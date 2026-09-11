@@ -110,6 +110,14 @@ FIXTURE_SERVER_DEPENDENT_KINDS = frozenset({"web-playwright"})
 # silently read as fully oracle-ready.
 VALIDATE_ONLY_KINDS = frozenset({"terraform"})
 
+# #3303 (epic #3237's teardown safety guard, slice 1): the ONLY resource-group
+# name shape the ephemeral-apply probe's teardown is ever allowed to delete.
+# Anchored at both ends deliberately — a prefix match on ``rg-coord-`` would
+# match every resource group the fleet owns, including ``rg-coord-shared``
+# (holds ``stcoordjdbackup``, the off-site restic backup) and
+# ``rg-coord-images``, both of which must never be touched by a teardown.
+EPHEMERAL_RG_PATTERN = re.compile(r"^rg-coord-ephemeral-[0-9a-f]{8}$")
+
 # libtest's ``--format json`` per-line test-event stream (`cargo test -- -Z
 # unstable-options --format json`) event -> our normalized status.
 _LIBTEST_EVENT_STATUS = {"ok": "pass", "failed": "fail", "ignored": "skip"}
@@ -146,6 +154,41 @@ _PLAYWRIGHT_STATUS = {
 
 class DriverError(Exception):
     """Raised when a driver can't run its suite or the ``kind`` is unknown."""
+
+
+def assert_ephemeral_rg(name: str) -> None:
+    """Raise :class:`DriverError` unless *name* is an ephemeral probe
+    resource group (#3303, epic #3237's teardown safety guard, slice 1).
+
+    The ephemeral-apply probe (a later slice) must route every teardown
+    through this function before deleting anything. It exists because
+    ``rg-coord-shared`` holds ``stcoordjdbackup`` — the off-site restic
+    backup, i.e. the thing that exists to survive everything else failing —
+    and ``rg-coord-images`` is live too. A teardown that computes a
+    resource-group name and deletes it is one bad variable away from taking
+    out the backup; today the only thing standing between those two facts is
+    prose in ``coord-infra/CLAUDE.md``. This makes it a check.
+
+    Fails CLOSED, not open: any *name* this cannot positively confirm
+    matches :data:`EPHEMERAL_RG_PATTERN` — a non-string, ``None``, an empty
+    string, one with leading/trailing whitespace, uppercase hex, or one that
+    merely *contains* a valid ephemeral name rather than being exactly one
+    (anchoring rules that out) — raises. Mirrors
+    :func:`coord.drive_queue.plan_is_destructive`, whose docstring spells out
+    the same reasoning: an unparseable shape is "cannot confirm this is
+    safe", never "probably fine".
+
+    Raises, rather than returning a bool, so a caller that forgets to check
+    a returned ``False`` still can't proceed straight into a delete.
+    """
+    if not isinstance(name, str) or not EPHEMERAL_RG_PATTERN.fullmatch(name):
+        raise DriverError(
+            f"refusing to treat {name!r} as an ephemeral probe resource "
+            "group — it does not match "
+            f"{EPHEMERAL_RG_PATTERN.pattern!r} exactly. Teardown must never "
+            "run against a resource group it cannot positively confirm is "
+            "ephemeral."
+        )
 
 
 @dataclass

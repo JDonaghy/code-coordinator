@@ -72,9 +72,11 @@ import pytest
 from coord.acceptance import build_verdict
 from coord.acceptance_drivers import (
     DriverError,
+    EPHEMERAL_RG_PATTERN,
     FIXTURE_SERVER_DEPENDENT_KINDS,
     SUPPORTED_KINDS,
     VALIDATE_ONLY_KINDS,
+    assert_ephemeral_rg,
     parse_conftest_json,
     parse_playwright_json_report,
     parse_pytest_junit_xml,
@@ -1273,3 +1275,91 @@ class TestRunDriverTerraformPolicyGate:
             {"id": "conftest: main.tf", "status": "pass", "message": ""},
         ]
         assert result.exit_code == 0
+
+
+class TestAssertEphemeralRg:
+    """#3303: the ephemeral-apply probe's teardown safety guard, slice 1.
+
+    No cloud account, no network, pure string validation — the guard must
+    raise DriverError on anything that isn't exactly
+    ``rg-coord-ephemeral-<8 lowercase hex>``, and must never merely return a
+    falsy value that a caller could forget to check.
+    """
+
+    def test_accepts_a_valid_ephemeral_name(self) -> None:
+        assert_ephemeral_rg("rg-coord-ephemeral-deadbeef") is None
+
+    def test_accepts_various_valid_hex_suffixes(self) -> None:
+        for suffix in ("00000000", "ffffffff", "0a1b2c3d", "12345678"):
+            assert_ephemeral_rg(f"rg-coord-ephemeral-{suffix}") is None
+
+    def test_rejects_rg_coord_shared(self) -> None:
+        """Holds stcoordjdbackup — the off-site restic backup. Must never match."""
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-shared")
+
+    def test_rejects_rg_coord_images(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-images")
+
+    def test_rejects_rg_coord_pilot(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-pilot")
+
+    def test_rejects_rg_coord_prod_tfstate(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-prod-tfstate")
+
+    def test_rejects_a_name_that_merely_contains_a_valid_one(self) -> None:
+        """Anchoring must reject this, not just plain substring checks."""
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-shared-rg-coord-ephemeral-deadbeef")
+
+    def test_rejects_a_valid_name_with_trailing_suffix(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-ephemeral-deadbeefx")
+
+    def test_rejects_empty_string(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("")
+
+    def test_rejects_none(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg(None)  # type: ignore[arg-type]
+
+    def test_rejects_non_string(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg(12345)  # type: ignore[arg-type]
+
+    def test_rejects_a_list(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg(["rg-coord-ephemeral-deadbeef"])  # type: ignore[arg-type]
+
+    def test_rejects_leading_whitespace(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg(" rg-coord-ephemeral-deadbeef")
+
+    def test_rejects_trailing_whitespace(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-ephemeral-deadbeef ")
+
+    def test_rejects_trailing_newline(self) -> None:
+        """re.match's `$` matches before a trailing newline — fullmatch must not."""
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-ephemeral-deadbeef\n")
+
+    def test_rejects_uppercase_hex(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-ephemeral-DEADBEEF")
+
+    def test_rejects_short_hex_suffix(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-ephemeral-dead")
+
+    def test_rejects_non_hex_suffix(self) -> None:
+        with pytest.raises(DriverError):
+            assert_ephemeral_rg("rg-coord-ephemeral-zzzzzzzz")
+
+    def test_pattern_is_anchored_at_both_ends(self) -> None:
+        assert EPHEMERAL_RG_PATTERN.pattern.startswith("^")
+        assert EPHEMERAL_RG_PATTERN.pattern.endswith("$")
