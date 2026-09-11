@@ -88,11 +88,62 @@ def _headers(svc: ServiceConfig) -> dict[str, str]:
     return headers
 
 
+# #3295: per-service-URL ETag cache for `GET /board`, so a thin client that
+# calls `fetch_board_payload()` repeatedly in a short window (dashboard
+# panels each doing their own read, drive-queue polling, ...) gets a
+# bodyless 304 back and reuses the last body instead of re-shipping and
+# re-parsing the full board (measured at 3.5MB) on every call. The daemon
+# has served `ETag` / honoured `If-None-Match` on `GET /board` since #1336;
+# nothing on the server changes here, only this client now uses it.
+# Process-local and never persisted — like `board_service._RESOURCE_ROUTE_SUPPORT`
+# — so a fresh process (or a test) starts with an empty cache and the very
+# next call is an unconditional GET.
+_board_payload_cache: dict[str, tuple[str, dict]] = {}
+
+
+def reset_board_payload_cache() -> None:
+    """Forget every cached ``(etag, body)`` pair (tests; #3295)."""
+    _board_payload_cache.clear()
+
+
 def fetch_board_payload(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
-    """GET /board → the raw projection dict (also carries machines/merge_queue/…)."""
-    resp = httpx.get(f"{svc.url}/board", headers=_headers(svc), timeout=timeout)
+    """GET /board → the raw projection dict (also carries machines/merge_queue/…).
+
+    #3295: sends ``If-None-Match`` with the ETag from this *svc.url*'s last
+    successful fetch, if any. A ``304`` means the daemon is telling us the
+    board hasn't changed since that ETag was minted — the cached body from
+    that fetch is still exactly correct, so it's returned as-is with no
+    re-parse. A ``200`` (first call for this URL, or the board really did
+    change) refreshes the cache with the new ``ETag``/body pair; a response
+    carrying no ``ETag`` at all clears any stale entry rather than caching
+    something we can't validate next time.
+    """
+    headers = _headers(svc)
+    cached = _board_payload_cache.get(svc.url)
+    if cached is not None:
+        headers["If-None-Match"] = cached[0]
+    resp = httpx.get(f"{svc.url}/board", headers=headers, timeout=timeout)
+    if resp.status_code == 304:
+        if cached is not None:
+            return cached[1]
+        # Should never happen — we only ever send `If-None-Match` when
+        # *cached* is set, so a 304 here means the daemon answered a
+        # conditional response to an unconditional request. Surfacing this
+        # loudly beats silently returning `None`/an empty board that looks
+        # like a real (if suspiciously quiet) fleet.
+        raise RuntimeError(
+            f"GET {svc.url}/board answered 304 but this client sent no "
+            "If-None-Match (no cached ETag for this service) — refusing to "
+            "guess at a board"
+        )
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    etag = resp.headers.get("ETag")
+    if etag:
+        _board_payload_cache[svc.url] = (etag, body)
+    else:
+        _board_payload_cache.pop(svc.url, None)
+    return body
 
 
 def fetch_healthz(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:

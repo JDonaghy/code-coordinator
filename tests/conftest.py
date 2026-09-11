@@ -140,6 +140,26 @@ def _fresh_resource_route_support():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_board_payload_cache():
+    """#3295: forget every cached ``GET /board`` ETag/body between tests.
+
+    ``coord.client.fetch_board_payload`` now memoizes ``(etag, body)`` per
+    service URL so a thin client sending a repeat ``If-None-Match`` can reuse
+    the daemon's 304. That memo is module-level — same shape as
+    ``_fresh_resource_route_support`` above — so without a reset a test that
+    populates it for a fake ``http://daemon:7435`` (a URL string reused
+    across dozens of unrelated tests) would leak a stale ``If-None-Match``
+    header, and a stale cached body, into the next test that happens to
+    reuse it.
+    """
+    from coord import client as _cc
+
+    _cc.reset_board_payload_cache()
+    yield
+    _cc.reset_board_payload_cache()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_webapp_bundle(monkeypatch, tmp_path):
     """#2009: never let the HOST's live webapp bundle change a test's answer.
 

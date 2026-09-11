@@ -2378,22 +2378,90 @@ def build_app(
         # would take those down to protest a missing frontend.
         logger.warning("coord web: %s", webapp_bundle_missing_message(webapp_dist))
 
+    # #3295: per-process board memo. Before this, EVERY `/api/*` request on
+    # the daemon host (no `board_service` configured — the deployment
+    # actually in use) fell through to `read_board()`: open sqlite, run the
+    # query, walk every row through `assemble_board()`. A single screen load
+    # (a few panels each polling their own endpoint) or one background
+    # `_background_poller()` tick fanned that out into 2-5 independent
+    # builds of the SAME board. In thin-client mode (`board_service`
+    # configured) the equivalent waste was `_read_board_and_machine_health()`
+    # and `_read_fleet_health()` each firing their OWN `fetch_board_payload()`
+    # round trip for the same daemon snapshot.
+    #
+    # `_board_memo` is local to this `build_app()` closure — like
+    # `_seen_terminal`/`_orphaned_since` below — never a module global, so
+    # each dashboard process (and each test's own `build_app()`) gets an
+    # independent memo that can never bleed into another's.
+    _BOARD_MEMO_TTL_S = 2.0
+    _board_memo: dict[str, Any] = {"at": 0.0, "board": None, "payload": None}
+
+    def _fetch_board_and_payload():  # -> tuple[Board, dict | None]
+        """Uncached ``(board, payload)`` build — what the memo below wraps.
+
+        ``payload`` is the raw ``/board`` projection dict when this process
+        is a thin client (``board_service`` configured) — it carries sibling
+        keys (``fleet_health``, ...) a bare :class:`Board` does not — and
+        ``None`` when reading the local DB/daemon-host path directly, since
+        there is no daemon payload to share in that mode.
+        """
+        from coord import board_service  # noqa: PLC0415
+
+        svc = board_service.resolve()
+        if svc is not None:
+            from coord.client import board_from_payload, fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            return board_from_payload(payload), payload
+        return read_board(), None
+
+    def _memoized_board_and_payload():  # -> tuple[Board, dict | None]
+        """``(board, payload)``, rebuilt at most once per ``_BOARD_MEMO_TTL_S``.
+
+        The ONE read every board-shaped handler below goes through —
+        ``_read_board()``, ``_read_board_and_machine_health()`` and
+        ``_read_fleet_health()`` all call this rather than each doing their
+        own ``read_board()``/``fetch_board_payload()`` (#3295: "one question,
+        one answer" applies to *how the data is obtained*, not just what it
+        says). A short TTL rather than invalidate-on-write: long enough to
+        collapse a burst of requests (one screen load, one SSE tick) into a
+        single build, short enough that no panel is ever more than ~2s
+        behind the DB/daemon.
+        """
+        now = time.monotonic()
+        if _board_memo["board"] is not None and (now - _board_memo["at"]) < _BOARD_MEMO_TTL_S:
+            return _board_memo["board"], _board_memo["payload"]
+        board, payload = _fetch_board_and_payload()
+        _board_memo.update(at=now, board=board, payload=payload)
+        return board, payload
+
     def _read_board():
-        """The board for this request — seeded fixture or the live DB/daemon.
+        """The board for this request — seeded fixture or the memoized live DB/daemon.
 
         Fixture mode rebuilds the Board from the raw payload on every call, so
         a handler that mutates what it is handed (``unstick`` →
-        ``mark_failed_by_id``) can't leak that into the next request.
+        ``mark_failed_by_id``) can't leak that into the next request. Live
+        mode goes through :func:`_memoized_board_and_payload` (#3295).
         """
         if _fixture is not None:
             return _fixture.board()
-        return read_board()
+        board, _payload = _memoized_board_and_payload()
+        return board
 
     def _write_board(board) -> None:  # noqa: ANN001
-        """Persist *board* — a no-op in fixture mode (writes never execute)."""
+        """Persist *board* — a no-op in fixture mode (writes never execute).
+
+        Invalidates the #3295 board memo rather than repopulating it with
+        *board*: in thin-client mode the write only carries the mutated
+        `Board`, not a fresh daemon payload (`fleet_health` et al.), so
+        keeping a stale/partial cache entry around risks a subsequent
+        `_read_fleet_health()`/`_read_board_and_machine_health()` call
+        serving an empty block instead of paying for one more real read.
+        """
         if _fixture is not None:
             return
         write_board(board)
+        _board_memo.update(at=0.0, board=None, payload=None)
 
     def _read_board_and_machine_health() -> tuple:  # -> tuple[Board, dict[str, dict]]
         """The board plus every configured machine's latest daemon-tick-
@@ -2423,16 +2491,19 @@ def build_app(
         install, or nothing has ticked the health refresher yet) — callers
         must treat that the same as an ``unknown`` state, never as healthy
         (#1485's failure mode).
+
+        #3295: the thin-client branch now reads through
+        :func:`_memoized_board_and_payload` instead of calling
+        ``fetch_board_payload`` itself — sharing the SAME daemon round trip
+        ``_read_fleet_health()`` (and ``_read_board()``) make within the
+        memo window, rather than each paying for its own.
         """
         from coord import board_service  # noqa: PLC0415
 
         svc = board_service.resolve()
         if svc is not None:
-            from coord.client import board_from_payload, fetch_board_payload  # noqa: PLC0415
-
-            payload = fetch_board_payload(svc)
-            board = board_from_payload(payload)
-            rows = (payload.get("fleet_health") or {}).get("machine_health") or []
+            board, payload = _memoized_board_and_payload()
+            rows = ((payload or {}).get("fleet_health") or {}).get("machine_health") or []
             return board, {row["machine"]: row for row in rows}
 
         from coord.health.fleet_snapshot import machine_health_rows  # noqa: PLC0415
@@ -2494,15 +2565,19 @@ def build_app(
         ``coord status``. Per-machine severities still come from the same
         row-assembly the thin-client path rides (``machine_health_rows``), so
         the two modes can't drift on that half.
+
+        #3295: the thin-client branch reads through
+        :func:`_memoized_board_and_payload` — the same memo
+        ``_read_board_and_machine_health()`` reads through — instead of
+        issuing its own ``fetch_board_payload`` call, so the two no longer
+        double the daemon I/O a single request burst costs.
         """
         from coord import board_service  # noqa: PLC0415
 
         svc = board_service.resolve()
         if svc is not None:
-            from coord.client import fetch_board_payload  # noqa: PLC0415
-
-            payload = fetch_board_payload(svc)
-            return payload.get("fleet_health") or dict(_EMPTY_FLEET_HEALTH_BLOCK)
+            _board, payload = _memoized_board_and_payload()
+            return (payload or {}).get("fleet_health") or dict(_EMPTY_FLEET_HEALTH_BLOCK)
 
         from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
 
@@ -2746,12 +2821,21 @@ def build_app(
     _sessions_offline_since: dict[str, float] = {}
 
     async def _background_poller() -> None:
-        """Runs forever; polls agents every _POLL_INTERVAL seconds."""
+        """Runs forever; polls agents every _POLL_INTERVAL seconds.
+
+        #3295: passes its own board read through the shared
+        ``_read_board()``/memo rather than letting ``_poll_once`` fall back
+        to its own bare ``read_board()`` — a tick landing inside a client's
+        own ``/api/board`` poll window reuses that build instead of paying
+        for a second one, and the tick's own build is then what the very
+        next client poll reuses.
+        """
         await asyncio.sleep(10)  # Short initial delay so the server is ready
         while True:
             try:
                 possibly_stuck = await _poll_once(
                     config, event_source, _seen_terminal, _orphaned_since,
+                    board=_read_board(),
                     needs_attention_seen=_needs_attention_seen,
                 )
                 event_source.publish(BOARD_UPDATED, {
