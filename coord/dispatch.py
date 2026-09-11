@@ -260,13 +260,16 @@ than trusting them as written.
 
 Your job, in order:
 
-1. **Decompose fully.** Read the epic's own decomposition/handoff \
-instructions (if it carries them, follow those verbatim) and file every \
-child issue this epic implies. Register each one against this epic with \
-`coord milestone add-child <repo> <this epic's issue number> <new issue \
-number>` (REPO EPIC ISSUE, all positional — no `--child` flag) so the \
-epic's checklist and this epic's tracking stay in sync — never hand-edit \
-the checklist directly.
+1. **Decompose fully — except the slice you implement below.** Read the \
+epic's own decomposition/handoff instructions (if it carries them, follow \
+those verbatim) and file a child issue for every slice EXCEPT the one you \
+implement in step 2. Register each one against this epic with `coord \
+milestone add-child <repo> <this epic's issue number> <new issue number>` \
+(REPO EPIC ISSUE, all positional — no `--child` flag) so the epic's \
+checklist and this epic's tracking stay in sync — never hand-edit the \
+checklist directly. Do NOT also file the slice from step 2 as a child \
+issue: this PR IS that slice's delivery, and a separate issue for it would \
+be a duplicate nobody needs to work (#3275).
 2. **Implement only the first slice in this pickup.** Do not attempt the \
 whole epic in one PR — that defeats the point of decomposing it.
 3. **Leave this epic open.** Do not close it yourself and do not word your \
@@ -274,12 +277,14 @@ PR body as "Closes #N" — the coordinator already opens this PR with `Refs \
 #N`, non-closing, for exactly this reason. The epic closes only when its \
 checklist is complete.
 
-Do NOT queue the newly-filed children or re-queue this epic yourself —
-`coord drive-queue add` is coordinator-side once this assignment reports
-`done` (#3246): it reads the checklist you just wrote back off GitHub (not
-your own report of it), queues the first ready batch chained serially, and
-re-queues this epic behind them. That step used to be step 2/3 of this same
-list and worked only ~half the time when a one-shot worker session did it —
+Do NOT queue the newly-filed children or touch this epic's own queue row
+yourself — `coord drive-queue add` is coordinator-side once this assignment
+reports `done` (#3246): it reads the checklist you just wrote back off
+GitHub (not your own report of it) and chains the first ready batch,
+serially, BEHIND THIS EPIC — never the other way around, since your PR
+above already implements the slice the rest of the checklist builds on, so
+it must land first (#3275). That step used to be step 2/3 of this same list
+and worked only ~half the time when a one-shot worker session did it —
 moving it here means it happens from an OBSERVATION of the checklist, not
 from trusting this session's own final message.
 """

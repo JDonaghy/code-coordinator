@@ -2298,7 +2298,7 @@ def done_work(**kw) -> IssueState:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# #3246: epic-decompose's steps 2/3, coordinator-side
+# #3246/#3275: epic-decompose's steps 2/3, coordinator-side
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # `EPIC_DECOMPOSE_CONTRACT` used to ask the worker to queue the first batch
@@ -2308,6 +2308,15 @@ def done_work(**kw) -> IssueState:
 # neither queue row ever existed. These tests cover the coordinator-side
 # replacement: `_epic_decompose_batch` (pure planner over a fetched
 # snapshot) and its wiring into `decide()`.
+#
+# #3275: claude-coordinator#3261 showed the "re-queue the epic behind the
+# last child" half of that plan is a guaranteed dependency cycle, not a
+# predictor false positive — the epic's own PR implements the first slice,
+# so #2247's overlap predictor correctly chains a duplicate-slice child
+# `--after` the epic, and re-queueing the epic `--after` that same child
+# then closes the loop every time. The fix removes that half entirely: the
+# batch now chains BEHIND the epic (first child `--after` the epic, not
+# `--after` nothing) and the planner never touches the epic's own queue row.
 
 EPIC = 3230
 CHILD_A = 3232
@@ -2338,7 +2347,12 @@ class TestEpicDecomposeBatchPlanner:
         snap = EpicChecklistSnapshot(children=(), queued_keys=frozenset(), epic_after=())
         assert _epic_decompose_batch(state(repo="r", issue=EPIC), snap) is None
 
-    def test_first_unqueued_child_is_queued_with_no_after(self) -> None:
+    def test_first_unqueued_child_chains_after_the_epic(self) -> None:
+        """#3275: the first batch child chains `--after` the EPIC, not
+        nothing — the epic's own PR implements the slice this checklist
+        builds on, so it must land first. `--reject-after` rides along so
+        #2247's own predictor can never independently re-derive the reverse
+        edge that deadlocked claude-coordinator#3261."""
         snap = EpicChecklistSnapshot(
             children=(EpicChildStatus(CHILD_A),),
             queued_keys=frozenset(),
@@ -2346,12 +2360,16 @@ class TestEpicDecomposeBatchPlanner:
         )
         action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
         assert action is not None
-        assert action.command == ("drive-queue", "add", "r", str(CHILD_A))
+        assert action.command == (
+            "drive-queue", "add", "r", str(CHILD_A),
+            "--after", entry_key("r", EPIC),
+            "--reject-after", entry_key("r", EPIC),
+        )
 
     def test_second_child_chains_after_the_first(self) -> None:
         """The first child is already queued (a previous poll's action) —
-        the next call must queue the second one chained behind it, not
-        re-queue the first or skip straight to the epic."""
+        the next call must queue the second one chained behind IT, not
+        behind the epic directly (and not re-queue the first)."""
         snap = EpicChecklistSnapshot(
             children=(EpicChildStatus(CHILD_A), EpicChildStatus(CHILD_B)),
             queued_keys=frozenset({entry_key("r", CHILD_A)}),
@@ -2360,26 +2378,28 @@ class TestEpicDecomposeBatchPlanner:
         action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
         assert action is not None
         assert action.command == (
-            "drive-queue", "add", "r", str(CHILD_B), "--after", entry_key("r", CHILD_A),
+            "drive-queue", "add", "r", str(CHILD_B),
+            "--after", entry_key("r", CHILD_A),
+            "--reject-after", entry_key("r", EPIC),
         )
 
-    def test_batch_fully_queued_then_requeues_the_epic_behind_the_last(self) -> None:
+    def test_batch_fully_queued_is_a_noop(self) -> None:
+        """#3275: once every batch child is queued there is nothing left to
+        do — the epic's own queue row is never touched. The old plan's
+        "re-queue the epic behind the last child" step is gone entirely,
+        not merely reordered: that step is what turned #2247's (correct)
+        `--after` from the first child onto the epic into a 2-cycle."""
         snap = EpicChecklistSnapshot(
             children=(EpicChildStatus(CHILD_A), EpicChildStatus(CHILD_B)),
             queued_keys=frozenset({entry_key("r", CHILD_A), entry_key("r", CHILD_B)}),
             epic_after=(),
         )
-        action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
-        assert action is not None
-        assert action.command == (
-            "drive-queue", "add", "r", str(EPIC), "--after", entry_key("r", CHILD_B),
-        )
+        assert _epic_decompose_batch(state(repo="r", issue=EPIC), snap) is None
 
-    def test_everything_already_done_is_a_noop(self) -> None:
-        """Batch fully queued AND the epic's own `after=` already names the
-        last batch child — nothing left to do; must fall through to the
-        ordinary Test/Review/Merge machinery instead of re-issuing the same
-        `add` forever."""
+    def test_everything_already_done_is_a_noop_regardless_of_epic_after(self) -> None:
+        """Batch fully queued — nothing left to do, whether or not the
+        epic's own queue row happens to carry an `after=` from some other
+        source; the planner no longer reads that field at all (#3275)."""
         snap = EpicChecklistSnapshot(
             children=(EpicChildStatus(CHILD_A), EpicChildStatus(CHILD_B)),
             queued_keys=frozenset({entry_key("r", CHILD_A), entry_key("r", CHILD_B)}),
@@ -2398,8 +2418,13 @@ class TestEpicDecomposeBatchPlanner:
         )
         action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
         assert action is not None
-        # CHILD_B is first in the (closed-filtered) batch, so no --after yet.
-        assert action.command == ("drive-queue", "add", "r", str(CHILD_B))
+        # CHILD_B is first in the (closed-filtered) batch, so it chains
+        # after the EPIC, same as any other first-in-batch child.
+        assert action.command == (
+            "drive-queue", "add", "r", str(CHILD_B),
+            "--after", entry_key("r", EPIC),
+            "--reject-after", entry_key("r", EPIC),
+        )
 
     def test_child_blocked_on_an_open_dependency_is_skipped(self) -> None:
         """The claude-coordinator#3230 shape: an epic author marks a child
@@ -2419,7 +2444,9 @@ class TestEpicDecomposeBatchPlanner:
         assert action is not None
         # CHILD_B is blocked, so CHILD_C is next after CHILD_A, not CHILD_B.
         assert action.command == (
-            "drive-queue", "add", "r", str(CHILD_C), "--after", entry_key("r", CHILD_A),
+            "drive-queue", "add", "r", str(CHILD_C),
+            "--after", entry_key("r", CHILD_A),
+            "--reject-after", entry_key("r", EPIC),
         )
 
     def test_blocked_child_becomes_eligible_once_its_dependency_closes(self) -> None:
@@ -2440,22 +2467,40 @@ class TestEpicDecomposeBatchPlanner:
         )
         action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap_closed)
         assert action is not None
-        assert action.command == ("drive-queue", "add", "r", str(CHILD_A))
+        assert action.command == (
+            "drive-queue", "add", "r", str(CHILD_A),
+            "--after", entry_key("r", EPIC),
+            "--reject-after", entry_key("r", EPIC),
+        )
 
     def test_batch_is_capped_at_six(self) -> None:
+        """With the whole eligible batch already queued, there is nothing
+        left to do — the cap is never exceeded by chasing a 7th child, and
+        (#3275) there is no epic re-queue step left to fall into either."""
         children = tuple(EpicChildStatus(3000 + i) for i in range(9))
         assert len(children) > _EPIC_DECOMPOSE_BATCH_SIZE
         queued = frozenset(
             entry_key("r", c.issue_number) for c in children[:_EPIC_DECOMPOSE_BATCH_SIZE]
         )
         snap = EpicChecklistSnapshot(children=children, queued_keys=queued, epic_after=())
+        assert _epic_decompose_batch(state(repo="r", issue=EPIC), snap) is None
+
+    def test_batch_cap_leaves_the_seventh_child_unqueued(self) -> None:
+        """Only the first five of nine eligible children are queued — the
+        6th (last slot in the batch) must be next, chained behind the 5th;
+        the 7th (outside the cap) must never be reached."""
+        children = tuple(EpicChildStatus(3000 + i) for i in range(9))
+        cap = _EPIC_DECOMPOSE_BATCH_SIZE
+        queued = frozenset(entry_key("r", c.issue_number) for c in children[: cap - 1])
+        snap = EpicChecklistSnapshot(children=children, queued_keys=queued, epic_after=())
         action = _epic_decompose_batch(state(repo="r", issue=EPIC), snap)
         assert action is not None
-        # The 7th child (index 6) is NOT queued — the epic re-queue behind
-        # the 6th is next, not a 7th batch member.
-        last_in_batch = children[_EPIC_DECOMPOSE_BATCH_SIZE - 1].issue_number
+        sixth = children[cap - 1].issue_number
+        fifth = children[cap - 2].issue_number
         assert action.command == (
-            "drive-queue", "add", "r", str(EPIC), "--after", entry_key("r", last_in_batch),
+            "drive-queue", "add", "r", str(sixth),
+            "--after", entry_key("r", fifth),
+            "--reject-after", entry_key("r", EPIC),
         )
 
 
@@ -2490,15 +2535,20 @@ class TestEpicDecomposeFollowupWiring:
         verifier = FakeVerifier(epic_snapshot=snap)
         action = step(epic_done_work(work_test_state=""), verifier=verifier)
         assert action.kind == RUN
-        assert action.command == ("drive-queue", "add", REPO, str(CHILD_A))
+        assert action.command == (
+            "drive-queue", "add", REPO, str(CHILD_A),
+            "--after", entry_key(REPO, EPIC),
+            "--reject-after", entry_key(REPO, EPIC),
+        )
 
     def test_fully_satisfied_batch_falls_through_to_the_test_gate(self) -> None:
         """Nothing left to queue — must behave byte-identically to a plain
-        `work` done row reaching the same point."""
+        `work` done row reaching the same point. #3275: the epic's own
+        `epic_after` is irrelevant now — the planner never reads it."""
         snap = EpicChecklistSnapshot(
             children=(EpicChildStatus(CHILD_A),),
             queued_keys=frozenset({entry_key(REPO, CHILD_A)}),
-            epic_after=(entry_key(REPO, CHILD_A),),
+            epic_after=(),
         )
         verifier = FakeVerifier(epic_snapshot=snap)
         action = step(epic_done_work(work_test_state=""), verifier=verifier)
