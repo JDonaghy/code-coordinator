@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -270,19 +271,33 @@ class _Launches(list):
 
 @pytest.fixture
 def launches(monkeypatch) -> _Launches:
-    """Capture the `coord drive --tmux` argv instead of running it."""
+    """Capture the `coord drive --tmux` argv instead of running it.
+
+    `subprocess.run` is a single process-wide symbol, so this stub sees
+    every subprocess call this module makes — not just the drive launch.
+    Since #3282, `remove` also shells out to plain ``tmux`` (``has-session``/
+    ``kill-session``, to stop a driver it is orphaning) — a call this fixture
+    predates and must not swallow into the launch outcome. Bare ``tmux ...``
+    argvs are passed to a fixed "nothing there" default (``has-session``
+    exits 1: no session; ``kill-session`` likewise, though `remove`'s own
+    tests patch `coord.interactive.tmux_session_alive` directly and never
+    reach this path) rather than recorded — `captured` stays exactly what
+    its name says, the launch argv only.
+    """
     captured = _Launches()
     captured.outcome = {"returncode": 0, "stderr": ""}
 
     class _Result:
-        def __init__(self) -> None:
-            self.returncode = captured.outcome["returncode"]
+        def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+            self.returncode = returncode
             self.stdout = ""
-            self.stderr = captured.outcome["stderr"]
+            self.stderr = stderr
 
     def fake_run(argv, **_kw):
+        if argv and argv[0] == "tmux":
+            return _Result(returncode=1)  # no such session — not a launch
         captured.append(list(argv))
-        return _Result()
+        return _Result(captured.outcome["returncode"], captured.outcome["stderr"])
 
     monkeypatch.setattr("coord.commands.drive_queue.subprocess.run", fake_run)
     return captured
@@ -1507,6 +1522,111 @@ def test_remove_of_an_unqueued_issue_exits_non_zero(cli):
     result = cli("remove", REPO, "9999")
     assert result.exit_code != 0
     assert "not in the drive queue" in result.output
+
+
+# ── remove owns the driver it orphans (#3282) ───────────────────────────────
+#
+# Before this fix, `remove` deleted only the queue row: a driver already
+# running for that issue never re-checks whether its own row still exists,
+# so it kept dispatching worker legs — for an issue with no representation
+# left in any queue view — until an operator noticed by accident. These
+# assert that (a) a live session is actually killed and its death confirmed
+# by a FRESH probe taken after the kill (#2096 — never trust the subprocess
+# exit code alone), and (b) a session that can't be confirmed dead makes
+# `remove` fail loudly (non-zero, names the session) instead of printing the
+# same success line the incident's silent case did. A live Driver process
+# actually dispatching a further leg is `coord/drive.py` territory
+# (`tests/test_drive.py`), outside this file's scope — what's covered here
+# is the CLI-visible half: `remove` can no longer claim success while a
+# session it never confirmed dead keeps running.
+
+
+def test_remove_kills_a_live_driver_session(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    session = f"coord-drive-{REPO}-1650"
+    alive_probes: list[str] = []
+
+    def fake_alive(name, *, host=None):
+        alive_probes.append(name)
+        # Alive on the pre-kill check; confirmed dead on the POST-kill
+        # re-probe (#2096) — never trust `kill-session`'s exit code alone.
+        return len(alive_probes) == 1
+
+    kill_calls: list[list[str]] = []
+
+    def fake_run(argv, **_kw):
+        kill_calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", fake_alive)
+    monkeypatch.setattr("coord.commands.drive_queue.subprocess.run", fake_run)
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code == 0, result.output
+    assert f"removed {REPO}#1650 from the drive queue" in result.output
+    assert f"killed driver session {session!r}" in result.output
+    assert kill_calls == [["tmux", "kill-session", "-t", session]]
+    assert alive_probes == [session, session]  # pre-kill, then post-kill
+    assert queued(1650) is None
+
+
+def test_remove_with_no_live_driver_is_unchanged(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: False)
+
+    kill_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "coord.commands.drive_queue.subprocess.run",
+        lambda argv, **_kw: kill_calls.append(list(argv)),
+    )
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == f"removed {REPO}#1650 from the drive queue"
+    assert kill_calls == []  # nothing alive, nothing to kill
+    assert queued(1650) is None
+
+
+def test_remove_reports_failure_loudly_when_the_driver_cannot_be_killed(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    session = f"coord-drive-{REPO}-1650"
+    # Still alive on both the pre-kill check AND the post-kill re-probe: the
+    # `kill-session` call "succeeded" (returncode 0) but nothing died.
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "coord.commands.drive_queue.subprocess.run",
+        lambda argv, **_kw: subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr=""),
+    )
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code != 0
+    assert session in result.output
+    assert "still" in result.output
+    # The bug this closes: never print the bare success line while a driver
+    # may still be dispatching.
+    assert f"removed {REPO}#1650 from the drive queue\n" not in result.output
+    # The row itself is dequeued regardless — that's a separate, cheap, and
+    # idempotent DB write; only the best-effort tmux cleanup failed.
+    assert queued(1650) is None
+
+
+def test_remove_reports_failure_when_kill_session_itself_errors(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: True)
+
+    def boom(argv, **_kw):
+        raise OSError("tmux: command not found")
+
+    monkeypatch.setattr("coord.commands.drive_queue.subprocess.run", boom)
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code != 0
+    assert "coord-drive-" in result.output
+    assert "tmux: command not found" in result.output
 
 
 def test_move_reorders_the_queue(cli):
