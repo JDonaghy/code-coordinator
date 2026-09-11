@@ -7829,6 +7829,32 @@ def _get_drive_queue_entry_local(repo_name: str, issue_number: int) -> dict | No
     return _decode_drive_queue_row(row) if row is not None else None
 
 
+def _get_drive_queue_archive_entry_local(
+    repo_name: str, issue_number: int
+) -> dict | None:
+    """The archived drive-queue entry for one issue, or ``None``.
+
+    #3296: a live-table miss for (repo_name, issue_number) is ambiguous —
+    "never queued" and "archived after going terminal" look identical
+    without this. Callers that want to tell them apart (the `?state=`
+    history read in ``coord.serve_app``) fall back to this. Defensive
+    against ``drive_queue_archive`` not existing yet, same guard as
+    :func:`_drive_queue_archive_rows_local`.
+    """
+    conn = get_connection()
+    try:
+        row = sql.execute(
+            conn,
+            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue_archive "  # noqa: S608 — constant
+            "WHERE repo_name = ? AND issue_number = ?",
+            (repo_name, issue_number),
+        ).fetchone()
+    except sql.driver_errors() as exc:  # #2784: not just sqlite3.OperationalError
+        rollback_after_driver_error(conn, exc)
+        return None
+    return _decode_drive_queue_row(row) if row is not None else None
+
+
 def list_drive_queue(repo_name: str | None = None) -> list[dict]:
     """Every drive-queue entry in run order, optionally filtered to one repo.
 
@@ -7843,19 +7869,67 @@ def list_drive_queue(repo_name: str | None = None) -> list[dict]:
     return _list_drive_queue_local(repo_name)
 
 
-def _list_drive_queue_local(repo_name: str | None = None) -> list[dict]:
+def _list_drive_queue_local(
+    repo_name: str | None = None, *, state: str | None = None
+) -> list[dict]:
+    """Live ``drive_queue`` rows, optionally filtered to one repo and/or one
+    ``state`` value.
+
+    #3296: an explicit ``state`` filter also pulls in matching
+    ``drive_queue_archive`` rows — ``coord.housekeeping.sweep()`` moves
+    terminal drive-queue rows there once they age out of the retention
+    window, and a caller asking "show me every `done` entry" must not have
+    them silently vanish the moment they're archived. Omitting ``state``
+    (the pre-#3296 call shape every other caller in this module still uses)
+    reads only the live table, unchanged.
+    """
     conn = get_connection()
+    where: list[str] = []
+    params: list[object] = []
     if repo_name:
-        rows = sql.execute(conn,
-            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
-            "WHERE repo_name = ? ORDER BY position, id",
-            (repo_name,),
+        where.append("repo_name = ?")
+        params.append(repo_name)
+    if state:
+        where.append("state = ?")
+        params.append(state)
+    clause = f" WHERE {' AND '.join(where)}" if where else ""
+    rows = sql.execute(
+        conn,
+        f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue{clause} "  # noqa: S608 — constant
+        "ORDER BY position, id",
+        params,
+    ).fetchall()
+    entries = [_decode_drive_queue_row(r) for r in rows]
+    if state:
+        entries.extend(_drive_queue_archive_rows_local(repo_name, state))
+    return entries
+
+
+def _drive_queue_archive_rows_local(repo_name: str | None, state: str) -> list[dict]:
+    """``drive_queue_archive`` rows matching *state* (+ optional *repo_name*).
+
+    Defensive against ``drive_queue_archive`` not existing yet — it is only
+    created the first time ``coord.housekeeping.sweep()`` archives a
+    drive-queue row — mirroring
+    :func:`coord.merge_queue._archived_merged_issue_keys`'s guard for the
+    same not-yet-archived case on ``merge_queue_archive``.
+    """
+    conn = get_connection()
+    where = ["state = ?"]
+    params: list[object] = [state]
+    if repo_name:
+        where.append("repo_name = ?")
+        params.append(repo_name)
+    try:
+        rows = sql.execute(
+            conn,
+            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue_archive "  # noqa: S608 — constant
+            f"WHERE {' AND '.join(where)} ORDER BY id",
+            params,
         ).fetchall()
-    else:
-        rows = sql.execute(conn,
-            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
-            "ORDER BY position, id"
-        ).fetchall()
+    except sql.driver_errors() as exc:  # #2784: not just sqlite3.OperationalError
+        rollback_after_driver_error(conn, exc)
+        return []
     return [_decode_drive_queue_row(r) for r in rows]
 
 
