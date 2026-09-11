@@ -45,9 +45,11 @@ def _gates_via_daemon(svc, params: dict) -> None:
     help=(
         "Print a work row's gate columns (test_state, smoke_test, test_reason, "
         "test_toolchain, review_state, review_verdict, review_of_assignment_id), "
-        "plus the LIVE review/test/merge gate decision — including whether a recorded verdict "
-        "is #1479-stale (recorded against a base/branch SHA that has since "
-        "moved) and the SHAs compared. Read-only: never mutates board state."
+        "plus the LIVE review/test/uat/merge gate decision — including whether a recorded "
+        "verdict is #1479-stale (recorded against a base/branch SHA that has since "
+        "moved) and the SHAs compared. A gate that does not apply (e.g. uat, when "
+        "not configured for this repo) is still shown, with an explicit reason. "
+        "Read-only: never mutates board state."
     )
 )
 @click.argument("repo")

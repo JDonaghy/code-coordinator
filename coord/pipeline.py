@@ -32,7 +32,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from coord.merge_queue import evaluate_uat_verdict, is_uat_gate_reason, requires_uat
+from coord.merge_queue import (
+    evaluate_uat_verdict,
+    is_uat_gate_reason,
+    requires_uat,
+    uat_inapplicable_reason,
+)
 
 if TYPE_CHECKING:
     from coord.config import Config
@@ -187,6 +192,17 @@ class GateSpec:
     #: for the same allowance).
     identifies_reason: Callable[[str], bool] | None = None
 
+    #: ``(entry, config) -> str | None`` — a human-readable reason THIS gate
+    #: does not apply to *entry*, populated only when ``applies`` would
+    #: return ``False`` (``None`` on the ``applies=True`` branch). #3273
+    #: (S-5 of #3261): this is what lets a render path (``coord gates``) walk
+    #: every registry gate and give the skipped ones an explicit reason
+    #: ("UAT not configured for this repo", "issue exempt via
+    #: uat_checks.exempt", ...) instead of silently omitting them — the same
+    #: posture ``milestone_gate.plan_sequence`` already takes for the
+    #: Gate-A..D walk. ``None`` for a gate that hasn't grown this yet.
+    explain_inapplicable: Callable[["QueuedMerge", "Config"], str | None] | None = None
+
 
 GATE_REGISTRY: dict[str, GateSpec] = {
     "uat": GateSpec(
@@ -196,6 +212,7 @@ GATE_REGISTRY: dict[str, GateSpec] = {
         verdicts=("passed", "failed", None),
         fail_route="coord.drive._park_uat_fixup_dispatch_failure",
         identifies_reason=is_uat_gate_reason,
+        explain_inapplicable=uat_inapplicable_reason,
     ),
 }
 
