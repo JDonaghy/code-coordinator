@@ -123,6 +123,45 @@ class TestInsertRepoEntry:
         assert "test_command" not in entry
         assert "build_command" not in entry
 
+    def test_a_double_quote_in_the_command_does_not_break_the_yaml(self, tmp_path):
+        """#3285: the old `f'    test_command: "{value}"'` wrapping let a
+        literal `"` in the value terminate the YAML scalar early. This is the
+        exact ordinary shape that hit it — a shell loop that quotes a
+        variable, which is the *correct* way to write one."""
+        cmd = (
+            'for f in $(find modules -name main.bicep); do '
+            'az bicep build --file "$f" --stdout > /dev/null || exit 1; done'
+        )
+        entry = render_repo_entry(
+            "newrepo", "acme/newrepo", "main", test_command=cmd,
+        )
+        out = insert_repo_entry(COMMENTED_CONFIG, entry)
+        cfg = _load(tmp_path, out)
+        assert cfg.repo("newrepo").test_command == cmd
+
+    def test_a_backslash_in_the_command_does_not_silently_corrupt_it(self, tmp_path):
+        """#3285: a `\\` inside the old hand-rolled double-quoted scalar is a
+        YAML escape character, so the write did NOT fail — it silently
+        rewrote the value to something the operator never typed. This must
+        now round-trip byte-for-byte instead."""
+        cmd = r'find . -name "*.py" -not -path "*\.venv*" | xargs -0'
+        entry = render_repo_entry(
+            "newrepo", "acme/newrepo", "main", build_command=cmd,
+        )
+        out = insert_repo_entry(COMMENTED_CONFIG, entry)
+        cfg = _load(tmp_path, out)
+        assert cfg.repo("newrepo").build_command == cmd
+
+    def test_a_plain_command_is_still_rendered_on_one_line(self, tmp_path):
+        """The YAML emitter must not be given free rein to wrap long-but-plain
+        commands across lines — this module's block finder (`_find_block`)
+        and the rest of the surgery in this file assume one field per line."""
+        entry = render_repo_entry(
+            "newrepo", "acme/newrepo", "main", test_command="make test",
+        )
+        line = next(l for l in entry.splitlines() if "test_command" in l)
+        assert line == '    test_command: make test'
+
 
 class TestAddRepoToMachine:
     def test_inline_flow_list_gains_the_repo_and_a_path(self, tmp_path):
@@ -366,3 +405,18 @@ class TestAcceptanceDriverEntry:
         out = insert_acceptance_driver_entry(config, entry)
         cfg = _load(tmp_path, out)
         assert list(cfg.acceptance.drivers) == ["grocery"]
+
+    def test_run_and_setup_containing_quotes_round_trip(self, tmp_path):
+        """#3285: `run`/`setup` were hand-quoted the same way `test_command`
+        was — same early-termination-on-`"` and silent-corruption-on-`\\`
+        failure modes, just one field over."""
+        run = 'pytest -k "not slow" tests/acceptance/{ms}'
+        setup = r'pip install -r requirements\test.txt'
+        entry = render_acceptance_driver_entry(
+            "grocery", "cli-pytest", run, setup=setup,
+        )
+        out = insert_acceptance_driver_entry(CONFIG_NO_ACCEPTANCE, entry)
+        cfg = _load(tmp_path, out)
+        grocery = cfg.acceptance.drivers["grocery"]
+        assert grocery.run == run
+        assert grocery.setup == setup
