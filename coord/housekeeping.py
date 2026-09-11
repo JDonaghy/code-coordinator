@@ -41,6 +41,30 @@ is wired in too, reclaiming ``~/.coord/confirm-worktrees/`` entries that
 outlived ``confirm_branch``'s own per-run cleanup. That is disk hygiene, not
 DB archiving, but reusing this sweep's cadence beats inventing a second timer
 for a second maintenance job.
+
+#3296: the same sweep also archives two tables #1107/#762 never reached —
+both ~800 KB of every ``/board`` poll with no retention policy at all, per a
+live-fleet sample that found 1,114 ``drive_queue`` rows all ``state=done``
+and 13 of 14 ``plans`` rows belonging to assignments no longer on the board:
+
+* terminal ``drive_queue`` rows (:data:`coord.drive_queue.TERMINAL_QUEUE_STATES`
+  — the same "is this queue entry terminal" answer the tick processor itself
+  uses, not a second definition) older than the retention window ->
+  ``drive_queue_archive``. Age is read off the row's own last-touched
+  timestamp (``reason_at`` if the row was ever updated post-launch, else
+  ``launched_at``, else ``enqueued_at``) — the same fallback chain
+  ``merge_queue``'s ``last_attempt or enqueued_at`` uses just below.
+* ``plans`` rows whose ``assignment_id`` no longer appears in the live
+  ``assignments`` table (i.e. that assignment has itself already been
+  archived — by this sweep or an earlier one) -> ``plans_archive``. A plan
+  can only orphan once its assignment ages out, which already implies it is
+  past the retention window, so no separate cutoff is needed for ``plans``.
+
+Both move via the same ``_move_rows``/``_ensure_archive_mirror`` machinery
+above — move-not-delete, dumb-mirror archive tables — so ``GET
+/drive-queue?state=...`` can still retrieve archived history (see
+``coord.serve_app``) and nothing is ever unreachable, only un-shipped by
+default from the live table / board projection.
 """
 
 from __future__ import annotations
@@ -71,6 +95,10 @@ _NOTIFICATIONS_ARCHIVE = "notifications_archive"
 _MERGE_QUEUE = "merge_queue"
 _MERGE_QUEUE_ARCHIVE = "merge_queue_archive"
 _MERGE_QUEUE_MERGED_STATE = "merged"
+_DRIVE_QUEUE = "drive_queue"
+_DRIVE_QUEUE_ARCHIVE = "drive_queue_archive"
+_PLANS = "plans"
+_PLANS_ARCHIVE = "plans_archive"
 _BATCH = 400  # keep IN(...) clauses well under SQLite's 999-variable limit
 
 
@@ -148,20 +176,27 @@ def _move_rows(
 
 def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
     """Archive stale terminal assignments + their notifications + merged
-    merge_queue entries, and reclaim leaked confirm-worktree directories.
+    merge_queue entries + terminal drive_queue rows + orphaned plans, and
+    reclaim leaked confirm-worktree directories.
 
     Returns ``{"archived_assignments": N, "archived_notifications": M,
-    "archived_merge_queue": K, "removed_confirm_worktrees": W, "dry_run": bool,
-    "retention_days": D}``. ``archived_*``/``removed_confirm_worktrees`` are
-    the counts that were (or, for ``dry_run``, would be) moved/deleted.  A
-    no-op returns zeros.
+    "archived_merge_queue": K, "archived_drive_queue": Q, "archived_plans": P,
+    "removed_confirm_worktrees": W, "dry_run": bool, "retention_days": D}``.
+    ``archived_*``/``removed_confirm_worktrees`` are the counts that were (or,
+    for ``dry_run``, would be) moved/deleted.  A no-op returns zeros.
 
     Conservative by construction: nothing active, recent (within the archive
     window), queued-for-merge, latest-of-an-open-issue, or review-linked to any
     such row is ever moved. Merge queue entries are archived only once they
     are in the terminal ``MERGED`` state (#1107 Part 3) — non-terminal /
     conflicted entries are left for ``prune_stale_queue_entries`` or manual
-    ``coord merge --drop``.
+    ``coord merge --drop``. Drive-queue entries are archived only once they
+    are in a :data:`coord.drive_queue.TERMINAL_QUEUE_STATES` state AND older
+    than the retention window (#3296) — a fresh ``done``/``blocked``/
+    ``failed`` row stays put until it ages out, same as everything else this
+    sweep touches. ``plans`` rows follow their assignment: once an
+    assignment_id no longer appears in the live ``assignments`` table, its
+    plan is orphaned and moves too.
 
     #2974: ``removed_confirm_worktrees`` is independent of the DB-archiving
     ``cutoff``/``retention_days`` above (it has its own, much shorter,
@@ -179,6 +214,8 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
         "archived_assignments": 0,
         "archived_notifications": 0,
         "archived_merge_queue": 0,
+        "archived_drive_queue": 0,
+        "archived_plans": 0,
         "removed_confirm_worktrees": len(swept_worktrees["removed"]),
         "dry_run": dry_run,
         "retention_days": _archive_retention_days(),
@@ -240,10 +277,47 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
         )
     ]
 
+    # #3296: terminal drive_queue rows past the retention window. Reuses
+    # `coord.drive_queue.TERMINAL_QUEUE_STATES` — the same "is this queue
+    # entry terminal" the tick processor itself answers — rather than a
+    # second, driftable definition here.
+    from coord.drive_queue import TERMINAL_QUEUE_STATES  # noqa: PLC0415
+
+    dq_rows = sql.execute(
+        conn,
+        "SELECT id, state, reason_at, launched_at, enqueued_at "  # noqa: S608
+        f"FROM {_DRIVE_QUEUE}",
+    ).fetchall()
+    dq_candidates = [
+        r["id"]
+        for r in dq_rows
+        if (r["state"] or "").lower() in TERMINAL_QUEUE_STATES
+        and (r["reason_at"] or r["launched_at"] or r["enqueued_at"] or 0) < cutoff
+    ]
+
+    # #3296: `plans` rows whose assignment is no longer in the live
+    # `assignments` table — orphaned either by the archiving just computed
+    # above, or by an earlier sweep (run before this feature existed, hence
+    # the live fleet's 13-of-14-orphaned sample). No separate cutoff: a plan
+    # can only orphan once its assignment ages out, which already implies
+    # it's past the retention window.
+    live_assignment_ids = {r["assignment_id"] for r in index} - candidate_set
+    plan_candidates = [
+        r["assignment_id"]
+        for r in sql.execute(
+            conn, f"SELECT assignment_id FROM {_PLANS}"  # noqa: S608
+        ).fetchall()
+        if r["assignment_id"] and r["assignment_id"] not in live_assignment_ids
+    ]
+
     result["archived_assignments"] = len(candidates)
     result["archived_notifications"] = len(notif_ids)
     result["archived_merge_queue"] = len(mq_merged_ids)
-    if dry_run or (not candidates and not notif_ids and not mq_merged_ids):
+    result["archived_drive_queue"] = len(dq_candidates)
+    result["archived_plans"] = len(plan_candidates)
+    if dry_run or not (
+        candidates or notif_ids or mq_merged_ids or dq_candidates or plan_candidates
+    ):
         return result
 
     with conn:
@@ -259,4 +333,8 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
             _move_rows(
                 conn, _MERGE_QUEUE, _MERGE_QUEUE_ARCHIVE, "assignment_id", mq_merged_ids
             )
+        if dq_candidates:
+            _move_rows(conn, _DRIVE_QUEUE, _DRIVE_QUEUE_ARCHIVE, "id", dq_candidates)
+        if plan_candidates:
+            _move_rows(conn, _PLANS, _PLANS_ARCHIVE, "assignment_id", plan_candidates)
     return result

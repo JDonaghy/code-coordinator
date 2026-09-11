@@ -4800,7 +4800,11 @@ def openapi_spec() -> dict:
                 "summary": (
                     "#1753: read the operator-declared `coord drive` work "
                     "queue in run order. Filter by repo_name (+ optional "
-                    "issue_number); omit both to list the whole queue."
+                    "issue_number); omit both to list the whole queue. "
+                    "#3296: an explicit `state` also pulls in matching rows "
+                    "`coord.housekeeping.sweep()` has since archived, so "
+                    "terminal history stays reachable after it ages out of "
+                    "the live table."
                 ),
                 "parameters": [
                     {
@@ -4810,6 +4814,16 @@ def openapi_spec() -> dict:
                     {
                         "name": "issue_number", "in": "query", "required": False,
                         "schema": {"type": "integer"},
+                    },
+                    {
+                        "name": "state", "in": "query", "required": False,
+                        "schema": {"type": "string"},
+                        "description": (
+                            "#3296: filter by drive_queue.state (e.g. "
+                            "'done'/'blocked'/'failed'). When given, also "
+                            "reads drive_queue_archive so archived rows "
+                            "matching this state are still returned."
+                        ),
                     },
                 ],
                 "responses": {
@@ -8745,9 +8759,16 @@ def build_app(
         # filters to that repo; `repo_name` + `issue_number` narrows to the (at
         # most one) entry for that issue; neither given lists the whole queue
         # (hand-sized by definition — one row per issue an operator queued).
+        #
+        # #3296: `?state=` additionally reads `drive_queue_archive` — the
+        # live table alone would silently lose a terminal entry the moment
+        # `coord.housekeeping.sweep()` ages it out, making archived history
+        # unreachable rather than merely un-shipped-by-default from the
+        # unfiltered list.
         from coord import state  # noqa: PLC0415
 
         repo_name = request.query_params.get("repo_name")
+        state_filter = request.query_params.get("state")
         raw_issue = request.query_params.get("issue_number")
         issue_number = None
         if raw_issue is not None:
@@ -8760,9 +8781,21 @@ def build_app(
         try:
             if repo_name and issue_number is not None:
                 entry = state._get_drive_queue_entry_local(repo_name, issue_number)
+                if entry is None and state_filter:
+                    entry = state._get_drive_queue_archive_entry_local(
+                        repo_name, issue_number
+                    )
+                if (
+                    entry is not None
+                    and state_filter
+                    and entry.get("state") != state_filter
+                ):
+                    entry = None
                 entries = [entry] if entry else []
             else:
-                entries = state._list_drive_queue_local(repo_name)
+                entries = state._list_drive_queue_local(
+                    repo_name, state=state_filter
+                )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "drive-queue read failed", "detail": str(e)},
