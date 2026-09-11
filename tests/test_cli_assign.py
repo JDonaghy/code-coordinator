@@ -34,6 +34,16 @@ machines:
 """
 
 # Config with pipeline.labels defined to test label→gate resolution.
+#
+# #3269: the ``needs-smoke`` label's gate list says ``test``, not ``smoke``.
+# "smoke" is this codebase's *internal stage* name for the smoke-test
+# assignment (``assignment.type == "smoke"``); the *gate* name that
+# ``required_gates``/``default_gates`` speak is "test" — see #1724 and
+# ``coord.pipeline._STAGE_NAME_TO_GATE_NAME``. This fixture carried the
+# stage name until #3269 added the gate-name registry, which is exactly the
+# class of silently-inert config that registry exists to reject: nothing
+# consults "smoke", so ``requires_smoke``'s ``"test" in gates`` never
+# matched and the gate this label was written to *add* was never enforced.
 CONFIG_YAML_WITH_PIPELINE = """\
 repos:
   - name: api
@@ -50,7 +60,7 @@ pipeline:
   labels:
     documentation: [merge]
     hotfix: [merge]
-    needs-smoke: [review, smoke, merge]
+    needs-smoke: [review, test, merge]
 """
 
 
@@ -787,7 +797,7 @@ class TestAssignLabelGateResolution:
             )
         assert result.exit_code == 0
         proposal = disp.call_args[0][0]
-        assert proposal.required_gates == ["review", "smoke", "merge"]
+        assert proposal.required_gates == ["review", "test", "merge"]
 
     def test_unrecognized_label_falls_back_to_default_gates(
         self, pipeline_config_file: Path, coord_dir: Path
