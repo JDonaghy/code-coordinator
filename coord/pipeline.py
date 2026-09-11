@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from coord.merge_queue import evaluate_uat_verdict, requires_uat
+from coord.merge_queue import evaluate_uat_verdict, is_uat_gate_reason, requires_uat
 
 if TYPE_CHECKING:
     from coord.config import Config
@@ -122,16 +122,16 @@ class PipelineView:
 # and `evaluate_uat_verdict` stay the single source of truth for "does this
 # entry need UAT" / "does it currently pass").
 #
-# Nothing consumes this registry yet. `coord/merge_queue.py` and
-# `coord/drive.py` keep calling `requires_uat`/`evaluate_uat_verdict`
-# directly (S-3/S-4 of #3261 switch call sites over). This module is the
-# home for it rather than `coord/merge_queue.py` itself because `drive.py`
-# will need to import the registry too (S-4) and already imports
-# `coord/merge_queue.py` — putting the registry in `merge_queue.py` would
-# make `drive.py`'s future import of it indistinguishable from its existing
-# `merge_queue` import, whereas `coord/pipeline.py` has no runtime
-# dependents in `coord/drive.py` today, so `pipeline.py` importing
-# `merge_queue.py` (one-directional) creates no cycle in either direction.
+# S-3 (`coord/merge_queue.py`'s `_gate_in_effective_gates`) and S-4
+# (`coord/drive.py`'s `_merge_gate_kind`) both now consume this registry —
+# see their own call sites for how. This module is the home for it rather
+# than `coord/merge_queue.py` itself because `drive.py` needs to import the
+# registry too and already imports `coord/merge_queue.py` — putting the
+# registry in `merge_queue.py` would make `drive.py`'s import of it
+# indistinguishable from its existing `merge_queue` import, whereas
+# `coord/pipeline.py` has no runtime dependents in `coord/drive.py`, so
+# `pipeline.py` importing `merge_queue.py` (one-directional) creates no
+# cycle in either direction.
 
 
 @dataclass(frozen=True)
@@ -173,6 +173,20 @@ class GateSpec:
     #: ``coord.drive._park_uat_fixup_dispatch_failure``.
     fail_route: str
 
+    #: ``(reason) -> bool`` — True when a captured/persisted gate-refusal
+    #: string (a board ``merge_reason``/``entry.error``, or a line from a
+    #: captured ``coord merge --only`` diagnostic) names THIS gate (#3272,
+    #: S-4 of #3261). This is how ``coord.drive._merge_gate_kind`` looks a
+    #: gate's identity up structurally instead of hardcoding its own private
+    #: copy of the gate's message vocabulary — the #2096 "one question, one
+    #: answer" fix for the split that let `coord/drive.py`'s
+    #: ``_UAT_GATE_MARKERS`` silently drift out of sync with the message
+    #: :func:`coord.merge_queue.evaluate_uat_verdict` actually produces.
+    #: ``None`` for a gate that hasn't been wired into reason-classification
+    #: yet (only ``uat`` is today — see ``requires_uat``/``evaluate`` above
+    #: for the same allowance).
+    identifies_reason: Callable[[str], bool] | None = None
+
 
 GATE_REGISTRY: dict[str, GateSpec] = {
     "uat": GateSpec(
@@ -181,6 +195,7 @@ GATE_REGISTRY: dict[str, GateSpec] = {
         evaluate=evaluate_uat_verdict,
         verdicts=("passed", "failed", None),
         fail_route="coord.drive._park_uat_fixup_dispatch_failure",
+        identifies_reason=is_uat_gate_reason,
     ),
 }
 

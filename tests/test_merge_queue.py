@@ -5065,6 +5065,49 @@ class TestUatGate:
         assert "preview: https://preview.example/worker/w1" in message
         assert "coord uat w1 --passed|--failed" in message
 
+    def test_reformatting_the_uat_message_does_not_change_the_merge_gate_kind(
+        self, monkeypatch,
+    ) -> None:
+        """#3272 (S-4 of #3261): before this fix, `coord.drive._merge_gate_
+        kind` recognized a UAT-gate refusal via its OWN private, hardcoded
+        copy of `evaluate_uat_verdict`'s opening words (`_UAT_GATE_MARKERS`)
+        — a second, independent copy of the exact same string this module's
+        `UAT_GATE_REASON_PREFIX` already carried for `_is_recomputable_gate_
+        error`/`display_error`. Rewording the message here (a wording-only
+        change, no semantic change) had nothing forcing the drive.py copy to
+        follow, so the two could silently drift apart and the #3214 UAT
+        fix-up dispatch would stop firing with no error anywhere.
+
+        `_merge_gate_kind` now asks `coord.pipeline.GATE_REGISTRY["uat"]
+        .identifies_reason` — which IS `is_uat_gate_reason`, built off THIS
+        module's `UAT_GATE_REASON_PREFIX` — so moving the identity prefix
+        moves both the message `evaluate_uat_verdict` produces and what
+        `_merge_gate_kind` recognizes, together, in one edit. Proven by
+        actually rewording the identity prefix and watching classification
+        follow it — the regression this slice exists to close.
+        """
+        from coord.drive import _merge_gate_kind
+
+        monkeypatch.setattr(mq, "UAT_GATE_REASON_PREFIX", "UAT preview review outcome")
+
+        cfg = self._config()
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+
+        assert ok is False
+        # The human-facing wording actually changed...
+        assert message.startswith("UAT preview review outcome")
+        assert "uat verdict" not in message.lower()
+        # ...yet `_merge_gate_kind` still recognizes it as the UAT gate,
+        # because it reads the SAME live identity, not a stale copy.
+        assert _merge_gate_kind(message) == "uat"
+        # And the OLD wording — which a stale, independently-hardcoded
+        # marker would still (wrongly) match — no longer classifies at all,
+        # proving there is exactly one source of truth, not two that
+        # happened to agree before the reword.
+        assert _merge_gate_kind("uat verdict missing — preview: x") is None
+
     def test_evaluate_uat_verdict_passed(self) -> None:
         cfg = self._config()
         work = self._work("w1", uat_state="passed")
