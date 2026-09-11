@@ -316,6 +316,41 @@ def _no_live_gh(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_tmux_driver_probe(monkeypatch):
+    """#3282 review (non-blocking): default ``coord.drive.tmux_session_alive``
+    to "nothing is alive" instead of shelling out to a real local tmux
+    server.
+
+    Before #3282, a drive-queue *dequeue* never touched tmux at all — only
+    the dedicated tmux-focused suites (``tests/test_drive_tmux.py``,
+    ``tests/test_cli_reattach_sessions.py``, and friends) reached this seam,
+    and each of those already mocks it deliberately. Since #3282,
+    ``coord.drive.stop_live_driver_session`` — called after EVERY successful
+    drive-queue dequeue, to own the live driver a bare row-delete would
+    otherwise orphan (the CLI's ``coord drive-queue remove``, the board
+    daemon's own ``/drive-queue`` ``dequeue`` route, and the dashboard's
+    local-mode fallback of the same) — probes it first. Without this
+    default, any test anywhere in the suite that exercises a plain dequeue
+    and never seeded a real tmux session (the overwhelming majority — this
+    always resolves to ``False`` for them anyway) would make a real, if fast
+    and harmless, ``tmux has-session`` subprocess call: the exact
+    live-subprocess-in-a-unit-test hazard ``_no_live_gh`` above guards for
+    ``gh``.
+
+    Mirrors that fixture's PURPOSE, not its "guard and raise" strictness:
+    unlike ``_gh``, ``tmux_session_alive`` has no equivalent "the caller
+    already exposes a DI seam for this" escape hatch to detect, so this just
+    defaults it to the safe, common-case answer rather than raising. A test
+    that wants a live (or a still-alive-after-kill) session monkeypatches
+    this back explicitly — its own ``monkeypatch.setattr`` call runs after
+    this fixture's, so it wins — exactly as
+    ``tests/test_cli_drive_queue.py``'s ``test_remove_kills_a_live_driver_
+    session`` and its siblings already do.
+    """
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: False)
+
+
+@pytest.fixture(autouse=True)
 def _interactive_stdin_is_tty(monkeypatch):
     """#2086: ``coord assign --interactive`` now refuses up front when
     stdin is not a TTY (``coord.commands.dispatch._stdin_is_tty()``) — a

@@ -8630,7 +8630,27 @@ def build_app(
                 deleted = state._dequeue_drive_queue_local(
                     body["repo_name"], body["issue_number"]
                 )
-                return JSONResponse({"deleted": bool(deleted)})
+                # #3282: this daemon process runs ON the daemon host — the
+                # only machine `coord drive-queue tick` (and every `coord
+                # drive --tmux` session it launches) ever runs on — so this
+                # is exactly where a dequeue must own the live driver it may
+                # be orphaning. Every dequeue-routed client (the CLI's
+                # `coord drive-queue remove`, the dashboard's `remove`
+                # action) gets this for free without probing its own,
+                # unrelated host.
+                driver_ok, driver_session, driver_detail = True, None, None
+                if deleted:
+                    from coord.drive import stop_live_driver_session  # noqa: PLC0415
+
+                    driver_ok, driver_session, driver_detail = stop_live_driver_session(
+                        body["repo_name"], body["issue_number"]
+                    )
+                return JSONResponse({
+                    "deleted": bool(deleted),
+                    "driver_ok": driver_ok,
+                    "driver_session": driver_session,
+                    "driver_detail": driver_detail,
+                })
             if action == "update":
                 fields = body.get("fields")
                 if not isinstance(fields, dict):

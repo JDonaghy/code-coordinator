@@ -4735,6 +4735,75 @@ def parse_drive_session_name(session_name: str) -> tuple[str, int] | None:
     return repo, int(issue_str)
 
 
+def stop_live_driver_session(
+    repo: str, issue: int, *, host: TmuxHost = TmuxHost(None)
+) -> tuple[bool, str | None, str | None]:
+    """Kill the live ``coord drive --tmux`` session for REPO ISSUE, if any (#3282).
+
+    A driver never re-checks whether its own drive-queue row still exists, so
+    a bare dequeue orphans it: it keeps dispatching worker legs for an issue
+    that no longer has any representation in the queue. This is the ONE seam
+    every "remove this drive-queue entry" call path is expected to route
+    through after a successful dequeue, so none of them can independently
+    "forget" to own the driver they just orphaned (#2096's "one question, one
+    answer" — three independent implementations of "remove an entry" must not
+    disagree about whether it kills a live driver):
+
+    * ``coord.commands.drive_queue.drive_queue_remove`` (the CLI), via
+      ``coord.state.dequeue_drive_queue``'s local branch;
+    * the board daemon's own ``POST /drive-queue`` ``dequeue`` action
+      (``coord.serve_app.post_drive_queue``);
+    * the dashboard's local-mode fallback of the same
+      (``coord.dashboard.server``'s ``_drive_queue_write``).
+
+    ``host=TmuxHost(None)`` (local) by design, not a gap to close: per
+    :func:`drive_session_name`'s own module note, a drive session is LOCAL
+    ONLY — it runs a subprocess on whatever machine launched it. Every call
+    site above executes exactly where a drive-queue row write physically
+    lands: a local (non-daemon) write runs on the operator's own machine, and
+    a daemon-routed write is performed BY the daemon process itself, on the
+    daemon host — which is also the only machine ``coord drive-queue tick``
+    (and therefore every ``coord drive --tmux`` session it launches) ever
+    runs on. A THIN CLIENT must not call this function directly: it would
+    probe its own, unrelated host and find nothing to kill, exactly the
+    silent gap this closes — which is why the kill always happens on the
+    write side, never the caller side.
+
+    Returns ``(ok, session, detail)``:
+
+    * ``(True, None, None)`` — no live session; nothing to do.
+    * ``(True, session, None)`` — a live session existed and a FRESH
+      liveness re-probe, taken AFTER the kill attempt, confirms it is gone
+      now (#2096: never trust the subprocess's exit code alone).
+    * ``(False, session, detail)`` — a live session existed and could not be
+      confirmed dead; *detail* says why.
+    """
+    session = drive_session_name(repo, issue)
+    if not tmux_session_alive(session, host=host):
+        return True, None, None
+
+    try:
+        result = subprocess.run(
+            host.cmd(["kill-session", "-t", session]),
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, session, str(exc)
+
+    if result.returncode != 0:
+        return False, session, (result.stderr or result.stdout or "").strip()
+
+    # #2096: confirm from a fresh probe taken AFTER the kill, never from a
+    # zero returncode alone — `kill-session` can exit 0 against a session
+    # that respawns (e.g. a wrapping supervisor) without actually being gone.
+    if tmux_session_alive(session, host=host):
+        return False, session, "session still reports alive after kill-session"
+
+    return True, session, None
+
+
 def list_drive_sessions(*, host: TmuxHost = TmuxHost(None)) -> list[dict[str, Any]]:
     """Return live ``coord-drive-*`` tmux sessions on *host* as parsed dicts.
 

@@ -2620,10 +2620,12 @@ def build_app(
         `coord.state` implementation detail.
 
         Returns the daemon's per-action response dict verbatim
-        (``{"moved": bool}`` / ``{"deleted": bool}`` / ``{"updated": bool}``
-        / ``{"entry_id": int}``), whether it came from the wire or from the
-        matching local ``_*_local`` function directly — the same functions
-        ``coord/serve_app.py``'s own ``post_drive_queue`` route calls.
+        (``{"moved": bool}`` / ``{"deleted": bool, "driver_ok": bool,
+        "driver_session": str | None, "driver_detail": str | None}`` (#3282)
+        / ``{"updated": bool}`` / ``{"entry_id": int}``), whether it came
+        from the wire or from the matching local ``_*_local`` function
+        directly — the same functions ``coord/serve_app.py``'s own
+        ``post_drive_queue`` route calls.
         """
         from coord import board_service
 
@@ -2641,10 +2643,29 @@ def build_app(
         )
 
         if action == "dequeue":
-            return {
-                "deleted": _dequeue_drive_queue_local(
+            deleted = _dequeue_drive_queue_local(
+                fields["repo_name"], fields["issue_number"]
+            )
+            # #3282: mirrors `coord/serve_app.py`'s own `dequeue` handler —
+            # this branch only runs when there is no configured board
+            # daemon, i.e. this dashboard process IS writing the local DB
+            # directly, so it is also the machine any live `coord drive
+            # --tmux` session for this row would be running on. Owns the
+            # driver it may be orphaning rather than leaving that to the
+            # (daemon-routed) branch above, which already gets it for free
+            # from `post_drive_queue`.
+            driver_ok, driver_session, driver_detail = True, None, None
+            if deleted:
+                from coord.drive import stop_live_driver_session  # noqa: PLC0415
+
+                driver_ok, driver_session, driver_detail = stop_live_driver_session(
                     fields["repo_name"], fields["issue_number"]
                 )
+            return {
+                "deleted": deleted,
+                "driver_ok": driver_ok,
+                "driver_session": driver_session,
+                "driver_detail": driver_detail,
             }
         if action == "enqueue":
             entry_id = _enqueue_drive_queue_local(
@@ -3447,7 +3468,38 @@ def build_app(
             return JSONResponse(
                 {"ok": False, "error": "drive-queue entry not found"}, status_code=404
             )
-        return JSONResponse({"ok": True})
+
+        # #3282: `remove` must never report bare success while a live driver
+        # it was supposed to kill may still be dispatching — the exact
+        # silent gap this issue closes. `result` here is `_drive_queue_write
+        # ("dequeue", ...)`'s response, which now always carries `driver_ok`/
+        # `driver_session`/`driver_detail` (#3282) alongside `deleted`,
+        # whether it came from this process's own local write or from the
+        # daemon's `/drive-queue` route.
+        if action == "remove" and result.get("driver_session") and not result.get(
+            "driver_ok", True
+        ):
+            session = result["driver_session"]
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": (
+                        f"removed from the drive queue, but its live driver "
+                        f"session {session!r} could not be confirmed killed "
+                        f"({result.get('driver_detail')}) — it may still be "
+                        "dispatching; kill it manually with `tmux kill-session "
+                        f"-t {session}` and verify with `coord drive-stop "
+                        f"{repo_name} {issue_number}`"
+                    ),
+                    "driver_session": session,
+                },
+                status_code=409,
+            )
+
+        response: dict[str, Any] = {"ok": True}
+        if action == "remove" and result.get("driver_session"):
+            response["driver_session"] = result["driver_session"]
+        return JSONResponse(response)
 
     async def api_report_catalogue(request: Request) -> Response:  # noqa: ARG001 — Starlette handler signature
         """GET /api/report — the report catalogue (#2492).

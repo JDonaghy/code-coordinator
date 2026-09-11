@@ -7591,11 +7591,29 @@ def _enqueue_drive_queue_local(
     return entry_id
 
 
-def dequeue_drive_queue(repo_name: str, issue_number: int) -> bool:
-    """Remove an issue from the drive queue, renumbering what's left.
+def dequeue_drive_queue(repo_name: str, issue_number: int) -> dict:
+    """Remove an issue from the drive queue, renumbering what's left — and,
+    #3282, own the live driver session that removal orphans.
 
-    Routes to the daemon when ``board_service`` is set. Returns whether a row
-    was actually removed.
+    Routes to the daemon when ``board_service`` is set. Either way, a
+    successful removal is followed by a
+    :func:`coord.drive.stop_live_driver_session` attempt: the daemon branch
+    lets the daemon's own ``/drive-queue`` ``dequeue`` handler
+    (``coord.serve_app.post_drive_queue``) do it — on the daemon host, the
+    only machine a drive session's tmux server can actually be reached from
+    — and the local branch does it in-process here, since a local
+    (non-daemon) write always executes on that same machine. Neither branch
+    probes for a driver when nothing was removed (an issue never in the
+    queue has nothing to orphan).
+
+    Returns ``{"removed": bool, "driver_ok": bool, "driver_session":
+    str | None, "driver_detail": str | None}``. ``driver_session`` is
+    ``None`` when no live session was found — nothing to report, the exact
+    pre-#3282 behaviour. ``driver_ok`` is only ever ``False`` when a live
+    session existed and could not be confirmed dead; ``driver_detail`` then
+    says why (see :func:`coord.drive.stop_live_driver_session`'s own
+    ``(ok, session, detail)`` contract, which this layers ``removed`` on top
+    of unchanged).
     """
     svc = _board_service()
     resp = _route_write(
@@ -7608,8 +7626,27 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> bool:
         },
     )
     if resp is not None:
-        return bool(resp.get("deleted"))
-    return _dequeue_drive_queue_local(repo_name, issue_number)
+        return {
+            "removed": bool(resp.get("deleted")),
+            "driver_ok": bool(resp.get("driver_ok", True)),
+            "driver_session": resp.get("driver_session"),
+            "driver_detail": resp.get("driver_detail"),
+        }
+
+    removed = _dequeue_drive_queue_local(repo_name, issue_number)
+    driver_ok, driver_session, driver_detail = True, None, None
+    if removed:
+        from coord.drive import stop_live_driver_session  # noqa: PLC0415
+
+        driver_ok, driver_session, driver_detail = stop_live_driver_session(
+            repo_name, issue_number
+        )
+    return {
+        "removed": removed,
+        "driver_ok": driver_ok,
+        "driver_session": driver_session,
+        "driver_detail": driver_detail,
+    }
 
 
 def _dequeue_drive_queue_local(repo_name: str, issue_number: int) -> bool:

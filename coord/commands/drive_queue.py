@@ -1602,64 +1602,6 @@ def drive_queue_log_intervention(
 # ── remove / move ────────────────────────────────────────────────────────────
 
 
-def _stop_live_driver_session(repo: str, issue: int) -> tuple[bool, str | None, str | None]:
-    """Kill the live ``coord drive --tmux`` session for REPO ISSUE, if any (#3282).
-
-    A driver never re-checks whether its own queue row still exists, so a
-    bare ``dequeue_drive_queue`` orphans it: it keeps dispatching worker legs
-    for an issue that no longer has any representation in the queue. This is
-    ``remove``'s other half — it must own the driver it is orphaning, not
-    just the row.
-
-    Uses the exact same seam `coord drive-stop` (`coord/commands/drive.py`)
-    uses to answer "is this driver's tmux session alive" —
-    `coord.drive.drive_session_name` + `coord.interactive.tmux_session_alive`
-    — so the two commands can never disagree about it (one question, one
-    answer). ``TmuxHost(None)`` (local) by design, not a gap to close: per
-    `drive_session_name`'s own module note, a drive session is LOCAL ONLY —
-    it runs a subprocess on whatever machine launched it (the drive-queue
-    tick's own host) — same as `drive-stop`/`drive-attach`, which have no
-    remote variant either.
-
-    Returns ``(ok, session, detail)``:
-
-    * ``(True, None, None)`` — no live session; nothing to do.
-    * ``(True, session, None)`` — a live session existed and a FRESH
-      liveness re-probe, taken AFTER the kill attempt, confirms it is gone
-      now (#2096: never trust the subprocess's exit code alone).
-    * ``(False, session, detail)`` — a live session existed and could not be
-      confirmed dead; *detail* says why.
-    """
-    from coord.drive import drive_session_name  # noqa: PLC0415
-    from coord.interactive import TmuxHost, tmux_session_alive  # noqa: PLC0415
-
-    host = TmuxHost(None)
-    session = drive_session_name(repo, issue)
-    if not tmux_session_alive(session, host=host):
-        return True, None, None
-
-    try:
-        result = subprocess.run(
-            host.cmd(["kill-session", "-t", session]),
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        return False, session, str(exc)
-
-    if result.returncode != 0:
-        return False, session, (result.stderr or result.stdout or "").strip()
-
-    # #2096: confirm from a fresh probe taken AFTER the kill, never from a
-    # zero returncode alone — `kill-session` can exit 0 against a session
-    # that respawns (e.g. a wrapping supervisor) without actually being gone.
-    if tmux_session_alive(session, host=host):
-        return False, session, "session still reports alive after kill-session"
-
-    return True, session, None
-
-
 @drive_queue_group.command("remove")
 @click.argument("repo")
 @click.argument("issue", type=int)
@@ -1672,13 +1614,22 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
     Pipeline. `coord untrack` stays the only way to evict a card; do not
     "fix" this asymmetry by mirroring `add`'s label write here.
 
-    #3282: also owns the driver it is orphaning. A queue row and a live
-    `coord drive --tmux` session are two different systems that cannot be
-    updated atomically, so the row is dequeued first (unchanged contract —
-    an issue never in the queue still fails exactly as before) and the
-    session-kill is attempted second, best-effort. Its failure is reported
-    loudly (non-zero exit, session named) rather than silently claiming
-    success while a driver keeps dispatching — the whole bug this closes.
+    #3282: also owns the driver it is orphaning. `coord.state.
+    dequeue_drive_queue` dequeues the row AND attempts to kill its live
+    `coord drive --tmux` session (:func:`coord.drive.stop_live_driver_session`
+    — on whichever host actually performed the write: the daemon host for a
+    thin-client dispatch, this machine for a local one; this CLI never probes
+    its own host directly, since that would look for the session on the WRONG
+    machine whenever this is run as a thin client). The row and the tmux
+    session are two different systems that cannot be updated atomically, so
+    the row is dequeued first (unchanged contract — an issue never in the
+    queue still fails exactly as before) and the session-kill is best-effort
+    second. Its failure is reported loudly (non-zero exit, session named)
+    rather than silently claiming success while a driver keeps dispatching —
+    the whole bug this closes. This is also the ONE code path every other
+    "remove this drive-queue entry" surface (the dashboard's `remove` action,
+    the board daemon's own `/drive-queue` `dequeue` route) shares — none of
+    them can independently forget to own the driver they orphan.
     """
     from coord.state import dequeue_drive_queue, get_drive_queue_entry  # noqa: PLC0415
 
@@ -1694,17 +1645,17 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
     except Exception:  # noqa: BLE001 — observability only, never blocks the remove
         before = None
 
-    removed = dequeue_drive_queue(repo, issue)
-    if not removed:
+    removal = dequeue_drive_queue(repo, issue)
+    if not removal["removed"]:
         raise click.ClickException(f"{entry_key(repo, issue)} is not in the drive queue")
     _record_operator_release(before, resolution="operator_removed")
 
-    ok, session, detail = _stop_live_driver_session(repo, issue)
+    session = removal["driver_session"]
     if session is None:
         # No live driver — behaves exactly as before #3282.
         click.echo(f"removed {entry_key(repo, issue)} from the drive queue")
         return
-    if ok:
+    if removal["driver_ok"]:
         click.echo(
             f"removed {entry_key(repo, issue)} from the drive queue "
             f"(killed driver session {session!r})"
@@ -1712,10 +1663,10 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
         return
     raise click.ClickException(
         f"removed {entry_key(repo, issue)} from the drive queue, but its live "
-        f"driver session {session!r} could not be confirmed killed ({detail}) "
-        "— it may still be dispatching; kill it manually with "
-        f"`tmux kill-session -t {session}` and verify with `coord drive-stop "
-        f"{repo} {issue}`"
+        f"driver session {session!r} could not be confirmed killed "
+        f"({removal['driver_detail']}) — it may still be dispatching; kill it "
+        f"manually with `tmux kill-session -t {session}` and verify with "
+        f"`coord drive-stop {repo} {issue}`"
     )
 
 
