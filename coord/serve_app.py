@@ -5942,6 +5942,10 @@ def build_app(
             # bytes themselves — see the docstring above. The wire `body`
             # computed just above is untouched and still carries every
             # field, including the ones excluded here.
+            # No `default=str` needed (unlike the fallback above): reaching
+            # this branch means the strict encode of `result` just SUCCEEDED,
+            # and the projection is a key-subset of those same values, so it
+            # cannot contain a type the strict encoder would reject.
             digest_body = _json.dumps(
                 _board_digest_projection(result), ensure_ascii=False,
                 allow_nan=False, indent=None, separators=(",", ":"),

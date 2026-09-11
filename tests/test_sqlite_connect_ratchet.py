@@ -273,10 +273,18 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "checkpoint tick.",
     ),
     "test_board_read_path.py": Classification(
-        8, (BUCKET_C,),
-        "All file DBs for SqliteStore/TestClient; two are deliberate second "
+        9, (BUCKET_C,),
+        "All file DBs for SqliteStore/TestClient; three are deliberate second "
         "connections to an already-existing file DB, asserting "
-        "cross-connection visibility — the definition of bucket C.",
+        "cross-connection visibility — the definition of bucket C. The third "
+        "(#3293, test_board_version_stable_across_audit_and_health_tick_noise) "
+        "is the same shape as the #1336 one above it: it reopens the live "
+        "`detail_db` mid-test to land an audit_log row inside the 900s "
+        "recency window, then asserts the running daemon's next rebuild sees "
+        "it. Neither the autouse `coord_db` fixture nor "
+        "tests.backends.scratch_database() fits — both hand back a DIFFERENT "
+        "database than the one SqliteStore is already holding by path, so the "
+        "write would be invisible to the endpoint under test.",
     ),
     "test_needs_attention.py": Classification(
         4, (BUCKET_C,),
