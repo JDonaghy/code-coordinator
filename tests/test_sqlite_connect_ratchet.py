@@ -156,13 +156,19 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "site: it goes through tests.backends.open_named_session().",
     ),
     "test_sql_dialect.py": Classification(
-        7, (BUCKET_A,),
+        9, (BUCKET_A,),
         "The SQLite half of the dialect seam's own tests: dialect detection "
         "from a real sqlite3 connection, journal_mode=WAL, "
         "busy_timeout/query_only pragmas, a `mode=ro` URI connection. These "
         "must hardcode the driver — asserting `detect_dialect(conn) == "
         "'sqlite'` against a connection whose type an env var chooses is "
-        "circular.",
+        "circular. "
+        "+2 for #3294's sqlite_data_version test: `PRAGMA data_version` only "
+        "reports commits made by a connection OTHER than the reader's own, so "
+        "a writer and a reader on one file DB are the unit under test, not "
+        "incidental setup — a single connection (or a `:memory:` one, which "
+        "no second connection can reach) could not observe the property at "
+        "all.",
     ),
     "test_deploy_coord_db_backup.py": Classification(
         2, (BUCKET_A,),
@@ -273,15 +279,23 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "checkpoint tick.",
     ),
     "test_board_read_path.py": Classification(
-        9, (BUCKET_C,),
-        "All file DBs for SqliteStore/TestClient; three are deliberate second "
+        10, (BUCKET_C,),
+        "All file DBs for SqliteStore/TestClient; four are deliberate second "
         "connections to an already-existing file DB, asserting "
         "cross-connection visibility — the definition of bucket C. The third "
         "(#3293, test_board_version_stable_across_audit_and_health_tick_noise) "
         "is the same shape as the #1336 one above it: it reopens the live "
         "`detail_db` mid-test to land an audit_log row inside the 900s "
         "recency window, then asserts the running daemon's next rebuild sees "
-        "it. Neither the autouse `coord_db` fixture nor "
+        "it. The fourth (#3294, "
+        "test_board_rebuild_trigger_is_a_write_not_the_ttl_clock) is that "
+        "same shape once more, and is the most load-bearing instance of it: "
+        "the write MUST come from a connection the daemon knows nothing "
+        "about, because the behaviour under test is precisely that an "
+        "external writer (the drive-queue timer, a concurrent `coord notify`) "
+        "invalidates the /board cache without any POST to bust it. Routing it "
+        "through the daemon's own write path would assert the opposite of "
+        "what the test is for. Neither the autouse `coord_db` fixture nor "
         "tests.backends.scratch_database() fits — both hand back a DIFFERENT "
         "database than the one SqliteStore is already holding by path, so the "
         "write would be invisible to the endpoint under test.",
