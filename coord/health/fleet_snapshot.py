@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -276,6 +277,13 @@ class FleetHealthRefresher:
         # than fabricating a 0.
         self._board_latency_ms: float | None = None
         self._board_payload_bytes: int | None = None
+        # #3294: one timestamp per PUBLISHED /board build (never per request
+        # — a cache hit or a 304 doesn't rebuild, so it doesn't append here).
+        # This is the daemon-side, directly-measured answer to "did #3294's
+        # write-triggered cache actually cut rebuilds?", rather than an
+        # assumption — see `_builds_per_minute` and `probe_board_latency`
+        # (coord/health/checks/fleet_board.py).
+        self._board_build_timestamps: deque[float] = deque()
 
     def snapshot(self) -> FleetHealthSnapshot:
         return self._snapshot
@@ -284,12 +292,31 @@ class FleetHealthRefresher:
         """Called by the /board handler after each publish (#1630/#1597).
 
         Deliberately NOT I/O and NOT gated on the tick cadence — recording a
-        float+int is free, and the alternative (recomputing board latency
-        independently from this refresher) would mean building a whole
-        second board just to measure it, defeating the point of the check.
+        float+int (+ one timestamp, #3294) is free, and the alternative
+        (recomputing board latency independently from this refresher) would
+        mean building a whole second board just to measure it, defeating the
+        point of the check.
         """
         self._board_latency_ms = latency_ms
         self._board_payload_bytes = payload_bytes
+        self._board_build_timestamps.append(time.time())
+        self._prune_build_timestamps()
+
+    def _prune_build_timestamps(self, now: float | None = None) -> None:
+        """Drop build timestamps older than 60s — #3294's rolling window."""
+        cutoff = (now if now is not None else time.time()) - 60.0
+        timestamps = self._board_build_timestamps
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.popleft()
+
+    def _builds_per_minute(self, now: float) -> int:
+        """#3294: how many /board REBUILDS (not requests) published in the
+        last 60s — the direct measurement backing the write-triggered
+        cache's whole premise ("rebuilds should track writes, not a 5s poll
+        clock"). Read by `refresh()` below into ``daemon_host`` for
+        ``fleet_board_latency`` (coord/health/checks/fleet_board.py)."""
+        self._prune_build_timestamps(now)
+        return len(self._board_build_timestamps)
 
     def refresh(self, config) -> FleetHealthSnapshot:  # noqa: ANN001 — coord.config.Config
         from coord import network, state  # noqa: PLC0415
@@ -376,6 +403,7 @@ class FleetHealthRefresher:
         daemon_host["phantom_running"] = self._phantom_running_rows(machines)
         daemon_host["board_latency_ms"] = self._board_latency_ms
         daemon_host["board_payload_bytes"] = self._board_payload_bytes
+        daemon_host["board_builds_per_minute"] = self._builds_per_minute(now)
         # #2858: per-repo issues-sync staleness — a small local JSON read
         # (coord.issues_sync_status), same "daemon-host-local fact" shape as
         # the two lines above. `coord.health.checks.issues_sync_staleness`

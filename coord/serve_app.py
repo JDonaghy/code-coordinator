@@ -5821,14 +5821,30 @@ def build_app(
 
     _machine_metrics_sampler = machine_metrics_sampler or MachineMetricsSampler()
 
-    # Short-TTL cache for the computed /board projection so burst polls from the
-    # TUI don't each pay the full board_projection + merge-plan + stage-projection
+    # Cache for the computed /board projection so burst polls from the TUI
+    # don't each pay the full board_projection + merge-plan + stage-projection
     # recomputation (~465-issue load measured in the issue). Keyed to nothing
-    # (one board per daemon instance). TTL controlled by COORD_BOARD_CACHE_TTL
-    # (default 1.5 s). Busted immediately on board-mutating POSTs so a user
-    # action is visible on the very next poll without waiting out the TTL.
+    # (one board per daemon instance).
+    #
+    # #3294: the cache's PRIMARY invalidation trigger is "has anything
+    # written since this build?" (``store.change_token()``, ``dao.CoordStore``
+    # protocol — SQLite: ``PRAGMA data_version``), not a fixed clock. A 1.5 s
+    # TTL forced a full rebuild on essentially every poll, because pollers
+    # run at 5 s and always missed the window — and the rebuild (the
+    # ``fleet_board_latency`` check's own 0.65-0.8 s measurement) is what
+    # actually held the GIL, not the wire cost the ETag already covers.
+    # ``COORD_BOARD_CACHE_TTL`` (default below) survives only as a SAFETY
+    # UPPER BOUND — a rebuild is forced past that age regardless of the
+    # change token, in case the token's source ever misses a write path —
+    # not as the primary trigger. Busted immediately on board-mutating POSTs
+    # (``_bust_board_cache``, unchanged by #3294) so a user action is visible
+    # on the very next poll without waiting on either signal.
     _board_cache: dict | None = None
     _board_cache_at: float = 0.0
+    # #3294: the ``store.change_token()`` value as of ``_board_cache``'s
+    # build. A poll is served from cache only when the CURRENT token still
+    # equals this one — i.e. nothing has written since.
+    _board_cache_token: str | None = None
     # #1597 Part 2: the fully-rendered JSON bytes for the currently-cached
     # build, shared verbatim by every response that serves ``_board_cache``
     # (a fresh build's own responses, every single-flight follower, and
@@ -6040,17 +6056,34 @@ def build_app(
         # config reloads prompt.
         _refresh_config()
 
-        # Part 2 (cache): serve a cached projection if it's still within the TTL.
-        # Burst polls (TUI polls every ~2 s) hit the cache; the real computation
-        # only runs once per TTL window.  Cache is busted immediately by the
-        # board-mutating POST handlers below so user actions are visible on the
-        # very next poll without waiting out the TTL.
+        # Part 2 (cache): serve the cached projection when nothing has
+        # written since it was built (#3294). Burst polls (TUI polls every
+        # ~2 s) hit the cache; the real computation only runs when a write
+        # actually happened. Cache is also busted immediately by the
+        # board-mutating POST handlers below so user actions are visible on
+        # the very next poll without waiting on either signal.
         import time as _time  # noqa: PLC0415
-        _ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "1.5"))
+        # Safety upper bound only (#3294) — see the comment on
+        # `_board_cache_token` above. Raised from the pre-#3294 1.5 s default
+        # now that the change-token check is the primary trigger.
+        _safety_ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "30"))
         _now = _time.monotonic()
         nonlocal _board_cache, _board_cache_at, _board_cache_built_at, _board_body
-        nonlocal _board_inflight
+        nonlocal _board_cache_token, _board_inflight
         _client_etag = request.headers.get("if-none-match")
+
+        # #3294: cheap "did anything write?" probe — see
+        # `dao.CoordStore.change_token`'s docstring. Run inline (not
+        # threadpooled) like `_refresh_config()`'s stat() just above: a
+        # single PRAGMA on an already-open connection, not I/O of the shape
+        # #1336 invariant 1 guards against. A failure here must never crash
+        # the read path over a cache optimization — treat it as "assume
+        # changed" (a sentinel that can never equal a real cached token) so
+        # the worst case is an extra rebuild, never a wedged/stale cache.
+        try:
+            _current_token: str | None = store.change_token()
+        except Exception:  # noqa: BLE001 — fail toward rebuilding, not crashing
+            _current_token = None
 
         def _respond(result: dict, etag: str | None, body: bytes | None) -> Response:
             if _client_etag and etag and _client_etag == etag:
@@ -6076,7 +6109,18 @@ def build_app(
             _cached_etag = _board_etag
             _cached_at = _board_cache_at
             _cached_body = _board_body
-        if _cached is not None and (_now - _cached_at) < _ttl:
+            _cached_token = _board_cache_token
+        # #3294: fresh iff nothing wrote since this build (token still
+        # matches) AND we're inside the safety-TTL ceiling. `_cached_token
+        # is not None` rules out a `None == None` false match when either
+        # side came from a failed change_token() read (see above).
+        _fresh = (
+            _cached is not None
+            and _cached_token is not None
+            and _cached_token == _current_token
+            and (_now - _cached_at) < _safety_ttl
+        )
+        if _fresh:
             return _respond(_cached, _cached_etag, _cached_body)
 
         # #1597 Part 1: single-flight the rebuild.  On a cache miss, at most
@@ -6122,12 +6166,24 @@ def build_app(
         # concurrent request calls _refresh_config() while _build() is running.
         _cfg = config
 
-        def _build() -> tuple[float, dict]:
+        def _build() -> tuple[float, str | None, dict]:
             # Snapshot-order stamp: captured immediately before the DB read so
             # the publish step below can reject a build whose snapshot is
             # older than the one already cached (concurrent rebuilds can
             # finish out of order).
             _built_at = _time.monotonic()
+            # #3294: the change token AS OF this build's snapshot moment —
+            # published alongside the cache below so the *next* request's
+            # freshness check compares against "what had (or hadn't) written
+            # by the time THIS build started", not some later moment.
+            # `None` (never a real token — see `_current_token` above) if the
+            # read itself fails; that means the published cache below can
+            # never look "fresh" to a later poll, which is the safe direction
+            # to fail in.
+            try:
+                _built_token = store.change_token()
+            except Exception:  # noqa: BLE001 — see `_current_token` above
+                _built_token = None
             # ── board projection ──────────────────────────────────────────────
             try:
                 projection = store.board_projection()
@@ -6593,7 +6649,7 @@ def build_app(
             from coord.board_wire import bound_board_payload as _bound  # noqa: PLC0415
 
             _bound(projection)
-            return _built_at, projection
+            return _built_at, _built_token, projection
 
         # This coroutine is the single-flight leader: it alone runs _build(),
         # then fans its outcome out to every waiter (itself plus every
@@ -6601,7 +6657,7 @@ def build_app(
         # of the acceptance test, and why a failed build must reach every
         # waiter rather than wedging the followers.
         try:
-            built_at, result = await run_in_threadpool(_build)
+            built_at, built_token, result = await run_in_threadpool(_build)
         except _BoardReadError as e:
             _board_inflight = None  # clear FIRST: a retry must build fresh,
             # never see a "done" future and think it must wait on this one.
@@ -6650,7 +6706,9 @@ def build_app(
                     _board_body = body
                     _board_cache_at = _time.monotonic()
                     _board_cache_built_at = built_at
-                    # #1630: feed this build's own latency + wire size to the
+                    _board_cache_token = built_token  # #3294
+                    # #1630/#3294: feed this build's own latency + wire size
+                    # (+ the fact that a build happened at all) to the
                     # fleet-health snapshot's board-latency check — read back
                     # on the health-poll tick's own cadence, never recomputed
                     # inline (see FleetHealthRefresher.record_board_stats).

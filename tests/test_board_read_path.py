@@ -186,6 +186,70 @@ def test_board_version_bumps_when_content_changes(
         assert r3.headers["etag"] != r1.headers["etag"]
 
 
+# ── #3294: the cache rebuilds on a write, not on a clock ─────────────────────
+
+
+def test_board_rebuild_trigger_is_a_write_not_the_ttl_clock(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#3294 acceptance: two ``/board`` requests with NO intervening write
+    must produce exactly one ``board_projection()`` build, and a write
+    between them must force a second — asserted on a build counter, never on
+    timing (the issue's own words: "Timing-based assertions will be flaky —
+    count builds").
+
+    The write here is a RAW external SQLite commit — not a POST to
+    ``/board``, which already busted the cache explicitly and always did.
+    This is the case #3294 actually exists for: the drive-queue timer and a
+    concurrent ``coord notify`` write the DB directly, with no daemon POST
+    anywhere in the picture. Before #3294 a write from either of those
+    sources was invisible to the ``/board`` cache until its TTL (1.5 s by
+    default, pre-fix) happened to expire on its own. This test pins the
+    safety-TTL to a deliberately generous 60 s specifically so the *only*
+    thing that can explain the second build is the change-token check
+    noticing the external write — a TTL-only cache would still be showing
+    the stale, pre-write board at that point.
+    """
+    call_count = 0
+    original_projection = SqliteStore.board_projection
+
+    def counting_projection(self):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        return original_projection(self)
+
+    monkeypatch.setattr(SqliteStore, "board_projection", counting_projection)
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "60")  # generous safety ceiling
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        r1 = cli.get("/board")
+        assert r1.status_code == 200
+        assert call_count == 1
+
+        r2 = cli.get("/board")
+        assert r2.status_code == 200
+        assert call_count == 1, "no write happened — must still be exactly one build"
+
+        # A write from OUTSIDE the daemon entirely: no POST /board, no
+        # `_bust_board_cache()` call — the drive-queue-timer / `coord notify`
+        # shape the issue names.
+        conn = sqlite3.connect(str(detail_db))
+        conn.execute(
+            "UPDATE assignments SET status='failed' WHERE assignment_id='work1'"
+        )
+        conn.commit()
+        conn.close()
+
+        r3 = cli.get("/board")
+        assert r3.status_code == 200
+        assert call_count == 2, (
+            "an external write must trigger a rebuild via the change token, "
+            "well before the 60s safety TTL elapses"
+        )
+
+
 def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
     """#3293 unit-level check on ``_board_digest_projection`` itself: the
     three named culprits (``audit_recent_count``, ``issues[*].synced_at``,
@@ -420,12 +484,22 @@ def test_stale_concurrent_rebuild_is_never_published(
 
     monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "1000")  # cache once published
 
+    # #3294: `_build()` is faked below (it never touches the real store), so
+    # pin `store.change_token()` to a fixed value too — otherwise the
+    # handler's real (unmocked) freshness check would compare the fake
+    # build's canned token against the REAL store's live `PRAGMA
+    # data_version` and never see a match, breaking the cache-hit path this
+    # test relies on for its final 304. Irrelevant to what this test
+    # actually exercises (out-of-order publish, not change detection).
+    store = SqliteStore(detail_db)
+    monkeypatch.setattr(store, "change_token", lambda: "fixed-token")
+
     # Deterministic out-of-order completion: the first request's build
     # carries a NEWER snapshot stamp than the second's (as if the second
     # started earlier but finished later).
     results = iter([
-        (100.0, {"round_number": 1, "marker": "NEW"}),
-        (50.0, {"round_number": 1, "marker": "STALE"}),
+        (100.0, "fixed-token", {"round_number": 1, "marker": "NEW"}),
+        (50.0, "fixed-token", {"round_number": 1, "marker": "STALE"}),
     ])
 
     async def _fake_run_in_threadpool(fn, *args):  # noqa: ANN001, ARG001
@@ -434,7 +508,7 @@ def test_stale_concurrent_rebuild_is_never_published(
     monkeypatch.setattr(sc, "run_in_threadpool", _fake_run_in_threadpool)
 
     cfg = load_config(valid_config_path)
-    app = build_app(SqliteStore(detail_db), cfg)
+    app = build_app(store, cfg)
     with TestClient(app) as cli:
         r1 = cli.get("/board")
         assert r1.json()["marker"] == "NEW"
