@@ -55,6 +55,7 @@ independence; for smoke we want a *capable* machine for hardware, and
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -295,9 +296,21 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
 class SmokePartition:
     """One capability set that some single configured machine can satisfy —
     i.e. one Test-stage leg, if/when the fan-out described above ships.
+
+    `files` (#3298) are the touched paths that actually put THIS partition on
+    the board — the union of files matched by whichever `capability_rules`
+    entries contributed `capabilities`' requirements — as opposed to the
+    diff's full `touched_files`. Resolving the Test-stage command against
+    *this* narrower set, per partition, is what lets a `SmokeRule.command`
+    declared on the contributing rule win for only its own leg instead of
+    every leg in the fan-out (`coord.smoke.resolve_smoke_command`). Never
+    empty for a partition `partition_capability_requirements` actually
+    returns — every partition is built from at least one rule that matched at
+    least one touched file.
     """
 
     capabilities: tuple[str, ...]
+    files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -355,6 +368,12 @@ def partition_capability_requirements(
     Rules with an empty `requires` never enter this — they mean "no extra
     capability needed", already handled by the existing any-capable-machine
     path in `dispatch_smoke`, not a partition of their own.
+
+    #3298: each returned :class:`SmokePartition` also carries `files` — the
+    touched paths matched by whichever rule(s) contributed its capabilities
+    — so a caller can resolve the Test-stage command per partition, scoped to
+    only the files that put THAT partition on the board, instead of the
+    diff's full `touched_files`.
     """
     seen: dict[frozenset[str], tuple[int, list[str]]] = {}
     order: list[frozenset[str]] = []
@@ -369,6 +388,7 @@ def partition_capability_requirements(
             order.append(key)
 
     groups: list[set[str]] = []
+    group_rule_indices: list[list[int]] = []
     unroutable: list[UnroutableCapability] = []
     for key in order:
         rule_index, rule_files = seen[key]
@@ -385,12 +405,25 @@ def partition_capability_requirements(
             candidate = group | caps
             if capable_for(sorted(candidate)):
                 groups[i] = candidate
+                group_rule_indices[i].append(rule_index)
                 merged = True
                 break
         if not merged:
             groups.append(caps)
+            group_rule_indices.append([rule_index])
 
-    partitions = [SmokePartition(capabilities=tuple(sorted(g))) for g in groups]
+    partitions = [
+        SmokePartition(
+            capabilities=tuple(sorted(group)),
+            files=tuple(sorted({
+                path
+                for rule_index in rule_indices
+                for path in touched_files
+                if _rule_matches([path], rules[rule_index])
+            })),
+        )
+        for group, rule_indices in zip(groups, group_rule_indices)
+    ]
     return partitions, unroutable
 
 
@@ -486,43 +519,70 @@ def smoke_leg_capabilities(issue_title: str | None) -> tuple[str, ...] | None:
 _FANOUT_MANIFEST_RE = re.compile(r"^\[\[smoke-fanout:([^\]]*)\]\]\n?")
 
 
-def _encode_fanout_manifest(legs: list[tuple[str, tuple[str, ...]]]) -> str:
+def _encode_fanout_manifest(
+    legs: list[tuple[str, tuple[str, ...], str | None]],
+) -> str:
     """The manifest line stamped at the FRONT of the parent's ``test_reason``
-    for a #3182 fan-out: ``[[smoke-fanout:<id>=<caps>,...]]``, one entry per
-    leg dispatched (or already active/completed) this round. Preserved
-    byte-for-byte across every later rewrite of the parent's ``test_reason``
-    (the running-progress stamp, and the final aggregate) so
+    for a #3182 fan-out: ``[[smoke-fanout:<id>=<caps>=<command_b64>,...]]``,
+    one entry per leg dispatched (or already active/completed) this round.
+    Preserved byte-for-byte across every later rewrite of the parent's
+    ``test_reason`` (the running-progress stamp, and the final aggregate) so
     :func:`finalize_smoke_fanout` can always find its siblings again from
     just the parent's own row — see the module note above for why this, and
     not a new query endpoint.
+
+    ``command_b64`` (#3298) is the partition's own resolved Test-stage
+    command, URL-safe base64-encoded so an arbitrary shell command — commas,
+    brackets, newlines, anything a real ``test_command``/rule ``command`` can
+    contain — can never corrupt this manifest's own ``,``/``=``/``]``
+    delimiters. Encodes as an empty third field when the command is unknown
+    (``None``), which round-trips through :func:`_parse_fanout_manifest` as
+    ``command=None`` rather than raising or misparsing.
     """
-    body = ",".join(
-        f"{leg_id}={'+'.join(sorted(caps))}" for leg_id, caps in legs
-    )
+    def _entry(leg_id: str, caps: tuple[str, ...], command: str | None) -> str:
+        cap_str = "+".join(sorted(caps))
+        cmd_b64 = (
+            base64.urlsafe_b64encode(command.encode()).decode() if command else ""
+        )
+        return f"{leg_id}={cap_str}={cmd_b64}"
+
+    body = ",".join(_entry(leg_id, caps, command) for leg_id, caps, command in legs)
     return f"[[smoke-fanout:{body}]]"
 
 
 def _parse_fanout_manifest(
     test_reason: str | None,
-) -> list[tuple[str, tuple[str, ...]]] | None:
-    """The ``(leg_id, capabilities)`` pairs :func:`_encode_fanout_manifest`
-    wrote, or ``None`` when *test_reason* carries no manifest (not a fan-out
-    row). Tolerates a malformed entry by skipping just that entry, never
-    raising.
+) -> list[tuple[str, tuple[str, ...], str | None]] | None:
+    """The ``(leg_id, capabilities, command)`` triples
+    :func:`_encode_fanout_manifest` wrote, or ``None`` when *test_reason*
+    carries no manifest (not a fan-out row). Tolerates a malformed entry by
+    skipping just that entry, never raising.
+
+    ``command`` is ``None`` for a pre-#3298 two-field entry
+    (``<id>=<caps>``, no trailing ``=<command_b64>``) — an already-in-flight
+    row from before this field existed — as well as for a malformed base64
+    payload; either way the caller gets "unknown command", never a crash.
     """
     if not test_reason:
         return None
     m = _FANOUT_MANIFEST_RE.match(test_reason)
     if not m:
         return None
-    legs: list[tuple[str, tuple[str, ...]]] = []
+    legs: list[tuple[str, tuple[str, ...], str | None]] = []
     for entry in m.group(1).split(","):
         if not entry:
             continue
-        leg_id, _, caps = entry.partition("=")
+        leg_id, _, rest = entry.partition("=")
+        caps, _, cmd_b64 = rest.partition("=")
         if not leg_id or not caps:
             continue
-        legs.append((leg_id, tuple(caps.split("+"))))
+        command: str | None = None
+        if cmd_b64:
+            try:
+                command = base64.urlsafe_b64decode(cmd_b64.encode()).decode()
+            except (ValueError, UnicodeDecodeError):
+                command = None
+        legs.append((leg_id, tuple(caps.split("+")), command))
     return legs
 
 
@@ -601,33 +661,44 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
         if not legs:
             return  # not a fan-out row
 
-        leg_states: list[tuple[tuple[str, ...], str | None, str | None]] = [
+        # #3298: carry each leg's own resolved command forward from the
+        # manifest (never re-read from the leg's row — `_record_smoke_verdict`
+        # overwrites a leg's own `test_reason` with its terminal verdict text,
+        # so the command it ran is only ever recoverable from here) into the
+        # failure report, so two failing legs that ran DIFFERENT commands
+        # (possible now that command resolution is scoped per partition) read
+        # as distinguishable instead of two identically-shaped failures.
+        leg_states: list[tuple[tuple[str, ...], str | None, str | None, str | None]] = [
             (
                 caps,
                 load_assignment_test_state(leg_id),
                 load_assignment_test_reason(leg_id),
+                command,
             )
-            for leg_id, caps in legs
+            for leg_id, caps, command in legs
         ]
-        if any(state in (None, "running") for _, state, _ in leg_states):
+        if any(state in (None, "running") for _, state, _, _ in leg_states):
             return  # not everyone has reported in yet
 
         severity = {"failed": 3, TEST_STATE_BLOCKED: 2, "skipped": 1, "passed": 0}
         worst = max(
-            (state for _, state, _ in leg_states if state in severity),
+            (state for _, state, _, _ in leg_states if state in severity),
             key=lambda s: severity[s],
             default="passed",
         )
         summary = "; ".join(
-            f"[{'+'.join(caps)}]={state}" for caps, state, _ in leg_states
+            f"[{'+'.join(caps)}]={state}" for caps, state, _, _ in leg_states
         )
-        manifest_line = _encode_fanout_manifest([(lid, caps) for lid, caps in legs])
+        manifest_line = _encode_fanout_manifest(
+            [(lid, caps, command) for lid, caps, command in legs]
+        )
 
         if worst == "failed":
             named = "; ".join(
                 f"capability set [{'+'.join(caps)}] failed"
+                + (f" (ran `{command}`)" if command else "")
                 + (f" — {reason}" if reason else "")
-                for caps, state, reason in leg_states
+                for caps, state, reason, command in leg_states
                 if state == "failed"
             )
             final_state, headline = "failed", f"Test stage failed (#3182): {named}."
@@ -1591,6 +1662,61 @@ def _report_unroutable_partitions(
     completed.test_reason = reason
 
 
+def _report_unconfigured_smoke_command(
+    completed: Assignment, caps: list[str],
+) -> None:
+    """#3298: a capability-partition leg's own files resolve to NO smoke
+    command at all — every source (`smoke_tests.capability_rules[].command`,
+    `repos[].ci_command`, `smoke_tests.default_command`,
+    `repos[].test_command`) came up empty for the files that put THIS
+    partition on the board.
+
+    A `coordinator.yml` config gap, never a routing puzzle — reported exactly
+    like :func:`_report_unroutable_partitions`, but per partition and naming
+    the capability set, so a misconfiguration on one platform (e.g. a repo
+    whose `test_command` needs GTK, with a `macos` rule that carries no
+    `command` override of its own) is never silently attributed to the whole
+    fan-out — a sibling partition that DOES resolve a command still
+    dispatches.
+
+    Never raises: a board-write failure must not take the caller down.
+    """
+    caps_label = "+".join(caps) if caps else "(none)"
+    reason = (
+        f"Test stage cannot run capability-partition leg [{caps_label}] "
+        f"(#3298): no smoke command is configured for repo "
+        f"{completed.repo_name!r} for this partition's own files (checked "
+        "smoke_tests.capability_rules[].command, repos[].ci_command, "
+        "smoke_tests.default_command, and repos[].test_command). Configure "
+        "one — e.g. a `command` on the capability_rules entry that created "
+        "this partition — so it stops silently no-oping."
+    )
+    logger.warning(
+        "dispatch_smoke: %s#%s — %s", completed.repo_name,
+        completed.issue_number, reason,
+    )
+    if completed.test_state == TEST_STATE_BLOCKED:
+        return  # already recorded — the report has been made
+    if completed.assignment_id is None:
+        return
+    try:
+        from coord.state import record_test_verdict
+
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=reason,
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "dispatch_smoke: failed to record the blocked Test verdict for %s",
+            completed.assignment_id,
+        )
+        return
+    completed.test_state = TEST_STATE_BLOCKED
+    completed.test_reason = reason
+
+
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
 
@@ -2168,44 +2294,64 @@ def _dispatch_smoke_fanout(
     probe contradiction, a missing `repo_paths` entry) is reported exactly
     like the single-leg unroutable case (`_report_unroutable_smoke`), naming
     that capability set — never a silent retry (#1678).
+
+    #3298: the Test-stage command is resolved ONCE PER PARTITION, scoped to
+    that partition's own `SmokePartition.files` — not once, up front, against
+    the WHOLE diff's `touched` — so a `SmokeRule.command` declared on the
+    rule that created one partition can win for only that partition's leg
+    instead of leaking into every other leg in the fan-out. A repo with no
+    rule-scoped `command` anywhere is unaffected: every partition then falls
+    through the same `ci_command`/`default_command`/`test_command`
+    precedence it always has, which does not vary with which files are
+    passed, so this is a no-op for every repo that hasn't opted in.
     """
     smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
     repo = config.repo(completed.repo_name)
     if repo is None:
         return []
 
-    resolved = resolve_smoke_command(repo, smoke_cfg, touched_files=touched)
-    smoke_command = resolved.command
-    if smoke_command is None:
-        logger.warning(
-            "dispatch_smoke: %s#%s needs a %d-way capability fan-out %s but "
-            "no smoke command is configured (repos[].ci_command, "
-            "smoke_tests.default_command, or this repo's test_command) — "
-            "skipping. Configure one so the Test stage stops silently "
-            "no-oping for this repo.",
-            completed.repo_name, completed.issue_number, len(partitions),
-            [list(p.capabilities) for p in partitions],
-        )
-        return []
-    if not resolved.ci_equivalent and repo.github:
-        logger.warning(
-            "dispatch_smoke: %s#%s Test verdict will NOT be CI-equivalent — "
-            "running %s (%s) across a %d-way capability fan-out while CI "
-            "runs whatever %s's workflows say. Set repos[%s].ci_command to "
-            "the command CI runs (#2091).",
-            completed.repo_name, completed.issue_number, smoke_command,
-            resolved.source, len(partitions), repo.github, repo.name,
-        )
-
     smoke_model_alias = config.models.default
     smoke_model_wire = config.models.resolve(smoke_model_alias)
 
-    leg_manifest: list[tuple[str, tuple[str, ...]]] = []
+    leg_manifest: list[tuple[str, tuple[str, ...], str | None]] = []
     new_legs: list[Assignment] = []
     blocking: list[tuple[list[str], list[SmokeAttempt]]] = []
+    unconfigured: list[list[str]] = []
 
     for partition in partitions:
         caps = list(partition.capabilities)
+
+        # #3298: scope resolution to the files that put THIS partition on the
+        # board — never the full diff's `touched` — so a rule-scoped command
+        # is attributed to the one leg it was written for. `partition.files`
+        # is never empty for a partition this function actually returned
+        # (see `SmokePartition`'s docstring); the `or touched` is a defensive
+        # fallback, not a path this should ever take.
+        resolved = resolve_smoke_command(
+            repo, smoke_cfg, touched_files=list(partition.files) or touched,
+        )
+        smoke_command = resolved.command
+        if smoke_command is None:
+            logger.warning(
+                "dispatch_smoke: %s#%s — capability-partition leg %s has no "
+                "smoke command configured (checked smoke_tests."
+                "capability_rules[].command, repos[].ci_command, "
+                "smoke_tests.default_command, and this repo's test_command) "
+                "— skipping this partition. Configure one so it stops "
+                "silently no-oping (#3298).",
+                completed.repo_name, completed.issue_number, caps,
+            )
+            unconfigured.append(caps)
+            continue
+        if not resolved.ci_equivalent and repo.github:
+            logger.warning(
+                "dispatch_smoke: %s#%s — capability-partition leg %s Test "
+                "verdict will NOT be CI-equivalent — running %s (%s) while "
+                "CI runs whatever %s's workflows say. Set "
+                "repos[%s].ci_command to the command CI runs (#2091).",
+                completed.repo_name, completed.issue_number, caps,
+                smoke_command, resolved.source, repo.github, repo.name,
+            )
 
         existing = _find_leg_for_partition(
             board, repo_name=completed.repo_name, branch=completed.branch,
@@ -2215,7 +2361,9 @@ def _dispatch_smoke_fanout(
             # Already dispatched (still running, or already terminal) by an
             # earlier call for this same row — this tick just fills whatever
             # OTHER partition is still missing, never re-dispatches this one.
-            leg_manifest.append((existing.assignment_id or "", partition.capabilities))
+            leg_manifest.append(
+                (existing.assignment_id or "", partition.capabilities, smoke_command)
+            )
             continue
 
         candidates = rank_smoke_machines(
@@ -2287,14 +2435,17 @@ def _dispatch_smoke_fanout(
             review_of_assignment_id=completed.assignment_id,
             model=smoke_model_alias,
             test_state="running",
-            test_reason=f"Test stage leg running — capability set {caps} (#3182)",
+            test_reason=(
+                f"Test stage leg running — capability set {caps} using "
+                f"`{smoke_command}` (#3182/#3298)"
+            ),
         )
         board.active.append(leg_assignment)
 
         from coord.state import record_dispatched_assignment  # noqa: PLC0415
 
         record_dispatched_assignment(assignment=leg_assignment, repo_github=repo.github)
-        leg_manifest.append((leg_id, partition.capabilities))
+        leg_manifest.append((leg_id, partition.capabilities, smoke_command))
         new_legs.append(leg_assignment)
 
     # A partition every candidate durably refused — report it exactly like
@@ -2302,6 +2453,13 @@ def _dispatch_smoke_fanout(
     # per blocked partition; each is independently idempotent.)
     for caps, attempts in blocking:
         _report_unroutable_smoke(completed, caps, attempts)
+
+    # A partition whose own files resolve to NO smoke command at all — a
+    # `coordinator.yml` config gap, never a routing puzzle (#3298). Reported
+    # per partition, naming it, so a misconfiguration on one platform is
+    # never silently attributed to the whole fan-out.
+    for caps in unconfigured:
+        _report_unconfigured_smoke_command(completed, caps)
 
     # Stamp the parent's aggregate "running" — carrying the manifest so
     # `finalize_smoke_fanout` can find every leg again from just this row —
@@ -2330,7 +2488,9 @@ def _dispatch_smoke_fanout(
     ):
         from coord.state import record_test_verdict  # noqa: PLC0415
 
-        summary = "; ".join(f"[{'+'.join(sorted(caps))}]" for _, caps in leg_manifest)
+        summary = "; ".join(
+            f"[{'+'.join(sorted(caps))}]" for _, caps, _ in leg_manifest
+        )
         manifest_line = _encode_fanout_manifest(leg_manifest)
         running_reason = (
             f"{manifest_line}\nTest stage running across {len(partitions)} "
