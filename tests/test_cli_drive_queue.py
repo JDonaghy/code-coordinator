@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -32,6 +33,7 @@ from click.testing import CliRunner
 
 from coord import state
 from coord.cli import main
+from coord.drive import tmux_session_alive as _REAL_TMUX_SESSION_ALIVE
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
     DISPATCH_FAILURE_MIN_BACKOFF_SECONDS,
@@ -52,6 +54,14 @@ from tests.backends import set_board_meta
 #: (state -> `_apply_issue_labels_local` -> `github_ops`) monkeypatches this
 #: back in; see `test_add_labels_gh_with_the_resolved_slug_...`.
 _REAL_APPLY_ISSUE_LABELS = state.apply_issue_labels
+
+# `_REAL_TMUX_SESSION_ALIVE` (imported above): the genuine
+# `coord.drive.tmux_session_alive`, captured at import time — before
+# `tests/conftest.py`'s suite-wide `_no_live_tmux_driver_probe` (autouse,
+# #3282) defaults it to "nothing is alive". The one test that wants a REAL
+# local tmux probe (`test_remove_stops_a_live_driver_from_dispatching_
+# further`) restores it, same capture-and-restore shape as
+# `_REAL_APPLY_ISSUE_LABELS` above.
 
 REPO = "claude-coordinator"
 # A SECOND repo, so #1972's per-repo capacity has something to be per-repo
@@ -1534,11 +1544,25 @@ def test_remove_of_an_unqueued_issue_exits_non_zero(cli):
 # by a FRESH probe taken after the kill (#2096 — never trust the subprocess
 # exit code alone), and (b) a session that can't be confirmed dead makes
 # `remove` fail loudly (non-zero, names the session) instead of printing the
-# same success line the incident's silent case did. A live Driver process
-# actually dispatching a further leg is `coord/drive.py` territory
-# (`tests/test_drive.py`), outside this file's scope — what's covered here
-# is the CLI-visible half: `remove` can no longer claim success while a
-# session it never confirmed dead keeps running.
+# same success line the incident's silent case did. The kill itself now
+# lives in `coord.drive.stop_live_driver_session` (moved there in the #3282
+# review so `coord.state.dequeue_drive_queue`'s daemon branch AND the
+# dashboard's local fallback share the exact same seam the CLI uses — see
+# that function's docstring), so these patch `coord.drive.tmux_session_alive`
+# / `coord.drive.subprocess.run` rather than this module's own.
+#
+# `test_remove_stops_a_live_driver_from_dispatching_further` below is the
+# other half the #3282 review asked for by name: "assert no new assignment
+# is created for the issue after a remove — the actual failure here was a
+# dispatch ten minutes later, so assert on that, not just on process
+# absence." A mocked `tmux_session_alive`/`subprocess.run` pair (as every
+# other test here uses) can only prove `remove` ASKED tmux to kill the right
+# name — it says nothing about whether doing so actually stops further work.
+# That test runs a REAL local tmux session standing in for a driver that
+# "dispatches a leg" once per tick, kills it through the real, unmocked
+# `stop_live_driver_session` -> `tmux kill-session` path, and asserts the
+# dispatch marker goes flat afterwards — precisely what a dispatch ten
+# minutes later would have falsified.
 
 
 def test_remove_kills_a_live_driver_session(cli, monkeypatch):
@@ -1558,8 +1582,8 @@ def test_remove_kills_a_live_driver_session(cli, monkeypatch):
         kill_calls.append(list(argv))
         return subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("coord.interactive.tmux_session_alive", fake_alive)
-    monkeypatch.setattr("coord.commands.drive_queue.subprocess.run", fake_run)
+    monkeypatch.setattr("coord.drive.tmux_session_alive", fake_alive)
+    monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
 
     result = cli("remove", REPO, "1650")
 
@@ -1573,11 +1597,15 @@ def test_remove_kills_a_live_driver_session(cli, monkeypatch):
 
 def test_remove_with_no_live_driver_is_unchanged(cli, monkeypatch):
     cli("add", REPO, "1650")
-    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: False)
+    # Explicit even though the suite-wide `_no_live_tmux_driver_probe`
+    # default (tests/conftest.py) already makes this the case — this test's
+    # whole point is "nothing alive", so it says so rather than relying on
+    # an ambient default it doesn't otherwise reference.
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: False)
 
     kill_calls: list[list[str]] = []
     monkeypatch.setattr(
-        "coord.commands.drive_queue.subprocess.run",
+        "coord.drive.subprocess.run",
         lambda argv, **_kw: kill_calls.append(list(argv)),
     )
 
@@ -1594,9 +1622,9 @@ def test_remove_reports_failure_loudly_when_the_driver_cannot_be_killed(cli, mon
     session = f"coord-drive-{REPO}-1650"
     # Still alive on both the pre-kill check AND the post-kill re-probe: the
     # `kill-session` call "succeeded" (returncode 0) but nothing died.
-    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: True)
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: True)
     monkeypatch.setattr(
-        "coord.commands.drive_queue.subprocess.run",
+        "coord.drive.subprocess.run",
         lambda argv, **_kw: subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr=""),
     )
 
@@ -1615,18 +1643,83 @@ def test_remove_reports_failure_loudly_when_the_driver_cannot_be_killed(cli, mon
 
 def test_remove_reports_failure_when_kill_session_itself_errors(cli, monkeypatch):
     cli("add", REPO, "1650")
-    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: True)
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: True)
 
     def boom(argv, **_kw):
         raise OSError("tmux: command not found")
 
-    monkeypatch.setattr("coord.commands.drive_queue.subprocess.run", boom)
+    monkeypatch.setattr("coord.drive.subprocess.run", boom)
 
     result = cli("remove", REPO, "1650")
 
     assert result.exit_code != 0
     assert "coord-drive-" in result.output
     assert "tmux: command not found" in result.output
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real local tmux binary")
+def test_remove_stops_a_live_driver_from_dispatching_further(cli, tmp_path, monkeypatch):
+    """#3282 review (blocking): "assert no new assignment is created for the
+    issue after a remove — the actual failure here was a dispatch ten
+    minutes later, so assert on that, not just on process absence."
+
+    Every other test in this section mocks BOTH `tmux_session_alive` and the
+    kill subprocess, which can only prove `remove` ASKED tmux to kill the
+    right name. This one runs a REAL local tmux session standing in for a
+    driver that "dispatches a leg" by appending a line to a marker file once
+    per tick, forever, until killed — then calls `remove` through the real,
+    unmocked `coord.drive.stop_live_driver_session` -> `tmux kill-session`
+    path (restoring the suite-wide `_no_live_tmux_driver_probe` default,
+    same pattern as `_REAL_APPLY_ISSUE_LABELS` above) and asserts the marker
+    file's line count goes flat afterwards — exactly what a dispatch ten
+    minutes later would have falsified.
+    """
+    monkeypatch.setattr("coord.drive.tmux_session_alive", _REAL_TMUX_SESSION_ALIVE)
+
+    cli("add", REPO, "1650")
+    session = f"coord-drive-{REPO}-1650"
+    marker = tmp_path / "dispatches.log"
+    script = (
+        "import pathlib, time\n"
+        f"p = pathlib.Path({str(marker)!r})\n"
+        "while True:\n"
+        "    with p.open('a') as f:\n"
+        "        f.write('leg\\n')\n"
+        "    time.sleep(0.1)\n"
+    )
+    launch = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=10.0,
+    )
+    assert launch.returncode == 0, launch.stderr
+    try:
+        # Give the fake driver a moment to actually start "dispatching" —
+        # at least two legs, so the post-remove check below has a baseline
+        # that could plausibly have kept growing.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if marker.exists() and marker.read_text().count("leg") >= 2:
+                break
+            time.sleep(0.05)
+        assert marker.exists() and marker.read_text().count("leg") >= 2, (
+            "fake driver never dispatched its first legs"
+        )
+
+        result = cli("remove", REPO, "1650")
+        assert result.exit_code == 0, result.output
+        assert f"killed driver session {session!r}" in result.output
+
+        after_remove = marker.read_text().count("leg")
+        time.sleep(0.6)  # several multiples of the fake driver's 0.1s tick
+        assert marker.read_text().count("leg") == after_remove, (
+            "the 'driver' kept dispatching after remove reported it killed "
+            "the session — the exact #3282 incident (a fresh work leg "
+            "dispatched ten minutes after an operator removed the row)"
+        )
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session], capture_output=True, text=True,
+        )
 
 
 def test_move_reorders_the_queue(cli):

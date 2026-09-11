@@ -3701,7 +3701,15 @@ def test_drive_queue_writes_route_when_service_set(coord_db, monkeypatch):
     ) == 42
     assert state.update_drive_queue_entry("api", 7, state="running") is True
     assert state.move_drive_queue_entry("api", 7, 0) is True
-    assert state.dequeue_drive_queue("api", 7) is True
+    # #3282: `dequeue_drive_queue` now also carries the daemon's driver-stop
+    # verdict; a reply predating that field (as stubbed above) defaults to
+    # "nothing to report", same as a dequeue that found no live session.
+    assert state.dequeue_drive_queue("api", 7) == {
+        "removed": True,
+        "driver_ok": True,
+        "driver_session": None,
+        "driver_detail": None,
+    }
 
     assert {c["path"] for c in calls} == {"/drive-queue"}
     assert [c["payload"]["action"] for c in calls] == [
