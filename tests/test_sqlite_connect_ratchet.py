@@ -458,6 +458,23 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "A file DB for board_projection, plus a check_same_thread=False "
         "connection for the daemon threadpool sweep.",
     ),
+    "test_housekeeping.py": Classification(
+        2, (BUCKET_C,),
+        "#3296's drive_queue/plans archival tests, the same two shapes as "
+        "test_board_cap_762.py above (the file this one extends the sweep "
+        "alongside). One is a `file_db` fixture whose *path* is handed to "
+        "SqliteStore(path) for the board_projection read while its *conn* is "
+        "handed to db.override_connection() for the sweep's write, so both "
+        "halves must agree on one on-disk database; the other is a "
+        "check_same_thread=False connection because the /drive-queue route "
+        "runs on a TestClient worker thread. Neither fits the autouse "
+        "coord_db fixture (`:memory:` has no path for SqliteStore to open, "
+        "and it is single-thread-bound) nor tests.backends."
+        "scratch_database() (it yields a connection, not the path "
+        "SqliteStore needs, and SqliteStore is the SQLite arm of the store "
+        "seam by definition — following COORD_TEST_BACKEND to Postgres "
+        "would hand it a database it cannot open).",
+    ),
     "test_approved_work_2532.py": Classification(
         2, (BUCKET_C,),
         "A thread-safe rw_db override for the write side plus a detail_db "
