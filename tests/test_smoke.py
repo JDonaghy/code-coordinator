@@ -259,6 +259,69 @@ def test_partition_ignores_unmatched_rules() -> None:
     assert unroutable == []
 
 
+def test_partition_accumulates_files_from_every_rule_sharing_one_requires_set() -> None:
+    """#3298 fix-round-1: `seen` used to key on `frozenset(rule.requires)`
+    and keep only the FIRST matching rule for a given set — so a second rule
+    declaring the identical capability set (a broad rule plus a narrower
+    override for a subdirectory of the same platform, the exact shape the
+    issue wants for vimcode/quadraui) never contributed its OWN files to the
+    partition. Both rules' matched files must appear."""
+    rules = [
+        SmokeRule(files=["a/"], requires=["gtk"]),
+        SmokeRule(files=["b/"], requires=["gtk"], command="test-b-only"),
+    ]
+    touched = ["a/x.rs", "b/y.rs"]
+    partitions, unroutable = partition_capability_requirements(
+        touched, rules, lambda caps: True,
+    )
+    assert unroutable == []
+    assert partitions == [
+        SmokePartition(capabilities=("gtk",), files=("a/x.rs", "b/y.rs")),
+    ]
+
+
+def test_partition_lets_a_shadowed_rules_command_win_for_its_own_partition() -> None:
+    """End-to-end version of the above: with the files correctly accumulated,
+    `resolve_rule_command` scoped to the partition's own files must resolve
+    the SECOND rule's `command` — before the fix this came back `None`
+    because `b/y.rs` never made it into `partition.files` at all."""
+    rules = [
+        SmokeRule(files=["a/"], requires=["gtk"]),
+        SmokeRule(files=["b/"], requires=["gtk"], command="test-b-only"),
+    ]
+    touched = ["a/x.rs", "b/y.rs"]
+    partitions, unroutable = partition_capability_requirements(
+        touched, rules, lambda caps: True,
+    )
+    assert unroutable == []
+    assert len(partitions) == 1
+    resolved = resolve_rule_command(list(partitions[0].files), rules)
+    assert resolved is not None
+    assert resolved.command == "test-b-only"
+
+
+def test_partition_unroutable_reports_files_from_every_rule_sharing_the_set() -> None:
+    """The unroutable-diagnosis path shares the same `seen` accumulation —
+    a second rule sharing an unroutable capability set must still contribute
+    its own DECLARED file pattern to `rule_files`, not just the first rule's
+    (matching pre-fix single-rule behaviour: `rule_files` is the rule's own
+    `files` patterns, not the matched touched paths — see
+    `SmokePartition.files` for that)."""
+    rules = [
+        SmokeRule(files=["src/cuda/kernels/"], requires=["cuda"]),
+        SmokeRule(files=["src/cuda/tests/"], requires=["cuda"]),
+    ]
+    touched = ["src/cuda/kernels/a.cu", "src/cuda/tests/b.cu"]
+    partitions, unroutable = partition_capability_requirements(
+        touched, rules, _quadraui_capable_for,
+    )
+    assert partitions == []
+    assert len(unroutable) == 1
+    bad = unroutable[0]
+    assert bad.capabilities == ("cuda",)
+    assert bad.rule_files == ("src/cuda/kernels/", "src/cuda/tests/")
+
+
 # ── Rule command override (#3056) ───────────────────────────────────────────
 
 

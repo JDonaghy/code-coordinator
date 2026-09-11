@@ -375,7 +375,15 @@ def partition_capability_requirements(
     only the files that put THAT partition on the board, instead of the
     diff's full `touched_files`.
     """
-    seen: dict[frozenset[str], tuple[int, list[str]]] = {}
+    # #3298 fix-round-1: `seen` used to keep only the FIRST rule matching a
+    # given `requires` set and silently drop every later one with the same
+    # set — so a second rule sharing a capability set (e.g. a broad `gtk`
+    # rule plus a narrower `gtk` override carrying its own `command`) never
+    # entered `order`/`group_rule_indices` at all, and its files never made
+    # it into the partition's `files`, so `resolve_rule_command` could never
+    # see them and its `command` could never win. Every rule matching a
+    # given key must accumulate here, not just the first.
+    seen: dict[frozenset[str], list[int]] = {}
     order: list[frozenset[str]] = []
     for i, rule in enumerate(rules):
         if not rule.requires:
@@ -384,19 +392,31 @@ def partition_capability_requirements(
             continue
         key = frozenset(rule.requires)
         if key not in seen:
-            seen[key] = (i, list(rule.files))
+            seen[key] = []
             order.append(key)
+        seen[key].append(i)
 
     groups: list[set[str]] = []
     group_rule_indices: list[list[int]] = []
     unroutable: list[UnroutableCapability] = []
     for key in order:
-        rule_index, rule_files = seen[key]
+        rule_indices_for_key = seen[key]
         caps = set(key)
         if not capable_for(sorted(caps)):
+            # `rule_files` here is diagnostic text for `describe()` — the
+            # DECLARED file patterns of every rule sharing this unroutable
+            # capability set (e.g. `["src/cuda/"]`), same as pre-#3298-fix
+            # for a single rule, just unioned (order-preserving, deduped)
+            # across every rule now accumulated under this key instead of
+            # only the first.
+            rule_files: list[str] = []
+            for rule_index in rule_indices_for_key:
+                for f in rules[rule_index].files:
+                    if f not in rule_files:
+                        rule_files.append(f)
             unroutable.append(UnroutableCapability(
                 capabilities=tuple(sorted(caps)),
-                rule_index=rule_index,
+                rule_index=rule_indices_for_key[0],
                 rule_files=tuple(rule_files),
             ))
             continue
@@ -405,12 +425,12 @@ def partition_capability_requirements(
             candidate = group | caps
             if capable_for(sorted(candidate)):
                 groups[i] = candidate
-                group_rule_indices[i].append(rule_index)
+                group_rule_indices[i].extend(rule_indices_for_key)
                 merged = True
                 break
         if not merged:
             groups.append(caps)
-            group_rule_indices.append([rule_index])
+            group_rule_indices.append(list(rule_indices_for_key))
 
     partitions = [
         SmokePartition(
@@ -2332,15 +2352,11 @@ def _dispatch_smoke_fanout(
         )
         smoke_command = resolved.command
         if smoke_command is None:
-            logger.warning(
-                "dispatch_smoke: %s#%s — capability-partition leg %s has no "
-                "smoke command configured (checked smoke_tests."
-                "capability_rules[].command, repos[].ci_command, "
-                "smoke_tests.default_command, and this repo's test_command) "
-                "— skipping this partition. Configure one so it stops "
-                "silently no-oping (#3298).",
-                completed.repo_name, completed.issue_number, caps,
-            )
+            # Skip this partition — `_report_unconfigured_smoke_command`
+            # below logs and records the board-visible reason exactly once,
+            # same convention as the `blocking`/`_report_unroutable_smoke`
+            # path just below: no separate log here, or every unconfigured
+            # partition would be logged twice.
             unconfigured.append(caps)
             continue
         if not resolved.ci_equivalent and repo.github:
@@ -2417,6 +2433,12 @@ def _dispatch_smoke_fanout(
 
         choice, briefing, agent_response = result
         leg_id = agent_response.get("id") or uuid.uuid4().hex[:12]
+        # Escape a literal backtick in the resolved command so it cannot
+        # prematurely close the backtick-fenced span below — this
+        # `test_reason` is informational display text only (the manifest
+        # carries the authoritative base64-encoded copy), but a broken
+        # fence is an easy, easily-avoided papercut.
+        escaped_smoke_command = smoke_command.replace("`", "\\`")
         leg_assignment = Assignment(
             machine_name=choice.machine.name,
             repo_name=completed.repo_name,
@@ -2437,7 +2459,7 @@ def _dispatch_smoke_fanout(
             test_state="running",
             test_reason=(
                 f"Test stage leg running — capability set {caps} using "
-                f"`{smoke_command}` (#3182/#3298)"
+                f"`{escaped_smoke_command}` (#3182/#3298)"
             ),
         )
         board.active.append(leg_assignment)
