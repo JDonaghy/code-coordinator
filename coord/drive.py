@@ -3580,17 +3580,6 @@ _SMOKE_GATE_MARKERS = (
 )
 _REVIEW_GATE_MARKERS = ("review required", "review not approved")
 
-# #2947 (follow-up to #2687): the UAT gate — a human-attended block that only
-# `coord uat <id> --passed` (never a `coord merge` retry) can clear.
-# `evaluate_uat_verdict` (coord.merge_queue) always opens its message with
-# "uat verdict " — "uat verdict missing", "uat verdict FAILED: …", or the
-# board-unavailable stand-in "uat verdict required but board unavailable to
-# confirm" — so that one prefix covers every wording both `process()` (live
-# merge attempt) and `_entry_gate_status` (board/plan render) produce, the
-# same "both callers, one string" guarantee `_SMOKE_GATE_MARKERS`/
-# `_REVIEW_GATE_MARKERS` document above.
-_UAT_GATE_MARKERS = ("uat verdict",)
-
 # #2704: the branch-head-unknown condition
 # (`coord.merge_queue.UNKNOWN_BRANCH_HEAD_REASON`) is its OWN gate kind —
 # neither "smoke" nor "review" — even though `merge_gate_failures` reports it
@@ -3623,10 +3612,25 @@ def _merge_gate_kind(reason: str) -> str | None:
 
     #2947: `"uat"` is likewise its own kind, never folded into "review" or
     "smoke" — it is a human-attended gate with no re-runnable measurement
-    behind it (see `_UAT_GATE_MARKERS`), so callers must route it to a
-    bare wait for a human verdict, never a `coord merge` retry or an
-    automated re-test/re-review escalation.
+    behind it, so callers must route it to a bare wait for a human verdict,
+    never a `coord merge` retry or an automated re-test/re-review
+    escalation.
+
+    #3272 (S-4 of #3261): the UAT arm no longer hardcodes its own copy of
+    `evaluate_uat_verdict`'s message vocabulary — it looks the "uat"
+    `GateSpec`'s `identifies_reason` up in `coord.pipeline.GATE_REGISTRY`
+    and asks THAT, so a rewording of the message in `coord/merge_queue.py`
+    can never silently desync from what this module recognizes (the #2096
+    "one question, one answer" fix for the split that used to exist between
+    this module's private `_UAT_GATE_MARKERS` and
+    `coord.merge_queue.evaluate_uat_verdict`'s actual message). Deferred
+    import: `coord.pipeline` imports `coord.merge_queue` at module level, and
+    while nothing today imports `coord.drive` back, keeping this import
+    local avoids adding a module-level edge from a widely-imported module
+    like `drive.py` into `pipeline.py`'s own load order.
     """
+    from coord.pipeline import GATE_REGISTRY  # noqa: PLC0415
+
     r = (reason or "").lower()
     if _UNKNOWN_BRANCH_HEAD_MARKER in r:
         return "unknown_head"
@@ -3634,7 +3638,9 @@ def _merge_gate_kind(reason: str) -> str | None:
         return "smoke"
     if any(marker in r for marker in _REVIEW_GATE_MARKERS):
         return "review"
-    if any(marker in r for marker in _UAT_GATE_MARKERS):
+    uat_spec = GATE_REGISTRY.get("uat")
+    identifies_uat_reason = uat_spec.identifies_reason if uat_spec is not None else None
+    if identifies_uat_reason is not None and identifies_uat_reason(r):
         return "uat"
     return None
 

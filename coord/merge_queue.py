@@ -1201,9 +1201,9 @@ def evaluate_uat_verdict(
     resolution = _resolve_uat_preview_url(entry, config, gh_ops)
     if uat_state == "failed":
         reason_part = f": {uat_reason}" if (uat_reason or "").strip() else ""
-        message = f"uat verdict FAILED{reason_part}"
+        message = f"{UAT_GATE_REASON_PREFIX} FAILED{reason_part}"
     else:
-        message = "uat verdict missing"
+        message = f"{UAT_GATE_REASON_PREFIX} missing"
     if resolution.url:
         message += f" — preview: {resolution.url}"
     else:
@@ -3584,7 +3584,41 @@ _STALE_GATE_ERROR_PREFIXES = ("smoke test verdict is stale:",)
 # can't be matched by equality; both variants (missing/failed) share this
 # prefix and go stale the same #420 way: `coord uat --passed` outside a
 # merge attempt doesn't touch the stored `entry.error` string.
-_UAT_GATE_ERROR_PREFIX = "uat verdict"
+#
+# #3272 (S-4 of #3261): this is the ONLY place the UAT gate's identity
+# prefix is spelled out. `evaluate_uat_verdict` (and the board-unavailable
+# stand-in in `process()`) build their messages off THIS constant rather
+# than a second hardcoded literal, and `is_uat_gate_reason` below — the
+# function `coord.pipeline`'s "uat" `GateSpec` row exposes as its
+# `identifies_reason` field, which `coord.drive._merge_gate_kind` looks up
+# through the registry — classifies off it too. Before this, `coord/drive.py`
+# kept its OWN independently-hardcoded copy of this same string
+# (`_UAT_GATE_MARKERS`); rewording the message here without remembering
+# that second copy existed would silently stop `_merge_gate_kind` from
+# recognizing a UAT block, and with it the #3214 UAT fix-up dispatch. One
+# question ("is this reason the UAT gate's?"), one answer (#2096).
+UAT_GATE_REASON_PREFIX = "uat verdict"
+
+
+def is_uat_gate_reason(reason: str | None) -> bool:
+    """True when *reason* names a UAT-gate refusal — built off
+    :data:`UAT_GATE_REASON_PREFIX`, the single source both
+    :func:`evaluate_uat_verdict` (message construction) and this predicate
+    (classification) key off, so the two can never drift apart the way
+    #3272 (S-4 of #3261) found `coord.drive._merge_gate_kind`'s private,
+    independently-hardcoded copy already had.
+
+    A case-insensitive SUBSTRING match, not an anchored prefix: *reason* is
+    sometimes the bare message (`entry.error`/`state.merge_reason`, which
+    does start with the prefix) and sometimes a whole diagnostic LINE that
+    wraps it — `coord merge --only` echoes ``  gate uat: <reason> — will
+    block this merge`` (see `coord.drive._extract_gate_refusal_reason`) —
+    so the prefix can legitimately appear mid-string. Mirrors
+    `_SMOKE_GATE_MARKERS`/`_REVIEW_GATE_MARKERS` in `coord/drive.py`, which
+    are substring markers for exactly the same reason.
+    """
+    return UAT_GATE_REASON_PREFIX.lower() in (reason or "").lower()
+
 
 # #2085: the honest third answer for the review gate on a read-only surface —
 # neither "not approved" (unconfirmed failure) nor cleared (unconfirmed
@@ -3601,7 +3635,7 @@ def _is_recomputable_gate_error(err: str | None) -> bool:
     return (
         err in _STALE_GATE_ERRORS
         or err.startswith(_STALE_GATE_ERROR_PREFIXES)
-        or err.startswith(_UAT_GATE_ERROR_PREFIX)
+        or is_uat_gate_reason(err)
     )
 
 
@@ -3670,7 +3704,7 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
         if entry.error.startswith(_STALE_GATE_ERROR_PREFIXES):
             return entry.error
         return None
-    if entry.error.startswith(_UAT_GATE_ERROR_PREFIX):
+    if is_uat_gate_reason(entry.error):
         # #2687: no staleness nuance to preserve here (unlike the smoke
         # branch above) — a UAT verdict carries no SHA anchor that can go
         # stale, so a fresh recompute is always the right answer: cleared
@@ -7584,7 +7618,7 @@ def process(
                     else _run_declared_uat_checks(entry, board, config, gh_ops)
                 )
                 uat_ok, uat_msg = (
-                    (False, "uat verdict required but board unavailable to confirm")
+                    (False, f"{UAT_GATE_REASON_PREFIX} required but board unavailable to confirm")
                     if board is None
                     else evaluate_uat_verdict(entry, board, config, gh_ops)
                 )
