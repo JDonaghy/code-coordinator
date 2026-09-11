@@ -578,6 +578,20 @@ def check_audit_recent_count_is_a_bounded_window(store: CoordStore) -> None:
     assert count == 0, "an ancient audit row must fall outside the recency window"
 
 
+def check_change_token(store: CoordStore) -> None:
+    """#3294: ``change_token()`` is a cheap, stable "did anything write?"
+    signal — two calls with no intervening write return the SAME token. The
+    token's shape is deliberately opaque to callers (a comparable value, not
+    a specific format), since a Postgres implementation may use a completely
+    different representation than SQLite's ``PRAGMA data_version`` — this
+    check only asserts the contract every backend must uphold: stability
+    across repeat reads.
+    """
+    token = store.change_token()
+    assert isinstance(token, str)
+    assert token == store.change_token()
+
+
 def check_reads_are_repeatable(store: CoordStore) -> None:
     """The same read twice returns the same thing.
 
@@ -649,6 +663,7 @@ CONTRACT_CHECKS: tuple[Check, ...] = (
         check_audit_recent_count_is_a_bounded_window,
     ),
     Check("reads_are_repeatable", (), check_reads_are_repeatable),
+    Check("change_token", ("change_token",), check_change_token),
 )
 
 
