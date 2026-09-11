@@ -1655,10 +1655,19 @@ class EpicChecklistSnapshot:
     (``coord milestone add-child``), read fresh off GitHub rather than
     trusted from the worker's final message (the whole premise of #3246).
     ``queued_keys`` is every ``"repo#N"`` key already present in the drive
-    queue, and ``epic_after`` is the epic's OWN current queue row's
-    declared ``after=`` edges (``()`` when the epic isn't queued, or is
-    queued with no edge) — both needed to tell "already handled" apart from
-    "still to do" without re-adding something that's already there.
+    queue — needed to tell "already handled" apart from "still to do"
+    without re-adding something that's already there.
+
+    ``epic_after`` is the epic's OWN current queue row's declared ``after=``
+    edges. #3275 removed the one thing this used to drive — planning a
+    re-queue of the epic itself is gone, because "epic behind the last
+    child" is exactly the ordering that made claude-coordinator#3261
+    deadlock (see :func:`_epic_decompose_batch`'s docstring) — so this field
+    is no longer read by the planner. Left on the snapshot rather than
+    removed: it is still live, freely-available observability (a fetch this
+    function already had to do to build the rest of the snapshot), and a
+    future reader debugging "why is this epic's queue row shaped like that"
+    benefits from it costing nothing extra to look at.
     """
 
     children: tuple[EpicChildStatus, ...] = ()
@@ -2131,7 +2140,7 @@ def _escalate_dead_end(state: IssueState, dead_end: DeadEnd) -> Action:
     )
 
 
-# ── #3246: epic-decompose's steps 2/3, coordinator-side ─────────────────────
+# ── #3246/#3275: epic-decompose's steps 2/3, coordinator-side ───────────────
 #
 # `coord.dispatch.EPIC_DECOMPOSE_CONTRACT` used to ask the epic-decompose
 # worker itself to queue the first batch of newly-filed children (chained
@@ -2144,10 +2153,33 @@ def _escalate_dead_end(state: IssueState, dead_end: DeadEnd) -> Action:
 # the write happened — only re-observing the state is — so this reads the
 # epic's live `## Sub-issues` checklist (the durable trace of the worker's
 # step 1, `coord milestone add-child`) and the live drive queue, and issues
-# whatever `coord drive-queue add` call is still missing, one per poll,
-# until the batch and the epic's own re-queue both exist. Idempotent by
-# construction (every `add` upserts by (repo, issue)), so re-running this on
-# every poll while nothing is missing is a no-op that just falls through.
+# whatever `coord drive-queue add` call is still missing, one per poll.
+# Idempotent by construction (every `add` upserts by (repo, issue)), so
+# re-running this on every poll while nothing is missing is a no-op that
+# just falls through.
+#
+# #3275: the "re-queue the epic behind the last child" half of that plan
+# (claude-coordinator#3261's incident) is GONE, not fixed — it was
+# self-contradictory by construction, independent of any predictor bug. The
+# epic's own branch implements the first slice (`EPIC_DECOMPOSE_CONTRACT`
+# step 2), so its in-flight diff IS that slice's file set; the moment a
+# checklist child declares the same files (#3269 duplicated slice 1 exactly),
+# #2247's overlap predictor correctly chains that child `--after` the epic —
+# and re-queueing the epic `--after` the last child, as the old plan did,
+# then closes a 2-cycle with that same edge every single time, not just on a
+# false positive. There is no ordering of "epic behind last child" that can
+# ever be correct here: the epic must land FIRST, because the checklist's
+# later slices build on the code its own PR adds. So this now chains the
+# BATCH after the epic (the first child gets `--after <epic>`, each
+# following child chains behind the one before it, exactly as before) and
+# never touches the epic's own queue row at all — once every batch child is
+# queued, there is nothing left to do. `--reject-after <epic>` rides along on
+# every child in the batch as a second, independent guard: even if some
+# child's declared files happen to overlap the epic's PR for an unrelated
+# reason (a shared test file, say), the explicit chain above already encodes
+# the only ordering that matters, and letting #2247 ALSO try to add its own
+# copy of the very edge #3275 exists to stop the epic from ever depending on
+# would just be re-introducing the same risk through the back door.
 
 _EPIC_DECOMPOSE_BATCH_SIZE = 6
 
@@ -2169,12 +2201,23 @@ def _epic_decompose_batch(
     already queued), so re-deriving it every poll always converges on the
     same batch rather than drifting.
 
+    #3275: the batch chains behind the EPIC, not the other way around — see
+    the module comment above this function for why "epic behind the last
+    child" is a guaranteed cycle, not just a #2247 false positive. The first
+    unqueued child's `--after` names the epic itself; every child after that
+    still chains behind the one before it, exactly as before. Every add in
+    the batch also carries `--reject-after <epic>` (#2603's narrow escape
+    hatch) so #2247's own predictor can never independently re-derive the
+    reverse edge this function exists to rule out.
+
     Returns ``None`` when there is nothing left to queue — either every
-    eligible child (and the epic's own re-queue) is already there, or the
-    checklist has no eligible child at all (e.g. step 1 never filed
-    anything; that is a DIFFERENT defect than the one this function exists
-    to close, and is left to surface on its own rather than `_die()`-ing
-    here on a case this function was never asked to police).
+    eligible child is already there, or the checklist has no eligible child
+    at all (e.g. step 1 never filed anything; that is a DIFFERENT defect
+    than the one this function exists to close, and is left to surface on
+    its own rather than `_die()`-ing here on a case this function was never
+    asked to police). Unlike the pre-#3275 version, there is no follow-up
+    step once the batch is fully queued — the epic's own queue row is never
+    touched by this function at all.
     """
     terminal = {c.issue_number for c in snapshot.children if c.closed}
     eligible = [
@@ -2185,44 +2228,31 @@ def _epic_decompose_batch(
     if not batch:
         return None
 
+    epic_key = entry_key(state.repo, state.issue)
     for i, child in enumerate(batch):
         key = entry_key(state.repo, child.issue_number)
         if key in snapshot.queued_keys:
             continue
-        command = ["drive-queue", "add", state.repo, str(child.issue_number)]
-        if i > 0:
-            command += ["--after", entry_key(state.repo, batch[i - 1].issue_number)]
+        prior_key = entry_key(state.repo, batch[i - 1].issue_number) if i > 0 else epic_key
+        command = [
+            "drive-queue", "add", state.repo, str(child.issue_number),
+            "--after", prior_key,
+            "--reject-after", epic_key,
+        ]
         return Action(
             kind=RUN,
             label=(
                 f"EPIC-DECOMPOSE #{state.issue}: queueing batch child "
-                f"{key} ({i + 1}/{len(batch)}, #3246)"
+                f"{key} ({i + 1}/{len(batch)}, #3246/#3275)"
             ),
             command=tuple(command),
             error_message=(
                 f"coord drive-queue add failed for {key} while queuing "
-                f"epic #{state.issue}'s first batch (#3246)"
+                f"epic #{state.issue}'s first batch (#3246/#3275)"
             ),
         )
 
-    last_key = entry_key(state.repo, batch[-1].issue_number)
-    if snapshot.epic_after == (last_key,):
-        return None
-    epic_command = [
-        "drive-queue", "add", state.repo, str(state.issue), "--after", last_key,
-    ]
-    return Action(
-        kind=RUN,
-        label=(
-            f"EPIC-DECOMPOSE #{state.issue}: re-queueing epic behind "
-            f"{last_key} (#3246)"
-        ),
-        command=tuple(epic_command),
-        error_message=(
-            f"coord drive-queue add failed while re-queueing epic "
-            f"#{state.issue} behind {last_key} (#3246)"
-        ),
-    )
+    return None
 
 
 def _decide_epic_decompose_followup(
@@ -2629,8 +2659,9 @@ def decide(
             f"{state.work_machine or machine}"
         )
 
-    # #3246: an epic-decompose leg's steps 2/3 (queue the first batch of
-    # newly-filed children, re-queue the epic behind them) are coordinator-
+    # #3246/#3275: an epic-decompose leg's step 2 (queue the first batch of
+    # newly-filed children, chained BEHIND this epic — never the epic
+    # re-queued behind them, see `_epic_decompose_batch`) is coordinator-
     # side now, not worker-reported — see `_decide_epic_decompose_followup`.
     # Positioned here, right after the branch check and before the dead-end
     # predicate, so a batch still being queued (one `coord drive-queue add`
