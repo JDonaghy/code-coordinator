@@ -697,6 +697,11 @@ class TestMachinesAPI:
 
             class _Resp:
                 status_code = 200
+                # #3295: fetch_board_payload now reads the ETag off a real
+                # response's `.headers` to decide whether to cache the body
+                # for a future `If-None-Match` — an empty mapping here means
+                # "no ETag returned", which is a valid (if uncacheable) 200.
+                headers: dict = {}
 
                 def raise_for_status(self):
                     return None
@@ -1129,6 +1134,10 @@ class TestMachinesHealthAPI:
 
             class _Resp:
                 status_code = 200
+                # #3295: see the identical comment in
+                # TestMachinesAPI.test_thin_client_reads_the_daemons_published_fleet_health_block
+                # — fetch_board_payload now reads `.headers` for an ETag.
+                headers: dict = {}
 
                 def raise_for_status(self):
                     return None
