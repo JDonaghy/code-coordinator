@@ -336,6 +336,55 @@ def _log_superseded(row) -> None:
     )
 
 
+# ── Gate registry lookups (#3261 S-3) ───────────────────────────────────────
+#
+# `coord.pipeline` imports `requires_uat`/`evaluate_uat_verdict` from THIS
+# module at module level (#3261 S-2's `GATE_REGISTRY` wraps them) — so a
+# module-level `from coord.pipeline import GATE_REGISTRY` here would
+# deadlock the cycle (whichever module loads first would hit the other
+# still mid-initialization). The import below is deferred into the
+# functions that need it instead; both modules are always fully loaded by
+# the time a gate check actually runs, so it's a cheap `sys.modules` cache
+# hit, not a real re-import.
+#
+# Only "uat" has a `GateSpec` row today (#3261 S-2) — "review"/"test" don't
+# yet (the epic explicitly allows deferring their registry rows to a later
+# slice; see the #3261 issue). `_registry_gate_name` is a passthrough for
+# any key without a row, so `requires_review`/`requires_smoke` keep their
+# exact current behaviour, and picking up a future "review"/"test"
+# `GateSpec` needs no further change here — just the registry row.
+
+
+def _registry_gate_name(key: str) -> str:
+    """Resolve *key* to its canonical name via
+    :data:`coord.pipeline.GATE_REGISTRY` when *key* has a row there, else
+    return *key* unchanged (see the module comment above this function)."""
+    from coord.pipeline import GATE_REGISTRY
+
+    spec = GATE_REGISTRY.get(key)
+    return spec.name if spec is not None else key
+
+
+def _gate_in_effective_gates(gate_key: str, entry: "QueuedMerge", config) -> bool:
+    """True when *gate_key* (registry-resolved, see :func:`_registry_gate_name`)
+    is present in *entry*'s effective gate list.
+
+    Effective gate list: ``entry``'s own ``required_gates`` when set, falling
+    back to ``config.pipeline.default_gates`` otherwise (#1213) — the
+    resolution rule :func:`requires_review`/:func:`requires_smoke`/
+    :func:`requires_uat` all share. Extracted here once (#2096: one question,
+    one answer) instead of repeating ``gates = ...; return X in gates`` at
+    each call site. Caller is responsible for the ``config.pipeline is None``
+    short-circuit — its return value differs per gate (True for review,
+    False for smoke/uat), so it can't live in this shared helper.
+    """
+    pipeline = getattr(config, "pipeline", None)
+    if pipeline is None:
+        return False
+    gates = getattr(entry, "required_gates", None) or (pipeline.default_gates or [])
+    return _registry_gate_name(gate_key) in gates
+
+
 # ── Review gate (#253) ──────────────────────────────────────────────────────
 
 def requires_review(entry: "QueuedMerge", config) -> bool:
@@ -359,8 +408,7 @@ def requires_review(entry: "QueuedMerge", config) -> bool:
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None:
         return True
-    gates = getattr(entry, "required_gates", None) or (pipeline.default_gates or [])
-    return "review" in gates
+    return _gate_in_effective_gates("review", entry, config)
 
 
 def _backfill_branch_patch_id(entry: "QueuedMerge", gh_ops: "GhOps | None") -> str | None:
@@ -913,8 +961,7 @@ def requires_smoke(entry: "QueuedMerge", config) -> bool:
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None:
         return False
-    gates = getattr(entry, "required_gates", None) or (pipeline.default_gates or [])
-    return "test" in gates
+    return _gate_in_effective_gates("test", entry, config)
 
 
 # ── UAT gate (#2687) ─────────────────────────────────────────────────────────
@@ -981,8 +1028,7 @@ def requires_uat(entry: "QueuedMerge", config) -> bool:
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None or config is None:
         return False
-    gates = getattr(entry, "required_gates", None) or (pipeline.default_gates or [])
-    if "uat" not in gates:
+    if not _gate_in_effective_gates("uat", entry, config):
         return False
     repo = _uat_repo_for(entry, config)
     if repo is None:
@@ -1240,6 +1286,16 @@ def _run_declared_uat_checks(
 
 
 # ── Gate-bypass auditing (#1213) ────────────────────────────────────────────
+#
+# #3261 S-3 scope note: this function's literal ``"review"``/``"test"``/
+# ``"uat"`` checks are deliberately NOT routed through
+# ``_gate_in_effective_gates``/``GATE_REGISTRY``. It asks a different
+# question than ``requires_review``/``requires_smoke``/``requires_uat`` —
+# "which named gates does the DEFAULT list carry that entry's own resolved
+# list dropped" (comparing two lists against each other), not "does entry
+# require gate X" (one list against a name) — so it isn't one of the three
+# membership tests S-3 targets, and folding it into the shared helper would
+# just be a name coincidence, not the same question in #2096's sense.
 
 def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
     """Which of the default pipeline's gates *entry*'s resolved gate list

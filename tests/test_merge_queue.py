@@ -5007,6 +5007,52 @@ class TestUatGate:
         )
         assert mq.requires_uat(_q("a"), cfg) is False
 
+    # ── gate-list membership routed through GATE_REGISTRY (#3261 S-3) ──
+
+    def test_registry_gate_name_uses_the_registered_gatespec_name(self) -> None:
+        from coord.pipeline import GATE_REGISTRY
+
+        assert mq._registry_gate_name("uat") == GATE_REGISTRY["uat"].name == "uat"
+
+    def test_registry_gate_name_passes_through_an_unregistered_key(self) -> None:
+        # "review"/"test" have no `GateSpec` row yet — the #3261 epic
+        # explicitly allows deferring them to a later slice — so this must
+        # be a passthrough, not a KeyError or a silent False.
+        assert mq._registry_gate_name("review") == "review"
+        assert mq._registry_gate_name("test") == "test"
+        assert mq._registry_gate_name("nonsense") == "nonsense"
+
+    def test_requires_uat_follows_a_renamed_registry_row(self, monkeypatch) -> None:
+        """#2096: prove `requires_uat`'s gate-list check actually reads
+        `GATE_REGISTRY["uat"].name` rather than a hardcoded ``"uat"``
+        literal that happens to match today — rename the row and confirm
+        the entries that match flip accordingly. A check that can't be
+        swayed by its own registry data isn't really consulting it."""
+        import coord.pipeline as pipeline_mod
+        from dataclasses import replace
+
+        renamed_spec = replace(pipeline_mod.GATE_REGISTRY["uat"], name="uat_v2")
+        monkeypatch.setattr(
+            pipeline_mod, "GATE_REGISTRY",
+            dict(pipeline_mod.GATE_REGISTRY, uat=renamed_spec),
+        )
+
+        # An entry tagged with the OLD gate name no longer matches...
+        cfg_old_name = self._config(gates=["uat"])
+        assert mq.requires_uat(_q("a"), cfg_old_name) is False
+        # ...but one tagged with the renamed row's NEW name does.
+        cfg_new_name = self._config(gates=["uat_v2"])
+        assert mq.requires_uat(_q("a"), cfg_new_name) is True
+
+    def test_gate_in_effective_gates_false_when_no_pipeline(self) -> None:
+        from dataclasses import dataclass
+
+        @dataclass
+        class _NoPipelineCfg:
+            pass
+
+        assert mq._gate_in_effective_gates("uat", _q("a"), _NoPipelineCfg()) is False
+
     # ── evaluate_uat_verdict ──
 
     def test_evaluate_uat_verdict_missing_names_preview_and_command(self) -> None:
