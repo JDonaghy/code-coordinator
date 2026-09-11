@@ -361,17 +361,34 @@ def add_repo_to_machine(
     ``repos: [a, b]`` flow list and a block list. Idempotent — a repo already
     listed is left alone rather than duplicated (a duplicate is not a parse
     error, so nothing downstream would ever have told the operator).
+
+    A *wrapped* flow sequence — ``repos: [a, b,`` with the closing ``]`` on a
+    later line, which is what a formatter (or a human) produces once the list
+    outgrows one line — is a third spelling this function cannot rewrite.
+    Rather than fall through and misreport it as a missing `repos:` key
+    (#3284), it is detected explicitly and refused with a message that says
+    what is actually true, before anything is written.
     """
     lines = text.splitlines(keepends=True)
     start, end = _machine_entry_range(lines, machine)
 
     # ── `repos:` list ────────────────────────────────────────────────────
     repos_line = None
+    wrapped_line = None
     for i in range(start, end):
         if re.match(r"^\s*repos:\s*(\[.*\])?\s*$", lines[i]):
             repos_line = i
             break
+        if re.match(r"^\s*repos:\s*\[", lines[i]) and "]" not in lines[i]:
+            wrapped_line = i
+            break
     if repos_line is None:
+        if wrapped_line is not None:
+            raise RepoEditError(
+                f"machine {machine!r} has a multi-line flow sequence for "
+                "`repos:`, which this editor cannot rewrite; reflow it onto "
+                "one line and retry"
+            )
         raise RepoEditError(
             f"machine {machine!r} has no `repos:` key — refusing to guess where "
             "to put one"

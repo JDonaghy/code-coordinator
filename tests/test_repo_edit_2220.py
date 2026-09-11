@@ -196,6 +196,29 @@ machines:
         assert laptop.repos == ["api", "newrepo"]
         assert laptop.repo_path("newrepo") == "~/src/newrepo"
 
+    def test_wrapped_flow_sequence_is_detected_and_refused(self):
+        """#3284: a `repos:` flow list wrapped across multiple lines — the
+        spelling any formatter or human produces once the list outgrows one
+        line — must be refused with a message naming the real cause, not
+        misreported as a missing `repos:` key. The refusal must also happen
+        before anything is written, so the original text is untouched."""
+        wrapped_cfg = """\
+repos:
+  - name: vimcode
+    github: acme/vimcode
+
+machines:
+  - name: dell64
+    host: dell64.tailnet
+    capabilities: [python]
+    repos: [vimcode, quadraui, claude-coordinator, coord-portal, stick-demo,
+            space-invaders, coord-web, coord-tui, grocery-list, coord-infra]
+    repo_paths:
+      vimcode: ~/src/vimcode
+"""
+        with pytest.raises(RepoEditError, match="multi-line flow sequence"):
+            add_repo_to_machine(wrapped_cfg, "dell64", "easy-azure", "~/src/easy-azure")
+
     def test_machine_with_no_repo_paths_gains_the_key(self, tmp_path):
         """A machine with `repos:` but no `repo_paths:` entry is exactly the
         #1801 dispatch blocker — adding the key is a fix, not an assumption."""
