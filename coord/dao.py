@@ -623,8 +623,11 @@ class SqliteStore:
         a safety upper bound (see serve_app.py) in case this token's source
         ever misses a write path.
 
-        SQLite: ``PRAGMA data_version``, which changes whenever ANY
-        connection -- not just this process's own POSTs, but the
+        SQLite: :func:`coord.sql.sqlite_data_version` (``PRAGMA
+        data_version``, spelled in the dialect seam rather than here --
+        ``PRAGMA`` is SQLite-only statement text and ``coord/sql.py`` is the
+        one module allowed to name one, #2782/#1948), which changes whenever
+        ANY connection -- not just this process's own POSTs, but the
         drive-queue timer and a concurrent ``coord notify`` writing locally
         too -- commits to the database file. **Unlike every other read in
         this class, this is NOT a fresh connection per call**: ``data_version``
@@ -657,7 +660,7 @@ class SqliteStore:
             if self._change_conn is None:
                 self._change_conn = self._open_change_conn()
             try:
-                row = sql.execute(self._change_conn, "PRAGMA data_version").fetchone()
+                return sql.sqlite_data_version(self._change_conn)
             except Exception:  # noqa: BLE001 — reopen-once fallback, see below
                 # Stale/broken connection (e.g. the underlying file was
                 # replaced out from under us) — reopen once. A repeat
@@ -668,5 +671,4 @@ class SqliteStore:
                 except Exception:  # noqa: BLE001 — already broken, best effort
                     pass
                 self._change_conn = self._open_change_conn()
-                row = sql.execute(self._change_conn, "PRAGMA data_version").fetchone()
-        return str(row["data_version"]) if row is not None else "0"
+                return sql.sqlite_data_version(self._change_conn)
