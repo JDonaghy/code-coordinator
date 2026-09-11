@@ -1036,6 +1036,25 @@ class LivenessAuditorConfig:
     claude_bin: str | None = None
 
 
+KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
+"""Gate names the pipeline currently understands, in ``pipeline.default_gates``
+and any ``pipeline.labels[*]`` entry (#3269, S-1 of #3261).
+
+This is a name registry only — validation that a gate name is *known* — not
+yet the gate's real behavioural data (that starts with S-2 of #3261, which
+turns each name into a ``GateSpec``). Mirrors the posture of
+``coord.acceptance_drivers.SUPPORTED_KINDS``: a name may be declared ahead of
+being wired up as real gate data, but naming something that doesn't exist at
+all must fail config load, never parse clean and silently vanish (the
+``"reveiw"`` typo #3269 was filed over — nothing consults it, and
+``"review" in gates`` in ``coord.merge_queue`` never matches it).
+
+Seeded with exactly the four gate names in use fleet-wide today:
+``test``, ``review``, ``uat`` (#2687), ``merge``. Adding a fifth here is a
+separate, deliberate change, not part of this slice.
+"""
+
+
 @dataclass
 class PipelineConfig:
     """Assignment lifecycle gate configuration.
@@ -3468,6 +3487,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         value = raw["default_gates"]
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ConfigError("pipeline.default_gates must be a list of strings")
+        unknown = [v for v in value if v not in KNOWN_GATE_NAMES]
+        if unknown:
+            raise ConfigError(
+                f"pipeline.default_gates has unknown gate name(s) {unknown!r} "
+                f"(known: {', '.join(KNOWN_GATE_NAMES)})"
+            )
         cfg.default_gates = list(value)
 
     if "labels" in raw:
@@ -3480,6 +3505,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
             if not isinstance(v, list) or not all(isinstance(g, str) for g in v):
                 raise ConfigError(
                     f"pipeline.labels[{k!r}] must be a list of gate name strings"
+                )
+            unknown = [g for g in v if g not in KNOWN_GATE_NAMES]
+            if unknown:
+                raise ConfigError(
+                    f"pipeline.labels[{k!r}] has unknown gate name(s) {unknown!r} "
+                    f"(known: {', '.join(KNOWN_GATE_NAMES)})"
                 )
         cfg.labels = {k: list(v) for k, v in value.items()}
 
