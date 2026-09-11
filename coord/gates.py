@@ -1,6 +1,6 @@
 """#1657: ``coord gates <repo> <issue>`` — read a work row's gate columns
-plus the LIVE gate decision (review / test / merge), without a hand-extracted
-bearer token and a raw ``/board`` curl.
+plus the LIVE gate decision (review / test / uat / merge), without a
+hand-extracted bearer token and a raw ``/board`` curl.
 
 Two things were missing before this module existed:
 
@@ -24,6 +24,12 @@ reuses ``coord.merge_queue``'s own review/smoke gate functions
 :func:`~coord.merge_queue.evaluate_smoke_verdict`) rather than
 re-implementing the #1479 freshness math a second time, so this can never
 drift from what ``coord merge``/``coord merge --plan`` actually decide.
+#3273 (S-5 of #3261): any OTHER gate described in
+``coord.pipeline.GATE_REGISTRY`` (today just ``"uat"``) is walked generically
+rather than hardcoded here — a gate added to that registry in the future
+needs no further change to this module, and one that doesn't currently
+apply (not configured, an exempt issue, ...) is reported with an explicit
+reason rather than silently omitted.
 
 Read-only by construction: nothing in this module calls ``save_board``,
 ``save_queue``, or any ``gh`` write. The synthetic
@@ -680,20 +686,64 @@ def build_gate_report(
             "round has actually been tested (#2024)."
         )
 
+    # #3273 (S-5 of #3261): walk every OTHER registry-backed gate (today just
+    # "uat" — "review"/"test" stay the bespoke blocks above, since they carry
+    # richer per-gate detail — #1479 SHA staleness anchors, #1956 verdict-
+    # unparseable detection — that doesn't fit GateSpec's generic
+    # ``(ok, message)`` evaluator shape; see #3273's epic-closing comment on
+    # #3261 for why that's a real seam, not an oversight). This is what lets
+    # a gate added to `coord.pipeline.GATE_REGISTRY` in the future show up
+    # here with zero further changes to this module, and it's what fixes the
+    # actual #3273 gap: before this, `coord gates` never even asked about
+    # UAT, so it could print "merge READY" for an entry `coord merge` would
+    # refuse outright on `uat_required`.
+    from coord.pipeline import GATE_REGISTRY  # noqa: PLC0415
+
+    registry_decisions: dict[str, GateDecision] = {}
+    for gate_name, spec in GATE_REGISTRY.items():
+        if gate_name in ("review", "test"):
+            continue  # already covered by the bespoke blocks above
+        gate_required = spec.applies(entry, config)
+        if not gate_required:
+            decision = GateDecision(
+                gate=gate_name,
+                required=False,
+                ok=True,
+                reason=spec.explain_inapplicable(entry, config)
+                if spec.explain_inapplicable is not None
+                else None,
+            )
+        else:
+            gate_ok, gate_message = spec.evaluate(entry, board, config, gh_ops)
+            decision = GateDecision(
+                gate=gate_name,
+                required=True,
+                ok=gate_ok,
+                reason=(gate_message or None) if not gate_ok else None,
+            )
+        registry_decisions[gate_name] = decision
+        report.decisions.append(decision)
+
     merge_blocked_gate: str | None = None
     if review_required and not review_ok:
         merge_blocked_gate = REVIEW_REQUIRED
     elif smoke_required and not test_ok:
         merge_blocked_gate = SMOKE_REQUIRED
+    else:
+        for gate_name, decision in registry_decisions.items():
+            if decision.required and not decision.ok:
+                merge_blocked_gate = f"{gate_name}_required"
+                break
     merge_decision = GateDecision(
         gate="merge", required=True, ok=merge_blocked_gate is None, reason=merge_blocked_gate,
     )
     report.decisions.append(merge_decision)
     if merge_decision.ok:
+        gate_names_summary = "/".join(["review", "test", *registry_decisions.keys()])
         report.notes.append(
-            "merge READY reflects the review/test gates only — CI checks and the "
-            "#1318 epic-closing-keyword guard are evaluated live by `coord merge`/"
-            "`coord merge --plan`, not by `coord gates`."
+            f"merge READY reflects the {gate_names_summary} gates only — CI checks "
+            "and the #1318 epic-closing-keyword guard are evaluated live by "
+            "`coord merge`/`coord merge --plan`, not by `coord gates`."
         )
 
     # #3236: the apply-verdict gate, appended ONLY when a --hold-after entry
@@ -808,6 +858,30 @@ def format_gate_report(report: GateReport) -> str:
                 lines.append(f"           {test.reason}")
             else:
                 lines.append(f"  test   : BLOCKED — {test.reason}")
+        # #3273 (S-5 of #3261): any other registry-backed gate (today just
+        # "uat") renders generically here, in `report.decisions`' own
+        # insertion order — a gate GATE_REGISTRY grows in the future needs no
+        # new branch here, and — the actual fix this slice makes — a
+        # skipped/inapplicable one (UAT not configured, or an exempt issue)
+        # gets an explicit reason instead of being silently omitted like it
+        # was before #3273.
+        _KNOWN_GATE_LINES = ("review", "test", "merge", "apply")
+        for decision in report.decisions:
+            if decision.gate in _KNOWN_GATE_LINES:
+                continue
+            label = f"{decision.gate:<6}"
+            if not decision.required:
+                lines.append(
+                    f"  {label} : not required"
+                    + (f" — {decision.reason}" if decision.reason else "")
+                )
+            elif decision.ok:
+                lines.append(
+                    f"  {label} : passed"
+                    + (f" (recorded on {decision.assignment_id})" if decision.assignment_id else "")
+                )
+            else:
+                lines.append(f"  {label} : BLOCKED — {decision.reason}")
         merge = by_gate.get("merge")
         if merge is not None:
             lines.append(

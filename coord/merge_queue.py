@@ -1005,10 +1005,15 @@ def _uat_repo_for(entry, config):
         return None
 
 
-def requires_uat(entry: "QueuedMerge", config) -> bool:
-    """True when *entry* must have a recorded UAT verdict before merging.
+def _uat_applicability(entry: "QueuedMerge", config) -> tuple[bool, str | None]:
+    """``(applies, reason_if_not)`` — the single source both :func:`requires_uat`
+    and :func:`uat_inapplicable_reason` (#3273, S-5 of #3261) read, so a
+    caller asking "does UAT gate this entry" and one asking "why not" can
+    never disagree about which condition actually decided it (#2096: one
+    question, one answer). *reason* is only meaningful when *applies* is
+    ``False`` — always ``None`` on the ``True`` branch.
 
-    See the module-comment above this function for the two-part opt-in.
+    See the module comment above this function for the two-part opt-in.
     Duck-typed on ``entry.repo_name``/``entry.required_gates``, matching
     :func:`requires_review`/:func:`requires_smoke`.
 
@@ -1027,18 +1032,43 @@ def requires_uat(entry: "QueuedMerge", config) -> bool:
     """
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None or config is None:
-        return False
+        return False, "no pipeline configuration available"
     if not _gate_in_effective_gates("uat", entry, config):
-        return False
+        return False, '"uat" is not in this entry\'s effective gate list (required_gates / pipeline.default_gates)'
     repo = _uat_repo_for(entry, config)
     if repo is None:
-        return False
+        return False, f"repo {getattr(entry, 'repo_name', None)!r} not found in configuration"
     uat_checks_cfg = getattr(repo, "uat_checks", None)
-    if uat_checks_cfg is not None and uat_checks_cfg.is_exempt(
-        getattr(entry, "issue_number", None)
-    ):
-        return False
-    return bool(repo.uat_preview) or bool(getattr(repo, "uat_live_preview", False))
+    issue_number = getattr(entry, "issue_number", None)
+    if uat_checks_cfg is not None and uat_checks_cfg.is_exempt(issue_number):
+        return False, f"issue #{issue_number} is exempt via this repo's uat_checks.exempt"
+    if not (bool(repo.uat_preview) or bool(getattr(repo, "uat_live_preview", False))):
+        return False, "repo has neither uat_preview nor uat_live_preview configured"
+    return True, None
+
+
+def requires_uat(entry: "QueuedMerge", config) -> bool:
+    """True when *entry* must have a recorded UAT verdict before merging.
+
+    Delegates entirely to :func:`_uat_applicability` — see that function's
+    docstring for the full two-part opt-in this decides.
+    """
+    return _uat_applicability(entry, config)[0]
+
+
+def uat_inapplicable_reason(entry: "QueuedMerge", config) -> str | None:
+    """Human-readable reason UAT does *not* gate *entry*, or ``None`` when it
+    does (i.e. :func:`requires_uat` would return ``True``).
+
+    #3273 (S-5 of #3261): the ``coord gates`` render path used to omit the
+    UAT gate entirely rather than say why it isn't running — this is what
+    lets it render "uat : not required — <reason>" instead of silently
+    dropping the gate, mirroring how ``milestone_gate.plan_sequence`` gives
+    every remaining gate an explicit reason rather than skipping the ones
+    that won't fire. Shares :func:`_uat_applicability` with
+    :func:`requires_uat` so the two can never drift apart on WHY.
+    """
+    return _uat_applicability(entry, config)[1]
 
 
 def _uat_branch_work(entry: "QueuedMerge", board) -> list:
