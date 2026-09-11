@@ -99,6 +99,9 @@ from coord.models import Board
 
 __all__ = [
     "TRACKING_ISSUE_LABEL",
+    "looks_like_epic_title",
+    "UnlabelledEpic",
+    "find_unlabelled_epics",
     "WorkOrderError",
     "WorkOrderNode",
     "WorkOrder",
@@ -133,6 +136,80 @@ __all__ = [
 # (`coord issue create --label epic --milestone ...`) when a milestone
 # doesn't have one yet.
 TRACKING_ISSUE_LABEL = "epic"
+
+
+# #3227: the detection counterpart to #1057's prevention. #1057 made `coord
+# milestone write-order` ensure TRACKING_ISSUE_LABEL on the tracking issue at
+# promotion time, but that only covers issues that go through write-order —
+# a hand-filed issue whose title reads as an epic (or one seeded through a
+# path #1057 doesn't touch) can still end up unlabelled and therefore
+# invisible to `coord plans`/`ready_frontier`'s label-keyed lookup, and would
+# dispatch as plain `type="work"` if it ever got queued (the #1314 trap
+# #3132 exists to avoid). `looks_like_epic_title`/`find_unlabelled_epics`
+# are pure text/label checks — no I/O — so the CLI (`coord milestone
+# lint-labels`, coord/commands/milestone.py) can run them straight off the
+# local issue cache with no GitHub round trip.
+_EPIC_TITLE_RE = re.compile(r"\[epic\]|\bepic\s*:", re.IGNORECASE)
+
+
+def looks_like_epic_title(title: str) -> bool:
+    """True if *title* reads like an epic/tracking-issue title.
+
+    Matches ``Epic:``/``EPIC:``/``epic:`` (optionally preceded by another
+    bracket tag, e.g. ``[platform] Epic: ...``) and the bracket form
+    ``[epic]`` — the two conventions observed across this repo's actual
+    epic titles. Purely a text heuristic: says nothing about whether the
+    issue carries :data:`TRACKING_ISSUE_LABEL`.
+    """
+    return bool(_EPIC_TITLE_RE.search(title or ""))
+
+
+@dataclass(frozen=True)
+class UnlabelledEpic:
+    """One issue whose title reads as an epic but doesn't carry
+    :data:`TRACKING_ISSUE_LABEL` — a `find_unlabelled_epics` hit."""
+
+    repo: str
+    number: int
+    title: str
+
+
+def find_unlabelled_epics(issues: Iterable[dict]) -> list[UnlabelledEpic]:
+    """Pure scan over *issues* for titles that look like epics but aren't
+    labelled ``epic``.
+
+    Each item in *issues* is expected to carry at least ``number`` and
+    ``title``, plus a ``labels`` list (either plain strings — the local
+    ``issues`` cache table's shape, see ``coord/db.py`` — or GitHub's raw
+    ``[{"name": ...}]`` dicts) and a repo identifier under ``repo_name`` (or
+    ``repo`` as a fallback key). No I/O: callers own fetching *issues*, so
+    this can run against a purely local cache read just as well as a live
+    GitHub listing — deliberately the same "pure / board-driven" posture as
+    the rest of this module.
+    """
+    hits: list[UnlabelledEpic] = []
+    for issue in issues:
+        title = issue.get("title") or ""
+        if not looks_like_epic_title(title):
+            continue
+        raw_labels = issue.get("labels") or []
+        names = {
+            (lbl.get("name") if isinstance(lbl, dict) else str(lbl))
+            for lbl in raw_labels
+        }
+        if TRACKING_ISSUE_LABEL in names:
+            continue
+        number = issue.get("number")
+        if number is None:
+            continue
+        hits.append(
+            UnlabelledEpic(
+                repo=str(issue.get("repo_name") or issue.get("repo") or ""),
+                number=int(number),
+                title=title,
+            )
+        )
+    return hits
 
 
 class WorkOrderError(ValueError):
