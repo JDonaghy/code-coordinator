@@ -30,7 +30,9 @@ what the coarse PipelineStage status captures.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
+
+from coord.merge_queue import evaluate_uat_verdict, requires_uat
 
 if TYPE_CHECKING:
     from coord.config import Config
@@ -107,6 +109,80 @@ class PipelineView:
     # recently made progress) — see compute_pipeline for the derivation.
     # None only when nothing involved has finished yet (still coding).
     finished_at: float | None = None
+
+
+# ── GateSpec registry (#3261 S-2) ────────────────────────────────────────────
+#
+# A `GateSpec` describes one pipeline gate as data: what decides the gate
+# applies to a given queue entry, what decides it currently passes, the
+# vocabulary a human/producer may record as a verdict, and the identity of
+# the fail-route a stuck verdict is escalated/dispatched to. This is a PURE
+# refactor — each field below wraps an already-existing function/constant,
+# never reimplements it (#2096: one question, one answer — `requires_uat`
+# and `evaluate_uat_verdict` stay the single source of truth for "does this
+# entry need UAT" / "does it currently pass").
+#
+# Nothing consumes this registry yet. `coord/merge_queue.py` and
+# `coord/drive.py` keep calling `requires_uat`/`evaluate_uat_verdict`
+# directly (S-3/S-4 of #3261 switch call sites over). This module is the
+# home for it rather than `coord/merge_queue.py` itself because `drive.py`
+# will need to import the registry too (S-4) and already imports
+# `coord/merge_queue.py` — putting the registry in `merge_queue.py` would
+# make `drive.py`'s future import of it indistinguishable from its existing
+# `merge_queue` import, whereas `coord/pipeline.py` has no runtime
+# dependents in `coord/drive.py` today, so `pipeline.py` importing
+# `merge_queue.py` (one-directional) creates no cycle in either direction.
+
+
+@dataclass(frozen=True)
+class GateSpec:
+    """Static description of one pipeline gate, keyed by name in
+    :data:`GATE_REGISTRY`.
+
+    Every field wraps an existing implementation named in the #3261/S-2
+    issue's table — this type does not reimplement gate logic, it just
+    gives the existing functions/constants a shared shape so a future
+    caller (S-3/S-4) can look a gate up by name instead of hardcoding a
+    ``if gate == "uat": ...`` branch at each call site.
+    """
+
+    #: One of ``coord.config.KNOWN_GATE_NAMES``.
+    name: str
+
+    #: ``(entry, config) -> bool`` — True when *entry* must clear this gate
+    #: before it may merge. E.g. :func:`coord.merge_queue.requires_uat`.
+    applies: Callable[["QueuedMerge", "Config"], bool]
+
+    #: ``(entry, board, config, gh_ops=None) -> (ok, message)`` — the gate's
+    #: current pass/fail verdict for *entry*, plus an operator-facing
+    #: ``message`` populated when not ``ok``. E.g.
+    #: :func:`coord.merge_queue.evaluate_uat_verdict`.
+    evaluate: Callable[..., tuple[bool, str]]
+
+    #: The verdict values a producer (human or automation) may record for
+    #: this gate, including ``None`` for "no verdict yet / cleared"
+    #: (:func:`coord.state.record_uat_verdict` accepts ``uat_state=None`` to
+    #: reset a stuck entry). Deliberately narrower than Test's for UAT — no
+    #: ``"skipped"``/``"running"`` — see that function's docstring for why.
+    verdicts: tuple[str | None, ...]
+
+    #: Identity (not a callable — see the module comment above on avoiding
+    #: an import of ``coord/drive.py`` here) of the fail-route a verdict
+    #: that cannot converge is escalated/dispatched to. For ``uat`` this is
+    #: the #3214 fix-up dispatch path,
+    #: ``coord.drive._park_uat_fixup_dispatch_failure``.
+    fail_route: str
+
+
+GATE_REGISTRY: dict[str, GateSpec] = {
+    "uat": GateSpec(
+        name="uat",
+        applies=requires_uat,
+        evaluate=evaluate_uat_verdict,
+        verdicts=("passed", "failed", None),
+        fail_route="coord.drive._park_uat_fixup_dispatch_failure",
+    ),
+}
 
 
 # ── Canonical gate naming (#1724) ────────────────────────────────────────────
