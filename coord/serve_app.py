@@ -5665,6 +5665,104 @@ def openapi_spec() -> dict:
     )
 
 
+# #3293: keys whose values are inherently volatile per-build (a sliding
+# window count) but carry no board-state signal of their own — excluded from
+# the ``/board`` ETag DIGEST INPUT only (see ``_board_digest_projection``
+# below and ``_stamp_board_version``'s docstring). Every one of these fields
+# still ships on the wire, unchanged; this only stops them from deciding
+# whether the version bumps.
+_BOARD_DIGEST_VOLATILE_TOP_KEYS = frozenset({"audit_recent_count"})
+
+
+def _board_digest_projection(result: dict) -> dict:
+    """A copy of *result* with digest-irrelevant volatile fields stripped.
+
+    Used ONLY to compute the ``/board`` ETag/version digest (#3293) — the
+    actual wire body is `result` itself, untouched. Three culprits, in order
+    of how often they move (see issue #3293's measurements):
+
+    - ``audit_recent_count``: a sliding 900s window count, changed on
+      essentially every build.
+    - ``issues[*].synced_at``: ~788 rows share one sync timestamp that moves
+      on the issues-sync tick, re-digesting the whole issues section at once.
+    - ``fleet_health``: moves on the 60s health tick. Its ``refreshed_at``
+      clock and its ``fleet_board_latency`` check are excluded — the latter
+      measures THIS /board response's own fetch latency and serialized size
+      and stores that measurement inside the response, which is structurally
+      self-invalidating for a content digest.
+
+    Deliberately narrow: per-machine health severities/results/headrooms are
+    left in the digest, because a real state change there (a machine going
+    offline, a disk filling up) SHOULD bump the ETag — only the fields that
+    move on their own, independent of any real state change, are excluded.
+    """
+    projection = {
+        k: v for k, v in result.items() if k not in _BOARD_DIGEST_VOLATILE_TOP_KEYS
+    }
+
+    issues = projection.get("issues")
+    if isinstance(issues, list):
+        projection["issues"] = [
+            {k: v for k, v in issue.items() if k != "synced_at"}
+            if isinstance(issue, dict) else issue
+            for issue in issues
+        ]
+
+    fleet_health = projection.get("fleet_health")
+    if isinstance(fleet_health, dict):
+        projection["fleet_health"] = _board_digest_fleet_health(fleet_health)
+
+    return projection
+
+
+def _board_digest_fleet_health(fleet_health: dict) -> dict:
+    """Strip ``fleet_health``'s clocks + self-referential latency check.
+
+    See ``_board_digest_projection`` — digest input only, never the wire body.
+    """
+    masked = {k: v for k, v in fleet_health.items() if k != "refreshed_at"}
+
+    machine_health = masked.get("machine_health")
+    if isinstance(machine_health, list):
+        masked["machine_health"] = [
+            _board_digest_health_row(row) if isinstance(row, dict) else row
+            for row in machine_health
+        ]
+
+    fleet_checks = masked.get("fleet_checks")
+    if isinstance(fleet_checks, list):
+        masked["fleet_checks"] = [
+            _board_digest_check_result(c) if isinstance(c, dict) else c
+            for c in fleet_checks
+        ]
+
+    return masked
+
+
+def _board_digest_health_row(row: dict) -> dict:
+    """Drop one machine's poll clocks (``received_at``/``checked_at``) from
+    the digest input — the results/severity/headroom that actually describe
+    the machine's state stay in, per ``_board_digest_projection``'s docstring.
+    """
+    return {k: v for k, v in row.items() if k not in ("received_at", "checked_at")}
+
+
+def _board_digest_check_result(check: dict) -> dict:
+    """Drop ``fleet_board_latency``'s self-measurement from the digest input.
+
+    This one check answers "how fast/big was the /board response that is
+    carrying this very check result?" — its ``headroom`` text and ``values``
+    (``latency_ms``/``payload_bytes``) are a measurement of the response
+    embedded in the response, so they change on every build regardless of
+    whether anything a human/client cares about actually changed. Every
+    other fleet check's headroom/values reflect real, digest-worthy state
+    and are left untouched.
+    """
+    if check.get("check_id") != "fleet_board_latency":
+        return check
+    return {k: v for k, v in check.items() if k not in ("headroom", "values")}
+
+
 def build_app(
     store: CoordStore,
     config: Config,
@@ -5768,13 +5866,31 @@ def build_app(
     _board_inflight: asyncio.Future[tuple] | None = None
 
     def _stamp_board_version(result: dict) -> tuple[str, bytes]:
-        """Serialize *result* to JSON exactly once, bump the version when the
-        content changed, stamp ``board_version`` into the payload, and
-        return ``(etag, body_bytes)`` — the SAME bytes serve as both the
-        content-hash input and the wire body (#1597 Part 2: previously this
-        hashed a separate ``sort_keys=True`` dump and the caller re-encoded
-        the dict a second time via ``JSONResponse`` — ~10 MB of JSON work per
-        build for a 5 MB board).
+        """Serialize *result* to JSON exactly once for the wire body, bump
+        the version when a STABLE PROJECTION of the content changed, stamp
+        ``board_version`` into the payload, and return ``(etag, body_bytes)``.
+
+        #1597 Part 2: the wire ``body`` bytes below are the same bytes
+        published to callers — no second encoder pass for the response
+        itself.
+
+        #3293: the content-hash input is deliberately NOT those same bytes
+        any more. The payload embeds fields that move on every build without
+        any board-state signal of their own — ``audit_recent_count`` (a
+        sliding 900s window count), ``issues[*].synced_at`` (~788 rows
+        re-stamped on one shared sync tick), and ``fleet_health``'s clocks
+        and its self-referential ``fleet_board_latency`` check (which
+        measures THIS response's own fetch latency/size and stores the
+        measurement inside the response being measured). Hashing those made
+        the ETag change on effectively every request, defeating #1336's
+        cache-validated polling entirely. ``_board_digest_projection`` builds
+        a masked copy for hashing only; the wire ``body`` — and every field
+        in it, unchanged — still carries the real values. This does cost a
+        second JSON encode of (most of) the payload on every cache-miss
+        rebuild, which is rare relative to requests (TTL-cached in between);
+        that's the trade #1597 avoided but #3293 requires; a truly stable
+        ETag that lets pollers 304 is worth far more than skipping it on the
+        rebuild path.
 
         ``board_version`` can't be known before the hash is computed (it
         depends on whether the hash changed), so it is deliberately excluded
@@ -5822,7 +5938,15 @@ def build_app(
                 indent=None, separators=(",", ":"), default=str,
             ).encode("utf-8")
         else:
-            digest = hashlib.sha256(body).hexdigest()[:16]
+            # #3293: hash a stable PROJECTION of the content, not the wire
+            # bytes themselves — see the docstring above. The wire `body`
+            # computed just above is untouched and still carries every
+            # field, including the ones excluded here.
+            digest_body = _json.dumps(
+                _board_digest_projection(result), ensure_ascii=False,
+                allow_nan=False, indent=None, separators=(",", ":"),
+            ).encode("utf-8")
+            digest = hashlib.sha256(digest_body).hexdigest()[:16]
         if digest != _board_hash:
             _board_hash = digest
             _board_version += 1
