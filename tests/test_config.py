@@ -1123,6 +1123,63 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
     assert cfg.pipeline.gates_for_label(None) == ["test", "review", "merge"]
 
 
+# ── #3269: gate-name registry (S-1 of #3261) ────────────────────────────────
+
+
+def test_pipeline_default_gates_rejects_unknown_name(tmp_path: Path) -> None:
+    """A typo'd gate name in default_gates fails config load rather than
+    parsing clean and silently dropping that gate fleet-wide (#3269)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  default_gates: [test, reveiw, merge]\n"
+    )
+    with pytest.raises(ConfigError, match="default_gates"):
+        load(p)
+
+
+def test_pipeline_labels_rejects_unknown_gate_name(tmp_path: Path) -> None:
+    """An unknown gate name in a label's gate list fails config load and
+    names which label it came from (#3269)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  labels:\n"
+        "    hotfix: [merge, uatt]\n"
+    )
+    with pytest.raises(ConfigError, match="hotfix"):
+        load(p)
+
+
+def test_pipeline_all_known_gate_names_still_load(tmp_path: Path) -> None:
+    """Every currently-known gate name (test/review/uat/merge), in both
+    default_gates and labels, still loads exactly as before (#3269)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  default_gates: [test, review, uat, merge]\n"
+        "  labels:\n"
+        "    hotfix: [test, merge]\n"
+        "    full: [test, review, uat, merge]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.default_gates == ["test", "review", "uat", "merge"]
+    assert cfg.pipeline.gates_for_label("hotfix") == ["test", "merge"]
+    assert cfg.pipeline.gates_for_label("full") == ["test", "review", "uat", "merge"]
+
+
 # ── #846: attention_thresholds / convergence_rounds ─────────────────────────
 
 
