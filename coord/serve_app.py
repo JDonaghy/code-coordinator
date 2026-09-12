@@ -29,6 +29,10 @@ Endpoints:
 * ``GET /leg-counts`` — all-time per-issue assignment leg counts by type,
   keyed ``"repo#N"`` (#3060); spans ``assignments`` + ``assignments_archive``,
   not part of ``/board`` or ``/drive-queue``.
+* ``GET /usage-rows`` — full-history assignment rows for ``coord usage``
+  (#3313), optionally windowed by ``?since=``/``?until=`` (Unix-epoch
+  floats); spans ``assignments`` + ``assignments_archive`` like
+  ``/leg-counts``, deliberately NOT ``/board``'s retention-capped set.
 * ``GET /config``   — the raw ``coordinator.yml`` bytes the daemon owns, so a
   client needs no local config file.
 * ``POST /result``  — record an interactive-session result (#590); body is a
@@ -4915,6 +4919,36 @@ def openapi_spec() -> dict:
                 "responses": {"200": {"description": "OK"}},
             },
         },
+        "/usage-rows": {
+            "get": {
+                "summary": (
+                    "#3313: full-history assignment rows for `coord usage` — "
+                    "spans `assignments` + `assignments_archive` like "
+                    "`/leg-counts`. NOT `/board`'s retention-capped set."
+                ),
+                "parameters": [
+                    {
+                        "name": "since",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "number"},
+                        "description": "Unix-epoch float; unbounded if omitted.",
+                    },
+                    {
+                        "name": "until",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "number"},
+                        "description": "Unix-epoch float; unbounded if omitted.",
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Malformed since/until"},
+                    "503": {"description": "usage-rows read failed"},
+                },
+            },
+        },
         "/issues": {
             "get": {
                 "summary": (
@@ -8924,6 +8958,46 @@ def build_app(
             )
         return JSONResponse(counts)
 
+    async def get_usage_rows(request: Request) -> Response:
+        # #3313: `coord usage`, run from any thin client, under-reported
+        # spend by ~8x because `coord.usage.fetch_usage_rows`'s remote branch
+        # read the SAME `/board` payload `coord status` polls — which #762
+        # caps to active + pipeline-referenced + `COORD_BOARD_RETENTION_DAYS`
+        # (default 14) of terminal rows. A usage rollup wants full history,
+        # so a WIDER `--since` window could report LESS than a narrower one
+        # (whichever board-retention slice happened to be resident). This is
+        # its own endpoint — deliberately, like `/leg-counts`/`/audit`, never
+        # folded into `/board` — spanning `assignments` +
+        # `assignments_archive` via `coord.usage._local_usage_rows`.
+        #
+        # `since`/`until` (optional Unix-epoch floats) push the caller's
+        # resolved window down into the read itself. Same "bad query param
+        # -> 400" convention as `/audit`'s `_ts_param` (one question, one
+        # answer — a malformed timestamp shouldn't be treated differently by
+        # two sibling read endpoints).
+        from coord.usage import _local_usage_rows  # noqa: PLC0415
+
+        def _parse_float(name: str) -> float | None:
+            raw = request.query_params.get(name)
+            if raw is None or raw == "":
+                return None
+            return float(raw)
+
+        try:
+            since = _parse_float("since")
+            until = _parse_float("until")
+        except ValueError as e:
+            return JSONResponse({"error": f"bad query parameter: {e}"}, status_code=400)
+
+        try:
+            rows, truncated = _local_usage_rows(since=since, until=until)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "usage-rows read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"rows": rows, "truncated": truncated})
+
     async def get_issues_collection(request: Request) -> Response:
         # #3227: backs `coord plans --lint-epics` on a thin client — the
         # daemon-routed half of `coord.state.cached_open_issues`. Repeated
@@ -11247,6 +11321,7 @@ def build_app(
         Route("/drive-queue", get_drive_queue, methods=["GET"]),
         Route("/drive-queue", post_drive_queue, methods=["POST"]),
         Route("/leg-counts", get_leg_counts, methods=["GET"]),
+        Route("/usage-rows", get_usage_rows, methods=["GET"]),
         Route("/pause", get_pause, methods=["GET"]),
         Route("/pause", post_pause, methods=["POST"]),
         Route("/github-backoff", get_github_backoff, methods=["GET"]),

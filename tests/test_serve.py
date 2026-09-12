@@ -3585,6 +3585,48 @@ def test_serve_leg_counts(tmp_path: Path, valid_config_path: Path, rw_db):
         assert r.json() == {"api#1": {"work": 1, "review": 1}}
 
 
+def test_serve_usage_rows(tmp_path: Path, valid_config_path: Path, rw_db):
+    """#3313: `GET /usage-rows` — deliberately its OWN endpoint like
+    `/leg-counts`, spanning `assignments` + `assignments_archive` rather than
+    `/board`'s retention-capped set. This is what fixes `coord usage`
+    under-reporting spend ~8x (and reporting less for a WIDER --since window)
+    on any thin client."""
+    now = time.time()
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, type, status, dispatched_at, cost_usd) "
+        "VALUES ('live-1', 'm', 'api', 1, 't', 'work', 'done', ?, 1.5)",
+        (now,),
+    )
+    rw_db.execute("CREATE TABLE assignments_archive AS SELECT * FROM assignments WHERE 0")
+    rw_db.execute(
+        "INSERT INTO assignments_archive (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, type, status, dispatched_at, cost_usd) "
+        "VALUES ('old-1', 'm', 'api', 2, 't', 'work', 'done', ?, 2.5)",
+        (now - 60 * 86400,),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        # Unbounded: both the live row and the archived row come back.
+        r = cli.get("/usage-rows")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["truncated"] is False
+        assert {row["assignment_id"] for row in body["rows"]} == {"live-1", "old-1"}
+
+        # `since` scopes the read server-side — a WIDER window must never
+        # return FEWER rows than this narrower one (the #3313 regression).
+        r_narrow = cli.get("/usage-rows", params={"since": now - 86400})
+        assert [row["assignment_id"] for row in r_narrow.json()["rows"]] == ["live-1"]
+        r_wide = cli.get("/usage-rows", params={"since": now - 90 * 86400})
+        assert len(r_wide.json()["rows"]) >= len(r_narrow.json()["rows"])
+
+        # A malformed timestamp is a 400, same convention as `/audit`.
+        r_bad = cli.get("/usage-rows", params={"since": "not-a-number"})
+        assert r_bad.status_code == 400
+
+
 def test_serve_issues_collection(tmp_path: Path, valid_config_path: Path, rw_db):
     """#3227/#3228: `GET /issues` — the daemon-routed half of
     `coord.state.cached_open_issues`, backing `coord plans --lint-epics`/

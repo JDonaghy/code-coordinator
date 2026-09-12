@@ -1218,6 +1218,46 @@ def fetch_audit_log(
     return resp.json()
 
 
+def fetch_usage_rows_from_daemon(
+    svc: ServiceConfig,
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict:
+    """GET full-history usage rows from the daemon's ``/usage-rows`` (#3313).
+
+    Unlike ``GET /board`` (capped by #762 to active + pipeline-referenced +
+    ``COORD_BOARD_RETENTION_DAYS`` of terminal rows), this spans
+    ``assignments`` + ``assignments_archive`` — a usage rollup wants full
+    history, not the TUI's retention-capped board projection. *since*/
+    *until* (Unix-epoch floats) narrow the daemon-side read; omitting both
+    fetches unbounded all-time history.
+
+    Like :func:`fetch_audit_log`, this does NOT fail-soft: ``coord usage`` is
+    an explicit read the user asked for, so a transport/HTTP error —
+    including a 404 from a daemon that predates this endpoint — raises
+    ``httpx.HTTPError`` for the CLI to report plainly, rather than silently
+    rendering a truncated (or empty) total as if it were complete.
+
+    Returns ``{"rows": [...], "truncated": bool}`` — ``truncated`` is set by
+    the daemon when its own safety ceiling
+    (``coord.usage.USAGE_ROWS_MAX_ROWS``) was hit; the caller (
+    :func:`coord.usage.fetch_usage_rows`) is responsible for surfacing that.
+    """
+    params: dict[str, Any] = {}
+    if since is not None:
+        params["since"] = since
+    if until is not None:
+        params["until"] = until
+    resp = httpx.get(
+        f"{svc.url}/usage-rows", params=params, headers=_headers(svc), timeout=timeout
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, dict) else {"rows": [], "truncated": False}
+
+
 # #1742: the report engine lives on the daemon (the audit trail it folds
 # does), so a thin client fetches both the catalogue and the rendered result
 # over HTTP. Like fetch_audit_log, these do NOT fail-soft — `coord report` is
