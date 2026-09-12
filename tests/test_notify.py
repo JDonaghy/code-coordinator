@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1702,6 +1703,229 @@ class TestCostCapture:
         assert row["output_tokens"] == 400
         assert row["cache_creation_tokens"] == 100
         assert row["cache_read_tokens"] == 600
+
+
+# ── #3314: claude_session_id retry sweep ──────────────────────────────────────
+
+
+class TestClaudeSessionIdMissingQuery:
+    """Unit tests for the state.py query backing the #3314 retry sweep."""
+
+    def test_finds_terminal_row_with_null_session_id(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        _record("miss1")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=? "
+            "WHERE assignment_id='miss1'",
+            (time.time(),),
+        )
+        conn.commit()
+
+        pending = state_mod.list_assignments_missing_claude_session_id(
+            max_age_seconds=3600,
+        )
+        assert [p["assignment_id"] for p in pending] == ["miss1"]
+        assert pending[0]["machine_name"] == "laptop"
+
+    def test_excludes_rows_that_already_have_a_session_id(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        _record("have1")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=?, "
+            "claude_session_id='sess-1' WHERE assignment_id='have1'",
+            (time.time(),),
+        )
+        conn.commit()
+
+        assert state_mod.list_assignments_missing_claude_session_id(
+            max_age_seconds=3600,
+        ) == []
+
+    def test_excludes_rows_older_than_the_retry_window(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        _record("old1")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=? "
+            "WHERE assignment_id='old1'",
+            (time.time() - 7200,),
+        )
+        conn.commit()
+
+        assert state_mod.list_assignments_missing_claude_session_id(
+            max_age_seconds=3600,
+        ) == []
+
+    def test_excludes_rows_still_running(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        # `_record` leaves status at its 'running' default — never
+        # transitioned, so it must never be a retry candidate.
+        _record("running1")
+        assert state_mod.list_assignments_missing_claude_session_id(
+            max_age_seconds=3600,
+        ) == []
+
+    def test_includes_every_terminal_status_mark_notified_writes(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        """Mirrors the exact status literals `_mark_notified_local` writes
+        (see that function) — a status this query doesn't recognize would
+        silently drop that whole class of row from ever being retried."""
+        from coord.db import get_connection
+        conn = get_connection()
+        for i, status in enumerate(
+            ("done", "failed", "advisory", "refused_policy", "refused_premise"),
+        ):
+            aid = f"term{i}"
+            _record(aid)
+            conn.execute(
+                "UPDATE assignments SET status=?, finished_at=? WHERE assignment_id=?",
+                (status, time.time(), aid),
+            )
+        conn.commit()
+
+        pending_ids = {
+            p["assignment_id"]
+            for p in state_mod.list_assignments_missing_claude_session_id(
+                max_age_seconds=3600,
+            )
+        }
+        assert pending_ids == {"term0", "term1", "term2", "term3", "term4"}
+
+
+class TestClaudeSessionIdRetrySweep:
+    """#3314: `_capture_claude_session_id` gets exactly one look at the
+    agent's status entry, at the instant `detect_transitions` first sees a
+    completion — after that the assignment is marked notified and never
+    polled for this purpose again. `retry_pending_claude_session_id_captures`
+    is the coordinator-side recovery: give a still-missing row another
+    look at the agent's live `/status`, exactly like `coord chat-continue`'s
+    own fallback in `coord/commands/dispatch.py`."""
+
+    def test_captures_session_id_now_present_on_agent(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        _record("race1")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=? "
+            "WHERE assignment_id='race1'",
+            (time.time(),),
+        )
+        conn.commit()
+
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("race1", "done", claude_session_id="sess-race-1"),
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status):
+            captured = notify_mod.retry_pending_claude_session_id_captures(config)
+
+        assert captured == ["race1"]
+        row = get_connection().execute(
+            "SELECT claude_session_id FROM assignments WHERE assignment_id='race1'"
+        ).fetchone()
+        assert row["claude_session_id"] == "sess-race-1"
+
+    def test_no_op_when_agent_still_has_no_session_id(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        _record("race2")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=? "
+            "WHERE assignment_id='race2'",
+            (time.time(),),
+        )
+        conn.commit()
+
+        agent_status = {"active": [], "completed": [_agent_completed("race2", "done")]}
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status):
+            captured = notify_mod.retry_pending_claude_session_id_captures(config)
+
+        assert captured == []
+        row = get_connection().execute(
+            "SELECT claude_session_id FROM assignments WHERE assignment_id='race2'"
+        ).fetchone()
+        assert row["claude_session_id"] is None
+
+    def test_offline_machine_is_skipped_without_error(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        _record("race3")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=? "
+            "WHERE assignment_id='race3'",
+            (time.time(),),
+        )
+        conn.commit()
+
+        with patch.object(notify_mod, "_agent_status", return_value=None):
+            captured = notify_mod.retry_pending_claude_session_id_captures(config)
+        assert captured == []
+
+    def test_no_pending_rows_short_circuits_without_polling_agents(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        with patch.object(notify_mod, "_agent_status") as mock_status:
+            captured = notify_mod.retry_pending_claude_session_id_captures(config)
+        assert captured == []
+        mock_status.assert_not_called()
+
+    def test_wired_into_full_run_recovers_a_missed_capture(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        """End-to-end reproduction of #3314's actual race: pass 1 detects
+        the completion and posts it while the agent's entry still has no
+        claude_session_id (the DB row is left NULL, exactly as the bug
+        report describes); pass 2's agent poll now reports it, and the
+        retry sweep folded into `notify.run()` must capture it — without
+        re-posting the already-notified completion comment."""
+        _record("race4")
+        agent_status_first = {
+            "active": [], "completed": [_agent_completed("race4", "done")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status_first), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        row = get_connection().execute(
+            "SELECT claude_session_id, status FROM assignments WHERE assignment_id='race4'"
+        ).fetchone()
+        assert row["status"] == "done"
+        assert row["claude_session_id"] is None
+
+        agent_status_second = {
+            "active": [],
+            "completed": [
+                _agent_completed("race4", "done", claude_session_id="sess-race-4"),
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status_second), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+
+        mock_post.assert_not_called()
+        row2 = get_connection().execute(
+            "SELECT claude_session_id FROM assignments WHERE assignment_id='race4'"
+        ).fetchone()
+        assert row2["claude_session_id"] == "sess-race-4"
 
 
 # ── #252: smoke-test list capture on completion ──────────────────────────────

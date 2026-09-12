@@ -3224,6 +3224,63 @@ def _update_assignment_claude_session_id_local(
     conn.commit()
 
 
+# #3314: the terminal statuses `_mark_notified_local` ever writes to
+# `assignments.status` — kept as one literal tuple so
+# `list_assignments_missing_claude_session_id`'s WHERE clause can't silently
+# drift from what a completed/failed/advisory/refused-* row actually looks
+# like on this table. `_mark_notified_local` folds EVENT_FAILURE *and*
+# entry_status=='cancelled' (see `coord.notify.detect_transitions`) into the
+# same `status='failed'` write, so 'cancelled' is deliberately not a separate
+# member here — no row is ever persisted with that literal status.
+_TERMINAL_ASSIGNMENT_STATUSES = ("done", "failed", "advisory", "refused_policy", "refused_premise")
+
+
+def list_assignments_missing_claude_session_id(
+    *, max_age_seconds: float, now: float | None = None,
+) -> list[dict]:
+    """#3314: candidates for a claude_session_id re-poll — terminal rows that
+    still have no session id, bounded to a recent window.
+
+    ``coord.notify._capture_claude_session_id`` gets exactly one look at an
+    assignment's agent-status entry (the poll that first observes its
+    terminal transition); once that transition is posted, the assignment
+    never surfaces again in ``detect_transitions``, so a session id the
+    agent hadn't finished capturing *yet* at that exact instant was silently
+    dropped and never retried. This is the query
+    ``coord.notify.retry_pending_claude_session_id_captures`` sweeps each
+    pass to give those rows another look — see that function's docstring for
+    the retry itself.
+
+    *max_age_seconds* bounds the sweep to recently-finished rows: the
+    agent's own live ``/status`` response only reports a session id for an
+    assignment it still remembers, so retrying rows from long ago costs a
+    real HTTP round-trip per candidate machine for something structurally
+    unrecoverable — the same reasoning ``count_purgeable``'s ``older_than_secs``
+    window uses, applied here to bound retry cost rather than storage.
+
+    Local-DB only, like :func:`_update_assignment_claude_session_id_local` —
+    ``coord notify``'s callers (the CLI reroute, the daemon's own drain tick)
+    always run this against the canonical DB directly (#1493's
+    ``COORD_NOTIFY_ON_DAEMON``), so there is no ``board_service`` indirection
+    to route through here.
+    """
+    conn = get_connection()
+    cutoff = (now if now is not None else time.time()) - max_age_seconds
+    placeholders = ", ".join("?" for _ in _TERMINAL_ASSIGNMENT_STATUSES)
+    rows = sql.execute(
+        conn,
+        "SELECT assignment_id, machine_name FROM assignments "
+        f"WHERE status IN ({placeholders}) "
+        "AND (claude_session_id IS NULL OR claude_session_id = '') "
+        "AND finished_at IS NOT NULL AND finished_at >= ?",
+        (*_TERMINAL_ASSIGNMENT_STATUSES, cutoff),
+    ).fetchall()
+    return [
+        {"assignment_id": row["assignment_id"], "machine_name": row["machine_name"]}
+        for row in rows
+    ]
+
+
 def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     """#208/#665: record the worker's final cost — routes to the daemon when set.
 
