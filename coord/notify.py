@@ -3512,12 +3512,19 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             )
             # #3182: same self-record-then-fold split as the EVENT_COMPLETION
             # branch above — a crashed fan-out leg resolves onto ITS OWN row,
-            # never straight onto the shared parent.
+            # never straight onto the shared parent. #3315 review: `parent_id`
+            # is passed too, as `fanout_parent_id`, so the environmental
+            # retry budget is tracked on the PERSISTENT parent row rather
+            # than this leg's own fresh one — see `propagate_smoke_terminal_
+            # failure`'s `fanout_parent_id` docstring for why a leg-scoped
+            # tally could never reach the budget (a fresh leg id is minted
+            # every fan-out round, so it would always read as zero).
             leg_caps = smoke_leg_capabilities(record.get("issue_title"))
             if leg_caps is not None:
                 propagate_smoke_terminal_failure(
                     parent_assignment_id=transition.assignment_id,
                     failure_reason=_failure_reason,
+                    fanout_parent_id=parent_id,
                 )
                 finalize_smoke_fanout(parent_id)
             else:

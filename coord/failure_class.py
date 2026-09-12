@@ -128,6 +128,22 @@ DEFAULT_BACKOFF_CEILING_SECS = 1800.0
 #: reset.
 DEFAULT_USAGE_LIMIT_PARK_SECS = 3600.0
 
+#: How many CONSECUTIVE environmental deaths in a row (a Claude API 429/5xx,
+#: a dropped connection — this module's own `is_environmental` verdict, never
+#: a genuine code defect) are tolerated before parking the row instead of
+#: clearing it for yet another automatic retry.
+#:
+#: Shared by every stage that bounds this same kind of retry against this
+#: same kind of failure: the WORK stage (`coord.drive._ENVIRONMENTAL_WORK_
+#: RETRY_BUDGET`, #2360) and the Test stage (`coord.smoke.ENVIRONMENTAL_
+#: SMOKE_RETRY_BUDGET`, `coord.reconcile.propagate_smoke_terminal_failure`,
+#: #3315). Living here — the leaf module both `coord.drive` and `coord.smoke`
+#: already depend on for `classify_failure` — means the two never drift into
+#: independently-tuned knobs that happen to agree today and silently diverge
+#: the next time either is retuned (#3315 review): one number, one place,
+#: reused rather than duplicated.
+ENVIRONMENTAL_RETRY_BUDGET = 5
+
 
 # ── classification ──────────────────────────────────────────────────────────
 

@@ -1326,6 +1326,203 @@ def test_sustained_429_caps_smoke_legs_and_parks_the_row(
     )
 
 
+def test_propagate_smoke_terminal_failure_fanout_tracks_budget_on_the_parent(
+    coord_db,
+) -> None:
+    """#3315 review (blocking finding): a #3182 fan-out leg's death must
+    bound the SAME environmental retry budget the single-leg path already
+    bounds — tracked on the PERSISTENT parent row, never on the leg's own
+    fresh one.
+
+    Before the fix, `coord.notify`'s fan-out branch called
+    `propagate_smoke_terminal_failure(parent_assignment_id=<leg's own id>,
+    ...)` with no way to reach the real parent at all: every fan-out round
+    mints a brand-new leg id (`_dispatch_smoke_fanout`'s
+    `uuid.uuid4().hex[:12]`), so a tally read off that id was always empty
+    and the budget could never fire — reproducing the unbounded-spin
+    incident this issue exists to close, on the ONE call shape (fan-out)
+    the original PR's tests never exercised.
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        TEST_STATE_BLOCKED,
+        _encode_fanout_manifest,
+        _parse_fanout_manifest,
+    )
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+        record_test_verdict,
+    )
+
+    parent = Assignment(
+        assignment_id="w-fanout-429", machine_name="dell64", repo_name="api",
+        issue_number=3315, issue_title="X", type="work", status="done",
+        branch="issue-3315-fanout",
+    )
+    _record_dispatched_assignment_local(assignment=parent, repo_github="acme/api")
+    # Seed the in-flight #3182 fan-out state `_dispatch_smoke_fanout` stamps
+    # on a real dispatch: the manifest naming the two sibling legs, plus the
+    # aggregate "running" verdict. `_record_dispatched_assignment_local`'s
+    # own UPSERT never touches `test_state`/`test_reason` (#1426's dispatch
+    # marker is a SEPARATE write in production too), so this mirrors that
+    # second write explicitly.
+    record_test_verdict(
+        assignment_id="w-fanout-429",
+        test_state="running",
+        test_reason=(
+            f"{_encode_fanout_manifest([('leg-gtk', ('gtk',), None), ('leg-win', ('windows',), None)])}\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    def _row(assignment_id: str) -> dict:
+        return get_connection().execute(
+            "SELECT test_state, test_reason FROM assignments WHERE "
+            "assignment_id=?", (assignment_id,),
+        ).fetchone()
+
+    # Every round mints a FRESH leg id — exactly the #3182 fan-out shape —
+    # so the budget can only ever be reachable if it is tracked on the
+    # parent, never on any one of these transient ids.
+    for i in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET - 1):
+        leg_id = f"leg-gtk-round{i}"
+        _record_dispatched_assignment_local(
+            assignment=Assignment(
+                assignment_id=leg_id, machine_name="dell64", repo_name="api",
+                issue_number=3315, issue_title="[smoke:gtk] X", type="smoke",
+                status="failed", branch="issue-3315-fanout",
+                review_of_assignment_id="w-fanout-429",
+            ),
+            repo_github="acme/api",
+        )
+        propagate_smoke_terminal_failure(
+            parent_assignment_id=leg_id,
+            failure_reason="api error 429",
+            fanout_parent_id="w-fanout-429",
+        )
+        parent_row = _row("w-fanout-429")
+        assert parent_row["test_state"] != TEST_STATE_BLOCKED, (
+            f"parked too early, after only {i + 1} death(s) — got "
+            f"{parent_row['test_reason']!r}"
+        )
+        assert environmental_smoke_legs(parent_row["test_reason"]) == i + 1
+        # The manifest must survive every intermediate re-stamp — losing it
+        # would strand `finalize_smoke_fanout`'s ability to ever find the
+        # sibling legs again.
+        assert _parse_fanout_manifest(parent_row["test_reason"]) is not None
+        # The dying leg's OWN row is cleared for retry, exactly like the
+        # single-leg path — `_find_leg_for_partition` needs this to treat it
+        # as retryable.
+        assert _row(leg_id)["test_state"] is None
+
+    # The BUDGETth death — from a THIRD distinct, never-before-seen leg id —
+    # must exhaust the shared budget and park the PARENT.
+    final_leg_id = "leg-windows-final"
+    _record_dispatched_assignment_local(
+        assignment=Assignment(
+            assignment_id=final_leg_id, machine_name="macmini", repo_name="api",
+            issue_number=3315, issue_title="[smoke:windows] X", type="smoke",
+            status="failed", branch="issue-3315-fanout",
+            review_of_assignment_id="w-fanout-429",
+        ),
+        repo_github="acme/api",
+    )
+    propagate_smoke_terminal_failure(
+        parent_assignment_id=final_leg_id,
+        failure_reason="api error 429",
+        fanout_parent_id="w-fanout-429",
+    )
+
+    parent_row = _row("w-fanout-429")
+    assert parent_row["test_state"] == TEST_STATE_BLOCKED, (
+        "a sustained fan-out-leg 429 must eventually park the PARENT row, "
+        f"not clear forever — got {parent_row!r}"
+    )
+    assert "429" in parent_row["test_reason"]
+    assert "rate limit" in parent_row["test_reason"].lower()
+    # The leg that triggered the park reads consistently parked too.
+    assert _row(final_leg_id)["test_state"] == TEST_STATE_BLOCKED
+
+
+def test_dispatch_smoke_fanout_end_to_end_caps_legs_under_sustained_429(
+    repo: Repo, coord_db,
+) -> None:
+    """#3315 review acceptance: drive the REAL `_dispatch_smoke_legs` fan-out
+    path (not just `propagate_smoke_terminal_failure` in isolation) against a
+    diff that partitions into two capability sets, with every leg dying
+    environmentally — the #3182 shape the issue's own tests never covered.
+    The number of legs dispatched across the whole outage must stay bounded
+    (single digits), and the row must end up parked, not silently stuck
+    `running` forever nor spinning without limit.
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import TEST_STATE_BLOCKED, _dispatch_smoke_legs  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["windows"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["src/win/"], requires=["windows"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    record_dispatched_assignment(assignment=completed, repo_github="acme/api")
+    board = Board(completed=[completed])
+    diff = ["src/gtk/a.c", "src/win/b.c"]
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg"}, "macmini.tail": {"id": "macmini-leg"},
+    })
+
+    total_legs = 0
+    for _ in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET + 3):
+        if completed.test_state == TEST_STATE_BLOCKED:
+            break
+        legs = _dispatch_smoke_legs(
+            completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+        )
+        total_legs += len(legs)
+        for leg in legs:
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=leg.assignment_id,
+                failure_reason="api error 429",
+                fanout_parent_id=completed.assignment_id,
+            )
+        # Simulate the next tick's fresh `read_board()` — the legs that just
+        # "ran" are no longer in flight, and `completed` (the same long-lived
+        # work row across every iteration in production) reflects whatever
+        # was just persisted.
+        board.active = []
+        row = coord_db.execute(
+            "SELECT test_state, test_reason FROM assignments WHERE "
+            "assignment_id=?", (completed.assignment_id,),
+        ).fetchone()
+        completed.test_state = row["test_state"]
+        completed.test_reason = row["test_reason"]
+
+    assert completed.test_state == TEST_STATE_BLOCKED, (
+        "a sustained fan-out 429 must park the parent row instead of "
+        f"leaving it stuck — got test_state={completed.test_state!r}, "
+        f"test_reason={completed.test_reason!r}"
+    )
+    assert total_legs <= 2 * ENVIRONMENTAL_SMOKE_RETRY_BUDGET, (
+        "a sustained 429 must cap the number of dispatched fan-out legs in "
+        f"the single digits, not spin like the 542-leg incident — "
+        f"dispatched {total_legs}"
+    )
+    assert "429" in (completed.test_reason or "")
+    assert "rate limit" in (completed.test_reason or "").lower()
+
+
 # ── dispatch_smoke (HTTP mocked) ────────────────────────────────────────────
 
 
