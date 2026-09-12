@@ -950,7 +950,14 @@ def propagate_smoke_terminal_failure(
       :func:`coord.smoke.dispatch_pending_smoke` auto-queue picks the work
       row back up on its next tick and re-dispatches a fresh Test stage —
       never spending the bounded ``coord fix`` retry budget on a code defect
-      that never existed.
+      that never existed. #3315: that clear is bounded, not infinite — after
+      :data:`coord.smoke.ENVIRONMENTAL_SMOKE_RETRY_BUDGET` CONSECUTIVE
+      environmental deaths on the same row (tracked the same way #2272's
+      mute-leg budget is, a tally embedded in ``test_reason``) this instead
+      parks the row at :data:`coord.smoke.TEST_STATE_BLOCKED` naming the
+      cause, so a sustained provider outage (an exhausted weekly usage
+      limit, 542 zero-token legs observed on one issue over 12h18m) goes
+      quiet instead of re-dispatching against the wall forever.
     * **work** (an unclassifiable crash, a real defect) — records
       ``test_state="failed"`` exactly like a normal non-zero-exit smoke
       completion already does (`coord/notify.py`'s completion handler), so
@@ -974,7 +981,14 @@ def propagate_smoke_terminal_failure(
     if not parent_assignment_id:
         return
     from coord.failure_class import classify_failure  # noqa: PLC0415
-    from coord.smoke import mute_smoke_legs, mute_smoke_tally  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
+        TEST_STATE_BLOCKED,
+        environmental_smoke_legs,
+        environmental_smoke_tally,
+        mute_smoke_legs,
+        mute_smoke_tally,
+    )
     from coord.state import (  # noqa: PLC0415
         load_assignment_test_reason,
         record_test_verdict,
@@ -998,17 +1012,52 @@ def propagate_smoke_terminal_failure(
         # self-healing cause and #1605's unbounded re-dispatch of it is
         # deliberate) — it is only preserved, so mute legs keep counting
         # across it.
-        carried = mute_smoke_legs(
-            load_assignment_test_reason(parent_assignment_id)
-        )
+        previous_reason = load_assignment_test_reason(parent_assignment_id)
+        carried = mute_smoke_legs(previous_reason)
         prefix = f"{mute_smoke_tally(carried)} — " if carried else ""
+
+        # #3315: unlike the mute-leg tally, THIS one IS incremented here — a
+        # sustained environmental outage (an exhausted usage limit, a 429/5xx
+        # window) is exactly the case #1605's "unbounded re-dispatch is
+        # deliberate" reasoning above does not cover: 542 zero-token legs on
+        # one issue over 12h18m, stopped only when the provider's own window
+        # reset. Bounded at `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` CONSECUTIVE
+        # environmental deaths (mirrors `coord/drive.py`'s WORK-stage
+        # `_ENVIRONMENTAL_WORK_RETRY_BUDGET`, #2360) — a genuine blip clears
+        # in one or two legs, well under budget; a sustained outage parks
+        # instead of spinning against the wall.
+        env_legs = environmental_smoke_legs(previous_reason) + 1
+        if env_legs >= ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
+            record_test_verdict(
+                assignment_id=parent_assignment_id,
+                test_state=TEST_STATE_BLOCKED,
+                test_reason=(
+                    f"{prefix}{environmental_smoke_tally(env_legs)}: the "
+                    f"Test-stage environmental retry budget "
+                    f"({ENVIRONMENTAL_SMOKE_RETRY_BUDGET}) is exhausted "
+                    f"after {env_legs} consecutive environmental deaths — "
+                    f"{cause}. This looks like a sustained provider outage "
+                    "or an exhausted account usage limit (HTTP 429/5xx "
+                    "rate limit), not a code defect, so the row is parked "
+                    "instead of re-dispatched (#3315) — the fleet should go "
+                    "quiet, not keep spinning against the wall. Recover "
+                    "with `coord diagnose <repo> <issue> --stage test "
+                    "--reset` once the provider is healthy again, or record "
+                    "the verdict by hand with `coord test --passed|--fail "
+                    f"{parent_assignment_id}`."
+                ),
+            )
+            return
         record_test_verdict(
             assignment_id=parent_assignment_id,
             test_state=None,
             test_reason=(
-                f"{prefix}Test stage worker died environmentally "
-                f"({cause}) — cleared for automatic "
-                "re-dispatch, not recorded as a work failure (#1605)"
+                f"{prefix}{environmental_smoke_tally(env_legs)}: Test stage "
+                f"worker died environmentally ({cause}) — cleared for "
+                "automatic re-dispatch, not recorded as a work failure "
+                f"(#1605); {ENVIRONMENTAL_SMOKE_RETRY_BUDGET - env_legs} of "
+                f"the {ENVIRONMENTAL_SMOKE_RETRY_BUDGET}-leg retry budget "
+                "left before the row parks instead (#3315)."
             ),
         )
     else:

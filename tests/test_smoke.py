@@ -10,6 +10,8 @@ import pytest
 from coord.config import Config, SmokeRule, SmokeTestsConfig, load
 from coord.models import Assignment, Board, Machine, Repo
 from coord.smoke import (
+    ENVIRONMENTAL_SMOKE_MARKER,
+    ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
     MUTE_SMOKE_LEG_BUDGET,
     NO_SMOKE_VERDICT_MARKER,
     SMOKE_SYSTEM_PROMPT,
@@ -19,6 +21,8 @@ from coord.smoke import (
     build_smoke_briefing,
     dispatch_pending_smoke,
     dispatch_smoke,
+    environmental_smoke_legs,
+    environmental_smoke_tally,
     finalize_smoke_fanout,
     match_rules,
     mute_smoke_legs,
@@ -1101,6 +1105,225 @@ def test_environmental_death_adds_no_tally_when_there_is_none(coord_db) -> None:
     ).fetchone()
     assert row["test_state"] is None
     assert mute_smoke_legs(row["test_reason"]) == 0
+
+
+# ── #3315: environmental Test-stage retries — the rate-limit budget ────────
+
+
+@pytest.mark.parametrize(
+    "reason, expected",
+    [
+        (None, 0),
+        ("", 0),
+        ("dispatched: Test stage running (#1426)", 0),
+        ("headless smoke: 5 failed", 0),
+        # Bare marker, no count — one leg.
+        (f"{ENVIRONMENTAL_SMOKE_MARKER}: died environmentally", 1),
+        (f"{ENVIRONMENTAL_SMOKE_MARKER} x2: …", 2),
+        (f"{ENVIRONMENTAL_SMOKE_MARKER} x5: parked", 5),
+        # Case/spacing tolerance, so a hand-edited reason still counts.
+        ("ENVIRONMENTAL-RETRY (#3315) X3", 3),
+    ],
+)
+def test_environmental_smoke_legs_reads_the_tally_back(reason, expected) -> None:
+    assert environmental_smoke_legs(reason) == expected
+
+
+def test_environmental_smoke_tally_round_trips_through_environmental_smoke_legs() -> None:
+    """The writer and the reader must agree, or the budget silently resets."""
+    for count in range(1, 8):
+        assert environmental_smoke_legs(environmental_smoke_tally(count)) == count
+    assert environmental_smoke_tally(1) == ENVIRONMENTAL_SMOKE_MARKER
+
+
+def test_dispatch_smoke_carries_the_environmental_retry_tally_across_the_running_stamp(
+    gtk_and_server_config: Config,
+) -> None:
+    """The #2272 regression, replayed for the #3315 environmental budget.
+
+    `test_reason` is the only field that survives from one Test-stage leg to
+    the next. If `dispatch_smoke`'s own "running" stamp does not re-state the
+    environmental tally, the very next dispatch erases it — and
+    `coord.reconcile.propagate_smoke_terminal_failure`'s budget (bounded at
+    `ENVIRONMENTAL_SMOKE_RETRY_BUDGET`) can never fire, because every
+    intervening dispatch resets the counter it is trying to bound.
+    """
+    parent = _completed(machine="server")
+    parent.test_reason = f"{ENVIRONMENTAL_SMOKE_MARKER} x2: died environmentally"
+    board = Board(completed=[parent])
+
+    result = dispatch_smoke(
+        parent, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-run"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is not None
+    assert parent.test_state == "running"
+    assert environmental_smoke_legs(parent.test_reason) == 2, (
+        "the environmental-retry tally must survive the `running` stamp, or "
+        f"the #3315 budget can never fire — got {parent.test_reason!r}"
+    )
+    assert f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive" in parent.test_reason
+
+
+def test_propagate_smoke_terminal_failure_parks_after_retry_budget_exhausted(
+    coord_db,
+) -> None:
+    """#3315 acceptance core: a SUSTAINED environmental Test-stage death (a
+    429 that never clears) must not clear `test_state` back to NULL forever
+    — the observed incident was 542 such clears, every one a zero-token leg,
+    over 12h18m before the account's weekly usage window reset on its own.
+
+    After `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` CONSECUTIVE environmental
+    deaths on the same row, the row must park instead, with a reason an
+    operator can act on without guessing (names the 429 / rate limit).
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+    )
+
+    work = Assignment(
+        assignment_id="w-429", machine_name="laptop", repo_name="api",
+        issue_number=3315, issue_title="X", type="work", status="done",
+        branch="issue-3315",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    for _ in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET):
+        propagate_smoke_terminal_failure(
+            parent_assignment_id="w-429", failure_reason="api error 429",
+        )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-429",),
+    ).fetchone()
+    assert row["test_state"] == TEST_STATE_BLOCKED, (
+        "a sustained environmental failure must eventually park, not clear "
+        f"forever — got test_state={row['test_state']!r}, "
+        f"test_reason={row['test_reason']!r}"
+    )
+    assert "429" in row["test_reason"]
+    assert "rate limit" in row["test_reason"].lower()
+
+    # Exhausted stays exhausted — one more environmental death must not
+    # un-park the row.
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-429", failure_reason="api error 429",
+    )
+    row2 = get_connection().execute(
+        "SELECT test_state FROM assignments WHERE assignment_id=?", ("w-429",),
+    ).fetchone()
+    assert row2["test_state"] == TEST_STATE_BLOCKED
+
+
+def test_propagate_smoke_terminal_failure_does_not_park_a_transient_blip(
+    coord_db,
+) -> None:
+    """The ordinary #1605 case is unchanged: ONE environmental death well
+    under budget must still clear for automatic re-dispatch, never park."""
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+    )
+
+    work = Assignment(
+        assignment_id="w-blip", machine_name="laptop", repo_name="api",
+        issue_number=3316, issue_title="X", type="work", status="done",
+        branch="issue-3316",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-blip", failure_reason="api error 529",
+    )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-blip",),
+    ).fetchone()
+    assert row["test_state"] is None
+    assert environmental_smoke_legs(row["test_reason"]) == 1
+
+
+def test_sustained_429_caps_smoke_legs_and_parks_the_row(
+    gtk_and_server_config: Config, coord_db,
+) -> None:
+    """#3315 end-to-end acceptance: drive the actual smoke DISPATCH path
+    (`dispatch_smoke`) against a stubbed provider that always fails
+    environmentally (a stand-in for a `claude -p` worker that immediately
+    hits a 429 and never reaches the model, exactly the observed 541-of-542
+    zero-turn/zero-token legs), and assert the number of legs actually
+    dispatched is capped in the single digits rather than spinning for
+    hours.
+
+    Alternates a real `dispatch_smoke` call with the same
+    `propagate_smoke_terminal_failure` outcome `coord.notify` records when a
+    Test-stage worker dies without ever printing a verdict — the two
+    together are exactly the "leg fails -> row clears -> next tick
+    re-dispatches" loop the incident rode for 12h18m.
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+    completed = _completed()
+    record_dispatched_assignment(assignment=completed, repo_github="acme/api")
+    board = Board(completed=[completed])
+    client = _FakeClient({"id": "smoke-run"})
+    diff_lookup = lambda repo, branch: ["src/gtk/window.c"]  # noqa: E731
+
+    dispatched_legs = 0
+    for _ in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET + 3):
+        result = dispatch_smoke(
+            completed, board, gtk_and_server_config,
+            http_client=client, diff_lookup=diff_lookup,
+        )
+        if result is not None:
+            dispatched_legs += 1
+        # The leg that just "ran" is no longer in flight by the next tick —
+        # its own terminal event has already been reconciled, same as the
+        # real board once `coord.notify` posts the failure comment.
+        board.active = []
+        propagate_smoke_terminal_failure(
+            parent_assignment_id=completed.assignment_id,
+            failure_reason="api error 429",
+        )
+        # Simulate the next tick's `read_board()` picking up what was just
+        # persisted — `completed` is the same long-lived work row across
+        # every iteration in production.
+        row = coord_db.execute(
+            "SELECT test_state, test_reason FROM assignments WHERE "
+            "assignment_id=?", (completed.assignment_id,),
+        ).fetchone()
+        completed.test_state = row["test_state"]
+        completed.test_reason = row["test_reason"]
+
+    assert dispatched_legs <= ENVIRONMENTAL_SMOKE_RETRY_BUDGET, (
+        "a sustained 429 must cap the number of dispatched Test-stage legs "
+        f"at {ENVIRONMENTAL_SMOKE_RETRY_BUDGET} (single digits), not spin "
+        f"like the 542-leg incident — dispatched {dispatched_legs}"
+    )
+    assert completed.test_state == TEST_STATE_BLOCKED
+    assert "429" in (completed.test_reason or "")
+    assert "rate limit" in (completed.test_reason or "").lower()
+
+    # And the row stays quiet: one more tick must not dispatch another leg.
+    calls_before = len(client.calls)
+    result = dispatch_smoke(
+        completed, board, gtk_and_server_config,
+        http_client=client, diff_lookup=diff_lookup,
+    )
+    assert result is None
+    assert len(client.calls) == calls_before, (
+        "a parked row must not dispatch another leg — that refusal is what "
+        "actually stops the billing (#3315)"
+    )
 
 
 # ── dispatch_smoke (HTTP mocked) ────────────────────────────────────────────
