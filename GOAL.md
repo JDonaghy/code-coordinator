@@ -5,13 +5,13 @@
 > priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source
 > of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-09-11._
+> _Last updated: 2026-09-11_
 
 ## 🎯 North star
 
-**File an epic, and have it decomposed into issues and worked through to merge without an
-operator.** One command in, working merged software out — decomposition, dispatch, test,
-review and merge all unattended, across the fleet.
+**File an epic, and have it decomposed into issues and worked through to merge without an operator.**
+One command in, working merged software out — decomposition, dispatch, test, review
+and merge all unattended, across the fleet.
 
 This replaces the previous north star (*"make human-attended interactive `claude` sessions
 drivable end-to-end from the coord-tui board"*, 2026-06/07). That lifecycle was built and
