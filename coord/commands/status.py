@@ -2913,7 +2913,11 @@ def _usage_by_issue(
 
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
-    rows = fetch_usage_rows()
+    # #3313: push the resolved window down into the fetch itself — filtering
+    # only in `aggregate()` below let a thin client's truncated fetch (see
+    # `coord.usage.fetch_usage_rows`) silently under-report, and a WIDER
+    # window could report LESS than a narrower one.
+    rows = fetch_usage_rows(since=window.start, until=window.end)
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by="issue", window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
@@ -2933,6 +2937,12 @@ def _usage_issue_drill(
     cfg = _load_config(config_path)
     has_window_flag = today or week or month or since_spec
     window = _usage_resolve_window(today, week, month, since_spec) if has_window_flag else None
+    # #3313: push the resolved window down into the fetch itself (None/None
+    # when no window flag was given, i.e. unbounded all-history — unchanged
+    # from before). See `_usage_by_issue` above for why this can't be left to
+    # client-side filtering alone.
+    since = window.start if window is not None else None
+    until = window.end if window is not None else None
     # #1553: select by the *attributed* issue, matching the `--by issue`
     # summary above. Selecting on the raw `issue_number` while the summary
     # groups on `for_issue_number` would make the two views disagree — the
@@ -2940,7 +2950,7 @@ def _usage_issue_drill(
     # the child, and the child's drill would be empty.
     rows = [
         row
-        for row in fetch_usage_rows()
+        for row in fetch_usage_rows(since=since, until=until)
         if row_issue_number(row) == issue_number
         and (window is None or leg_in_window(row, window))
     ]
@@ -2967,7 +2977,8 @@ def _usage_by_dim(
 
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
-    rows = fetch_usage_rows()
+    # #3313: see `_usage_by_issue` above.
+    rows = fetch_usage_rows(since=window.start, until=window.end)
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by=by_dim, window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
@@ -2997,7 +3008,8 @@ def _usage_by_time(
 
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
-    rows = fetch_usage_rows()
+    # #3313: see `_usage_by_issue` above.
+    rows = fetch_usage_rows(since=window.start, until=window.end)
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by=dim, window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(resolved_sort), reverse=True)
