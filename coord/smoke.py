@@ -2750,6 +2750,20 @@ def dispatch_pending_smoke(
     real :mod:`coord.github_ops` explicitly, the same module every other
     live gate check in this codebase hands `merge_queue`'s gate functions.
 
+    A confirmed-stale verdict is **cleared** (``record_test_verdict(...,
+    test_state=None)``, mirrored in-memory on ``completed.test_state``)
+    *before* the re-dispatch, not left in place — so the row reads
+    "running"/unset for the duration of the new leg instead of still showing
+    the old terminal verdict. Leaving the old verdict in place would (a) trip
+    `_dispatch_smoke_single_leg`'s #1819 guard, which refuses to stamp
+    "running" over any terminal verdict, so the new leg would never be
+    recorded as in-flight and every following tick would re-probe and
+    re-dispatch again; and (b) on completion, make
+    `coord.notify._record_smoke_verdict` see the stale verdict as
+    "already terminal", wrongly credit it to the worker's own `coord test`
+    (#2217/#2464), and skip reading the new worker's actual verdict entirely
+    — silently laundering a stale pass into a fresh-anchored one.
+
     Returns the list of smoke `Assignment`s actually dispatched. The caller
     is responsible for persisting the board.
     """
@@ -2827,6 +2841,43 @@ def dispatch_pending_smoke(
                 completed.repo_name, completed.issue_number,
                 completed.assignment_id, completed.test_state,
             )
+            # Clear the stale verdict BEFORE dispatching the re-run — both
+            # the persisted row (`record_test_verdict(test_state=None)`, the
+            # same "make this row eligible for re-dispatch" step every other
+            # clearer in this codebase already takes: `coord/reconcile.py`'s
+            # environmental-death clear, `coord/notify.py`'s mute-leg-budget
+            # clear) and the in-memory `completed.test_state` this loop
+            # itself is about to hand to `_dispatch_smoke_legs`.
+            #
+            # Skipping this step left the stale "passed" sitting on the row
+            # for the ENTIRE duration of the new run: `_dispatch_smoke_single_
+            # leg`'s own #1819 guard (never stamp "running" over a terminal
+            # verdict) would refuse to record the new leg as in-flight, so
+            # every subsequent tick still saw "passed" and kept re-dispatching
+            # (re-triggering the live #1479 SHA lookup on every one), AND —
+            # far worse — when the new leg completed,
+            # `coord.notify._record_smoke_verdict` would read the still-
+            # "passed" `current_state`, wrongly conclude the worker
+            # self-recorded it via `coord test` (#2217/#2464's branch), and
+            # never inspect the new worker's actual `SMOKE:` verdict at all —
+            # silently laundering a stale pass into a fresh-anchored one with
+            # no real observation behind it (worse than the deadlock #3309
+            # set out to fix). Clearing it here makes the row read "running"
+            # (or unset) until the new leg's own verdict lands, exactly like
+            # every other re-dispatch path.
+            if completed.assignment_id is not None:
+                from coord.state import record_test_verdict  # noqa: PLC0415
+
+                record_test_verdict(
+                    assignment_id=completed.assignment_id,
+                    test_state=None,
+                    test_reason=(
+                        f"Cleared a #1479-stale {completed.test_state!r} Test "
+                        "verdict for re-dispatch — the recorded verdict was "
+                        "against a base/branch that has since moved (#3309)."
+                    ),
+                )
+            completed.test_state = None
 
         # #685: per-issue test-mode policy gates auto-smoke dispatch.
         #   test-mode:auto  → headless smoke (auto-dispatch here).

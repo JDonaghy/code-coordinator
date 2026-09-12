@@ -3162,6 +3162,125 @@ def test_dispatch_pending_smoke_keeps_skipping_skipped_verdict_with_gh_ops(
     assert not mock_dispatch.called
 
 
+def test_dispatch_pending_smoke_redispatch_round_trip_records_new_verdict_not_stale_one(
+    gtk_and_server_config: Config, monkeypatch, tmp_path: Path,
+) -> None:
+    """#3309 review round trip: the earlier test suite mocked out
+    `coord.smoke._dispatch_smoke_legs` entirely and only asserted it got
+    *called* — it never exercised the real dispatch → `board.active` →
+    completion path through `coord.notify._record_smoke_verdict`, which is
+    exactly where the reviewer's blocking finding lived: a re-dispatch that
+    never clears the stale verdict first leaves `_dispatch_smoke_single_
+    leg`'s #1819 guard refusing to stamp "running", so the parent sits at
+    the stale `passed` for the whole new run — and when that run completes,
+    `_record_smoke_verdict` reads the still-"passed" row, wrongly credits it
+    to the #2217/#2464 "worker self-recorded" branch, and never looks at the
+    new leg's actual verdict at all.
+
+    This drives the REAL `_dispatch_smoke_legs`/`_dispatch_smoke_single_leg`
+    code (only the network POST and the diff lookup are stubbed — the same
+    seams `dispatch_smoke`'s own direct tests stub), then completes the
+    resulting smoke assignment with a verdict that CONTRADICTS the stale one
+    (`SMOKE: fail` where the stale verdict was `passed`) and asserts the
+    parent ends up `failed`, proving the new leg's verdict — not the
+    laundered old one — is what actually lands.
+    """
+    import coord.smoke as smoke_mod
+    from coord.notify import EVENT_COMPLETION, Transition, _record_smoke_verdict
+    from coord.state import (
+        _record_dispatched_assignment_local,
+        load_assignment_test_reason,
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    # Seed the parent work row exactly as a real drive would have left it
+    # pre-rebase: done, with a `passed` verdict already recorded.
+    parent = Assignment(
+        assignment_id="work-1", machine_name="server", repo_name="api",
+        issue_number=287, issue_title="GTK key routing fix", type="work",
+        status="done", branch="issue-1-fix",
+    )
+    _record_dispatched_assignment_local(assignment=parent, repo_github="acme/api")
+    record_test_verdict(
+        assignment_id="work-1", test_state="passed",
+        test_reason="headless smoke, pre-rebase",
+    )
+
+    row = replace(
+        parent, test_state="passed", test_reason="headless smoke, pre-rebase",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+
+    # Stub only the network-facing seams — everything else (the #1819 guard,
+    # the `board.active` append, the clear-then-stamp this fix adds) runs
+    # for real, through the actual `_dispatch_smoke_legs` implementation.
+    real_dispatch_smoke_legs = smoke_mod._dispatch_smoke_legs
+    fake_client = _FakeClient({"id": "smoke-1"})
+
+    def _stubbed_network(completed, board, config, *, now=None):
+        return real_dispatch_smoke_legs(
+            completed, board, config,
+            http_client=fake_client, diff_lookup=lambda r, b: [], now=now,
+        )
+
+    monkeypatch.setattr(smoke_mod, "_dispatch_smoke_legs", _stubbed_network)
+
+    dispatched = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+
+    assert len(dispatched) == 1
+    smoke_assignment = dispatched[0]
+    assert smoke_assignment.assignment_id == "smoke-1"
+    assert board.active == [smoke_assignment]
+
+    # The blocking finding: the stale "passed" must NOT survive the
+    # dispatch, in memory or persisted — it must read "running" (or unset),
+    # never the old terminal verdict, for the duration of the new run.
+    assert row.test_state != "passed", (
+        "the stale verdict must be cleared before dispatch, not left in "
+        "place for the duration of the new run (#3309 review)"
+    )
+    assert load_assignment_test_state("work-1") != "passed"
+
+    # Complete the NEW smoke leg with a verdict that CONTRADICTS the stale
+    # one. Record it as an in-flight smoke row first (mirrors what the real
+    # dispatch already wrote via `record_dispatched_assignment`).
+    _record_dispatched_assignment_local(
+        assignment=smoke_assignment, repo_github="acme/api",
+    )
+    log_path = tmp_path / "smoke-1.log"
+    log_path.write_text("SMOKE: fail 3 tests failed\n", encoding="utf-8")
+    transition = Transition(
+        assignment_id="smoke-1", machine_name=smoke_assignment.machine_name,
+        repo_name="api", issue_number=287, event=EVENT_COMPLETION, exit_code=0,
+    )
+    entry = {
+        "started_at": 1000.0, "finished_at": 1010.0,
+        "branch": "issue-1-fix", "log_path": str(log_path),
+    }
+
+    _record_smoke_verdict(transition, entry, "work-1")
+
+    # If the stale "passed" had survived the dispatch, this would still read
+    # "passed" (laundered via the #2217/#2464 self-recorded branch, never
+    # having looked at the log above at all). With the fix, the new leg's
+    # own `SMOKE: fail` verdict is what actually gets recorded.
+    assert load_assignment_test_state("work-1") == "failed", (
+        f"expected the NEW leg's verdict to win, got "
+        f"{load_assignment_test_state('work-1')!r} — the stale verdict was "
+        "laundered instead of being overwritten by a real observation"
+    )
+    reason = load_assignment_test_reason("work-1") or ""
+    assert "self-recorded" not in reason, (
+        "a freshly-observed failure must not carry the self-recorded-pass "
+        f"audit trail meant for a different case: {reason!r}"
+    )
+
+
 # ── #3099: an ADVISORY row with confirmed commits is the #1357 false
 # positive and must be promoted to 'done' so Test actually dispatches,
 # instead of being skipped forever (the livelock #3099 reports: `coord
