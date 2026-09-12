@@ -3855,12 +3855,18 @@ def _dispatch_board_pending_smoke(config: Config) -> None:
     local `scripts/coord-test-runner.sh` subprocess (#1395). Mirrors
     :func:`_dispatch_board_pending_reviews` exactly, and is safe to call even
     when the board file doesn't exist.
+
+    #3309: passes the real `github_ops` (already imported at module level)
+    as *gh_ops* so `dispatch_pending_smoke` can detect a #1479-stale
+    passed/failed/skipped verdict and re-dispatch instead of skipping it
+    forever — without it, the staleness check fails open and this call would
+    be no more capable than before that fix.
     """
     from coord.board_service import read_board, write_board
     from coord.smoke import dispatch_pending_smoke
 
     board = read_board()
-    dispatched = dispatch_pending_smoke(board, config)
+    dispatched = dispatch_pending_smoke(board, config, gh_ops=github_ops)
     if dispatched:
         write_board(board)
 

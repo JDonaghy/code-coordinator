@@ -3000,6 +3000,168 @@ def test_dispatch_pending_smoke_calls_dispatch_smoke_for_eligible_rows(
     assert result == [sentinel]
 
 
+# ── #3309: dispatch_pending_smoke skips on verdict PRESENCE, the merge gate
+# blocks on FRESHNESS — a rebase (moved base) makes a recorded `passed`
+# verdict #1479-stale, and without a re-dispatch here nothing ever produces a
+# fresh one: the row deadlocks (test skips forever, merge reports
+# smoke_required forever). `_test_verdict_is_stale` reuses the SAME predicate
+# `coord merge`/`coord gates` apply (`merge_queue.evaluate_smoke_verdict`),
+# via a `gh_ops` stub mirroring `coord.merge_queue.GhOps`. ──────────────────
+
+
+class _FakeGh:
+    """Stub gh_ops — returns fixed SHAs/patch-id, mirrors tests/test_gates.py's
+    own `FakeGh` for the identical `coord.merge_queue.GhOps` surface."""
+
+    def __init__(self, *, branch_sha="branchsha", base_sha="basesha", patch_id="patchid"):
+        self.branch_sha = branch_sha
+        self.base_sha = base_sha
+        self.patch_id = patch_id
+
+    def get_branch_sha(self, repo: str, branch: str) -> str | None:
+        return self.branch_sha if branch != "main" else self.base_sha
+
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        return self.patch_id
+
+
+def test_dispatch_pending_smoke_redispatches_stale_passed_verdict(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3309 repro: a `passed` verdict recorded against an old base, the base
+    has since moved (a #241 conflict-fix rebase) — must re-dispatch instead of
+    skipping on presence alone forever."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="passed", test_reason="headless smoke",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    sentinel = object()
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert mock_dispatch.called
+    assert mock_dispatch.call_args[0][0] is row
+    assert result == [sentinel]
+
+
+def test_dispatch_pending_smoke_keeps_skipping_a_fresh_passed_verdict(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """Same anchors, but the live base/branch SHAs still match what the
+    verdict was recorded against — genuinely fresh, must stay skipped even
+    though a `gh_ops` is now supplied."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="passed",
+        test_head_sha="branchsha", test_base_sha="basesha",
+        test_patch_id="patchid",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="basesha", patch_id="patchid")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_stale_check_is_off_by_default(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """No `gh_ops` supplied (the default) fails open exactly like before
+    #3309 — never treats a recorded verdict as stale without a live SHA to
+    compare against, so every pre-existing caller that doesn't pass `gh_ops`
+    keeps behaving identically."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="passed",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+@pytest.mark.parametrize("state", ["blocked", "running"])
+def test_dispatch_pending_smoke_keeps_skipping_blocked_and_running_with_gh_ops(
+    gtk_and_server_config: Config, monkeypatch, state: str,
+) -> None:
+    """#1672/#1678: `blocked` (unroutable fleet report, must fire ONCE, never
+    re-probe) and `running` (genuinely in flight) must stay skipped even when
+    a live `gh_ops` is available — staleness is not evaluated for either, by
+    design."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state=state,
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_does_not_redispatch_a_failed_verdict(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """A `failed` verdict carries no #1479 staleness anchor at all (only
+    `passed`/`skipped` get one stamped, `state._record_test_verdict_local`) —
+    `evaluate_smoke_verdict` reports it SMOKE_MISSING, not SMOKE_STALE, so it
+    must NOT be re-dispatched by this fix (a fix round is a NEW work row, not
+    a re-run of the same failed suite)."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(), test_state="failed", test_reason="assertion error")
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_keeps_skipping_skipped_verdict_with_gh_ops(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#1732: `skipped` is a structural claim about the diff, not a
+    measurement at a SHA — it can never go stale, base move or not."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="skipped",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
 # ── #3099: an ADVISORY row with confirmed commits is the #1357 false
 # positive and must be promoted to 'done' so Test actually dispatches,
 # instead of being skipped forever (the livelock #3099 reports: `coord
