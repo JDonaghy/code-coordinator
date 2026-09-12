@@ -2349,9 +2349,15 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # #685 per-issue test-mode gate (test-mode:smoke skips auto-dispatch —
     # the TUI offers the interactive smoke agent instead), and the
     # has_active_followup dedupe.
+    #
+    # #3309: passes the real `github_ops` as *gh_ops* so a #1479-stale
+    # passed/failed/skipped verdict (a rebase moved the base or branch out
+    # from under it) is re-dispatched instead of skipped forever — without
+    # it, the staleness check inside `dispatch_pending_smoke` fails open.
+    from coord import github_ops  # noqa: PLC0415
     from coord.smoke import dispatch_pending_smoke
 
-    for smoke in dispatch_pending_smoke(board, config):
+    for smoke in dispatch_pending_smoke(board, config, gh_ops=github_ops):
         if smoke.assignment_id is not None:
             changed.append(smoke.assignment_id)
 

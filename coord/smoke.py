@@ -67,6 +67,8 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from coord.merge_queue import GhOps
+
 import httpx
 
 from coord import github_ops
@@ -1367,6 +1369,68 @@ def _fetch_touched_files(repo_github: str, branch: str) -> list[str]:
 TEST_STATE_BLOCKED = "blocked"
 
 
+def _test_verdict_is_stale(
+    completed: Assignment,
+    board: Board,
+    config: Config,
+    gh_ops: "GhOps | None",
+) -> bool:
+    """#3309: True when *completed*'s own recorded Test verdict is
+    #1479-stale — recorded against a base/branch combination that has since
+    moved (typically a #241 conflict-fix rebase).
+
+    ``dispatch_pending_smoke`` used to treat ANY recorded ``test_state`` as
+    "someone is already handling this row" and skip it forever. That is
+    correct for a fresh verdict, but a rebase can make a ``passed`` verdict
+    stale without ever clearing it — from that moment the merge gate reports
+    ``smoke_required`` while this producer, its only automatic source, keeps
+    skipping the row on every tick. Nothing else ever re-asks once the drive
+    that recorded the original verdict has exited (that is what made the
+    rebase necessary in the first place), so the entry deadlocks silently.
+
+    Reuses :func:`coord.merge_queue.evaluate_smoke_verdict` — the SAME
+    function ``coord merge``/``coord gates`` call to decide
+    ``smoke_required`` — rather than a second implementation of the #1479
+    freshness math that could silently drift from it (#2096, "one question,
+    one answer"). Built via :func:`coord.merge_queue.live_gate_entry`, the
+    one shared constructor for gate-checking a raw work
+    :class:`~coord.models.Assignment` before it has gone through a live
+    ``coord merge`` pass (#2085) — mirrors exactly what
+    :func:`coord.gates.build_gate_report` does for the same reason.
+
+    Only a genuinely :data:`~coord.merge_queue.SMOKE_STALE` result returns
+    ``True``. A :data:`~coord.merge_queue.SMOKE_MISSING` result (e.g. a
+    ``"failed"`` verdict — #1479's staleness anchors are stamped only for
+    ``"passed"``/``"skipped"``, ``coord.state._record_test_verdict_local``)
+    or a :data:`~coord.merge_queue.SMOKE_UNKNOWN` result (a live SHA lookup
+    that could not be confirmed — a transient GitHub read failure) both
+    return ``False``: re-dispatching on either would either resurrect a
+    "failed" row nothing asked to re-run, or fire on a probe that never
+    actually observed a discrepancy.
+
+    ``gh_ops=None`` (or no ``repo.github``/``completed.branch``) fails open
+    to ``False`` — the #821/#1475 convention every #1479 staleness check
+    follows: with no live SHA to compare against, every anchor check inside
+    ``evaluate_smoke_verdict`` is a no-op and it reports the verdict fresh,
+    exactly as it did before this function existed.
+    """
+    if gh_ops is None or not completed.branch:
+        return False
+    repo = config.repo(completed.repo_name)
+    if repo is None or not repo.github:
+        return False
+
+    from coord import merge_queue as mq  # noqa: PLC0415
+    from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+
+    target_branch = resolve_base_branch_for_issue_number(
+        repo, repo.github, completed.issue_number,
+    )
+    entry = mq.live_gate_entry(completed, repo.github, target_branch, gh_ops)
+    status = mq.evaluate_smoke_verdict(entry, board, gh_ops)
+    return (not status.ok) and status.kind == mq.SMOKE_STALE
+
+
 # ── Mute Test-stage legs: the retry budget (#2244/#2272) ────────────────────
 #
 # A Test-stage leg that finishes without printing a `SMOKE:` marker records NO
@@ -2654,13 +2718,14 @@ def dispatch_pending_smoke(
     config: Config,
     *,
     now: float | None = None,
+    gh_ops: "GhOps | None" = None,
 ) -> list[Assignment]:
     """Bulk Test-stage dispatch — the smoke analogue of
     :func:`coord.review.dispatch_pending_reviews`.
 
     Scans the FULL completed backlog on `board` (not just rows that just
-    transitioned this pass) for work-like completions with no test verdict
-    yet, and dispatches a smoke assignment for each eligible one via
+    transitioned this pass) for work-like completions with no FRESH test
+    verdict yet, and dispatches a smoke assignment for each eligible one via
     :func:`dispatch_smoke` (which itself enforces `auto_queue`, the #459-style
     dedupe via `has_active_followup`, and capability routing).
 
@@ -2672,6 +2737,18 @@ def dispatch_pending_smoke(
     thin-client/timer-only setup with nobody running `coord resume` never
     dispatched the Test stage at all — the gap `drive-issue.sh` had to paper
     over with a local `scripts/coord-test-runner.sh` subprocess (#1395).
+
+    #3309: a row carrying a recorded ``passed``/``failed``/``skipped``
+    verdict is skipped UNLESS :func:`_test_verdict_is_stale` says that
+    verdict is #1479-stale (a rebase moved the base or the branch out from
+    under it) — see that function for why "stale" and "missing"/"unknown"
+    get different treatment. *gh_ops* backs that live SHA comparison; the
+    default ``None`` fails open (no live lookup, a recorded verdict is never
+    treated as stale — identical to this function's behaviour before #3309),
+    matching the #821/#1475 convention every other #1479 staleness check
+    follows. Production callers (`coord.notify`, `coord.reconcile`) pass the
+    real :mod:`coord.github_ops` explicitly, the same module every other
+    live gate check in this codebase hands `merge_queue`'s gate functions.
 
     Returns the list of smoke `Assignment`s actually dispatched. The caller
     is responsible for persisting the board.
@@ -2714,19 +2791,42 @@ def dispatch_pending_smoke(
                 continue
         if completed.status != "done":
             continue
-        if completed.test_state is not None:
-            # Already has a verdict ("passed"/"failed"/"skipped"), or is
+        if completed.test_state in (TEST_STATE_BLOCKED, "running"):
             # "running" — someone (an interactive --smoke-of session, or a
-            # smoke assignment already in flight) is already handling it.
+            # smoke assignment already in flight) is genuinely handling this
+            # row right now; skip unconditionally, no re-probing needed.
             #
-            # #1672: this is also what makes the unroutable report fire ONCE.
-            # `dispatch_smoke` records `test_state="blocked"` when no
+            # #1672: "blocked" is also what makes the unroutable report fire
+            # ONCE. `dispatch_smoke` records `test_state="blocked"` when no
             # capability-matched machine can take the stage, so the next tick
             # lands here and skips instead of re-probing a fleet that is
             # still broken and re-logging the identical refusal every 30 s
             # (#1678). Clearing it (`coord diagnose <repo> <issue> --stage
             # test --reset`) puts the row back in this scan.
             continue
+        if completed.test_state is not None:
+            # A terminal verdict exists ("passed"/"failed"/"skipped"). Before
+            # #3309 presence alone was enough to skip forever — but a
+            # "passed" verdict can go #1479-stale the moment the merge base
+            # moves (a #241 conflict-fix rebase), and once the drive that
+            # recorded it has exited nothing else ever asks for a fresh one:
+            # the merge gate then reports `smoke_required` against a row this
+            # producer, its only automatic source, believes is already
+            # handled — and it deadlocks silently forever. Re-dispatch only
+            # when the SAME staleness predicate the merge gate applies
+            # (`_test_verdict_is_stale`, #1479) confirms the recorded verdict
+            # is genuinely stale — never merely because it's missing or
+            # unconfirmable (see that function's docstring).
+            if not _test_verdict_is_stale(completed, board, config, gh_ops):
+                continue
+            logger.info(
+                "dispatch_pending_smoke: %s#%s row %s carries a %r Test "
+                "verdict recorded against a base/branch that has since "
+                "moved (#1479) — re-dispatching instead of deadlocking "
+                "against the merge gate's `smoke_required` (#3309).",
+                completed.repo_name, completed.issue_number,
+                completed.assignment_id, completed.test_state,
+            )
 
         # #685: per-issue test-mode policy gates auto-smoke dispatch.
         #   test-mode:auto  → headless smoke (auto-dispatch here).
