@@ -4098,6 +4098,226 @@ def test_dispatch_scoped_reviews_for_queue_respects_per_pass_cap(
     assert len(dispatched) == 1
 
 
+# ── #3310: the scoped path's missing atomic in-flight claim ─────────────────
+#
+# vimcode#883 (2026-09-11): two review workers dispatched ONE SECOND apart,
+# both carrying `review_of_assignment_id=d9a216082383` — the same work leg —
+# and both run to completion on the same machine; the collision was only
+# caught downstream, at the findings writer
+# (`review_findings_clobber_blocked`), after both metered legs had been paid
+# for. #3113 gave `dispatch_review` an atomic `claim_review_dispatch`, but
+# `dispatch_scoped_review` had NO claim at all (only its callers' in-memory
+# `already_handled` board scan, which is a snapshot and stale-able across
+# processes exactly like the one #3113 replaced), and
+# `maybe_scoped_review_for_completed_fix`'s claim was keyed on the completed
+# FIX leg, not on the parent the review it emits actually carries — so the
+# two never serialized against each other.
+#
+# The helper below builds the eligible-for-scoped-review board/queue shape
+# these tests share; the `stale_board` argument is what makes the race
+# testable: two producers in separate processes each hold their OWN Board
+# snapshot, so the second one genuinely cannot see the first one's dispatch.
+
+
+def _scoped_race_fixture() -> tuple[Board, "QueuedMerge"]:
+    """Board + PENDING queue entry eligible for a scoped re-review."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+    return board, entry
+
+
+def test_scoped_review_queue_sweep_race_dispatches_exactly_one(
+    two_machine_config: Config,
+) -> None:
+    """#3310 REPRO: two producers (the `coord notify` driver at a 5-minute
+    cadence and the drive-queue tick at 3) reach the merge-queue scoped
+    sweep seconds apart, each with its own board snapshot. Before the fix
+    both dispatched — two metered reviews, one work leg. Exactly one may
+    win now."""
+    board_a, entry_a = _scoped_race_fixture()
+    board_b, entry_b = _scoped_race_fixture()  # the second process's snapshot
+
+    client_a = _FakeHTTPClient({"id": "scoped-race-a"})
+    client_b = _FakeHTTPClient({"id": "scoped-race-b"})
+
+    first = dispatch_scoped_reviews_for_queue(
+        board_a, two_machine_config, queue_items=[entry_a],
+        http_client=client_a, diff_fetcher=_scoped_diff_fetcher,
+    )
+    second = dispatch_scoped_reviews_for_queue(
+        board_b, two_machine_config, queue_items=[entry_b],
+        http_client=client_b, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert len(first) == 1, "the first producer must dispatch"
+    assert second == [], (
+        "the second producer dispatched a duplicate scoped review for the "
+        "same review_of_assignment_id — the #3310 race"
+    )
+    # And it cost nothing: the loser never POSTed to an agent at all.
+    assert client_b.calls == []
+
+
+def test_scoped_review_claim_blocks_when_full_review_already_claimed(
+    two_machine_config: Config,
+) -> None:
+    """The claim is keyed on the parent the review will carry, which is the
+    SAME key `dispatch_review` claims for that work assignment — so a full
+    review already in flight for `w1` blocks a scoped one, and vice versa."""
+    from coord.state import claim_review_dispatch
+
+    board, entry = _scoped_race_fixture()
+    assert claim_review_dispatch("w1") is True  # stand-in for dispatch_review
+
+    client = _FakeHTTPClient({"id": "scoped-blocked"})
+    result = dispatch_scoped_review(
+        entry, _scoped_prior_review(), board, two_machine_config,
+        http_client=client, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is None
+    assert client.calls == []
+    assert board.active == []
+
+
+def test_scoped_review_retains_claim_for_terminal_status_release(
+    two_machine_config: Config,
+) -> None:
+    """On success the claim is HELD (a second pass must still lose it) and
+    handed off to the dispatched review row's own terminal-status write —
+    `release_review_claim_if_row_is_review` keys on exactly the
+    `review_of_assignment_id` the scoped review stamps, so nothing new has
+    to release it and it can never be stranded."""
+    from coord.state import has_review_claim, release_review_claim_if_row_is_review
+
+    board, entry = _scoped_race_fixture()
+    result = dispatch_scoped_review(
+        entry, _scoped_prior_review(), board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "scoped-held"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is not None
+    assert result.review_of_assignment_id == "w1"
+    assert has_review_claim("w1") is True
+
+    release_review_claim_if_row_is_review(result.assignment_id)
+    assert has_review_claim("w1") is False, (
+        "the claim must clear through the ordinary terminal-status hook — a "
+        "held-forever claim denies every later legitimate re-review"
+    )
+
+
+def test_scoped_review_releases_claim_when_every_candidate_unreachable(
+    two_machine_config: Config,
+) -> None:
+    """A transient "all agents unreachable" pass dispatched nothing, so the
+    next pass must be free to retry — never stranded behind a claim nothing
+    will ever clear (the coord-tui#49 failure shape #3206 fixed for the full
+    path)."""
+    import httpx
+
+    from coord.state import has_review_claim
+
+    class _UnreachableClient:
+        def post(self, url: str, *, json: dict, timeout: float):
+            raise httpx.ConnectError("agent down")
+
+    board, entry = _scoped_race_fixture()
+    result = dispatch_scoped_review(
+        entry, _scoped_prior_review(), board, two_machine_config,
+        http_client=_UnreachableClient(), diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is None
+    assert has_review_claim("w1") is False
+
+
+def test_scoped_review_releases_claim_when_dispatch_raises(
+    two_machine_config: Config,
+) -> None:
+    """Release-then-reraise: an unhandled exception between winning the claim
+    and recording the review creates no review row, so the terminal-status
+    release hook would never fire for it."""
+    from coord.state import has_review_claim
+
+    class _ExplodingClient:
+        def post(self, url: str, *, json: dict, timeout: float):
+            raise RuntimeError("boom")
+
+    board, entry = _scoped_race_fixture()
+    with pytest.raises(RuntimeError):
+        dispatch_scoped_review(
+            entry, _scoped_prior_review(), board, two_machine_config,
+            http_client=_ExplodingClient(), diff_fetcher=_scoped_diff_fetcher,
+        )
+
+    assert has_review_claim("w1") is False
+
+
+def test_completed_fix_scoped_dispatch_blocks_later_queue_sweep(
+    two_machine_config: Config,
+) -> None:
+    """#3310's cross-path race: `maybe_scoped_review_for_completed_fix`
+    claims the completed FIX leg (`cifix1`), but the review it emits carries
+    the WORK leg (`w1`) as its parent — so before the fix the merge-queue
+    sweep, keyed on nothing at all, happily dispatched a second review for
+    `w1` moments later. Now the parent-keyed claim serializes them."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])
+
+    first = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "scoped-cross-a"}),
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+    )
+    assert first is not None
+    assert first.review_of_assignment_id == "w1"
+
+    # The other producer, one tick later, with its own (pre-dispatch) snapshot.
+    stale_board, stale_entry = _scoped_race_fixture()
+    client_b = _FakeHTTPClient({"id": "scoped-cross-b"})
+    second = dispatch_scoped_reviews_for_queue(
+        stale_board, two_machine_config, queue_items=[stale_entry],
+        http_client=client_b, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert second == [], (
+        "the merge-queue sweep dispatched a duplicate review for w1 while the "
+        "completed-fix path's review was still in flight"
+    )
+    assert client_b.calls == []
+
+
 # ── maybe_scoped_review_for_completed_fix (#3161) ───────────────────────────
 # The bridge that makes the widened trigger actually reachable: a completed
 # ci-fix/fix-round leg gets a review dispatched against it directly by
