@@ -1907,6 +1907,71 @@ def dispatch_smoke(
     return legs[0] if legs else None
 
 
+def _gate_zero_commit_branch(completed: Assignment, config: Config) -> bool:
+    """#3305: refuse to dispatch a Test leg against a branch that carries no
+    commits over its base — there is nothing to check out, so the leg fails
+    at checkout and the next tick dispatches another, forever (the observed
+    incident: claude-coordinator#3230's `epic-decompose` row spun 111 failed
+    smoke legs, 83% of the fleet's 21-day failures, before an operator
+    intervened by hand).
+
+    This is `coord/review.py`'s #1534 zero-commit gate, ported to the Test
+    stage one pipeline step earlier — same primitive
+    (:func:`coord.github_ops.branch_commits_ahead_for_assignment`), same
+    fail-open polarity: only a definite ``ahead == 0`` blocks. ``None`` (a
+    ``gh api compare`` failure, or a repo missing from *config*) must dispatch
+    exactly as today — a network blip must never strand a real Test run, and
+    review.py already caught the case that matters (`review_state ==
+    "zero_commits"`) independently, so this gate is a backstop, not the
+    primary signal.
+
+    Scoped to every `WORK_LIKE_TYPES` completion, not just `epic-decompose`:
+    nothing about the failure shape is decompose-specific — any worker killed
+    mid-session before its first push reproduces it.
+
+    Returns ``True`` (and records a terminal ``TEST_STATE_BLOCKED`` verdict on
+    the row, same as :func:`_report_unroutable_smoke`) when this completion
+    must NOT be dispatched. The caller is responsible for stopping there.
+    """
+    ahead = github_ops.branch_commits_ahead_for_assignment(completed, config)
+    if ahead != 0:
+        return False
+
+    reason = (
+        f"Test stage refused: branch {completed.branch!r} carries 0 commits "
+        f"ahead of its base — nothing was ever pushed (or the branch was "
+        f"deleted), so a Test leg can only fail at checkout (#3305). "
+        f"Re-dispatch the work instead of retrying Test; clear this with "
+        f"`coord diagnose {completed.repo_name} {completed.issue_number} "
+        f"--stage test --reset` once a real branch exists."
+    )
+    logger.warning(
+        "dispatch_smoke: %s#%s — %s", completed.repo_name,
+        completed.issue_number, reason,
+    )
+    if completed.assignment_id is None:
+        # No row to write to (shouldn't happen for a board completion) — the
+        # log above is the only surface left.
+        return True
+    try:
+        from coord.state import record_test_verdict  # noqa: PLC0415
+
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=reason,
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "dispatch_smoke: failed to record the zero-commit Test verdict "
+            "for %s", completed.assignment_id,
+        )
+        return True
+    completed.test_state = TEST_STATE_BLOCKED
+    completed.test_reason = reason
+    return True
+
+
 def _dispatch_smoke_legs(
     completed: Assignment,
     board: Board,
@@ -1937,6 +2002,9 @@ def _dispatch_smoke_legs(
         # --stage test --reset`) once the fleet is fixed. `dispatch_pending_
         # smoke` already skips rows with a verdict; this covers the callers
         # that hand us a row directly (reconcile).
+        return []
+
+    if _gate_zero_commit_branch(completed, config):
         return []
 
     # #1819: a row that a LATER work-like row superseded on the same branch is
