@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from coord.models import WORK_LIKE_TYPES
+
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
     from coord.acceptance import ManifestData
     from coord.config import Config
@@ -73,7 +75,20 @@ STAGE_ASSIGNMENT_TYPES: dict[str, tuple[str, ...]] = {
     # number (false "stage looks healthy"/wrong-row confidence) instead of
     # flagging the real wedge.
     "review": ("review", "test-author", "mock-author"),
-    "test": ("work", "plan"),
+    # #3305: the Test-gate's own `test_state`/`test_reason` is written onto
+    # whichever `WORK_LIKE_TYPES` row was actually dispatched to Test —
+    # `dispatch_smoke`'s #3305 zero-commit gate blocks `mock-author`/
+    # `test-author`/`epic-decompose` rows exactly like `work` rows (it's
+    # scoped to all of `WORK_LIKE_TYPES`, not just `work`). Before this, an
+    # operator running the gate's own recommended `coord diagnose --stage
+    # test --reset` against one of those three types found no `("work",
+    # "plan")` row for the issue, took the `latest is None` early return, and
+    # reported `recovered=True` ("nothing wedged") without ever finding, let
+    # alone clearing, the blocked row — a false "healthy" that left the row
+    # stuck at `TEST_STATE_BLOCKED` forever. Widened to match the dispatch
+    # side's own definition of "carries a test_state" instead of a narrower,
+    # silently-inconsistent set.
+    "test": ("plan", *sorted(WORK_LIKE_TYPES)),
     "merge": ("work", "plan"),
     # #2087: previously absent entirely — `--stage smoke` (or an implicit
     # `current_stage()` pick landing on a `type="smoke"` row, e.g. a Test
@@ -1499,7 +1514,14 @@ def _do_reset(
         )
         return
     if stage == "test":
-        _reset_test_stage(repo_name, issue_number, res, dry_run=dry_run)
+        # #3305: thread `latest.assignment_id` through so a `test-author`/
+        # `mock-author` reset — like the `review` reset above — only clears
+        # the ONE JIT-slice row being diagnosed, not every sibling slice that
+        # happens to share `issue_number` (the milestone tracking issue).
+        _reset_test_stage(
+            repo_name, issue_number, res,
+            dry_run=dry_run, assignment_id=latest.assignment_id,
+        )
         return
 
     # work / plan / merge — clear a live/phantom session, KEEP the branch.
@@ -1704,16 +1726,28 @@ def _reset_review_stage(
 
 
 def _reset_test_stage(
-    repo_name: str, issue_number: int, res: DiagnoseResult, *, dry_run: bool
+    repo_name: str, issue_number: int, res: DiagnoseResult, *,
+    dry_run: bool, assignment_id: str | None = None,
 ) -> None:
-    """Clear the Test-gate verdict so the issue is re-testable.  No code touched."""
+    """Clear the Test-gate verdict so the issue is re-testable.  No code touched.
+
+    #3305: *assignment_id* is the row being diagnosed (``latest.assignment_id``).
+    ``state.reset_work_test_state`` blasts by ``issue_number`` alone for
+    ``work``/``plan``/``epic-decompose`` (safe — issue_number uniquely
+    identifies one work chain for those types) but requires *assignment_id*
+    to touch a ``test-author``/``mock-author`` row, since those share
+    ``issue_number`` across sibling JIT-slice assignments for the same
+    milestone tracking issue.
+    """
     from coord import state  # noqa: PLC0415
 
     if dry_run:
         res.findings.append("(dry-run) would clear test_state → re-testable")
         res.needs_reset = True
         return
-    updated = state.reset_work_test_state(repo_name, issue_number)
+    updated = state.reset_work_test_state(
+        repo_name, issue_number, assignment_id=assignment_id
+    )
     res.actions_taken.append(f"cleared Test verdict on {updated} work row(s) (re-testable)")
     res.reset_performed = True
     res.recovered = True

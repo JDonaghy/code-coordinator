@@ -1500,13 +1500,49 @@ def test_reset_test_clears_test_state(monkeypatch, config) -> None:
     calls: dict = {}
     monkeypatch.setattr(
         "coord.state.reset_work_test_state",
-        lambda repo, issue: calls.setdefault("test", (repo, issue)) or 1,
+        lambda repo, issue, *, assignment_id=None: calls.setdefault(
+            "test", (repo, issue, assignment_id)
+        )
+        or 1,
     )
     a = _assign(aid="w1", typ="work", status="done")  # test verdict rides the work row
     board = Board(completed=[a])
     res = diagnose.diagnose_stage(board, config, "api", 42, "test", reset=True)
     assert res.reset_performed is True
-    assert calls["test"] == ("api", 42)
+    assert calls["test"] == ("api", 42, "w1")
+
+
+def test_reset_test_finds_epic_decompose_row(monkeypatch, config) -> None:
+    """#3305 review: `coord diagnose --stage test --reset` is the gate's own
+    recommended recovery command for a `TEST_STATE_BLOCKED` row — including
+    an `epic-decompose` row, the exact type of the original #3230 incident.
+    Before this fix `STAGE_ASSIGNMENT_TYPES["test"] == ("work", "plan")`
+    meant `stage_assignments` found no row for an `epic-decompose` completion,
+    so `diagnose_stage` took the `latest is None` early return and reported
+    `recovered=True` ("nothing wedged") without ever touching the blocked
+    row. Assert the row is now actually found and its test_state cleared."""
+    _stub(monkeypatch, session="dead")
+    calls: dict = {}
+    monkeypatch.setattr(
+        "coord.state.reset_work_test_state",
+        lambda repo, issue, *, assignment_id=None: calls.setdefault(
+            "test", (repo, issue, assignment_id)
+        )
+        or 1,
+    )
+    a = _assign(aid="ed1", typ="epic-decompose", status="done", issue=3230)
+    a.test_state = "blocked"
+    a.test_reason = "Test stage refused: branch carries 0 commits ahead of its base"
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 3230, "test", reset=True)
+    assert res.reset_performed is True
+    assert res.recovered is True
+    assert calls["test"] == ("api", 3230, "ed1")
+    # Sanity: without --reset, the same row must be *found* too (not the
+    # `latest is None` early return) even though it's already "healthy" —
+    # only the fact that it locates the row matters here.
+    findings_res = diagnose.diagnose_stage(board, config, "api", 3230, "test")
+    assert any("ed1" in f for f in findings_res.findings)
 
 
 # ── #1605: stuck test_state with a terminal smoke child ─────────────────────
