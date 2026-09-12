@@ -2712,15 +2712,44 @@ def reset_work_review_state(
     return cur.rowcount
 
 
-def reset_work_test_state(repo_name: str, issue_number: int) -> int:
-    """Clear the work/plan rows' Test-gate verdict (``test_state`` /
-    ``test_reason``) so the issue is re-testable.  Returns rows updated."""
+def reset_work_test_state(
+    repo_name: str, issue_number: int, *, assignment_id: str | None = None
+) -> int:
+    """Clear a work-like row's Test-gate verdict (``test_state`` /
+    ``test_reason``) so the issue is re-testable.  Returns rows updated.
+
+    #3305: ``coord diagnose --stage test --reset`` must clear the row it
+    diagnosed regardless of which ``WORK_LIKE_TYPES`` member it is — the
+    Test-gate's #3305 zero-commit gate (``coord.smoke._gate_zero_commit_branch``)
+    blocks ``mock-author``/``test-author``/``epic-decompose`` rows exactly
+    like ``work`` rows, so a reset that only understood ``work``/``plan``
+    silently did nothing for the other three (the exact incident type,
+    ``epic-decompose``, included). Mirrors :func:`reset_work_review_state`'s
+    #1180 split: ``work``/``plan``/``epic-decompose`` are safe to blast by
+    ``issue_number`` alone (it uniquely identifies one issue's work chain for
+    these types), but ``test-author``/``mock-author`` share ``issue_number``
+    across sibling JIT-slice assignments for the same milestone tracking
+    issue, so those two additionally require *assignment_id* to match — a
+    caller that doesn't know which specific row it means (``assignment_id``
+    left as ``None``) leaves them untouched rather than risk clobbering a
+    sibling slice's genuine verdict.
+    """
     conn = get_connection()
-    cur = sql.execute(conn,
-        "UPDATE assignments SET test_state=NULL, test_reason=NULL "
-        "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
-        (repo_name, issue_number),
-    )
+    if assignment_id is not None:
+        cur = sql.execute(conn,
+            "UPDATE assignments SET test_state=NULL, test_reason=NULL "
+            "WHERE repo_name=? AND issue_number=? AND ("
+            "type IN ('work','plan','epic-decompose') OR "
+            "(type IN ('test-author','mock-author') AND assignment_id=?)"
+            ")",
+            (repo_name, issue_number, assignment_id),
+        )
+    else:
+        cur = sql.execute(conn,
+            "UPDATE assignments SET test_state=NULL, test_reason=NULL "
+            "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan','epic-decompose')",
+            (repo_name, issue_number),
+        )
     conn.commit()
     return cur.rowcount
 
