@@ -3182,6 +3182,86 @@ def _capture_claude_session_id(transition: Transition, entry: dict) -> None:
         )
 
 
+# #3314: how long a still-missing claude_session_id stays worth retrying.
+# The agent's own live /status response only reports a session id for an
+# assignment it still remembers — bounded so `retry_pending_claude_session_id_
+# captures` doesn't keep spending an HTTP round-trip per candidate machine on
+# a row whose window of recoverability (see that function's docstring) has
+# long since closed.
+CLAUDE_SESSION_ID_RETRY_WINDOW_SECONDS = 30 * 60
+
+
+def retry_pending_claude_session_id_captures(config: Config) -> list[str]:
+    """#3314: re-poll agents for a ``claude_session_id`` that
+    :func:`_capture_claude_session_id` missed at completion-transition time.
+
+    That function gets exactly ONE look at an assignment's agent-status
+    entry — the single poll that ``detect_transitions`` first observes it
+    transitioning to a terminal state. ``post_transition`` then marks the
+    assignment notified, which removes it from every future poll's
+    candidate set — so a session id the agent hadn't finished capturing
+    *yet* at that exact instant (a timing/ordering race between the
+    worker's process reap and the agent's own log-tail parse, landing on
+    some machines far more often than others — see #3314's own repro) was
+    silently dropped and never retried, even though the agent's live
+    ``/status`` would go on to report it correctly a poll or two later.
+
+    This mirrors the identical fallback ``coord chat-continue`` already
+    falls back to when its DB read comes back NULL
+    (``coord/commands/dispatch.py``): re-query the agent's live ``/status``
+    for the specific assignment IDs still missing one, and persist whatever
+    it reports now. Grouped by machine so a fleet with many candidates on
+    one host still costs one ``/status`` call per host, not one per row.
+
+    Best-effort and silent on any single-machine failure — this is pure
+    local bookkeeping (no GitHub post, no new dispatch), safe to call every
+    pass. Returns the list of assignment IDs captured this pass, for tests.
+    """
+    from coord.state import (  # noqa: PLC0415
+        list_assignments_missing_claude_session_id,
+        update_assignment_claude_session_id,
+    )
+
+    pending = list_assignments_missing_claude_session_id(
+        max_age_seconds=CLAUDE_SESSION_ID_RETRY_WINDOW_SECONDS,
+    )
+    if not pending:
+        return []
+
+    by_machine: dict[str, set[str]] = {}
+    for row in pending:
+        by_machine.setdefault(row["machine_name"], set()).add(row["assignment_id"])
+
+    machines_by_name = {m.name: m for m in config.machines}
+    captured: list[str] = []
+    for machine_name, wanted in by_machine.items():
+        machine = machines_by_name.get(machine_name)
+        if machine is None:
+            continue
+        try:
+            status = _agent_status(machine.host)
+            if status is None:
+                continue
+            for bucket in ("completed", "active"):
+                for entry in status.get(bucket, []):
+                    aid = entry.get("id")
+                    if aid not in wanted:
+                        continue
+                    session_id = entry.get("claude_session_id")
+                    if not isinstance(session_id, str) or not session_id:
+                        continue
+                    update_assignment_claude_session_id(aid, session_id)
+                    captured.append(aid)
+                    wanted.discard(aid)
+        except Exception as exc:  # noqa: BLE001 — one bad machine must not sink the rest
+            log.warning(
+                "retry_pending_claude_session_id_captures: failed for machine %s: %s",
+                machine_name, exc,
+            )
+            continue
+    return captured
+
+
 def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     """Post the GitHub comment for one transition and mark it notified."""
     started = entry.get("started_at")
@@ -4269,6 +4349,7 @@ def run_drain(
     ``finished_at`` stamped                     yes      no race, no cost
     completion comment posted                   yes      ``coord:`` markers make it idempotent
     test-gate backfill (#1076/#1152)            yes      no race, no cost
+    claude_session_id retry sweep (#3314)       yes      no race, no cost; idempotent re-poll
     Test-stage smoke dispatch (#1426)           yes      the gate review waits on; see below
     orphaned review findings posted             yes      comment + verdict capture only
     review dispatch                             yes      guarded; see below
@@ -4464,6 +4545,17 @@ def _run_drain_locked(config: Config) -> DrainResult:
                 review_completions.append((transition, record, entry))
     except Exception:  # noqa: BLE001
         log.exception("notify drain: detect_transitions failed")
+
+    # Step 1b (#3314): re-poll agents for any claude_session_id step 1's
+    # transition loop missed — see retry_pending_claude_session_id_captures'
+    # docstring for the timing race this recovers from (the agent's own
+    # log-tail parse racing its process reap, on some machines far more
+    # often than others). No race, no cost if repeated — pure local
+    # bookkeeping, same as `finished_at`/test-gate backfill above.
+    try:
+        retry_pending_claude_session_id_captures(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: retry_pending_claude_session_id_captures failed")
 
     # Step 2 (#2844): open PRs for work-leg completions still missing one —
     # BEFORE the Test-stage dispatch below, so the pull_request CI run starts
@@ -4737,6 +4829,17 @@ def run(
             and (record.get("issue_title") or "").startswith("[fix-")
         ):
             fix_completions.append((transition, record))
+
+    # #3314: re-poll agents for any claude_session_id the transition loop
+    # above missed — see retry_pending_claude_session_id_captures' docstring
+    # for the timing race this recovers from. Pure local bookkeeping (no
+    # GitHub post, no new dispatch), so it isn't gated on `_roll_pending` and
+    # doesn't get its own bucket in this function's return tuple, matching
+    # _capture_cost/_capture_smoke_tests/_capture_completion_summary above.
+    try:
+        retry_pending_claude_session_id_captures(config)
+    except Exception:  # noqa: BLE001
+        log.exception("retry_pending_claude_session_id_captures: unexpected error")
 
     # Also detect and post stuck signals
     stuck_posted: list[StuckDetection] = []
