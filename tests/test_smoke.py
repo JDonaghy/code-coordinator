@@ -1232,6 +1232,104 @@ def test_dispatch_smoke_skipped_for_failed_or_review(
     ) is None
 
 
+# ── #3305: zero-commit gate — port of review.py's #1534 gate one pipeline
+# stage earlier, so a `status="done"` work-like row whose branch was never
+# pushed cannot spin the Test stage forever. ────────────────────────────────
+
+
+def test_dispatch_smoke_blocks_definite_zero_commit_branch(
+    gtk_and_server_config: Config, monkeypatch, coord_db,
+) -> None:
+    """A confirmed `ahead == 0` must refuse to dispatch a Test leg — there is
+    no branch to check out — and record a terminal, self-explaining verdict
+    on the row instead of leaving it to spin every tick (claude-coordinator
+    #3230's 111-failed-leg incident)."""
+    from coord.state import record_dispatched_assignment
+    from coord.smoke import TEST_STATE_BLOCKED
+
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 0
+    )
+    completed = _completed()
+    record_dispatched_assignment(assignment=completed, repo_github="acme/api")
+    board = Board(completed=[completed])
+
+    result = dispatch_smoke(
+        completed, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is None
+    assert completed.test_state == TEST_STATE_BLOCKED
+    reason = completed.test_reason or ""
+    assert completed.branch in reason
+    assert "#3305" in reason
+    assert "coord diagnose" in reason
+
+    row = coord_db.execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        (completed.assignment_id,),
+    ).fetchone()
+    assert row["test_state"] == TEST_STATE_BLOCKED
+    assert completed.branch in row["test_reason"]
+
+
+def test_dispatch_smoke_dispatches_when_commit_count_unconfirmable(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """Fail OPEN: `ahead is None` (a `gh api compare` failure, or a repo
+    missing from config) must dispatch exactly as if the gate didn't exist —
+    a network blip must never strand a real Test run (mirrors review.py's
+    #1534 fail-open polarity)."""
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: None
+    )
+    result = dispatch_smoke(
+        _completed(), Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+
+
+def test_dispatch_smoke_unaffected_when_branch_has_commits(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """The ordinary, well-behaved case — a branch with real commits ahead of
+    base — must dispatch exactly as before the gate existed."""
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 4
+    )
+    result = dispatch_smoke(
+        _completed(), Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+
+
+def test_dispatch_smoke_zero_commit_gate_scopes_to_every_work_like_type(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3305 explicitly scopes the gate to ALL of `WORK_LIKE_TYPES`, not just
+    `epic-decompose` — any killed-mid-session worker of any work-like type
+    reproduces the same unpushed-branch shape."""
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 0
+    )
+    decompose = replace(_completed(), type="epic-decompose", assignment_id="ed1")
+    result = dispatch_smoke(
+        decompose, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is None
+    assert decompose.test_state == "blocked"
+
+
 def test_dispatch_smoke_dispatches_for_mock_author_type(
     gtk_and_server_config: Config,
 ) -> None:
