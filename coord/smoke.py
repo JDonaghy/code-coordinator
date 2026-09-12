@@ -1516,6 +1516,82 @@ def mute_smoke_tally(count: int) -> str:
     return f"{NO_SMOKE_VERDICT_MARKER} x{count}"
 
 
+# ── Environmental Test-stage retries: the rate-limit budget (#3315) ─────────
+#
+# A sustained Claude API 429 (the account's weekly usage limit exhausted
+# mid-window, 2026-09-11/12) produced 542 Test-stage legs on one issue over
+# 12h18m — every leg died at zero turns/zero tokens. Each death is correctly
+# classified `environmental` by `coord.reconcile.propagate_smoke_terminal_
+# failure` (#1605) and cleared back to `test_state=None` so the row isn't
+# charged against the work-failure budget — right for a genuine blip, but
+# that clear was UNCONDITIONAL, so `dispatch_pending_smoke` picked the row
+# straight back up on the very next tick and re-dispatched into the same
+# exhausted budget, forever. Nothing ever stopped it; the window resetting on
+# its own is what ended the incident.
+#
+# The fix mirrors `coord/drive.py`'s WORK-stage environmental retry budget
+# (`_ENVIRONMENTAL_WORK_RETRY_BUDGET`, #2360): "environmental" means "don't
+# spend the WORK-failure budget on the provider's fault", never "retry
+# infinitely". Same shape as the mute-leg budget just above — a marker +
+# tally embedded in `test_reason`, the one field that survives across
+# Test-stage legs — because it is the same problem: bound a retry that a
+# naive re-dispatch treats as free.
+#
+# Kept as its own constant here rather than importing
+# `coord.drive._ENVIRONMENTAL_WORK_RETRY_BUDGET` directly: smoke.py must not
+# depend on drive.py (see this module's docstring, "why a separate module
+# from coord/review.py"), so the two budgets are independent knobs that
+# happen to agree on the same number on purpose — an operator reading
+# "environmental, budget exhausted" on either stage sees the same tolerance.
+ENVIRONMENTAL_SMOKE_RETRY_BUDGET = 5
+
+#: The marker left in the parent work row's ``test_reason`` when an
+#: environmental Test-stage death (#1605) is cleared for automatic
+#: re-dispatch. Suffixed with `` xN`` from the second CONSECUTIVE leg on,
+#: exactly like :data:`NO_SMOKE_VERDICT_MARKER` — see :func:`environmental_
+#: smoke_tally`.
+ENVIRONMENTAL_SMOKE_MARKER = "environmental-retry (#3315)"
+
+#: Matches the marker with or without its `` xN`` tally — mirrors
+#: :data:`_MUTE_TALLY_RE`.
+_ENV_RETRY_TALLY_RE = re.compile(
+    re.escape(ENVIRONMENTAL_SMOKE_MARKER) + r"(?:\s*x\s*(\d+))?", re.IGNORECASE
+)
+
+
+def environmental_smoke_legs(test_reason: str | None) -> int:
+    """How many CONSECUTIVE environmental Test-stage deaths *test_reason*
+    records (0 if none) — the reader half of the #3315 budget, mirroring
+    :func:`mute_smoke_legs`.
+
+    Any write that is NOT an environmental-death clear (a mute-leg record, a
+    real pass/fail verdict, a fresh dispatch's plain "running" stamp) does not
+    carry this marker, so the tally naturally resets to 0 the moment the row
+    stops dying environmentally — exactly the behaviour the #3315 budget
+    needs: only *consecutive* environmental deaths count against it.
+    """
+    if not test_reason:
+        return 0
+    match = _ENV_RETRY_TALLY_RE.search(test_reason)
+    if match is None:
+        return 0
+    raw = match.group(1)
+    if raw is None:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:  # pragma: no cover — regex only matches digits
+        return 1
+
+
+def environmental_smoke_tally(count: int) -> str:
+    """The marker for *count* consecutive environmental Test-stage deaths —
+    mirrors :func:`mute_smoke_tally`."""
+    if count <= 1:
+        return ENVIRONMENTAL_SMOKE_MARKER
+    return f"{ENVIRONMENTAL_SMOKE_MARKER} x{count}"
+
+
 #: Soft (transient) unroutable reports already logged this process, keyed by
 #: ``(assignment_id, message)``. Transient conditions — a machine that is
 #: merely unreachable right now — are left re-dispatchable so the stage
@@ -2394,9 +2470,23 @@ def _dispatch_smoke_single_leg(
         # the board-carried value when it is unavailable (thin client, remote
         # read failure). Both are bounded previews at worst and the tally is
         # written at the front of the reason, so either still carries it.
+        authoritative_reason = load_assignment_test_reason(completed.assignment_id)
+        board_reason = getattr(completed, "test_reason", None)
         prior_legs = max(
-            mute_smoke_legs(load_assignment_test_reason(completed.assignment_id)),
-            mute_smoke_legs(getattr(completed, "test_reason", None)),
+            mute_smoke_legs(authoritative_reason), mute_smoke_legs(board_reason),
+        )
+        # #3315: ...and this stamp must ALSO carry the ENVIRONMENTAL-retry
+        # tally forward, for the identical #2272 reason above — a fresh
+        # `record_test_verdict(test_state="running", ...)` call is the same
+        # writer that used to erase the mute-leg count, and it erases this
+        # tally exactly the same way if it isn't re-stated here. Without this,
+        # the #3315 budget below (`coord.reconcile.propagate_smoke_terminal_
+        # failure`) can never fire: every "running" stamp between two
+        # environmental deaths would silently hand the row a fresh budget,
+        # reproducing the 542-leg incident this exists to bound.
+        prior_env_legs = max(
+            environmental_smoke_legs(authoritative_reason),
+            environmental_smoke_legs(board_reason),
         )
         running_reason = "dispatched: Test stage running (#1426)"
         if prior_legs:
@@ -2404,6 +2494,13 @@ def _dispatch_smoke_single_leg(
                 f"{mute_smoke_tally(prior_legs)} — {running_reason}; "
                 f"retry {prior_legs + 1} of {MUTE_SMOKE_LEG_BUDGET} after "
                 f"{prior_legs} Test-stage leg(s) produced no verdict (#2272)"
+            )
+        if prior_env_legs:
+            running_reason = (
+                f"{environmental_smoke_tally(prior_env_legs)} — "
+                f"{running_reason} ({prior_env_legs} of "
+                f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive "
+                "environmental Test-stage death(s) so far, #3315)"
             )
 
         record_test_verdict(
