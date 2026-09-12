@@ -74,6 +74,10 @@ import httpx
 from coord import github_ops
 from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
+# #3315 review: the shared environmental-retry-budget knob — see
+# `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` below for why this lives in
+# `coord.failure_class` rather than as this module's own literal.
+from coord.failure_class import ENVIRONMENTAL_RETRY_BUDGET
 from coord.models import (
     SEALED_PATH_AUTHOR_TYPES,
     WORK_LIKE_TYPES,
@@ -1537,13 +1541,16 @@ def mute_smoke_tally(count: int) -> str:
 # Test-stage legs — because it is the same problem: bound a retry that a
 # naive re-dispatch treats as free.
 #
-# Kept as its own constant here rather than importing
-# `coord.drive._ENVIRONMENTAL_WORK_RETRY_BUDGET` directly: smoke.py must not
-# depend on drive.py (see this module's docstring, "why a separate module
-# from coord/review.py"), so the two budgets are independent knobs that
-# happen to agree on the same number on purpose — an operator reading
-# "environmental, budget exhausted" on either stage sees the same tolerance.
-ENVIRONMENTAL_SMOKE_RETRY_BUDGET = 5
+# #3315 review: this is `coord.failure_class.ENVIRONMENTAL_RETRY_BUDGET`
+# under a local name, not a second independently-tuned literal — smoke.py
+# already has no reason to depend on `coord.drive` (nothing else here does),
+# but it — like `coord.drive` — already depends on `coord.failure_class` for
+# the environmental/work classification itself, so that leaf module is where
+# the ONE shared number belongs. Importing it directly here (rather than
+# threading it through every caller as a parameter) keeps this module's
+# `_dispatch_smoke_single_leg`/`_dispatch_smoke_fanout` display text able to
+# name the budget without a `coord.reconcile` round-trip.
+ENVIRONMENTAL_SMOKE_RETRY_BUDGET = ENVIRONMENTAL_RETRY_BUDGET
 
 #: The marker left in the parent work row's ``test_reason`` when an
 #: environmental Test-stage death (#1605) is cleared for automatic
@@ -1590,6 +1597,27 @@ def environmental_smoke_tally(count: int) -> str:
     if count <= 1:
         return ENVIRONMENTAL_SMOKE_MARKER
     return f"{ENVIRONMENTAL_SMOKE_MARKER} x{count}"
+
+
+def environmental_smoke_tally_reset(test_reason: str | None) -> str:
+    """*test_reason* with any #3315 environmental-tally marker (and its
+    `` xN`` suffix) removed, trailing whitespace trimmed.
+
+    Every OTHER writer of this tally (`_dispatch_smoke_single_leg`,
+    `coord.reconcile.propagate_smoke_terminal_failure`'s single-leg branch)
+    reconstructs its whole `test_reason` from scratch each time, so the old
+    marker is simply never carried into the new string — no stripping
+    needed. The #3182 fan-out PARENT row is the one exception: its
+    `test_reason` starts with the `[[smoke-fanout:...]]` manifest
+    `_parse_fanout_manifest`/`finalize_smoke_fanout` need to find every
+    sibling leg again, so a re-stamp there must APPEND the updated tally
+    onto that existing text rather than replacing it wholesale — and without
+    this, repeated appends would pile up a duplicate marker per death
+    instead of one running count.
+    """
+    if not test_reason:
+        return ""
+    return _ENV_RETRY_TALLY_RE.sub("", test_reason).rstrip()
 
 
 #: Soft (transient) unroutable reports already logged this process, keyed by
@@ -2737,7 +2765,10 @@ def _dispatch_smoke_fanout(
     if leg_manifest and completed.assignment_id is not None and completed.test_state not in (
         "passed", "skipped", "failed", TEST_STATE_BLOCKED,
     ):
-        from coord.state import record_test_verdict  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            load_assignment_test_reason,
+            record_test_verdict,
+        )
 
         summary = "; ".join(
             f"[{'+'.join(sorted(caps))}]" for _, caps, _ in leg_manifest
@@ -2747,6 +2778,27 @@ def _dispatch_smoke_fanout(
             f"{manifest_line}\nTest stage running across {len(partitions)} "
             f"capability-partition leg(s) (#3182): {summary}."
         )
+        # #3315 review: carry the shared fan-out environmental-retry tally
+        # FORWARD across this rewrite — the identical #2272/#3315 reason the
+        # single-leg path's own "running" stamp must
+        # (`_dispatch_smoke_single_leg`, above): this call REPLACES the
+        # parent's `test_reason` wholesale, and `coord.reconcile.propagate_
+        # smoke_terminal_failure`'s fan-out branch is the only other writer
+        # of this field — if a re-dispatch round here doesn't re-embed
+        # whatever count it left, the very next environmental death reads
+        # zero and the budget can never accumulate past one.
+        authoritative_reason = load_assignment_test_reason(completed.assignment_id)
+        prior_env_legs = max(
+            environmental_smoke_legs(authoritative_reason),
+            environmental_smoke_legs(completed.test_reason),
+        )
+        if prior_env_legs:
+            running_reason = (
+                f"{running_reason}\n{environmental_smoke_tally(prior_env_legs)} "
+                f"({prior_env_legs} of {ENVIRONMENTAL_SMOKE_RETRY_BUDGET} "
+                "consecutive environmental fan-out-leg death(s) so far, "
+                "#3315)"
+            )
         record_test_verdict(
             assignment_id=completed.assignment_id,
             test_state="running",

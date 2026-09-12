@@ -124,6 +124,7 @@ from coord.interactive import (
 from coord.dead_end import DeadEnd, detect_dead_end
 from coord.drive_queue import dispatch_type_for_labels, entries_from_rows, entry_key
 from coord.failure_class import (
+    ENVIRONMENTAL_RETRY_BUDGET,
     classify_failure,
     environmental_backoff_secs,
     plan_usage_limit_resume,
@@ -254,7 +255,15 @@ _CAPTURED_OUTPUT_LIMIT = 4000
 # that window). `max()` against `opts.max_work_retries` at the call site
 # means a run configured with a bigger flat budget than this default is
 # never *tightened* for the environmental case.
-_ENVIRONMENTAL_WORK_RETRY_BUDGET = 5
+# #3315 review: this is now `coord.failure_class.ENVIRONMENTAL_RETRY_BUDGET`
+# under a local name, not an independent literal — the Test stage
+# (`coord.smoke`/`coord.reconcile`) bounds the identical kind of retry
+# against the identical kind of failure and used to carry its own separate
+# `= 5`, which could silently drift from this one the next time either got
+# retuned. Kept as a local alias (rather than rewriting every call site
+# below to the imported name) so this module's own history/diff stays
+# readable.
+_ENVIRONMENTAL_WORK_RETRY_BUDGET = ENVIRONMENTAL_RETRY_BUDGET
 
 # #3214: how many CONSECUTIVE times a same-branch UAT fix-up dispatch
 # (`coord fix <work_aid> --force`, dispatched from the "uat" arm of
