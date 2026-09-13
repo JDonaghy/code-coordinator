@@ -2127,7 +2127,14 @@ def _dispatch_fix_of(
 
     # Iteration accounting mirrors the auto-loop fix path so the merge
     # gate and the next review see an identical work→fix→review chain.
-    next_iteration = (work.review_iteration or 0) + 1
+    # #3322: literally the same function now — `next_fix_iteration` reads the
+    # max round already spent on this (repo, issue, branch) rather than
+    # trusting whichever `work` row `--fix-of` happened to resolve to, so a
+    # `coord fix` interleaved with headless bounces can't re-issue a number
+    # the chain already used (and stall model escalation / the cap with it).
+    from coord.auto_loop import next_fix_iteration as _next_fix_iter  # noqa: PLC0415
+
+    next_iteration = _next_fix_iter(_fx_board, work)
     max_iter = cfg.pipeline.max_review_iterations
     if next_iteration > max_iter:
         if force:
@@ -2752,6 +2759,18 @@ def _dispatch_rework_of(
 
     # Resolve branch: try to find a work assignment by ID first, then
     # fall back to treating the argument as a literal branch name.
+    # #3322: `coord rework` writes to the same branch as every other fix door,
+    # so it shares their iteration counter — and shares the bug. Both arms
+    # below used to read the counter off ONE row (`--rework-of`'s own, or the
+    # FIRST completed row on the branch, which is the oldest, not the newest),
+    # which re-issued a round number the chain had already spent. Route both
+    # through the shared helper so the number is strictly greater than every
+    # round already on that (repo, issue, branch).
+    from coord.auto_loop import (  # noqa: PLC0415
+        next_fix_iteration as _next_fix_iter,
+        next_fix_iteration_for_branch as _next_fix_iter_branch,
+    )
+
     _rw_board = _interactive_board(_build_board_rw)
     _rw_work = _rw_board.find_by_id(rework_of)
     if _rw_work is not None:
@@ -2762,14 +2781,14 @@ def _dispatch_rework_of(
             )
             sys.exit(2)
         rw_branch = _rw_work.branch
-        next_rw_iteration = (_rw_work.review_iteration or 0) + 1
+        next_rw_iteration = _next_fix_iter(_rw_board, _rw_work)
         rw_work_id: str | None = _rw_work.assignment_id
     else:
         # Treat the argument as a branch name — useful when the
         # original assignment has aged off the board.
         rw_branch = rework_of
-        # Look for any completed work on that branch to inherit
-        # the iteration counter; default to 1 if none found.
+        # Look for any completed work on that branch to link back to;
+        # the iteration counter comes from the whole chain, not this one row.
         _branch_work = next(
             (
                 a for a in _rw_board.completed
@@ -2777,10 +2796,11 @@ def _dispatch_rework_of(
             ),
             None,
         )
-        next_rw_iteration = (
-            (_branch_work.review_iteration or 0) + 1
-            if _branch_work is not None
-            else 1
+        next_rw_iteration = _next_fix_iter_branch(
+            _rw_board,
+            repo_name=repo,
+            issue_number=issue,
+            branch=rw_branch,
         )
         rw_work_id = (
             _branch_work.assignment_id if _branch_work is not None else None
