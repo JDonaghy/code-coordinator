@@ -3563,7 +3563,7 @@ class TestFixIterationMonotonicAcrossDispatchPaths:
 
         config.pipeline.max_review_iterations = 10
         config.pipeline.auto_dispatch_stalled = True
-        work, review, board = self._chain(1)  # iter 0 work + iter 1 fix
+        work, _review, board = self._chain(1)  # iter 0 work + iter 1 fix
 
         findings = ReviewFindings(
             verdict="request-changes", body="## Blocking\n- 1. still broken\n"
