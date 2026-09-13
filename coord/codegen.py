@@ -824,7 +824,11 @@ RUST_FIELD_OVERRIDES: dict[str, dict[str, RustField]] = {
             doc=(
                 "#803: fix-round counter — 0 on the original work assignment, N on the",
                 "N-th fix.  Used to compute the next iteration's escalated model via",
-                "[`fix_model_for_iteration`]: `next_iteration = review_iteration + 1`.",
+                "[`fix_model_for_iteration`].  #3322: the next iteration is the MAX",
+                "`review_iteration` over every work-like row on the same (repo, issue,",
+                "branch), plus one — not this row's own value plus one.  The coordinator",
+                "owns that computation (`coord.auto_loop.next_fix_iteration`); read this",
+                "field as the round a row belongs to, never as a base to increment.",
             ),
         ),
         "acceptance_state": _f(
