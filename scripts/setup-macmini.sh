@@ -179,11 +179,20 @@ for pkg in python@3.12 node pipx tmux; do
     brew install "$pkg" && ok "installed $pkg"
   fi
 done
+# gtk4 is OPTIONAL here and either state is fine. Installing it lets this box
+# BUILD gui-on targets (a default `cargo build` of vimcode, whose `gui` feature
+# is on by default); it does NOT make the box gtk-CAPABLE. Those are different
+# claims and only the first is about packages -- see docs/MAC_MINI.md
+# "Does not route there" for the measurement behind the second.
 brew list --versions gtk4 >/dev/null 2>&1 \
-  && ok "gtk4 present" \
-  || skip "gtk4 NOT installed — deliberate. GTK4-on-quartz behaves differently
-       enough that a 'gtk' capability here would be a lie for visual work
-       (docs/MAC_MINI.md). Install it only when macOS GTK is a real target."
+  && ok "gtk4 $(brew list --versions gtk4 | awk '{print $2}') present — lets gui-on
+       targets BUILD here. Does NOT confer the 'gtk' capability: 3 vimcode paint
+       tests fail on quartz and pass on Linux at the same SHA (docs/MAC_MINI.md).
+       Do not add 'gtk' to this machine's capabilities on the strength of this." \
+  || skip "gtk4 not installed — fine, and not required by anything this script
+       sets up. Install it only if you need to build gui-on targets here
+       (e.g. a default-features \`cargo build\` of vimcode); it still would not
+       make this box gtk-capable."
 
 PYTHON312="$BREW_PREFIX/bin/python3.12"
 [[ -x "$PYTHON312" ]] || die "expected python3.12 at $PYTHON312 after brew install"
