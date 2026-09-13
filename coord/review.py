@@ -5107,6 +5107,7 @@ def dispatch_headless_fix(
         _fix_model_for_iteration,
         _load_review_findings,
         _work_is_terminal,
+        next_fix_iteration,
     )
     from coord.state import issue_context_block  # noqa: PLC0415
 
@@ -5116,7 +5117,9 @@ def dispatch_headless_fix(
     if _work_is_terminal(work, config):
         return None
 
-    next_iteration = (work.review_iteration or 0) + 1
+    # #3322: shared with every other fix door — the max round already spent
+    # on this (repo, issue, branch), not just `work`'s own counter.
+    next_iteration = next_fix_iteration(board, work)
     max_iter = config.pipeline.max_review_iterations
     if next_iteration > max_iter:
         return None

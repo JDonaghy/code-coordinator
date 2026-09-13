@@ -16,6 +16,8 @@ from coord.auto_loop import (
     _dispatch_fix,
     _fix_model_for_iteration,
     _post_max_iterations_notice,
+    next_fix_iteration,
+    next_fix_iteration_for_branch,
     process_review_completion,
     run_for_fix_transition,
     run_for_review_transition,
@@ -1149,6 +1151,41 @@ class TestFixModelForIteration:
         assert _fix_model_for_iteration(cfg, 2) is None
         assert _fix_model_for_iteration(cfg, 5) is None
 
+    def test_never_resolves_none_while_escalation_is_enabled(self) -> None:
+        """#3322 acceptance: with `pipeline.escalate_fix_model: true`, no fix
+        round may resolve `model=None`.
+
+        quadraui#962's third round dispatched with no model at all, so the
+        agent fell through to `claude -p`'s own default and the board kept no
+        record of what actually ran. Every iteration a real chain can reach
+        must name a model.
+        """
+        cfg = _config_with_models(default="sonnet")
+        for iteration in range(1, 11):
+            assert _fix_model_for_iteration(cfg, iteration) is not None
+
+    def test_empty_default_falls_back_to_bottom_of_ladder(self) -> None:
+        """#3322: an unset `models.default` must not silently disable the
+        escalation ladder the operator explicitly turned on — fall back to the
+        ladder's own bottom rung and climb from there."""
+        cfg = _config_with_models(default="", escalation=["haiku", "sonnet", "opus"])
+        assert _fix_model_for_iteration(cfg, 1) == "haiku"
+        assert _fix_model_for_iteration(cfg, 2) == "sonnet"
+        assert _fix_model_for_iteration(cfg, 3) == "opus"
+
+    def test_none_only_when_there_is_no_model_to_name(self) -> None:
+        """Both `models.default` and `models.escalation` empty is the one
+        config that can still yield None — it names no model anywhere."""
+        # `_config_with_models` treats an empty ladder as "use the default
+        # ladder", so build this one directly.
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            models=ModelsConfig(default="", escalation=[]),
+            pipeline=PipelineConfig(escalate_fix_model=True),
+        )
+        assert _fix_model_for_iteration(cfg, 1) is None
+
 
 class TestFixModelDispatch:
     """The escalated model lands on both the POST payload and the Assignment."""
@@ -1535,7 +1572,10 @@ class TestFullCycle:
             )
 
         assert actions[0].kind == "max_iterations"
-        mock_notice.assert_called_once_with(work, config)
+        # #3322: the notice now carries the round count read off the whole
+        # branch chain, so a sweep that hands us the iteration-0 row can't
+        # tell the human "completed 0 fix round(s)".
+        mock_notice.assert_called_once_with(work, config, completed_rounds=3)
         assert len(board.active) == 0  # no fix dispatched
 
 
@@ -3338,3 +3378,313 @@ class TestDispatchFixReachabilityFallback:
         assert "laptop" in actions[0].detail
         assert "server" in actions[0].detail
         assert "--machine" in actions[0].detail
+
+
+# ── #3322: the fix-round counter is monotonic across every dispatch path ─────
+
+
+def _fix_row(
+    assignment_id: str,
+    review_iteration: int,
+    *,
+    branch: str = "issue-1-fix",
+    issue_number: int = 1,
+    repo_name: str = "api",
+    type: str = "work",  # noqa: A002 - matches Assignment's field name
+    model: str | None = "sonnet",
+    status: str = "done",
+) -> Assignment:
+    """A completed fix row on a branch, as `_dispatch_fix` would have left it."""
+    return Assignment(
+        machine_name="laptop",
+        repo_name=repo_name,
+        issue_number=issue_number,
+        issue_title=f"[fix-{review_iteration}] Fix the thing",
+        assignment_id=assignment_id,
+        status=status,
+        branch=branch,
+        pr_url="https://github.com/acme/api/pull/42",
+        dispatched_at=float(review_iteration),
+        finished_at=float(review_iteration) + 0.5,
+        type=type,
+        review_state="done",
+        review_iteration=review_iteration,
+        model=model,
+    )
+
+
+class TestNextFixIteration:
+    """The helper itself: max(review_iteration) over the branch chain, + 1."""
+
+    def test_returns_one_for_a_fresh_original_work_row(self) -> None:
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work)
+        assert next_fix_iteration(board, work) == 1
+
+    def test_reads_the_max_over_the_chain_not_the_row_it_was_given(self) -> None:
+        """The whole point of #3322: `work` is frequently NOT the newest row.
+
+        The stalled-pipeline sweep resolves `work` from the stalled detection,
+        which is the ORIGINAL iteration-0 row. `work.review_iteration + 1`
+        therefore re-issued 1 on the third round (vimcode#940).
+        """
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work)
+        board.completed.append(_fix_row("fix-1", 1))
+        board.completed.append(_fix_row("fix-2", 2))
+
+        # Handed the ORIGINAL row, not the newest.
+        assert next_fix_iteration(board, work) == 3
+
+    def test_counts_rows_that_are_still_active(self) -> None:
+        """A fix dispatched moments ago lives in `board.active`, not
+        `completed` — it must still bump the counter."""
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work)
+        board.active.append(_fix_row("fix-1", 1, status="running"))
+        assert next_fix_iteration(board, work) == 2
+
+    def test_ignores_rows_on_a_different_branch(self) -> None:
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work)
+        board.completed.append(_fix_row("other", 7, branch="issue-1-second-attempt"))
+        assert next_fix_iteration(board, work) == 1
+
+    def test_ignores_rows_for_a_different_issue_or_repo(self) -> None:
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work)
+        board.completed.append(_fix_row("other-issue", 9, issue_number=2))
+        board.completed.append(_fix_row("other-repo", 9, repo_name="web"))
+        assert next_fix_iteration(board, work) == 1
+
+    def test_ignores_review_rows(self) -> None:
+        """Review rows mirror the work row's counter rather than owning one."""
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work)
+        stale_review = _review_assignment(assignment_id="rev-9")
+        stale_review.review_iteration = 9
+        board.completed.append(stale_review)
+        assert next_fix_iteration(board, work) == 1
+
+    def test_counts_sealed_path_author_rows(self) -> None:
+        """`_dispatch_fix` emits test-author/mock-author fixes too — they share
+        the branch and therefore the counter."""
+        work = _work_assignment(review_iteration=0, type="test-author")
+        board = _board_with(work)
+        board.completed.append(_fix_row("ta-1", 2, type="test-author"))
+        assert next_fix_iteration(board, work) == 3
+
+    def test_never_regresses_below_the_row_it_was_given(self) -> None:
+        """Even if the caller's own row somehow isn't on the board, its
+        counter is a floor."""
+        work = _work_assignment(review_iteration=4)
+        board = Board(repos=[Repo(name="api", github="acme/api")])
+        assert next_fix_iteration(board, work) == 5
+
+    def test_branch_keyed_form_matches_the_assignment_keyed_form(self) -> None:
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work)
+        board.completed.append(_fix_row("fix-1", 1))
+        board.completed.append(_fix_row("fix-2", 2))
+
+        assert next_fix_iteration_for_branch(
+            board, repo_name="api", issue_number=1, branch="issue-1-fix",
+        ) == next_fix_iteration(board, work)
+
+    def test_branch_keyed_form_starts_at_one_with_no_history(self) -> None:
+        board = Board(repos=[Repo(name="api", github="acme/api")])
+        assert next_fix_iteration_for_branch(
+            board, repo_name="api", issue_number=1, branch="issue-1-nothing",
+        ) == 1
+
+
+class TestFixIterationMonotonicAcrossDispatchPaths:
+    """#3322 acceptance: a board with an original work row plus N fix rows on
+    one branch — every fix dispatch must produce a `review_iteration` strictly
+    greater than the max already present for that (repo, issue, branch)."""
+
+    @staticmethod
+    def _chain(n_fix_rows: int) -> tuple[Assignment, Assignment, Board]:
+        """Original work row (iter 0) + *n_fix_rows* fix rows (iter 1..N), and
+        a request-changes review pointing at the ORIGINAL row — the exact
+        shape the stalled-pipeline sweep hands `process_review_completion`."""
+        work = _work_assignment(review_iteration=0)
+        review = _review_assignment(review_of="work-abc")
+        board = _board_with(work, review)
+        for i in range(1, n_fix_rows + 1):
+            board.completed.append(_fix_row(f"fix-{i}", i))
+        return work, review, board
+
+    @staticmethod
+    def _dispatch(review, board, config, tmp_path):
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\nStill broken.\nEND_REVIEW\n"
+        )
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": uuid.uuid4().hex[:12]}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file), http_client=mock_http,
+            )
+        return actions, mock_http
+
+    @pytest.mark.parametrize("existing_fix_rows", [0, 1, 2])
+    def test_auto_loop_bounce_never_repeats_a_round(
+        self, config: Config, tmp_path, existing_fix_rows: int
+    ) -> None:
+        config.pipeline.max_review_iterations = 10
+        _work, review, board = self._chain(existing_fix_rows)
+        prior_max = max(
+            [a.review_iteration or 0 for a in board.completed if a.type == "work"]
+        )
+
+        actions, _ = self._dispatch(review, board, config, tmp_path)
+
+        assert [a.kind for a in actions] == ["fix_dispatched"]
+        fix = board.active[0]
+        assert fix.review_iteration == prior_max + 1
+        assert fix.review_iteration > prior_max
+
+    def test_sweep_path_dispatch_climbs_instead_of_reusing_iteration_1(
+        self, config: Config, tmp_path
+    ) -> None:
+        """vimcode#940's actual regression, through the sweep's own entry point.
+
+        The sweep re-runs `process_review_completion` on a review whose
+        `review_of_assignment_id` is the ORIGINAL iteration-0 work row while a
+        fix at iteration 1 already exists on the branch. Before #3322 this
+        produced iteration 1 *again* and de-escalated back to sonnet.
+        """
+        from coord.notify import StalledDetection, dispatch_stalled_pipeline_action
+
+        config.pipeline.max_review_iterations = 10
+        config.pipeline.auto_dispatch_stalled = True
+        work, review, board = self._chain(1)  # iter 0 work + iter 1 fix
+
+        findings = ReviewFindings(
+            verdict="request-changes", body="## Blocking\n- 1. still broken\n"
+        )
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "sweep-fix"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        detection = StalledDetection(
+            assignment_id=work.assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            reason="review_request_changes_no_fix",
+            detail="review returned request-changes but no fix was dispatched",
+        )
+
+        with patch("coord.auto_loop.record_dispatched_assignment"), patch(
+            "coord.auto_loop._load_review_findings", return_value=findings
+        ), patch("coord.auto_loop.httpx.post", mock_http.post):
+            action = dispatch_stalled_pipeline_action(
+                detection, work, board, config,
+            )
+
+        assert action.kind == "fix_dispatch_attempted", action.detail
+        dispatched = [a for a in board.active if a.type == "work"]
+        assert len(dispatched) == 1
+        fix = dispatched[0]
+        assert fix.review_iteration == 2, (
+            "the sweep read the counter off the original iteration-0 row and "
+            f"re-issued a spent round: got {fix.review_iteration}"
+        )
+        # ...and the model escalated with it, instead of dropping back to
+        # models.default (sonnet) forever.
+        assert fix.model == "opus"
+        assert fix.issue_title.startswith("[fix-2] ")
+
+    def test_headless_dashboard_fix_shares_the_same_counter(
+        self, config: Config
+    ) -> None:
+        """`coord.review.dispatch_headless_fix` — the phone/dashboard door —
+        is the third writer of this counter and must agree with the other two."""
+        from coord.review import dispatch_headless_fix
+
+        config.pipeline.max_review_iterations = 10
+        work, review, board = self._chain(2)  # iter 0 work + fixes at 1 and 2
+        review.review_verdict = "request-changes"
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "phone-fix"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"), patch(
+            "coord.auto_loop._load_review_findings",
+            return_value=ReviewFindings(verdict="request-changes", body="nope"),
+        ), patch("coord.state.issue_context_block", return_value=""):
+            fix = dispatch_headless_fix(
+                work, board, config, parent_type="review", http_client=mock_http,
+            )
+
+        assert fix is not None
+        assert fix.review_iteration == 3
+        assert fix.model == "opus"
+
+    def test_three_rounds_in_a_row_produce_1_2_3_and_escalate(
+        self, config: Config, tmp_path
+    ) -> None:
+        """quadraui#951's correct shape, driven end to end: three consecutive
+        bounces off the SAME original work row (the sweep's binding) climb
+        0 → 1 → 2 → 3 and stay escalated once they leave the base rung."""
+        config.pipeline.max_review_iterations = 10
+        work = _work_assignment(review_iteration=0)
+        review = _review_assignment(review_of="work-abc")
+        board = _board_with(work, review)
+
+        seen: list[tuple[int, str | None]] = []
+        for _ in range(3):
+            actions, _ = self._dispatch(review, board, config, tmp_path)
+            assert [a.kind for a in actions] == ["fix_dispatched"], actions
+            fix = board.active.pop()
+            fix.status = "done"
+            board.completed.append(fix)
+            seen.append((fix.review_iteration, fix.model))
+            # The review row is reused verbatim, still pointing at `work` —
+            # exactly what the sweep does on each pass.
+            work.review_state = "dispatched"
+
+        assert [it for it, _ in seen] == [1, 2, 3]
+        assert [m for _, m in seen] == ["sonnet", "opus", "opus"]
+
+    def test_max_review_iterations_halts_a_chain_that_keeps_failing(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#3322 acceptance: the cap fires through the sweep's binding.
+
+        With `max_review_iterations=3` and fix rows already at 1, 2 and 3, a
+        further bounce off the ORIGINAL iteration-0 row used to compute 1 —
+        under the cap — and dispatch forever. It must now stop.
+        """
+        config.pipeline.max_review_iterations = 3
+        _work, review, board = self._chain(3)
+
+        with patch("coord.auto_loop._post_max_iterations_notice") as notice:
+            actions, mock_http = self._dispatch(review, board, config, tmp_path)
+
+        assert [a.kind for a in actions] == ["max_iterations"]
+        assert board.active == [], "no fix may be dispatched past the cap"
+        mock_http.post.assert_not_called()
+        # The human is told the real number of rounds spent, not the
+        # iteration-0 row's counter.
+        assert notice.call_args.kwargs["completed_rounds"] == 3
+
+    def test_cap_still_allows_the_final_permitted_round(
+        self, config: Config, tmp_path
+    ) -> None:
+        """One below the cap still dispatches — the guard bounds the chain, it
+        doesn't shorten it."""
+        config.pipeline.max_review_iterations = 3
+        _work, review, board = self._chain(2)
+
+        actions, _ = self._dispatch(review, board, config, tmp_path)
+
+        assert [a.kind for a in actions] == ["fix_dispatched"]
+        assert board.active[0].review_iteration == 3

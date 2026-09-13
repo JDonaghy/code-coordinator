@@ -1191,7 +1191,11 @@ def fix_briefing_cmd(aid: str, config_path: Path) -> None:
 
     repo_cfg = cfg.repo(work.repo_name)
     repo_github = repo_cfg.github if repo_cfg else work.repo_name
-    next_iteration = (work.review_iteration or 0) + 1
+    # #3322: shared with every other fix door — the max round already spent
+    # on this (repo, issue, branch), not just `work`'s own counter.
+    from coord.auto_loop import next_fix_iteration as _next_fix_iter  # noqa: PLC0415
+
+    next_iteration = _next_fix_iter(board, work)
     max_iter = cfg.pipeline.max_review_iterations
     if fix_from_test_fail:
         # #1337: the board wire carries a bounded PREVIEW of test_reason; the

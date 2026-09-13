@@ -50,7 +50,12 @@ from coord.config import Config
 from coord.db import is_lock_contention_error
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 from coord import github_ops
-from coord.models import SEALED_PATH_AUTHOR_TYPES, Assignment, Board
+from coord.models import (
+    SEALED_PATH_AUTHOR_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+)
 from coord.review import (
     ReviewFindings,
     blocking_findings_confirmed_absent,
@@ -688,6 +693,87 @@ def _post_advisory_nits_notice(
         )
 
 
+def next_fix_iteration(board: Board, work: Assignment) -> int:
+    """The fix-round number the NEXT fix worker on *work*'s branch must carry.
+
+    #3322: the ONE answer to "given (repo, issue, branch), what is the next
+    fix iteration?".  Every fix-dispatch door calls this instead of computing
+    ``(work.review_iteration or 0) + 1`` for itself:
+
+    * :func:`_dispatch_fix_for_review` (the headless auto-loop bounce, which
+      the #1478 stalled-pipeline sweep also reaches via
+      :func:`process_review_completion`),
+    * ``coord.commands.dispatch_workers._dispatch_fix_of`` (``coord fix``,
+      human-attended),
+    * ``coord.commands.review.fix`` (the interactive ``coord fix`` twin),
+    * :func:`coord.review.dispatch_headless_fix` (the dashboard/phone
+      "unstick this row" button).
+
+    The old per-call-site expression was only correct when *work* happened to
+    be the NEWEST work-like row on the branch.  It frequently wasn't: the
+    stalled sweep resolves *work* from the stalled detection (typically the
+    ORIGINAL iteration-0 row, not the latest fix), so a third round recomputed
+    ``1`` — a number already spent.  Both consequences were silent:
+    ``_fix_model_for_iteration`` re-resolved iteration 1 to
+    ``models.default`` forever (escalation never reached opus), and
+    ``pipeline.max_review_iterations`` compared against a counter that had
+    stopped climbing, so the "stop and ask a human" guard was unreachable on
+    exactly the stories that needed it.  Observed live on vimcode#940
+    (0 → 1 → 0 → 1) against quadraui#951's correct 0 → 1 → 2 the same day.
+
+    Reads the max ``review_iteration`` across every :data:`~coord.models.
+    WORK_LIKE_TYPES` row for that (repo, issue, branch) — ``active`` and
+    ``completed`` alike, since a fix dispatched moments ago is still active —
+    and returns one more.  Review rows are excluded: they mirror the work
+    row's counter rather than owning one.  Branch matching is exact so a
+    genuinely fresh branch for the same issue starts its own chain; when
+    *work* itself has no branch yet, only equally branchless rows count
+    (nothing else can be proven to be on the same chain).
+
+    Monotonic by construction: the result is always strictly greater than
+    every ``review_iteration`` already present on that chain, so the counter
+    can neither repeat nor go backwards no matter which door dispatched.
+    """
+    return next_fix_iteration_for_branch(
+        board,
+        repo_name=work.repo_name,
+        issue_number=work.issue_number,
+        branch=work.branch,
+        floor=work.review_iteration or 0,
+    )
+
+
+def next_fix_iteration_for_branch(
+    board: Board,
+    *,
+    repo_name: str,
+    issue_number: int,
+    branch: str | None,
+    floor: int = 0,
+) -> int:
+    """:func:`next_fix_iteration` keyed on the (repo, issue, branch) triple
+    directly, for the one caller (``coord rework <branch-name>``) that has a
+    branch but no ``Assignment`` row to hang it on.
+
+    *floor* is a lower bound folded into the max — used to keep a caller's own
+    row counted even in the (impossible-in-practice) case where it isn't on
+    the board it passed in.
+
+    Returns ``floor + 1`` when nothing matches, so a chain with no recorded
+    history still starts at 1.
+    """
+    highest = floor
+    for a in (*board.active, *board.completed):
+        if a.type not in WORK_LIKE_TYPES:
+            continue
+        if a.repo_name != repo_name or a.issue_number != issue_number:
+            continue
+        if a.branch != branch:
+            continue
+        highest = max(highest, a.review_iteration or 0)
+    return highest + 1
+
+
 def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
     """Choose the model alias for a fix worker on a given bounce *iteration*.
 
@@ -704,11 +790,22 @@ def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
 
     Example with escalation ``[haiku, sonnet, opus]`` and default ``sonnet``:
     iter 1 → sonnet, iter 2 → opus, iter 3 → opus (capped).
+
+    #3322: with escalation ENABLED this never returns ``None`` — a fix that
+    dispatches with no model at all leaves no record of what actually ran
+    (observed on quadraui#962). An empty ``models.default`` falls back to the
+    bottom rung of ``models.escalation`` rather than silently disabling the
+    ladder the operator asked for; only a config with BOTH unset can still
+    yield ``None``, and that config has no model to name in the first place.
     """
     if not config.pipeline.escalate_fix_model:
         return None
 
-    model = config.models.default
+    model = config.models.default or (
+        config.models.escalation[0] if config.models.escalation else ""
+    )
+    if not model:
+        return None
     # iteration 1 stays on the base model; each later iteration escalates one
     # rung (next_model caps at the top of the ladder).
     for _ in range(max(iteration, 1) - 1):
@@ -880,8 +977,12 @@ def _dispatch_fix_for_review(
             ),
         )]
 
-    # Compute the next iteration number and check the limit.
-    next_iteration = (work.review_iteration or 0) + 1
+    # Compute the next iteration number and check the limit.  #3322: read it
+    # off the WHOLE branch chain, not off `work` alone — the stalled-pipeline
+    # sweep reaches this function with `work` bound to the ORIGINAL
+    # iteration-0 row, so `work.review_iteration + 1` re-issued a number the
+    # chain had already spent (vimcode#940: 0 → 1 → 0 → 1).
+    next_iteration = next_fix_iteration(board, work)
     max_iter = config.pipeline.max_review_iterations
 
     if next_iteration > max_iter:
@@ -890,7 +991,9 @@ def _dispatch_fix_for_review(
             "— stopping loop and notifying user",
             max_iter, work.assignment_id,
         )
-        _post_max_iterations_notice(work, config)
+        _post_max_iterations_notice(
+            work, config, completed_rounds=next_iteration - 1,
+        )
         return [LoopAction(
             kind="max_iterations",
             assignment_id=review.assignment_id,
@@ -1421,15 +1524,28 @@ def _dispatch_fix(
     return fix_assignment
 
 
-def _post_max_iterations_notice(work: Assignment, config: Config) -> None:
-    """Post a GitHub issue comment when the loop hits the iteration limit."""
+def _post_max_iterations_notice(
+    work: Assignment, config: Config, *, completed_rounds: int | None = None,
+) -> None:
+    """Post a GitHub issue comment when the loop hits the iteration limit.
+
+    #3322: *completed_rounds* overrides ``work.review_iteration`` for the
+    "completed N fix round(s)" line. The auto-loop's cap check now reads the
+    round count off the whole branch chain (:func:`next_fix_iteration`), and
+    the ``work`` row it hands us may be the ORIGINAL iteration-0 row rather
+    than the newest fix — reporting *its* counter would tell the human "0 fix
+    rounds, which equals the maximum of 3".
+    """
     from coord import github_ops  # noqa: PLC0415
 
     repo = config.repo(work.repo_name)
     if repo is None:
         return
 
-    completed_rounds = work.review_iteration  # rounds completed so far
+    # rounds completed so far
+    completed_rounds = (
+        work.review_iteration if completed_rounds is None else completed_rounds
+    )
     max_iter = config.pipeline.max_review_iterations
     body = (
         f"<!-- coord:event=auto_loop_stopped assignment={work.assignment_id} -->\n"
