@@ -444,6 +444,89 @@ def milestone_add_child_cmd(
 
 
 @milestone_group.command(
+    "lint-labels",
+    help=(
+        "#3227: read-only report of open issues whose title reads like an "
+        "epic (`Epic:`, `EPIC:`, `[epic]`) but don't carry the `epic` label "
+        "(TRACKING_ISSUE_LABEL) -- invisible to `coord plans` and to the "
+        "WORK-stage dispatch-type check (#3132) as a result. The detection "
+        "counterpart to #1057, which stops new ones at `coord milestone "
+        "write-order` promotion time but can't catch issues that never go "
+        "through that command.\n\n"
+        "Reads only the local issue cache (the `issues` table) -- no "
+        "GitHub round trip -- so it's cheap to run often. Never labels "
+        "anything; a human acts on the report."
+    ),
+)
+@click.option(
+    "--repo", default=None,
+    help="Restrict to this coord-local repo name. Default: every cached repo.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit JSON instead of a table.",
+)
+@_CONFIG_OPTION
+def milestone_lint_labels_cmd(repo: str | None, as_json: bool, config_path: Path) -> None:
+    cfg = _load_config(config_path)
+
+    repo_filter: str | None = None
+    if repo is not None:
+        repo_entry = cfg.repo(repo)
+        if repo_entry is None:
+            click.echo(f"error: unknown repo {repo!r}", err=True)
+            sys.exit(2)
+        repo_filter = repo_entry.name
+
+    from coord import sql  # noqa: PLC0415
+    from coord.db import get_connection  # noqa: PLC0415
+    from coord.milestone_order import find_unlabelled_epics  # noqa: PLC0415
+
+    conn = get_connection()
+    query = "SELECT repo_name, number, title, labels FROM issues WHERE LOWER(state) != 'closed'"
+    params: tuple = ()
+    if repo_filter is not None:
+        query += " AND repo_name = ?"
+        params = (repo_filter,)
+    rows = sql.execute(conn, query, params).fetchall()
+
+    issues: list[dict] = []
+    for row in rows:
+        try:
+            labels = json.loads(row["labels"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            labels = []
+        issues.append(
+            {
+                "repo_name": row["repo_name"],
+                "number": row["number"],
+                "title": row["title"],
+                "labels": labels,
+            }
+        )
+
+    hits = sorted(find_unlabelled_epics(issues), key=lambda h: (h.repo, h.number))
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                [{"repo": h.repo, "number": h.number, "title": h.title} for h in hits],
+                indent=2,
+            )
+        )
+        return
+
+    if not hits:
+        click.echo("No unlabelled epics found.")
+        return
+
+    for h in hits:
+        click.echo(
+            f"{h.repo}  #{h.number}  {h.title!r}  "
+            f"(missing '{TRACKING_ISSUE_LABEL}' label)"
+        )
+
+
+@milestone_group.command(
     "sync",
     help=(
         "#1061 (EP-2): backfill the live GitHub sub-issues API from an "

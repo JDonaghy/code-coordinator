@@ -14,10 +14,13 @@ import pytest
 from coord.milestone_order import (
     Frontier,
     ProgressStatus,
+    UnlabelledEpic,
     WorkOrder,
     WorkOrderError,
     WorkOrderNode,
     compute_progress,
+    find_unlabelled_epics,
+    looks_like_epic_title,
     milestone_work_order_membership,
     parse_progress,
     parse_sub_issues,
@@ -923,3 +926,69 @@ class TestMilestoneWorkOrderMembership:
         assert {(r["repo_name"], r["tracking_issue"]) for r in result} == {
             ("api", 1120), ("web", 55),
         }
+
+
+# ── looks_like_epic_title / find_unlabelled_epics (#3227) ───────────────────
+
+
+class TestLooksLikeEpicTitle:
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Epic: goal-driven autonomous planner",
+            "EPIC: coordinator↔vimcode integration (shared board)",
+            "epic: durable pipeline post-mortem",
+            "[epic] Pipeline escape-hatch: flag long-running tasks",
+            "[platform] Epic: Cloud Platform & Engineer Pool",
+            "[portal] Epic: Customer Portal",
+        ],
+    )
+    def test_matches_known_epic_title_shapes(self, title: str) -> None:
+        assert looks_like_epic_title(title) is True
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "coord milestone: ensure the epic label when promoting",
+            "Fix the epicenter calculation bug",
+            "Add a new endpoint",
+            "",
+        ],
+    )
+    def test_does_not_match_plain_titles(self, title: str) -> None:
+        assert looks_like_epic_title(title) is False
+
+
+class TestFindUnlabelledEpics:
+    def test_flags_epic_titled_issue_without_the_label(self) -> None:
+        issues = [_issue(837, labels=[], body="", title="Epic: goal-driven planner")]
+        hits = find_unlabelled_epics(issues)
+        assert hits == [UnlabelledEpic(repo="api", number=837, title="Epic: goal-driven planner")]
+
+    def test_does_not_flag_a_labelled_epic(self) -> None:
+        issues = [_issue(836, labels=["epic"], body="", title="Epic: Customer Portal")]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_does_not_flag_a_non_epic_title(self) -> None:
+        issues = [_issue(1, labels=[], body="", title="Fix a bug")]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_accepts_github_style_label_dicts(self) -> None:
+        issues = [
+            {
+                "repo_name": "api",
+                "number": 836,
+                "title": "Epic: Customer Portal",
+                "labels": [{"name": "epic"}, {"name": "coord"}],
+            }
+        ]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_multiple_repos_each_report_their_own_hits(self) -> None:
+        issues = [
+            _issue(380, labels=[], body="", title="Epic: goal-driven planner", repo_name="api"),
+            _issue(531, labels=[], body="", title="EPIC: coordinator integration", repo_name="vimcode"),
+            _issue(55, labels=["epic"], body="", title="Epic: already labelled", repo_name="web"),
+        ]
+        hits = {(h.repo, h.number) for h in find_unlabelled_epics(issues)}
+        assert hits == {("api", 380), ("vimcode", 531)}
