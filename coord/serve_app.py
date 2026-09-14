@@ -8131,8 +8131,14 @@ def build_app(
         # coord.state.merge_smoke_fanout_manifest's docstring for the race
         # this closes (two ticks racing on DIFFERENT capability partitions
         # of the SAME work row, each with only its own partial view of the
-        # manifest). Runs on the daemon so `_SMOKE_FANOUT_MANIFEST_LOCK`
-        # serializes every caller fleet-wide, not just within one process.
+        # manifest). Routing it here means a THIN CLIENT never runs the
+        # read-merge-write itself; the local function this delegates to takes
+        # the cross-process `flock` (state.smoke_fanout_manifest_lock_path)
+        # for its duration, so this request also serializes against the
+        # sibling `coord notify` / `coord drive-queue tick` CLI processes
+        # that run on this same DB-owning host and call it directly.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
         from coord import state  # noqa: PLC0415
 
         body = await _read_json(request)
@@ -8142,10 +8148,17 @@ def build_app(
             new_entries = [
                 (entry[0], tuple(entry[1]), entry[2]) for entry in body["new_entries"]
             ]
-            test_state, test_reason = state._merge_smoke_fanout_manifest_local(
-                assignment_id=body["assignment_id"],
-                new_entries=new_entries,
-                total_partitions=body["total_partitions"],
+            # `run_in_threadpool` because that cross-process lock acquire can
+            # BLOCK (up to `_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT`), and doing
+            # that on the event-loop thread would stall every other daemon
+            # request behind one contended merge — same reason `post_notify`
+            # below runs its own `FileLock`-taking body off the loop.
+            test_state, test_reason = await run_in_threadpool(
+                lambda: state._merge_smoke_fanout_manifest_local(
+                    assignment_id=body["assignment_id"],
+                    new_entries=new_entries,
+                    total_partitions=body["total_partitions"],
+                )
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)

@@ -2616,16 +2616,67 @@ def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
 
 
 # #3333 review: serializes the read-merge-write cycle in
-# `_merge_smoke_fanout_manifest_local` below — the daemon-process analogue of
+# `_merge_smoke_fanout_manifest_local` below — the analogue of
 # `serve_app._merge_lock`'s "any caller that does the same load->mutate->save
 # cycle on shared state must take the same lock" rule, applied here to the
 # #3182 fan-out's `[[smoke-fanout:...]]` manifest instead of the merge-queue
-# table. A bare `threading.Lock()` is enough: every request that reaches
-# `_merge_smoke_fanout_manifest_local` — whether via a direct local call or
-# via `post_smoke_fanout_merge` on the daemon — runs in the SAME process, so
-# this one lock object is shared by every caller regardless of which machine
-# actually issued the request.
+# table.
+#
+# TWO locks, because one process boundary is not enough (#3333 fix round 2).
+# The first round guarded this with a bare `threading.Lock()` on the
+# assumption that every caller reaches the canonical DB through the board
+# daemon and therefore runs in one process. That assumption is false for the
+# exact topology this issue is about: `docs/AGENT_OPERATIONS.md` requires the
+# daemon host to have NO `client.toml` (so `_board_service()` there is always
+# `None` and every caller runs `_merge_smoke_fanout_manifest_local` directly),
+# and it runs `coord notify` and `coord drive-queue tick` on that host as two
+# SEPARATE `Type=oneshot` systemd units — i.e. two sibling OS processes, each
+# with its own unrelated `threading.Lock()` object in its own memory. That is
+# precisely the pair of PIDs named in the original incident. A process-local
+# lock cannot serialize them, and the SELECT-then-UPDATE below has no
+# DB-engine-level atomicity of its own (unlike `claim_smoke_dispatch`, which
+# is a single `INSERT ... OR IGNORE` statement and so is genuinely atomic
+# across processes).
+#
+# So the read-merge-write takes `coord.filelock.FileLock` — the `flock(2)`
+# advisory lock every coord process already shares for exactly this class of
+# problem (`coord/confirm_test.py`, `coord/drive.py`, `coord/notify.py`) —
+# and the `threading.Lock()` stays *inside* it purely so two threads of one
+# process (two concurrent daemon requests) serialize on a cheap in-memory
+# primitive instead of spinning on `flock`'s 0.25s retry granularity.
 _SMOKE_FANOUT_MANIFEST_LOCK = threading.Lock()
+
+# How long to wait for the cross-process lock before giving up on it. The
+# critical section is two statements against a local database, so sustained
+# contention past this means something is badly wrong rather than merely
+# busy; see `_merge_smoke_fanout_manifest_local` for what happens then.
+_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT = 30.0
+
+
+def smoke_fanout_manifest_lock_path() -> Path:
+    """Path of the cross-process lock guarding the fan-out manifest (#3333).
+
+    Lives beside the database it guards (``$COORD_DIR``), not in a fixed
+    ``~/.coord``: two processes pointed at different ``COORD_DIR``s are
+    working on different databases and have no reason to contend on one
+    lock.
+
+    ``$COORD_SMOKE_FANOUT_MANIFEST_LOCK`` overrides it outright — the same
+    env-var seam ``coord.notifier.store``/``coord.github_throttle`` expose,
+    and for the same reason: it is what lets the test suite's autouse
+    ``_no_real_smoke_fanout_manifest_lock`` fixture keep a test from ever
+    creating (or flock-ing) a file in the OPERATOR's real ``~/.coord`` while
+    a live fleet is merging manifests through it.
+
+    A function rather than a module constant for the same reason
+    :func:`coord.filelock.notify_lock_path` is one — a constant captured at
+    import would freeze whatever ``COORD_DIR`` was when this module first
+    loaded, which on the daemon is process start.
+    """
+    override = os.environ.get("COORD_SMOKE_FANOUT_MANIFEST_LOCK")
+    if override:
+        return Path(override)
+    return Path(sys.modules[__name__].COORD_DIR) / "smoke-fanout-manifest.lock"
 
 
 def merge_smoke_fanout_manifest(
@@ -2653,15 +2704,20 @@ def merge_smoke_fanout_manifest(
     named in the #3333 review: "today the last writer silently wins").
 
     This performs the read-current-manifest / merge-in-*new_entries* /
-    write-back cycle as ONE step, guarded by ``_SMOKE_FANOUT_MANIFEST_LOCK``
-    for its duration — so two calls racing each other always serialize
-    rather than interleaving their own read and write, and the LAST one to
-    run always folds in every partition any earlier one has already
-    committed. Routes to the daemon (the canonical DB when one is
-    configured) via ``/smoke-fanout-merge``, where the SAME local function
-    (and therefore the same lock, held on the ONE process that owns the
-    canonical DB) runs — never on each thin client's own, mutually
-    uncoordinated process.
+    write-back cycle as ONE step, guarded for its duration by a
+    **cross-process** ``flock`` (:func:`smoke_fanout_manifest_lock_path`) —
+    so two calls racing each other always serialize rather than interleaving
+    their own read and write, and the LAST one to run always folds in every
+    partition any earlier one has already committed. The lock is taken by
+    whichever process actually touches the canonical DB, which is the point:
+    a thin client routes here to the daemon via ``/smoke-fanout-merge`` and
+    never runs the cycle itself, while on the daemon host — where
+    ``client.toml`` is deliberately absent, so `_board_service()` is always
+    ``None`` and every ``coord`` CLI invocation runs the cycle locally — the
+    several sibling `coord notify` / `coord drive-queue tick` processes
+    contend on the one lock FILE rather than on a process-local primitive
+    none of them shares. See ``_SMOKE_FANOUT_MANIFEST_LOCK`` above for why
+    the process-local lock alone was not enough.
 
     Returns the row's own authoritative ``(test_state, test_reason)`` AFTER
     this call — which may not be ``("running", <this call's own text>)``: a
@@ -2711,10 +2767,70 @@ def _merge_smoke_fanout_manifest_local(
 
     Called directly by the daemon's ``/smoke-fanout-merge`` endpoint so it
     never re-routes back over HTTP — mirrors every other ``_*_local`` write
-    in this module. Holds ``_SMOKE_FANOUT_MANIFEST_LOCK`` for the full
-    read-merge-write so two threads in the SAME process (e.g. two concurrent
-    daemon requests for the same or different parents) can never interleave
-    their own read and write.
+    in this module.
+
+    Holds BOTH locks for the full read-merge-write: the ``flock`` at
+    :func:`smoke_fanout_manifest_lock_path`, so two sibling ``coord``
+    *processes* on the DB-owning host (the documented `coord notify` /
+    `coord drive-queue tick` timer pair) cannot interleave their own read and
+    write, and ``_SMOKE_FANOUT_MANIFEST_LOCK`` inside it so two *threads* of
+    one process (two concurrent daemon requests) settle it in memory without
+    touching the filesystem at all.
+
+    If the cross-process lock is still held after
+    ``_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT`` this proceeds **unlocked** rather
+    than failing the dispatch — the same deliberate degradation
+    ``coord/confirm_test.py`` and ``serve_app.post_notify`` already document
+    for their own ``FileLock``s ("running anyway"). Refusing to write would
+    leave the parent row with no manifest naming the legs that are already
+    live, which is a strictly worse outcome than falling back to the
+    pre-#3333 last-writer-wins behaviour on a lock that has been contended
+    for 30 continuous seconds over a two-statement critical section.
+    """
+    from coord.filelock import FileLock, LockBusy  # noqa: PLC0415
+
+    file_lock: FileLock | None = FileLock(smoke_fanout_manifest_lock_path())
+    try:
+        file_lock.acquire(timeout=_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT)
+    except LockBusy:
+        _log.warning(
+            "smoke fan-out manifest lock at %s still held after %.0fs; merging "
+            "%s's manifest unlocked — a concurrent merge may be lost (#3333)",
+            smoke_fanout_manifest_lock_path(),
+            _SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT,
+            assignment_id,
+        )
+        file_lock = None
+    except OSError as exc:  # unwritable $COORD_DIR, exotic filesystem, ...
+        _log.warning(
+            "could not take the smoke fan-out manifest lock at %s (%s); "
+            "merging %s's manifest unlocked (#3333)",
+            smoke_fanout_manifest_lock_path(), exc, assignment_id,
+        )
+        file_lock = None
+
+    try:
+        return _merge_smoke_fanout_manifest_locked(
+            assignment_id=assignment_id,
+            new_entries=new_entries,
+            total_partitions=total_partitions,
+        )
+    finally:
+        if file_lock is not None:
+            file_lock.release()
+
+
+def _merge_smoke_fanout_manifest_locked(
+    *,
+    assignment_id: str,
+    new_entries: list[tuple[str, tuple[str, ...], str | None]],
+    total_partitions: int,
+) -> tuple[str | None, str | None]:
+    """The read-merge-write itself, run with the cross-process ``flock``
+    already held by :func:`_merge_smoke_fanout_manifest_local` (#3333).
+
+    Split out only so the lock acquisition above stays readable; it is not a
+    separate entry point and must never be called without that lock.
     """
     from coord.smoke import (  # noqa: PLC0415
         TEST_STATE_BLOCKED,

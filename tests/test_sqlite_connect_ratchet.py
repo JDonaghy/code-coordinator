@@ -170,6 +170,28 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "no second connection can reach) could not observe the property at "
         "all.",
     ),
+    "test_smoke_fanout_manifest_3333.py": Classification(
+        4, (BUCKET_A, BUCKET_C),
+        "#3333's cross-process regression: the fan-out manifest merge has to "
+        "be proven safe against two *separate OS processes* (the daemon "
+        "host's `coord notify` and `coord drive-queue tick` systemd units, "
+        "which are exactly the pair that raced in the incident), because a "
+        "process-local threading.Lock passed every sequential test while that "
+        "topology stayed broken. Two subprocesses can only meet on a database "
+        "they each open *by path*, so a real on-disk SQLite file is the unit "
+        "under test's own deployment shape, not incidental setup (A): one "
+        "site seeds the parent work row, the other reads the merged manifest "
+        "back after both children exit. The autouse coord_db fixture's "
+        "`:memory:` database is invisible to a child process, and "
+        "scratch_database() is out for the usual backend-following reason — "
+        "every test here is skipped under COORD_TEST_BACKEND=postgres, where "
+        "a second process would reach the server rather than a file. "
+        "+2 for the daemon half of the same seam (C): the standard "
+        "`rw_db`/`file_db` pair every POST-route test in this tree uses — "
+        "SqliteStore resolves the daemon's database by path, and TestClient "
+        "runs the handler on a worker thread, which is doubly load-bearing "
+        "here because this route now does its merge in a threadpool.",
+    ),
     "test_deploy_coord_db_backup.py": Classification(
         2, (BUCKET_A,),
         "On-disk coord.db file backup/copy and snapshot verification — the "
