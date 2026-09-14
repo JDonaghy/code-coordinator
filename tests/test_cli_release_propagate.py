@@ -2863,6 +2863,101 @@ def test_drain_no_cordon_keeps_polling_while_fully_deferred(
     assert "--give-up-after deadline" in result.output
 
 
+# ── #3335: the #2240/#2741 breaker's abandoned hosts must not read as
+# converged ──────────────────────────────────────────────────────────────
+#
+# `plan_cordons` builds `DeadlockRelease.hosts` as exactly the
+# cordoned-and-still-behind set (`set(live) - set(to_uncordon)`) — the
+# breaker gives up on them, it does not confirm them current. But
+# `_apply_cordons` clears their cordon through the SAME `clear_cordon()` call
+# (and appends to the SAME `outcome.uncordoned` list) a proven-current host's
+# roll does, so `record.cordons["uncordoned"]` cannot tell the two apart.
+
+
+def test_drain_remaining_hosts_keeps_breaker_abandoned_hosts_as_remaining():
+    """Pure unit test on `_drain_remaining_hosts`, using the exact shape from
+    the #3335 report's evidence: `released.hosts` also shows up in
+    `uncordoned` (because `_apply_cordons` clears their cordon), but that
+    must not remove them from what this attempt still counts as behind."""
+    record = rp.PropagationRecord(
+        started_at=0.0,
+        target_version="0.5.467",
+        cordons={
+            "cordoned": [], "stuck_in_cooldown": [], "collateral_spared": [],
+            "unknown": [],
+            "uncordoned": ["dell64", "precision"],
+            "released": {
+                "hosts": ["dell64", "precision"],
+                "consecutive_deferrals": 2, "max_deferrals": 2,
+                "cooldown_seconds": 1800.0, "target_version": "0.5.467",
+            },
+        },
+    )
+    assert release_cmd._drain_remaining_hosts(record) == {"dell64", "precision"}
+
+
+def test_drain_remaining_hosts_still_clears_a_host_genuinely_rolled_and_uncordoned():
+    """The existing case the `uncordoned` subtraction protects (see the
+    function's own docstring): a host cordoned early in an attempt and
+    rolled+uncordoned later in that SAME attempt must still read as done —
+    the #3335 fix must not regress this by, say, always keeping
+    `uncordoned` hosts as remaining."""
+    record = rp.PropagationRecord(
+        started_at=0.0,
+        cordons={
+            "cordoned": ["laptop"], "uncordoned": ["laptop"],
+            "stuck_in_cooldown": [], "collateral_spared": [], "unknown": [],
+        },
+    )
+    assert release_cmd._drain_remaining_hosts(record) == set()
+
+
+def test_run_drain_does_not_report_convergence_when_the_breaker_abandons_hosts(
+    monkeypatch,
+):
+    """#3335: drive `_run_drain` directly against a stubbed
+    `release_propagate.callback` (the unit-test shape the issue itself
+    proposes) whose every attempt comes back `deferred` with the breaker
+    having just released+uncordoned `dell64` and `precision`. Before the
+    fix, `_drain_remaining_hosts` read that as an empty `remaining` set on
+    attempt 1 and `_run_drain` exited 0 claiming full convergence. It must
+    instead keep treating them as behind and, once `--give-up-after`
+    elapses, name them as stragglers and exit non-zero."""
+    breaker_cordons = {
+        "cordoned": [], "stuck_in_cooldown": [], "collateral_spared": [],
+        "unknown": [],
+        "uncordoned": ["dell64", "precision"],
+        "released": {
+            "hosts": ["dell64", "precision"],
+            "consecutive_deferrals": 2, "max_deferrals": 2,
+            "cooldown_seconds": 1800.0, "target_version": "0.5.467",
+        },
+        "released_at": 1789357441.35,
+    }
+
+    def _fake_attempt(**kwargs):
+        record = rp.PropagationRecord(
+            started_at=0.0, target_version="0.5.467", status=rp.STATUS_DEFERRED,
+            cordons=breaker_cordons,
+        )
+        exc = SystemExit(0)
+        exc.record = record
+        raise exc
+
+    monkeypatch.setattr(release_cmd.release_propagate, "callback", _fake_attempt)
+    slept: list[float] = []
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: slept.append(s))
+
+    with pytest.raises(SystemExit) as exc_info:
+        release_cmd._run_drain(
+            deadline_seconds=0.0, poll_seconds=1.0, do_cordon=True, as_json=False,
+        )
+    assert exc_info.value.code == 1
+    # This is the exact regression: before the fix this branch never runs —
+    # the loop exits 0 via "every host reached the target" on attempt 1.
+    assert slept, "must have kept polling instead of declaring convergence on attempt 1"
+
+
 # ── #3047 review: `--drain --json` must be one parseable document ────────
 
 
