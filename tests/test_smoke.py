@@ -2690,6 +2690,102 @@ def test_dispatch_smoke_fans_out_one_leg_per_partition(repo: Repo) -> None:
     assert "gtk+windows" in reason and "macos" in reason
 
 
+def test_dispatch_smoke_fanout_second_work_row_gets_its_own_legs(repo: Repo) -> None:
+    """#3328 regression: `_find_leg_for_partition`'s dedupe used to match on
+    ``(repo_name, branch, capabilities)`` alone, so a SECOND work row on the
+    same branch (the ordinary shape after a review bounce or a `coord retry`)
+    matched the FIRST row's already-terminal legs, credited them into its own
+    fan-out manifest, and dispatched no legs of its own — wedging the second
+    row's `test_state` at `"running"` with zero real children forever (the
+    #2803 sweep can never find a child to roll a verdict up from).
+
+    Every work row must end up with at least one `type="smoke"` child of its
+    own — either a fresh leg, or a reused one whose `review_of_assignment_id`
+    is re-keyed onto it. This asserts the "fresh leg" half of that contract.
+    """
+    from coord.smoke import _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    branch = "issue-952-fix"
+
+    # The FIRST work row's fan-out already ran to a terminal verdict — both
+    # legs are `board.completed`, exactly the shape a finished Test stage
+    # leaves behind.
+    first_parent_id = "work-first-111"
+    board = Board(
+        completed=[
+            Assignment(
+                machine_name="dell64", repo_name="api", issue_number=952,
+                issue_title="[smoke:gtk+windows] fix", briefing="b",
+                assignment_id="leg-gtk-win-first", status="done",
+                branch=branch, dispatched_at=1.0, finished_at=2.0,
+                type="smoke", review_of_assignment_id=first_parent_id,
+                test_state="passed",
+            ),
+            Assignment(
+                machine_name="macmini", repo_name="api", issue_number=952,
+                issue_title="[smoke:macos] fix", briefing="b",
+                assignment_id="leg-macos-first", status="done",
+                branch=branch, dispatched_at=1.0, finished_at=2.0,
+                type="smoke", review_of_assignment_id=first_parent_id,
+                test_state="passed",
+            ),
+        ],
+    )
+
+    # The SECOND work row — a review bounce / retry landed a new SHA on the
+    # same branch.
+    second_completed = _completed(
+        machine="dell64", branch=branch, repo="api",
+    )
+    second_completed.assignment_id = "work-second-222"
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg-second"},
+        "macmini.tail": {"id": "macmini-leg-second"},
+    })
+
+    legs = _dispatch_smoke_legs(
+        second_completed, board, cfg, http_client=client,
+        diff_lookup=lambda r, b: diff,
+    )
+
+    # The second row must get legs OF ITS OWN — not "zero, because the
+    # first row's legs already looked handled".
+    assert len(legs) == 2
+    assert {a.review_of_assignment_id for a in legs} == {"work-second-222"}
+    assert {a.assignment_id for a in legs} == {
+        "dell64-leg-second", "macmini-leg-second",
+    }
+
+    # The manifest on the second row must name ITS OWN new legs, never the
+    # first row's foreign leg ids.
+    reason = second_completed.test_reason or ""
+    assert "[[smoke-fanout:" in reason
+    assert "dell64-leg-second" in reason and "macmini-leg-second" in reason
+    assert "leg-gtk-win-first" not in reason
+    assert "leg-macos-first" not in reason
+    assert second_completed.test_state == "running"
+
+
 # ── #3298: per-partition command resolution ─────────────────────────────────
 
 
