@@ -2895,6 +2895,135 @@ def test_dispatch_smoke_fanout_concurrent_ticks_never_double_dispatch_a_partitio
     assert client_b.calls == []
 
 
+def test_dispatch_smoke_fanout_concurrent_ticks_on_different_partitions_never_drop_either(
+    repo: Repo, coord_db,
+) -> None:
+    """#3333 review: the sequential regression above
+    (`..._never_double_dispatch_a_partition`) only proves that a SECOND call
+    for the same work row, running AFTER the first call already finished
+    dispatching (and manifesting) both partitions, is a safe no-op — its own
+    `leg_manifest` ends up empty and it never touches `test_reason` at all.
+
+    It does not exercise the gap the review actually flagged: two ticks
+    racing on DIFFERENT partitions of the SAME parent each win
+    `claim_smoke_dispatch` for their own partition (the claim is scoped
+    per-partition on purpose — a fan-out legitimately dispatches several
+    legs for one parent) and each then reaches the final manifest stamp with
+    only ITS OWN partial `leg_manifest`. Before the #3333-review fix,
+    whichever call's `record_test_verdict` write landed LAST silently
+    overwrote the other's real, live leg out of the parent's
+    `[[smoke-fanout:...]]` manifest forever — nothing else ever re-derives
+    it, so the dropped leg's eventual pass/fail was never folded into the
+    aggregate.
+
+    Simulated deterministically: pre-claim the `macos` partition (as if tick
+    A already won that race and is still mid-flight — a real `/assign` POST
+    hasn't landed yet, so nothing is on the board or in the DB's manifest
+    for `macos`) before running tick B, which can then only ever see (and
+    itself win/dispatch) the `gtk+windows` partition. Tick B's own
+    `leg_manifest` is then a strict SUBSET of the full fan-out — exactly
+    what a call that lost a partition race produces. Once tick A's own
+    (slower) dispatch finally lands its leg through the same merge seam, the
+    parent's manifest must name BOTH partitions, never just whichever call
+    wrote last.
+    """
+    from coord.smoke import (
+        _capability_matched_machines,
+        _dispatch_smoke_fanout,
+        _parse_fanout_manifest,
+        partition_capability_requirements,
+    )
+    from coord.state import (
+        claim_smoke_dispatch,
+        load_assignment_test_reason,
+        merge_smoke_fanout_manifest,
+        record_dispatched_assignment,
+    )
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+
+    def _capable_for(caps: list[str]) -> bool:
+        return bool(_capability_matched_machines(caps, "api", cfg))
+
+    partitions, unroutable = partition_capability_requirements(
+        diff, cfg.smoke_tests.capability_rules, _capable_for
+    )
+    assert not unroutable
+
+    # The parent work row itself must exist on the shared DB for the
+    # manifest merge below to have somewhere real to land — in production
+    # `completed` always already went through `record_dispatched_assignment`
+    # when the work itself was dispatched.
+    record_dispatched_assignment(
+        assignment=replace(
+            _completed(machine="dell64", branch="issue-952-fix", repo="api"),
+            assignment_id="work-952",
+        ),
+        repo_github=repo.github,
+    )
+
+    # Tick A "wins" the macos partition's claim first (as if it read-and-
+    # claimed before tick B ever ran) but is still slow dispatching it —
+    # simulated by taking the claim directly, with no corresponding board/DB
+    # leg yet.
+    assert claim_smoke_dispatch("work-952", "macos") is True
+
+    client_b = _MultiHostClient(assign={
+        "dell64.tail": {"id": "leg-gtk-win-b"},
+        "macmini.tail": {"id": "leg-macos-b"},
+    })
+    completed_b = _completed(machine="dell64", branch="issue-952-fix", repo="api")
+    completed_b.assignment_id = "work-952"
+
+    legs_b = _dispatch_smoke_fanout(
+        completed_b, Board(), cfg, touched=diff, partitions=partitions,
+        http_client=client_b,
+    )
+
+    # Tick B only ever dispatches gtk+windows — it lost the (pre-seeded)
+    # macos claim race before it ever attempted to dispatch it, and never
+    # spent a real /assign call on the partition it lost.
+    assert len(legs_b) == 1
+    assert legs_b[0].assignment_id == "leg-gtk-win-b"
+    assert "macmini.tail" not in client_b.assigned_hosts
+
+    # Tick A now finishes its (slower) dispatch and lands its own leg into
+    # the SAME parent's manifest through the identical #3333-review merge
+    # seam `_dispatch_smoke_fanout` itself uses.
+    merge_smoke_fanout_manifest(
+        assignment_id="work-952",
+        new_entries=[("leg-macos-a", ("macos",), "make smoke")],
+        total_partitions=2,
+    )
+
+    # Whichever call's write landed last, the parent's manifest must name
+    # BOTH legs — never just the last writer's own partial view.
+    reason = load_assignment_test_reason("work-952")
+    legs = _parse_fanout_manifest(reason)
+    assert legs is not None
+    leg_ids = {leg_id for leg_id, _, _ in legs}
+    assert leg_ids == {"leg-gtk-win-b", "leg-macos-a"}
+
+
 # ── #3298: per-partition command resolution ─────────────────────────────────
 
 

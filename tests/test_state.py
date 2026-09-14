@@ -4836,6 +4836,144 @@ class TestResetWorkTestStateReleasesSmokeClaims:
         assert state.claim_smoke_dispatch("w1", "macos") is True
 
 
+# ── #3333 review: merge_smoke_fanout_manifest's atomic read-merge-write ─────
+
+
+class TestMergeSmokeFanoutManifest:
+    """`merge_smoke_fanout_manifest` (#3333 review): two `_dispatch_smoke_
+    fanout` calls racing on DIFFERENT capability partitions of the SAME
+    parent each reach the final manifest stamp with only their own PARTIAL
+    `leg_manifest`. A plain `record_test_verdict` overwrite there (the
+    pre-review code) let whichever call wrote last silently erase the
+    other's real, live leg from the parent's `[[smoke-fanout:...]]`
+    manifest forever. This is the read-merge-write primitive that closes
+    that gap — tested directly here, independent of `_dispatch_smoke_fanout`
+    itself (see tests/test_smoke.py for the end-to-end regression)."""
+
+    def _seed_work_row(self, assignment_id: str = "w1", *, issue_number: int = 7) -> None:
+        from coord.models import Assignment
+
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="api", issue_number=issue_number,
+                issue_title="Some work", assignment_id=assignment_id,
+                type="work", status="done",
+            ),
+            repo_github="acme/api",
+        )
+
+    def test_first_merge_writes_running_with_the_new_entry(self, coord_db) -> None:
+        self._seed_work_row()
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "running"
+        assert "leg-macos" in (test_reason or "")
+        assert state.load_assignment_test_state("w1") == "running"
+        assert "leg-macos" in (state.load_assignment_test_reason("w1") or "")
+
+    def test_second_merge_for_a_different_partition_keeps_the_first_leg(
+        self, coord_db,
+    ) -> None:
+        """The exact quadraui#952-shaped gap: tick A's merge (macos) must
+        survive tick B's later merge (gtk+windows) for the SAME parent —
+        the second call's own `new_entries` never names macos at all, so a
+        plain overwrite would drop it."""
+        self._seed_work_row()
+        state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-gtk-win", ("gtk", "windows"), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "running"
+        assert "leg-macos" in (test_reason or "")
+        assert "leg-gtk-win" in (test_reason or "")
+        from coord.smoke import _parse_fanout_manifest
+
+        legs = _parse_fanout_manifest(state.load_assignment_test_reason("w1"))
+        assert legs is not None
+        assert {leg_id for leg_id, _, _ in legs} == {"leg-macos", "leg-gtk-win"}
+
+    def test_merge_order_does_not_matter(self, coord_db) -> None:
+        """Whichever call runs LAST must still fold in every partition any
+        earlier call already committed — not just the specific two-call
+        ordering exercised above."""
+        self._seed_work_row()
+        state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-gtk-win", ("gtk", "windows"), "make smoke")],
+            total_partitions=2,
+        )
+        state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        from coord.smoke import _parse_fanout_manifest
+
+        legs = _parse_fanout_manifest(state.load_assignment_test_reason("w1"))
+        assert legs is not None
+        assert {leg_id for leg_id, _, _ in legs} == {"leg-macos", "leg-gtk-win"}
+
+    def test_never_clobbers_an_already_terminal_verdict(self, coord_db) -> None:
+        """#1819: a terminal verdict already on the row (a human's `coord
+        test` override, or `finalize_smoke_fanout` beating this call to it)
+        must be returned UNCHANGED, never relaxed back to 'running'."""
+        self._seed_work_row()
+        state.record_test_verdict(
+            assignment_id="w1", test_state="passed", test_reason="all green",
+        )
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "passed"
+        assert test_reason == "all green"
+        assert state.load_assignment_test_state("w1") == "passed"
+        assert state.load_assignment_test_reason("w1") == "all green"
+
+    def test_still_returns_a_computed_value_when_the_row_does_not_exist(
+        self, coord_db,
+    ) -> None:
+        """A caller (or a unit test) that hands in an `assignment_id` with
+        no real DB row yet must still get back a value to mirror onto its
+        own in-memory `Assignment` — mirrors every other verdict writer in
+        this module tolerating a no-op UPDATE against an absent row."""
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="does-not-exist",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "running"
+        assert "leg-macos" in (test_reason or "")
+
+    def test_empty_new_entries_is_a_noop(self, coord_db) -> None:
+        self._seed_work_row()
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1", new_entries=[], total_partitions=2,
+        )
+
+        assert (test_state, test_reason) == (None, None)
+        assert state.load_assignment_test_state("w1") is None
+
+
 # ── #3113: render_issue_context_entries exempts review findings from the
 #    block-level char cap ───────────────────────────────────────────────────
 

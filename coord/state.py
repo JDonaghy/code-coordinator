@@ -16,6 +16,7 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 import time
 import warnings
 from collections.abc import Iterable
@@ -2612,6 +2613,176 @@ def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
         _release_smoke_dispatch_claim_local(row_of_id, "+".join(sorted(caps)))
     except Exception:  # noqa: BLE001 — best-effort; never break the status write
         pass
+
+
+# #3333 review: serializes the read-merge-write cycle in
+# `_merge_smoke_fanout_manifest_local` below — the daemon-process analogue of
+# `serve_app._merge_lock`'s "any caller that does the same load->mutate->save
+# cycle on shared state must take the same lock" rule, applied here to the
+# #3182 fan-out's `[[smoke-fanout:...]]` manifest instead of the merge-queue
+# table. A bare `threading.Lock()` is enough: every request that reaches
+# `_merge_smoke_fanout_manifest_local` — whether via a direct local call or
+# via `post_smoke_fanout_merge` on the daemon — runs in the SAME process, so
+# this one lock object is shared by every caller regardless of which machine
+# actually issued the request.
+_SMOKE_FANOUT_MANIFEST_LOCK = threading.Lock()
+
+
+def merge_smoke_fanout_manifest(
+    *,
+    assignment_id: str,
+    new_entries: list[tuple[str, tuple[str, ...], str | None]],
+    total_partitions: int,
+) -> tuple[str | None, str | None]:
+    """Atomically merge *new_entries* — the legs THIS call itself found
+    already-existing or claimed-and-dispatched this round — into
+    *assignment_id*'s ``[[smoke-fanout:...]]`` manifest, and (re)stamp the
+    parent row ``running`` with the MERGED text (#3333 review).
+
+    Closes the gap the previous plain ``record_test_verdict(test_state=
+    "running", ...)`` write in ``coord.smoke._dispatch_smoke_fanout`` left
+    open: two concurrent ticks racing on the SAME multi-partition work row
+    can each win :func:`claim_smoke_dispatch` for a DIFFERENT capability
+    partition — the claim is scoped per-partition, not per-row, precisely
+    because a fan-out legitimately dispatches several legs for one parent.
+    Each call's own ``leg_manifest`` then names only ITS partition; writing
+    that straight to ``test_reason`` let whichever call's write landed LAST
+    silently erase the other's real, live leg from the parent's manifest
+    forever — nothing else ever re-derives it, so the dropped leg's eventual
+    pass/fail was never folded into the aggregate at all (the exact gap
+    named in the #3333 review: "today the last writer silently wins").
+
+    This performs the read-current-manifest / merge-in-*new_entries* /
+    write-back cycle as ONE step, guarded by ``_SMOKE_FANOUT_MANIFEST_LOCK``
+    for its duration — so two calls racing each other always serialize
+    rather than interleaving their own read and write, and the LAST one to
+    run always folds in every partition any earlier one has already
+    committed. Routes to the daemon (the canonical DB when one is
+    configured) via ``/smoke-fanout-merge``, where the SAME local function
+    (and therefore the same lock, held on the ONE process that owns the
+    canonical DB) runs — never on each thin client's own, mutually
+    uncoordinated process.
+
+    Returns the row's own authoritative ``(test_state, test_reason)`` AFTER
+    this call — which may not be ``("running", <this call's own text>)``: a
+    row that already carries a terminal verdict (a human's ``coord test``
+    override, or ``finalize_smoke_fanout`` beating this call to it) is left
+    untouched, and its CURRENT values are returned unchanged. Callers MUST
+    mirror this return onto their own in-memory ``Assignment.test_state``/
+    ``test_reason`` rather than assuming their own locally-computed text
+    won — a later bulk ``write_board()`` upsert of the whole in-memory board
+    would otherwise re-overwrite the merged/terminal DB row with the
+    caller's own stale, partial view, reproducing this exact bug through a
+    different seam. Returns ``(None, None)`` only when there is nothing to
+    merge at all (no *assignment_id* or no *new_entries*) — a nonexistent
+    row still yields a computed ``("running", <merged text>)`` so a caller
+    (production or a unit test exercising this against a bare in-memory
+    ``Assignment``) always has a value to mirror, mirroring how every other
+    verdict writer in this module tolerates a no-op write against an absent
+    row.
+    """
+    if not assignment_id or not new_entries:
+        return None, None
+    svc = _board_service()
+    payload = {
+        "assignment_id": assignment_id,
+        "total_partitions": total_partitions,
+        "new_entries": [
+            [leg_id, list(caps), command] for leg_id, caps, command in new_entries
+        ],
+    }
+    resp = _route_write(svc, "/smoke-fanout-merge", payload)
+    if resp is not None:
+        return resp.get("test_state"), resp.get("test_reason")
+    return _merge_smoke_fanout_manifest_local(
+        assignment_id=assignment_id,
+        new_entries=new_entries,
+        total_partitions=total_partitions,
+    )
+
+
+def _merge_smoke_fanout_manifest_local(
+    *,
+    assignment_id: str,
+    new_entries: list[tuple[str, tuple[str, ...], str | None]],
+    total_partitions: int,
+) -> tuple[str | None, str | None]:
+    """Local-DB read-merge-write for :func:`merge_smoke_fanout_manifest`.
+
+    Called directly by the daemon's ``/smoke-fanout-merge`` endpoint so it
+    never re-routes back over HTTP — mirrors every other ``_*_local`` write
+    in this module. Holds ``_SMOKE_FANOUT_MANIFEST_LOCK`` for the full
+    read-merge-write so two threads in the SAME process (e.g. two concurrent
+    daemon requests for the same or different parents) can never interleave
+    their own read and write.
+    """
+    from coord.smoke import (  # noqa: PLC0415
+        TEST_STATE_BLOCKED,
+        _build_fanout_running_reason,
+        _parse_fanout_manifest,
+        environmental_smoke_legs,
+    )
+
+    with _SMOKE_FANOUT_MANIFEST_LOCK:
+        conn = get_connection()
+        row = sql.execute(
+            conn,
+            "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        # A missing row (the parent work assignment was never persisted —
+        # true of nothing in production, where `completed` always already
+        # went through `record_dispatched_assignment` when the work itself
+        # was dispatched, but true of plenty of unit tests that exercise
+        # `_dispatch_smoke_fanout` against a bare in-memory `Assignment`)
+        # is treated as "no prior manifest, nothing terminal" rather than a
+        # reason to bail — `_record_test_verdict_local` below already
+        # tolerates writing to a nonexistent assignment_id as a silent
+        # no-op UPDATE (mirroring every other verdict writer in this
+        # module), and the caller still needs a computed "running" value
+        # back to mirror onto its own in-memory row either way.
+        if row is None:
+            current_state, current_reason = None, None
+        else:
+            current_state = row["test_state"] if hasattr(row, "keys") else row[0]
+            current_reason = row["test_reason"] if hasattr(row, "keys") else row[1]
+
+        if current_state in ("passed", "skipped", "failed", TEST_STATE_BLOCKED):
+            # #1819: never clobber a terminal verdict already on the row — a
+            # human's `coord test` override, or `finalize_smoke_fanout`
+            # having already folded every leg (possibly including a
+            # partition this very call just dispatched) into an aggregate.
+            # Return it UNCHANGED so the caller mirrors the real current
+            # state onto its own in-memory row rather than a stale
+            # "running".
+            return current_state, current_reason
+
+        existing = _parse_fanout_manifest(current_reason) or []
+        # Merge keyed on the (sorted) capability tag, never on leg id — a
+        # given partition has exactly one live leg at a time (the atomic
+        # `claim_smoke_dispatch` guarantees that), so this call's own entry
+        # for a partition IS the authoritative one for that partition;
+        # anything already in `existing` for a DIFFERENT partition came from
+        # a sibling call and must survive the merge untouched.
+        merged: dict[tuple[str, ...], tuple[str, tuple[str, ...], str | None]] = {
+            tuple(sorted(caps)): (leg_id, caps, command)
+            for leg_id, caps, command in existing
+        }
+        for leg_id, caps, command in new_entries:
+            merged[tuple(sorted(caps))] = (leg_id, caps, command)
+        leg_manifest = list(merged.values())
+
+        running_reason = _build_fanout_running_reason(
+            leg_manifest,
+            total_partitions=total_partitions,
+            prior_env_legs=environmental_smoke_legs(current_reason),
+        )
+        _record_test_verdict_local(
+            assignment_id=assignment_id,
+            test_state="running",
+            test_reason=running_reason,
+        )
+        return "running", running_reason
 
 
 # ── Review-findings tracking ──────────────────────────────────────────────────
