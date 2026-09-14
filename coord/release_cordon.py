@@ -201,16 +201,53 @@ for a few minutes — a healthy busy signal observed twice, 15-40 seconds apart,
 misread as a 40-minute stall.
 
 The fix is :data:`DEFAULT_CORDON_STALL_SECONDS`: an explicit elapsed-time
-floor, measured from the OLDEST record in the same trailing window the count
-and ``progressed`` already use (:attr:`DeferralPressure.window_started_at`,
+floor, measured from the OLDEST record in the WHOLE current deferred-and-
+cordoned streak (:attr:`DeferralPressure.window_started_at`,
 :meth:`DeferralPressure.window_span`), required *in addition to* the count
 before :func:`plan_cordons` releases anything. This makes the release
 condition mean the same ~40 minutes of genuine stillness regardless of how
 often it is checked — a caller that polls faster does not reach the bar
-sooner, it just re-attempts (and keeps renewing the window) more often while
-waiting for the same span to actually elapse. An unreadable window span fails
-the floor, never satisfies it — the same direction every other read failure in
+sooner, it just re-attempts (and re-renews the streak) more often while
+waiting for the same span to actually elapse. An unreadable span fails the
+floor, never satisfies it — the same direction every other read failure in
 this module already fails toward.
+
+REVIEW: THE FIRST CUT BOUNDED THE FLOOR TO THE SAME WINDOW THE COUNT USES
+----------------------------------------------------------------------------
+The first #3336 cut anchored ``window_started_at`` to the same trailing
+``max_deferrals``-sized window ``progressed`` compares — the newest
+``max_deferrals`` cordoned-deferral records, the SAME bound
+``consecutive >= max_deferrals`` itself counts against. That window can
+never span more than ``max_deferrals`` poll intervals, no matter how long
+the real streak behind it has run, because every new tick both extends the
+streak by one record AND ages the oldest record in the (fixed-size) window
+out of it — the window slides, it does not grow.
+
+At the propagate timer's calibrated 20-minute cadence this happened to work:
+the release condition first becomes reachable (``consecutive`` first hits
+``max_deferrals``) exactly when the window's span first hits
+``max_deferrals`` intervals, i.e. 40 minutes — precisely
+:data:`DEFAULT_CORDON_STALL_SECONDS`, by construction. But that was a
+coincidence of the calibration, not a property of the mechanism: at
+``--drain``'s much faster default cadence (15 seconds), the identical bounded
+window caps out at ``max_deferrals * 15s`` = 30 seconds and NEVER grows past
+it, however many hours the real stall continues — verified directly against
+the first cut: 20 consecutive deferred records, 1200 seconds apart (6.6 hours
+of a genuinely wedged fleet), still measured a 1200-second window and still
+did not release. The elapsed-time floor this section exists to add was
+unreachable on the mechanism's own primary, calibrated caller's replacement
+under `--drain`, and reintroduced the exact unbounded-cordon failure #2240
+was written to end — just moved from "fires too easily" to "never fires".
+
+The fix is what :attr:`DeferralPressure.window_started_at` now does: anchor
+to the oldest record in the streak ``consecutive`` itself walks, unbounded,
+so a longer genuine stall actually produces a longer measured span — the
+span keeps growing with real elapsed time at ANY poll cadence, reaching
+``cordon_stall_seconds`` sooner or later regardless of how often the caller
+ticks. ``progressed``'s own window stays deliberately bounded (see the #2741
+section above; that reasoning is about aging out *stale evidence of
+progress* and is unrelated to this) — only the elapsed-time floor's anchor
+needed to be decoupled from it.
 
 THE TRIGGER IS COUPLED TO RELEASE FREQUENCY, SO IT IS A KNOB
 --------------------------------------------------------------
@@ -300,23 +337,30 @@ DEFAULT_DRIFT_THRESHOLD = 1
 #: sustains itself.
 DEFAULT_MAX_DEFERRALS = 2
 
-#: How long, in wall-clock seconds, the trailing deferral window (the newest
-#: ``max_deferrals`` cordoned-deferral records) must SPAN — oldest record's
-#: ``started_at`` to ``now`` — before the #2240 release may fire, in addition
-#: to the tick count (#3336). ``DEFAULT_MAX_DEFERRALS`` (2) was calibrated
-#: against the 20-minute ``coord-release-propagate.timer``: two deferrals at
-#: that cadence really is ~40 minutes of an unchanged fleet, which is the
-#: figure this default reproduces. #3047's ``--drain`` loop reuses this exact
-#: same tick-counting machinery on a much faster interval
+#: How long, in wall-clock seconds, the CURRENT deferred-and-cordoned streak
+#: (unbounded — oldest cordoned-deferral record in the whole streak, all the
+#: way back to the last non-deferral / version change / release, NOT just the
+#: newest ``max_deferrals`` of them) must SPAN before the #2240 release may
+#: fire, in addition to the tick count (#3336). ``DEFAULT_MAX_DEFERRALS`` (2)
+#: was calibrated against the 20-minute ``coord-release-propagate.timer``: two
+#: deferrals at that cadence really is ~40 minutes of an unchanged fleet,
+#: which is the figure this default reproduces. #3047's ``--drain`` loop
+#: reuses this exact same tick-counting machinery on a much faster interval
 #: (``--drain-interval``, default 15s) — with the tick count alone, "two
 #: attempts 15s apart" trips the identical release meant to require ~40
 #: minutes, after ~30 seconds of a leg that is still running normally. This
 #: floor makes the release condition mean the same thing no matter how often
 #: it is polled: a faster poller does not reach the bar sooner, it just
-#: re-attempts (and re-renews the window) more often while waiting for the
-#: SAME wall-clock span to elapse. 2400s (40 minutes) is deliberately the
-#: figure the timer's own cadence already produces, not a new number chosen
-#: independently of it.
+#: re-attempts (and re-renews the streak) more often while waiting for the
+#: SAME wall-clock span to elapse — the span is measured from the whole
+#: streak's actual start, so it keeps growing with real elapsed time at ANY
+#: cadence rather than being capped at a fixed number of poll intervals
+#: (review fix: an earlier cut bounded the span the same way ``progressed``'s
+#: window is bounded, which made this floor unreachable at any cadence
+#: faster than the one it happened to be calibrated against — see the module
+#: docstring's #3336 "REVIEW" subsection). 2400s (40 minutes) is deliberately
+#: the figure the timer's own cadence already produces, not a new number
+#: chosen independently of it.
 DEFAULT_CORDON_STALL_SECONDS = 2400.0
 
 #: How long cordoning stays OFF after a deadlock release (#2240). Without a
@@ -702,18 +746,27 @@ class DeferralPressure:
     #: stronger claim" is the same rule the rest of this module follows on a
     #: read failure.
     progressed: bool = False
-    #: #3336: the ``started_at`` of the OLDEST record in the same trailing
-    #: window ``progressed`` is compared over (the newest ``max_deferrals``
-    #: cordoned-deferral records) — i.e. the timestamp the #2240 release
-    #: condition's new elapsed-time floor is measured FROM. ``None`` — never
-    #: ``0.0`` — when that timestamp could not be established: an empty
-    #: window (``consecutive == 0``), or the oldest record in it carrying no
-    #: readable ``started_at`` (a record written before this field existed).
-    #: ``0.0`` would read as "started at the epoch", i.e. an all-time-elapsed
-    #: window, which is the wrong direction to fail in for a floor that
-    #: exists specifically to make releasing HARDER on missing evidence, not
-    #: easier — same rule the rest of this module applies to every other
-    #: read failure.
+    #: #3336: the ``started_at`` of the OLDEST record in the WHOLE current
+    #: deferred-and-cordoned streak — the same unbounded span ``consecutive``
+    #: itself counts over, NOT the trailing ``max_deferrals``-sized window
+    #: ``progressed`` compares (review fix: an earlier cut bounded this the
+    #: same way ``progressed`` is bounded, which meant the measured span could
+    #: never exceed ``max_deferrals`` poll intervals no matter how long the
+    #: real stall ran — trivially satisfied at the propagate timer's
+    #: calibrated 20-minute cadence, but permanently unreachable at
+    #: ``--drain``'s much faster default poll, where that same bound caps out
+    #: at a few seconds forever). This is the timestamp the #2240 release
+    #: condition's elapsed-time floor is measured FROM: a longer genuine
+    #: streak now produces a longer measured span, which is what makes the
+    #: floor mean the same wall-clock duration regardless of poll cadence.
+    #: ``None`` — never ``0.0`` — when that timestamp could not be
+    #: established: an empty streak (``consecutive == 0``), or the oldest
+    #: record in it carrying no readable ``started_at`` (a record written
+    #: before this field existed). ``0.0`` would read as "started at the
+    #: epoch", i.e. an all-time-elapsed window, which is the wrong direction
+    #: to fail in for a floor that exists specifically to make releasing
+    #: HARDER on missing evidence, not easier — same rule the rest of this
+    #: module applies to every other read failure.
     window_started_at: float | None = None
 
     def cooling_for(self, now: float, cooldown: float) -> float:
@@ -931,13 +984,21 @@ def deferral_pressure(
     #3336: also reads back each cordoned-deferral record's own ``started_at``
     — the same field :class:`~coord.release_propagate.PropagationRecord`
     always journals — into :attr:`DeferralPressure.window_started_at`: the
-    timestamp of the OLDEST record in that same trailing window. A tick count
-    alone cannot tell "two attempts 40 minutes apart" (the timer's cadence,
-    what ``max_deferrals`` was calibrated against) from "two attempts 15
-    seconds apart" (``--drain``'s default poll, #3047) — and the latter trips
-    at the exact same count after the exact same healthy leg has merely been
-    observed twice, ~30 seconds apart. :func:`plan_cordons` turns this into
-    an elapsed-time floor alongside the count.
+    timestamp of the OLDEST record in the WHOLE current streak, UNBOUNDED —
+    not sliced to the same trailing window ``progressed`` compares (review
+    fix: an earlier cut used that same bounded slice here too, which meant
+    the measured span could never exceed ``max_deferrals`` poll intervals no
+    matter how long the real streak ran — see the module docstring's
+    "REVIEW" subsection under #3336 for why that made the floor unreachable
+    at any cadence faster than the one it happened to be calibrated against).
+    A tick count alone cannot tell "two attempts 40 minutes apart" (the
+    timer's cadence, what ``max_deferrals`` was calibrated against) from "two
+    attempts 15 seconds apart" (``--drain``'s default poll, #3047) — and the
+    latter trips at the exact same count after the exact same healthy leg has
+    merely been observed twice, ~30 seconds apart. :func:`plan_cordons` turns
+    this into an elapsed-time floor alongside the count — one that keeps
+    growing with the streak's real duration regardless of how fast the caller
+    polls.
     """
     want = normalize_version(target_version)
     consecutive = 0
@@ -1006,17 +1067,36 @@ def deferral_pressure(
     # all, leaves `progressed` at its safe default (False) — see the field's
     # own docstring for why that direction, not the reverse, is safe.
     progressed = len(window) >= 2 and len(set(window)) > 1
-    # #3336: `started_ats` was built in the same newest-first order as
-    # `consecutive` was counted (one entry per cordoned-deferred record,
-    # unconditionally — unlike `signatures`, which skips unreadable ones), so
-    # the same slice bounds it to the identical trailing window and its LAST
-    # entry is that window's OLDEST record. `None` — never a fabricated
-    # timestamp — when that record's own `started_at` could not be read, or
-    # the window is empty (`consecutive == 0`): see `window_started_at`'s own
-    # docstring for why an unreadable anchor must fail the elapsed-time floor
-    # rather than default toward satisfying it.
-    time_window = started_ats[:max(effective_max_deferrals, 0)]
-    window_started_at = time_window[-1] if time_window else None
+    # #3336 review: `window_started_at` used to be sliced to the same
+    # trailing `effective_max_deferrals`-sized window as `progressed` — but
+    # that window can only ever SPAN, at most, `max_deferrals` poll
+    # intervals, no matter how long the real streak behind it has run. At
+    # the propagate timer's calibrated 20-minute cadence that boundary
+    # happens to land exactly on `DEFAULT_CORDON_STALL_SECONDS` (2 records,
+    # 20 minutes apart, evaluated one interval later = 40 minutes) — but at
+    # `--drain`'s much faster default cadence (15s) the SAME bounded window
+    # caps out at `max_deferrals * 15s` = 30s and never grows past it, no
+    # matter how many hours the real stall continues, because each new tick
+    # both adds a record AND ages the oldest one in the window out of it in
+    # lockstep. A count-based floor sliced to a count-based window cannot
+    # measure a span independent of that count.
+    #
+    # So `started_ats` (built unconditionally, one entry per cordoned-
+    # deferred record, over the SAME unbounded streak `consecutive` itself
+    # walks — stopping only at a non-deferral, a version change, or the last
+    # release) is read back WITHOUT that slice: its last entry is the oldest
+    # record in the WHOLE current streak, however long that streak actually
+    # is. A longer genuine stall now produces a longer measured span, which
+    # is the entire point of an elapsed-time floor — `progressed`'s window
+    # stays deliberately bounded (see the #2741 review section above; that
+    # reasoning is unrelated and still applies), but the elapsed-time floor
+    # must not inherit a bound that was sized for a different question.
+    # `None` — never a fabricated timestamp — when the oldest record's own
+    # `started_at` could not be read, or the streak is empty
+    # (`consecutive == 0`): see `window_started_at`'s own docstring for why
+    # an unreadable anchor must fail the elapsed-time floor rather than
+    # default toward satisfying it.
+    window_started_at = started_ats[-1] if started_ats else None
     return DeferralPressure(
         consecutive=consecutive,
         last_release_at=last_release_at,
@@ -1284,8 +1364,8 @@ def plan_cordons(
     * an unexpired **cooldown** from a previous release suppresses all new
       cordons — without it the next run re-cordons (the hosts really are
       still behind) and the deadlock re-arms 20 minutes later;
-    * ``consecutive >= max_deferrals`` AND NOT ``progressed`` AND the trailing
-      window has actually SPANNED at least *cordon_stall_seconds* of
+    * ``consecutive >= max_deferrals`` AND NOT ``progressed`` AND the current
+      streak has actually SPANNED at least *cordon_stall_seconds* of
       wall-clock time (#3336) **releases** every live cordon
       (:class:`DeadlockRelease`) and starts that cooldown.
       #2741: the count alone used to be sufficient, and that fired the
@@ -1304,9 +1384,13 @@ def plan_cordons(
       :data:`DEFAULT_CORDON_STALL_SECONDS`, ~40 minutes — the same figure the
       timer's own cadence already produces) is measured via
       :meth:`DeferralPressure.window_span`, from the OLDEST record in the
-      exact same trailing window ``progressed`` compares. A window whose span
-      could not be established (:attr:`DeferralPressure.window_started_at` is
-      ``None`` — an empty window, or the oldest record predates this field)
+      WHOLE current streak — deliberately NOT the same trailing window
+      ``progressed`` compares (review fix: an earlier cut shared that bound,
+      which capped the measurable span at ``max_deferrals`` poll intervals
+      forever, however long the real stall ran — see the module docstring's
+      #3336 "REVIEW" subsection). A streak whose span could not be
+      established (:attr:`DeferralPressure.window_started_at` is
+      ``None`` — an empty streak, or the oldest record predates this field)
       fails the floor, the same "unreadable degrades toward not releasing"
       direction the rest of this function already follows. ``0`` (or
       negative) disables the floor and restores the pre-#3336 count-only
