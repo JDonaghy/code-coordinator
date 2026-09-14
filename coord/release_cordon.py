@@ -181,6 +181,37 @@ count alone) — never the reverse, which would fail toward holding the fleet
 cordoned longer on missing data, the same wrong direction #2101's read-side
 failures already refuse everywhere else in this module.
 
+#3336: A TICK COUNT MEANS A DIFFERENT DURATION AT EVERY POLL CADENCE
+------------------------------------------------------------------------
+``DEFAULT_MAX_DEFERRALS`` (2) was calibrated against one specific caller:
+``coord-release-propagate.timer``, which ticks every 20 minutes. Two
+consecutive deferrals at that cadence really is ~40 minutes of an unchanged
+fleet — long enough that a normal drain finishes inside it, per the reasoning
+in the #2240 section above.
+
+#3047 added a second caller of the exact same counting machinery:
+``coord release propagate --drain``, which re-attempts on ``--drain-interval``
+(default 15 seconds) instead of 20 minutes. Nothing about the count changed —
+``deferral_pressure`` still just counts consecutive cordoned deferrals — but
+what the count *means* changed by a factor of ~80, because the count was never
+actually measuring time; it was standing in for time under the assumption that
+every caller ticked at the same cadence. Under `--drain`'s default, the
+release fired after ~75 seconds against a fleet with one leg running normally
+for a few minutes — a healthy busy signal observed twice, 15-40 seconds apart,
+misread as a 40-minute stall.
+
+The fix is :data:`DEFAULT_CORDON_STALL_SECONDS`: an explicit elapsed-time
+floor, measured from the OLDEST record in the same trailing window the count
+and ``progressed`` already use (:attr:`DeferralPressure.window_started_at`,
+:meth:`DeferralPressure.window_span`), required *in addition to* the count
+before :func:`plan_cordons` releases anything. This makes the release
+condition mean the same ~40 minutes of genuine stillness regardless of how
+often it is checked — a caller that polls faster does not reach the bar
+sooner, it just re-attempts (and keeps renewing the window) more often while
+waiting for the same span to actually elapse. An unreadable window span fails
+the floor, never satisfies it — the same direction every other read failure in
+this module already fails toward.
+
 THE TRIGGER IS COUPLED TO RELEASE FREQUENCY, SO IT IS A KNOB
 --------------------------------------------------------------
 Cordon-on-any-drift costs one fleet drain per release. Before #2081 landed,
@@ -268,6 +299,25 @@ DEFAULT_DRIFT_THRESHOLD = 1
 #: and the whole finding of #2240 is that noise does not break a cycle which
 #: sustains itself.
 DEFAULT_MAX_DEFERRALS = 2
+
+#: How long, in wall-clock seconds, the trailing deferral window (the newest
+#: ``max_deferrals`` cordoned-deferral records) must SPAN — oldest record's
+#: ``started_at`` to ``now`` — before the #2240 release may fire, in addition
+#: to the tick count (#3336). ``DEFAULT_MAX_DEFERRALS`` (2) was calibrated
+#: against the 20-minute ``coord-release-propagate.timer``: two deferrals at
+#: that cadence really is ~40 minutes of an unchanged fleet, which is the
+#: figure this default reproduces. #3047's ``--drain`` loop reuses this exact
+#: same tick-counting machinery on a much faster interval
+#: (``--drain-interval``, default 15s) — with the tick count alone, "two
+#: attempts 15s apart" trips the identical release meant to require ~40
+#: minutes, after ~30 seconds of a leg that is still running normally. This
+#: floor makes the release condition mean the same thing no matter how often
+#: it is polled: a faster poller does not reach the bar sooner, it just
+#: re-attempts (and re-renews the window) more often while waiting for the
+#: SAME wall-clock span to elapse. 2400s (40 minutes) is deliberately the
+#: figure the timer's own cadence already produces, not a new number chosen
+#: independently of it.
+DEFAULT_CORDON_STALL_SECONDS = 2400.0
 
 #: How long cordoning stays OFF after a deadlock release (#2240). Without a
 #: cooldown the very next run re-cordons — the hosts are still behind — and
@@ -652,12 +702,33 @@ class DeferralPressure:
     #: stronger claim" is the same rule the rest of this module follows on a
     #: read failure.
     progressed: bool = False
+    #: #3336: the ``started_at`` of the OLDEST record in the same trailing
+    #: window ``progressed`` is compared over (the newest ``max_deferrals``
+    #: cordoned-deferral records) — i.e. the timestamp the #2240 release
+    #: condition's new elapsed-time floor is measured FROM. ``None`` — never
+    #: ``0.0`` — when that timestamp could not be established: an empty
+    #: window (``consecutive == 0``), or the oldest record in it carrying no
+    #: readable ``started_at`` (a record written before this field existed).
+    #: ``0.0`` would read as "started at the epoch", i.e. an all-time-elapsed
+    #: window, which is the wrong direction to fail in for a floor that
+    #: exists specifically to make releasing HARDER on missing evidence, not
+    #: easier — same rule the rest of this module applies to every other
+    #: read failure.
+    window_started_at: float | None = None
 
     def cooling_for(self, now: float, cooldown: float) -> float:
         """Seconds of cooldown left at *now*; 0 when cordoning may resume."""
         if not self.last_release_at or cooldown <= 0:
             return 0.0
         return max(0.0, self.last_release_at + cooldown - now)
+
+    def window_span(self, now: float) -> float | None:
+        """Wall-clock seconds since :attr:`window_started_at`; ``None`` when
+        that timestamp is unknown — see its own docstring for why that must
+        fail the #3336 elapsed-time floor rather than satisfy it."""
+        if self.window_started_at is None:
+            return None
+        return max(0.0, now - self.window_started_at)
 
     def to_dict(self) -> dict:
         return {
@@ -666,6 +737,7 @@ class DeferralPressure:
             "max_deferrals": self.max_deferrals,
             "target_version": self.target_version,
             "progressed": self.progressed,
+            "window_started_at": self.window_started_at,
         }
 
 
@@ -684,6 +756,13 @@ class DeadlockRelease:
     max_deferrals: int = DEFAULT_MAX_DEFERRALS
     cooldown_seconds: float = DEFAULT_RELEASE_COOLDOWN_SECONDS
     target_version: str | None = None
+    #: #3336: the wall-clock span (`DeferralPressure.window_span`) the
+    #: release condition actually measured — purely for the message below, so
+    #: an operator reading it does not have to reconstruct "was this really
+    #: 40 minutes, or a fast `--drain` poll?" from the journal by hand.
+    #: `None` only when the elapsed-time floor was skipped entirely
+    #: (`cordon_stall_seconds <= 0`, the explicit pre-#3336 override).
+    stalled_seconds: float | None = None
 
     @property
     def message(self) -> str:
@@ -701,13 +780,21 @@ class DeadlockRelease:
             if self.consecutive_deferrals <= self.max_deferrals
             else f"the most recent {self.max_deferrals} of them"
         )
+        # #3336: name the actual elapsed span, not just the tick count — the
+        # whole point of the fix is that the count alone no longer proves
+        # anything about how long the fleet has actually been unchanged.
+        span_desc = (
+            f", spanning ~{self.stalled_seconds / 60.0:.0f}m of wall-clock time,"
+            if self.stalled_seconds is not None
+            else ""
+        )
         return (
-            f"CORDON RELEASED (#2240/#2741): {self.consecutive_deferrals} "
+            f"CORDON RELEASED (#2240/#2741/#3336): {self.consecutive_deferrals} "
             f"consecutive propagate runs deferred {version} while holding a "
-            f"cordon, and the fleet's busy signal held IDENTICAL across "
-            f"{window_desc} — no leg completed, no new leg dispatched. That "
-            f"is a genuine stall, not a cordon blocking dispatch (a review "
-            f"for in-flight work already routes onto a cordoned host "
+            f"cordon{span_desc}, and the fleet's busy signal held IDENTICAL "
+            f"across {window_desc} — no leg completed, no new leg dispatched. "
+            f"That is a genuine stall, not a cordon blocking dispatch (a "
+            f"review for in-flight work already routes onto a cordoned host "
             f"regardless — only NEW drive launches are gated) and not a "
             f"converging drain that just hasn't hit a quiescent tick yet. "
             f"Uncordoning {who} and "
@@ -723,6 +810,7 @@ class DeadlockRelease:
             "max_deferrals": self.max_deferrals,
             "cooldown_seconds": self.cooldown_seconds,
             "target_version": self.target_version,
+            "stalled_seconds": self.stalled_seconds,
             "message": self.message,
         }
 
@@ -839,12 +927,28 @@ def deferral_pressure(
     stops being recent enough to matter, so it reads as a stall again —
     while a streak still shorter than the window behaves exactly as before
     (the window is the whole streak so far).
+
+    #3336: also reads back each cordoned-deferral record's own ``started_at``
+    — the same field :class:`~coord.release_propagate.PropagationRecord`
+    always journals — into :attr:`DeferralPressure.window_started_at`: the
+    timestamp of the OLDEST record in that same trailing window. A tick count
+    alone cannot tell "two attempts 40 minutes apart" (the timer's cadence,
+    what ``max_deferrals`` was calibrated against) from "two attempts 15
+    seconds apart" (``--drain``'s default poll, #3047) — and the latter trips
+    at the exact same count after the exact same healthy leg has merely been
+    observed twice, ~30 seconds apart. :func:`plan_cordons` turns this into
+    an elapsed-time floor alongside the count.
     """
     want = normalize_version(target_version)
     consecutive = 0
     last_release_at = 0.0
     max_deferrals: int | None = None
     signatures: list[frozenset[tuple[str, str, str | None]]] = []
+    #: Parallel to `consecutive`, not to `signatures` — appended once per
+    #: cordoned-deferred record regardless of whether its `quiescence`
+    #: snapshot was readable, so the window this anchors always matches the
+    #: window `consecutive >= max_deferrals` is itself counting.
+    started_ats: list[float | None] = []
     for raw in reversed(list(records)):
         if not isinstance(raw, Mapping):
             break
@@ -878,6 +982,10 @@ def deferral_pressure(
             signature = _busy_signature(raw)
             if signature is not None:
                 signatures.append(signature)
+            try:
+                started_ats.append(float(raw.get("started_at")))
+            except (TypeError, ValueError):
+                started_ats.append(None)
     effective_max_deferrals = (
         DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
     )
@@ -898,6 +1006,17 @@ def deferral_pressure(
     # all, leaves `progressed` at its safe default (False) — see the field's
     # own docstring for why that direction, not the reverse, is safe.
     progressed = len(window) >= 2 and len(set(window)) > 1
+    # #3336: `started_ats` was built in the same newest-first order as
+    # `consecutive` was counted (one entry per cordoned-deferred record,
+    # unconditionally — unlike `signatures`, which skips unreadable ones), so
+    # the same slice bounds it to the identical trailing window and its LAST
+    # entry is that window's OLDEST record. `None` — never a fabricated
+    # timestamp — when that record's own `started_at` could not be read, or
+    # the window is empty (`consecutive == 0`): see `window_started_at`'s own
+    # docstring for why an unreadable anchor must fail the elapsed-time floor
+    # rather than default toward satisfying it.
+    time_window = started_ats[:max(effective_max_deferrals, 0)]
+    window_started_at = time_window[-1] if time_window else None
     return DeferralPressure(
         consecutive=consecutive,
         last_release_at=last_release_at,
@@ -906,6 +1025,7 @@ def deferral_pressure(
             DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
         ),
         progressed=progressed,
+        window_started_at=window_started_at,
     )
 
 
@@ -1143,6 +1263,7 @@ def plan_cordons(
     max_deferrals: int = DEFAULT_MAX_DEFERRALS,
     release_cooldown: float = DEFAULT_RELEASE_COOLDOWN_SECONDS,
     daemon_host: str | None = None,
+    cordon_stall_seconds: float = DEFAULT_CORDON_STALL_SECONDS,
 ) -> CordonPlan:
     """Decide this run's cordon writes. Pure.
 
@@ -1163,8 +1284,10 @@ def plan_cordons(
     * an unexpired **cooldown** from a previous release suppresses all new
       cordons — without it the next run re-cordons (the hosts really are
       still behind) and the deadlock re-arms 20 minutes later;
-    * ``consecutive >= max_deferrals`` AND NOT ``progressed`` **releases**
-      every live cordon (:class:`DeadlockRelease`) and starts that cooldown.
+    * ``consecutive >= max_deferrals`` AND NOT ``progressed`` AND the trailing
+      window has actually SPANNED at least *cordon_stall_seconds* of
+      wall-clock time (#3336) **releases** every live cordon
+      (:class:`DeadlockRelease`) and starts that cooldown.
       #2741: the count alone used to be sufficient, and that fired the
       release while two reviews were actively dispatching onto the cordoned
       hosts — a converging drain, not a deadlock. ``progressed`` (see
@@ -1172,6 +1295,23 @@ def plan_cordons(
       changed somewhere in the streak; a streak that never released still
       must also show that signal was IDENTICAL on every tick before this
       concludes nothing is moving.
+      #3336: the count alone ALSO cannot tell "N attempts 20 minutes apart"
+      (what ``max_deferrals`` was calibrated against) from "N attempts 15
+      seconds apart" (``--drain``'s default poll interval, #3047) — a faster
+      poller reaches the same count in a fraction of the time, over a fleet
+      that is not stalled at all, just running a leg that takes longer than
+      one poll. ``cordon_stall_seconds`` (default
+      :data:`DEFAULT_CORDON_STALL_SECONDS`, ~40 minutes — the same figure the
+      timer's own cadence already produces) is measured via
+      :meth:`DeferralPressure.window_span`, from the OLDEST record in the
+      exact same trailing window ``progressed`` compares. A window whose span
+      could not be established (:attr:`DeferralPressure.window_started_at` is
+      ``None`` — an empty window, or the oldest record predates this field)
+      fails the floor, the same "unreadable degrades toward not releasing"
+      direction the rest of this function already follows. ``0`` (or
+      negative) disables the floor and restores the pre-#3336 count-only
+      behaviour, the same escape hatch ``max_deferrals=0`` is for the count
+      itself.
 
     Proven-current hosts are uncordoned in every one of these branches: that
     is never the wrong move, and skipping it during a cooldown would leave a
@@ -1254,10 +1394,23 @@ def plan_cordons(
             blocked_behind=blocked_behind,
             stuck_in_cooldown=stuck,
         )
+    # #3336: the tick count is necessary but, on its own, means something
+    # different at every poll cadence — see this function's docstring. The
+    # elapsed-time floor is skippable via `cordon_stall_seconds <= 0` (the
+    # same style of escape hatch `max_deferrals <= 0` already is), and
+    # otherwise requires a PROVEN span: an unknown window span (`None`, from
+    # an unreadable or empty window) fails the floor rather than satisfying
+    # it.
+    stall_span = pressure.window_span(now)
+    stalled_long_enough = (
+        cordon_stall_seconds <= 0
+        or (stall_span is not None and stall_span >= cordon_stall_seconds)
+    )
     if (
         max_deferrals > 0
         and pressure.consecutive >= max_deferrals
         and not pressure.progressed
+        and stalled_long_enough
     ):
         return CordonPlan(
             uncordon=to_uncordon,
@@ -1268,6 +1421,7 @@ def plan_cordons(
                 max_deferrals=max_deferrals,
                 cooldown_seconds=release_cooldown,
                 target_version=target_version,
+                stalled_seconds=stall_span,
             ),
             collateral_spared=tuple(sorted(collateral)),
             blocked_behind=blocked_behind,
@@ -1347,6 +1501,13 @@ class CordonOutcome:
     #: out of the newest record instead of every caller of
     #: :func:`describe_deferral_pressure` assuming the default.
     max_deferrals: int = DEFAULT_MAX_DEFERRALS
+    #: The ``--cordon-stall-seconds`` this run actually resolved to (the flag
+    #: value, or :data:`DEFAULT_CORDON_STALL_SECONDS` when unset). #3336:
+    #: recorded on every run for the same reason `max_deferrals` is —
+    #: a postmortem reading the journal directly should not have to guess
+    #: which elapsed-time floor a given release decision was actually made
+    #: against.
+    cordon_stall_seconds: float = DEFAULT_CORDON_STALL_SECONDS
     #: #2176: behind hosts this run spared (or actively released) because
     #: they have no busy signal of their own and cannot roll ahead of a busy,
     #: behind daemon host anyway. Mirrors `CordonPlan.collateral_spared`.
@@ -1373,6 +1534,7 @@ class CordonOutcome:
             "cooling_seconds": self.cooling_seconds,
             "pressure": dict(self.pressure),
             "max_deferrals": self.max_deferrals,
+            "cordon_stall_seconds": self.cordon_stall_seconds,
             "collateral_spared": list(self.collateral_spared),
             "blocked_behind": self.blocked_behind,
             "stuck_in_cooldown": list(self.stuck_in_cooldown),
