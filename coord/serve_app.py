@@ -4038,6 +4038,84 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/smoke-claim": {
+            "post": {
+                "summary": (
+                    "Atomically claim the right to dispatch a Test-stage "
+                    "fan-out leg for one capability partition (#3333) — a "
+                    "conditional insert so two racing coordinator passes "
+                    "can never both dispatch the same partition"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "work_assignment_id": {"type": "string"},
+                                    "capability_partition": {"type": "string"},
+                                },
+                                "required": [
+                                    "work_assignment_id",
+                                    "capability_partition",
+                                ],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — `claimed` is true iff this call won",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {
+                        "description": (
+                            "Missing work_assignment_id or capability_partition"
+                        )
+                    },
+                },
+            }
+        },
+        "/smoke-claim-release": {
+            "post": {
+                "summary": (
+                    "Release a claim taken via /smoke-claim (#3333) so a "
+                    "later legitimate retry of the same partition (an "
+                    "environmental death, or an operator `coord stop`) "
+                    "isn't permanently stranded"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "work_assignment_id": {"type": "string"},
+                                    "capability_partition": {"type": "string"},
+                                },
+                                "required": [
+                                    "work_assignment_id",
+                                    "capability_partition",
+                                ],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — idempotent, absent claim is a no-op",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {
+                        "description": (
+                            "Missing work_assignment_id or capability_partition"
+                        )
+                    },
+                },
+            }
+        },
         "/needs-attention-notified": {
             "post": {
                 "summary": (
@@ -7947,6 +8025,48 @@ def build_app(
             )
         return JSONResponse({"ok": True})
 
+    async def post_smoke_claim(request: Request) -> Response:
+        # #3333: atomic smoke fan-out dispatch claim on the daemon's
+        # canonical DB — see coord.state.claim_smoke_dispatch's docstring
+        # for the race this closes.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            claimed = state._claim_smoke_dispatch_local(
+                body["work_assignment_id"], body["capability_partition"],
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "smoke-claim write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True, "claimed": claimed})
+
+    async def post_smoke_claim_release(request: Request) -> Response:
+        # #3333: release a claim taken via post_smoke_claim above.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._release_smoke_dispatch_claim_local(
+                body["work_assignment_id"], body["capability_partition"],
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "smoke-claim-release write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_review_posted(request: Request) -> Response:
         # #905: mark a review assignment as posted (sets review_posted_at) on the
         # daemon's DB so thin-client notify runs correctly.
@@ -11282,6 +11402,8 @@ def build_app(
         Route("/review-findings", post_review_findings, methods=["POST"]),
         Route("/review-claim", post_review_claim, methods=["POST"]),
         Route("/review-claim-release", post_review_claim_release, methods=["POST"]),
+        Route("/smoke-claim", post_smoke_claim, methods=["POST"]),
+        Route("/smoke-claim-release", post_smoke_claim_release, methods=["POST"]),
         Route("/review-posted", post_review_posted, methods=["POST"]),
         Route(
             "/needs-attention-notified",

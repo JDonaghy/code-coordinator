@@ -961,9 +961,40 @@ def propagate_smoke_terminal_failure(
     failure_reason: str | None,
     environmental: bool | None = None,
     fanout_parent_id: str | None = None,
+    operator_cancelled: bool = False,
 ) -> None:
     """#1605: resolve a work row's ``test_state`` when its Test-stage
     (``type="smoke"``) child dies without ever reporting pass/fail.
+
+    *operator_cancelled* (#3333): set ``True`` when *parent_assignment_id*'s
+    own terminal status came from an operator ``coord stop`` (agent
+    ``/status`` entry ``status == "cancelled"``), never a genuine crash or
+    test failure. For a #3182 fan-out leg (*fanout_parent_id* given) whose
+    OTHER sibling legs are still running or already carry a `"passed"`
+    verdict, this skips the ordinary WORK/environmental classification below
+    entirely and instead clears *this leg's own* ``test_state`` back to
+    ``None`` — never ``"failed"`` — so the leg reads exactly like an
+    unresolved #1605 environmental death: `coord.smoke.finalize_smoke_fanout`
+    treats an unset/`"running"` leg as "not everyone has reported in yet"
+    (never folds it into the aggregate) and
+    `coord.smoke._find_leg_for_partition`'s existing retry criterion (a
+    terminal row with no real verdict) redispatches a fresh leg for the same
+    partition on the next `dispatch_pending_smoke` tick. Without this, a
+    single cancelled leg's terminal write would let `finalize_smoke_fanout`
+    fold `"failed"` into the parent's AND-across-legs aggregate even while a
+    sibling partition is still green or still running — the same
+    parent-keyed over-reach `release_review_claim_if_row_is_review` (#3206)
+    fixed for review claims, here in the Test stage: `coord stop` on a leg is
+    an operator saying "this leg should not exist", never evidence the code
+    under test is broken (the quadraui#952 incident: a still-running
+    `[macos]` leg and an already-PASSED `[gtk+windows]` leg sat next to a
+    `coord stop`-cancelled duplicate `[macos]` leg, and the cancellation
+    alone flipped the parent's verdict to `"failed"`).
+
+    A no leg-manifest sibling (a genuinely solo cancellation, or every
+    sibling already terminal-without-a-real-verdict itself) falls through to
+    the ordinary classification below unchanged — there is nothing live or
+    green left to protect, so recording the classified verdict is correct.
 
     Before this, a smoke assignment landing on ``status="failed"`` (a dead
     agent, a killed process group, a terminal API error — anything short of
@@ -1045,6 +1076,7 @@ def propagate_smoke_terminal_failure(
     from coord.smoke import (  # noqa: PLC0415
         ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
         TEST_STATE_BLOCKED,
+        _parse_fanout_manifest,
         environmental_smoke_legs,
         environmental_smoke_tally,
         environmental_smoke_tally_reset,
@@ -1053,8 +1085,43 @@ def propagate_smoke_terminal_failure(
     )
     from coord.state import (  # noqa: PLC0415
         load_assignment_test_reason,
+        load_assignment_test_state,
         record_test_verdict,
     )
+
+    if (
+        operator_cancelled
+        and fanout_parent_id
+        and fanout_parent_id != parent_assignment_id
+    ):
+        manifest = _parse_fanout_manifest(load_assignment_test_reason(fanout_parent_id)) or []
+        siblings_alive_or_passed = any(
+            leg_id != parent_assignment_id
+            and load_assignment_test_state(leg_id) in (None, "running", "passed")
+            for leg_id, _caps, _cmd in manifest
+        )
+        if siblings_alive_or_passed:
+            # #3333: this leg's own status is only "failed" because an
+            # operator cancelled it — not because it (or anything else)
+            # actually failed — and a sibling partition is still live or
+            # already green. Clear this leg's own verdict instead of
+            # recording a failure: `finalize_smoke_fanout` then holds the
+            # aggregate at "running" (an unset leg is "not everyone has
+            # reported in yet", never folded in as "worst") and
+            # `_find_leg_for_partition`'s existing retry criterion picks this
+            # partition back up for a fresh leg on the next dispatch tick.
+            record_test_verdict(
+                assignment_id=parent_assignment_id,
+                test_state=None,
+                test_reason=(
+                    "Test-stage fan-out leg cancelled by an operator "
+                    "(`coord stop`) while a sibling leg was still running "
+                    "or already passed — cleared for a fresh re-dispatch of "
+                    "this partition rather than recorded as a work failure "
+                    "(#3333); the parent's own verdict is unaffected."
+                ),
+            )
+            return
 
     classification = classify_failure(failure_reason=failure_reason)
     if environmental is None:

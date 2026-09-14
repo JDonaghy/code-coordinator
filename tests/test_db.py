@@ -2386,7 +2386,12 @@ class TestUatStateAndReasonColumns:
 # `portal_sync_state.preview_verdict_watermark_*` columns.
 # #3236 bumped this to (14, 91): `drive_queue.plan_destructive` /
 # `apply_verdict` / `apply_verdict_reason` / `apply_verdict_at`.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (15, 93)
+# #3333 bumped this to (16, 93): a new `smoke_claims` TABLE (not a column —
+# `_MIGRATE_ADD_COLUMNS`'s length is unchanged at 93, so only the version
+# moved, to force `_ensure_schema`'s `CREATE TABLE IF NOT EXISTS` to run once
+# more on an existing database) — same shape as #3113's `review_claims` bump
+# above.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (16, 93)
 
 
 class TestMigrateAddColumnsVersionGuard:

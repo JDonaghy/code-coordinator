@@ -3601,10 +3601,18 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             # every fan-out round, so it would always read as zero).
             leg_caps = smoke_leg_capabilities(record.get("issue_title"))
             if leg_caps is not None:
+                # #3333: `entry["status"] == "cancelled"` is the agent's own
+                # marker for an operator `coord stop` (coord.agent.CANCELLED)
+                # — distinguishes "this leg should not exist" from a genuine
+                # crash/test failure, so `propagate_smoke_terminal_failure`
+                # can protect a still-live/already-passed sibling partition
+                # from a false aggregate failure instead of folding this
+                # leg's cancellation straight into the parent's verdict.
                 propagate_smoke_terminal_failure(
                     parent_assignment_id=transition.assignment_id,
                     failure_reason=_failure_reason,
                     fanout_parent_id=parent_id,
+                    operator_cancelled=entry.get("status") == "cancelled",
                 )
                 finalize_smoke_fanout(parent_id)
             else:

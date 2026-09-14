@@ -306,9 +306,21 @@ def _update_local_state(
     # review's claim leaked forever (coord-tui#49). Both seams now call the
     # same `coord.state.release_review_claim_if_row_is_review` — one
     # question, one answer.
-    from coord.state import release_review_claim_if_row_is_review  # noqa: PLC0415
+    #
+    # #3333: the same split-brain risk applies to a #3182 fan-out leg's own
+    # smoke-dispatch claim (coord.state.claim_smoke_dispatch) — so this
+    # chokepoint and `_mark_notified_local` both also call
+    # `coord.state.release_smoke_claim_if_row_is_smoke_leg`.
+    from coord.state import (  # noqa: PLC0415
+        release_review_claim_if_row_is_review,
+        release_smoke_claim_if_row_is_smoke_leg,
+    )
 
     release_review_claim_if_row_is_review(assignment_id)
+    # #3333: same chokepoint, same reasoning, for a #3182 fan-out leg's own
+    # smoke-dispatch claim (coord.state.claim_smoke_dispatch) — see
+    # release_smoke_claim_if_row_is_smoke_leg's docstring.
+    release_smoke_claim_if_row_is_smoke_leg(assignment_id)
 
 
 def _record_notification(
