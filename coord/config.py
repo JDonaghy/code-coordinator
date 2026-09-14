@@ -3040,6 +3040,19 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
             entry.get("quiet_hours"), machine_index=i, machine_name=name,
         )
 
+        # #3340: optional per-machine floor for the `/health` reachability
+        # probe timeout — see `Machine.health_timeout`'s docstring for why
+        # this exists instead of just raising `network.DEFAULT_TIMEOUT`.
+        machine_health_timeout = entry.get("health_timeout")
+        if machine_health_timeout is not None:
+            if isinstance(machine_health_timeout, bool) or not isinstance(
+                machine_health_timeout, (int, float)
+            ):
+                raise ConfigError(f"machines[{i}].health_timeout must be a number (seconds)")
+            if machine_health_timeout <= 0:
+                raise ConfigError(f"machines[{i}].health_timeout must be greater than 0")
+            machine_health_timeout = float(machine_health_timeout)
+
         machines.append(
             Machine(
                 name=name,
@@ -3049,6 +3062,7 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
                 repo_paths=repo_paths,
                 max_workers=machine_max_workers,
                 quiet_hours=quiet_hours,
+                health_timeout=machine_health_timeout,
             )
         )
     return machines

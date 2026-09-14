@@ -154,6 +154,65 @@ def test_machine_max_workers_rejects_zero_or_negative(tmp_path: Path) -> None:
         load(p)
 
 
+# ── #3340: per-machine /health reachability-probe timeout floor ────────────
+
+
+def test_machine_health_timeout_parsed(tmp_path: Path) -> None:
+    """#3340: machines[].health_timeout raises the effective
+    `network.check_machine` budget for one machine (e.g. a macOS agent whose
+    cold /health outruns DEFAULT_TIMEOUT) without touching every other
+    machine's default."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: slow\n    host: h\n    repos: [api]\n    health_timeout: 8.5\n"
+        "  - name: normal\n    host: h2\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    by_name = {m.name: m for m in cfg.machines}
+    assert by_name["slow"].health_timeout == 8.5
+    # Unset stays None — callers fall back to network.DEFAULT_TIMEOUT.
+    assert by_name["normal"].health_timeout is None
+
+
+def test_machine_health_timeout_accepts_integer(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    health_timeout: 10\n"
+    )
+    cfg = load(p)
+    assert cfg.machines[0].health_timeout == 10.0
+
+
+def test_machine_health_timeout_rejects_non_number(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    health_timeout: \"slow\"\n"
+    )
+    with pytest.raises(ConfigError, match="health_timeout must be a number"):
+        load(p)
+
+
+def test_machine_health_timeout_rejects_zero_or_negative(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    health_timeout: 0\n"
+    )
+    with pytest.raises(ConfigError, match="health_timeout must be greater than 0"):
+        load(p)
+
+
 # ── #1862: per-machine quiet hours ──────────────────────────────────────────
 
 

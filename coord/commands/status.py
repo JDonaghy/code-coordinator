@@ -277,6 +277,12 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     for s in statuses:
         m = s.machine
         latency = f" ({s.latency_ms:.0f}ms)" if s.latency_ms is not None else ""
+        # #3340: a verdict reached only after `check_machine` retried a slow
+        # (but connected) /health reply is worth flagging here — the same
+        # machine reading fine on this poll and "timed out" on the next is
+        # otherwise silent and easy for an operator to discount.
+        if s.retried:
+            latency += " retried"
         if s.is_online:
             status_result = fetch_status(m, timeout=timeout)
             if status_result.ok:

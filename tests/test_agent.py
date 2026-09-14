@@ -265,6 +265,59 @@ def test_health_reports_machine(tmp_path: Path) -> None:
     assert h["completed"] == 0
 
 
+def test_health_timing_breakdown_covers_every_section(tmp_path: Path) -> None:
+    """#3340: a cold /health on macOS measured 2-7s against callers'
+    fixed 3.0s probe budget, and every previously-named suspect (tool
+    probes, worktree/artifact scans) measured well under the observed cost
+    on that host — so `AgentServer.health()` now times every section it
+    runs and publishes the breakdown, rather than leaving the next report
+    with the same unclosed accounting.
+
+    This only pins the diagnostic's *shape* (every section present, timings
+    non-negative, `total` at least the sum of the parts — extra untimed work
+    between marks, e.g. building the response dict itself, is expected) —
+    which section is actually slow on any given host is exactly what this
+    diagnostic exists to answer, not something this test can assert without
+    the macOS repro.
+    """
+    server = _server(tmp_path)
+    timing = server.health()["health_timing_ms"]
+    expected_sections = {
+        "reload_config",
+        "assignment_tally",
+        "worktree_bytes",
+        "artifact_bytes",
+        "servable_repos",
+        "tool_versions",
+        "local_health",
+        "total",
+    }
+    assert set(timing) == expected_sections
+    for section, ms in timing.items():
+        assert isinstance(ms, (int, float)), section
+        assert ms >= 0, section
+    per_section_sum = sum(ms for k, ms in timing.items() if k != "total")
+    assert timing["total"] >= per_section_sum - 0.5  # float rounding slack
+
+
+def test_health_timing_breakdown_logs_when_slow(tmp_path: Path, monkeypatch, caplog) -> None:
+    """The breakdown is also logged (not just returned) so an operator
+    watching THIS agent's own log — not a client polling it — sees a cold
+    /health without needing to catch the one slow poll in the act."""
+    import logging
+
+    import coord.agent as agent_module
+
+    server = _server(tmp_path)
+    monkeypatch.setattr(agent_module, "_SLOW_HEALTH_WARN_MS", -1.0)
+    with caplog.at_level(logging.WARNING, logger="coord.agent"):
+        server.health()
+    assert any(
+        "took" in rec.getMessage() and "breakdown" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 def test_health_includes_tool_versions_for_baseline_and_capabilities(
     tmp_path: Path,
 ) -> None:

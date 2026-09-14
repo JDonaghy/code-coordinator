@@ -13,8 +13,10 @@ from coord import network
 from coord.models import Machine
 
 
-def _m(name: str = "laptop", host: str = "laptop.tailnet") -> Machine:
-    return Machine(name=name, host=host, repos=["api"])
+def _m(
+    name: str = "laptop", host: str = "laptop.tailnet", *, health_timeout: float | None = None
+) -> Machine:
+    return Machine(name=name, host=host, repos=["api"], health_timeout=health_timeout)
 
 
 class TestClassifyError:
@@ -113,6 +115,113 @@ class TestCheckMachine:
             s = network.check_machine(_m())
         assert s.state == network.HTTP_ERROR
         assert "invalid JSON" in s.reason
+
+
+class TestCheckMachineRetryAndTimeoutFloor:
+    """#3340: a cold /health can outrun DEFAULT_TIMEOUT on a healthy agent.
+
+    `check_machine` responds two ways: retry once on a `ReadTimeout` (the
+    connect succeeded — the agent is there, it just hadn't answered yet),
+    and let `machine.health_timeout` raise the effective budget for a
+    machine known to need it. Neither changes behavior for a machine with
+    no override and no slow-but-connected reply — that's what the existing
+    `TestCheckMachine`/`TestClassifyError` cases above still pin down.
+    """
+
+    def test_read_timeout_retries_and_succeeds(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"machine": "laptop", "active": 0}
+        calls = {"n": 0}
+
+        def fake_get(url, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ReadTimeout("cold /health, still computing")
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            s = network.check_machine(_m())
+        assert calls["n"] == 2
+        assert s.is_online
+        assert s.state == network.ONLINE
+        assert s.retried is True
+
+    def test_read_timeout_retries_once_then_still_reports_timeout(self) -> None:
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ReadTimeout("still cold")
+        ) as mock_get:
+            s = network.check_machine(_m())
+        # Exactly one retry — a wedged agent still reports TIMEOUT rather
+        # than being retried forever.
+        assert mock_get.call_count == 2
+        assert s.state == network.TIMEOUT
+        assert not s.is_online
+        assert s.retried is True
+
+    def test_connect_timeout_is_not_retried(self) -> None:
+        """A ConnectTimeout means the TCP handshake itself never completed —
+        materially stronger evidence of "down" than a ReadTimeout, so this
+        gets no retry (matches `TestCheckMachine.test_timeout`'s single-call
+        expectation, now asserted explicitly on call count)."""
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ConnectTimeout("slow")
+        ) as mock_get:
+            s = network.check_machine(_m())
+        assert mock_get.call_count == 1
+        assert s.state == network.TIMEOUT
+        assert s.retried is False
+
+    def test_retry_on_slow_reply_false_disables_retry(self) -> None:
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ReadTimeout("cold")
+        ) as mock_get:
+            s = network.check_machine(_m(), retry_on_slow_reply=False)
+        assert mock_get.call_count == 1
+        assert s.state == network.TIMEOUT
+        assert s.retried is False
+
+    def test_health_timeout_raises_effective_timeout(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}
+        seen_timeouts: list[float] = []
+
+        def fake_get(url, timeout=None):
+            seen_timeouts.append(timeout)
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            network.check_machine(_m(health_timeout=8.0), timeout=network.DEFAULT_TIMEOUT)
+        assert seen_timeouts == [8.0]
+
+    def test_health_timeout_never_shrinks_a_larger_caller_timeout(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}
+        seen_timeouts: list[float] = []
+
+        def fake_get(url, timeout=None):
+            seen_timeouts.append(timeout)
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            network.check_machine(_m(health_timeout=2.0), timeout=10.0)
+        assert seen_timeouts == [10.0]
+
+    def test_no_health_timeout_uses_caller_timeout_unchanged(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}
+        seen_timeouts: list[float] = []
+
+        def fake_get(url, timeout=None):
+            seen_timeouts.append(timeout)
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            network.check_machine(_m(), timeout=network.DEFAULT_TIMEOUT)
+        assert seen_timeouts == [network.DEFAULT_TIMEOUT]
 
 
 class TestCheckAll:

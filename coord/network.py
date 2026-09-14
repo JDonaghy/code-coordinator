@@ -40,6 +40,13 @@ class MachineStatus:
     reason: str = ""
     latency_ms: float | None = None
     health: dict | None = None
+    # #3340: was this verdict reached only after `check_machine` retried a
+    # `ReadTimeout` once? A reader that only cares about the final verdict
+    # can ignore this; one that's trying to characterize *how* flaky a host
+    # is (e.g. deciding whether to raise its `health_timeout`) needs it —
+    # `latency_ms`/`state` alone can't distinguish "answered promptly" from
+    # "answered promptly on the second try".
+    retried: bool = False
 
     @property
     def is_online(self) -> bool:
@@ -71,15 +78,58 @@ def is_retryable(state: str) -> bool:
     return state in (TIMEOUT, RATE_LIMITED, HTTP_ERROR)
 
 
-def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> MachineStatus:
-    """Ping `machine`'s /health endpoint and classify the result."""
+def check_machine(
+    machine: Machine, timeout: float = DEFAULT_TIMEOUT, *, retry_on_slow_reply: bool = True
+) -> MachineStatus:
+    """Ping `machine`'s /health endpoint and classify the result.
+
+    #3340: two independent adjustments on top of a plain GET, both aimed at
+    the same failure mode — a perfectly reachable agent reading as
+    "unreachable" because it happened to answer slowly, not because it
+    didn't answer at all:
+
+    - **Per-machine floor.** `machine.health_timeout`, when set, raises the
+      effective timeout for *this* machine — never lowers it below what the
+      caller asked for (`max()`, not a straight override), so a caller that
+      already requested something longer for its own reasons isn't capped
+      down by a machine's floor. `DEFAULT_TIMEOUT` itself is untouched —
+      every machine without an explicit `health_timeout` behaves exactly as
+      before.
+    - **One retry on a slow-but-connected reply.** `httpx.ReadTimeout` means
+      the TCP connect already succeeded — the agent is there, it just hadn't
+      finished answering within budget. That is materially weaker evidence
+      of "down" than a `ConnectTimeout`/`ConnectError` (which gets no
+      retry): on this codebase's own agents, `/health` computes several
+      TTL-cached sections (`AgentServer.health()`), and an abandoned
+      cold-cache computation from the first attempt keeps running server-side
+      even after the client gives up waiting — so an immediate second GET
+      often lands on an already-warm cache. One retry only: a genuinely wedged
+      agent still ends up reporting TIMEOUT, just after one extra round trip
+      instead of none.
+    """
     url = f"http://{machine.host}:{AGENT_PORT}/health"
-    start = time.perf_counter()
-    try:
-        resp = httpx.get(url, timeout=timeout)
-    except Exception as e:  # noqa: BLE001 — we classify all network errors
-        state, reason = classify_error(e)
-        return MachineStatus(machine=machine, state=state, reason=reason)
+    effective_timeout = (
+        max(timeout, machine.health_timeout)
+        if getattr(machine, "health_timeout", None)
+        else timeout
+    )
+    attempts_left = 2 if retry_on_slow_reply else 1
+    retried = False
+    while True:
+        start = time.perf_counter()
+        try:
+            resp = httpx.get(url, timeout=effective_timeout)
+        except httpx.ReadTimeout as e:
+            attempts_left -= 1
+            if attempts_left > 0:
+                retried = True
+                continue
+            state, reason = classify_error(e)
+            return MachineStatus(machine=machine, state=state, reason=reason, retried=retried)
+        except Exception as e:  # noqa: BLE001 — we classify all other network errors
+            state, reason = classify_error(e)
+            return MachineStatus(machine=machine, state=state, reason=reason, retried=retried)
+        break
 
     latency_ms = (time.perf_counter() - start) * 1000.0
     if resp.status_code != 200:
@@ -88,6 +138,7 @@ def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> Machine
             state=HTTP_ERROR,
             reason=f"HTTP {resp.status_code}",
             latency_ms=latency_ms,
+            retried=retried,
         )
     try:
         health = resp.json()
@@ -97,6 +148,7 @@ def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> Machine
             state=HTTP_ERROR,
             reason="invalid JSON from /health",
             latency_ms=latency_ms,
+            retried=retried,
         )
     return MachineStatus(
         machine=machine,
@@ -104,6 +156,7 @@ def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> Machine
         reason="",
         latency_ms=latency_ms,
         health=health,
+        retried=retried,
     )
 
 
