@@ -152,6 +152,17 @@ class BoardAssignment:
     # for the sibling fields this rides alongside. Appended last, matching
     # DDL order (`_MIGRATE_ADD_COLUMNS` in coord/db.py).
     num_turns: int | None = None
+    # #3339: the explicit operator assertion that clears a terminal
+    # `refused_premise` row (`coord.state.mark_premise_rechecked` /
+    # `coord drive-queue clear-refusal`). Undeclared here, these two columns
+    # would be silently dropped from `/board` per this module's own
+    # docstring — and `coord.drive_state.project()`'s
+    # `work_premise_rechecked_at`/`_reason` read ONLY this wire payload
+    # (`BoardFetcher.fetch()`), so on any daemon-routed fleet `decide()`'s
+    # bypass branch in `coord/drive.py` would never see a recheck a human
+    # just recorded. Appended last, matching DDL order.
+    premise_rechecked_at: float | None = None
+    premise_rechecked_reason: str | None = None
 
 
 @dataclasses.dataclass(kw_only=True)
