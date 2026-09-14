@@ -409,6 +409,7 @@ def test_every_projected_table_has_a_dto() -> None:
         "issues", "drive_escalations", "drive_queue",
     }
     assert all(dataclasses.is_dataclass(cls) for cls in BOARD_PROJECTIONS.values())
+    assert board_schema.decode_row("notifications", {"id": 1}) == {"id": 1}
 
 
 # ── #3339: refused_premise's clear-refusal signal must survive the wire ─────
@@ -493,4 +494,3 @@ def test_premise_rechecked_fields_reach_the_board_wire_and_project(
     assert state.work_status == "refused_premise"
     assert state.work_premise_rechecked_at == wire_row["premise_rechecked_at"]
     assert state.work_premise_rechecked_reason == "quadraui#971 landed"
-    assert board_schema.decode_row("notifications", {"id": 1}) == {"id": 1}

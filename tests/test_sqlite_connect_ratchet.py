@@ -280,15 +280,21 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "alongside it rather than split across two buckets.",
     ),
     "test_board_schema.py": Classification(
-        3, (BUCKET_A, BUCKET_C),
+        4, (BUCKET_A, BUCKET_C),
         "Judgement call, reclassified from B during review: "
         "test_project_row_reads_sqlite_row_column_names_not_values exists "
         "specifically to pin that `sqlite3.Row` is a *sequence*, so `\"x\" in "
         "row` tests values not keys — the #632-class trap that blanks the "
         "whole board. Handing it a dict_row connection under "
         "COORD_TEST_BACKEND=postgres would silently stop testing the thing it "
-        "was written to test. The other two sites are C: a seeded fixture DB "
-        "for SqliteStore plus a reopen to prove a column really leaked.",
+        "was written to test. The other three sites are C: a seeded fixture DB "
+        "for SqliteStore, a reopen to prove a column really leaked, and "
+        "(#3339, test_premise_rechecked_fields_reach_the_board_wire_and_project) "
+        "a seeded refusal row written into the same on-disk `_seeded_db` file "
+        "the TestClient's SqliteStore then reads back over HTTP — the autouse "
+        "`coord_db` connection is `:memory:` and `SqliteStore` opens its own "
+        "`mode=ro` connection BY PATH, so a fixture-only version of that test "
+        "would assert against an empty board.",
     ),
 
     # ── C: genuinely needs a second / separate connection ─────────────────
