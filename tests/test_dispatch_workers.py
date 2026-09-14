@@ -262,6 +262,69 @@ class TestFixOfIterationIsMonotonic:
         assert "(iteration 3/3)" in capsys.readouterr().out
 
 
+class TestFixOfTitleDoesNotStack:
+    """#3323: `_dispatch_fix_of` (`coord fix --fix-of`, the human-attended
+    front door) must build the round-N title through the same
+    `coord.auto_loop.fix_round_title` helper the headless bounce uses, so an
+    already-marked incoming title collapses instead of stacking another
+    `[fix-N]` in front of it — both in the dispatched spec and in the board
+    record `coord fix` keeps."""
+
+    def _run_fix_capturing_provider(
+        self, board: Board, cfg: Config, repo: Repo, *, issue_title: str,
+    ) -> MagicMock:
+        provider = _fake_provider()
+        with patch("coord.auto_loop._load_review_findings", return_value=None):
+            _dispatch_fix_of(
+                machine="laptop",
+                repo="api",
+                issue=7,
+                briefing="",
+                model=None,
+                dry_run=True,
+                force=False,
+                fix_of="review-1",
+                cfg=cfg,
+                machine_obj=_fake_machine_obj(),
+                repo_cfg=repo,
+                issue_title=issue_title,
+                provider=provider,
+                _is_local=True,
+                _svc=None,
+                _interactive_board=lambda _builder: board,
+                _issue_ctx="",
+                _ctx_write_hint="",
+            )
+        return provider
+
+    def test_round_3_title_has_no_residue_of_rounds_1_and_2(
+        self, cfg: Config, repo: Repo,
+    ) -> None:
+        cfg.pipeline.max_review_iterations = 10
+        _work, _review, board = _chain(2)
+
+        provider = self._run_fix_capturing_provider(
+            board, cfg, repo,
+            issue_title="[fix-2] [fix-1] Widget is broken",
+        )
+
+        spec = provider.build_command.call_args.args[0]
+        assert spec.issue_title == "[fix-3] Widget is broken"
+
+    def test_a_clean_title_just_gets_prepended(
+        self, cfg: Config, repo: Repo,
+    ) -> None:
+        cfg.pipeline.max_review_iterations = 10
+        _work, _review, board = _chain(0)
+
+        provider = self._run_fix_capturing_provider(
+            board, cfg, repo, issue_title="Widget is broken",
+        )
+
+        spec = provider.build_command.call_args.args[0]
+        assert spec.issue_title == "[fix-1] Widget is broken"
+
+
 class TestReworkIterationIsMonotonic:
     """`coord rework` writes to the same branch, so it shares the counter."""
 

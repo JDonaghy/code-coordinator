@@ -39,6 +39,7 @@ Data model:
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -774,6 +775,44 @@ def next_fix_iteration_for_branch(
     return highest + 1
 
 
+# #3323: matches a leading run of one or more `[fix-N] ` / `[conflict-fix] `
+# markers — the two title tags a fix round can inherit from its parent row.
+_FIX_TITLE_MARKER_RE = re.compile(r"^(?:\[(?:fix-\d+|conflict-fix)\]\s*)+")
+
+
+def fix_round_title(base_title: str, iteration: int) -> str:
+    """The ``issue_title`` a fix round *iteration* worker carries.
+
+    #3323: every fix-dispatch door used to format
+    ``f"[fix-{iteration}] {base_title}"`` straight off the PARENT row's
+    already-prefixed title (the fix or review row this round follows), so
+    each round's marker stacked in front of the previous one instead of
+    replacing it — a round-3 fix row read
+    ``[fix-3] [fix-2] [fix-1] <real title>``, pushing the real issue title
+    off a TUI board column's visible width. This is the ONE place that
+    formats a fix-round title; every call site below routes through it
+    instead of building the f-string itself, so a future dispatch door
+    can't reintroduce the stack:
+
+    * :func:`_dispatch_fix` (headless ``auto_loop`` bounce, two title
+      assignments — the outbound wire payload and the board record),
+    * ``coord.commands.dispatch_workers._dispatch_fix_of`` (``coord fix``,
+      human-attended — spec + board record).
+
+    Stripping any leading run of ``[fix-N] `` / ``[conflict-fix] `` markers
+    before prepending the new one makes the transform idempotent:
+    ``fix_round_title(fix_round_title(t, 1), 2) == fix_round_title(t, 2)``,
+    and applying it to an already-normalised round-N title is a no-op.
+
+    Leg-type prefixes (``[review]``, ``[smoke]``, ``[smoke:macos]``, …) are
+    applied by a different layer, on top of THIS function's output — they
+    are untouched here and remain correct as-is; only the ``[fix-N]`` /
+    ``[conflict-fix]`` run collapses.
+    """
+    stripped = _FIX_TITLE_MARKER_RE.sub("", base_title)
+    return f"[fix-{iteration}] {stripped}"
+
+
 def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
     """Choose the model alias for a fix worker on a given bounce *iteration*.
 
@@ -1410,7 +1449,7 @@ def _dispatch_fix(
         "repo_name": work.repo_name,
         "repo_path": repo_path,
         "issue_number": work.issue_number,
-        "issue_title": f"[fix-{iteration}] {work.issue_title}",
+        "issue_title": fix_round_title(work.issue_title, iteration),
         "briefing": briefing,
         "files_allowed": work.files_allowed,
         "files_forbidden": work.files_forbidden,
@@ -1465,7 +1504,7 @@ def _dispatch_fix(
         machine_name=machine.name,
         repo_name=work.repo_name,
         issue_number=work.issue_number,
-        issue_title=f"[fix-{iteration}] {work.issue_title}",
+        issue_title=fix_round_title(work.issue_title, iteration),
         files_allowed=list(work.files_allowed),
         files_forbidden=list(work.files_forbidden),
         briefing=briefing,
