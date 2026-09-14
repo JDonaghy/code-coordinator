@@ -1787,15 +1787,33 @@ def _drain_remaining_hosts(record: "rp.PropagationRecord") -> set[str]:
     — and its stale cordon, no longer renewed once ``--drain`` has walked
     away, would eventually lapse and reopen for new work still on the old
     version.
+
+    #3335: also folds in ``released.hosts`` — the #2240/#2741 deadlock
+    breaker's abandoned set. ``plan_cordons`` builds that set as exactly
+    "cordoned and still behind" (``set(live) - set(to_uncordon)``), so these
+    hosts are behind BY CONSTRUCTION; the breaker gives up on them, it does
+    not confirm them current. ``_apply_cordons`` clears their cordon and
+    appends them to the SAME ``uncordoned`` list a proven-current host's roll
+    appends to — that list cannot tell "rolled and confirmed" apart from
+    "abandoned and released" — so ``released.hosts`` must be added to
+    ``remaining`` and kept out of the ``uncordoned`` subtraction even though
+    it also appears there. Skipping this reproduces the exact "every host
+    reached the target" / exit 0 failure the ``unknown`` carve-out above
+    exists to prevent, except worse: the breaker doesn't even leave a stale
+    cordon behind, it clears it immediately and opens a 30-minute
+    no-cordon cooldown on hosts still on the old version.
     """
     cordons = record.cordons or {}
+    released_hosts = set((cordons.get("released") or {}).get("hosts") or [])
     remaining = (
         set(cordons.get("cordoned") or [])
         | set(cordons.get("collateral_spared") or [])
         | set(cordons.get("stuck_in_cooldown") or [])
         | set(cordons.get("unknown") or [])
+        | released_hosts
     )
-    return remaining - set(cordons.get("uncordoned") or [])
+    uncordoned = set(cordons.get("uncordoned") or []) - released_hosts
+    return remaining - uncordoned
 
 
 def _run_drain(
