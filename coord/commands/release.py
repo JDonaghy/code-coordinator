@@ -3164,14 +3164,34 @@ def release_cordon(
                 "routes onto a cordoned host)"
             )
         else:
+            # #3336 review: reaching `max_deferrals` no longer implies release
+            # is imminent — `plan_cordons` also requires the streak to have
+            # SPANNED `cordon_stall_seconds` of real wall-clock time (~40
+            # minutes by default), which a fast poller (e.g. `--drain`'s
+            # 15s default) can take many more than `max_deferrals` attempts
+            # to reach. Naming both the count and the elapsed requirement —
+            # and how much of it has actually elapsed so far — keeps this
+            # line honest about what "outright" depends on, instead of
+            # promising a release that may still be a long wait away.
+            span = pressure.window_span(now)
+            elapsed_note = (
+                f", and has run for ~{span / 60.0:.0f}m of the "
+                f"~{rc.DEFAULT_CORDON_STALL_SECONDS / 60.0:.0f}m required"
+                if span is not None
+                else ""
+            )
             stall_note = (
                 "these cordons have not produced a rollable window, and the "
                 "fleet's busy signal has held identical across every one of "
                 "those runs — a cordon does not itself block follow-on "
                 "dispatch (a review still routes onto a cordoned host), so "
                 "this is read as a genuine stall. `coord release propagate` "
-                f"releases it outright after {rc.DEFAULT_MAX_DEFERRALS} "
-                "(#2240/#2741)"
+                f"releases it outright once BOTH {rc.DEFAULT_MAX_DEFERRALS} "
+                "consecutive deferrals have happened AND the streak has "
+                f"spanned ~{rc.DEFAULT_CORDON_STALL_SECONDS / 60.0:.0f}m of "
+                f"wall-clock time{elapsed_note} (#2240/#2741/#3336) — a fast "
+                "poller (e.g. `--drain`) reaches the count in far fewer "
+                "minutes but still has to wait out the same elapsed floor"
             )
         click.echo(f"\n! {rc.describe_deferral_pressure(pressure)}: {stall_note}.")
     if stuck_hosts:

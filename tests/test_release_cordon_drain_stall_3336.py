@@ -15,15 +15,27 @@ after the identical busy signal has merely been observed twice, ~30 seconds
 apart — a healthy leg, not a stall.
 
 The fix is an elapsed-time floor (`DEFAULT_CORDON_STALL_SECONDS`, alongside
-the existing tick count) measured from the OLDEST record in the same
-trailing window `progressed` already compares
-(`DeferralPressure.window_started_at` / `window_span`). This file tests it at
-two levels:
+the existing tick count) measured from the OLDEST record in the CURRENT
+deferred-and-cordoned streak (`DeferralPressure.window_started_at` /
+`window_span`). This file tests it at three levels:
 
 * pure, direct `deferral_pressure`/`plan_cordons` calls — the exact shape the
   issue asks for: two deferred records 15 seconds apart must NOT release;
-  two 40 minutes apart (what the timer's own cadence already produces) still
-  must;
+  two 40 minutes apart still must;
+* review fix (post-first-cut): the first #3336 cut anchored the elapsed-time
+  floor to the SAME trailing `max_deferrals`-sized window `progressed`
+  compares, which meant the measured span could never exceed
+  `max_deferrals` poll intervals no matter how long the real streak ran —
+  unreachable at `--drain`'s default cadence, however long a genuine stall
+  actually persisted (verified: 20 consecutive records 1200s apart, i.e.
+  6.6 real hours, still measured only a 1200s span and never released).
+  `test_real_timer_cadence_at_default_max_deferrals_releases_after_the_third_tick`
+  and `test_real_drain_cadence_a_genuine_multi_hour_stall_still_releases`
+  simulate the REAL multi-tick invocation shape (each tick's own fresh
+  clock read, one poll interval after the newest already-journaled record —
+  see `coord/commands/release.py`'s `_apply_cordons`) at, respectively, the
+  timer's real 20-minute cadence and `--drain`'s real 15-second default, and
+  assert a genuine stall still eventually releases at both;
 * one black-box `coord release propagate --drain` run at the SHIPPED
   DEFAULT `--drain-interval`, reproducing the incident directly: a fleet
   behind the target, one leg that keeps the busy signal genuinely
@@ -110,10 +122,18 @@ def test_deferral_pressure_reads_back_the_oldest_windows_timestamp() -> None:
     assert pressure.window_span(1015.0) == 15.0
 
 
-def test_window_started_at_ages_out_the_same_as_progressed() -> None:
-    """The elapsed-time anchor is bound to the SAME trailing window
-    (`max_deferrals`-sized) as the tick count and `progressed` — a record
-    older than that window must not stretch the measured span."""
+def test_window_started_at_does_not_age_out_the_same_as_progressed() -> None:
+    """Review fix: unlike `progressed` (deliberately bounded to the trailing
+    `max_deferrals`-sized window — see #2741's reasoning, unrelated to this),
+    the elapsed-time anchor is NOT bound to that same window. A record older
+    than it must still be able to stretch the measured span — that is the
+    whole point of an elapsed-time floor: a longer genuine streak must
+    produce a longer measured span, at any poll cadence. The first #3336 cut
+    got this backwards (shared `progressed`'s bound here too), which meant
+    the measured span could never exceed `max_deferrals` poll intervals no
+    matter how long the real stall ran — see `release_cordon.py`'s module
+    docstring, the #3336 "REVIEW" subsection, for the incident this
+    reproduces."""
     records = [
         _deferred_with_busy(started_at=0.0),
         _deferred_with_busy(started_at=10_000.0, max_deferrals=2),
@@ -122,10 +142,10 @@ def test_window_started_at_ages_out_the_same_as_progressed() -> None:
     pressure = rc.deferral_pressure(records, target_version="0.5.77")
     assert pressure.consecutive == 3
     assert pressure.max_deferrals == 2
-    # The oldest record (t=0) is OUTSIDE the trailing 2-record window —
-    # the anchor must be the newest 2 records' oldest, t=10_000, not t=0.
-    assert pressure.window_started_at == 10_000.0
-    assert pressure.window_span(10_015.0) == 15.0
+    # The anchor is the OLDEST record in the WHOLE streak (t=0) — not just
+    # the newest 2 of them (which would be t=10_000, `progressed`'s window).
+    assert pressure.window_started_at == 0.0
+    assert pressure.window_span(10_015.0) == 10_015.0
 
 
 def test_window_started_at_is_none_without_a_readable_timestamp() -> None:
@@ -190,11 +210,24 @@ def test_two_deferrals_15_seconds_apart_do_not_trip_the_breaker() -> None:
 
 
 def test_two_deferrals_40_minutes_apart_still_trip_the_breaker() -> None:
-    """The flip side: the identical shape, but the trailing window has
-    genuinely spanned `DEFAULT_CORDON_STALL_SECONDS` (~40 minutes — the same
-    figure the propagate timer's own 20-minute cadence already produces at
-    `max_deferrals=2`). This must still release, exactly as it did before
-    #3336 — the fix adds a floor, it does not disable the mechanism."""
+    """The flip side of the 15s test above, exercising the elapsed-time
+    arithmetic directly: once the streak has genuinely spanned
+    `DEFAULT_CORDON_STALL_SECONDS` (~40 minutes), it must still release,
+    exactly as it did before #3336 — the fix adds a floor, it does not
+    disable the mechanism.
+
+    Review note: this hand-picks a single 40-minute gap between exactly two
+    records and is a direct test of the release arithmetic in isolation —
+    it does NOT, on its own, represent what a real 20-minute-cadence
+    `coord-release-propagate.timer` run actually produces (a real run's
+    `now` is always its OWN fresh clock read, one poll interval after the
+    newest already-journaled record — never equal to that record's own
+    timestamp the way this test's `now` is set here). The real multi-tick
+    shape, and the review finding that the first #3336 cut could not
+    actually reach this floor under it, are covered by
+    `test_real_timer_cadence_at_default_max_deferrals_releases_after_the_third_tick`
+    and `test_real_drain_cadence_a_genuine_multi_hour_stall_still_releases`
+    below."""
     stuck = [_busy("live RUNNING assignment", "server:1", host="server")]
     t0 = 1_000_000.0
     records = [
@@ -219,6 +252,117 @@ def test_two_deferrals_40_minutes_apart_still_trip_the_breaker() -> None:
     assert plan.released.hosts == ("server",)
     assert "CORDON RELEASED" in plan.released.message
     assert "~40m" in plan.released.message
+
+
+def test_real_timer_cadence_at_default_max_deferrals_releases_after_the_third_tick() -> None:
+    """Review fix regression: simulates the REAL `coord-release-propagate
+    .timer` invocation shape (`OnUnitActiveSec=20min`,
+    `deploy/coord-release-propagate.timer`) end to end at the shipped
+    default `--cordon-max-deferrals` (2) — one `plan_cordons` call per tick,
+    each with its own fresh `now` one full interval after the newest
+    already-journaled record (exactly what `_apply_cordons`'s
+    `now = time.time()` produces on every real invocation: each run's own
+    record is only appended to the journal by `_finish`, AFTER this
+    evaluation runs — so `now` can never equal a past record's own
+    timestamp the way a hand-picked single-gap test might).
+
+    The first #3336 cut's bounded window happened to just barely reach the
+    floor here — 2 records spanning exactly one 20-minute interval, window
+    capped at `max_deferrals` intervals — matching `DEFAULT_CORDON_STALL_
+    SECONDS` (2400s = `max_deferrals` * 1200s) by construction of the
+    calibration. This test pins that this specific, real cadence still
+    releases at exactly the third tick under the review fix too."""
+    stuck = [_busy("live RUNNING assignment", "server:1", host="server")]
+    interval = 1200.0  # the timer's own cadence
+    records: list[dict] = []
+    releases: list[rc.CordonPlan] = []
+    for tick in range(1, 4):
+        now = tick * interval
+        pressure = rc.deferral_pressure(records, target_version="0.5.77")
+        plan = rc.plan_cordons(
+            target_version="0.5.77",
+            host_versions={"server": "0.5.70"},
+            # Renewed every tick, same as a real cordoned host's own
+            # renewal on every propagate run — a fixed `_live("server")`
+            # (`created=0.0`) would go stale and fall out of `live` by the
+            # third tick, which is a fixture artifact, not the thing under
+            # test.
+            existing={"server": rc.Cordon(
+                machine="server", target_version="0.5.77",
+                created_at=0.0, renewed_at=now - interval,
+                expires_at=now + rc.DEFAULT_TTL_SECONDS,
+            )},
+            now=now,
+            pressure=pressure,
+        )
+        releases.append(plan)
+        if plan.released is not None:
+            break
+        records.append(
+            _deferred_with_busy(cordoned=("server",), busy=stuck, started_at=now)
+        )
+    assert [p.released for p in releases[:2]] == [None, None], (
+        "the first two ticks (consecutive 0, then 1) must not release yet"
+    )
+    assert len(releases) == 3 and releases[2].released is not None, (
+        "the third tick, when consecutive first reaches max_deferrals=2 "
+        "and the streak's own oldest record is 2 real ticks (~40 real "
+        "minutes) in the past, must release"
+    )
+    assert releases[2].released.hosts == ("server",)
+
+
+def test_real_drain_cadence_a_genuine_multi_hour_stall_still_releases() -> None:
+    """The reviewer's own suggested regression, verbatim: feed the window
+    the REAL `--drain` poll cadence (`DEFAULT_DRAIN_INTERVAL_SECONDS`, 15s)
+    at the real shipped default `max_deferrals` (2), and confirm a GENUINE,
+    indefinite stall — the busy signal never changing across however many
+    polls it takes — still eventually releases.
+
+    This is the exact case the first #3336 cut silently failed: its bounded
+    window meant a fast poller's measured span was permanently capped at
+    `max_deferrals * drain_interval` (30s at these defaults) and could never
+    grow no matter how many hours the real stall continued, so the breaker
+    never fired — reintroducing the unbounded-cordon failure #2240 exists to
+    prevent, on the mechanism's own primary caller. The fix must hold at
+    ANY poll cadence: a faster poller takes more attempts to cover the same
+    real elapsed time, not fewer real minutes to trip the breaker, and not
+    forever."""
+    stuck = [_busy("live RUNNING assignment", "server:1", host="server")]
+    interval = 15.0  # DEFAULT_DRAIN_INTERVAL_SECONDS
+    records: list[dict] = []
+    plan: rc.CordonPlan | None = None
+    tick = 0
+    max_ticks = int(rc.DEFAULT_CORDON_STALL_SECONDS // interval) + 20
+    while tick < max_ticks:
+        tick += 1
+        now = tick * interval
+        pressure = rc.deferral_pressure(records, target_version="0.5.77")
+        plan = rc.plan_cordons(
+            target_version="0.5.77",
+            host_versions={"server": "0.5.70"},
+            existing=_live("server"),
+            now=now,
+            pressure=pressure,
+        )
+        if plan.released is not None:
+            break
+        if now < rc.DEFAULT_CORDON_STALL_SECONDS:
+            # A healthy drain must not trip early either — this file's own
+            # core regression, re-checked on every tick of this longer run.
+            assert plan.released is None, (
+                f"tripped after only {now:.0f}s of real time, well under "
+                f"the {rc.DEFAULT_CORDON_STALL_SECONDS:.0f}s floor"
+            )
+        records.append(
+            _deferred_with_busy(cordoned=("server",), busy=stuck, started_at=now)
+        )
+    assert plan is not None and plan.released is not None, (
+        "a genuine, indefinite stall polled every 15s must still eventually "
+        "release — the exact case the bounded-window anchor silently never "
+        "did, at the mechanism's own shipped defaults"
+    )
+    assert plan.released.hosts == ("server",)
 
 
 def test_an_unreadable_window_never_satisfies_the_floor() -> None:
