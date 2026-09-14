@@ -3252,6 +3252,7 @@ class TestFixCompletionDispatchTypes:
 
     def _record_fix_assignment(
         self, assignment_id: str, *, fix_type: str, parent_id: str = "review-parent-1",
+        issue_title: str = "[fix-1] Fix the thing",
     ) -> None:
         """Insert a completed-bounce-fix assignment directly into the DB, as
         ``auto_loop._dispatch_fix`` would have recorded it: review_of_assignment_id
@@ -3264,7 +3265,7 @@ class TestFixCompletionDispatchTypes:
             machine_name="laptop",
             repo_name="api",
             issue_number=42,
-            issue_title="[fix-1] Fix the thing",
+            issue_title=issue_title,
             briefing="fix briefing",
             type=fix_type,
             review_of_assignment_id=parent_id,
@@ -3333,6 +3334,36 @@ class TestFixCompletionDispatchTypes:
             notify_mod.run(config)
 
         mock_fix.assert_not_called()
+
+    def test_round_3_normalized_title_still_triggers_fix_transition(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#3323: the detector's ``.startswith("[fix-")`` check must still
+        recognize a round-3 title produced by
+        :func:`coord.auto_loop.fix_round_title` — a single, un-stacked
+        ``"[fix-3] <title>"`` — the shape every fix round now carries after
+        the #3323 normalization, not just the round-1 shape the other tests
+        in this class use."""
+        from coord.auto_loop import fix_round_title
+
+        self._record_fix_assignment(
+            "fix-w-3",
+            fix_type="work",
+            issue_title=fix_round_title("Fix the thing", 3),
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("fix-w-3", "done")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch(
+                 "coord.auto_loop.run_for_fix_transition", return_value=[]
+             ) as mock_fix:
+            notify_mod.run(config)
+
+        mock_fix.assert_called_once()
+        assert mock_fix.call_args.args[0] == "fix-w-3"
 
 
 # ── #2272: the dispatch↔reap loop must terminate ────────────────────────────

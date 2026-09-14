@@ -2132,7 +2132,10 @@ def _dispatch_fix_of(
     # trusting whichever `work` row `--fix-of` happened to resolve to, so a
     # `coord fix` interleaved with headless bounces can't re-issue a number
     # the chain already used (and stall model escalation / the cap with it).
-    from coord.auto_loop import next_fix_iteration as _next_fix_iter  # noqa: PLC0415
+    from coord.auto_loop import (  # noqa: PLC0415
+        fix_round_title as _fix_round_title,
+        next_fix_iteration as _next_fix_iter,
+    )
 
     next_iteration = _next_fix_iter(_fx_board, work)
     max_iter = cfg.pipeline.max_review_iterations
@@ -2256,7 +2259,7 @@ def _dispatch_fix_of(
         repo_name=repo,
         repo_path=fix_repo_path,
         issue_number=issue,
-        issue_title=f"[fix-{next_iteration}] {issue_title}",
+        issue_title=_fix_round_title(issue_title, next_iteration),
         briefing=effective_briefing,
         model=resolved_model,
         type="work",
@@ -2303,7 +2306,7 @@ def _dispatch_fix_of(
         machine_name=machine,
         repo_name=repo,
         issue_number=issue,
-        issue_title=f"[fix-{next_iteration}] {issue_title}",
+        issue_title=_fix_round_title(issue_title, next_iteration),
         briefing=effective_briefing,
         assignment_id=assignment_id,
         status="running",

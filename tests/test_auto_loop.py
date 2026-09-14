@@ -16,6 +16,7 @@ from coord.auto_loop import (
     _dispatch_fix,
     _fix_model_for_iteration,
     _post_max_iterations_notice,
+    fix_round_title,
     next_fix_iteration,
     next_fix_iteration_for_branch,
     process_review_completion,
@@ -3688,3 +3689,98 @@ class TestFixIterationMonotonicAcrossDispatchPaths:
 
         assert [a.kind for a in actions] == ["fix_dispatched"]
         assert board.active[0].review_iteration == 3
+
+
+class TestFixRoundTitle:
+    """#3323: `fix_round_title` replaces the previous round's `[fix-N] ` /
+    `[conflict-fix] ` marker instead of stacking another one in front of it."""
+
+    def test_first_round_just_prepends(self) -> None:
+        assert fix_round_title("macOS never emits WindowClose", 1) == (
+            "[fix-1] macOS never emits WindowClose"
+        )
+
+    def test_second_round_replaces_the_first_marker_instead_of_stacking(self) -> None:
+        round1 = fix_round_title("macOS never emits WindowClose", 1)
+        round2 = fix_round_title(round1, 2)
+
+        assert round2 == "[fix-2] macOS never emits WindowClose"
+        assert "[fix-1]" not in round2
+
+    def test_third_round_leaves_no_residue_of_earlier_rounds(self) -> None:
+        title = "macOS never emits UiEvent::WindowClose"
+        round1 = fix_round_title(title, 1)
+        round2 = fix_round_title(round1, 2)
+        round3 = fix_round_title(round2, 3)
+
+        assert round3 == f"[fix-3] {title}"
+        assert "[fix-1]" not in round3
+        assert "[fix-2]" not in round3
+
+    def test_applying_twice_at_the_same_iteration_is_idempotent(self) -> None:
+        title = "macOS never emits WindowClose"
+        once = fix_round_title(title, 2)
+        twice = fix_round_title(once, 2)
+        assert once == twice == "[fix-2] macOS never emits WindowClose"
+
+    def test_strips_a_leading_conflict_fix_marker_too(self) -> None:
+        conflict_titled = "[conflict-fix] macOS never emits WindowClose"
+        result = fix_round_title(conflict_titled, 1)
+        assert result == "[fix-1] macOS never emits WindowClose"
+
+    def test_leaves_a_title_with_no_fix_marker_untouched_but_prepended(self) -> None:
+        """`[review]` / `[smoke]` are applied by a DIFFERENT layer, on top of
+        this function's output — `fix_round_title` itself is only ever
+        called with a work row's own title (never a review/smoke row's), so
+        it never sees a leg-type tag to preserve. Confirm a title with no
+        `[fix-N]`/`[conflict-fix]` marker at all is left alone besides the
+        new prefix — nothing is eaten that shouldn't be."""
+        title = "[audit] macOS never emits WindowClose"
+        result = fix_round_title(title, 2)
+        assert result == "[fix-2] [audit] macOS never emits WindowClose"
+
+
+class TestDispatchFixTitleDoesNotStack:
+    """#3323 acceptance: `_dispatch_fix` (the headless auto-loop bounce) must
+    build a round-N title off the PARENT row's title with any earlier
+    `[fix-N]` marker stripped — both the outbound wire payload and the board
+    record it keeps."""
+
+    def _work(self, issue_title: str, review_iteration: int = 1) -> Assignment:
+        return Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=5,
+            issue_title=issue_title,
+            briefing="Original briefing.",
+            assignment_id="work-3323",
+            status="done",
+            branch="issue-5-fix-thing",
+            dispatched_at=0.0,
+            finished_at=1.0,
+            type="work",
+            review_iteration=review_iteration,
+        )
+
+    def test_round_3_title_has_no_residue_of_rounds_1_and_2(self) -> None:
+        cfg = _two_machine_config()
+        # `work` is round 2's completed fix row — exactly what a third
+        # review→fix bounce hands `_dispatch_fix`.
+        work = self._work("[fix-2] [fix-1] macOS never emits WindowClose", 2)
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-round-3"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, cfg, iteration=3,
+                http_client=mock_http,
+                status_fetcher=_reachable_status_fetcher,
+            )
+
+        assert result is not None
+        assert result.issue_title == "[fix-3] macOS never emits WindowClose"
+        # The wire payload sent to the agent must match the board record.
+        wire_title = mock_http.post.call_args.kwargs["json"]["issue_title"]
+        assert wire_title == "[fix-3] macOS never emits WindowClose"
