@@ -177,6 +177,31 @@ def test_doctor_flags_missing_baseline_tool(valid_config_path, monkeypatch) -> N
     assert "✗ gh: not found" in result.output
 
 
+def test_doctor_flags_dead_claude_credentials(valid_config_path, monkeypatch) -> None:
+    """#3326: a machine whose `claude` OAuth session is dead (the observed
+    dellserver state — empty accessToken/refreshToken) must fail `coord
+    doctor`, not report fit to be routed work. `claude` has no registered
+    capability, so this exercises the plain baseline-tool-missing path
+    (`_missing_probe`, no capability arg) exactly like `test_doctor_flags_
+    missing_baseline_tool` does for `gh`."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({
+                "git": _ok_probe(), "gh": _ok_probe(),
+                "claude": _missing_probe(),
+            }, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1
+    assert "✗ claude: not found" in result.output
+
+
 def test_doctor_flags_claimed_capability_the_probe_contradicts(
     valid_config_path, monkeypatch,
 ) -> None:
