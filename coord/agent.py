@@ -67,6 +67,13 @@ def __getattr__(name: str) -> Path:
 # files") are visible without having to open the per-assignment log file.
 _log = logging.getLogger(__name__)
 
+# #3340: how slow `AgentServer.health()` has to be, in this process's own
+# measurement, before it's worth a log line. Set comfortably below
+# `coord.network.DEFAULT_TIMEOUT` (3000ms) — the budget a *caller* probes
+# with — so an operator sees the warning here before (or instead of) the
+# caller-side "timed out" verdict, not only after one already landed.
+_SLOW_HEALTH_WARN_MS = 1000.0
+
 
 def _dir_size(path: Path) -> int:
     """Return total bytes consumed by all regular files under *path*.
@@ -5972,7 +5979,32 @@ class AgentServer:
         # critically — the `repos` list published below is the post-reload one,
         # so `coord repo doctor`'s `machines.agent_repo_skew` clears itself
         # instead of instructing an operator to restart a busy agent.
+        #
+        # #3340: a cold /health on the fleet's macOS host was observed taking
+        # 2-7s against `coord.network.check_machine`'s fixed (at the time)
+        # 3.0s budget — long enough to flip a perfectly reachable agent to
+        # "timed out" in `coord status`/`coord doctor`/`coord release verify`.
+        # Every previously-suspected section (tool-version probes, the
+        # worktree/artifact byte scans) measured well under 200ms on the
+        # affected host, which leaves most of the 2-7s unaccounted for. Rather
+        # than guess again, every section below is individually timed; the
+        # breakdown is logged here (visible in THIS agent's own log) and also
+        # returned as `health_timing_ms` in the response body, so a caller on
+        # a different machine — `coord doctor`, a `coord release verify` run —
+        # can see exactly which section is slow without SSHing in. This is a
+        # diagnostic, not a fix for the underlying cost: whichever section it
+        # points at is the next thing to actually fix.
+        _timing: dict[str, float] = {}
+        _t0 = _prev = time.perf_counter()
+
+        def _mark(section: str) -> None:
+            nonlocal _prev
+            now = time.perf_counter()
+            _timing[section] = round((now - _prev) * 1000.0, 1)
+            _prev = now
+
         self._maybe_reload_config()
+        _mark("reload_config")
         with self._lock:
             active = sum(1 for a in self._assignments.values() if a.status == RUNNING)
             completed = sum(
@@ -5982,13 +6014,36 @@ class AgentServer:
                     DONE, FAILED, CANCELLED, ADVISORY, REFUSED_POLICY, REFUSED_PREMISE,
                 )
             )
+        _mark("assignment_tally")
         worktree_bytes = self._cached_worktree_bytes()
+        _mark("worktree_bytes")
         artifact_bytes = self._cached_artifact_bytes()
+        _mark("artifact_bytes")
         servable_repos, degraded_repos = self._servable_repos()
+        _mark("servable_repos")
+        tool_versions = self._cached_tool_versions()
+        _mark("tool_versions")
+        local_health = self._cached_local_health()
+        _mark("local_health")
         # #2299: the coordinator.yml this agent re-reads on every poll, or
         # None when there is nothing local to watch (config-free / thin-client).
         watched_config = getattr(self._health_config, "path", None)
+        _timing["total"] = round((_prev - _t0) * 1000.0, 1)
+        if _timing["total"] >= _SLOW_HEALTH_WARN_MS:
+            _log.warning(
+                "coord agent: /health on %s took %.0fms — a cold reply above "
+                "network.DEFAULT_TIMEOUT (3000ms, the budget callers probe "
+                "with) reads as unreachable even though this agent is up. "
+                "breakdown(ms)=%s",
+                self.machine_name, _timing["total"], _timing,
+            )
         return {
+            # #3340 diagnostic: per-section wall time for this exact /health
+            # call, in the order the sections actually ran. `total` includes
+            # everything timed above (and is what a caller's own wall-clock
+            # measurement should roughly match); it does NOT include time
+            # spent serializing/transmitting the JSON response itself.
+            "health_timing_ms": _timing,
             "machine": self.machine_name,
             "capabilities": self.capabilities,
             # #1712: None on the normal path; a human-readable reason when
@@ -6031,7 +6086,7 @@ class AgentServer:
             # for gtk, ...). Makes version skew observable fleet-wide
             # (`coord doctor`) instead of only discoverable by SSHing in
             # after a mysterious failure, the way #1564's gh skew was.
-            "tool_versions": self._cached_tool_versions(),
+            "tool_versions": tool_versions,
             # #1630: this machine's own H-1 check-registry results (disk,
             # worktrees, cargo target dirs, repo state, agent venv, ...),
             # cache-refreshed on a timer (see `_local_health_ttl`) rather than
@@ -6043,7 +6098,7 @@ class AgentServer:
             # a health engine that raises produces an `unknown`-severity
             # block (`_cached_local_health`'s own try/except) rather than
             # omitting the key, so an old/new client can always find it.
-            "health": self._cached_local_health(),
+            "health": local_health,
             # #2237 item 7: how often the graph self-heal pass has actually
             # run on this machine, and how often guard 1 (the idle-gate)
             # turned it away because an assignment was RUNNING. The busiest

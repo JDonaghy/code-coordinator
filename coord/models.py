@@ -348,6 +348,17 @@ class Machine:
     # `QuietHours` above. Routing consults this only through
     # `coord.machine_pause.paused_set()`, never directly.
     quiet_hours: QuietHours | None = None
+    # #3340: optional per-machine floor for the `/health` reachability probe
+    # budget (`coord.network.check_machine`'s `timeout`). `None` (unset, the
+    # default) means "no override" — every other machine keeps
+    # `network.DEFAULT_TIMEOUT` (3.0s) exactly as before. This exists because
+    # a fixed, fleet-wide timeout is a cliff: the macOS agent's cold `/health`
+    # measured 2-7s (#3340), any other platform could differ again, and
+    # simply raising the module constant just moves the cliff onto whichever
+    # host is slowest next. `check_machine` takes the *larger* of the
+    # caller's requested timeout and this value — a per-machine floor, never
+    # a ceiling that could silently shrink a caller's own longer request.
+    health_timeout: float | None = None
 
     def can_work_on(self, repo_name: str) -> bool:
         return repo_name in self.repos
