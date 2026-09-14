@@ -409,4 +409,88 @@ def test_every_projected_table_has_a_dto() -> None:
         "issues", "drive_escalations", "drive_queue",
     }
     assert all(dataclasses.is_dataclass(cls) for cls in BOARD_PROJECTIONS.values())
+
+
+# ── #3339: refused_premise's clear-refusal signal must survive the wire ─────
+
+
+def test_premise_rechecked_fields_reach_the_board_wire_and_project(
+    tmp_path: Path,
+) -> None:
+    """Regression for the #3339 review finding: `BoardAssignment` originally
+    shipped without `premise_rechecked_at`/`premise_rechecked_reason`, so —
+    per this module's own contract — they were silently dropped from
+    `/board` no matter how correctly `coord.state.mark_premise_rechecked`
+    wrote them to the DB.  `coord.drive_state.project()` (what
+    `coord/drive.py`'s `decide()` reads to bypass a stale `refused_premise`
+    refusal) has no other source for these two fields than that wire, so on
+    any daemon-routed fleet `coord drive-queue clear-refusal` would write
+    the column correctly and the drive would never see it.
+
+    Drives the REAL write path (`mark_premise_rechecked`, what
+    `clear-refusal` calls), the REAL HTTP `/board` read path, and the REAL
+    `project()` — so a DTO that forgets to declare a column fails here
+    exactly the way it broke a live fleet.
+    """
+    import time
+
+    import coord.db as db_mod
+    from coord.config import Repo
+    from coord.drive_state import project
+    from coord.state import mark_premise_rechecked
+
+    db_path = _seeded_db(tmp_path / "coord.db")
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, "
+        " machine_name, type, status, dispatched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            # A recent `dispatched_at` (not the #748 fixture's epoch
+            # timestamps) so #762's board-retention cap keeps this row —
+            # a terminal row past the retention cutoff is dropped from
+            # `/board` regardless of the DTO, which would make this test
+            # pass for the wrong reason.
+            "a-3339-refused", "claude-coordinator", 947, "issue 947",
+            "precision", "work", "refused_premise", time.time(),
+        ),
+    )
+    conn.commit()
+
+    # The autouse `_no_board_service` fixture keeps board-service resolution
+    # unset, so this routes straight to `_mark_premise_rechecked_local` —
+    # exactly what `coord drive-queue clear-refusal` does when run on the
+    # daemon host itself, or what the daemon's own PATCH handler does when
+    # run from a worker machine.
+    db_mod.override_connection(conn)
+    try:
+        mark_premise_rechecked("a-3339-refused", "quadraui#971 landed")
+    finally:
+        db_mod.override_connection(None)
+        conn.close()
+
+    payload = _serve_client(db_path).get("/board").json()
+    matches = [
+        row for row in payload["assignments"]
+        if row["assignment_id"] == "a-3339-refused"
+    ]
+    assert len(matches) == 1, "the seeded refusal row must round-trip onto /board"
+    wire_row = matches[0]
+    assert wire_row["premise_rechecked_at"] is not None, (
+        "premise_rechecked_at was dropped from /board — BoardAssignment must "
+        "declare it (see coord/board_schema.py)"
+    )
+    assert wire_row["premise_rechecked_reason"] == "quadraui#971 landed"
+
+    config = Config(
+        repos=[Repo(name="claude-coordinator", github="john/claude-coordinator")],
+        machines=[],
+    )
+    state = project(payload, "claude-coordinator", 947, config)
+    assert state.work_aid == "a-3339-refused"
+    assert state.work_status == "refused_premise"
+    assert state.work_premise_rechecked_at == wire_row["premise_rechecked_at"]
+    assert state.work_premise_rechecked_reason == "quadraui#971 landed"
     assert board_schema.decode_row("notifications", {"id": 1}) == {"id": 1}
