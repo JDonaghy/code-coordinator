@@ -2120,6 +2120,11 @@ def _mark_notified_local(
     # override events above pass (no row matches that string), so this is
     # safe to call unconditionally.
     release_review_claim_if_row_is_review(assignment_id)
+    # #3333: same reasoning, for a #3182 fan-out leg's own smoke-dispatch
+    # claim (coord.state.claim_smoke_dispatch) — see
+    # release_smoke_claim_if_row_is_smoke_leg's docstring. Also a no-op for
+    # every non-fan-out-leg row, so safe to call unconditionally here too.
+    release_smoke_claim_if_row_is_smoke_leg(assignment_id)
 
     # #1036: this is the single funnel every notify.py call site (completion,
     # failure, advisory, stuck, needs-attention, stalled, liveness) reaches —
@@ -2442,6 +2447,173 @@ def release_review_claim_if_row_is_review(assignment_id: str) -> None:
         pass
 
 
+# ── Atomic smoke fan-out dispatch claim (#3333) ──────────────────────────────
+
+
+def claim_smoke_dispatch(work_assignment_id: str, capability_partition: str) -> bool:
+    """Atomically claim the right to dispatch a Test-stage leg for
+    *capability_partition* on *work_assignment_id* — the #3182 fan-out's peer
+    of :func:`claim_review_dispatch` (#3113), keyed on the pair rather than on
+    the work assignment alone because a fan-out legitimately dispatches
+    several legs for ONE parent (one per capability partition), never two for
+    the SAME partition.
+
+    Returns ``True`` when THIS call wins the claim, ``False`` when another
+    caller already holds it.
+
+    Before this, ``dispatch_smoke``'s only per-partition dedupe was
+    :func:`coord.smoke._find_leg_for_partition` — a read of the board, so two
+    ticks that both read before either writes both dispatch the same
+    partition. This is the DB-level conditional insert that closes the gap,
+    exactly like ``claim_review_dispatch`` does for reviews: a single
+    ``INSERT ... OR IGNORE`` is atomic even across two separate
+    processes/machines, so exactly one caller ever sees ``rowcount > 0`` for
+    a given ``(work_assignment_id, capability_partition)`` pair. This is what
+    the quadraui#952 incident needed — two ticks 8 seconds apart both
+    dispatched the same ``[smoke:macos]`` partition to a ``max_workers=1``
+    host, and the second leg's write silently overwrote the first leg's
+    ``[[smoke-fanout:...]]`` manifest entry.
+
+    Routes to the daemon when ``board_service`` is configured (the claim
+    table lives on the shared canonical DB, same as ``assignments``), else
+    writes the local DB directly.
+
+    Released by :func:`release_smoke_dispatch_claim` — call sites are
+    ``coord.smoke._dispatch_smoke_fanout`` itself (a partition whose claim it
+    won but then failed to dispatch on, e.g. no reachable machine this tick)
+    and :func:`release_smoke_claim_if_row_is_smoke_leg` (the leg's own
+    terminal-status write), so a legitimate later retry of the same
+    partition (an environmental death, or an operator ``coord stop``) is
+    never permanently stranded by a claim nothing will ever release.
+    """
+    if not work_assignment_id or not capability_partition:
+        return True
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/smoke-claim",
+        {
+            "work_assignment_id": work_assignment_id,
+            "capability_partition": capability_partition,
+        },
+    )
+    if resp is not None:
+        return bool(resp.get("claimed", False))
+    return _claim_smoke_dispatch_local(work_assignment_id, capability_partition)
+
+
+def _claim_smoke_dispatch_local(work_assignment_id: str, capability_partition: str) -> bool:
+    """Local-DB write for :func:`claim_smoke_dispatch`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP — mirrors :func:`_claim_review_dispatch_local`.
+    """
+    conn = get_connection()
+    cur = sql.insert_ignore(
+        conn, "smoke_claims",
+        ["work_assignment_id", "capability_partition", "claimed_at"],
+        (work_assignment_id, capability_partition, time.time()),
+    )
+    conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+def release_smoke_dispatch_claim(work_assignment_id: str, capability_partition: str) -> None:
+    """Release a claim taken by :func:`claim_smoke_dispatch`.
+
+    Idempotent — deleting an absent row is a no-op. Routes to the daemon
+    exactly like :func:`claim_smoke_dispatch` does: a thin client that
+    claimed via the ``/smoke-claim`` POST above must release through the same
+    seam, or the claim it took on the daemon's canonical DB would never
+    actually clear.
+    """
+    if not work_assignment_id or not capability_partition:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/smoke-claim-release",
+        {
+            "work_assignment_id": work_assignment_id,
+            "capability_partition": capability_partition,
+        },
+    )
+    if resp is not None:
+        return
+    _release_smoke_dispatch_claim_local(work_assignment_id, capability_partition)
+
+
+def _release_smoke_dispatch_claim_local(
+    work_assignment_id: str, capability_partition: str,
+) -> None:
+    """Local-DB write for :func:`release_smoke_dispatch_claim`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP, and by :func:`release_smoke_claim_if_row_is_smoke_leg` (which
+    always runs against whatever DB is local to that process).
+    """
+    conn = get_connection()
+    sql.execute(
+        conn,
+        "DELETE FROM smoke_claims WHERE work_assignment_id=? AND capability_partition=?",
+        (work_assignment_id, capability_partition),
+    )
+    conn.commit()
+
+
+def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
+    """Release *assignment_id*'s own smoke-dispatch claim, iff that row is
+    itself a #3182 fan-out leg (``type="smoke"`` with a capability tag in its
+    ``issue_title``) (#3333).
+
+    Mirrors :func:`release_review_claim_if_row_is_review` exactly — the ONE
+    "did a smoke fan-out leg just reach a terminal status, and if so release
+    the claim it took" check, called from the same two chokepoints that
+    function is: ``coord.issue_store._update_local_state`` (the worker
+    self-report / git-floor backstop path) and this module's own
+    :func:`_mark_notified_local` (the ``coord notify`` polling path a
+    reaped/cancelled leg's terminal write goes through when no daemon
+    reconcile tick got there first). One shared function closes the gap for
+    both existing callers and any future one, same #2096/#3206 reasoning.
+
+    A no-op for every non-fan-out-leg row (an ordinary single-partition smoke
+    row, a work/review row, the composite ``f"{aid}:stuck"``-style keys
+    ``_mark_notified_local``'s override events pass) — none of those match
+    ``type == "smoke"`` with a parseable capability tag, so this is safe to
+    call unconditionally from either chokepoint.
+
+    Best-effort: a lookup failure here must never turn a successful status
+    write into a raised exception.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    try:
+        row = sql.execute(
+            conn,
+            "SELECT type, review_of_assignment_id, issue_title FROM assignments "
+            "WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        if row is None:
+            return
+        row_type = row["type"] if hasattr(row, "keys") else row[0]
+        row_of_id = (
+            row["review_of_assignment_id"] if hasattr(row, "keys") else row[1]
+        )
+        row_title = row["issue_title"] if hasattr(row, "keys") else row[2]
+        if row_type != "smoke" or not row_of_id:
+            return
+        from coord.smoke import smoke_leg_capabilities  # noqa: PLC0415
+
+        caps = smoke_leg_capabilities(row_title)
+        if caps is None:
+            return  # an ordinary untagged single-leg smoke row — never claimed
+        _release_smoke_dispatch_claim_local(row_of_id, "+".join(sorted(caps)))
+    except Exception:  # noqa: BLE001 — best-effort; never break the status write
+        pass
+
+
 # ── Review-findings tracking ──────────────────────────────────────────────────
 
 def update_assignment_review_findings(
@@ -2733,23 +2905,57 @@ def reset_work_test_state(
     caller that doesn't know which specific row it means (``assignment_id``
     left as ``None``) leaves them untouched rather than risk clobbering a
     sibling slice's genuine verdict.
+
+    #3333: also releases any outstanding #3182 fan-out ``smoke_claims`` for
+    every row this clears — read from the OLD ``test_reason`` (which carries
+    the ``[[smoke-fanout:...]]`` manifest, see
+    :func:`coord.smoke._encode_fanout_manifest`) BEFORE the ``UPDATE`` below
+    wipes it. Without this, ``coord diagnose --stage test --reset``'s whole
+    point — force a fresh Test-stage dispatch — would silently do nothing
+    for a partition whose phantom fan-out leg died without ever reaching a
+    terminal status write of its own (the one thing that otherwise releases
+    a claim, via :func:`release_smoke_claim_if_row_is_smoke_leg`): the reset
+    clears the row's verdict, but :func:`coord.state.claim_smoke_dispatch`
+    still finds that partition claimed on the very next dispatch attempt and
+    the row never actually re-dispatches — the exact "permanently stranded"
+    failure mode :func:`claim_review_dispatch` was built to avoid for
+    reviews. Best-effort: a manifest-parse failure here never blocks the
+    reset itself.
     """
     conn = get_connection()
     if assignment_id is not None:
-        cur = sql.execute(conn,
-            "UPDATE assignments SET test_state=NULL, test_reason=NULL "
-            "WHERE repo_name=? AND issue_number=? AND ("
+        where = (
+            "repo_name=? AND issue_number=? AND ("
             "type IN ('work','plan','epic-decompose') OR "
             "(type IN ('test-author','mock-author') AND assignment_id=?)"
-            ")",
-            (repo_name, issue_number, assignment_id),
+            ")"
         )
+        params: tuple = (repo_name, issue_number, assignment_id)
     else:
-        cur = sql.execute(conn,
-            "UPDATE assignments SET test_state=NULL, test_reason=NULL "
-            "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan','epic-decompose')",
-            (repo_name, issue_number),
-        )
+        where = "repo_name=? AND issue_number=? AND type IN ('work','plan','epic-decompose')"
+        params = (repo_name, issue_number)
+
+    try:
+        from coord.smoke import _parse_fanout_manifest  # noqa: PLC0415
+
+        rows = sql.execute(
+            conn,
+            f"SELECT assignment_id, test_reason FROM assignments WHERE {where}",
+            params,
+        ).fetchall()
+        for row in rows:
+            aid = row["assignment_id"] if hasattr(row, "keys") else row[0]
+            reason = row["test_reason"] if hasattr(row, "keys") else row[1]
+            if not aid or not reason:
+                continue
+            for _leg_id, caps, _cmd in _parse_fanout_manifest(reason) or []:
+                _release_smoke_dispatch_claim_local(aid, "+".join(sorted(caps)))
+    except Exception:  # noqa: BLE001 — best-effort; never block the reset itself
+        pass
+
+    cur = sql.execute(
+        conn, f"UPDATE assignments SET test_state=NULL, test_reason=NULL WHERE {where}", params,
+    )
     conn.commit()
     return cur.rowcount
 

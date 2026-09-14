@@ -824,7 +824,13 @@ def retry_on_locked(
 #
 # #3263: bumped 14 -> 15 for the two `merge_queue.ci_seen_checks_sha`/
 # `ci_seen_check_names_json` columns appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 15
+#
+# #3333: bumped 15 -> 16 for the new `smoke_claims` TABLE above (not a
+# column — same shape as #3113's bump for `review_claims`: `_migrate_add_
+# columns` below is unchanged, `CREATE TABLE IF NOT EXISTS` in `_SCHEMA_SQL`
+# is what actually creates it on an existing database, and that only runs
+# when `_ensure_schema` runs, which is gated on this version bump).
+_DB_SCHEMA_VERSION = 16
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1668,6 +1674,36 @@ _SCHEMA_SQL = """
         CREATE TABLE IF NOT EXISTS review_claims (
             of_assignment_id TEXT    PRIMARY KEY,
             claimed_at       REAL    NOT NULL
+        );
+
+        -- #3333: atomic Test-stage fan-out dispatch claim — mirrors #3113's
+        -- `review_claims` above but keyed on `(work_assignment_id,
+        -- capability_partition)` rather than one id alone, because a fan-out
+        -- legitimately dispatches several legs for ONE parent (one per
+        -- capability partition, #3182) — never two for the SAME partition.
+        -- `coord.state.claim_smoke_dispatch` does the same conditional
+        -- `INSERT ... OR IGNORE` + `rowcount` check `claim_review_dispatch`
+        -- does; the loser of the race skips dispatching that partition
+        -- entirely THIS tick instead of also spending a metered Test-stage
+        -- leg. This is the DB-level fix for the quadraui#952 incident:
+        -- `coord-notify.timer` and `coord-drive-queue.timer` ticks 8 seconds
+        -- apart both dispatched the same `[smoke:macos]` partition to a
+        -- `max_workers=1` host, and the SECOND leg silently overwrote the
+        -- `[[smoke-fanout:...]]` manifest entry the FIRST leg had just
+        -- written — an operator who then `coord stop`ped the leg the
+        -- corrupted manifest pointed at watched a still-passing work row get
+        -- recorded as a Test FAILURE. Released the moment the claimed leg's
+        -- own assignment row reaches a terminal status
+        -- (`coord.state.release_smoke_claim_if_row_is_smoke_leg`, called
+        -- from the same two terminal-write chokepoints
+        -- `release_review_claim_if_row_is_review` already is) so a
+        -- legitimate retry of the same partition (an environmental death, or
+        -- an operator `coord stop`) is never permanently stranded.
+        CREATE TABLE IF NOT EXISTS smoke_claims (
+            work_assignment_id   TEXT    NOT NULL,
+            capability_partition TEXT    NOT NULL,
+            claimed_at           REAL    NOT NULL,
+            PRIMARY KEY (work_assignment_id, capability_partition)
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);

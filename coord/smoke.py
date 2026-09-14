@@ -2654,6 +2654,33 @@ def _dispatch_smoke_fanout(
             )
             continue
 
+        # #3333: `_find_leg_for_partition` above is a READ of the board — two
+        # ticks (`coord notify`, `coord drive-queue`, a drive session) that
+        # both read "nothing dispatched yet" before either writes both fall
+        # through to here and would both dispatch this exact partition. This
+        # atomic `INSERT ... OR IGNORE` closes that window: exactly one
+        # caller ever wins `claim_smoke_dispatch` for a given
+        # `(work_assignment_id, capability_partition)` pair, mirroring
+        # `claim_review_dispatch` (#3113). The loser skips this partition
+        # entirely THIS tick rather than also spending a metered Test-stage
+        # leg — a later tick's `_find_leg_for_partition` will find the
+        # winner's leg once it has actually landed on the board.
+        partition_tag = "+".join(sorted(partition.capabilities))
+        from coord.state import (  # noqa: PLC0415
+            claim_smoke_dispatch,
+            release_smoke_dispatch_claim,
+        )
+
+        if not claim_smoke_dispatch(completed.assignment_id or "", partition_tag):
+            logger.debug(
+                "dispatch_smoke: %s#%s — lost the atomic dispatch-claim "
+                "race for capability partition %s (#3333); another "
+                "in-flight tick is dispatching it, leaving it for a later "
+                "tick to pick up as `existing`.",
+                completed.repo_name, completed.issue_number, caps,
+            )
+            continue
+
         candidates = rank_smoke_machines(
             caps, completed.repo_name, completed.machine_name, board, config,
         )
@@ -2690,6 +2717,11 @@ def _dispatch_smoke_fanout(
         )
 
         if result is None:
+            # #3333: won the claim above but dispatched nothing with it —
+            # release it so a LATER tick (this partition still needs a leg
+            # either way) isn't permanently blocked by an orphaned claim
+            # nothing will ever fulfill.
+            release_smoke_dispatch_claim(completed.assignment_id or "", partition_tag)
             transient = any(a.transient for a in attempts)
             if transient or not attempts:
                 logger.warning(

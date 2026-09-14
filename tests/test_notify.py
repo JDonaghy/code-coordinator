@@ -2841,6 +2841,157 @@ class TestSmokeCompletionVerdict:
             f"{row['test_reason']!r}"
         )
 
+    def test_operator_cancelled_leg_does_not_fail_the_parent_while_sibling_runs(
+        self, coord_db,
+    ) -> None:
+        """#3333 regression (quadraui#952): an operator `coord stop` on ONE
+        fan-out leg reports EVENT_FAILURE with the agent's own `status ==
+        "cancelled"` marker — never evidence the CODE under test is broken.
+        While a sibling partition is still running, the parent's aggregate
+        must stay `running` (never fold this leg's cancellation in as a
+        `failed` verdict) — before this fix, `coord stop`ping the leg the
+        (already-corrupted) manifest happened to point at flipped a
+        still-healthy work row's verdict straight to `failed`."""
+        from coord.notify import EVENT_FAILURE, Transition, post_transition  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            get_connection,
+            load_assignment_test_state,
+            record_test_verdict,
+        )
+
+        self._record_work("work-cancel")
+        self._record_fanout_leg(
+            "leg-macos-a", parent_id="work-cancel", capabilities=("macos",),
+        )
+        self._record_fanout_leg(
+            "leg-gtk", parent_id="work-cancel", capabilities=("gtk", "windows"),
+        )
+        record_test_verdict(
+            assignment_id="work-cancel", test_state="running",
+            test_reason=(
+                "[[smoke-fanout:leg-macos-a=macos,leg-gtk=gtk+windows]]\n"
+                "Test stage running across 2 capability-partition leg(s) "
+                "(#3182): [macos]; [gtk+windows]."
+            ),
+        )
+
+        cancel = Transition(
+            assignment_id="leg-macos-a", machine_name="macmini", repo_name="api",
+            issue_number=42, event=EVENT_FAILURE, exit_code=None,
+        )
+        cancel_record = {
+            "repo_github": "acme/api", "type": "smoke",
+            "review_of_assignment_id": "work-cancel",
+            "issue_title": "[smoke:macos] Fix thing",
+        }
+        cancel_entry = {
+            "started_at": 1000.0, "finished_at": 1010.0,
+            "branch": "issue-42-fix-thing", "log_path": None,
+            "status": "cancelled",
+        }
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.post_failure"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(cancel, cancel_record, cancel_entry)
+
+        # The cancelled leg's own verdict is cleared, not "failed" — so
+        # `_find_leg_for_partition` treats it as retryable on the next
+        # dispatch tick rather than a genuine terminal failure.
+        assert load_assignment_test_state("leg-macos-a") is None
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+            ("work-cancel",),
+        ).fetchone()
+        assert row["test_state"] == "running", (
+            "an operator cancellation must not fail the aggregate while a "
+            f"sibling leg is still running — got {row['test_state']!r}"
+        )
+
+        # The still-running sibling leg is unaffected and, once it later
+        # passes, the aggregate must resolve on ITS verdict — never see the
+        # cancellation again.
+        from coord.smoke import finalize_smoke_fanout  # noqa: PLC0415
+
+        record_test_verdict(assignment_id="leg-gtk", test_state="passed")
+        finalize_smoke_fanout("work-cancel")
+        row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?",
+            ("work-cancel",),
+        ).fetchone()
+        assert row["test_state"] == "running", (
+            "finalize must keep waiting — the cancelled leg is still "
+            "cleared (None), i.e. 'not everyone has reported in yet', not "
+            f"folded in as a verdict; got {row['test_state']!r}"
+        )
+
+    def test_operator_cancelled_leg_fails_the_parent_when_no_sibling_survives(
+        self, coord_db,
+    ) -> None:
+        """The guard only protects a LIVE/passed sibling. When every other
+        leg is already a non-verdict terminal row too (nothing left to
+        protect), an operator cancellation falls through to the ordinary
+        classification unchanged."""
+        from coord.notify import EVENT_FAILURE, Transition, post_transition  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            get_connection,
+            load_assignment_test_state,
+            record_test_verdict,
+        )
+
+        self._record_work("work-cancel-solo")
+        self._record_fanout_leg(
+            "leg-macos-solo", parent_id="work-cancel-solo", capabilities=("macos",),
+        )
+        record_test_verdict(
+            assignment_id="work-cancel-solo", test_state="running",
+            test_reason=(
+                "[[smoke-fanout:leg-macos-solo=macos]]\n"
+                "Test stage running across 1 capability-partition leg(s) "
+                "(#3182): [macos]."
+            ),
+        )
+
+        cancel = Transition(
+            assignment_id="leg-macos-solo", machine_name="macmini", repo_name="api",
+            issue_number=42, event=EVENT_FAILURE, exit_code=None,
+        )
+        cancel_record = {
+            "repo_github": "acme/api", "type": "smoke",
+            "review_of_assignment_id": "work-cancel-solo",
+            "issue_title": "[smoke:macos] Fix thing",
+        }
+        cancel_entry = {
+            "started_at": 1000.0, "finished_at": 1010.0,
+            "branch": "issue-42-fix-thing", "log_path": None,
+            "status": "cancelled",
+        }
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.post_failure"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(cancel, cancel_record, cancel_entry)
+
+        assert load_assignment_test_state("leg-macos-solo") == "failed"
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?",
+            ("work-cancel-solo",),
+        ).fetchone()
+        assert row["test_state"] == "failed"
+
     def test_interactive_smoke_mode_not_auto_certified(
         self, coord_db
     ) -> None:
