@@ -8,7 +8,9 @@ Mirrors tests/test_github_ops.py's TestGetPrChecks patterns for mocking
 
 from __future__ import annotations
 
+import json
 import subprocess
+import time
 from unittest.mock import patch
 
 from coord import prereqs
@@ -154,7 +156,7 @@ class TestProbeAll:
     def test_baseline_always_probed(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
             probes = prereqs.probe_all([])
-        assert set(probes) == {"git", "gh"}
+        assert set(probes) == {p.tool for p in prereqs.BASELINE_PREREQS}
 
     def test_capability_prereqs_only_probed_when_declared(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
@@ -167,7 +169,7 @@ class TestProbeAll:
     def test_unrecognised_capability_probes_nothing_extra(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
             probes = prereqs.probe_all(["some-future-capability"])
-        assert set(probes) == {"git", "gh"}
+        assert set(probes) == {p.tool for p in prereqs.BASELINE_PREREQS}
 
     def test_tool_versions_summary_is_json_friendly(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
@@ -185,7 +187,9 @@ class TestProbeAll:
         cross-check it exists to unblock would quietly narrow again."""
         with patch("coord.prereqs.shutil.which", return_value=None):
             probes = prereqs.probe_all(prereqs.ALL_CAPABILITY_NAMES)
-        expected_tools = {p.tool for p in prereqs.CAPABILITY_PREREQS} | {"git", "gh"}
+        expected_tools = {p.tool for p in prereqs.CAPABILITY_PREREQS} | {
+            p.tool for p in prereqs.BASELINE_PREREQS
+        }
         assert set(probes) == expected_tools
 
 
@@ -859,3 +863,196 @@ class TestGhFloorIsSingleSourceOfTruth:
         must import it, never hardcode a second copy that can drift."""
         gh_prereq = next(p for p in prereqs.BASELINE_PREREQS if p.tool == "gh")
         assert gh_prereq.min_version == GH_PR_CHECKS_JSON_MIN_VERSION
+
+
+class TestClaudeCredentialsPrereq:
+    """#3326: `coord doctor` never probed `claude` at all, so a machine
+    whose OAuth session was dead (empty accessToken/refreshToken, the real
+    state observed on dellserver 2026-09-13) reported fit to be routed work.
+    `claude` is BASELINE (not capability-gated, like `az`/`opencode`) because
+    the default provider has no `capabilities:` string a machine can lack —
+    see the module comment above `_probe_claude_credentials`."""
+
+    def _claude_prereq(self):
+        return next(p for p in prereqs.BASELINE_PREREQS if p.tool == "claude")
+
+    def _write_credentials(self, home, oauth: dict) -> None:
+        creds_dir = home / ".claude"
+        creds_dir.mkdir(parents=True, exist_ok=True)
+        (creds_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": oauth}), encoding="utf-8"
+        )
+
+    def test_backed_by_claude_and_is_baseline(self) -> None:
+        assert self._claude_prereq().capability is None
+        assert "claude" not in {p.tool for p in prereqs.CAPABILITY_PREREQS}
+
+    def test_probe_is_a_custom_probe_not_a_binary_check(self) -> None:
+        """`claude --version` succeeds even with blanked OAuth tokens — the
+        binary being on PATH proves nothing about the credential, so this
+        prereq must never fall through to the generic binary-probe path."""
+        assert self._claude_prereq().custom_probe is not None
+
+    def test_missing_binary_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+        assert "claude CLI not found on PATH" in probe.what_breaks
+
+    def _probe_linux(self, home, monkeypatch):
+        monkeypatch.setenv("HOME", str(home))
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            return prereqs.probe(self._claude_prereq())
+
+    def test_missing_credentials_file_probes_not_met(self, tmp_path, monkeypatch) -> None:
+        probe = self._probe_linux(tmp_path, monkeypatch)
+        assert probe.found is False
+        assert probe.ok is False
+        assert "does not exist" in probe.what_breaks
+
+    def test_unparsable_credentials_file_probes_not_met_distinctly(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Missing file and unparsable-but-present file are different
+        defects with different remedies — both must be UNMET, but the
+        acceptance bar wants them distinguishable in `what_breaks`, unlike
+        the shared "empty or expired tokens" bucket below."""
+        creds_dir = tmp_path / ".claude"
+        creds_dir.mkdir(parents=True)
+        (creds_dir / ".credentials.json").write_text("not json", encoding="utf-8")
+        probe = self._probe_linux(tmp_path, monkeypatch)
+        assert probe.found is False
+        assert probe.ok is False
+        assert "not valid JSON" in probe.what_breaks
+        # Distinct wording from the missing-file case.
+        missing_probe = self._probe_linux(tmp_path / "other-home", monkeypatch)
+        assert missing_probe.what_breaks != probe.what_breaks
+
+    def test_empty_string_tokens_probe_not_met(self, tmp_path, monkeypatch) -> None:
+        """The exact state observed on dellserver: `accessToken` and
+        `refreshToken` both blanked to `""` by a failed background refresh,
+        while `refreshTokenExpiresAt` is still comfortably in the future —
+        so a check that only compares expiry timestamps would call this
+        host healthy. Reading the token strings themselves is the only
+        signal that catches it."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "",
+            "refreshToken": "",
+            "expiresAt": 0,
+            "refreshTokenExpiresAt": (time.time() + 3600 * 24 * 365) * 1000,
+            "subscriptionType": "max",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+        assert "empty or expired" in probe.what_breaks
+        # Distinct wording from the missing/unparsable-file case.
+        assert "does not exist" not in probe.what_breaks
+        assert "not valid JSON" not in probe.what_breaks
+
+    def test_expired_refresh_token_probes_not_met(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": 0,
+            "refreshTokenExpiresAt": 1000,  # long past
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+
+    def test_healthy_credential_probes_met_and_reports_subscription_tier(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": (time.time() + 3600) * 1000,
+            "refreshTokenExpiresAt": (time.time() + 3600 * 24 * 365) * 1000,
+            "subscriptionType": "max",
+            "rateLimitTier": "default_claude_max_20x",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is True
+        assert probe.ok is True
+        assert probe.version == "max"
+
+    def test_no_expiry_fields_but_live_tokens_still_probes_met(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A credential file with non-empty tokens and no (or non-numeric)
+        expiry fields must not false-negative — degrade to "can't confirm
+        expiry, trust the tokens" rather than false-failing on a format this
+        module hasn't seen."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is True
+        assert probe.ok is True
+
+    def test_probe_never_spawns_claude_itself(self, tmp_path, monkeypatch) -> None:
+        """Guard against a future refactor reintroducing a billable `claude
+        -p` call into `coord doctor`, which is documented as costing exactly
+        what `coord status` costs and runs fleet-wide."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": (time.time() + 3600) * 1000,
+            "refreshTokenExpiresAt": (time.time() + 3600 * 24 * 365) * 1000,
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"), \
+             patch("coord.prereqs.subprocess.run") as mock_run:
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.ok is True
+        mock_run.assert_not_called()
+
+    def test_darwin_uses_keychain_presence_not_the_linux_file(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Claude Code stores OAuth in the login Keychain on darwin, not
+        `~/.claude/.credentials.json` (#3170) — a probe that only checked
+        the file would report every healthy mac as UNMET."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "darwin"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(returncode=0),
+             ) as mock_run:
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is True
+        assert probe.ok is True
+        args = mock_run.call_args[0][0]
+        assert args[:2] == ["security", "find-generic-password"]
+
+    def test_darwin_missing_keychain_item_probes_not_met(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "darwin"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(returncode=1),
+             ):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False

@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -482,6 +483,149 @@ def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
     )
 
 
+# --- `claude` provider: credential availability, not just the binary (#3326) -
+#
+# Every worker, reviewer, smoke, and fix leg this fleet dispatches is a
+# `claude -p` subprocess (`coord.providers.claude.ClaudeProvider`) unless an
+# assignment/repo/label override picks a different provider — and
+# `providers_cfg.default` is `"claude"` (`coord.providers.__init__.
+# resolve_provider_name`), so a plain repo with no provider config at all
+# still lands here. That default has no matching `capabilities:` string the
+# way `provider:opencode` does (`coord.config.provider_capability`) — a
+# machine cannot opt OUT of being asked to run `claude`, only additionally
+# advertise another provider — so this is a `BASELINE_PREREQS` entry, not a
+# `CAPABILITY_PREREQS` one gated behind a capability nothing ever declares.
+#
+# `claude --version` is useless here, exactly like a bare `az --version`
+# would be for azure (see `_probe_azure_credentials` above, the pattern this
+# copies): it only proves the binary is on `PATH`, and a dead OAuth session
+# leaves the binary perfectly runnable. The 2026-09-13 dellserver incident
+# this closes: a failed background token refresh wrote back an EMPTY
+# `accessToken`/`refreshToken` while leaving `refreshTokenExpiresAt` still in
+# the future — so a naive "is the session expired" check reading only the
+# expiry timestamps would have called this host healthy. The only signal
+# that actually caught it is reading the tokens themselves.
+#
+# Deliberately does NOT spawn `claude -p` to verify the credential — `coord
+# doctor` is documented as costing exactly what `coord status` costs, and
+# runs fleet-wide, so a probe that spawned a billable subprocess per machine
+# would break that contract. Reading and validating
+# `~/.claude/.credentials.json` locally is free and sufficient: it is the
+# exact file (and exact fields) `claude -p` itself reads before opening a
+# session, so a probe that parses it directly cannot diverge from what the
+# real dispatch will see.
+#
+# macOS does not use this file at all — Claude Code stores OAuth in the
+# login Keychain there (`coord.machine_onboard`'s identity check hit this
+# already, #3170). This probe branches the same way: presence-only via
+# `security find-generic-password` on darwin (no `-w`, so it never reads the
+# secret value and never risks a keychain-unlock prompt — same stance
+# `machine_onboard.py` already takes), full token-content validation on
+# every other platform.
+CLAUDE_OAUTH_KEYCHAIN_SERVICE = "Claude Code-credentials"  # macOS only, #3170
+
+
+def _claude_credentials_path() -> Path:
+    return Path("~/.claude/.credentials.json").expanduser()
+
+
+def _claude_not_found(prereq: Prereq, reason: str) -> ToolProbe:
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=False,
+        version=None, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=f"{reason} — {prereq.what_breaks}",
+    )
+
+
+def _probe_claude_credentials_darwin(prereq: Prereq, timeout: float) -> ToolProbe:
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", CLAUDE_OAUTH_KEYCHAIN_SERVICE],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _claude_not_found(
+            prereq, "`security find-generic-password` hung or could not run"
+        )
+    if result.returncode != 0:
+        return _claude_not_found(
+            prereq,
+            f"no {CLAUDE_OAUTH_KEYCHAIN_SERVICE!r} item in the login Keychain "
+            "— run `claude` (interactive login) on this machine",
+        )
+    # Presence only (see module comment above) — no subscription tier is
+    # available on darwin without reading the secret value.
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=None, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
+def _probe_claude_credentials_linux(prereq: Prereq, _timeout: float) -> ToolProbe:
+    path = _claude_credentials_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return _claude_not_found(
+            prereq,
+            f"{path} does not exist or is unreadable — run `claude` "
+            "(interactive login) on this machine to create it",
+        )
+    oauth = None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            oauth = data.get("claudeAiOauth")
+    except ValueError:
+        oauth = None
+    if not isinstance(oauth, dict):
+        return _claude_not_found(
+            prereq,
+            f"{path} is not valid JSON or has no claudeAiOauth block — run "
+            "`claude` (interactive login) on this machine to recreate it",
+        )
+    access_token = oauth.get("accessToken") or ""
+    refresh_token = oauth.get("refreshToken") or ""
+    refresh_expires_at = oauth.get("refreshTokenExpiresAt")
+    now_ms = time.time() * 1000.0
+    refresh_expired = (
+        isinstance(refresh_expires_at, (int, float))
+        and refresh_expires_at > 0
+        and refresh_expires_at < now_ms
+    )
+    if not access_token or not refresh_token or refresh_expired:
+        return _claude_not_found(
+            prereq,
+            f"{path} holds empty or expired OAuth tokens — a failed "
+            "background refresh can blank accessToken/refreshToken while "
+            "leaving refreshTokenExpiresAt looking alive (#3326) — run "
+            "`claude` (or `claude setup-token`) on this machine to "
+            "re-authenticate",
+        )
+    tier = oauth.get("subscriptionType") or oauth.get("rateLimitTier")
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=tier, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
+def _probe_claude_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the baseline `claude` prereq (#3326).
+
+    Never raises — every failure mode (binary missing, file missing,
+    unparsable file, empty/expired tokens, a hung `security` call on darwin)
+    degrades to `found=False` with a `what_breaks` naming which one and the
+    remedy, same contract as every other probe in this module.
+    """
+    if shutil.which(prereq.binary) is None:
+        return _claude_not_found(prereq, "claude CLI not found on PATH")
+    if sys.platform == "darwin":
+        return _probe_claude_credentials_darwin(prereq, timeout)
+    return _probe_claude_credentials_linux(prereq, timeout)
+
+
 # Required on every machine, no matter its declared capabilities — coord
 # itself doesn't function without these.
 BASELINE_PREREQS: tuple[Prereq, ...] = (
@@ -501,6 +645,20 @@ BASELINE_PREREQS: tuple[Prereq, ...] = (
             "the CI merge gate cannot read check status — see "
             "coord.github_ops.GhTooOldForJsonChecks (#1564)"
         ),
+    ),
+    # #3326: see the module comment above `_probe_claude_credentials` for
+    # why this is baseline (no machine can opt out of being asked to run
+    # the default provider) and why it validates the credential file rather
+    # than spawning `claude -p`.
+    Prereq(
+        tool="claude", binary="claude", version_args=(), version_re="",
+        min_version=None, capability=None,
+        what_breaks=(
+            "every claude-provider dispatch (worker, reviewer, smoke, fix) "
+            "authenticates as api_error at turn 1 and burns zero turns / $0 "
+            "while looking dispatched (#3326)"
+        ),
+        custom_probe=_probe_claude_credentials,
     ),
 )
 
