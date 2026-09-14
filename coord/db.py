@@ -830,7 +830,11 @@ def retry_on_locked(
 # columns` below is unchanged, `CREATE TABLE IF NOT EXISTS` in `_SCHEMA_SQL`
 # is what actually creates it on an existing database, and that only runs
 # when `_ensure_schema` runs, which is gated on this version bump).
-_DB_SCHEMA_VERSION = 16
+#
+# #3339: bumped 16 -> 17 for the two `assignments.premise_rechecked_at`/
+# `premise_rechecked_reason` columns appended to `_migrate_add_columns`
+# below.
+_DB_SCHEMA_VERSION = 17
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -2246,6 +2250,19 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # commit" by `coord.merge_queue._ci_seen_check_names`.
     "ALTER TABLE merge_queue ADD COLUMN ci_seen_checks_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE merge_queue ADD COLUMN ci_seen_check_names_json TEXT",
+    # #3339: the explicit operator assertion that clears a terminal
+    # `refused_premise` row — see `coord.state.mark_premise_rechecked` and
+    # `coord drive-queue clear-refusal`. Unlike `refused_policy`, a premise
+    # refusal has no mechanical staleness check (a title rewrite cannot make
+    # a missing prerequisite exist — see the #3164 comment in
+    # `coord/drive.py`'s `decide()`), so the ONLY way `decide()`'s
+    # `refused_premise` branch bypasses its `_die()` is a human recording,
+    # on THIS assignment id, that they rechecked the premise and it now
+    # holds. NULL/'' for every row predating this migration and for every
+    # row an operator has not (yet) asserted against — read identically to
+    # "still blocking".
+    "ALTER TABLE assignments ADD COLUMN premise_rechecked_at REAL",
+    "ALTER TABLE assignments ADD COLUMN premise_rechecked_reason TEXT",
 ]
 
 

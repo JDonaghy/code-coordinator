@@ -1280,7 +1280,10 @@ def _recover_work_like(
             "purpose (retrying reproduces the identical refusal, since "
             "nothing about the premise has changed) — needs the "
             "coordinator: re-scope or close the issue and audit the "
-            "`after=` edges of anything queued behind it (#3164)"
+            "`after=` edges of anything queued behind it (#3164). If the "
+            "prerequisite has since landed, `coord drive-queue "
+            "clear-refusal <repo> <issue> --reason \"...\"` then "
+            "`drive-queue remove` + `add` dispatches fresh work (#3339)"
         )
         res.recovered = False
     else:

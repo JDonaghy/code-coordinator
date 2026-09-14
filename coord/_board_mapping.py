@@ -181,6 +181,11 @@ def row_to_assignment(row: object) -> Assignment:
         # session's own bash tool). None for a hand or coordinator/brain
         # dispatch, and for rows predating this column.
         dispatched_by_assignment_id=d.get("dispatched_by_assignment_id"),
+        # #3339: the `coord drive-queue clear-refusal` assertion; None for
+        # every row predating this column and for every row nobody has
+        # asserted against.
+        premise_rechecked_at=d.get("premise_rechecked_at"),
+        premise_rechecked_reason=d.get("premise_rechecked_reason"),
     )
 
 

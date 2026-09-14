@@ -2008,7 +2008,12 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
             "prerequisite unmet. Retrying cannot change that verdict. Needs "
             "the coordinator: re-scope or close the issue (no title rewrite "
             "fixes this) and audit the `after=` edges of anything queued "
-            "behind it, then `coord drive-queue remove` once handled (#3164).",
+            "behind it. If the prerequisite has since landed, `coord "
+            "drive-queue clear-refusal <repo> <issue> --reason \"...\"` "
+            "records that on this assignment, then `coord drive-queue "
+            "remove` + `add` dispatches fresh work (#3339) — `remove` alone "
+            "does nothing, since it only clears the queue row, not this "
+            "board verdict.",
             err=True,
         )
         sys.exit(1)

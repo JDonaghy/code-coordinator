@@ -3996,7 +3996,9 @@ def _reconcile_running(
             "Re-scope or close the issue, and audit the `after=` edges of "
             "anything queued behind it (`coord drive-queue list`) — "
             "whatever they were waiting on is not landing on the timescale "
-            "they assumed."
+            "they assumed. If the prerequisite has since landed, `coord "
+            "drive-queue clear-refusal <repo> <issue> --reason \"...\"` "
+            "then `remove` + `add` dispatches fresh work (#3339)."
         )
         return (
             Reconcile(

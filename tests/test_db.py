@@ -2391,7 +2391,7 @@ class TestUatStateAndReasonColumns:
 # moved, to force `_ensure_schema`'s `CREATE TABLE IF NOT EXISTS` to run once
 # more on an existing database) — same shape as #3113's `review_claims` bump
 # above.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (16, 93)
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (17, 95)
 
 
 class TestMigrateAddColumnsVersionGuard:

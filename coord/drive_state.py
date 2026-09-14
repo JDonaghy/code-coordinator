@@ -138,6 +138,16 @@ class IssueState:
     # (title rewritten) after it finished, and can name the row's age in
     # whatever it reports instead of silently re-quoting stale prose.
     work_finished_at: float | None = None
+    # #3339: the `coord drive-queue clear-refusal` assertion against THIS
+    # work row, if any — ``None``/``""`` (the overwhelming majority) means
+    # nothing has been asserted, read identically to "still blocking" by
+    # `decide()`'s `refused_premise` branch. Unlike `refused_policy`'s
+    # branch-vs-title staleness check, a premise refusal has no mechanical
+    # signal of its own (a title rewrite cannot make a missing prerequisite
+    # exist), so this is the ONLY thing that can make `decide()` bypass the
+    # `_die()` — an explicit, auditable human claim, never inferred.
+    work_premise_rechecked_at: float | None = None
+    work_premise_rechecked_reason: str = ""
 
     review_aid: str = ""
     review_status: str = ""
@@ -410,6 +420,14 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
     except (TypeError, ValueError):
         work_finished_at = None
 
+    premise_rechecked_raw = (work or {}).get("premise_rechecked_at")
+    try:
+        work_premise_rechecked_at = (
+            float(premise_rechecked_raw) if premise_rechecked_raw is not None else None
+        )
+    except (TypeError, ValueError):
+        work_premise_rechecked_at = None
+
     # #1453: oracle-loop JIT slice resolution — both reads are over data
     # already published on /board, no extra I/O (see IssueState's docstring
     # for the two source lists and their TUI-side counterparts).
@@ -511,6 +529,8 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_acceptance_reason=g(work, "acceptance_reason"),
         work_acceptance_sha=g(work, "acceptance_sha"),
         work_finished_at=work_finished_at,
+        work_premise_rechecked_at=work_premise_rechecked_at,
+        work_premise_rechecked_reason=g(work, "premise_rechecked_reason"),
         review_aid=g(review, "assignment_id"),
         review_status=g(review, "status"),
         review_verdict=g(review, "review_verdict"),

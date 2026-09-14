@@ -4329,6 +4329,60 @@ def _update_assignment_stop_reason_local(assignment_id: str, stop_reason: str) -
         rollback_after_driver_error(conn, exc)
 
 
+def mark_premise_rechecked(assignment_id: str, reason: str) -> None:
+    """#3339: record the operator's explicit assertion that a terminal
+    ``refused_premise`` row's prerequisite has since landed — routes to the
+    daemon when set.
+
+    A `refused_premise` row (`coord.agent.REFUSED_PREMISE`, #3164) has no
+    mechanical staleness check the way `refused_policy` does: rewriting the
+    issue's title cannot make a missing prerequisite exist, so
+    `coord.drive.decide()`'s `refused_premise` branch has nothing to compare
+    against on its own. This is the signal that fills that gap — written by
+    `coord drive-queue clear-refusal`, an explicit, auditable human claim
+    ("I rechecked, the premise holds now"), never inferred. `decide()` reads
+    it back (`IssueState.work_premise_rechecked_at`, populated from this
+    column) and bypasses the `_die()` exactly once, for THIS assignment id
+    only — a fresh dispatch that refuses again produces a new assignment id
+    with this column unset, so the bypass never becomes a standing override.
+
+    *reason* is required (the CLI enforces non-empty) so the audit trail
+    always carries the operator's own justification, not just a timestamp.
+    Overwrite-idempotent (unlike `update_assignment_stop_reason`'s
+    first-writer-wins): an operator asserting a second time — say, after
+    fixing a typo'd upstream issue reference — should not have their
+    correction silently dropped.
+    """
+    if not assignment_id or not reason:
+        return
+    svc = _board_service()
+    resp = _route_assignment_patch(
+        svc, assignment_id, {"premise_rechecked_reason": reason},
+        rpc_endpoint="/assignment-usage",
+    )
+    if resp is not None:
+        return
+    _mark_premise_rechecked_local(assignment_id, reason)
+
+
+def _mark_premise_rechecked_local(assignment_id: str, reason: str) -> None:
+    """Write ``premise_rechecked_at``/``premise_rechecked_reason`` directly
+    to the local DB.  Called by the daemon endpoint."""
+    if not assignment_id or not reason:
+        return
+    conn = get_connection()
+    try:
+        sql.execute(conn,
+            "UPDATE assignments SET premise_rechecked_at=?, "
+            "premise_rechecked_reason=? WHERE assignment_id=?",
+            (time.time(), reason, assignment_id),
+        )
+        conn.commit()
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+        # Column may not exist yet (pre-migration DB or test fixtures).
+        rollback_after_driver_error(conn, exc)
+
+
 def mark_assignment_interactive(assignment_id: str) -> None:
     """#546/#665: flag the row as interactive — routes to the daemon when set.
 

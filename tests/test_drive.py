@@ -2059,6 +2059,60 @@ def test_refused_premise_remedy_never_mentions_a_retarget():
     assert "after=" in action.message
 
 
+def test_refused_premise_remedy_names_clear_refusal_when_not_rechecked():
+    """#3339: the still-blocking remedy must point at the ONE thing that
+    actually clears this — `coord drive-queue clear-refusal` — not just
+    `drive-queue remove`, which (per the bug report) is a no-op on its
+    own: it clears the queue row, not this board verdict."""
+    action = step(
+        state(work_aid="w1", work_status="refused_premise", work_finished_at=1000.0)
+    )
+    assert action.is_exit
+    assert "clear-refusal" in action.message
+
+
+def test_refused_premise_is_bypassed_when_the_premise_was_rechecked():
+    """#3339: unlike a title rewrite (which #2871's mechanism cannot apply
+    here — see the sibling `..._never_mentions_a_retarget` test above), an
+    explicit `coord drive-queue clear-refusal` assertion on THIS assignment
+    id — the ONLY signal `decide()` has for "the prerequisite has since
+    landed" — must dispatch fresh work instead of dying on the same old
+    refusal again."""
+    s = state(
+        work_aid="w1",
+        work_status="refused_premise",
+        work_finished_at=1000.0,
+        work_premise_rechecked_at=2000.0,
+        work_premise_rechecked_reason="quadraui#971 landed",
+    )
+    action = step(s)
+    assert action.kind == RUN
+    assert action.command[0] == "assign"
+    assert action.audit_event is not None
+    event_type, summary, details = action.audit_event
+    assert event_type == "refused_premise_rechecked"
+    assert "w1" in summary
+    assert "quadraui#971 landed" in summary
+    assert details["stale_assignment_id"] == "w1"
+    assert details["premise_rechecked_reason"] == "quadraui#971 landed"
+
+
+def test_refused_premise_is_not_bypassed_without_an_explicit_recheck():
+    """The inverse of the bypass test above: nothing was ever asserted
+    (`work_premise_rechecked_at` unset, the overwhelming majority case), so
+    this must still die exactly like before #3339 — no automatic staleness
+    check of any kind applies to a premise refusal."""
+    s = state(
+        work_aid="w1",
+        work_status="refused_premise",
+        work_finished_at=1000.0,
+    )
+    action = step(s)
+    assert action.is_exit
+    assert PREMISE_REFUSAL_MARKER in action.message
+    assert action.audit_event is None
+
+
 def test_an_unknown_terminal_status_refuses_to_guess():
     """No terminal status may fall through to a bare wait (PR #1386)."""
     action = step(state(work_aid="w1", work_status="wat"))
