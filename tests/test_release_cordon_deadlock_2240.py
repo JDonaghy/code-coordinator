@@ -425,15 +425,25 @@ def test_the_cordon_holds_below_the_bound() -> None:
 def test_the_cordon_is_released_at_the_bound() -> None:
     """The line the whole issue turns on: a cordon that has failed to produce
     quiescence twice running is not draining anything, it is blocking the
-    work whose completion it is waiting for."""
+    work whose completion it is waiting for.
+
+    #3336: the count alone is no longer sufficient — `window_started_at` also
+    has to prove the trailing window actually SPANNED the elapsed-time floor
+    (default ~40 minutes). Set far enough before `now` that the floor is
+    comfortably cleared, so this test still exercises what it always did:
+    the count/progressed decision, not the new time floor (covered on its
+    own in `tests/test_release_cordon_drain_stall_3336.py`).
+    """
     plan = rc.plan_cordons(
         target_version="0.5.77",
         host_versions={
             "dellserver": "0.5.70", "elitebook": "0.5.70", "precision": "0.5.70",
         },
         existing=_live("dellserver", "elitebook", "precision"),
-        now=100.0,
-        pressure=rc.DeferralPressure(consecutive=rc.DEFAULT_MAX_DEFERRALS),
+        now=100.0 + rc.DEFAULT_CORDON_STALL_SECONDS,
+        pressure=rc.DeferralPressure(
+            consecutive=rc.DEFAULT_MAX_DEFERRALS, window_started_at=100.0,
+        ),
     )
     assert plan.cordon == (), "a released run must not re-cordon in the same breath"
     assert plan.released is not None
@@ -933,6 +943,15 @@ def test_a_between_legs_entry_no_longer_holds_the_fleet_forever(
     the board's retention window), so every run is a fleet-wide deferral.
     Pre-#2240 this repeats forever; the four journalled runs 21 minutes apart
     are the observation. Here it must self-release.
+
+    #3336: `--cordon-stall-seconds 0` disables the elapsed-time floor added
+    on top of this same count/progressed decision, so this test keeps
+    exercising exactly what it always did (fix 1a/1b, the counting and
+    acting on it) with successive CLI invocations running in real,
+    effectively-zero elapsed time — the floor's own behaviour (and the
+    #3336 bug it fixes: a fast `--drain` poll must NOT trip this on the
+    default) is covered separately in
+    `tests/test_release_cordon_drain_stall_3336.py`.
     """
     state_dir = _stub_state_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(
@@ -948,7 +967,7 @@ def test_a_between_legs_entry_no_longer_holds_the_fleet_forever(
 
     # ── ticks 1..N: cordon, defer, cordon, defer ─────────────────────────
     for tick in range(rc.DEFAULT_MAX_DEFERRALS):
-        result = _propagate(valid_config_path)
+        result = _propagate(valid_config_path, "--cordon-stall-seconds", "0")
         assert result.exit_code == 0, result.output
         assert mp.cordoned_names() == {"laptop", "server"}, (
             f"tick {tick}: the drain must still be tried first — #2101 is not "
@@ -956,7 +975,7 @@ def test_a_between_legs_entry_no_longer_holds_the_fleet_forever(
         )
 
     # ── the tick that breaks the cycle ───────────────────────────────────
-    breaker = _propagate(valid_config_path)
+    breaker = _propagate(valid_config_path, "--cordon-stall-seconds", "0")
     assert breaker.exit_code == 0, breaker.output
     assert "CORDON RELEASED" in breaker.output
     assert mp.cordoned_names() == set(), (
@@ -973,7 +992,7 @@ def test_a_between_legs_entry_no_longer_holds_the_fleet_forever(
     assert resumed.launch is not None and resumed.launch.key == "api#8"
 
     # ── and it does not immediately re-cordon on the next tick ───────────
-    after = _propagate(valid_config_path)
+    after = _propagate(valid_config_path, "--cordon-stall-seconds", "0")
     assert after.exit_code == 0, after.output
     assert mp.cordoned_names() == set(), (
         "re-cordoning here re-arms the deadlock 20 minutes later, which is "
@@ -1088,6 +1107,12 @@ def test_a_stall_after_progress_still_releases(
     correctly `True` and nothing releases yet); only at tick 3, reading a
     prior journal of [A, B, B], is the trailing two-tick window finally
     [B, B] — unchanged — and the release fires.
+
+    #3336: `--cordon-stall-seconds 0` disables the elapsed-time floor added
+    on top of this decision — these ticks run in real, effectively-zero
+    elapsed time, and this test's whole point is the `progressed`-window
+    logic above, not the floor (covered separately in
+    `tests/test_release_cordon_drain_stall_3336.py`).
     """
     state_dir = _stub_state_dir(monkeypatch, tmp_path)
     monkeypatch.setattr(
@@ -1118,7 +1143,7 @@ def test_a_stall_after_progress_still_releases(
     _stub_board_sequence(monkeypatch, [progressing_board, wedged_board])
 
     # tick 0: cordons, defers on #100/#200. Journal so far: [A].
-    first = _propagate(valid_config_path)
+    first = _propagate(valid_config_path, "--cordon-stall-seconds", "0")
     assert first.exit_code == 0, first.output
     assert "CORDON RELEASED" not in first.output
     assert mp.cordoned_names() == {"laptop", "server"}
@@ -1126,7 +1151,7 @@ def test_a_stall_after_progress_still_releases(
     # tick 1: #100/#200 -> #101/#201. Prior journal is [A] — one readable
     # snapshot proves nothing either way, and the count (1) is still below
     # `max_deferrals` — so this cannot release regardless. Journal now [A, B].
-    second = _propagate(valid_config_path)
+    second = _propagate(valid_config_path, "--cordon-stall-seconds", "0")
     assert second.exit_code == 0, second.output
     assert "CORDON RELEASED" not in second.output, (
         "released before there was even enough evidence to judge — "
@@ -1137,7 +1162,7 @@ def test_a_stall_after_progress_still_releases(
     # tick 2: #101/#201 again. Prior journal is [A, B] — genuinely
     # different, real convergence — must NOT release even though the count
     # has now reached `max_deferrals`. Journal now [A, B, B].
-    third = _propagate(valid_config_path)
+    third = _propagate(valid_config_path, "--cordon-stall-seconds", "0")
     assert third.exit_code == 0, third.output
     assert "CORDON RELEASED" not in third.output, (
         "released while the drain was still converging — " + third.output
@@ -1149,7 +1174,7 @@ def test_a_stall_after_progress_still_releases(
     # though the streak as a whole did change once, further back. This is
     # now a genuine stall and must self-release, same as the plain
     # between-legs deadlock does.
-    fourth = _propagate(valid_config_path)
+    fourth = _propagate(valid_config_path, "--cordon-stall-seconds", "0")
     assert fourth.exit_code == 0, fourth.output
     assert "CORDON RELEASED" in fourth.output, (
         "a stall that developed AFTER earlier progress must still be "
@@ -1209,7 +1234,11 @@ def test_two_runs_are_enough_at_the_documented_minimum(
     """The acceptance bullet verbatim — "run propagate twice, and assert every
     host is uncordoned and dispatchable afterwards" — at `N=1`. The shipped
     default of 2 buys one more drain attempt before giving up; the bound
-    itself is what matters and it is a knob."""
+    itself is what matters and it is a knob.
+
+    #3336: `--cordon-stall-seconds 0` disables the separate elapsed-time
+    floor — these two runs happen in real, effectively-zero elapsed time,
+    and this test's own point is the tick-count knob, not the floor."""
     _stub_state_dir(monkeypatch, tmp_path)
     _stub_board(
         monkeypatch,
@@ -1218,11 +1247,17 @@ def test_two_runs_are_enough_at_the_documented_minimum(
     )
     _stub_verify(monkeypatch, versions={"laptop": ["0.5.70"], "server": ["0.5.70"]})
 
-    first = _propagate(valid_config_path, "--cordon-max-deferrals", "1")
+    first = _propagate(
+        valid_config_path, "--cordon-max-deferrals", "1",
+        "--cordon-stall-seconds", "0",
+    )
     assert first.exit_code == 0, first.output
     assert mp.cordoned_names() == {"laptop", "server"}
 
-    second = _propagate(valid_config_path, "--cordon-max-deferrals", "1")
+    second = _propagate(
+        valid_config_path, "--cordon-max-deferrals", "1",
+        "--cordon-stall-seconds", "0",
+    )
     assert second.exit_code == 0, second.output
     assert mp.cordoned_names() == set()
 
