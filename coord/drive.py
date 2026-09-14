@@ -2586,22 +2586,68 @@ def decide(
         # REFUSED_POLICY there is no #2871 staleness/retarget bypass here —
         # rewriting the issue's TITLE cannot make a missing prerequisite
         # exist, so a fresh `coord drive` launch on the same row would just
-        # reproduce the identical, correct refusal. `_die()` exactly like
-        # every other terminal branch here, WITHOUT the staleness check
-        # REFUSED_POLICY runs above.
+        # reproduce the identical, correct refusal.
+        #
+        # #3339: that reasoning holds for a title rewrite, but not for the
+        # prerequisite itself landing after the refusal — which #3164
+        # explicitly calls "the normal case, not an exotic one". Nothing
+        # mechanical can tell the two apart (there is no #2871-style
+        # branch-vs-title signal to compare — the premise lives in the
+        # issue BODY, not its title), so the bypass here is a human's
+        # explicit, auditable assertion instead of an automatic staleness
+        # check: `coord drive-queue clear-refusal` writes
+        # `premise_rechecked_at`/`premise_rechecked_reason` onto THIS
+        # assignment id (`coord.state.mark_premise_rechecked`), and its
+        # mere presence — never inferred, never re-derived — is what lets
+        # this branch dispatch fresh work instead of dying again on a
+        # premise the operator has already rechecked. A fresh dispatch that
+        # refuses again produces a NEW assignment id with this column
+        # unset, so the bypass cannot become a standing override — it only
+        # ever covers the one row it was recorded against.
         age_seconds = (
             time.time() - state.work_finished_at
             if state.work_finished_at is not None
             else None
         )
         age = _format_age(age_seconds) if age_seconds is not None else "unknown age"
+        if state.work_premise_rechecked_at:
+            recheck_age_seconds = time.time() - state.work_premise_rechecked_at
+            recheck_age = _format_age(recheck_age_seconds)
+            bypass_summary = (
+                f"pre-dispatch: bypassing refused_premise assignment "
+                f"{state.work_aid} ({age} old) on issue {state.repo}#{state.issue} "
+                f"— operator asserted {recheck_age} ago that the premise has "
+                f"been rechecked ({state.work_premise_rechecked_reason!r}); "
+                "dispatching fresh work (#3339)"
+            )
+            dispatch = _dispatch_work_stage(
+                state, opts, counters, machine, oracle, gate_checker, verifier
+            )
+            return replace(
+                dispatch,
+                audit_event=(
+                    "refused_premise_rechecked",
+                    bypass_summary,
+                    {
+                        "stale_assignment_id": state.work_aid,
+                        "age_seconds": age_seconds,
+                        "premise_rechecked_reason": state.work_premise_rechecked_reason,
+                    },
+                ),
+            )
         remedy = (
             "Needs the coordinator: re-scope or close the issue — no title "
             "rewrite fixes this, the prerequisite the worker checked for "
             "genuinely does not exist yet — and audit the `after=` edges of "
             "anything queued behind it (`coord drive-queue list`), since "
             "whatever they were waiting on is not landing on the timescale "
-            "they assumed."
+            "they assumed. OR, if the prerequisite has since landed, assert "
+            "that once re-scoped: `coord drive-queue clear-refusal "
+            f"{state.repo} {state.issue} --reason \"...\"` records the "
+            "recheck on THIS assignment, then `coord drive-queue remove "
+            f"{state.repo} {state.issue}` + `add` dispatches fresh work "
+            "(#3339) — a parked entry never resumes on its own, so both "
+            "steps are required."
         )
         return _die(
             f"pre-dispatch refusal on assignment {state.work_aid} "

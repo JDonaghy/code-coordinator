@@ -329,6 +329,8 @@ def test_drive_queue_is_registered_with_every_verb():
         "cancel-roll",
         # #3236: the apply-verdict gate's accountable-release verb.
         "apply-verdict",
+        # #3339: the refused_premise unblock verb.
+        "clear-refusal",
     }
 
 
@@ -1532,6 +1534,55 @@ def test_remove_of_an_unqueued_issue_exits_non_zero(cli):
     result = cli("remove", REPO, "9999")
     assert result.exit_code != 0
     assert "not in the drive queue" in result.output
+
+
+# ── clear-refusal (#3339) ────────────────────────────────────────────────────
+#
+# `coord retry`/the printed #3164 remedy both used to name `drive-queue
+# remove` as the way to clear a terminal `refused_premise` row — which does
+# nothing, because the block lives on the BOARD work row, not the queue
+# entry. These assert the actual fix: an explicit, auditable assertion
+# ("I rechecked, the premise holds now") recorded on the assignment itself.
+
+
+def test_clear_refusal_records_the_recheck_on_the_refused_assignment(cli, seed, coord_db):
+    seed(assignments=[{"issue_number": 1650, "status": "refused_premise"}])
+    result = cli(
+        "clear-refusal", REPO, "1650", "--reason", "quadraui#971 landed",
+    )
+    assert result.exit_code == 0, result.output
+    assert "recorded premise recheck" in result.output
+    assert "a-claude-coordinator-0" in result.output
+    row = coord_db.execute(
+        "SELECT premise_rechecked_at, premise_rechecked_reason, status "
+        "FROM assignments WHERE assignment_id = ?",
+        ("a-claude-coordinator-0",),
+    ).fetchone()
+    assert row["premise_rechecked_at"] is not None
+    assert row["premise_rechecked_reason"] == "quadraui#971 landed"
+    # The write is additive: it does not itself resurrect the terminal
+    # `refused_premise` status — `decide()` reads BOTH columns together.
+    assert row["status"] == "refused_premise"
+
+
+def test_clear_refusal_of_a_non_refused_assignment_exits_non_zero(cli, seed):
+    seed(assignments=[{"issue_number": 1650, "status": "done"}])
+    result = cli("clear-refusal", REPO, "1650", "--reason", "landed")
+    assert result.exit_code != 0
+    assert "not 'refused_premise'" in result.output
+
+
+def test_clear_refusal_of_an_issue_with_no_work_row_exits_non_zero(cli):
+    result = cli("clear-refusal", REPO, "9999", "--reason", "landed")
+    assert result.exit_code != 0
+    assert "no work assignment found" in result.output
+
+
+def test_clear_refusal_requires_a_nonempty_reason(cli, seed):
+    seed(assignments=[{"issue_number": 1650, "status": "refused_premise"}])
+    result = cli("clear-refusal", REPO, "1650", "--reason", "   ")
+    assert result.exit_code != 0
+    assert "must not be empty" in result.output
 
 
 # ── remove owns the driver it orphans (#3282) ───────────────────────────────

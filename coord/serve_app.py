@@ -8334,6 +8334,12 @@ def build_app(
                 # #2316: same endpoint, same reason as the fields above —
                 # one round-trip covers the diagnostic capture too.
                 state._update_assignment_stop_reason_local(aid, body["stop_reason"])
+            if body.get("premise_rechecked_reason"):
+                # #3339: same endpoint, same reason as the fields above —
+                # `coord drive-queue clear-refusal`'s write.
+                state._mark_premise_rechecked_local(
+                    aid, body["premise_rechecked_reason"]
+                )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "assignment-usage write failed", "detail": str(e)},
@@ -9864,6 +9870,11 @@ def build_app(
             if body.get("failure_reason") is not None:
                 state._set_assignment_failure_reason_local(aid, body["failure_reason"])
                 applied.append("failure_reason")
+            if body.get("premise_rechecked_reason"):
+                state._mark_premise_rechecked_local(
+                    aid, body["premise_rechecked_reason"]
+                )
+                applied.append("premise_rechecked_reason")
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {

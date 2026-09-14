@@ -192,6 +192,11 @@ class AssignmentPatch:
     claude_session_id: str | None = None
     #: ``/assignment-failure-reason`` — also flips the row to ``failed``.
     failure_reason: str | None = None
+    #: #3339: the operator's explicit "I rechecked, the premise holds now"
+    #: assertion against a terminal ``refused_premise`` row — see
+    #: ``coord.state.mark_premise_rechecked`` and
+    #: ``coord drive-queue clear-refusal``.
+    premise_rechecked_reason: str | None = None
 
 
 @dataclass(kw_only=True)

@@ -258,6 +258,116 @@ class TestStopReason:
         update_assignment_stop_reason("some-id", "")  # must not raise
 
 
+class TestPremiseRechecked:
+    """#3339: premise_rechecked_at/premise_rechecked_reason — the explicit
+    operator assertion that clears a terminal `refused_premise` row.
+
+    Unlike `refused_policy`, a premise refusal has no mechanical staleness
+    check (rewriting the issue's title cannot make a missing prerequisite
+    exist — see coord/drive.py's `decide()`), so this pair of columns is the
+    ONLY signal that can make `decide()` dispatch fresh work instead of
+    dying again on the same old refusal. Written by `coord drive-queue
+    clear-refusal`, read back by `coord.drive_state.project` as
+    `IssueState.work_premise_rechecked_at`/`_reason`.
+    """
+
+    def test_schema_has_premise_rechecked_columns(self, coord_db) -> None:
+        from coord.db import get_connection
+        conn = get_connection()
+        cols = {name for name, _type in sql.table_columns(conn, "assignments")}
+        assert "premise_rechecked_at" in cols, (
+            "assignments table is missing premise_rechecked_at column — "
+            "check _migrate_add_columns in coord/db.py"
+        )
+        assert "premise_rechecked_reason" in cols
+
+    def test_mark_premise_rechecked_persists_the_value(self, coord_db) -> None:
+        from coord.state import mark_premise_rechecked
+
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=3339,
+            issue_title="Premise recheck test",
+            rationale="test",
+            briefing="hello",
+        )
+        assignment_id = "test-premise-recheck-001"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT premise_rechecked_at, premise_rechecked_reason "
+            "FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
+        assert row[1] is None
+
+        mark_premise_rechecked(assignment_id, "quadraui#971 landed")
+
+        row = conn.execute(
+            "SELECT premise_rechecked_at, premise_rechecked_reason "
+            "FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row[0] is not None
+        assert row[1] == "quadraui#971 landed"
+
+    def test_mark_premise_rechecked_overwrites_on_a_second_call(self, coord_db) -> None:
+        """Unlike stop_reason's first-writer-wins, a second assertion (e.g.
+        correcting a typo'd upstream issue reference) must not be silently
+        dropped — the operator's latest word on the matter should stand."""
+        from coord.state import mark_premise_rechecked
+
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=3339,
+            issue_title="Premise recheck test",
+            rationale="test",
+            briefing="hello",
+        )
+        assignment_id = "test-premise-recheck-002"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
+
+        mark_premise_rechecked(assignment_id, "first reason")
+        mark_premise_rechecked(assignment_id, "corrected reason")
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT premise_rechecked_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row[0] == "corrected reason"
+
+    def test_mark_premise_rechecked_noop_on_missing(self, coord_db) -> None:
+        """Calling with a nonexistent assignment_id silently does nothing."""
+        from coord.state import mark_premise_rechecked
+
+        mark_premise_rechecked("no-such-id", "landed")  # must not raise
+
+    def test_mark_premise_rechecked_noop_on_empty(self, coord_db) -> None:
+        """Calling with an empty assignment_id/reason silently does nothing."""
+        from coord.state import mark_premise_rechecked
+
+        mark_premise_rechecked("", "landed")  # must not raise
+        mark_premise_rechecked("some-id", "")  # must not raise
+
+
 class TestDispatchedByAssignmentId:
     """#2417: dispatched_by_assignment_id — the calling worker's own
     assignment id, captured from $COORD_ASSIGNMENT_ID at dispatch time, so a
