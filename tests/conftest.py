@@ -881,6 +881,29 @@ def _no_real_roll_pending_ledger_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_smoke_fanout_manifest_lock(monkeypatch, tmp_path):
+    """#3333: never let a test create — or ``flock`` — the OPERATOR'S real
+    ``~/.coord/smoke-fanout-manifest.lock``.
+
+    Same hazard as the ``_no_real_*_store`` fixtures above, one file over,
+    with one twist: this file's *contents* are irrelevant (it is an advisory
+    ``flock`` target, always empty), but *holding* it is not — a test that
+    took it would briefly serialize against a live fleet's real `coord
+    notify` / `coord drive-queue tick` fan-out manifest merges on the same
+    machine.
+
+    ``coord.state.smoke_fanout_manifest_lock_path`` reads
+    ``$COORD_SMOKE_FANOUT_MANIFEST_LOCK`` first for exactly this redirect —
+    the same env-var seam ``_no_real_notifier_state`` uses, not a
+    monkeypatched private function.
+    """
+    monkeypatch.setenv(
+        "COORD_SMOKE_FANOUT_MANIFEST_LOCK",
+        str(tmp_path / "smoke-fanout-manifest.lock"),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_self_cordon_state(monkeypatch, tmp_path):
     """#2572: never let a test write the OPERATOR'S real
     ``~/.coord/self_cordon_escalation.json``.
