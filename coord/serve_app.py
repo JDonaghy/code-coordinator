@@ -4116,6 +4116,64 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/smoke-fanout-merge": {
+            "post": {
+                "summary": (
+                    "Atomically merge a #3182 fan-out leg into the parent's "
+                    "`[[smoke-fanout:...]]` manifest and re-stamp it "
+                    "'running' (#3333 review) — read-merge-write as one "
+                    "step so two ticks claiming DIFFERENT capability "
+                    "partitions of the same parent never overwrite each "
+                    "other's manifest entry"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "total_partitions": {"type": "integer"},
+                                    "new_entries": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "array",
+                                            "description": (
+                                                "[leg_id, capabilities, "
+                                                "command_or_null]"
+                                            ),
+                                        },
+                                    },
+                                },
+                                "required": [
+                                    "assignment_id",
+                                    "total_partitions",
+                                    "new_entries",
+                                ],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — `test_state`/`test_reason` are the row's "
+                            "own authoritative values after the merge, which "
+                            "may be a terminal verdict rather than 'running' "
+                            "if one landed first"
+                        ),
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {
+                        "description": (
+                            "Missing assignment_id, total_partitions or "
+                            "new_entries"
+                        )
+                    },
+                },
+            }
+        },
         "/needs-attention-notified": {
             "post": {
                 "summary": (
@@ -8067,6 +8125,39 @@ def build_app(
             )
         return JSONResponse({"ok": True})
 
+    async def post_smoke_fanout_merge(request: Request) -> Response:
+        # #3333 review: atomic read-merge-write of a #3182 fan-out's
+        # `[[smoke-fanout:...]]` manifest on the daemon's canonical DB — see
+        # coord.state.merge_smoke_fanout_manifest's docstring for the race
+        # this closes (two ticks racing on DIFFERENT capability partitions
+        # of the SAME work row, each with only its own partial view of the
+        # manifest). Runs on the daemon so `_SMOKE_FANOUT_MANIFEST_LOCK`
+        # serializes every caller fleet-wide, not just within one process.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            new_entries = [
+                (entry[0], tuple(entry[1]), entry[2]) for entry in body["new_entries"]
+            ]
+            test_state, test_reason = state._merge_smoke_fanout_manifest_local(
+                assignment_id=body["assignment_id"],
+                new_entries=new_entries,
+                total_partitions=body["total_partitions"],
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "smoke-fanout-merge write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            {"ok": True, "test_state": test_state, "test_reason": test_reason}
+        )
+
     async def post_review_posted(request: Request) -> Response:
         # #905: mark a review assignment as posted (sets review_posted_at) on the
         # daemon's DB so thin-client notify runs correctly.
@@ -11404,6 +11495,7 @@ def build_app(
         Route("/review-claim-release", post_review_claim_release, methods=["POST"]),
         Route("/smoke-claim", post_smoke_claim, methods=["POST"]),
         Route("/smoke-claim-release", post_smoke_claim_release, methods=["POST"]),
+        Route("/smoke-fanout-merge", post_smoke_fanout_merge, methods=["POST"]),
         Route("/review-posted", post_review_posted, methods=["POST"]),
         Route(
             "/needs-attention-notified",
