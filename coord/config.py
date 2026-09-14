@@ -1064,6 +1064,12 @@ class PipelineConfig:
     issue label names to gate lists, allowing per-label overrides — e.g.
     a ``hotfix`` label could bypass review with ``hotfix: [merge]``.
 
+    Every gate name in ``default_gates`` and in each ``labels[*]`` list must
+    be a member of :data:`KNOWN_GATE_NAMES` — ``_parse_pipeline`` raises
+    :class:`ConfigError` on an unrecognised name rather than accepting it
+    silently (#3261 S-1). A name nothing consumes used to be
+    indistinguishable from a name that works.
+
     ``auto_loop`` enables the automated review → fix → re-review cycle.
     When ``True`` (default), a review that requests changes automatically
     dispatches a fix worker.  The fix worker then receives a fresh review,
