@@ -614,9 +614,11 @@ def _parse_fanout_manifest(
 
 def _find_leg_for_partition(
     board: Board, *, repo_name: str, branch: str | None, capabilities: tuple[str, ...],
+    review_of_assignment_id: str | None,
 ) -> Assignment | None:
-    """The most-recently-dispatched smoke leg on ``(repo_name, branch)`` whose
-    capability tag matches *capabilities*, from either ``board.active`` or
+    """The most-recently-dispatched smoke leg belonging to the work row
+    *review_of_assignment_id*, on ``(repo_name, branch)``, whose capability
+    tag matches *capabilities*, from either ``board.active`` or
     ``board.completed``.
 
     The per-partition peer of ``coord.claim.has_active_branch_followup``
@@ -627,6 +629,16 @@ def _find_leg_for_partition(
     sibling partition ever gets a machine — a later tick must still recognise
     the finished one as already handled rather than re-dispatching a
     duplicate for it.
+
+    #3328: matching is scoped to ``review_of_assignment_id`` — i.e. THIS
+    work row's own legs — never just ``(repo_name, branch, capabilities)``.
+    A branch acquires a new work row on every review bounce / retry, and a
+    match on branch alone finds the PRIOR work row's already-terminal legs,
+    wrongly credits them to the new row (writing foreign leg ids into its
+    fan-out manifest) and dispatches nothing of its own — leaving the new
+    row's ``test_state`` stuck at ``"running"`` with zero real children, an
+    unrecoverable (and, via the #2803 sweep, self-re-triggering) wedge. Every
+    work row must get its own legs, one way or another.
 
     A COMPLETED leg with no genuine verdict (``test_state`` still ``None``/
     ``"running"`` — an #1605 environmental death cleared it for retry, same
@@ -641,6 +653,8 @@ def _find_leg_for_partition(
     best: Assignment | None = None
     for a in list(board.active) + list(board.completed):
         if a.type != "smoke" or a.repo_name != repo_name or a.branch != branch:
+            continue
+        if a.review_of_assignment_id != review_of_assignment_id:
             continue
         if smoke_leg_capabilities(a.issue_title) != target:
             continue
@@ -2629,6 +2643,7 @@ def _dispatch_smoke_fanout(
         existing = _find_leg_for_partition(
             board, repo_name=completed.repo_name, branch=completed.branch,
             capabilities=partition.capabilities,
+            review_of_assignment_id=completed.assignment_id,
         )
         if existing is not None:
             # Already dispatched (still running, or already terminal) by an
