@@ -4827,22 +4827,62 @@ def _dispatch_headless(
         )
     )
 
+    # Claim check — #3347: run this even under --dry-run so an operator
+    # checking before queuing sees the same skip a real dispatch would hit,
+    # instead of a clean bill of health followed by a live failure the very
+    # next time this exact command runs for real.
+    from coord.claim import adopt_remote_branch_claim, claim_message, find_work_claim
+
+    board = read_board()
+    claim = None if force else find_work_claim(issue, repo, repo_cfg.github, board)
+    if claim is not None:
+        click.echo(f"  skipping: {claim_message(claim)}", err=True)
+        if claim.source == "remote_branch":
+            # The board has no active row for this issue, yet an unmerged
+            # `issue-{N}-*` branch already exists on the remote — real,
+            # finished Work-stage output with nowhere to attach to (#611's
+            # branch-backfill sweep only fills a missing branch on an
+            # EXISTING row; there is no row here at all). Refusing outright
+            # (the pre-#3347 behaviour) was correct about not double-
+            # dispatching, but its non-zero exit read as a dispatch failure
+            # to `coord drive`, which burned the entry's retry budget and
+            # blocked it — cascading to every `after=` dependent — even
+            # though the work this issue needed was already done and
+            # pushed. Adopt it instead: a `dry_run` merely previews this
+            # (no board mutation, same as every other `--dry-run` branch
+            # above), a real run commits it and exits 0 so `coord drive`
+            # sees a clean exit rather than a death to retry.
+            if dry_run:
+                click.echo(
+                    f"  (dry run — would adopt {claim.branch} as a done work "
+                    "assignment instead of failing; not dispatched)"
+                )
+                return
+            adopted = adopt_remote_branch_claim(
+                claim,
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=issue_title,
+                required_gates=resolved_gates,
+                driven_by=driven_by,
+            )
+            board.completed.append(adopted)
+            write_board(board)
+            click.echo(
+                f"  adopted existing branch as work assignment "
+                f"{adopted.assignment_id} — Test/Review can now proceed "
+                "against it without a fresh dispatch"
+            )
+            return
+        if dry_run:
+            click.echo("  (dry run — not dispatched)")
+            return
+        sys.exit(1)
+
     if dry_run:
         click.echo("  (dry run — not dispatched)")
         return
-
-    # Claim check
-    from coord.claim import claim_message, find_work_claim
-
-    board = read_board()
-    if not force:
-        claim = find_work_claim(issue, repo, repo_cfg.github, board)
-        if claim is not None:
-            click.echo(
-                f"  skipping: {claim_message(claim)}",
-                err=True,
-            )
-            sys.exit(1)
 
     # #267: dependency freshness check — same machinery `coord approve`
     # uses.  Default for `coord assign` is `--auto-pull` (the manual /

@@ -18,10 +18,11 @@ the same completed assignment).
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Callable
 
-from coord.models import Board
+from coord.models import Assignment, Board
 
 
 # A branch_lookup takes (repo_github, issue_number) and returns the matching
@@ -142,6 +143,84 @@ def claim_remedy_hint(claim: Claim, repo_name: str, issue_number: int) -> str:
         f"if its PR already merged, delete the stale branch with `git push "
         f"origin --delete {branch}`, then dispatch again; if the PR is still "
         f"open, wait for it to land (or close it) first"
+    )
+
+
+def adopt_remote_branch_claim(
+    claim: Claim,
+    *,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    issue_title: str,
+    required_gates: list[str] | None = None,
+    driven_by: str | None = None,
+) -> Assignment:
+    """Build a `done` work assignment for a `source="remote_branch"` claim (#3347).
+
+    A ``remote_branch`` claim means the board had NO active row for this
+    issue, yet ``issue-{N}-*`` already exists on the remote and is genuinely
+    unmerged (``find_work_claim`` already dropped every merged/squash-merged
+    candidate via ``_drop_merged_branches`` before returning this). That is
+    real, finished Work-stage output with nowhere on the board to attach to
+    — `coord reconcile-merges`'s #611 branch-backfill sweep only fills in a
+    *missing branch* on an *existing* assignment row; it is a no-op here
+    because no row exists at all.
+
+    Without this, `coord assign` used to just refuse (correctly refusing to
+    double-dispatch) and exit non-zero, which `coord drive` read as a
+    dispatch failure: the queue entry burned its retry budget and went
+    `blocked`, taking every `after=` dependent down with it — even though
+    the work this issue needed was already done and pushed.
+
+    This is the alternative: adopt the branch as though a work session had
+    just finished normally — `status="done"`, `review_state="pending"` (the
+    same value `coord.reconcile`'s Pass 1 stamps on every finished work row)
+    so the existing review/smoke auto-dispatch loop picks it up on its own,
+    with no new pipeline machinery needed downstream of this row's write.
+
+    *machine_name* names the machine this exact `coord assign` invocation
+    was about to dispatch to — a real, configured machine, so the row passes
+    `coord.state._validate_dispatch_target` the same as any other write
+    through `coord.board_service.write_board`. Nothing actually ran there;
+    the field is purely to satisfy the schema, the same fiction the #611
+    backfill sweep already relies on for a branch pushed by a session whose
+    own board row this repo may since have pruned.
+
+    The caller is responsible for appending the returned :class:`Assignment`
+    to a :class:`Board` and calling `coord.board_service.write_board` — this
+    function only builds the row; it never touches storage itself, so it
+    stays a pure, easily-tested constructor like the rest of this module.
+    """
+    if claim.source != "remote_branch":
+        raise ValueError(
+            f"adopt_remote_branch_claim requires a remote_branch claim, got "
+            f"{claim.source!r}"
+        )
+    now = time.time()
+    return Assignment(
+        # A deterministic, legible id rather than leaving it None: #2087's
+        # `write_board` can route to a REMOTE daemon (`coord.board_service`),
+        # which only mutates the daemon's own copy of a fallback-generated
+        # id — never this in-memory object — so a caller printing the id
+        # right after `write_board` must not depend on `coord.state.
+        # save_board`'s local-only "mutates in place" fallback (it would
+        # print `None` on a thin client). Also idempotent: re-adopting the
+        # same (repo, issue) after a board rebuild lands on the same row via
+        # `ON CONFLICT DO UPDATE` instead of piling up duplicates.
+        assignment_id=f"adopted-{repo_name}-{issue_number}",
+        machine_name=machine_name,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        status="done",
+        type="work",
+        branch=claim.branch,
+        dispatched_at=now,
+        finished_at=now,
+        review_state="pending",
+        required_gates=list(required_gates or []),
+        driven_by=driven_by,
     )
 
 
