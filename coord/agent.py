@@ -6172,18 +6172,43 @@ class AgentServer:
         anywhere in the registry (or in building its HealthContext) becomes
         an `unknown`-severity block carrying the error, never a missing key
         or a crashed /health poll.
+
+        #3344: this whole method is `health()`'s `local_health` section, and
+        #3340's own instrumentation of the *outer* handler found that on a
+        cold macOS agent this section alone was 97% of `/health`'s cost —
+        an opaque ~2.4s with nothing inside it timed. The breakdown below
+        does for THIS method's phases what `health()`'s `_mark` does for
+        the outer sections: every phase timed, published as `timing_ms` in
+        the returned block, and the run-registry's own per-check timings
+        (`HealthReport.check_durations_ms`, #3344) folded in under
+        `check_durations_ms` so a slow individual check — not just "the
+        registry ran slow" — is visible from a caller on a different
+        machine, the same way `health_timing_ms` already is.
         """
         now = time.time()
         cached = self._local_health_cache
         if cached is not None and (now - cached[0]) < self._local_health_ttl:
             return cached[1]
 
+        _timing: dict[str, float] = {}
+        _t0 = _prev = time.perf_counter()
+
+        def _mark(phase: str) -> None:
+            nonlocal _prev
+            _now = time.perf_counter()
+            _timing[phase] = round((_now - _prev) * 1000.0, 1)
+            _prev = _now
+
+        check_durations_ms: dict[str, float] = {}
         try:
             from coord.health.context import build_context
             from coord.health.registry import run_all
 
             ctx = build_context(self._health_config, allow_network=False, now=now)
+            _mark("build_context")
             report = run_all(ctx, scopes=("machine", "checkout"))
+            _mark("run_checks")
+            check_durations_ms = report.check_durations_ms
             try:
                 # #1729 (H-6): best-effort and deliberately its own
                 # try/except — a bug in the self-heal pass must never
@@ -6192,12 +6217,14 @@ class AgentServer:
                 self._self_heal_stale_graphs(ctx, report)
             except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
                 _log.warning("graph self-heal pass failed: %s", exc)
+            _mark("self_heal_graphs")
             try:
                 # Same isolation as the graph pass above: a skills-sync bug
                 # must never blind this whole health block.
                 self._self_heal_missing_skills()
             except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
                 _log.warning("skills self-heal pass failed: %s", exc)
+            _mark("self_heal_skills")
             report_dict = report.to_dict()
             payload = {
                 "schema": report_dict["schema"],
@@ -6214,6 +6241,7 @@ class AgentServer:
                     {**r, "checked_at": now} for r in report_dict["results"]
                 ],
             }
+            _mark("serialize")
         except Exception as exc:  # noqa: BLE001 — fail soft, never break /health
             payload = {
                 "schema": 1,
@@ -6224,6 +6252,30 @@ class AgentServer:
                 "results": [],
                 "error": f"{type(exc).__name__}: {exc}",
             }
+            _mark("error")
+
+        _timing["total"] = round((_prev - _t0) * 1000.0, 1)
+        payload["timing_ms"] = _timing
+        # #3344: per-check breakdown from the registry run, rounded like
+        # every other timing published here. Empty when the run never
+        # reached `run_all` (e.g. `build_context` itself raised) — absence
+        # here means "no checks ran", not "checks ran instantly".
+        payload["check_durations_ms"] = {
+            k: round(v, 1) for k, v in check_durations_ms.items()
+        }
+        if _timing["total"] >= _SLOW_HEALTH_WARN_MS:
+            slowest = sorted(
+                check_durations_ms.items(), key=lambda kv: kv[1], reverse=True
+            )[:5]
+            _log.warning(
+                "coord agent: local_health on %s took %.0fms — this is the "
+                "`local_health` section of AgentServer.health() "
+                "(see that call's own health_timing_ms for how much of the "
+                "total /health cost this section was). "
+                "breakdown(ms)=%s slowest_checks(ms)=%s",
+                self.machine_name, _timing["total"],
+                _timing, [(k, round(v, 1)) for k, v in slowest],
+            )
 
         self._local_health_cache = (now, payload)
         return payload

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import time
 from pathlib import Path
 
 import pytest
@@ -257,6 +258,100 @@ def test_checks_run_in_declared_order(isolated_registry, ctx) -> None:
             )
         )
     assert [r.check_id for r in run_all(ctx).results] == ["early", "late"]
+
+
+# ── per-check timing (#3344) ─────────────────────────────────────────────────
+
+
+def test_run_all_records_a_duration_for_every_check_that_ran(
+    isolated_registry, ctx
+) -> None:
+    """#3344: `/health`'s `health_timing_ms` broke down the outer handler
+    into sections, but `local_health` — one of those sections — was itself
+    a single opaque block. This is the registry half of un-opaquing it:
+    every check that actually runs gets its own wall-clock entry, not just
+    the run's total."""
+    isolated_registry.register(
+        Check(
+            id="fast",
+            scope="machine",
+            probe=lambda c: CheckResult(
+                check_id="fast", scope="machine", severity=Severity.OK, headroom=""
+            ),
+        )
+    )
+
+    def _slow(_ctx: HealthContext) -> CheckResult:
+        time.sleep(0.05)
+        return CheckResult(
+            check_id="slow", scope="machine", severity=Severity.OK, headroom=""
+        )
+
+    isolated_registry.register(Check(id="slow", scope="machine", probe=_slow))
+
+    report = run_all(ctx)
+    assert set(report.check_durations_ms) == {"fast", "slow"}
+    for ms in report.check_durations_ms.values():
+        assert ms >= 0
+    # The slow probe's own sleep must show up on ITS entry, not blurred into
+    # the total or attributed to its neighbour.
+    assert report.check_durations_ms["slow"] >= 45  # 50ms sleep, slack for jitter
+    assert report.check_durations_ms["fast"] < report.check_durations_ms["slow"]
+
+
+def test_check_durations_exclude_skipped_and_disabled_checks(
+    isolated_registry, ctx
+) -> None:
+    """A check that never ran (network-skipped, operator-disabled) must not
+    get a fabricated 0ms entry — that would read as "ran instantly" instead
+    of "didn't run", the same distinction `skipped` already protects for
+    `results`."""
+    isolated_registry.register(
+        Check(
+            id="net",
+            scope="machine",
+            cost=registry.COST_NETWORK,
+            probe=lambda c: pytest.fail("should be skipped"),
+        )
+    )
+    isolated_registry.register(
+        Check(id="disabled", scope="machine", probe=lambda c: pytest.fail("should be skipped"))
+    )
+    ctx.allow_network = False
+    ctx.thresholds.disabled_checks = ["disabled"]
+    report = run_all(ctx)
+    assert report.check_durations_ms == {}
+
+
+def test_check_durations_ms_survives_a_raising_probe(isolated_registry, ctx) -> None:
+    """`run_check` converts a raised probe into an `unknown` result rather
+    than aborting the run (see the fail-soft test above) — the timing
+    entry must follow the same contract: the probe still cost wall time,
+    even though it produced no useful data."""
+
+    def _boom(_ctx: HealthContext) -> CheckResult:
+        raise RuntimeError("disk went away")
+
+    isolated_registry.register(Check(id="boom", scope="machine", probe=_boom))
+    report = run_all(ctx)
+    assert "boom" in report.check_durations_ms
+    assert report.check_durations_ms["boom"] >= 0
+
+
+def test_check_durations_ms_in_to_dict(isolated_registry, ctx) -> None:
+    isolated_registry.register(
+        Check(
+            id="a",
+            scope="machine",
+            probe=lambda c: CheckResult(
+                check_id="a", scope="machine", severity=Severity.OK, headroom=""
+            ),
+        )
+    )
+    body = run_all(ctx).to_dict()
+    assert "check_durations_ms" in body
+    assert set(body["check_durations_ms"]) == {"a"}
+    assert isinstance(body["check_durations_ms"]["a"], (int, float))
 
 
 # ── report aggregation ───────────────────────────────────────────────────────
