@@ -255,6 +255,27 @@ def test_adopt_remote_branch_claim_defaults_required_gates_to_empty() -> None:
         claim, machine_name="m", repo_name="api", issue_number=1, issue_title="t",
     )
     assert assignment.required_gates == []
+
+
+def test_adopt_remote_branch_claim_defaults_type_to_work() -> None:
+    claim = Claim(issue_number=1, repo_name="api", source="remote_branch", branch="issue-1-x")
+    assignment = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+    )
+    assert assignment.type == "work"
+
+
+def test_adopt_remote_branch_claim_honours_explicit_assignment_type() -> None:
+    """#3347 review (non-blocking): the adopted row's `type` must match what
+    THIS dispatch attempt would actually have used — plan-only or a labelled
+    epic's `dispatch_type` — not always a hardcoded "work", since type-keyed
+    guards elsewhere (e.g. #1314's epic auto-close guard) read this field."""
+    claim = Claim(issue_number=1, repo_name="api", source="remote_branch", branch="issue-1-x")
+    assignment = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+        assignment_type="epic-decompose",
+    )
+    assert assignment.type == "epic-decompose"
     assert assignment.driven_by is None
 
 

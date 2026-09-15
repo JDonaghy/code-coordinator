@@ -534,6 +534,73 @@ class TestAssignDispatch:
         board = state_mod.build_board()
         assert not board.active and not board.completed
 
+    def test_remote_branch_claim_does_not_double_adopt_a_completed_row(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#3347 review: `find_work_claim` only scans `board.active` —
+        `Board.mark_done()` moves a finished work row to `board.completed`
+        the moment a Work-stage worker finishes, which is the normal state
+        for every issue between "Work done" and "Test/Review dispatched",
+        not a rare edge case. In that window a `remote_branch` claim still
+        fires (the branch is real and unmerged), but the board is NOT
+        actually empty for this issue — a real row already tracks it. The
+        adopt path must notice that (via `assignments_for_issue`, which
+        unions active + completed) and skip adopting a second, phantom row
+        with a different, fabricated `assignment_id` — otherwise a later
+        bulk review/smoke dispatch loop (keyed on `assignment_id`, not
+        `(repo, issue)`) could double-dispatch against the same PR.
+
+        Deliberately does NOT patch `find_work_claim` — the whole point is
+        to exercise its real board.active-only scan against a `completed`
+        row, only stubbing the remote branch lookup underneath it."""
+        from coord.models import Assignment, Board, Repo
+        from coord.state import save_board
+
+        real_work = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=967,
+            issue_title="Fix drift",
+            assignment_id="real-abc123",
+            status="done",
+            branch="issue-967-fix",
+            type="work",
+            dispatched_at=0.0,
+            finished_at=1.0,
+            review_state="pending",
+        )
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[real_work],
+        )
+        save_board(board)
+
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix drift"}), \
+             patch(
+                 "coord.claim._default_branch_lookup",
+                 return_value=["issue-967-fix"],
+             ), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "967", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "skipping" in result.output
+        assert "already tracked by assignment real-abc123" in result.output
+        assert "adopted" not in result.output
+        disp.assert_not_called()
+
+        after = state_mod.build_board()
+        matching = [
+            a for a in (list(after.active) + list(after.completed))
+            if a.repo_name == "api" and a.issue_number == 967
+        ]
+        assert len(matching) == 1
+        assert matching[0].assignment_id == "real-abc123"
+
     def test_force_bypasses_claim_check_and_sets_fresh_branch(self, config_file: Path, coord_dir: Path) -> None:
         """--force should skip claim detection and pass fresh_branch=True to dispatch."""
         with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
