@@ -4832,26 +4832,62 @@ def _dispatch_headless(
     # instead of a clean bill of health followed by a live failure the very
     # next time this exact command runs for real.
     from coord.claim import adopt_remote_branch_claim, claim_message, find_work_claim
+    from coord.gates import assignments_for_issue  # noqa: PLC0415
 
     board = read_board()
     claim = None if force else find_work_claim(issue, repo, repo_cfg.github, board)
     if claim is not None:
         click.echo(f"  skipping: {claim_message(claim)}", err=True)
         if claim.source == "remote_branch":
-            # The board has no active row for this issue, yet an unmerged
-            # `issue-{N}-*` branch already exists on the remote — real,
-            # finished Work-stage output with nowhere to attach to (#611's
-            # branch-backfill sweep only fills a missing branch on an
-            # EXISTING row; there is no row here at all). Refusing outright
-            # (the pre-#3347 behaviour) was correct about not double-
-            # dispatching, but its non-zero exit read as a dispatch failure
-            # to `coord drive`, which burned the entry's retry budget and
-            # blocked it — cascading to every `after=` dependent — even
-            # though the work this issue needed was already done and
-            # pushed. Adopt it instead: a `dry_run` merely previews this
-            # (no board mutation, same as every other `--dry-run` branch
-            # above), a real run commits it and exits 0 so `coord drive`
-            # sees a clean exit rather than a death to retry.
+            # The board has no *active* row for this issue, yet an unmerged
+            # `issue-{N}-*` branch already exists on the remote. That is
+            # usually real, finished Work-stage output with nowhere to
+            # attach to (#611's branch-backfill sweep only fills a missing
+            # branch on an EXISTING row; there is no row here at all).
+            # Refusing outright (the pre-#3347 behaviour) was correct about
+            # not double-dispatching, but its non-zero exit read as a
+            # dispatch failure to `coord drive`, which burned the entry's
+            # retry budget and blocked it — cascading to every `after=`
+            # dependent — even though the work this issue needed was
+            # already done and pushed. Adopt it instead: a `dry_run` merely
+            # previews this (no board mutation, same as every other
+            # `--dry-run` branch above), a real run commits it and exits 0
+            # so `coord drive` sees a clean exit rather than a death to
+            # retry.
+            #
+            # BUT: `find_work_claim` only scans `board.active` — the moment
+            # a Work-stage worker finishes, `Board.mark_done()` moves its
+            # row to `board.completed` (the normal state for every issue
+            # between "Work done" and "Test/Review dispatched", not a rare
+            # edge case). In that window there IS already a real board row
+            # for this issue, with a real `uuid.uuid4().hex[:12]`
+            # `assignment_id`, sitting in `board.completed` — invisible to
+            # `find_work_claim`, so this branch fires anyway. Adopting
+            # unconditionally there would write a SECOND completed row with
+            # a fabricated `adopted-{repo}-{issue}` id, and nothing
+            # downstream dedupes review/smoke dispatch by anything but
+            # `assignment_id` — risking a redundant Test/Review run against
+            # a PR that's already been reviewed. So before adopting, check
+            # the full board (active + completed) via `assignments_for_issue`
+            # — the same union `coord gates`' own "no assignments found"
+            # check uses — and only adopt when truly no row exists.
+            existing = assignments_for_issue(board, repo, issue)
+            if existing:
+                current = existing[-1]
+                if dry_run:
+                    click.echo(
+                        f"  (dry run — {claim.branch} already tracked by "
+                        f"assignment {current.assignment_id}; not adopting, "
+                        "not dispatched)"
+                    )
+                    return
+                click.echo(
+                    f"  {claim.branch} already tracked by assignment "
+                    f"{current.assignment_id} — nothing to adopt; the "
+                    "existing Test/Review auto-dispatch loop will pick it "
+                    "up on its own"
+                )
+                return
             if dry_run:
                 click.echo(
                     f"  (dry run — would adopt {claim.branch} as a done work "
@@ -4866,6 +4902,11 @@ def _dispatch_headless(
                 issue_title=issue_title,
                 required_gates=resolved_gates,
                 driven_by=driven_by,
+                # #3347 review: match whatever type THIS dispatch attempt
+                # would actually have used (plan-only → "plan", a labelled
+                # epic → its dispatch_type) rather than always "work" — see
+                # `adopt_remote_branch_claim`'s docstring.
+                assignment_type=proposal.type,
             )
             board.completed.append(adopted)
             write_board(board)

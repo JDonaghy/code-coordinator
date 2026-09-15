@@ -155,17 +155,24 @@ def adopt_remote_branch_claim(
     issue_title: str,
     required_gates: list[str] | None = None,
     driven_by: str | None = None,
+    assignment_type: str = "work",
 ) -> Assignment:
     """Build a `done` work assignment for a `source="remote_branch"` claim (#3347).
 
-    A ``remote_branch`` claim means the board had NO active row for this
+    A ``remote_branch`` claim means the board had NO *active* row for this
     issue, yet ``issue-{N}-*`` already exists on the remote and is genuinely
     unmerged (``find_work_claim`` already dropped every merged/squash-merged
-    candidate via ``_drop_merged_branches`` before returning this). That is
-    real, finished Work-stage output with nowhere on the board to attach to
-    — `coord reconcile-merges`'s #611 branch-backfill sweep only fills in a
-    *missing branch* on an *existing* assignment row; it is a no-op here
-    because no row exists at all.
+    candidate via ``_drop_merged_branches`` before returning this). Most of
+    the time that also means no row *at all* — real, finished Work-stage
+    output with nowhere on the board to attach to — `coord reconcile-merges`'s
+    #611 branch-backfill sweep only fills in a *missing branch* on an
+    *existing* assignment row; it is a no-op here because no row exists at
+    all. (Callers MUST confirm that with `coord.gates.assignments_for_issue`,
+    which unions ``board.active`` *and* ``board.completed``, before calling
+    this — a `completed` row for the same issue is the normal state between
+    "Work done" and "Test/Review dispatched" and is invisible to
+    ``find_work_claim``'s active-only scan; adopting on top of it would write
+    a second, phantom row. See #3347's review.)
 
     Without this, `coord assign` used to just refuse (correctly refusing to
     double-dispatch) and exit non-zero, which `coord drive` read as a
@@ -186,6 +193,15 @@ def adopt_remote_branch_claim(
     the field is purely to satisfy the schema, the same fiction the #611
     backfill sweep already relies on for a branch pushed by a session whose
     own board row this repo may since have pruned.
+
+    *assignment_type* defaults to ``"work"`` but should be passed as
+    whatever this exact dispatch attempt would actually have used —
+    ``"plan"`` for a plan-only dispatch, or a labelled epic's
+    `dispatch_type` (e.g. ``"epic-decompose"``) — rather than always
+    hardcoding `"work"`. Downstream `type`-keyed guards (e.g. #1314's
+    epic auto-close guard) read this field, and a mismatched type on the
+    adopted row would fool them about what kind of work actually produced
+    the branch.
 
     The caller is responsible for appending the returned :class:`Assignment`
     to a :class:`Board` and calling `coord.board_service.write_board` — this
@@ -214,7 +230,7 @@ def adopt_remote_branch_claim(
         issue_number=issue_number,
         issue_title=issue_title,
         status="done",
-        type="work",
+        type=assignment_type,
         branch=claim.branch,
         dispatched_at=now,
         finished_at=now,
