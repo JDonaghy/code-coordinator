@@ -6,6 +6,7 @@ import pytest
 
 from coord.claim import (
     Claim,
+    adopt_remote_branch_claim,
     claim_message,
     claim_remedy_hint,
     find_work_claim,
@@ -177,6 +178,84 @@ def test_claim_remedy_hint_for_remote_branch_names_branch_delete_not_diagnose() 
     # diagnose` inspects board stages and cannot clear a remote_branch claim,
     # so it must not be offered here at all.
     assert "coord diagnose" not in hint
+
+
+# ── adopt_remote_branch_claim (#3347) ────────────────────────────────────────
+# A `remote_branch` claim means real, finished Work-stage output exists with
+# no board row to attach it to (#611's branch-backfill sweep needs an
+# EXISTING row and is a no-op here). Adopting it as a `done` work assignment
+# lets the normal review/smoke auto-dispatch loop pick it up, instead of
+# `coord assign` refusing outright and `coord drive` reading that refusal as
+# a dispatch failure to retry and then block on.
+
+
+def test_adopt_remote_branch_claim_builds_a_done_work_assignment() -> None:
+    claim = Claim(
+        issue_number=967, repo_name="vimcode", source="remote_branch",
+        branch="issue-967-macos-textmetrics-hit-drift",
+    )
+    assignment = adopt_remote_branch_claim(
+        claim,
+        machine_name="macmini",
+        repo_name="vimcode",
+        issue_number=967,
+        issue_title="macOS TextMetrics hit-test drift",
+        required_gates=["review", "merge"],
+        driven_by="drive:vimcode#967",
+    )
+    assert assignment.status == "done"
+    assert assignment.type == "work"
+    assert assignment.branch == "issue-967-macos-textmetrics-hit-drift"
+    assert assignment.machine_name == "macmini"
+    assert assignment.repo_name == "vimcode"
+    assert assignment.issue_number == 967
+    assert assignment.issue_title == "macOS TextMetrics hit-test drift"
+    # #951: the same default a normal finished work row gets, so the
+    # existing review/smoke auto-dispatch loop admits this row too.
+    assert assignment.review_state == "pending"
+    assert assignment.required_gates == ["review", "merge"]
+    assert assignment.driven_by == "drive:vimcode#967"
+    assert assignment.dispatched_at is not None
+    assert assignment.finished_at is not None
+
+
+def test_adopt_remote_branch_claim_id_is_deterministic() -> None:
+    """A stable id (not the `save_board` fallback, which never mutates a
+    thin client's in-memory copy) so a caller can report it immediately
+    after `write_board`, and so re-adopting the same issue upserts the same
+    row instead of piling up duplicates."""
+    claim = Claim(issue_number=42, repo_name="api", source="remote_branch", branch="issue-42-x")
+    a1 = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=42, issue_title="t",
+    )
+    a2 = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=42, issue_title="t",
+    )
+    assert a1.assignment_id == a2.assignment_id
+    assert a1.assignment_id
+
+
+def test_adopt_remote_branch_claim_rejects_a_board_source_claim() -> None:
+    """Adoption only makes sense for a claim with nothing on the board —
+    calling it on a `source="board"` claim would silently paper over a real
+    duplicate-dispatch race instead of refusing it."""
+    claim = Claim(
+        issue_number=7, repo_name="api", source="board",
+        machine_name="server", assignment_id="old-1",
+    )
+    with pytest.raises(ValueError):
+        adopt_remote_branch_claim(
+            claim, machine_name="m", repo_name="api", issue_number=7, issue_title="t",
+        )
+
+
+def test_adopt_remote_branch_claim_defaults_required_gates_to_empty() -> None:
+    claim = Claim(issue_number=1, repo_name="api", source="remote_branch", branch="issue-1-x")
+    assignment = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+    )
+    assert assignment.required_gates == []
+    assert assignment.driven_by is None
 
 
 # ── has_active_followup ─────────────────────────────────────────────────────
