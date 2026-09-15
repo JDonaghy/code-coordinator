@@ -3828,6 +3828,56 @@ def test_dispatch_pending_smoke_keeps_skipping_a_fresh_passed_verdict(
     assert not mock_dispatch.called
 
 
+def test_dispatch_pending_smoke_skips_row_verdicted_after_the_scan_snapshot(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3343 repro: `board.completed`'s row is a snapshot that predates a
+    verdict another smoke leg just recorded on the SAME row's DB record — the
+    in-memory `test_state` still reads `None` ("no verdict yet"), but the
+    persisted row already carries a fresh `passed`.
+
+    Before this fix, this loop trusted the stale in-memory `test_state`
+    unconditionally and dispatched a redundant leg — which then (via
+    `_dispatch_smoke_single_leg`'s own #1819 "never stamp running over a
+    terminal verdict" guard, ALSO reading the same stale snapshot) clobbered
+    the just-recorded `passed` back to `running`, while the legacy
+    `smoke_test` mirror (written together with the terminal verdict) was left
+    untouched — producing exactly the `smoke_test=pass` / `test_state=running`
+    split #3343 reports, and the merge gate reading "no verdict recorded"
+    forever after. The fix re-reads the authoritative single-row `test_state`
+    before evaluating the skip conditions, so a verdict landed by ANY writer
+    since the snapshot was taken is honoured instead of overwritten.
+    """
+    from unittest.mock import patch as _patch
+
+    from coord.state import _record_dispatched_assignment_local, record_test_verdict
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    parent = _completed()
+    _record_dispatched_assignment_local(assignment=parent, repo_github="acme/api")
+    # A verdict lands on the persisted row — e.g. another smoke leg's
+    # completion reap, running concurrently with this scan.
+    record_test_verdict(assignment_id=parent.assignment_id, test_state="passed")
+
+    # The in-memory row this scan is holding was read BEFORE that write —
+    # `test_state` is still unset.
+    stale_row = replace(parent, test_state=None)
+    board = Board(completed=[stale_row])
+
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert result == []
+    assert not mock_dispatch.called
+    # The in-memory row is corrected to match reality...
+    assert stale_row.test_state == "passed"
+    # ...and the persisted verdict was never touched, let alone clobbered.
+    from coord.state import load_assignment_test_state
+
+    assert load_assignment_test_state(parent.assignment_id) == "passed"
+
+
 def test_dispatch_pending_smoke_stale_check_is_off_by_default(
     gtk_and_server_config: Config, monkeypatch,
 ) -> None:

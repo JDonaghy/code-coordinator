@@ -2541,7 +2541,33 @@ def _dispatch_smoke_single_leg(
     if completed.assignment_id is not None and completed.test_state not in (
         "passed", "skipped", "failed",
     ):
-        from coord.state import load_assignment_test_reason, record_test_verdict  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            load_assignment_test_reason,
+            load_assignment_test_state,
+            record_test_verdict,
+        )
+
+        # #3343: re-check the authoritative `test_state` ONE MORE TIME, right
+        # before this write. `_dispatch_smoke_legs` (our caller) already
+        # re-read it before choosing to call us at all, but the
+        # `_walk_candidates_and_dispatch` call just above — machine ranking
+        # plus an HTTP dispatch round trip — is exactly the window in which
+        # ANOTHER already-in-flight smoke leg on this same branch can finish
+        # and record a terminal verdict. Trusting `completed.test_
+        # state` here (a snapshot from before that window) would blindly
+        # overwrite a just-landed `passed`/`skipped`/`failed` back to
+        # `running` — the precise defect reported in #3343: `smoke_test`
+        # carries the terminal mirror (set together with the terminal write)
+        # while `test_state` gets clobbered back to `running` by this stamp,
+        # and every gate that reads `test_state` (the canonical column, per
+        # `coord/gates.py`) then reports "no verdict recorded" forever, so
+        # `dispatch_pending_smoke` keeps re-dispatching — one leg fired 4s
+        # after the branch had already merged on the strength of the verdict
+        # this stamp was about to erase.
+        authoritative_state = load_assignment_test_state(completed.assignment_id)
+        if authoritative_state in ("passed", "skipped", "failed"):
+            completed.test_state = authoritative_state
+            return smoke_assignment
 
         # Belt and braces: the authoritative single-row read, falling back to
         # the board-carried value when it is unavailable (thin client, remote
@@ -3016,7 +3042,7 @@ def dispatch_pending_smoke(
     if smoke_cfg is None or not smoke_cfg.auto_queue:
         return []
 
-    from coord.state import get_issue_test_mode
+    from coord.state import get_issue_test_mode, load_assignment_test_state
 
     dispatched: list[Assignment] = []
     for completed in board.completed:
@@ -3050,6 +3076,29 @@ def dispatch_pending_smoke(
                 continue
         if completed.status != "done":
             continue
+
+        # #3343: refresh `test_state` from the authoritative single-row store
+        # right before evaluating it below. `completed` is `board`'s
+        # in-memory copy — a snapshot taken once, at the start of whatever
+        # tick called this function — and this loop can run for a while (the
+        # `_test_verdict_is_stale` check a few lines down does live `gh`
+        # round trips per row, and dispatching a leg for an EARLIER row in
+        # this same loop can itself take seconds). A verdict recorded on
+        # THIS row by a smoke leg that finishes while this scan is still
+        # running is invisible to the stale snapshot, so the checks below
+        # would read "no verdict yet" and dispatch a redundant leg — the
+        # #3343 incident: 3 wasted smoke legs on one issue, the last
+        # dispatched 4s after the branch had already merged on the strength
+        # of an earlier leg's verdict. `None` (row unknown, or a remote read
+        # failed) is left as-is — never worse than what this loop already
+        # tolerated before #3343, and `_dispatch_smoke_single_leg`'s own
+        # pre-write re-check is the belt-and-braces backstop if a race still
+        # slips past this one.
+        if completed.assignment_id is not None:
+            fresh_test_state = load_assignment_test_state(completed.assignment_id)
+            if fresh_test_state is not None:
+                completed.test_state = fresh_test_state
+
         if completed.test_state in (TEST_STATE_BLOCKED, "running"):
             # "running" — someone (an interactive --smoke-of session, or a
             # smoke assignment already in flight) is genuinely handling this
