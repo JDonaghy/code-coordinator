@@ -318,6 +318,77 @@ def test_health_timing_breakdown_logs_when_slow(tmp_path: Path, monkeypatch, cap
     )
 
 
+def test_local_health_timing_breakdown_covers_every_phase(tmp_path: Path) -> None:
+    """#3344: `health_timing_ms` broke `AgentServer.health()` down into
+    sections, and #3340's own measurements found `local_health` was 97% of
+    a cold poll's cost — a single opaque block with nothing inside it
+    timed. This pins the shape of un-opaquing that section the same way
+    `test_health_timing_breakdown_covers_every_section` pins the outer
+    one: every phase `_cached_local_health` runs is present, non-negative,
+    and `total` accounts for at least the sum of the parts. Which phase is
+    actually slow on a given host is exactly what this instrumentation
+    exists to answer, not something assertable without the macOS repro.
+    """
+    server = _server(tmp_path)
+    local_health = server.health()["health"]
+    timing = local_health["timing_ms"]
+    expected_phases = {
+        "build_context",
+        "run_checks",
+        "self_heal_graphs",
+        "self_heal_skills",
+        "serialize",
+        "total",
+    }
+    assert set(timing) == expected_phases
+    for phase, ms in timing.items():
+        assert isinstance(ms, (int, float)), phase
+        assert ms >= 0, phase
+    per_phase_sum = sum(ms for k, ms in timing.items() if k != "total")
+    assert timing["total"] >= per_phase_sum - 0.5  # float rounding slack
+
+
+def test_local_health_publishes_per_check_durations(tmp_path: Path) -> None:
+    """The registry's own per-check timings (#3344) ride along in the same
+    block, so a caller can see WHICH check inside `run_checks` was slow —
+    not just that `local_health` (or `run_checks` within it) was slow."""
+    server = _server(tmp_path)
+    local_health = server.health()["health"]
+    check_durations = local_health["check_durations_ms"]
+    # At least one machine-scope check always runs in this fixture's
+    # environment (e.g. `disk`), so the breakdown isn't vacuously empty.
+    assert check_durations
+    for check_id, ms in check_durations.items():
+        assert isinstance(ms, (int, float)), check_id
+        assert ms >= 0, check_id
+    # Every id in the breakdown must correspond to a result the run
+    # actually reported (or, same as the outer report, be absent for a
+    # skipped/disabled check) — never a check the run never touched.
+    reported_ids = {r["check_id"] for r in local_health["results"]}
+    assert set(check_durations) >= reported_ids or reported_ids == set()
+
+
+def test_local_health_logs_when_slow(tmp_path: Path, monkeypatch, caplog) -> None:
+    """Same idea as the outer `health_timing_ms` warning, scoped to this
+    section: an operator watching THIS agent's own log sees which check
+    made a cold `local_health` run slow, without needing a client to poll
+    it in the act."""
+    import logging
+
+    import coord.agent as agent_module
+
+    server = _server(tmp_path)
+    monkeypatch.setattr(agent_module, "_SLOW_HEALTH_WARN_MS", -1.0)
+    with caplog.at_level(logging.WARNING, logger="coord.agent"):
+        server.health()
+    assert any(
+        "local_health" in rec.getMessage()
+        and "breakdown" in rec.getMessage()
+        and "slowest_checks" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 def test_health_includes_tool_versions_for_baseline_and_capabilities(
     tmp_path: Path,
 ) -> None:

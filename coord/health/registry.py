@@ -203,6 +203,14 @@ class HealthReport:
     results: list[CheckResult] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     duration_secs: float = 0.0
+    # #3344: per-check wall time, in milliseconds, keyed by `Check.id` — the
+    # `duration_secs` total above answers "was this run slow", this answers
+    # "which check made it slow". Populated by `run_all` for every check that
+    # actually ran (skipped/disabled checks are absent, same as `results`).
+    # A check id maps to a list because `only=`/repeated ids aren't possible
+    # via the registry, but the type stays a plain float per id — one probe
+    # call, one timing — rather than pretending a check could run twice.
+    check_durations_ms: dict[str, float] = field(default_factory=dict)
 
     @property
     def severity(self) -> Severity:
@@ -224,6 +232,14 @@ class HealthReport:
             "counts": self.counts(),
             "skipped": list(self.skipped),
             "duration_secs": round(self.duration_secs, 3),
+            # #3344: same breakdown `/health`'s `health_timing_ms` publishes
+            # one level up — which individual check cost what, not just the
+            # run's total. Rounded to 1dp like `AgentServer.health()`'s own
+            # section timings, for the same reason: sub-0.1ms precision on a
+            # wall-clock probe is noise, not signal.
+            "check_durations_ms": {
+                k: round(v, 1) for k, v in self.check_durations_ms.items()
+            },
             "results": [r.to_dict() for r in self.results],
         }
 
@@ -263,7 +279,9 @@ def run_all(
         if chk.cost == COST_NETWORK and not ctx.allow_network:
             report.skipped.append(f"{chk.id} (network probe, --no-network)")
             continue
+        _check_started = time.monotonic()
         report.results.extend(run_check(chk, ctx))
+        report.check_durations_ms[chk.id] = (time.monotonic() - _check_started) * 1000.0
     report.duration_secs = time.monotonic() - started
     return report
 
