@@ -22,7 +22,9 @@ import pytest
 
 from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.conflict_fix import (
+    ALL_CANDIDATES_UNREACHABLE,
     CONFLICT_FIX_SYSTEM_PROMPT,
+    NO_MACHINE_CONFIGURED,
     SEALED_CONFLICT_FIX_TITLE_PREFIX,
     SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT,
     SEALED_SCOPE_STUCK_MARKER,
@@ -33,6 +35,7 @@ from coord.conflict_fix import (
     build_stale_rebase_briefing,
     dispatch_conflict_fix,
     pick_conflict_fix_machine,
+    select_conflict_fix_machine,
     sealed_conflict_could_touch_manifest,
     sealed_conflict_is_manifest_only,
     sealed_scope_verdict_in_text,
@@ -49,6 +52,7 @@ from coord.merge_queue import (
     is_rebase_refusal,
 )
 from coord.models import Assignment, Board, Machine, Repo
+from coord.network import StatusResult
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -561,6 +565,126 @@ class TestPickMachine:
         )
         assert pick_conflict_fix_machine("api", Board(), cfg) is None
 
+    def test_without_status_fetcher_a_dead_idle_machine_still_wins(
+        self, two_machine_config: Config,
+    ) -> None:
+        """Pins down the OLD (pre-#3353) default behaviour as still intact:
+        with no liveness signal supplied at all, "idle" is the only
+        criterion — exactly like #3353's root cause on unfixed `main`. This
+        is not the bug fix; it is the backward-compatibility half of it."""
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            status="running",
+        ))
+        machine = pick_conflict_fix_machine("api", board, two_machine_config)
+        assert machine is not None
+        assert machine.name == "server"
+
+
+# ── #3353: liveness-aware machine selection ─────────────────────────────────
+
+
+def _status_fetcher(reachable: set[str]):
+    """Fake `status_fetcher`: online for every machine in *reachable*,
+    unreachable (network timeout) for everyone else."""
+
+    def _fetch(machine, timeout=None):  # noqa: ARG001 — matches fetch_status's shape
+        if machine.name in reachable:
+            return StatusResult(data={"assignments": []})
+        return StatusResult(error="timeout")
+
+    return _fetch
+
+
+class TestLivenessAwareMachineSelection:
+    """#3353: machine selection asked "is this machine busy?" and never "is
+    it alive?" — a machine with zero `pending`/`running` assignments reads
+    as idle regardless of whether its agent answers at all, so a box that
+    had been down for 18 hours was picked AHEAD of a healthy one further
+    down `coordinator.yml`'s machine list (root cause: the old picker's
+    only exclusion was a `busy` set derived from board rows).
+
+    Every test below fails against unfixed `main`: `pick_conflict_fix_machine`
+    there has no `status_fetcher` parameter at all, and its fallback branch
+    for "everyone busy" is `candidates[0]` — the config's declaration order
+    — never anything liveness-derived.
+    """
+
+    def test_idle_but_unreachable_loses_to_busy_but_alive(
+        self, two_machine_config: Config,
+    ) -> None:
+        """The exact #986 shape: the only repo-capable machines are (a)
+        busy (laptop) and (b) unreachable (server, idle). Selection must
+        not return the unreachable one."""
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            status="running",
+        ))
+        pick = select_conflict_fix_machine(
+            "api", board, two_machine_config,
+            status_fetcher=_status_fetcher({"laptop"}),
+        )
+        assert pick.machine is not None
+        assert pick.machine.name == "laptop"
+
+    def test_all_candidates_unreachable_is_distinguished_from_no_machine(
+        self, two_machine_config: Config,
+    ) -> None:
+        """A capacity stall ("everyone's busy") and a liveness problem
+        ("nobody answers") must not collapse into one ambiguous `None` —
+        the caller needs to be able to tell them apart (#3353 item 4)."""
+        pick = select_conflict_fix_machine(
+            "api", Board(), two_machine_config,
+            status_fetcher=_status_fetcher(set()),
+        )
+        assert pick.machine is None
+        assert pick.reason == ALL_CANDIDATES_UNREACHABLE
+        assert set(pick.unreachable) == {"laptop", "server"}
+
+    def test_no_capable_machine_keeps_its_own_distinct_reason(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="a/b")],
+            machines=[Machine(name="m", host="h", repos=["other"])],
+        )
+        pick = select_conflict_fix_machine(
+            "api", Board(), cfg, status_fetcher=_status_fetcher(set()),
+        )
+        assert pick.machine is None
+        assert pick.reason == NO_MACHINE_CONFIGURED
+        assert pick.reason != ALL_CANDIDATES_UNREACHABLE
+
+    def test_preferred_machine_unreachable_falls_through_to_a_live_one(
+        self, two_machine_config: Config,
+    ) -> None:
+        pick = select_conflict_fix_machine(
+            "api", Board(), two_machine_config,
+            prefer_machine="laptop",
+            status_fetcher=_status_fetcher({"server"}),
+        )
+        assert pick.machine is not None
+        assert pick.machine.name == "server"
+
+    def test_a_flapping_unpolled_machine_is_not_treated_as_dead(
+        self, two_machine_config: Config,
+    ) -> None:
+        """The mirror-image half of #3353: when no liveness signal is
+        available at all (the "unknown"/flapping case — no `status_fetcher`
+        opted in), a candidate must not be excluded as though it were
+        confirmed dead. `select_conflict_fix_machine` without
+        `status_fetcher` behaves exactly like the pre-#3353 picker: "idle"
+        alone is enough."""
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            status="running",
+        ))
+        pick = select_conflict_fix_machine("api", board, two_machine_config)
+        assert pick.machine is not None
+        assert pick.machine.name == "server"
+        assert pick.reason == ""
+
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
@@ -646,6 +770,59 @@ class TestDispatch:
             _entry(), Board(), two_machine_config, http_client=_Failing(),
         )
         assert result is None
+
+    def test_declined_dispatch_leaves_a_durable_audit_trace(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#3353 item 3: the #986 regression — a conflict-fix that could
+        not be dispatched used to leave NO assignment row, NO retry-cap
+        consumption, and one ambiguous caller-side `click.echo` as its only
+        trace, indistinguishable from "already in flight". This asserts the
+        durable half directly: with every candidate confirmed unreachable,
+        `dispatch_conflict_fix` must still write a greppable audit row
+        naming the real reason, entirely independent of whichever of its
+        several call sites triggered it."""
+        result = dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=_FakeHTTPClient({"id": "would-not-fire"}),
+            prefer_machine="laptop",
+            status_fetcher=_status_fetcher(set()),
+        )
+        assert result is None
+
+        row = coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='conflict_fix_dispatch_declined'"
+        ).fetchone()
+        assert row is not None, (
+            "a declined conflict-fix dispatch left no audit trace at all — "
+            "the exact #986 silent-failure shape"
+        )
+        details = json.loads(row["details_json"])
+        assert details["reason"] == ALL_CANDIDATES_UNREACHABLE
+        assert set(details["unreachable"]) == {"laptop", "server"}
+        # Distinguishable from the retry-cap ("already in flight") outcome,
+        # which is a totally different `event_type` (`conflict_human_required`,
+        # `reason="retry_cap"`, written by the CALLER in
+        # `coord/commands/merge.py`, not by this function) — never the same
+        # row shape as a genuine machine-liveness problem.
+        assert row["event_type"] != "conflict_human_required"
+
+    def test_reachable_machine_present_dispatches_normally_with_status_fetcher(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """Opting into liveness-checking must not regress the ordinary
+        successful-dispatch path when a candidate IS reachable."""
+        result = dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=_FakeHTTPClient({"id": "fix-live-1"}),
+            prefer_machine="laptop",
+            status_fetcher=_status_fetcher({"laptop"}),
+        )
+        assert result is not None
+        assert result.machine_name == "laptop"
+        assert coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='conflict_fix_dispatch_declined'"
+        ).fetchone() is None
 
     def test_payload_includes_deny_commands(
         self, two_machine_config: Config, coord_db,

@@ -1588,6 +1588,7 @@ def dispatch_stalled_pipeline_action(
             sealed_conflict_could_touch_manifest,
         )
         from coord.merge_queue import load_queue  # noqa: PLC0415
+        from coord.network import fetch_status  # noqa: PLC0415
 
         entry = next(
             (m for m in load_queue() if m.assignment_id == work.assignment_id), None,
@@ -1653,7 +1654,13 @@ def dispatch_stalled_pipeline_action(
                             "human"
                         ),
                     )
-        fix = dispatch_conflict_fix(entry, board, config, prefer_machine=work.machine_name)
+        # #3353: opt into a live liveness check on machine selection — a
+        # machine with no pending/running assignments otherwise reads as
+        # idle regardless of whether its agent answers at all.
+        fix = dispatch_conflict_fix(
+            entry, board, config, prefer_machine=work.machine_name,
+            status_fetcher=fetch_status,
+        )
         if fix is None:
             return StalledDispatchAction(
                 kind="no_action",
@@ -1670,6 +1677,7 @@ def dispatch_stalled_pipeline_action(
             has_prior_conflict_fix,
         )
         from coord.merge_queue import load_queue  # noqa: PLC0415
+        from coord.network import fetch_status  # noqa: PLC0415
 
         entry = next(
             (m for m in load_queue() if m.assignment_id == work.assignment_id), None,
@@ -1693,7 +1701,7 @@ def dispatch_stalled_pipeline_action(
         # conflict or a content change shows up.
         fix = dispatch_conflict_fix(
             entry, board, config, prefer_machine=work.machine_name,
-            stale_rebase=True,
+            stale_rebase=True, status_fetcher=fetch_status,
         )
         if fix is None:
             return StalledDispatchAction(
