@@ -993,13 +993,24 @@ def has_prior_conflict_fix(
 # always actually the second thing.
 NO_MACHINE_CONFIGURED = "no_capable_machine"
 ALL_CANDIDATES_UNREACHABLE = "all_candidates_unreachable"
+# #3353 review (round 2): selection SUCCEEDED — a machine was picked and
+# passed its liveness probe — and then the `POST /assign` to that very
+# machine failed anyway. This is the "flapping machine" case the issue's
+# "Second half" calls out: the probe and the real request disagree because
+# they are seconds apart. Set on the pick handed back through
+# `dispatch_conflict_fix`'s *machine_pick_out* (and ONLY there — never
+# returned by `select_conflict_fix_machine`, which cannot know about a POST
+# it doesn't make), so a caller's decline message can say "picked X, X then
+# refused the assignment" instead of misreporting it as a config problem.
+ASSIGN_POST_FAILED = "assign_post_failed"
 
 
 @dataclass
 class ConflictFixMachinePick:
     """Outcome of :func:`select_conflict_fix_machine` (#3353).
 
-    ``reason`` is only meaningful when ``machine is None``:
+    As returned by :func:`select_conflict_fix_machine`, ``reason`` is only
+    meaningful when ``machine is None``:
 
     - :data:`NO_MACHINE_CONFIGURED` — no configured machine declares this
       repo at all (unchanged from the pre-#3353 picker's only ``None``
@@ -1011,6 +1022,14 @@ class ConflictFixMachinePick:
 
     Never returned for "everyone's busy" — a busy-but-reachable machine is
     still picked (queues on the agent), exactly like before #3353.
+
+    One reason DOES travel with a non-``None`` ``machine``, and only ever
+    on the copy :func:`dispatch_conflict_fix` hands back through its
+    *machine_pick_out* sink: :data:`ASSIGN_POST_FAILED`, meaning selection
+    picked ``machine`` and then the ``POST /assign`` to it failed. See that
+    constant. Callers reading a pick out of *machine_pick_out* must
+    therefore test ``reason`` BEFORE falling back to a ``machine is not
+    None`` branch.
     """
 
     machine: Machine | None
@@ -1191,6 +1210,14 @@ def dispatch_conflict_fix(
     entry in ``coordinator.yml`` — which is itself useful signal: an empty
     list tells the caller "selection was never reached", distinct from
     "selection ran and declined".
+
+    That includes the case where selection SUCCEEDED and the ``POST
+    /assign`` to the picked machine then failed (a machine that passed its
+    liveness probe and refused the request seconds later — the issue's
+    "flapping machine"): the pick is appended with
+    :data:`ASSIGN_POST_FAILED` and its ``machine`` still set, so the caller
+    can name the machine that refused instead of reporting a config
+    problem that doesn't exist.
 
     *status_fetcher* (#3353) opts machine selection into a live liveness
     check — see :func:`select_conflict_fix_machine`'s docstring; ``None``
@@ -1394,6 +1421,17 @@ def dispatch_conflict_fix(
         resp.raise_for_status()
         agent_response = resp.json()
     except (httpx.HTTPError, httpx.TimeoutException):
+        # #3353 review (round 2): selection RAN and succeeded here — the
+        # machine was picked and (when the caller opted into
+        # *status_fetcher*) passed a live probe moments ago — and the
+        # `/assign` POST still failed. Without this append, *machine_pick_out*
+        # stayed empty and the caller's decline message read "selection was
+        # never reached", which is the opposite of what happened. Mutating
+        # `pick.reason` rather than building a new pick keeps `pick.machine`
+        # (the machine that actually refused) attached to the reason.
+        pick.reason = ASSIGN_POST_FAILED
+        if machine_pick_out is not None:
+            machine_pick_out.append(pick)
         return None
 
     fix_assignment = Assignment(
