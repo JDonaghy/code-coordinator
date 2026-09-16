@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass
+from typing import Callable
 
 import httpx
 
@@ -61,6 +63,7 @@ from coord.models import (
     Board,
     Machine,
 )
+from coord.network import StatusResult, probe_reachable
 
 
 CONFLICT_FIX_SYSTEM_PROMPT = """\
@@ -978,41 +981,265 @@ def has_prior_conflict_fix(
 
 # ── Machine selection ───────────────────────────────────────────────────────
 
+
+# #3353 root cause: the old picker's only exclusion was `busy` (derived
+# purely from board rows), so a machine that had been offline for hours —
+# zero `pending`/`running` assignments, same as a genuinely idle one — read
+# as the BEST candidate and was picked ahead of healthy machines further
+# down `coordinator.yml`'s machine list. `NO_MACHINE_CONFIGURED` and
+# `ALL_CANDIDATES_UNREACHABLE` let a caller tell "nobody declares this
+# repo" apart from "a live agent problem", instead of one ambiguous
+# "no machine" bucket that was — per the issue's branch-3 analysis — nearly
+# always actually the second thing.
+NO_MACHINE_CONFIGURED = "no_capable_machine"
+ALL_CANDIDATES_UNREACHABLE = "all_candidates_unreachable"
+# #3353 review (round 2): selection SUCCEEDED — a machine was picked and
+# passed its liveness probe — and then the `POST /assign` to that very
+# machine failed anyway. This is the "flapping machine" case the issue's
+# "Second half" calls out: the probe and the real request disagree because
+# they are seconds apart. Set on the pick handed back through
+# `dispatch_conflict_fix`'s *machine_pick_out* (and ONLY there — never
+# returned by `select_conflict_fix_machine`, which cannot know about a POST
+# it doesn't make), so a caller's decline message can say "picked X, X then
+# refused the assignment" instead of misreporting it as a config problem.
+ASSIGN_POST_FAILED = "assign_post_failed"
+# #3353 review (round 3): selection picked a machine, but that machine has
+# no `repo_paths` entry for this repo — a `coordinator.yml` error, not a
+# liveness or capacity problem. It used to be the one decline shape that
+# left `pick.reason` empty, so `_record_conflict_fix_machine_failure`'s
+# `if pick.reason:` guard skipped it and it produced NO durable audit row
+# at all — the "silent failure" #3353 exists to eliminate, surviving in the
+# one branch nobody looked at.
+NO_REPO_PATH_CONFIGURED = "no_repo_path_configured"
+
+
+@dataclass
+class ConflictFixMachinePick:
+    """Outcome of :func:`select_conflict_fix_machine` (#3353).
+
+    As returned by :func:`select_conflict_fix_machine`, ``reason`` is only
+    meaningful when ``machine is None``:
+
+    - :data:`NO_MACHINE_CONFIGURED` — no configured machine declares this
+      repo at all (unchanged from the pre-#3353 picker's only ``None``
+      case).
+    - :data:`ALL_CANDIDATES_UNREACHABLE` — one or more machines declare the
+      repo, but a live reachability check (only performed when the caller
+      opts in via *status_fetcher* — see that parameter below) found every
+      one of them down right now. ``unreachable`` names them.
+
+    Never returned for "everyone's busy" — a busy-but-reachable machine is
+    still picked (queues on the agent), exactly like before #3353.
+
+    One reason DOES travel with a non-``None`` ``machine``, and only ever
+    on the copy :func:`dispatch_conflict_fix` hands back through its
+    *machine_pick_out* sink: :data:`ASSIGN_POST_FAILED`, meaning selection
+    picked ``machine`` and then the ``POST /assign`` to it failed. See that
+    constant. Callers reading a pick out of *machine_pick_out* must
+    therefore test ``reason`` BEFORE falling back to a ``machine is not
+    None`` branch.
+    """
+
+    machine: Machine | None
+    reason: str = ""
+    unreachable: tuple[str, ...] = ()
+
+
+def select_conflict_fix_machine(
+    repo_name: str,
+    board: Board,
+    config: Config,
+    *,
+    prefer_machine: str | None = None,
+    status_fetcher: Callable[..., StatusResult] | None = None,
+) -> ConflictFixMachinePick:
+    """Pick a machine that has *repo_name* checked out. ``prefer_machine``
+    wins if it can handle the repo (typically the original worker), so the
+    rebase uses an existing local checkout.
+
+    #3353: *status_fetcher* is the liveness-check opt-in. When ``None``
+    (the default), this behaves EXACTLY like the pre-#3353 picker — busy
+    exclusion only, "anyone (including busy)" as the last resort — so every
+    existing caller that doesn't pass it is unaffected byte-for-byte.
+    Passing a fetcher (production: :func:`coord.network.fetch_status`,
+    tests: a fake) turns on a live ``/status`` probe of each candidate
+    (:func:`coord.network.probe_reachable` — the SAME seam
+    :func:`coord.dispatch.select_fix_machine` (#3208) uses, never
+    ``/health``'s much heavier, cache-cold-prone check — see that
+    function's docstring) and EXCLUDES a candidate confirmed unreachable,
+    at any busy/idle rank, rather than treating "no assignments" as
+    equivalent to "alive". A candidate with no probe result yet (the
+    fetcher never got a chance to run because a higher-ranked one already
+    won) is never probed at all — "unknown" is never manufactured into
+    "dead"; it just never comes up.
+
+    Ranking, best first, once liveness-checking is on:
+    1. *prefer_machine*, if idle and reachable.
+    2. Idle and reachable.
+    3. Busy and reachable (still queues on the agent, but the agent is
+       actually there to receive it).
+    Only when NO candidate is reachable does this return ``None`` with
+    :data:`ALL_CANDIDATES_UNREACHABLE` — distinct from
+    :data:`NO_MACHINE_CONFIGURED`, and from the retry-cap "already in
+    flight" refusal callers check for separately before ever reaching this
+    function.
+    """
+    candidates = [m for m in config.machines if m.can_work_on(repo_name)]
+    if not candidates:
+        return ConflictFixMachinePick(None, reason=NO_MACHINE_CONFIGURED)
+
+    busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
+    live_check = status_fetcher is not None
+    _reachable_cache: dict[str, bool] = {}
+
+    def _alive(m: Machine) -> bool:
+        if not live_check:
+            return True
+        if m.name not in _reachable_cache:
+            ok, _reason = probe_reachable(m, status_fetcher=status_fetcher)
+            _reachable_cache[m.name] = ok
+        return _reachable_cache[m.name]
+
+    # 1. The preferred machine if it's idle, can handle the repo, and (when
+    #    liveness-checking is on) reachable.
+    if prefer_machine is not None:
+        preferred = next((m for m in candidates if m.name == prefer_machine), None)
+        if preferred is not None and preferred.name not in busy and _alive(preferred):
+            return ConflictFixMachinePick(preferred)
+
+    # 2. Any idle, reachable machine that handles the repo.
+    idle = [m for m in candidates if m.name not in busy and _alive(m)]
+    if idle:
+        return ConflictFixMachinePick(idle[0])
+
+    if not live_check:
+        # Pre-#3353 behaviour, preserved exactly: no liveness signal at
+        # all → anyone (including busy) — the assignment queues on the
+        # agent.
+        return ConflictFixMachinePick(candidates[0])
+
+    # 3. Busy but reachable — queues on the agent, which is at least there.
+    busy_alive = [m for m in candidates if m.name in busy and _alive(m)]
+    if busy_alive:
+        return ConflictFixMachinePick(busy_alive[0])
+
+    # Every candidate confirmed unreachable.
+    dead = tuple(m.name for m in candidates if not _alive(m))
+    return ConflictFixMachinePick(None, reason=ALL_CANDIDATES_UNREACHABLE, unreachable=dead)
+
+
 def pick_conflict_fix_machine(
     repo_name: str,
     board: Board,
     config: Config,
     *,
     prefer_machine: str | None = None,
+    status_fetcher: Callable[..., StatusResult] | None = None,
 ) -> Machine | None:
-    """Pick a machine that has *repo_name* checked out. ``prefer_machine``
-    wins if it can handle the repo (typically the original worker), so the
-    rebase uses an existing local checkout.
-
-    Returns ``None`` when no configured machine can handle the repo.
-    """
-    candidates = [m for m in config.machines if m.can_work_on(repo_name)]
-    if not candidates:
-        return None
-
-    busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
-
-    # 1. The preferred machine if it's idle and can handle the repo.
-    if prefer_machine is not None:
-        preferred = next((m for m in candidates if m.name == prefer_machine), None)
-        if preferred is not None and preferred.name not in busy:
-            return preferred
-
-    # 2. Any idle machine that handles the repo.
-    idle = [m for m in candidates if m.name not in busy]
-    if idle:
-        return idle[0]
-
-    # 3. Anyone (including busy) — the assignment will queue on the agent.
-    return candidates[0]
+    """Back-compat thin wrapper around :func:`select_conflict_fix_machine`
+    for callers that only want the picked machine, not the full reason —
+    unchanged signature/behaviour by default (#3353)."""
+    return select_conflict_fix_machine(
+        repo_name, board, config,
+        prefer_machine=prefer_machine, status_fetcher=status_fetcher,
+    ).machine
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
+
+
+def _record_conflict_fix_machine_failure(
+    entry: QueuedMerge, pick: ConflictFixMachinePick,
+) -> None:
+    """#3353: the durable, greppable trace a declined machine-selection used
+    to never leave anywhere but a single ambiguous ``click.echo`` line at
+    whichever of :func:`dispatch_conflict_fix`'s several call sites happened
+    to trigger it (``coord/commands/merge.py``, ``coord/notify.py`` x2,
+    ``coord/reconcile.py``'s semantic-escalation path). One audit row here
+    covers all of them, keyed on the SAME ``pick.reason`` the caller-facing
+    message can now quote instead of guessing.
+
+    ``record_audit`` is itself best-effort (swallows all write failures),
+    so a DB hiccup here never takes down the dispatch decline it's
+    recording.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="merge",
+        event_type="conflict_fix_dispatch_declined",
+        actor="daemon",
+        summary=(
+            f"conflict-fix not dispatched for "
+            f"{entry.repo_name}#{entry.issue_number}: {pick.reason}"
+        ),
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details={"reason": pick.reason, "unreachable": list(pick.unreachable)},
+    )
+
+
+def describe_conflict_fix_decline(
+    machine_pick_out: "list[ConflictFixMachinePick]",
+) -> str:
+    """Render the caller-facing reason a :func:`dispatch_conflict_fix` call
+    returned ``None`` (#3353 item 4).
+
+    ``machine_pick_out`` is the sink list the caller handed to
+    ``dispatch_conflict_fix``; this is the ONE answer to "why didn't the
+    conflict-fix land" for every caller that reports one — ``coord
+    merge``'s ``_dispatch_conflict_fixes`` and ``coord/notify.py``'s two
+    stalled-pipeline arms (#3353 review round 3: those two still printed a
+    hardcoded ``(no machine / no repo_path)`` that conflated all four
+    shapes, which is the same ambiguity item 4 set out to kill, and a
+    second copy of this branching would be the #2096 drift the durable
+    audit row already had to work around).
+
+    An EMPTY list means selection never ran — ``dispatch_conflict_fix``
+    declined before reaching it (no matching ``repos:`` entry, an
+    already-in-flight or retry-capped conflict-fix, or a sealed-path
+    no-op).
+    """
+    if not machine_pick_out:
+        return (
+            "no repo config matches this repo, or dispatch was declined "
+            "before machine selection ran"
+        )
+    pick = machine_pick_out[0]
+    if pick.reason == ALL_CANDIDATES_UNREACHABLE:
+        return (
+            "every capable machine is unreachable right now "
+            f"({', '.join(pick.unreachable)}) — an agent problem, not a "
+            "capacity stall"
+        )
+    if pick.reason == NO_MACHINE_CONFIGURED:
+        return "no configured machine can work on this repo"
+    if pick.reason == ASSIGN_POST_FAILED:
+        # Selection ran and PICKED a machine; the `/assign` POST to it then
+        # failed. The "flapping machine" the issue's Second half warns
+        # about — a live probe and the real request seconds apart can
+        # genuinely disagree. Must be tested before the `pick.machine is
+        # not None` fallback below, which would otherwise mislabel it.
+        name = pick.machine.name if pick.machine else "the picked machine"
+        return (
+            f"{name} passed its liveness probe but then refused the "
+            "assignment POST — a flapping agent, not a capacity stall"
+        )
+    if pick.reason == NO_REPO_PATH_CONFIGURED:
+        name = pick.machine.name if pick.machine else "the picked machine"
+        return (
+            f"no repo_path configured for {name} — a coordinator.yml "
+            "problem, not a machine problem"
+        )
+    if pick.machine is not None:  # pragma: no cover — every decline shape
+        # that carries a machine now sets an explicit reason above; kept as
+        # a safety net rather than an unhandled branch.
+        return "machine selection succeeded but dispatch declined downstream"
+    # pragma: no cover — `pick.machine is None` always sets `pick.reason`
+    # (see ConflictFixMachinePick's docstring).
+    return "machine selection declined for an unrecorded reason"
 
 
 def dispatch_conflict_fix(
@@ -1027,12 +1254,52 @@ def dispatch_conflict_fix(
     model: str | None = None,
     stuck_summary: str | None = None,
     stale_rebase: bool = False,
+    status_fetcher: Callable[..., StatusResult] | None = None,
+    machine_pick_out: "list[ConflictFixMachinePick] | None" = None,
 ) -> Assignment | None:
     """Send a ``type="conflict-fix"`` assignment for *entry* to an agent.
 
     Returns the new ``Assignment``, or ``None`` when dispatch couldn't proceed
     (no capable machine, no ``repo_path`` configured, agent unreachable, …).
     The caller is responsible for persisting the board.
+
+    *machine_pick_out* (#3353 review): an optional caller-supplied list this
+    function appends the internal :class:`ConflictFixMachinePick` to,
+    IMMEDIATELY BEFORE any ``None`` return that happened after selection
+    actually ran. A caller that wants to explain WHY dispatch declined
+    (``coord.commands.merge``'s failure echo) used to re-call
+    :func:`select_conflict_fix_machine` a second time just to reconstruct
+    that reason — doubling the live ``/status`` probes to every candidate
+    for every declined dispatch, and opening a (very unlikely) TOCTOU
+    window where the two calls could disagree if reachability flips
+    between them. Passing a list here instead lets the caller read the
+    SAME pick this call already made, at zero extra cost. Left empty (never
+    appended) when dispatch declined BEFORE selection ever ran — the retry
+    cap, an active conflict-fix already in flight, or no matching ``repos:``
+    entry in ``coordinator.yml`` — which is itself useful signal: an empty
+    list tells the caller "selection was never reached", distinct from
+    "selection ran and declined".
+
+    That includes the case where selection SUCCEEDED and the ``POST
+    /assign`` to the picked machine then failed (a machine that passed its
+    liveness probe and refused the request seconds later — the issue's
+    "flapping machine"): the pick is appended with
+    :data:`ASSIGN_POST_FAILED` and its ``machine`` still set, so the caller
+    can name the machine that refused instead of reporting a config
+    problem that doesn't exist.
+
+    *status_fetcher* (#3353) opts machine selection into a live liveness
+    check — see :func:`select_conflict_fix_machine`'s docstring; ``None``
+    (the default) preserves the pre-#3353 busy-only selection exactly.
+    Whenever selection declines with a machine-related reason (as opposed
+    to the retry-cap/in-flight checks above, which already leave their own
+    trace via the caller's ``HUMAN_REQUIRED``/audit handling), this writes
+    a durable audit row (see :func:`_record_conflict_fix_machine_failure`)
+    — #3353's #3: a conflict-fix that couldn't be dispatched used to leave
+    no assignment row, no retry-cap consumption, and one ambiguous caller
+    log line as its only trace. This makes that trace durable and
+    greppable regardless of which of this function's several call sites
+    triggered it.
 
     Retry cap: blocks on two conditions — (1) an **active** conflict-fix
     (``running``/``pending``) for this entry is already in flight, preventing
@@ -1111,14 +1378,30 @@ def dispatch_conflict_fix(
     if repo is None:
         return None
 
-    machine = pick_conflict_fix_machine(
-        entry.repo_name, board, config, prefer_machine=prefer_machine,
+    pick = select_conflict_fix_machine(
+        entry.repo_name, board, config,
+        prefer_machine=prefer_machine, status_fetcher=status_fetcher,
     )
+    machine = pick.machine
     if machine is None:
+        if pick.reason:
+            _record_conflict_fix_machine_failure(entry, pick)
+        if machine_pick_out is not None:
+            machine_pick_out.append(pick)
         return None
 
     repo_path = machine.repo_path(entry.repo_name)
     if repo_path is None:
+        # #3353 review (round 3): tag the reason and record the audit row
+        # here too. Previously this branch left `pick.reason == ""`, so the
+        # `if pick.reason:` guard above meant this was the ONE decline
+        # shape with no durable trace — the exact silent-failure shape
+        # item 3 of the issue exists to close, just via a config error
+        # rather than a dead box.
+        pick.reason = NO_REPO_PATH_CONFIGURED
+        _record_conflict_fix_machine_failure(entry, pick)
+        if machine_pick_out is not None:
+            machine_pick_out.append(pick)
         return None
 
     if semantic:
@@ -1215,6 +1498,17 @@ def dispatch_conflict_fix(
         resp.raise_for_status()
         agent_response = resp.json()
     except (httpx.HTTPError, httpx.TimeoutException):
+        # #3353 review (round 2): selection RAN and succeeded here — the
+        # machine was picked and (when the caller opted into
+        # *status_fetcher*) passed a live probe moments ago — and the
+        # `/assign` POST still failed. Without this append, *machine_pick_out*
+        # stayed empty and the caller's decline message read "selection was
+        # never reached", which is the opposite of what happened. Mutating
+        # `pick.reason` rather than building a new pick keeps `pick.machine`
+        # (the machine that actually refused) attached to the reason.
+        pick.reason = ASSIGN_POST_FAILED
+        if machine_pick_out is not None:
+            machine_pick_out.append(pick)
         return None
 
     fix_assignment = Assignment(

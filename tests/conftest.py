@@ -276,6 +276,40 @@ def _no_real_usage_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_dispatch_liveness_probe(monkeypatch):
+    """#3353: `coord approve`, `coord assign`, and `coord milestone dispatch`
+    now opt `coord.dispatch.dispatch()`'s `type="work"` liveness-routing gate
+    (`route_work_by_liveness`) into a REAL `coord.network.fetch_status` probe
+    of the proposed machine before ever POSTing to it — see
+    `route_work_by_liveness`'s docstring. Left unpatched, every CLI-level
+    test in this suite that exercises one of those three commands (almost
+    none of which care about liveness routing at all) would make a real
+    network call against whatever bogus `*.tailnet`/`*.tail` hostname its
+    fixture config uses — exactly the class of non-hermetic dependency
+    `_no_agent_health_probe` (#904) and `_no_assign_repo_drift_probe`
+    (#2219) above already exist to prevent, and measurably slower (~0.5s of
+    DNS-failure overhead per test) even where it doesn't change the result.
+
+    Defaults to "every machine answers" (fail-open — matching this issue's
+    own design goal: an unknown/unprobed machine must never strand work,
+    only a CONFIRMED-down one should), so an untouched test sees
+    `route_work_by_liveness` return `None` (nothing to reroute) exactly as
+    if the caller had never opted in. Tests exercising the liveness gate
+    itself pass their own `status_fetcher=` directly to `dispatch()` /
+    `route_work_by_liveness` (bypassing this default entirely, same as
+    `select_fix_machine`'s (#3208) equivalent tests already do), or
+    monkeypatch `coord.network.fetch_status` themselves after this fixture
+    runs, which wins.
+    """
+    from coord.network import StatusResult
+
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(data={"assignments": []}),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_gh(monkeypatch):
     """#1484: default every ``coord.github_ops`` helper to fail exactly as it
     would on a host where ``gh`` isn't on PATH (raise ``GhError``, a

@@ -3653,7 +3653,14 @@ def build_app(
         )
 
     async def api_approve(request: Request) -> JSONResponse:
-        from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
+        from coord.dispatch import (
+            apply_liveness_reroute,
+            caching_status_fetcher,
+            compute_do_not_touch,
+            dispatch,
+            post_briefing,
+        )
+        from coord.network import fetch_status
         from coord.state import (
             clear_proposals, load_dispatched, load_proposals as load_p,
             record_dispatched,
@@ -3697,6 +3704,46 @@ def build_app(
 
         from coord.claim import claim_message, find_work_claim
 
+        # ── Liveness-based reroute (#3353 review) ───────────────────────
+        # This route is a full production `type="work"` dispatch path — the
+        # `coord web` Phone Control Center approves the SAME
+        # `load_proposals()` set `coord approve` does, through the SAME
+        # `dispatch()` chokepoint — so it needs the same "is the proposed
+        # machine actually alive, not merely un-busy" gate. Until this, it
+        # POSTed straight at whatever machine `coord plan` named, which is
+        # exactly how #3349 and coord-tui#79 were burned on a box that had
+        # been offline for 18 hours.
+        #
+        # Shared helper rather than a second copy of `coord approve`'s
+        # loop: two independent answers to "is this machine up" is the
+        # #2096 violation that let this route fall behind in the first
+        # place. `_status_fetcher` is the per-request caching wrapper,
+        # handed to `dispatch()` below too so each machine is probed once
+        # for the whole batch.
+        #
+        # Runs before the claim/dispatch loop for the same reason `coord
+        # approve` runs it before its freshness pre-check: `p.machine_name`
+        # must already name the machine the work actually lands on when
+        # `record_dispatched` persists it.
+        _status_fetcher = caching_status_fetcher(fetch_status)
+        rerouted = {
+            r.proposal_id: r
+            for r in apply_liveness_reroute(
+                selected,
+                machines=config.machines,
+                # #3353 review round 3: keep the preview reroute
+                # capability-aware, so it can never move a
+                # capability-matched diff onto a box that doesn't cover
+                # it. `dispatch()`'s own #3241 capability gate + #3353
+                # liveness gate (which this route does NOT pre-run, unlike
+                # `coord approve`) remain the authoritative pair — they
+                # run on the cached probe results a moment later and will
+                # refuse rather than drop a capability.
+                capability_rules=config.smoke_tests.capability_rules,
+                status_fetcher=_status_fetcher,
+            )
+        }
+
         in_flight = load_dispatched()
         board_for_claim = _read_board()
         results = []
@@ -3714,7 +3761,15 @@ def build_app(
                     })
                     continue
             try:
-                response = dispatch(p, config)
+                # #3353 review: the preview reroute above already moved
+                # `p.machine_name` onto a live machine when one existed, so
+                # `dispatch()`'s own internal `route_work_by_liveness` gate
+                # is a cache-served no-op in that case. It still matters
+                # when NOTHING was reachable: that's where the descriptive
+                # "every candidate unreachable" refusal is raised, caught
+                # by the `except Exception` below and reported per-proposal
+                # instead of silently becoming a POST timeout.
+                response = dispatch(p, config, status_fetcher=_status_fetcher)
                 assignment_id = response.get("id", "pending")
                 if repo:
                     record_dispatched(
@@ -3728,7 +3783,18 @@ def build_app(
                     post_briefing(p, config, assignment_id=assignment_id, do_not_touch=do_not_touch)
                 except Exception:
                     pass
-                results.append({"id": p.id, "assignment_id": assignment_id, "ok": True})
+                result = {"id": p.id, "assignment_id": assignment_id, "ok": True}
+                # #3353 review: tell the phone client the work moved, and
+                # where — otherwise a liveness reroute is invisible from
+                # the only surface this route has, and the operator reads
+                # the machine `coord plan` proposed rather than the one
+                # actually running their issue.
+                moved = rerouted.get(p.id)
+                if moved is not None:
+                    result["machine_name"] = moved.to_machine
+                    result["rerouted_from"] = moved.from_machine
+                    result["reroute_reason"] = "liveness"
+                results.append(result)
             except Exception as e:
                 results.append({"id": p.id, "ok": False, "error": str(e)})
 

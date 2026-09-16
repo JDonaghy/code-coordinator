@@ -2814,6 +2814,7 @@ def _try_semantic_escalation(
         dispatch_conflict_fix,
         semantic_escalation_disabled,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
 
     if semantic_escalation_disabled(config):
         return None
@@ -2829,6 +2830,14 @@ def _try_semantic_escalation(
             semantic=True,
             model=model,
             stuck_summary=stuck_summary,
+            # #3353 review: this was the one remaining `dispatch_conflict_fix`
+            # call site with no liveness check — a dead machine with zero
+            # active assignments would still be picked first here too, the
+            # same pre-#3353 bug via a fourth call site. Low real-world
+            # impact only because `pipeline.escalate_semantic_conflicts`
+            # defaults off; wired now so turning it on doesn't reopen the
+            # bug this issue exists to close.
+            status_fetcher=fetch_status,
         )
     except Exception as exc:  # noqa: BLE001 — never break reconcile on this
         import logging  # noqa: PLC0415

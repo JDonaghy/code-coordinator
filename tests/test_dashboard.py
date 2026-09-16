@@ -1016,6 +1016,178 @@ class TestApproveAPI:
         assert r.status_code == 400
 
 
+# ── #3353 review: liveness gating on the phone dashboard's approve route ────
+#
+# `POST /api/approve` (the `coord web` Phone Control Center) dispatches the
+# SAME `load_proposals()` set `coord approve` does, through the SAME
+# `coord.dispatch.dispatch()` chokepoint — but it was the one production
+# `type="work"` call site never wired to a liveness probe, so it kept POSTing
+# straight at machines that had been offline for hours. That is exactly how
+# #3349 and coord-tui#79 were burned on 2026-09-15.
+#
+# Black-box through the real Starlette route (CLAUDE.md's acceptance bar):
+# these drive the HTTP surface an operator's phone actually hits and assert
+# on the response body plus which agent host the dispatch POST went to.
+# `coord.network.fetch_status` is the ONE seam stubbed — every other layer
+# (the route, `apply_liveness_reroute`, `dispatch()`'s own internal gate) is
+# the real code. All three fail against the previous round, where
+# `api_approve` called `dispatch(p, config)` with no `status_fetcher` and
+# `route_work_by_liveness` short-circuited to `None`.
+
+
+def _two_machine_config() -> Config:
+    """`laptop` first in config order (so a busy-only picker reaches it
+    first), `desktop` second — the #3353 shape where the FIRST machine is
+    the dead one."""
+    return Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[
+            Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/tmp/api"},
+            ),
+            Machine(
+                name="desktop", host="desktop.tailnet", repos=["api"],
+                repo_paths={"api": "/tmp/api"},
+            ),
+        ],
+    )
+
+
+def _reachable_only(*names: str):
+    """Fake `coord.network.fetch_status`: online for *names*, timing out for
+    everyone else. Same shape as tests/test_dispatch.py's helper."""
+    from coord.network import StatusResult
+
+    def _fetch(machine, timeout=None):  # noqa: ARG001 — matches fetch_status
+        if machine.name in names:
+            return StatusResult(data={"assignments": []})
+        return StatusResult(error="timeout")
+
+    return _fetch
+
+
+def _work_proposal() -> Proposal:
+    return Proposal(
+        id=1, machine_name="laptop", repo_name="api",
+        issue_number=3349, issue_title="Fix the thing",
+        rationale="test", type="work",
+    )
+
+
+@patch("coord.state.load_board", return_value=None)
+@patch("coord.state.build_board", return_value=Board())
+@patch("coord.state.save_board")
+@patch("coord.state.clear_proposals")
+@patch("coord.state.record_dispatched")
+@patch("coord.state.load_dispatched", return_value=[])
+@patch("coord.state.load_proposals")
+@patch("coord.dispatch.post_briefing")
+@patch("coord.dispatch.httpx.post")
+class TestApproveAPILivenessRouting:
+    def test_work_proposal_is_rerouted_off_an_unreachable_machine(
+        self, mock_post, mock_briefing, mock_load_p, *_mocks,
+    ) -> None:
+        """The #3349/coord-tui#79 shape, approved from the phone: `laptop`
+        (what `coord plan` proposed) has been down for hours, `desktop`
+        covers the same repo and is up. The POST must go to `desktop`."""
+        mock_load_p.return_value = [_work_proposal()]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "xyz"}
+        mock_resp.raise_for_status = lambda: None
+        mock_post.return_value = mock_resp
+
+        client = TestClient(build_app(_two_machine_config()))
+        with patch("coord.network.fetch_status", _reachable_only("desktop")):
+            r = client.post("/api/approve", json={"ids": [1]})
+
+        assert r.status_code == 200
+        result = r.json()["results"][0]
+        assert result["ok"] is True
+        # The assignment landed on the LIVE machine, not the proposed one.
+        assert "desktop.tailnet" in mock_post.call_args.args[0]
+        assert "laptop.tailnet" not in mock_post.call_args.args[0]
+        # …and the phone client is told the work moved, so the operator
+        # doesn't read the machine `coord plan` named.
+        assert result["machine_name"] == "desktop"
+        assert result["rerouted_from"] == "laptop"
+        assert result["reroute_reason"] == "liveness"
+
+    def test_every_machine_unreachable_refuses_instead_of_posting(
+        self, mock_post, mock_briefing, mock_load_p, *_mocks,
+    ) -> None:
+        """#3353 item 3: with nothing reachable the route must report a
+        per-proposal failure naming liveness — never fall through to a POST
+        that burns a dead-box timeout (and, in the drive queue, an
+        attempt)."""
+        mock_load_p.return_value = [_work_proposal()]
+
+        client = TestClient(build_app(_two_machine_config()))
+        with patch("coord.network.fetch_status", _reachable_only()):
+            r = client.post("/api/approve", json={"ids": [1]})
+
+        assert r.status_code == 200
+        result = r.json()["results"][0]
+        assert result["ok"] is False
+        assert "unreachable" in result["error"]
+        # Both machines named, so the failure points at the real problem.
+        assert "laptop" in result["error"]
+        assert "desktop" in result["error"]
+        mock_post.assert_not_called()
+
+    def test_reachable_proposed_machine_dispatches_unchanged(
+        self, mock_post, mock_briefing, mock_load_p, *_mocks,
+    ) -> None:
+        """No regression for the ordinary case: when the proposed machine
+        answers, nothing is rerouted and no reroute keys appear in the
+        response."""
+        mock_load_p.return_value = [_work_proposal()]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "xyz"}
+        mock_resp.raise_for_status = lambda: None
+        mock_post.return_value = mock_resp
+
+        client = TestClient(build_app(_two_machine_config()))
+        with patch("coord.network.fetch_status", _reachable_only("laptop", "desktop")):
+            r = client.post("/api/approve", json={"ids": [1]})
+
+        assert r.status_code == 200
+        result = r.json()["results"][0]
+        assert result["ok"] is True
+        assert "laptop.tailnet" in mock_post.call_args.args[0]
+        assert "rerouted_from" not in result
+
+    def test_each_machine_is_probed_once_per_request(
+        self, mock_post, mock_briefing, mock_load_p, *_mocks,
+    ) -> None:
+        """#3353 review: the route's preview reroute and `dispatch()`'s own
+        internal gate both ask "is this machine up" for the same proposal.
+        The shared `caching_status_fetcher` collapses that to ONE real `GET
+        /status` per machine per request — without it this is 2 probes for
+        one proposal (and 2N for N proposals aimed at one machine)."""
+        mock_load_p.return_value = [_work_proposal()]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "xyz"}
+        mock_resp.raise_for_status = lambda: None
+        mock_post.return_value = mock_resp
+
+        probed: list[str] = []
+        live = _reachable_only("laptop", "desktop")
+
+        def _counting(machine, timeout=None):
+            probed.append(machine.name)
+            return live(machine, timeout=timeout)
+
+        client = TestClient(build_app(_two_machine_config()))
+        with patch("coord.network.fetch_status", _counting):
+            r = client.post("/api/approve", json={"ids": [1]})
+
+        assert r.status_code == 200
+        assert probed == ["laptop"], (
+            f"expected one probe of the proposed machine, got {probed}"
+        )
+
+
 class TestRejectAPI:
     def test_reject_removes_proposals(self) -> None:
         proposals = [

@@ -473,6 +473,7 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
 
     from coord.audit import record_audit  # noqa: PLC0415
     from coord.conflict_fix import (  # noqa: PLC0415
+        describe_conflict_fix_decline,
         dispatch_conflict_fix,
         has_prior_conflict_fix,
     )
@@ -481,6 +482,7 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
         classify_conflict,
         is_rebase_refusal,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
     from coord.state import load_board, save_board  # noqa: PLC0415
 
     fix_board = load_board()
@@ -535,13 +537,20 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                     details={"reason": "retry_cap"},
                 )
                 continue
+            prefer = _machine_for_assignment(fix_board, ev.entry.assignment_id)
+            # #3353: opt machine selection into a LIVE liveness check —
+            # without this, a machine with no pending/running assignments
+            # reads as idle regardless of whether its agent answers at all,
+            # so a box that has been down for hours gets picked ahead of a
+            # healthy one. See `coord.conflict_fix.select_conflict_fix_machine`.
+            pick_out: list = []
             fix = dispatch_conflict_fix(
                 ev.entry,
                 fix_board,
                 config,
-                prefer_machine=_machine_for_assignment(
-                    fix_board, ev.entry.assignment_id,
-                ),
+                prefer_machine=prefer,
+                status_fetcher=fetch_status,
+                machine_pick_out=pick_out,
             )
             if fix is not None:
                 click.echo(
@@ -550,9 +559,25 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                 )
                 dispatched_any = True
             else:
+                # #3353 item 4: this branch is reached only when the retry
+                # cap ABOVE already said no ("already in flight" is not
+                # possible here) — so report the REAL reason instead of the
+                # old, permanently-ambiguous "no machine / already in
+                # flight" line. #3353 review: read it off `pick_out`
+                # (populated by `dispatch_conflict_fix` itself, the SAME
+                # selection call it already made) rather than re-running
+                # `select_conflict_fix_machine` a second time here — that
+                # used to double the live `/status` probes to every
+                # candidate for every declined dispatch and opened a TOCTOU
+                # window where the two calls could disagree. #3353 review
+                # (round 3): the branching itself now lives in
+                # `describe_conflict_fix_decline`, shared with
+                # `coord/notify.py`'s two stalled-pipeline arms, which
+                # otherwise kept printing the old ambiguous line.
+                detail = describe_conflict_fix_decline(pick_out)
                 click.echo(
                     f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
-                    "conflict-fix not dispatched (no machine / already in flight)"
+                    f"conflict-fix not dispatched ({detail})"
                 )
         elif kind == "human":
             ev.entry.state = HUMAN_REQUIRED

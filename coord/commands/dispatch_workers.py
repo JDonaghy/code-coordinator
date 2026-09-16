@@ -4684,6 +4684,7 @@ def _dispatch_headless(
         post_briefing,
         resolve_dispatch_model_alias,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
     from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
@@ -4999,6 +5000,13 @@ def _dispatch_headless(
     try:
         response = dispatch(
             proposal, cfg, pull_repos=pull_repos, fresh_branch=force,
+            # #3353: opt `type="work"` dispatch into a live liveness
+            # reroute — without this, `coord assign` (like `coord
+            # approve`, wired the same way) POSTed straight to the named
+            # machine regardless of whether its agent answered at all, the
+            # same busy-vs-alive confusion that sent #3349/coord-tui#79 to
+            # a dead box.
+            status_fetcher=fetch_status,
         )
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)

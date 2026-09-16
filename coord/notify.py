@@ -1583,11 +1583,13 @@ def dispatch_stalled_pipeline_action(
 
     if detection.reason == "merge_conflict_unresolved":
         from coord.conflict_fix import (  # noqa: PLC0415
+            describe_conflict_fix_decline,
             dispatch_conflict_fix,
             has_prior_conflict_fix,
             sealed_conflict_could_touch_manifest,
         )
         from coord.merge_queue import load_queue  # noqa: PLC0415
+        from coord.network import fetch_status  # noqa: PLC0415
 
         entry = next(
             (m for m in load_queue() if m.assignment_id == work.assignment_id), None,
@@ -1653,11 +1655,26 @@ def dispatch_stalled_pipeline_action(
                             "human"
                         ),
                     )
-        fix = dispatch_conflict_fix(entry, board, config, prefer_machine=work.machine_name)
+        # #3353: opt into a live liveness check on machine selection — a
+        # machine with no pending/running assignments otherwise reads as
+        # idle regardless of whether its agent answers at all.
+        # #3353 review (round 3): report the REAL decline reason, read off
+        # the pick `dispatch_conflict_fix` already made, instead of the old
+        # hardcoded "(no machine / no repo_path)" — the same ambiguity item
+        # 4 killed in `coord merge`, still live on this arm. Shared
+        # formatter, not a second copy of the branching (#2096).
+        pick_out: list = []
+        fix = dispatch_conflict_fix(
+            entry, board, config, prefer_machine=work.machine_name,
+            status_fetcher=fetch_status, machine_pick_out=pick_out,
+        )
         if fix is None:
             return StalledDispatchAction(
                 kind="no_action",
-                detail="dispatch_conflict_fix declined (no machine / no repo_path)",
+                detail=(
+                    "dispatch_conflict_fix declined: "
+                    + describe_conflict_fix_decline(pick_out)
+                ),
             )
         return StalledDispatchAction(
             kind="conflict_fix_dispatched",
@@ -1666,10 +1683,12 @@ def dispatch_stalled_pipeline_action(
 
     if detection.reason == "merge_gate_checks_stale":
         from coord.conflict_fix import (  # noqa: PLC0415
+            describe_conflict_fix_decline,
             dispatch_conflict_fix,
             has_prior_conflict_fix,
         )
         from coord.merge_queue import load_queue  # noqa: PLC0415
+        from coord.network import fetch_status  # noqa: PLC0415
 
         entry = next(
             (m for m in load_queue() if m.assignment_id == work.assignment_id), None,
@@ -1691,14 +1710,21 @@ def dispatch_stalled_pipeline_action(
         # identical (patch-id-verified) rebase, and escalates to a human
         # exactly like any other conflict-fix failure the instant a real
         # conflict or a content change shows up.
+        # #3353 review (round 3): same real-reason reporting as the
+        # `merge_conflict_unresolved` arm above.
+        pick_out: list = []
         fix = dispatch_conflict_fix(
             entry, board, config, prefer_machine=work.machine_name,
-            stale_rebase=True,
+            stale_rebase=True, status_fetcher=fetch_status,
+            machine_pick_out=pick_out,
         )
         if fix is None:
             return StalledDispatchAction(
                 kind="no_action",
-                detail="dispatch_conflict_fix declined (no machine / no repo_path)",
+                detail=(
+                    "dispatch_conflict_fix declined: "
+                    + describe_conflict_fix_decline(pick_out)
+                ),
             )
         return StalledDispatchAction(
             kind="conflict_fix_dispatched",
