@@ -477,7 +477,6 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
         NO_MACHINE_CONFIGURED,
         dispatch_conflict_fix,
         has_prior_conflict_fix,
-        select_conflict_fix_machine,
     )
     from coord.merge_queue import (  # noqa: PLC0415
         HUMAN_REQUIRED,
@@ -545,12 +544,14 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
             # reads as idle regardless of whether its agent answers at all,
             # so a box that has been down for hours gets picked ahead of a
             # healthy one. See `coord.conflict_fix.select_conflict_fix_machine`.
+            pick_out: list = []
             fix = dispatch_conflict_fix(
                 ev.entry,
                 fix_board,
                 config,
                 prefer_machine=prefer,
                 status_fetcher=fetch_status,
+                machine_pick_out=pick_out,
             )
             if fix is not None:
                 click.echo(
@@ -561,25 +562,43 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
             else:
                 # #3353 item 4: this branch is reached only when the retry
                 # cap ABOVE already said no ("already in flight" is not
-                # possible here) — so re-derive the REAL reason
-                # (`dispatch_conflict_fix` itself already wrote the durable
-                # audit row; this is just the human-readable echo) instead
-                # of the old, permanently-ambiguous "no machine / already
-                # in flight" line.
-                pick = select_conflict_fix_machine(
-                    ev.entry.repo_name, fix_board, config,
-                    prefer_machine=prefer, status_fetcher=fetch_status,
-                )
-                if pick.reason == ALL_CANDIDATES_UNREACHABLE:
+                # possible here) — so report the REAL reason instead of the
+                # old, permanently-ambiguous "no machine / already in
+                # flight" line. #3353 review: read it off `pick_out`
+                # (populated by `dispatch_conflict_fix` itself, the SAME
+                # selection call it already made) rather than re-running
+                # `select_conflict_fix_machine` a second time here — that
+                # used to double the live `/status` probes to every
+                # candidate for every declined dispatch and opened a TOCTOU
+                # window where the two calls could disagree.
+                if not pick_out:
+                    # Selection never ran at all: dispatch declined before
+                    # reaching it — no `repos:` entry in coordinator.yml
+                    # matches this repo (or, redundantly with the retry-cap
+                    # check above, the entry already has an active/failed
+                    # conflict-fix).
                     detail = (
-                        "every capable machine is unreachable right now "
-                        f"({', '.join(pick.unreachable)}) — an agent "
-                        "problem, not a capacity stall"
+                        "no repo config matches this repo, or dispatch was "
+                        "declined before machine selection ran"
                     )
-                elif pick.reason == NO_MACHINE_CONFIGURED:
-                    detail = "no configured machine can work on this repo"
                 else:
-                    detail = "no repo_path configured for the picked machine"
+                    pick = pick_out[0]
+                    if pick.reason == ALL_CANDIDATES_UNREACHABLE:
+                        detail = (
+                            "every capable machine is unreachable right now "
+                            f"({', '.join(pick.unreachable)}) — an agent "
+                            "problem, not a capacity stall"
+                        )
+                    elif pick.reason == NO_MACHINE_CONFIGURED:
+                        detail = "no configured machine can work on this repo"
+                    elif pick.machine is not None:
+                        detail = "no repo_path configured for the picked machine"
+                    else:  # pragma: no cover — pick.machine is None always
+                        # sets pick.reason (see ConflictFixMachinePick's
+                        # docstring), so this is unreachable in practice;
+                        # kept as a safety net rather than an unhandled
+                        # branch.
+                        detail = "machine selection declined for an unrecorded reason"
                 click.echo(
                     f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                     f"conflict-fix not dispatched ({detail})"

@@ -1167,12 +1167,30 @@ def dispatch_conflict_fix(
     stuck_summary: str | None = None,
     stale_rebase: bool = False,
     status_fetcher: Callable[..., StatusResult] | None = None,
+    machine_pick_out: "list[ConflictFixMachinePick] | None" = None,
 ) -> Assignment | None:
     """Send a ``type="conflict-fix"`` assignment for *entry* to an agent.
 
     Returns the new ``Assignment``, or ``None`` when dispatch couldn't proceed
     (no capable machine, no ``repo_path`` configured, agent unreachable, …).
     The caller is responsible for persisting the board.
+
+    *machine_pick_out* (#3353 review): an optional caller-supplied list this
+    function appends the internal :class:`ConflictFixMachinePick` to,
+    IMMEDIATELY BEFORE any ``None`` return that happened after selection
+    actually ran. A caller that wants to explain WHY dispatch declined
+    (``coord.commands.merge``'s failure echo) used to re-call
+    :func:`select_conflict_fix_machine` a second time just to reconstruct
+    that reason — doubling the live ``/status`` probes to every candidate
+    for every declined dispatch, and opening a (very unlikely) TOCTOU
+    window where the two calls could disagree if reachability flips
+    between them. Passing a list here instead lets the caller read the
+    SAME pick this call already made, at zero extra cost. Left empty (never
+    appended) when dispatch declined BEFORE selection ever ran — the retry
+    cap, an active conflict-fix already in flight, or no matching ``repos:``
+    entry in ``coordinator.yml`` — which is itself useful signal: an empty
+    list tells the caller "selection was never reached", distinct from
+    "selection ran and declined".
 
     *status_fetcher* (#3353) opts machine selection into a live liveness
     check — see :func:`select_conflict_fix_machine`'s docstring; ``None``
@@ -1272,10 +1290,14 @@ def dispatch_conflict_fix(
     if machine is None:
         if pick.reason:
             _record_conflict_fix_machine_failure(entry, pick)
+        if machine_pick_out is not None:
+            machine_pick_out.append(pick)
         return None
 
     repo_path = machine.repo_path(entry.repo_name)
     if repo_path is None:
+        if machine_pick_out is not None:
+            machine_pick_out.append(pick)
         return None
 
     if semantic:

@@ -32,8 +32,10 @@ from coord.dispatch import (
     resolve_dispatch_model,
     resolve_dispatch_model_alias,
     route_work_by_capability,
+    route_work_by_liveness,
 )
 from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo
+from coord.network import StatusResult
 from coord.review import repo_focus_lines
 
 
@@ -3523,6 +3525,274 @@ class TestDispatchCapabilityRouting:
         )
 
         dispatch(p, cfg)
+
+        assert "dell64.tailnet" in mock_post.call_args.args[0]
+        assert p.machine_name == "dell64"
+
+
+# ── #3353: liveness-aware work-dispatch routing ─────────────────────────────
+#
+# #3349 and coord-tui#79 (2026-09-15) were each dispatched straight at a
+# machine that had been offline for hours: `route_work_by_capability` above
+# only reroutes on a `## Files` capability-rule match, and `dispatch()`
+# POSTed to `proposal.machine_name` with no reachability signal at all — the
+# same busy-vs-alive confusion #3353 already fixed for conflict-fix machine
+# selection (`coord.conflict_fix.select_conflict_fix_machine`), left open
+# for the router that actually produced those two incidents.
+#
+# Every test below fails against unfixed `main`: `route_work_by_liveness`
+# doesn't exist there, and `dispatch()` has no `status_fetcher` parameter.
+
+
+def _status_fetcher(reachable: set[str]):
+    """Fake `status_fetcher`: online for every machine in *reachable*,
+    unreachable (network timeout) for everyone else. Same fake shape as
+    tests/test_conflict_fix.py's identical helper — both probe through
+    `coord.network.probe_reachable`."""
+
+    def _fetch(machine, timeout=None):  # noqa: ARG001 — matches fetch_status's shape
+        if machine.name in reachable:
+            return StatusResult(data={"assignments": []})
+        return StatusResult(error="timeout")
+
+    return _fetch
+
+
+class TestRouteWorkByLiveness:
+    def test_no_status_fetcher_returns_none(self) -> None:
+        """Opt-in only (#2096, same contract as `coord.conflict_fix.
+        select_conflict_fix_machine`'s `status_fetcher`): no probe at all
+        when a caller hasn't wired a fetcher in, so every existing
+        `dispatch()` call site is unaffected byte-for-byte."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+        )
+        assert result is None
+
+    def test_reachable_proposed_machine_returns_none(self) -> None:
+        """Nothing to reroute — the caller's job is to leave
+        `proposal.machine_name` untouched."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher({"dell64"}),
+        )
+        assert result is None
+
+    def test_unreachable_proposed_machine_reroutes_to_live_fallback(self) -> None:
+        """The exact #3349/coord-tui#79 shape: dell64 has been down for
+        hours, macmini is up and covers the same repo. Selection must not
+        stay pinned on the dead machine."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert result is not None
+        assert result.machine_name == "macmini"
+        assert result.rerouted is True
+        assert ("dell64", "timeout") in result.tried
+
+    def test_all_candidates_unreachable_signals_none_machine_name(self) -> None:
+        """The caller must treat this as a hard refusal, not "proceed with
+        the original pick" — falling through would burn a POST timeout
+        against a box already confirmed dead (#3353 item 3)."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher(set()),
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+        assert {name for name, _ in result.tried} == {"dell64", "macmini"}
+
+    def test_unknown_proposed_machine_returns_none(self) -> None:
+        """`dispatch()`'s own "Unknown machine" check is the right place
+        for this refusal, not a second one here."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="ghost",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher(set()),
+        )
+        assert result is None
+
+    def test_incapable_and_paused_machines_are_never_probed_as_fallbacks(self) -> None:
+        """Same candidate filter as `route_work_by_capability` (#3241
+        review): a machine that doesn't declare this repo, has no
+        `repo_path` configured for it, or is `coord pause`d must never be
+        probed at all, let alone picked."""
+        from coord.machine_pause import local_pause
+
+        local_pause("macmini")
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(name="other-repo-only", host="oro.tailnet", repos=["other"]),
+            Machine(
+                name="no-repo-path", host="nrp.tailnet", repos=["quadraui"],
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher(set()),  # nobody answers
+        )
+        assert result is not None
+        assert result.machine_name is None
+        # Only dell64 (the proposed machine) was ever probed — the other
+        # three were filtered out of the fallback candidate list before a
+        # single probe ran against them.
+        assert {name for name, _ in result.tried} == {"dell64"}
+
+
+class TestDispatchLivenessRouting:
+    """#3353 end-to-end: `dispatch()` itself reroutes a `type="work"`
+    dispatch around an unreachable proposed machine when a caller opts in
+    via `status_fetcher`, and refuses outright — rather than burning a POST
+    timeout against a confirmed-dead box — when nothing is reachable.
+    """
+
+    def _config(self, machines: list[Machine]) -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=machines,
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_reroutes_to_live_machine_and_updates_proposal(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config([
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+
+        dispatch(p, cfg, status_fetcher=_status_fetcher({"macmini"}))
+
+        assert "macmini.tailnet" in mock_post.call_args.args[0]
+        # Mutated in place, same contract as the #3241 capability reroute —
+        # `post_briefing()` (called right after by every caller with this
+        # SAME object) must announce where the work actually landed.
+        assert p.machine_name == "macmini"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_all_candidates_unreachable_raises_instead_of_posting(
+        self, mock_post: MagicMock,
+    ) -> None:
+        cfg = self._config([
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+
+        with pytest.raises(ValueError, match="unreachable"):
+            dispatch(p, cfg, status_fetcher=_status_fetcher(set()))
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_no_status_fetcher_never_probes_and_dispatches_unchanged(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Regression: the default (no opt-in) fixtures dispatch exactly
+        as before #3353 — no probe happens at all, even against a machine
+        a fetcher would call unreachable."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)  # status_fetcher defaults to None
+        assert "laptop.tailnet" in mock_post.call_args.args[0]
+        assert proposal.machine_name == "laptop"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_non_work_type_is_never_liveness_routed(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Only `type="work"` goes through liveness routing — a "plan"
+        proposal is dispatched exactly where proposed even against an
+        unreachable-everywhere fetcher; `dispatch()`'s own POST timeout is
+        that path's existing failure mode, unchanged by #3353."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config([
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Plan the thing",
+            rationale="best fit", briefing="Plan it", type="plan",
+        )
+
+        dispatch(p, cfg, status_fetcher=_status_fetcher(set()))
 
         assert "dell64.tailnet" in mock_post.call_args.args[0]
         assert p.machine_name == "dell64"
