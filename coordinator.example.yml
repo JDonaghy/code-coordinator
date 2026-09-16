@@ -8,6 +8,21 @@ repos:
     default_branch: develop
     build_command: "cargo build"
     test_command: "cargo test --no-default-features"
+    # #3351 (vimcode#865): `tests/nvim_conformance.rs` (1,436 oracle-backed
+    # cases) hard-fails on EVERY lane — Work and Test alike, since both run
+    # `cargo test` — when `nvim` is missing, unparseable, or older than
+    # vimcode's own MIN_NVIM_VERSION. This is repo-wide, not tied to any
+    # particular changed file, so it cannot be expressed as a
+    # `smoke_tests.capability_rules` entry (those are keyed by PATH PREFIX
+    # across the WHOLE fleet, not by repo — see the sharp-edge comment on
+    # that block below — and vimcode shares Cargo.toml/Cargo.lock/src/ with
+    # every other Rust repo here). `requires:` is the repo-scoped
+    # counterpart: every machine listed under `machines:` for this repo
+    # must also declare `nvim` in its own `capabilities:`, or
+    # `coord.dispatch.route_work_by_capability` /
+    # `coord.smoke.dispatch_smoke` refuse to route here (`coord doctor`
+    # reports which host is missing it — `coord/prereqs.py`'s `nvim` entry).
+    requires: [nvim]
 
   - name: quadraui
     github: JDonaghy/quadraui
@@ -139,7 +154,9 @@ machines:
   # Desktop A — Dell Precision, full GTK builds
   - name: precision
     host: john-precision-3571
-    capabilities: [gtk, rust, python]
+    # #3351: `nvim` backs vimcode's `requires: [nvim]` above — every machine
+    # that carries vimcode needs it, or dispatch refuses to route there.
+    capabilities: [gtk, rust, python, nvim]
     repos: [vimcode, quadraui, code-coordinator, coord-tui]
     repo_paths:
       vimcode: ~/src/vimcode
@@ -153,7 +170,8 @@ machines:
   # Desktop B — HP EliteBook, full GTK builds
   - name: elitebook
     host: john-hp-elitebook-830-g7-notebook-pc
-    capabilities: [gtk, rust, python]
+    # #3351: see the `precision` entry above — same vimcode requirement.
+    capabilities: [gtk, rust, python, nvim]
     repos: [vimcode, quadraui, code-coordinator, coord-tui]
     repo_paths:
       vimcode: ~/src/vimcode
@@ -180,7 +198,8 @@ machines:
   # Server — Dell server, no display (no GTK builds)
   - name: dellserver
     host: dellserver
-    capabilities: [rust, python]
+    # #3351: see the `precision` entry above — same vimcode requirement.
+    capabilities: [rust, python, nvim]
     repos: [vimcode, quadraui, code-coordinator]
     repo_paths:
       vimcode: ~/src/vimcode

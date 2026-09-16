@@ -1056,3 +1056,175 @@ class TestClaudeCredentialsPrereq:
             probe = prereqs.probe(self._claude_prereq())
         assert probe.found is False
         assert probe.ok is False
+
+
+class TestNvimCapabilityManifest:
+    """#3351 (vimcode#865): `nvim` backs the `nvim` capability — vimcode's
+    1,436-case nvim-conformance oracle hard-fails on every lane without a
+    usable Neovim at or above `NVIM_MIN_VERSION`. Unlike every other probe
+    in this module, an unparseable banner must REFUSE rather than degrade
+    to "unknown, assume fine" — see the module comment above
+    `_probe_nvim`/`NVIM_MIN_VERSION` for why this prereq is deliberately
+    stricter than the generic lenient contract `ToolProbe.ok` documents.
+    """
+
+    def _nvim_prereq(self):
+        return next(p for p in prereqs.CAPABILITY_PREREQS if p.tool == "nvim")
+
+    def test_backed_by_nvim_and_gated_by_the_nvim_capability(self) -> None:
+        prereq = self._nvim_prereq()
+        assert prereq.binary == "nvim"
+        assert prereq.capability == "nvim"
+        assert prereq.min_version == prereqs.NVIM_MIN_VERSION
+        assert prereqs.NVIM_MIN_VERSION == "0.12"
+
+    def test_probe_is_a_custom_probe_not_the_generic_lenient_path(self) -> None:
+        """The generic `probe()` path treats an unparseable version as
+        "unknown, assume fine" (`ok=True`) — wrong here, since the whole
+        point of this prereq is to fail closed rather than silently pass a
+        vacuous oracle run (vimcode#865)."""
+        assert self._nvim_prereq().custom_probe is not None
+
+    def test_probe_all_covers_it_only_when_declared(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["nvim"])
+        assert "nvim" in probes
+
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes_undeclared = prereqs.probe_all(["rust"])
+        assert "nvim" not in probes_undeclared
+
+    def test_missing_binary_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+        assert "not found on PATH" in probe.what_breaks
+
+    def test_real_banner_parses_and_meets_the_floor(self) -> None:
+        """The fleet standard: upstream stable v0.12.5, banner shaped
+        exactly like the real `nvim --version` output."""
+        with patch("coord.prereqs.shutil.which", return_value="/opt/homebrew/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(
+                     stdout="NVIM v0.12.5\nBuild type: Release\nLuaJIT ...\n",
+                 ),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is True
+        assert probe.version == "0.12.5"
+        assert probe.meets_floor is True
+        assert probe.ok is True
+
+    def test_below_floor_version_is_refused(self) -> None:
+        """A 0.9.x nvim — old enough to predate vimcode's floor — must read
+        UNMET, not just "old"."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="NVIM v0.9.5\nBuild type: Release\n"),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is True
+        assert probe.version == "0.9.5"
+        assert probe.meets_floor is False
+        assert probe.ok is False
+
+    def test_unparseable_banner_is_refused_not_trusted(self) -> None:
+        """The acceptance bar this prereq exists to meet: unlike every other
+        probe here (see `TestProbe.
+        test_unparseable_version_degrades_to_unknown_not_failure`), an
+        `nvim --version` banner this module can't parse must NOT be
+        silently trusted — that would just move vimcode#865's exact
+        silent-false-green one layer up the stack."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="something unexpected\n"),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is True
+        assert probe.version is None
+        assert probe.meets_floor is False
+        assert probe.ok is False
+
+    def test_nonzero_exit_is_refused(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(returncode=1, stderr="not a real nvim"),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+
+    def test_hang_is_refused_not_degraded_to_found(self) -> None:
+        """Unlike the generic `probe()` path (a hung binary is still
+        "found", version simply unknown), a hung `nvim --version` here must
+        not report `found=True` with an unconfirmed version — see the
+        fail-closed posture documented on `_probe_nvim`."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 side_effect=subprocess.TimeoutExpired(cmd="nvim", timeout=10),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+
+    def test_machine_not_declaring_nvim_is_never_dinged(self) -> None:
+        """A machine that never claims `nvim` in its `capabilities:` must
+        not be flagged for lacking it — `unmet_capabilities` only reports
+        claims it can actually verify."""
+        assert prereqs.unmet_capabilities(["rust", "gtk"], {}) == {}
+        probes = {
+            "cargo": prereqs.ToolProbe(
+                tool="cargo", capability="rust", found=True, version="1.80.0",
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        assert prereqs.unmet_capabilities(["rust"], probes) == {}
+
+    def test_unmet_when_nvim_missing(self) -> None:
+        probes = {
+            "nvim": prereqs.ToolProbe(
+                tool="nvim", capability="nvim", found=False, version=None,
+                min_version=prereqs.NVIM_MIN_VERSION, meets_floor=None,
+                what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["nvim"], probes)
+        assert "nvim" in unmet
+        assert "not found" in unmet["nvim"][0]
+
+    def test_unmet_when_nvim_below_floor(self) -> None:
+        probes = {
+            "nvim": prereqs.ToolProbe(
+                tool="nvim", capability="nvim", found=True, version="0.9.5",
+                min_version=prereqs.NVIM_MIN_VERSION, meets_floor=False,
+                what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["nvim"], probes)
+        assert "nvim" in unmet
+        assert "0.9.5" in unmet["nvim"][0]
+        assert prereqs.NVIM_MIN_VERSION in unmet["nvim"][0]
+
+    def test_met_when_nvim_probe_passes(self) -> None:
+        probes = {
+            "nvim": prereqs.ToolProbe(
+                tool="nvim", capability="nvim", found=True, version="0.12.5",
+                min_version=prereqs.NVIM_MIN_VERSION, meets_floor=True,
+                what_breaks="",
+            ),
+        }
+        assert prereqs.unmet_capabilities(["nvim"], probes) == {}
+
+    def test_all_capability_names_includes_nvim(self) -> None:
+        """#3351 acceptance: `ALL_CAPABILITY_NAMES` is derived from
+        `CAPABILITY_PREREQS`, so this entry must be picked up automatically
+        — no separate registration needed for a config-free agent to probe
+        it too, and no separate wiring needed for `coord doctor` to report
+        it UNMET."""
+        assert "nvim" in prereqs.ALL_CAPABILITY_NAMES

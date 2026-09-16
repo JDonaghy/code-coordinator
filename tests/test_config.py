@@ -627,6 +627,75 @@ def test_artifact_paths_non_string_element(tmp_path: Path) -> None:
         load(p)
 
 
+# ── requires (#3351) ─────────────────────────────────────────────────────────
+
+
+def test_repo_requires_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: vimcode\n"
+        "    github: a/vimcode\n"
+        "    requires: [nvim]\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [vimcode]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("vimcode").requires == ["nvim"]
+
+
+def test_repo_requires_default_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").requires == []
+
+
+def test_repo_requires_not_a_list_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n    requires: nvim\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="requires must be a list of strings"):
+        load(p)
+
+
+def test_repo_requires_non_string_element_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "    requires:\n"
+        "      - 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="requires must be a list of strings"):
+        load(p)
+
+
+def test_repo_requires_unrecognised_key_not_warned(tmp_path: Path) -> None:
+    """`requires` must be in `_KNOWN_REPO_KEYS`, else it would raise a
+    spurious "unrecognised key" warning for every repo that declares it."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: vimcode\n    github: a/vimcode\n    requires: [nvim]\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [vimcode]\n"
+    )
+    cfg = load(p)
+    assert cfg.warnings == []
+
+
 # ── uat_preview (#2687) ──────────────────────────────────────────────────────
 
 

@@ -245,6 +245,14 @@ class _StubRepo:
     artifact_paths: list[str] = field(default_factory=list)
     new_issue_guidance: str | None = None
     provider: str | None = None
+    # #3351: dispatch()'s capability-routing gate reads Repo.requires for
+    # every `type="work"` proposal — keep this stub in sync with the real
+    # dataclass's field. Deliberately mirrored here rather than papered over
+    # with a `getattr(repo, "requires", ())` in coord/dispatch.py: a missing
+    # attribute silently defaulting to "requires nothing" is exactly the
+    # permissive-fallback shape #2096 forbids, and would make the routing
+    # gate unable to fail on a real Repo that lost the field.
+    requires: list[str] = field(default_factory=list)
 
 
 @dataclass

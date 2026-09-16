@@ -626,6 +626,91 @@ def _probe_claude_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
     return _probe_claude_credentials_linux(prereq, timeout)
 
 
+# --- `nvim` capability: vimcode's oracle suite hard-fails without one (#3351) -
+#
+# vimcode's `tests/nvim_conformance.rs` (1,436 oracle-backed cases,
+# vimcode#865) hard-fails on EVERY lane — Work and Test alike — when `nvim`
+# is missing, unparseable, or older than vimcode's own `MIN_NVIM_VERSION`.
+# There is no cross-repo import seam for that constant the way
+# `GH_PR_CHECKS_JSON_MIN_VERSION` gives `gh` above (#1564's precedent is
+# INSIDE this repo; vimcode is a different repo entirely) — so
+# `NVIM_MIN_VERSION` below is a comment-linked duplicate, not a shared
+# source of truth, and must be bumped by hand if vimcode's ever moves. A new
+# cross-repo dependency just to import one constant would be a worse trade
+# than a documented duplicate.
+#
+# This is the one prereq in this module that deliberately does NOT follow
+# the "unparseable version degrades to unknown, assume fine" contract
+# `ToolProbe.ok` documents for every other probe here (see `probe`'s
+# nonzero-returncode branch and `test_unparseable_version_degrades_to_
+# unknown_not_failure`). vimcode#865 already made the opposite call for its
+# own in-suite check — fail closed rather than pass 1,436 vacuous cases —
+# specifically because a missing/broken oracle is indistinguishable from a
+# real Vim-compat regression once the suite goes green. Silently trusting
+# an unparseable `nvim --version` banner here would just move that same
+# silent-false-green one layer up the stack, which is the exact failure
+# this prereq exists to catch. So `_probe_nvim` refuses (`meets_floor=False`)
+# rather than shrugs (`meets_floor=None`) when the banner can't be parsed,
+# and reports `found=False` outright on a hang, a nonzero exit, or a
+# missing binary — the same fail-closed posture, applied one layer up.
+NVIM_MIN_VERSION = "0.12"  # vimcode's MIN_NVIM_VERSION (vimcode#865)
+
+
+def _probe_nvim(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `nvim` capability (#3351).
+
+    See the module comment above `NVIM_MIN_VERSION` for why this refuses
+    outright on an unparseable banner rather than degrading to "unknown,
+    assume fine" the way the generic `probe()` path does. Never raises —
+    same contract as every other probe in this module.
+    """
+    if shutil.which(prereq.binary) is None:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=f"nvim not found on PATH — {prereq.what_breaks}",
+        )
+    try:
+        result = subprocess.run(
+            [prereq.binary, *prereq.version_args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"`nvim --version` hung or could not run — {prereq.what_breaks}"
+            ),
+        )
+    if result.returncode != 0:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"`nvim --version` exited nonzero — {prereq.what_breaks}"
+            ),
+        )
+    version = _parse_version(
+        (result.stdout or "") + (result.stderr or ""), prereq.version_re
+    )
+    if version is None:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=True,
+            version=None, min_version=prereq.min_version, meets_floor=False,
+            what_breaks=(
+                "`nvim --version` output did not match the expected 'NVIM "
+                f"v<version>' banner — {prereq.what_breaks}"
+            ),
+        )
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=version, min_version=prereq.min_version,
+        meets_floor=meets_floor(version, prereq.min_version),
+        what_breaks=prereq.what_breaks,
+    )
+
+
 # Required on every machine, no matter its declared capabilities — coord
 # itself doesn't function without these.
 BASELINE_PREREQS: tuple[Prereq, ...] = (
@@ -779,6 +864,22 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
             "authenticate against Azure"
         ),
         custom_probe=_probe_azure_credentials,
+    ),
+    # #3351 (vimcode#865): backs the `nvim` capability — vimcode's own
+    # nvim-conformance oracle (1,436 cases) hard-fails on every lane when
+    # `nvim` is absent, unparseable, or below `NVIM_MIN_VERSION`. See the
+    # module comment above `NVIM_MIN_VERSION` for the fail-closed posture
+    # and why this cannot use the generic lenient probe path.
+    Prereq(
+        tool="nvim", binary="nvim", version_args=("--version",),
+        version_re=r"NVIM v(\S+)", min_version=NVIM_MIN_VERSION,
+        capability="nvim",
+        what_breaks=(
+            "the vimcode nvim-conformance suite hard-fails (vimcode#865), "
+            "turning every vimcode leg red with a failure that looks like "
+            "a Vim-compat regression"
+        ),
+        custom_probe=_probe_nvim,
     ),
 )
 

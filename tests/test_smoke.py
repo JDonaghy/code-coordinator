@@ -29,6 +29,7 @@ from coord.smoke import (
     mute_smoke_tally,
     partition_capability_requirements,
     pick_smoke_machine,
+    required_capabilities,
     resolve_rule_command,
     resolve_smoke_command,
     smoke_leg_capabilities,
@@ -151,6 +152,48 @@ def test_match_rules_bare_star_is_never_a_suffix_wildcard() -> None:
     rule author meant."""
     rules = [SmokeRule(files=["*"], requires=["azure"])]
     assert match_rules(["anything.py"], rules) == []
+
+
+# ── required_capabilities (#3351) ────────────────────────────────────────────
+#
+# `Repo.requires` (repo-wide, unconditional on touched files — vimcode's
+# nvim-conformance oracle is the motivating case) UNION `match_rules`'s
+# file-matched result. Both `dispatch_smoke` and `coord.dispatch.
+# route_work_by_capability` call this ONE function (#2096) rather than each
+# computing the union themselves.
+
+
+def test_required_capabilities_includes_repo_requires_with_no_files_matched() -> None:
+    """The whole point: a repo's `requires` must gate a leg even when the
+    diff touches nothing any `capability_rules` entry matches — vimcode has
+    no `capability_rules` entry of its own at all."""
+    caps = required_capabilities(["nvim"], ["src/parser.rs"], [])
+    assert caps == ["nvim"]
+
+
+def test_required_capabilities_unions_repo_requires_and_matched_rules() -> None:
+    rules = [SmokeRule(files=["src/gtk/"], requires=["gtk"])]
+    caps = required_capabilities(["nvim"], ["src/gtk/window.c"], rules)
+    assert set(caps) == {"nvim", "gtk"}
+
+
+def test_required_capabilities_deduplicates_when_both_sides_agree() -> None:
+    rules = [SmokeRule(files=["src/gtk/"], requires=["nvim"])]
+    caps = required_capabilities(["nvim"], ["src/gtk/window.c"], rules)
+    assert caps == ["nvim"]
+
+
+def test_required_capabilities_empty_repo_requires_matches_match_rules_exactly() -> None:
+    """A repo declaring no `requires` at all must behave exactly like
+    `match_rules` alone — no regression for the overwhelming majority of
+    repos that never set this field."""
+    rules = [SmokeRule(files=["src/gtk/"], requires=["gtk"])]
+    touched = ["src/gtk/window.c", "src/lib/util.c"]
+    assert required_capabilities([], touched, rules) == match_rules(touched, rules)
+
+
+def test_required_capabilities_returns_empty_when_neither_side_matches() -> None:
+    assert required_capabilities([], ["docs/README.md"], []) == []
 
 
 # ── Partitioning (#3177) ─────────────────────────────────────────────────────
@@ -1849,6 +1892,33 @@ def test_dispatch_smoke_sends_to_capable_different_machine(
     assert payload["repo_path"] == "/d/api"
     # Briefing should mention the test_command fallback (make test).
     assert "make test" in payload["briefing"]
+
+
+def test_dispatch_smoke_routes_by_repo_requires_with_no_matching_file_rule(
+    repo: Repo,
+) -> None:
+    """#3351: vimcode's shape — the repo declares `requires: [nvim]` but has
+    NO `capability_rules` entry of its own at all, so the diff's touched
+    files match nothing. The Test-stage leg must still route to the
+    nvim-capable machine, never to "any capable-for-repo machine"."""
+    nvim_repo = replace(repo, requires=["nvim"])
+    cfg = Config(
+        repos=[nvim_repo],
+        machines=[
+            _machine("no-nvim-box", "no-nvim.tail", caps=["python"], path="/srv/api"),
+            _machine("nvim-box", "nvim.tail", caps=["python", "nvim"], path="/d/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(auto_queue=True, capability_rules=[]),
+    )
+    board = Board()
+    client = _FakeClient({"id": "smoke-1"})
+    result = dispatch_smoke(
+        _completed(machine="no-nvim-box"), board, cfg,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["src/parser.rs"],
+    )
+    assert result is not None
+    assert result.machine_name == "nvim-box"
 
 
 def test_dispatch_smoke_pins_model_to_models_default(

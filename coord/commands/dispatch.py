@@ -426,12 +426,14 @@ def approve(
     for p in selected:
         if p.type != "work":
             continue
+        repo_cfg_for_routing = cfg.repo(p.repo_name)
         routing = route_work_by_capability(
             proposed_machine_name=p.machine_name,
             repo_name=p.repo_name,
             files_likely=p.files_likely,
             machines=cfg.machines,
             capability_rules=cfg.smoke_tests.capability_rules,
+            repo_requires=repo_cfg_for_routing.requires if repo_cfg_for_routing else (),
         )
         if routing is not None and routing.rerouted:
             click.echo(
