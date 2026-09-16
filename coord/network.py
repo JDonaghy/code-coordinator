@@ -14,7 +14,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import httpx
 
@@ -350,6 +350,46 @@ def fetch_status(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> StatusRe
         return StatusResult(error=f"connection error: {exc}")
     except (httpx.HTTPError, ValueError) as exc:
         return StatusResult(error=str(exc))
+
+
+def probe_reachable(
+    machine: Machine,
+    *,
+    status_fetcher: Callable[..., StatusResult] | None = None,
+    timeout: float | None = None,
+) -> tuple[bool, str]:
+    """Whether *machine*'s agent answers a live liveness probe right now.
+
+    #3353: this is deliberately built on :func:`fetch_status` (``GET
+    /status``, i.e. ``AgentServer.list_assignments()``) rather than
+    :func:`check_machine` (``GET /health``). ``/health`` computes several
+    TTL-cached sections (disk, tool versions, the H-1 check registry) and a
+    cold-cache recompute can run into the seconds (#3344) — exactly the
+    latency/false-negative risk a liveness gate must not bake into a
+    dispatch decision. ``/status`` carries none of that: it is a cheap,
+    synchronous read of in-memory assignment state.
+
+    Returns ``(reachable, reason)`` — *reason* is ``""`` on success, else
+    the classified network failure (:attr:`StatusResult.error`), so a
+    caller can report WHY a candidate was skipped rather than just THAT it
+    was.
+
+    *status_fetcher* defaults to :func:`fetch_status` and exists so a
+    caller — or a test — can substitute a fake without a real network call.
+    This is the ONE seam :func:`coord.dispatch.select_fix_machine` (#3208)
+    and :func:`coord.conflict_fix.select_conflict_fix_machine` (#3353) both
+    probe liveness through, rather than two independently-drifting answers
+    to "is this machine up" (#2096, "one question, one answer").
+
+    *timeout*, when given, is forwarded to the fetcher as a keyword
+    argument; left as ``None`` (the default) it is omitted entirely so a
+    caller-supplied fake fetcher that only accepts ``(machine)`` — like
+    every one of :func:`coord.dispatch.select_fix_machine`'s own tests —
+    keeps working unchanged.
+    """
+    fetch = status_fetcher or fetch_status
+    result = fetch(machine, timeout=timeout) if timeout is not None else fetch(machine)
+    return result.ok, (result.error or "")
 
 
 def fetch_repos(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> dict | None:

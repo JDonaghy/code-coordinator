@@ -1383,6 +1383,7 @@ def select_fix_machine(
     """
     from coord.machine_pause import follow_on_paused_set
     from coord.network import fetch_status as _fetch_status
+    from coord.network import probe_reachable
 
     fetch = status_fetcher or _fetch_status
     # #2240: the same follow-on cordon `_dispatch_fix` has always used — a
@@ -1419,10 +1420,14 @@ def select_fix_machine(
         if not _capable(m):
             tried.append((m.name, f"cannot work on repo {repo_name!r}"))
             continue
-        result = fetch(m)
-        if result.ok:
+        # #3353: routed through the shared `coord.network.probe_reachable`
+        # seam (rather than calling `fetch` directly) so this and
+        # `coord.conflict_fix.select_conflict_fix_machine` answer "is this
+        # machine up" identically — see that function's docstring.
+        reachable, reason = probe_reachable(m, status_fetcher=fetch)
+        if reachable:
             return FixMachineSelection(m, tried)
-        tried.append((m.name, result.error or "unreachable"))
+        tried.append((m.name, reason or "unreachable"))
 
     return FixMachineSelection(None, tried)
 

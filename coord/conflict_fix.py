@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass
+from typing import Callable
 
 import httpx
 
@@ -61,6 +63,7 @@ from coord.models import (
     Board,
     Machine,
 )
+from coord.network import StatusResult, probe_reachable
 
 
 CONFLICT_FIX_SYSTEM_PROMPT = """\
@@ -978,41 +981,177 @@ def has_prior_conflict_fix(
 
 # ── Machine selection ───────────────────────────────────────────────────────
 
+
+# #3353 root cause: the old picker's only exclusion was `busy` (derived
+# purely from board rows), so a machine that had been offline for hours —
+# zero `pending`/`running` assignments, same as a genuinely idle one — read
+# as the BEST candidate and was picked ahead of healthy machines further
+# down `coordinator.yml`'s machine list. `NO_MACHINE_CONFIGURED` and
+# `ALL_CANDIDATES_UNREACHABLE` let a caller tell "nobody declares this
+# repo" apart from "a live agent problem", instead of one ambiguous
+# "no machine" bucket that was — per the issue's branch-3 analysis — nearly
+# always actually the second thing.
+NO_MACHINE_CONFIGURED = "no_capable_machine"
+ALL_CANDIDATES_UNREACHABLE = "all_candidates_unreachable"
+
+
+@dataclass
+class ConflictFixMachinePick:
+    """Outcome of :func:`select_conflict_fix_machine` (#3353).
+
+    ``reason`` is only meaningful when ``machine is None``:
+
+    - :data:`NO_MACHINE_CONFIGURED` — no configured machine declares this
+      repo at all (unchanged from the pre-#3353 picker's only ``None``
+      case).
+    - :data:`ALL_CANDIDATES_UNREACHABLE` — one or more machines declare the
+      repo, but a live reachability check (only performed when the caller
+      opts in via *status_fetcher* — see that parameter below) found every
+      one of them down right now. ``unreachable`` names them.
+
+    Never returned for "everyone's busy" — a busy-but-reachable machine is
+    still picked (queues on the agent), exactly like before #3353.
+    """
+
+    machine: Machine | None
+    reason: str = ""
+    unreachable: tuple[str, ...] = ()
+
+
+def select_conflict_fix_machine(
+    repo_name: str,
+    board: Board,
+    config: Config,
+    *,
+    prefer_machine: str | None = None,
+    status_fetcher: Callable[..., StatusResult] | None = None,
+) -> ConflictFixMachinePick:
+    """Pick a machine that has *repo_name* checked out. ``prefer_machine``
+    wins if it can handle the repo (typically the original worker), so the
+    rebase uses an existing local checkout.
+
+    #3353: *status_fetcher* is the liveness-check opt-in. When ``None``
+    (the default), this behaves EXACTLY like the pre-#3353 picker — busy
+    exclusion only, "anyone (including busy)" as the last resort — so every
+    existing caller that doesn't pass it is unaffected byte-for-byte.
+    Passing a fetcher (production: :func:`coord.network.fetch_status`,
+    tests: a fake) turns on a live ``/status`` probe of each candidate
+    (:func:`coord.network.probe_reachable` — the SAME seam
+    :func:`coord.dispatch.select_fix_machine` (#3208) uses, never
+    ``/health``'s much heavier, cache-cold-prone check — see that
+    function's docstring) and EXCLUDES a candidate confirmed unreachable,
+    at any busy/idle rank, rather than treating "no assignments" as
+    equivalent to "alive". A candidate with no probe result yet (the
+    fetcher never got a chance to run because a higher-ranked one already
+    won) is never probed at all — "unknown" is never manufactured into
+    "dead"; it just never comes up.
+
+    Ranking, best first, once liveness-checking is on:
+    1. *prefer_machine*, if idle and reachable.
+    2. Idle and reachable.
+    3. Busy and reachable (still queues on the agent, but the agent is
+       actually there to receive it).
+    Only when NO candidate is reachable does this return ``None`` with
+    :data:`ALL_CANDIDATES_UNREACHABLE` — distinct from
+    :data:`NO_MACHINE_CONFIGURED`, and from the retry-cap "already in
+    flight" refusal callers check for separately before ever reaching this
+    function.
+    """
+    candidates = [m for m in config.machines if m.can_work_on(repo_name)]
+    if not candidates:
+        return ConflictFixMachinePick(None, reason=NO_MACHINE_CONFIGURED)
+
+    busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
+    live_check = status_fetcher is not None
+    _reachable_cache: dict[str, bool] = {}
+
+    def _alive(m: Machine) -> bool:
+        if not live_check:
+            return True
+        if m.name not in _reachable_cache:
+            ok, _reason = probe_reachable(m, status_fetcher=status_fetcher)
+            _reachable_cache[m.name] = ok
+        return _reachable_cache[m.name]
+
+    # 1. The preferred machine if it's idle, can handle the repo, and (when
+    #    liveness-checking is on) reachable.
+    if prefer_machine is not None:
+        preferred = next((m for m in candidates if m.name == prefer_machine), None)
+        if preferred is not None and preferred.name not in busy and _alive(preferred):
+            return ConflictFixMachinePick(preferred)
+
+    # 2. Any idle, reachable machine that handles the repo.
+    idle = [m for m in candidates if m.name not in busy and _alive(m)]
+    if idle:
+        return ConflictFixMachinePick(idle[0])
+
+    if not live_check:
+        # Pre-#3353 behaviour, preserved exactly: no liveness signal at
+        # all → anyone (including busy) — the assignment queues on the
+        # agent.
+        return ConflictFixMachinePick(candidates[0])
+
+    # 3. Busy but reachable — queues on the agent, which is at least there.
+    busy_alive = [m for m in candidates if m.name in busy and _alive(m)]
+    if busy_alive:
+        return ConflictFixMachinePick(busy_alive[0])
+
+    # Every candidate confirmed unreachable.
+    dead = tuple(m.name for m in candidates if not _alive(m))
+    return ConflictFixMachinePick(None, reason=ALL_CANDIDATES_UNREACHABLE, unreachable=dead)
+
+
 def pick_conflict_fix_machine(
     repo_name: str,
     board: Board,
     config: Config,
     *,
     prefer_machine: str | None = None,
+    status_fetcher: Callable[..., StatusResult] | None = None,
 ) -> Machine | None:
-    """Pick a machine that has *repo_name* checked out. ``prefer_machine``
-    wins if it can handle the repo (typically the original worker), so the
-    rebase uses an existing local checkout.
-
-    Returns ``None`` when no configured machine can handle the repo.
-    """
-    candidates = [m for m in config.machines if m.can_work_on(repo_name)]
-    if not candidates:
-        return None
-
-    busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
-
-    # 1. The preferred machine if it's idle and can handle the repo.
-    if prefer_machine is not None:
-        preferred = next((m for m in candidates if m.name == prefer_machine), None)
-        if preferred is not None and preferred.name not in busy:
-            return preferred
-
-    # 2. Any idle machine that handles the repo.
-    idle = [m for m in candidates if m.name not in busy]
-    if idle:
-        return idle[0]
-
-    # 3. Anyone (including busy) — the assignment will queue on the agent.
-    return candidates[0]
+    """Back-compat thin wrapper around :func:`select_conflict_fix_machine`
+    for callers that only want the picked machine, not the full reason —
+    unchanged signature/behaviour by default (#3353)."""
+    return select_conflict_fix_machine(
+        repo_name, board, config,
+        prefer_machine=prefer_machine, status_fetcher=status_fetcher,
+    ).machine
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
+
+
+def _record_conflict_fix_machine_failure(
+    entry: QueuedMerge, pick: ConflictFixMachinePick,
+) -> None:
+    """#3353: the durable, greppable trace a declined machine-selection used
+    to never leave anywhere but a single ambiguous ``click.echo`` line at
+    whichever of :func:`dispatch_conflict_fix`'s several call sites happened
+    to trigger it (``coord/commands/merge.py``, ``coord/notify.py`` x2,
+    ``coord/reconcile.py``'s semantic-escalation path). One audit row here
+    covers all of them, keyed on the SAME ``pick.reason`` the caller-facing
+    message can now quote instead of guessing.
+
+    ``record_audit`` is itself best-effort (swallows all write failures),
+    so a DB hiccup here never takes down the dispatch decline it's
+    recording.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="merge",
+        event_type="conflict_fix_dispatch_declined",
+        actor="daemon",
+        summary=(
+            f"conflict-fix not dispatched for "
+            f"{entry.repo_name}#{entry.issue_number}: {pick.reason}"
+        ),
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details={"reason": pick.reason, "unreachable": list(pick.unreachable)},
+    )
 
 
 def dispatch_conflict_fix(
@@ -1027,12 +1166,26 @@ def dispatch_conflict_fix(
     model: str | None = None,
     stuck_summary: str | None = None,
     stale_rebase: bool = False,
+    status_fetcher: Callable[..., StatusResult] | None = None,
 ) -> Assignment | None:
     """Send a ``type="conflict-fix"`` assignment for *entry* to an agent.
 
     Returns the new ``Assignment``, or ``None`` when dispatch couldn't proceed
     (no capable machine, no ``repo_path`` configured, agent unreachable, …).
     The caller is responsible for persisting the board.
+
+    *status_fetcher* (#3353) opts machine selection into a live liveness
+    check — see :func:`select_conflict_fix_machine`'s docstring; ``None``
+    (the default) preserves the pre-#3353 busy-only selection exactly.
+    Whenever selection declines with a machine-related reason (as opposed
+    to the retry-cap/in-flight checks above, which already leave their own
+    trace via the caller's ``HUMAN_REQUIRED``/audit handling), this writes
+    a durable audit row (see :func:`_record_conflict_fix_machine_failure`)
+    — #3353's #3: a conflict-fix that couldn't be dispatched used to leave
+    no assignment row, no retry-cap consumption, and one ambiguous caller
+    log line as its only trace. This makes that trace durable and
+    greppable regardless of which of this function's several call sites
+    triggered it.
 
     Retry cap: blocks on two conditions — (1) an **active** conflict-fix
     (``running``/``pending``) for this entry is already in flight, preventing
@@ -1111,10 +1264,14 @@ def dispatch_conflict_fix(
     if repo is None:
         return None
 
-    machine = pick_conflict_fix_machine(
-        entry.repo_name, board, config, prefer_machine=prefer_machine,
+    pick = select_conflict_fix_machine(
+        entry.repo_name, board, config,
+        prefer_machine=prefer_machine, status_fetcher=status_fetcher,
     )
+    machine = pick.machine
     if machine is None:
+        if pick.reason:
+            _record_conflict_fix_machine_failure(entry, pick)
         return None
 
     repo_path = machine.repo_path(entry.repo_name)

@@ -473,14 +473,18 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
 
     from coord.audit import record_audit  # noqa: PLC0415
     from coord.conflict_fix import (  # noqa: PLC0415
+        ALL_CANDIDATES_UNREACHABLE,
+        NO_MACHINE_CONFIGURED,
         dispatch_conflict_fix,
         has_prior_conflict_fix,
+        select_conflict_fix_machine,
     )
     from coord.merge_queue import (  # noqa: PLC0415
         HUMAN_REQUIRED,
         classify_conflict,
         is_rebase_refusal,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
     from coord.state import load_board, save_board  # noqa: PLC0415
 
     fix_board = load_board()
@@ -535,13 +539,18 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                     details={"reason": "retry_cap"},
                 )
                 continue
+            prefer = _machine_for_assignment(fix_board, ev.entry.assignment_id)
+            # #3353: opt machine selection into a LIVE liveness check —
+            # without this, a machine with no pending/running assignments
+            # reads as idle regardless of whether its agent answers at all,
+            # so a box that has been down for hours gets picked ahead of a
+            # healthy one. See `coord.conflict_fix.select_conflict_fix_machine`.
             fix = dispatch_conflict_fix(
                 ev.entry,
                 fix_board,
                 config,
-                prefer_machine=_machine_for_assignment(
-                    fix_board, ev.entry.assignment_id,
-                ),
+                prefer_machine=prefer,
+                status_fetcher=fetch_status,
             )
             if fix is not None:
                 click.echo(
@@ -550,9 +559,30 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                 )
                 dispatched_any = True
             else:
+                # #3353 item 4: this branch is reached only when the retry
+                # cap ABOVE already said no ("already in flight" is not
+                # possible here) — so re-derive the REAL reason
+                # (`dispatch_conflict_fix` itself already wrote the durable
+                # audit row; this is just the human-readable echo) instead
+                # of the old, permanently-ambiguous "no machine / already
+                # in flight" line.
+                pick = select_conflict_fix_machine(
+                    ev.entry.repo_name, fix_board, config,
+                    prefer_machine=prefer, status_fetcher=fetch_status,
+                )
+                if pick.reason == ALL_CANDIDATES_UNREACHABLE:
+                    detail = (
+                        "every capable machine is unreachable right now "
+                        f"({', '.join(pick.unreachable)}) — an agent "
+                        "problem, not a capacity stall"
+                    )
+                elif pick.reason == NO_MACHINE_CONFIGURED:
+                    detail = "no configured machine can work on this repo"
+                else:
+                    detail = "no repo_path configured for the picked machine"
                 click.echo(
                     f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
-                    "conflict-fix not dispatched (no machine / already in flight)"
+                    f"conflict-fix not dispatched ({detail})"
                 )
         elif kind == "human":
             ev.entry.state = HUMAN_REQUIRED
