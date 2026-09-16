@@ -1003,6 +1003,14 @@ ALL_CANDIDATES_UNREACHABLE = "all_candidates_unreachable"
 # it doesn't make), so a caller's decline message can say "picked X, X then
 # refused the assignment" instead of misreporting it as a config problem.
 ASSIGN_POST_FAILED = "assign_post_failed"
+# #3353 review (round 3): selection picked a machine, but that machine has
+# no `repo_paths` entry for this repo — a `coordinator.yml` error, not a
+# liveness or capacity problem. It used to be the one decline shape that
+# left `pick.reason` empty, so `_record_conflict_fix_machine_failure`'s
+# `if pick.reason:` guard skipped it and it produced NO durable audit row
+# at all — the "silent failure" #3353 exists to eliminate, surviving in the
+# one branch nobody looked at.
+NO_REPO_PATH_CONFIGURED = "no_repo_path_configured"
 
 
 @dataclass
@@ -1173,6 +1181,67 @@ def _record_conflict_fix_machine_failure(
     )
 
 
+def describe_conflict_fix_decline(
+    machine_pick_out: "list[ConflictFixMachinePick]",
+) -> str:
+    """Render the caller-facing reason a :func:`dispatch_conflict_fix` call
+    returned ``None`` (#3353 item 4).
+
+    ``machine_pick_out`` is the sink list the caller handed to
+    ``dispatch_conflict_fix``; this is the ONE answer to "why didn't the
+    conflict-fix land" for every caller that reports one — ``coord
+    merge``'s ``_dispatch_conflict_fixes`` and ``coord/notify.py``'s two
+    stalled-pipeline arms (#3353 review round 3: those two still printed a
+    hardcoded ``(no machine / no repo_path)`` that conflated all four
+    shapes, which is the same ambiguity item 4 set out to kill, and a
+    second copy of this branching would be the #2096 drift the durable
+    audit row already had to work around).
+
+    An EMPTY list means selection never ran — ``dispatch_conflict_fix``
+    declined before reaching it (no matching ``repos:`` entry, an
+    already-in-flight or retry-capped conflict-fix, or a sealed-path
+    no-op).
+    """
+    if not machine_pick_out:
+        return (
+            "no repo config matches this repo, or dispatch was declined "
+            "before machine selection ran"
+        )
+    pick = machine_pick_out[0]
+    if pick.reason == ALL_CANDIDATES_UNREACHABLE:
+        return (
+            "every capable machine is unreachable right now "
+            f"({', '.join(pick.unreachable)}) — an agent problem, not a "
+            "capacity stall"
+        )
+    if pick.reason == NO_MACHINE_CONFIGURED:
+        return "no configured machine can work on this repo"
+    if pick.reason == ASSIGN_POST_FAILED:
+        # Selection ran and PICKED a machine; the `/assign` POST to it then
+        # failed. The "flapping machine" the issue's Second half warns
+        # about — a live probe and the real request seconds apart can
+        # genuinely disagree. Must be tested before the `pick.machine is
+        # not None` fallback below, which would otherwise mislabel it.
+        name = pick.machine.name if pick.machine else "the picked machine"
+        return (
+            f"{name} passed its liveness probe but then refused the "
+            "assignment POST — a flapping agent, not a capacity stall"
+        )
+    if pick.reason == NO_REPO_PATH_CONFIGURED:
+        name = pick.machine.name if pick.machine else "the picked machine"
+        return (
+            f"no repo_path configured for {name} — a coordinator.yml "
+            "problem, not a machine problem"
+        )
+    if pick.machine is not None:  # pragma: no cover — every decline shape
+        # that carries a machine now sets an explicit reason above; kept as
+        # a safety net rather than an unhandled branch.
+        return "machine selection succeeded but dispatch declined downstream"
+    # pragma: no cover — `pick.machine is None` always sets `pick.reason`
+    # (see ConflictFixMachinePick's docstring).
+    return "machine selection declined for an unrecorded reason"
+
+
 def dispatch_conflict_fix(
     entry: QueuedMerge,
     board: Board,
@@ -1323,6 +1392,14 @@ def dispatch_conflict_fix(
 
     repo_path = machine.repo_path(entry.repo_name)
     if repo_path is None:
+        # #3353 review (round 3): tag the reason and record the audit row
+        # here too. Previously this branch left `pick.reason == ""`, so the
+        # `if pick.reason:` guard above meant this was the ONE decline
+        # shape with no durable trace — the exact silent-failure shape
+        # item 3 of the issue exists to close, just via a config error
+        # rather than a dead box.
+        pick.reason = NO_REPO_PATH_CONFIGURED
+        _record_conflict_fix_machine_failure(entry, pick)
         if machine_pick_out is not None:
             machine_pick_out.append(pick)
         return None

@@ -700,14 +700,23 @@ def dispatch(
             proposed_machine_name=proposal.machine_name,
             repo_name=proposal.repo_name,
             machines=config.machines,
+            # #3353 review round 3: this gate runs AFTER the capability gate
+            # above, so `proposal.machine_name` here is already the
+            # capability-chosen machine. Handing the same diff + rules in
+            # keeps the fallback search from quietly undoing that routing
+            # when the capability-matched machine is the one that's down.
+            files_likely=proposal.files_likely,
+            capability_rules=config.smoke_tests.capability_rules,
             status_fetcher=status_fetcher,
         )
         if liveness_routing is not None:
             if liveness_routing.machine_name is None:
                 detail = "; ".join(f"{name} ({why})" for name, why in liveness_routing.tried)
                 raise ValueError(
-                    f"every machine capable of {proposal.repo_name!r} is "
-                    f"unreachable right now: {detail} — nothing dispatched (#3353)"
+                    f"no machine can take this {proposal.repo_name!r} dispatch "
+                    f"right now — every capable machine is unreachable, or the "
+                    f"only reachable ones would drop a capability this diff "
+                    f"requires: {detail} — nothing dispatched (#3353)"
                 )
             if liveness_routing.rerouted:
                 proposal.machine_name = liveness_routing.machine_name
@@ -1418,14 +1427,25 @@ class LivenessRouting:
     fetcher in gets `None` back from `route_work_by_liveness` and
     `proposal.machine_name` is left completely untouched.
 
-    `machine_name` is `None` only when the proposed machine AND every other
-    repo-capable, unpaused candidate all failed a live probe — the caller
-    must not silently fall through to POSTing at the proposed machine (a
-    fresh dead-box timeout that burns a drive-queue attempt, exactly what
-    happened to #3349/#79); `tried` names every machine actually probed, in
-    probe order, paired with why it was skipped — same shape as
-    `FixMachineSelection.tried` below, so both "why didn't a fix land" and
-    "why didn't a dispatch land" read the same way to an operator.
+    `machine_name` is `None` when the proposed machine AND every other
+    eligible candidate all failed a live probe — the caller must not
+    silently fall through to POSTing at the proposed machine (a fresh
+    dead-box timeout that burns a drive-queue attempt, exactly what
+    happened to #3349/#79) — and ALSO (#3353 review round 3) when the only
+    reachable candidates would cover FEWER of the diff's required
+    `capability_rules` capabilities than the proposed machine does. A
+    refusal there is deliberate: silently rerouting a capability-matched
+    diff onto a capability-blind box is the very UNCONFIRMED-verdict hole
+    `route_work_by_capability` exists to close (#2217/#2464), and it would
+    be *worse* than pre-#3353 behaviour, which at least failed loudly with
+    an `httpx` timeout instead of succeeding on the wrong hardware.
+
+    `tried` names every machine considered, in order, paired with why it
+    was skipped — a live-probe reason for the ones actually probed, and a
+    `capability shortfall` note for the ones ruled out before any probe —
+    same shape as `FixMachineSelection.tried` below, so both "why didn't a
+    fix land" and "why didn't a dispatch land" read the same way to an
+    operator.
 
     `rerouted` is True when `machine_name` differs from what was proposed —
     i.e. the proposed machine failed its probe and a live fallback existed.
@@ -1441,6 +1461,8 @@ def route_work_by_liveness(
     proposed_machine_name: str,
     repo_name: str,
     machines: list[Machine],
+    files_likely: "list[str] | None" = None,
+    capability_rules: "list[SmokeRule] | None" = None,
     status_fetcher=None,
     now: "datetime | None" = None,
 ) -> LivenessRouting | None:
@@ -1465,6 +1487,31 @@ def route_work_by_liveness(
     elsewhere, so (like that function, and unlike `select_fix_machine`
     below) it deliberately does NOT use `follow_on_paused_set()`.
 
+    *files_likely* / *capability_rules* make that filter CAPABILITY-AWARE
+    (#3353 review round 3), closing the gap between this gate and the
+    #3241 one it runs after. `dispatch()` runs `route_work_by_capability`
+    first, so by the time this sees `proposed_machine_name` it is already
+    the capability-CHOSEN machine when any rule matched the diff's `##
+    Files`. A capability-blind fallback filter here would therefore undo
+    that routing the instant the capability-matched machine was also down:
+    a GTK diff routed to the one GTK box would silently land on a box with
+    no GTK at all, and the POST would look perfectly successful — the
+    UNCONFIRMED-verdict hole (#2217/#2464) reopened by the very gate that
+    was supposed to make dispatch safer.
+
+    So fallbacks are scored with the SAME `coord.smoke.match_rules` matcher
+    and the same "count the covered capabilities" rule
+    `route_work_by_capability` uses (never a second copy of that logic —
+    #2096), and a fallback is eligible only if it covers at LEAST as many
+    of the matched capabilities as the proposed machine does. Note this is
+    a floor, not an AND over the requirements: it preserves
+    `CapabilityRouting`'s never-zero-machines property (a gtk+windows diff
+    that no single machine fully covers still reroutes, to another machine
+    with the same best-available coverage) while refusing the one case that
+    is strictly a regression — dropping coverage the dispatcher had already
+    secured. Passing neither argument (the default) keeps the old
+    capability-blind behaviour for callers that have no diff to match.
+
     *status_fetcher* and *now* are forwarded to `probe_reachable`/
     `paused_set` untouched — see those functions' docstrings.
     """
@@ -1484,6 +1531,15 @@ def route_work_by_liveness(
 
     tried: list[tuple[str, str]] = [(proposed_machine_name, reason or "unreachable")]
 
+    required: tuple[str, ...] = ()
+    if capability_rules:
+        from coord.smoke import match_rules  # noqa: PLC0415
+
+        required = tuple(match_rules(list(files_likely or []), capability_rules))
+
+    def _coverage(m: Machine) -> int:
+        return sum(1 for cap in required if cap in m.capabilities)
+
     paused = paused_set(machines, now=now)
     fallbacks = [
         m for m in machines
@@ -1492,12 +1548,33 @@ def route_work_by_liveness(
         and m.repo_path(repo_name) is not None
         and m.name not in paused
     ]
-    for m in fallbacks:
+
+    skipped: list[tuple[str, str]] = []
+    if required:
+        floor = _coverage(proposed)
+        eligible = [m for m in fallbacks if _coverage(m) >= floor]
+        for m in fallbacks:
+            if _coverage(m) < floor:
+                missing = ", ".join(c for c in required if c not in m.capabilities)
+                skipped.append(
+                    (m.name, f"capability shortfall (does not cover: {missing})")
+                )
+        # Stable sort: better coverage first, `machines` declaration order
+        # preserved within a tier — same determinism rule as
+        # `route_work_by_capability`'s tie-break, never dict/set order.
+        eligible.sort(key=_coverage, reverse=True)
+    else:
+        eligible = fallbacks
+
+    for m in eligible:
         ok, why = probe_reachable(m, status_fetcher=status_fetcher)
         if ok:
-            return LivenessRouting(machine_name=m.name, rerouted=True, tried=tuple(tried))
+            return LivenessRouting(
+                machine_name=m.name, rerouted=True, tried=tuple(tried),
+            )
         tried.append((m.name, why or "unreachable"))
 
+    tried.extend(skipped)
     return LivenessRouting(machine_name=None, rerouted=False, tried=tuple(tried))
 
 
@@ -1567,6 +1644,7 @@ def apply_liveness_reroute(
     proposals: "list[Proposal]",
     *,
     machines: list[Machine],
+    capability_rules: "list[SmokeRule] | None" = None,
     status_fetcher=None,
 ) -> list[LivenessReroute]:
     """Move every `type="work"` proposal in *proposals* off an unreachable
@@ -1603,6 +1681,13 @@ def apply_liveness_reroute(
     proposal is left exactly as proposed and this returns `[]`. Pass it
     through :func:`caching_status_fetcher` and hand the SAME wrapper to
     `dispatch()` to avoid probing each machine twice per batch.
+
+    *capability_rules* (`config.smoke_tests.capability_rules`) is forwarded
+    alongside each proposal's own `files_likely` so the reroute stays
+    capability-aware (#3353 review round 3) — BOTH callers run their #3241
+    capability reroute immediately before this one, so without it this loop
+    would undo that decision for exactly the diffs that most need it. See
+    :func:`route_work_by_liveness`'s docstring.
     """
     if status_fetcher is None:
         return []
@@ -1615,6 +1700,8 @@ def apply_liveness_reroute(
             proposed_machine_name=p.machine_name,
             repo_name=p.repo_name,
             machines=machines,
+            files_likely=p.files_likely,
+            capability_rules=capability_rules,
             status_fetcher=status_fetcher,
         )
         if routing is None or routing.machine_name is None or not routing.rerouted:

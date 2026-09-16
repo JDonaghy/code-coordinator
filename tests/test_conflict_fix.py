@@ -34,6 +34,7 @@ from coord.conflict_fix import (
     build_conflict_fix_briefing,
     build_sealed_manifest_conflict_briefing,
     build_stale_rebase_briefing,
+    describe_conflict_fix_decline,
     dispatch_conflict_fix,
     pick_conflict_fix_machine,
     select_conflict_fix_machine,
@@ -863,6 +864,51 @@ class TestDispatch:
         # `coord/commands/merge.py`, not by this function) — never the same
         # row shape as a genuine machine-liveness problem.
         assert row["event_type"] != "conflict_human_required"
+
+    def test_missing_repo_path_also_leaves_a_durable_audit_trace(
+        self, repo: Repo, coord_db,
+    ) -> None:
+        """#3353 review (round 3): the "picked machine has no `repo_paths`
+        entry for this repo" decline used to leave `pick.reason == ""`, so
+        `_record_conflict_fix_machine_failure`'s `if pick.reason:` guard
+        skipped it — the ONE decline shape still producing no durable
+        trace at all, i.e. the silent failure item 3 exists to kill,
+        surviving in a config-error branch. Fails against the round-2
+        commit, where the audit table stays empty here."""
+        from coord.conflict_fix import NO_REPO_PATH_CONFIGURED
+
+        cfg = Config(
+            repos=[repo],
+            machines=[
+                # Declares the repo under `repos:` but has no `repo_paths`
+                # entry for it — a real `coordinator.yml` mismatch shape.
+                Machine(name="laptop", host="laptop.tail", repos=["api"]),
+            ],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=False),
+        )
+        pick_out: list = []
+        result = dispatch_conflict_fix(
+            _entry(), Board(), cfg,
+            http_client=_FakeHTTPClient({"id": "would-not-fire"}),
+            prefer_machine="laptop",
+            status_fetcher=_status_fetcher({"laptop"}),
+            machine_pick_out=pick_out,
+        )
+        assert result is None
+
+        row = coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='conflict_fix_dispatch_declined'"
+        ).fetchone()
+        assert row is not None, (
+            "a conflict-fix declined for a missing repo_path left no audit "
+            "trace — the same silent-failure shape as #986, via a config error"
+        )
+        assert json.loads(row["details_json"])["reason"] == NO_REPO_PATH_CONFIGURED
+        # And the caller-facing reason names the machine and the real cause.
+        assert pick_out[0].reason == NO_REPO_PATH_CONFIGURED
+        detail = describe_conflict_fix_decline(pick_out)
+        assert "repo_path" in detail
+        assert "laptop" in detail
 
     def test_reachable_machine_present_dispatches_normally_with_status_fetcher(
         self, two_machine_config: Config, coord_db,

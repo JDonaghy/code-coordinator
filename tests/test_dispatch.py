@@ -3689,6 +3689,154 @@ class TestRouteWorkByLiveness:
         # single probe ran against them.
         assert {name for name, _ in result.tried} == {"dell64"}
 
+    # ── #3353 review (round 3): capability-aware fallbacks ──────────────
+    #
+    # This gate runs AFTER the #3241 capability gate, so the machine it is
+    # handed is already the capability-CHOSEN one whenever a rule matched.
+    # A capability-blind fallback search silently undid that: a GTK diff
+    # routed to the one GTK box would land on a box with no GTK at all and
+    # the POST would look perfectly successful — strictly worse than
+    # pre-#3353 behaviour, which at least failed loudly on a timeout.
+    #
+    # These fail against the round-2 commit, where `route_work_by_liveness`
+    # has no `files_likely`/`capability_rules` parameters at all.
+
+    def _capability_machines(self) -> list[Machine]:
+        return [
+            Machine(
+                name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="headless", host="headless.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+
+    def test_refuses_rather_than_dropping_a_required_capability(self) -> None:
+        """The blocking regression: the only GTK machine is down, and the
+        only reachable machine cannot build the diff's own suite. A reroute
+        there is the UNCONFIRMED-verdict hole (#2217/#2464) reopened, so
+        this must refuse (`machine_name is None`) instead."""
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=self._capability_machines(),
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless"}),
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+        # And it says WHY headless was ruled out, rather than leaving the
+        # operator to guess it was another dead box.
+        reasons = dict(result.tried)
+        assert "capability shortfall" in reasons["headless"]
+        assert "gtk" in reasons["headless"]
+
+    def test_capability_blind_fallback_is_never_even_probed(self) -> None:
+        """A machine ruled out on coverage costs no network probe — the
+        same "filter before probing" property the paused/incapable test
+        above asserts."""
+        probed: list[str] = []
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            probed.append(machine.name)
+            return StatusResult(error="timeout")
+
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=self._capability_machines(),
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_fetch,
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert probed == ["gtkbox"]
+
+    def test_reroutes_to_another_equally_capable_machine(self) -> None:
+        """Capability awareness must not become a blanket refusal: a
+        SECOND GTK machine that is up still takes the work."""
+        machines = [
+            *self._capability_machines(),
+            Machine(
+                name="gtkbox2", host="gtkbox2.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=machines,
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless", "gtkbox2"}),
+        )
+        assert result is not None
+        assert result.machine_name == "gtkbox2"
+        assert result.rerouted is True
+
+    def test_unmatched_diff_still_reroutes_to_any_live_machine(self) -> None:
+        """`capability_rules` present but nothing in `files_likely`
+        matches: the requirement set is empty, so every repo-capable
+        machine stays eligible exactly as before (no accidental
+        tightening of the common case)."""
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=self._capability_machines(),
+            files_likely=["README.md"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless"}),
+        )
+        assert result is not None
+        assert result.machine_name == "headless"
+
+    def test_never_refuses_when_no_machine_fully_covers_the_diff(self) -> None:
+        """`CapabilityRouting`'s never-zero-machines property (#3177/#1678)
+        is preserved: the floor is "cover at least as much as the proposed
+        machine did", NOT an AND over every requirement. A gtk+macos diff
+        that no single machine fully covers still reroutes to the other
+        one-capability machine rather than stranding the work."""
+        machines = [
+            Machine(
+                name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=machines,
+            files_likely=["quadraui/src/gtk/window.rs", "quadraui/src/macos/x.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert result is not None
+        assert result.machine_name == "macmini"
+
 
 class TestDispatchLivenessRouting:
     """#3353 end-to-end: `dispatch()` itself reroutes a `type="work"`
@@ -3799,6 +3947,47 @@ class TestDispatchLivenessRouting:
         assert "dell64.tailnet" in mock_post.call_args.args[0]
         assert p.machine_name == "dell64"
 
+    @patch("coord.dispatch.httpx.post")
+    def test_capability_routed_dead_machine_refuses_instead_of_downgrading(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#3353 review (round 3), end to end through `dispatch()`: the
+        #3241 capability gate moves a GTK diff onto the one GTK box; that
+        box is also down. The liveness gate must NOT then hand the work to
+        the reachable-but-GTK-less machine and POST as if all were well —
+        that is a silent UNCONFIRMED-verdict dispatch (#2217/#2464), worse
+        than the loud pre-#3353 timeout. Fails against the round-2 commit,
+        which POSTs happily to `headless.tailnet`."""
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=[
+                Machine(
+                    name="headless", host="headless.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                ),
+                Machine(
+                    name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["gtk"],
+                ),
+            ],
+            smoke_tests=SmokeTestsConfig(capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ]),
+        )
+        p = Proposal(
+            id=1, machine_name="headless", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the GTK thing",
+            rationale="best fit", files_likely=["quadraui/src/gtk/window.rs"],
+            briefing="Fix it", type="work",
+        )
+
+        with pytest.raises(ValueError, match="capability"):
+            # headless is reachable, but the capability gate ahead of the
+            # liveness gate has already moved this proposal onto gtkbox.
+            dispatch(p, cfg, status_fetcher=_status_fetcher({"headless"}))
+        mock_post.assert_not_called()
+
 
 class TestApplyLivenessReroute:
     """#3353 review (round 2): the batch-level helper both approve doors —
@@ -3881,6 +4070,38 @@ class TestApplyLivenessReroute:
         assert [m.proposal_id for m in moved] == [1]
         assert dead.machine_name == "macmini"
         assert live.machine_name == "macmini"
+
+    def test_capability_rules_are_honoured_by_the_batch_helper(self) -> None:
+        """#3353 review (round 3): both approve doors run their #3241
+        capability reroute immediately before this helper, so a
+        capability-blind batch reroute here would undo it. With the rules
+        threaded through, a GTK proposal whose GTK machine is down is left
+        untouched for `dispatch()` to refuse — never quietly moved onto the
+        GTK-less box. Fails against the round-2 commit, which moves it."""
+        machines = [
+            Machine(
+                name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="headless", host="headless.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        p = self._proposal()
+        p.machine_name = "gtkbox"
+        p.files_likely = ["quadraui/src/gtk/window.rs"]
+
+        moved = apply_liveness_reroute(
+            [p], machines=machines,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless"}),
+        )
+        assert moved == []
+        assert p.machine_name == "gtkbox"
 
 
 class TestCachingStatusFetcher:

@@ -474,7 +474,14 @@ def approve(
     # it to one probe per machine either way.
     _status_fetcher = caching_status_fetcher(fetch_status)
     for reroute in apply_liveness_reroute(
-        selected, machines=cfg.machines, status_fetcher=_status_fetcher
+        selected,
+        machines=cfg.machines,
+        # #3353 review round 3: the capability reroute right above already
+        # moved capability-matched proposals onto the machine that covers
+        # the diff. Handing the same rules in here keeps this loop from
+        # silently moving them back off it when that machine is down.
+        capability_rules=cfg.smoke_tests.capability_rules,
+        status_fetcher=_status_fetcher,
     ):
         click.echo(
             f"  [{reroute.proposal_id}] liveness-rerouted "
