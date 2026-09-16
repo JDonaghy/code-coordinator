@@ -473,9 +473,7 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
 
     from coord.audit import record_audit  # noqa: PLC0415
     from coord.conflict_fix import (  # noqa: PLC0415
-        ALL_CANDIDATES_UNREACHABLE,
-        ASSIGN_POST_FAILED,
-        NO_MACHINE_CONFIGURED,
+        describe_conflict_fix_decline,
         dispatch_conflict_fix,
         has_prior_conflict_fix,
     )
@@ -571,50 +569,12 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                 # `select_conflict_fix_machine` a second time here — that
                 # used to double the live `/status` probes to every
                 # candidate for every declined dispatch and opened a TOCTOU
-                # window where the two calls could disagree.
-                if not pick_out:
-                    # Selection never ran at all: dispatch declined before
-                    # reaching it — no `repos:` entry in coordinator.yml
-                    # matches this repo (or, redundantly with the retry-cap
-                    # check above, the entry already has an active/failed
-                    # conflict-fix).
-                    detail = (
-                        "no repo config matches this repo, or dispatch was "
-                        "declined before machine selection ran"
-                    )
-                else:
-                    pick = pick_out[0]
-                    if pick.reason == ALL_CANDIDATES_UNREACHABLE:
-                        detail = (
-                            "every capable machine is unreachable right now "
-                            f"({', '.join(pick.unreachable)}) — an agent "
-                            "problem, not a capacity stall"
-                        )
-                    elif pick.reason == NO_MACHINE_CONFIGURED:
-                        detail = "no configured machine can work on this repo"
-                    elif pick.reason == ASSIGN_POST_FAILED:
-                        # #3353 review (round 2): selection ran and PICKED a
-                        # machine; the `/assign` POST to it then failed. The
-                        # "flapping machine" the issue's Second half warns
-                        # about — a live probe and the real request seconds
-                        # apart can genuinely disagree. Must be checked
-                        # before the `pick.machine is not None` branch below,
-                        # which would otherwise mislabel this as a missing
-                        # `repo_path`.
-                        detail = (
-                            f"{pick.machine.name if pick.machine else 'the picked machine'} "
-                            "passed its liveness probe but then refused the "
-                            "assignment POST — a flapping agent, not a "
-                            "capacity stall"
-                        )
-                    elif pick.machine is not None:
-                        detail = "no repo_path configured for the picked machine"
-                    else:  # pragma: no cover — pick.machine is None always
-                        # sets pick.reason (see ConflictFixMachinePick's
-                        # docstring), so this is unreachable in practice;
-                        # kept as a safety net rather than an unhandled
-                        # branch.
-                        detail = "machine selection declined for an unrecorded reason"
+                # window where the two calls could disagree. #3353 review
+                # (round 3): the branching itself now lives in
+                # `describe_conflict_fix_decline`, shared with
+                # `coord/notify.py`'s two stalled-pipeline arms, which
+                # otherwise kept printing the old ambiguous line.
+                detail = describe_conflict_fix_decline(pick_out)
                 click.echo(
                     f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                     f"conflict-fix not dispatched ({detail})"

@@ -3729,7 +3729,18 @@ def build_app(
         rerouted = {
             r.proposal_id: r
             for r in apply_liveness_reroute(
-                selected, machines=config.machines, status_fetcher=_status_fetcher
+                selected,
+                machines=config.machines,
+                # #3353 review round 3: keep the preview reroute
+                # capability-aware, so it can never move a
+                # capability-matched diff onto a box that doesn't cover
+                # it. `dispatch()`'s own #3241 capability gate + #3353
+                # liveness gate (which this route does NOT pre-run, unlike
+                # `coord approve`) remain the authoritative pair — they
+                # run on the cached probe results a moment later and will
+                # refuse rather than drop a capability.
+                capability_rules=config.smoke_tests.capability_rules,
+                status_fetcher=_status_fetcher,
             )
         }
 

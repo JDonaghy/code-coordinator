@@ -1595,6 +1595,101 @@ class TestDispatchPerReason:
         _, call_kwargs = stub.call_args
         assert call_kwargs["stale_rebase"] is True
 
+    def test_conflict_fix_decline_reports_the_real_reason(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#3353 item 4 / review round 3: this arm used to report a
+        hardcoded "(no machine / no repo_path)" for EVERY decline, which is
+        the same ambiguity `coord merge` already stopped printing — an
+        unreachable agent read as a config problem. It must now quote the
+        real pick reason, naming the machines that didn't answer. Fails
+        against the round-2 commit, whose detail string mentions neither
+        "unreachable" nor "dell64"."""
+        from coord.conflict_fix import (
+            ALL_CANDIDATES_UNREACHABLE,
+            ConflictFixMachinePick,
+        )
+
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+
+        def _decline(entry, board_arg, cfg, **kwargs):  # noqa: ARG001
+            kwargs["machine_pick_out"].append(ConflictFixMachinePick(
+                machine=None,
+                reason=ALL_CANDIDATES_UNREACHABLE,
+                unreachable=("dell64", "macmini"),
+            ))
+            return None
+
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", _decline)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work, board, config
+        )
+
+        assert action.kind == "no_action"
+        assert "unreachable" in action.detail
+        assert "dell64" in action.detail
+        # Distinguishable from a genuine capacity stall, which is what the
+        # old wording implied.
+        assert "not a capacity stall" in action.detail
+
+    def test_stale_rebase_decline_reports_the_real_reason_too(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Same fix on the `merge_gate_checks_stale` arm — the reviewer
+        named BOTH `coord/notify.py` call sites, and a shared formatter is
+        only worth having if both actually use it (#2096)."""
+        from coord.conflict_fix import ConflictFixMachinePick
+
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_gate_checks_stale"
+
+        machine = Machine(name="dell64", host="dell64.tail", repos=["vimcode"])
+
+        def _decline(entry, board_arg, cfg, **kwargs):  # noqa: ARG001
+            kwargs["machine_pick_out"].append(ConflictFixMachinePick(
+                machine=machine, reason="assign_post_failed",
+            ))
+            return None
+
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", _decline)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work, board, config
+        )
+
+        assert action.kind == "no_action"
+        assert "dell64" in action.detail
+        assert "flapping agent" in action.detail
+
     def test_merge_gate_checks_stale_no_dispatch_when_flag_off(
         self, config: Config, monkeypatch
     ) -> None:
