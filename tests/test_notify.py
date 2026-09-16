@@ -3993,3 +3993,138 @@ class _FakeAssignClient:
 
     def get(self, url, *, timeout):
         return self._Resp({})
+
+
+# ── #3349 review: `post_transition`'s conflict-fix completion arm must ──────
+# read the stale-rebase-mismatch marker, mirroring the SEMANTIC marker ──────
+
+
+class TestConflictFixCompletionStaleRebaseMismatch:
+    """`coord notify` is the routinely-scheduled path for a conflict-fix
+    completion (unlike the full `reconcile()`, which only `coord resume`
+    calls) — see the identical #2565 rationale on the SEMANTIC-marker check
+    a few lines above this one in `coord/notify.py`. Before this fix, the
+    conflict-fix completion arm here only checked for the SEMANTIC marker;
+    a stale-rebase worker (dispatched for `merge_gate_checks_stale`, #3349)
+    that correctly refused to push and left a `STALE_REBASE_MISMATCH_MARKER`
+    STUCK line instead was misread as a resolved rebase and the merge entry
+    was silently reset to PENDING via `on_conflict_fix_done(succeeded=True)`."""
+
+    def _transition(self, assignment_id: str = "fix-1") -> "notify_mod.Transition":
+        from coord.notify import EVENT_COMPLETION, Transition
+        return Transition(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=7,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+
+    def _record(self) -> dict:
+        return {
+            "repo_github": "acme/api",
+            "type": "conflict-fix",
+            "review_of_assignment_id": "merge-1",
+        }
+
+    def _entry(self, log_path: str) -> dict:
+        return {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": "issue-7-thing",
+            "log_path": log_path,
+        }
+
+    def test_stale_rebase_marker_downgrades_succeeded_and_flags_mismatch(
+        self, tmp_path: Path,
+    ) -> None:
+        from coord.conflict_fix import STALE_REBASE_MISMATCH_MARKER
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ\n"
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["parent_assignment_id"] == "merge-1"
+        assert kwargs["succeeded"] is False
+        assert kwargs["semantic"] is False
+        assert kwargs["stale_rebase_mismatch"] is True
+        assert "patch-id before abc123, after def456 differ" in (
+            kwargs["stuck_summary"] or ""
+        )
+
+    def test_no_marker_still_reports_succeeded(self, tmp_path: Path) -> None:
+        """The overwhelming common case — a real rebase-and-push, no marker
+        in the log — is unaffected: the entry still re-enqueues as before."""
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nSTATUS: pushed\n")
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["succeeded"] is True
+        assert kwargs["semantic"] is False
+        assert kwargs["stale_rebase_mismatch"] is False
+
+    def test_semantic_marker_takes_precedence_and_skips_stale_rebase_check(
+        self, tmp_path: Path,
+    ) -> None:
+        """The two markers are mutually exclusive per real dispatch, but the
+        detection code checks stale-rebase only `if not semantic` — pin that
+        short-circuit so a semantic verdict is never also reported as a
+        stale-rebase mismatch."""
+        from coord.conflict_fix import SEMANTIC_STUCK_MARKER
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:1-9 — both sides "
+            "rewrote parse_args() differently\n"
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.board_service.read_board", side_effect=Exception("no board")),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["succeeded"] is False
+        assert kwargs["semantic"] is True
+        assert kwargs["stale_rebase_mismatch"] is False

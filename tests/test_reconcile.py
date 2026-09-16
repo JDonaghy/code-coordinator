@@ -822,3 +822,134 @@ class TestReconcileConflictFixSemanticMarker:
         entry = mq.load_queue()[0]
         assert entry.state == PENDING
         assert entry.error is None
+
+
+# ── #3349 review: a stale-rebase mismatch give-up must not be read as ───────
+# success either ───────────────────────────────────────────────────────────
+
+
+class TestReconcileConflictFixStaleRebaseMismatchMarker:
+    """Mirrors `TestReconcileConflictFixSemanticMarker` above, but for a
+    stale-rebase dispatch (`dispatch_conflict_fix(..., stale_rebase=True)`,
+    used for the `merge_gate_checks_stale` stall reason, #3349). That
+    worker's briefing tells it to stop and NOT push when its rebase turns
+    out not to be content-preserving — a real conflict marker, or a
+    patch-id mismatch — and ends its turn with a `STUCK:` line carrying
+    `STALE_REBASE_MISMATCH_MARKER` instead of pushing. Before this fix,
+    `reconcile()`'s "done" branch only checked for the SEMANTIC marker, so
+    this correct refusal was misread as a resolved rebase and the entry was
+    silently reset to PENDING, discarding the escalation the worker itself
+    asked for."""
+
+    @patch("coord.reconcile._query_agent")
+    def test_done_conflict_fix_with_stale_rebase_marker_does_not_reset_to_pending(
+        self, mock_query: MagicMock, tmp_path: Path, coord_db,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.conflict_fix import STALE_REBASE_MISMATCH_MARKER
+        from coord.merge_queue import HUMAN_REQUIRED, PENDING, QueuedMerge
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=PENDING,
+                error="CI stale: checks predate the current base",
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ\n"
+        )
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[stale-rebase] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state == HUMAN_REQUIRED
+        assert "manual resolution required" in (entry.error or "").lower()
+        assert "patch-id before abc123, after def456 differ" in (entry.error or "")
+
+    @patch("coord.reconcile._query_agent")
+    def test_done_conflict_fix_without_stale_rebase_marker_still_resets_to_pending(
+        self, mock_query: MagicMock, tmp_path: Path, coord_db,
+    ) -> None:
+        """The overwhelming common case for a stale-rebase dispatch — a
+        clean rebase and push, no marker in the log — is unaffected."""
+        from coord import merge_queue as mq
+        from coord.merge_queue import PENDING, QueuedMerge
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=PENDING,
+                error="CI stale: checks predate the current base",
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text("STATUS: rebase started\nSTATUS: pushed\n")
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[stale-rebase] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state == PENDING
+        assert entry.error is None

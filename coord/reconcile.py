@@ -2843,6 +2843,7 @@ def on_conflict_fix_done(
     machine_name: str,
     succeeded: bool,
     semantic: bool = False,
+    stale_rebase_mismatch: bool = False,
     board: Board | None = None,
     config: Config | None = None,
     stuck_summary: str | None = None,
@@ -2854,6 +2855,17 @@ def on_conflict_fix_done(
     ``coord merge`` retries.  On failure: marked HUMAN_REQUIRED so the TUI
     can surface "manual resolution required", and a comment is posted on
     the underlying issue so the user is notified outside the TUI too.
+
+    *stale_rebase_mismatch* (#3349 review): when ``True``, a stale-rebase
+    worker (dispatched for ``merge_gate_checks_stale``, not an ordinary
+    conflict) correctly refused to push per its own briefing's "When NOT to
+    guess" section — its rebase either hit a real conflict marker or
+    produced a different patch-id than the pre-rebase branch, so it is not
+    a pure content-preserving rebase. This is NOT a SEMANTIC give-up (no
+    tier-2 escalation applies — there is nothing to retry with a stronger
+    model; the base and this branch genuinely overlap) and lands directly
+    on HUMAN_REQUIRED with that reason recorded, mirroring the *semantic*
+    handling below but skipping its escalation path entirely.
 
     #2566: when *semantic* is ``True`` and the tier-2 escalation didn't
     fire specifically because ``pipeline.escalate_semantic_conflicts`` is
@@ -2901,6 +2913,25 @@ def on_conflict_fix_done(
                     f"the account's {usage_limit_reason} — not a real "
                     "conflict. Wait for the reset, then re-run `coord "
                     "merge` to retry unchanged."
+                )
+                failed_entry = entry
+            elif stale_rebase_mismatch:
+                # #3349 review: a stale-rebase worker's refusal is a
+                # correct, deliberate stop — not a give-up to retry with a
+                # stronger model — so it goes straight to HUMAN_REQUIRED
+                # with the mismatch reason recorded, skipping the SEMANTIC
+                # tier-2 escalation path entirely.
+                entry.state = mq.HUMAN_REQUIRED
+                detail = stuck_summary or (
+                    "rebase was not content-preserving (a conflict marker "
+                    "appeared, or the resulting patch-id differed from the "
+                    "pre-rebase branch's)"
+                )
+                entry.error = (
+                    f"{existing_error}; stale-rebase worker refused to "
+                    f"push: {detail}. This is a genuine content conflict "
+                    "against the new base, not a pure rebase — manual "
+                    "resolution required."
                 )
                 failed_entry = entry
             else:
@@ -3029,6 +3060,18 @@ def _on_conflict_fix_done(
     diagnose in the transcript — it was cut off, not concluded) and pass the
     reason through so the parked entry gets an accurate message instead of
     "manual rebase required".
+
+    #3349 review: the same "clean exit is not proof of success" problem
+    applies to a stale-rebase dispatch (``dispatch_conflict_fix(...,
+    stale_rebase=True)``, used for ``merge_gate_checks_stale``) — its
+    briefing's own "When NOT to guess" section tells the worker to stop and
+    NOT push when the rebase turns out not to be content-preserving, ending
+    with a clean-looking turn just like a SEMANTIC give-up does. Check for
+    :data:`coord.conflict_fix.STALE_REBASE_MISMATCH_MARKER` alongside the
+    SEMANTIC marker and downgrade *succeeded* the same way — the two
+    markers are mutually exclusive per dispatch, but checking both here
+    means this wrapper doesn't need to know which kind of conflict-fix
+    dispatch it's looking at.
     """
     parent_id = fix_assignment.review_of_assignment_id
     if not parent_id:
@@ -3037,6 +3080,7 @@ def _on_conflict_fix_done(
     usage_limit_reason = (agent_entry or {}).get("usage_limit_reason")
 
     semantic = False
+    stale_rebase_mismatch = False
     stuck_summary: str | None = None
     if (
         not usage_limit_reason
@@ -3048,6 +3092,12 @@ def _on_conflict_fix_done(
         )
         if semantic:
             succeeded = False
+        else:
+            stale_rebase_mismatch, stuck_summary = _stale_rebase_mismatch_verdict(
+                fix_assignment, agent_entry, config,
+            )
+            if stale_rebase_mismatch:
+                succeeded = False
 
     on_conflict_fix_done(
         parent_assignment_id=parent_id,
@@ -3055,6 +3105,7 @@ def _on_conflict_fix_done(
         machine_name=fix_assignment.machine_name or "",
         succeeded=succeeded,
         semantic=semantic,
+        stale_rebase_mismatch=stale_rebase_mismatch,
         board=board,
         config=config,
         stuck_summary=stuck_summary,
@@ -3098,6 +3149,49 @@ def _semantic_verdict(
             except Exception:  # noqa: BLE001
                 stuck_summary = None
     return semantic, stuck_summary
+
+
+def _stale_rebase_mismatch_verdict(
+    fix_assignment: Assignment,
+    agent_entry: dict | None,
+    config: Config,
+) -> tuple[bool, str | None]:
+    """(is_stale_rebase_mismatch, stuck line) for a finished conflict-fix
+    worker. Mirrors :func:`_semantic_verdict` exactly, but reads for
+    :data:`coord.conflict_fix.STALE_REBASE_MISMATCH_MARKER` (#3349) — a
+    stale-rebase worker that hit a real conflict or a patch-id mismatch
+    during its rebase and correctly refused to push, per its own briefing's
+    "When NOT to guess" section.
+
+    Best-effort — any failure to read the log means "not a mismatch", which
+    preserves the pre-#3349 behaviour (reset to PENDING on a clean exit).
+    """
+    from coord.conflict_fix import detect_stale_rebase_mismatch  # noqa: PLC0415
+
+    log_path = (agent_entry or {}).get("log_path")
+    machine = next(
+        (m for m in config.machines if m.name == fix_assignment.machine_name), None,
+    )
+    try:
+        mismatch = detect_stale_rebase_mismatch(
+            log_path=log_path,
+            host=machine.host if machine is not None else None,
+            assignment_id=fix_assignment.assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — never break reconcile on a log read
+        return False, None
+
+    stuck_summary: str | None = None
+    if mismatch:
+        progress = (agent_entry or {}).get("progress") or {}
+        stuck_summary = progress.get("stuck")
+        if not stuck_summary and log_path:
+            try:
+                from coord.progress import parse_progress  # noqa: PLC0415
+                stuck_summary = parse_progress(log_path).stuck
+            except Exception:  # noqa: BLE001
+                stuck_summary = None
+    return mismatch, stuck_summary
 
 
 def _extract_issue_number(branch: str) -> int | None:
