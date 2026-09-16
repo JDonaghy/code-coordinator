@@ -1084,7 +1084,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-oc-1"}
 
@@ -1131,7 +1131,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-oc-2"}
 
@@ -1179,7 +1179,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-label-1"}
 
@@ -1230,7 +1230,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-1"}
 
@@ -1291,7 +1291,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-1"}
 
@@ -1326,7 +1326,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-1"}
 

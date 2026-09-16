@@ -1072,6 +1072,7 @@ def dispatch_entry(
         post_briefing,
         resolve_dispatch_model_alias,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
     from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
@@ -1231,7 +1232,15 @@ def dispatch_entry(
     )
 
     try:
-        response = dispatch(proposal, config)
+        # #3353: this was the third of the three plain-dispatch call sites
+        # this module's own `ASSIGN_POST_TIMEOUT_SECS` comment already
+        # documented as lacking a live pre-probe (the same gap `coord
+        # approve`/`coord assign` had). Wired the same way: opt-in via
+        # `status_fetcher`, so `dispatch()`'s internal liveness-routing
+        # gate excludes an unreachable `machine` in favor of any other
+        # repo-capable, reachable candidate instead of burning a
+        # drive-queue attempt on a dead box.
+        response = dispatch(proposal, config, status_fetcher=fetch_status)
     except (httpx.HTTPError, ValueError) as e:
         return DispatchOutcome(
             issue_number=issue_number, machine_name=machine.name, ok=False, error=str(e)

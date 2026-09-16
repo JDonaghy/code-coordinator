@@ -53,12 +53,20 @@ AGENT_PORT = 7433
 # Raised well past ordinary worktree-setup latency — this bounds ACTUAL
 # unreachability, not a slow-but-working `/assign`. The `coord fix` callers
 # already screen out unreachability with a live pre-probe before ever
-# reaching this timeout; plain `coord assign`/`coord approve` dispatches
-# (`coord/commands/dispatch.py`, `coord/commands/plan_followup.py`,
-# `coord/milestone_dispatch.py`) do not, so a genuinely dead machine now
-# takes up to 60s to fail there instead of 15s — a real but accepted latency
-# trade-off against a worker that legitimately just needs more time to set
-# up a worktree.
+# reaching this timeout. #3353: `coord approve` (`coord/commands/
+# dispatch.py`) and `coord milestone dispatch` (`coord/milestone_dispatch.
+# py`) now do too — both wire `dispatch()`'s `status_fetcher` param, which
+# turns on `route_work_by_liveness`'s pre-POST reachability check for
+# `type="work"` and reroutes around a dead proposed machine instead of ever
+# reaching this timeout for it. `coord assign` (`coord/commands/
+# dispatch_workers.py`'s `_dispatch_headless`) is wired the same way.
+# `coord/commands/plan_followup.py`'s plain follow-up dispatch does NOT opt
+# in — its callers that care about reachability already resolve a live
+# machine via `select_fix_machine` before ever building the Proposal (see
+# `_dispatch_followup`'s `machine_name` param docstring) — so a genuinely
+# dead machine reached THAT path still takes up to 60s to fail here instead
+# of 15s, an accepted latency trade-off against a worker that legitimately
+# just needs more time to set up a worktree.
 ASSIGN_POST_TIMEOUT_SECS = 60.0
 
 _log = logging.getLogger(__name__)
@@ -610,11 +618,18 @@ def dispatch(
     *,
     pull_repos: Iterable[str] = (),
     fresh_branch: bool = False,
+    status_fetcher=None,
 ) -> dict:
     """POST an assignment to the agent server on the target machine.
 
     Returns the response JSON from the agent server (which includes the
     server-assigned `id`).
+
+    *status_fetcher* (#3353) opts the `type="work"` liveness-routing gate
+    below into a LIVE reachability probe of `proposal.machine_name` before
+    ever POSTing to it — see `route_work_by_liveness`'s docstring. `None`
+    (the default) performs no probe at all, exactly like every caller that
+    predates this parameter.
     """
     machine = next(
         (m for m in config.machines if m.name == proposal.machine_name), None
@@ -665,6 +680,54 @@ def dispatch(
             f"No repo_path configured for {proposal.repo_name!r} on machine {machine.name!r}. "
             f"Add it to coordinator.yml under machines[].repo_paths."
         )
+
+    # #3353: STRUCTURAL LIVENESS-ROUTING GATE — the router that sent
+    # #3349/coord-tui#79 to a dead box: `capability_routing` above only
+    # reroutes on a `## Files` capability-rule match, never on whether the
+    # winning machine actually answers. Without this, `dispatch()` POSTed
+    # straight to a machine with zero `pending`/`running` assignments
+    # regardless of whether its agent was reachable at all — the exact
+    # busy-vs-alive confusion #3353 fixed for conflict-fix selection, still
+    # open here (see this module's own `ASSIGN_POST_TIMEOUT_SECS` #3214
+    # comment, which had already documented this gap for `coord approve` /
+    # `coord assign`). Opt-in via *status_fetcher*, same contract as
+    # `coord.conflict_fix.select_conflict_fix_machine`'s parameter of the
+    # same name — every caller that hasn't wired a fetcher in yet is
+    # unaffected byte-for-byte.
+    liveness_routing: LivenessRouting | None = None
+    if proposal.type == "work":
+        liveness_routing = route_work_by_liveness(
+            proposed_machine_name=proposal.machine_name,
+            repo_name=proposal.repo_name,
+            machines=config.machines,
+            status_fetcher=status_fetcher,
+        )
+        if liveness_routing is not None:
+            if liveness_routing.machine_name is None:
+                detail = "; ".join(f"{name} ({why})" for name, why in liveness_routing.tried)
+                raise ValueError(
+                    f"every machine capable of {proposal.repo_name!r} is "
+                    f"unreachable right now: {detail} — nothing dispatched (#3353)"
+                )
+            if liveness_routing.rerouted:
+                proposal.machine_name = liveness_routing.machine_name
+                machine = next(
+                    (m for m in config.machines if m.name == liveness_routing.machine_name),
+                    None,
+                )
+                if machine is None:  # pragma: no cover — route_work_by_liveness
+                    # only ever names a machine it drew from config.machines.
+                    raise ValueError(
+                        f"Unknown machine: {liveness_routing.machine_name!r}"
+                    )
+                repo_path = machine.repo_path(proposal.repo_name)
+                if repo_path is None:  # pragma: no cover — route_work_by_liveness's
+                    # candidate filter already requires a configured repo_path.
+                    raise ValueError(
+                        f"No repo_path configured for {proposal.repo_name!r} on "
+                        f"machine {machine.name!r}. Add it to coordinator.yml "
+                        "under machines[].repo_paths."
+                    )
 
     # Resolve deny-list from the repo's worker_permissions config.
     repo = config.repo(proposal.repo_name)
@@ -1129,14 +1192,23 @@ def dispatch_with_retry(
     pull_repos: Iterable[str] = (),
     fresh_branch: bool = False,
     on_retry: callable | None = None,
+    status_fetcher=None,
 ) -> dict:
-    """Dispatch with exponential backoff on transient failures."""
+    """Dispatch with exponential backoff on transient failures.
+
+    *status_fetcher* (#3353) is forwarded to `dispatch()` untouched — see
+    its docstring for the liveness-routing gate it opts into.
+    """
     from coord.network import classify_error, is_retryable
 
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return dispatch(proposal, config, pull_repos=pull_repos, fresh_branch=fresh_branch)
+            return dispatch(
+                proposal, config,
+                pull_repos=pull_repos, fresh_branch=fresh_branch,
+                status_fetcher=status_fetcher,
+            )
         except httpx.HTTPError as exc:
             state, reason = classify_error(exc)
             if not is_retryable(state) or attempt == max_retries:
@@ -1323,6 +1395,110 @@ def route_work_by_capability(
         unmet_capabilities=unmet,
         rerouted=best.name != proposed_machine_name,
     )
+
+
+@dataclass(frozen=True)
+class LivenessRouting:
+    """Outcome of routing a `type="work"` dispatch around an unreachable
+    proposed machine (#3353).
+
+    `route_work_by_capability` above reroutes on a capability-rule match;
+    this reroutes on the ONE thing that mattered for #3349 and
+    coord-tui#79 (2026-09-15, both "loud, attempts burned" — see the
+    issue): whether `proposed_machine_name`'s agent actually answers right
+    now. Before this, `dispatch()` POSTed straight to whatever machine the
+    brain proposed or an operator named, with no liveness signal at all —
+    the exact busy-vs-alive confusion #3353 already fixed for conflict-fix
+    machine selection (`coord.conflict_fix.select_conflict_fix_machine`),
+    left open here.
+
+    Same opt-in shape as that function's `status_fetcher` parameter (#2096,
+    "one question, one answer" — both route through the SAME
+    `coord.network.probe_reachable` seam): a caller that hasn't wired a
+    fetcher in gets `None` back from `route_work_by_liveness` and
+    `proposal.machine_name` is left completely untouched.
+
+    `machine_name` is `None` only when the proposed machine AND every other
+    repo-capable, unpaused candidate all failed a live probe — the caller
+    must not silently fall through to POSTing at the proposed machine (a
+    fresh dead-box timeout that burns a drive-queue attempt, exactly what
+    happened to #3349/#79); `tried` names every machine actually probed, in
+    probe order, paired with why it was skipped — same shape as
+    `FixMachineSelection.tried` below, so both "why didn't a fix land" and
+    "why didn't a dispatch land" read the same way to an operator.
+
+    `rerouted` is True when `machine_name` differs from what was proposed —
+    i.e. the proposed machine failed its probe and a live fallback existed.
+    """
+
+    machine_name: str | None
+    rerouted: bool
+    tried: tuple[tuple[str, str], ...] = ()
+
+
+def route_work_by_liveness(
+    *,
+    proposed_machine_name: str,
+    repo_name: str,
+    machines: list[Machine],
+    status_fetcher=None,
+    now: "datetime | None" = None,
+) -> LivenessRouting | None:
+    """Reroute a `type="work"` dispatch away from `proposed_machine_name`
+    when it fails a LIVE reachability probe, onto any other repo-capable,
+    unpaused machine that passes one (#3353).
+
+    Returns `None` — meaning "nothing for the caller to do, proceed
+    unchanged" — in three cases: *status_fetcher* is `None` (opted out,
+    the default); `proposed_machine_name` isn't in `machines` at all
+    (`dispatch()`'s own "Unknown machine" check is the right place for
+    that refusal, not a second one here); or the proposed machine's probe
+    succeeds (nothing to reroute). Returns a `LivenessRouting` with
+    `machine_name=None` — which the caller MUST treat as a hard refusal,
+    not a "proceed with the original pick" signal — only when the proposed
+    machine is down AND every fallback is too.
+
+    Candidate filter for fallbacks mirrors `route_work_by_capability`'s
+    (#3241 review): `can_work_on(repo_name)`, a configured `repo_path`, and
+    not in the FULL cordon-inclusive `paused_set()` — this is new work
+    being routed for the first time, not the tail of a leg already running
+    elsewhere, so (like that function, and unlike `select_fix_machine`
+    below) it deliberately does NOT use `follow_on_paused_set()`.
+
+    *status_fetcher* and *now* are forwarded to `probe_reachable`/
+    `paused_set` untouched — see those functions' docstrings.
+    """
+    if status_fetcher is None:
+        return None
+
+    from coord.machine_pause import paused_set  # noqa: PLC0415
+    from coord.network import probe_reachable  # noqa: PLC0415
+
+    proposed = next((m for m in machines if m.name == proposed_machine_name), None)
+    if proposed is None:
+        return None
+
+    reachable, reason = probe_reachable(proposed, status_fetcher=status_fetcher)
+    if reachable:
+        return None
+
+    tried: list[tuple[str, str]] = [(proposed_machine_name, reason or "unreachable")]
+
+    paused = paused_set(machines, now=now)
+    fallbacks = [
+        m for m in machines
+        if m.name != proposed_machine_name
+        and m.can_work_on(repo_name)
+        and m.repo_path(repo_name) is not None
+        and m.name not in paused
+    ]
+    for m in fallbacks:
+        ok, why = probe_reachable(m, status_fetcher=status_fetcher)
+        if ok:
+            return LivenessRouting(machine_name=m.name, rerouted=True, tried=tuple(tried))
+        tried.append((m.name, why or "unreachable"))
+
+    return LivenessRouting(machine_name=None, rerouted=False, tried=tuple(tried))
 
 
 @dataclass

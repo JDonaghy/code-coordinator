@@ -303,8 +303,9 @@ def approve(
         dispatch_with_retry,
         post_briefing,
         route_work_by_capability,
+        route_work_by_liveness,
     )
-    from coord.network import classify_error, fetch_repos
+    from coord.network import classify_error, fetch_repos, fetch_status
     from coord.state import (
         clear_proposals,
         load_proposals,
@@ -436,6 +437,45 @@ def approve(
                 f"  [{p.id}] capability-rerouted {p.machine_name} → "
                 f"{routing.machine_name} (#3241 — {p.machine_name} does not "
                 "cover this diff's required capabilities)",
+                err=True,
+            )
+            p.machine_name = routing.machine_name
+
+    # ── Liveness-based reroute (#3353) ──────────────────────────────────
+    # Same reasoning as the capability reroute right above (must run before
+    # the freshness pre-check and the per-proposal loop, both keyed on
+    # `p.machine_name`) applied to the OTHER half of #3241's routing gap:
+    # #3349 and coord-tui#79 (2026-09-15) were sent straight to a machine
+    # that had been offline for hours, because nothing between `coord plan`
+    # and the POST to `/assign` ever asked whether the proposed machine was
+    # actually reachable — only whether it was busy. `dispatch()` performs
+    # this SAME reroute again internally (`route_work_by_liveness`, reused
+    # here, not duplicated — it has other callers) as a same-machine no-op
+    # the second time; doing it here first keeps the freshness check,
+    # `dispatched_this_batch` bookkeeping, and this echo all pointed at
+    # where the work actually lands, exactly like the capability reroute.
+    for p in selected:
+        if p.type != "work":
+            continue
+        routing = route_work_by_liveness(
+            proposed_machine_name=p.machine_name,
+            repo_name=p.repo_name,
+            machines=cfg.machines,
+            status_fetcher=fetch_status,
+        )
+        if routing is None:
+            continue
+        if routing.machine_name is None:
+            # Every capable machine is unreachable — leave `p.machine_name`
+            # as-is; `dispatch()` raises the same descriptive refusal below,
+            # where the existing `except ValueError` handler already
+            # reports and skips it (no need to duplicate that here).
+            continue
+        if routing.rerouted:
+            click.echo(
+                f"  [{p.id}] liveness-rerouted {p.machine_name} → "
+                f"{routing.machine_name} (#3353 — {p.machine_name} did not "
+                "answer a live reachability probe)",
                 err=True,
             )
             p.machine_name = routing.machine_name
@@ -722,6 +762,13 @@ def approve(
                 backoff_base=cfg.concurrency.backoff_base,
                 pull_repos=pull_repos,
                 on_retry=_on_retry,
+                # #3353: the preview reroute above already moved
+                # `p.machine_name` onto a live machine when one existed —
+                # this makes `dispatch()`'s own internal check a no-op in
+                # that case, and is what actually raises the "every
+                # candidate unreachable" refusal (caught below) when it
+                # didn't.
+                status_fetcher=fetch_status,
             )
         except httpx.HTTPError as e:
             state, reason = classify_error(e)
