@@ -23,6 +23,7 @@ import pytest
 from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.conflict_fix import (
     ALL_CANDIDATES_UNREACHABLE,
+    ASSIGN_POST_FAILED,
     CONFLICT_FIX_SYSTEM_PROMPT,
     NO_MACHINE_CONFIGURED,
     SEALED_CONFLICT_FIX_TITLE_PREFIX,
@@ -770,6 +771,62 @@ class TestDispatch:
             _entry(), Board(), two_machine_config, http_client=_Failing(),
         )
         assert result is None
+
+    def test_post_failure_after_a_successful_pick_reports_the_machine(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#3353 review (round 2): the "flapping machine" the issue's
+        Second half warns about — `laptop` passes its live probe during
+        selection and then refuses the `/assign` POST moments later.
+
+        `machine_pick_out` used to be appended to ONLY in the "no machine"
+        and "no repo_path" branches, so a POST failure left it EMPTY and
+        `coord merge`'s decline message read "no repo config matches this
+        repo, or dispatch was declined before machine selection ran" —
+        precisely backwards: selection ran and picked a machine. Fails
+        against the previous round's code, where `pick_out == []` here.
+        """
+        import httpx
+
+        class _Failing:
+            def post(self, url, *, json, timeout):
+                raise httpx.ConnectError("connection reset")
+
+        pick_out: list = []
+        result = dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=_Failing(),
+            prefer_machine="laptop",
+            status_fetcher=_status_fetcher({"laptop", "server"}),
+            machine_pick_out=pick_out,
+        )
+        assert result is None
+        assert len(pick_out) == 1, (
+            "a POST failure after a successful pick reported no pick at all "
+            "— the caller can only say 'selection never ran', which is wrong"
+        )
+        assert pick_out[0].reason == ASSIGN_POST_FAILED
+        # The machine that actually refused is still attached, so the
+        # caller can name it rather than describing a config problem.
+        assert pick_out[0].machine is not None
+        assert pick_out[0].machine.name == "laptop"
+
+    def test_successful_dispatch_leaves_the_pick_sink_untouched(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """The sink is a DECLINE channel — a dispatch that actually landed
+        must not append anything, or a caller reading it would report a
+        failure reason for a success."""
+        pick_out: list = []
+        result = dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=_FakeHTTPClient({"id": "fix-ok-1"}),
+            prefer_machine="laptop",
+            status_fetcher=_status_fetcher({"laptop"}),
+            machine_pick_out=pick_out,
+        )
+        assert result is not None
+        assert pick_out == []
 
     def test_declined_dispatch_leaves_a_durable_audit_trace(
         self, two_machine_config: Config, coord_db,

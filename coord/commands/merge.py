@@ -474,6 +474,7 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     from coord.audit import record_audit  # noqa: PLC0415
     from coord.conflict_fix import (  # noqa: PLC0415
         ALL_CANDIDATES_UNREACHABLE,
+        ASSIGN_POST_FAILED,
         NO_MACHINE_CONFIGURED,
         dispatch_conflict_fix,
         has_prior_conflict_fix,
@@ -591,6 +592,21 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                         )
                     elif pick.reason == NO_MACHINE_CONFIGURED:
                         detail = "no configured machine can work on this repo"
+                    elif pick.reason == ASSIGN_POST_FAILED:
+                        # #3353 review (round 2): selection ran and PICKED a
+                        # machine; the `/assign` POST to it then failed. The
+                        # "flapping machine" the issue's Second half warns
+                        # about — a live probe and the real request seconds
+                        # apart can genuinely disagree. Must be checked
+                        # before the `pick.machine is not None` branch below,
+                        # which would otherwise mislabel this as a missing
+                        # `repo_path`.
+                        detail = (
+                            f"{pick.machine.name if pick.machine else 'the picked machine'} "
+                            "passed its liveness probe but then refused the "
+                            "assignment POST — a flapping agent, not a "
+                            "capacity stall"
+                        )
                     elif pick.machine is not None:
                         detail = "no repo_path configured for the picked machine"
                     else:  # pragma: no cover — pick.machine is None always

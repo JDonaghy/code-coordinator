@@ -1501,6 +1501,135 @@ def route_work_by_liveness(
     return LivenessRouting(machine_name=None, rerouted=False, tried=tuple(tried))
 
 
+@dataclass(frozen=True)
+class LivenessReroute:
+    """One proposal moved off an unreachable machine by
+    :func:`apply_liveness_reroute` — `proposal_id` is the
+    `Proposal.id` that moved, `from_machine` the machine originally
+    proposed, `to_machine` where it will actually be dispatched.
+
+    Exists so the shared batch helper can stay output-agnostic: `coord
+    approve` renders these as `click.echo` lines on stderr, the dashboard's
+    `POST /api/approve` folds them into its JSON results array, and neither
+    has to re-derive "did this move, and from where".
+    """
+
+    proposal_id: int
+    from_machine: str
+    to_machine: str
+
+
+def caching_status_fetcher(fetcher=None):
+    """Wrap a status fetcher so each machine is probed at most ONCE for the
+    lifetime of the returned callable (#3353 review).
+
+    A single `coord approve` / `POST /api/approve` batch asks "is this
+    machine up" twice for every `type="work"` proposal — once in the
+    caller's own preview reroute (:func:`apply_liveness_reroute`, which has
+    to run early so the freshness pre-check and the operator-facing echo
+    are keyed to the machine the work actually lands on) and again inside
+    :func:`dispatch` a moment later. That is a real second `GET /status`
+    per dispatch, and with N proposals aimed at the same machine it is
+    2N probes for one answer.
+
+    Wrapping the fetcher here collapses them to one probe per machine per
+    batch. It also closes the small TOCTOU window between the two: the
+    preview reroute and `dispatch()`'s own gate now see the SAME verdict,
+    so they cannot disagree about where the work should go and silently
+    re-route it a second time.
+
+    Deliberately scoped to one batch, not module-global: liveness is the
+    thing being measured, and a process-lifetime cache would make a
+    long-running daemon act on a stale up/down reading. Callers construct a
+    fresh one per invocation.
+
+    *fetcher* defaults to :func:`coord.network.fetch_status`. Results are
+    cached by `machine.name`; the wrapper accepts and forwards the same
+    optional `timeout` keyword :func:`coord.network.probe_reachable` may
+    pass, but a differing `timeout` does NOT bust the cache (within one
+    batch every caller uses the default).
+    """
+    from coord.network import fetch_status as _fs  # noqa: PLC0415
+
+    fetch = fetcher or _fs
+    cache: dict[str, object] = {}
+
+    def _cached(machine, **kwargs):
+        key = machine.name
+        if key not in cache:
+            cache[key] = fetch(machine, **kwargs)
+        return cache[key]
+
+    return _cached
+
+
+def apply_liveness_reroute(
+    proposals: "list[Proposal]",
+    *,
+    machines: list[Machine],
+    status_fetcher=None,
+) -> list[LivenessReroute]:
+    """Move every `type="work"` proposal in *proposals* off an unreachable
+    machine, in place, and report what moved (#3353).
+
+    This is the ONE answer to "before dispatching an approved batch, is each
+    proposal's machine actually alive?" (#2096, "one question, one answer").
+    It exists because that question had grown TWO independent askers:
+    `coord.commands.dispatch.approve` (`coord approve`) and
+    `coord.dashboard.server`'s `POST /api/approve` — the `coord web` phone
+    dashboard, which dispatches the SAME `load_proposals()` set through the
+    SAME :func:`dispatch` chokepoint. When only the first learned to check
+    liveness, the phone dashboard kept POSTing straight at dead boxes, the
+    exact failure (#3349, coord-tui#79 on 2026-09-15) #3353 exists to fix.
+
+    Must be called BEFORE any per-proposal state keyed on
+    `proposal.machine_name` is computed (the freshness pre-check, `coord
+    approve`'s `dispatched_this_batch` #2804 collision guard, the
+    operator-facing echo), for the same reason the #3241 capability reroute
+    runs there: otherwise all of it describes a machine the work never
+    reaches. :func:`dispatch` re-runs :func:`route_work_by_liveness`
+    internally — that call stays, since `dispatch()` has callers that never
+    come through here — and becomes a same-machine no-op once this has run.
+
+    Proposals whose every capable machine is unreachable are left
+    **untouched**: `dispatch()` raises the descriptive
+    "every candidate unreachable" `ValueError` for those, and both callers
+    already have an error path that reports and skips a failed dispatch.
+    Duplicating that refusal here would give two different messages for one
+    condition.
+
+    *status_fetcher* is the opt-in, forwarded verbatim to
+    :func:`route_work_by_liveness`: `None` (the default) means every
+    proposal is left exactly as proposed and this returns `[]`. Pass it
+    through :func:`caching_status_fetcher` and hand the SAME wrapper to
+    `dispatch()` to avoid probing each machine twice per batch.
+    """
+    if status_fetcher is None:
+        return []
+
+    moved: list[LivenessReroute] = []
+    for p in proposals:
+        if p.type != "work":
+            continue
+        routing = route_work_by_liveness(
+            proposed_machine_name=p.machine_name,
+            repo_name=p.repo_name,
+            machines=machines,
+            status_fetcher=status_fetcher,
+        )
+        if routing is None or routing.machine_name is None or not routing.rerouted:
+            continue
+        moved.append(
+            LivenessReroute(
+                proposal_id=p.id,
+                from_machine=p.machine_name,
+                to_machine=routing.machine_name,
+            )
+        )
+        p.machine_name = routing.machine_name
+    return moved
+
+
 @dataclass
 class FixMachineSelection:
     """Outcome of picking a machine for a same-branch fix dispatch (#3208).

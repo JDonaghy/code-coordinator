@@ -31,6 +31,8 @@ from coord.dispatch import (
     post_briefing,
     resolve_dispatch_model,
     resolve_dispatch_model_alias,
+    apply_liveness_reroute,
+    caching_status_fetcher,
     route_work_by_capability,
     route_work_by_liveness,
 )
@@ -3796,3 +3798,188 @@ class TestDispatchLivenessRouting:
 
         assert "dell64.tailnet" in mock_post.call_args.args[0]
         assert p.machine_name == "dell64"
+
+
+class TestApplyLivenessReroute:
+    """#3353 review (round 2): the batch-level helper both approve doors —
+    `coord approve` and the `coord web` dashboard's `POST /api/approve` —
+    now share. Two hand-rolled copies of "is this machine alive" is the
+    #2096 violation that let the dashboard path fall a whole round behind.
+    """
+
+    def _machines(self) -> list[Machine]:
+        return [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+
+    def _proposal(self, pid: int = 1, ptype: str = "work") -> Proposal:
+        return Proposal(
+            id=pid, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type=ptype,
+        )
+
+    def test_no_status_fetcher_is_a_total_no_op(self) -> None:
+        """Opt-in only — a caller that hasn't wired a fetcher must see
+        `machine_name` untouched and no probe at all."""
+        p = self._proposal()
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(), status_fetcher=None,
+        )
+        assert moved == []
+        assert p.machine_name == "dell64"
+
+    def test_unreachable_proposal_is_moved_and_reported(self) -> None:
+        p = self._proposal()
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(),
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert p.machine_name == "macmini"
+        assert len(moved) == 1
+        assert moved[0].proposal_id == 1
+        assert moved[0].from_machine == "dell64"
+        assert moved[0].to_machine == "macmini"
+
+    def test_all_unreachable_leaves_the_proposal_untouched(self) -> None:
+        """Deliberate: `dispatch()` raises the single descriptive "every
+        candidate unreachable" refusal for this case, and both callers
+        already report a failed dispatch per proposal. Mutating or
+        skipping here would give two different messages for one condition.
+        """
+        p = self._proposal()
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(), status_fetcher=_status_fetcher(set()),
+        )
+        assert moved == []
+        assert p.machine_name == "dell64"
+
+    def test_non_work_proposals_are_never_touched(self) -> None:
+        p = self._proposal(ptype="plan")
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(),
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert moved == []
+        assert p.machine_name == "dell64"
+
+    def test_mixed_batch_moves_only_what_needs_moving(self) -> None:
+        dead = self._proposal(pid=1)
+        live = self._proposal(pid=2)
+        live.machine_name = "macmini"
+        moved = apply_liveness_reroute(
+            [dead, live], machines=self._machines(),
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert [m.proposal_id for m in moved] == [1]
+        assert dead.machine_name == "macmini"
+        assert live.machine_name == "macmini"
+
+
+class TestCachingStatusFetcher:
+    """#3353 review (round 2): `coord approve` / `POST /api/approve` ask
+    "is this machine up" twice per work proposal — once in the preview
+    reroute, once inside `dispatch()`. That is a real second `GET /status`
+    per dispatch, not a free no-op, and the two answers could disagree.
+    """
+
+    def test_repeat_probes_of_one_machine_hit_the_wire_once(self) -> None:
+        calls: list[str] = []
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            calls.append(machine.name)
+            return StatusResult(data={"assignments": []})
+
+        cached = caching_status_fetcher(_fetch)
+        m = Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"])
+        assert cached(m).ok
+        assert cached(m).ok
+        assert cached(m).ok
+        assert calls == ["dell64"]
+
+    def test_distinct_machines_are_each_probed(self) -> None:
+        """Not a blanket "answer once for everything" cache — the cache key
+        is the machine, or a dead box would inherit a live one's verdict."""
+        calls: list[str] = []
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            calls.append(machine.name)
+            return StatusResult(
+                data={"assignments": []} if machine.name == "macmini" else None,
+                error=None if machine.name == "macmini" else "timeout",
+            )
+
+        cached = caching_status_fetcher(_fetch)
+        dell = Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"])
+        mac = Machine(name="macmini", host="macmini.tailnet", repos=["quadraui"])
+        assert cached(dell).ok is False
+        assert cached(mac).ok is True
+        assert cached(dell).ok is False
+        assert calls == ["dell64", "macmini"]
+
+    def test_a_fresh_wrapper_does_not_inherit_a_previous_batch_verdict(self) -> None:
+        """Scoped to one batch on purpose: liveness is the thing being
+        measured, so a process-lifetime cache would make a long-running
+        daemon act on a stale up/down reading."""
+        state = {"up": False}
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            return (
+                StatusResult(data={"assignments": []}) if state["up"]
+                else StatusResult(error="timeout")
+            )
+
+        m = Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"])
+        assert caching_status_fetcher(_fetch)(m).ok is False
+        state["up"] = True
+        assert caching_status_fetcher(_fetch)(m).ok is True
+
+    def test_reroute_and_dispatch_share_one_probe_per_machine(self) -> None:
+        """The end-to-end point of the wrapper: a preview reroute followed
+        by `dispatch()`'s own internal gate costs ONE probe per machine,
+        not two."""
+        calls: list[str] = []
+        live = _status_fetcher({"macmini"})
+
+        def _fetch(machine, timeout=None):
+            calls.append(machine.name)
+            return live(machine, timeout=timeout)
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=[
+                Machine(
+                    name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                ),
+                Machine(
+                    name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                ),
+            ],
+        )
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+        cached = caching_status_fetcher(_fetch)
+
+        apply_liveness_reroute([p], machines=cfg.machines, status_fetcher=cached)
+        with patch("coord.dispatch.httpx.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"ok": True}
+            mock_post.return_value = mock_resp
+            dispatch(p, cfg, status_fetcher=cached)
+
+        assert "macmini.tailnet" in mock_post.call_args.args[0]
+        # dell64 probed once (preview), macmini once (preview fallback).
+        # `dispatch()`'s repeat of both is served from the cache.
+        assert calls == ["dell64", "macmini"]

@@ -300,10 +300,11 @@ def approve(
     from coord.dispatch import (
         compute_do_not_touch,
         dispatch,
+        apply_liveness_reroute,
+        caching_status_fetcher,
         dispatch_with_retry,
         post_briefing,
         route_work_by_capability,
-        route_work_by_liveness,
     )
     from coord.network import classify_error, fetch_repos, fetch_status
     from coord.state import (
@@ -448,37 +449,40 @@ def approve(
     # #3349 and coord-tui#79 (2026-09-15) were sent straight to a machine
     # that had been offline for hours, because nothing between `coord plan`
     # and the POST to `/assign` ever asked whether the proposed machine was
-    # actually reachable — only whether it was busy. `dispatch()` performs
-    # this SAME reroute again internally (`route_work_by_liveness`, reused
-    # here, not duplicated — it has other callers) as a same-machine no-op
-    # the second time; doing it here first keeps the freshness check,
-    # `dispatched_this_batch` bookkeeping, and this echo all pointed at
-    # where the work actually lands, exactly like the capability reroute.
-    for p in selected:
-        if p.type != "work":
-            continue
-        routing = route_work_by_liveness(
-            proposed_machine_name=p.machine_name,
-            repo_name=p.repo_name,
-            machines=cfg.machines,
-            status_fetcher=fetch_status,
+    # actually reachable — only whether it was busy.
+    #
+    # The loop itself lives in `coord.dispatch.apply_liveness_reroute`, NOT
+    # here: the `coord web` dashboard's `POST /api/approve` dispatches the
+    # same `load_proposals()` set through the same `dispatch()` chokepoint
+    # and needs the identical gate (#3353 review round 2 — it was the
+    # overlooked fourth call site), and two hand-rolled copies of "is this
+    # machine alive" is precisely the #2096 violation that let them drift.
+    #
+    # `_status_fetcher` is the per-invocation caching wrapper, shared with
+    # `dispatch_with_retry` below so each machine is probed once for the
+    # whole batch instead of once here and again inside `dispatch()`.
+    #
+    # #3353 review: this runs under `--dry-run` too, unlike the freshness
+    # pre-check right below it. Deliberate — `--dry-run`'s job is to print
+    # where the work WOULD land, and suppressing the reroute would print
+    # the dead machine, which is the bug. `probe_reachable` is a `GET
+    # /status` (a read of in-memory agent state, no side effects, no cold
+    # recompute — see its docstring on why it is not `/health`), so a dry
+    # run stays read-only; the freshness check is gated because it is an
+    # expensive multi-repo fetch plus GitHub API calls, not because
+    # touching the network at all is forbidden. The caching wrapper keeps
+    # it to one probe per machine either way.
+    _status_fetcher = caching_status_fetcher(fetch_status)
+    for reroute in apply_liveness_reroute(
+        selected, machines=cfg.machines, status_fetcher=_status_fetcher
+    ):
+        click.echo(
+            f"  [{reroute.proposal_id}] liveness-rerouted "
+            f"{reroute.from_machine} → {reroute.to_machine} (#3353 — "
+            f"{reroute.from_machine} did not answer a live reachability "
+            "probe)",
+            err=True,
         )
-        if routing is None:
-            continue
-        if routing.machine_name is None:
-            # Every capable machine is unreachable — leave `p.machine_name`
-            # as-is; `dispatch()` raises the same descriptive refusal below,
-            # where the existing `except ValueError` handler already
-            # reports and skips it (no need to duplicate that here).
-            continue
-        if routing.rerouted:
-            click.echo(
-                f"  [{p.id}] liveness-rerouted {p.machine_name} → "
-                f"{routing.machine_name} (#3353 — {p.machine_name} did not "
-                "answer a live reachability probe)",
-                err=True,
-            )
-            p.machine_name = routing.machine_name
 
     # ── Freshness pre-check ──────────────────────────────────────────
     machine_repos: dict[str, dict | None] = {}
@@ -767,8 +771,10 @@ def approve(
                 # this makes `dispatch()`'s own internal check a no-op in
                 # that case, and is what actually raises the "every
                 # candidate unreachable" refusal (caught below) when it
-                # didn't.
-                status_fetcher=fetch_status,
+                # didn't. Same caching wrapper the preview used, so that
+                # no-op is served from the batch cache rather than costing
+                # a second real `GET /status` per proposal (#3353 review).
+                status_fetcher=_status_fetcher,
             )
         except httpx.HTTPError as e:
             state, reason = classify_error(e)
