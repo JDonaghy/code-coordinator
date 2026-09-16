@@ -1116,7 +1116,11 @@ def _resolve_uat_preview_url(
 
     1. ``Repo.uat_preview`` (:meth:`coord.models.Repo.resolve_uat_preview_url`)
        — an explicit operator override, for a repo whose preview host has a
-       genuinely templatable URL. Always wins when set.
+       genuinely templatable URL. Wins when set AND every placeholder it
+       references has a value for this entry (#3350: `Repo.
+       unresolved_uat_preview_placeholder` is the one place that decides
+       this — see #2096). Otherwise falls through to step 2, same as if
+       ``uat_preview`` were unset.
     2. ``Repo.uat_live_preview`` — the live GitHub-Deployment lookup
        (:func:`coord.github_ops.get_pr_deployment_url`, via *gh_ops*),
        matched on environment name rather than recency. Requires both a
@@ -1125,7 +1129,9 @@ def _resolve_uat_preview_url(
 
     Returns a :class:`UatPreviewResolution` with ``url=None`` when neither
     resolves — never a guessed/constructed URL (the #2948 bug: a template
-    placeholder that renders a plausible but dead link).
+    placeholder that renders a plausible but dead link — and #3350, the
+    same bug reached through the override template rendering successfully
+    on an EMPTY substitution rather than failing to render at all).
 
     #3216: *gh_ops* is probed via ``getattr(gh_ops, "get_pr_deployment_url",
     None)`` — the same optional-method convention
@@ -1138,25 +1144,62 @@ def _resolve_uat_preview_url(
     repo = _uat_repo_for(entry, config)
     if repo is None:
         return UatPreviewResolution(None, "repo not found in configuration")
+    override_branch = getattr(entry, "branch", None)
+    override_issue = getattr(entry, "issue_number", None)
+    override_pr = getattr(entry, "pr_number", None)
+    override_unresolved: str | None = None
     if repo.uat_preview:
-        return UatPreviewResolution(
-            repo.resolve_uat_preview_url(
-                branch=getattr(entry, "branch", None),
-                issue_number=getattr(entry, "issue_number", None),
-                pr_number=getattr(entry, "pr_number", None),
+        url = repo.resolve_uat_preview_url(
+            branch=override_branch,
+            issue_number=override_issue,
+            pr_number=override_pr,
+        )
+        if url:
+            return UatPreviewResolution(url)
+        # #3350: `resolve_uat_preview_url` returns `None` both when
+        # `uat_preview` is unset (not this branch — we already checked) and
+        # when a placeholder it references has no value for this entry.
+        # Name the gap so a caller that has nowhere else to fall through
+        # (no uat_live_preview) reports "unresolved: missing X", never the
+        # #2948-class dead link this whole function exists to prevent.
+        override_unresolved = (
+            repo.unresolved_uat_preview_placeholder(
+                branch=override_branch,
+                issue_number=override_issue,
+                pr_number=override_pr,
             )
+            or "a template placeholder"
         )
     if not getattr(repo, "uat_live_preview", False):
+        if override_unresolved:
+            return UatPreviewResolution(
+                None,
+                f"uat_preview template could not resolve ({override_unresolved} "
+                "unavailable for this entry) and uat_live_preview is not enabled",
+            )
         return UatPreviewResolution(
             None, "no uat_preview override configured and uat_live_preview is not enabled"
         )
-    branch = getattr(entry, "branch", None)
+    branch = override_branch
     if not branch:
+        if override_unresolved:
+            return UatPreviewResolution(
+                None,
+                f"uat_preview template could not resolve ({override_unresolved} "
+                "unavailable for this entry) and the branch is unknown",
+            )
         return UatPreviewResolution(
             None, "no uat_preview override configured and the branch is unknown"
         )
     lookup = getattr(gh_ops, "get_pr_deployment_url", None)
     if lookup is None:
+        if override_unresolved:
+            return UatPreviewResolution(
+                None,
+                f"uat_preview template could not resolve ({override_unresolved} "
+                "unavailable for this entry) and no live GitHub-Deployment lookup "
+                "is available from this read path",
+            )
         return UatPreviewResolution(
             None,
             "no uat_preview override configured and no live GitHub-Deployment "
@@ -1168,6 +1211,13 @@ def _resolve_uat_preview_url(
         url = None
     if url:
         return UatPreviewResolution(url)
+    if override_unresolved:
+        return UatPreviewResolution(
+            None,
+            f"uat_preview template could not resolve ({override_unresolved} "
+            "unavailable for this entry) and no matching GitHub Deployment "
+            "found for this branch",
+        )
     return UatPreviewResolution(
         None,
         "no uat_preview override configured and no matching GitHub Deployment "

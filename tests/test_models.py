@@ -274,6 +274,60 @@ def test_resolve_uat_preview_url_malformed_format_spec_falls_back_to_raw() -> No
     assert repo.resolve_uat_preview_url(branch="b1") == "https://example/{}/"
 
 
+# ── #3350: a referenced placeholder with no value must not render empty ─────
+
+
+def test_resolve_uat_preview_url_missing_referenced_value_returns_none() -> None:
+    """The grocery-list#36 case verbatim: `{pr_number}` is referenced by the
+    template but has no value for this entry — must resolve to `None`, never
+    a partial URL ending in a dead trailing `/pull/` (the #2948 bug through a
+    different door)."""
+    repo = Repo(
+        name="grocery-list", github="acme/grocery-list",
+        uat_preview="https://github.com/JDonaghy/grocery-list/pull/{pr_number}",
+    )
+    assert repo.resolve_uat_preview_url(branch="issue-36-x", pr_number=None) is None
+
+
+def test_resolve_uat_preview_url_unreferenced_missing_value_still_resolves() -> None:
+    """A template that never references `{pr_number}` must still resolve
+    when `pr_number` is `None` — the check is "placeholders this template
+    USES", never "every placeholder has a value"."""
+    repo = Repo(name="api", github="acme/api", uat_preview="https://preview.example/{branch}")
+    assert (
+        repo.resolve_uat_preview_url(branch="b1", pr_number=None)
+        == "https://preview.example/b1"
+    )
+
+
+def test_resolve_uat_preview_url_fully_resolvable_template_unchanged() -> None:
+    """Regression guard: every placeholder with a value renders exactly as
+    before this fix — this must not make a working preview stricter."""
+    repo = Repo(
+        name="api", github="acme/api",
+        uat_preview="https://preview/{repo}/{issue_number}/{pr_number}/{branch}",
+    )
+    url = repo.resolve_uat_preview_url(branch="b1", issue_number=42, pr_number=7)
+    assert url == "https://preview/api/42/7/b1"
+
+
+def test_unresolved_uat_preview_placeholder_names_the_missing_field() -> None:
+    repo = Repo(
+        name="grocery-list", github="acme/grocery-list",
+        uat_preview="https://github.com/JDonaghy/grocery-list/pull/{pr_number}",
+    )
+    assert (
+        repo.unresolved_uat_preview_placeholder(branch="issue-36-x", pr_number=None)
+        == "pr_number"
+    )
+    assert repo.unresolved_uat_preview_placeholder(branch="issue-36-x", pr_number=37) is None
+
+
+def test_unresolved_uat_preview_placeholder_none_when_uat_preview_unset() -> None:
+    repo = Repo(name="api", github="acme/api")
+    assert repo.unresolved_uat_preview_placeholder(pr_number=None) is None
+
+
 # ── #3132: epic-decompose type membership ────────────────────────────────────
 
 
