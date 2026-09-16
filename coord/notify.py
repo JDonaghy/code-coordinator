@@ -612,7 +612,7 @@ def detect_stalled_pipeline(
     """Scan the board for *done* work chains stuck on an unmet precondition
     that a fresh review/fix transition would already have resolved (#1441).
 
-    Five candidate stall states, checked per pipeline "head" (the most
+    Seven candidate stall states, checked per pipeline "head" (the most
     recent work-like assignment for a given (repo, issue) — see
     :func:`_pipeline_heads`):
 
@@ -3532,9 +3532,23 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # same HUMAN_REQUIRED/escalation outcome a reported failure would,
         # instead of silently retrying the identical, already-diagnosed
         # conflict.
+        # #3349 review: the same clean-exit ambiguity applies to a
+        # stale-rebase dispatch (`dispatch_conflict_fix(..., stale_rebase=
+        # True)`, used for `merge_gate_checks_stale`) — its briefing tells
+        # the worker to stop and NOT push when the rebase isn't content-
+        # preserving, which ends the turn just as cleanly as a resolved
+        # rebase does. Check for `STALE_REBASE_MISMATCH_MARKER` alongside
+        # the SEMANTIC marker (mutually exclusive per dispatch, so only
+        # checked when semantic is False) and downgrade `succeeded` the
+        # same way, without routing it through the SEMANTIC tier-2
+        # escalation path — see `coord.reconcile.on_conflict_fix_done`'s
+        # `stale_rebase_mismatch` docstring for why that's a separate arm.
         parent_id = record.get("review_of_assignment_id")
         if parent_id:
-            from coord.conflict_fix import detect_semantic_conflict  # noqa: PLC0415
+            from coord.conflict_fix import (  # noqa: PLC0415
+                detect_semantic_conflict,
+                detect_stale_rebase_mismatch,
+            )
             from coord.reconcile import on_conflict_fix_done  # noqa: PLC0415
 
             log_path = entry.get("log_path")
@@ -3547,6 +3561,17 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 )
             except Exception:  # noqa: BLE001 — best-effort, never break notify
                 semantic = False
+
+            stale_rebase_mismatch = False
+            if not semantic:
+                try:
+                    stale_rebase_mismatch = detect_stale_rebase_mismatch(
+                        log_path=log_path,
+                        host=host,
+                        assignment_id=transition.assignment_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    stale_rebase_mismatch = False
 
             stuck_summary: str | None = None
             board = None
@@ -3571,13 +3596,26 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                     config = _load_config()
                 except Exception:  # noqa: BLE001
                     board, config = None, None
+            elif stale_rebase_mismatch:
+                # No board/config needed here — a stale-rebase mismatch has
+                # no tier-2 escalation path, it goes straight to
+                # HUMAN_REQUIRED inside `on_conflict_fix_done`.
+                progress = entry.get("progress") or {}
+                stuck_summary = progress.get("stuck")
+                if not stuck_summary and log_path:
+                    try:
+                        from coord.progress import parse_progress  # noqa: PLC0415
+                        stuck_summary = parse_progress(log_path).stuck
+                    except Exception:  # noqa: BLE001
+                        stuck_summary = None
 
             on_conflict_fix_done(
                 parent_assignment_id=parent_id,
                 fix_assignment_id=transition.assignment_id,
                 machine_name=transition.machine_name,
-                succeeded=not semantic,
+                succeeded=not semantic and not stale_rebase_mismatch,
                 semantic=semantic,
+                stale_rebase_mismatch=stale_rebase_mismatch,
                 board=board,
                 config=config,
                 stuck_summary=stuck_summary,

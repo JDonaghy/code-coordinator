@@ -790,6 +790,51 @@ def detect_semantic_conflict(
     return False
 
 
+def detect_stale_rebase_mismatch(
+    *,
+    log_path: str | None = None,
+    host: str | None = None,
+    assignment_id: str | None = None,
+    port: int = AGENT_PORT,
+    timeout: float = 15.0,
+) -> bool:
+    """True when a finished stale-rebase conflict-fix worker refused to push
+    because its rebase was not content-preserving (a real conflict, or a
+    patch-id mismatch it caught in step 5 of :func:`build_stale_rebase_briefing`).
+
+    Mirrors :func:`detect_semantic_conflict` exactly (same local-log-then-
+    agent-endpoint lookup, same best-effort ``False`` on any read/transport
+    failure) but reads for :data:`STALE_REBASE_MISMATCH_MARKER` via
+    :func:`stale_rebase_mismatch_verdict_in_text` instead of the semantic
+    marker — the two dispatch types (stale-rebase vs. ordinary conflict-fix)
+    are mutually exclusive per assignment, but callers that don't already
+    know which kind they're looking at can safely check both (#3349 review).
+    """
+    if log_path:
+        try:
+            from pathlib import Path  # noqa: PLC0415
+
+            p = Path(log_path)
+            if p.exists():
+                raw = p.read_text(encoding="utf-8", errors="replace")
+                if stale_rebase_mismatch_verdict_in_text(raw):
+                    return True
+        except OSError:
+            pass
+
+    if host and assignment_id:
+        try:
+            resp = httpx.get(
+                f"http://{host}:{port}/logs/{assignment_id}", timeout=timeout
+            )
+            resp.raise_for_status()
+            return stale_rebase_mismatch_verdict_in_text(resp.text)
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return False
+
+    return False
+
+
 def semantic_escalation_disabled(config: Config | None) -> bool:
     """True when a SEMANTIC give-up has nowhere to escalate to (#2566).
 
@@ -1232,6 +1277,11 @@ def dispatch_conflict_fix(
             # narrowly-authorized sealed-manifest dispatch apart from the
             # ordinary conflict-fix without re-deriving it from the title.
             "sealed_author": sealed_author,
+            # #3349 review (non-blocking): same reasoning as sealed_author
+            # above — lets the audit trail distinguish a staleness-only
+            # rebase dispatch from an ordinary conflict-fix without
+            # re-deriving it from the assignment title prefix.
+            "stale_rebase": stale_rebase,
         },
     )
 
