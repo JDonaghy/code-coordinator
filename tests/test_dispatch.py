@@ -3102,6 +3102,52 @@ class TestRouteWorkByCapability:
         )
         assert result is None
 
+    def test_repo_requires_routes_even_when_no_file_rule_matches(self) -> None:
+        """#3351: vimcode's shape — the repo unconditionally `requires` a
+        capability that no `capability_rules` entry (file-keyed) could ever
+        express repo-wide. A diff touching files matching NO rule at all
+        must still reroute to a machine that declares it."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["vimcode"],
+                repo_paths={"vimcode": "/home/user/src/vimcode"},
+                capabilities=["rust"],
+            ),
+            Machine(
+                name="precision", host="precision.tailnet", repos=["vimcode"],
+                repo_paths={"vimcode": "/home/user/src/vimcode"},
+                capabilities=["rust", "nvim"],
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="vimcode",
+            files_likely=["src/parser.rs"],
+            machines=machines,
+            capability_rules=[],
+            repo_requires=["nvim"],
+        )
+        assert result is not None
+        assert result.machine_name == "precision"
+        assert result.rerouted is True
+        assert result.unmet_capabilities == ()
+
+    def test_repo_requires_empty_behaves_exactly_as_before(self) -> None:
+        """No `repo_requires` at all (the default) must match today's
+        behaviour precisely — the overwhelming majority of repos never set
+        `Repo.requires`."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["src/cli.py"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["src/macos/"], requires=["macos"])],
+        )
+        assert result is None
+
     def test_no_capable_machine_for_repo_returns_none(self) -> None:
         """No configured machine can even work on this repo at all — that
         refusal belongs to `dispatch()`'s own unresolved-machine/repo_path

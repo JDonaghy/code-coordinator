@@ -2517,6 +2517,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "uat_preview",
         "uat_live_preview",
         "uat_checks",
+        "requires",
     }
 )
 
@@ -2801,6 +2802,17 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
         # without checks (today's behaviour, unchanged).
         uat_checks = _parse_uat_checks(entry.get("uat_checks"), i)
 
+        # #3351: requires — capabilities EVERY leg of this repo needs,
+        # regardless of which files a diff touches. See `Repo.requires`'s
+        # docstring for why this is a repo-scoped field rather than another
+        # `smoke_tests.capability_rules` entry (that mechanism is keyed by
+        # file-path prefix across the WHOLE fleet, not by repo, so it cannot
+        # express "every leg of THIS repo" without risking over-matching
+        # every other repo that happens to share a path prefix).
+        requires = entry.get("requires", []) or []
+        if not isinstance(requires, list) or not all(isinstance(r, str) for r in requires):
+            raise ConfigError(f"repos[{i}].requires must be a list of strings")
+
         repos.append(
             Repo(
                 name=name,
@@ -2822,6 +2834,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 uat_preview=uat_preview,
                 uat_live_preview=uat_live_preview_raw,
                 uat_checks=uat_checks,
+                requires=list(requires),
             )
         )
     return repos, warnings

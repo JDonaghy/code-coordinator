@@ -17,6 +17,13 @@ Public entry points:
 
 - `match_rules(touched_files, rules)`  — pure: returns the union of required
   capabilities for any rule whose `files` prefix matches a touched file.
+- `required_capabilities(repo_requires, touched_files, rules)` (#3351) —
+  pure: `match_rules`'s result UNION `repo_requires` (`Repo.requires` —
+  capabilities every leg of a repo needs regardless of which files
+  changed, e.g. vimcode's repo-wide nvim-conformance oracle). The single
+  function both this module's own routing and `coord.dispatch.
+  route_work_by_capability`'s Work-leg routing call, so the two answer
+  "what does this diff need" identically.
 - `partition_capability_requirements(touched_files, rules, capable_for)`
   (#3177) — pure: groups matched rules' requirements into the fewest
   capability sets a single configured machine can each satisfy, and reports
@@ -62,7 +69,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -266,6 +273,33 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
             continue
         for cap in rule.requires:
             seen.setdefault(cap, None)
+    return list(seen.keys())
+
+
+def required_capabilities(
+    repo_requires: Iterable[str], touched_files: list[str], rules: list[SmokeRule]
+) -> list[str]:
+    """Every capability a diff needs: `repo_requires` (`Repo.requires`,
+    #3351 — capabilities EVERY leg of this repo needs regardless of which
+    files changed, e.g. vimcode's repo-wide nvim-conformance oracle) UNION
+    whichever `capability_rules` a touched file matches (`match_rules`).
+
+    This is the single function both `dispatch_smoke` (Test-stage routing,
+    below) and `coord.dispatch.route_work_by_capability` (#3241, Work-leg
+    routing) call to answer "what does this diff need" — so the two can
+    never drift into disagreeing answers (#2096, "one question, one
+    answer"), the same guarantee `_rule_matches` already gives the
+    file-based half of this question.
+
+    Deterministic order: `repo_requires` first (declaration order), then
+    any additional capability a matched rule contributes that isn't already
+    in `repo_requires`.
+    """
+    seen: dict[str, None] = {}
+    for cap in repo_requires:
+        seen.setdefault(cap, None)
+    for cap in match_rules(touched_files, rules):
+        seen.setdefault(cap, None)
     return list(seen.keys())
 
 
@@ -2253,6 +2287,16 @@ def _dispatch_smoke_legs(
     # rules split across capability sets no one machine carries together must
     # dispatch one leg per partition, not silently narrow to (or fail on) the
     # flat union. See `partition_capability_requirements`'s module docstring.
+    #
+    # #3351: `repo.requires` (repo-wide capabilities, unconditional on
+    # `touched`) is NOT folded into this partitioning step — only into the
+    # flat `required_capabilities` union `_dispatch_smoke_single_leg` computes
+    # below. That is exact for every repo declaring `requires` today (vimcode
+    # has zero `capability_rules` entries of its own, so this always yields
+    # `partitions == []` and the single-leg path runs). A future repo that
+    # combines `requires` with its OWN multi-partition-triggering
+    # `capability_rules` would need `repo.requires` folded in here too —
+    # tracked as a known gap, not a silent one.
     def _capable_for(caps: list[str]) -> bool:
         return bool(_capability_matched_machines(caps, completed.repo_name, config))
 
@@ -2330,7 +2374,11 @@ def _dispatch_smoke_single_leg(
     ):
         return None
 
-    required_caps = match_rules(touched, smoke_cfg.capability_rules)
+    # #3351: `repo.requires` (repo-wide, e.g. vimcode's nvim oracle) UNION
+    # whatever `capability_rules` this diff's touched files match — see
+    # `required_capabilities`'s docstring for why this must be the one
+    # function both routing paths call.
+    required_caps = required_capabilities(repo.requires, touched, smoke_cfg.capability_rules)
     # #2091: resolve *with* provenance — the Test verdict this dispatch will
     # produce is only as meaningful as the suite behind it. #3056: pass the
     # touched files so a matching rule's own `command` (routing AND the

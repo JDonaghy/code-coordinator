@@ -624,23 +624,27 @@ def dispatch(
 
     # #3241: STRUCTURAL CAPABILITY-ROUTING GATE — a `type="work"` diff whose
     # declared `## Files` (`proposal.files_likely`) match
-    # `smoke_tests.capability_rules` gets rerouted to the machine that best
-    # satisfies them, using the SAME matcher (`coord.smoke.match_rules`) the
-    # Test stage's own routing uses. Without this, work dispatch picked
-    # purely by load/name among machines that merely carry the repo, so a
-    # platform-specific diff could land on a machine that can never run its
-    # own suite — the worker then self-records an UNCONFIRMED `coord test`
-    # verdict (#2217/#2464) because no independent re-run was ever possible
-    # there. See `route_work_by_capability`'s and `CapabilityRouting`'s
-    # docstrings for the multi-capability (never-zero-machines) case.
+    # `smoke_tests.capability_rules`, OR whose repo unconditionally
+    # `requires` a capability (#3351), gets rerouted to the machine that best
+    # satisfies them, using the SAME function (`coord.smoke.
+    # required_capabilities`) the Test stage's own routing uses. Without
+    # this, work dispatch picked purely by load/name among machines that
+    # merely carry the repo, so a platform-specific diff could land on a
+    # machine that can never run its own suite — the worker then
+    # self-records an UNCONFIRMED `coord test` verdict (#2217/#2464) because
+    # no independent re-run was ever possible there. See
+    # `route_work_by_capability`'s and `CapabilityRouting`'s docstrings for
+    # the multi-capability (never-zero-machines) case.
     capability_routing: CapabilityRouting | None = None
     if proposal.type == "work":
+        repo_cfg_for_routing = config.repo(proposal.repo_name)
         capability_routing = route_work_by_capability(
             proposed_machine_name=proposal.machine_name,
             repo_name=proposal.repo_name,
             files_likely=proposal.files_likely,
             machines=config.machines,
             capability_rules=config.smoke_tests.capability_rules,
+            repo_requires=repo_cfg_for_routing.requires if repo_cfg_for_routing else (),
         )
         if capability_routing is not None and capability_routing.rerouted:
             proposal.machine_name = capability_routing.machine_name
@@ -1226,22 +1230,26 @@ def route_work_by_capability(
     files_likely: list[str],
     machines: list[Machine],
     capability_rules: list[SmokeRule],
+    repo_requires: Iterable[str] = (),
     now: "datetime | None" = None,
 ) -> CapabilityRouting | None:
     """Pick the machine for a `type="work"` dispatch whose declared `##
-    Files` (`files_likely`) match `smoke_tests.capability_rules` (#3241).
+    Files` (`files_likely`) match `smoke_tests.capability_rules`, OR whose
+    repo unconditionally `requires` a capability (#3241, #3351).
 
-    Reuses `coord.smoke.match_rules` — the SAME matcher the Test stage's own
-    routing uses — rather than a second copy of the "does this rule apply"
-    logic. #2096 ("one question, one answer"): a second copy drifting from
-    the first is how the dead-prefix bugs in #1072 and #2953 happened.
-    Deferred import (not a module-level one) because `coord.smoke` imports
-    `AGENT_PORT`/`ASSIGN_POST_TIMEOUT_SECS` from this module — a module-level
-    import here would be circular.
+    Reuses `coord.smoke.required_capabilities` — the SAME function the Test
+    stage's own routing uses to union `repo_requires` (`Repo.requires`,
+    #3351 — e.g. vimcode's repo-wide nvim oracle) with the file-matched
+    `capability_rules` result — rather than a second copy of the "what does
+    this diff need" logic. #2096 ("one question, one answer"): a second copy
+    drifting from the first is how the dead-prefix bugs in #1072 and #2953
+    happened. Deferred import (not a module-level one) because `coord.smoke`
+    imports `AGENT_PORT`/`ASSIGN_POST_TIMEOUT_SECS` from this module — a
+    module-level import here would be circular.
 
-    Returns `None` when `files_likely` matches no capability rule at all
-    (the overwhelmingly common case) or when no machine survives the
-    candidate filter below — both are the caller's signal to leave
+    Returns `None` when neither `repo_requires` nor `files_likely` needs
+    anything (the overwhelmingly common case) or when no machine survives
+    the candidate filter below — both are the caller's signal to leave
     `proposal.machine_name` exactly as proposed; `dispatch()`'s own
     unresolved-machine/repo_path checks are the right place for THAT
     refusal, not a second one here.
@@ -1289,9 +1297,9 @@ def route_work_by_capability(
     one machine fully covers it.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
-    from coord.smoke import match_rules  # noqa: PLC0415
+    from coord.smoke import required_capabilities  # noqa: PLC0415
 
-    required = match_rules(files_likely, capability_rules)
+    required = required_capabilities(repo_requires, files_likely, capability_rules)
     if not required:
         return None
 

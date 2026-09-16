@@ -167,6 +167,28 @@ class Repo:
     # `coord uat --passed` writes (attributed to `actor="checker"`), so
     # `evaluate_uat_verdict` never needs to know a third path exists.
     uat_checks: UatCheckConfig | None = None
+    # #3351: capabilities EVERY leg of this repo needs, regardless of which
+    # files a diff touches — the repo-level counterpart to
+    # `smoke_tests.capability_rules`, which can only gate on a matched file
+    # path (`coord.smoke.match_rules`). vimcode's `tests/nvim_conformance.rs`
+    # (vimcode#865) is the motivating case: it hard-fails on EVERY lane
+    # regardless of which files changed, so a `files:`-keyed rule can never
+    # correctly cover it — worse, `capability_rules` patterns are matched by
+    # PATH PREFIX across the WHOLE fleet, not scoped to one repo (see the
+    # `#2899, AND THE SHARP EDGE...` comment in coordinator.example.yml), and
+    # vimcode shares `Cargo.toml`/`Cargo.lock`/`src/` with every other Rust
+    # repo in this fleet (quadraui, coord-tui) — a "catch-all" files glob
+    # broad enough to cover vimcode would also over-match those siblings and
+    # needlessly gate THEIR routing on `nvim`. This field sidesteps both
+    # problems: it is keyed by repo name (this dataclass), never by path.
+    #
+    # `coord.smoke.required_capabilities` is the single function that unions
+    # this list with `match_rules`'s file-matched result — both
+    # `coord.smoke.dispatch_smoke` (Test-stage routing) and
+    # `coord.dispatch.route_work_by_capability` (#3241, Work-leg routing)
+    # call it, so the two can never drift into disagreeing answers about
+    # what a diff needs (#2096, "one question, one answer").
+    requires: list[str] = field(default_factory=list)
 
     def unresolved_uat_preview_placeholder(
         self,
