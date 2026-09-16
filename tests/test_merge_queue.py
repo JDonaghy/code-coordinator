@@ -5236,6 +5236,55 @@ class TestUatGate:
         assert "abc123" not in message
         assert gh.deployment_url_calls == []
 
+    def test_evaluate_uat_verdict_unresolved_override_falls_through_to_live_lookup(
+        self,
+    ) -> None:
+        # #3350: an override template that references `{pr_number}` but has
+        # no value for this entry (grocery-list#36's exact shape) must NOT
+        # stop at a partially-rendered dead link — it falls through to the
+        # live lookup, same as if `uat_preview` were unset entirely.
+        cfg = self._config(
+            uat_preview="https://example.com/pull/{pr_number}", uat_live_preview=True,
+        )
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        gh = FakeGh(deployment_urls={"worker/w1": "https://abc123.example.pages.dev"})
+        ok, message = mq.evaluate_uat_verdict(_q("w1", pr=None), board, cfg, gh)
+        assert ok is False
+        assert "preview: https://abc123.example.pages.dev" in message
+        assert "/pull/" not in message
+
+    def test_evaluate_uat_verdict_unresolved_override_no_live_preview_names_gap(
+        self,
+    ) -> None:
+        # #3350: no `uat_live_preview` to fall through to either — the
+        # message must name the unresolved placeholder, never print a URL
+        # with a trailing empty path segment (the grocery-list#36 bug).
+        cfg = self._config(
+            uat_preview="https://example.com/pull/{pr_number}", uat_live_preview=False,
+        )
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1", pr=None), board, cfg)
+        assert ok is False
+        assert "/pull/" not in message
+        assert "could not be resolved" in message
+        assert "pr_number" in message
+
+    def test_evaluate_uat_verdict_override_resolves_when_pr_number_known(self) -> None:
+        # Same template as above, but this entry DOES have a pr_number —
+        # renders the real link, not a guess.
+        cfg = self._config(
+            uat_preview="https://example.com/pull/{pr_number}", uat_live_preview=True,
+        )
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        gh = FakeGh(deployment_urls={"worker/w1": "https://abc123.example.pages.dev"})
+        ok, message = mq.evaluate_uat_verdict(_q("w1", pr=37), board, cfg, gh)
+        assert ok is False
+        assert "preview: https://example.com/pull/37" in message
+        assert gh.deployment_url_calls == []
+
     def test_evaluate_uat_verdict_unresolved_preview_says_so(self) -> None:
         # #2948 acceptance bar: `uat_live_preview` is set but the live lookup
         # finds nothing for this branch — the message must say the URL is
