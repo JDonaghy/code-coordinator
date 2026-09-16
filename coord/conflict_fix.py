@@ -31,6 +31,16 @@ is explicitly authorized to resolve a ``manifest.yml`` conflict additively
 and nothing else. It refuses (and the entry escalates to a human exactly
 like any other conflict-fix failure) the moment the conflict reaches beyond
 that one file.
+
+#3349: a merge entry can also be refused with no conflict at all — a
+``checks_stale`` merge-gate refusal (:data:`coord.merge_queue.CI_STALE_PREFIX`)
+means the branch's CI ran against a base that has since moved, and only a
+rebase clears it. ``dispatch_conflict_fix(..., stale_rebase=True)`` reuses
+this same worker for that case, briefed narrowly (see
+:func:`build_stale_rebase_briefing`) to perform a PURE, content-preserving
+rebase and refuse — rather than resolve — the instant a real conflict or a
+content change (a ``git patch-id --stable`` mismatch) shows up, since that
+would mean the "just stale" premise was wrong.
 """
 
 from __future__ import annotations
@@ -477,6 +487,158 @@ def sealed_conflict_could_touch_manifest(files: list[str]) -> bool:
     return any(_is_sealed_manifest_path(f) for f in files)
 
 
+# ── #3349: stale-CI rebase (no expected conflict) ───────────────────────────
+#
+# A `checks_stale` merge-gate refusal (`coord.merge_queue.CI_STALE_PREFIX`)
+# means the PR's CI ran against a base that has since moved — nothing is
+# actually IN CONFLICT, only stale. A plain `git pull --rebase` is expected
+# to apply cleanly and reproduce the EXACT same diff (content-addressed
+# patch-id unchanged) — the #951 reference case this issue is built from was
+# one clean commit, `git patch-id --stable` byte-identical before and after.
+# If that does NOT hold — a real conflict marker appears, or the rebase
+# completes but the patch-id changed anyway — the "just stale" premise was
+# wrong: the base's move actually overlaps this branch's own changes, which
+# needs a human judgment call, not a guess from an automatic worker. This
+# briefing is deliberately narrower than :func:`build_conflict_fix_briefing`
+# (which expects and resolves real conflicts): it refuses to touch a
+# conflict marker at all, mirroring the sealed-author briefing's "refuse the
+# instant scope is exceeded" shape rather than the mechanical/semantic
+# self-classification one.
+
+# Marker a stale-rebase conflict-fix worker's log carries when it refuses
+# because the rebase was not content-preserving (a real conflict, or a
+# patch-id mismatch) — mirrors SEMANTIC_STUCK_MARKER/SEALED_SCOPE_STUCK_
+# MARKER: a fixed, machine-parseable string, not prose.
+STALE_REBASE_MISMATCH_MARKER = "coord:conflict=stale-rebase-mismatch"
+
+# Title prefix for a stale-rebase conflict-fix dispatch — visible in the TUI
+# Pipeline row so an operator can tell at a glance this used the narrower,
+# no-conflict-expected briefing rather than the ordinary one.
+STALE_REBASE_FIX_TITLE_PREFIX = "[stale-rebase-fix]"
+
+STALE_REBASE_FIX_SYSTEM_PROMPT = """\
+You are a Claude Code conflict-fix worker. This branch's CI ran against a \
+base that has since moved (a `checks_stale` merge-gate refusal) — there is \
+no known content conflict, only a stale base. Your job is a PURE rebase: \
+replay the branch's existing commits onto the current target branch and \
+push, with no content changes.
+
+Rules:
+- The coordinator denies `gh` and `git push --force` for this worker. \
+Don't try to use them — the harness will reject the call.
+- Stay on the worker's branch — do NOT push to main / develop / target.
+- Use git push --force-with-lease (NOT --force).
+- Before pushing, confirm the rebase changed nothing: compare the branch's \
+content-addressed `git patch-id --stable` against the target branch BEFORE \
+and AFTER the rebase. They must match exactly.
+- If a real conflict marker appears during the rebase, OR the before/after \
+patch-id differs, DO NOT resolve it and DO NOT push. This dispatch is only \
+authorized for a clean, content-preserving rebase — a real conflict means \
+the base's move genuinely overlaps this branch's own changes, which needs a \
+human judgment call, not a guess. Stop and end your turn with a STUCK: line \
+that starts with the marker `coord:conflict=stale-rebase-mismatch`, e.g.
+  STUCK: coord:conflict=stale-rebase-mismatch — patch-id before <hash>, \
+after <hash> differ
+The coordinator reads that marker from your transcript, not your process \
+exit code (which you cannot control), and escalates to a human.
+
+Progress reporting:
+- After each significant step (rebase started, patch-id verified, tests \
+passed, pushed), output:
+  STATUS: [what you just did] → [what you're about to do] → [confidence]
+- If you stop, output the STUCK: line described above and wait for \
+guidance.\
+"""
+
+
+def build_stale_rebase_briefing(
+    *,
+    entry: QueuedMerge,
+    repo_path: str,
+    test_command: str | None,
+) -> str:
+    """Briefing for a conflict-fix dispatched against a ``checks_stale``-only
+    merge-gate refusal (#3349) — no known content conflict, just a base that
+    moved since CI last ran.
+
+    Distinct from :func:`build_conflict_fix_briefing`: that one expects and
+    resolves real conflicts additively; this one explicitly refuses to guess
+    at one at all — a genuine conflict here means the "just stale" premise
+    that triggered this dispatch was wrong, so the worker escalates instead
+    of resolving it.
+    """
+    test_cmd = test_command or "echo '(no test command configured)'"
+    lines: list[str] = [
+        f"# Stale-CI rebase: {entry.repo_github} branch `{entry.branch}`",
+        "",
+        f"`{entry.branch}` was refused for merge into `{entry.target_branch}` "
+        "solely because its CI checks predate the current base — no content "
+        "conflict is known.",
+        f"Reason: {entry.error or 'CI stale'}",
+        "",
+        f"Issue: #{entry.issue_number} — {entry.issue_title}",
+        "",
+        "## Where you are",
+        "",
+        f"You are already in a dedicated git worktree checked out on "
+        f"`{entry.branch}` — the coordinator created it for you. Work HERE.",
+        "",
+        f"Do **NOT** `cd {repo_path}` (that is the machine's shared base "
+        "checkout) and do NOT `git checkout` / `git switch` anywhere. Leaving "
+        f"the base checkout parked on `{entry.branch}` breaks every later "
+        "dispatch against that branch on this machine (#1694).",
+        "",
+        "## Steps",
+        "",
+        "1. `git fetch origin`",
+        "2. Record the pre-rebase content fingerprint: "
+        f"`git diff origin/{entry.target_branch}...HEAD | git patch-id --stable`",
+        f"3. `git pull --rebase origin {entry.target_branch}`",
+        "4. If a conflict marker appears ANYWHERE, stop — see \"When NOT to "
+        "guess\" below. Do not resolve it.",
+        "5. Record the post-rebase fingerprint the same way: "
+        f"`git diff origin/{entry.target_branch}...HEAD | git patch-id --stable`. "
+        "It must EXACTLY match step 2's. If it doesn't, stop — see below.",
+        f"6. Run tests: `{test_cmd}`",
+        f"7. `git push --force-with-lease origin {entry.branch}`",
+        "8. Exit 0 if push succeeds; non-zero otherwise.",
+        "",
+        "## When NOT to guess",
+        "",
+        "This dispatch is authorized for a PURE, content-preserving rebase "
+        "only — not conflict resolution. If a conflict marker appears "
+        "during the rebase, or the patch-id from step 5 differs from step "
+        "2's, DO NOT resolve it and DO NOT push: that means the base "
+        "genuinely overlaps this branch's own changes, which is a human "
+        "judgment call, not this worker's. Stop and end your turn with a "
+        "`STUCK:` line that begins with the exact marker "
+        f"`{STALE_REBASE_MISMATCH_MARKER}` and then names what happened, e.g.",
+        "",
+        f"    STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before <hash>, "
+        "after <hash> differ",
+        "",
+        "The coordinator reads that marker from your transcript, not your",
+        "process exit code (which you cannot control), and escalates to a",
+        f"human on issue #{entry.issue_number}.",
+        "",
+        "You will NOT use `gh` or `git push --force` — both are denied by",
+        "the harness. The coordinator owns PR retries and issue posting.",
+    ]
+    return "\n".join(lines)
+
+
+def stale_rebase_mismatch_verdict_in_text(text: str | None) -> bool:
+    """True when a stale-rebase conflict-fix worker's log carries the
+    :data:`STALE_REBASE_MISMATCH_MARKER` — i.e. it refused because the
+    rebase was not content-preserving (a real conflict, or a patch-id
+    mismatch). Mirrors :func:`semantic_verdict_in_text`/
+    :func:`sealed_scope_verdict_in_text`.
+    """
+    if not text:
+        return False
+    return STALE_REBASE_MISMATCH_MARKER in _decode_worker_text(text)
+
+
 def build_conflict_fix_briefing(
     *,
     entry: QueuedMerge,
@@ -819,6 +981,7 @@ def dispatch_conflict_fix(
     semantic: bool = False,
     model: str | None = None,
     stuck_summary: str | None = None,
+    stale_rebase: bool = False,
 ) -> Assignment | None:
     """Send a ``type="conflict-fix"`` assignment for *entry* to an agent.
 
@@ -867,6 +1030,21 @@ def dispatch_conflict_fix(
     differ. Not wired into the ``semantic=True`` escalation path: a sealed
     entry's refusal is a scope boundary, not a call for a stronger model —
     the file stays sealed regardless of which model resolves it.
+
+    ``stale_rebase=True`` (#3349) dispatches the remedy for a merge-gate
+    refusal recorded SOLELY as CI staleness
+    (``coord.notify``'s ``merge_gate_checks_stale`` stall reason) — no
+    content conflict is known, only a base that moved since CI last ran.
+    Uses :func:`build_stale_rebase_briefing` instead of the ordinary
+    briefing: that one is narrower, authorizing only a PURE,
+    content-preserving rebase (``git patch-id --stable`` verified
+    unchanged before/after) and refusing — STUCK, retry cap consumed
+    exactly like any other conflict-fix failure — the instant a real
+    conflict marker or a content change shows up, rather than attempting
+    to resolve it. Goes through the SAME retry-cap check as the ordinary
+    (non-``semantic``) path below — a staleness-only block that recurs
+    against the same error after a prior conflict-fix attempt escalates to
+    a human exactly like a recurring mechanical conflict would.
     """
     if semantic:
         if has_prior_semantic_escalation(board, entry.assignment_id):
@@ -878,7 +1056,11 @@ def dispatch_conflict_fix(
     ):
         return None
 
-    sealed_author = not semantic and entry.assignment_type in SEALED_PATH_AUTHOR_TYPES
+    sealed_author = (
+        not semantic
+        and not stale_rebase
+        and entry.assignment_type in SEALED_PATH_AUTHOR_TYPES
+    )
 
     repo = config.repo(entry.repo_name)
     if repo is None:
@@ -908,6 +1090,14 @@ def dispatch_conflict_fix(
         title = f"{SEMANTIC_FIX_TITLE_PREFIX} {entry.issue_title}"
         if model:
             title = f"{SEMANTIC_FIX_TITLE_PREFIX}[{model}] {entry.issue_title}"
+    elif stale_rebase:
+        briefing = build_stale_rebase_briefing(
+            entry=entry,
+            repo_path=repo_path,
+            test_command=repo.test_command,
+        )
+        system_prompt = STALE_REBASE_FIX_SYSTEM_PROMPT
+        title = f"{STALE_REBASE_FIX_TITLE_PREFIX} {entry.issue_title}"
     elif sealed_author:
         briefing = build_sealed_manifest_conflict_briefing(
             entry=entry,

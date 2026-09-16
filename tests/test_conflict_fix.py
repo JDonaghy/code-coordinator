@@ -26,15 +26,20 @@ from coord.conflict_fix import (
     SEALED_CONFLICT_FIX_TITLE_PREFIX,
     SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT,
     SEALED_SCOPE_STUCK_MARKER,
+    STALE_REBASE_FIX_TITLE_PREFIX,
+    STALE_REBASE_MISMATCH_MARKER,
     build_conflict_fix_briefing,
     build_sealed_manifest_conflict_briefing,
+    build_stale_rebase_briefing,
     dispatch_conflict_fix,
     pick_conflict_fix_machine,
     sealed_conflict_could_touch_manifest,
     sealed_conflict_is_manifest_only,
     sealed_scope_verdict_in_text,
+    stale_rebase_mismatch_verdict_in_text,
 )
 from coord.merge_queue import (
+    CI_STALE_PREFIX,
     CONFLICT,
     HUMAN_REQUIRED,
     MERGED,
@@ -214,6 +219,60 @@ class TestBuildBriefing:
             entry=_entry(), repo_path="/work/api", test_command=None,
         )
         assert "no test command configured" in briefing
+
+
+# ── #3349: checks_stale rebase (no expected conflict) ───────────────────────
+
+
+class TestBuildStaleRebaseBriefing:
+    def test_contains_pure_rebase_steps_and_patch_id_check(self) -> None:
+        briefing = build_stale_rebase_briefing(
+            entry=_entry(error=f"{CI_STALE_PREFIX} checks predate the current base"),
+            repo_path="/work/api", test_command="pytest -x",
+        )
+        assert "git fetch origin" in briefing
+        assert "git pull --rebase origin main" in briefing
+        assert "git push --force-with-lease origin issue-1-fix" in briefing
+        assert "patch-id" in briefing.lower()
+        assert "pytest -x" in briefing
+
+    def test_refuses_to_guess_on_conflict_or_mismatch(self) -> None:
+        briefing = build_stale_rebase_briefing(
+            entry=_entry(), repo_path="/work/api", test_command="pytest",
+        )
+        assert "DO NOT" in briefing or "do not" in briefing.lower()
+        assert STALE_REBASE_MISMATCH_MARKER in briefing
+
+    def test_includes_error_context(self) -> None:
+        briefing = build_stale_rebase_briefing(
+            entry=_entry(error=f"{CI_STALE_PREFIX} checks predate develop@abcd"),
+            repo_path="/work/api", test_command=None,
+        )
+        assert f"{CI_STALE_PREFIX} checks predate develop@abcd" in briefing
+
+    def test_no_test_command_falls_back(self) -> None:
+        briefing = build_stale_rebase_briefing(
+            entry=_entry(), repo_path="/work/api", test_command=None,
+        )
+        assert "no test command configured" in briefing
+
+
+class TestStaleRebaseMismatchVerdictInText:
+    def test_true_when_marker_present(self) -> None:
+        assert stale_rebase_mismatch_verdict_in_text(
+            f"STATUS: rebasing\nSTUCK: {STALE_REBASE_MISMATCH_MARKER} "
+            "patch-id before abc123, after def456 differ"
+        ) is True
+
+    def test_false_when_absent(self) -> None:
+        assert stale_rebase_mismatch_verdict_in_text("STATUS: pushed\n") is False
+        assert stale_rebase_mismatch_verdict_in_text(None) is False
+        assert stale_rebase_mismatch_verdict_in_text("") is False
+
+    def test_false_for_ordinary_semantic_marker(self) -> None:
+        assert stale_rebase_mismatch_verdict_in_text(
+            "STUCK: coord:conflict=semantic src/foo.py:1-9 — contradictory"
+        ) is False
 
 
 # ── #2555: sealed-author (test-author/mock-author) conflict resolution ─────
@@ -758,6 +817,67 @@ class TestDispatch:
             "HTTP should not be called when the identical failure recurs "
             "after a done conflict-fix"
         )
+
+    def test_stale_rebase_uses_the_narrower_briefing_and_title(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#3349: `stale_rebase=True` sends the stale-rebase system prompt/
+        title, not the ordinary conflict-fix one — the worker gets narrower
+        authorization (pure rebase only, no conflict resolution)."""
+        client = _FakeHTTPClient({"id": "fix-id-stale"})
+        entry = _entry(error=f"{CI_STALE_PREFIX} checks predate the current base")
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop", stale_rebase=True,
+        )
+        assert result is not None
+        assert result.issue_title.startswith(STALE_REBASE_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] != CONFLICT_FIX_SYSTEM_PROMPT
+        assert "patch-id" in payload["briefing"].lower()
+
+    def test_stale_rebase_skips_the_sealed_author_branch(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A `checks_stale` block on a sealed-author (test-author/mock-author)
+        row still gets the stale-rebase briefing, not the sealed-manifest
+        one — a pure, content-preserving rebase can never violate the
+        sealed-path rule (it makes no content changes at all when it
+        succeeds), so there is nothing to special-case here."""
+        client = _FakeHTTPClient({"id": "fix-id-stale-sealed"})
+        entry = _entry(
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+            assignment_type="test-author",
+        )
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop", stale_rebase=True,
+        )
+        assert result is not None
+        assert result.issue_title.startswith(STALE_REBASE_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] != SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+
+    def test_stale_rebase_retry_cap_blocks_second_dispatch_on_recurrence(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """Same retry-cap machinery as the mechanical path: a second
+        staleness block recurring with the identical error after a prior
+        conflict-fix attempt does not dispatch again."""
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="prev-fix", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        entry = _entry(error=f"{CI_STALE_PREFIX} checks predate the current base")
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            entry, board, two_machine_config,
+            http_client=client, stale_rebase=True,
+        )
+        assert result is None
+        assert client.calls == []
 
 
 class TestSemanticEscalationDisabled:

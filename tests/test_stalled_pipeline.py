@@ -33,7 +33,7 @@ from coord.health.checks.stalled_pipeline import (
     probe_stalled_pipeline,
 )
 from coord.health.models import HealthContext, Severity
-from coord.merge_queue import CONFLICT, PENDING, QueuedMerge
+from coord.merge_queue import CI_STALE_PREFIX, CONFLICT, PENDING, QueuedMerge
 from coord.models import Assignment, Board, Machine, Repo
 from coord.worker_events import (
     UsageLimitKill,
@@ -910,6 +910,128 @@ class TestMergeConflictUnresolved:
         assert results == []
 
 
+# ── #3349: checks_stale merge-gate refusal, no automatic remedy anywhere ────
+
+
+class TestMergeGateChecksStale:
+    def test_flags_entry_blocked_solely_on_stale_ci(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "merge_gate_checks_stale"
+        assert "issue-951-fix" in results[0][0].detail
+
+    def test_not_flagged_for_checks_failed(self, config: Config) -> None:
+        """A failing check is not a staleness problem — a rebase must never
+        be offered as a way to mask a genuinely red CI run (acceptance
+        criterion: only `checks_stale` triggers this, not `checks_failed`/
+        `checks_pending`, the other two `MERGE_GATE_REFUSAL_KINDS`)."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error="CI failed: build (failure)",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+    def test_not_flagged_for_checks_pending(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error="CI running: build",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+    def test_not_flagged_when_no_error_recorded(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+    def test_not_flagged_when_conflict_fix_already_active(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+            Assignment(
+                machine_name="mac-mini", repo_name="vimcode", issue_number=951,
+                issue_title="[stale-rebase-fix] t", assignment_id="cf-1",
+                status="running", type="conflict-fix",
+                review_of_assignment_id="work-1",
+            ),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+    def test_not_flagged_when_conflict_fix_retry_cap_hit(self, config: Config) -> None:
+        """#3349 acceptance criterion: a second staleness block against the
+        same base does not dispatch a second worker — `has_prior_conflict_fix`
+        blocks on the SAME error recurring after a prior conflict-fix
+        attempt, exactly like the mechanical-conflict arm."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+            Assignment(
+                machine_name="mac-mini", repo_name="vimcode", issue_number=951,
+                issue_title="[stale-rebase-fix] t", assignment_id="cf-1",
+                status="failed", type="conflict-fix",
+                review_of_assignment_id="work-1",
+            ),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+
 # ── #1478: the dispatch arm ─────────────────────────────────────────────────
 #
 # `dispatch_stalled_pipeline_action` reuses the SAME dispatch machinery the
@@ -1432,6 +1554,75 @@ class TestDispatchPerReason:
         assert action.kind == "conflict_fix_dispatched"
         assert "cf-1" in action.detail
         stub.assert_called_once()
+
+    def test_merge_gate_checks_stale_dispatches_conflict_fix(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#3349: a `checks_stale`-only merge-gate refusal reuses the same
+        conflict-fix worker as `merge_conflict_unresolved`, but with
+        `stale_rebase=True` — the whole point of this issue is that nothing
+        else in the system rescues this block."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_gate_checks_stale"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=951,
+            issue_title="[stale-rebase-fix] t", assignment_id="cf-2",
+            status="pending", type="conflict-fix",
+        )
+        stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        assert "cf-2" in action.detail
+        stub.assert_called_once()
+        _, call_kwargs = stub.call_args
+        assert call_kwargs["stale_rebase"] is True
+
+    def test_merge_gate_checks_stale_no_dispatch_when_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Acceptance criterion: with `auto_dispatch_stalled` unset (default
+        False), detection still narrates, but dispatch does nothing."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_gate_checks_stale"
+
+        stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "disabled"
+        stub.assert_not_called()
 
 
 # ── #2537: merge_conflict_unresolved on a sealed-author row confined to the
