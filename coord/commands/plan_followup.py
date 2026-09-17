@@ -13,6 +13,7 @@ import httpx
 
 from coord.config import Config
 from coord.dispatch import DispatchRefused
+from coord.failure_classifier import classify_failure
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 
@@ -1044,6 +1045,14 @@ def fix(
             or ""
         )
 
+    # #3360: classify the failure BEFORE deciding whether to escalate the
+    # model — see coord/failure_classifier.py for the "compliance vs
+    # capability vs unknown" split. A ratchet/lint/policy failure (compliance)
+    # re-dispatches at the same rung; only a genuine behavioural failure
+    # (capability) climbs the ladder; no evidence at all (unknown) defaults
+    # to NOT escalating.
+    classification = classify_failure(test_output)
+
     guidance_text = guidance or "Fix the failing tests and push."
     if forced_without_evidence and uat_failed and assignment.uat_reason:
         # #3208: a real, board-recorded UAT failure — not the caller merely
@@ -1065,6 +1074,25 @@ def fix(
         _what = "red CI" if ci_story is not None else "a failed smoke test"
         _failure_heading = "CI failure" if ci_story is not None else "Test failure"
 
+    # #3360: when the failure classifies as a compliance nit (a ratchet, a
+    # lint/formatter check, a files_forbidden/sealed-path violation), say so
+    # explicitly — the worker is on the SAME model rung as the attempt that
+    # tripped it, and the fix is normally "read the failure output, it names
+    # the exact rule and often the exact fix" rather than a design problem.
+    _compliance_note = (
+        (
+            f"\n## Note (#3360)\n"
+            f"This failure classified as a **compliance** check "
+            f"({classification.matched}), not a behavioural bug — the model "
+            f"was NOT escalated for this retry. The failure output above "
+            f"almost always names the exact repo-specific rule (a pinned "
+            f"count, a formatting rule, a forbidden file) and often the fix "
+            f"itself. Read it before changing any logic.\n"
+        )
+        if classification.category == "compliance"
+        else ""
+    )
+
     briefing = (
         f"You are fixing {_what} for issue #{assignment.issue_number}: {assignment.issue_title}\n\n"
         f"The previous worker created branch {assignment.branch}. You are already on that branch.\n"
@@ -1074,7 +1102,8 @@ def fix(
         f"Run `git fetch origin && git log --oneline origin/{default_branch}..HEAD` to see what was done.\n"
         f"Run `git diff origin/{default_branch}...HEAD` to see the full diff.\n\n"
         f"## {_failure_heading}\n"
-        f"{test_output}\n\n"
+        f"{test_output}\n"
+        f"{_compliance_note}\n"
         f"## Guidance\n"
         f"{guidance_text}\n\n"
         f"## Rules\n"
@@ -1144,11 +1173,26 @@ def fix(
             "(#3208; the branch is fetched from the remote)",
         )
 
-    # Determine escalated model for the fix-up.
+    # #3360: classify before escalating. Climbing the model-escalation ladder
+    # on EVERY failed leg mis-prices a compliance failure (a ratchet, a
+    # lint/formatter check, a files_forbidden violation) — no model
+    # capability difference lets a worker guess a repo-specific fact it was
+    # never told, and #3357 shows the top rung can still spin for nothing.
+    # Only a failure classified as "capability" climbs; "compliance" and
+    # "unknown" (no evidence to classify) both stay on the current rung.
     original_model = assignment.model or cfg.models.default
-    escalated = cfg.models.next_model(original_model)
+    if classification.should_escalate:
+        escalated = cfg.models.next_model(original_model)
+    else:
+        escalated = original_model
     if escalated != original_model:
         click.echo(f"  escalating model: {original_model} → {escalated}")
+    elif not classification.should_escalate:
+        click.echo(
+            f"  not escalating model (#3360, {classification.category}"
+            + (f": {classification.matched}" if classification.matched else "")
+            + f") — staying on {original_model or 'default'}"
+        )
 
     try:
         new_id = _dispatch_followup(
