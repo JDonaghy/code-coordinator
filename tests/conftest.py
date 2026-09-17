@@ -828,6 +828,29 @@ def _no_real_github_backoff_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_machine_fault_store(monkeypatch, tmp_path):
+    """#3367: never let a test write the OPERATOR'S real
+    ``~/.coord/machine_faults.json``.
+
+    Same hazard as ``_no_real_github_backoff_store`` immediately above, one
+    file over: this one is ``coord.machine_fault``'s consecutive-fault
+    counter, which `_decide_review`/`_decide_work` (`coord/drive.py`) write
+    on every machine-fault classification and which can trigger a REAL
+    `coord.machine_pause.pause()` call once the streak crosses
+    `AUTO_PAUSE_THRESHOLD`. A leaked test write could plant a stale streak
+    that auto-pauses a real fleet machine the next time any test (or a
+    developer's own local run) happens to exercise this path.
+
+    ``coord.machine_fault._state_path`` reads
+    ``$COORD_MACHINE_FAULT_STATE`` first for exactly this redirect, the
+    same env-var seam ``_no_real_github_backoff_store`` uses.
+    """
+    monkeypatch.setenv(
+        "COORD_MACHINE_FAULT_STATE", str(tmp_path / "machine-fault-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_issues_sync_status_store(monkeypatch, tmp_path):
     """#2858: never let a test write the OPERATOR'S real
     ``~/.coord/issues_sync_status.json``.
