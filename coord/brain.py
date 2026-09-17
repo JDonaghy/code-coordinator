@@ -99,6 +99,30 @@ def gather_context(config: Config) -> dict:
             machine_status[machine.name] = resp.json()
         except (httpx.HTTPError, httpx.TimeoutException):
             machine_status[machine.name] = {"status": "offline"}
+            continue
+
+        # #3371: best-effort cross-check of this machine's claude credential
+        # health, so `build_prompt` can steer the brain away from proposing
+        # work on a host that cannot authenticate at all — the #3367 fleet
+        # incident (four zero-turn/$0 dispatch failures to `precision`
+        # before a human noticed) happened precisely because nothing
+        # upstream of dispatch treated a dead credential as disqualifying.
+        # `/status` (fetched above) never carried this — `tool_versions`
+        # only lives in `/health` (#1570 B) — so this is a second request,
+        # not a reuse of the one above; failure here is never fatal to
+        # planning: `claude_credential_ok`'s own degrade-to-"assume
+        # healthy" stance covers a missing/failed fetch the same way it
+        # covers an agent that predates the probe.
+        try:
+            health_resp = httpx.get(
+                f"http://{machine.host}:{AGENT_PORT}/health",
+                timeout=5,
+            )
+            tool_versions = health_resp.json().get("tool_versions")
+            if tool_versions:
+                machine_status[machine.name]["tool_versions"] = tool_versions
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError, AttributeError):
+            pass
 
     return {
         "issues_by_repo": issues_by_repo,
@@ -111,6 +135,7 @@ def build_prompt(config: Config, context: dict) -> str:
     from coord.config import IMPLICIT_PROVIDER_TYPES
     from coord.deps import blocked_repos
     from coord.models import Assignment
+    from coord.prereqs import claude_credential_ok
     from coord.providers import (
         machines_supporting_provider,
         provider_type_for,
@@ -164,6 +189,14 @@ def build_prompt(config: Config, context: dict) -> str:
             state = "paused (do not propose work)"
         elif status.get("status") == "offline":
             state = "offline"
+        elif not claude_credential_ok(status.get("tool_versions")):
+            # #3371: a machine whose `claude` OAuth credential cannot
+            # authenticate is not routable, full stop — every default-
+            # provider dispatch to it fails at turn 1 for $0 (the #3367
+            # incident). Checked before "busy"/"idle": a dead credential
+            # disqualifies regardless of whether it also happens to be
+            # running something else right now.
+            state = "credential dead (do not propose work — #3371)"
         elif status.get("assignment"):
             state = f"busy (working on: {status['assignment'].get('issue_title', '?')})"
         else:

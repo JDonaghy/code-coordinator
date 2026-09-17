@@ -1328,7 +1328,7 @@ def gather_facts(
     ``--ssh``), and absent that, from #3128's own ``worker`` default.
     """
     from coord import network  # noqa: PLC0415
-    from coord.prereqs import ToolProbe, unmet_capabilities  # noqa: PLC0415
+    from coord.prereqs import tool_probe_from_dict, unmet_capabilities  # noqa: PLC0415
 
     machine = next((m for m in cfg.machines if m.name == machine_name), None)
     known_repos = [r.name for r in (getattr(cfg, "repos", None) or [])]
@@ -1370,19 +1370,15 @@ def gather_facts(
             facts.version = health.get("version")
             facts.health_checks = health_checks_from_health(health)
 
-            # Same construction `coord doctor` uses (coord/commands/status.py)
-            # — `what_breaks` is a static description that never crosses the
-            # wire, so it is reconstructed as empty rather than guessed.
+            # #3371: the SAME reconstruction `coord doctor` uses
+            # (`coord.prereqs.tool_probe_from_dict`, coord/commands/status.py)
+            # — this used to duplicate that construction inline, which is
+            # exactly the split-brain #2096 warns about ("two independent
+            # implementations that agree today"). `what_breaks` is a static
+            # description that never crosses the wire, so it is
+            # reconstructed as empty rather than guessed.
             probes = {
-                tool: ToolProbe(
-                    tool=tool,
-                    capability=spec.get("capability"),
-                    found=bool(spec.get("found", False)),
-                    version=spec.get("version"),
-                    min_version=spec.get("min_version"),
-                    meets_floor=spec.get("meets_floor"),
-                    what_breaks="",
-                )
+                tool: tool_probe_from_dict(tool, spec)
                 for tool, spec in (health.get("tool_versions") or {}).items()
                 if isinstance(spec, dict)
             }

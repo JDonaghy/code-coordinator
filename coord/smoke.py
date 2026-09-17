@@ -1100,18 +1100,13 @@ def _capability_probe_reasons(
     if not raw_probes:
         return {}
 
-    from coord.prereqs import ToolProbe, unmet_capabilities
+    from coord.prereqs import tool_probe_from_dict, unmet_capabilities
 
+    # #3371: the SAME reconstruction `coord doctor` and `coord.machine_onboard`
+    # use (`tool_probe_from_dict`) — not a fourth independent copy of the same
+    # dict->ToolProbe logic (#2096's "one question, one answer").
     probes = {
-        tool: ToolProbe(
-            tool=tool,
-            capability=info.get("capability"),
-            found=bool(info.get("found", False)),
-            version=info.get("version"),
-            min_version=info.get("min_version"),
-            meets_floor=info.get("meets_floor"),
-            what_breaks="",
-        )
+        tool: tool_probe_from_dict(tool, info)
         for tool, info in raw_probes.items()
         if isinstance(info, dict)
     }

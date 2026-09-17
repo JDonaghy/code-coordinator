@@ -101,6 +101,60 @@ class TestBuildPrompt:
         assert "busy" in prompt
         assert "Something" in prompt
 
+    def test_dead_credential_machine_is_flagged_not_routable(self, config: Config) -> None:
+        """#3371: a machine whose claude OAuth credential cannot
+        authenticate must read as unroutable in the brain's own prompt, not
+        "idle" — the #3367 incident was exactly this: `precision` looked
+        idle and kept getting proposed while its credential was dead."""
+        context = {
+            "issues_by_repo": {"api": [], "shared": []},
+            "machine_status": {
+                "laptop": {
+                    "status": "idle",
+                    "tool_versions": {
+                        "claude": {
+                            "found": False, "version": None,
+                            "min_version": None, "meets_floor": None,
+                            "capability": None, "ok": False,
+                            "expires_at": None,
+                        },
+                    },
+                },
+                "server": {"status": "idle"},
+            },
+        }
+        prompt = build_prompt(config, context)
+        laptop_line = next(l for l in prompt.splitlines() if l.startswith("- laptop"))
+        assert "credential dead" in laptop_line
+        # `server` has no tool_versions at all (degrade-to-ok) and must
+        # still read as ordinarily idle.
+        server_line = next(l for l in prompt.splitlines() if l.startswith("- server"))
+        assert "idle" in server_line
+        assert "credential dead" not in server_line
+
+    def test_healthy_credential_machine_stays_idle(self, config: Config) -> None:
+        context = {
+            "issues_by_repo": {"api": [], "shared": []},
+            "machine_status": {
+                "laptop": {
+                    "status": "idle",
+                    "tool_versions": {
+                        "claude": {
+                            "found": True, "version": "max",
+                            "min_version": None, "meets_floor": None,
+                            "capability": None, "ok": True,
+                            "expires_at": None,
+                        },
+                    },
+                },
+                "server": {"status": "idle"},
+            },
+        }
+        prompt = build_prompt(config, context)
+        laptop_line = next(l for l in prompt.splitlines() if l.startswith("- laptop"))
+        assert "idle" in laptop_line
+        assert "credential dead" not in laptop_line
+
     def test_long_body_truncated(self, config: Config) -> None:
         context = {
             "issues_by_repo": {
@@ -214,6 +268,57 @@ class TestGatherContext:
 
         ctx = gather_context(config)
         assert ctx["machine_status"]["laptop"] == {"status": "offline"}
+
+    @patch("coord.brain.httpx.get")
+    @patch("coord.brain.github_ops.get_open_issues")
+    def test_carries_tool_versions_from_health_for_credential_check(
+        self, mock_issues: MagicMock, mock_get: MagicMock, config: Config,
+    ) -> None:
+        """#3371: `gather_context` must also fetch `/health`'s
+        `tool_versions` (not just `/status`) — `build_prompt`'s
+        credential-dead routing check has nothing to read otherwise."""
+        mock_issues.return_value = []
+        status_resp = MagicMock()
+        status_resp.json.return_value = {"status": "idle"}
+        health_resp = MagicMock()
+        health_resp.json.return_value = {
+            "tool_versions": {"claude": {"found": False, "ok": False}},
+        }
+
+        def _get(url, timeout):
+            return health_resp if url.endswith("/health") else status_resp
+
+        mock_get.side_effect = _get
+
+        ctx = gather_context(config)
+        assert ctx["machine_status"]["laptop"]["tool_versions"] == {
+            "claude": {"found": False, "ok": False},
+        }
+        # `/status` fields are preserved alongside the merged-in field.
+        assert ctx["machine_status"]["laptop"]["status"] == "idle"
+
+    @patch("coord.brain.httpx.get")
+    @patch("coord.brain.github_ops.get_open_issues")
+    def test_health_fetch_failure_is_best_effort(
+        self, mock_issues: MagicMock, mock_get: MagicMock, config: Config,
+    ) -> None:
+        """A `/health` fetch failure must not break planning — it just
+        leaves `tool_versions` unset, which `claude_credential_ok`
+        degrades to "assume healthy"."""
+        mock_issues.return_value = []
+        status_resp = MagicMock()
+        status_resp.json.return_value = {"status": "idle"}
+        import httpx
+
+        def _get(url, timeout):
+            if url.endswith("/health"):
+                raise httpx.ConnectError("refused")
+            return status_resp
+
+        mock_get.side_effect = _get
+
+        ctx = gather_context(config)
+        assert ctx["machine_status"]["laptop"] == {"status": "idle"}
 
 
 class TestPropose:

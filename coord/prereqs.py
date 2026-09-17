@@ -80,6 +80,14 @@ class ToolProbe:
     min_version: str | None
     meets_floor: bool | None  # None: no floor to check, or version unknown
     what_breaks: str
+    # #3371: epoch-milliseconds expiry of whatever credential backs this
+    # probe, when the probe can actually read one — today only the `claude`
+    # baseline prereq on Linux populates this (from
+    # `claudeAiOauth.refreshTokenExpiresAt`; darwin's Keychain-backed probe
+    # is presence-only and leaves this `None`, see the module comment above
+    # `_probe_claude_credentials_darwin`). `None` means "no expiry known",
+    # not "never expires" — never treat it as a green signal.
+    expires_at: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -104,6 +112,7 @@ class ToolProbe:
             "meets_floor": self.meets_floor,
             "capability": self.capability,
             "ok": self.ok,
+            "expires_at": self.expires_at,
         }
 
 
@@ -604,10 +613,23 @@ def _probe_claude_credentials_linux(prereq: Prereq, _timeout: float) -> ToolProb
             "re-authenticate",
         )
     tier = oauth.get("subscriptionType") or oauth.get("rateLimitTier")
+    # #3371: surface "whatever expiry is knowable" — `refreshTokenExpiresAt`
+    # is the SESSION lifetime (weeks), not the short-lived access token's
+    # `expiresAt` (hours, auto-refreshed and therefore not the thing an
+    # operator needs forward visibility into — see this field's own
+    # `refresh_expired` check above, which already treats it as the
+    # authoritative "is this credential dead" signal). Only published when
+    # it parses as a real positive timestamp; a missing/garbled field
+    # degrades to `None` ("no expiry known"), never to a fabricated one.
+    known_expires_at = (
+        float(refresh_expires_at)
+        if isinstance(refresh_expires_at, (int, float)) and refresh_expires_at > 0
+        else None
+    )
     return ToolProbe(
         tool=prereq.tool, capability=prereq.capability, found=True,
         version=tier, min_version=prereq.min_version, meets_floor=None,
-        what_breaks=prereq.what_breaks,
+        what_breaks=prereq.what_breaks, expires_at=known_expires_at,
     )
 
 
@@ -1021,6 +1043,106 @@ def probe_all(
 def tool_versions_summary(probes: dict[str, ToolProbe]) -> dict[str, dict]:
     """JSON-friendly form of `probe_all()`'s result."""
     return {tool: p.to_dict() for tool, p in probes.items()}
+
+
+def tool_probe_from_dict(tool: str, info: dict) -> ToolProbe:
+    """Reconstruct a :class:`ToolProbe` from one entry of a `/health`
+    response's `tool_versions` dict (the shape :meth:`ToolProbe.to_dict`
+    produces).
+
+    #3371 / #2096 ("one question, one answer"): this is the ONE place a
+    `/health` payload's raw probe dict is turned back into a `ToolProbe` so
+    ``.ok`` can be asked of it. Before this existed, `coord doctor` did this
+    reconstruction inline and nothing else could reuse it — a second caller
+    (:func:`claude_credential_ok`, added the same issue) would otherwise
+    have had to re-derive its own opinion of "is this probe OK" from the
+    raw dict fields, which is exactly the split-brain #2096 warns about.
+    `what_breaks` is not part of the wire payload (`to_dict()` omits it —
+    it is prose for a human reading `coord doctor`'s own probe table, not a
+    live probe's `Prereq.what_breaks`), so it is left empty here; nothing
+    downstream reads it off a reconstructed probe.
+    """
+    return ToolProbe(
+        tool=tool,
+        capability=info.get("capability"),
+        found=bool(info.get("found", False)),
+        version=info.get("version"),
+        min_version=info.get("min_version"),
+        meets_floor=info.get("meets_floor"),
+        what_breaks="",
+        expires_at=info.get("expires_at"),
+    )
+
+
+def claude_credential_ok(tool_versions: dict | None) -> bool:
+    """Can this machine's default-provider (`claude`) OAuth credential
+    authenticate right now?
+
+    Single source of truth for that question (#3371, #2096's "one question,
+    one answer"): `coord doctor` and `coord plan`'s routing filter
+    (`coord.brain.build_prompt`) must both answer it by calling THIS, not
+    by maintaining two independent opinions derived from the same
+    `tool_versions["claude"]` dict that could silently drift apart — see
+    #3367/#3368/#3369's incident, where nothing upstream of a failed
+    dispatch treated a dead credential as disqualifying at all.
+
+    Degrades to `True` ("assume healthy") when `tool_versions` is missing
+    entirely, or has no `claude` entry — an agent that predates #3326's
+    probe, or one whose `/health` call itself failed and left this field
+    unset, must not be newly treated as broken. That matches every other
+    `tool_versions` consumer's degrade-to-unknown stance (`coord doctor`'s
+    "no tool_versions in /health" branch; `unmet_capabilities`'s `p is
+    None` skip).
+    """
+    if not tool_versions:
+        return True
+    info = tool_versions.get("claude")
+    if not isinstance(info, dict):
+        return True
+    return tool_probe_from_dict("claude", info).ok
+
+
+#: How far ahead of a KNOWN `claude` credential expiry `coord doctor` warns
+#: (#3371 — the operator's own complaint was "no insight into when it
+#: expires", not just "no insight that it already has"). 3 days: the fleet
+#: table in #3371's evidence shows access-token churn on the order of
+#: hours, but the underlying session/refresh-token lifetime is "a few
+#: weeks" per the same report — 3 days gives a human time to notice a
+#: `coord doctor` run and re-authenticate before the #3367 incident (four
+#: zero-cost dispatch failures before anyone noticed) repeats. Only ever
+#: fires when `expires_at` is actually known (see `ToolProbe.expires_at`'s
+#: docstring) — silence here is "no expiry known", never "not expiring".
+CLAUDE_CREDENTIAL_EXPIRY_WARN_SECONDS = 3 * 24 * 3600.0
+
+
+def claude_credential_expiry_warning(info: dict, *, now: float | None = None) -> str | None:
+    """Human-readable warning when *info* (one `tool_versions["claude"]`
+    entry) names a known expiry within
+    :data:`CLAUDE_CREDENTIAL_EXPIRY_WARN_SECONDS`, else `None`.
+
+    Only meaningful for a probe that is currently `ok` — an already-dead
+    credential is reported by the ordinary `✗ claude: ...` line `coord
+    doctor` already renders (via `tool_probe_from_dict(...).ok`), and
+    re-flagging it here as "expiring soon" would just be a second, weaker
+    name for the same failure. Callers should check `.ok` first.
+
+    *now* defaults to `time.time() * 1000` (`expires_at` is epoch
+    milliseconds, matching `claudeAiOauth.refreshTokenExpiresAt`); overridable
+    for tests.
+    """
+    expires_at = info.get("expires_at") if isinstance(info, dict) else None
+    if not isinstance(expires_at, (int, float)) or expires_at <= 0:
+        return None
+    now_ms = (time.time() if now is None else now) * 1000.0
+    remaining_seconds = (expires_at - now_ms) / 1000.0
+    if remaining_seconds <= 0 or remaining_seconds > CLAUDE_CREDENTIAL_EXPIRY_WARN_SECONDS:
+        return None
+    remaining_days = remaining_seconds / 86400.0
+    return (
+        f"claude credential expires in ~{remaining_days:.1f} day(s) — "
+        "re-authenticate (`claude` or `claude setup-token`) before it does "
+        "(#3371)"
+    )
 
 
 def unmet_capabilities(
