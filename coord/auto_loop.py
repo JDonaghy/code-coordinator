@@ -50,6 +50,7 @@ from coord import sql
 from coord.config import Config
 from coord.db import is_lock_contention_error
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
+from coord.failure_classifier import classify_failure
 from coord import github_ops
 from coord.models import (
     SEALED_PATH_AUTHOR_TYPES,
@@ -813,7 +814,9 @@ def fix_round_title(base_title: str, iteration: int) -> str:
     return f"[fix-{iteration}] {stripped}"
 
 
-def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
+def _fix_model_for_iteration(
+    config: Config, iteration: int, failure_text: str | None = None,
+) -> str | None:
     """Choose the model alias for a fix worker on a given bounce *iteration*.
 
     Pure function so the iteration → model mapping is unit-testable.
@@ -825,7 +828,16 @@ def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
     When escalation is enabled:
       - iteration 1 → ``config.models.default`` (first fix stays cheap/fast).
       - iteration 2+ → climb one rung up ``config.models.escalation`` per
-        iteration, capped at the top of the ladder.
+        iteration, capped at the top of the ladder — UNLESS *failure_text*
+        (#3360, the review/test-failure text that triggered THIS iteration)
+        classifies as a compliance nit (see ``coord/failure_classifier.py``),
+        in which case this iteration stays on the rung iteration-1 already
+        reached instead of climbing further. Escalating a review's compliance
+        nit — a ratchet, a lint/formatter check, a ``files_forbidden``
+        violation — mis-prices it exactly like #3357: no model capability
+        difference lets a worker guess a repo-specific fact it was never
+        told. ``failure_text=None`` (the default) preserves the old
+        pure-iteration ladder for callers that have no failure text to offer.
 
     Example with escalation ``[haiku, sonnet, opus]`` and default ``sonnet``:
     iter 1 → sonnet, iter 2 → opus, iter 3 → opus (capped).
@@ -845,11 +857,17 @@ def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
     )
     if not model:
         return None
-    # iteration 1 stays on the base model; each later iteration escalates one
-    # rung (next_model caps at the top of the ladder).
-    for _ in range(max(iteration, 1) - 1):
+    steps = max(iteration, 1) - 1
+    if steps <= 0:
+        return model
+    # Climb every step EXCEPT the last one unconditionally — the last step is
+    # the rung THIS iteration's failure would buy, and #3360 gates it.
+    for _ in range(steps - 1):
         model = config.models.next_model(model)
-    return model
+    if failure_text is not None and not classify_failure(failure_text).should_escalate:
+        # Compliance nit (or no evidence) — stay on the rung already reached.
+        return model
+    return config.models.next_model(model)
 
 
 def _merge_blocking_review_findings(
@@ -1061,7 +1079,13 @@ def _dispatch_fix_for_review(
     briefing = issue_context_block(work.repo_name, work.issue_number) + _build_fix_briefing(
         work, merged_findings, next_iteration, max_iter
     )
-    model = _fix_model_for_iteration(config, next_iteration)
+    # #3360: classify the review findings driving THIS bounce before letting
+    # the iteration counter buy a bigger model — a request-changes review
+    # that flags a compliance nit (ratchet, lint, files_forbidden) must not
+    # climb the ladder just because it landed on a later iteration.
+    model = _fix_model_for_iteration(
+        config, next_iteration, failure_text=merged_findings.body,
+    )
     fix_failure: list[str] = []
     fix = _dispatch_fix(
         work, briefing, board, config, next_iteration,

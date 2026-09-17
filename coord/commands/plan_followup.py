@@ -1079,6 +1079,9 @@ def fix(
     # explicitly — the worker is on the SAME model rung as the attempt that
     # tripped it, and the fix is normally "read the failure output, it names
     # the exact rule and often the exact fix" rather than a design problem.
+    # Newline-terminated (with the trailing blank line the briefing needs
+    # before "## Guidance") either way, so the assembly below never needs a
+    # second conditional `\n` tacked on next to it (nit from #3360 review).
     _compliance_note = (
         (
             f"\n## Note (#3360)\n"
@@ -1087,10 +1090,10 @@ def fix(
             f"was NOT escalated for this retry. The failure output above "
             f"almost always names the exact repo-specific rule (a pinned "
             f"count, a formatting rule, a forbidden file) and often the fix "
-            f"itself. Read it before changing any logic.\n"
+            f"itself. Read it before changing any logic.\n\n"
         )
         if classification.category == "compliance"
-        else ""
+        else "\n"
     )
 
     briefing = (
@@ -1103,7 +1106,7 @@ def fix(
         f"Run `git diff origin/{default_branch}...HEAD` to see the full diff.\n\n"
         f"## {_failure_heading}\n"
         f"{test_output}\n"
-        f"{_compliance_note}\n"
+        f"{_compliance_note}"
         f"## Guidance\n"
         f"{guidance_text}\n\n"
         f"## Rules\n"
@@ -1608,11 +1611,22 @@ def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
         f"- Commit your work and push with git push origin HEAD"
     )
 
-    # Determine escalated model for the continuation worker.
+    # #3360: `resume-stuck` IS the spin scenario — it exists specifically to
+    # recover a worker the stuck-detector flagged (`!! N turns without a git
+    # commit`), which is neither a capability nor a compliance problem. The
+    # issue's own proposal (category 3, "Spin") is explicit: escalating a
+    # spin is the worst case, because a bigger model spins more expensively
+    # without fixing anything a bigger model *can* fix — #3357 is exactly
+    # this: a spin that got escalated to opus and burned 25 turns for zero
+    # commits. So this door never climbs the ladder; the continuation
+    # dispatches on the SAME rung the stuck worker was already running on.
     original_model = assignment.model or cfg.models.default
-    escalated = cfg.models.next_model(original_model)
-    if escalated != original_model:
-        click.echo(f"  escalating model: {original_model} → {escalated}")
+    escalated = original_model
+    click.echo(
+        f"  not escalating model (#3360: resume-stuck is the spin case, "
+        f"escalating buys a more expensive spin, not a fix) — staying on "
+        f"{original_model or 'default'}"
+    )
 
     try:
         new_id = _dispatch_followup(cfg, assignment, briefing, model=escalated)

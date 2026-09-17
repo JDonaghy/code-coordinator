@@ -1188,6 +1188,57 @@ class TestFixModelForIteration:
         assert _fix_model_for_iteration(cfg, 1) is None
 
 
+class TestFixModelForIterationClassifiesFailureText:
+    """#3360: a compliance-nit failure text gates the LAST climb — the
+    rung this iteration would otherwise buy on top of iteration-1's. Passing
+    no `failure_text` (the default) preserves the old pure-iteration ladder
+    exactly, so every test above is unaffected."""
+
+    _RATCHET_TEXT = (
+        "FAILED tests/test_sqlite_connect_ratchet.py::"
+        "test_sqlite_connect_site_counts_are_pinned - the pinned count "
+        "changed"
+    )
+    _BEHAVIOURAL_TEXT = (
+        "FAILED tests/test_widget.py::test_returns_sorted - "
+        "AssertionError: assert [3, 1, 2] == [1, 2, 3]"
+    )
+
+    def test_compliance_failure_stays_on_iteration_1s_rung(self) -> None:
+        cfg = _config_with_models(default="sonnet")
+        assert (
+            _fix_model_for_iteration(cfg, 2, failure_text=self._RATCHET_TEXT)
+            == "sonnet"
+        )
+
+    def test_capability_failure_still_climbs(self) -> None:
+        cfg = _config_with_models(default="sonnet")
+        assert (
+            _fix_model_for_iteration(cfg, 2, failure_text=self._BEHAVIOURAL_TEXT)
+            == "opus"
+        )
+
+    def test_no_failure_text_defaults_to_not_escalating(self) -> None:
+        # #3360: "unknown" (no evidence) also defaults to NOT escalating —
+        # explicit empty string, distinct from the `None` default below
+        # which preserves the OLD pure-iteration behaviour for callers with
+        # nothing to pass.
+        cfg = _config_with_models(default="sonnet")
+        assert _fix_model_for_iteration(cfg, 2, failure_text="") == "sonnet"
+
+    def test_iteration_1_is_unaffected_by_failure_text(self) -> None:
+        # Iteration 1 never climbs regardless — nothing to gate.
+        cfg = _config_with_models(default="sonnet")
+        assert (
+            _fix_model_for_iteration(cfg, 1, failure_text=self._BEHAVIOURAL_TEXT)
+            == "sonnet"
+        )
+
+    def test_omitting_failure_text_preserves_old_pure_iteration_ladder(self) -> None:
+        cfg = _config_with_models(default="sonnet")
+        assert _fix_model_for_iteration(cfg, 2) == "opus"
+
+
 class TestFixModelDispatch:
     """The escalated model lands on both the POST payload and the Assignment."""
 

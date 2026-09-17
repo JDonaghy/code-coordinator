@@ -2217,9 +2217,13 @@ def _dispatch_fix_of(
     # auto-loop path.  Explicit --model always wins; when omitted,
     # _fix_model_for_iteration returns the appropriate tier (or None when
     # pipeline.escalate_fix_model=False), falling back to cfg.models.default.
+    # #3360: gate the per-iteration climb on what actually failed — a
+    # compliance nit in `_findings_body` stays on the current rung.
     resolved_model = (
         model
-        or _fix_model_for_iteration(cfg, next_iteration)
+        or _fix_model_for_iteration(
+            cfg, next_iteration, failure_text=_findings_body,
+        )
         or cfg.models.default
     )
     assignment_id = _uuid.uuid4().hex[:12]
