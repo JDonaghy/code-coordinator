@@ -219,23 +219,52 @@ def _no_agent_credential_probe(monkeypatch):
     ``host.tailnet`` hostname.
 
     Exactly the same reasoning (and exactly the same shape) as
-    ``_no_agent_health_probe`` above: the real fetcher already degrades to
+    ``_no_agent_health_probe`` above: the real fetchers already degrade to
     "assume healthy" on any probe failure, so this changes no test's
     OUTCOME — it just stops the suite's default behaviour from depending
     on network/DNS timing, and removes the second live probe per review
     candidate that landing the gate would otherwise have added. Tests
     exercising the gate itself pass an explicit ``credential_fetcher=``
-    (or monkeypatch this name to something stricter), which takes
+    (or monkeypatch these names to something stricter), which takes
     priority and is unaffected.
 
-    Deliberately narrow: only ``dispatch_review``/``dispatch_scoped_review``
-    default to a live probe. ``coord.network.claude_credential_reachable``
-    itself is NOT stubbed here — every other seam takes it as an explicit,
-    opt-in ``credential_fetcher=``, and ``tests/test_network.py`` tests the
-    real function directly.
+    BOTH names must be stubbed, and an earlier round of #3371 got this
+    wrong by dropping the second one. It is true that ``dispatch()`` /
+    ``pick_machine()`` / ``pick_machine_choice()`` take the probe as an
+    opt-in ``credential_fetcher=`` defaulting to ``None`` — but their
+    production CALLERS hardcode the real
+    ``coord.network.claude_credential_reachable`` unconditionally:
+    ``coord/mock_author.py``, ``coord/commands/milestone.py``,
+    ``coord/commands/dispatch.py``, ``coord/commands/dispatch_workers.py``,
+    ``coord/commands/plan_followup.py``, ``coord/dashboard/server.py``,
+    ``coord/decomposition_chat.py``, ``coord/milestone_chat.py``,
+    ``coord/new_issue_chat.py``, ``coord/refine_chat.py``,
+    ``coord/reconcile.py``, ``coord/serve_app.py``. So a test that drives
+    one of those commands with only ``coord.dispatch.dispatch_with_retry``
+    (or ``coord.dispatch.dispatch``) mocked — e.g.
+    ``tests/test_mock_author.py``'s dispatch tests,
+    ``tests/test_cli_milestone_dispatch.py`` — still reaches the real probe
+    *through its caller*, one hop before the seam it mocked, and fires a
+    live ``httpx.get("http://laptop.tailnet:7433/health")``.
+
+    Every one of those call sites does a FUNCTION-LOCAL ``from coord.network
+    import claude_credential_reachable``, resolved at call time, so patching
+    the module attribute here reaches all of them. This is the exact sibling
+    of ``fetch_status``'s stub in ``_no_dispatch_liveness_probe`` (#3353),
+    which is wired into these same call sites alongside
+    ``credential_fetcher``.
+
+    ``tests/test_network.py::TestClaudeCredentialReachable`` tests the real
+    function directly; it overrides this stub back to the real callable via
+    its own narrower class-scoped autouse fixture (a closer fixture is
+    instantiated after this one and wins), so the rest of the suite stays
+    hermetic without making the function itself untestable.
     """
     monkeypatch.setattr(
         "coord.review._fetch_agent_claude_credential_ok", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        "coord.network.claude_credential_reachable", lambda *a, **k: True
     )
 
 

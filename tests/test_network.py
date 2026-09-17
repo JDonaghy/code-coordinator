@@ -12,6 +12,12 @@ import pytest
 from coord import network
 from coord.models import Machine
 
+# #3371: captured at import time, i.e. before `tests/conftest.py`'s autouse
+# `_no_agent_credential_probe` swaps the module attribute for a fail-open stub.
+# `TestClaudeCredentialReachable` below restores this real callable for its own
+# tests only; see that class's fixture.
+_REAL_CLAUDE_CREDENTIAL_REACHABLE = network.claude_credential_reachable
+
 
 def _m(
     name: str = "laptop", host: str = "laptop.tailnet", *, health_timeout: float | None = None
@@ -499,6 +505,29 @@ class TestCheckHostResolution:
 class TestClaudeCredentialReachable:
     """#3371: the live half of the single source of truth — is a machine's
     claude credential NOT confirmed dead right now."""
+
+    @pytest.fixture(autouse=True)
+    def _real_credential_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Undo `tests/conftest.py`'s global `_no_agent_credential_probe`
+        stub for this class only.
+
+        That stub keeps the ~dozen production call sites that hardcode
+        `claude_credential_reachable` from firing live `/health` GETs at
+        fixture hostnames like `laptop.tailnet`. This class is the one
+        place that must exercise the real function, and it does so
+        hermetically by patching `network.httpx.get`. A class-level autouse
+        fixture is instantiated after the conftest-level one of the same
+        scope, so this re-patch wins.
+        """
+        monkeypatch.setattr(
+            network, "claude_credential_reachable", _REAL_CLAUDE_CREDENTIAL_REACHABLE
+        )
+
+    def test_the_global_stub_is_overridden_here(self) -> None:
+        """Guard the fixture above: if conftest's autouse stub ever won the
+        ordering race, every other test in this class would silently assert
+        against `lambda *a, **k: True` and pass for the wrong reason."""
+        assert network.claude_credential_reachable is _REAL_CLAUDE_CREDENTIAL_REACHABLE
 
     def test_dead_credential_reports_false(self) -> None:
         resp = MagicMock()
