@@ -470,7 +470,18 @@ class TestApproveProviderAwareModel:
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"id": "oc-approve-2"}
         mock_resp.raise_for_status.return_value = None
+        # #3376: `coord approve` now wires a REAL issue-liveness fetcher
+        # into `dispatch()` (issue-closed / branch-already-merged), which
+        # legitimately reads the issue from GitHub for its OWN reason.
+        # Stub that one fetcher out so `get_issue` stays a clean proxy for
+        # "did MODEL RESOLUTION re-fetch the issue?", which is all this
+        # test is about — see TestApproveDispatchLivenessGate below for the
+        # coverage of the liveness read itself.
         with patch("coord.dispatch.httpx.post", return_value=mock_resp) as mock_post, \
+             patch(
+                 "coord.dispatch_liveness.github_issue_liveness_fetcher",
+                 return_value=lambda _repo, _issue: (False, False),
+             ), \
              patch("coord.github_ops.get_issue") as mock_get_issue, \
              patch("coord.github_ops.post_issue_comment"):
             result = CliRunner().invoke(
@@ -487,6 +498,89 @@ class TestApproveProviderAwareModel:
         )
         assert "zhipuai/glm-4.6" in result.output
         assert "overriding plan-time model 'haiku'" in result.output
+
+
+class TestApproveDispatchLivenessGate:
+    """#3376: `coord approve` is a production dispatch chokepoint, so the
+    STRUCTURAL DISPATCH-LIVENESS GATE's two new predicates (issue already
+    closed, branch already merged) must actually RUN there — the whole
+    point of the issue is that a mechanism nothing calls spends workers
+    anyway. These drive the real CLI end to end and assert on what did or
+    did not go out over the wire, so the gate is proven both to fire and
+    to stay out of the way (a gate that cannot fail is not a gate; a gate
+    that always fires is worse).
+    """
+
+    def _one_proposal(self) -> None:
+        from coord.models import Proposal
+
+        state_mod.save_proposals(
+            [
+                Proposal(
+                    id=1, machine_name="laptop", repo_name="api",
+                    issue_number=10, issue_title="t", rationale="r",
+                    files_likely=["a.py"], briefing="b", type="work",
+                ),
+            ]
+        )
+
+    def _approve(
+        self, config_file: Path, *, issue_state: str, branch_merged: bool
+    ) -> tuple[object, MagicMock]:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "live-1"}
+        mock_resp.raise_for_status.return_value = None
+        with patch("coord.dispatch.httpx.post", return_value=mock_resp) as mock_post, \
+             patch(
+                 "coord.github_ops.get_issue",
+                 return_value={"state": issue_state, "labels": []},
+             ), \
+             patch(
+                 "coord.claim.any_matching_branch_merged",
+                 return_value=branch_merged,
+             ), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["approve", "1", "--config", str(config_file)]
+            )
+        return result, mock_post
+
+    def test_closed_issue_is_refused_before_anything_is_spent(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        self._one_proposal()
+        result, mock_post = self._approve(
+            config_file, issue_state="CLOSED", branch_merged=False
+        )
+        assert result.exit_code == 0, result.output
+        mock_post.assert_not_called()
+        out = output_and_stderr(result)
+        assert "already closed" in out, out
+        assert "#3376" in out, out
+
+    def test_already_merged_branch_is_refused_before_anything_is_spent(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        self._one_proposal()
+        result, mock_post = self._approve(
+            config_file, issue_state="OPEN", branch_merged=True
+        )
+        assert result.exit_code == 0, result.output
+        mock_post.assert_not_called()
+        out = output_and_stderr(result)
+        assert "already merged" in out, out
+
+    def test_open_unmerged_issue_still_dispatches(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        """The other half: the gate must not refuse ordinary work."""
+        self._one_proposal()
+        result, mock_post = self._approve(
+            config_file, issue_state="OPEN", branch_merged=False
+        )
+        assert result.exit_code == 0, result.output
+        mock_post.assert_called_once()
+        assert "dispatched to agent server" in result.output
 
 
 PROVIDER_LABEL_CONFIG_YAML = """\
