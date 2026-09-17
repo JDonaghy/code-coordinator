@@ -2184,6 +2184,7 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         confirmation_timeout,
         expected_confirmation_seconds,
         record_confirmation_duration,
+        record_inconclusive_confirmation,
         spend_confirmation_budget,
     )
 
@@ -2278,12 +2279,23 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         # and must never overwrite a previously-learned expectation.
         if result is not None and result.kind in RECORDABLE_DURATION_KINDS:
             record_confirmation_duration(transition.repo_name, elapsed)
+        # #3357 item 3: a confirmation that genuinely RAN and came back
+        # inconclusive is evidence about THIS repo's machine/toolchain, not
+        # about the branch — tally it (repo x kind) so a chronic pattern
+        # ("this repo's Test gate has been a rubber stamp for N merges") is
+        # discoverable instead of being rediscovered by a client. Never
+        # counted for the "confirmation wasn't even attempted" short-circuits
+        # above (disabled, budget exhausted, config unloadable) — those say
+        # nothing about whether this repo's toolchain actually works here.
+        if result is not None and result.inconclusive:
+            record_inconclusive_confirmation(transition.repo_name, result.kind)
 
 
 def _confirmed_pass_verdict(
     transition: Transition, entry: dict, parent_id: str, *, claim_reason: str,
-) -> tuple[str, str]:
-    """#2464: the ``(test_state, test_reason)`` to record for a *claimed* pass.
+) -> tuple[str, str, str]:
+    """#2464: the ``(test_state, test_reason, test_confirmation)`` to record
+    for a *claimed* pass.
 
     The Test stage's pass claim — whether it arrived as a ``SMOKE: pass``
     marker or as the worker calling ``coord test --passed`` on itself (#2217) —
@@ -2319,6 +2331,17 @@ def _confirmed_pass_verdict(
       nobody checked. See :mod:`coord.confirm_test` on why a missing toolchain,
       a missing checkout or a timeout must never read as a failing branch.
 
+    #3357: the THIRD element of the returned tuple is the machine-readable
+    counterpart to that same story — one of
+    :data:`~coord.confirm_test.TEST_CONFIRMATION_VALUES`
+    (``"confirmed"`` / ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``),
+    recorded alongside ``test_state`` so a caller (the merge gate, `coord
+    gates`, the dashboard) can finally tell "passed, independently confirmed"
+    from "passed, because nobody could check" WITHOUT parsing the English
+    text of ``test_reason``. This does not change which branch below fires,
+    or what ``test_state`` any branch records — #2464's fallback direction is
+    unchanged; this only stops flattening the distinction on the way out.
+
     #2563: whatever output the run captured — failing node ids, the
     assertion, tracebacks — is also persisted to *parent_id*'s
     ``test_output/<id>.txt`` (:func:`coord.confirm_test.write_confirmation_output`)
@@ -2329,7 +2352,13 @@ def _confirmed_pass_verdict(
     one-line summary — #1337 deliberately keeps unbounded free text out of the
     board upsert, and this does not undo that; the file is the long form.
     """
-    from coord.confirm_test import write_confirmation_output  # noqa: PLC0415
+    from coord.confirm_test import (  # noqa: PLC0415
+        TEST_CONFIRMATION_BASELINE_RED,
+        TEST_CONFIRMATION_CONFIRMED,
+        TEST_CONFIRMATION_REFUTED,
+        TEST_CONFIRMATION_UNCONFIRMED,
+        write_confirmation_output,
+    )
 
     result = _run_pass_confirmation(transition, entry)
 
@@ -2339,6 +2368,7 @@ def _confirmed_pass_verdict(
             f"{claim_reason} — UNCONFIRMED: no independent re-run was possible "
             "on this machine, so this verdict rests on the worker's own report "
             "(#2464).",
+            TEST_CONFIRMATION_UNCONFIRMED,
         )
 
     # Best-effort and unconditional on *kind*: REFUTED/BASELINE-RED/TIMEOUT/
@@ -2403,6 +2433,7 @@ def _confirmed_pass_verdict(
                 f"{parent_id}` and the confirmation output, recover with "
                 f"`coord fix --force --guidance <what's broken> {parent_id}` "
                 "or re-dispatch the Test stage by hand.",
+                TEST_CONFIRMATION_REFUTED,
             )
 
         return (
@@ -2411,6 +2442,7 @@ def _confirmed_pass_verdict(
             f"Test-stage worker claimed a pass ({claim_reason}), but re-running "
             "the repo's own command out-of-band disagreed — trust the run, not "
             "the report.",
+            TEST_CONFIRMATION_REFUTED,
         )
 
     if result.baseline_red:
@@ -2422,12 +2454,14 @@ def _confirmed_pass_verdict(
             "skipped",
             f"baseline-red (#2170), found by an independent re-run (#2464): "
             f"{result.reason}",
+            TEST_CONFIRMATION_BASELINE_RED,
         )
 
     if result.confirmed:
         return (
             "passed",
             f"{claim_reason} — independently confirmed (#2464): {result.reason}",
+            TEST_CONFIRMATION_CONFIRMED,
         )
 
     log.warning(
@@ -2438,6 +2472,7 @@ def _confirmed_pass_verdict(
     return (
         "passed",
         f"{claim_reason} — UNCONFIRMED: {result.reason}",
+        TEST_CONFIRMATION_UNCONFIRMED,
     )
 
 
@@ -2507,7 +2542,7 @@ def _record_smoke_verdict(
             # ran, so a (potentially 20-minute) run that agreed with the
             # claim would leave no trace it ever happened — including on the
             # next reap of the same already-passed parent.
-            state, reason = _confirmed_pass_verdict(
+            state, reason, confirmation = _confirmed_pass_verdict(
                 transition, entry, parent_id,
                 claim_reason="worker self-recorded via `coord test` (#2217)",
             )
@@ -2515,6 +2550,7 @@ def _record_smoke_verdict(
                 assignment_id=parent_id,
                 test_state=state,
                 test_reason=reason,
+                test_confirmation=confirmation,
             )
             if state != "passed":
                 log.warning(
@@ -2582,7 +2618,7 @@ def _record_smoke_verdict(
         # stopped a worker printing it after a partial or backgrounded run it
         # never finished polling (#2272/#2301). Confirm it against a real run
         # before it becomes a merge-gate-satisfying verdict.
-        state, reason = _confirmed_pass_verdict(
+        state, reason, confirmation = _confirmed_pass_verdict(
             transition, entry, parent_id,
             claim_reason="headless smoke reported SMOKE: pass",
         )
@@ -2590,6 +2626,7 @@ def _record_smoke_verdict(
             assignment_id=parent_id,
             test_state=state,
             test_reason=reason,
+            test_confirmation=confirmation,
         )
         return
 

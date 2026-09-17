@@ -1352,6 +1352,7 @@ def record_test_verdict(
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
     test_toolchain: str | None = None,
+    test_confirmation: str | None = None,
 ) -> None:
     """Record a Test-gate verdict on one assignment — routes to the daemon when set.
 
@@ -1378,6 +1379,16 @@ def record_test_verdict(
     caller predating this parameter — records no toolchain; nothing treats
     that as a failure, only as "unknown", same as every other advisory
     health signal in this codebase.
+
+    ``test_confirmation`` (#3357) is **optional and machine-readable
+    provenance** for *this* ``test_state`` write — one of
+    ``coord.confirm_test.TEST_CONFIRMATION_VALUES`` (``"confirmed"`` /
+    ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``), supplied by
+    :func:`coord.notify._confirmed_pass_verdict` when a #2464 out-of-band
+    confirmation actually ran. ``None`` — the default, and every caller that
+    isn't reporting a confirmation outcome — records no provenance; nothing
+    reads that as either "confirmed" or "unconfirmed", only as "the
+    confirmation question was never asked about this write."
     """
     svc = _board_service()
     resp = _route_write(
@@ -1390,6 +1401,7 @@ def record_test_verdict(
             "smoke_test": smoke_test,
             "smoke_test_reason": smoke_test_reason,
             "test_toolchain": test_toolchain,
+            "test_confirmation": test_confirmation,
         },
     )
     if resp is not None:
@@ -1401,6 +1413,7 @@ def record_test_verdict(
         smoke_test=smoke_test,
         smoke_test_reason=smoke_test_reason,
         test_toolchain=test_toolchain,
+        test_confirmation=test_confirmation,
     )
 
 
@@ -1412,6 +1425,7 @@ def _record_test_verdict_local(
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
     test_toolchain: str | None = None,
+    test_confirmation: str | None = None,
 ) -> None:
     """UPDATE the assignment's test_state/test_reason (+ smoke_test mirror).
 
@@ -1437,6 +1451,13 @@ def _record_test_verdict_local(
     THIS verdict; carrying a previous verdict's toolchain forward across a
     re-test would misattribute the new result to hardware that didn't
     produce it.
+
+    #3357: ``test_confirmation`` gets the identical same-statement treatment
+    for the identical reason — it describes whether THIS verdict was
+    independently confirmed, so a later verdict that omits it (a headless
+    smoke failure, a mute-leg park) must not leave a PREVIOUS confirmation's
+    "confirmed"/"unconfirmed" sitting on the row looking like it describes
+    the new write.
     """
     if smoke_test is None:
         # Derive the legacy mirror from the canonical verdict.
@@ -1451,9 +1472,9 @@ def _record_test_verdict_local(
 
     def _write() -> None:
         sql.execute(conn,
-            "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=? "
-            "WHERE assignment_id=?",
-            (test_state, test_reason, test_toolchain, assignment_id),
+            "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=?, "
+            "test_confirmation=? WHERE assignment_id=?",
+            (test_state, test_reason, test_toolchain, test_confirmation, assignment_id),
         )
         # Mirror to legacy smoke_test only for pass/fail, matching coord test /
         # the TUI's record_test_verdict_conn.
@@ -3511,6 +3532,42 @@ def load_assignment_test_state(assignment_id: str) -> str | None:
     if row is None:
         return None
     return row["test_state"] if hasattr(row, "keys") else row[0]
+
+
+def load_assignment_test_confirmation(assignment_id: str) -> str | None:
+    """#3357: the current ``test_confirmation`` provenance for one assignment.
+
+    One of ``coord.confirm_test.TEST_CONFIRMATION_VALUES`` (``"confirmed"`` /
+    ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``), or ``None`` when
+    no #2464 confirmation question was ever asked about the row's current
+    ``test_state`` — a headless smoke failure, a mute-leg park, a row
+    predating this column, or a remote read that failed. Same daemon-first,
+    local-fallback routing as :func:`load_assignment_test_state`.
+    """
+    if not assignment_id:
+        return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_assignment  # noqa: PLC0415
+
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return row.get("test_confirmation")
+            return None
+        except Exception:  # noqa: BLE001 — degraded fallback, never blocking
+            return None
+    try:
+        conn = get_connection()
+        row = sql.execute(conn,
+            "SELECT test_confirmation FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    return row["test_confirmation"] if hasattr(row, "keys") else row[0]
 
 
 def load_assignment_review_verdict(assignment_id: str) -> tuple[str | None, str | None]:

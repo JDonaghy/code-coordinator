@@ -281,6 +281,186 @@ INCONCLUSIVE_KINDS = frozenset({
 })
 
 
+# ── #3357: provenance, as a field, not prose ────────────────────────────────
+#
+# #2464's fallback (record `passed` on an inconclusive result, with the story
+# in `test_reason`'s free text) is deliberately unchanged by this issue — see
+# this module's own "FAIL DIRECTION" section and #1814. The defect #3357
+# reports is downstream of that decision: every consumer of `test_state`
+# (the merge gate, `coord gates`, the dashboard, the auto-loop) sees the
+# identical string `"passed"` whether a real suite run backed it or nobody
+# could even attempt one. These four values are the machine-readable answer
+# to "was this actually observed", recorded alongside `test_state` (never
+# instead of it — `test_state` keeps deciding the merge gate) so a caller can
+# finally tell the two apart without parsing English out of `test_reason`.
+#
+# Deliberately only four values, matching `ConfirmationResult`'s own
+# exhaustive branch (`confirmed`/`refuted`/`baseline_red`/`inconclusive`) —
+# this is that same taxonomy, renamed for the board column rather than the
+# in-memory result object:
+#
+# * ``TEST_CONFIRMATION_CONFIRMED`` — `ConfirmationResult.confirmed`: a real
+#   build+test ran to completion and passed.
+# * ``TEST_CONFIRMATION_UNCONFIRMED`` — `ConfirmationResult.inconclusive`, OR
+#   no confirmation could even be attempted (confirmation disabled, budget
+#   exhausted, config unloadable) — the #2464 fallback case. This is the
+#   value the merge-gate row from #3357's own evidence (grocery-list#36)
+#   should have carried and did not.
+# * ``TEST_CONFIRMATION_REFUTED`` — `ConfirmationResult.refuted`: a real run
+#   disagreed with the claim. Recorded whether the resulting `test_state`
+#   ends up `"failed"` or the #2579 `TEST_STATE_CONTESTED` — both are a
+#   REAL run contradicting the claim, they differ only in what a
+#   already-approved review means for auto-dispatching a fix.
+# * ``TEST_CONFIRMATION_BASELINE_RED`` — `ConfirmationResult.baseline_red`
+#   (#2170): the suite failed identically on the merge-base, so nothing was
+#   learned about the BRANCH specifically, but a real run did happen.
+#
+# ``None`` (the column default) is a fifth, implicit state: no confirmation
+# question was ever asked about this write at all — a headless smoke
+# FAILURE, a human `coord test --passed` write that has not yet been reaped
+# by a notify pass, a mute-leg park, ``TEST_STATE_BLOCKED``, ... None of
+# those went through `_confirmed_pass_verdict`, so nothing here would be
+# honest to claim. Renders as "no confirmation attempted", never as either
+# extreme.
+TEST_CONFIRMATION_CONFIRMED = "confirmed"
+TEST_CONFIRMATION_UNCONFIRMED = "unconfirmed"
+TEST_CONFIRMATION_REFUTED = "refuted"
+TEST_CONFIRMATION_BASELINE_RED = "baseline_red"
+
+#: Every value `test_confirmation` may hold — for validation / display sites
+#: that want to assert exhaustiveness rather than silently falling through.
+TEST_CONFIRMATION_VALUES = frozenset({
+    TEST_CONFIRMATION_CONFIRMED,
+    TEST_CONFIRMATION_UNCONFIRMED,
+    TEST_CONFIRMATION_REFUTED,
+    TEST_CONFIRMATION_BASELINE_RED,
+})
+
+
+# ── #3357 item 3: chronic inconclusives are a fleet defect, not noise ───────
+#
+# "A machine that cannot run this repo's suite" is not a per-branch accident
+# — it recurs on every PASS claim until someone fixes the toolchain. #3357
+# says: count it (repo × kind) so that becomes visible as "this repo's Test
+# gate has been a rubber stamp for N merges" instead of being rediscovered by
+# a client (grocery-list#38). Deliberately does NOT block anything here —
+# the issue is explicit that turning this into a merge block is a judgment
+# call for later; this only makes the count exist somewhere a future
+# `coord doctor`/`coord diagnose --graph` surface can read.
+#
+# Same fail-soft, tempfile-then-rename discipline as
+# `record_confirmation_duration` immediately above, and for the identical
+# reason: this is a hint for an operator, never a correctness dependency, so
+# a torn read/write degrading to "count reset to 1" is an acceptable cost a
+# lock-guarded store is not worth paying to avoid.
+_CONFIRM_INCONCLUSIVE_COUNTS_FILENAME = "confirm_test_inconclusive_counts.json"
+
+
+def _inconclusive_counts_path() -> Path:
+    """Where the per-``(repo, kind)`` inconclusive tally is persisted (#3357).
+
+    Resolved fresh on every call against ``coord.state.COORD_DIR``, matching
+    :func:`_confirm_history_path`'s discipline just above.
+    """
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    return COORD_DIR / _CONFIRM_INCONCLUSIVE_COUNTS_FILENAME
+
+
+def _load_inconclusive_counts() -> dict[str, dict[str, int]]:
+    """Best-effort read of the persisted ``{repo: {kind: count}}`` tally.
+
+    Fail-soft on everything, mirroring :func:`_load_confirm_history` — a
+    missing file, corrupt JSON, or an unexpected shape all read as "nothing
+    counted yet" rather than raising, since this is purely a visibility aid.
+    """
+    import json  # noqa: PLC0415
+
+    try:
+        raw = _inconclusive_counts_path().read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    for repo, kinds in data.items():
+        if not isinstance(repo, str) or not isinstance(kinds, dict):
+            continue
+        clean: dict[str, int] = {}
+        for kind, count in kinds.items():
+            if isinstance(kind, str) and isinstance(count, int) and count > 0:
+                clean[kind] = count
+        if clean:
+            out[repo] = clean
+    return out
+
+
+def record_inconclusive_confirmation(repo_name: str, kind: str) -> None:
+    """Increment *repo_name*'s tally for an INCONCLUSIVE confirmation *kind* (#3357).
+
+    Callers pass this only when :attr:`ConfirmationResult.inconclusive` was
+    actually true for a confirmation that really ran — never for the "no
+    confirmation was even attempted" cases (disabled, budget exhausted,
+    config unloadable) that :func:`coord.notify._run_pass_confirmation`
+    already logs distinctly, since those say nothing about whether THIS
+    repo's toolchain works on this machine.
+
+    Best-effort and atomic, mirroring :func:`record_confirmation_duration`
+    exactly — a write failure here must never affect the verdict this is
+    charging against.
+    """
+    if not repo_name or kind not in INCONCLUSIVE_KINDS:
+        return
+    import json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    path = _inconclusive_counts_path()
+    counts = _load_inconclusive_counts()
+    per_repo = dict(counts.get(repo_name) or {})
+    per_repo[kind] = int(per_repo.get(kind, 0)) + 1
+    counts[repo_name] = per_repo
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".confirm_test_inconclusive_counts.", suffix=".tmp",
+            dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(counts, fh)
+            os.replace(tmp_name, path)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def inconclusive_confirmation_counts(
+    repo_name: str | None = None,
+) -> dict[str, dict[str, int]]:
+    """The persisted ``{repo: {kind: count}}`` inconclusive tally (#3357).
+
+    *repo_name* narrows to ``{kind: count}`` for that one repo (``{}`` if it
+    has never produced an inconclusive result); ``None`` (the default)
+    returns the whole fleet-wide map. Read-only — this is the seam a future
+    ``coord doctor`` / ``coord diagnose --graph`` surface reads to answer
+    "has this repo's Test gate been a rubber stamp"; wiring that display is
+    explicitly left to a follow-up (#3357's item 3 asks only to make the
+    count visible, not to pick where it is rendered).
+    """
+    counts = _load_inconclusive_counts()
+    if repo_name is not None:
+        return dict(counts.get(repo_name) or {})
+    return counts
+
+
 # ── Per-pass budget (#2464-review) ──────────────────────────────────────────
 #
 # Thread-local rather than a module global because the daemon runs drains from
@@ -1236,6 +1416,11 @@ __all__ = [
     "RECORDABLE_DURATION_KINDS",
     "REFUTING_KINDS",
     "STALE_WORKTREE_MAX_AGE_HOURS",
+    "TEST_CONFIRMATION_BASELINE_RED",
+    "TEST_CONFIRMATION_CONFIRMED",
+    "TEST_CONFIRMATION_REFUTED",
+    "TEST_CONFIRMATION_UNCONFIRMED",
+    "TEST_CONFIRMATION_VALUES",
     "ConfirmationResult",
     "begin_confirmation_pass",
     "branch_touched_files",
@@ -1245,8 +1430,10 @@ __all__ = [
     "confirmation_enabled",
     "confirmation_timeout",
     "expected_confirmation_seconds",
+    "inconclusive_confirmation_counts",
     "notify_client_timeout_seconds",
     "record_confirmation_duration",
+    "record_inconclusive_confirmation",
     "spend_confirmation_budget",
     "sweep_stale_confirm_worktrees",
     "unmet_confirmation_capabilities",

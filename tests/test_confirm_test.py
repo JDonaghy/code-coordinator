@@ -947,8 +947,8 @@ class TestSmokeVerdictIsConfirmed:
         from coord.state import get_connection
 
         row = get_connection().execute(
-            "SELECT test_state, smoke_test, test_reason FROM assignments "
-            "WHERE assignment_id=?",
+            "SELECT test_state, smoke_test, test_reason, test_confirmation "
+            "FROM assignments WHERE assignment_id=?",
             ("work-1",),
         ).fetchone()
         assert row is not None, "the work assignment must exist"
@@ -1097,6 +1097,10 @@ class TestSmokeVerdictIsConfirmed:
             f"than leaving whatever text (or nothing) was there before: "
             f"{row['test_reason']!r}"
         )
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_CONFIRMED, (
+            "#3357: the same distinction must ALSO land as a machine-readable "
+            f"field, not just prose in test_reason: {row['test_confirmation']!r}"
+        )
 
     def test_self_recorded_pass_inconclusive_confirmation_is_annotated(
         self, coord_db, tmp_path: Path
@@ -1125,6 +1129,11 @@ class TestSmokeVerdictIsConfirmed:
             f"say nobody checked, not silently discard the attempt: "
             f"{row['test_reason']!r}"
         )
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_UNCONFIRMED, (
+            "#3357: this is the exact grocery-list#36 shape — the field must "
+            f"say UNCONFIRMED, not None and not 'confirmed': "
+            f"{row['test_confirmation']!r}"
+        )
 
     def test_confirmed_pass_is_recorded_passed(
         self, coord_db, tmp_path: Path
@@ -1142,6 +1151,7 @@ class TestSmokeVerdictIsConfirmed:
         assert row["test_state"] == "passed"
         assert row["smoke_test"] == "pass", "#1384's legacy mirror still derives"
         assert "confirmed" in (row["test_reason"] or "").lower()
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_CONFIRMED
 
     def test_inconclusive_confirmation_leaves_the_pass_intact(
         self, coord_db, tmp_path: Path
@@ -1171,6 +1181,10 @@ class TestSmokeVerdictIsConfirmed:
             "and the row must SAY it is unconfirmed rather than implying a "
             f"verdict nobody checked: {row['test_reason']!r}"
         )
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_UNCONFIRMED, (
+            "#3357: this is grocery-list#36's exact shape — a machine-"
+            f"readable field must say so too: {row['test_confirmation']!r}"
+        )
 
     def test_baseline_red_confirmation_records_skipped(
         self, coord_db, tmp_path: Path, isolated_coord_dir: Path
@@ -1198,6 +1212,7 @@ class TestSmokeVerdictIsConfirmed:
         assert row["test_state"] == "skipped", (
             f"expected 'skipped' for a red baseline, got {row['test_state']!r}"
         )
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_BASELINE_RED
         stored = isolated_coord_dir / "test_output" / "work-1.txt"
         assert stored.read_text() == "tests/test_x.py::test_a FAILED (also red on main)"
 
@@ -1775,6 +1790,82 @@ class TestExpectedConfirmationDurationHistory:
         history_path = isolated_coord_dir / "confirm_test_history.json"
         ct.record_confirmation_duration("quadraui", 777.0)
         assert json.loads(history_path.read_text())["quadraui"] == 777.0
+
+
+class TestInconclusiveConfirmationCounts:
+    """#3357 item 3: chronic INCONCLUSIVE confirmations on the same repo are
+    an infrastructure bug ("this machine cannot run this repo's suite"), not
+    a property of the branch. Counting them (repo x kind) is what lets that
+    become visible as "this repo's Test gate has been a rubber stamp for N
+    merges" instead of being rediscovered by a client (grocery-list#38).
+    Deliberately does not block anything — this only makes the count exist.
+    """
+
+    def test_never_recorded_reports_empty(self) -> None:
+        assert ct.inconclusive_confirmation_counts("quadraui") == {}
+        assert ct.inconclusive_confirmation_counts() == {}
+
+    def test_records_and_reads_back_by_repo_and_kind(self) -> None:
+        ct.record_inconclusive_confirmation("quadraui", KIND_INFRA)
+        assert ct.inconclusive_confirmation_counts("quadraui") == {KIND_INFRA: 1}
+
+    def test_repeated_kind_increments_rather_than_overwrites(self) -> None:
+        """Unlike `record_confirmation_duration` (last-measurement-wins), a
+        chronic pattern is exactly what a running TALLY is for — losing count
+        on every repeat would hide the "N merges" story this exists to tell."""
+        for _ in range(3):
+            ct.record_inconclusive_confirmation("quadraui", KIND_INFRA)
+        assert ct.inconclusive_confirmation_counts("quadraui") == {KIND_INFRA: 3}
+
+    def test_different_kinds_are_tallied_separately(self) -> None:
+        ct.record_inconclusive_confirmation("quadraui", KIND_INFRA)
+        ct.record_inconclusive_confirmation("quadraui", KIND_TIMEOUT)
+        ct.record_inconclusive_confirmation("quadraui", KIND_TIMEOUT)
+        assert ct.inconclusive_confirmation_counts("quadraui") == {
+            KIND_INFRA: 1, KIND_TIMEOUT: 2,
+        }
+
+    def test_tallying_is_per_repo(self) -> None:
+        ct.record_inconclusive_confirmation("quadraui", KIND_INFRA)
+        ct.record_inconclusive_confirmation("claude-coordinator", KIND_INFRA)
+        assert ct.inconclusive_confirmation_counts("quadraui") == {KIND_INFRA: 1}
+        assert ct.inconclusive_confirmation_counts("claude-coordinator") == {
+            KIND_INFRA: 1,
+        }
+
+    def test_a_non_inconclusive_kind_is_never_counted(self) -> None:
+        """Guards the fail-direction discipline this whole module protects:
+        a CONFIRMED or REFUTED result says something about the BRANCH, not
+        the machine — counting it here would misattribute a real result as
+        an infra defect."""
+        ct.record_inconclusive_confirmation("quadraui", KIND_OK)
+        ct.record_inconclusive_confirmation("quadraui", KIND_SUITE)
+        ct.record_inconclusive_confirmation("quadraui", KIND_BASELINE_RED)
+        assert ct.inconclusive_confirmation_counts("quadraui") == {}
+
+    def test_with_no_repo_name_returns_the_whole_fleet_map(self) -> None:
+        ct.record_inconclusive_confirmation("quadraui", KIND_INFRA)
+        ct.record_inconclusive_confirmation("claude-coordinator", KIND_TIMEOUT)
+        assert ct.inconclusive_confirmation_counts() == {
+            "quadraui": {KIND_INFRA: 1},
+            "claude-coordinator": {KIND_TIMEOUT: 1},
+        }
+
+    def test_a_corrupt_counts_file_reads_as_never_counted(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        counts_path = isolated_coord_dir / "confirm_test_inconclusive_counts.json"
+        counts_path.write_text("not json{{{", encoding="utf-8")
+        assert ct.inconclusive_confirmation_counts("quadraui") == {}
+
+    def test_counts_survive_being_read_back_from_a_fresh_process_view(
+        self, isolated_coord_dir: Path,
+    ) -> None:
+        import json
+
+        counts_path = isolated_coord_dir / "confirm_test_inconclusive_counts.json"
+        ct.record_inconclusive_confirmation("quadraui", KIND_INFRA)
+        assert json.loads(counts_path.read_text())["quadraui"] == {KIND_INFRA: 1}
 
 
 class TestConfirmationTimeoutSkipsAKnownDoomedRepo:

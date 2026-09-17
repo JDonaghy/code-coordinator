@@ -41,6 +41,7 @@ def _work(
     test_base_sha: str | None = None,
     test_patch_id: str | None = None,
     test_toolchain: str | None = None,
+    test_confirmation: str | None = None,
     review_state: str | None = None,
     review_verdict: str | None = None,
     required_gates: list[str] | None = None,
@@ -61,6 +62,7 @@ def _work(
         test_base_sha=test_base_sha,
         test_patch_id=test_patch_id,
         test_toolchain=test_toolchain,
+        test_confirmation=test_confirmation,
         review_state=review_state,
         review_verdict=review_verdict,
         required_gates=required_gates or [],
@@ -893,6 +895,50 @@ class TestFormatting:
         board2 = Board(active=[], completed=[no_toolchain])
         report2 = build_gate_report(board2, config, "api", 42)
         assert "test_toolchain=unknown" in format_gate_report(report2)
+
+    def test_format_annotates_an_unconfirmed_pass(self, config: Config) -> None:
+        """#3357: grocery-list#36's exact shape — `test_state="passed"` with
+        nothing on the summary line saying nobody actually observed a run."""
+        work = _work(test_state="passed", test_confirmation="unconfirmed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+
+        text = format_gate_report(report)
+        assert "test   : passed (recorded on w1) (UNCONFIRMED — suite never ran)" in text
+
+    def test_format_annotates_a_baseline_red_pass(self, config: Config) -> None:
+        work = _work(test_state="skipped", test_confirmation="baseline_red")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+
+        text = format_gate_report(report)
+        assert "(baseline-red — branch not at fault, #2170)" in text
+
+    def test_format_does_not_annotate_a_confirmed_pass(self, config: Config) -> None:
+        """A REAL confirmed pass, or a row that never went through the #2464
+        confirmation path at all (test_confirmation=None), must render
+        exactly as it did before #3357 — no noise on the common case."""
+        confirmed = _work(test_state="passed", test_confirmation="confirmed")
+        board = Board(active=[], completed=[confirmed])
+        report = build_gate_report(board, config, "api", 42)
+        text = format_gate_report(report)
+        assert "test   : passed (recorded on w1)" in text
+        assert "UNCONFIRMED" not in text
+        assert "baseline-red" not in text
+
+        never_asked = _work(test_state="passed")
+        board2 = Board(active=[], completed=[never_asked])
+        report2 = build_gate_report(board2, config, "api", 42)
+        text2 = format_gate_report(report2)
+        assert "test   : passed (recorded on w1)" in text2
+        assert "UNCONFIRMED" not in text2
+
+    def test_report_to_dict_carries_test_confirmation(self, config: Config) -> None:
+        work = _work(test_state="passed", test_confirmation="unconfirmed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+        payload = report_to_dict(report)
+        assert payload["rows"][0]["test_confirmation"] == "unconfirmed"
 
     def test_report_to_dict_is_json_serializable(self, config: Config) -> None:
         work = _work(test_state="passed", test_toolchain="node 20.11.0")

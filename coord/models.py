@@ -963,6 +963,29 @@ class Assignment:
     # producing toolchain could not be resolved — renders as "unknown", not
     # as a mismatch.
     test_toolchain: str | None = None
+    # #3357: machine-readable provenance for `test_state` — was this write
+    # actually BACKED by an observation (coord.confirm_test's out-of-band
+    # re-run, #2464), or just carried forward from the worker's own claim?
+    # None | "confirmed" | "unconfirmed" | "refuted" | "baseline_red" (see
+    # coord.confirm_test.TEST_CONFIRMATION_VALUES for the exhaustive set).
+    # Before this field, that distinction lived ONLY as English prose inside
+    # `test_reason` — every consumer (the merge gate, `coord gates`, the
+    # dashboard, the auto-loop) read the identical `test_state="passed"`
+    # whether a real suite run backed it or nobody could even attempt one
+    # (grocery-list#36: "test : passed" printed over a row whose own reason
+    # said "NOTHING was learned about the branch"). `test_state` itself is
+    # UNCHANGED by this field — #2464's fallback (record `passed` on an
+    # inconclusive result) stays exactly as it was; this only makes the
+    # provenance queryable instead of requiring a human to parse
+    # `test_reason`. None for every write that never asked the confirmation
+    # question at all (a headless smoke FAILURE, a mute-leg park, a fresh
+    # `coord test --passed` not yet reaped by a notify pass, every row
+    # predating this column) — rendered as "no confirmation attempted",
+    # never as either extreme. Written in the SAME statement as `test_state`
+    # (`coord.state._record_test_verdict_local`), mirroring `test_toolchain`
+    # just above: it describes THIS verdict, so it must never survive a
+    # later verdict that didn't supply one.
+    test_confirmation: str | None = None
     # #253: parsed adversarial-review verdict for type="review" assignments.
     # None | "approve" | "request-changes". Set when notify or auto_loop
     # extracts the structured REVIEW_VERDICT from the reviewer's log; consumed
