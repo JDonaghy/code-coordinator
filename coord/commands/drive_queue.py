@@ -1253,6 +1253,40 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         for key in cycle:
             cycle_keys[key] = message
 
+    # #3369: `states` above is a single static snapshot of the raw persisted
+    # rows — sufficient for a dependent whose pre-req is DIRECTLY `blocked`
+    # on #2806's unconfirmed-probe text (that shape is matched straight off
+    # `dep_reasons`), but not for one two or more `after=` hops from it. A
+    # live tick discovers that second hop in the SAME pass — position order
+    # means `states[dep]` is already flipped to `waiting` by the time a
+    # later entry's own verdict is derived (`plan_tick`'s `STATE_BLOCKED`
+    # loop mutates `states` as it walks) — but `list` never runs a tick, so
+    # without this it kept reporting "it will never satisfy" for every
+    # entry beyond the first hop, contradicting what the very next real tick
+    # would compute for the identical graph (the vimcode#1059..#1069
+    # incident: six dependents chained behind one unconfirmed probe
+    # failure). This mirrors `_reconcile_blocked_after`'s own resume guard,
+    # entry by entry, walked in the same position order a real tick uses:
+    # only a row whose OWN `last_reason` is already `_resolve_prereqs`'s
+    # unsatisfiable-`after=` verdict (never a permanent #1844/#2019 refusal
+    # or an unrelated cause) is a candidate, and it only cascades as
+    # `waiting` here if a fresh `diagnose_blocked_after` — against this SAME
+    # progressively-corrected view — agrees it is no longer unsatisfiable.
+    cascaded_states = dict(states)
+    if board is not None:
+        for candidate in sorted(all_entries, key=lambda e: (e.position, e.key)):
+            if candidate.state != STATE_BLOCKED or not candidate.after:
+                continue
+            if is_permanent_block_reason(candidate.last_reason):
+                continue
+            if not is_unsatisfiable_prereq_reason(candidate.last_reason):
+                continue
+            pre_diag = diagnose_blocked_after(
+                candidate, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons
+            )
+            if not pre_diag.unsatisfiable:
+                cascaded_states[candidate.key] = STATE_WAITING
+
     for entry in entries:
         diagnosed = (
             board is not None and entry.state in _DIAGNOSABLE_STATES and bool(entry.after)
@@ -1261,7 +1295,7 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         dependency_reason = ""
         if diagnosed:
             diagnosis = diagnose_blocked_after(
-                entry, board, states, cycle_keys, dep_reasons=dep_reasons
+                entry, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons
             )
             unsatisfied = diagnosis.unsatisfied
             dependency_reason = diagnosis.dependency_reason
@@ -1336,8 +1370,32 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             if entry.hold_scope == HOLD_SCOPE_FLEET:
                 bits.append("scope=fleet")
         click.echo("  ".join(bits))
-        if entry.last_reason:
-            click.echo(f"      last{_reason_age_suffix(entry, now)}: {entry.last_reason}")
+        # #3369: a dependency-caused row's `last:` line is, by default, the
+        # frozen `entry.last_reason` a PAST tick wrote — which can say "it
+        # will never satisfy" about a pre-req whose OWN current state has
+        # since turned out to be a retryable #2806 probe failure rather than
+        # a confirmed-still-shut gate (#3368), or that only became true two
+        # `after=` hops away from where the actual retry is happening (this
+        # row's diagnosis cascades through `cascaded_states` above the same
+        # way a live tick's own position-ordered walk would). `diagnosis.
+        # dependency_reason` is already the CURRENT `_resolve_prereqs`
+        # verdict against that same graph — showing it here instead of the
+        # frozen text is the same "recomputed, never read off the frozen
+        # last_reason" rule #2183 already applies to the `after=` list
+        # itself (see `unsatisfied` above) and to which remedy note prints
+        # below, just closing the one place that rule didn't yet reach: the
+        # dependent's own headline reason. A row that is NOT dependency-
+        # caused (no `after=`, or its real cause is unrelated to it) keeps
+        # showing its own frozen `last_reason` exactly as before.
+        using_fresh_reason = diagnosed and bool(dependency_reason)
+        display_reason = dependency_reason if using_fresh_reason else entry.last_reason
+        # The age suffix (#2133) times how long `entry.last_reason` has sat
+        # unrevalidated — meaningless (and actively misleading, implying the
+        # fresh sentence is itself stale) once that text has been swapped
+        # for a diagnosis computed THIS call.
+        age_suffix = "" if using_fresh_reason else _reason_age_suffix(entry, now)
+        if display_reason:
+            click.echo(f"      last{age_suffix}: {display_reason}")
         if diagnosed:
             # #2183 point 4: `blocked`/`failed` is terminal — say so where the
             # operator is already reading the row, not just in an unrelated

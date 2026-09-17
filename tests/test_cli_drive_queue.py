@@ -1409,6 +1409,84 @@ def test_blocked_row_purely_by_an_unsatisfiable_prereq_gets_the_2362_note(
     assert "re-checked against the merge gate automatically (#2230)" in block_1650
 
 
+def test_list_cascades_an_unconfirmed_probe_failure_through_a_two_hop_after_chain(
+    cli, seed,
+):
+    """#3369: the vimcode#1059..#1069 incident. #1059 itself is `blocked` on
+    #2806's explicitly-retryable "gate could not be read this tick" verdict
+    — its OWN text says so. #1060 is chained `--after` #1059 and #1061 is
+    chained `--after` #1060 (two hops from the unconfirmed probe failure),
+    both still sitting on disk with the pre-#3368 frozen "it will never
+    satisfy" verdict, exactly as a real queue looks the tick after a probe
+    failure and before the next tick's sweep has re-derived them.
+
+    #3368 already fixed the ONE-hop case (#1060 reading #1059's own text
+    directly). But `list`'s #2183 re-diagnosis computes every row's
+    dependency reason off a single static snapshot of `states`/`last_reason`
+    — so #1061's diagnosis saw #1060 as plain `blocked` with the OLD literal
+    "it will never satisfy" text (which does not itself match #2806's
+    marker), and rendered #1061 as permanently unsatisfiable too, even
+    though a live tick — which mutates `states` as it walks the chain in
+    position order — would resume BOTH #1060 and #1061 to `waiting` in the
+    very same tick. `list` must never show a bleaker verdict than the next
+    real tick would compute."""
+    seed(issues={1059: "open", 1060: "open", 1061: "open"})
+    cli("add", REPO, "1059")
+    root_reason = (
+        f"{REPO}#1059's merge gate could not be read this tick (no "
+        "merge-queue row for this entry, even after the self-heal enqueue "
+        "attempt) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; #2230's sweep will try again next tick rather than "
+        "guessing (#2806)"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 1059, state="blocked", last_reason=root_reason, attempts=2,
+    )
+    cli("add", REPO, "1060", "--after", "1059")
+    state._update_drive_queue_entry_local(
+        REPO,
+        1060,
+        state="blocked",
+        last_reason=f"pre-req {REPO}#1059 is queued but blocked — it will never satisfy",
+        attempts=2,
+    )
+    cli("add", REPO, "1061", "--after", "1060,1059")
+    state._update_drive_queue_entry_local(
+        REPO,
+        1061,
+        state="blocked",
+        last_reason=f"pre-req {REPO}#1060 is queued but blocked — it will never satisfy",
+        attempts=1,
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+
+    row_1060 = _row_for(result.output, f"{REPO}#1060")
+    row_1061 = _row_for(result.output, f"{REPO}#1061")
+    idx_1060 = result.output.index(row_1060)
+    idx_1061 = result.output.index(row_1061)
+    block_1060 = result.output[idx_1060:idx_1061]
+    block_1061 = result.output[idx_1061:]
+
+    # Neither dependent may render the terminal "it will never satisfy"
+    # verdict any more — #1059's own text already says its block is a
+    # retryable probe failure, not a confirmed-still-shut gate, and that
+    # honesty must survive both hops.
+    assert "it will never satisfy" not in block_1060
+    assert "it will never satisfy" not in block_1061
+    # #1060 is one hop from the unconfirmed probe failure, so its own fresh
+    # verdict names it explicitly.
+    assert "retrying" in block_1060 or "unconfirmed probe failure" in block_1060
+    # #1061 is two hops away: its own immediate pre-req (#1060) is no longer
+    # itself `blocked`/`failed` in this same cascaded reading, so its honest
+    # verdict is an ordinary "still waiting on #1060" deferral rather than a
+    # repeat of the specific probe-failure wording — the point is only that
+    # it must never overclaim permanence about a chain that is, in fact,
+    # about to resume on its own.
+    assert "waiting on" in block_1061 and REPO in block_1061
+
+
 def test_a_blocked_entry_resumes_and_launches_once_a_live_recheck_confirms_its_prereq_landed(
     cli, seed, launches, monkeypatch,
 ):
