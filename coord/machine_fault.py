@@ -59,6 +59,26 @@ fleet's one pause mechanism (already daemon-aware, already rendered by
 unavailable" concept that could silently disagree with it (#2096: "one
 question, one answer").
 
+CALLER CONTRACT, post-review-#1 tightening: `record_fault`/`maybe_auto_pause`
+are mechanism only — this module does not decide which classifications are
+allowed to drive them, and on its own `classify_machine_fault` returning
+`is_machine_fault=True` is NOT sufficient reason to call them. The caller
+(`coord.drive`'s `_machine_fault_warnings`) only does so for `signal ==
+"auth_failure"`. The `instant_zero_cost` shape signal is DELIBERATELY
+excluded from feeding the counter/pause, even though it still earns the
+"redispatch without charging the issue's retry budget" treatment: a
+pre-launch failure that never got a worker process running at all (bad
+`pull_repos`/`repo_path` entry, worktree setup failure, a raw spawn
+`OSError` — none of these are a `claude` OAuth problem) lands on
+`num_turns=0`/`cost_usd=None` for the exact same reason a genuine dead
+credential does (see `is_instant_zero_cost_failure`'s own note below), and a
+systemic config defect reproduces IDENTICALLY on every machine that shares
+it. Letting the shape signal alone drive `record_fault` would auto-pause the
+whole fleet one host at a time as each is tried in turn — the same
+wrong-culprit failure class this module exists to fix, just relocated from
+"one host's auth" to "any pre-launch failure, fleet-wide". See
+`coord.drive._machine_fault_warnings` for the enforcement point.
+
 SCOPE NOTE: the fault *counter* itself is local-only — it lives wherever the
 `coord drive` decision loop happens to run, and is not routed through the
 daemon the way `coord.machine_pause`'s pause SET is. The PAUSE it triggers

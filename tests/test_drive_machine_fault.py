@@ -57,9 +57,13 @@ def test_an_auth_failed_review_redispatches_without_spending_review_retries():
 
 
 def test_an_instant_zero_cost_review_failure_is_also_a_machine_fault():
-    """No auth text at all — the generic "1 turn / $0" shape alone must be
-    enough, per #3367's own framing ("four identical instances is not
-    ambiguity... regardless of the error text")."""
+    """No auth text at all — the generic "1 turn / $0" shape alone must
+    still be enough to avoid charging the issue's own retry budget, per
+    #3367's own framing ("four identical instances is not ambiguity...
+    regardless of the error text"). It must NOT, however, feed the
+    per-machine consecutive-fault counter or auto-pause — see the review-#1
+    fix and `test_repeated_instant_zero_cost_failures_do_not_auto_pause`
+    below."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_work_retries=1)
     s = work_tested(
@@ -74,6 +78,43 @@ def test_an_instant_zero_cost_review_failure_is_also_a_machine_fault():
     assert action.kind == RUN
     assert counters.review_retries == 0
     assert counters.review_machine_fault_retries == 1
+    assert machine_fault.consecutive_faults("precision") == 0
+
+
+def test_repeated_instant_zero_cost_failures_do_not_auto_pause():
+    """Review-#1 fix: a genuine PRE-LAUNCH/config failure (never got a
+    worker process running — e.g. `AgentServer._fail`'s "no repo_path
+    configured for dependency") has the IDENTICAL num_turns=0/cost=None
+    shape as a dead OAuth credential, and — being a config defect, not a
+    host defect — reproduces identically on every machine sharing it. This
+    must NOT walk the fleet auto-pausing healthy machines one at a time the
+    way the auth-text signal legitimately does (see
+    `test_repeated_auth_failures_on_the_same_machine_auto_pause_it`): no
+    auth wording anywhere, num_turns=0, cost=None, repeated well past
+    `AUTO_PAUSE_THRESHOLD`, and `precision` must still be routable."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = work_tested(
+        review_aid="r1",
+        review_status="failed",
+        review_machine="precision",
+        review_failure_reason="no repo_path configured for dependency 'vimcode'",
+        review_num_turns=0,
+        review_cost_usd=None,
+    )
+    assert "precision" not in machine_pause.local_paused_set()
+    # One past `AUTO_PAUSE_THRESHOLD` (proving the threshold alone doesn't
+    # trip it), staying under `_MACHINE_FAULT_RETRY_BUDGET`
+    # (`AUTO_PAUSE_THRESHOLD + 2`) so this loop doesn't hit the unrelated
+    # "died anyway" terminal path exercised by
+    # `test_a_machine_fault_that_outlives_its_own_local_budget_still_dies`.
+    for _ in range(machine_fault.AUTO_PAUSE_THRESHOLD + 1):
+        action = step(s, opts, counters=counters)
+        assert action.kind == RUN
+    assert "precision" not in machine_pause.local_paused_set()
+    assert machine_fault.consecutive_faults("precision") == 0
+    # The issue's own review-retry budget is still untouched throughout.
+    assert counters.review_retries == 0
 
 
 def test_a_genuine_review_failure_still_spends_the_ordinary_budget():
