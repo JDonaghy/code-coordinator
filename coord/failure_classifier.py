@@ -2,21 +2,38 @@
 escalate the model on retry.
 
 The model-escalation ladder (``ModelsConfig.escalation`` / ``next_model`` in
-``coord/config.py``) climbs on ANY failed leg today — every automatic
-fix-dispatch door (``coord/commands/plan_followup.py``'s ``fix()``, the
-Test/CI-failure arm) treats a red leg as "the model was not strong enough"
-and reaches for a pricier one. That is the wrong move for a COMPLIANCE
-failure: a ratchet, a lint/formatter check, a ``files_forbidden``/sealed-path
-violation. No amount of model capability lets a worker guess a repo-specific
-fact it was never told — opus cannot infer a ratchet's pinned count any
-better than sonnet can. #3357 paid for exactly this: a tripped
-``sqlite3.connect`` ratchet bought an opus worker that spun 25 turns and
-committed nothing.
+``coord/config.py``) used to climb on ANY failed leg — every automatic
+fix-dispatch door treated a red leg as "the model was not strong enough" and
+reached for a pricier one. That is the wrong move for a COMPLIANCE failure: a
+ratchet, a lint/formatter check, a ``files_forbidden``/sealed-path violation.
+No amount of model capability lets a worker guess a repo-specific fact it was
+never told — opus cannot infer a ratchet's pinned count any better than
+sonnet can. #3357 paid for exactly this: a tripped ``sqlite3.connect`` ratchet
+bought an opus worker that spun 25 turns and committed nothing.
 
 ``classify_failure()`` is the ONE classifier every escalation-gated dispatch
 door calls (#2096 "one question, one answer" — two independent
 implementations of "is this failure a compliance nit or a real bug" would be
-a split-brain waiting to happen).
+a split-brain waiting to happen). As of #3360 that is every known door:
+
+- ``coord/commands/plan_followup.py``'s ``fix()`` — the Test/CI-failure arm.
+- ``coord/commands/dispatch.py``'s ``retry()`` — via
+  :func:`failure_text_for_assignment` below, since this door only has the
+  board row, not an already-loaded test/review body.
+- ``coord/auto_loop.py``'s ``_fix_model_for_iteration`` — the headless
+  review→fix bounce reached from both ``coord notify``'s completion
+  transition and ``coord fix``'s review-triggered arm
+  (``_fix_from_review`` → ``process_review_completion`` →
+  ``_dispatch_fix_for_review``), plus the dashboard's "unstick this row"
+  button (``coord.review.dispatch_headless_fix``) and the human-attended
+  ``coord fix`` CLI (``coord.commands.dispatch_workers``). All three thread
+  the review/test findings text through as ``failure_text``.
+- ``coord/commands/plan_followup.py``'s ``resume_stuck()`` is the ONE
+  exception, deliberately: it is the recovery path for a worker the
+  stuck-detector already flagged (turns elapsed, no commit) — the issue's
+  own "Spin" category, which is neither a capability nor a compliance
+  question, so it never calls ``classify_failure()`` at all and never
+  escalates; see the comment at its call site.
 
 Classification
 --------------
@@ -42,6 +59,24 @@ to have kept #3357 on sonnet: classify by known compliance signatures, and
 default everything else (including "no evidence") away from escalation
 rather than assuming capability difficulty. It does not attempt full natural
 -language failure-cause classification.
+
+ACCEPTED RISK (flagged in #3360 review, not fixed — the direction is safe).
+Two known false-positive shapes, both reviewed and accepted because they only
+ever cause a WRONGLY-SKIPPED escalation, never a wrong one:
+
+- A single failure text can carry BOTH a tripped ratchet and a genuine
+  behavioural assertion failure; this classifies the whole blob as
+  "compliance" and skips escalation for the real bug too. Cheap because the
+  same-rung retry is one leg, and once the ratchet is fixed the genuine
+  failure surfaces alone on the next iteration.
+- A signature (e.g. ``ratchet``, ``clippy``) could in principle appear in an
+  unrelated domain's own vocabulary (code that itself implements or tests
+  something literally named "ratchet"). None of today's signatures look
+  dangerously generic, but a false hit here still only means "wrongly skip
+  escalation" — the safe-by-design direction per #3360's own cost model
+  (a wrong same-rung retry costs one cheap leg; a wrong escalation costs the
+  most expensive rung on the ladder, and #3357 shows that rung can still
+  fail outright).
 """
 
 from __future__ import annotations
@@ -141,3 +176,41 @@ def classify_failure(text: str | None) -> FailureClassification:
             "escalating the model rung"
         ),
     )
+
+
+def failure_text_for_assignment(assignment) -> str:  # noqa: ANN001
+    """Best-effort failure text for a board ``Assignment``, for feeding
+    :func:`classify_failure`.
+
+    A door that only has the board row (e.g. ``coord retry``, dispatching a
+    failed/advisory WORK-like assignment with no CLI-supplied CI story or
+    already-loaded review findings) still needs SOME text to classify —
+    otherwise it can only ever see ``"unknown"`` and never detect a
+    compliance signature at all. This concatenates every reason field the
+    board might have recorded, so "which field wins" has one answer (#2096)
+    instead of a per-door dialect:
+
+    - ``failure_reason`` — the worker/dispatch-level failure summary.
+    - the fuller test-reason text via ``load_assignment_test_reason``
+      (falls back to the board-carried ``test_reason``/``smoke_test_reason``
+      previews — #1337).
+    - ``acceptance_reason`` (#2344) / ``uat_reason`` (#3208) — trust-gate
+      verdicts.
+
+    Classification only needs ONE field to carry a compliance signature to
+    skip escalation, so concatenating costs nothing: a field that doesn't
+    apply to this assignment is simply empty and contributes nothing to the
+    scan.
+    """
+    from coord.state import load_assignment_test_reason  # noqa: PLC0415
+
+    assignment_id = getattr(assignment, "assignment_id", None)
+    parts = [
+        getattr(assignment, "failure_reason", None),
+        load_assignment_test_reason(assignment_id) if assignment_id else None,
+        getattr(assignment, "test_reason", None),
+        getattr(assignment, "smoke_test_reason", None),
+        getattr(assignment, "acceptance_reason", None),
+        getattr(assignment, "uat_reason", None),
+    ]
+    return "\n".join(p for p in parts if p)

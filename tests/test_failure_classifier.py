@@ -9,7 +9,10 @@ particular dispatch door.
 
 from __future__ import annotations
 
-from coord.failure_classifier import classify_failure
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from coord.failure_classifier import classify_failure, failure_text_for_assignment
 
 
 class TestComplianceSignatures:
@@ -108,3 +111,80 @@ class TestUnknownDefaultsToNotEscalating:
         result = classify_failure("   \n\t  ")
         assert result.category == "unknown"
         assert result.should_escalate is False
+
+
+class TestFailureTextForAssignment:
+    """#3360: `coord retry` only has the board row, not an already-loaded
+    test/review body — `failure_text_for_assignment` is what feeds
+    `classify_failure` for that door (and any other door in the same
+    position)."""
+
+    def test_gathers_failure_reason(self) -> None:
+        assignment = SimpleNamespace(
+            assignment_id="a1", failure_reason="worker crashed: OOM",
+            test_reason=None, smoke_test_reason=None,
+            acceptance_reason=None, uat_reason=None,
+        )
+        with patch(
+            "coord.state.load_assignment_test_reason", return_value=None,
+        ):
+            text = failure_text_for_assignment(assignment)
+        assert "worker crashed: OOM" in text
+
+    def test_prefers_full_test_reason_over_preview(self) -> None:
+        assignment = SimpleNamespace(
+            assignment_id="a1", failure_reason=None,
+            test_reason="truncated preview...",
+            smoke_test_reason=None, acceptance_reason=None, uat_reason=None,
+        )
+        with patch(
+            "coord.state.load_assignment_test_reason",
+            return_value="the FULL ratchet failure text",
+        ):
+            text = failure_text_for_assignment(assignment)
+        assert "the FULL ratchet failure text" in text
+
+    def test_concatenates_every_available_reason(self) -> None:
+        assignment = SimpleNamespace(
+            assignment_id="a1",
+            failure_reason="dispatch-level failure",
+            test_reason=None,
+            smoke_test_reason="smoke failed too",
+            acceptance_reason="acceptance also failed",
+            uat_reason="and UAT",
+        )
+        with patch(
+            "coord.state.load_assignment_test_reason", return_value=None,
+        ):
+            text = failure_text_for_assignment(assignment)
+        assert "dispatch-level failure" in text
+        assert "smoke failed too" in text
+        assert "acceptance also failed" in text
+        assert "and UAT" in text
+
+    def test_no_reasons_at_all_yields_empty_string(self) -> None:
+        assignment = SimpleNamespace(
+            assignment_id="a1", failure_reason=None, test_reason=None,
+            smoke_test_reason=None, acceptance_reason=None, uat_reason=None,
+        )
+        with patch(
+            "coord.state.load_assignment_test_reason", return_value=None,
+        ):
+            text = failure_text_for_assignment(assignment)
+        assert text == ""
+        # Feeds straight into classify_failure's "unknown" default.
+        assert classify_failure(text).category == "unknown"
+        assert classify_failure(text).should_escalate is False
+
+    def test_no_assignment_id_skips_the_test_reason_lookup(self) -> None:
+        assignment = SimpleNamespace(
+            assignment_id=None, failure_reason="something failed",
+            test_reason=None, smoke_test_reason=None,
+            acceptance_reason=None, uat_reason=None,
+        )
+        with patch(
+            "coord.state.load_assignment_test_reason",
+        ) as load_tr:
+            text = failure_text_for_assignment(assignment)
+        load_tr.assert_not_called()
+        assert "something failed" in text

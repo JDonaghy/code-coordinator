@@ -2210,9 +2210,28 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
 
     original_model = assignment.model or cfg.models.default
     if provider_type_for(resolved_provider_name, cfg.providers) in IMPLICIT_PROVIDER_TYPES:
-        escalated = cfg.models.next_model(original_model)
-        if escalated != original_model:
-            click.echo(f"  escalating model: {original_model} → {escalated}")
+        # #3360: classify what actually failed before climbing the ladder —
+        # a compliance nit (a ratchet, a lint/formatter check, a
+        # files_forbidden violation) re-dispatches at the SAME rung, since no
+        # model-capability difference fixes a repo-specific fact the worker
+        # was never told (#3357 paid for exactly this on the top rung).
+        from coord.failure_classifier import (  # noqa: PLC0415
+            classify_failure,
+            failure_text_for_assignment,
+        )
+
+        classification = classify_failure(failure_text_for_assignment(assignment))
+        if classification.should_escalate:
+            escalated = cfg.models.next_model(original_model)
+            if escalated != original_model:
+                click.echo(f"  escalating model: {original_model} → {escalated}")
+        else:
+            escalated = original_model
+            click.echo(
+                f"  not escalating model (#3360, {classification.category}"
+                + (f": {classification.matched}" if classification.matched else "")
+                + f") — staying on {original_model or 'default'}"
+            )
         retry_model = escalated
     else:
         # Not a claude-family provider — the escalation ladder doesn't

@@ -408,6 +408,15 @@ class TestResumeStuck:
         assert "Do NOT start over" in proposal.briefing
         assert "#42" in proposal.briefing
 
+        # #3360: resume-stuck IS the "spin" scenario the issue calls the
+        # worst case to escalate (a bigger model just spins more
+        # expensively) — it must dispatch the continuation on the SAME
+        # model rung, never climb the ladder. The assignment carries no
+        # explicit model, so this stays on cfg.models.default ("sonnet"),
+        # not next_model("sonnet") == "opus".
+        assert proposal.model == "sonnet"
+        assert "not escalating model" in result.output
+
     def test_resume_stuck_on_non_running_assignment(
         self, config_file: Path, coord_dir: Path
     ) -> None:

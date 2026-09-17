@@ -5179,7 +5179,11 @@ def dispatch_headless_fix(
         issue_context_block(work.repo_name, work.issue_number)
         + _build_fix_briefing(work, findings_obj, next_iteration, max_iter)
     )
-    model = _fix_model_for_iteration(config, next_iteration)
+    # #3360: gate the escalation on what actually failed — a compliance nit
+    # in `findings_obj.body` stays on the current rung instead of climbing.
+    model = _fix_model_for_iteration(
+        config, next_iteration, failure_text=findings_obj.body,
+    )
     return _dispatch_fix(
         work, briefing, board, config, next_iteration,
         model=model, http_client=http_client,
