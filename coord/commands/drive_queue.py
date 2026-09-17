@@ -1239,6 +1239,13 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         else {}
     )
     states = {e.key: e.state for e in all_entries}
+    # #3368: `diagnose_blocked_after`'s `dep_reasons` param, threaded through
+    # here too — so `list`/`status`'s re-derived `dependency_reason` (below)
+    # never disagrees with what a live tick would compute for the same
+    # `after=` graph: a dep whose OWN `last_reason` is #2806's "unconfirmed
+    # probe failure" text must read the same way here as it does in
+    # `coord.drive_queue._resolve_prereqs`.
+    dep_reasons = {e.key: e.last_reason for e in all_entries}
     cycle_keys: dict[str, str] = {}
     cycle = find_cycle({e.key: list(e.after) for e in all_entries})
     if cycle is not None:
@@ -1253,7 +1260,9 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         unsatisfied = entry.after
         dependency_reason = ""
         if diagnosed:
-            diagnosis = diagnose_blocked_after(entry, board, states, cycle_keys)
+            diagnosis = diagnose_blocked_after(
+                entry, board, states, cycle_keys, dep_reasons=dep_reasons
+            )
             unsatisfied = diagnosis.unsatisfied
             dependency_reason = diagnosis.dependency_reason
 
@@ -4211,6 +4220,27 @@ def _fetch_live_prereq_terminal(
         if e.state != STATE_RUNNING or e.key in targets:
             continue
         if e.key in board.live_sessions:
+            continue
+        if board.facts(e.key).landed:
+            continue
+        targets.add(e.key)
+    # #3368: a `parked`/`blocked`/`failed` entry's OWN key gets the same
+    # live re-check, bounded exactly like the #2850 `running` case just
+    # above — the vimcode#1059 incident: a `blocked` row merged out of band
+    # (an operator `coord drive` to completion) and stayed `blocked` forever
+    # because `coord.drive_queue`'s #2055 re-check trusted only the cached
+    # `board.facts(key).landed`, and this key was never added as a live-check
+    # TARGET at all when no OTHER entry's `after=` happened to name it (a
+    # leaf issue with no dependents chained behind it). Every dependent
+    # ALREADY gets a live re-check of its pre-reqs via the loop above; a
+    # `blocked`/`parked`/`failed` entry deserves the identical chance to
+    # notice its OWN issue landed, whether or not anything is chained after
+    # it — same "one question, one answer" reasoning the #2850 widening
+    # above already established for `running`.
+    for e in entries:
+        if e.state not in (STATE_PARKED, STATE_BLOCKED, STATE_FAILED):
+            continue
+        if e.key in targets:
             continue
         if board.facts(e.key).landed:
             continue

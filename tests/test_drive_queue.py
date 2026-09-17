@@ -4442,6 +4442,97 @@ def test_a_blocked_entry_stays_blocked_while_its_prereq_is_still_blocked():
     assert plan.launch is None
 
 
+# ── #3368: an unconfirmed pre-req block must never render as terminal ──────
+#
+# `_reconcile_blocked_unreadable`'s #2806 "gate could not be read this tick"
+# verdict is EXPLICITLY retryable — its own text says so ("NOT a
+# confirmed-still-shut gate, only a failed probe"). Before this,
+# `_resolve_prereqs` collapsed that shape into the SAME "it will never
+# satisfy" verdict a genuinely dead/permanently-blocked pre-req gets,
+# contradicting the very reason it was quoting — the vimcode#1059 incident's
+# second defect: one row called its own state a retryable probe failure,
+# while six dependents rendered that same state as permanent.
+
+
+def test_a_waiting_entry_defers_rather_than_blocks_when_its_prereq_is_blocked_only_on_an_unconfirmed_probe_failure():
+    dep_key = entry_key(REPO, 1059)
+    dep_reason = (
+        f"{dep_key}'s merge gate could not be read this tick (no PR number "
+        "yet) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; #2230's sweep will try again next tick rather than "
+        "guessing (#2806)"
+    )
+    entries = [
+        entry(1059, position=0, state=STATE_BLOCKED, last_reason=dep_reason),
+        entry(1060, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    # An ordinary deferral — NOT a block-and-escalate: the entry keeps its
+    # position, spends no attempt budget, and is free to try again next tick.
+    assert plan.blocked == ()
+    assert len(plan.deferrals) == 1
+    deferral = plan.deferrals[0]
+    assert deferral.key == entry_key(REPO, 1060)
+    assert "it will never satisfy" not in deferral.reason
+    assert "retrying" in deferral.reason
+    assert "unconfirmed probe failure" in deferral.reason
+
+
+def test_a_waiting_entry_still_blocks_when_its_prereq_is_blocked_for_a_confirmed_reason():
+    """The #3368 carve-out is scoped to the #2806 marker text ONLY — an
+    ordinary confirmed-still-shut gate (or any other blocked cause) keeps
+    the pre-#3368 "it will never satisfy" verdict exactly as before."""
+    dep_key = entry_key(REPO, 1059)
+    entries = [
+        entry(
+            1059,
+            position=0,
+            state=STATE_BLOCKED,
+            last_reason="checks_failed: test (3.12) — confirmed still red",
+        ),
+        entry(1060, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert len(plan.blocked) == 1
+    blocked = plan.blocked[0]
+    assert blocked.key == entry_key(REPO, 1060)
+    assert "it will never satisfy" in blocked.reason
+
+
+def test_a_blocked_entry_resumes_once_its_prereqs_block_turns_out_to_be_an_unconfirmed_probe_failure():
+    """A dependent already `blocked` on the frozen (pre-#3368) "it will
+    never satisfy" verdict must still resume once a FRESH re-derivation
+    (`_reconcile_blocked_after`, #2362) finds the named pre-req's CURRENT
+    block cause is #2806's unconfirmed-probe-failure marker — the same
+    self-heal #2362 already gives a pre-req that landed, extended to a
+    pre-req that merely turned out to be retryable rather than dead."""
+    dep_key = entry_key(REPO, 1059)
+    dep_reason = (
+        f"{dep_key}'s merge gate could not be read this tick (no PR number "
+        "yet) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; #2230's sweep will try again next tick rather than "
+        "guessing (#2806)"
+    )
+    entries = [
+        entry(1059, position=0, state=STATE_BLOCKED, last_reason=dep_reason),
+        entry(
+            1060,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(entries, board(), capacity=2)
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1060))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert "it will never satisfy" not in reconcile.reason
+
+
 def test_a_blocked_entry_with_an_unrelated_cause_is_not_resumed_by_a_landed_prereq():
     """A `blocked` entry that merely HAS an `after=` list, but whose
     `last_reason` names a DIFFERENT cause (exhausted attempts, not an
