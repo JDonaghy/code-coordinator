@@ -4700,6 +4700,7 @@ def _dispatch_headless(
         post_briefing,
         resolve_dispatch_model_alias,
     )
+    from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
     from coord.network import claude_credential_reachable, fetch_status  # noqa: PLC0415
     from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
@@ -5029,6 +5030,12 @@ def _dispatch_headless(
             # here too), so this must actually refuse a dead-credential
             # host, not just be capable of it.
             credential_fetcher=claude_credential_reachable,
+            # #3376 review round 1: `coord assign` is a production
+            # dispatch chokepoint (`coord drive`'s WORK stage funnels
+            # through here too) — wire the other two STRUCTURAL
+            # DISPATCH-LIVENESS GATE predicates the same way
+            # `credential_fetcher` just above already is.
+            issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
         )
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)

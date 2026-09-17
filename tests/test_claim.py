@@ -771,6 +771,108 @@ def test_find_work_claim_still_blocks_unmerged_remote_branch(monkeypatch) -> Non
     assert claim.branch == "issue-319-active"
 
 
+def test_list_matching_remote_branches_includes_merged_and_unmerged(monkeypatch) -> None:
+    """#3376: `list_matching_remote_branches` is the UNFILTERED lookup
+    `any_matching_branch_merged` needs — unlike `_default_branch_lookup`
+    (claim detection), it must NOT drop a branch just because it merged."""
+    import json
+
+    import coord.claim as claim_mod
+
+    def _fake(*args, **kwargs):
+        path = args[1]
+        if "matching-refs" in path:
+            return json.dumps([
+                {"ref": "refs/heads/issue-500-done"},
+                {"ref": "refs/heads/issue-500-followup"},
+            ])
+        return "{}"
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    assert claim_mod.list_matching_remote_branches("acme/api", 500) == [
+        "issue-500-done", "issue-500-followup",
+    ]
+
+
+def test_list_matching_remote_branches_empty_on_gh_error(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr("coord.github_ops._gh", _boom)
+    assert claim_mod.list_matching_remote_branches("acme/api", 500) == []
+
+
+def _gh_stub_with_matching_refs(branches, default_branch, ahead_by):
+    """Like `_gh_stub`, but also answers the `matching-refs` lookup
+    `list_matching_remote_branches` makes first — `_gh_stub` alone only
+    covers `/compare/` and `default_branch`, which is all `_drop_merged_
+    branches` (given an already-known branch list) ever needed."""
+    import json
+
+    def _fake(*args, **kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if "matching-refs" in path:
+            return json.dumps([{"ref": f"refs/heads/{b}"} for b in branches])
+        if "/compare/" in path:
+            head = path.split("...", 1)[1]
+            return json.dumps({"ahead_by": ahead_by.get(head, 1)})
+        return json.dumps({"default_branch": default_branch})
+
+    return _fake
+
+
+def test_any_matching_branch_merged_true_when_pr_merged(monkeypatch) -> None:
+    """#3376: the `branch_merged` predicate `coord.dispatch_liveness.
+    github_issue_liveness_fetcher` needs — a merged `issue-N-*` branch must
+    read `True` even though `_default_branch_lookup`'s own filtered list
+    would come back empty for the same input."""
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(["issue-9-done"], "main", {"issue-9-done": 0}),
+    )
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is True
+
+
+def test_any_matching_branch_merged_false_when_unmerged(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(["issue-9-live"], "main", {"issue-9-live": 3}),
+    )
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is False
+
+
+def test_any_matching_branch_merged_false_when_no_branch_exists(monkeypatch) -> None:
+    """No `issue-N-*` branch on the remote at all — nothing to have merged,
+    must not be confused with "merged" (fail toward NOT refusing dispatch)."""
+    import json
+
+    import coord.claim as claim_mod
+
+    def _fake(*args, **kwargs):
+        if "matching-refs" in args[1]:
+            return json.dumps([])
+        return "{}"
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is False
+
+
+def test_any_matching_branch_merged_false_on_gh_error(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr("coord.github_ops._gh", _boom)
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is False
+
+
 # ── #1553: has_active_work_followup keys on the EFFECTIVE issue ─────────────
 
 

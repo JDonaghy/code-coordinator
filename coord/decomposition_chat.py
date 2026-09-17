@@ -934,6 +934,13 @@ def dispatch_decomposition_chat(
     # transient failure backoff can fix — refuse before POSTing an
     # assignment that would fail at turn 1 for $0 (dispatch()'s
     # STRUCTURAL CREDENTIAL-HEALTH GATE raises ValueError).
+    # #3376 review round 1: NOT wiring `issue_liveness_fetcher` here on
+    # purpose — this proposal carries the "No existing issue yet" 0
+    # sentinel (see above), so there is no real issue/branch to check
+    # liveness of. See `coord.new_issue_chat`'s identical dispatch site for
+    # the full rationale; every dispatcher in this family that carries a
+    # REAL issue number (milestone-chat, refine-chat, mock-author) wires
+    # it.
     response = dispatch_with_retry(
         proposal,
         config,

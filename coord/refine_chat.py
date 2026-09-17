@@ -279,6 +279,7 @@ def dispatch_refinement(
     )
 
     from coord.dispatch import dispatch_with_retry
+    from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
     from coord.network import claude_credential_reachable  # noqa: PLC0415
     from coord.state import record_dispatched_assignment
     from coord.models import Assignment
@@ -287,11 +288,16 @@ def dispatch_refinement(
     # transient failure backoff can fix — refuse before POSTing an
     # assignment that would fail at turn 1 for $0 (dispatch()'s
     # STRUCTURAL CREDENTIAL-HEALTH GATE raises ValueError).
+    # #3376 review round 1: this proposal is keyed to a REAL issue (unlike
+    # the board-refinement dispatch below, which uses the #316
+    # issue_number=0 sentinel and has no real issue to check) — wire the
+    # other two STRUCTURAL DISPATCH-LIVENESS GATE predicates too.
     response = dispatch_with_retry(
         proposal, cfg,
         max_retries=cfg.concurrency.max_retries,
         backoff_base=cfg.concurrency.backoff_base,
         credential_fetcher=claude_credential_reachable,
+        issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
     )
 
     assignment_id = response.get("id") or uuid.uuid4().hex[:12]

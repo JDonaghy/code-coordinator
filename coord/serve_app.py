@@ -2033,6 +2033,7 @@ def _milestone_drain_tick(config: Config) -> list:
         # #3371: wire the credential-health probe here — this tick loop is
         # a production dispatch path, not a test, so a dead-credential
         # host must actually be excluded from machine selection.
+        from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
         from coord.network import claude_credential_reachable  # noqa: PLC0415
 
         plan = md.plan_dispatch(
@@ -2040,9 +2041,15 @@ def _milestone_drain_tick(config: Config) -> list:
             oracle_loop=config.acceptance.has_driver(repo_name),
             credential_fetcher=claude_credential_reachable,
         )
+        # #3376 review round 1: this drain tick is a real production
+        # dispatch chokepoint — wire the other two STRUCTURAL
+        # DISPATCH-LIVENESS GATE predicates through to `dispatch_entry` /
+        # `coord.dispatch.dispatch()`, same as the credential probe above.
+        _issue_liveness_fetcher = github_issue_liveness_fetcher(config)
         for pick in plan.to_dispatch:
             outcome = md.dispatch_entry(
-                pick, repo_cfg, config, board, tracking_issue=tracking_issue
+                pick, repo_cfg, config, board, tracking_issue=tracking_issue,
+                issue_liveness_fetcher=_issue_liveness_fetcher,
             )
             outcomes.append(outcome)
             if outcome.ok:
@@ -2227,6 +2234,7 @@ def _milestone_gate_tick(config: Config, *, now: float | None = None) -> list:
                 # the documented primary driver for an oracle-loop milestone.
                 # #3371: same credential-health wiring as the drain
                 # tick above.
+                from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
                 from coord.network import claude_credential_reachable  # noqa: PLC0415
 
                 plan = md.plan_dispatch(
@@ -2234,10 +2242,16 @@ def _milestone_gate_tick(config: Config, *, now: float | None = None) -> list:
                     oracle_loop=config.acceptance.has_driver(repo_cfg.name),
                     credential_fetcher=claude_credential_reachable,
                 )
+                # #3376 review round 1: same issue-liveness wiring as the
+                # drain tick above — this gate-walk dispatch is the OTHER
+                # daemon production chokepoint `md.dispatch_entry` funnels
+                # through.
+                _issue_liveness_fetcher = github_issue_liveness_fetcher(config)
                 for pick in plan.to_dispatch:
                     outcome = md.dispatch_entry(
                         pick, repo_cfg, config, board,
                         tracking_issue=record.tracking_issue,
+                        issue_liveness_fetcher=_issue_liveness_fetcher,
                     )
                     dispatched.append(outcome)
                     if outcome.ok:
