@@ -503,6 +503,7 @@ def dispatch_acceptance_mock(
         )
 
     from coord.dispatch import dispatch_with_retry, post_briefing  # noqa: PLC0415
+    from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
     from coord.network import claude_credential_reachable  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
@@ -522,12 +523,17 @@ def dispatch_acceptance_mock(
         # transient failure backoff can fix — refuse before POSTing an
         # assignment that would fail at turn 1 for $0 (dispatch()'s
         # STRUCTURAL CREDENTIAL-HEALTH GATE raises ValueError).
+        # #3376 review round 1: this proposal is keyed to the milestone's
+        # real tracking issue — wire the other two STRUCTURAL
+        # DISPATCH-LIVENESS GATE predicates the same way the credential
+        # probe just above already is.
         response = dispatch_with_retry(
             proposal,
             config,
             max_retries=config.concurrency.max_retries,
             backoff_base=config.concurrency.backoff_base,
             credential_fetcher=claude_credential_reachable,
+            issue_liveness_fetcher=github_issue_liveness_fetcher(config),
         )
     except (ValueError, httpx.HTTPError) as e:
         raise RuntimeError(f"could not dispatch mock-author to {machine.name!r}: {e}") from e

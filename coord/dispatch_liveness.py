@@ -60,14 +60,18 @@ byte-for-byte unaffected, exactly like every pre-#3371 caller of
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from coord.audit import record_audit
+
+if TYPE_CHECKING:
+    from coord.config import Config
 
 __all__ = [
     "LivenessRefusal",
     "check_dispatch_liveness",
     "record_dispatch_refusal",
+    "github_issue_liveness_fetcher",
     "PREDICATE_ISSUE_CLOSED",
     "PREDICATE_BRANCH_MERGED",
     "PREDICATE_MACHINE_UNHEALTHY",
@@ -140,6 +144,54 @@ def check_dispatch_liveness(
             ),
         )
     return None
+
+
+def github_issue_liveness_fetcher(
+    config: "Config",
+) -> Callable[[str, int], tuple[bool, bool]]:
+    """Build a REAL `(repo_name, issue_number) -> (issue_closed,
+    branch_merged)` fetcher, backed by live GitHub calls — the piece #3376
+    review round 1 found missing: `check_dispatch_liveness`'s two new
+    predicates existed and were unit-tested, but every actual dispatch
+    chokepoint (`coord approve`, `coord assign`, `coord drive`'s WORK
+    stage, the daemon auto-loop, the dashboard approve route, and the
+    milestone/refine/new-issue/decomposition chat dispatchers /
+    mock-author) passed `credential_fetcher` but never `issue_liveness_
+    fetcher` — exactly the "mechanism that exists but nothing actually
+    calls" gap #3371's own review round already found once for
+    `credential_fetcher` (see `coord/commands/dispatch.py`'s and
+    `coord/commands/dispatch_workers.py`'s comments at their own
+    `credential_fetcher` wiring).
+
+    Resolves `repo_name` (coordinator.yml's internal name) to `owner/repo`
+    via *config* — every fetcher call inside `coord.dispatch.dispatch()`
+    only ever hands this `(proposal.repo_name, proposal.issue_number)`, so
+    the GitHub-repo mapping has to happen inside the closure, not at the
+    call site.
+
+    issue_closed: `coord.github_ops.issue_is_closed` — one `gh` call.
+    branch_merged: `coord.claim.any_matching_branch_merged` — is there a
+    remote `issue-{N}-*` branch (any slug, not a title-guessed one — a
+    dispatch site has no reliable way to know which title a PRIOR dispatch
+    used to slugify its branch, and issue titles can be edited after the
+    fact) whose current tip has already merged. Both fail open (`False`) on
+    any GitHub/network hiccup — same "never refuse on evidence we don't
+    have" posture `claude_credential_reachable` documents for the third
+    predicate, and matching `issue_is_closed`'s/`pr_is_merged`'s own
+    documented fail-open contracts.
+    """
+
+    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+        from coord import github_ops  # noqa: PLC0415
+        from coord.claim import any_matching_branch_merged  # noqa: PLC0415
+
+        repo_cfg = config.repo(repo_name)
+        repo_github = repo_cfg.github if repo_cfg is not None else repo_name
+        issue_closed = github_ops.issue_is_closed(repo_github, issue_number)
+        branch_merged = any_matching_branch_merged(repo_github, issue_number)
+        return issue_closed, branch_merged
+
+    return fetcher
 
 
 def record_dispatch_refusal(

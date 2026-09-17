@@ -8,13 +8,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from coord.config import Config
 from coord.dispatch_liveness import (
     PREDICATE_BRANCH_MERGED,
     PREDICATE_ISSUE_CLOSED,
     PREDICATE_MACHINE_UNHEALTHY,
     check_dispatch_liveness,
+    github_issue_liveness_fetcher,
     record_dispatch_refusal,
 )
+from coord.models import Repo
 
 
 class TestCheckDispatchLiveness:
@@ -113,3 +116,55 @@ class TestRecordDispatchRefusal:
         assert kwargs["machine"] == "laptop"
         assert kwargs["details"]["predicate"] == PREDICATE_ISSUE_CLOSED
         assert kwargs["details"]["assignment_type"] == "review"
+
+
+class TestGithubIssueLivenessFetcher:
+    """#3376 review round 1: `github_issue_liveness_fetcher` is the REAL
+    fetcher production callers wire into `coord.dispatch.dispatch()`'s
+    `issue_liveness_fetcher` — previously the two predicates existed
+    (above) but nothing supplied live facts at any real dispatch
+    chokepoint. These pin the factory's own behavior in isolation from any
+    particular call site.
+    """
+
+    def _config(self) -> Config:
+        return Config(repos=[Repo(name="api", github="acme/api")], machines=[])
+
+    @patch("coord.claim.any_matching_branch_merged", return_value=False)
+    @patch("coord.github_ops.issue_is_closed", return_value=True)
+    def test_resolves_repo_name_to_github_and_reports_closed(
+        self, mock_closed: MagicMock, mock_merged: MagicMock,
+    ) -> None:
+        fetcher = github_issue_liveness_fetcher(self._config())
+        issue_closed, branch_merged = fetcher("api", 42)
+        assert issue_closed is True
+        assert branch_merged is False
+        mock_closed.assert_called_once_with("acme/api", 42)
+        mock_merged.assert_called_once_with("acme/api", 42)
+
+    @patch("coord.claim.any_matching_branch_merged", return_value=True)
+    @patch("coord.github_ops.issue_is_closed", return_value=False)
+    def test_reports_branch_merged(
+        self, mock_closed: MagicMock, mock_merged: MagicMock,
+    ) -> None:
+        fetcher = github_issue_liveness_fetcher(self._config())
+        issue_closed, branch_merged = fetcher("api", 42)
+        assert issue_closed is False
+        assert branch_merged is True
+
+    @patch("coord.claim.any_matching_branch_merged", return_value=False)
+    @patch("coord.github_ops.issue_is_closed", return_value=False)
+    def test_unknown_repo_name_falls_back_to_itself_as_github_slug(
+        self, mock_closed: MagicMock, mock_merged: MagicMock,
+    ) -> None:
+        # No repo named "ghost" in this Config — the fetcher must not
+        # raise; it falls back to treating the internal name as the
+        # `owner/repo` slug directly (same "never let a missing config
+        # entry crash a dispatch" posture every other fetcher in this
+        # module takes).
+        fetcher = github_issue_liveness_fetcher(self._config())
+        issue_closed, branch_merged = fetcher("ghost", 1)
+        assert issue_closed is False
+        assert branch_merged is False
+        mock_closed.assert_called_once_with("ghost", 1)
+        mock_merged.assert_called_once_with("ghost", 1)

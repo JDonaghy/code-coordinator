@@ -1067,6 +1067,7 @@ def dispatch_entry(
     board: Board,
     *,
     tracking_issue: int | None = None,
+    issue_liveness_fetcher=None,
 ) -> DispatchOutcome:
     """Dispatch one ready-frontier entry to its picked machine.
 
@@ -1089,6 +1090,17 @@ def dispatch_entry(
     dispatching (defense-in-depth against the frontier snapshot going stale
     between planning and dispatch — e.g. a race with a manual `coord
     assign`), matching the same check ``_dispatch_headless`` performs.
+
+    *issue_liveness_fetcher* (#3376) is an optional ``(repo_name: str,
+    issue_number: int) -> (issue_closed: bool, branch_merged: bool)``
+    callable threaded straight through to :func:`coord.dispatch.dispatch`'s
+    parameter of the same name — the STRUCTURAL DISPATCH-LIVENESS GATE's
+    other two predicates. ``None`` (the default) performs no check and
+    refuses nothing, same opt-in shape as every other fetcher in this
+    module; the daemon's auto-drain/gate ticks (``coord.serve_app``'s
+    ``_milestone_drain_tick``/``_milestone_gate_tick``) are the production
+    callers that wire ``coord.dispatch_liveness.github_issue_liveness_
+    fetcher(config)`` in.
     """
     from coord import github_ops  # noqa: PLC0415
     from coord.claim import claim_message, find_work_claim  # noqa: PLC0415
@@ -1265,7 +1277,10 @@ def dispatch_entry(
         # gate excludes an unreachable `machine` in favor of any other
         # repo-capable, reachable candidate instead of burning a
         # drive-queue attempt on a dead box.
-        response = dispatch(proposal, config, status_fetcher=fetch_status)
+        response = dispatch(
+            proposal, config, status_fetcher=fetch_status,
+            issue_liveness_fetcher=issue_liveness_fetcher,
+        )
     except (httpx.HTTPError, ValueError) as e:
         return DispatchOutcome(
             issue_number=issue_number, machine_name=machine.name, ok=False, error=str(e)

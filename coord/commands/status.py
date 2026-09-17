@@ -975,13 +975,17 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # time. Best-effort, same "never let an observability add-on break the
     # command it's riding on" posture as the usage/burn-rate block above —
     # see `coord.invariant_alarms` for the checks themselves (pure,
-    # independently unit-tested) and why only #1 and #5 are wired here:
-    # #2/#4 need cross-tick history this single-shot command doesn't have
-    # (`coord drive-queue status` / a future daemon-side tracker owns
-    # those), and #3 needs a per-stage verdict-field mapping this command
-    # doesn't resolve today.
+    # independently unit-tested) and why #2/#4 are still not wired here:
+    # #2 (queue stalled) and #4 (host staged stale) both need CROSS-TICK
+    # history (a persisted "last seen shape" + a consecutive-occurrence
+    # counter) that nothing in this codebase tracks today — a genuine new
+    # piece of persisted state, not just a missing call site, and out of
+    # scope for this pass; `coord drive-queue status` / a future
+    # daemon-side tracker owns adding that. #1, #3, #5 need no such
+    # history and are wired below.
     try:
         from coord.invariant_alarms import (
+            check_gate_done_without_verdict,
             check_machines_busy_while_queue_empty,
             check_zero_turn_zero_cost_terminal,
         )
@@ -1002,14 +1006,86 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             )
             if alarm is not None:
                 alarms.append(alarm)
+        # Alarm 3 — #3375's own loop condition: a stage reached a
+        # terminal-success status WITHOUT ever recording the verdict its
+        # own gate requires. Scoped here to the two row/verdict-field pairs
+        # that need no per-repo gate-configuration resolution to check
+        # correctly (unlike "test", where `test_state is None` on a `done`
+        # work row is the ORDINARY waiting-for-`coord test` state, not an
+        # anomaly — that mapping is exactly what this command doesn't
+        # resolve, per the note above):
+        #   - a `type="review"` row that reached `status="done"` with no
+        #     parseable `review_verdict` at all (#1956's own defect shape —
+        #     `coord gates`' `review : ERROR` line surfaces this per-issue
+        #     already; this is the SAME fact, fleet-wide, unprompted).
+        #   - a `type="smoke"` row that reached `status="done"` with no
+        #     `smoke_test` ever recorded — a smoke worker that ran to
+        #     completion without ever writing pass/fail, #3375's own
+        #     "5 smoke dispatches, 4 fully completed" shape.
+        for a in list(board.active) + list(board.completed):
+            if a.status != "done":
+                continue
+            if a.type == "review" and a.review_verdict is None:
+                alarm = check_gate_done_without_verdict(
+                    stage=f"review ({a.assignment_id or '?'})",
+                    status=a.status,
+                    has_required_verdict=False,
+                )
+            elif a.type == "smoke" and a.smoke_test is None:
+                alarm = check_gate_done_without_verdict(
+                    stage=f"smoke ({a.assignment_id or '?'})",
+                    status=a.status,
+                    has_required_verdict=False,
+                )
+            else:
+                alarm = None
+            if alarm is not None:
+                alarms.append(alarm)
         # #2786's `num_turns`/`total_cost_usd` live on `AssignmentUsage`
         # (`coord.usage.collect_usage`'s output), not on the plain
         # `coord.models.Assignment` rows `board.completed` holds — reuse
         # the SAME builder the burn-rate line above already calls rather
         # than re-deriving "how many turns did this leg take" a second way
         # (#2096: one question, one answer).
-        usage = build_session_usage(list(board.active) + list(board.completed))
+        #
+        # #3376 review round 1: this MUST pass `remote_by_id`, or every
+        # assignment whose log lives on a DIFFERENT fleet machine (the
+        # ordinary case for a completed row on a multi-machine coordinator)
+        # falls through `_assignment_to_usage`'s "neither local nor remote"
+        # branch — `cost_unknown=True` but `num_turns` stays at its
+        # dataclass default of `0`, not `None`. Without a real
+        # `remote_by_id`, `check_zero_turn_zero_cost_terminal` below then
+        # sees `num_turns=0, cost_usd=None` — indistinguishable from a
+        # genuine instant $0 failure — and alarm 5 fires on essentially
+        # every remote-machine row, turning "alert: (none)" into "alert:
+        # (always)". `agent_completed` (above, populated for free while
+        # this same command was already polling every online machine's
+        # `/status` for the "Machines:" section) is the exact `assignment_id
+        # -> agent_status_dict` shape `build_session_usage`'s `remote_by_id`
+        # expects — the same shape `coord usage --remote` builds via its own
+        # (extra) `fetch_status` round trip. No second network call needed.
+        usage = build_session_usage(
+            list(board.active) + list(board.completed),
+            remote_by_id=agent_completed or None,
+        )
         for au in usage.assignments:
+            # #3376 review round 1: deliberately NOT nulling `num_turns`
+            # the same way `cost_usd` is nulled below — `coord.machine_
+            # fault.is_instant_zero_cost_failure` documents `num_turns=None`
+            # as "never measured, don't flag" (unlike `cost_usd=None`,
+            # which it treats the same as a real `$0`), so nulling both
+            # would make this alarm NEVER fire for a genuinely-never-
+            # captured row (a machine that's offline right now, so even
+            # `remote_by_id` above has nothing for it) — exactly the "ghost
+            # dispatch that never actually ran" shape this alarm exists to
+            # catch (`tests/test_cli_status_invariant_alarms.py::
+            # test_fires_on_a_done_row_with_no_measurable_work`). The
+            # `remote_by_id` wiring above is the actual fix for the false
+            # positive: a REACHABLE remote machine's real `num_turns` now
+            # gets used instead of the `0` default, so this only still
+            # reads "0 turns" when that is either locally confirmed or
+            # nothing anywhere (local, remote, or now-fetched) could say
+            # otherwise — which is the alarm's whole point.
             alarm = check_zero_turn_zero_cost_terminal(
                 assignment_id=au.assignment_id or "?",
                 status=au.status,

@@ -306,6 +306,7 @@ def approve(
         post_briefing,
         route_work_by_capability,
     )
+    from coord.dispatch_liveness import github_issue_liveness_fetcher
     from coord.network import claude_credential_reachable, classify_error, fetch_repos, fetch_status
     from coord.state import (
         clear_proposals,
@@ -314,6 +315,11 @@ def approve(
     )
 
     cfg = _load_config(config_path)
+    # #3376 review round 1: `coord approve` is THE production entry point
+    # for approved-proposal dispatch — wire the real issue-liveness fetcher
+    # here the same way `credential_fetcher` is already wired just below,
+    # or the two new predicates stay a mechanism nothing calls.
+    _issue_liveness_fetcher = github_issue_liveness_fetcher(cfg)
     proposals = load_proposals()
     if not proposals:
         click.echo("No pending proposals. Run `coord plan` first.", err=True)
@@ -790,6 +796,10 @@ def approve(
                 # exact gap the #3371 review round found: a mechanism that
                 # exists but nothing actually calls).
                 credential_fetcher=claude_credential_reachable,
+                # #3376 review round 1: the other two STRUCTURAL DISPATCH-
+                # LIVENESS GATE predicates (issue closed / branch already
+                # merged) — see `github_issue_liveness_fetcher`'s docstring.
+                issue_liveness_fetcher=_issue_liveness_fetcher,
             )
         except httpx.HTTPError as e:
             state, reason = classify_error(e)

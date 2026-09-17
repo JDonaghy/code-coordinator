@@ -3660,6 +3660,7 @@ def build_app(
             dispatch,
             post_briefing,
         )
+        from coord.dispatch_liveness import github_issue_liveness_fetcher
         from coord.network import claude_credential_reachable, fetch_status
         from coord.state import (
             clear_proposals, load_dispatched, load_proposals as load_p,
@@ -3775,9 +3776,16 @@ def build_app(
                 # "overlooked fourth call site" note above is exactly the
                 # trap a mechanism-but-not-wired credential gate would
                 # repeat.
+                # #3376 review round 1: same "mechanism exists but nothing
+                # calls it" gap the credential probe above closed for
+                # #3371 — wire the other two STRUCTURAL DISPATCH-LIVENESS
+                # GATE predicates so this route (the same `dispatch()`
+                # chokepoint `coord approve` funnels through) refuses on an
+                # already-closed issue or already-merged branch too.
                 response = dispatch(
                     p, config, status_fetcher=_status_fetcher,
                     credential_fetcher=claude_credential_reachable,
+                    issue_liveness_fetcher=github_issue_liveness_fetcher(config),
                 )
                 assignment_id = response.get("id", "pending")
                 if repo:

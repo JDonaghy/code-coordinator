@@ -403,12 +403,18 @@ def has_active_work_followup(
 # ── Default branch lookup (uses gh) ─────────────────────────────────────────
 
 
-def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
-    """Return remote branches whose name starts with `issue-{N}-`.
+def list_matching_remote_branches(repo_github: str, issue_number: int) -> list[str]:
+    """Every remote branch whose name starts with `issue-{N}-`, merged or not.
 
     Uses `gh api repos/.../git/matching-refs/heads/issue-{N}-`. Empty result
     on any lookup failure — we'd rather wave through a dispatch than block
-    on a transient GH error.
+    on a transient GH error. Public (#3376): `_default_branch_lookup` below
+    is the claim-detection caller that then drops the merged ones; the
+    dispatch-liveness `branch_merged` predicate
+    (`coord.dispatch_liveness.github_issue_liveness_fetcher`, via
+    `any_matching_branch_merged`) needs the UNFILTERED list instead — one
+    raw lookup, two different filters, rather than two independently
+    drifting `gh api matching-refs` call sites (#2096).
     """
     from coord import github_ops
 
@@ -432,11 +438,41 @@ def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
         ref = r.get("ref", "")
         if isinstance(ref, str) and ref.startswith("refs/heads/"):
             branches.append(ref[len("refs/heads/"):])
-    # Drop branches already fully merged into the default branch — a merged
-    # branch is finished work, not an active claim. A stale merged branch (e.g. a
-    # PR head that wasn't auto-deleted on merge) must not block new work on the
-    # issue forever (the chat→work block on a long-merged issue-N-* branch).
+    return branches
+
+
+def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
+    """Return remote branches whose name starts with `issue-{N}-`, with any
+    already fully-merged into the default branch dropped.
+
+    A merged branch is finished work, not an active claim. A stale merged
+    branch (e.g. a PR head that wasn't auto-deleted on merge) must not
+    block new work on the issue forever (the chat→work block on a
+    long-merged issue-N-* branch).
+    """
+    branches = list_matching_remote_branches(repo_github, issue_number)
     return _drop_merged_branches(repo_github, branches)
+
+
+def any_matching_branch_merged(repo_github: str, issue_number: int) -> bool:
+    """#3376: True when at least one remote branch matching `issue-{N}-*`
+    has already merged into the repo's default branch — the `branch_merged`
+    predicate `coord.dispatch_liveness.check_dispatch_liveness` needs,
+    backed by a live GitHub check.
+
+    Reuses the exact merge-detection `_drop_merged_branches` already
+    performs for claim detection (PR-merged OR `ahead_by == 0` ancestry,
+    survives squash merges — #3103): this is just "did filtering drop
+    anything", with the fail-open direction flipped to match a REFUSAL
+    predicate rather than a claim-signal — no matching branch at all, or
+    any lookup failure, returns `False` ("not merged, don't refuse
+    dispatch on this"), never `True`.
+    """
+    branches = list_matching_remote_branches(repo_github, issue_number)
+    if not branches:
+        return False
+    unmerged = set(_drop_merged_branches(repo_github, branches))
+    return any(b not in unmerged for b in branches)
 
 
 def _repo_default_branch(repo_github: str) -> str | None:

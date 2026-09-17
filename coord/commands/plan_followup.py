@@ -138,6 +138,7 @@ def _dispatch_followup(
     """
     from coord.board_service import read_board, write_board
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
+    from coord.dispatch_liveness import github_issue_liveness_fetcher
     from coord.network import claude_credential_reachable
     from coord.state import record_dispatched
     from coord.models import Proposal
@@ -173,7 +174,15 @@ def _dispatch_followup(
     # probe — this is the follow-up/fix dispatch chokepoint (`coord fix`,
     # `coord pr`, conflict-fix, smoke fix-ups), a production path, not a
     # test.
-    response = dispatch(proposal, cfg, credential_fetcher=claude_credential_reachable)
+    # #3376 review round 1: wire the other two predicates too — a
+    # conflict-fix/smoke-fix-up follow-up can legitimately race a manual
+    # merge of `original`'s own branch/issue between dispatch decision and
+    # this call, and re-fixing an already-merged branch is exactly the
+    # "cannot matter" case this gate exists for.
+    response = dispatch(
+        proposal, cfg, credential_fetcher=claude_credential_reachable,
+        issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
+    )
     assignment_id = response.get("id", "pending")
     record_dispatched(
         assignment_id=assignment_id,
