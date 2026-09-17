@@ -1188,7 +1188,37 @@ def reopen_issue(
                         caller="github_ops.reopen_issue")
 
 
-def check_pr_mergeable(repo: str, number: int) -> bool | None:
+#: How many times :func:`check_pr_mergeable` re-reads a PR's mergeability
+#: while GitHub still answers ``UNKNOWN`` before giving up as unresolved
+#: (#3359). GitHub computes ``mergeable`` **asynchronously, triggered by a
+#: read** — the first read schedules the computation, it does not report it.
+#: A caller that reads once and gives up never lets that computation land,
+#: no matter how many TICKS later it asks again: each tick's first read
+#: re-triggers the same async job and reads back ``UNKNOWN`` again, forever.
+#: That was the actual vimcode#1031 incident: 44 deferrals over ~2 days
+#: against an ordinary, actionable merge conflict the whole time — GitHub
+#: never got the second read that would have told the tick so. Mirrors
+#: :data:`coord.merge_queue.SIBLING_SWEEP_ATTEMPTS`, the #2246 fix for the
+#: identical "UNKNOWN is not clean" problem in the post-merge sibling sweep.
+MERGEABLE_POLL_ATTEMPTS = 3
+
+#: Seconds between :func:`check_pr_mergeable` retries — mirrors
+#: :data:`coord.merge_queue.SIBLING_SWEEP_INTERVAL`. Total added wall-clock
+#: per call is bounded by ``(MERGEABLE_POLL_ATTEMPTS - 1) *
+#: MERGEABLE_POLL_INTERVAL``, and is paid ONLY when GitHub is genuinely still
+#: computing — a first read of ``MERGEABLE``/``CONFLICTING`` resolves
+#: immediately, no sleep at all.
+MERGEABLE_POLL_INTERVAL = 2.0
+
+
+def check_pr_mergeable(
+    repo: str,
+    number: int,
+    *,
+    attempts: int = MERGEABLE_POLL_ATTEMPTS,
+    interval: float = MERGEABLE_POLL_INTERVAL,
+    sleep: Callable[[float], None] | None = None,
+) -> bool | None:
     """Return GitHub's current mergeability verdict for PR *number* (#1477).
 
     Used by the merge queue's stale-``CONFLICT`` reconciliation
@@ -1196,25 +1226,50 @@ def check_pr_mergeable(repo: str, number: int) -> bool | None:
     a parked entry's branch has since become clean — a conflict-fix worker
     landed, or a human pushed a fix by hand — rather than trusting the
     ``gh pr merge`` failure message cached from whenever the queue last
-    attempted it.
+    attempted it. Also the probe :func:`coord.merge_queue._pr_reports_
+    conflicting` uses to tell a genuine conflict apart from a merely-
+    unreadable CI check list (#2380/#1877) — the exact fork #3359 found
+    parked forever on a first-read ``UNKNOWN``.
 
     Returns ``True`` when GitHub reports ``MERGEABLE``, ``False`` when it
-    reports ``CONFLICTING``, and ``None`` for anything else — including
-    ``UNKNOWN`` (GitHub computes mergeability asynchronously; a very recent
-    push can read back unresolved for a few seconds) and any ``gh``
-    error/timeout. Callers must treat ``None`` the same as ``False`` — an
-    inconclusive read is never a green light to unpark an entry.
+    reports ``CONFLICTING``. Everything else — malformed JSON, a missing
+    ``mergeable`` field, or any ``gh`` error/timeout — returns ``None``
+    immediately, no retry: those aren't the async-compute case and a repeat
+    call would just fail the same way.
+
+    ``UNKNOWN`` is different (#3359): GitHub has not computed mergeability
+    yet, and computing it is a background job *this very read just
+    triggered*. Rather than surface that as an inconclusive ``None`` on the
+    first miss, this re-reads up to *attempts* times, sleeping *interval*
+    seconds between reads (the same bounded round-robin
+    :func:`coord.merge_queue.sweep_sibling_conflicts` already uses for #2246
+    — see :data:`MERGEABLE_POLL_ATTEMPTS`), giving the computation a real
+    chance to land inside this one call instead of never getting asked
+    again. Still returns ``None`` if it reads ``UNKNOWN`` on every attempt —
+    an unresolved read is unresolved evidence, not a verdict to guess at.
+
+    Callers must treat ``None`` the same as ``False`` — an inconclusive read
+    is never a green light to unpark an entry.
     """
-    try:
-        value = _gh_json(
-            "pr", "view", str(number), "--repo", repo, "--json", "mergeable",
-            default={}, caller="github_ops.check_pr_mergeable").get("mergeable")
-    except Exception:  # noqa: BLE001 — fail-safe: unknown mergeability blocks nothing
-        return None
-    if value == "MERGEABLE":
-        return True
-    if value == "CONFLICTING":
-        return False
+    _sleep = sleep if sleep is not None else time.sleep
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            # Only ever paid when GitHub is genuinely still computing.
+            _sleep(interval)
+        try:
+            value = _gh_json(
+                "pr", "view", str(number), "--repo", repo, "--json", "mergeable",
+                default={}, caller="github_ops.check_pr_mergeable").get("mergeable")
+        except Exception:  # noqa: BLE001 — fail-safe: unknown mergeability blocks nothing
+            return None
+        if value == "MERGEABLE":
+            return True
+        if value == "CONFLICTING":
+            return False
+        if value != "UNKNOWN":
+            # Malformed/missing field — not the async-compute case a retry
+            # would help; a repeat call would just fail the same way.
+            return None
     return None
 
 

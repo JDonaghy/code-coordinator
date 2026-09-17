@@ -2567,8 +2567,18 @@ def _pr_reports_conflicting(gh_ops, repo: str | None, number: int | None) -> boo
     design's "``mergeable == CONFLICTING`` or ``mergeStateStatus == DIRTY``"
     framing: :func:`coord.github_ops.check_pr_mergeable` already reads GitHub's
     ``mergeable`` field, which is exactly ``CONFLICTING`` whenever
-    ``mergeStateStatus`` would read ``DIRTY`` — one probe, one `gh` call,
-    same readable-and-definitive signal either way.
+    ``mergeStateStatus`` would read ``DIRTY`` — one probe call, same
+    readable-and-definitive signal either way.
+
+    #3359: "GitHub still computing it" used to mean a single ``UNKNOWN``
+    read gave up instantly, every tick, forever — GitHub only computes
+    ``mergeable`` when something reads it, and a probe that reads once and
+    stops never lets that computation land. :func:`coord.github_ops.
+    check_pr_mergeable` now re-polls internally on ``UNKNOWN`` (bounded,
+    same shape as :func:`sweep_sibling_conflicts`'s #2246 retry), so this
+    function's own single call already carries that chance — a ``None``
+    reaching here means the retry budget was genuinely exhausted, not that
+    nobody asked twice.
     """
     probe = getattr(gh_ops, "check_pr_mergeable", None)
     if probe is None or not repo or number is None:
