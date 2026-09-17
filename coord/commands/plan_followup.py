@@ -1079,22 +1079,23 @@ def fix(
     # explicitly — the worker is on the SAME model rung as the attempt that
     # tripped it, and the fix is normally "read the failure output, it names
     # the exact rule and often the exact fix" rather than a design problem.
-    # Newline-terminated (with the trailing blank line the briefing needs
-    # before "## Guidance") either way, so the assembly below never needs a
-    # second conditional `\n` tacked on next to it (nit from #3360 review).
-    _compliance_note = (
-        (
-            f"\n## Note (#3360)\n"
+    # Both branches end with the blank line the briefing needs before
+    # "## Guidance", so the assembly below interpolates it unconditionally
+    # and never needs a second conditional `\n` next to it.  Written as an
+    # if/else rather than a ternary-into-an-f-string-concat for readability
+    # (nit from the #3360 review).
+    if classification.category == "compliance":
+        _compliance_note = (
+            "\n## Note (#3360)\n"
             f"This failure classified as a **compliance** check "
             f"({classification.matched}), not a behavioural bug — the model "
-            f"was NOT escalated for this retry. The failure output above "
-            f"almost always names the exact repo-specific rule (a pinned "
-            f"count, a formatting rule, a forbidden file) and often the fix "
-            f"itself. Read it before changing any logic.\n\n"
+            "was NOT escalated for this retry. The failure output above "
+            "almost always names the exact repo-specific rule (a pinned "
+            "count, a formatting rule, a forbidden file) and often the fix "
+            "itself. Read it before changing any logic.\n\n"
         )
-        if classification.category == "compliance"
-        else "\n"
-    )
+    else:
+        _compliance_note = "\n"
 
     briefing = (
         f"You are fixing {_what} for issue #{assignment.issue_number}: {assignment.issue_title}\n\n"

@@ -36,13 +36,27 @@ a split-brain waiting to happen). As of #3360 that is every known door:
   ``_dispatch_fix_for_review``), plus the dashboard's "unstick this row"
   button (``coord.review.dispatch_headless_fix``) and the human-attended
   ``coord fix`` CLI (``coord.commands.dispatch_workers``). All three thread
-  the review/test findings text through as ``failure_text``.
+  the review/test findings text through as ``failure_text`` AND the rung the
+  previous round actually dispatched at through as ``previous_model``
+  (``coord.auto_loop.last_fix_model_for_branch``). Both halves are load
+  bearing: gating only the last marginal step of a ladder replayed from the
+  iteration counter still climbs unconditionally for every step before it,
+  so the gate evaporated from round 3 onwards (#3360 round-2 review).
 - ``coord/commands/plan_followup.py``'s ``resume_stuck()`` is the ONE
   exception, deliberately: it is the recovery path for a worker the
   stuck-detector already flagged (turns elapsed, no commit) — the issue's
   own "Spin" category, which is neither a capability nor a compliance
   question, so it never calls ``classify_failure()`` at all and never
   escalates; see the comment at its call site.
+
+NOT an escalation-gated door, and therefore deliberately not a caller:
+``coord/ci_fix.py``'s ``dispatch_ci_fix()``. It is the fourth automatic
+fix-dispatch path, but it calls ``_dispatch_fix`` with no ``model=`` at all,
+so it has never climbed the ladder and there is no escalation decision here
+to gate. Flagged in the #3360 review only so the next reader can confirm the
+"every escalation-gated door" claim above is exhaustive rather than an
+oversight; wiring the classifier in would change nothing about which model
+runs.
 
 Classification
 --------------
@@ -104,7 +118,11 @@ _COMPLIANCE_SIGNATURES: tuple[tuple[str, re.Pattern[str]], ...] = (
         # (`tests/test_*_ratchet.py`, e.g. #3357's
         # `test_sqlite_connect_ratchet.py`) as well as the bare word, which
         # is rare enough outside that context to be a safe signal.
-        re.compile(r"_ratchet\.py|\bratchet(?:ed|ing)?\b", re.IGNORECASE),
+        # #3360 review: the inflection group must cover the PLURAL too —
+        # `\bratchet\b` never fires on "ratchets" (the word boundary sits
+        # between "t" and "s"), and real failure text says "2 ratchets
+        # tripped" / "these ratchets" often enough to matter.
+        re.compile(r"_ratchet\.py|\bratchet(?:e[sd]|ing|s)?\b", re.IGNORECASE),
     ),
     (
         "lint-or-format",

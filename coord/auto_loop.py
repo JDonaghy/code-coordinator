@@ -776,6 +776,65 @@ def next_fix_iteration_for_branch(
     return highest + 1
 
 
+def last_fix_model_for_branch(
+    board: Board,
+    *,
+    repo_name: str,
+    issue_number: int,
+    branch: str | None,
+    before_iteration: int,
+) -> str | None:
+    """The model alias the most recent fix round on this chain ACTUALLY ran at.
+
+    #3360 (round-2 review): :func:`_fix_model_for_iteration` used to derive
+    the "rung already reached" baseline by replaying the ladder from the
+    iteration counter — i.e. by ASSUMING every earlier bounce escalated. The
+    moment one of them was gated as a compliance nit (the whole point of
+    #3360) that assumption is wrong, and the gate silently evaporated from
+    round 3 onwards: the same ratchet failure repeated at iterations 1..5
+    still reached the top of the ladder by iteration 3, because only the
+    final marginal step was ever classified.
+
+    This is the board-backed answer instead: scan the same (repo, issue,
+    branch) chain :func:`next_fix_iteration_for_branch` scans and report the
+    ``model`` recorded on the highest fix round STRICTLY BELOW
+    *before_iteration* — the rung the previous round really dispatched at,
+    whatever the classifier decided back then.
+
+    Iteration-0 rows (the original work dispatch) are excluded: their model
+    comes from the issue's labels / operator choice, not from the fix ladder,
+    and iteration 1 deliberately restarts at ``models.default`` regardless.
+
+    Returns ``None`` when nothing on the chain carries a usable model — a
+    fresh chain, a board that predates model recording, or a caller with no
+    board at all. Callers then fall back to the old pure-iteration recompute
+    rather than refusing to escalate.
+    """
+    best_key: tuple[int, float] = (0, 0.0)
+    best_model: str | None = None
+    for a in (*board.active, *board.completed):
+        if a.type not in WORK_LIKE_TYPES:
+            continue
+        if a.repo_name != repo_name or a.issue_number != issue_number:
+            continue
+        if a.branch != branch:
+            continue
+        iteration = a.review_iteration or 0
+        if iteration < 1 or iteration >= before_iteration:
+            continue
+        model = (getattr(a, "model", None) or "").strip()
+        if not model:
+            continue
+        # Tie-break equal iterations (a re-dispatch of the same round) on
+        # dispatch time so the answer is deterministic and reflects the row
+        # that actually ran most recently.
+        key = (iteration, float(getattr(a, "dispatched_at", 0.0) or 0.0))
+        if key >= best_key:
+            best_key = key
+            best_model = model
+    return best_model
+
+
 # #3323: matches a leading run of one or more `[fix-N] ` / `[conflict-fix] `
 # markers — the two title tags a fix round can inherit from its parent row.
 _FIX_TITLE_MARKER_RE = re.compile(r"^(?:\[(?:fix-\d+|conflict-fix)\]\s*)+")
@@ -815,7 +874,10 @@ def fix_round_title(base_title: str, iteration: int) -> str:
 
 
 def _fix_model_for_iteration(
-    config: Config, iteration: int, failure_text: str | None = None,
+    config: Config,
+    iteration: int,
+    failure_text: str | None = None,
+    previous_model: str | None = None,
 ) -> str | None:
     """Choose the model alias for a fix worker on a given bounce *iteration*.
 
@@ -827,20 +889,37 @@ def _fix_model_for_iteration(
 
     When escalation is enabled:
       - iteration 1 → ``config.models.default`` (first fix stays cheap/fast).
-      - iteration 2+ → climb one rung up ``config.models.escalation`` per
-        iteration, capped at the top of the ladder — UNLESS *failure_text*
-        (#3360, the review/test-failure text that triggered THIS iteration)
-        classifies as a compliance nit (see ``coord/failure_classifier.py``),
-        in which case this iteration stays on the rung iteration-1 already
-        reached instead of climbing further. Escalating a review's compliance
-        nit — a ratchet, a lint/formatter check, a ``files_forbidden``
-        violation — mis-prices it exactly like #3357: no model capability
-        difference lets a worker guess a repo-specific fact it was never
-        told. ``failure_text=None`` (the default) preserves the old
-        pure-iteration ladder for callers that have no failure text to offer.
+      - iteration 2+ → climb ONE rung up ``config.models.escalation`` from
+        the rung the previous round dispatched at, capped at the top of the
+        ladder — UNLESS *failure_text* (#3360, the review/test-failure text
+        that triggered THIS iteration) classifies as a compliance nit (see
+        ``coord/failure_classifier.py``), in which case this iteration stays
+        on the previous round's rung instead of climbing. Escalating a
+        review's compliance nit — a ratchet, a lint/formatter check, a
+        ``files_forbidden`` violation — mis-prices it exactly like #3357: no
+        model capability difference lets a worker guess a repo-specific fact
+        it was never told. ``failure_text=None`` (the default) preserves the
+        old pure-iteration ladder for callers that have no failure text to
+        offer.
+
+    *previous_model* is the rung the PREVIOUS round actually dispatched at,
+    read off the board by :func:`last_fix_model_for_branch` (#3360 round-2
+    review). It matters because the classifier gate is only sound if the
+    baseline it gates is real: deriving the baseline by replaying the ladder
+    from the iteration counter assumes every earlier bounce escalated, so a
+    compliance failure repeated across three rounds still bought the top of
+    the ladder by round 3 — the gate applied to the last marginal step only
+    and every step before it climbed unconditionally. When *previous_model*
+    is absent (a caller with no board) or off-ladder (an explicit
+    ``--model`` the escalation list does not contain, so there is no rung to
+    step from), the function falls back to that old pure-iteration recompute
+    rather than refusing to escalate.
 
     Example with escalation ``[haiku, sonnet, opus]`` and default ``sonnet``:
-    iter 1 → sonnet, iter 2 → opus, iter 3 → opus (capped).
+    iter 1 → sonnet, iter 2 → opus, iter 3 → opus (capped). With a
+    compliance-classified *failure_text* at every round and the board-backed
+    *previous_model* threaded through: iter 1 → sonnet, iter 2 → sonnet,
+    iter 3 → sonnet, … (never climbs, which is the #3360 acceptance bar).
 
     #3322: with escalation ENABLED this never returns ``None`` — a fix that
     dispatches with no model at all leaves no record of what actually ran
@@ -860,14 +939,27 @@ def _fix_model_for_iteration(
     steps = max(iteration, 1) - 1
     if steps <= 0:
         return model
-    # Climb every step EXCEPT the last one unconditionally — the last step is
-    # the rung THIS iteration's failure would buy, and #3360 gates it.
-    for _ in range(steps - 1):
-        model = config.models.next_model(model)
+
+    # The rung this bounce starts from.  Prefer the board's record of what the
+    # previous round REALLY ran at (#3360 round-2 review) — replaying the
+    # ladder from the iteration counter assumes every earlier bounce
+    # escalated, which is exactly the assumption the compliance gate breaks.
+    if previous_model and previous_model in config.models.escalation:
+        baseline = previous_model
+    else:
+        # No usable record — an off-ladder explicit --model, a chain with no
+        # model recorded, or a caller with no board.  Fall back to the old
+        # pure-iteration recompute: climb every step EXCEPT the last one
+        # unconditionally, since the last step is the rung THIS iteration's
+        # failure would buy and #3360 gates it below.
+        baseline = model
+        for _ in range(steps - 1):
+            baseline = config.models.next_model(baseline)
+
     if failure_text is not None and not classify_failure(failure_text).should_escalate:
         # Compliance nit (or no evidence) — stay on the rung already reached.
-        return model
-    return config.models.next_model(model)
+        return baseline
+    return config.models.next_model(baseline)
 
 
 def _merge_blocking_review_findings(
@@ -1082,9 +1174,20 @@ def _dispatch_fix_for_review(
     # #3360: classify the review findings driving THIS bounce before letting
     # the iteration counter buy a bigger model — a request-changes review
     # that flags a compliance nit (ratchet, lint, files_forbidden) must not
-    # climb the ladder just because it landed on a later iteration.
+    # climb the ladder just because it landed on a later iteration.  The
+    # baseline rung comes off the board (what round N-1 really dispatched at)
+    # rather than being replayed from the counter, so a compliance nit that
+    # survives three rounds still never climbs.
     model = _fix_model_for_iteration(
-        config, next_iteration, failure_text=merged_findings.body,
+        config, next_iteration,
+        failure_text=merged_findings.body,
+        previous_model=last_fix_model_for_branch(
+            board,
+            repo_name=work.repo_name,
+            issue_number=work.issue_number,
+            branch=work.branch,
+            before_iteration=next_iteration,
+        ),
     )
     fix_failure: list[str] = []
     fix = _dispatch_fix(

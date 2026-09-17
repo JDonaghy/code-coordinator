@@ -17,6 +17,7 @@ from coord.auto_loop import (
     _fix_model_for_iteration,
     _post_max_iterations_notice,
     fix_round_title,
+    last_fix_model_for_branch,
     next_fix_iteration,
     next_fix_iteration_for_branch,
     process_review_completion,
@@ -1239,6 +1240,242 @@ class TestFixModelForIterationClassifiesFailureText:
         assert _fix_model_for_iteration(cfg, 2) == "opus"
 
 
+class TestFixModelForIterationHonoursPreviousRung:
+    """#3360 round-2 review: the classifier gate must hold for EVERY bounce,
+    not just iteration 1→2.
+
+    The original implementation replayed the ladder from the iteration
+    counter and only classified the LAST marginal step, so it assumed every
+    earlier bounce had escalated. Under the repo's default ladder
+    (``[haiku, sonnet, opus]``, default ``sonnet``) the SAME
+    compliance-classified ratchet text repeated at every round still reached
+    the top of the ladder by round 3::
+
+        it=1 -> sonnet   it=2 -> sonnet   it=3 -> opus (WRONG)
+
+    Threading ``previous_model`` (what round N-1 REALLY dispatched at, read
+    off the board by ``last_fix_model_for_branch``) is what makes the gate
+    stick.
+    """
+
+    _RATCHET_TEXT = (
+        "FAILED tests/test_sqlite_connect_ratchet.py::"
+        "test_sqlite_connect_site_counts_are_pinned - the pinned count "
+        "changed"
+    )
+    _BEHAVIOURAL_TEXT = (
+        "FAILED tests/test_widget.py::test_returns_sorted - "
+        "AssertionError: assert [3, 1, 2] == [1, 2, 3]"
+    )
+
+    def test_repeated_compliance_failure_never_climbs_the_ladder(self) -> None:
+        """The reviewer's exact repro, with the real previous rung fed back
+        in each round: the ladder stays flat for every iteration inside
+        `pipeline.max_review_iterations` (default 5)."""
+        cfg = _config_with_models(default="sonnet")
+        previous: str | None = None
+        seen: list[str | None] = []
+        for iteration in range(1, 6):
+            model = _fix_model_for_iteration(
+                cfg, iteration,
+                failure_text=self._RATCHET_TEXT,
+                previous_model=previous,
+            )
+            seen.append(model)
+            previous = model
+        assert seen == ["sonnet"] * 5
+
+    def test_compliance_at_iteration_3_stays_on_the_real_previous_rung(self) -> None:
+        cfg = _config_with_models(default="sonnet")
+        assert (
+            _fix_model_for_iteration(
+                cfg, 3,
+                failure_text=self._RATCHET_TEXT,
+                previous_model="sonnet",
+            )
+            == "sonnet"
+        )
+
+    def test_capability_failure_climbs_one_rung_from_the_real_previous(self) -> None:
+        # Round 3 after two compliance-gated rounds on sonnet: a genuine
+        # behavioural failure buys exactly ONE rung, not the top of the
+        # ladder the iteration counter would have assumed.
+        cfg = _config_with_models(default="haiku")
+        assert (
+            _fix_model_for_iteration(
+                cfg, 3,
+                failure_text=self._BEHAVIOURAL_TEXT,
+                previous_model="haiku",
+            )
+            == "sonnet"
+        )
+
+    def test_mixed_chain_climbs_only_on_the_capability_rounds(self) -> None:
+        """A compliance round between two capability rounds must not be
+        'made up for' later — the chain climbs once per capability failure
+        and never more."""
+        cfg = _config_with_models(default="haiku")
+        texts = [
+            self._BEHAVIOURAL_TEXT,   # it=1 (never climbs anyway)
+            self._RATCHET_TEXT,       # it=2 → stays haiku
+            self._BEHAVIOURAL_TEXT,   # it=3 → haiku → sonnet
+            self._RATCHET_TEXT,       # it=4 → stays sonnet
+            self._BEHAVIOURAL_TEXT,   # it=5 → sonnet → opus
+        ]
+        previous: str | None = None
+        seen: list[str | None] = []
+        for iteration, text in enumerate(texts, start=1):
+            model = _fix_model_for_iteration(
+                cfg, iteration, failure_text=text, previous_model=previous,
+            )
+            seen.append(model)
+            previous = model
+        assert seen == ["haiku", "haiku", "sonnet", "sonnet", "opus"]
+
+    def test_previous_model_is_ignored_when_off_ladder(self) -> None:
+        """An explicit `--model` the escalation list doesn't contain gives no
+        rung to step from — fall back to the pure-iteration recompute rather
+        than freezing escalation forever."""
+        cfg = _config_with_models(default="sonnet")
+        assert (
+            _fix_model_for_iteration(
+                cfg, 2,
+                failure_text=self._BEHAVIOURAL_TEXT,
+                previous_model="some-custom-model",
+            )
+            == "opus"
+        )
+
+    def test_previous_model_does_not_override_iteration_1(self) -> None:
+        # Iteration 1 restarts the fix ladder at models.default regardless of
+        # what any earlier row recorded.
+        cfg = _config_with_models(default="sonnet")
+        assert (
+            _fix_model_for_iteration(
+                cfg, 1,
+                failure_text=self._BEHAVIOURAL_TEXT,
+                previous_model="opus",
+            )
+            == "sonnet"
+        )
+
+    def test_omitting_previous_model_preserves_old_behaviour(self) -> None:
+        cfg = _config_with_models(default="sonnet")
+        assert _fix_model_for_iteration(cfg, 3) == "opus"
+        assert _fix_model_for_iteration(cfg, 2) == "opus"
+
+
+class TestLastFixModelForBranch:
+    """#3360 round-2 review: the board-backed answer to 'what rung did the
+    previous fix round actually dispatch at?'."""
+
+    def _row(
+        self,
+        assignment_id: str,
+        *,
+        iteration: int,
+        model: str | None,
+        branch: str = "issue-1-fix",
+        dispatched_at: float = 0.0,
+        repo_name: str = "api",
+        issue_number: int = 1,
+        type: str = "work",  # noqa: A002
+    ) -> Assignment:
+        return replace(
+            _work_assignment(
+                assignment_id=assignment_id,
+                branch=branch,
+                review_iteration=iteration,
+                type=type,
+            ),
+            model=model,
+            dispatched_at=dispatched_at,
+            repo_name=repo_name,
+            issue_number=issue_number,
+        )
+
+    def _board(self, *rows: Assignment) -> Board:
+        return Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=list(rows),
+        )
+
+    def _ask(self, board: Board, before: int) -> str | None:
+        return last_fix_model_for_branch(
+            board,
+            repo_name="api",
+            issue_number=1,
+            branch="issue-1-fix",
+            before_iteration=before,
+        )
+
+    def test_returns_none_on_a_fresh_chain(self) -> None:
+        board = self._board(self._row("work-abc", iteration=0, model="opus"))
+        assert self._ask(board, 1) is None
+
+    def test_ignores_the_iteration_0_work_row(self) -> None:
+        """Round 1 restarts at models.default — the original work dispatch's
+        model (from labels/operator choice) is not a fix-ladder rung."""
+        board = self._board(self._row("work-abc", iteration=0, model="opus"))
+        assert self._ask(board, 2) is None
+
+    def test_returns_the_highest_round_below_the_target(self) -> None:
+        board = self._board(
+            self._row("work-abc", iteration=0, model="sonnet"),
+            self._row("fix-1", iteration=1, model="sonnet"),
+            self._row("fix-2", iteration=2, model="haiku"),
+        )
+        assert self._ask(board, 3) == "haiku"
+        assert self._ask(board, 2) == "sonnet"
+
+    def test_ignores_rows_at_or_above_the_target_iteration(self) -> None:
+        board = self._board(
+            self._row("fix-1", iteration=1, model="sonnet"),
+            self._row("fix-3", iteration=3, model="opus"),
+        )
+        assert self._ask(board, 3) == "sonnet"
+
+    def test_skips_rows_with_no_recorded_model(self) -> None:
+        board = self._board(
+            self._row("fix-1", iteration=1, model="sonnet"),
+            self._row("fix-2", iteration=2, model=None),
+        )
+        assert self._ask(board, 3) == "sonnet"
+
+    def test_ties_break_on_most_recent_dispatch(self) -> None:
+        board = self._board(
+            self._row("fix-2a", iteration=2, model="haiku", dispatched_at=10.0),
+            self._row("fix-2b", iteration=2, model="sonnet", dispatched_at=20.0),
+        )
+        assert self._ask(board, 3) == "sonnet"
+
+    def test_scans_active_rows_too(self) -> None:
+        board = self._board()
+        board.active.append(self._row("fix-1", iteration=1, model="sonnet"))
+        assert self._ask(board, 2) == "sonnet"
+
+    def test_other_branches_repos_and_issues_do_not_leak(self) -> None:
+        board = self._board(
+            self._row("other-branch", iteration=1, model="opus", branch="issue-1-alt"),
+            self._row("other-repo", iteration=1, model="opus", repo_name="web"),
+            self._row("other-issue", iteration=1, model="opus", issue_number=2),
+        )
+        assert self._ask(board, 2) is None
+
+    def test_review_rows_are_excluded(self) -> None:
+        board = self._board()
+        board.completed.append(
+            replace(
+                _review_assignment(assignment_id="review-1"),
+                model="opus",
+                review_iteration=1,
+            )
+        )
+        assert self._ask(board, 2) is None
+
+
 class TestFixModelDispatch:
     """The escalated model lands on both the POST payload and the Assignment."""
 
@@ -1301,6 +1538,103 @@ class TestFixModelDispatch:
         payload, fix = self._dispatch(cfg, tmp_path)
         assert "model" not in payload  # legacy behaviour: no model key
         assert fix.model is None
+
+
+class TestRound3ComplianceBounceDoesNotEscalate:
+    """#3360 round-2 review, end to end through the headless review→fix door.
+
+    Drives `process_review_completion` on a chain that has ALREADY spent two
+    compliance-gated fix rounds on ``sonnet`` and asserts round 3 dispatches
+    on ``sonnet`` again — both on the wire payload and on the board row.
+    Before the fix this dispatched ``opus``: the baseline rung was replayed
+    from the iteration counter (which assumes every earlier round escalated)
+    and only the last marginal step was ever classified.
+    """
+
+    _RATCHET_REVIEW_BODY = (
+        "## Blocking findings\n"
+        "- tests/test_sqlite_connect_ratchet.py fails: the pinned "
+        "sqlite3.connect call-site count is stale. Update the ratchet.\n"
+    )
+    _BEHAVIOURAL_REVIEW_BODY = (
+        "## Blocking findings\n"
+        "- The sort comparator is wrong: assert [3, 1, 2] == [1, 2, 3] in "
+        "tests/test_widget.py::test_returns_sorted.\n"
+    )
+
+    def _config(self) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tail",
+                    repos=["api"], repo_paths={"api": "/work/api"},
+                )
+            ],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+            models=ModelsConfig(
+                default="sonnet", escalation=["haiku", "sonnet", "opus"],
+            ),
+            pipeline=PipelineConfig(auto_loop=True, escalate_fix_model=True),
+        )
+
+    def _dispatch_round_3(self, tmp_path, review_body: str) -> tuple[Any, Any]:
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            f"REVIEW_VERDICT: request-changes\nREVIEW_BODY:\n{review_body}\nEND_REVIEW\n"
+        )
+        # The chain so far: original work (round 0), then two fix rounds that
+        # both stayed on sonnet because both failures were compliance nits.
+        work0 = _work_assignment(assignment_id="work-abc", review_iteration=0)
+        fix1 = replace(
+            _work_assignment(assignment_id="fix-1", review_iteration=1),
+            model="sonnet", dispatched_at=10.0,
+        )
+        fix2 = replace(
+            _work_assignment(assignment_id="fix-2", review_iteration=2),
+            model="sonnet", dispatched_at=20.0,
+        )
+        review = replace(
+            _review_assignment(assignment_id="review-3", review_of="fix-2"),
+            dispatched_at=30.0,
+        )
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[work0, fix1, fix2, review],
+        )
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-003"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            process_review_completion(
+                review, board, self._config(),
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        return mock_http.post.call_args.kwargs["json"], board.active[0]
+
+    def test_third_compliance_bounce_stays_on_the_previous_rung(
+        self, tmp_path
+    ) -> None:
+        payload, fix = self._dispatch_round_3(tmp_path, self._RATCHET_REVIEW_BODY)
+        assert fix.review_iteration == 3
+        assert payload["model"] == "sonnet"
+        assert fix.model == "sonnet"
+
+    def test_third_capability_bounce_still_climbs_exactly_one_rung(
+        self, tmp_path
+    ) -> None:
+        payload, fix = self._dispatch_round_3(
+            tmp_path, self._BEHAVIOURAL_REVIEW_BODY,
+        )
+        assert fix.review_iteration == 3
+        assert payload["model"] == "opus"
+        assert fix.model == "opus"
 
 
 # ── Unit tests: config parsing ───────────────────────────────────────────────
