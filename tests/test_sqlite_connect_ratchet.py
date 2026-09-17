@@ -288,13 +288,17 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "whole board. Handing it a dict_row connection under "
         "COORD_TEST_BACKEND=postgres would silently stop testing the thing it "
         "was written to test. The other three sites are C: a seeded fixture DB "
-        "for SqliteStore, a reopen to prove a column really leaked, and "
-        "(#3339, test_premise_rechecked_fields_reach_the_board_wire_and_project) "
-        "a seeded refusal row written into the same on-disk `_seeded_db` file "
-        "the TestClient's SqliteStore then reads back over HTTP — the autouse "
-        "`coord_db` connection is `:memory:` and `SqliteStore` opens its own "
-        "`mode=ro` connection BY PATH, so a fixture-only version of that test "
-        "would assert against an empty board.",
+        "for SqliteStore, a reopen to prove a column really leaked, and the "
+        "`_assignment_written_locally` helper — one site shared by BOTH "
+        "wire-round-trip regressions (#3339's premise_rechecked_*, #3357's "
+        "test_confirmation), which seed a row into the same on-disk "
+        "`_seeded_db` file the TestClient's SqliteStore then reads back over "
+        "HTTP. The autouse `coord_db` connection is `:memory:` and "
+        "`SqliteStore` opens its own `mode=ro` connection BY PATH, so a "
+        "fixture-only version of those tests would assert against an empty "
+        "board. #3357 added the second such test and deliberately added NO "
+        "site: the shared helper is why this count stayed at 4 rather than "
+        "growing one per column-survives-the-wire regression.",
     ),
 
     # ── C: genuinely needs a second / separate connection ─────────────────

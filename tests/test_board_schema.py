@@ -29,14 +29,18 @@ changes neither `/board`'s response body nor `GET /openapi.json`.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import sqlite3
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
 
+import coord.db as db_mod
 from coord import board_schema
 from coord.board_schema import (
     BOARD_PROJECTIONS,
@@ -99,6 +103,54 @@ def _seeded_db(path: Path, *, extra_column_on: str | None = None) -> Path:
 
 def _serve_client(db_path: Path) -> TestClient:
     return TestClient(build_serve_app(SqliteStore(db_path), Config(repos=[], machines=[])))
+
+
+@contextlib.contextmanager
+def _assignment_written_locally(
+    db_path: Path, *, assignment_id: str, issue_number: int, status: str
+) -> Iterator[sqlite3.Connection]:
+    """Seed one fresh `assignments` row into the on-disk fixture DB at *db_path*
+    and route `coord.state`'s local write path at that same connection.
+
+    Shared by the two "does this column survive the wire?" regressions below
+    (#3339 and #3357), which are the same test with a different writer: seed a
+    row, call the REAL `coord.state` mutator on it, then read it back over the
+    REAL HTTP `/board`.  Both need the row in the *file* `SqliteStore` opens
+    `mode=ro` BY PATH — the autouse `coord_db` connection is `:memory:`, so a
+    fixture-only version would assert against an empty board — which is why
+    they own a `sqlite3.connect` site at all (bucket C in
+    `tests/test_sqlite_connect_ratchet.py`).  Keeping it to ONE site is the
+    point of this helper: the ratchet counts call sites, not tests.
+
+    `dispatched_at` is *now*, not the #748 fixture's epoch timestamps, so
+    #762's board-retention cap keeps the row — a terminal row past the
+    retention cutoff is dropped from `/board` regardless of the DTO, which
+    would make these tests pass for the wrong reason.
+
+    The autouse `_no_board_service` fixture keeps board-service resolution
+    unset, so `override_connection` here means the mutator takes its *local*
+    branch — exactly what a `coord` command does when run on the daemon host
+    itself, or what the daemon's own handler does on behalf of a worker.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, "
+        " machine_name, type, status, dispatched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            assignment_id, "claude-coordinator", issue_number,
+            f"issue {issue_number}", "precision", "work", status, time.time(),
+        ),
+    )
+    conn.commit()
+    db_mod.override_connection(conn)
+    try:
+        yield conn
+    finally:
+        db_mod.override_connection(None)
+        conn.close()
 
 
 # ── safety: the wire did not move ───────────────────────────────────────────
@@ -433,44 +485,21 @@ def test_premise_rechecked_fields_reach_the_board_wire_and_project(
     `project()` — so a DTO that forgets to declare a column fails here
     exactly the way it broke a live fleet.
     """
-    import time
-
-    import coord.db as db_mod
     from coord.config import Repo
     from coord.drive_state import project
     from coord.state import mark_premise_rechecked
 
     db_path = _seeded_db(tmp_path / "coord.db")
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        "INSERT INTO assignments "
-        "(assignment_id, repo_name, issue_number, issue_title, "
-        " machine_name, type, status, dispatched_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            # A recent `dispatched_at` (not the #748 fixture's epoch
-            # timestamps) so #762's board-retention cap keeps this row —
-            # a terminal row past the retention cutoff is dropped from
-            # `/board` regardless of the DTO, which would make this test
-            # pass for the wrong reason.
-            "a-3339-refused", "claude-coordinator", 947, "issue 947",
-            "precision", "work", "refused_premise", time.time(),
-        ),
-    )
-    conn.commit()
-
-    # The autouse `_no_board_service` fixture keeps board-service resolution
-    # unset, so this routes straight to `_mark_premise_rechecked_local` —
-    # exactly what `coord drive-queue clear-refusal` does when run on the
-    # daemon host itself, or what the daemon's own PATCH handler does when
-    # run from a worker machine.
-    db_mod.override_connection(conn)
-    try:
+    # Routes straight to `_mark_premise_rechecked_local` — exactly what `coord
+    # drive-queue clear-refusal` does when run on the daemon host itself, or
+    # what the daemon's own PATCH handler does for a worker machine.
+    with _assignment_written_locally(
+        db_path,
+        assignment_id="a-3339-refused",
+        issue_number=947,
+        status="refused_premise",
+    ):
         mark_premise_rechecked("a-3339-refused", "quadraui#971 landed")
-    finally:
-        db_mod.override_connection(None)
-        conn.close()
 
     payload = _serve_client(db_path).get("/board").json()
     matches = [
@@ -517,38 +546,18 @@ def test_test_confirmation_reaches_the_board_wire(tmp_path: Path) -> None:
     `/board` read path, so a DTO that forgets to declare the column fails
     here instead of on a live fleet.
     """
-    import time
-
-    import coord.db as db_mod
     from coord.confirm_test import TEST_CONFIRMATION_UNCONFIRMED
     from coord.state import record_test_verdict
 
     db_path = _seeded_db(tmp_path / "coord.db")
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        "INSERT INTO assignments "
-        "(assignment_id, repo_name, issue_number, issue_title, "
-        " machine_name, type, status, dispatched_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            # A recent `dispatched_at` (not the #748 fixture's epoch
-            # timestamps) so #762's board-retention cap keeps this row — a
-            # terminal row past the retention cutoff is dropped from
-            # `/board` regardless of the DTO, which would make this test
-            # pass for the wrong reason.
-            "a-3357-confirm", "claude-coordinator", 3357, "issue 3357",
-            "precision", "work", "test", time.time(),
-        ),
-    )
-    conn.commit()
-
-    # The autouse `_no_board_service` fixture keeps board-service resolution
-    # unset, so this routes straight to `_record_test_verdict_local` —
-    # exactly what `coord.notify`'s confirmation reap path does when run on
-    # the daemon host itself.
-    db_mod.override_connection(conn)
-    try:
+    # Routes straight to `_record_test_verdict_local` — exactly what
+    # `coord.notify`'s confirmation reap path does on the daemon host itself.
+    with _assignment_written_locally(
+        db_path,
+        assignment_id="a-3357-confirm",
+        issue_number=3357,
+        status="test",
+    ):
         record_test_verdict(
             assignment_id="a-3357-confirm",
             test_state="passed",
@@ -558,9 +567,6 @@ def test_test_confirmation_reaches_the_board_wire(tmp_path: Path) -> None:
             ),
             test_confirmation=TEST_CONFIRMATION_UNCONFIRMED,
         )
-    finally:
-        db_mod.override_connection(None)
-        conn.close()
 
     payload = _serve_client(db_path).get("/board").json()
     matches = [
