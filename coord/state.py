@@ -6248,6 +6248,34 @@ def get_cached_issue_labels(repo_name: str, issue_number: int) -> list[str] | No
         return None
 
 
+def get_cached_issue_state(repo_name: str, issue_number: int) -> str | None:
+    """Return the local cache's ``"open"``/``"closed"`` reading for an
+    issue, or ``None`` if the issue isn't cached.
+
+    Read-only lookup against the local ``issues`` table — never calls
+    GitHub — mirroring :func:`get_cached_issue_labels` exactly. Used by
+    #3376's dispatch-liveness precondition (`coord.dispatch_liveness.
+    check_dispatch_liveness`) to answer "is this issue already closed"
+    without a live GitHub round-trip on every retry/reassign decision.
+
+    ``None`` means "unknown", not "open" — either the issue was never
+    synced at all, or (per :func:`_upsert_open_issues_local`'s 7-day
+    prune) it closed more than a week ago and its cache row has since been
+    reclaimed. A caller must treat ``None`` as "don't refuse", the same
+    "no evidence supplied is not a refusal" posture every other structural
+    gate in this codebase takes (see `coord.machine_fault.
+    classify_machine_fault`) — never as "confirmed open".
+    """
+    conn = get_connection()
+    row = sql.execute(conn,
+        "SELECT state FROM issues WHERE repo_name = ? AND number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["state"] or None
+
+
 def apply_issue_labels(
     repo_name: str,
     issue_number: int,

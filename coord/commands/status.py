@@ -969,6 +969,63 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     except (ImportError, OSError, ValueError, KeyError):
         pass  # Never let usage tracking break the status command.
 
+    # #3376: invariant alarms — every one of #3367/#3368/#3369/#3375 was
+    # visible only after a human happened to notice something looked odd,
+    # because every existing status surface said `alert: (none)` the whole
+    # time. Best-effort, same "never let an observability add-on break the
+    # command it's riding on" posture as the usage/burn-rate block above —
+    # see `coord.invariant_alarms` for the checks themselves (pure,
+    # independently unit-tested) and why only #1 and #5 are wired here:
+    # #2/#4 need cross-tick history this single-shot command doesn't have
+    # (`coord drive-queue status` / a future daemon-side tracker owns
+    # those), and #3 needs a per-stage verdict-field mapping this command
+    # doesn't resolve today.
+    try:
+        from coord.invariant_alarms import (
+            check_machines_busy_while_queue_empty,
+            check_zero_turn_zero_cost_terminal,
+        )
+        from coord.state import list_drive_queue
+        from coord.usage import build_session_usage
+
+        alarms = []
+        busy_machines = sorted(
+            {a.machine_name for a in board.active if a.status == "running"}
+        )
+        try:
+            queue_row_count = len(list_drive_queue())
+        except Exception:  # noqa: BLE001 — a queue read must not hide the rest
+            queue_row_count = None
+        if queue_row_count is not None:
+            alarm = check_machines_busy_while_queue_empty(
+                busy_machines=busy_machines, queue_row_count=queue_row_count,
+            )
+            if alarm is not None:
+                alarms.append(alarm)
+        # #2786's `num_turns`/`total_cost_usd` live on `AssignmentUsage`
+        # (`coord.usage.collect_usage`'s output), not on the plain
+        # `coord.models.Assignment` rows `board.completed` holds — reuse
+        # the SAME builder the burn-rate line above already calls rather
+        # than re-deriving "how many turns did this leg take" a second way
+        # (#2096: one question, one answer).
+        usage = build_session_usage(list(board.active) + list(board.completed))
+        for au in usage.assignments:
+            alarm = check_zero_turn_zero_cost_terminal(
+                assignment_id=au.assignment_id or "?",
+                status=au.status,
+                num_turns=au.num_turns,
+                cost_usd=(None if au.cost_unknown else au.total_cost_usd),
+            )
+            if alarm is not None:
+                alarms.append(alarm)
+        if alarms:
+            click.echo("")
+            click.echo("INVARIANT ALARMS (#3376):")
+            for alarm in alarms:
+                click.echo(f"  [{alarm.severity.upper()}] {alarm.summary}")
+    except Exception:  # noqa: BLE001 — never let this break `coord status`
+        pass
+
     # #1631 (H-4): the always-visible fleet-health footer. Printed
     # unconditionally, every run — including the all-OK case ("OK states its
     # OK-ness rather than printing nothing": a check nobody ever sees run is

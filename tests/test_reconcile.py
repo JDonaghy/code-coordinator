@@ -377,7 +377,107 @@ class TestReassignThreadsProvider:
         assert payload["model"] == cfg.models.resolve("opus")
 
 
-# ── #1711: the provider-availability gate, applied to retry routing ────────
+# ── #3376: the dispatch-liveness gate, applied to auto-reassign ────────────
+
+
+def _plain_cfg() -> Config:
+    return Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[
+            Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp"}),
+            Machine(name="server", host="s", repos=["api"], repo_paths={"api": "/tmp"}),
+        ],
+    )
+
+
+class TestReassignLivenessGate:
+    """#3376: `_reassign` must not burn a retry on an issue that's already
+    closed or a branch that's already merged — #3367's own incident was
+    exactly this shape one layer up (auto-retried dispatches against
+    something no longer real)."""
+
+    @patch("coord.reconcile.httpx.post")
+    def test_none_fetcher_is_a_no_op(self, mock_post: MagicMock) -> None:
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        result = _reassign(_failed(), Board(), _plain_cfg())
+        assert result is not None
+        mock_post.assert_called_once()
+
+    @patch("coord.reconcile.record_dispatch_refusal")
+    @patch("coord.reconcile.httpx.post")
+    def test_skips_reassign_when_issue_closed(
+        self, mock_post: MagicMock, mock_record: MagicMock,
+    ) -> None:
+        result = _reassign(
+            _failed(), Board(), _plain_cfg(),
+            issue_liveness_fetcher=lambda repo, num: (True, False),
+        )
+        assert result is None
+        mock_post.assert_not_called()
+        mock_record.assert_called_once()
+
+    @patch("coord.reconcile.record_dispatch_refusal")
+    @patch("coord.reconcile.httpx.post")
+    def test_skips_reassign_when_branch_already_merged(
+        self, mock_post: MagicMock, mock_record: MagicMock,
+    ) -> None:
+        result = _reassign(
+            _failed(), Board(), _plain_cfg(),
+            issue_liveness_fetcher=lambda repo, num: (False, True),
+        )
+        assert result is None
+        mock_post.assert_not_called()
+        mock_record.assert_called_once()
+
+    @patch("coord.reconcile.httpx.post")
+    def test_dispatches_when_still_live(self, mock_post: MagicMock) -> None:
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        result = _reassign(
+            _failed(), Board(), _plain_cfg(),
+            issue_liveness_fetcher=lambda repo, num: (False, False),
+        )
+        assert result is not None
+        mock_post.assert_called_once()
+
+
+class TestIssueLivenessFromCache:
+    """#3376: `_issue_liveness_from_cache` — the real fetcher `reconcile()`
+    wires into `_reassign` — reads only local state (the `issues` cache
+    table, the already-fetched board), never GitHub."""
+
+    def test_closed_from_local_cache(self) -> None:
+        from coord.reconcile import _issue_liveness_from_cache
+
+        _seed_issue("api", 7)
+        conn = get_connection()
+        conn.execute(
+            "UPDATE issues SET state = 'closed' WHERE repo_name = 'api' AND number = 7"
+        )
+        conn.commit()
+        closed, merged = _issue_liveness_from_cache(Board(), "api", 7)
+        assert closed is True
+        assert merged is False
+
+    def test_unknown_issue_reads_as_not_closed(self) -> None:
+        from coord.reconcile import _issue_liveness_from_cache
+
+        closed, merged = _issue_liveness_from_cache(Board(), "api", 999)
+        assert closed is False
+        assert merged is False
+
+    def test_merged_from_board_completed_assignments(self) -> None:
+        from coord.reconcile import _issue_liveness_from_cache
+
+        board = Board(
+            completed=[_failed(status="merged", issue_number=42, type="work")]
+        )
+        closed, merged = _issue_liveness_from_cache(board, "api", 42)
+        assert closed is False
+        assert merged is True
 
 
 class TestReassignCapabilityGate:
