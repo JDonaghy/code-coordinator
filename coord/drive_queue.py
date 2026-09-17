@@ -2320,6 +2320,7 @@ def _resolve_prereqs(
     cycle_keys: Mapping[str, str],
     held_gates: Mapping[str, Hold] | None = None,
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    dep_reasons: Mapping[str, str] | None = None,
 ) -> _Verdict:
     """Decide whether *entry* may launch now.
 
@@ -2365,6 +2366,22 @@ def _resolve_prereqs(
     all. So it is now ALSO consulted there, for every ``dep_state`` other
     than ``STATE_DONE``: a pre-req that demonstrably landed must satisfy
     the dependent whatever its own queue row happens to claim.
+
+    *dep_reasons* (#3368) maps a dep key to its OWN current ``last_reason`` —
+    the same "prefer this tick's fresh write over the frozen snapshot" map
+    ``plan_tick`` already threads to the backoff check
+    (``effective_last_reason``). Consulted only in the ``dep_state in
+    (STATE_BLOCKED, STATE_FAILED)`` branch below: a dep sitting `blocked` on
+    :func:`is_unconfirmed_block_reason` — #2806's "gate could not be read
+    this tick, not a confirmed-still-shut gate" verdict — is, by that
+    verdict's OWN text, retryable, not terminal. Rendering the dependent's
+    verdict as "it will never satisfy" (unsatisfiable, blocks and escalates)
+    for that shape contradicts the very reason it is quoting; this instead
+    returns an ordinary unsatisfied deferral ("waiting on ... retrying"),
+    which keeps the dependent's position and re-derives a fresh verdict next
+    tick — exactly like waiting on any other still-in-flight dep. A dep
+    ABSENT here, or `blocked`/`failed` for any OTHER reason, keeps the
+    pre-#3368 "it will never satisfy" verdict unchanged.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
@@ -2414,6 +2431,25 @@ def _resolve_prereqs(
                 # landed, whatever its queue row claims.
                 continue
             if dep_state in (STATE_BLOCKED, STATE_FAILED):
+                dep_reason = (dep_reasons or {}).get(dep)
+                if dep_state == STATE_BLOCKED and _is_unconfirmed_block_reason(
+                    dep_reason
+                ):
+                    # #3368: *dep*'s own text already says its block is an
+                    # unconfirmed probe failure, not a confirmed-still-shut
+                    # gate (#2806) — rendering this dependent's verdict as
+                    # permanent would contradict the very reason it quotes.
+                    # An ordinary deferral, not a block: this entry keeps its
+                    # position and re-derives fresh next tick, same as
+                    # waiting on any other still-in-flight dep.
+                    return _Verdict(
+                        False,
+                        False,
+                        f"waiting on {dep} (queued, blocked, but its own gate "
+                        "reading is an unconfirmed probe failure, not a "
+                        "confirmed-still-shut gate — retrying, not blocked "
+                        "permanently, #3368)",
+                    )
                 return _Verdict(
                     False,
                     True,
@@ -2480,6 +2516,7 @@ def diagnose_blocked_after(
     states: Mapping[str, str],
     cycle_keys: Mapping[str, str],
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    dep_reasons: Mapping[str, str] | None = None,
 ) -> BlockedAfterDiagnosis:
     """Re-check a `blocked`/`failed` row's `after=` graph against the CURRENT
     board, fresh on every render (#2183).
@@ -2525,6 +2562,15 @@ def diagnose_blocked_after(
     ``unsatisfied`` here too, for the identical reason: a pre-req that a live
     read just confirmed closed/merged is not a caption worth showing as
     still-pending just because the cached board hasn't caught up yet.
+
+    *dep_reasons* (#3368) is passed straight through to
+    :func:`_resolve_prereqs` — see its own docstring. Threading it through
+    here (not just the launch walk) is what lets :func:`_reconcile_blocked_
+    after` resume a dependent off an "it will never satisfy" verdict the
+    moment the named pre-req's own block turns out to be an unconfirmed
+    probe failure rather than a confirmed-still-shut gate, and what lets
+    `coord drive-queue list`/`status` (#2183's rendering) compute the exact
+    same verdict a live tick would.
     """
     live_terminal = live_prereq_terminal or {}
     unsatisfied = tuple(
@@ -2538,6 +2584,7 @@ def diagnose_blocked_after(
     verdict = _resolve_prereqs(
         entry, board, states, cycle_keys, held_gates={},
         live_prereq_terminal=live_prereq_terminal,
+        dep_reasons=dep_reasons,
     )
     return BlockedAfterDiagnosis(
         unsatisfied,
@@ -2592,6 +2639,43 @@ def is_unsatisfiable_prereq_reason(text: str | None) -> bool:
     ``coord.commands.drive_queue._BLOCKED_AFTER_NOTE``.
     """
     return _is_unsatisfiable_prereq_reason(text)
+
+
+# #3368: the substring unique to `_reconcile_blocked_unreadable`'s #2806
+# verdict — "I probed this entry's merge gate this tick and the probe itself
+# failed" as opposed to "I probed it and it is still shut". A `blocked` dep
+# resting on THIS text is explicitly retryable, not terminal: #2230's sweep
+# tries again next tick rather than having confirmed anything is actually
+# still closed. `_resolve_prereqs` needs to tell the two apart for a
+# DEPENDENT's own verdict — see its `dep_state in (STATE_BLOCKED,
+# STATE_FAILED)` branch — so a chain stuck behind an unconfirmed probe
+# failure reads as "waiting, retrying" rather than "it will never satisfy".
+# Defined once here, and consumed by `_reconcile_blocked_unreadable`'s own
+# f-string below, so the marker text and the check for it can never drift
+# apart (one question, one answer).
+_UNCONFIRMED_BLOCK_MARKER = "NOT a confirmed-still-shut gate, only a failed probe"
+
+
+def _is_unconfirmed_block_reason(text: str | None) -> bool:
+    """Whether *text* is `_reconcile_blocked_unreadable`'s #2806
+    "gate could not be read this tick" verdict — see
+    :data:`_UNCONFIRMED_BLOCK_MARKER`.
+    """
+    if not text:
+        return False
+    return _UNCONFIRMED_BLOCK_MARKER in text
+
+
+def is_unconfirmed_block_reason(text: str | None) -> bool:
+    """Public alias for :func:`_is_unconfirmed_block_reason`.
+
+    #3368: a pre-req's own `blocked` row can be resting on #2806's
+    "gate_unreadable" verdict — an explicitly RETRYABLE probe failure, not a
+    confirmed-still-shut gate. `coord.commands.drive_queue` and tests use
+    this alias the same way they already use
+    :func:`is_unsatisfiable_prereq_reason`.
+    """
+    return _is_unconfirmed_block_reason(text)
 
 
 # ── #2944: the guaranteed-false wait ─────────────────────────────────────────
@@ -2792,6 +2876,7 @@ def _reconcile_blocked_after(
     states: Mapping[str, str],
     cycle_keys: Mapping[str, str],
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    dep_reasons: Mapping[str, str] | None = None,
 ) -> Reconcile | None:
     """#2362: resume a `blocked` entry whose ONLY cause was an unsatisfiable
     `after=` pre-req, once every named pre-req has since landed. #2756:
@@ -2872,7 +2957,7 @@ def _reconcile_blocked_after(
     if not _is_unsatisfiable_prereq_reason(entry.last_reason):
         return None
     diagnosis = diagnose_blocked_after(
-        entry, board, states, cycle_keys, live_prereq_terminal
+        entry, board, states, cycle_keys, live_prereq_terminal, dep_reasons
     )
     if diagnosis.unsatisfiable:
         return None
@@ -4591,7 +4676,7 @@ def _reconcile_blocked_unreadable(
         return None
     reason = (
         f"{entry.key}'s merge gate could not be read this tick ({note}) — "
-        "this is NOT a confirmed-still-shut gate, only a failed probe; "
+        f"this is {_UNCONFIRMED_BLOCK_MARKER}; "
         "#2230's sweep will try again next tick rather than guessing (#2806)"
     )
     return Reconcile(
@@ -5604,13 +5689,45 @@ def plan_tick(
     # have no other re-check, so the board keeps reporting finished work as
     # outstanding until someone notices and runs
     # `coord drive-queue remove`. See #1956 for a live instance.
+    #
+    # #3368: `facts.landed` ALONE is the same periodic `/board` cache
+    # `_resolve_prereqs`'s dependent-side check learned, via #2602/#2850, NOT
+    # to trust unconditionally — a `parked`/`blocked`/`failed` row's OWN
+    # issue can merge out of band (an operator's `coord drive` to
+    # completion, same as the vimcode#1059 incident) and outrun that cache
+    # exactly as easily as a dependent's pre-req can. Before this, the
+    # dependent side had a live recovery path (`live_prereq_terminal`) and
+    # THIS self-check did not — so a leaf `blocked` row with no dependent
+    # naming it in `after=` had no live check racing for it at all, and even
+    # a row WITH a dependent only got saved indirectly, by that dependent's
+    # OWN `after=` re-derivation (`_reconcile_blocked_after`) rather than
+    # this row's own state ever correcting. `live_prereq_terminal` is the
+    # SAME per-tick live re-check both call sites already share — one
+    # question ("has this key's issue actually landed?"), one answer,
+    # whether asked on behalf of the row itself or a dependent chained
+    # `--after` it.
     for entry in ordered:
         if entry.state not in (STATE_PARKED, STATE_BLOCKED, STATE_FAILED):
             continue
         facts = board.facts(entry.key)
-        if facts.landed:
-            witness = "merged" if facts.merged else "closed"
-            reason = f"done — issue already {witness} while {entry.state} (#2055)"
+        live_landed = (live_prereq_terminal or {}).get(entry.key, False)
+        if facts.landed or live_landed:
+            if facts.landed:
+                witness = "merged" if facts.merged else "closed"
+                reason = f"done — issue already {witness} while {entry.state} (#2055)"
+            else:
+                # #3368: the cached board does not (yet) show this landed,
+                # but a live re-check taken THIS tick confirms the issue is
+                # closed or its PR merged — `github_ops.work_is_terminal`
+                # (see `_fetch_live_prereq_terminal`) does not distinguish
+                # which, so neither does this text; the honest claim is "the
+                # live probe confirmed terminal", not a specific witness the
+                # probe never actually observed.
+                reason = (
+                    f"done — a live re-check this tick confirms the issue is "
+                    f"already closed or its PR merged while {entry.state} "
+                    "(#3368), independent of the cached board"
+                )
             reconciles.append(
                 Reconcile(
                     entry.key,
@@ -5645,7 +5762,12 @@ def plan_tick(
             # shapes ("it will never satisfy", and #2602's "not queued, not
             # merged and not open") — see :func:`_reconcile_blocked_after`.
             blocked_reconcile = _reconcile_blocked_after(
-                entry, board, states, cycle_keys, live_prereq_terminal
+                entry,
+                board,
+                states,
+                cycle_keys,
+                live_prereq_terminal,
+                effective_last_reason,
             )
             if blocked_reconcile is None:
                 # #2230: re-examine a `blocked` entry against the CURRENT gate
@@ -6243,7 +6365,13 @@ def plan_tick(
                 )
                 continue
             verdict = _resolve_prereqs(
-                entry, board, states, cycle_keys, held_gates, live_prereq_terminal
+                entry,
+                board,
+                states,
+                cycle_keys,
+                held_gates,
+                live_prereq_terminal,
+                effective_last_reason,
             )
             if not verdict.satisfied:
                 deferrals.append(
@@ -6329,7 +6457,13 @@ def plan_tick(
             landed_keys.add(entry.key)
             continue
         verdict = _resolve_prereqs(
-            entry, board, states, cycle_keys, held_gates, live_prereq_terminal
+            entry,
+            board,
+            states,
+            cycle_keys,
+            held_gates,
+            live_prereq_terminal,
+            effective_last_reason,
         )
         if verdict.unsatisfiable:
             blocked.append(

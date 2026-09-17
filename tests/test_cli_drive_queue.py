@@ -1501,6 +1501,47 @@ def test_a_dependent_is_released_when_its_prereq_is_wrongly_stuck_running(
     assert prereq["state"] == "done"
 
 
+def test_a_leaf_blocked_entry_with_no_dependents_reconciles_to_done_via_a_live_recheck(
+    cli, seed, launches, monkeypatch,
+):
+    """#3368: the vimcode#1059 incident — a `blocked` row's OWN issue merges
+    out of band (an operator's `coord drive` to completion) while the cached
+    board's `issues` row hasn't caught up yet. #2055's landed-check trusted
+    only `board.facts(key).landed`, the very cache #2602/#2850 already
+    learned NOT to trust unconditionally for a DEPENDENT's view of a
+    pre-req — but nothing gave THIS row's own key the same live re-check
+    unless some OTHER entry's `after=` happened to name it.  A leaf blocked
+    row (nothing queued behind it, exactly #1059's shape — it was the FIRST
+    of a six-long dependent chain, not itself an `after=` dependency of
+    anything already `waiting`/`blocked`) had no live check racing for it at
+    all and stayed `blocked` forever, even after two full ticks."""
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO,
+        1650,
+        state="blocked",
+        last_reason="review 0ef720978ec3 failed 1 retr(ies)",
+        attempts=2,
+    )
+
+    import coord.github_ops as github_ops
+
+    monkeypatch.setattr(
+        github_ops,
+        "work_is_terminal",
+        lambda repo_github, issue_number, branch, **_kw: (
+            repo_github == "john/claude-coordinator" and issue_number == 1650
+        ),
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1650)
+    assert entry["state"] == "done"
+    assert "#3368" in entry["last_reason"]
+
+
 def test_list_with_no_after_is_unaffected_by_the_2183_diagnosis(cli):
     """A `blocked` entry that never declared any `after=` at all keeps
     rendering exactly as it always has — no board dependency, no remedy
