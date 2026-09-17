@@ -22,6 +22,7 @@ from coord.comments import (
     format_refused_premise,
 )
 from coord.config import Config, SmokeRule
+from coord.dispatch_liveness import check_dispatch_liveness, record_dispatch_refusal
 from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo, coordinator_owned_docs
 
 AGENT_PORT = 7433
@@ -75,17 +76,28 @@ _log = logging.getLogger(__name__)
 class DispatchRefused(ValueError):
     """A pre-dispatch guard's refusal — deterministic, not transient (#1844).
 
-    Raised by :func:`enforce_oracle_readiness` and
-    :func:`enforce_epic_dispatch_guard` instead of a plain ``ValueError``:
-    both refuse on a condition that CANNOT change between attempts (no
-    acceptance slice exists yet; a tracking issue carries the epic label),
+    Raised by :func:`enforce_oracle_readiness`, :func:`enforce_epic_
+    dispatch_guard`, and (#3376) the STRUCTURAL DISPATCH-LIVENESS GATE
+    (`coord.dispatch_liveness.check_dispatch_liveness`, covering all three
+    of its predicates — a closed issue, an already-merged branch, or a
+    machine that fails its credential/health probe) instead of a plain
+    ``ValueError``: all of these refuse on a condition that CANNOT change
+    between attempts on this same target (no acceptance slice exists yet;
+    a tracking issue carries the epic label; the issue is already closed;
+    the same dead-credential machine is still dead a moment later),
     unlike the other ``ValueError``s ``dispatch()`` can raise (an unresolved
     machine/repo_path, the #437 TOS gate, a provider/machine capability
     mismatch) which this deliberately leaves alone — those are refusals too,
     but reclassifying their retry-worthiness is outside what this issue
     covers, and several of them ARE operator-fixable in ways a running fleet
     can race (e.g. adding a capability to a machine's config while `coord
-    drive-queue` is ticking).
+    drive-queue` is ticking). Reusing this ONE exception (#2096: "one
+    question, one answer") rather than adding a second, competing
+    "this refusal doesn't count" concept is what makes #3376's charging
+    rule ("a dispatch refused by the liveness precondition costs the issue
+    nothing") a byte-for-byte reuse of the `EXIT_DISPATCH_REFUSED` handling
+    `coord.drive` already built for #1844, instead of a second accounting
+    path that could quietly disagree with it.
 
     A subclass of ``ValueError``, not a new hierarchy: every existing
     ``except ValueError`` catch (CLI error handling, tests asserting the
@@ -620,6 +632,7 @@ def dispatch(
     fresh_branch: bool = False,
     status_fetcher=None,
     credential_fetcher=None,
+    issue_liveness_fetcher=None,
 ) -> dict:
     """POST an assignment to the agent server on the target machine.
 
@@ -635,10 +648,17 @@ def dispatch(
     *credential_fetcher* (#3371) is `(machine: Machine) -> bool` — `True`
     means "still routable", matching `coord.network.claude_credential_
     reachable`'s contract exactly (that is also its default in
-    production; see the STRUCTURAL CREDENTIAL-HEALTH GATE below). `None`
+    production; see the STRUCTURAL DISPATCH-LIVENESS GATE below). `None`
     (the default) performs no probe at all and refuses nothing, exactly
     like every caller that predates this parameter — same opt-in shape as
     *status_fetcher*.
+
+    *issue_liveness_fetcher* (#3376) is `(repo_name: str, issue_number: int)
+    -> (issue_closed: bool, branch_merged: bool)` — the other two
+    predicates of the same STRUCTURAL DISPATCH-LIVENESS GATE. `None` (the
+    default) performs no check at all and refuses nothing, same opt-in
+    shape as *credential_fetcher*. See `coord.dispatch_liveness` for the
+    single function all three predicates funnel through.
     """
     machine = next(
         (m for m in config.machines if m.name == proposal.machine_name), None
@@ -822,31 +842,51 @@ def dispatch(
         where="coord approve / dispatch",
     )
 
-    # #3371: STRUCTURAL CREDENTIAL-HEALTH GATE — refuse to route a dispatch
-    # to a machine whose claude credential a live probe just confirmed
-    # cannot authenticate. #3367's incident is exactly what this closes:
-    # four review dispatches to a dead-credential host each failed at turn
-    # 1 for $0.00 before anyone noticed, because nothing upstream of the
-    # POST treated a dead credential as disqualifying — `coord plan`'s
-    # prompt-hint (`coord.brain.build_prompt`) only helps a human who
-    # happens to eyeball the proposal before approving it; this is the
-    # mechanical backstop for when they don't. Same opt-in shape as
-    # *status_fetcher* above (#3353) and the SAME reason: *credential_
-    # fetcher* is `None` for every caller that hasn't wired one in, so this
-    # is a byte-for-byte no-op for the whole existing test suite and every
-    # caller that predates #3371. Production callers (`coord approve`/
-    # `coord assign`, the daemon auto-loop, the dashboard's approve route)
-    # wire `coord.network.claude_credential_reachable` — see those call
-    # sites — so a dead-credential host is refused HERE, before any
-    # worktree/HTTP work happens, rather than discovered from a wasted
-    # turn-1 failure afterwards.
-    if credential_fetcher is not None and not credential_fetcher(machine):
-        raise ValueError(
-            f"machine {machine.name!r} failed a live claude-credential "
-            "probe — not routable (#3371): re-authenticate (`claude` or "
-            "`claude setup-token`) on that host, or approve/assign this "
-            "to a different machine"
+    # #3376: STRUCTURAL DISPATCH-LIVENESS GATE — the single precondition
+    # (`coord.dispatch_liveness.check_dispatch_liveness`) that refuses a
+    # dispatch when the work cannot matter (the issue is already closed, or
+    # its branch already merged) or cannot succeed (the target machine
+    # fails its own credential/health probe). This absorbs and generalizes
+    # what used to be a standalone #3371 CREDENTIAL-HEALTH GATE here — the
+    # probe itself (`coord.network.claude_credential_reachable`) and its
+    # opt-in *credential_fetcher* contract are unchanged (`None` = no probe
+    # = no-op, byte-for-byte identical to every pre-#3371 caller); it is
+    # now one of three predicates a single function checks, rather than
+    # its own scattered `if`, so a fourth "did anyone check reality first"
+    # bug has one obvious place to add a fourth predicate instead of a
+    # fourth call site. *issue_liveness_fetcher* is the SAME opt-in shape:
+    # `None` for every caller that hasn't wired one in refuses nothing.
+    # See `coord.dispatch_liveness`'s module docstring for why a refusal
+    # here costs the issue's retry budget nothing (no assignment row is
+    # ever created) and how the refusal itself is still made visible
+    # (`record_dispatch_refusal`, via `coord.audit.record_audit`) rather
+    # than silently vanishing.
+    issue_closed: bool | None = None
+    branch_merged: bool | None = None
+    if issue_liveness_fetcher is not None:
+        issue_closed, branch_merged = issue_liveness_fetcher(
+            proposal.repo_name, proposal.issue_number
         )
+    machine_healthy: bool | None = None
+    if credential_fetcher is not None:
+        machine_healthy = bool(credential_fetcher(machine))
+    refusal = check_dispatch_liveness(
+        repo_name=proposal.repo_name,
+        issue_number=proposal.issue_number,
+        machine_name=machine.name,
+        issue_closed=issue_closed,
+        branch_merged=branch_merged,
+        machine_healthy=machine_healthy,
+    )
+    if refusal is not None:
+        record_dispatch_refusal(
+            refusal,
+            repo_name=proposal.repo_name,
+            issue_number=proposal.issue_number,
+            machine_name=machine.name,
+            assignment_type=proposal.type,
+        )
+        raise DispatchRefused(refusal.reason)
 
     deny_commands: list[str] = []
     if repo is not None and repo.worker_permissions is not None:
@@ -1243,17 +1283,20 @@ def dispatch_with_retry(
     on_retry: callable | None = None,
     status_fetcher=None,
     credential_fetcher=None,
+    issue_liveness_fetcher=None,
 ) -> dict:
     """Dispatch with exponential backoff on transient failures.
 
     *status_fetcher* (#3353) is forwarded to `dispatch()` untouched — see
     its docstring for the liveness-routing gate it opts into.
 
-    *credential_fetcher* (#3371) is forwarded to `dispatch()` untouched —
-    see its docstring for the STRUCTURAL CREDENTIAL-HEALTH GATE it opts
-    into. A `ValueError` from that gate is NOT retried (same as every
-    other `ValueError` this function already re-raises unchanged below) —
-    a dead credential is not a transient condition backoff can fix.
+    *credential_fetcher* (#3371) and *issue_liveness_fetcher* (#3376) are
+    forwarded to `dispatch()` untouched — see its docstring for the
+    STRUCTURAL DISPATCH-LIVENESS GATE they opt into. A `DispatchRefused`
+    from that gate is NOT retried (it is a `ValueError` subclass, so it
+    hits the same `except ValueError: raise` below unchanged) — a closed
+    issue, an already-merged branch, or a dead credential is not a
+    transient condition backoff can fix.
     """
     from coord.network import classify_error, is_retryable
 
@@ -1265,6 +1308,7 @@ def dispatch_with_retry(
                 pull_repos=pull_repos, fresh_branch=fresh_branch,
                 status_fetcher=status_fetcher,
                 credential_fetcher=credential_fetcher,
+                issue_liveness_fetcher=issue_liveness_fetcher,
             )
         except httpx.HTTPError as exc:
             state, reason = classify_error(exc)

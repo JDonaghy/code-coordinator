@@ -2591,6 +2591,111 @@ class TestCredentialHealthGate:
         mock_post.assert_called_once()
 
 
+class TestDispatchLivenessGate:
+    """#3376: the ONE dispatch liveness precondition, consolidated with
+    #3371's credential-health gate above into a single structural check —
+    refuses BEFORE any HTTP POST when the issue is already closed, its
+    branch already merged, or (unchanged from #3371) the machine fails a
+    live credential probe."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_none_fetcher_is_a_no_op(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """A caller that hasn't wired issue_liveness_fetcher in yet is
+        byte-for-byte unaffected — same posture as credential_fetcher."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.record_dispatch_refusal")
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_a_closed_issue(
+        self, mock_post: MagicMock, mock_record: MagicMock,
+        config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(DispatchRefused, match="already closed"):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (True, False),
+            )
+        mock_post.assert_not_called()
+        mock_record.assert_called_once()
+
+    @patch("coord.dispatch.record_dispatch_refusal")
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_an_already_merged_branch(
+        self, mock_post: MagicMock, mock_record: MagicMock,
+        config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(DispatchRefused, match="already merged"):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, True),
+            )
+        mock_post.assert_not_called()
+        mock_record.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_allows_an_open_unmerged_issue(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(
+            proposal, config,
+            issue_liveness_fetcher=lambda repo, num: (False, False),
+        )
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_still_refuses_dead_credential_via_same_gate(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """#3371's behaviour, now routed through the consolidated gate,
+        must still refuse a dead-credential machine — and the substring
+        every pre-existing caller matches on ("not routable") is
+        preserved."""
+        with pytest.raises(ValueError, match="not routable"):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, False),
+                credential_fetcher=lambda m: False,
+            )
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_all_three_predicates_raise_the_same_deterministic_exception(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """#3376: all three predicates funnel through the SAME
+        `DispatchRefused` #1844 already built — not a second, competing
+        "this doesn't count" concept — so every one of them gets the
+        existing `EXIT_DISPATCH_REFUSED` "don't charge the retry budget"
+        treatment `coord.drive`'s subprocess boundary already applies to
+        `enforce_oracle_readiness`/`enforce_epic_dispatch_guard`."""
+        with pytest.raises(DispatchRefused):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (True, False),
+            )
+        with pytest.raises(DispatchRefused):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, True),
+            )
+        with pytest.raises(DispatchRefused):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, False),
+                credential_fetcher=lambda m: False,
+            )
+        mock_post.assert_not_called()
+
+
 class TestProviderAwareModelResolution:
     """#1706 review fix: `config.models.default` is a Claude alias and must
     not silently shadow a non-Claude provider's own pinned `model`. Model
