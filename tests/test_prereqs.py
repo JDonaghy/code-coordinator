@@ -178,6 +178,7 @@ class TestProbeAll:
         assert summary["git"] == {
             "found": False, "version": None, "min_version": None,
             "meets_floor": None, "capability": None, "ok": False,
+            "expires_at": None,
         }
 
     def test_all_capability_names_probes_every_capability_prereq(self) -> None:
@@ -988,6 +989,26 @@ class TestClaudeCredentialsPrereq:
         assert probe.ok is True
         assert probe.version == "max"
 
+    def test_healthy_credential_reports_refresh_token_expiry(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """#3371: the operator's complaint was "no insight into when it
+        expires" — `refreshTokenExpiresAt` (the SESSION lifetime) must be
+        surfaced on the probe, not just used internally to decide ok/not-ok."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        expiry_ms = (time.time() + 3600 * 24 * 10) * 1000
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": (time.time() + 3600) * 1000,
+            "refreshTokenExpiresAt": expiry_ms,
+            "subscriptionType": "max",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.expires_at == expiry_ms
+
     def test_no_expiry_fields_but_live_tokens_still_probes_met(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -1005,6 +1026,7 @@ class TestClaudeCredentialsPrereq:
             probe = prereqs.probe(self._claude_prereq())
         assert probe.found is True
         assert probe.ok is True
+        assert probe.expires_at is None
 
     def test_probe_never_spawns_claude_itself(self, tmp_path, monkeypatch) -> None:
         """Guard against a future refactor reintroducing a billable `claude
@@ -1056,6 +1078,85 @@ class TestClaudeCredentialsPrereq:
             probe = prereqs.probe(self._claude_prereq())
         assert probe.found is False
         assert probe.ok is False
+
+
+class TestClaudeCredentialOk:
+    """#3371: `claude_credential_ok` is the single function `coord doctor`
+    and `coord.brain.build_prompt`'s routing filter must both call to ask
+    "is this machine's claude credential alive" — see the #2096 "one
+    question, one answer" rule in this function's own docstring."""
+
+    def test_dead_credential_is_not_ok(self) -> None:
+        """The gate must be able to fail: a `tool_versions["claude"]` entry
+        that mirrors a genuinely dead probe (`found=False`) must NOT default
+        to the permissive branch."""
+        tool_versions = {
+            "claude": {
+                "found": False, "version": None, "min_version": None,
+                "meets_floor": None, "capability": None, "ok": False,
+                "expires_at": None,
+            },
+        }
+        assert prereqs.claude_credential_ok(tool_versions) is False
+
+    def test_healthy_credential_is_ok(self) -> None:
+        tool_versions = {
+            "claude": {
+                "found": True, "version": "max", "min_version": None,
+                "meets_floor": None, "capability": None, "ok": True,
+                "expires_at": None,
+            },
+        }
+        assert prereqs.claude_credential_ok(tool_versions) is True
+
+    def test_missing_tool_versions_degrades_to_ok(self) -> None:
+        """An agent whose /health call failed, or that predates #3326's
+        probe entirely, must not be newly treated as broken."""
+        assert prereqs.claude_credential_ok(None) is True
+        assert prereqs.claude_credential_ok({}) is True
+
+    def test_missing_claude_entry_degrades_to_ok(self) -> None:
+        assert prereqs.claude_credential_ok({"git": {"ok": True}}) is True
+
+    def test_reuses_tool_probe_from_dict_not_a_second_opinion(self) -> None:
+        """Both callers must go through the same reconstruction — this pins
+        that `claude_credential_ok` is literally built on
+        `tool_probe_from_dict(...).ok`, not an independent re-derivation
+        that could silently drift from `coord doctor`'s own rendering."""
+        info = {
+            "found": True, "version": "max", "min_version": None,
+            "meets_floor": None, "capability": None, "expires_at": None,
+        }
+        probe = prereqs.tool_probe_from_dict("claude", info)
+        assert prereqs.claude_credential_ok({"claude": info}) == probe.ok
+
+
+class TestClaudeCredentialExpiryWarning:
+    """#3371: forward visibility into a KNOWN expiry — the operator's own
+    complaint was "no insight into when it expires", which `ok`/`found`
+    alone (already-dead vs. not) can never answer."""
+
+    def test_no_expires_at_is_silent(self) -> None:
+        assert prereqs.claude_credential_expiry_warning({"expires_at": None}) is None
+
+    def test_far_future_expiry_is_silent(self) -> None:
+        far_future_ms = (time.time() + 3600 * 24 * 365) * 1000
+        assert prereqs.claude_credential_expiry_warning(
+            {"expires_at": far_future_ms}
+        ) is None
+
+    def test_expiry_within_the_warn_window_warns(self) -> None:
+        soon_ms = (time.time() + 3600 * 24) * 1000  # 1 day out
+        warning = prereqs.claude_credential_expiry_warning({"expires_at": soon_ms})
+        assert warning is not None
+        assert "expires in ~1.0 day" in warning
+
+    def test_already_past_expiry_is_silent_not_double_reported(self) -> None:
+        """An already-expired credential is reported by the ordinary
+        `found=False` -> `✗ claude: ...` line; this must not ALSO fire —
+        that would be a second, weaker name for the same failure."""
+        past_ms = (time.time() - 3600) * 1000
+        assert prereqs.claude_credential_expiry_warning({"expires_at": past_ms}) is None
 
 
 class TestNvimCapabilityManifest:

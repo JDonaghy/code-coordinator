@@ -1503,7 +1503,11 @@ def doctor(
 ) -> None:
     from coord import network
     from coord.network import check_all
-    from coord.prereqs import ToolProbe, unmet_capabilities
+    from coord.prereqs import (
+        claude_credential_expiry_warning,
+        tool_probe_from_dict,
+        unmet_capabilities,
+    )
 
     cfg = _load_config(config_path)
     machines = cfg.machines
@@ -1610,16 +1614,13 @@ def doctor(
             any_problem = True
             continue
 
+        # #3371: reconstruct via the shared helper (not inline) so this and
+        # `claude_credential_ok` (the routing-eligibility check `coord
+        # plan` runs, `coord.brain.build_prompt`) can never silently
+        # disagree about what one `/health` probe entry means — #2096's
+        # "one question, one answer".
         probes = {
-            tool: ToolProbe(
-                tool=tool,
-                capability=info.get("capability"),
-                found=bool(info.get("found", False)),
-                version=info.get("version"),
-                min_version=info.get("min_version"),
-                meets_floor=info.get("meets_floor"),
-                what_breaks="",
-            )
+            tool: tool_probe_from_dict(tool, info)
             for tool, info in raw_probes.items()
             if isinstance(info, dict)
         }
@@ -1633,6 +1634,22 @@ def doctor(
                 detail = p.version or "found (version unknown)"
             floor = f"  (>= {p.min_version} required)" if p.min_version else ""
             click.echo(f"  {marker} {tool}: {detail}{floor}")
+            # #3371: forward visibility into a KNOWN credential expiry, not
+            # just "already dead" — the operator's own complaint ("I have
+            # no insight into when it expires") was about foresight, and
+            # `p.ok` above only ever answers the already-dead half. Only
+            # checked when the probe is currently `ok` (an already-failing
+            # probe already printed the `✗` line above; re-flagging it here
+            # too would just be a second, weaker name for the same thing).
+            if tool == "claude" and p.ok:
+                raw = raw_probes.get(tool)
+                warning = (
+                    claude_credential_expiry_warning(raw)
+                    if isinstance(raw, dict) else None
+                )
+                if warning:
+                    click.echo(f"  ⚠ WARN {warning}")
+                    any_problem = True
 
         unmet = unmet_capabilities(m.capabilities, probes)
         for cap, reasons in unmet.items():

@@ -202,6 +202,68 @@ def test_doctor_flags_dead_claude_credentials(valid_config_path, monkeypatch) ->
     assert "✗ claude: not found" in result.output
 
 
+def test_doctor_warns_ahead_of_credential_expiry(valid_config_path, monkeypatch) -> None:
+    """#3371: the operator's complaint was "no insight into when it
+    expires" — a credential that still authenticates (`ok=True`) but whose
+    KNOWN refresh-token expiry is imminent must WARN, not render the plain
+    `✓ claude: max` line #3371's own evidence quotes as misleadingly
+    healthy-looking."""
+    import time
+
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    soon_ms = (time.time() + 3600 * 24) * 1000  # 1 day out
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({
+                "git": _ok_probe(), "gh": _ok_probe(),
+                "claude": {
+                    "found": True, "version": "max", "min_version": None,
+                    "meets_floor": None, "capability": None, "ok": True,
+                    "expires_at": soon_ms,
+                },
+            }, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1
+    assert "✓ claude: max" in result.output
+    assert "WARN" in result.output
+    assert "expires in ~1.0 day" in result.output
+
+
+def test_doctor_healthy_far_future_expiry_does_not_warn(
+    valid_config_path, monkeypatch,
+) -> None:
+    import time
+
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    far_future_ms = (time.time() + 3600 * 24 * 365) * 1000
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({
+                "git": _ok_probe(), "gh": _ok_probe(),
+                "python3": _ok_probe("python"),
+                "claude": {
+                    "found": True, "version": "max", "min_version": None,
+                    "meets_floor": None, "capability": None, "ok": True,
+                    "expires_at": far_future_ms,
+                },
+            }, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0
+    assert "WARN" not in result.output
+
+
 def test_doctor_flags_claimed_capability_the_probe_contradicts(
     valid_config_path, monkeypatch,
 ) -> None:
