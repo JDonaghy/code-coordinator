@@ -219,20 +219,23 @@ def _no_agent_credential_probe(monkeypatch):
     ``host.tailnet`` hostname.
 
     Exactly the same reasoning (and exactly the same shape) as
-    ``_no_agent_health_probe`` above: the real fetchers already degrade to
+    ``_no_agent_health_probe`` above: the real fetcher already degrades to
     "assume healthy" on any probe failure, so this changes no test's
     OUTCOME — it just stops the suite's default behaviour from depending
     on network/DNS timing, and removes the second live probe per review
     candidate that landing the gate would otherwise have added. Tests
     exercising the gate itself pass an explicit ``credential_fetcher=``
-    (or monkeypatch these names to something stricter), which takes
+    (or monkeypatch this name to something stricter), which takes
     priority and is unaffected.
+
+    Deliberately narrow: only ``dispatch_review``/``dispatch_scoped_review``
+    default to a live probe. ``coord.network.claude_credential_reachable``
+    itself is NOT stubbed here — every other seam takes it as an explicit,
+    opt-in ``credential_fetcher=``, and ``tests/test_network.py`` tests the
+    real function directly.
     """
     monkeypatch.setattr(
         "coord.review._fetch_agent_claude_credential_ok", lambda *a, **k: True
-    )
-    monkeypatch.setattr(
-        "coord.network.claude_credential_reachable", lambda *a, **k: True
     )
 
 
