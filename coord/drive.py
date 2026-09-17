@@ -130,7 +130,6 @@ from coord.failure_class import (
     plan_usage_limit_resume,
 )
 from coord import machine_fault
-from coord.machine_fault import classify_machine_fault
 from coord.models import (
     DELIVERABLE_ANALYSIS_LABEL,
     EPIC_DECOMPOSE_TYPE,
@@ -278,6 +277,64 @@ _ENVIRONMENTAL_WORK_RETRY_BUDGET = ENVIRONMENTAL_RETRY_BUDGET
 # auto-pause has already fired (and the *next* redispatch already avoided
 # this host) before the local budget could ever be the thing that stops it.
 _MACHINE_FAULT_RETRY_BUDGET = machine_fault.AUTO_PAUSE_THRESHOLD + 2
+
+
+def _machine_fault_warnings(
+    fault: machine_fault.MachineFaultClassification,
+    fault_machine: str,
+    budget_kind: str,
+) -> tuple[str, ...]:
+    """Build the warning(s) for a machine-fault redispatch, and — ONLY for
+    the auth-text signal — bump *fault_machine*'s consecutive-fault counter
+    and check for auto-pause.
+
+    #3367 review: the generic shape signal (`instant_zero_cost`) still earns
+    the redispatch-without-charging-the-issue behaviour below (see caller),
+    but must NOT by itself feed `record_fault`/`maybe_auto_pause`.
+    `assignments.num_turns` defaults to `0` at dispatch time (`INTEGER
+    DEFAULT 0`, `coord/db.py`), and `cost_usd` stays `NULL` until a
+    stream-json result is actually parsed and captured (`_capture_tokens_
+    best_effort`/`_capture_cost_from_entry_best_effort`, `coord/
+    reconcile.py`) — so a PRE-LAUNCH failure that never got a worker process
+    running at all (a bad `pull_repos`/`repo_path` entry, a worktree setup
+    failure, a raw spawn `OSError`, all in `coord/agent.py`'s `AgentServer.
+    _fail`/`_pull_then_spawn`/`_spawn`) has the IDENTICAL num_turns=0/
+    cost=None shape as a genuine dead-credential leg — and, being a config
+    defect rather than a host defect, reproduces identically on every
+    machine that shares it. Auto-pausing on the shape signal alone would
+    walk the whole fleet pausing healthy machines one at a time as each is
+    tried in turn — the exact "wrong culprit blamed, capacity silently
+    drained" failure this module exists to fix, just relocated from "one
+    host" to "the whole fleet". The auth-text signal names a real,
+    host-specific cause (the literal OAuth wire tokens `claude` itself
+    emits) and is safe to drive the counter/pause; the generic shape signal
+    only earns not being charged to the issue.
+    """
+    if fault.signal != "auth_failure":
+        return (
+            f"{fault.reason} (host: {fault_machine}) — redispatching "
+            f"WITHOUT spending the issue's {budget_kind} retry budget, but "
+            "NOT counted toward auto-pause: the generic zero-turn/zero-cost "
+            "shape alone can't be told apart from an ordinary pre-launch/"
+            "config failure that would reproduce on every machine (#3367 "
+            "review)",
+        )
+    consecutive = machine_fault.record_fault(fault_machine, fault.reason)
+    just_paused, _ = machine_fault.maybe_auto_pause(fault_machine)
+    warnings = (
+        f"{fault.reason} (host: {fault_machine}, "
+        f"{consecutive} consecutive) — redispatching WITHOUT "
+        f"spending the issue's {budget_kind} retry budget (#3367)",
+    )
+    if just_paused:
+        warnings = warnings + (
+            f"AUTO-PAUSED {fault_machine}: {consecutive} consecutive "
+            "machine faults — run `coord unpause "
+            f"{fault_machine}` once its credentials are fixed "
+            "(#3367)",
+        )
+    return warnings
+
 
 # #3214: how many CONSECUTIVE times a same-branch UAT fix-up dispatch
 # (`coord fix <work_aid> --force`, dispatched from the "uat" arm of
@@ -2428,27 +2485,14 @@ def decide(
         # allow-listed 5xx/429/network signals anyway, so without this check
         # it would fall straight into the flat non-environmental budget and
         # reproduce the exact issue this closes.
-        fault = classify_machine_fault(
+        fault = machine_fault.classify_machine_fault(
             failure_reason=state.work_failure_reason or None,
             num_turns=state.work_num_turns,
             cost_usd=state.work_cost_usd,
         )
         if fault.is_machine_fault:
             fault_machine = state.work_machine or machine
-            consecutive = machine_fault.record_fault(fault_machine, fault.reason)
-            just_paused, _ = machine_fault.maybe_auto_pause(fault_machine)
-            warnings = (
-                f"{fault.reason} (host: {fault_machine}, "
-                f"{consecutive} consecutive) — redispatching WITHOUT "
-                "spending the issue's work retry budget (#3367)",
-            )
-            if just_paused:
-                warnings = warnings + (
-                    f"AUTO-PAUSED {fault_machine}: {consecutive} consecutive "
-                    "machine faults — run `coord unpause "
-                    f"{fault_machine}` once its credentials are fixed "
-                    "(#3367)",
-                )
+            warnings = _machine_fault_warnings(fault, fault_machine, "work")
             if counters.work_machine_fault_retries >= _MACHINE_FAULT_RETRY_BUDGET:
                 return _die(
                     f"work {state.work_aid} failed "
@@ -3435,27 +3479,14 @@ def _decide_review(
         # it; bounded separately by `_MACHINE_FAULT_RETRY_BUDGET` so a host
         # that somehow keeps getting picked despite the auto-pause below
         # still dies eventually instead of looping forever.
-        fault = classify_machine_fault(
+        fault = machine_fault.classify_machine_fault(
             failure_reason=state.review_failure_reason or None,
             num_turns=state.review_num_turns,
             cost_usd=state.review_cost_usd,
         )
         if fault.is_machine_fault:
             fault_machine = state.review_machine or machine
-            consecutive = machine_fault.record_fault(fault_machine, fault.reason)
-            just_paused, _ = machine_fault.maybe_auto_pause(fault_machine)
-            warnings = (
-                f"{fault.reason} (host: {fault_machine}, "
-                f"{consecutive} consecutive) — redispatching WITHOUT "
-                "spending the issue's review retry budget (#3367)",
-            )
-            if just_paused:
-                warnings = warnings + (
-                    f"AUTO-PAUSED {fault_machine}: {consecutive} consecutive "
-                    "machine faults — run `coord unpause "
-                    f"{fault_machine}` once its credentials are fixed "
-                    "(#3367)",
-                )
+            warnings = _machine_fault_warnings(fault, fault_machine, "review")
             if counters.review_machine_fault_retries >= _MACHINE_FAULT_RETRY_BUDGET:
                 return _die(
                     f"review {state.review_aid} failed "
