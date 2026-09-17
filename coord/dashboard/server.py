@@ -3660,7 +3660,7 @@ def build_app(
             dispatch,
             post_briefing,
         )
-        from coord.network import fetch_status
+        from coord.network import claude_credential_reachable, fetch_status
         from coord.state import (
             clear_proposals, load_dispatched, load_proposals as load_p,
             record_dispatched,
@@ -3769,7 +3769,16 @@ def build_app(
                 # "every candidate unreachable" refusal is raised, caught
                 # by the `except Exception` below and reported per-proposal
                 # instead of silently becoming a POST timeout.
-                response = dispatch(p, config, status_fetcher=_status_fetcher)
+                #
+                # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH GATE to a
+                # real live probe here too — the #3353 review's own
+                # "overlooked fourth call site" note above is exactly the
+                # trap a mechanism-but-not-wired credential gate would
+                # repeat.
+                response = dispatch(
+                    p, config, status_fetcher=_status_fetcher,
+                    credential_fetcher=claude_credential_reachable,
+                )
                 assignment_id = response.get("id", "pending")
                 if repo:
                     record_dispatched(

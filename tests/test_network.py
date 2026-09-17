@@ -494,3 +494,60 @@ class TestCheckHostResolution:
         with patch.object(network, "resolve_host_ip", return_value="100.118.111.76"):
             result = network.check_host_resolution(machine, ts_map)
         assert result.matches is True
+
+
+class TestClaudeCredentialReachable:
+    """#3371: the live half of the single source of truth — is a machine's
+    claude credential NOT confirmed dead right now."""
+
+    def test_dead_credential_reports_false(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "tool_versions": {
+                "claude": {"found": False, "ok": False, "capability": None},
+            },
+        }
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is False
+
+    def test_healthy_credential_reports_true(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "tool_versions": {
+                "claude": {"found": True, "ok": True, "capability": None},
+            },
+        }
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_missing_tool_versions_fails_open(self) -> None:
+        """An agent that predates #3326's probe (no `claude` entry at all,
+        or no `tool_versions` key) must not be newly treated as dead."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"machine": "laptop"}
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_network_error_fails_open(self) -> None:
+        """A probe that CAN'T answer must never itself exclude a host —
+        only a probe that answers "dead" may (see the module docstring)."""
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ConnectTimeout("slow")
+        ):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_non_200_fails_open(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 500
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_invalid_json_fails_open(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.side_effect = ValueError("nope")
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True

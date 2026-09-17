@@ -2554,6 +2554,43 @@ class TestProviderMachineCapabilityGate:
         mock_post.assert_called_once()
 
 
+class TestCredentialHealthGate:
+    """#3371: dispatch() refuses to route to a machine a live probe
+    confirms has a dead claude credential, BEFORE any HTTP POST happens —
+    the mechanical "not routable" enforcement, mirroring #1711's shape
+    exactly (opt-in *credential_fetcher*, `None` = untouched behaviour)."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_none_fetcher_is_a_no_op(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Every caller that predates #3371 (credential_fetcher omitted)
+        must behave byte-for-byte as before."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_a_dead_credential_machine(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(ValueError, match="not routable"):
+            dispatch(proposal, config, credential_fetcher=lambda m: False)
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_allows_a_healthy_credential_machine(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config, credential_fetcher=lambda m: True)
+        mock_post.assert_called_once()
+
+
 class TestProviderAwareModelResolution:
     """#1706 review fix: `config.models.default` is a Claude alias and must
     not silently shadow a non-Claude provider's own pinned `model`. Model

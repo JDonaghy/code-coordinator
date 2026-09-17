@@ -619,6 +619,7 @@ def dispatch(
     pull_repos: Iterable[str] = (),
     fresh_branch: bool = False,
     status_fetcher=None,
+    credential_fetcher=None,
 ) -> dict:
     """POST an assignment to the agent server on the target machine.
 
@@ -630,6 +631,14 @@ def dispatch(
     ever POSTing to it — see `route_work_by_liveness`'s docstring. `None`
     (the default) performs no probe at all, exactly like every caller that
     predates this parameter.
+
+    *credential_fetcher* (#3371) is `(machine: Machine) -> bool` — `True`
+    means "still routable", matching `coord.network.claude_credential_
+    reachable`'s contract exactly (that is also its default in
+    production; see the STRUCTURAL CREDENTIAL-HEALTH GATE below). `None`
+    (the default) performs no probe at all and refuses nothing, exactly
+    like every caller that predates this parameter — same opt-in shape as
+    *status_fetcher*.
     """
     machine = next(
         (m for m in config.machines if m.name == proposal.machine_name), None
@@ -812,6 +821,33 @@ def dispatch(
         providers_cfg=config.providers,
         where="coord approve / dispatch",
     )
+
+    # #3371: STRUCTURAL CREDENTIAL-HEALTH GATE — refuse to route a dispatch
+    # to a machine whose claude credential a live probe just confirmed
+    # cannot authenticate. #3367's incident is exactly what this closes:
+    # four review dispatches to a dead-credential host each failed at turn
+    # 1 for $0.00 before anyone noticed, because nothing upstream of the
+    # POST treated a dead credential as disqualifying — `coord plan`'s
+    # prompt-hint (`coord.brain.build_prompt`) only helps a human who
+    # happens to eyeball the proposal before approving it; this is the
+    # mechanical backstop for when they don't. Same opt-in shape as
+    # *status_fetcher* above (#3353) and the SAME reason: *credential_
+    # fetcher* is `None` for every caller that hasn't wired one in, so this
+    # is a byte-for-byte no-op for the whole existing test suite and every
+    # caller that predates #3371. Production callers (`coord approve`/
+    # `coord assign`, the daemon auto-loop, the dashboard's approve route)
+    # wire `coord.network.claude_credential_reachable` — see those call
+    # sites — so a dead-credential host is refused HERE, before any
+    # worktree/HTTP work happens, rather than discovered from a wasted
+    # turn-1 failure afterwards.
+    if credential_fetcher is not None and not credential_fetcher(machine):
+        raise ValueError(
+            f"machine {machine.name!r} failed a live claude-credential "
+            "probe — not routable (#3371): re-authenticate (`claude` or "
+            "`claude setup-token`) on that host, or approve/assign this "
+            "to a different machine"
+        )
+
     deny_commands: list[str] = []
     if repo is not None and repo.worker_permissions is not None:
         deny_commands = repo.worker_permissions.deny
@@ -1206,11 +1242,18 @@ def dispatch_with_retry(
     fresh_branch: bool = False,
     on_retry: callable | None = None,
     status_fetcher=None,
+    credential_fetcher=None,
 ) -> dict:
     """Dispatch with exponential backoff on transient failures.
 
     *status_fetcher* (#3353) is forwarded to `dispatch()` untouched — see
     its docstring for the liveness-routing gate it opts into.
+
+    *credential_fetcher* (#3371) is forwarded to `dispatch()` untouched —
+    see its docstring for the STRUCTURAL CREDENTIAL-HEALTH GATE it opts
+    into. A `ValueError` from that gate is NOT retried (same as every
+    other `ValueError` this function already re-raises unchanged below) —
+    a dead credential is not a transient condition backoff can fix.
     """
     from coord.network import classify_error, is_retryable
 
@@ -1221,6 +1264,7 @@ def dispatch_with_retry(
                 proposal, config,
                 pull_repos=pull_repos, fresh_branch=fresh_branch,
                 status_fetcher=status_fetcher,
+                credential_fetcher=credential_fetcher,
             )
         except httpx.HTTPError as exc:
             state, reason = classify_error(exc)

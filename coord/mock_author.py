@@ -428,7 +428,12 @@ def dispatch_acceptance_mock(
                 f"machine {machine_override!r} does not list repo {repo_name!r}"
             )
     else:
-        picked: Machine | None = pick_machine(repo_name, board, config)
+        # #3371: live credential-health check — a production dispatch path.
+        from coord.network import claude_credential_reachable  # noqa: PLC0415
+
+        picked: Machine | None = pick_machine(
+            repo_name, board, config, credential_fetcher=claude_credential_reachable,
+        )
         if picked is None:
             raise RuntimeError(
                 f"no idle machine claims repo {repo_name!r} — mock-author "

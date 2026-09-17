@@ -1904,7 +1904,10 @@ def milestone_gate_b_cmd(
             click.echo(f"error: unknown machine {machine_name!r}", err=True)
             sys.exit(2)
     else:
-        machine = pick_machine(repo, board, cfg)
+        # #3371: live credential-health check — a production dispatch path.
+        from coord.network import claude_credential_reachable  # noqa: PLC0415
+
+        machine = pick_machine(repo, board, cfg, credential_fetcher=claude_credential_reachable)
         if machine is None:
             click.echo(
                 f"error: no idle, capable, unpaused machine available for {repo!r}",

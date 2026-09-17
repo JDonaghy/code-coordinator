@@ -1755,6 +1755,7 @@ def _reassign(
     *,
     model: str | None = None,
     issue_labels: list[str] | None = None,
+    credential_fetcher=None,
 ) -> Assignment | None:
     """Re-dispatch a failed assignment to a machine with spare capacity.
 
@@ -1770,6 +1771,18 @@ def _reassign(
     a retry the same way it is on a first dispatch — without this, every
     retry fell through to the repo/global default regardless of which
     label originally routed the issue.
+
+    *credential_fetcher* (#3371) is an optional ``(machine: Machine) ->
+    bool`` callable — ``True`` means "still routable", matching
+    ``coord.network.claude_credential_reachable``'s contract (that is also
+    the default `reconcile()` wires in at this function's one call site
+    below). `None` (the default here) performs no probe at all and
+    excludes nothing — same opt-in shape as `coord.dispatch.dispatch`'s
+    *status_fetcher*/*credential_fetcher*, kept opt-in on this LOWER-level
+    function specifically so every existing direct caller/test of
+    `_reassign` stays byte-for-byte unaffected; the real wiring happens
+    one level up, at `reconcile()`'s own call site, which IS a production
+    entry point.
 
     Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
     :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
@@ -1832,6 +1845,15 @@ def _reassign(
     def can_run_provider(m: Machine) -> bool:
         return machine_supports_provider(m, resolved_provider_name, config.providers)
 
+    # #3371: STRUCTURAL CREDENTIAL-HEALTH FILTER, same opt-in shape as the
+    # #1711 capability filter just above — a retry must never route BACK
+    # onto a machine a live probe just confirmed can't authenticate. `None`
+    # (the default) excludes nothing, so every existing caller/test of
+    # `_reassign` is unaffected; `reconcile()`'s own call site below wires
+    # `coord.network.claude_credential_reachable`.
+    def credential_ok(m: Machine) -> bool:
+        return credential_fetcher is None or credential_fetcher(m)
+
     candidates = [
         m for m in config.machines
         if m.can_work_on(failed.repo_name)
@@ -1840,11 +1862,12 @@ def _reassign(
         and can_run_provider(m)
         and m.name != failed.machine_name
         and m.name not in paused
+        and credential_ok(m)
     ]
     if not candidates:
         # Fall back to including the same machine that failed last time —
-        # paused machines (and #1711 capability-lacking machines) stay
-        # excluded even from the fallback.
+        # paused machines (and #1711 capability-lacking, #3371 credential-
+        # dead machines) stay excluded even from the fallback.
         candidates = [
             m for m in config.machines
             if m.can_work_on(failed.repo_name)
@@ -1852,6 +1875,7 @@ def _reassign(
             and has_room(m)
             and can_run_provider(m)
             and m.name not in paused
+            and credential_ok(m)
         ]
     if not candidates:
         return None
@@ -2680,8 +2704,16 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 failed_a.repo_name, failed_a.issue_number,
             )
             try:
+                # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH FILTER to a
+                # real live probe — `reconcile()` is the production
+                # auto-reassign path (daemon tick loop / `coord reconcile`
+                # / `coord notify`), not a test, so a dead-credential host
+                # must actually be excluded, not just excludable.
+                from coord.network import claude_credential_reachable  # noqa: PLC0415
+
                 reassigned = _reassign(
                     failed_a, board, config, issue_labels=cached_labels,
+                    credential_fetcher=claude_credential_reachable,
                 )
             except RetryProviderMismatch:
                 # Refuse rather than substitute (#2323) — leave the failed

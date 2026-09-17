@@ -1212,6 +1212,8 @@ def pick_reviewer_machine(
     repo_name: str,
     board: Board,
     config: Config,
+    *,
+    credential_fetcher=None,
 ) -> ReviewerChoice | None:
     """Pick a reviewer machine — different from the worker if possible.
 
@@ -1233,6 +1235,17 @@ def pick_reviewer_machine(
     ``pending``/``running`` rows too old to still be believed — a zombie row
     used to make a real machine look occupied indefinitely and push selection
     onto an offline "free" candidate.
+
+    #3371: *credential_fetcher* is an optional ``(host: str) -> bool``
+    callable — ``True`` means "still routable", same contract as
+    :func:`dispatch_review`'s parameter of the same name. Unlike that
+    function this is `None`-opts-out (no live probe at all) by default:
+    this picker commits to a single machine with no fall-through loop to
+    retry on rejection, so nothing calls it for a live dispatch today —
+    :func:`dispatch_review` (via :func:`_ranked_reviewer_candidates`) is
+    the enforced production path (#904's fall-through loop). Kept
+    consistent here anyway so a future caller of this public function
+    isn't silently missing the #3371 gate the wired path has.
     """
     from coord.machine_pause import follow_on_paused_set
     paused = follow_on_paused_set(config.machines)
@@ -1240,6 +1253,8 @@ def pick_reviewer_machine(
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
     ]
+    if credential_fetcher is not None:
+        candidates = [m for m in candidates if credential_fetcher(m.host)]
     if not candidates:
         return None
 
@@ -2677,6 +2692,42 @@ def _fetch_agent_advertised_repos(
     return None
 
 
+def _fetch_agent_claude_credential_ok(
+    host: str, port: int = AGENT_PORT, *, timeout: float = 2.0,
+) -> bool:
+    """Query an agent's ``/health`` and report whether its claude credential
+    can authenticate (#3371) — the review-dispatch default for
+    *credential_fetcher*, mirroring `_fetch_agent_advertised_repos` above
+    byte-for-byte: same endpoint, same short timeout, same fail-open
+    contract (`coord.network.claude_credential_reachable` IS this same
+    probe; a separate copy lives here only because this module already
+    open-codes its own `/health` GET for the repos check and a caller
+    injecting a stub for one should not have to also stub the other).
+
+    Returns ``True`` ("still routable") on any network/parse failure or a
+    `tool_versions` block that's missing/unknown — never exclude a machine
+    solely because its health probe hiccuped. Returns ``False`` only when
+    the probe succeeds and positively reports the credential dead — the
+    live signal `coord doctor` already renders as ``✗ claude: ...``, now
+    consulted BEFORE a review is routed instead of only discovered from
+    the #3367 incident's $0 turn-1 failures.
+    """
+    url = f"http://{host}:{port}/health"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            from coord.prereqs import claude_credential_ok  # noqa: PLC0415
+
+            tool_versions = data.get("tool_versions")
+            return claude_credential_ok(
+                tool_versions if isinstance(tool_versions, dict) else None
+            )
+    except Exception:  # noqa: BLE001 — fail-open: any network or parse error
+        pass
+    return True
+
+
 def _record_mechanical_review_verdict(
     completed: Assignment,
     board: Board,
@@ -2818,6 +2869,7 @@ def dispatch_review(
     remote_branch_checker=None,
     branch_sha_fetcher=None,
     health_checker=None,
+    credential_fetcher=None,
     milestone_fetcher=None,
     patch_id_computer=None,
     diff_fetcher=None,
@@ -2838,6 +2890,20 @@ def dispatch_review(
     that returns the repo names a given agent advertises, or ``None`` to
     fail-open.  When not provided, ``_fetch_agent_advertised_repos`` is called
     directly.  Inject a stub in tests to avoid real network probes.
+
+    *credential_fetcher* is an optional ``(host: str) -> bool`` callable
+    (#3371) — ``True`` means "still routable", mirroring
+    ``_fetch_agent_claude_credential_ok``'s contract exactly (that is also
+    the default when not provided — this is a LIVE probe by default, not
+    opt-in, matching *health_checker*'s own default-to-real convention
+    above rather than *status_fetcher*'s opt-out-by-None one elsewhere in
+    this codebase, because review dispatch already pays a per-candidate
+    ``/health`` GET for *health_checker* and every existing test that
+    exercises this loop already tolerates that). A machine whose probe
+    reports the credential dead is skipped exactly like a repo-advertising
+    drift is — the #3367 incident this closes routed FOUR review dispatches
+    to a dead-credential host before anyone noticed, because nothing
+    upstream of the POST treated a dead credential as disqualifying.
 
     *patch_id_computer* is an optional ``(diff_text: str | None) -> str |
     None`` callable (#1475) that fingerprints the merge-base diff being
@@ -3512,6 +3578,22 @@ def dispatch_review(
                     "[review] skipping candidate %s: /health advertises repos %r "
                     "but repo %r is not listed — possible config drift",
                     machine.name, advertised, completed.repo_name,
+                )
+                had_rejection = True
+                continue
+
+            # #3371: skip a candidate a live probe confirms has a dead
+            # claude credential — the mechanical "not routable" enforcement
+            # #3371 asks for, applied at the exact chokepoint #3367's
+            # incident went through (four review dispatches to precision,
+            # each failing at turn 1 for $0.00). Fail-open on a probe that
+            # can't answer, same as the repos check just above.
+            _cf = credential_fetcher if credential_fetcher is not None else _fetch_agent_claude_credential_ok
+            if not _cf(machine.host):
+                log.warning(
+                    "[review] skipping candidate %s: claude-credential probe "
+                    "failed — not routable (#3371)",
+                    machine.name,
                 )
                 had_rejection = True
                 continue
@@ -4222,6 +4304,7 @@ def dispatch_scoped_review(
     terminal_cache: dict | None = None,
     check_test_coverage: bool = False,
     parent_claim_held: bool = False,
+    credential_fetcher=None,
 ) -> Assignment | None:
     """Dispatch a SCOPED re-review (#1476, widened by #3161) for a merge
     entry whose approval was voided ONLY by a content-changing conflict-fix
@@ -4260,6 +4343,12 @@ def dispatch_scoped_review(
     not the prior reviewer) so the scoped review stays independent of the
     code it's judging, mirroring :func:`dispatch_review`'s
     ``completed.machine_name`` contract.
+
+    *credential_fetcher* (#3371): same contract and default (live-probe,
+    not opt-in — see :func:`dispatch_review`'s docstring) as that
+    function's own parameter of the same name; a candidate a live probe
+    confirms has a dead claude credential is skipped before a briefing is
+    even built for it.
 
     *check_test_coverage* (#3161): runs the #2192 "missing test coverage"
     nudge (:func:`diff_missing_test_coverage`, log-only — never gates, never
@@ -4495,6 +4584,17 @@ def dispatch_scoped_review(
         for machine, _same_as_worker in candidates:
             repo_path = machine.repo_path(entry.repo_name)
             if repo_path is None:
+                continue
+
+            # #3371: same live credential-health skip as `dispatch_review`'s
+            # candidate loop — see that function's docstring.
+            _cf = credential_fetcher if credential_fetcher is not None else _fetch_agent_claude_credential_ok
+            if not _cf(machine.host):
+                log.warning(
+                    "[review] scoped-review skipping candidate %s: "
+                    "claude-credential probe failed — not routable (#3371)",
+                    machine.name,
+                )
                 continue
 
             briefing = build_scoped_review_briefing(

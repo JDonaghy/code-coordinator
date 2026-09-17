@@ -743,6 +743,7 @@ def pick_machine(
     config: "Config",
     *,
     exclude: frozenset[str] = frozenset(),
+    credential_fetcher=None,
 ) -> Machine | None:
     """Deterministically pick an idle, capable, unpaused machine for *repo_name*.
 
@@ -760,6 +761,18 @@ def pick_machine(
     ``Board.idle_machines()``, which filters ``board.machines`` — a separate
     DB-synced snapshot that isn't guaranteed to be populated on every board
     read path. ``config.machines`` is the authoritative machine list here.
+
+    #3371: *credential_fetcher* is an optional ``(machine: Machine) -> bool``
+    callable — ``True`` means "still routable", matching
+    ``coord.network.claude_credential_reachable``'s contract. `None` (the
+    default) probes nothing and excludes nothing — same opt-in shape as
+    ``coord.dispatch.dispatch``'s *status_fetcher*, so this stays byte-for-
+    byte unaffected for the #1630 advisory-only guard test
+    (`tests/test_fleet_health_snapshot.py::
+    test_health_never_influences_dispatch_routing_or_merge_ordering`, which
+    calls this with no extra kwargs) and for every existing caller/test.
+    Production callers (`coord.milestone_dispatch`'s own frontier dispatch,
+    `coord.mock_author`, `coord milestone dispatch`) wire the real probe.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
 
@@ -775,6 +788,8 @@ def pick_machine(
         if not m.can_work_on(repo_name):
             continue
         if m.repo_path(repo_name) is None:
+            continue
+        if credential_fetcher is not None and not credential_fetcher(m):
             continue
         return m
     return None
@@ -843,10 +858,17 @@ def plan_dispatch(
     terminal_issues: frozenset[int] | set[int],
     *,
     oracle_loop: bool = False,
+    credential_fetcher=None,
 ) -> MilestonePlan:
     """Compute the ready frontier and pick a machine for each ready entry.
 
-    Pure — no GitHub/HTTP calls, no dispatch side effects. Greedily assigns
+    Pure — no GitHub/HTTP calls, no dispatch side effects — UNLESS
+    *credential_fetcher* (#3371) is supplied: `None` (the default) keeps
+    this function exactly as pure as before; a caller that wires
+    `coord.network.claude_credential_reachable` (or a stub) opts into a
+    live probe per candidate via `pick_machine`'s parameter of the same
+    name, trading purity for the #3371 "not routable" guarantee. Greedily
+    assigns
     each :class:`~coord.milestone_order.FrontierEntry` in frontier order to
     the first idle+capable machine not already claimed by an earlier entry
     in *this* call (so a cohort of N ready issues fans out across up to N
@@ -894,7 +916,10 @@ def plan_dispatch(
         if oracle_loop and picks:
             deferred.append(DeferredByOracleLoop(entry))
             continue
-        machine = pick_machine(repo_cfg.name, board, config, exclude=frozenset(used))
+        machine = pick_machine(
+            repo_cfg.name, board, config, exclude=frozenset(used),
+            credential_fetcher=credential_fetcher,
+        )
         if machine is None:
             skipped.append(NoMachineAvailable(entry))
             continue

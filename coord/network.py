@@ -392,6 +392,61 @@ def probe_reachable(
     return result.ok, (result.error or "")
 
 
+# #3371: CREDENTIAL-HEALTH TIMEOUT is deliberately much SHORTER than
+# DEFAULT_TIMEOUT/check_machine's own budget. `/health` computes several
+# TTL-cached sections and a cold-cache recompute can run into the seconds
+# (#3344, see `probe_reachable`'s own docstring above for why liveness
+# routing avoids `/health` entirely for that reason) — but THIS probe has
+# an existing, already-accepted precedent for eating that risk anyway:
+# `coord.review._fetch_agent_advertised_repos` has hit `/health` with a
+# short timeout as a "preventative pre-filter, not a blocking gate" since
+# before this issue, fail-open on any timeout. This mirrors that contract
+# exactly rather than inventing a second one.
+CREDENTIAL_PROBE_TIMEOUT = 2.0
+
+
+def claude_credential_reachable(
+    machine: Machine, *, timeout: float = CREDENTIAL_PROBE_TIMEOUT,
+) -> bool:
+    """Live ``GET /health`` probe (#3371): is *machine*'s claude credential
+    NOT confirmed dead right now?
+
+    This is the network half of the single source of truth
+    :func:`coord.prereqs.claude_credential_ok` is the pure half of — a
+    "not routable" gate must ask the same question the free-text `coord
+    plan` hint (`coord.brain.build_prompt`) and `coord doctor` already ask,
+    never a second, independently-drifting one (#2096).
+
+    Returns ``True`` — meaning "still a candidate" — for every case where
+    this CAN'T prove the credential dead: unreachable, timed out, a non-200
+    response, unparsable JSON, or an agent too old to report
+    ``tool_versions`` at all. A probe that can't answer must never itself
+    take a host out of the routing pool; only a probe that answers, and
+    answers "dead", may (matches `claude_credential_ok`'s own degrade-to-
+    healthy contract, just reached over the wire instead of from an
+    already-fetched dict).
+
+    Returns ``False`` only when the probe actually succeeds and
+    ``tool_versions["claude"]`` reads as broken — the same live signal
+    `coord doctor` already renders as ``✗ claude: ...``, now consulted
+    BEFORE a dispatch is routed instead of only discovered from a $0
+    turn-1 failure afterwards (#3367).
+    """
+    try:
+        resp = httpx.get(f"http://{machine.host}:{AGENT_PORT}/health", timeout=timeout)
+        if resp.status_code != 200:
+            return True
+        data = resp.json()
+    except Exception:  # noqa: BLE001 — fail-open: a broken probe never excludes
+        return True
+    if not isinstance(data, dict):
+        return True
+    from coord.prereqs import claude_credential_ok  # noqa: PLC0415 — leaf import
+
+    tool_versions = data.get("tool_versions")
+    return claude_credential_ok(tool_versions if isinstance(tool_versions, dict) else None)
+
+
 def fetch_repos(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> dict | None:
     """GET /repos. Returns None on network error (per-repo errors come back inside the dict)."""
     try:

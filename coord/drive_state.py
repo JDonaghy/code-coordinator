@@ -836,9 +836,28 @@ def pick_machine_choice(
     config: Any,
     *,
     issue_labels: list[str] | None = None,
+    credential_fetcher=None,
 ) -> MachineChoice:
     """Least-loaded unpaused, reachable, **and capable** machine that hosts
     *repo*.
+
+    #3371: *credential_fetcher* is an optional ``(machine) -> bool``
+    callable — ``True`` means "still routable", matching
+    ``coord.network.claude_credential_reachable``'s contract. ``None``
+    (the default) probes nothing, same as every existing caller — this
+    function runs once PER ISSUE on every drive-queue tick (`project()`
+    below), so unlike the other #3371 call sites a real default here would
+    multiply into one live ``/health`` GET per candidate machine per
+    issue per tick with no batching, an I/O cost this payload-driven
+    module is deliberately built to avoid (see `_unreachable_machine_names`
+    above, which reads an already-polled snapshot instead of a live probe
+    for exactly this reason). The actual dispatch this picks a machine
+    FOR still goes through `coord assign` -> `coord.dispatch.dispatch()`,
+    which structurally refuses a dead-credential host regardless of
+    whether this advisory pick avoided it — so leaving this opt-in-only
+    is a UX/throughput gap (a bad pick gets refused and retried rather
+    than routed around), not a safety one. A caller that wants this
+    filtered proactively (with its own batching/caching) can inject one.
 
     Deliberately simple — this is not ``coord plan``'s brain (which costs an
     LLM call).  Load is counted from the board's non-terminal rows, so a
@@ -905,6 +924,7 @@ def pick_machine_choice(
         if repo in (m.repos or [])
         and m.name not in paused
         and m.name not in unreachable
+        and (credential_fetcher is None or credential_fetcher(m))
     ]
     if not hosts:
         return MachineChoice(pause_read_error=pause_read_error)
@@ -950,14 +970,20 @@ def pick_machine_choice(
 
 def pick_machine(
     payload: dict, repo: str, config: Any, *, issue_labels: list[str] | None = None,
+    credential_fetcher=None,
 ) -> str:
     """Thin string-returning wrapper around :func:`pick_machine_choice`.
 
     Kept for callers (and the pre-#1906 test suite) that only want the
     picked machine's name, not the provider provenance / failure-mode split
     — see that function's docstring for the *issue_labels* contract.
+    *credential_fetcher* (#3371) is forwarded to :func:`pick_machine_choice`
+    untouched — see that function's docstring.
     """
-    return pick_machine_choice(payload, repo, config, issue_labels=issue_labels).name
+    return pick_machine_choice(
+        payload, repo, config, issue_labels=issue_labels,
+        credential_fetcher=credential_fetcher,
+    ).name
 
 
 # ── board fetch (the one I/O boundary) ───────────────────────────────────────

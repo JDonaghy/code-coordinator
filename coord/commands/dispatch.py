@@ -306,7 +306,7 @@ def approve(
         post_briefing,
         route_work_by_capability,
     )
-    from coord.network import classify_error, fetch_repos, fetch_status
+    from coord.network import claude_credential_reachable, classify_error, fetch_repos, fetch_status
     from coord.state import (
         clear_proposals,
         load_proposals,
@@ -784,6 +784,12 @@ def approve(
                 # no-op is served from the batch cache rather than costing
                 # a second real `GET /status` per proposal (#3353 review).
                 status_fetcher=_status_fetcher,
+                # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH GATE to a real
+                # live probe — `coord approve` is a production entry point,
+                # not a test, so this must not stay opt-in-but-unwired (the
+                # exact gap the #3371 review round found: a mechanism that
+                # exists but nothing actually calls).
+                credential_fetcher=claude_credential_reachable,
             )
         except httpx.HTTPError as e:
             state, reason = classify_error(e)
