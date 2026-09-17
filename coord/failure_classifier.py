@@ -11,6 +11,15 @@ never told — opus cannot infer a ratchet's pinned count any better than
 sonnet can. #3357 paid for exactly this: a tripped ``sqlite3.connect`` ratchet
 bought an opus worker that spun 25 turns and committed nothing.
 
+NOT ``coord/failure_class.py`` (#2096 disambiguation). That neighbouring
+module also exports a ``classify_failure()`` returning a
+``FailureClassification``, but it answers a DIFFERENT question —
+"environmental (529 / usage limit / network) vs work" for resume scheduling
+and the liveness gate — and nothing here duplicates it. The two are
+orthogonal evidence lanes over the same ``failure_reason`` text: a leg can be
+environmental *and* compliance-shaped, and each lane is consulted by its own
+callers. Keep them separate; do not "unify" them into one verdict.
+
 ``classify_failure()`` is the ONE classifier every escalation-gated dispatch
 door calls (#2096 "one question, one answer" — two independent
 implementations of "is this failure a compliance nit or a real bug" would be

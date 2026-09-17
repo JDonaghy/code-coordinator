@@ -535,7 +535,22 @@ class TestCliRetryProviderRouting:
         """Regression control: an ordinary claude-provider retry (no
         `providers:` block at all) must keep escalating exactly as
         before — #2323 must not disable escalation universally, only for a
-        retry that resolves to a non-claude-family provider."""
+        retry that resolves to a non-claude-family provider.
+
+        #3360 added a second gate in front of the same ladder: the failed
+        leg's failure text is classified first, and only a genuine
+        *behavioural* failure climbs (a compliance nit — ratchet, lint,
+        `files_forbidden` — re-dispatches at the same rung, and a row with
+        no failure evidence at all defaults to not escalating, per the
+        issue's "default to not escalating" acceptance bar). So this
+        control now seeds the row with an ordinary assertion failure —
+        i.e. the *capability* case, which is what "escalates exactly as
+        before" means post-#3360. The assertions are unchanged: a claude
+        retry walks sonnet → opus, an opencode retry never does
+        (`test_direct_retry_dispatches_through_opencode` above), and the
+        same-rung/compliance half of the gate is covered by
+        `tests/test_retry_escalation_classify_3360.py`.
+        """
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: acme/api\n"
@@ -547,7 +562,14 @@ class TestCliRetryProviderRouting:
             "models:\n  default: sonnet\n  escalation: [haiku, sonnet, opus]\n"
         )
         board = Board(completed=[
-            _failed(assignment_id="workid2", issue_number=2),
+            _failed(
+                assignment_id="workid2",
+                issue_number=2,
+                failure_reason=(
+                    "FAILED tests/test_widget.py::test_returns_sorted - "
+                    "AssertionError: assert [3, 1, 2] == [1, 2, 3]"
+                ),
+            ),
         ])
         resp = MagicMock()
         resp.json.return_value = {"id": "retry2"}
