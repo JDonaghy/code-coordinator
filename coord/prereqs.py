@@ -37,6 +37,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from coord.claude_setup_token import (
+    CLAUDE_OAUTH_TOKEN_ENV,
+    MINT_HINT,
+    load_setup_token,
+)
 from coord.config import provider_capability
 from coord.github_ops import GH_PR_CHECKS_JSON_MIN_VERSION
 
@@ -560,7 +565,7 @@ def _probe_claude_credentials_darwin(prereq: Prereq, timeout: float) -> ToolProb
         return _claude_not_found(
             prereq,
             f"no {CLAUDE_OAUTH_KEYCHAIN_SERVICE!r} item in the login Keychain "
-            "— run `claude` (interactive login) on this machine",
+            f"and no long-lived credential — {MINT_HINT}",
         )
     # Presence only (see module comment above) — no subscription tier is
     # available on darwin without reading the secret value.
@@ -578,8 +583,8 @@ def _probe_claude_credentials_linux(prereq: Prereq, _timeout: float) -> ToolProb
     except OSError:
         return _claude_not_found(
             prereq,
-            f"{path} does not exist or is unreadable — run `claude` "
-            "(interactive login) on this machine to create it",
+            f"{path} does not exist or is unreadable and no long-lived "
+            f"credential is configured — {MINT_HINT}",
         )
     oauth = None
     try:
@@ -633,6 +638,40 @@ def _probe_claude_credentials_linux(prereq: Prereq, _timeout: float) -> ToolProb
     )
 
 
+def _probe_claude_setup_token(prereq: Prereq) -> ToolProbe | None:
+    """#3371 Part A: report on this host's long-lived `claude setup-token`
+    credential, or `None` when it has not adopted one.
+
+    Ordered AHEAD of the interactive-session probe below because
+    `coord.claude_setup_token.inject_setup_token` — the only place a
+    headless worker's environment is built — resolves the credential in
+    exactly that order too. The probe must report on the credential the
+    next dispatch will actually authenticate with; a probe that ranked the
+    two sources differently from dispatch would be a split-brain answer to
+    one question (#2096), which is precisely the failure #3371 exists to
+    close.
+
+    `expires_at` stays `None`: a minted setup-token publishes no expiry
+    anywhere we can read, and `ToolProbe.expires_at`'s contract is that
+    `None` means "no expiry known", never "does not expire".
+    """
+    status = load_setup_token()
+    if not status.present:
+        return None
+    if not status.usable:
+        return _claude_not_found(prereq, status.problem or "unusable credential")
+    version = "subscription (setup-token)"
+    if status.source == "env":
+        version += f" via ${CLAUDE_OAUTH_TOKEN_ENV}"
+    if status.note:
+        version += f" — {status.note}"
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=version, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
 def _probe_claude_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
     """`custom_probe` backing the baseline `claude` prereq (#3326).
 
@@ -643,6 +682,9 @@ def _probe_claude_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
     """
     if shutil.which(prereq.binary) is None:
         return _claude_not_found(prereq, "claude CLI not found on PATH")
+    long_lived = _probe_claude_setup_token(prereq)
+    if long_lived is not None:
+        return long_lived
     if sys.platform == "darwin":
         return _probe_claude_credentials_darwin(prereq, timeout)
     return _probe_claude_credentials_linux(prereq, timeout)

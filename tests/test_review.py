@@ -3457,6 +3457,54 @@ def test_dispatch_scoped_review_dispatches_with_delta_in_briefing(
     assert "kept-from-before" in payload["briefing"]
 
 
+def test_dispatch_scoped_review_skips_candidate_with_dead_claude_credential(
+    two_machine_config: Config,
+) -> None:
+    """#3371: the scoped-review candidate loop must enforce credential health
+    the same way `dispatch_review`'s does — the two paths are structurally
+    identical, so this closes the "only one of them is proven to be able to
+    reject" gap the review round flagged."""
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+    client = _FakeHTTPClient({"id": "scoped-cred-1"})
+
+    def _credential_ok(host: str) -> bool:
+        # server's claude credential is confirmed dead.
+        return "server" not in host
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, diff_fetcher=_scoped_diff_fetcher,
+        credential_fetcher=_credential_ok,
+    )
+
+    assert result is not None
+    # server was filtered by the credential probe; the loop fell through.
+    assert result.machine_name == "laptop"
+    assert result.assignment_id == "scoped-cred-1"
+    assert len(client.calls) == 1
+    url, _ = client.calls[0]
+    assert "laptop.tail" in url
+    assert "server.tail" not in url
+
+
+def test_dispatch_scoped_review_dispatches_when_every_credential_is_healthy(
+    two_machine_config: Config,
+) -> None:
+    """The gate's other half: a healthy probe must not disturb the existing
+    preference order (the #1485 fail-open shape)."""
+    board = Board()
+    result = dispatch_scoped_review(
+        _scoped_entry(), _scoped_prior_review(), board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "scoped-cred-2"}),
+        diff_fetcher=_scoped_diff_fetcher,
+        credential_fetcher=lambda host: True,
+    )
+    assert result is not None
+    assert result.machine_name == "server"
+
+
 def test_dispatch_scoped_review_check_test_coverage_logs_nudge(
     two_machine_config: Config, caplog,
 ) -> None:

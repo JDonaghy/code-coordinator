@@ -1003,6 +1003,85 @@ def test_a_stale_tui_binary_is_still_a_warn_not_a_version_finding() -> None:
     assert list(report.versions) == [RELEASED]
 
 
+# ── #3371: credential validity + forward expiry, fleet-wide ────────────────
+#
+# `coord doctor` already fails a host whose claude credential is dead, but
+# the issue also asks for `coord release verify` / the fleet watchdog to warn
+# AHEAD of expiry — the operator's complaint was "no insight into when it
+# expires", and `release verify` is the one command run across the whole
+# fleet after a deploy.
+
+
+def _claude_probe(**overrides) -> dict:
+    probe = {
+        "found": True, "version": "max", "min_version": None,
+        "meets_floor": None, "capability": None, "ok": True,
+        "expires_at": None,
+    }
+    probe.update(overrides)
+    return probe
+
+
+def _health_with_claude(probe: dict) -> dict:
+    body = _health(_agent_venv(RELEASED))
+    body["tool_versions"] = {"claude": probe}
+    return body
+
+
+def test_dead_claude_credential_is_reported_fleet_wide() -> None:
+    report = rv.verify(
+        machine_health={
+            "precision": _health_with_claude(_claude_probe(found=False, ok=False))
+        },
+        expected=RELEASED,
+    )
+    cred = [f for f in report.findings if f.lane == "claude credential"]
+    assert len(cred) == 1, [(f.lane, f.summary) for f in report.findings]
+    assert "cannot authenticate" in cred[0].summary
+    assert cred[0].host == "precision"
+    # WARN, never CRIT: `coord release propagate --rollback-on-red` gates on
+    # this report and an expired OAuth session is not a reason to roll a
+    # RELEASE back.
+    assert cred[0].severity == "warn"
+    assert report.exit_code == rv.EXIT_WARN
+
+
+def test_claude_credential_expiring_soon_warns_before_it_dies() -> None:
+    import time
+
+    soon_ms = (time.time() + 36 * 3600) * 1000.0
+    report = rv.verify(
+        machine_health={"dell64": _health_with_claude(_claude_probe(expires_at=soon_ms))},
+        expected=RELEASED,
+    )
+    cred = [f for f in report.findings if f.lane == "claude credential"]
+    assert len(cred) == 1
+    assert "expires in" in cred[0].summary
+    assert cred[0].severity == "warn"
+
+
+def test_healthy_claude_credential_is_silent() -> None:
+    import time
+
+    far_ms = (time.time() + 90 * 86400) * 1000.0
+    report = rv.verify(
+        machine_health={"dell64": _health_with_claude(_claude_probe(expires_at=far_ms))},
+        expected=RELEASED,
+    )
+    assert [f for f in report.findings if f.lane == "claude credential"] == []
+
+
+def test_agent_without_tool_versions_is_not_a_credential_finding() -> None:
+    """An agent predating the #3326 probe reports no data — "no data" is
+    never a green signal, but it is not a defect this command can assert
+    either (the same degrade-to-unknown stance `claude_credential_ok` takes).
+    """
+    report = rv.verify(
+        machine_health={"old": _health(_agent_venv(RELEASED))}, expected=RELEASED,
+    )
+    assert [f for f in report.findings if f.lane == "claude credential"] == []
+
+
 def test_absent_cli_venv_is_not_a_lane() -> None:
     """Most machines never had one. An absent optional lane must not become a
     permanent UNKNOWN."""

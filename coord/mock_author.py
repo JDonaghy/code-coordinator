@@ -503,6 +503,7 @@ def dispatch_acceptance_mock(
         )
 
     from coord.dispatch import dispatch_with_retry, post_briefing  # noqa: PLC0415
+    from coord.network import claude_credential_reachable  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
     # #1059 review: dispatch_with_retry can raise ValueError (bad machine/repo
@@ -517,11 +518,16 @@ def dispatch_acceptance_mock(
     # single clean line, no partial dispatch is recorded (record_dispatched
     # below never runs when this raises), and no claim is left dangling.
     try:
+        # #3371: a dead claude credential on the target host is not a
+        # transient failure backoff can fix — refuse before POSTing an
+        # assignment that would fail at turn 1 for $0 (dispatch()'s
+        # STRUCTURAL CREDENTIAL-HEALTH GATE raises ValueError).
         response = dispatch_with_retry(
             proposal,
             config,
             max_retries=config.concurrency.max_retries,
             backoff_base=config.concurrency.backoff_base,
+            credential_fetcher=claude_credential_reachable,
         )
     except (ValueError, httpx.HTTPError) as e:
         raise RuntimeError(f"could not dispatch mock-author to {machine.name!r}: {e}") from e
