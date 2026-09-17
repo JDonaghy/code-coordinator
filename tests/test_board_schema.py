@@ -494,3 +494,82 @@ def test_premise_rechecked_fields_reach_the_board_wire_and_project(
     assert state.work_status == "refused_premise"
     assert state.work_premise_rechecked_at == wire_row["premise_rechecked_at"]
     assert state.work_premise_rechecked_reason == "quadraui#971 landed"
+
+
+# ── #3357: test_confirmation must survive the wire too ──────────────────────
+
+
+def test_test_confirmation_reaches_the_board_wire(tmp_path: Path) -> None:
+    """Regression for the #3357 review finding: `BoardAssignment` originally
+    shipped without `test_confirmation`, so — per this module's own
+    contract — it was silently dropped from `/board` no matter how correctly
+    `coord.state.record_test_verdict` wrote it to the DB.  Any daemon-fronted
+    consumer of the generic `/board` payload (the TUI, `coord gates` if it
+    ever stopped bypassing `/board` via `_gates_via_daemon`, the dashboard's
+    pipeline surfaces) would be structurally blind to the confirmation
+    provenance even though the column held the right value in SQLite.
+
+    This is the identical failure mode `test_premise_rechecked_fields_reach_
+    the_board_wire_and_project` above regression-tests for
+    `premise_rechecked_at`/`_reason` (#3339) — the same mistake landed again
+    one PR later. Drives the REAL write path (`coord.state.record_test_verdict`,
+    what `coord.notify`'s confirmation reap path calls) and the REAL HTTP
+    `/board` read path, so a DTO that forgets to declare the column fails
+    here instead of on a live fleet.
+    """
+    import time
+
+    import coord.db as db_mod
+    from coord.confirm_test import TEST_CONFIRMATION_UNCONFIRMED
+    from coord.state import record_test_verdict
+
+    db_path = _seeded_db(tmp_path / "coord.db")
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, "
+        " machine_name, type, status, dispatched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            # A recent `dispatched_at` (not the #748 fixture's epoch
+            # timestamps) so #762's board-retention cap keeps this row — a
+            # terminal row past the retention cutoff is dropped from
+            # `/board` regardless of the DTO, which would make this test
+            # pass for the wrong reason.
+            "a-3357-confirm", "claude-coordinator", 3357, "issue 3357",
+            "precision", "work", "test", time.time(),
+        ),
+    )
+    conn.commit()
+
+    # The autouse `_no_board_service` fixture keeps board-service resolution
+    # unset, so this routes straight to `_record_test_verdict_local` —
+    # exactly what `coord.notify`'s confirmation reap path does when run on
+    # the daemon host itself.
+    db_mod.override_connection(conn)
+    try:
+        record_test_verdict(
+            assignment_id="a-3357-confirm",
+            test_state="passed",
+            test_reason=(
+                "worker self-recorded via `coord test` (#2217) — "
+                "UNCONFIRMED: confirmation could not run the suite"
+            ),
+            test_confirmation=TEST_CONFIRMATION_UNCONFIRMED,
+        )
+    finally:
+        db_mod.override_connection(None)
+        conn.close()
+
+    payload = _serve_client(db_path).get("/board").json()
+    matches = [
+        row for row in payload["assignments"]
+        if row["assignment_id"] == "a-3357-confirm"
+    ]
+    assert len(matches) == 1, "the seeded row must round-trip onto /board"
+    wire_row = matches[0]
+    assert wire_row["test_confirmation"] == TEST_CONFIRMATION_UNCONFIRMED, (
+        "test_confirmation was dropped from /board — BoardAssignment must "
+        "declare it (see coord/board_schema.py)"
+    )

@@ -163,6 +163,17 @@ class BoardAssignment:
     # just recorded. Appended last, matching DDL order.
     premise_rechecked_at: float | None = None
     premise_rechecked_reason: str | None = None
+    # #3357: whether the `test_state` write above was independently confirmed
+    # by an out-of-band suite run — one of
+    # `coord.confirm_test.TEST_CONFIRMATION_VALUES` ("confirmed" /
+    # "unconfirmed" / "refuted" / "baseline_red"), or `None` when no
+    # confirmation was ever attempted for this write
+    # (`coord.state._record_test_verdict_local`). Undeclared here, this
+    # column would be silently dropped from `/board` per this module's own
+    # docstring above — exactly the #3339 mistake this same comment block
+    # was written to prevent, repeated one PR later. Appended last, matching
+    # DDL order (`_MIGRATE_ADD_COLUMNS` in coord/db.py).
+    test_confirmation: str | None = None
 
 
 @dataclasses.dataclass(kw_only=True)
