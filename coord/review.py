@@ -5107,6 +5107,7 @@ def dispatch_headless_fix(
         _fix_model_for_iteration,
         _load_review_findings,
         _work_is_terminal,
+        last_fix_model_for_branch,
         next_fix_iteration,
     )
     from coord.state import issue_context_block  # noqa: PLC0415
@@ -5181,8 +5182,19 @@ def dispatch_headless_fix(
     )
     # #3360: gate the escalation on what actually failed — a compliance nit
     # in `findings_obj.body` stays on the current rung instead of climbing.
+    # The rung is the one round N-1 really dispatched at (read off the board),
+    # not one replayed from the iteration counter, so the gate holds for
+    # round 3+ too.
     model = _fix_model_for_iteration(
-        config, next_iteration, failure_text=findings_obj.body,
+        config, next_iteration,
+        failure_text=findings_obj.body,
+        previous_model=last_fix_model_for_branch(
+            board,
+            repo_name=work.repo_name,
+            issue_number=work.issue_number,
+            branch=work.branch,
+            before_iteration=next_iteration,
+        ),
     )
     return _dispatch_fix(
         work, briefing, board, config, next_iteration,

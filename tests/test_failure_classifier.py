@@ -12,6 +12,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from coord.failure_classifier import classify_failure, failure_text_for_assignment
 
 
@@ -31,6 +33,24 @@ class TestComplianceSignatures:
 
     def test_bare_ratchet_word_is_compliance(self) -> None:
         result = classify_failure("this trips the lock-contention ratchet")
+        assert result.category == "compliance"
+        assert result.should_escalate is False
+        assert result.matched == "ratchet"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "2 ratchets tripped on this branch",
+            "these ratchets are stale",
+            "the pinned count was ratcheted up last week",
+            "ratcheting the sqlite3.connect budget",
+        ],
+    )
+    def test_ratchet_inflections_are_compliance(self, text: str) -> None:
+        """#3360 review: `\\bratchet\\b` never fires on the PLURAL — the word
+        boundary sits between 't' and 's' — and real failure text says
+        "N ratchets tripped" often enough to matter."""
+        result = classify_failure(text)
         assert result.category == "compliance"
         assert result.should_escalate is False
         assert result.matched == "ratchet"
