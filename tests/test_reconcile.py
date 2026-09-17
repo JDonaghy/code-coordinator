@@ -263,6 +263,62 @@ class TestReassignThreadsProvider:
         assert "provider" not in payload
 
     @patch("coord.reconcile.httpx.post")
+    def test_skips_a_machine_a_live_probe_confirms_credential_dead(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#3371: a retry must never route BACK onto a machine a live probe
+        just confirmed can't authenticate — the mechanical "not routable"
+        enforcement, mirroring #1711's capability filter right above it in
+        `_reassign`."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp"}),
+                Machine(name="server", host="s", repos=["api"], repo_paths={"api": "/tmp"}),
+                Machine(name="workstation", host="w", repos=["api"], repo_paths={"api": "/tmp"}),
+            ],
+        )
+        board = Board()
+        failed = _failed(machine_name="laptop")
+
+        result = _reassign(
+            failed, board, cfg,
+            credential_fetcher=lambda m: m.name != "server",
+        )
+
+        assert result is not None
+        assert result.machine_name == "workstation"
+
+    @patch("coord.reconcile.httpx.post")
+    def test_credential_dead_excluded_even_from_the_fallback(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """The ONLY machine in the fleet is the one that just failed, and a
+        live probe confirms ITS credential is dead too — `_reassign` must
+        return `None` rather than retry onto a known-dead host, exactly like
+        the #1711 capability comment documents for a capability-lacking
+        machine ("stay excluded even from the fallback")."""
+        board = Board()
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp"}),
+            ],
+        )
+        failed = _failed(machine_name="laptop")
+
+        result = _reassign(
+            failed, board, cfg,
+            credential_fetcher=lambda m: False,
+        )
+
+        assert result is None
+        mock_post.assert_not_called()
+
+    @patch("coord.reconcile.httpx.post")
     def test_a_model_dropped_from_the_ladder_is_not_inherited_forever(
         self, mock_post: MagicMock,
     ) -> None:

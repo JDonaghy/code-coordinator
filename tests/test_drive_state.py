@@ -1019,6 +1019,36 @@ def test_pick_machine_returns_empty_when_nothing_hosts_the_repo():
     assert pick_machine({}, REPO, make_config(machines=[])) == ""
 
 
+def test_pick_machine_credential_fetcher_none_is_a_no_op():
+    """#3371: every caller that predates this parameter (omitted, the
+    default) must behave byte-for-byte as before."""
+    config = make_config(
+        machines=[Machine(name="only", host="only", repos=[REPO])]
+    )
+    assert pick_machine({}, REPO, config) == "only"
+
+
+def test_pick_machine_skips_a_machine_a_credential_fetcher_reports_dead():
+    config = make_config(
+        machines=[
+            Machine(name="dead", host="dead", repos=[REPO]),
+            Machine(name="healthy", host="healthy", repos=[REPO]),
+        ]
+    )
+    picked = pick_machine(
+        {}, REPO, config, credential_fetcher=lambda m: m.name != "dead",
+    )
+    assert picked == "healthy"
+
+
+def test_pick_machine_choice_returns_no_host_when_only_candidate_is_credential_dead():
+    config = make_config(
+        machines=[Machine(name="only", host="only", repos=[REPO])]
+    )
+    choice = pick_machine_choice({}, REPO, config, credential_fetcher=lambda m: False)
+    assert choice.name == ""
+
+
 def test_pick_machine_is_deterministic_on_a_tie():
     config = make_config(
         machines=[

@@ -2030,9 +2030,15 @@ def _milestone_drain_tick(config: Config) -> list:
         # see plan_dispatch's oracle_loop docstring for why (two concurrently
         # dispatched entries under one milestone race on the same shared
         # tests/acceptance/ms-N/manifest.yml).
+        # #3371: wire the credential-health probe here — this tick loop is
+        # a production dispatch path, not a test, so a dead-credential
+        # host must actually be excluded from machine selection.
+        from coord.network import claude_credential_reachable  # noqa: PLC0415
+
         plan = md.plan_dispatch(
             ctx.work_order, board, config, repo_cfg, ctx.terminal_issues,
             oracle_loop=config.acceptance.has_driver(repo_name),
+            credential_fetcher=claude_credential_reachable,
         )
         for pick in plan.to_dispatch:
             outcome = md.dispatch_entry(
@@ -2219,9 +2225,14 @@ def _milestone_gate_tick(config: Config, *, now: float | None = None) -> list:
                 # validator and plan_queue's chaining alone don't cover: the
                 # gate walk (docs/ORACLE_LOOP.md's "oracle drive", #1453) is
                 # the documented primary driver for an oracle-loop milestone.
+                # #3371: same credential-health wiring as the drain
+                # tick above.
+                from coord.network import claude_credential_reachable  # noqa: PLC0415
+
                 plan = md.plan_dispatch(
                     ctx.work_order, board, config, repo_cfg, ctx.terminal_issues,
                     oracle_loop=config.acceptance.has_driver(repo_cfg.name),
+                    credential_fetcher=claude_credential_reachable,
                 )
                 for pick in plan.to_dispatch:
                     outcome = md.dispatch_entry(

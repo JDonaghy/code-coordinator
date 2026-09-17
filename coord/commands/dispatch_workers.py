@@ -4700,7 +4700,7 @@ def _dispatch_headless(
         post_briefing,
         resolve_dispatch_model_alias,
     )
-    from coord.network import fetch_status  # noqa: PLC0415
+    from coord.network import claude_credential_reachable, fetch_status  # noqa: PLC0415
     from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
@@ -5023,6 +5023,12 @@ def _dispatch_headless(
             # same busy-vs-alive confusion that sent #3349/coord-tui#79 to
             # a dead box.
             status_fetcher=fetch_status,
+            # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH GATE to a real
+            # live probe — `coord assign` is a production dispatch
+            # chokepoint (`coord drive`'s own WORK stage funnels through
+            # here too), so this must actually refuse a dead-credential
+            # host, not just be capable of it.
+            credential_fetcher=claude_credential_reachable,
         )
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)

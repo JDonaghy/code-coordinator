@@ -7063,6 +7063,45 @@ def test_dispatch_review_skips_machine_advertising_other_repo_in_health(
     assert "server.tail" not in url
 
 
+# ── #3371: credential-health skip ────────────────────────────────────────────
+
+
+def test_dispatch_review_skips_candidate_with_dead_claude_credential(
+    two_machine_config: Config,
+) -> None:
+    """#3371: a candidate a live probe confirms has a dead claude credential
+    is skipped, exactly like a repo-advertising config-drift signal —
+    dispatch_review falls through to the next candidate instead of routing
+    (and burning a wasted turn-1 failure on) a known-dead host."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "cred-filter-1"})
+
+    def _credential_ok(host: str) -> bool:
+        # server's claude credential is confirmed dead.
+        return "server" not in host
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 7, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        health_checker=lambda host: None,  # opt out of the unrelated #904 repo check
+        credential_fetcher=_credential_ok,
+    )
+
+    assert result is not None
+    # server was filtered by the credential probe; dispatch fell through to laptop.
+    assert result.machine_name == "laptop"
+    assert result.assignment_id == "cred-filter-1"
+    assert len(client.calls) == 1
+    url, _ = client.calls[0]
+    assert "laptop.tail" in url
+    assert "server.tail" not in url
+
+
 def test_dispatch_review_includes_machine_when_health_probe_fails(
     two_machine_config: Config,
 ) -> None:
