@@ -211,6 +211,32 @@ def _no_agent_health_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_agent_credential_probe(monkeypatch):
+    """#3371: default the credential-health gate's live ``/health`` probe to
+    fail-open (healthy) so the ~60 ``dispatch_review``/``dispatch`` call
+    sites that don't pass ``credential_fetcher=`` never make a real
+    ``httpx.get(".../health")`` call keyed off a fixture's bogus
+    ``host.tailnet`` hostname.
+
+    Exactly the same reasoning (and exactly the same shape) as
+    ``_no_agent_health_probe`` above: the real fetchers already degrade to
+    "assume healthy" on any probe failure, so this changes no test's
+    OUTCOME — it just stops the suite's default behaviour from depending
+    on network/DNS timing, and removes the second live probe per review
+    candidate that landing the gate would otherwise have added. Tests
+    exercising the gate itself pass an explicit ``credential_fetcher=``
+    (or monkeypatch these names to something stricter), which takes
+    priority and is unaffected.
+    """
+    monkeypatch.setattr(
+        "coord.review._fetch_agent_claude_credential_ok", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        "coord.network.claude_credential_reachable", lambda *a, **k: True
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_assign_repo_drift_probe(monkeypatch):
     """#2219: default `coord assign`'s live-agent repo-capability cross-check
     (``coord.commands.dispatch._repo_capability_refusal``) to fail-open

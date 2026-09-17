@@ -194,14 +194,20 @@ def dispatch_new_issue_chat(
     )
 
     from coord.dispatch import dispatch_with_retry
+    from coord.network import claude_credential_reachable  # noqa: PLC0415
     from coord.models import Assignment
     from coord.state import record_dispatched_assignment
 
+    # #3371: a dead claude credential on the target host is not a
+    # transient failure backoff can fix — refuse before POSTing an
+    # assignment that would fail at turn 1 for $0 (dispatch()'s
+    # STRUCTURAL CREDENTIAL-HEALTH GATE raises ValueError).
     response = dispatch_with_retry(
         proposal,
         config,
         max_retries=config.concurrency.max_retries,
         backoff_base=config.concurrency.backoff_base,
+        credential_fetcher=claude_credential_reachable,
     )
 
     assignment_id = response.get("id") or uuid.uuid4().hex[:12]

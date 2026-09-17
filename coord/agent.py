@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from coord import cargo_cache
+from coord.claude_setup_token import inject_setup_token
 from coord.config_reload import reload_config_if_stale
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
@@ -1770,6 +1771,23 @@ def _worker_subprocess_env(
 
     if assignment_id is not None:
         env["COORD_ASSIGNMENT_ID"] = assignment_id
+
+    # #3371 Part A: adopt this host's long-lived, SUBSCRIPTION-backed
+    # `claude setup-token` credential when the operator has minted one.
+    # This is the only place a headless worker's environment is built, so
+    # it is the only place the credential has to be threaded through.
+    #
+    # NOT `ANTHROPIC_API_KEY` — `CLAUDE_CODE_OAUTH_TOKEN` is the OAuth
+    # channel (`claude setup-token --help`: "long-lived authentication
+    # token (requires Claude subscription)"), so billing and entitlements
+    # stay on the Max subscription exactly as CLAUDE.md requires. An
+    # API-key-shaped token is refused rather than injected; see
+    # `coord.claude_setup_token` for the #2462 scar tissue in full.
+    #
+    # No-ops entirely on a host that has not opted in (no token file, no
+    # inherited token), so an interactive `claude login` host keeps
+    # authenticating exactly as it does today.
+    inject_setup_token(env)
 
     return env
 
