@@ -97,6 +97,12 @@ class IssueState:
     work_provider: str = ""
     work_test_state: str = ""
     work_test_reason: str = ""
+    # #3367: worker-reported turn count / cost for the work row — the
+    # `review_num_turns`/`review_cost_usd` siblings below explain why these
+    # exist; `coord.machine_fault.classify_machine_fault` needs both to
+    # tell "this host is broken" apart from "this work genuinely failed".
+    work_num_turns: int | None = None
+    work_cost_usd: float | None = None
     # #3201: the LATEST work row's own human UAT verdict — "" | "passed" |
     # "failed", mirroring `work_test_state` above. Sourced from the same
     # `Assignment.uat_state`/`uat_reason`/`uat_actor` fields
@@ -158,6 +164,17 @@ class IssueState:
     # `_decide_review` can report *why* a failed review died instead of a
     # bare "failed".
     review_failure_reason: str = ""
+    # #3367: which machine actually ran the (possibly failed) review, and
+    # its worker-reported turn count / cost — the three fields
+    # `coord.machine_fault.classify_machine_fault` needs to tell "the host
+    # is broken" apart from "the work failed". `work_machine` already
+    # existed for the same reason on the work row; these are its review-row
+    # siblings, sourced from the same board wire fields
+    # (`Assignment.machine_name`/`num_turns`/`cost_usd`) every other
+    # `review_*`/`work_*` projection here already reads.
+    review_machine: str = ""
+    review_num_turns: int | None = None
+    review_cost_usd: float | None = None
 
     smoke_aid: str = ""
     smoke_status: str = ""
@@ -518,6 +535,8 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_provider=g(work, "provider_name"),
         work_test_state=g(work, "test_state"),
         work_test_reason=g(work, "test_reason"),
+        work_num_turns=g(work, "num_turns", None),
+        work_cost_usd=g(work, "cost_usd", None),
         work_uat_state=g(work, "uat_state"),
         work_uat_reason=g(work, "uat_reason"),
         work_uat_actor=g(work, "uat_actor"),
@@ -535,6 +554,9 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         review_status=g(review, "status"),
         review_verdict=g(review, "review_verdict"),
         review_failure_reason=g(review, "failure_reason"),
+        review_machine=g(review, "machine_name"),
+        review_num_turns=g(review, "num_turns", None),
+        review_cost_usd=g(review, "cost_usd", None),
         smoke_aid=g(smoke, "assignment_id"),
         smoke_status=g(smoke, "status"),
         smoke_failure_reason=g(smoke, "failure_reason"),

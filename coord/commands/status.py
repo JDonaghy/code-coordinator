@@ -249,6 +249,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # the flatly wrong "PAUSED". Fetch the effective window map (daemon-aware,
     # fail-soft) and hand it to describe_pause_state, which also names where
     # each window came from — "set here" vs "from coordinator.yml".
+    from coord.machine_fault import describe as _describe_machine_fault  # noqa: PLC0415
     from coord.machine_pause import (  # noqa: PLC0415
         cordons as fetch_cordons,
         describe_pause_state,
@@ -402,6 +403,18 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         if degraded:
             for repo_name, reason in degraded.items():
                 click.echo(f"    ⚠ degraded: {repo_name} — {reason}")
+
+        # #3367: a machine whose Claude credentials are dead (or that keeps
+        # producing 1-turn/$0 "never actually ran" failures) used to render
+        # as a plain `online • idle` here — the exact blind spot that let
+        # precision eat four identical dispatches before a human noticed.
+        # `coord.machine_fault.describe` is local-only (see that module's
+        # own scope note), so this renders whatever THIS box has recorded;
+        # the pause itself (if the streak crossed the auto-pause threshold)
+        # is fleet-wide and already visible via the `PAUSED —` label above.
+        fault_desc = _describe_machine_fault(m.name)
+        if fault_desc:
+            click.echo(f"    ⚠ machine fault: {fault_desc}")
 
         # #2490: this host is behind the release, was idle last tick, and
         # nothing is cordoning it because a #2240 deadlock-release cooldown
