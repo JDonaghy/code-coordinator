@@ -834,7 +834,13 @@ def retry_on_locked(
 # #3339: bumped 16 -> 17 for the two `assignments.premise_rechecked_at`/
 # `premise_rechecked_reason` columns appended to `_migrate_add_columns`
 # below.
-_DB_SCHEMA_VERSION = 17
+#
+# #3357: bumped 17 -> 18 for the new `assignments.test_confirmation` column
+# appended to `_migrate_add_columns` below — machine-readable provenance
+# ("confirmed"/"unconfirmed"/"refuted"/"baseline_red") for a `test_state`
+# write, alongside `coord.state._record_test_verdict_local`. See
+# coord.models.Assignment.test_confirmation.
+_DB_SCHEMA_VERSION = 18
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -2263,6 +2269,18 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # "still blocking".
     "ALTER TABLE assignments ADD COLUMN premise_rechecked_at REAL",
     "ALTER TABLE assignments ADD COLUMN premise_rechecked_reason TEXT",
+    # #3357: machine-readable provenance for a `test_state` write — was it
+    # actually backed by coord.confirm_test's out-of-band re-run, or just
+    # carried forward from the worker's own claim? Written in the SAME
+    # statement as `test_state`/`test_toolchain` by
+    # `coord.state._record_test_verdict_local`, so it never survives a later
+    # verdict that didn't supply one. NULL for every row predating this
+    # column and for any write that never asked the confirmation question
+    # (a headless smoke failure, a mute-leg park, ...) — read as "no
+    # confirmation attempted", never as either "confirmed" or "unconfirmed".
+    # See coord.models.Assignment.test_confirmation and
+    # coord.confirm_test.TEST_CONFIRMATION_VALUES for the exhaustive set.
+    "ALTER TABLE assignments ADD COLUMN test_confirmation TEXT",
 ]
 
 

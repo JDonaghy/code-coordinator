@@ -43,6 +43,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
+from coord.confirm_test import (
+    TEST_CONFIRMATION_BASELINE_RED,
+    TEST_CONFIRMATION_UNCONFIRMED,
+)
 from coord.models import WORK_LIKE_TYPES, effective_issue_number
 
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
@@ -84,6 +88,17 @@ class AssignmentGateRow:
     # None for pre-1629 rows or an unresolvable toolchain — rendered as
     # "unknown", never as a mismatch.
     test_toolchain: str | None
+    # #3357: machine-readable provenance for test_state — None | "confirmed"
+    # | "unconfirmed" | "refuted" | "baseline_red" (see
+    # coord.confirm_test.TEST_CONFIRMATION_VALUES). None means no #2464
+    # out-of-band confirmation was ever attempted for this row's current
+    # test_state (a headless smoke failure, a mute-leg park, a row predating
+    # this column, or a fresh `coord test --passed` not yet reaped by a
+    # notify pass) — rendered as no annotation at all, never as either
+    # extreme. This is the field grocery-list#36 (#3357's own evidence) was
+    # filed over: `test_state="passed"` read identically whether a real run
+    # backed it or nobody could even attempt one.
+    test_confirmation: str | None
     review_state: str | None
     review_verdict: str | None
     review_of_assignment_id: str | None
@@ -160,6 +175,7 @@ def _row_from_assignment(a: "Assignment") -> AssignmentGateRow:
         smoke_test=a.smoke_test,
         test_reason=a.test_reason,
         test_toolchain=a.test_toolchain,
+        test_confirmation=a.test_confirmation,
         review_state=a.review_state,
         review_verdict=a.review_verdict,
         review_of_assignment_id=a.review_of_assignment_id,
@@ -763,6 +779,24 @@ def _short_sha(sha: str | None) -> str:
     return sha[:7] if sha else "unknown"
 
 
+def _row_test_confirmation(report: "GateReport", assignment_id: str | None) -> str | None:
+    """The ``test_confirmation`` provenance carried by the row *assignment_id*
+    names, or ``None`` when unknown/unset (#3357).
+
+    ``test.assignment_id`` (#2024) already names WHICH row supplied the live
+    test-gate verdict — routinely not ``winner`` on a ``--fix-of`` chain, see
+    the module docstring's #2024 section — so this looks that exact row up in
+    ``report.rows`` rather than re-deriving "the winning row" a second way.
+    ``None`` when *assignment_id* is unset (a gate report built without a
+    live smoke-status lookup) or names a row this report didn't collect —
+    both fail open to "say nothing", never to a wrong confirmation state.
+    """
+    if not assignment_id:
+        return None
+    row = next((r for r in report.rows if r.assignment_id == assignment_id), None)
+    return row.test_confirmation if row is not None else None
+
+
 def format_gate_report(report: GateReport) -> str:
     """Human-readable rendering of *report* for the CLI's default (non-JSON) output."""
     lines: list[str] = [f"gates {report.repo_name}#{report.issue_number}"]
@@ -844,9 +878,28 @@ def format_gate_report(report: GateReport) -> str:
                 # `coord drive` are allowed to answer differently (branch gate
                 # vs per-iteration gate) — they are not allowed to do it
                 # silently.
+                #
+                # #3357: and now say whether that "passed" was ever actually
+                # OBSERVED. A bare "test : passed" reads identically whether
+                # a #2464 out-of-band re-run backed it or nobody could even
+                # attempt one (grocery-list#36: the row's own `test_reason`
+                # said "NOTHING was learned about the branch" underneath an
+                # unqualified "passed" summary line). `confirmed` and `None`
+                # (no confirmation question was ever asked — a self-recorded
+                # verdict this notify pass hasn't reaped yet, a row predating
+                # this column, ...) both stay silent, matching today's output
+                # exactly; only the two cases worth an operator's attention
+                # get an annotation.
+                confirmation = _row_test_confirmation(report, test.assignment_id)
+                suffix = ""
+                if confirmation == TEST_CONFIRMATION_UNCONFIRMED:
+                    suffix = " (UNCONFIRMED — suite never ran)"
+                elif confirmation == TEST_CONFIRMATION_BASELINE_RED:
+                    suffix = " (baseline-red — branch not at fault, #2170)"
                 lines.append(
                     "  test   : passed"
                     + (f" (recorded on {test.assignment_id})" if test.assignment_id else "")
+                    + suffix
                 )
             elif test.anchor:
                 noun = "base" if test.anchor == "base" else "branch"

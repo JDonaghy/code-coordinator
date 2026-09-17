@@ -7856,6 +7856,9 @@ def build_app(
                 # #1629: absent on a client older than this field — `.get`
                 # defaults to None, same as no toolchain having been resolved.
                 test_toolchain=body.get("test_toolchain"),
+                # #3357: absent on a client older than this field — `.get`
+                # defaults to None, same as "no confirmation attempted".
+                test_confirmation=body.get("test_confirmation"),
             )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(

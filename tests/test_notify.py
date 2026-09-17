@@ -3784,7 +3784,7 @@ class TestConfirmedPassVerdictSignalKill:
         with patch(
             "coord.notify._run_pass_confirmation", return_value=killed,
         ):
-            state, reason = _confirmed_pass_verdict(
+            state, reason, confirmation = _confirmed_pass_verdict(
                 self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
             )
 
@@ -3795,6 +3795,10 @@ class TestConfirmedPassVerdictSignalKill:
         )
         assert "REFUTED" not in reason
         assert "UNCONFIRMED" in reason
+        assert confirmation == ct.TEST_CONFIRMATION_UNCONFIRMED, (
+            "#3357: the machine-readable field must agree with the prose — "
+            f"got {confirmation!r}"
+        )
 
     def test_exit_127_confirmation_is_also_unconfirmed_not_failed(self) -> None:
         """#2596's acceptance explicitly names exit 127 alongside SIGTERM: a
@@ -3819,7 +3823,7 @@ class TestConfirmedPassVerdictSignalKill:
         with patch(
             "coord.notify._run_pass_confirmation", return_value=missing_toolchain,
         ):
-            state, reason = _confirmed_pass_verdict(
+            state, reason, confirmation = _confirmed_pass_verdict(
                 self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
             )
 
@@ -3830,6 +3834,7 @@ class TestConfirmedPassVerdictSignalKill:
         )
         assert "REFUTED" not in reason
         assert "UNCONFIRMED" in reason
+        assert confirmation == ct.TEST_CONFIRMATION_UNCONFIRMED
 
 
 class TestConfirmedPassVerdictPostApprovalReconcile:
@@ -3902,7 +3907,7 @@ class TestConfirmedPassVerdictPostApprovalReconcile:
             "coord.notify._run_pass_confirmation",
             return_value=self._refuted_result(),
         ):
-            state, reason = _confirmed_pass_verdict(
+            state, reason, confirmation = _confirmed_pass_verdict(
                 self._transition(), {"branch": "issue-42-fix-thing"}, "work-1",
                 claim_reason="worker self-recorded via `coord test` (#2217)",
             )
@@ -3922,6 +3927,12 @@ class TestConfirmedPassVerdictPostApprovalReconcile:
             "the confirmation's own reason must still be quoted, not "
             f"replaced: {reason!r}"
         )
+        from coord import confirm_test as ct  # noqa: PLC0415
+
+        assert confirmation == ct.TEST_CONFIRMATION_REFUTED, (
+            "#3357: a REAL run refuted this claim, whether the resulting "
+            f"test_state is 'failed' or CONTESTED — got {confirmation!r}"
+        )
 
     def test_refutation_with_no_review_yet_keeps_todays_failed_behaviour(
         self, coord_db,
@@ -3936,13 +3947,17 @@ class TestConfirmedPassVerdictPostApprovalReconcile:
             "coord.notify._run_pass_confirmation",
             return_value=self._refuted_result(),
         ):
-            state, reason = _confirmed_pass_verdict(
+            state, reason, confirmation = _confirmed_pass_verdict(
                 self._transition(), {"branch": "issue-42-fix-thing"}, "work-2",
                 claim_reason="worker self-recorded via `coord test` (#2217)",
             )
 
         assert state == "failed"
         assert "REFUTED" in reason
+
+        from coord import confirm_test as ct  # noqa: PLC0415
+
+        assert confirmation == ct.TEST_CONFIRMATION_REFUTED
 
     def test_refutation_with_a_request_changes_review_keeps_todays_failed_behaviour(
         self, coord_db,
@@ -3960,13 +3975,131 @@ class TestConfirmedPassVerdictPostApprovalReconcile:
             "coord.notify._run_pass_confirmation",
             return_value=self._refuted_result(),
         ):
-            state, reason = _confirmed_pass_verdict(
+            state, reason, confirmation = _confirmed_pass_verdict(
                 self._transition(), {"branch": "issue-42-fix-thing"}, "work-3",
                 claim_reason="worker self-recorded via `coord test` (#2217)",
             )
 
         assert state == "failed"
         assert "REFUTED" in reason
+
+        from coord import confirm_test as ct  # noqa: PLC0415
+
+        assert confirmation == ct.TEST_CONFIRMATION_REFUTED
+
+
+class TestConfirmedPassVerdictConfirmationField:
+    """#3357: `_confirmed_pass_verdict`'s THIRD return value —
+    ``test_confirmation`` — must carry, as a machine-readable field, the exact
+    distinction that used to live only as English prose inside
+    ``test_reason``: "passed, independently confirmed" vs. "passed, because
+    nobody could check" are both recorded as ``test_state="passed"`` (#2464's
+    fallback direction is deliberately unchanged), but grocery-list#36 is
+    what happens when nothing besides free text tells them apart downstream.
+    """
+
+    def _transition(self):
+        from coord.notify import Transition, EVENT_COMPLETION  # noqa: PLC0415
+
+        return Transition(
+            assignment_id="work-1",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+
+    def test_a_real_confirmed_pass_is_marked_confirmed(self) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        confirmed = ct.ConfirmationResult(
+            kind=ct.KIND_OK,
+            reason="independently re-ran `pytest` at origin/issue-42-fix and it passed",
+            returncode=0,
+        )
+        entry = {"branch": "issue-42-fix-thing"}
+
+        with patch("coord.notify._run_pass_confirmation", return_value=confirmed):
+            state, reason, confirmation = _confirmed_pass_verdict(
+                self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
+            )
+
+        assert state == "passed"
+        assert "independently confirmed" in reason
+        assert confirmation == ct.TEST_CONFIRMATION_CONFIRMED, (
+            f"a real, completed, green run must record CONFIRMED provenance "
+            f"— got {confirmation!r}"
+        )
+
+    def test_baseline_red_confirmation_is_marked_baseline_red_not_confirmed(
+        self,
+    ) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        baseline_red = ct.ConfirmationResult(
+            kind=ct.KIND_BASELINE_RED,
+            reason=(
+                "confirmation ran the suite command and it failed (exit 1), "
+                "but every failure reproduces on the merge-base (#2170)"
+            ),
+            returncode=1,
+        )
+        entry = {"branch": "issue-42-fix-thing"}
+
+        with patch(
+            "coord.notify._run_pass_confirmation", return_value=baseline_red,
+        ):
+            state, reason, confirmation = _confirmed_pass_verdict(
+                self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
+            )
+
+        assert state == "skipped"
+        assert confirmation == ct.TEST_CONFIRMATION_BASELINE_RED, (
+            "a real run that only proved the BASE is red, not the branch, "
+            f"must not be conflated with a confirmed pass — got {confirmation!r}"
+        )
+
+    def test_confirmed_provenance_actually_lands_on_the_board_row(
+        self, coord_db,
+    ) -> None:
+        """End-to-end: the `record_test_verdict` call `_record_smoke_verdict`
+        makes must persist `test_confirmation`, not just compute it — a
+        caller reading `coord.state.load_assignment_test_confirmation` (or
+        `coord gates`) after the fact must see the real value, not None."""
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.models import Assignment
+        from coord.state import (  # noqa: PLC0415
+            _record_dispatched_assignment_local,
+            load_assignment_test_confirmation,
+            record_test_verdict,
+        )
+
+        work = Assignment(
+            assignment_id="work-9",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Fix thing",
+            type="work",
+            status="done",
+            branch="issue-42-fix-thing",
+        )
+        _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+        record_test_verdict(
+            assignment_id="work-9",
+            test_state="passed",
+            test_reason="SMOKE: pass — UNCONFIRMED: no independent re-run was possible",
+            test_confirmation=ct.TEST_CONFIRMATION_UNCONFIRMED,
+        )
+
+        assert (
+            load_assignment_test_confirmation("work-9")
+            == ct.TEST_CONFIRMATION_UNCONFIRMED
+        )
 
 
 class _FakeAssignClient:
