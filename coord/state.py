@@ -7705,11 +7705,17 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
         milestone = issue.get("milestone") or {}
         milestone_number = milestone.get("number") if milestone else None
         milestone_title = milestone.get("title") if milestone else None
+        # #3384: `gh issue list --json stateReason` — `"reopened"` when a
+        # human explicitly reopened this issue, `""`/null for an issue that
+        # has simply never been closed. Lowercased on write so
+        # `coord.drive_queue.build_board_view`'s `== "reopened"` compare
+        # never has to guess GitHub's casing.
+        state_reason = str(issue.get("stateReason") or "").lower()
         sql.execute(conn,
             """
             INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at,
-                                milestone_number, milestone_title)
-            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)
+                                milestone_number, milestone_title, state_reason)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
             ON CONFLICT (repo_name, number) DO UPDATE SET
                 title            = excluded.title,
                 body             = excluded.body,
@@ -7717,7 +7723,8 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
                 labels           = excluded.labels,
                 synced_at        = excluded.synced_at,
                 milestone_number = excluded.milestone_number,
-                milestone_title  = excluded.milestone_title
+                milestone_title  = excluded.milestone_title,
+                state_reason     = excluded.state_reason
             """,
             (
                 repo_name,
@@ -7728,6 +7735,7 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
                 now,
                 milestone_number,
                 milestone_title,
+                state_reason,
             ),
         )
     # #603: the per-issue context digest is short-lived — drop it for any issue

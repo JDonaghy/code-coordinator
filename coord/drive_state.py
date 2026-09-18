@@ -1125,6 +1125,13 @@ def _local_issue_rows() -> list[dict]:
     which guards this SELECT and the HTTP shape against drifting apart
     again.
 
+    #3384: ``state_reason`` added alongside the rest — what
+    ``coord.drive_queue.build_board_view`` needs to populate
+    ``IssueFacts.reopened``, without which a reopened issue's stale
+    ``merged`` witness would keep reading as ``landed`` on this exact
+    daemon-host path forever (the one that runs every real
+    ``coord drive-queue tick``).
+
     Deliberately queries ``get_connection()`` rather than
     ``coord.dao.SqliteStore`` — see :meth:`BoardFetcher._fetch_local`'s
     docstring for why the latter is wrong for anything running in-process
@@ -1141,7 +1148,7 @@ def _local_issue_rows() -> list[dict]:
         rows = sql.execute(
             get_connection(),
             "SELECT repo_name, number, title, state, milestone_number, "
-            "milestone_title, labels, body, synced_at FROM issues",
+            "milestone_title, labels, body, synced_at, state_reason FROM issues",
         ).fetchall()
     except Exception:  # noqa: BLE001 — see the fail-soft note above
         return []
