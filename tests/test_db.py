@@ -1100,6 +1100,77 @@ class TestOverrideConnection:
         _ensure_schema(sqlite3.connect(":memory:"))
 
 
+# ── pytest-gap sentinel (#3385) ──────────────────────────────────────────────
+#
+# #3385: `main`'s `Tests` workflow was red for 33 days with thousands of
+# `ProductionDatabaseGuardError`s, and #3380's daemon-lifespan-shutdown fix
+# left the count unchanged -- because the actual gap is in `coord.db`'s
+# connection singleton itself, not the daemon: `tests/conftest.py`'s autouse
+# `coord_db` fixture only guarantees an isolated override while ONE test's
+# own setup/call/teardown phases are running. Its teardown used to call
+# `close()`, which resets `_conn` to plain `None` -- reopening the #1960 gap
+# one layer up for anything that calls `get_connection()` in the window
+# between one test's teardown and the next test's setup, or before the very
+# first test's setup has run at all. #1960's own `PYTEST_CURRENT_TEST` guard
+# inside `_open()` only protects that window if the env var happens to still
+# be set at that exact moment, which is not guaranteed. `_pytest_gap_
+# sentinel()` (installed by both `pytest_configure` and `coord_db`'s
+# teardown in `tests/conftest.py`) closes it unconditionally: `_conn` is
+# never plain `None` for the life of a pytest process, so `get_connection()`
+# can no longer fall through to `_open()` -- and therefore the real
+# `~/.coord/coord.db` -- while pytest is running, regardless of timing.
+class TestPytestGapSentinel:
+    def test_any_attribute_access_raises_the_guard(self) -> None:
+        sentinel = db_mod._pytest_gap_sentinel()
+        with pytest.raises(db_mod.ProductionDatabaseGuardError, match="coord_db"):
+            sentinel.execute("SELECT 1")
+
+    def test_probing_closed_also_raises(self) -> None:
+        """`_connection_is_closed` -- the first thing `get_connection()` does
+        with a cached connection -- reads `.closed` via
+        `getattr(conn, "closed", False)`. The sentinel must not silently
+        answer "not closed" here: that would let `get_connection()` hand the
+        sentinel back as if it were a usable connection, deferring the
+        failure to whatever statement runs next instead of raising at the
+        point the gap was actually reached."""
+        sentinel = db_mod._pytest_gap_sentinel()
+        with pytest.raises(db_mod.ProductionDatabaseGuardError):
+            db_mod._connection_is_closed(sentinel)
+
+    def test_get_connection_raises_instead_of_opening_the_real_path(self) -> None:
+        """Simulates the exact gap #3385 closes: `_conn` holding the
+        sentinel, as `coord_db`'s teardown (and `pytest_configure`, before
+        the first test) now leave it, instead of plain `None`.
+
+        RED against the pre-#3385 shape (installing plain `None` here
+        instead): `get_connection()` would fall through to `_open()`, whose
+        only protection is whether `PYTEST_CURRENT_TEST` happens to be set at
+        that exact moment -- true during this test's own body, so it would
+        incidentally still raise here, just via a DIFFERENT code path (and
+        not at all in the actual gap this issue is about, between two tests,
+        which this single-test assertion cannot reach). GREEN here
+        demonstrates the sentinel raises unconditionally, before `_open()`
+        -- and therefore the real `~/.coord/coord.db` -- is ever reached,
+        which is what actually closes the inter-test gap.
+
+        Restores the real per-test connection in a ``finally`` rather than
+        via ``monkeypatch``: an earlier autouse fixture in
+        ``tests/conftest.py`` already pulls the shared ``monkeypatch``
+        instance's setup forward ahead of ``coord_db`` (see
+        ``_no_frozen_coord_dir_constants``'s docstring), which pushes
+        ``monkeypatch``'s own undo to AFTER ``coord_db``'s teardown -- so a
+        ``monkeypatch.setattr`` here would leave the sentinel installed when
+        ``coord_db``'s teardown tries to ``close()`` it.
+        """
+        original_conn = db_mod._conn
+        db_mod.override_connection(db_mod._pytest_gap_sentinel())
+        try:
+            with pytest.raises(db_mod.ProductionDatabaseGuardError, match="coord_db"):
+                db_mod.get_connection()
+        finally:
+            db_mod.override_connection(original_conn)
+
+
 # ── _resolve_store_target (#827) ─────────────────────────────────────────────
 
 _VALID_REPOS_MACHINES_YAML = (
