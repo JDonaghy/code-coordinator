@@ -248,6 +248,13 @@ class BoardIssue:
     # #3384: GitHub's own `stateReason` — `"reopened"` when a human explicitly
     # reopened this issue via `gh issue reopen`, `""` for an issue that has
     # never been closed. See `coord.drive_queue.IssueFacts.reopened`.
+    #
+    # ABSENT, not `""`, on the wire when it is the empty default: it would
+    # otherwise cost ~20 bytes on every issue row of every poll to say nothing
+    # (`coord.board_wire._drop_default_state_reason`, which is also why it is
+    # not in this DTO's `required` list — it has a default). Read it as
+    # `row.get("state_reason") or ""`; the Rust side gets `#[serde(default)]`
+    # from `coord.codegen`.
     state_reason: str = ""
 
 

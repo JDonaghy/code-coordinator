@@ -395,3 +395,172 @@ def test_active_work_never_dropped_regardless_of_terminal_history_size(
     issue = next(i for i in board["issues"] if i["number"] == 99999)
     assert issue["state"] == "open"
     assert issue["body"] == "the open body"  # open issue body untouched by the closed-body drop
+
+
+# ── #3384: the reopen witness must survive the wire's byte policy ──────────
+#
+# `issues.state_reason` (GitHub's own `stateReason`) is the ONLY witness that
+# lets `coord.drive_queue.IssueFacts.landed` tell "a human reopened this
+# issue because the merged PR did not finish the work" apart from "this repo
+# merges into develop and never auto-closes the issue" — both otherwise read
+# as `merged=True, issue_state="open"`. It is also a defaulted field on every
+# one of the board's ~800 issue rows, which is ~20 bytes each, per poll: on
+# the 3000-row seed above, 57 KB, enough on its own to breach
+# BOARD_PAYLOAD_BYTE_BUDGET. `bound_issue_row` therefore drops the EMPTY
+# default from the wire and keeps every non-empty value.
+#
+# These guard both halves at once — the cheap shape (the default is gone) and
+# the expensive one that actually matters (a real reopen still reaches the
+# consumer, over the real HTTP wire, and still flips `landed` to False). A
+# byte-saving cut that silently took the witness with it would pass the
+# budget guard above and re-open #3384; it fails here instead.
+
+
+def _board_over_http(db_path: Path, cfg_path: Path) -> dict:
+    cfg = load_config(cfg_path)
+    app = build_app(SqliteStore(db_path), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def _seed_reopened_and_control(conn: sqlite3.Connection) -> None:
+    """One issue merged-then-reopened, one merged-and-never-closed control.
+
+    Both carry a merged work assignment, so `IssueFacts.merged` is True for
+    each and `state_reason` is the ONLY thing that can tell them apart.
+    """
+    conn.executemany(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, status, type, dispatched_at, finished_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        [
+            ("a-reopened", "m", "api", 3380, "reopened", "merged", "work", NOW, NOW),
+            ("a-control", "m", "api", 3381, "never closed", "merged", "work", NOW, NOW),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+        "synced_at, state_reason) VALUES (?,?,?,?,?,?,?,?)",
+        [
+            ("api", 3380, "reopened", "", "open", "[]", NOW, "reopened"),
+            ("api", 3381, "never closed", "", "open", "[]", NOW, ""),
+        ],
+    )
+    conn.commit()
+
+
+def test_bound_issue_row_drops_the_empty_state_reason_default() -> None:
+    """The byte cut: an empty `state_reason` leaves the wire entirely rather
+    than shipping `""` on every issue row of every poll."""
+    row = {"state": "open", "body": "", "state_reason": ""}
+    bound_issue_row(row)
+    assert "state_reason" not in row
+
+
+def test_bound_issue_row_keeps_a_reopened_state_reason() -> None:
+    """...and the witness itself is never the thing that gets cut."""
+    row = {"state": "open", "body": "", "state_reason": "reopened"}
+    bound_issue_row(row)
+    assert row["state_reason"] == "reopened"
+
+
+def test_bound_issue_row_keeps_a_state_reason_it_does_not_interpret() -> None:
+    """The cut drops the DEFAULT, not "anything that isn't 'reopened'" — a
+    value GitHub starts sending that coord has no opinion about still reaches
+    clients intact."""
+    row = {"state": "closed", "body": "", "state_reason": "not_planned"}
+    bound_issue_row(row)
+    assert row["state_reason"] == "not_planned"
+
+
+def test_state_reason_policy_is_the_same_for_a_tracking_issue() -> None:
+    """Epics take an early return out of `bound_issue_row` for the body cap
+    (#1791/#1939); the `state_reason` policy is applied above it, so the wire
+    shape of that field does not depend on which kind of issue a row is."""
+    from coord.milestone_order import TRACKING_ISSUE_LABEL
+
+    epic = {"state": "open", "body": "x", "labels": [TRACKING_ISSUE_LABEL],
+            "state_reason": ""}
+    bound_issue_row(epic)
+    assert "state_reason" not in epic
+
+    reopened_epic = {"state": "open", "body": "x", "labels": [TRACKING_ISSUE_LABEL],
+                     "state_reason": "reopened"}
+    bound_issue_row(reopened_epic)
+    assert reopened_epic["state_reason"] == "reopened"
+
+
+def test_a_reopened_issue_is_still_not_landed_after_the_http_wire(
+    tmp_path: Path, valid_config_path: Path
+) -> None:
+    """#3384 end to end over the REAL wire: serve `/board` from a seeded DB,
+    reduce the response exactly as `coord drive-queue tick` does, and assert
+    the reopened issue's stale `merged` record still does NOT read as landed
+    — while the control issue (merged, never closed, the quadraui case) still
+    does. This is the assertion the byte cut could break."""
+    from coord.drive_queue import build_board_view, entry_key
+
+    db = tmp_path / "reopened.db"
+    conn = _ensure_schema_db(db)
+    _seed_reopened_and_control(conn)
+    conn.close()
+
+    board = _board_over_http(db, valid_config_path)
+    view = build_board_view(board)
+
+    reopened = view.facts(entry_key("api", 3380))
+    assert reopened.merged is True  # the stale record is still on the board
+    assert reopened.reopened is True  # ...and the witness survived the wire
+    assert reopened.landed is False  # ...so the entry is NOT waved through
+
+    control = view.facts(entry_key("api", 3381))
+    assert control.merged is True
+    assert control.reopened is False
+    assert control.landed is True
+
+
+def test_the_wire_and_the_daemon_host_local_path_agree_on_reopened(
+    tmp_path: Path, valid_config_path: Path, coord_db
+) -> None:
+    """One question, one answer (#2085): `reopened` is asked on two surfaces
+    — the HTTP `/board` wire (thin clients) and the daemon host's own local
+    SELECTs, which never run through `coord.board_wire` at all. Dropping the
+    empty default on only one of them would put the two surfaces on different
+    answers for the same DB. Assert all three reductions agree, row for row.
+    """
+    from coord.commands.drive_queue import _local_issue_rows as tick_rows
+    from coord.drive_queue import build_board_view, entry_key
+    from coord.drive_state import _local_issue_rows as drive_rows
+
+    db = tmp_path / "reopened.db"
+    conn = _ensure_schema_db(db)
+    _seed_reopened_and_control(conn)
+    conn.close()
+
+    # Same rows again, this time in the autouse `coord_db` the local paths read.
+    _seed_reopened_and_control(coord_db)
+
+    board = _board_over_http(db, valid_config_path)
+    assignments = board["assignments"]
+    views = {
+        "http": build_board_view(board),
+        "drive_state": build_board_view(
+            {"assignments": assignments, "issues": drive_rows()}
+        ),
+        "tick": build_board_view(
+            {"assignments": assignments, "issues": tick_rows()}
+        ),
+    }
+    for number, expected in ((3380, True), (3381, False)):
+        key = entry_key("api", number)
+        answers = {name: v.facts(key).reopened for name, v in views.items()}
+        assert set(answers.values()) == {expected}, (
+            f"api#{number}: the three surfaces disagree about `reopened` "
+            f"({answers}) — a split-brain, whichever one is right"
+        )
+        landed = {name: v.facts(key).landed for name, v in views.items()}
+        assert set(landed.values()) == {not expected}, (
+            f"api#{number}: the three surfaces disagree about `landed` ({landed})"
+        )
