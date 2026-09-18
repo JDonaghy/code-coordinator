@@ -2890,6 +2890,126 @@ class TestRecordTestVerdictToolchain:
         assert row.test_toolchain is None
 
 
+class TestRecordTestVerdictBaselineRedStreak:
+    """#3386 (item 3 of #3378): `_record_test_verdict_local` is the single
+    write choke point (#1337) both the automatic `SMOKE: baseline-red` path
+    and the human `coord test --skipped ... --reason "baseline-red
+    (#2170): ..."` remedy route through — so it is where the per-repo
+    consecutive baseline-red streak must be kept, to guarantee neither path
+    can dodge the count the way each independently rendered as an
+    indistinguishable "passed" before #3378 item 2.
+
+    Persisted in `board_meta` (see `record_baseline_red_classification`'s
+    docstring), so `coord_db` (autouse, conftest.py) already gives every
+    test here a private, isolated connection — no extra fixture needed.
+    """
+
+    @staticmethod
+    def _seed_assignment(coord_db, *, assignment_id="aid-1", repo_name="api"):
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, branch) VALUES (?, 'm1', ?, 1, 't', ?)",
+            (assignment_id, repo_name, f"worker/{assignment_id}"),
+        )
+        coord_db.commit()
+
+    def test_baseline_red_skip_increments_the_repo_streak(self, coord_db) -> None:
+        from coord.state import baseline_red_streak
+
+        self._seed_assignment(coord_db)
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="skipped",
+            test_reason="baseline-red (#2170): pre-existing failures",
+            test_confirmation="baseline_red",
+        )
+
+        assert baseline_red_streak("api") == 1
+
+    def test_repeated_baseline_red_skips_accumulate_across_assignments(
+        self, coord_db,
+    ) -> None:
+        from coord.state import baseline_red_streak
+
+        self._seed_assignment(coord_db, assignment_id="aid-1")
+        self._seed_assignment(coord_db, assignment_id="aid-2")
+
+        for aid in ("aid-1", "aid-2"):
+            record_test_verdict(
+                assignment_id=aid, test_state="skipped",
+                test_confirmation="baseline_red",
+            )
+
+        assert baseline_red_streak("api") == 2
+
+    def test_structural_skip_does_not_touch_the_streak(self, coord_db) -> None:
+        """No `test_confirmation` at all (#1076/#1152's ordinary
+        "nothing to smoke-test" skip) says nothing about the merge base —
+        must never be counted as a baseline-red classification."""
+        from coord.state import baseline_red_streak
+
+        self._seed_assignment(coord_db)
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="skipped",
+            test_reason="contract/fixture-only, nothing to smoke-test",
+        )
+
+        assert baseline_red_streak("api") == 0
+
+    def test_genuine_passed_verdict_clears_an_existing_streak(self, coord_db) -> None:
+        from coord.state import baseline_red_streak, record_baseline_red_classification
+
+        self._seed_assignment(coord_db, assignment_id="aid-1")
+        record_baseline_red_classification("api")
+        record_baseline_red_classification("api")
+        assert baseline_red_streak("api") == 2
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        assert baseline_red_streak("api") == 0
+
+    def test_a_failed_verdict_does_not_clear_the_streak(self, coord_db) -> None:
+        """A `failed` verdict says the BRANCH is broken, not that the base
+        is clean — must not reset a chronic baseline-red streak."""
+        from coord.state import baseline_red_streak, record_baseline_red_classification
+
+        self._seed_assignment(coord_db, assignment_id="aid-1")
+        record_baseline_red_classification("api")
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="failed", test_reason="real failure",
+        )
+
+        assert baseline_red_streak("api") == 1
+
+    def test_streak_is_tracked_per_repo(self, coord_db) -> None:
+        from coord.state import baseline_red_streak
+
+        self._seed_assignment(coord_db, assignment_id="aid-1", repo_name="api")
+        self._seed_assignment(coord_db, assignment_id="aid-2", repo_name="web")
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="skipped",
+            test_confirmation="baseline_red",
+        )
+
+        assert baseline_red_streak("api") == 1
+        assert baseline_red_streak("web") == 0
+
+    def test_literal_matches_the_canonical_confirm_test_constant(self) -> None:
+        """`_record_test_verdict_local` compares `test_confirmation` against
+        the literal `"baseline_red"` rather than importing
+        `coord.confirm_test.TEST_CONFIRMATION_BASELINE_RED` (that would be a
+        circular import: `coord.confirm_test` -> `coord.revalidate` ->
+        `coord.merge_queue` -> `coord.state`). Pin the literal against the
+        canonical constant so the two can never silently drift apart
+        (#2096)."""
+        from coord.confirm_test import TEST_CONFIRMATION_BASELINE_RED
+
+        assert TEST_CONFIRMATION_BASELINE_RED == "baseline_red"
+
+
 class TestRecordUatVerdict:
     """#2687: `record_uat_verdict` — the single-row seam writer behind
     `coord uat <id> --passed|--failed`. Deliberately simpler than

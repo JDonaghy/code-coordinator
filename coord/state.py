@@ -1513,6 +1513,32 @@ def _record_test_verdict_local(
             issue_number=row["issue_number"],
             branch=row["branch"],
         )
+
+    # #3386 (item 3 of #3378): keep the per-repo consecutive baseline-red
+    # streak in lockstep with the verdict this function is the SINGLE write
+    # choke point for (#1337) — both the automatic `SMOKE: baseline-red`
+    # path (`coord.notify._confirmed_pass_verdict`) and the human-attended
+    # `coord test --skipped ... --reason "baseline-red (#2170): ..."` remedy
+    # (`coord.commands.test_gate`) funnel through here, so incrementing here
+    # (rather than at either call site) means neither can silently dodge the
+    # count the way each independently rendered as an indistinguishable
+    # "passed" before #3378 item 2. A genuine (non-baseline-red) `passed`
+    # resets the streak: real, positive evidence the CURRENT merge base is
+    # not red.
+    if row is not None and row["repo_name"]:
+        # Mirrors `coord.confirm_test.TEST_CONFIRMATION_BASELINE_RED` — kept
+        # as a literal (not an import) because `coord.confirm_test` imports
+        # `coord.revalidate`, which imports `coord.merge_queue`, which
+        # imports THIS module (for `COORD_DIR`), so a module-level import of
+        # `coord.confirm_test` here would be circular. Pinned against drift
+        # by `tests/test_state.py::
+        # TestRecordTestVerdictBaselineRedStreak::
+        # test_literal_matches_the_canonical_confirm_test_constant`.
+        if test_state == "skipped" and test_confirmation == "baseline_red":
+            record_baseline_red_classification(row["repo_name"])
+        elif test_state == "passed":
+            clear_baseline_red_streak(row["repo_name"])
+
     if row is not None and test_state is not None:
         # #1605: `test_state=None` (clearing a verdict for re-dispatch, not
         # recording one) isn't a verdict to audit — `f"test_{test_state}"`
@@ -1541,6 +1567,180 @@ def _record_test_verdict_local(
             f"Test FAILED: {test_reason.strip()}",
             source="test",
         )
+
+
+# ── #3386 (item 3 of #3378): bound the baseline-red bypass ──────────────────
+#
+# #3378 item 2 made a `baseline-red` (#2170) skip machine-readable via
+# `test_confirmation`, but a machine-readable bypass is still a bypass:
+# `coord.merge_queue.evaluate_smoke_verdict` treats ANY `"skipped"` verdict
+# as an unconditional merge-gate pass (#1732), so the branch merges with its
+# Test stage never having actually run. #2170's bypass is defensible for as
+# long as it takes to notice `main` is red and fix it — hours, not days. It
+# ran 33 days live, unnoticed, merging every branch dispatched against
+# `claude-coordinator` the whole time (confirmed live on #3383, 2026-09-18).
+#
+# The fix is a per-repo streak: every `baseline_red`-confirmed skip
+# increments it (`record_baseline_red_classification`, called above from
+# the single write choke point `_record_test_verdict_local` — #1337), and
+# any genuine (non-baseline-red) `passed` verdict for that repo resets it to
+# zero (`clear_baseline_red_streak`) — proof the CURRENT merge base is not,
+# in fact, red. `coord.merge_queue.evaluate_smoke_verdict` reads the SAME
+# streak (`baseline_red_merge_blocked`) before trusting a fresh
+# baseline-red skip, so `coord merge` and `coord gates` can never disagree
+# about whether a repo has crossed the line (#2096: one question, one
+# answer).
+#
+# Persisted in `board_meta` (one JSON blob under one key), the same seam
+# `save_milestone_gate` above uses — unlike the *advisory*, fail-soft flat
+# files `coord.confirm_test`'s chronic-inconclusive-count tally uses, this
+# streak directly GATES a merge, so it needs the same durability and
+# same-transaction atomicity every other correctness-critical board write
+# gets, not a best-effort file that degrades silently on a torn write.
+# Deliberately does NOT live in `coord.confirm_test`: that module imports
+# `coord.revalidate`, which imports `coord.merge_queue`, which imports THIS
+# module — so `coord.merge_queue.evaluate_smoke_verdict` (the actual merge
+# refusal) can import these functions directly, with no circular-import
+# deferral needed.
+_BASELINE_RED_STREAKS_META_KEY = "baseline_red_streaks"
+
+#: How many CONSECUTIVE `baseline_red`-confirmed skips one repo may
+#: accumulate — with no genuine `passed` verdict in between — before its
+#: Test gate stops being a bypass and starts being a hard merge refusal
+#: (#3386). The issue's own bound is "hours, not days"; 3 is small enough
+#: that a chronic outage cannot hide behind it for weeks, and large enough
+#: that one noisy, quickly-fixed CI blip doesn't halt a repo outright.
+#: Pinned by test — raising it raises the outage-tolerance ceiling (and the
+#: unattended-merge risk) for every repo at once, which must be a
+#: deliberate act, never an accident of drift.
+BASELINE_RED_STREAK_LIMIT = 3
+
+
+def _load_baseline_red_streaks_raw(conn) -> dict[str, int]:
+    """Best-effort decode of the persisted ``{repo: streak}`` map.
+
+    A missing row, corrupt JSON, or an unexpected shape all read as "no
+    streak yet" — a decode failure here must never itself block (or wrongly
+    un-block) a merge.
+    """
+    row = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key = ?",
+        (_BASELINE_RED_STREAKS_META_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        repo: count for repo, count in data.items()
+        if isinstance(repo, str) and isinstance(count, int) and count > 0
+    }
+
+
+def _save_baseline_red_streaks_raw(conn, streaks: dict[str, int]) -> None:
+    sql.upsert(
+        conn, "board_meta", ["key", "value"],
+        (_BASELINE_RED_STREAKS_META_KEY, json.dumps(streaks)),
+        conflict_columns=["key"],
+    )
+
+
+def record_baseline_red_classification(repo_name: str | None) -> int:
+    """Increment and persist *repo_name*'s consecutive baseline-red streak (#3386).
+
+    Called exactly once per `baseline_red`-confirmed skip recorded for the
+    repo — from :func:`_record_test_verdict_local`, the single write choke
+    point BOTH the automatic path (a headless worker's `SMOKE: baseline-red`
+    marker, via `coord.notify._confirmed_pass_verdict`) and the
+    human-attended remedy (`coord test --skipped ... --reason
+    "baseline-red (#2170): ..."`, via `coord.commands.test_gate`) route
+    through (#1337) — so neither path can silently bypass the count the way
+    each independently bypassed the merge gate before #3378 item 2.
+
+    Returns the new streak so a caller can log/escalate inline without a
+    second read. A falsy *repo_name* is a no-op returning ``0``.
+    """
+    if not repo_name:
+        return 0
+    conn = get_connection()
+    new_count = 0
+
+    def _write() -> None:
+        nonlocal new_count
+        streaks = _load_baseline_red_streaks_raw(conn)
+        new_count = int(streaks.get(repo_name, 0)) + 1
+        streaks[repo_name] = new_count
+        _save_baseline_red_streaks_raw(conn, streaks)
+        conn.commit()
+
+    # #2802: ride out transient `database is locked` contention the same
+    # way every neighbouring write in this module does — see
+    # `_record_test_verdict_local`, this function's only caller.
+    retry_on_locked(_write)
+    return new_count
+
+
+def clear_baseline_red_streak(repo_name: str | None) -> None:
+    """Reset *repo_name*'s consecutive baseline-red streak to zero (#3386).
+
+    Called when a genuine (non-`baseline_red`) ``passed`` verdict is
+    recorded for the repo — real, positive evidence that the CURRENT merge
+    base is not, in fact, red, so whatever streak this repo was
+    accumulating no longer describes reality. A `"failed"` verdict
+    deliberately does **not** reset it: it says the branch under test is
+    broken, not that the base is clean.
+    """
+    if not repo_name:
+        return
+    conn = get_connection()
+
+    def _write() -> None:
+        streaks = _load_baseline_red_streaks_raw(conn)
+        if repo_name in streaks:
+            del streaks[repo_name]
+            _save_baseline_red_streaks_raw(conn, streaks)
+            conn.commit()
+
+    retry_on_locked(_write)
+
+
+def baseline_red_streak(repo_name: str) -> int:
+    """*repo_name*'s persisted consecutive baseline-red streak (0 if none) (#3386)."""
+    return _load_baseline_red_streaks_raw(get_connection()).get(repo_name, 0)
+
+
+def baseline_red_streaks(repo_name: str | None = None) -> dict[str, int]:
+    """The persisted ``{repo: streak}`` map (#3386).
+
+    *repo_name* narrows to ``{repo_name: streak}`` (``{}`` if it has none);
+    ``None`` (the default) returns the whole fleet-wide map. This is the
+    seam a `coord doctor`/`coord status` repo-level alert (#3386 item 5)
+    reads to surface a chronically-red merge base without an operator
+    having to go looking for it one issue at a time, the way #3378 itself
+    was only found (33 days late, on #3383).
+    """
+    streaks = _load_baseline_red_streaks_raw(get_connection())
+    if repo_name is not None:
+        return {repo_name: streaks[repo_name]} if repo_name in streaks else {}
+    return streaks
+
+
+def baseline_red_merge_blocked(repo_name: str | None) -> bool:
+    """True when *repo_name* has hit the #3386 consecutive-streak limit.
+
+    The ONE predicate both the real merge refusal
+    (:func:`coord.merge_queue.evaluate_smoke_verdict`) and any repo-level
+    alert surface (#3386 item 5) must call — never a second,
+    independently-derived comparison against :data:`BASELINE_RED_STREAK_LIMIT`
+    (#2096: one question, one answer).
+    """
+    if not repo_name:
+        return False
+    return baseline_red_streak(repo_name) >= BASELINE_RED_STREAK_LIMIT
 
 
 def record_uat_verdict(

@@ -180,6 +180,60 @@ class TestSmokeVerdict:
         assert board.completed[0].test_state == "skipped"
         assert board.completed[0].test_confirmation == "baseline_red"
 
+    def test_baseline_red_skip_prints_the_repo_streak_note(
+        self, config_file: Path, board_with_done: Board,
+    ) -> None:
+        """#3386 (item 3 of #3378): the human recording the bypass must see
+        the running count RIGHT HERE — the command that records it is the
+        one place a human is already looking. Silence here is exactly how
+        #3378's bypass ran unnoticed for 33 days."""
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "test", "abc123", "--skipped",
+            "--reason", "baseline-red (#2170): reproduces on the merge-base",
+            "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        assert "api" in result.output
+        assert "1/" in result.output or "streak is now 1" in result.output
+        assert "#3386" in result.output
+
+    def test_baseline_red_skip_warns_once_the_streak_limit_is_hit(
+        self, config_file: Path, board_with_done: Board,
+    ) -> None:
+        """Once the repo has crossed `BASELINE_RED_STREAK_LIMIT`, the note
+        must escalate to a WARNING that says merges are now refused — not
+        just another quiet tally line."""
+        from coord.state import BASELINE_RED_STREAK_LIMIT, record_baseline_red_classification
+
+        for _ in range(BASELINE_RED_STREAK_LIMIT - 1):
+            record_baseline_red_classification("api")
+
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "test", "abc123", "--skipped",
+            "--reason", "baseline-red (#2170): reproduces on the merge-base",
+            "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        assert "WARNING" in result.output
+        assert str(BASELINE_RED_STREAK_LIMIT) in result.output
+        assert "#3386" in result.output
+
+    def test_structural_skip_prints_no_streak_note(
+        self, config_file: Path, board_with_done: Board,
+    ) -> None:
+        """An ordinary structural skip says nothing about the merge base —
+        must not print the baseline-red streak note at all."""
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "test", "abc123", "--skipped",
+            "--reason", "trivial dep bump, covered by regression test",
+            "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        assert "#3386" not in result.output
+
     def test_running_records_transient_marker(
         self, config_file: Path, board_with_done: Board,
     ) -> None:

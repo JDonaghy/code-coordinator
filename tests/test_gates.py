@@ -914,6 +914,30 @@ class TestFormatting:
         text = format_gate_report(report)
         assert "(baseline-red — branch not at fault, #2170)" in text
 
+    def test_format_blocks_after_the_consecutive_baseline_red_streak_limit(
+        self, config: Config,
+    ) -> None:
+        """#3386 (item 3 of #3378): `coord gates` reuses
+        `coord.merge_queue.evaluate_smoke_verdict` for its own live decision
+        (#2096: one question, one answer), so once a repo has crossed the
+        consecutive baseline-red streak limit, the SAME "test : passed
+        (baseline-red...)" row from the test above must instead render
+        BLOCKED — never a silent pass, no matter how fresh this particular
+        skip is."""
+        from coord.state import BASELINE_RED_STREAK_LIMIT, record_baseline_red_classification
+
+        for _ in range(BASELINE_RED_STREAK_LIMIT):
+            record_baseline_red_classification("api")
+
+        work = _work(test_state="skipped", test_confirmation="baseline_red")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+
+        text = format_gate_report(report)
+        assert "test   : BLOCKED" in text
+        assert "#3386" in text
+        assert "merge  : BLOCKED" in text
+
     def test_format_does_not_annotate_a_confirmed_pass(self, config: Config) -> None:
         """A REAL confirmed pass, or a row that never went through the #2464
         confirmation path at all (test_confirmation=None), must render
