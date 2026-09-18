@@ -124,6 +124,7 @@ from coord.overlap_predict import (
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
+    from coord.merge_queue import QueuedMerge
 
 log = logging.getLogger(__name__)
 
@@ -4740,14 +4741,49 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
         click.echo(f"merge-only: {reason}")
 
 
+# #3396: the `stage` this call site's escalations are recorded under —
+# mirrors `ROLL_PENDING_ALERT_STAGE`/`SELF_CORDON_ALERT_STAGE` above, but
+# keyed per-entry (the entry's own `(repo_name, issue_number)`) rather than a
+# single fleet-wide slot, since more than one branch can be `checks_stale` at
+# once. `_run_auto_revalidate_checks_stale`'s cleanup pass reads this same
+# constant back to find which open escalations are its own to dismiss.
+CHECKS_STALE_ALERT_STAGE = "checks_stale"
+
+
+def _record_checks_stale_escalation(entry: "QueuedMerge", *, reason: str) -> None:
+    """Write (or refresh) the durable, human-visible escalation for *entry*
+    (#3396 item 2) — ``coord escalate list``/``coord escalate run`` and the
+    TUI already surface this table for every other "needs a human" condition
+    in this file; a `checks_stale` block that this tick cannot move forward
+    on its own now reaches it too, instead of only ever reprinting the same
+    diagnosis to the journal every ~3 minutes forever.
+
+    Best-effort: a write failure here must not take down the rest of the
+    tick — the caller already echoed the reason to stdout, which is the
+    floor this falls back to.
+    """
+    try:
+        from coord.state import record_drive_escalation  # noqa: PLC0415
+
+        record_drive_escalation(
+            entry.repo_name,
+            entry.issue_number,
+            stage=CHECKS_STALE_ALERT_STAGE,
+            reason=reason,
+            gate_readings=f"error={entry.error}",
+            proposed_command=f"coord merge --only {entry.repo_name} {entry.issue_number}",
+            assignment_id=entry.assignment_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — the stdout line is the floor
+        click.echo(f"  (could not record the checks_stale escalation: {exc})")
+
+
 def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
-    """#2535: best-effort surfacing of merge-queue entries blocked SOLELY on
+    """#2535: unattended remedy for merge-queue entries blocked SOLELY on
     stale CI checks against an already-approved review — closing the gap
     where nothing periodic ever looks at such an entry on an operator's
-    behalf, so it just sits until someone notices ``--dry-run``'s
-    ``checks_stale`` line by hand (the trigger: #2530's Gate-A PR #2534 sat
-    blocked 2026-08-21 on nothing but 210 unrelated merges having landed
-    since its CI last ran).
+    behalf (the trigger: #2530's Gate-A PR #2534 sat blocked 2026-08-21 on
+    nothing but 210 unrelated merges having landed since its CI last ran).
 
     #3266: this used to auto-fire a ``gh run rerun`` (``CiStore.
     rerun_for_pr``) for exactly this shape, up to ``MAX_CI_STALE_RERUNS`` —
@@ -4756,46 +4792,89 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     there too: a ``gh run rerun`` replays the SAME event payload against
     the SAME base the stale checks already used, so it can never see a
     base that has since moved — which is the ONLY thing a staleness
-    reading means. Every tick that found a candidate here was spending a
-    full CI cycle (this repo's median: ~62 minutes) on a guaranteed no-op,
-    twice, before the shared ``ci_stale_reruns`` budget parked the entry
-    anyway (claude-coordinator#2972). Per this repo's "one question, one
-    answer" rule, this tick and ``process()`` must agree on the same
-    question ("should we auto-rerun CI for a checks_stale block?") — they
-    now both answer "no, park and point at a rebase" identically, rather
-    than this call site silently keeping the old answer #2197 already gave
-    up on live. See ``MAX_CI_STALE_RERUNS``'s comment in
+    reading means. See ``MAX_CI_STALE_RERUNS``'s comment in
     ``coord/merge_queue.py`` and ``ci_stale_reason``'s docstring for the
-    full reasoning and the actual remedy (rebase onto the target branch,
-    then ``git push --force-with-lease`` — the only thing that produces a
-    check against the CURRENT base).
+    full reasoning. The actual remedy is a rebase onto the target branch
+    followed by ``git push --force-with-lease`` — the only thing that
+    produces a check against the CURRENT base.
+
+    #3396: from #2535 through #3266 this call site only ever *reported*
+    that remedy — it never performed it, so a `checks_stale` entry whose
+    owning `coord drive` session had already exhausted its merge attempts
+    and exited had NOTHING left watching it: this tick re-diagnosed the
+    same block every ~3 minutes, forever, and the stale-rebase worker
+    that exists for exactly this shape (:func:`coord.conflict_fix.
+    dispatch_conflict_fix` with ``stale_rebase=True``, #3349) was never
+    dispatched. #3349 already wired that worker into
+    ``coord.notify``'s stalled-pipeline sweep (``merge_gate_checks_stale``),
+    but that sweep only runs when ``coord notify`` is invoked and
+    ``pipeline.auto_dispatch_stalled`` is on — it is not this tick, which
+    runs unconditionally every few minutes on the daemon host. Per this
+    repo's "one question, one answer" rule this call site now reuses the
+    IDENTICAL dispatcher rather than re-deriving the decision: a
+    content-preserving rebase gets force-pushed and the merge queue picks
+    it up on its own next attempt, with no operator action, exactly like
+    the #1090 reference case in the issue. A rebase that turns out to
+    conflict (or change content) still refuses and escalates — the
+    worker's own narrow briefing (:func:`coord.conflict_fix.
+    build_stale_rebase_briefing`) enforces that, not this call site.
+
+    Escalation (#3396 item 2): a candidate this function cannot move
+    forward — a conflict-fix already tried and failed against this SAME
+    error (:func:`coord.conflict_fix.has_prior_conflict_fix`), or dispatch
+    itself declined (no capable/reachable machine, no ``repo_path``) — is
+    recorded via :func:`coord.state.record_drive_escalation` under the
+    entry's OWN ``(repo, issue)``, the same durable, human-visible table
+    ``coord escalate list``/``coord escalate run`` already serve for every
+    other "needs a human" condition in this file (see
+    ``ROLL_PENDING_ALERT_REPO``/``SELF_CORDON_ALERT_REPO`` above for the
+    established one-slot-per-condition pattern; this one is naturally
+    keyed per-entry instead, since more than one branch can be
+    ``checks_stale`` at once). Before #3396 a block that "needs a human"
+    only ever reached this function's own stdout/journal line, printed
+    again unchanged every tick — never a place an operator or the TUI
+    would actually see it (the issue's own complaint: `coord drive-queue
+    status` reporting ``alert: (none)`` throughout). A candidate that
+    clears on its own (the rebase lands, or the base stops moving) is no
+    longer in the next tick's *candidates* list, so its escalation (if any)
+    is dismissed below — the table only ever holds genuinely-live blocks.
 
     Deliberately narrow — this is NOT ``merge.auto_drain`` reopened (that
     flag stays ``False`` by design; see ``docs/DRIVE_QUEUE.md`` and the
     2026-06-07 incident it guards against). This step never merges
-    anything, never mutates the queue, and never touches an entry blocked
-    on review, a real CI failure, or a conflict — it only *reports* the
-    exact shape :func:`coord.merge_queue.ci_revalidation_candidates` scopes
+    anything and never mutates the merge-queue row itself — it only ever
+    dispatches the SAME bounded, self-refusing worker
+    :func:`coord.conflict_fix.dispatch_conflict_fix` already provides
+    for the identical shape reached from a live drive/stalled-pipeline
+    sweep, gated by the SAME one-per-entry retry cap
+    (:func:`coord.conflict_fix.has_prior_conflict_fix`) — so a second
+    tick finding the same still-stale entry while a rebase attempt is
+    already running/pending does nothing, and one that already failed
+    escalates instead of retrying. It never touches an entry blocked on
+    review, a real CI failure, or a conflict — only the exact shape
+    :func:`coord.merge_queue.ci_revalidation_candidates` scopes
     ``--revalidate``'s (equally no-op) CI arm to (#1851/#1925): ``PENDING``,
     review approved, smoke fresh, CI checks green but predating the current
     base.
 
     ``MAX_CI_STALE_RERUNS``/``ci_stale_reruns`` are read nowhere in this
-    function any more — nothing here increments or checks that budget, so a
-    row already carrying a nonzero count from before this fix is left
-    exactly as ``process()`` leaves it (converges to 0 on the next
-    genuinely-fresh reading, never incremented further by this call site).
+    function — nothing here increments or checks that budget, so a row
+    already carrying a nonzero count from before #3266 is left exactly as
+    ``process()`` leaves it (converges to 0 on the next genuinely-fresh
+    reading, never incremented further by this call site).
 
-    Cost-visible (#1632's posture) in the opposite direction from before:
-    there is no external spend to report any more, only a
-    :func:`coord.audit.record_audit` (operational tier) row per candidate
-    per tick, so an operator watching the trail still sees the block
-    without this function ever burning a CI cycle trying (and failing) to
-    clear it.
+    Cost-visible (#1632's posture): dispatching a worker is real, visible
+    spend — a :func:`coord.audit.record_audit` (business tier) row marks
+    it, distinct from the operational-tier rows for a declined/escalated
+    candidate, so an operator watching the audit trail can tell "this tick
+    spent a session" from "this tick only reported a block" at a glance.
 
-    Deliberately NOT behind a new config flag — this is strictly a
-    supplementary read with no external action, so there is nothing new to
-    gate.
+    Deliberately NOT behind a new config flag — the worker it dispatches
+    already carries its own bounded, self-refusing briefing and one-shot
+    retry cap; there is nothing further to gate that
+    ``pipeline.auto_dispatch_stalled`` (the flag guarding ``coord
+    notify``'s unrelated, broader stalled-pipeline sweep) doesn't already
+    cover for that other call site.
 
     Best-effort like every other optional step in this tick (conflict
     reconciliation in ``_auto_drain_tick``, the merge-only fast path above):
@@ -4815,10 +4894,32 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
         from coord.audit import record_audit  # noqa: PLC0415
         from coord.ci_store import build_ci_store  # noqa: PLC0415
         from coord.commands._common import _load_config  # noqa: PLC0415
-        from coord.state import load_board as _load_board  # noqa: PLC0415
+        from coord.conflict_fix import (  # noqa: PLC0415
+            _has_active_conflict_fix,
+            describe_conflict_fix_decline,
+            dispatch_conflict_fix,
+            has_prior_conflict_fix,
+        )
+        from coord.network import fetch_status  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            dismiss_drive_escalation,
+            list_drive_escalations,
+            load_board as _load_board,
+        )
 
         cfg = _load_config(config_path)
-        board = _load_board()
+        # #3396: `load_board()` can legitimately return `None` (no board data
+        # at all yet). `ci_revalidation_candidates` already tolerates that
+        # (its gate reads never dereference a `None` board when the gate they
+        # guard isn't required), but `has_prior_conflict_fix`/
+        # `dispatch_conflict_fix` below unconditionally walk
+        # `board.active`/`board.completed` — an empty board is the correct
+        # "no prior assignments exist" reading for both, and keeps the two
+        # calls sharing the exact same object rather than one seeing `None`
+        # and the other a stand-in.
+        from coord.models import Board  # noqa: PLC0415
+
+        board = _load_board() or Board()
         ci_store = build_ci_store(
             cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env,
         )
@@ -4829,34 +4930,116 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     except Exception:  # noqa: BLE001 — best-effort, see docstring
         return
 
+    # #3396: drop any prior checks_stale escalation for an entry that is no
+    # longer a candidate this tick — either it landed, or the base stopped
+    # moving. Runs even when *candidates* is empty (that's the fully-healed
+    # case). Best-effort: a read/write hiccup here must not stop the actual
+    # dispatch loop below from running.
+    try:
+        live_keys = {(c.repo_name, c.issue_number) for c in candidates}
+        for esc in list_drive_escalations():
+            if esc.get("stage") != CHECKS_STALE_ALERT_STAGE:
+                continue
+            key = (esc.get("repo_name"), esc.get("issue_number"))
+            if key not in live_keys:
+                dismiss_drive_escalation(esc["repo_name"], esc["issue_number"])
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        pass
+
     if not candidates:
         return
 
     for entry in candidates:
         label = f"{entry.repo_name} #{entry.issue_number} ({entry.branch})"
-        # #3266: no `gh run rerun` fires here any more — a same-base replay
-        # cannot clear a staleness reading, so this is visibility only, not
-        # a remedy attempt. See the docstring above and
-        # `coord.merge_queue.ci_stale_reason` for why.
-        click.echo(
-            f"auto-revalidate: {label} is checks_stale — a CI re-run cannot "
-            "clear it (same base); needs a rebase onto the target branch "
-            "and `git push --force-with-lease`, or a human running `coord "
-            "merge --only` after one"
+
+        if has_prior_conflict_fix(board, entry.assignment_id, current_error=entry.error):
+            if _has_active_conflict_fix(board, entry.assignment_id):
+                # A stale-rebase attempt is already running/pending for this
+                # entry (dispatched by this same tick earlier, a live drive,
+                # or the `coord notify` sweep) — nothing to do, and nothing
+                # to escalate: it will resolve, or fail and escalate, on its
+                # own.
+                click.echo(
+                    f"auto-revalidate: {label} is checks_stale — a "
+                    "stale-rebase conflict-fix is already in flight for it"
+                )
+                continue
+            # A prior stale-rebase (or ordinary conflict-fix) attempt for
+            # this SAME error already failed — the retry cap is spent, and
+            # re-diagnosing it every tick forever is exactly the #3396 bug.
+            # Escalate once into the durable table instead of only echoing.
+            reason = (
+                f"{label} is checks_stale and a prior conflict-fix attempt "
+                "already failed against this same block — a CI re-run "
+                "cannot clear it (same base) and the automatic rebase "
+                "already gave up; needs a human"
+            )
+            click.echo(f"auto-revalidate: {reason}")
+            record_audit(
+                tier="operational", category="merge",
+                event_type="merge_checks_stale_human_required",
+                actor="drive-queue-tick",
+                summary=reason,
+                repo=entry.repo_name, issue=entry.issue_number,
+                assignment_id=entry.assignment_id,
+                details={"pr_number": entry.pr_number, "error": entry.error},
+            )
+            _record_checks_stale_escalation(entry, reason=reason)
+            continue
+
+        pick_out: list = []
+        fix = dispatch_conflict_fix(
+            entry, board, cfg, stale_rebase=True,
+            status_fetcher=fetch_status, machine_pick_out=pick_out,
         )
+        if fix is not None:
+            click.echo(
+                f"auto-revalidate: {label} is checks_stale — dispatched a "
+                f"stale-rebase conflict-fix ({fix.assignment_id}) to "
+                f"{fix.machine_name} (#3396: no live drive needed)"
+            )
+            record_audit(
+                tier="business", category="merge",
+                event_type="merge_checks_stale_auto_rebase_dispatched",
+                actor="drive-queue-tick",
+                summary=(
+                    f"stale-rebase conflict-fix dispatched: {label} → "
+                    f"{fix.machine_name}"
+                ),
+                repo=entry.repo_name, issue=entry.issue_number,
+                assignment_id=fix.assignment_id,
+                details={
+                    "pr_number": entry.pr_number,
+                    "merge_entry_id": entry.assignment_id,
+                },
+            )
+            continue
+
+        # Dispatch declined before ever starting a rebase — no capable or
+        # reachable machine, no `repo_path` configured, or a flapping agent
+        # (#3353). Still `checks_stale`, still gate-ready, and still nobody
+        # is going to clear it on its own — surface it the same durable way
+        # a genuine retry-cap exhaustion does, rather than a print-only line
+        # nothing but the journal ever sees.
+        decline_reason = describe_conflict_fix_decline(pick_out)
+        reason = (
+            f"{label} is checks_stale with a content-preserving rebase "
+            f"expected to clear it, but dispatch declined: {decline_reason}"
+        )
+        click.echo(f"auto-revalidate: {reason}")
         record_audit(
             tier="operational", category="merge",
             event_type="merge_checks_stale_parked",
             actor="drive-queue-tick",
             summary=(
                 f"checks_stale: {label} needs a rebase, not a CI re-run "
-                "(#3266) — a same-base `gh run rerun` can never clear "
-                "staleness"
+                f"(#3266); auto-dispatch declined: {decline_reason} (#3396)"
             ),
             repo=entry.repo_name, issue=entry.issue_number,
             assignment_id=entry.assignment_id,
-            details={"pr_number": entry.pr_number},
+            details={"pr_number": entry.pr_number, "decline_reason": decline_reason},
         )
+        _record_checks_stale_escalation(entry, reason=reason)
 
 
 def _run_resume_probe(entry: QueueEntry) -> ProbeResult:
