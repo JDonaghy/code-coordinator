@@ -3589,6 +3589,15 @@ def test_auto_revalidate_surfaces_but_never_reruns_an_entry_blocked_on_stale_che
     assert entries[0]["issue"] == 2534
     assert entries[0]["repo"] == REPO
 
+    # #3396 review: the escalation's `proposed_command` must be a command
+    # `coord escalate run` can actually execute — `--only` is a single-value
+    # Click option that takes the durable `repo#issue` key (#1477), not two
+    # space-separated positional-looking tokens (Click would reject the
+    # latter with "Got unexpected extra argument").
+    escalation = state._get_drive_escalation_local(REPO, 2534)
+    assert escalation is not None
+    assert escalation["proposed_command"] == f"coord merge --only {REPO}#2534"
+
 
 def test_auto_revalidate_keeps_surfacing_an_already_exhausted_entry(
     cli_no_gates, coord_db, stale_ci_backend,
@@ -3619,6 +3628,12 @@ def test_auto_revalidate_keeps_surfacing_an_already_exhausted_entry(
     entries = query_audit_log(event_type="merge_checks_stale_parked")["entries"]
     assert len(entries) == 1
     assert entries[0]["issue"] == 2534
+
+    # #3396 review: same `proposed_command` check as the sibling test above —
+    # this path (dispatch declined) writes the escalation too.
+    escalation = state._get_drive_escalation_local(REPO, 2534)
+    assert escalation is not None
+    assert escalation["proposed_command"] == f"coord merge --only {REPO}#2534"
 
 
 # ── #3396: auto-revalidate now DISPATCHES the stale-rebase worker, rather
@@ -3669,6 +3684,41 @@ def test_auto_revalidate_dispatches_a_stale_rebase_worker_with_no_live_drive(
     assert state._get_drive_escalation_local(REPO, 2534) is None
 
 
+def test_auto_revalidate_dismisses_a_prior_decline_escalation_once_dispatch_succeeds(
+    cli_no_gates, coord_db, stale_ci_backend, monkeypatch,
+):
+    """#3396 review: an EARLIER tick may have already written a
+    `checks_stale` escalation for this entry (dispatch declined that time —
+    no machine, no repo_path). Once a LATER tick finds dispatch available
+    and actually fires the stale-rebase worker, that stale "needs a human"
+    record must not keep sitting in `coord escalate list`/the TUI — the
+    entry now has a worker actively running against it, not a stuck block
+    only a human can move."""
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    set_board_meta(coord_db, "board_initialized", "1")
+    state._record_drive_escalation_local(
+        REPO, 2534, stage="checks_stale",
+        reason="dispatch declined: no machine available",
+        gate_readings="gate: READY",
+        proposed_command=f"coord merge --only {REPO}#2534",
+    )
+    assert state._get_drive_escalation_local(REPO, 2534) is not None
+
+    fix_assignment = Assignment(
+        machine_name="dellserver", repo_name=REPO, issue_number=2534,
+        issue_title="[stale-rebase-fix] issue 2534", assignment_id="cf-3396b",
+        status="pending", type="conflict-fix",
+    )
+    stub = MagicMock(return_value=fix_assignment)
+    monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    assert "dispatched a stale-rebase conflict-fix" in result.output
+
+    assert state._get_drive_escalation_local(REPO, 2534) is None
+
+
 def test_auto_revalidate_escalates_once_a_prior_stale_rebase_attempt_failed(
     cli_no_gates, coord_db, stale_ci_backend,
 ):
@@ -3695,6 +3745,7 @@ def test_auto_revalidate_escalates_once_a_prior_stale_rebase_attempt_failed(
     escalation = state._get_drive_escalation_local(REPO, 2534)
     assert escalation is not None
     assert escalation["stage"] == "checks_stale"
+    assert escalation["proposed_command"] == f"coord merge --only {REPO}#2534"
 
     from coord.audit import query_audit_log
 
