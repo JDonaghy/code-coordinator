@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # #3392: the `postgres` job below is opt-in and runs ONLY from here.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -371,6 +373,21 @@ jobs:
   # what every other job's `pip install -e ".[dev]"` pulls in.
   postgres:
     runs-on: ubuntu-latest
+    # #3392, 2026-09-18: taken out of automatic CI by operator decision -- the
+    # Postgres migration is not current work, and until it is this job is pure
+    # noise. It gates nothing (`continue-on-error: true` below, and it is not a
+    # required check in branch protection), emits ~3700
+    # ProductionDatabaseGuardError that dominate every `--log-failed` read of
+    # this workflow, and costs 65-70 min of runner time per push to main. It
+    # misdirected #3378 item 1, #3380 and #3385 -- all three were scoped as
+    # "make main green" against a job that cannot redden main.
+    #
+    # RESTORE by deleting this one `if:` line when the migration becomes active
+    # work. Everything below is unchanged and still correct. Sequence then is:
+    # remove the `if:`, work the failure list down, THEN remove
+    # `continue-on-error` -- that last step is what turns this into a real gate
+    # and it is the deliberate END of that work, not the start.
+    if: github.event_name == 'workflow_dispatch'
     continue-on-error: true
     services:
       postgres:
