@@ -3079,7 +3079,7 @@ class TestSmokeCompletionBaselineRedVerdict(TestSmokeCompletionVerdict):
 
         conn = get_connection()
         row = conn.execute(
-            "SELECT test_state, smoke_test, test_reason "
+            "SELECT test_state, smoke_test, test_reason, test_confirmation "
             "FROM assignments WHERE assignment_id=?",
             ("work-4",),
         ).fetchone()
@@ -3096,6 +3096,14 @@ class TestSmokeCompletionBaselineRedVerdict(TestSmokeCompletionVerdict):
         assert row["smoke_test"] != "fail"
         assert "baseline-red" in (row["test_reason"] or "").lower()
         assert "all 6 failures reproduce on origin/main" in row["test_reason"]
+        # #3378: before this fix, this write recorded a bare
+        # test_state='skipped' with NO `test_confirmation` — so `coord
+        # gates`'s renderer (`_row_test_confirmation`, #3357) had nothing to
+        # key its "(baseline-red — branch not at fault, #2170)" annotation
+        # off, and the merge gate rendered this exactly like an ordinary
+        # validated "test : passed". This is THE defect claude-coordinator
+        # issue #3378 reports live on #3376's gate output.
+        assert row["test_confirmation"] == "baseline_red"
 
     def test_nonzero_exit_without_baseline_red_line_still_fails(
         self, coord_db, tmp_path
@@ -3215,8 +3223,8 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         from coord.state import get_connection  # noqa: PLC0415
 
         return get_connection().execute(
-            "SELECT test_state, smoke_test, test_reason FROM assignments "
-            "WHERE assignment_id=?",
+            "SELECT test_state, smoke_test, test_reason, test_confirmation "
+            "FROM assignments WHERE assignment_id=?",
             (work_id,),
         ).fetchone()
 
@@ -3365,6 +3373,13 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         assert row["test_state"] == "skipped"
         assert row["smoke_test"] != "fail"
         assert "baseline-red" in (row["test_reason"] or "").lower()
+        # #3378: this write must carry machine-readable provenance too, not
+        # just a skipped state with a hopeful reason string — `coord gates`'
+        # renderer only annotates a baseline-red bypass distinctly from a
+        # real "passed" when this column says so (see
+        # `test_baseline_red_verdict_sets_parent_test_state_skipped` above
+        # for the full incident this closes).
+        assert row["test_confirmation"] == "baseline_red"
 
     def test_worker_recorded_verdict_is_not_clobbered(
         self, coord_db, tmp_path

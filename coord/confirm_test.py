@@ -336,6 +336,51 @@ TEST_CONFIRMATION_VALUES = frozenset({
     TEST_CONFIRMATION_BASELINE_RED,
 })
 
+#: #3378: the canonical prefix a ``test_reason`` carries when a ``skipped``
+#: verdict was recorded because the MERGE-BASE itself is red (#2170), not the
+#: branch. Every surface that RECORDS one of these skips must start
+#: ``test_reason`` with exactly this string, and every surface that needs to
+#: RECOGNIZE one (:func:`test_confirmation_for_skip_reason` below) reads this
+#: same constant rather than a private copy of the literal — #2096's "one
+#: question, one answer": two call sites independently spelling
+#: ``"baseline-red (#2170)"`` and happening to agree today is exactly the
+#: split-brain that rule exists to prevent.
+#:
+#: Two call sites already emitted this literal before this constant existed:
+#: `coord.notify`'s automatic `SMOKE: baseline-red` marker path (the ONLY
+#: place a headless worker's own report reaches this), and
+#: `coord.commands.test_gate`'s human-attended remedy hint (`coord test
+#: --skipped ... --reason "baseline-red (#2170): ..."`), printed after a
+#: local build/test run reproduces its failure on the merge-base. Both now
+#: import this constant instead of re-literalling it.
+BASELINE_RED_REASON_PREFIX = "baseline-red (#2170)"
+
+
+def test_confirmation_for_skip_reason(reason: str | None) -> str | None:
+    """The ``test_confirmation`` a ``--skipped`` verdict's *reason* implies.
+
+    #3378: ``coord test --skipped <id> --reason "..."`` is a single,
+    general-purpose CLI verb — most of its callers are recording an
+    ordinary structural skip (#1076/#1152: "contract/fixture-only, nothing
+    to smoke-test"), which carries no confirmation provenance at all
+    (``None``, same as before this function existed). But
+    `coord.commands.test_gate` itself instructs a human to run this exact
+    command with a *reason* starting with :data:`BASELINE_RED_REASON_PREFIX`
+    when a local run reproduces identically on the merge-base — and, left
+    unrecognized, that skip rendered completely indistinguishably from an
+    ordinary "passed" on the merge gate (the #3378 defect: a bypass reading
+    as a pass). Recognizing the canonical prefix the tooling itself emits
+    and asks the human to paste back closes that gap without resorting to
+    free-text sniffing of an arbitrary reason.
+
+    Returns :data:`~coord.confirm_test.TEST_CONFIRMATION_BASELINE_RED` when
+    *reason* carries that prefix, else ``None`` — never guesses on anything
+    else.
+    """
+    if reason and reason.startswith(BASELINE_RED_REASON_PREFIX):
+        return TEST_CONFIRMATION_BASELINE_RED
+    return None
+
 
 # ── #3357 item 3: chronic inconclusives are a fleet defect, not noise ───────
 #
@@ -1404,6 +1449,7 @@ def confirm_branch(
 
 
 __all__ = [
+    "BASELINE_RED_REASON_PREFIX",
     "CONFIRM_DEFAULT_TIMEOUT_SECONDS",
     "CONFIRM_MIN_RUN_SECONDS",
     "CONFIRM_PASS_BUDGET_SECONDS",
@@ -1436,6 +1482,7 @@ __all__ = [
     "record_inconclusive_confirmation",
     "spend_confirmation_budget",
     "sweep_stale_confirm_worktrees",
+    "test_confirmation_for_skip_reason",
     "unmet_confirmation_capabilities",
     "write_confirmation_output",
 ]
