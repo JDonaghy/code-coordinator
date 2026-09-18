@@ -504,6 +504,29 @@ class _NoActiveTestConnectionSentinel:
     immediately via ``__getattr__``, so a caller that reaches this gets a
     clear, correctly-attributed error instead of a real database file
     quietly being opened (or silently reused) underneath it.
+
+    **Scope, stated plainly (#3385 review).** This closes exactly one seam:
+    the ``coord.db._conn`` singleton that :func:`get_connection` reads. It
+    is a real, previously-unguarded gap, but it is not asserted here to be
+    the sole or even primary source of the ~3700
+    ``ProductionDatabaseGuardError`` failures the issue reports on ``main``
+    -- that would require the actual CI failure log, which this fix was not
+    verified against (see the commit message for what evidence is, and is
+    not, available). One other unguarded route was found by inspection
+    while investigating this and is flagged rather than silently left for
+    someone else to rediscover: ``coord.dao.SqliteStore._connect()``'s
+    SQLite branch opens ``self._path`` (``DB_PATH`` by default,
+    resolved once at ``__init__``) with no pytest/non-release guard at all
+    -- unlike its Postgres branch, which calls
+    ``refuse_postgres_under_pytest`` first. ``SqliteStore()`` with no
+    explicit ``db_path`` (e.g. ``coord/reports.py``'s
+    ``_default_usage_rows``) would reach that unguarded path. Left
+    unmodified here: it is outside this fix's file scope
+    (``tests/conftest.py`` / ``coord/db.py``) and there is no confirmed
+    evidence it contributes to the reported count -- but if a post-merge
+    ``main`` ``Tests`` run still shows a nonzero
+    ``ProductionDatabaseGuardError`` count after this change, that is the
+    next place to look.
     """
 
     def __getattr__(self, name: str) -> Any:
