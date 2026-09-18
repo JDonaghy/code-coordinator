@@ -2465,7 +2465,10 @@ class TestUatStateAndReasonColumns:
 # #3357 bumped this to (18, 96): `assignments.test_confirmation` —
 # machine-readable provenance for a `test_state` write (confirmed by a real
 # out-of-band re-run, or merely carried forward from the worker's claim).
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (18, 96)
+# #3384 bumped this to (19, 97): `issues.state_reason` — GitHub's own witness
+# that an issue was explicitly reopened, distinguishing that from an issue
+# that merged without ever auto-closing.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (19, 97)
 
 
 class TestMigrateAddColumnsVersionGuard:

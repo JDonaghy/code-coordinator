@@ -2553,6 +2553,69 @@ class TestCachedOpenIssues:
         ]
 
 
+class TestUpsertOpenIssuesStateReason:
+    """#3384: `_upsert_open_issues_local` persists GitHub's `stateReason` so
+    `coord.drive_queue.IssueFacts.reopened` has something to read — see
+    `coord.github_ops.get_open_issues`'s ``--json stateReason`` field."""
+
+    def test_reopened_state_reason_is_persisted_lowercased(self, coord_db) -> None:
+        from coord.state import upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1,
+                    "title": "t",
+                    "body": "",
+                    "labels": [],
+                    "stateReason": "REOPENED",
+                }
+            ],
+        )
+        row = coord_db.execute(
+            "SELECT state_reason FROM issues WHERE repo_name = ? AND number = ?",
+            ("api", 1),
+        ).fetchone()
+        assert row["state_reason"] == "reopened"
+
+    def test_absent_state_reason_persists_as_empty_string(self, coord_db) -> None:
+        from coord.state import upsert_open_issues
+
+        upsert_open_issues(
+            "api", [{"number": 1, "title": "t", "body": "", "labels": []}]
+        )
+        row = coord_db.execute(
+            "SELECT state_reason FROM issues WHERE repo_name = ? AND number = ?",
+            ("api", 1),
+        ).fetchone()
+        assert row["state_reason"] == ""
+
+    def test_a_second_sync_without_state_reason_clears_a_stale_reopened_flag(
+        self, coord_db
+    ) -> None:
+        """A row's `state_reason` must track the LATEST sync, not stick at
+        whatever the first sync happened to see — otherwise an issue that was
+        reopened and then re-closed-and-reopened-without-a-reason (or simply
+        re-synced after GitHub's own reason cleared) would read `reopened`
+        forever."""
+        from coord.state import upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [{"number": 1, "title": "t", "body": "", "labels": [],
+              "stateReason": "reopened"}],
+        )
+        upsert_open_issues(
+            "api", [{"number": 1, "title": "t", "body": "", "labels": []}]
+        )
+        row = coord_db.execute(
+            "SELECT state_reason FROM issues WHERE repo_name = ? AND number = ?",
+            ("api", 1),
+        ).fetchone()
+        assert row["state_reason"] == ""
+
+
 class TestTestVerdictStalenessAnchor:
     """#1479: `record_test_verdict` best-effort captures test_head_sha /
     test_patch_id / test_base_sha alongside a terminal (passed/skipped)

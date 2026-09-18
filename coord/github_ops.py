@@ -701,6 +701,13 @@ def get_open_issues(repo: str, *, force_through_backoff: bool = False) -> list[d
     _sync_issues_tick`` once ``coord.issues_sync_status.is_starved(repo)``
     says this repo has gone too long without a successful sync — see
     :func:`coord.github_ops._gh`'s docstring for what it actually changes.
+
+    #3384: ``stateReason`` is requested alongside the rest — GitHub sets it
+    to ``"reopened"`` on an issue a human explicitly reopened via ``gh issue
+    reopen`` (and leaves it ``null`` for an issue that has simply never been
+    closed). ``coord.state._upsert_open_issues_local`` persists it so
+    ``coord.drive_queue.IssueFacts.landed`` can refuse to treat a reopened
+    issue as done on the strength of a stale merge record.
     """
     # #658: raised from 100 → 500 so repos with many open issues don't silently
     # skip old issue numbers during coord sync.  GitHub paginates the REST list
@@ -708,7 +715,7 @@ def get_open_issues(repo: str, *, force_through_backoff: bool = False) -> list[d
     # repo — acceptable for a background sync.
     return _gh_json(
         "issue", "list", "--repo", repo, "--state", "open",
-        "--json", "number,title,labels,milestone,body,assignees",
+        "--json", "number,title,labels,milestone,body,assignees,stateReason",
         "--limit", "500",
         default=[],
         force_through_backoff=force_through_backoff, caller="github_ops.get_open_issues")

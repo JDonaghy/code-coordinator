@@ -1194,6 +1194,19 @@ class IssueFacts:
     # see `issue_cache_stale` for the ONE thing this changes.
     issue_synced_at: float | None = None
     merged: bool = False  # a work-like assignment with status == 'merged'
+    # #3384: GitHub's own witness that a human explicitly reopened this
+    # issue (`stateReason == "reopened"` off `gh issue list`/`get_open_
+    # issues`) — `False` for an issue that has simply never been closed.
+    # `merged` above is a permanent historical record: once any work-like
+    # assignment for this issue reaches `status == "merged"` it never
+    # un-merges, even after the issue is reopened for incomplete work
+    # (claude-coordinator#3384 — a PR merged with its goal unmet, reopened,
+    # and a freshly re-queued entry still short-circuited straight to
+    # `done` on the strength of that stale record). `reopened` is what lets
+    # `landed` below tell that apart from quadraui-style repos whose merged
+    # PRs never auto-close the linked issue at all — both otherwise read
+    # identically as `merged=True, issue_state="open"`.
+    reopened: bool = False
     active_work: bool = False  # a NON-terminal work-like assignment
     # #3239: a work-like assignment with status == 'done' — completed
     # successfully but not yet merged (still owed Test/Review/Merge). Unlike
@@ -1315,8 +1328,25 @@ class IssueFacts:
         rows the merge projection can miss, and quadraui-style repos can merge
         a PR into ``develop`` while the linked issue stays open — so neither
         signal alone is reliable.
+
+        #3384: `reopened` is the one override neither of those signals sees.
+        `closed` wins outright whenever it is true — a merge that legitimately
+        re-closed a reopened issue is done, full stop. But when the issue is
+        currently OPEN and carries GitHub's own "a human explicitly reopened
+        this" witness, a bare `merged` reading must NOT count: it is provably
+        stale — the very act of reopening is an operator's statement that an
+        earlier merge did not finish the work, and trusting the merge record
+        over it is claude-coordinator#3380's incident replayed (a PR merged
+        with its goal unmet, reopened, and every entry gated `--after` it
+        released anyway). An issue that has simply never closed (the
+        quadraui case above) never sets `reopened`, so this changes nothing
+        for it.
         """
-        return self.merged or self.closed
+        if self.closed:
+            return True
+        if self.reopened:
+            return False
+        return self.merged
 
 
 def _issue_cache_stale(facts: IssueFacts, now: float | None) -> bool:
@@ -1435,6 +1465,10 @@ def build_board_view(
         synced_at = row.get("synced_at")
         if isinstance(synced_at, (int, float)):
             entry["issue_synced_at"] = float(synced_at)
+        # #3384: GitHub's own witness that this issue was explicitly
+        # reopened — see `IssueFacts.reopened`'s docstring for why `merged`
+        # alone cannot be trusted once this is set.
+        entry["reopened"] = str(row.get("state_reason") or "").lower() == "reopened"
 
     # #1891: `merge_ci_pending` — mirrors `drive_state._merge_entry`'s OWN
     # reason resolution exactly (live `merge_plan` reason, falling back to

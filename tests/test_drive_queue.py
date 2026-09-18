@@ -112,6 +112,7 @@ def board(
     merged: tuple[int, ...] = (),
     closed: tuple[int, ...] = (),
     open_: tuple[int, ...] = (),
+    reopened: tuple[int, ...] = (),
     active: tuple[int, ...] = (),
     sessions: tuple[int, ...] = (),
     ci_pending: tuple[int, ...] = (),
@@ -120,14 +121,18 @@ def board(
 ) -> BoardView:
     facts: dict[str, IssueFacts] = {}
     for issue in {
-        *merged, *closed, *open_, *active, *ci_pending, *ci_pending_live, *ci_absent,
+        *merged, *closed, *open_, *reopened, *active,
+        *ci_pending, *ci_pending_live, *ci_absent,
     }:
         facts[entry_key(REPO, issue)] = IssueFacts(
             known=True,
             issue_state=(
-                "closed" if issue in closed else ("open" if issue in open_ else "")
+                "closed" if issue in closed else ("open" if issue in open_ or issue in reopened else "")
             ),
             merged=issue in merged,
+            # #3384: GitHub's own witness that a human explicitly reopened
+            # this issue — see `IssueFacts.reopened`.
+            reopened=issue in reopened,
             active_work=issue in active,
             # #1891: the board's current read of this issue's merge gate —
             # nothing stronger than "CI checks have not reported yet".
@@ -158,6 +163,37 @@ def board(
         issues=facts,
         live_sessions=frozenset(entry_key(REPO, i) for i in sessions),
     )
+
+
+# ── IssueFacts.landed / #3384's reopened override ───────────────────────────
+
+
+def test_landed_is_false_for_a_bare_merged_witness_on_a_reopened_issue():
+    facts = IssueFacts(known=True, issue_state="open", merged=True, reopened=True)
+    assert not facts.landed
+
+
+def test_landed_is_true_for_a_merged_issue_that_simply_never_closed():
+    # The quadraui case #611 exists for: `reopened` is never set for an
+    # issue that has never been closed, so a bare `merged` witness still
+    # counts.
+    facts = IssueFacts(known=True, issue_state="open", merged=True, reopened=False)
+    assert facts.landed
+
+
+def test_landed_prefers_closed_over_a_stale_reopened_flag():
+    # `closed` wins outright, even over a (stale, or defensively-set)
+    # `reopened` reading — a merge that legitimately re-closes a reopened
+    # issue is still done.
+    facts = IssueFacts(
+        known=True, issue_state="closed", merged=True, reopened=True,
+    )
+    assert facts.landed
+
+
+def test_reopened_alone_with_no_merge_record_is_still_not_landed():
+    facts = IssueFacts(known=True, issue_state="open", reopened=True)
+    assert not facts.landed
 
 
 # ── keys and --after parsing ─────────────────────────────────────────────────
@@ -1548,6 +1584,49 @@ def test_a_waiting_entry_whose_work_merged_but_issue_still_open_also_reconciles(
     reconcile = plan.reconciles[0]
     assert reconcile.updates["state"] == STATE_DONE
     assert "merged" in reconcile.reason
+
+
+# ── plan_tick: a reopened issue's stale `merged` witness (#3384) ────────────
+#
+# claude-coordinator#3384: a PR merged with its goal unmet, the issue was
+# reopened (`gh issue reopen`), and a freshly re-queued entry still
+# short-circuited straight to `done` on the strength of the stale `merged`
+# record — silently skipping the work AND releasing every entry gated
+# `--after` it. These pin the fix: `IssueFacts.reopened` (GitHub's own
+# `stateReason == "reopened"` witness) overrides a bare `merged` reading,
+# but never a `closed` one — a merge that legitimately re-closes a reopened
+# issue is still done.
+
+
+def test_a_reopened_issues_stale_merged_witness_does_not_reconcile_to_done():
+    entries = [entry(3380)]
+    plan = plan_tick(entries, board(merged=(3380,), reopened=(3380,)), capacity=1)
+    assert plan.reconciles == ()
+    assert plan.launch is not None and plan.launch.issue == 3380
+
+
+def test_a_reopened_but_since_reclosed_issue_still_reconciles_to_done():
+    # `closed` wins outright — reopening does not permanently poison an
+    # issue that later legitimately closes again.
+    entries = [entry(3380)]
+    plan = plan_tick(entries, board(merged=(3380,), closed=(3380,)), capacity=1)
+    assert [r.outcome for r in plan.reconciles] == ["done"]
+
+
+def test_a_reopened_prereq_does_not_release_its_dependent():
+    # The other half of #3384: every entry gated `--after` the reopened
+    # issue must stay shut, not be released by its stale `merged` witness.
+    entries = [
+        entry(3380, position=0, after=()),
+        entry(3383, position=1, after=(entry_key(REPO, 3380),)),
+    ]
+    plan = plan_tick(
+        entries, board(merged=(3380,), reopened=(3380,)), capacity=2
+    )
+    assert plan.launch is not None and plan.launch.issue == 3380
+    assert plan.blocked == ()
+    outcomes = {r.key: r.outcome for r in plan.reconciles}
+    assert entry_key(REPO, 3383) not in outcomes
 
 
 def test_a_landed_waiting_entry_does_not_consume_an_attempt():
@@ -3974,6 +4053,18 @@ def test_a_blocked_entry_that_closed_without_merging_also_reconciles_to_done():
     reconcile = plan.reconciles[0]
     assert reconcile.outcome == "done"
     assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_a_blocked_entrys_reopened_issue_is_not_resurrected_to_done():
+    # #3384: the same reopened override applies here — a `blocked` entry
+    # whose issue merged and was later reopened for incomplete work must
+    # NOT be waved through to `done` on the stale `merged` record.
+    entries = [entry(3380, position=3, state=STATE_BLOCKED, attempts=2)]
+    plan = plan_tick(
+        entries, board(merged=(3380,), reopened=(3380,)), capacity=1
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
 
 
 def test_a_still_blocked_entry_is_left_untouched_not_resumed_to_waiting():

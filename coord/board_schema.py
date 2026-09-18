@@ -245,6 +245,10 @@ class BoardIssue:
     synced_at: float | None = None
     milestone_number: int | None = None
     milestone_title: str | None = None
+    # #3384: GitHub's own `stateReason` — `"reopened"` when a human explicitly
+    # reopened this issue via `gh issue reopen`, `""` for an issue that has
+    # never been closed. See `coord.drive_queue.IssueFacts.reopened`.
+    state_reason: str = ""
 
 
 @dataclasses.dataclass(kw_only=True)

@@ -2532,6 +2532,18 @@ class TestGhJsonHelper:
         with patch("coord.github_ops._gh", return_value=""):
             assert github_ops.get_open_issues("acme/api") == []
 
+    def test_get_open_issues_requests_state_reason(self) -> None:
+        """#3384: `coord.drive_queue.IssueFacts.reopened` needs GitHub's own
+        `stateReason` ("reopened" when a human explicitly reopened a closed
+        issue) to tell that apart from an issue that has simply never
+        closed — without it in this fetch, the field never reaches the
+        local `issues` cache at all."""
+        with patch("coord.github_ops._gh", return_value="[]") as mock_gh:
+            github_ops.get_open_issues("acme/api")
+        args = mock_gh.call_args.args
+        json_index = args.index("--json")
+        assert "stateReason" in args[json_index + 1].split(",")
+
     def test_get_pr_size_degrades_to_zero_on_empty_stdout(self) -> None:
         """Regression: another explicitly-named unguarded site (#1353)."""
         with patch("coord.github_ops._gh", return_value=""):

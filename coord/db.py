@@ -1049,7 +1049,16 @@ def retry_on_locked(
 # ("confirmed"/"unconfirmed"/"refuted"/"baseline_red") for a `test_state`
 # write, alongside `coord.state._record_test_verdict_local`. See
 # coord.models.Assignment.test_confirmation.
-_DB_SCHEMA_VERSION = 18
+#
+# #3384: bumped 18 -> 19 for the new `issues.state_reason` column appended
+# to `_migrate_add_columns` below — carries GitHub's own `stateReason`
+# (`"reopened"` when a human explicitly reopened a closed issue) so
+# `coord.drive_queue.IssueFacts.reopened`/`.landed` can tell "this issue was
+# reopened for incomplete work" apart from "this issue never closed in the
+# first place" (a quadraui-style merge into a non-default branch) — both
+# read identically as `merged=True, issue_state="open"` otherwise. See
+# `coord.drive_queue.IssueFacts.landed`'s docstring.
+_DB_SCHEMA_VERSION = 19
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -2490,6 +2499,17 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # See coord.models.Assignment.test_confirmation and
     # coord.confirm_test.TEST_CONFIRMATION_VALUES for the exhaustive set.
     "ALTER TABLE assignments ADD COLUMN test_confirmation TEXT",
+    # #3384: GitHub's own `stateReason` for this issue — `''`/NULL for every
+    # row predating this migration and for an issue that has never closed,
+    # `"reopened"` (lowercased on write — see
+    # `coord.state._upsert_open_issues_local`) when a human explicitly
+    # reopened a previously-closed issue via `gh issue reopen`. This is the
+    # ONLY witness that lets `coord.drive_queue.IssueFacts.landed` tell a
+    # genuine reopen (the work is NOT done, no matter what an earlier PR
+    # merge recorded) apart from a quadraui-style repo whose merged PRs never
+    # auto-close the linked issue at all — both look identical as
+    # `merged=True, issue_state="open"` without it.
+    "ALTER TABLE issues ADD COLUMN state_reason TEXT NOT NULL DEFAULT ''",
 ]
 
 

@@ -2815,13 +2815,21 @@ def _local_issue_rows() -> list[dict]:
 
     Fail-soft: an unreadable/absent table degrades to ``[]``, which puts the
     daemon host back on the assignment-only signals rather than aborting.
+
+    #3384: ``state_reason`` selected alongside ``state`` — this IS the
+    ``coord drive-queue tick`` daemon-host path, so without it
+    ``coord.drive_queue.IssueFacts.reopened`` would never populate on the
+    one host that actually ticks the queue, and a reopened issue's stale
+    ``merged`` witness would keep short-circuiting entries straight to
+    ``done`` there regardless of the fix in ``build_board_view``.
     """
     from coord import sql  # noqa: PLC0415
     from coord.db import get_connection  # noqa: PLC0415
 
     try:
         rows = sql.execute(
-            get_connection(), "SELECT repo_name, number, state FROM issues"
+            get_connection(),
+            "SELECT repo_name, number, state, state_reason FROM issues",
         ).fetchall()
     except Exception:  # noqa: BLE001 — see the fail-soft note above
         return []
