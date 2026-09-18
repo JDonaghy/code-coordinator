@@ -834,14 +834,33 @@ def diagnose_stage(
     return res
 
 
-# #3383: a claim taken by `claim_review_dispatch` microseconds before its
-# caller inserts the review row it's claiming for looks, from a single read,
+# #3383: a claim taken by `claim_review_dispatch` shortly before its caller
+# inserts the review row it's claiming for looks, from a single read,
 # identical to a genuinely leaked claim — the same false-positive window
 # `_recover_review` below already documents for the terminal-row case
 # (#3206). Below this age the claim is reported but NOT offered for release;
-# above it, treated as leaked. Short on purpose: `dispatch_review` claims and
-# inserts its row in the same request, not across a network round trip.
-_REVIEW_CLAIM_LEAK_GRACE_SECS = 30.0
+# above it, treated as leaked.
+#
+# NOT short on purpose — `dispatch_review` (coord/review.py) claims at
+# `claim_review_dispatch` (~line 3070) and does NOT insert the review's
+# `assignments` row until `record_dispatched_assignment` (~line 3763); its
+# own `except Exception` handler at ~line 3815 calls the ~500 lines between
+# those two points "pr_lookup, briefing assembly, JSON handling of
+# agent_response, ...". That gap includes several sequential GitHub API
+# calls (`work_is_terminal`, `branch_commits_ahead`, `pr_lookup`,
+# `branch_exists_on_remote`, `pr_diff`, `get_compare_files`,
+# `get_compare_diff`, `get_pr_commit_messages`, an issue-body fetch) and then
+# a candidate loop that POSTs to each reviewer machine's `/assign` with
+# `timeout=ASSIGN_POST_TIMEOUT_SECS` (`coord/dispatch.py` — 60.0s),
+# falling through to the next candidate on rejection/timeout/unreachability.
+# A single slow/unreachable first-choice reviewer machine alone can burn the
+# full 60s before a second candidate is even tried, and there is no hard cap
+# on candidate count — so this has to clear that whole chain, not one
+# network round trip. Picked as a small multiple of minutes so it
+# comfortably outlasts a worst-case multi-candidate dispatch plus GitHub API
+# latency, while still being short enough that a *genuinely* leaked claim
+# doesn't sit unrecoverable for long once someone runs `--reset`.
+_REVIEW_CLAIM_LEAK_GRACE_SECS = 600.0
 
 
 def _leaked_review_claim_without_row(
@@ -884,6 +903,18 @@ def _leaked_review_claim_without_row(
         review_claim_age_secs,
     )
 
+    # Narrowing, acknowledged: this only checks the NEWEST `work`-type row
+    # for the issue, whereas `claim_review_dispatch` is keyed on whatever
+    # work-assignment id `dispatch_review` was actually called with. If the
+    # issue ever accumulates more than one `work` row (e.g. a rework/retry
+    # dispatched after the original work assignment that leaked the claim),
+    # a claim held on the *older* id is invisible here because this checks
+    # only the *newest* one. `_recover_review` avoids this by reading the
+    # exact id off the review row's own `review_of_assignment_id` FK — there
+    # is no review row here to read that FK from, so this has to guess.
+    # Probably rare, and the issue's own "worth also considering" `coord
+    # doctor` suggestion is the more complete fix; left as a known gap
+    # rather than iterating over every `work` row here.
     work_rows = stage_assignments(board, repo_name, issue_number, "work")
     work_latest = _latest(work_rows)
     if work_latest is None or not work_latest.assignment_id:
@@ -939,6 +970,15 @@ def _leaked_review_claim_without_row(
             res.reset_performed = True
             res.recovered = True
             res.branch_preserved = True
+            # Matches `_do_reset`'s (#3206) convention: a successful release
+            # must clear the `needs_reset=True` set a few lines above, or
+            # `to_json_dict()` — documented as read by the TUI without
+            # scraping human-readable lines — carries the internally
+            # contradictory `recovered=true needs_reset=true
+            # reset_performed=true` even though the plain-text CLI's "still
+            # wedged" warning happens to be gated on `not reset` and so never
+            # shows it.
+            res.needs_reset = False
     return True
 
 

@@ -1468,6 +1468,47 @@ def test_reset_review_releases_leaked_claim_with_no_review_rows(
     assert state.claim_review_dispatch("w1") is True
 
 
+def test_reset_review_reports_leaked_claim_delete_failure_when_row_survives(
+    monkeypatch, config, coord_db
+) -> None:
+    """#3383 non-blocking review gap: `_leaked_review_claim_without_row`'s
+    own release path has the same "trust the write, not a re-read" risk that
+    `_do_reset`'s analogous #3206 terminal-row path already guards against
+    (see `test_reset_review_reports_delete_failure_when_row_survives`
+    above) — but nothing exercised it for this no-review-row shape. Simulate
+    `release_review_dispatch_claim` reporting success while the claim is
+    still present on re-read (mirrors the coord-tui#49 non-persisting write)
+    and assert the action line is honest about it rather than claiming the
+    claim is gone."""
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="dispatched",
+        dispatched_at=100.0,
+    ))
+    assert state.claim_review_dispatch("w1") is True
+    _backdate_review_claim("w1", seconds_ago=3600.0)
+
+    # Simulate a release call that reports success but never actually
+    # removes the row — `has_review_claim` still finds it on re-read.
+    monkeypatch.setattr(state, "release_review_dispatch_claim", lambda *a, **k: None)
+
+    board = Board(completed=[_assign(aid="w1", typ="work", status="done", dispatched_at=100.0)])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is False
+    assert res.recovered is False
+    assert res.needs_reset is True
+    assert any(
+        "did NOT persist" in f
+        for f in res.findings
+    )
+    # Still held — the release never actually took.
+    assert state.claim_review_dispatch("w1") is False
+
+
 def test_diagnose_review_fresh_claim_without_row_not_treated_as_leaked(
     monkeypatch, config, coord_db
 ) -> None:
