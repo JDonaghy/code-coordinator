@@ -666,31 +666,10 @@ def rollback_after_driver_error(conn: Any | None, exc: BaseException) -> None:
         pass
 
 
-def open_savepoint(conn: Any, name: str) -> None:
-    """Issue ``SAVEPOINT`` *name* on *conn* — the paired opener for
-    :func:`rollback_pending_write` (#3382 review).
-
-    Goes through ``sql.execute`` (``conn.cursor().execute(...)``), the same
-    PEP 249 cursor-level seam every other statement in this tree uses --
-    **not** ``conn.execute()`` -- for the reason :func:`coord.sql.execute`'s
-    own docstring gives: not every driver (or test double standing in for
-    one, e.g. this module's own test suite's commit-failure wrappers)
-    implements the connection-level convenience shortcut.
-
-    Deliberately does **not** catch anything: if the SAVEPOINT statement
-    itself fails (e.g. hits contention acquiring the lock a write needs),
-    nothing of the caller's own has been applied yet — the same "a failed
-    STATEMENT applies nothing" reasoning :func:`rollback_after_driver_error`
-    already documents -- so there is nothing to roll back, and the caller's
-    own ``except sql.driver_errors():`` was never entered (this call sits
-    outside the ``try:``) to invoke :func:`rollback_pending_write` for it.
-    """
-    sql.execute(conn, f"SAVEPOINT {name}")
-
-
-def rollback_pending_write(conn: Any | None, exc: BaseException, *, savepoint: str) -> None:
-    """Undo *savepoint*'s own changes on *conn* after *exc* — the #3382
-    sibling of :func:`rollback_after_driver_error` for a writer whose own
+def undo_pending_write(conn: Any | None, exc: BaseException, *, undo: Callable[[], Any]) -> None:
+    """Run *undo* — a compensating statement touching only THIS write's own
+    row — after *exc*, the #3382 sibling of
+    :func:`rollback_after_driver_error` for a writer whose own
     ``conn.commit()`` call, not just the statement before it, can raise.
 
     :func:`rollback_after_driver_error` deliberately no-ops for a plain
@@ -720,78 +699,92 @@ def rollback_pending_write(conn: Any | None, exc: BaseException, *, savepoint: s
     claim" about a claim only this process's own earlier, abandoned attempt
     took.
 
-    **Why a SAVEPOINT, not a bare ``conn.rollback()`` (#3382 review).** An
-    earlier version of this function called ``conn.rollback()``
-    unconditionally. On ``coord.db``'s shared, process-wide SQLite
-    singleton (see this module's own docstring), that is not safe: the
-    connection is reused by every OTHER ``_*_local`` writer this process
-    dispatches through ``run_in_threadpool`` on a real OS worker thread
-    (the daemon's own periodic tick loop, ``/board`` build, ``/assignment/*``
-    handlers), and Python's ``sqlite3`` module joins ANY thread's statement
-    issued on this one connection between commits into the SAME open
-    transaction, regardless of which thread issued it. A bare
-    ``conn.rollback()`` while this write's own statement sits pending does
-    not just undo THIS write — it discards *every* other thread's own
-    not-yet-committed statement too, so an unrelated writer that already
-    got a "success" back from ``sql.execute``/``sql.insert_ignore`` (nothing
-    in this tree commits internally — see ``coord/sql.py``) silently loses
-    it the moment its own later ``conn.commit()`` either no-ops or raises
-    ``cannot commit - no transaction is active``. That is a *new* failure
-    mode this function must not introduce: every other writer in this file
-    relies on :func:`rollback_after_driver_error`'s SQLite no-op precisely
-    so "no SQLite caller can lose uncommitted work it expected to survive
-    into the next statement" stays true.
+    **Why a compensating statement, and not a transaction-level undo of any
+    kind (#3382 review rounds 1 and 2).** Two earlier shapes of this
+    function were both rejected, for the same underlying reason:
 
-    A ``SAVEPOINT`` taken by :func:`open_savepoint` immediately before this
-    write's own statement scopes the undo to exactly what happened *after*
-    that savepoint: ``ROLLBACK TO SAVEPOINT`` only reverts changes made
-    since it was established, leaving anything already pending on the
-    connection from before it — another thread's own still-open statement —
-    untouched, still queued for whichever writer's ``commit()`` reaches it
-    next, exactly as before this issue. ``RELEASE SAVEPOINT`` afterwards
-    drops the now-empty savepoint marker without touching the (possibly
-    still non-empty) surrounding transaction. Verified against a real
-    ``sqlite3`` connection (Python 3.12, SQLite 3.45): issuing ``SAVEPOINT``
-    while another statement is already pending does not implicitly commit
-    it (SQLite's implicit-BEGIN-before-DML / implicit-commit-before-
-    non-DML/DQL heuristic does not fire for an explicit ``SAVEPOINT``/
-    ``RELEASE``/``ROLLBACK TO`` statement), and a subsequent ``commit()`` by
-    the connection's next writer durably persists that earlier pending
-    statement exactly as if this rollback had never run.
+    * ``conn.rollback()`` (round 1). On ``coord.db``'s shared, process-wide
+      SQLite singleton (see this module's own docstring), that discards
+      *every* other thread's not-yet-committed statement too — this process
+      dispatches other ``_*_local`` writers through ``run_in_threadpool`` on
+      real OS worker threads (the daemon's periodic tick, the ``/board``
+      build, ``/assignment/*`` handlers), and Python's ``sqlite3`` joins ANY
+      thread's statement issued on this one connection between commits into
+      the SAME open transaction. An unrelated writer that already got
+      ``sql.execute``/``sql.insert_ignore``'s success back (nothing in this
+      tree commits internally — see ``coord/sql.py``) then silently loses it
+      when its own later ``conn.commit()`` no-ops or raises ``cannot commit
+      - no transaction is active`` — this issue's own second logged symptom.
+
+    * ``SAVEPOINT`` + ``ROLLBACK TO SAVEPOINT`` (round 2), whether the
+      savepoint name is a shared literal or made unique per call. Unique
+      names fix only the narrower half of the problem (two concurrent calls
+      resolving each other's marker, since SQLite binds a name to the most
+      recently established savepoint of that name). They do **not** fix the
+      half that matters: ``ROLLBACK TO SAVEPOINT`` reverts the database to
+      its state *just after that savepoint was established*, so it undoes
+      every statement issued since — including another thread's, which this
+      writer has no business undoing — and destroys that thread's own
+      savepoints along the way. Verified against a real ``sqlite3``
+      connection (Python 3.12, SQLite 3.45): with two distinctly-named
+      savepoints opened back to back and one row inserted after each,
+      ``ROLLBACK TO`` the OUTER (uniquely-named) savepoint removes BOTH
+      rows. A transaction-scoped undo simply cannot express "mine only" on a
+      connection several threads write through.
+
+    So the undo is row-scoped instead: *undo* issues one statement that
+    names this write's own row and nothing else (delete the row this call
+    inserted, identified by its own ``claimed_at`` stamp; re-insert the row
+    this call deleted, with the ``claimed_at`` it read back first). It is
+    exact regardless of how other threads' statements interleave with this
+    one — before the failure or after it — because it never refers to their
+    rows.
+
+    It also degrades better than a transaction-level undo when an unrelated
+    thread's ``commit()`` lands *between* this write's statement and this
+    recovery: a savepoint would already have been destroyed by that commit
+    (``COMMIT`` releases all savepoints), leaving ``ROLLBACK TO`` to fail
+    and this write's row durably committed and leaked — precisely the
+    incident. The compensating statement instead stays pending and is
+    flushed by whichever ``commit()`` reaches it next (this closure's own
+    retry, or another writer's), so the net effect on this row is still
+    nothing.
 
     Call this from the ``except sql.driver_errors():`` block of a write
     closure that both executes a statement *and* calls ``conn.commit()``
-    itself, having opened *savepoint* via :func:`open_savepoint` as the
-    first thing inside the ``try:`` — today, the ``review_claims``/
-    ``smoke_claims`` claim and release writes in ``coord/state.py``
-    (#3113/#3333), the two sites where "did this claim land" is an
-    exclusive-ownership decision the rest of the system relies on, unlike
-    most of this module's writers where a duplicate-on-retry UPDATE/DELETE
-    is harmless. Unlike :func:`rollback_after_driver_error`, this does not
-    inspect *exc* for a SQLSTATE: the plain-SQLite case above is exactly
-    what it exists to cover, and on Postgres — where :func:`get_connection`
-    already hands each THREAD its own connection (see this module's
-    docstring), so no other thread's statement can ever be sitting on it —
-    a savepoint-scoped rollback undoes the identical, single write a bare
-    ``conn.rollback()`` would have, on top of whatever
-    ``retry_on_locked``'s own :func:`rollback_after_driver_error` call
-    already did, which is a harmless no-op.
+    itself, and **only when that closure's own statement actually applied**
+    (``cursor.rowcount``) — a statement that failed applied nothing, so
+    there is nothing to compensate, the same "a failed STATEMENT applies
+    nothing" reasoning :func:`rollback_after_driver_error` already
+    documents. Today's callers are the ``review_claims``/``smoke_claims``
+    claim and release writes in ``coord/state.py`` (#3113/#3333), the two
+    sites where "did this claim land" is an exclusive-ownership decision the
+    rest of the system relies on, unlike most of this module's writers where
+    a duplicate-on-retry UPDATE/DELETE is harmless.
+
+    Unlike :func:`rollback_after_driver_error`, this does not inspect *exc*
+    for a SQLSTATE: the plain-SQLite case above is exactly what it exists to
+    cover. On Postgres it is a harmless no-op in practice — a failed
+    ``COMMIT`` there aborts the whole transaction (so *undo* raises
+    ``InFailedSqlTransaction``, suppressed below) and
+    :func:`retry_on_locked`'s own :func:`rollback_after_driver_error` call
+    has already undone this write for real; ``get_connection()`` also hands
+    each THREAD its own connection there (see this module's docstring), so
+    no other thread's statement was ever at risk.
 
     Same suppression rule as :func:`rollback_after_driver_error`: a ``None``
-    *conn* is a no-op, and a failure of the rollback itself is swallowed so
-    it never masks *exc*, the exception actually worth seeing. If the
-    ``ROLLBACK TO SAVEPOINT``/``RELEASE SAVEPOINT`` pair itself cannot run
-    (sustained contention outlasting even this), *savepoint* is left open on
-    the connection for the next writer's own eventual commit/rollback to
-    resolve — the same residual, already-accepted risk
-    :func:`rollback_after_driver_error`'s own suppressed-failure path
-    carries today, not a new one.
+    *conn* is a no-op, and a failure of *undo* itself is swallowed so it
+    never masks *exc*, the exception actually worth seeing. If the
+    compensating statement cannot run either (sustained contention
+    outlasting even this), this write's own row is left pending for the next
+    writer's eventual commit/rollback to resolve — the same residual,
+    already-accepted risk :func:`rollback_after_driver_error`'s own
+    suppressed-failure path carries today, not a new one.
     """
     if conn is None:
         return
     try:
-        sql.execute(conn, f"ROLLBACK TO SAVEPOINT {savepoint}")
-        sql.execute(conn, f"RELEASE SAVEPOINT {savepoint}")
+        undo()
     except Exception:  # noqa: BLE001 — never mask the caught driver error
         pass
 

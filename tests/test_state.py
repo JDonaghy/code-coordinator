@@ -4563,11 +4563,11 @@ class TestReviewDispatchClaim:
 
 class TestReviewDispatchClaimLockContention:
     """#3382: `_claim_review_dispatch_local` had neither `retry_on_locked`
-    nor a rollback. Unlike a plain failed statement (SQLite's SQLITE_BUSY,
+    nor any undo. Unlike a plain failed statement (SQLite's SQLITE_BUSY,
     hit while acquiring the lock a write needs, applies nothing), a
     `conn.commit()` failure here happens AFTER the `INSERT OR IGNORE`
     already applied inside the still-open transaction — WAL-checkpoint
-    contention can make COMMIT itself raise. With no rollback, that
+    contention can make COMMIT itself raise. With no undo, that
     just-applied insert sat pending on the shared, process-wide connection
     until a completely unrelated handler's next unrelated `commit()` swept
     it up — two `coord review` callers each saw their own `/review-claim`
@@ -4582,10 +4582,19 @@ class TestReviewDispatchClaimLockContention:
         fails at `execute()` instead, simulating a statement that never got
         to write anything — a different, already-handled shape.
 
+        *during_first_failed_commit* is run once, just before the first
+        `commit()` raises: SQLite's COMMIT blocks for up to `busy_timeout`
+        (5s in production) before reporting SQLITE_BUSY, and this shared
+        connection is one every other `_*_local` writer dispatched through
+        `run_in_threadpool` also writes through — so another thread's own
+        statement genuinely can land *inside* this write's critical section,
+        not just before it. This hook makes that interleaving deterministic
+        rather than raced: the ordering is the property under test, and a
+        raced version would only sometimes exercise it.
+
         `cursor()` returns a thin tracking proxy (not the real cursor
-        directly) so tests can assert on the exact SAVEPOINT/`ROLLBACK TO
-        SAVEPOINT`/`RELEASE SAVEPOINT` statements #3382's savepoint-scoped
-        `coord.db.rollback_pending_write` issues, the same way
+        directly) so tests can assert on the exact statements #3382's
+        row-scoped `coord.db.undo_pending_write` issues, the same way
         `commit_calls`/`rollback_calls` already let them assert on
         `commit()`/`rollback()`."""
 
@@ -4603,9 +4612,12 @@ class TestReviewDispatchClaimLockContention:
             def __getattr__(self, name):  # noqa: ANN001,ANN204
                 return getattr(self._real_cursor, name)
 
-        def __init__(self, real_conn, fail_times: int) -> None:
+        def __init__(
+            self, real_conn, fail_times: int, during_first_failed_commit=None,  # noqa: ANN001
+        ) -> None:
             self._real = real_conn
             self._fail_times = fail_times
+            self._during_first_failed_commit = during_first_failed_commit
             self.commit_calls = 0
             self.rollback_calls = 0
             self.executed_sql: list[str] = []
@@ -4616,6 +4628,8 @@ class TestReviewDispatchClaimLockContention:
         def commit(self):
             self.commit_calls += 1
             if self.commit_calls <= self._fail_times:
+                if self.commit_calls == 1 and self._during_first_failed_commit is not None:
+                    self._during_first_failed_commit()
                 raise sqlite3.OperationalError("database is locked")
             self._real.commit()
 
@@ -4626,7 +4640,7 @@ class TestReviewDispatchClaimLockContention:
     def test_retries_through_a_commit_failure_then_reports_the_real_winner(
         self, coord_db, monkeypatch,
     ) -> None:
-        """The insert genuinely applied on attempt 1. Without a rollback
+        """The insert genuinely applied on attempt 1. Without an undo
         before the retry, attempt 2's own `INSERT OR IGNORE` sees it as a
         conflict and reports `rowcount == 0` — a caller that actually won
         the claim being told it lost. Pre-fix, this raises immediately
@@ -4637,41 +4651,34 @@ class TestReviewDispatchClaimLockContention:
 
         assert state.claim_review_dispatch("w1") is True
         assert flaky.commit_calls == 2  # one failed commit, one that landed
-        # #3382 review: the recovery is now a SAVEPOINT-scoped undo, not a
-        # whole-connection `conn.rollback()` — `rollback_calls` stays 0 (the
-        # old unconditional-rollback shape this replaces would have been 1),
-        # and the executed SQL shows the savepoint opened once per attempt
-        # plus exactly one `ROLLBACK TO SAVEPOINT`/`RELEASE SAVEPOINT` pair
-        # for the single failed attempt.
+        # #3382 review: the recovery is a row-scoped compensating statement,
+        # not a whole-connection `conn.rollback()` (round 1) and not a
+        # `ROLLBACK TO SAVEPOINT` (round 2) — neither can express "mine
+        # only" on a connection several threads write through. So
+        # `rollback_calls` stays 0, no savepoint statement is issued at all,
+        # and the executed SQL shows exactly one compensating DELETE naming
+        # this write's own row, for the single failed attempt.
         assert flaky.rollback_calls == 0
-        savepoints_opened = [s for s in flaky.executed_sql if s.startswith("SAVEPOINT ")]
-        rollbacks_to_savepoint = [
-            s for s in flaky.executed_sql if s.startswith("ROLLBACK TO SAVEPOINT ")
-        ]
-        releases = [s for s in flaky.executed_sql if s.startswith("RELEASE SAVEPOINT ")]
-        assert len(savepoints_opened) == 2  # one per attempt
-        assert len(rollbacks_to_savepoint) == 1  # only the failed attempt
-        assert len(releases) == 1
+        assert not [s for s in flaky.executed_sql if "SAVEPOINT" in s]
+        undos = [s for s in flaky.executed_sql if s.startswith("DELETE FROM review_claims")]
+        assert len(undos) == 1
+        assert "claimed_at=?" in undos[0]  # scoped to THIS attempt's own stamp
 
     def test_does_not_discard_a_genuinely_concurrent_writers_pending_row(
         self, coord_db, monkeypatch,
     ) -> None:
-        """#3382 review, blocking finding: `coord.db.get_connection()`'s
-        connection is shared with every OTHER `_*_local` writer this
-        process dispatches through `run_in_threadpool` on a real OS worker
-        thread — not just this one. Simulates that: a second writer's own
-        statement lands on the SAME shared connection BEFORE this claim
-        write ever starts, standing in for another thread's own in-flight,
-        not-yet-committed INSERT at the exact moment this write's own
-        `conn.commit()` fails. The earlier unconditional `conn.rollback()`
-        this PR replaced would have discarded that writer's row along with
-        this write's own abandoned insert — a caller who already got
-        `sql.insert_ignore`'s success back would then see their OWN later
-        `conn.commit()` either no-op or raise `cannot commit - no
-        transaction is active` (this issue's own second logged symptom).
-        Fails against a version of `rollback_pending_write` that calls
-        `conn.rollback()` unconditionally instead of scoping to a
-        savepoint."""
+        """#3382 review round 1: `coord.db.get_connection()`'s connection is
+        shared with every OTHER `_*_local` writer this process dispatches
+        through `run_in_threadpool` on a real OS worker thread — not just
+        this one. Simulates that: a second writer's own statement lands on
+        the SAME shared connection BEFORE this claim write ever starts,
+        standing in for another thread's own in-flight, not-yet-committed
+        INSERT at the moment this write's own `conn.commit()` fails. An
+        unconditional `conn.rollback()` would have discarded that writer's
+        row along with this write's own abandoned insert — a caller who
+        already got `sql.insert_ignore`'s success back would then see their
+        OWN later `conn.commit()` either no-op or raise `cannot commit - no
+        transaction is active` (this issue's own second logged symptom)."""
         monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
 
         # A concurrent, unrelated writer's own statement — pending,
@@ -4704,6 +4711,95 @@ class TestReviewDispatchClaimLockContention:
             ).fetchall()
         }
         assert rows == {"concurrent-writer-row"}
+
+    def test_does_not_discard_a_concurrent_writers_row_landing_mid_write(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """#3382 review round 2, blocking finding. The round-1 test above
+        seeds the other writer's statement BEFORE this write's critical
+        section, which a savepoint-scoped undo survives. This one lands it
+        INSIDE that section — while this write's own `commit()` is blocked
+        on `busy_timeout`, which is exactly when another `run_in_threadpool`
+        thread gets to run — and that is the case `ROLLBACK TO SAVEPOINT`
+        cannot handle: it reverts the database to its state just after the
+        savepoint, taking every statement issued since with it, whether the
+        savepoint name is a shared literal or made unique per call.
+
+        Fails against the savepoint-scoped shape this replaces (the
+        concurrent writer's row is silently discarded, and its own caller
+        still gets `{"ok": true}` back)."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        def another_threads_write() -> None:
+            sql.execute(
+                coord_db,
+                "INSERT OR IGNORE INTO review_claims (of_assignment_id, claimed_at) "
+                "VALUES (?, ?)",
+                ("concurrent-writer-row", 2.0),
+            )
+
+        flaky = self._CommitFlakyConn(
+            coord_db, fail_times=999, during_first_failed_commit=another_threads_write
+        )
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.claim_review_dispatch("w1")
+
+        coord_db.commit()
+
+        rows = {
+            r["of_assignment_id"]
+            for r in sql.execute(
+                coord_db, "SELECT of_assignment_id FROM review_claims"
+            ).fetchall()
+        }
+        assert rows == {"concurrent-writer-row"}
+
+    def test_a_failed_release_undoes_only_its_own_row(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """#3382 review round 2, the finding's own worked example, on the
+        path it names as "not hypothetical": two worker machines completing
+        two different review assignments at nearly the same moment each get
+        their own `run_in_threadpool` thread and both reach
+        `_release_review_dispatch_claim_local` for DIFFERENT
+        `of_assignment_id`s.
+
+        Thread A (this call) releases `w-a` and its commit fails; thread B's
+        release of `w-b` lands mid-flight and its own commit follows. B's
+        delete must stand — B never failed and never asked for anything to
+        be undone — while A's must be undone, because A's caller was told
+        (correctly) that its release did not land."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        assert state.claim_review_dispatch("w-a") is True
+        assert state.claim_review_dispatch("w-b") is True
+
+        def thread_b_releases_its_own_claim() -> None:
+            sql.execute(
+                coord_db, "DELETE FROM review_claims WHERE of_assignment_id=?", ("w-b",)
+            )
+
+        flaky = self._CommitFlakyConn(
+            coord_db, fail_times=999,
+            during_first_failed_commit=thread_b_releases_its_own_claim,
+        )
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.release_review_dispatch_claim("w-a")
+
+        coord_db.commit()  # thread B's own commit
+
+        rows = {
+            r["of_assignment_id"]
+            for r in sql.execute(
+                coord_db, "SELECT of_assignment_id FROM review_claims"
+            ).fetchall()
+        }
+        # A's release failed honestly: its claim is still held (and still
+        # releasable later), and B's release is real.
+        assert rows == {"w-a"}
 
     def test_exhausted_retries_leave_no_phantom_row_for_a_later_commit(
         self, coord_db, monkeypatch,
@@ -4975,7 +5071,7 @@ class TestSmokeDispatchClaim:
 
 class TestSmokeDispatchClaimLockContention:
     """#3382: `_claim_smoke_dispatch_local` mirrors `_claim_review_dispatch_local`
-    exactly — including the same missing `retry_on_locked`/rollback before
+    exactly — including the same missing `retry_on_locked`/undo before
     this fix. See `TestReviewDispatchClaimLockContention` for the full
     incident this shape reproduces; this pins the same fix for its sibling
     claim table."""
@@ -5040,6 +5136,84 @@ class TestSmokeDispatchClaimLockContention:
             ).fetchall()
         }
         assert rows == {("concurrent-writer-row", "gtk")}
+
+    def test_does_not_discard_a_concurrent_writers_row_landing_mid_write(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """Smoke-claim sibling of `TestReviewDispatchClaimLockContention.
+        test_does_not_discard_a_concurrent_writers_row_landing_mid_write` —
+        the #3382 round-2 finding: another thread's statement landing INSIDE
+        this write's critical section (while its `commit()` is blocked on
+        `busy_timeout`) is the case no transaction- or savepoint-scoped undo
+        can survive."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        def another_threads_write() -> None:
+            sql.execute(
+                coord_db,
+                "INSERT OR IGNORE INTO smoke_claims "
+                "(work_assignment_id, capability_partition, claimed_at) VALUES (?, ?, ?)",
+                ("concurrent-writer-row", "gtk", 2.0),
+            )
+
+        flaky = TestReviewDispatchClaimLockContention._CommitFlakyConn(
+            coord_db, fail_times=999, during_first_failed_commit=another_threads_write
+        )
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.claim_smoke_dispatch("w1", "macos")
+
+        coord_db.commit()
+
+        rows = {
+            (r["work_assignment_id"], r["capability_partition"])
+            for r in sql.execute(
+                coord_db, "SELECT work_assignment_id, capability_partition FROM smoke_claims"
+            ).fetchall()
+        }
+        assert rows == {("concurrent-writer-row", "gtk")}
+
+    def test_a_failed_release_undoes_only_its_own_row(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """Smoke sibling of `TestReviewDispatchClaimLockContention.
+        test_a_failed_release_undoes_only_its_own_row`: two fan-out legs for
+        the same parent finishing at once (#3182 dispatches one leg per
+        capability partition, so this is the normal shape, not a rare one)
+        each reach `_release_smoke_dispatch_claim_local` on their own
+        `run_in_threadpool` thread. The one whose commit fails must put back
+        only ITS partition's row."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+        assert state.claim_smoke_dispatch("w1", "gtk") is True
+
+        def other_leg_releases_its_own_partition() -> None:
+            sql.execute(
+                coord_db,
+                "DELETE FROM smoke_claims WHERE work_assignment_id=? "
+                "AND capability_partition=?",
+                ("w1", "gtk"),
+            )
+
+        flaky = TestReviewDispatchClaimLockContention._CommitFlakyConn(
+            coord_db, fail_times=999,
+            during_first_failed_commit=other_leg_releases_its_own_partition,
+        )
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.release_smoke_dispatch_claim("w1", "macos")
+
+        coord_db.commit()
+
+        rows = {
+            (r["work_assignment_id"], r["capability_partition"])
+            for r in sql.execute(
+                coord_db, "SELECT work_assignment_id, capability_partition FROM smoke_claims"
+            ).fetchall()
+        }
+        assert rows == {("w1", "macos")}
 
 
 # ── #3333: a smoke fan-out leg's terminal write must release its claim ──────

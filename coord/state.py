@@ -50,10 +50,9 @@ from coord.board_service import route_write as _route_write
 from coord.db import (
     get_connection,
     is_lock_contention_error,
-    open_savepoint,
     retry_on_locked,
     rollback_after_driver_error,
-    rollback_pending_write,
+    undo_pending_write,
 )
 from coord.models import (
     WORK_LIKE_TYPES,
@@ -2357,34 +2356,50 @@ def _claim_review_dispatch_local(of_assignment_id: str) -> bool:
     #3382: wrapped in :func:`coord.db.retry_on_locked`, unlike this
     function's original shape which had no lock-contention handling at all
     — a `database is locked` collision raised straight out to the caller as
-    a 503 with nothing retried. On top of the retry, the write closure opens
-    a ``SAVEPOINT`` via :func:`coord.db.open_savepoint` before its own
-    ``INSERT OR IGNORE`` and, on failure, rolls back only that savepoint via
-    :func:`coord.db.rollback_pending_write` before re-raising — see that
-    function's docstring for why a savepoint-scoped rollback, not a bare
-    ``conn.rollback()``, is required here: a `conn.commit()` failure can
-    leave a just-applied insert pending on the shared connection for a
-    wholly unrelated handler's next commit to durably persist later (the
-    incident this issue reports — a `review_claims` row held by neither of
-    the two calls that raced for it, wedging vimcode#1086's review for
-    ~13.5h), and an unscoped rollback would risk discarding that OTHER
-    handler's own still-pending statement instead of just this one's.
+    a 503 with nothing retried. On top of the retry, when the `INSERT OR
+    IGNORE` applied but the `conn.commit()` after it raised, the closure
+    undoes its own just-inserted row via
+    :func:`coord.db.undo_pending_write` before re-raising — see that
+    function's docstring for why the undo is a compensating statement
+    naming THIS row rather than any transaction-level rollback (neither a
+    bare ``conn.rollback()`` nor ``ROLLBACK TO SAVEPOINT`` can express
+    "mine only" on a connection several threads write through). Without it,
+    a `conn.commit()` failure leaves a just-applied insert pending on the
+    shared connection for a wholly unrelated handler's next commit to
+    durably persist later — the incident this issue reports, a
+    `review_claims` row held by neither of the two calls that raced for it,
+    wedging vimcode#1086's review for ~13.5h.
     """
-    _SAVEPOINT = "coord_review_claim"
 
     def _write() -> int:
         conn = get_connection()
-        open_savepoint(conn, _SAVEPOINT)
+        claimed_at = time.time()
+        inserted = 0
         try:
             cur = sql.insert_ignore(
                 conn, "review_claims", ["of_assignment_id", "claimed_at"],
-                (of_assignment_id, time.time()),
+                (of_assignment_id, claimed_at),
             )
+            inserted = cur.rowcount or 0
             conn.commit()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
-            rollback_pending_write(conn, exc, savepoint=_SAVEPOINT)
+            if inserted:
+                # Only this call's own row: `claimed_at` is the stamp THIS
+                # attempt generated, so a claim another process legitimately
+                # holds (different stamp) is never touched. `inserted == 0`
+                # means the insert either lost the race or never applied at
+                # all — nothing of ours to compensate for.
+                undo_pending_write(
+                    conn, exc,
+                    undo=lambda: sql.execute(
+                        conn,
+                        "DELETE FROM review_claims "
+                        "WHERE of_assignment_id=? AND claimed_at=?",
+                        (of_assignment_id, claimed_at),
+                    ),
+                )
             raise
-        return cur.rowcount or 0
+        return inserted
 
     return retry_on_locked(_write) > 0
 
@@ -2482,28 +2497,42 @@ def _release_review_dispatch_claim_local(of_assignment_id: str) -> None:
     that process is the daemon or a non-thin-client host, and which CAN run
     on a ``run_in_threadpool`` worker thread — #3382 review).
 
-    #3382: same `retry_on_locked` + savepoint-scoped-rollback-on-commit-
-    failure treatment as :func:`_claim_review_dispatch_local` — see that
-    function's docstring and :func:`coord.db.rollback_pending_write`'s for
-    why the rollback is scoped to a ``SAVEPOINT`` rather than a bare
-    ``conn.rollback()``: this write had neither before, and a lock
-    collision here left a stray `DELETE` pending on the shared connection
-    for the same reason the claim write did — an unscoped rollback on
-    recovery would additionally risk discarding a concurrent, unrelated
-    writer's own still-pending statement on that same shared connection.
+    #3382: same `retry_on_locked` + undo-this-row-on-commit-failure
+    treatment as :func:`_claim_review_dispatch_local` — see that function's
+    docstring and :func:`coord.db.undo_pending_write`'s for why the undo is
+    a compensating statement rather than any transaction-level rollback.
+    This write had neither before, and a lock collision here left a stray
+    `DELETE` pending on the shared connection for the same reason the claim
+    write did — so the undo here is the mirror image: put back the ONE row
+    this call deleted, with the `claimed_at` it read back before deleting,
+    leaving every other row (and every other thread's pending statement)
+    exactly as it found them.
     """
-    _SAVEPOINT = "coord_review_claim_release"
 
     def _write() -> None:
         conn = get_connection()
-        open_savepoint(conn, _SAVEPOINT)
+        row = sql.execute(
+            conn,
+            "SELECT claimed_at FROM review_claims WHERE of_assignment_id=?",
+            (of_assignment_id,),
+        ).fetchone()
+        claimed_at = row[0] if row is not None else None
+        deleted = 0
         try:
-            sql.execute(
+            cur = sql.execute(
                 conn, "DELETE FROM review_claims WHERE of_assignment_id=?", (of_assignment_id,)
             )
+            deleted = cur.rowcount or 0
             conn.commit()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
-            rollback_pending_write(conn, exc, savepoint=_SAVEPOINT)
+            if deleted and claimed_at is not None:
+                undo_pending_write(
+                    conn, exc,
+                    undo=lambda: sql.insert_ignore(
+                        conn, "review_claims", ["of_assignment_id", "claimed_at"],
+                        (of_assignment_id, claimed_at),
+                    ),
+                )
             raise
 
     retry_on_locked(_write)
@@ -2616,30 +2645,40 @@ def _claim_smoke_dispatch_local(work_assignment_id: str, capability_partition: s
 
     Called directly by the daemon endpoint so it never re-routes back over
     HTTP — mirrors :func:`_claim_review_dispatch_local`, including its
-    #3382 `retry_on_locked` + savepoint-scoped
-    :func:`coord.db.rollback_pending_write` treatment: this write is the
+    #3382 `retry_on_locked` + row-scoped
+    :func:`coord.db.undo_pending_write` treatment: this write is the
     same "INSERT OR IGNORE, then commit" exclusive-claim shape, so it was
     exposed to the identical 503-after-successful-write class that issue
     reports for the review claim table, and to the same review-flagged risk
-    of an unscoped rollback discarding an unrelated writer's own pending
-    statement on the shared connection.
+    of a transaction-level rollback discarding an unrelated writer's own
+    pending statement on the shared connection.
     """
-    _SAVEPOINT = "coord_smoke_claim"
 
     def _write() -> int:
         conn = get_connection()
-        open_savepoint(conn, _SAVEPOINT)
+        claimed_at = time.time()
+        inserted = 0
         try:
             cur = sql.insert_ignore(
                 conn, "smoke_claims",
                 ["work_assignment_id", "capability_partition", "claimed_at"],
-                (work_assignment_id, capability_partition, time.time()),
+                (work_assignment_id, capability_partition, claimed_at),
             )
+            inserted = cur.rowcount or 0
             conn.commit()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
-            rollback_pending_write(conn, exc, savepoint=_SAVEPOINT)
+            if inserted:
+                undo_pending_write(
+                    conn, exc,
+                    undo=lambda: sql.execute(
+                        conn,
+                        "DELETE FROM smoke_claims WHERE work_assignment_id=? "
+                        "AND capability_partition=? AND claimed_at=?",
+                        (work_assignment_id, capability_partition, claimed_at),
+                    ),
+                )
             raise
-        return cur.rowcount or 0
+        return inserted
 
     return retry_on_locked(_write) > 0
 
@@ -2679,23 +2718,38 @@ def _release_smoke_dispatch_claim_local(
     always runs against whatever DB is local to that process, and CAN run
     on a ``run_in_threadpool`` worker thread — #3382 review).
 
-    #3382: same `retry_on_locked` + savepoint-scoped-rollback-on-commit-
-    failure treatment as :func:`_release_review_dispatch_claim_local`.
+    #3382: same `retry_on_locked` + undo-this-row-on-commit-failure
+    treatment as :func:`_release_review_dispatch_claim_local`.
     """
-    _SAVEPOINT = "coord_smoke_claim_release"
 
     def _write() -> None:
         conn = get_connection()
-        open_savepoint(conn, _SAVEPOINT)
+        row = sql.execute(
+            conn,
+            "SELECT claimed_at FROM smoke_claims "
+            "WHERE work_assignment_id=? AND capability_partition=?",
+            (work_assignment_id, capability_partition),
+        ).fetchone()
+        claimed_at = row[0] if row is not None else None
+        deleted = 0
         try:
-            sql.execute(
+            cur = sql.execute(
                 conn,
                 "DELETE FROM smoke_claims WHERE work_assignment_id=? AND capability_partition=?",
                 (work_assignment_id, capability_partition),
             )
+            deleted = cur.rowcount or 0
             conn.commit()
         except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
-            rollback_pending_write(conn, exc, savepoint=_SAVEPOINT)
+            if deleted and claimed_at is not None:
+                undo_pending_write(
+                    conn, exc,
+                    undo=lambda: sql.insert_ignore(
+                        conn, "smoke_claims",
+                        ["work_assignment_id", "capability_partition", "claimed_at"],
+                        (work_assignment_id, capability_partition, claimed_at),
+                    ),
+                )
             raise
 
     retry_on_locked(_write)

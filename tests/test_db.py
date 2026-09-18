@@ -2837,14 +2837,14 @@ class TestRollbackAfterDriverError:
 
 class _ExecuteAlwaysFailsConn:
     """Wraps a real connection: `cursor().execute()` always raises — stands
-    in for a connection where even `ROLLBACK TO SAVEPOINT`/`RELEASE
-    SAVEPOINT` themselves hit sustained contention, for
-    `TestRollbackPendingWrite.test_a_failing_rollback_never_masks_the_
-    caught_error`. Deliberately does NOT delegate `cursor()` to the real
-    connection (unlike `tests/test_state.py`'s `_CommitFlakyConn`, which
-    only fakes `commit()`) — every statement this wrapper's cursor is asked
-    to run fails, exactly like `_RollbackRecorder(fail=True)` did for the
-    old unconditional-`conn.rollback()` shape this class replaces."""
+    in for a connection where even the compensating statement
+    `undo_pending_write` issues hits sustained contention, for
+    `TestUndoPendingWrite.test_a_failing_undo_never_masks_the_caught_error`.
+    Deliberately does NOT delegate `cursor()` to the real connection (unlike
+    `tests/test_state.py`'s `_CommitFlakyConn`, which only fakes
+    `commit()`) — every statement this wrapper's cursor is asked to run
+    fails, exactly like `_RollbackRecorder(fail=True)` did for the old
+    unconditional-`conn.rollback()` shape this class replaces."""
 
     __module__ = "sqlite3"  # coord.sql.detect_dialect keys off this
 
@@ -2856,76 +2856,101 @@ class _ExecuteAlwaysFailsConn:
         return self._FailingCursor()
 
 
-class TestOpenSavepoint:
-    """#3382's `db.open_savepoint` — the paired opener for
-    `rollback_pending_write`'s savepoint-scoped undo."""
+class TestUndoPendingWrite:
+    """#3382 review round 2: `db.undo_pending_write` runs a compensating
+    statement naming THIS write's own row, not any transaction-level undo —
+    neither `conn.rollback()` (round 1) nor `SAVEPOINT` +
+    `ROLLBACK TO SAVEPOINT` (round 2) can express "mine only" on
+    `coord.db`'s shared, process-wide SQLite singleton, which every other
+    `_*_local` writer dispatched through `run_in_threadpool` also writes
+    through. See the function's own docstring for the full incident."""
 
-    def test_issues_a_savepoint_visible_to_rollback_to(
+    def _seed_unrelated_pending_write(self, conn: sqlite3.Connection, key: str) -> None:
+        """A write pending on *conn*, uncommitted — mirrors another thread's
+        own in-flight statement on the shared singleton."""
+        conn.execute(f"INSERT INTO board_meta (key, value) VALUES ('{key}', 'pending')")  # noqa: S608
+
+    def test_undoes_only_this_writes_own_row(
         self, isolated_conn: sqlite3.Connection,
     ) -> None:
-        db_mod.open_savepoint(isolated_conn, "sp_test")
-        isolated_conn.execute(
-            "INSERT INTO board_meta (key, value) VALUES ('probe', 'x')"
-        )
-        isolated_conn.execute("ROLLBACK TO SAVEPOINT sp_test")  # must not raise
-        isolated_conn.execute("RELEASE SAVEPOINT sp_test")
-
-
-class TestRollbackPendingWrite:
-    """#3382 review: `db.rollback_pending_write` is now scoped to a
-    `SAVEPOINT`, not a bare `conn.rollback()` of the whole connection —
-    on `coord.db`'s shared, process-wide SQLite singleton, an unscoped
-    rollback discards *every* thread's pending statement, not just this
-    write's own (see the function's own docstring for the full incident).
-    These tests pin that a write already pending BEFORE this savepoint was
-    opened — standing in for another thread's own still-uncommitted
-    statement on the same shared connection — survives both the rollback
-    AND a later, unrelated commit."""
-
-    def _seed_unrelated_pending_write(self, conn: sqlite3.Connection) -> None:
-        """A write already pending on *conn*, uncommitted, BEFORE any
-        savepoint this test opens — mirrors another thread's own
-        in-flight, not-yet-committed statement on the shared singleton."""
-        conn.execute(
-            "INSERT INTO board_meta (key, value) VALUES ('unrelated', 'pending')"
-        )
-
-    def test_rolls_back_only_this_writes_own_savepoint(
-        self, isolated_conn: sqlite3.Connection,
-    ) -> None:
-        self._seed_unrelated_pending_write(isolated_conn)
-
-        db_mod.open_savepoint(isolated_conn, "sp_claim")
+        """Both halves of the hazard in one test: an unrelated writer's
+        statement pending BEFORE this write's own (what round 1's bare
+        `conn.rollback()` discarded) *and* one landing AFTER it (what a
+        `ROLLBACK TO SAVEPOINT` would discard, uniquely-named or not — see
+        `test_a_savepoint_scoped_undo_would_discard_a_later_write` below)
+        must both survive, while this write's own row goes."""
+        self._seed_unrelated_pending_write(isolated_conn, "before")
         isolated_conn.execute(
             "INSERT INTO board_meta (key, value) VALUES ('ours', 'should-vanish')"
         )
-        db_mod.rollback_pending_write(
+        self._seed_unrelated_pending_write(isolated_conn, "after")
+
+        db_mod.undo_pending_write(
             isolated_conn,
             sqlite3.OperationalError("database is locked"),
-            savepoint="sp_claim",
+            undo=lambda: sql.execute(
+                isolated_conn, "DELETE FROM board_meta WHERE key=?", ("ours",)
+            ),
         )
 
-        # Our own row is gone, but the earlier unrelated pending write is
-        # untouched and still committable by whoever's write it actually is.
+        # Both unrelated pending writes are untouched and still committable
+        # by whoever's writes they actually are.
         isolated_conn.commit()
         rows = {
             r["key"]: r["value"]
             for r in isolated_conn.execute("SELECT key, value FROM board_meta").fetchall()
         }
-        assert rows.get("unrelated") == "pending"
+        assert rows.get("before") == "pending"
+        assert rows.get("after") == "pending"
         assert "ours" not in rows
 
-    def test_none_connection_is_a_no_op(self) -> None:
-        db_mod.rollback_pending_write(
-            None, sqlite3.OperationalError("database is locked"), savepoint="sp_claim"
-        )  # must not raise
+    def test_a_savepoint_scoped_undo_would_discard_a_later_write(
+        self, isolated_conn: sqlite3.Connection,
+    ) -> None:
+        """Pins the premise of the design decision above, against the real
+        driver rather than by assertion: `ROLLBACK TO SAVEPOINT` reverts the
+        database to its state just after that savepoint, so it takes every
+        statement issued since with it — including another thread's, and
+        even when each thread uses its OWN distinctly-named savepoint (the
+        round-2 review's suggested fix, which closes only the narrower
+        name-collision half). If SQLite ever changed this, the comment
+        trail in `db.undo_pending_write` would be wrong and this test is how
+        we would find out."""
+        sql.execute(isolated_conn, "SAVEPOINT sp_thread_a")
+        sql.execute(isolated_conn, "SAVEPOINT sp_thread_b")  # unique name, still nested
+        isolated_conn.execute("INSERT INTO board_meta (key, value) VALUES ('a', 'x')")
+        isolated_conn.execute("INSERT INTO board_meta (key, value) VALUES ('b', 'x')")
 
-    def test_a_failing_rollback_never_masks_the_caught_error(self) -> None:
+        sql.execute(isolated_conn, "ROLLBACK TO SAVEPOINT sp_thread_a")
+        sql.execute(isolated_conn, "RELEASE SAVEPOINT sp_thread_a")
+        isolated_conn.commit()
+
+        keys = {
+            r["key"] for r in isolated_conn.execute("SELECT key FROM board_meta").fetchall()
+        }
+        assert "a" not in keys
+        assert "b" not in keys, (
+            "thread B's row survived — SQLite's ROLLBACK TO semantics changed, "
+            "and db.undo_pending_write's rationale needs revisiting"
+        )
+
+    def test_none_connection_is_a_no_op(self) -> None:
+        called: list[int] = []
+        db_mod.undo_pending_write(
+            None,
+            sqlite3.OperationalError("database is locked"),
+            undo=lambda: called.append(1),
+        )  # must not raise
+        assert called == []
+
+    def test_a_failing_undo_never_masks_the_caught_error(self) -> None:
         conn = _ExecuteAlwaysFailsConn()
 
-        db_mod.rollback_pending_write(
-            conn, sqlite3.OperationalError("database is locked"), savepoint="sp_claim"
-        )  # must not raise, even though ROLLBACK TO SAVEPOINT itself fails
+        db_mod.undo_pending_write(
+            conn,
+            sqlite3.OperationalError("database is locked"),
+            undo=lambda: sql.execute(conn, "DELETE FROM board_meta WHERE key=?", ("ours",)),
+        )  # must not raise, even though the compensating statement itself fails
 
 
 class TestBoardConnectionIfOpen:
