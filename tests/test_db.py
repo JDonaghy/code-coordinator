@@ -2835,47 +2835,97 @@ class TestRollbackAfterDriverError:
         assert conn.rollbacks == 1
 
 
+class _ExecuteAlwaysFailsConn:
+    """Wraps a real connection: `cursor().execute()` always raises — stands
+    in for a connection where even `ROLLBACK TO SAVEPOINT`/`RELEASE
+    SAVEPOINT` themselves hit sustained contention, for
+    `TestRollbackPendingWrite.test_a_failing_rollback_never_masks_the_
+    caught_error`. Deliberately does NOT delegate `cursor()` to the real
+    connection (unlike `tests/test_state.py`'s `_CommitFlakyConn`, which
+    only fakes `commit()`) — every statement this wrapper's cursor is asked
+    to run fails, exactly like `_RollbackRecorder(fail=True)` did for the
+    old unconditional-`conn.rollback()` shape this class replaces."""
+
+    __module__ = "sqlite3"  # coord.sql.detect_dialect keys off this
+
+    class _FailingCursor:
+        def execute(self, *_a, **_kw):  # noqa: ANN002,ANN003,ANN201
+            raise sqlite3.OperationalError("rollback itself failed")
+
+    def cursor(self):  # noqa: ANN201
+        return self._FailingCursor()
+
+
+class TestOpenSavepoint:
+    """#3382's `db.open_savepoint` — the paired opener for
+    `rollback_pending_write`'s savepoint-scoped undo."""
+
+    def test_issues_a_savepoint_visible_to_rollback_to(
+        self, isolated_conn: sqlite3.Connection,
+    ) -> None:
+        db_mod.open_savepoint(isolated_conn, "sp_test")
+        isolated_conn.execute(
+            "INSERT INTO board_meta (key, value) VALUES ('probe', 'x')"
+        )
+        isolated_conn.execute("ROLLBACK TO SAVEPOINT sp_test")  # must not raise
+        isolated_conn.execute("RELEASE SAVEPOINT sp_test")
+
+
 class TestRollbackPendingWrite:
-    """#3382's `db.rollback_pending_write` — the unconditional sibling of
-    `rollback_after_driver_error`, for a writer whose own `conn.commit()`
-    call (not just the statement before it) can raise. Unlike that
-    function, this must roll back for a PLAIN SQLite error too: that shape
-    is exactly what it exists to cover (see its docstring)."""
+    """#3382 review: `db.rollback_pending_write` is now scoped to a
+    `SAVEPOINT`, not a bare `conn.rollback()` of the whole connection —
+    on `coord.db`'s shared, process-wide SQLite singleton, an unscoped
+    rollback discards *every* thread's pending statement, not just this
+    write's own (see the function's own docstring for the full incident).
+    These tests pin that a write already pending BEFORE this savepoint was
+    opened — standing in for another thread's own still-uncommitted
+    statement on the same shared connection — survives both the rollback
+    AND a later, unrelated commit."""
 
-    def test_rolls_back_for_a_plain_sqlite_lock_error(self) -> None:
-        """The behaviour `rollback_after_driver_error` deliberately does
-        NOT have — `TestRollbackAfterDriverError.
-        test_plain_sqlite_error_is_left_completely_alone` pins that
-        function's `rollbacks == 0` for the exact same exception shape."""
-        conn = _RollbackRecorder()
-
-        db_mod.rollback_pending_write(conn, sqlite3.OperationalError("database is locked"))
-
-        assert conn.rollbacks == 1
-
-    def test_rolls_back_for_a_postgres_style_sqlstate_too(self) -> None:
-        """Unconditional means unconditional — a Postgres-shaped exception
-        still rolls back, same as `rollback_after_driver_error` would do on
-        its own (redundant here, but harmless)."""
-        conn = _RollbackRecorder()
-
-        db_mod.rollback_pending_write(
-            conn, PostgresStyleDriverError("no such table", SQLSTATE_UNDEFINED_TABLE)
+    def _seed_unrelated_pending_write(self, conn: sqlite3.Connection) -> None:
+        """A write already pending on *conn*, uncommitted, BEFORE any
+        savepoint this test opens — mirrors another thread's own
+        in-flight, not-yet-committed statement on the shared singleton."""
+        conn.execute(
+            "INSERT INTO board_meta (key, value) VALUES ('unrelated', 'pending')"
         )
 
-        assert conn.rollbacks == 1
+    def test_rolls_back_only_this_writes_own_savepoint(
+        self, isolated_conn: sqlite3.Connection,
+    ) -> None:
+        self._seed_unrelated_pending_write(isolated_conn)
+
+        db_mod.open_savepoint(isolated_conn, "sp_claim")
+        isolated_conn.execute(
+            "INSERT INTO board_meta (key, value) VALUES ('ours', 'should-vanish')"
+        )
+        db_mod.rollback_pending_write(
+            isolated_conn,
+            sqlite3.OperationalError("database is locked"),
+            savepoint="sp_claim",
+        )
+
+        # Our own row is gone, but the earlier unrelated pending write is
+        # untouched and still committable by whoever's write it actually is.
+        isolated_conn.commit()
+        rows = {
+            r["key"]: r["value"]
+            for r in isolated_conn.execute("SELECT key, value FROM board_meta").fetchall()
+        }
+        assert rows.get("unrelated") == "pending"
+        assert "ours" not in rows
 
     def test_none_connection_is_a_no_op(self) -> None:
         db_mod.rollback_pending_write(
-            None, sqlite3.OperationalError("database is locked")
+            None, sqlite3.OperationalError("database is locked"), savepoint="sp_claim"
         )  # must not raise
 
     def test_a_failing_rollback_never_masks_the_caught_error(self) -> None:
-        conn = _RollbackRecorder(fail=True)
+        conn = _ExecuteAlwaysFailsConn()
 
-        db_mod.rollback_pending_write(conn, sqlite3.OperationalError("database is locked"))
-
-        assert conn.rollbacks == 1
+        db_mod.rollback_pending_write(
+            conn, sqlite3.OperationalError("database is locked"), savepoint="sp_claim"
+        )  # must not raise, even though ROLLBACK TO SAVEPOINT itself fails
 
 
 class TestBoardConnectionIfOpen:
