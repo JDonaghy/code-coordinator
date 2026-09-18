@@ -3724,16 +3724,24 @@ def ci_revalidation_candidates(
     `rerun_for_pr` replays the same run against the same base it already
     used, so it can never see the new one. `process()`'s OWN #2197
     auto-rerun for this trigger was dropped for that reason (see
-    `MAX_CI_STALE_RERUNS`'s comment), and `coord.commands.drive_queue
-    ._run_auto_revalidate_checks_stale` (the unattended periodic call site)
-    was fixed the same way in the same change — it still calls this
-    function to find the candidates, but only to report them, never to
-    rerun anything. The one remaining caller that still calls
-    `rerun_for_pr` on what this returns is `coord.commands.merge
+    `MAX_CI_STALE_RERUNS`'s comment). The one remaining caller that still
+    calls `rerun_for_pr` on what this returns is `coord.commands.merge
     ._apply_ci_revalidation` (the opt-in ``--revalidate`` CI arm) — equally
     unable to clear the block, but lower severity since a human has to
     explicitly ask for it. Left as-is here: fixing it is a change to that
     module, out of this function's/file's scope, and a tracked follow-up.
+
+    #3396: `coord.commands.drive_queue._run_auto_revalidate_checks_stale`
+    (the unattended periodic call site) still calls this function to find
+    the candidates, but no longer only to report them — a #3266-through-
+    #3396 gap meant a `checks_stale` entry whose owning `coord drive`
+    session had already exited was never seen by anything that could
+    actually clear it, only re-diagnosed forever. That call site now
+    dispatches the SAME bounded, self-refusing stale-rebase worker
+    (:func:`coord.conflict_fix.dispatch_conflict_fix` with
+    ``stale_rebase=True``) a live drive or `coord notify`'s stalled-pipeline
+    sweep would already use for this exact shape — never a `gh run rerun`,
+    which stays the known no-op described above.
     """
     if ci_store is None or not ci_store.is_available:
         return []

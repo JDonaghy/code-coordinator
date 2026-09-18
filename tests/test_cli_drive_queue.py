@@ -27,12 +27,14 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
 
 from coord import state
 from coord.cli import main
+from coord.models import Assignment
 from coord.drive import tmux_session_alive as _REAL_TMUX_SESSION_ALIVE
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
@@ -3617,6 +3619,109 @@ def test_auto_revalidate_keeps_surfacing_an_already_exhausted_entry(
     entries = query_audit_log(event_type="merge_checks_stale_parked")["entries"]
     assert len(entries) == 1
     assert entries[0]["issue"] == 2534
+
+
+# ── #3396: auto-revalidate now DISPATCHES the stale-rebase worker, rather
+# than only ever reporting the block — see `_run_auto_revalidate_checks_
+# stale`'s docstring. `coord.conflict_fix.dispatch_conflict_fix` itself is
+# stubbed (never a real `/assign` POST) — the SAME seam
+# `tests/test_stalled_pipeline.py`'s equivalent `coord.notify` arm tests use,
+# since this tick's local import binds it fresh on every call.
+
+
+def test_auto_revalidate_dispatches_a_stale_rebase_worker_with_no_live_drive(
+    cli_no_gates, coord_db, stale_ci_backend, monkeypatch,
+):
+    """#3396 acceptance: a gate-READY `checks_stale` row with NO drive-queue
+    counterpart at all (this row is a bare `merge_queue` entry, exactly like
+    quadraui#1001 after its owning drive exhausted its attempts and exited)
+    still gets the SAME stale-rebase worker a live drive or `coord notify`'s
+    stalled-pipeline sweep would dispatch — no operator action."""
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    set_board_meta(coord_db, "board_initialized", "1")
+
+    fix_assignment = Assignment(
+        machine_name="dellserver", repo_name=REPO, issue_number=2534,
+        issue_title="[stale-rebase-fix] issue 2534", assignment_id="cf-3396",
+        status="pending", type="conflict-fix",
+    )
+    stub = MagicMock(return_value=fix_assignment)
+    monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    assert "dispatched a stale-rebase conflict-fix" in result.output
+    assert "cf-3396" in result.output
+
+    stub.assert_called_once()
+    _, call_kwargs = stub.call_args
+    assert call_kwargs["stale_rebase"] is True
+
+    from coord.audit import query_audit_log
+
+    entries = query_audit_log(
+        event_type="merge_checks_stale_auto_rebase_dispatched"
+    )["entries"]
+    assert len(entries) == 1
+    assert entries[0]["issue"] == 2534
+
+    # Never escalated — a fresh dispatch is progress, not a stuck block.
+    assert state._get_drive_escalation_local(REPO, 2534) is None
+
+
+def test_auto_revalidate_escalates_once_a_prior_stale_rebase_attempt_failed(
+    cli_no_gates, coord_db, stale_ci_backend,
+):
+    """#3396 item 2: once a conflict-fix already failed against this exact
+    block (the retry cap `has_prior_conflict_fix` enforces), re-diagnosing it
+    every ~3 minutes forever — the issue's own reported symptom — must stop.
+    It escalates into the durable `drive_escalations` table instead, the
+    same one `coord escalate list`/`coord escalate run` already serve."""
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    set_board_meta(coord_db, "board_initialized", "1")
+    coord_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, machine_name, "
+        " type, status, review_of_assignment_id, dispatched_at) "
+        "VALUES (?, ?, ?, ?, 'dellserver', 'conflict-fix', 'failed', ?, ?)",
+        ("cf-prior", REPO, 2534, "issue 2534", "w2534", 200.0),
+    )
+    coord_db.commit()
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    assert "needs a human" in result.output
+
+    escalation = state._get_drive_escalation_local(REPO, 2534)
+    assert escalation is not None
+    assert escalation["stage"] == "checks_stale"
+
+    from coord.audit import query_audit_log
+
+    entries = query_audit_log(event_type="merge_checks_stale_human_required")["entries"]
+    assert len(entries) == 1
+    assert entries[0]["issue"] == 2534
+
+
+def test_auto_revalidate_dismisses_a_stale_escalation_once_the_block_clears(
+    cli_no_gates, coord_db, stale_ci_backend,
+):
+    """The other half of #3396 item 2: an escalation must not outlive the
+    condition it describes, or `coord escalate list` rots into exactly the
+    kind of noise the issue's own `alert: (none)` complaint was about in the
+    other direction. Nothing in the merge queue names issue 9999 any more
+    (resolved since the escalation was written) — the tick's cleanup pass
+    must drop it even though this run finds zero `checks_stale` candidates."""
+    state._record_drive_escalation_local(
+        REPO, 9999, stage="checks_stale", reason="stale",
+        gate_readings="", proposed_command="coord merge --only x 9999",
+    )
+    assert state._get_drive_escalation_local(REPO, 9999) is not None
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+
+    assert state._get_drive_escalation_local(REPO, 9999) is None
 
 
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
