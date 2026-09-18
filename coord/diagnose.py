@@ -735,6 +735,22 @@ def diagnose_stage(
     latest = _latest(assignments)
 
     if latest is None:
+        # #3383: a `review_claims` row held for a work assignment with ZERO
+        # review/test-author/mock-author rows (never dispatched, or all
+        # deleted) is unreachable from `_recover_review` below — that
+        # function only ever runs once `latest` above is non-None. Before
+        # this, `--stage review` hit this exact branch and reported the
+        # stage healthy while `dispatch_review` was permanently wedged
+        # behind the leaked claim (#3206's failure one state earlier — see
+        # `_leaked_review_claim_without_row`'s docstring). Checked BEFORE
+        # the "no review assignment" finding below, on claim state rather
+        # than on row existence, exactly as #3206 already does once a row
+        # exists.
+        if stage == "review" and _leaked_review_claim_without_row(
+            board, repo_name, issue_number, res, reset=reset, dry_run=dry_run,
+        ):
+            _cleanup_issue(board, config, repo_name, issue_number, res, dry_run=dry_run, reset=reset)
+            return res
         res.findings.append(f"no {stage} assignment on the board for #{issue_number}")
         res.recovered = True  # nothing wedged
         # Still run the issue-wide cleanup below.
@@ -816,6 +832,114 @@ def diagnose_stage(
         dry_run=dry_run, reset=reset, skip_ids=handled,
     )
     return res
+
+
+# #3383: a claim taken by `claim_review_dispatch` microseconds before its
+# caller inserts the review row it's claiming for looks, from a single read,
+# identical to a genuinely leaked claim — the same false-positive window
+# `_recover_review` below already documents for the terminal-row case
+# (#3206). Below this age the claim is reported but NOT offered for release;
+# above it, treated as leaked. Short on purpose: `dispatch_review` claims and
+# inserts its row in the same request, not across a network round trip.
+_REVIEW_CLAIM_LEAK_GRACE_SECS = 30.0
+
+
+def _leaked_review_claim_without_row(
+    board: "Board",
+    repo_name: str,
+    issue_number: int,
+    res: DiagnoseResult,
+    *,
+    reset: bool,
+    dry_run: bool,
+) -> bool:
+    """#3383: detect (and, under ``--reset``, release) a leaked
+    ``review_claims`` row for a work assignment that has NO review /
+    test-author / mock-author row at all — the one shape `_recover_review`
+    can never see, because `diagnose_stage` only calls it once
+    `stage_assignments(..., "review")` finds a row. A claim can be (and, per
+    the issue that reported this, was) taken and never released when the
+    work assignment it's keyed on was dispatched to review, that review
+    never got as far as inserting its own `assignments` row (or its row was
+    later deleted, e.g. by an earlier `--reset`), and the claim outlived it.
+    Every future `dispatch_review` for that work assignment then denies
+    forever with the misleading #3113 "lost the atomic dispatch-claim race"
+    reason — while `coord diagnose --stage review` (which hit the
+    `latest is None` "no review assignment" branch before this function
+    existed) reported the stage healthy.
+
+    Checked against the WORK assignment's id — `claim_review_dispatch` is
+    keyed on the id of the assignment BEING reviewed, never on a review
+    row's own id (see `_recover_review`'s `work_assignment_id` resolution).
+
+    Returns ``True`` when a claim was found (whether or not it could be
+    released yet — see the grace-period case) and this function has already
+    appended the appropriate finding(s); ``False`` when there is nothing to
+    report, in which case the caller's own "no review assignment" message
+    is the correct (healthy) diagnosis.
+    """
+    from coord.state import (  # noqa: PLC0415
+        has_review_claim,
+        release_review_dispatch_claim,
+        review_claim_age_secs,
+    )
+
+    work_rows = stage_assignments(board, repo_name, issue_number, "work")
+    work_latest = _latest(work_rows)
+    if work_latest is None or not work_latest.assignment_id:
+        return False
+    work_assignment_id = work_latest.assignment_id
+    if not has_review_claim(work_assignment_id):
+        return False
+
+    age = review_claim_age_secs(work_assignment_id)
+    if age is not None and age < _REVIEW_CLAIM_LEAK_GRACE_SECS:
+        # Too fresh to distinguish from an in-flight `dispatch_review` call
+        # that has taken the claim but not yet inserted its review row —
+        # report it, but don't offer to release something that might still
+        # be a live, wanted dispatch.
+        res.findings.append(
+            f"work assignment {work_assignment_id} holds a review-dispatch "
+            f"claim taken {age:.1f}s ago with no review row yet — likely an "
+            "in-flight dispatch_review, not a leak; re-run diagnose again "
+            "shortly if this persists"
+        )
+        res.recovered = True
+        return True
+
+    res.findings.append(
+        f"no review assignment exists for #{issue_number}, but work "
+        f"assignment {work_assignment_id} still holds a review-dispatch "
+        "claim (leaked review_claims row, #3383 — the #3206 class one state "
+        "earlier) — every future dispatch_review for this work assignment "
+        "will deny with the misleading #3113 'lost the atomic dispatch-claim "
+        "race' reason until it is released. Re-run with --reset to release it."
+    )
+    res.recovered = False
+    res.needs_reset = True
+
+    if reset:
+        if dry_run:
+            res.findings.append(
+                "(dry-run) would release the leaked review-dispatch claim"
+            )
+            return True
+        release_review_dispatch_claim(work_assignment_id)
+        if has_review_claim(work_assignment_id):
+            res.findings.append(
+                f"release requested for {work_assignment_id}'s "
+                "review-dispatch claim, but it is still present on re-read "
+                "— the release did NOT persist"
+            )
+        else:
+            res.actions_taken.append(
+                "released leaked review-dispatch claim for work assignment "
+                f"{work_assignment_id} — dispatch_review is now re-dispatchable"
+            )
+            res.reset_performed = True
+            res.recovered = True
+            res.branch_preserved = True
+    return True
 
 
 def _recover_review(

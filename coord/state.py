@@ -2388,6 +2388,36 @@ def has_review_claim(of_assignment_id: str) -> bool:
     return row is not None
 
 
+def review_claim_age_secs(of_assignment_id: str) -> float | None:
+    """Seconds since *of_assignment_id*'s ``review_claims`` row was taken, or
+    ``None`` when no claim is held (#3383).
+
+    Sibling read to :func:`has_review_claim`, used by ``coord diagnose
+    --stage review`` to gate a claim release on age: a claim taken
+    microseconds ago by an in-flight :func:`claim_review_dispatch` call that
+    has not yet inserted its review ``assignments`` row is indistinguishable,
+    from a single read, from a genuinely leaked claim — exactly the
+    false-positive window already documented on the terminal-review-row path
+    in ``diagnose._recover_review`` (#3206). Comparing ``claimed_at`` against
+    a short grace period lets the caller tell "just claimed, dispatch still
+    running" apart from "claimed a long time ago, nothing is coming".
+
+    Same local-DB-only caveat as :func:`has_review_claim` — reads the local
+    connection, not the daemon, so it undercounts on a thin client.
+    """
+    if not of_assignment_id:
+        return None
+    conn = get_connection()
+    row = sql.execute(
+        conn,
+        "SELECT claimed_at FROM review_claims WHERE of_assignment_id=?",
+        (of_assignment_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return time.time() - row[0]
+
+
 def release_review_dispatch_claim(of_assignment_id: str) -> None:
     """Release a claim taken by :func:`claim_review_dispatch`.
 
