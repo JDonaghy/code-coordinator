@@ -1220,6 +1220,24 @@ def _record(a: Assignment) -> None:
     conn.commit()
 
 
+def _backdate_review_claim(of_assignment_id: str, *, seconds_ago: float) -> None:
+    """Push a `review_claims` row's `claimed_at` into the past — used to put
+    a claim outside #3383's grace period (real claims in these tests are
+    taken via `state.claim_review_dispatch`, which stamps `time.time()`;
+    without this every test claim looks "just taken", which is exactly the
+    fresh-claim case the grace period is meant to protect)."""
+    import time as _time
+
+    from coord.db import get_connection
+
+    conn = get_connection()
+    conn.execute(
+        "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+        (_time.time() - seconds_ago, of_assignment_id),
+    )
+    conn.commit()
+
+
 def test_reset_review_real_db_deletes_review_when_latest_is_the_review_row(
     monkeypatch, config, coord_db
 ) -> None:
@@ -1379,6 +1397,100 @@ def test_diagnose_review_healthy_when_no_claim_leaked(
 
     assert res.recovered is True
     assert any("healthy" in f for f in res.findings)
+
+
+def test_diagnose_review_detects_leaked_claim_with_no_review_rows(
+    monkeypatch, config, coord_db
+) -> None:
+    """#3383 regression: a `review_claims` row held for a work assignment
+    that has NO review/test-author/mock-author row AT ALL (the state one
+    step earlier than #3206's terminal-row case) used to be unreachable —
+    `stage_assignments(..., "review")` finds nothing, `latest is None`, and
+    `diagnose_stage` took the "no review assignment on the board" early
+    return before ever calling `_recover_review` (which is the only place
+    that cross-checked `review_claims`). This left the claim permanently
+    wedged with `coord diagnose --stage review --reset` reporting the stage
+    healthy AND doing nothing. This reproduces against unfixed `main`: the
+    old early return set `recovered=True` unconditionally with no claim
+    check at all.
+    """
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="dispatched",
+        dispatched_at=100.0,
+    ))
+    # Simulate the leak: a claim was taken (e.g. by a `dispatch_review` call
+    # whose review row never landed, or was later deleted) and never
+    # released — no review row exists to cross-check it against. Backdated
+    # well past the #3383 grace period so it isn't mistaken for a claim an
+    # in-flight `dispatch_review` just took (see the fresh-claim test below).
+    assert state.claim_review_dispatch("w1") is True
+    _backdate_review_claim("w1", seconds_ago=3600.0)
+
+    board = Board(completed=[_assign(aid="w1", typ="work", status="done", dispatched_at=100.0)])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", dry_run=True)
+
+    assert res.recovered is False
+    assert res.needs_reset is True
+    assert any("review_claims" in f or "review-dispatch claim" in f for f in res.findings)
+    # A dry-run must not touch the claim.
+    assert state.claim_review_dispatch("w1") is False
+
+
+def test_reset_review_releases_leaked_claim_with_no_review_rows(
+    monkeypatch, config, coord_db
+) -> None:
+    """#3383: `--reset` must actually clear the leaked claim detected above
+    so `coord review <work-assignment-id>` becomes dispatchable again — the
+    whole point of the issue (there was previously NO operator CLI path at
+    all to clear this)."""
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="dispatched",
+        dispatched_at=100.0,
+    ))
+    assert state.claim_review_dispatch("w1") is True
+    _backdate_review_claim("w1", seconds_ago=3600.0)
+
+    board = Board(completed=[_assign(aid="w1", typ="work", status="done", dispatched_at=100.0)])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    assert res.recovered is True
+    # The claim is gone — a fresh claim attempt for "w1" must succeed again,
+    # exactly like `dispatch_review` would need for a real re-dispatch.
+    assert state.claim_review_dispatch("w1") is True
+
+
+def test_diagnose_review_fresh_claim_without_row_not_treated_as_leaked(
+    monkeypatch, config, coord_db
+) -> None:
+    """Sibling of the two tests above: a claim taken only moments ago, with
+    no review row yet, is indistinguishable from an in-flight
+    `dispatch_review` call that has claimed but not yet inserted its review
+    row — the same false-positive window `_recover_review` already
+    documents for the terminal-row case (#3206), one state earlier. Must be
+    reported but NOT offered for release while this fresh."""
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    _record(_assign(aid="w1", typ="work", status="done", dispatched_at=100.0))
+    assert state.claim_review_dispatch("w1") is True  # claimed "just now"
+
+    board = Board(completed=[_assign(aid="w1", typ="work", status="done", dispatched_at=100.0)])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", dry_run=True)
+
+    assert res.needs_reset is False
+    assert any("in-flight dispatch_review" in f for f in res.findings)
+    # Untouched — still held.
+    assert state.claim_review_dispatch("w1") is False
 
 
 def test_reset_review_reports_delete_failure_when_row_survives(

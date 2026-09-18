@@ -4645,6 +4645,46 @@ class TestHasReviewClaim:
         assert state.has_review_claim("") is False
 
 
+class TestReviewClaimAgeSecs:
+    """`review_claim_age_secs` (#3383): sibling read to `has_review_claim`
+    used by `coord diagnose --stage review` to gate a claim release on age
+    — a claim taken microseconds ago by an in-flight `claim_review_dispatch`
+    call that hasn't inserted its review row yet must not be released as if
+    it were a leak (the same false-positive window #3206 documents for the
+    terminal-row case)."""
+
+    def test_small_positive_age_while_freshly_claimed(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        age = state.review_claim_age_secs("w1")
+        assert age is not None
+        assert 0.0 <= age < 5.0
+
+    def test_none_when_never_claimed(self, coord_db) -> None:
+        assert state.review_claim_age_secs("never-claimed") is None
+
+    def test_none_after_release(self, coord_db) -> None:
+        assert state.claim_review_dispatch("w1") is True
+        state.release_review_dispatch_claim("w1")
+        assert state.review_claim_age_secs("w1") is None
+
+    def test_none_for_empty_id(self, coord_db) -> None:
+        assert state.review_claim_age_secs("") is None
+
+    def test_reflects_a_backdated_claim(self, coord_db) -> None:
+        from coord.db import get_connection
+
+        assert state.claim_review_dispatch("w1") is True
+        conn = get_connection()
+        conn.execute(
+            "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+            (time.time() - 3600.0, "w1"),
+        )
+        conn.commit()
+        age = state.review_claim_age_secs("w1")
+        assert age is not None
+        assert age >= 3599.0
+
+
 class TestMarkNotifiedReleasesLeakedReviewClaim:
     """#3206 root-cause regression: a review assignment reaped by
     `AgentServer._reap`'s SIGKILL max-wait ceiling writes its terminal
