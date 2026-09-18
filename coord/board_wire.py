@@ -65,6 +65,19 @@ Rust call site of ``OpenIssue.body`` / ``PipelineIssue.body`` first. So the
 body now leaves the collection wire for open issues too, and
 :func:`bound_issue_row` keeps only the machine-parsed *residue* a client
 cannot re-fetch in time — see :data:`ALLOWED_GLOB_MARKER`.
+
+**#3384: a defaulted flag costs its bytes on EVERY row.** The reopen witness
+``issues.state_reason`` carries a value on the handful of rows GitHub
+actually set one on, and the empty default on every other issue on the
+board — and an empty-but-present key is ~20 bytes of wire per row per poll,
+which on the #1791 guard's 3000-row seed is ~57 KB and pushed the payload
+straight through :data:`BOARD_PAYLOAD_BYTE_BUDGET`. So the default is
+dropped from the wire entirely (:func:`_drop_default_state_reason`) and the
+key is present only when it says something. This is the same additive-only
+convention the ``<field>_truncated`` flags already follow, and it is the
+rule to apply to the NEXT defaulted field somebody adds to
+``coord/board_schema.py``: an always-present default is a per-row tax on a
+payload that is polled every few seconds and whose ETag never matches.
 """
 
 from __future__ import annotations
@@ -253,8 +266,51 @@ def _machine_readable_residue(body: str) -> str:
     )
 
 
+def _drop_default_state_reason(row: dict) -> None:
+    """#3384: drop ``state_reason`` from the wire when it is the empty default.
+
+    ``issues.state_reason`` is GitHub's own ``stateReason``: ``"reopened"``
+    on an issue a human explicitly reopened, and ``''`` on every issue that
+    has never been closed — i.e. on essentially the whole board.  Shipping
+    the empty default costs ~20 bytes on EVERY issue row of EVERY poll (~57 KB
+    on the #1791 guard's 3000-row seed, enough on its own to breach
+    :data:`BOARD_PAYLOAD_BYTE_BUDGET`) to tell a client something it already
+    assumes.
+
+    Safe because absent and empty are the SAME answer to every consumer, by
+    construction rather than by luck:
+
+    * ``coord.drive_queue.build_board_view`` reads it as
+      ``str(row.get("state_reason") or "").lower() == "reopened"`` — the one
+      question anything asks of this field — so a missing key and an empty
+      one both yield ``IssueFacts.reopened is False``.  That is also what
+      keeps this wire cut from splitting the answer in two: the daemon-host
+      local path (``coord.drive_state._local_issue_rows``, which never runs
+      through this module) still carries ``''``, and both paths land on the
+      identical fact.
+    * The Rust ``OpenIssue.state_reason`` is generated with
+      ``#[serde(default)]`` (``coord.codegen._rust_auto_field``), so an
+      absent key deserializes to ``String::new()``.
+    * ``state_reason`` is not in ``BoardIssue``'s ``required`` list in
+      ``/openapi.json`` (it has a dataclass default), so omitting it stays
+      inside the published contract.
+
+    A NON-empty value is always kept — this drops the default, it does not
+    filter for ``"reopened"`` specifically, so a value GitHub starts sending
+    that we do not yet interpret still reaches clients intact.
+    """
+    if not row.get("state_reason"):
+        row.pop("state_reason", None)
+
+
 def bound_issue_row(row: dict) -> None:
     """Apply the wire policy to one ``/board`` issue row (mutates).
+
+    **The empty ``state_reason`` default is dropped from every issue row**
+    (#3384), tracking issues included — see
+    :func:`_drop_default_state_reason`.  Deliberately above the epic
+    early-return below, so the wire shape of that field does not depend on
+    which kind of issue a row happens to be.
 
     **Tracking (epic) issues are exempt from the body cap.**  The TUI's
     Milestone DAG parses ``## Work order`` out of the tracking issue's body
@@ -282,6 +338,7 @@ def bound_issue_row(row: dict) -> None:
     exactly as for a closed issue, which is what arms that hydration
     (``pipeline.rs::issue_body_fetch_target``).
     """
+    _drop_default_state_reason(row)
     if _is_tracking_issue(row):
         return
     if _is_closed_issue(row):
