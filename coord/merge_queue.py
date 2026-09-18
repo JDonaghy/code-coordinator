@@ -3347,7 +3347,18 @@ def evaluate_smoke_verdict(
                 ok=True, kind=SMOKE_OK, assignment_id=getattr(a, "assignment_id", None)
             )
         if is_baseline_red_skip:
-            repo_for_streak = getattr(a, "repo_name", None) or repo_github
+            # #3386 review: the streak store is keyed by the coordinator's
+            # internal short `repo_name` (what `record_baseline_red_
+            # classification`/`_record_test_verdict_local` write) — NOT by
+            # `repo_github` (an "owner/repo" GitHub slug). A prior version
+            # of this fell back to `repo_github` when `a.repo_name` was
+            # falsy; that fallback would have looked up the wrong key and
+            # silently read streak=0 (never block) had it ever actually
+            # fired. A board-recorded work assignment's `repo_name` should
+            # always be populated, so there is no real fallback value to
+            # have here — dropped rather than kept as dead code with wrong
+            # semantics.
+            repo_for_streak = getattr(a, "repo_name", None)
             if repo_for_streak and baseline_red_merge_blocked(repo_for_streak):
                 return SmokeVerdictStatus(
                     ok=False,
