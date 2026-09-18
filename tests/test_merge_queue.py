@@ -10821,6 +10821,11 @@ class TestStaleSmokeVerdictReporting:
     stale verdict to BLOCK. See the "no behaviour change" clause in #1640.
     """
 
+    # #3386: the baseline-red-streak tests below persist to the `board_meta`
+    # table via `coord.state.record_baseline_red_classification` — no extra
+    # isolation fixture needed, `coord_db` (autouse, conftest.py) already
+    # gives every test in this suite a private in-memory connection.
+
     # ── helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
@@ -10997,6 +11002,127 @@ class TestStaleSmokeVerdictReporting:
 
         assert verdict.ok is True
         assert verdict.kind == mq.SMOKE_OK
+
+    # ── #3386 (items 3 + 4 of #3378): a `baseline_red` skip is bounded ─────
+    #
+    # A `"skipped"` verdict CONFIRMED `baseline_red` (#3378 item 2's
+    # `test_confirmation` stamp) is not the #1732 structural exemption above
+    # — it asserts the merge BASE, not the branch, is why the suite fails,
+    # and that assertion is bounded (item 3: too many in a row blocks the
+    # repo outright) and falsifiable by the branch moving on (item 4),
+    # unlike an ordinary structural skip.
+
+    @staticmethod
+    def _baseline_red_skip(aid: str = "w1", *, base_sha: str = "base-old") -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done",
+            branch=f"worker/{aid}",
+            test_state="skipped",
+            test_confirmation="baseline_red",
+            test_head_sha="branch-sha",
+            test_base_sha=base_sha,
+            test_patch_id="patch-1",
+        )
+
+    def test_fresh_baseline_red_skip_still_passes_below_the_streak_limit(self) -> None:
+        """Guard against over-blocking: a repo with no chronic streak must
+        still merge on a fresh, unmoved baseline-red skip."""
+        board = self._board(completed=[self._baseline_red_skip()])
+        entry = _q("w1", target="main")
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+
+    def test_baseline_red_skip_is_not_stale_when_base_moves_alone(self) -> None:
+        """Unlike `passed`, a `baseline_red` skip is not re-checked against
+        a moved BASE — that check exists to catch a measurement going
+        stale, whereas "the base is red" is exactly what this verdict
+        already asserts. Item 3's streak bound covers a chronically-moving
+        red base instead."""
+        board = self._board(completed=[self._baseline_red_skip()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+
+    def test_baseline_red_skip_goes_stale_when_branch_content_changed(self) -> None:
+        """#3386 item 4: the live defect on #3376 — a skip cited from a
+        since-superseded assignment (a fix round pushed new commits) no
+        longer describes what is actually on the branch."""
+        board = self._board(completed=[self._baseline_red_skip()])
+        entry = _q("w1", target="main")
+        entry.branch_head_sha = "branch-new"    # new commit pushed
+        entry.branch_patch_id = "patch-2"        # content actually changed
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "branch"
+
+    def test_baseline_red_skip_blocked_after_consecutive_streak_limit(self) -> None:
+        """#3386 item 3, the headline: a repo that has racked up
+        `BASELINE_RED_STREAK_LIMIT` consecutive baseline-red classifications
+        must stop merging outright — even on a perfectly fresh skip — until
+        the merge base itself is fixed. This is the test the issue asks to
+        state as failing against unfixed `main`: before this fix,
+        `evaluate_smoke_verdict` returns `ok=True` unconditionally for ANY
+        `"skipped"` state, streak or no streak."""
+        from coord import state as st
+
+        for _ in range(st.BASELINE_RED_STREAK_LIMIT):
+            st.record_baseline_red_classification("api")
+
+        board = self._board(completed=[self._baseline_red_skip()])
+        entry = _q("w1", target="main")
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_BASELINE_RED_BLOCKED
+        assert verdict.baseline_red_streak == st.BASELINE_RED_STREAK_LIMIT
+        assert "3" in (verdict.message or "") or str(
+            st.BASELINE_RED_STREAK_LIMIT
+        ) in (verdict.message or "")
+        assert "#3386" in (verdict.message or "")
+
+    def test_structural_skip_is_unaffected_by_a_chronic_baseline_red_streak(
+        self,
+    ) -> None:
+        """A repo's baseline-red streak must never bleed into an ORDINARY
+        structural skip (#1076/#1152, no `test_confirmation` at all) on the
+        same repo — that skip says nothing about whether the base is red."""
+        from coord import state as st
+
+        for _ in range(st.BASELINE_RED_STREAK_LIMIT):
+            st.record_baseline_red_classification("api")
+
+        work = self._tested_work()
+        work.test_state = "skipped"  # no test_confirmation set — structural
+        board = self._board(completed=[work])
+        entry = _q("w1", target="main")
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+
+    def test_literal_matches_the_canonical_confirm_test_constant(self) -> None:
+        """`evaluate_smoke_verdict` compares `test_confirmation` against the
+        literal `"baseline_red"` rather than importing
+        `coord.confirm_test.TEST_CONFIRMATION_BASELINE_RED` (that would be a
+        circular import: `coord.confirm_test` -> `coord.revalidate` ->
+        `coord.merge_queue`). Pin the literal against the canonical constant
+        so the two can never silently drift apart (#2096)."""
+        from coord.confirm_test import TEST_CONFIRMATION_BASELINE_RED
+
+        assert TEST_CONFIRMATION_BASELINE_RED == "baseline_red"
 
     def test_passed_verdict_still_goes_stale_when_base_moves(self) -> None:
         """#1479 must stay intact for `passed` — this fix must not over-reach

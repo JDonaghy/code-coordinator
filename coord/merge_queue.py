@@ -52,7 +52,13 @@ from coord.models import (
     trust_issue_closed_for,
 )
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
-from coord.state import COORD_DIR, dismiss_drive_escalation, record_uat_verdict
+from coord.state import (
+    COORD_DIR,
+    baseline_red_merge_blocked,
+    baseline_red_streak,
+    dismiss_drive_escalation,
+    record_uat_verdict,
+)
 from coord.uat_checks import UatCheckResult, evaluate_uat_checks
 
 _log = logging.getLogger(__name__)
@@ -1713,10 +1719,22 @@ def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
 # non-``None`` to run) straight to SMOKE_OK — a verdict this code never
 # actually confirmed still covers the current head. See
 # `UNKNOWN_BRANCH_HEAD_REASON`.
+#
+# #3386 adds a fourth: SMOKE_BASELINE_RED_BLOCKED — a `"skipped"` verdict
+# confirmed `baseline_red` (#3378 item 2) exists and is otherwise fresh, but
+# this repo has racked up `BASELINE_RED_STREAK_LIMIT` (or more) of them in a
+# row with no genuine `passed` verdict in between. #1732's "skipped never
+# goes stale" exemption is deliberately narrower than it looks: it covers a
+# STRUCTURAL skip (nothing to smoke-test) unconditionally, but a
+# `baseline_red` skip is a claim that the CURRENT merge base — not the
+# branch — is why the suite fails, and #3378 found that claim, satisfied
+# every time, merges a repo whose `main` has been red for 33 days without
+# anyone noticing. See `coord.state.baseline_red_merge_blocked`.
 SMOKE_OK = "ok"
 SMOKE_MISSING = "missing"
 SMOKE_STALE = "stale"
 SMOKE_UNKNOWN = "unknown"
+SMOKE_BASELINE_RED_BLOCKED = "baseline_red_blocked"
 
 
 def _short_sha(sha: str | None) -> str:
@@ -1773,6 +1791,9 @@ class SmokeVerdictStatus:
     # sentence. `None` for every other kind, and for a SMOKE_UNKNOWN whose
     # `gh_ops` stand-in didn't support `raise_on_transient` at all.
     probe_error: "GhTransientError | None" = None
+    # #3386: the repo's consecutive baseline-red streak that produced a
+    # SMOKE_BASELINE_RED_BLOCKED verdict — `None` for every other kind.
+    baseline_red_streak: int | None = None
 
     @property
     def short_reason(self) -> str | None:
@@ -1784,6 +1805,11 @@ class SmokeVerdictStatus:
             return None
         if self.kind == SMOKE_UNKNOWN:
             return unknown_branch_head_reason(self.probe_error)
+        if self.kind == SMOKE_BASELINE_RED_BLOCKED:
+            return (
+                f"{self.baseline_red_streak} consecutive baseline-red "
+                "classifications — merge base needs fixing (#3386)"
+            )
         if self.kind == SMOKE_STALE:
             if self.anchor == "run":
                 return (
@@ -1810,6 +1836,20 @@ class SmokeVerdictStatus:
             # `unknown_branch_head_reason` appends real status/request-id/
             # retry-after when `probe_error` carries any.
             return unknown_branch_head_reason(self.probe_error)
+        if self.kind == SMOKE_BASELINE_RED_BLOCKED:
+            # #3386: a bypass that still merges is not a bypass. This repo
+            # has recorded `baseline_red_streak` consecutive `baseline-red`
+            # (#2170) classifications with no genuine `passed` verdict in
+            # between — the merge base itself needs fixing before this or
+            # any other branch on this repo merges. Waiving requires
+            # `--skip-smoke`, same as any other smoke refusal; there is no
+            # per-branch fix, only a repo-level one.
+            return (
+                f"merge refused: {self.baseline_red_streak} consecutive "
+                "baseline-red (#2170) classifications on this repo with no "
+                "genuine passed verdict in between — the merge base itself "
+                "needs fixing, not another branch (#3386)"
+            )
         if self.kind == SMOKE_STALE:
             aid = self.assignment_id or "<assignment>"
             if self.anchor == "run":
@@ -3269,87 +3309,133 @@ def evaluate_smoke_verdict(
         # moves — a rename upstream, or new commits on the branch, can't
         # turn "there is nothing here a smoke test could exercise" into
         # false. Only `passed` verdicts go through the #1479 base/branch
-        # staleness check below; `skipped` is accepted unconditionally.
-        if test_state == "skipped":
+        # staleness check below; a STRUCTURAL `skipped` is accepted
+        # unconditionally, same as always.
+        #
+        # #3386: a `baseline_red`-confirmed skip (#3378 item 2) is NOT that
+        # structural claim — it asserts the merge BASE, not the branch, is
+        # why the suite fails, and that assertion is falsifiable two ways:
+        #   * item 3 — this repo has racked up too many of these in a row
+        #     with no genuine `passed` in between
+        #     (`coord.state.baseline_red_streak`), so even a fresh
+        #     one must not merge until the base itself is fixed. A bypass
+        #     that still merges every time is not a bypass, it is an outage
+        #     with a footnote — confirmed live on #3383 against a `main`
+        #     that had been red 33 days.
+        #   * item 4 — the branch has since moved on (a fix round pushed new
+        #     commits), so the classification no longer describes what is
+        #     actually on the branch (#3376's live gate defect: a skip cited
+        #     from a since-superseded assignment). Falls through to the same
+        #     branch-content check `passed` gets below.
+        # Deliberately does NOT run the base-move check just below even for
+        # a `baseline_red` skip: that check exists to catch a `passed`
+        # MEASUREMENT going stale, whereas "the base is red" is exactly what
+        # this classification already asserts — item 3's streak bound is
+        # what covers a chronically-moving red base instead.
+        test_confirmation = getattr(a, "test_confirmation", None)
+        # "baseline_red" mirrors `coord.confirm_test.TEST_CONFIRMATION_
+        # BASELINE_RED` — kept as a literal (not an import) to avoid a
+        # module-level import of `coord.confirm_test`, which imports
+        # `coord.revalidate`, which imports THIS module. Pinned against
+        # drift by `tests/test_merge_queue.py::TestStaleSmokeVerdictReporting::
+        # test_literal_matches_the_canonical_confirm_test_constant`.
+        is_baseline_red_skip = (
+            test_state == "skipped" and test_confirmation == "baseline_red"
+        )
+        if test_state == "skipped" and not is_baseline_red_skip:
             return SmokeVerdictStatus(
                 ok=True, kind=SMOKE_OK, assignment_id=getattr(a, "assignment_id", None)
             )
-
-        # Merge base moved: the tested combination (this branch + that base)
-        # no longer exists, even if the branch's own diff is unchanged.
-        test_base_sha = getattr(a, "test_base_sha", None)
-        if (
-            test_base_sha is not None
-            and current_base_sha is None
-            and not base_sha_attempted
-            and gh_ops is not None
-            and repo_github
-            and target_branch
-        ):
-            current_base_sha, base_sha_probe_failed, base_sha_probe_error = _gh_get_branch_sha(
-                gh_ops, repo_github, target_branch
-            )
-            base_sha_attempted = True
-
-        # #2704: the live probe just above positively confirmed it could not
-        # read GitHub, while a recorded verdict names a specific base SHA to
-        # compare against. Before #2704 a failed (or merely un-attempted)
-        # lookup was indistinguishable from a clean `None`, so this fell
-        # straight through to the "base moved" check below, which is a
-        # silent no-op on `current_base_sha is None` and lets execution
-        # reach SMOKE_OK further down: a verdict this call never actually
-        # confirmed still covers the current base. Fail closed instead — we
-        # do not KNOW whether the base moved, so we cannot vouch for it.
-        if test_base_sha is not None and base_sha_probe_failed:
-            if unknown is None:
-                unknown = SmokeVerdictStatus(
+        if is_baseline_red_skip:
+            repo_for_streak = getattr(a, "repo_name", None) or repo_github
+            if repo_for_streak and baseline_red_merge_blocked(repo_for_streak):
+                return SmokeVerdictStatus(
                     ok=False,
-                    kind=SMOKE_UNKNOWN,
+                    kind=SMOKE_BASELINE_RED_BLOCKED,
                     assignment_id=getattr(a, "assignment_id", None),
-                    anchor="base",
-                    recorded_sha=test_base_sha,
-                    probe_error=base_sha_probe_error,
+                    baseline_red_streak=baseline_red_streak(repo_for_streak),
                 )
-            continue
 
-        # #1738/#1778/#1847: the base moved, but a moved SHA doesn't
-        # necessarily mean a content change that could affect a test result.
-        # `_base_move_spared` tries, in order: is the base move itself
-        # provably inert content (docs/scripts/issue-template only, #1738);
-        # failing that, is *this branch*'s entire diff (as actually tested,
-        # test_base_sha..test_head_sha) provably inert (#1778); failing that,
-        # do the two diffs simply touch disjoint files (#1847) — a
-        # substantive base move and a substantive branch that have nothing to
-        # do with each other. Any one being true means the tested combination
-        # is still covered — fall through to the branch-content check below
-        # instead of staling here. If the branch has since gained real
-        # content, that check still catches it independently via the
-        # patch-id compare (#1847 doesn't short-circuit it).
         base_move_spare_reason: str | None = None
-        if (
-            test_base_sha is not None
-            and current_base_sha is not None
-            and test_base_sha != current_base_sha
-        ):
-            spared, base_move_spare_reason = _base_move_spared(
-                gh_ops,
-                repo_github,
-                test_base_sha,
-                current_base_sha,
-                getattr(a, "test_head_sha", None),
-            )
-            if not spared:
-                # stale: re-verify against the new base
-                if stale is None:
-                    stale = SmokeVerdictStatus(
+        test_base_sha = getattr(a, "test_base_sha", None)
+        if test_state == "passed":
+            # Merge base moved: the tested combination (this branch + that
+            # base) no longer exists, even if the branch's own diff is
+            # unchanged. #3386: skipped entirely for a `baseline_red` skip —
+            # see the comment above.
+            if (
+                test_base_sha is not None
+                and current_base_sha is None
+                and not base_sha_attempted
+                and gh_ops is not None
+                and repo_github
+                and target_branch
+            ):
+                current_base_sha, base_sha_probe_failed, base_sha_probe_error = (
+                    _gh_get_branch_sha(gh_ops, repo_github, target_branch)
+                )
+                base_sha_attempted = True
+
+            # #2704: the live probe just above positively confirmed it could
+            # not read GitHub, while a recorded verdict names a specific
+            # base SHA to compare against. Before #2704 a failed (or merely
+            # un-attempted) lookup was indistinguishable from a clean
+            # `None`, so this fell straight through to the "base moved"
+            # check below, which is a silent no-op on `current_base_sha is
+            # None` and lets execution reach SMOKE_OK further down: a
+            # verdict this call never actually confirmed still covers the
+            # current base. Fail closed instead — we do not KNOW whether
+            # the base moved, so we cannot vouch for it.
+            if test_base_sha is not None and base_sha_probe_failed:
+                if unknown is None:
+                    unknown = SmokeVerdictStatus(
                         ok=False,
-                        kind=SMOKE_STALE,
+                        kind=SMOKE_UNKNOWN,
                         assignment_id=getattr(a, "assignment_id", None),
                         anchor="base",
                         recorded_sha=test_base_sha,
-                        current_sha=current_base_sha,
+                        probe_error=base_sha_probe_error,
                     )
                 continue
+
+            # #1738/#1778/#1847: the base moved, but a moved SHA doesn't
+            # necessarily mean a content change that could affect a test
+            # result. `_base_move_spared` tries, in order: is the base move
+            # itself provably inert content (docs/scripts/issue-template
+            # only, #1738); failing that, is *this branch*'s entire diff (as
+            # actually tested, test_base_sha..test_head_sha) provably inert
+            # (#1778); failing that, do the two diffs simply touch disjoint
+            # files (#1847) — a substantive base move and a substantive
+            # branch that have nothing to do with each other. Any one being
+            # true means the tested combination is still covered — fall
+            # through to the branch-content check below instead of staling
+            # here. If the branch has since gained real content, that check
+            # still catches it independently via the patch-id compare
+            # (#1847 doesn't short-circuit it).
+            if (
+                test_base_sha is not None
+                and current_base_sha is not None
+                and test_base_sha != current_base_sha
+            ):
+                spared, base_move_spare_reason = _base_move_spared(
+                    gh_ops,
+                    repo_github,
+                    test_base_sha,
+                    current_base_sha,
+                    getattr(a, "test_head_sha", None),
+                )
+                if not spared:
+                    # stale: re-verify against the new base
+                    if stale is None:
+                        stale = SmokeVerdictStatus(
+                            ok=False,
+                            kind=SMOKE_STALE,
+                            assignment_id=getattr(a, "assignment_id", None),
+                            anchor="base",
+                            recorded_sha=test_base_sha,
+                            current_sha=current_base_sha,
+                        )
+                    continue
 
         # Branch content changed since the test ran. Same SHA-then-patch-id
         # fallback as has_approved_review: a content-identical rebase (SHA
