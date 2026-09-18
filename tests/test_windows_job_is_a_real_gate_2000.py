@@ -1,5 +1,15 @@
 """#2000: the `windows` job in .github/workflows/test.yml is a REAL gate now.
 
+    #3394 (2026-09-18) suspended the job from automatic CI — it is
+    `workflow_dispatch`-only until Windows is active work again. Read
+    `test_windows_job_is_never_automatic` below for what that changed and
+    what it deliberately did not. The rest of this file is UNCHANGED and
+    still load-bearing: the `continue-on-error` assertions guard the job's
+    shape for whenever it runs, and `test_tzdata_is_a_base_dependency_...`
+    guards a *production* defect that has nothing to do with CI scheduling.
+    Suspending the job must not weaken either, which is why this file was
+    re-pointed rather than deleted.
+
 #1895 (CP-4) added the job, but it died during *collection* on Windows:
 
     ERROR tests/test_failure_class.py - zoneinfo._common.ZoneInfoNotFoundError:
@@ -92,20 +102,45 @@ def test_windows_job_does_not_neuter_a_red_result() -> None:
         )
 
 
-def test_windows_job_stays_push_only() -> None:
-    """The `if:` guard is what makes a real gate safe here (#2039).
+def test_windows_job_is_never_automatic() -> None:
+    """The `if:` guard is what keeps this job off the critical path.
 
-    On `pull_request` the job is skipped, and `skipped` is in
-    `ci_store._PASSING_CONCLUSIONS`, so a red Windows run surfaces on main
-    without blocking every open PR in the repo. Removing this guard and the
-    `continue-on-error` removal in #2000 are only jointly safe — flip this
-    back to per-PR and a Windows regression becomes a repo-wide merge block.
+    #2039 originally made it push-only: on `pull_request` the job is skipped,
+    and `skipped` is in `ci_store._PASSING_CONCLUSIONS`, so a red Windows run
+    surfaced on main without blocking every open PR in the repo.
+
+    #3394 narrowed it further to `workflow_dispatch` only. The job had failed
+    every run sampled back to 2026-09-10 (~614 assorted errors), so push-only
+    still meant a permanently red `main` — and a permanently red `main` makes
+    coord mark every branch baseline-red and SKIP its test stage while the
+    gate still reports `test: passed`. That is a worse outcome than no signal,
+    because it is an *inverted* one.
+
+    Both shapes satisfy the property this test actually defends: **the
+    `windows` job never runs automatically on a `pull_request`.** Either
+    literal is accepted, so restoring #2039's push-only form (the documented
+    restore path, once the failures are fixed) does not require touching this
+    test. What is rejected is the job becoming per-PR, or losing its guard
+    altogether — that is the repo-wide merge block #2039 exists to prevent.
     """
     condition = _windows_job().get("if")
-    assert isinstance(condition, str) and "push" in condition, (
-        "the 'windows' job lost its `if: github.event_name == 'push'` guard. "
-        "Combined with #2000's continue-on-error removal, that makes a "
-        "~21-28 min Windows job a per-PR merge blocker (see #2039)."
+    assert isinstance(condition, str), (
+        "the 'windows' job lost its `if:` guard entirely, so it now runs on "
+        "every event including `pull_request`. Combined with #2000's "
+        "continue-on-error removal, that makes a ~21-28 min Windows job a "
+        "per-PR merge blocker (see #2039)."
+    )
+    accepted = ("workflow_dispatch", "push")
+    assert any(event in condition for event in accepted), (
+        f"the 'windows' job's `if:` is {condition!r}, which is neither "
+        "#3394's `github.event_name == 'workflow_dispatch'` (current) nor "
+        "#2039's `github.event_name == 'push'` (the restore target). One of "
+        "those two is required — anything else risks per-PR blocking."
+    )
+    assert "pull_request" not in condition, (
+        f"the 'windows' job's `if:` is {condition!r}, which admits "
+        "`pull_request` events. #2039: a ~21-28 min Windows job on every PR, "
+        "with no continue-on-error, blocks the whole repo on one regression."
     )
 
 
