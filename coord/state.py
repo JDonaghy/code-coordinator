@@ -52,6 +52,7 @@ from coord.db import (
     is_lock_contention_error,
     retry_on_locked,
     rollback_after_driver_error,
+    rollback_pending_write,
 )
 from coord.models import (
     WORK_LIKE_TYPES,
@@ -2630,14 +2631,36 @@ def _claim_review_dispatch_local(of_assignment_id: str) -> bool:
 
     Called directly by the daemon endpoint so it never re-routes back over
     HTTP — mirrors every other ``_*_local`` write in this module.
+
+    #3382: wrapped in :func:`coord.db.retry_on_locked`, unlike this
+    function's original shape which had no lock-contention handling at all
+    — a `database is locked` collision (this daemon serves concurrent
+    ``/review-claim`` requests via Starlette's threadpool on ONE shared
+    SQLite connection) raised straight out to the caller as a 503 with
+    nothing retried. On top of the retry, the write closure rolls back via
+    :func:`coord.db.rollback_pending_write` before re-raising — see that
+    function's docstring for why this specific "INSERT OR IGNORE, then
+    commit" shape needs an unconditional rollback where most of this
+    module's writers don't: a `conn.commit()` failure here can leave a
+    just-applied insert pending on the shared connection for a wholly
+    unrelated handler's next commit to durably persist later (the incident
+    this issue reports — a `review_claims` row held by neither of the two
+    calls that raced for it, wedging vimcode#1086's review for ~13.5h).
     """
-    conn = get_connection()
-    cur = sql.insert_ignore(
-        conn, "review_claims", ["of_assignment_id", "claimed_at"],
-        (of_assignment_id, time.time()),
-    )
-    conn.commit()
-    return (cur.rowcount or 0) > 0
+    def _write() -> int:
+        conn = get_connection()
+        try:
+            cur = sql.insert_ignore(
+                conn, "review_claims", ["of_assignment_id", "claimed_at"],
+                (of_assignment_id, time.time()),
+            )
+            conn.commit()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            rollback_pending_write(conn, exc)
+            raise
+        return cur.rowcount or 0
+
+    return retry_on_locked(_write) > 0
 
 
 def has_review_claim(of_assignment_id: str) -> bool:
@@ -2731,10 +2754,24 @@ def _release_review_dispatch_claim_local(of_assignment_id: str) -> None:
     HTTP, and by ``coord.issue_store._update_local_state`` (which always runs
     against whatever DB is local to that process — the canonical one, when
     that process is the daemon or a non-thin-client host).
+
+    #3382: same `retry_on_locked` + unconditional-rollback-on-commit-failure
+    treatment as :func:`_claim_review_dispatch_local` — this write had
+    neither before, and a lock collision here left a stray `DELETE` pending
+    on the shared connection for the same reason the claim write did.
     """
-    conn = get_connection()
-    sql.execute(conn, "DELETE FROM review_claims WHERE of_assignment_id=?", (of_assignment_id,))
-    conn.commit()
+    def _write() -> None:
+        conn = get_connection()
+        try:
+            sql.execute(
+                conn, "DELETE FROM review_claims WHERE of_assignment_id=?", (of_assignment_id,)
+            )
+            conn.commit()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            rollback_pending_write(conn, exc)
+            raise
+
+    retry_on_locked(_write)
 
 
 def release_review_claim_if_row_is_review(assignment_id: str) -> None:
@@ -2843,16 +2880,28 @@ def _claim_smoke_dispatch_local(work_assignment_id: str, capability_partition: s
     """Local-DB write for :func:`claim_smoke_dispatch`.
 
     Called directly by the daemon endpoint so it never re-routes back over
-    HTTP — mirrors :func:`_claim_review_dispatch_local`.
+    HTTP — mirrors :func:`_claim_review_dispatch_local`, including its
+    #3382 `retry_on_locked` + :func:`coord.db.rollback_pending_write`
+    treatment: this write is the same "INSERT OR IGNORE, then commit"
+    exclusive-claim shape, so it was exposed to the identical
+    503-after-successful-write class that issue reports for the review
+    claim table.
     """
-    conn = get_connection()
-    cur = sql.insert_ignore(
-        conn, "smoke_claims",
-        ["work_assignment_id", "capability_partition", "claimed_at"],
-        (work_assignment_id, capability_partition, time.time()),
-    )
-    conn.commit()
-    return (cur.rowcount or 0) > 0
+    def _write() -> int:
+        conn = get_connection()
+        try:
+            cur = sql.insert_ignore(
+                conn, "smoke_claims",
+                ["work_assignment_id", "capability_partition", "claimed_at"],
+                (work_assignment_id, capability_partition, time.time()),
+            )
+            conn.commit()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            rollback_pending_write(conn, exc)
+            raise
+        return cur.rowcount or 0
+
+    return retry_on_locked(_write) > 0
 
 
 def release_smoke_dispatch_claim(work_assignment_id: str, capability_partition: str) -> None:
@@ -2888,14 +2937,24 @@ def _release_smoke_dispatch_claim_local(
     Called directly by the daemon endpoint so it never re-routes back over
     HTTP, and by :func:`release_smoke_claim_if_row_is_smoke_leg` (which
     always runs against whatever DB is local to that process).
+
+    #3382: same `retry_on_locked` + unconditional-rollback-on-commit-failure
+    treatment as :func:`_release_review_dispatch_claim_local`.
     """
-    conn = get_connection()
-    sql.execute(
-        conn,
-        "DELETE FROM smoke_claims WHERE work_assignment_id=? AND capability_partition=?",
-        (work_assignment_id, capability_partition),
-    )
-    conn.commit()
+    def _write() -> None:
+        conn = get_connection()
+        try:
+            sql.execute(
+                conn,
+                "DELETE FROM smoke_claims WHERE work_assignment_id=? AND capability_partition=?",
+                (work_assignment_id, capability_partition),
+            )
+            conn.commit()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            rollback_pending_write(conn, exc)
+            raise
+
+    retry_on_locked(_write)
 
 
 def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:

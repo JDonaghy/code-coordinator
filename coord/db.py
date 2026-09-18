@@ -666,6 +666,63 @@ def rollback_after_driver_error(conn: Any | None, exc: BaseException) -> None:
         pass
 
 
+def rollback_pending_write(conn: Any | None, exc: BaseException) -> None:
+    """Roll back *conn* after *exc*, unconditionally — the #3382 sibling of
+    :func:`rollback_after_driver_error` for a writer whose own
+    ``conn.commit()`` call, not just the statement before it, can raise.
+
+    :func:`rollback_after_driver_error` deliberately no-ops for a plain
+    SQLite error (see its docstring): that is correct when the failure is a
+    STATEMENT that never got to write anything — SQLite's ``SQLITE_BUSY``,
+    hit while acquiring the lock a write needs, leaves nothing applied, so
+    simply re-running the whole write closure from scratch (what
+    :func:`retry_on_locked` does) is exactly as good as a rollback.
+
+    That reasoning does not hold when it is ``conn.commit()`` itself that
+    raises. WAL-checkpoint contention can make ``COMMIT`` hit
+    ``SQLITE_BUSY`` *after* the statement(s) before it already applied
+    inside the still-open transaction — the write is neither committed nor
+    undone, so it sits there, genuinely pending, on ``coord.db``'s shared
+    process-wide connection, ready for a completely unrelated handler's next
+    unrelated ``commit()`` to durably persist it later. #3382: this is
+    exactly how a ``review_claims`` row survived two callers who each saw
+    their own ``/review-claim`` POST fail with a 503 — neither call's own
+    retry-free write had anything guarding its ``commit()``, so the pending
+    insert outlived both failed calls and was swept up by a later,
+    completely unrelated write on the same shared connection.
+
+    A bare retry of the closure does not fix this the way it fixes a failed
+    statement, either: an ``INSERT OR IGNORE`` re-run against its own
+    still-pending prior insert reads back as a conflict (``rowcount == 0``),
+    so the retry silently misreports "someone else already holds this
+    claim" about a claim only this process's own earlier, abandoned attempt
+    took.
+
+    Call this from the ``except sql.driver_errors():`` block of a write
+    closure that both executes a statement *and* calls ``conn.commit()``
+    itself — today, the ``review_claims``/``smoke_claims`` claim and release
+    writes in ``coord/state.py`` (#3113/#3333), the two sites where "did
+    this claim land" is an exclusive-ownership decision the rest of the
+    system relies on, unlike most of this module's writers where a
+    duplicate-on-retry UPDATE/DELETE is harmless. Unlike
+    :func:`rollback_after_driver_error`, this does not inspect *exc* for a
+    SQLSTATE: the plain-SQLite case above is exactly what it exists to
+    cover, and rolling back an already-aborted Postgres transaction on top
+    of what ``retry_on_locked``'s own :func:`rollback_after_driver_error`
+    call would do anyway is a harmless no-op.
+
+    Same suppression rule as :func:`rollback_after_driver_error`: a ``None``
+    *conn* is a no-op, and a failure of the rollback itself is swallowed so
+    it never masks *exc*, the exception actually worth seeing.
+    """
+    if conn is None:
+        return
+    try:
+        conn.rollback()
+    except Exception:  # noqa: BLE001 — never mask the caught driver error
+        pass
+
+
 # #2538: a handful of consecutive short retries — long enough to ride out a
 # concurrent writer (the daemon's own passive tick, another `coord merge`/
 # `coord notify` invocation) that only holds the DB for a moment, short

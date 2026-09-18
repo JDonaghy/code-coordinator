@@ -4733,6 +4733,100 @@ class TestReviewDispatchClaim:
         assert state.claim_review_dispatch("") is True
 
 
+class TestReviewDispatchClaimLockContention:
+    """#3382: `_claim_review_dispatch_local` had neither `retry_on_locked`
+    nor a rollback. Unlike a plain failed statement (SQLite's SQLITE_BUSY,
+    hit while acquiring the lock a write needs, applies nothing), a
+    `conn.commit()` failure here happens AFTER the `INSERT OR IGNORE`
+    already applied inside the still-open transaction — WAL-checkpoint
+    contention can make COMMIT itself raise. With no rollback, that
+    just-applied insert sat pending on the shared, process-wide connection
+    until a completely unrelated handler's next unrelated `commit()` swept
+    it up — two `coord review` callers each saw their own `/review-claim`
+    POST fail with 503, yet a `review_claims` row survived that neither of
+    them ever actually won (the vimcode#1086 incident, wedged ~13.5h)."""
+
+    class _CommitFlakyConn:
+        """Wraps a real (in-memory) connection: `commit()` — not `execute()`
+        — raises `database is locked` on the first *fail_times* calls,
+        reproducing COMMIT itself hitting contention after the statement
+        before it already applied. Every other `_FlakyConn` in this file
+        fails at `execute()` instead, simulating a statement that never got
+        to write anything — a different, already-handled shape."""
+
+        __module__ = "sqlite3"
+
+        def __init__(self, real_conn, fail_times: int) -> None:
+            self._real = real_conn
+            self._fail_times = fail_times
+            self.commit_calls = 0
+            self.rollback_calls = 0
+
+        def cursor(self):
+            return self._real.cursor()
+
+        def commit(self):
+            self.commit_calls += 1
+            if self.commit_calls <= self._fail_times:
+                raise sqlite3.OperationalError("database is locked")
+            self._real.commit()
+
+        def rollback(self):
+            self.rollback_calls += 1
+            self._real.rollback()
+
+    def test_retries_through_a_commit_failure_then_reports_the_real_winner(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """The insert genuinely applied on attempt 1. Without a rollback
+        before the retry, attempt 2's own `INSERT OR IGNORE` sees it as a
+        conflict and reports `rowcount == 0` — a caller that actually won
+        the claim being told it lost. Pre-fix, this raises immediately
+        instead (no retry at all)."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._CommitFlakyConn(coord_db, fail_times=1)
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        assert state.claim_review_dispatch("w1") is True
+        assert flaky.commit_calls == 2  # one failed commit, one that landed
+        assert flaky.rollback_calls == 1
+
+    def test_exhausted_retries_leave_no_phantom_row_for_a_later_commit(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """The exact incident, as an acceptance test: a lock that never
+        clears must still raise (an honest 503) — and must not leave the
+        abandoned insert pending for some later, wholly unrelated write to
+        durably persist when IT commits. Fails against unfixed `main`,
+        where `_claim_review_dispatch_local` has no `except` at all around
+        its `conn.commit()`."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = self._CommitFlakyConn(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.claim_review_dispatch("w1")
+
+        # A later, wholly unrelated write on the SAME real connection —
+        # standing in for the next Starlette handler thread to reuse this
+        # process-wide singleton — must not durably commit the abandoned
+        # insert above along with its own change.
+        sql.execute(
+            coord_db,
+            "INSERT OR IGNORE INTO review_claims (of_assignment_id, claimed_at) "
+            "VALUES (?, ?)",
+            ("unrelated", 1.0),
+        )
+        coord_db.commit()
+
+        row = sql.execute(
+            coord_db,
+            "SELECT COUNT(*) AS n FROM review_claims WHERE of_assignment_id=?",
+            ("w1",),
+        ).fetchone()
+        assert row["n"] == 0
+
+
 # ── #3206: a reaper-killed review's claim must not leak ─────────────────────
 
 
@@ -4963,6 +5057,42 @@ class TestSmokeDispatchClaim:
         # to key a claim on, so never block.
         assert state.claim_smoke_dispatch("", "macos") is True
         assert state.claim_smoke_dispatch("w1", "") is True
+
+
+class TestSmokeDispatchClaimLockContention:
+    """#3382: `_claim_smoke_dispatch_local` mirrors `_claim_review_dispatch_local`
+    exactly — including the same missing `retry_on_locked`/rollback before
+    this fix. See `TestReviewDispatchClaimLockContention` for the full
+    incident this shape reproduces; this pins the same fix for its sibling
+    claim table."""
+
+    def test_exhausted_retries_leave_no_phantom_row_for_a_later_commit(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+        flaky = TestReviewDispatchClaimLockContention._CommitFlakyConn(
+            coord_db, fail_times=999
+        )
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.claim_smoke_dispatch("w1", "macos")
+
+        sql.execute(
+            coord_db,
+            "INSERT OR IGNORE INTO smoke_claims "
+            "(work_assignment_id, capability_partition, claimed_at) VALUES (?, ?, ?)",
+            ("unrelated", "macos", 1.0),
+        )
+        coord_db.commit()
+
+        row = sql.execute(
+            coord_db,
+            "SELECT COUNT(*) AS n FROM smoke_claims "
+            "WHERE work_assignment_id=? AND capability_partition=?",
+            ("w1", "macos"),
+        ).fetchone()
+        assert row["n"] == 0
 
 
 # ── #3333: a smoke fan-out leg's terminal write must release its claim ──────
