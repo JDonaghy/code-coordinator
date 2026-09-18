@@ -4770,8 +4770,10 @@ def _record_checks_stale_escalation(entry: "QueuedMerge", *, reason: str) -> Non
             entry.issue_number,
             stage=CHECKS_STALE_ALERT_STAGE,
             reason=reason,
-            gate_readings=f"error={entry.error}",
-            proposed_command=f"coord merge --only {entry.repo_name} {entry.issue_number}",
+            gate_readings=f"error={entry.error}" if entry.error else "gate: READY",
+            proposed_command=(
+                f"coord merge --only {entry.repo_name}#{entry.issue_number}"
+            ),
             assignment_id=entry.assignment_id,
         )
     except Exception as exc:  # noqa: BLE001 — the stdout line is the floor
@@ -4882,6 +4884,24 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     on a thin client — this daemon-host tick is the only place it ever
     runs, same guard :func:`_fetch_live_ci_gate`/
     :func:`_run_merge_only_candidates` use.
+
+    Known race, widened by this change (#3396 review): this tick is a new,
+    independent, ALWAYS-ON caller of ``dispatch_conflict_fix(...,
+    stale_rebase=True)`` (``deploy/coord-drive-queue.service``/``.timer``),
+    alongside ``coord notify``'s stalled-pipeline sweep (a separate systemd
+    timer, see ``docs/AGENT_OPERATIONS.md``) and a live drive's own merge
+    attempt — three independent callers for the identical shape now. The
+    shared guard (``has_prior_conflict_fix``/``_has_active_conflict_fix``)
+    is a plain board-snapshot read with no cross-process lock between them:
+    if two of these fire within the same window for the same gate-READY
+    ``checks_stale`` entry, both can independently observe "no prior fix in
+    flight" and dispatch a duplicate stale-rebase worker. Wasted spend, not
+    data loss — the second worker's push is a no-op or is itself refused —
+    but this is the first caller to fire unconditionally on a fixed timer
+    rather than behind a live drive or an opt-in flag, which widens the
+    window. A real fix needs a cross-process claim (e.g. a DB-level lock
+    keyed on the entry) rather than a snapshot read; tracked as a follow-up,
+    not fixed here.
     """
     from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
 
@@ -4930,6 +4950,22 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     except Exception:  # noqa: BLE001 — best-effort, see docstring
         return
 
+    # #3396 review: the cleanup pass below treats an escalation's absence
+    # from *candidates* as "confirmed cleared" — that's only a safe reading
+    # once we know `candidates` came from a REAL read, not from a
+    # `ci_store` that was `None`/unavailable (which `ci_revalidation_
+    # candidates` also answers with `[]`, indistinguishable by return value
+    # alone from "genuinely nothing is stale"). The `ci_store.is_available`
+    # check above, and the broader `except Exception: return` around this
+    # whole block, both already `return` BEFORE this point on exactly that
+    # ambiguous case — so reaching here at all already means the read was
+    # real. Do not restructure this so cleanup can be reached without a
+    # confirmed-available `ci_store` and a `ci_revalidation_candidates` call
+    # that returned normally; that reintroduces the "unconfirmed success"
+    # bug this comment describes (epic #2096: dismissing an escalation is
+    # asserting "resolved" — only do it from an observation, not an
+    # inability to look).
+    #
     # #3396: drop any prior checks_stale escalation for an entry that is no
     # longer a candidate this tick — either it landed, or the base stopped
     # moving. Runs even when *candidates* is empty (that's the fully-healed
@@ -5013,6 +5049,19 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
                     "merge_entry_id": entry.assignment_id,
                 },
             )
+            # #3396 review: an earlier tick may have already written a
+            # `checks_stale` escalation for this SAME entry (dispatch
+            # declined that time — no machine, no repo_path) before a later
+            # tick found dispatch available and actually fired the worker.
+            # Without this, `coord escalate list`/the TUI keep showing
+            # "needs a human" for an entry that in fact now has a
+            # stale-rebase worker actively running against it, until it
+            # eventually drops out of `candidates` entirely. Best-effort —
+            # a dismissal failure here must not undo the dispatch above.
+            try:
+                dismiss_drive_escalation(entry.repo_name, entry.issue_number)
+            except Exception:  # noqa: BLE001 — best-effort, see docstring
+                pass
             continue
 
         # Dispatch declined before ever starting a rebase — no capable or
