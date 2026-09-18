@@ -199,6 +199,53 @@ def checkout(tmp_path: Path) -> Path:
     return base
 
 
+# ── #3378: recognizing a baseline-red `--skipped` reason ────────────────────
+
+
+class TestConfirmationForSkipReason:
+    """`test_confirmation_for_skip_reason` is what lets `coord test --skipped
+    --reason "baseline-red (#2170): ..."` (the human-attended remedy
+    `coord.commands.test_gate` itself instructs — see that module's
+    `RESULT: BASELINE-RED` branch) stamp machine-readable provenance instead
+    of leaving `coord gates` unable to tell that bypass apart from an
+    ordinary validated pass (#3378, live incident on claude-coordinator
+    #3376)."""
+
+    def test_recognizes_the_canonical_prefix(self) -> None:
+        assert (
+            ct.test_confirmation_for_skip_reason(
+                f"{ct.BASELINE_RED_REASON_PREFIX}: every failure reproduces "
+                "identically on the merge-base"
+            )
+            == ct.TEST_CONFIRMATION_BASELINE_RED
+        )
+
+    def test_ordinary_structural_skip_is_not_baseline_red(self) -> None:
+        """#1076/#1152's "contract/fixture-only, nothing to smoke-test"
+        skips must stay unstamped — only the #2170 bypass gets provenance."""
+        assert (
+            ct.test_confirmation_for_skip_reason(
+                "trivial dep bump, covered by regression test in the same PR"
+            )
+            is None
+        )
+
+    def test_none_and_empty_reason_are_not_baseline_red(self) -> None:
+        assert ct.test_confirmation_for_skip_reason(None) is None
+        assert ct.test_confirmation_for_skip_reason("") is None
+
+    def test_prefix_must_anchor_at_the_start(self) -> None:
+        """The marker mentioned mid-sentence (e.g. quoting or explaining the
+        convention) must not be mistaken for the canonical machine-readable
+        reason — only a reason that STARTS with the prefix counts."""
+        assert (
+            ct.test_confirmation_for_skip_reason(
+                f"see the {ct.BASELINE_RED_REASON_PREFIX} convention"
+            )
+            is None
+        )
+
+
 # ── confirm_branch: the mechanical check ─────────────────────────────────────
 
 

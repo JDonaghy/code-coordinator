@@ -143,6 +143,42 @@ class TestSmokeVerdict:
         board = load_board()
         assert board.completed[0].test_state == "skipped"
         assert board.completed[0].test_reason == "trivial dep bump, covered by regression test"
+        # #3378: an ORDINARY structural skip (no run happened, nothing to
+        # confirm) carries no confirmation provenance — only a reason
+        # naming the #2170 baseline-red bypass does (see the sibling test
+        # below). Asserting `None` here pins that this stays the quiet
+        # default, not a regression that starts stamping every skip.
+        assert board.completed[0].test_confirmation is None
+
+    def test_skipped_with_baseline_red_reason_records_confirmation(
+        self, config_file: Path, board_with_done: Board,
+    ) -> None:
+        """#3378: `coord test --skipped --reason "baseline-red (#2170): ..."`
+        is the exact remedy `coord test`'s own `RESULT: BASELINE-RED` branch
+        instructs a human to run (see
+        `test_baseline_red_output_suggests_skipped_not_fail` below). Before
+        this fix it recorded a bare `test_state='skipped'` with no
+        provenance, so `coord gates` rendered it identically to an ordinary
+        validated 'test : passed' — the live #3376 incident this issue
+        reports. Recognizing the canonical prefix must stamp
+        `test_confirmation='baseline_red'` so that gate can finally tell
+        the two apart.
+        """
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "test", "abc123", "--skipped",
+            "--reason",
+            "baseline-red (#2170): every failure reproduces identically "
+            "on the merge-base",
+            "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        assert "SKIPPED" in result.output
+
+        from coord.state import load_board
+        board = load_board()
+        assert board.completed[0].test_state == "skipped"
+        assert board.completed[0].test_confirmation == "baseline_red"
 
     def test_running_records_transient_marker(
         self, config_file: Path, board_with_done: Board,

@@ -519,6 +519,26 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             except Exception:  # noqa: BLE001 — annotation only, never fatal
                 test_toolchain = None
 
+        # #3378: a `--skipped` verdict whose reason names the #2170
+        # baseline-red bypass (the exact remedy this file's own
+        # `RESULT: BASELINE-RED` branch below instructs a human to paste
+        # back — see `--reason` there) must carry that as machine-readable
+        # provenance, not just prose a human happened to type. Without this,
+        # `coord gates`' renderer (`_row_test_confirmation`, #3357) has
+        # nothing to key its "(baseline-red — branch not at fault, #2170)"
+        # annotation off, and the merge gate renders the bypass exactly like
+        # an ordinary validated "test : passed" — indistinguishable from a
+        # suite that actually ran. An ordinary structural `--skipped`
+        # (#1076/#1152: "contract/fixture-only, nothing to smoke-test")
+        # doesn't carry this prefix, so it stays `None` exactly as before.
+        from coord.confirm_test import test_confirmation_for_skip_reason
+
+        test_confirmation = (
+            test_confirmation_for_skip_reason(assignment.test_reason)
+            if verdict == "skip"
+            else None
+        )
+
         # #1337: single-row verdict write on BOTH paths (record_test_verdict
         # self-routes: daemon when board_service is set, direct UPDATE
         # locally).  The old local-path save_board() relied on the whole-board
@@ -532,6 +552,7 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             smoke_test=assignment.smoke_test,
             smoke_test_reason=assignment.smoke_test_reason,
             test_toolchain=test_toolchain,
+            test_confirmation=test_confirmation,
         )
         verdict_word = {
             "pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED", "running": "RUNNING",
@@ -674,6 +695,18 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             from coord.revalidate import is_baseline_red_failure  # noqa: PLC0415
 
             if is_baseline_red_failure(result.returncode, result.stdout or ""):
+                # #3378: the `--reason` text below MUST start with exactly
+                # `BASELINE_RED_REASON_PREFIX` — this `test()` command
+                # recognizes that canonical prefix (via
+                # `coord.confirm_test.test_confirmation_for_skip_reason`)
+                # and stamps the resulting `--skipped` verdict with
+                # `test_confirmation="baseline_red"`, which is what lets
+                # `coord gates` render this as a distinct bypass instead of
+                # an indistinguishable "test : passed" (the #3378 defect).
+                from coord.confirm_test import (  # noqa: PLC0415
+                    BASELINE_RED_REASON_PREFIX,
+                )
+
                 click.echo(
                     f"\nTests failed (exit {result.returncode}) — but the "
                     "runner already confirmed every failure reproduces "
@@ -684,7 +717,7 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
                 click.echo(f"  worktree kept for inspection: {wt_path}")
                 click.echo(
                     "  run: coord test --skipped "
-                    f"{assignment_id} --reason \"baseline-red (#2170): "
+                    f"{assignment_id} --reason \"{BASELINE_RED_REASON_PREFIX}: "
                     "pre-existing failures on this machine\"   "
                     "# NOT --fail — the branch made nothing worse"
                 )

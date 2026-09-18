@@ -2353,6 +2353,7 @@ def _confirmed_pass_verdict(
     board upsert, and this does not undo that; the file is the long form.
     """
     from coord.confirm_test import (  # noqa: PLC0415
+        BASELINE_RED_REASON_PREFIX,
         TEST_CONFIRMATION_BASELINE_RED,
         TEST_CONFIRMATION_CONFIRMED,
         TEST_CONFIRMATION_REFUTED,
@@ -2452,8 +2453,8 @@ def _confirmed_pass_verdict(
         )
         return (
             "skipped",
-            f"baseline-red (#2170), found by an independent re-run (#2464): "
-            f"{result.reason}",
+            f"{BASELINE_RED_REASON_PREFIX}, found by an independent re-run "
+            f"(#2464): {result.reason}",
             TEST_CONFIRMATION_BASELINE_RED,
         )
 
@@ -2513,6 +2514,10 @@ def _record_smoke_verdict(
        the auto-queue and waits for `coord diagnose --stage test --reset`
        rather than re-dispatching forever.
     """
+    from coord.confirm_test import (  # noqa: PLC0415
+        BASELINE_RED_REASON_PREFIX,
+        TEST_CONFIRMATION_BASELINE_RED,
+    )
     from coord.state import (  # noqa: PLC0415
         load_assignment_test_reason,
         load_assignment_test_state,
@@ -2581,15 +2586,28 @@ def _record_smoke_verdict(
         # #2170: `skipped`, not `failed` — the merge gate treats a skipped
         # Test stage as satisfied, and neither `coord fix` nor `coord drive`
         # burns an attempt on breakage this branch did not cause.
+        #
+        # #3378: `test_confirmation=TEST_CONFIRMATION_BASELINE_RED` is NOT
+        # optional here — this is the ONE place a headless worker's own
+        # `SMOKE: baseline-red` report reaches this write (#2170's own
+        # convention: "a baseline-red verdict has no `coord test` flag",
+        # `coord/smoke.py`), and before this fix it recorded a bare
+        # `test_state="skipped"` with no provenance at all. `coord gates`'
+        # renderer (`_row_test_confirmation`, #3357) only appends the
+        # "(baseline-red — branch not at fault, #2170)" annotation when this
+        # column is set — omit it and the merge gate renders this bypass as
+        # a plain, unqualified "test : passed", indistinguishable from a
+        # verdict a suite actually validated (#3378).
         record_test_verdict(
             assignment_id=parent_id,
             test_state="skipped",
             test_reason=(
-                f"baseline-red (#2170): {verdict.reason}"
+                f"{BASELINE_RED_REASON_PREFIX}: {verdict.reason}"
                 if verdict.reason
-                else "baseline-red (#2170): every failure reproduces "
+                else f"{BASELINE_RED_REASON_PREFIX}: every failure reproduces "
                 "identically on the merge-base"
             ),
+            test_confirmation=TEST_CONFIRMATION_BASELINE_RED,
         )
         return
 
