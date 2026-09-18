@@ -817,7 +817,30 @@ def retry_on_locked(
 # #3188: bumped 12 -> 13 for `assignments.uat_actor`, `assignments.
 # uat_prior`, and the two `portal_sync_state.preview_verdict_watermark_*`
 # columns appended to `_migrate_add_columns` below.
-_DB_SCHEMA_VERSION = 13
+#
+# #3236: bumped 13 -> 14 for the four `drive_queue.plan_destructive`/
+# `apply_verdict`/`apply_verdict_reason`/`apply_verdict_at` columns appended
+# to `_migrate_add_columns` below.
+#
+# #3263: bumped 14 -> 15 for the two `merge_queue.ci_seen_checks_sha`/
+# `ci_seen_check_names_json` columns appended to `_migrate_add_columns` below.
+#
+# #3333: bumped 15 -> 16 for the new `smoke_claims` TABLE above (not a
+# column — same shape as #3113's bump for `review_claims`: `_migrate_add_
+# columns` below is unchanged, `CREATE TABLE IF NOT EXISTS` in `_SCHEMA_SQL`
+# is what actually creates it on an existing database, and that only runs
+# when `_ensure_schema` runs, which is gated on this version bump).
+#
+# #3339: bumped 16 -> 17 for the two `assignments.premise_rechecked_at`/
+# `premise_rechecked_reason` columns appended to `_migrate_add_columns`
+# below.
+#
+# #3357: bumped 17 -> 18 for the new `assignments.test_confirmation` column
+# appended to `_migrate_add_columns` below — machine-readable provenance
+# ("confirmed"/"unconfirmed"/"refuted"/"baseline_red") for a `test_state`
+# write, alongside `coord.state._record_test_verdict_local`. See
+# coord.models.Assignment.test_confirmation.
+_DB_SCHEMA_VERSION = 18
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1050,7 +1073,9 @@ _SCHEMA_SQL = """
             ci_fix_head_sha TEXT NOT NULL DEFAULT '',
             ci_fix_noop_streak INTEGER NOT NULL DEFAULT 0,
             ci_fix_detail_sha TEXT NOT NULL DEFAULT '',
-            ci_fix_detail_json TEXT
+            ci_fix_detail_json TEXT,
+            ci_seen_checks_sha TEXT NOT NULL DEFAULT '',
+            ci_seen_check_names_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -1326,6 +1351,29 @@ _SCHEMA_SQL = """
             -- and for any entry enqueued without --no-acceptance, read
             -- identically to "no passthrough" by _launch_argv.
             no_acceptance INTEGER NOT NULL DEFAULT 0,
+            -- #3236: operator-declared (or `--terraform-plan-json`-derived)
+            -- flag that THIS entry's terraform plan carries a destroy or
+            -- replace action — see coord.drive_queue.plan_is_destructive.
+            -- Makes `resume_when` unconditionally ineligible to auto-release
+            -- the gate (coord.drive_queue._resolve_holds /
+            -- pending_probe_targets), no exceptions. 0 for every row
+            -- predating this column and for any entry not declared
+            -- destructive — unchanged pre-#3236 behaviour.
+            plan_destructive INTEGER NOT NULL DEFAULT 0,
+            -- #3236: the OBSERVED outcome of a `terraform apply` against
+            -- this entry's fired gate — '' (unset) / 'applied' /
+            -- 'apply_failed'. Written only by `coord drive-queue
+            -- apply-verdict`, never inferred from hold_state — see
+            -- coord.drive_queue.apply_gate_status for why collapsing
+            -- hold_state=='released' into "applied" would be an
+            -- unconfirmed-success bug (#2096). '' for every row predating
+            -- this column.
+            apply_verdict TEXT NOT NULL DEFAULT '',
+            apply_verdict_reason TEXT NOT NULL DEFAULT '',
+            -- Wall-clock capture time of apply_verdict, same "stamp a
+            -- point-in-time observation" discipline #2133's reason_at
+            -- established for last_reason. NULL until a verdict is recorded.
+            apply_verdict_at REAL,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -1636,6 +1684,36 @@ _SCHEMA_SQL = """
         CREATE TABLE IF NOT EXISTS review_claims (
             of_assignment_id TEXT    PRIMARY KEY,
             claimed_at       REAL    NOT NULL
+        );
+
+        -- #3333: atomic Test-stage fan-out dispatch claim — mirrors #3113's
+        -- `review_claims` above but keyed on `(work_assignment_id,
+        -- capability_partition)` rather than one id alone, because a fan-out
+        -- legitimately dispatches several legs for ONE parent (one per
+        -- capability partition, #3182) — never two for the SAME partition.
+        -- `coord.state.claim_smoke_dispatch` does the same conditional
+        -- `INSERT ... OR IGNORE` + `rowcount` check `claim_review_dispatch`
+        -- does; the loser of the race skips dispatching that partition
+        -- entirely THIS tick instead of also spending a metered Test-stage
+        -- leg. This is the DB-level fix for the quadraui#952 incident:
+        -- `coord-notify.timer` and `coord-drive-queue.timer` ticks 8 seconds
+        -- apart both dispatched the same `[smoke:macos]` partition to a
+        -- `max_workers=1` host, and the SECOND leg silently overwrote the
+        -- `[[smoke-fanout:...]]` manifest entry the FIRST leg had just
+        -- written — an operator who then `coord stop`ped the leg the
+        -- corrupted manifest pointed at watched a still-passing work row get
+        -- recorded as a Test FAILURE. Released the moment the claimed leg's
+        -- own assignment row reaches a terminal status
+        -- (`coord.state.release_smoke_claim_if_row_is_smoke_leg`, called
+        -- from the same two terminal-write chokepoints
+        -- `release_review_claim_if_row_is_review` already is) so a
+        -- legitimate retry of the same partition (an environmental death, or
+        -- an operator `coord stop`) is never permanently stranded.
+        CREATE TABLE IF NOT EXISTS smoke_claims (
+            work_assignment_id   TEXT    NOT NULL,
+            capability_partition TEXT    NOT NULL,
+            claimed_at           REAL    NOT NULL,
+            PRIMARY KEY (work_assignment_id, capability_partition)
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
@@ -2163,6 +2241,46 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # `coord.portal_sync._consume_preview_verdicts`.
     "ALTER TABLE portal_sync_state ADD COLUMN preview_verdict_watermark_at REAL",
     "ALTER TABLE portal_sync_state ADD COLUMN preview_verdict_watermark_rowid TEXT",
+    # #3236: see the CREATE TABLE comment above — the apply-verdict gate
+    # extension of #1757's --hold-after deploy gate. 0/'' for every row
+    # predating this migration, read identically to "not a destructive
+    # entry" / "no verdict recorded yet" by coord.drive_queue.
+    "ALTER TABLE drive_queue ADD COLUMN plan_destructive INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE drive_queue ADD COLUMN apply_verdict TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drive_queue ADD COLUMN apply_verdict_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE drive_queue ADD COLUMN apply_verdict_at REAL",
+    # #3263: the persisted half of the check-set shrinkage guard — see
+    # `coord.merge_queue.QueuedMerge.ci_seen_checks_sha`'s docstring and
+    # `coord.ci_store.shrunk_check_names`. ''/NULL for every row predating
+    # this migration, read identically to "nothing observed yet for this
+    # commit" by `coord.merge_queue._ci_seen_check_names`.
+    "ALTER TABLE merge_queue ADD COLUMN ci_seen_checks_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE merge_queue ADD COLUMN ci_seen_check_names_json TEXT",
+    # #3339: the explicit operator assertion that clears a terminal
+    # `refused_premise` row — see `coord.state.mark_premise_rechecked` and
+    # `coord drive-queue clear-refusal`. Unlike `refused_policy`, a premise
+    # refusal has no mechanical staleness check (a title rewrite cannot make
+    # a missing prerequisite exist — see the #3164 comment in
+    # `coord/drive.py`'s `decide()`), so the ONLY way `decide()`'s
+    # `refused_premise` branch bypasses its `_die()` is a human recording,
+    # on THIS assignment id, that they rechecked the premise and it now
+    # holds. NULL/'' for every row predating this migration and for every
+    # row an operator has not (yet) asserted against — read identically to
+    # "still blocking".
+    "ALTER TABLE assignments ADD COLUMN premise_rechecked_at REAL",
+    "ALTER TABLE assignments ADD COLUMN premise_rechecked_reason TEXT",
+    # #3357: machine-readable provenance for a `test_state` write — was it
+    # actually backed by coord.confirm_test's out-of-band re-run, or just
+    # carried forward from the worker's own claim? Written in the SAME
+    # statement as `test_state`/`test_toolchain` by
+    # `coord.state._record_test_verdict_local`, so it never survives a later
+    # verdict that didn't supply one. NULL for every row predating this
+    # column and for any write that never asked the confirmation question
+    # (a headless smoke failure, a mute-leg park, ...) — read as "no
+    # confirmation attempted", never as either "confirmed" or "unconfirmed".
+    # See coord.models.Assignment.test_confirmation and
+    # coord.confirm_test.TEST_CONFIRMATION_VALUES for the exhaustive set.
+    "ALTER TABLE assignments ADD COLUMN test_confirmation TEXT",
 ]
 
 

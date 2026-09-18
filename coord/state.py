@@ -16,6 +16,7 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 import time
 import warnings
 from collections.abc import Iterable
@@ -1351,6 +1352,7 @@ def record_test_verdict(
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
     test_toolchain: str | None = None,
+    test_confirmation: str | None = None,
 ) -> None:
     """Record a Test-gate verdict on one assignment — routes to the daemon when set.
 
@@ -1377,6 +1379,16 @@ def record_test_verdict(
     caller predating this parameter — records no toolchain; nothing treats
     that as a failure, only as "unknown", same as every other advisory
     health signal in this codebase.
+
+    ``test_confirmation`` (#3357) is **optional and machine-readable
+    provenance** for *this* ``test_state`` write — one of
+    ``coord.confirm_test.TEST_CONFIRMATION_VALUES`` (``"confirmed"`` /
+    ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``), supplied by
+    :func:`coord.notify._confirmed_pass_verdict` when a #2464 out-of-band
+    confirmation actually ran. ``None`` — the default, and every caller that
+    isn't reporting a confirmation outcome — records no provenance; nothing
+    reads that as either "confirmed" or "unconfirmed", only as "the
+    confirmation question was never asked about this write."
     """
     svc = _board_service()
     resp = _route_write(
@@ -1389,6 +1401,7 @@ def record_test_verdict(
             "smoke_test": smoke_test,
             "smoke_test_reason": smoke_test_reason,
             "test_toolchain": test_toolchain,
+            "test_confirmation": test_confirmation,
         },
     )
     if resp is not None:
@@ -1400,6 +1413,7 @@ def record_test_verdict(
         smoke_test=smoke_test,
         smoke_test_reason=smoke_test_reason,
         test_toolchain=test_toolchain,
+        test_confirmation=test_confirmation,
     )
 
 
@@ -1411,6 +1425,7 @@ def _record_test_verdict_local(
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
     test_toolchain: str | None = None,
+    test_confirmation: str | None = None,
 ) -> None:
     """UPDATE the assignment's test_state/test_reason (+ smoke_test mirror).
 
@@ -1436,6 +1451,13 @@ def _record_test_verdict_local(
     THIS verdict; carrying a previous verdict's toolchain forward across a
     re-test would misattribute the new result to hardware that didn't
     produce it.
+
+    #3357: ``test_confirmation`` gets the identical same-statement treatment
+    for the identical reason — it describes whether THIS verdict was
+    independently confirmed, so a later verdict that omits it (a headless
+    smoke failure, a mute-leg park) must not leave a PREVIOUS confirmation's
+    "confirmed"/"unconfirmed" sitting on the row looking like it describes
+    the new write.
     """
     if smoke_test is None:
         # Derive the legacy mirror from the canonical verdict.
@@ -1450,9 +1472,9 @@ def _record_test_verdict_local(
 
     def _write() -> None:
         sql.execute(conn,
-            "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=? "
-            "WHERE assignment_id=?",
-            (test_state, test_reason, test_toolchain, assignment_id),
+            "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=?, "
+            "test_confirmation=? WHERE assignment_id=?",
+            (test_state, test_reason, test_toolchain, test_confirmation, assignment_id),
         )
         # Mirror to legacy smoke_test only for pass/fail, matching coord test /
         # the TUI's record_test_verdict_conn.
@@ -2120,6 +2142,11 @@ def _mark_notified_local(
     # override events above pass (no row matches that string), so this is
     # safe to call unconditionally.
     release_review_claim_if_row_is_review(assignment_id)
+    # #3333: same reasoning, for a #3182 fan-out leg's own smoke-dispatch
+    # claim (coord.state.claim_smoke_dispatch) — see
+    # release_smoke_claim_if_row_is_smoke_leg's docstring. Also a no-op for
+    # every non-fan-out-leg row, so safe to call unconditionally here too.
+    release_smoke_claim_if_row_is_smoke_leg(assignment_id)
 
     # #1036: this is the single funnel every notify.py call site (completion,
     # failure, advisory, stuck, needs-attention, stalled, liveness) reaches —
@@ -2442,6 +2469,459 @@ def release_review_claim_if_row_is_review(assignment_id: str) -> None:
         pass
 
 
+# ── Atomic smoke fan-out dispatch claim (#3333) ──────────────────────────────
+
+
+def claim_smoke_dispatch(work_assignment_id: str, capability_partition: str) -> bool:
+    """Atomically claim the right to dispatch a Test-stage leg for
+    *capability_partition* on *work_assignment_id* — the #3182 fan-out's peer
+    of :func:`claim_review_dispatch` (#3113), keyed on the pair rather than on
+    the work assignment alone because a fan-out legitimately dispatches
+    several legs for ONE parent (one per capability partition), never two for
+    the SAME partition.
+
+    Returns ``True`` when THIS call wins the claim, ``False`` when another
+    caller already holds it.
+
+    Before this, ``dispatch_smoke``'s only per-partition dedupe was
+    :func:`coord.smoke._find_leg_for_partition` — a read of the board, so two
+    ticks that both read before either writes both dispatch the same
+    partition. This is the DB-level conditional insert that closes the gap,
+    exactly like ``claim_review_dispatch`` does for reviews: a single
+    ``INSERT ... OR IGNORE`` is atomic even across two separate
+    processes/machines, so exactly one caller ever sees ``rowcount > 0`` for
+    a given ``(work_assignment_id, capability_partition)`` pair. This is what
+    the quadraui#952 incident needed — two ticks 8 seconds apart both
+    dispatched the same ``[smoke:macos]`` partition to a ``max_workers=1``
+    host, and the second leg's write silently overwrote the first leg's
+    ``[[smoke-fanout:...]]`` manifest entry.
+
+    Routes to the daemon when ``board_service`` is configured (the claim
+    table lives on the shared canonical DB, same as ``assignments``), else
+    writes the local DB directly.
+
+    Released by :func:`release_smoke_dispatch_claim` — call sites are
+    ``coord.smoke._dispatch_smoke_fanout`` itself (a partition whose claim it
+    won but then failed to dispatch on, e.g. no reachable machine this tick)
+    and :func:`release_smoke_claim_if_row_is_smoke_leg` (the leg's own
+    terminal-status write), so a legitimate later retry of the same
+    partition (an environmental death, or an operator ``coord stop``) is
+    never permanently stranded by a claim nothing will ever release.
+    """
+    if not work_assignment_id or not capability_partition:
+        return True
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/smoke-claim",
+        {
+            "work_assignment_id": work_assignment_id,
+            "capability_partition": capability_partition,
+        },
+    )
+    if resp is not None:
+        return bool(resp.get("claimed", False))
+    return _claim_smoke_dispatch_local(work_assignment_id, capability_partition)
+
+
+def _claim_smoke_dispatch_local(work_assignment_id: str, capability_partition: str) -> bool:
+    """Local-DB write for :func:`claim_smoke_dispatch`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP — mirrors :func:`_claim_review_dispatch_local`.
+    """
+    conn = get_connection()
+    cur = sql.insert_ignore(
+        conn, "smoke_claims",
+        ["work_assignment_id", "capability_partition", "claimed_at"],
+        (work_assignment_id, capability_partition, time.time()),
+    )
+    conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
+def release_smoke_dispatch_claim(work_assignment_id: str, capability_partition: str) -> None:
+    """Release a claim taken by :func:`claim_smoke_dispatch`.
+
+    Idempotent — deleting an absent row is a no-op. Routes to the daemon
+    exactly like :func:`claim_smoke_dispatch` does: a thin client that
+    claimed via the ``/smoke-claim`` POST above must release through the same
+    seam, or the claim it took on the daemon's canonical DB would never
+    actually clear.
+    """
+    if not work_assignment_id or not capability_partition:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/smoke-claim-release",
+        {
+            "work_assignment_id": work_assignment_id,
+            "capability_partition": capability_partition,
+        },
+    )
+    if resp is not None:
+        return
+    _release_smoke_dispatch_claim_local(work_assignment_id, capability_partition)
+
+
+def _release_smoke_dispatch_claim_local(
+    work_assignment_id: str, capability_partition: str,
+) -> None:
+    """Local-DB write for :func:`release_smoke_dispatch_claim`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP, and by :func:`release_smoke_claim_if_row_is_smoke_leg` (which
+    always runs against whatever DB is local to that process).
+    """
+    conn = get_connection()
+    sql.execute(
+        conn,
+        "DELETE FROM smoke_claims WHERE work_assignment_id=? AND capability_partition=?",
+        (work_assignment_id, capability_partition),
+    )
+    conn.commit()
+
+
+def release_smoke_claim_if_row_is_smoke_leg(assignment_id: str) -> None:
+    """Release *assignment_id*'s own smoke-dispatch claim, iff that row is
+    itself a #3182 fan-out leg (``type="smoke"`` with a capability tag in its
+    ``issue_title``) (#3333).
+
+    Mirrors :func:`release_review_claim_if_row_is_review` exactly — the ONE
+    "did a smoke fan-out leg just reach a terminal status, and if so release
+    the claim it took" check, called from the same two chokepoints that
+    function is: ``coord.issue_store._update_local_state`` (the worker
+    self-report / git-floor backstop path) and this module's own
+    :func:`_mark_notified_local` (the ``coord notify`` polling path a
+    reaped/cancelled leg's terminal write goes through when no daemon
+    reconcile tick got there first). One shared function closes the gap for
+    both existing callers and any future one, same #2096/#3206 reasoning.
+
+    A no-op for every non-fan-out-leg row (an ordinary single-partition smoke
+    row, a work/review row, the composite ``f"{aid}:stuck"``-style keys
+    ``_mark_notified_local``'s override events pass) — none of those match
+    ``type == "smoke"`` with a parseable capability tag, so this is safe to
+    call unconditionally from either chokepoint.
+
+    Best-effort: a lookup failure here must never turn a successful status
+    write into a raised exception.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    try:
+        row = sql.execute(
+            conn,
+            "SELECT type, review_of_assignment_id, issue_title FROM assignments "
+            "WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        if row is None:
+            return
+        row_type = row["type"] if hasattr(row, "keys") else row[0]
+        row_of_id = (
+            row["review_of_assignment_id"] if hasattr(row, "keys") else row[1]
+        )
+        row_title = row["issue_title"] if hasattr(row, "keys") else row[2]
+        if row_type != "smoke" or not row_of_id:
+            return
+        from coord.smoke import smoke_leg_capabilities  # noqa: PLC0415
+
+        caps = smoke_leg_capabilities(row_title)
+        if caps is None:
+            return  # an ordinary untagged single-leg smoke row — never claimed
+        _release_smoke_dispatch_claim_local(row_of_id, "+".join(sorted(caps)))
+    except Exception:  # noqa: BLE001 — best-effort; never break the status write
+        pass
+
+
+# #3333 review: serializes the read-merge-write cycle in
+# `_merge_smoke_fanout_manifest_local` below — the analogue of
+# `serve_app._merge_lock`'s "any caller that does the same load->mutate->save
+# cycle on shared state must take the same lock" rule, applied here to the
+# #3182 fan-out's `[[smoke-fanout:...]]` manifest instead of the merge-queue
+# table.
+#
+# TWO locks, because one process boundary is not enough (#3333 fix round 2).
+# The first round guarded this with a bare `threading.Lock()` on the
+# assumption that every caller reaches the canonical DB through the board
+# daemon and therefore runs in one process. That assumption is false for the
+# exact topology this issue is about: `docs/AGENT_OPERATIONS.md` requires the
+# daemon host to have NO `client.toml` (so `_board_service()` there is always
+# `None` and every caller runs `_merge_smoke_fanout_manifest_local` directly),
+# and it runs `coord notify` and `coord drive-queue tick` on that host as two
+# SEPARATE `Type=oneshot` systemd units — i.e. two sibling OS processes, each
+# with its own unrelated `threading.Lock()` object in its own memory. That is
+# precisely the pair of PIDs named in the original incident. A process-local
+# lock cannot serialize them, and the SELECT-then-UPDATE below has no
+# DB-engine-level atomicity of its own (unlike `claim_smoke_dispatch`, which
+# is a single `INSERT ... OR IGNORE` statement and so is genuinely atomic
+# across processes).
+#
+# So the read-merge-write takes `coord.filelock.FileLock` — the `flock(2)`
+# advisory lock every coord process already shares for exactly this class of
+# problem (`coord/confirm_test.py`, `coord/drive.py`, `coord/notify.py`) —
+# and the `threading.Lock()` stays *inside* it purely so two threads of one
+# process (two concurrent daemon requests) serialize on a cheap in-memory
+# primitive instead of spinning on `flock`'s 0.25s retry granularity.
+_SMOKE_FANOUT_MANIFEST_LOCK = threading.Lock()
+
+# How long to wait for the cross-process lock before giving up on it. The
+# critical section is two statements against a local database, so sustained
+# contention past this means something is badly wrong rather than merely
+# busy; see `_merge_smoke_fanout_manifest_local` for what happens then.
+_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT = 30.0
+
+
+def smoke_fanout_manifest_lock_path() -> Path:
+    """Path of the cross-process lock guarding the fan-out manifest (#3333).
+
+    Lives beside the database it guards (``$COORD_DIR``), not in a fixed
+    ``~/.coord``: two processes pointed at different ``COORD_DIR``s are
+    working on different databases and have no reason to contend on one
+    lock.
+
+    ``$COORD_SMOKE_FANOUT_MANIFEST_LOCK`` overrides it outright — the same
+    env-var seam ``coord.notifier.store``/``coord.github_throttle`` expose,
+    and for the same reason: it is what lets the test suite's autouse
+    ``_no_real_smoke_fanout_manifest_lock`` fixture keep a test from ever
+    creating (or flock-ing) a file in the OPERATOR's real ``~/.coord`` while
+    a live fleet is merging manifests through it.
+
+    A function rather than a module constant for the same reason
+    :func:`coord.filelock.notify_lock_path` is one — a constant captured at
+    import would freeze whatever ``COORD_DIR`` was when this module first
+    loaded, which on the daemon is process start.
+    """
+    override = os.environ.get("COORD_SMOKE_FANOUT_MANIFEST_LOCK")
+    if override:
+        return Path(override)
+    return Path(sys.modules[__name__].COORD_DIR) / "smoke-fanout-manifest.lock"
+
+
+def merge_smoke_fanout_manifest(
+    *,
+    assignment_id: str,
+    new_entries: list[tuple[str, tuple[str, ...], str | None]],
+    total_partitions: int,
+) -> tuple[str | None, str | None]:
+    """Atomically merge *new_entries* — the legs THIS call itself found
+    already-existing or claimed-and-dispatched this round — into
+    *assignment_id*'s ``[[smoke-fanout:...]]`` manifest, and (re)stamp the
+    parent row ``running`` with the MERGED text (#3333 review).
+
+    Closes the gap the previous plain ``record_test_verdict(test_state=
+    "running", ...)`` write in ``coord.smoke._dispatch_smoke_fanout`` left
+    open: two concurrent ticks racing on the SAME multi-partition work row
+    can each win :func:`claim_smoke_dispatch` for a DIFFERENT capability
+    partition — the claim is scoped per-partition, not per-row, precisely
+    because a fan-out legitimately dispatches several legs for one parent.
+    Each call's own ``leg_manifest`` then names only ITS partition; writing
+    that straight to ``test_reason`` let whichever call's write landed LAST
+    silently erase the other's real, live leg from the parent's manifest
+    forever — nothing else ever re-derives it, so the dropped leg's eventual
+    pass/fail was never folded into the aggregate at all (the exact gap
+    named in the #3333 review: "today the last writer silently wins").
+
+    This performs the read-current-manifest / merge-in-*new_entries* /
+    write-back cycle as ONE step, guarded for its duration by a
+    **cross-process** ``flock`` (:func:`smoke_fanout_manifest_lock_path`) —
+    so two calls racing each other always serialize rather than interleaving
+    their own read and write, and the LAST one to run always folds in every
+    partition any earlier one has already committed. The lock is taken by
+    whichever process actually touches the canonical DB, which is the point:
+    a thin client routes here to the daemon via ``/smoke-fanout-merge`` and
+    never runs the cycle itself, while on the daemon host — where
+    ``client.toml`` is deliberately absent, so `_board_service()` is always
+    ``None`` and every ``coord`` CLI invocation runs the cycle locally — the
+    several sibling `coord notify` / `coord drive-queue tick` processes
+    contend on the one lock FILE rather than on a process-local primitive
+    none of them shares. See ``_SMOKE_FANOUT_MANIFEST_LOCK`` above for why
+    the process-local lock alone was not enough.
+
+    Returns the row's own authoritative ``(test_state, test_reason)`` AFTER
+    this call — which may not be ``("running", <this call's own text>)``: a
+    row that already carries a terminal verdict (a human's ``coord test``
+    override, or ``finalize_smoke_fanout`` beating this call to it) is left
+    untouched, and its CURRENT values are returned unchanged. Callers MUST
+    mirror this return onto their own in-memory ``Assignment.test_state``/
+    ``test_reason`` rather than assuming their own locally-computed text
+    won — a later bulk ``write_board()`` upsert of the whole in-memory board
+    would otherwise re-overwrite the merged/terminal DB row with the
+    caller's own stale, partial view, reproducing this exact bug through a
+    different seam. Returns ``(None, None)`` only when there is nothing to
+    merge at all (no *assignment_id* or no *new_entries*) — a nonexistent
+    row still yields a computed ``("running", <merged text>)`` so a caller
+    (production or a unit test exercising this against a bare in-memory
+    ``Assignment``) always has a value to mirror, mirroring how every other
+    verdict writer in this module tolerates a no-op write against an absent
+    row.
+    """
+    if not assignment_id or not new_entries:
+        return None, None
+    svc = _board_service()
+    payload = {
+        "assignment_id": assignment_id,
+        "total_partitions": total_partitions,
+        "new_entries": [
+            [leg_id, list(caps), command] for leg_id, caps, command in new_entries
+        ],
+    }
+    resp = _route_write(svc, "/smoke-fanout-merge", payload)
+    if resp is not None:
+        return resp.get("test_state"), resp.get("test_reason")
+    return _merge_smoke_fanout_manifest_local(
+        assignment_id=assignment_id,
+        new_entries=new_entries,
+        total_partitions=total_partitions,
+    )
+
+
+def _merge_smoke_fanout_manifest_local(
+    *,
+    assignment_id: str,
+    new_entries: list[tuple[str, tuple[str, ...], str | None]],
+    total_partitions: int,
+) -> tuple[str | None, str | None]:
+    """Local-DB read-merge-write for :func:`merge_smoke_fanout_manifest`.
+
+    Called directly by the daemon's ``/smoke-fanout-merge`` endpoint so it
+    never re-routes back over HTTP — mirrors every other ``_*_local`` write
+    in this module.
+
+    Holds BOTH locks for the full read-merge-write: the ``flock`` at
+    :func:`smoke_fanout_manifest_lock_path`, so two sibling ``coord``
+    *processes* on the DB-owning host (the documented `coord notify` /
+    `coord drive-queue tick` timer pair) cannot interleave their own read and
+    write, and ``_SMOKE_FANOUT_MANIFEST_LOCK`` inside it so two *threads* of
+    one process (two concurrent daemon requests) settle it in memory without
+    touching the filesystem at all.
+
+    If the cross-process lock is still held after
+    ``_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT`` this proceeds **unlocked** rather
+    than failing the dispatch — the same deliberate degradation
+    ``coord/confirm_test.py`` and ``serve_app.post_notify`` already document
+    for their own ``FileLock``s ("running anyway"). Refusing to write would
+    leave the parent row with no manifest naming the legs that are already
+    live, which is a strictly worse outcome than falling back to the
+    pre-#3333 last-writer-wins behaviour on a lock that has been contended
+    for 30 continuous seconds over a two-statement critical section.
+    """
+    from coord.filelock import FileLock, LockBusy  # noqa: PLC0415
+
+    file_lock: FileLock | None = FileLock(smoke_fanout_manifest_lock_path())
+    try:
+        file_lock.acquire(timeout=_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT)
+    except LockBusy:
+        _log.warning(
+            "smoke fan-out manifest lock at %s still held after %.0fs; merging "
+            "%s's manifest unlocked — a concurrent merge may be lost (#3333)",
+            smoke_fanout_manifest_lock_path(),
+            _SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT,
+            assignment_id,
+        )
+        file_lock = None
+    except OSError as exc:  # unwritable $COORD_DIR, exotic filesystem, ...
+        _log.warning(
+            "could not take the smoke fan-out manifest lock at %s (%s); "
+            "merging %s's manifest unlocked (#3333)",
+            smoke_fanout_manifest_lock_path(), exc, assignment_id,
+        )
+        file_lock = None
+
+    try:
+        return _merge_smoke_fanout_manifest_locked(
+            assignment_id=assignment_id,
+            new_entries=new_entries,
+            total_partitions=total_partitions,
+        )
+    finally:
+        if file_lock is not None:
+            file_lock.release()
+
+
+def _merge_smoke_fanout_manifest_locked(
+    *,
+    assignment_id: str,
+    new_entries: list[tuple[str, tuple[str, ...], str | None]],
+    total_partitions: int,
+) -> tuple[str | None, str | None]:
+    """The read-merge-write itself, run with the cross-process ``flock``
+    already held by :func:`_merge_smoke_fanout_manifest_local` (#3333).
+
+    Split out only so the lock acquisition above stays readable; it is not a
+    separate entry point and must never be called without that lock.
+    """
+    from coord.smoke import (  # noqa: PLC0415
+        TEST_STATE_BLOCKED,
+        _build_fanout_running_reason,
+        _parse_fanout_manifest,
+        environmental_smoke_legs,
+    )
+
+    with _SMOKE_FANOUT_MANIFEST_LOCK:
+        conn = get_connection()
+        row = sql.execute(
+            conn,
+            "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        # A missing row (the parent work assignment was never persisted —
+        # true of nothing in production, where `completed` always already
+        # went through `record_dispatched_assignment` when the work itself
+        # was dispatched, but true of plenty of unit tests that exercise
+        # `_dispatch_smoke_fanout` against a bare in-memory `Assignment`)
+        # is treated as "no prior manifest, nothing terminal" rather than a
+        # reason to bail — `_record_test_verdict_local` below already
+        # tolerates writing to a nonexistent assignment_id as a silent
+        # no-op UPDATE (mirroring every other verdict writer in this
+        # module), and the caller still needs a computed "running" value
+        # back to mirror onto its own in-memory row either way.
+        if row is None:
+            current_state, current_reason = None, None
+        else:
+            current_state = row["test_state"] if hasattr(row, "keys") else row[0]
+            current_reason = row["test_reason"] if hasattr(row, "keys") else row[1]
+
+        if current_state in ("passed", "skipped", "failed", TEST_STATE_BLOCKED):
+            # #1819: never clobber a terminal verdict already on the row — a
+            # human's `coord test` override, or `finalize_smoke_fanout`
+            # having already folded every leg (possibly including a
+            # partition this very call just dispatched) into an aggregate.
+            # Return it UNCHANGED so the caller mirrors the real current
+            # state onto its own in-memory row rather than a stale
+            # "running".
+            return current_state, current_reason
+
+        existing = _parse_fanout_manifest(current_reason) or []
+        # Merge keyed on the (sorted) capability tag, never on leg id — a
+        # given partition has exactly one live leg at a time (the atomic
+        # `claim_smoke_dispatch` guarantees that), so this call's own entry
+        # for a partition IS the authoritative one for that partition;
+        # anything already in `existing` for a DIFFERENT partition came from
+        # a sibling call and must survive the merge untouched.
+        merged: dict[tuple[str, ...], tuple[str, tuple[str, ...], str | None]] = {
+            tuple(sorted(caps)): (leg_id, caps, command)
+            for leg_id, caps, command in existing
+        }
+        for leg_id, caps, command in new_entries:
+            merged[tuple(sorted(caps))] = (leg_id, caps, command)
+        leg_manifest = list(merged.values())
+
+        running_reason = _build_fanout_running_reason(
+            leg_manifest,
+            total_partitions=total_partitions,
+            prior_env_legs=environmental_smoke_legs(current_reason),
+        )
+        _record_test_verdict_local(
+            assignment_id=assignment_id,
+            test_state="running",
+            test_reason=running_reason,
+        )
+        return "running", running_reason
+
+
 # ── Review-findings tracking ──────────────────────────────────────────────────
 
 def update_assignment_review_findings(
@@ -2712,14 +3192,77 @@ def reset_work_review_state(
     return cur.rowcount
 
 
-def reset_work_test_state(repo_name: str, issue_number: int) -> int:
-    """Clear the work/plan rows' Test-gate verdict (``test_state`` /
-    ``test_reason``) so the issue is re-testable.  Returns rows updated."""
+def reset_work_test_state(
+    repo_name: str, issue_number: int, *, assignment_id: str | None = None
+) -> int:
+    """Clear a work-like row's Test-gate verdict (``test_state`` /
+    ``test_reason``) so the issue is re-testable.  Returns rows updated.
+
+    #3305: ``coord diagnose --stage test --reset`` must clear the row it
+    diagnosed regardless of which ``WORK_LIKE_TYPES`` member it is — the
+    Test-gate's #3305 zero-commit gate (``coord.smoke._gate_zero_commit_branch``)
+    blocks ``mock-author``/``test-author``/``epic-decompose`` rows exactly
+    like ``work`` rows, so a reset that only understood ``work``/``plan``
+    silently did nothing for the other three (the exact incident type,
+    ``epic-decompose``, included). Mirrors :func:`reset_work_review_state`'s
+    #1180 split: ``work``/``plan``/``epic-decompose`` are safe to blast by
+    ``issue_number`` alone (it uniquely identifies one issue's work chain for
+    these types), but ``test-author``/``mock-author`` share ``issue_number``
+    across sibling JIT-slice assignments for the same milestone tracking
+    issue, so those two additionally require *assignment_id* to match — a
+    caller that doesn't know which specific row it means (``assignment_id``
+    left as ``None``) leaves them untouched rather than risk clobbering a
+    sibling slice's genuine verdict.
+
+    #3333: also releases any outstanding #3182 fan-out ``smoke_claims`` for
+    every row this clears — read from the OLD ``test_reason`` (which carries
+    the ``[[smoke-fanout:...]]`` manifest, see
+    :func:`coord.smoke._encode_fanout_manifest`) BEFORE the ``UPDATE`` below
+    wipes it. Without this, ``coord diagnose --stage test --reset``'s whole
+    point — force a fresh Test-stage dispatch — would silently do nothing
+    for a partition whose phantom fan-out leg died without ever reaching a
+    terminal status write of its own (the one thing that otherwise releases
+    a claim, via :func:`release_smoke_claim_if_row_is_smoke_leg`): the reset
+    clears the row's verdict, but :func:`coord.state.claim_smoke_dispatch`
+    still finds that partition claimed on the very next dispatch attempt and
+    the row never actually re-dispatches — the exact "permanently stranded"
+    failure mode :func:`claim_review_dispatch` was built to avoid for
+    reviews. Best-effort: a manifest-parse failure here never blocks the
+    reset itself.
+    """
     conn = get_connection()
-    cur = sql.execute(conn,
-        "UPDATE assignments SET test_state=NULL, test_reason=NULL "
-        "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
-        (repo_name, issue_number),
+    if assignment_id is not None:
+        where = (
+            "repo_name=? AND issue_number=? AND ("
+            "type IN ('work','plan','epic-decompose') OR "
+            "(type IN ('test-author','mock-author') AND assignment_id=?)"
+            ")"
+        )
+        params: tuple = (repo_name, issue_number, assignment_id)
+    else:
+        where = "repo_name=? AND issue_number=? AND type IN ('work','plan','epic-decompose')"
+        params = (repo_name, issue_number)
+
+    try:
+        from coord.smoke import _parse_fanout_manifest  # noqa: PLC0415
+
+        rows = sql.execute(
+            conn,
+            f"SELECT assignment_id, test_reason FROM assignments WHERE {where}",
+            params,
+        ).fetchall()
+        for row in rows:
+            aid = row["assignment_id"] if hasattr(row, "keys") else row[0]
+            reason = row["test_reason"] if hasattr(row, "keys") else row[1]
+            if not aid or not reason:
+                continue
+            for _leg_id, caps, _cmd in _parse_fanout_manifest(reason) or []:
+                _release_smoke_dispatch_claim_local(aid, "+".join(sorted(caps)))
+    except Exception:  # noqa: BLE001 — best-effort; never block the reset itself
+        pass
+
+    cur = sql.execute(
+        conn, f"UPDATE assignments SET test_state=NULL, test_reason=NULL WHERE {where}", params,
     )
     conn.commit()
     return cur.rowcount
@@ -2991,6 +3534,42 @@ def load_assignment_test_state(assignment_id: str) -> str | None:
     return row["test_state"] if hasattr(row, "keys") else row[0]
 
 
+def load_assignment_test_confirmation(assignment_id: str) -> str | None:
+    """#3357: the current ``test_confirmation`` provenance for one assignment.
+
+    One of ``coord.confirm_test.TEST_CONFIRMATION_VALUES`` (``"confirmed"`` /
+    ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``), or ``None`` when
+    no #2464 confirmation question was ever asked about the row's current
+    ``test_state`` — a headless smoke failure, a mute-leg park, a row
+    predating this column, or a remote read that failed. Same daemon-first,
+    local-fallback routing as :func:`load_assignment_test_state`.
+    """
+    if not assignment_id:
+        return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_assignment  # noqa: PLC0415
+
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return row.get("test_confirmation")
+            return None
+        except Exception:  # noqa: BLE001 — degraded fallback, never blocking
+            return None
+    try:
+        conn = get_connection()
+        row = sql.execute(conn,
+            "SELECT test_confirmation FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    return row["test_confirmation"] if hasattr(row, "keys") else row[0]
+
+
 def load_assignment_review_verdict(assignment_id: str) -> tuple[str | None, str | None]:
     """#2579: the parent WORK row's own ``(review_state, review_verdict)``.
 
@@ -3193,6 +3772,63 @@ def _update_assignment_claude_session_id_local(
         (claude_session_id, assignment_id),
     )
     conn.commit()
+
+
+# #3314: the terminal statuses `_mark_notified_local` ever writes to
+# `assignments.status` — kept as one literal tuple so
+# `list_assignments_missing_claude_session_id`'s WHERE clause can't silently
+# drift from what a completed/failed/advisory/refused-* row actually looks
+# like on this table. `_mark_notified_local` folds EVENT_FAILURE *and*
+# entry_status=='cancelled' (see `coord.notify.detect_transitions`) into the
+# same `status='failed'` write, so 'cancelled' is deliberately not a separate
+# member here — no row is ever persisted with that literal status.
+_TERMINAL_ASSIGNMENT_STATUSES = ("done", "failed", "advisory", "refused_policy", "refused_premise")
+
+
+def list_assignments_missing_claude_session_id(
+    *, max_age_seconds: float, now: float | None = None,
+) -> list[dict]:
+    """#3314: candidates for a claude_session_id re-poll — terminal rows that
+    still have no session id, bounded to a recent window.
+
+    ``coord.notify._capture_claude_session_id`` gets exactly one look at an
+    assignment's agent-status entry (the poll that first observes its
+    terminal transition); once that transition is posted, the assignment
+    never surfaces again in ``detect_transitions``, so a session id the
+    agent hadn't finished capturing *yet* at that exact instant was silently
+    dropped and never retried. This is the query
+    ``coord.notify.retry_pending_claude_session_id_captures`` sweeps each
+    pass to give those rows another look — see that function's docstring for
+    the retry itself.
+
+    *max_age_seconds* bounds the sweep to recently-finished rows: the
+    agent's own live ``/status`` response only reports a session id for an
+    assignment it still remembers, so retrying rows from long ago costs a
+    real HTTP round-trip per candidate machine for something structurally
+    unrecoverable — the same reasoning ``count_purgeable``'s ``older_than_secs``
+    window uses, applied here to bound retry cost rather than storage.
+
+    Local-DB only, like :func:`_update_assignment_claude_session_id_local` —
+    ``coord notify``'s callers (the CLI reroute, the daemon's own drain tick)
+    always run this against the canonical DB directly (#1493's
+    ``COORD_NOTIFY_ON_DAEMON``), so there is no ``board_service`` indirection
+    to route through here.
+    """
+    conn = get_connection()
+    cutoff = (now if now is not None else time.time()) - max_age_seconds
+    placeholders = ", ".join("?" for _ in _TERMINAL_ASSIGNMENT_STATUSES)
+    rows = sql.execute(
+        conn,
+        "SELECT assignment_id, machine_name FROM assignments "
+        f"WHERE status IN ({placeholders}) "
+        "AND (claude_session_id IS NULL OR claude_session_id = '') "
+        "AND finished_at IS NOT NULL AND finished_at >= ?",
+        (*_TERMINAL_ASSIGNMENT_STATUSES, cutoff),
+    ).fetchall()
+    return [
+        {"assignment_id": row["assignment_id"], "machine_name": row["machine_name"]}
+        for row in rows
+    ]
 
 
 def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
@@ -3747,6 +4383,60 @@ def _update_assignment_stop_reason_local(assignment_id: str, stop_reason: str) -
         # function. Nothing uncommitted is lost: the only statement in the
         # transaction is the UPDATE that just failed (the `commit()` above
         # is the last thing in the block).
+        rollback_after_driver_error(conn, exc)
+
+
+def mark_premise_rechecked(assignment_id: str, reason: str) -> None:
+    """#3339: record the operator's explicit assertion that a terminal
+    ``refused_premise`` row's prerequisite has since landed — routes to the
+    daemon when set.
+
+    A `refused_premise` row (`coord.agent.REFUSED_PREMISE`, #3164) has no
+    mechanical staleness check the way `refused_policy` does: rewriting the
+    issue's title cannot make a missing prerequisite exist, so
+    `coord.drive.decide()`'s `refused_premise` branch has nothing to compare
+    against on its own. This is the signal that fills that gap — written by
+    `coord drive-queue clear-refusal`, an explicit, auditable human claim
+    ("I rechecked, the premise holds now"), never inferred. `decide()` reads
+    it back (`IssueState.work_premise_rechecked_at`, populated from this
+    column) and bypasses the `_die()` exactly once, for THIS assignment id
+    only — a fresh dispatch that refuses again produces a new assignment id
+    with this column unset, so the bypass never becomes a standing override.
+
+    *reason* is required (the CLI enforces non-empty) so the audit trail
+    always carries the operator's own justification, not just a timestamp.
+    Overwrite-idempotent (unlike `update_assignment_stop_reason`'s
+    first-writer-wins): an operator asserting a second time — say, after
+    fixing a typo'd upstream issue reference — should not have their
+    correction silently dropped.
+    """
+    if not assignment_id or not reason:
+        return
+    svc = _board_service()
+    resp = _route_assignment_patch(
+        svc, assignment_id, {"premise_rechecked_reason": reason},
+        rpc_endpoint="/assignment-usage",
+    )
+    if resp is not None:
+        return
+    _mark_premise_rechecked_local(assignment_id, reason)
+
+
+def _mark_premise_rechecked_local(assignment_id: str, reason: str) -> None:
+    """Write ``premise_rechecked_at``/``premise_rechecked_reason`` directly
+    to the local DB.  Called by the daemon endpoint."""
+    if not assignment_id or not reason:
+        return
+    conn = get_connection()
+    try:
+        sql.execute(conn,
+            "UPDATE assignments SET premise_rechecked_at=?, "
+            "premise_rechecked_reason=? WHERE assignment_id=?",
+            (time.time(), reason, assignment_id),
+        )
+        conn.commit()
+    except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+        # Column may not exist yet (pre-migration DB or test fixtures).
         rollback_after_driver_error(conn, exc)
 
 
@@ -5558,6 +6248,34 @@ def get_cached_issue_labels(repo_name: str, issue_number: int) -> list[str] | No
         return None
 
 
+def get_cached_issue_state(repo_name: str, issue_number: int) -> str | None:
+    """Return the local cache's ``"open"``/``"closed"`` reading for an
+    issue, or ``None`` if the issue isn't cached.
+
+    Read-only lookup against the local ``issues`` table — never calls
+    GitHub — mirroring :func:`get_cached_issue_labels` exactly. Used by
+    #3376's dispatch-liveness precondition (`coord.dispatch_liveness.
+    check_dispatch_liveness`) to answer "is this issue already closed"
+    without a live GitHub round-trip on every retry/reassign decision.
+
+    ``None`` means "unknown", not "open" — either the issue was never
+    synced at all, or (per :func:`_upsert_open_issues_local`'s 7-day
+    prune) it closed more than a week ago and its cache row has since been
+    reclaimed. A caller must treat ``None`` as "don't refuse", the same
+    "no evidence supplied is not a refusal" posture every other structural
+    gate in this codebase takes (see `coord.machine_fault.
+    classify_machine_fault`) — never as "confirmed open".
+    """
+    conn = get_connection()
+    row = sql.execute(conn,
+        "SELECT state FROM issues WHERE repo_name = ? AND number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["state"] or None
+
+
 def apply_issue_labels(
     repo_name: str,
     issue_number: int,
@@ -7266,7 +7984,8 @@ _DRIVE_QUEUE_COLUMNS = (
     "attempts, deferrals, last_reason, reason_at, session_name, launched_at, "
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
     "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at, "
-    "max_fix_rounds, no_acceptance"
+    "max_fix_rounds, no_acceptance, plan_destructive, apply_verdict, "
+    "apply_verdict_reason, apply_verdict_at"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -7296,6 +8015,15 @@ _DRIVE_QUEUE_UPDATABLE = frozenset(
         "launch_host",
         "resumes",
         "retry_backoff_at",
+        # #3236: the apply-verdict gate extension — written by `coord
+        # drive-queue apply-verdict`, the same generic `update` path
+        # `resume` already uses for `hold_state`/`hold_probes`. Deliberately
+        # NOT `plan_destructive` — that is operator-declared at `add` time,
+        # same provenance split as `hold_after`/`hold_reason`/`resume_when`
+        # above it.
+        "apply_verdict",
+        "apply_verdict_reason",
+        "apply_verdict_at",
     }
 )
 
@@ -7350,6 +8078,7 @@ def enqueue_drive_queue(
     hold_scope: str = "entry",
     max_fix_rounds: int | None = None,
     no_acceptance: bool = False,
+    plan_destructive: bool = False,
 ) -> int | None:
     """Add an issue to the drive queue (or update the entry already there).
 
@@ -7388,6 +8117,13 @@ def enqueue_drive_queue(
     posture as ``max_fix_rounds``: a later `add` that omits `--no-acceptance`
     clears a previously-set one rather than leaving it in place.
 
+    ``plan_destructive`` (#3236) declares this gate as carrying a
+    destroy/replace terraform plan — see
+    ``coord.drive_queue.validate_apply_gate``/``plan_is_destructive`` for
+    what enforces the hard rule this unlocks ("a destroy/replace plan never
+    auto-resumes via ``resume_when``"). Same replace-on-every-`add` posture
+    as ``max_fix_rounds``/``no_acceptance``.
+
     Routes to the daemon when ``board_service`` is set, else writes the local
     DB. Returns the local row id on the local path; the daemon's row id when
     routed.
@@ -7410,6 +8146,7 @@ def enqueue_drive_queue(
             "hold_scope": normalized_scope,
             "max_fix_rounds": max_fix_rounds,
             "no_acceptance": bool(no_acceptance),
+            "plan_destructive": bool(plan_destructive),
         },
     )
     if resp is not None:
@@ -7426,6 +8163,7 @@ def enqueue_drive_queue(
         hold_scope=normalized_scope,
         max_fix_rounds=max_fix_rounds,
         no_acceptance=no_acceptance,
+        plan_destructive=plan_destructive,
     )
 
 
@@ -7442,6 +8180,7 @@ def _enqueue_drive_queue_local(
     hold_scope: str = "entry",
     max_fix_rounds: int | None = None,
     no_acceptance: bool = False,
+    plan_destructive: bool = False,
 ) -> int:
     now = time.time()
     after_json = json.dumps([str(a) for a in (after or [])])
@@ -7465,6 +8204,7 @@ def _enqueue_drive_queue_local(
     if max_fix_rounds is not None and int(max_fix_rounds) < 1:
         max_fix_rounds = None
     no_acceptance_int = 1 if no_acceptance else 0
+    plan_destructive_int = 1 if plan_destructive else 0
 
     # #2846: wrapped in retry_on_locked like every other write in this
     # module — this upsert is idempotent by natural key (repo_name,
@@ -7491,7 +8231,8 @@ def _enqueue_drive_queue_local(
             sql.execute(conn,
                 "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
                 "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
-                "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ? WHERE id = ?",
+                "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ?, "
+                "plan_destructive = ? WHERE id = ?",
                 (
                     machine,
                     after_json,
@@ -7502,6 +8243,7 @@ def _enqueue_drive_queue_local(
                     hold_scope,
                     max_fix_rounds,
                     no_acceptance_int,
+                    plan_destructive_int,
                     existing["id"],
                 ),
             )
@@ -7516,8 +8258,8 @@ def _enqueue_drive_queue_local(
             "INSERT INTO drive_queue "
             "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
             " hold_after, hold_reason, resume_when, hold_state, hold_scope, "
-            " max_fix_rounds, no_acceptance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " max_fix_rounds, no_acceptance, plan_destructive) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo_name,
                 issue_number,
@@ -7532,6 +8274,7 @@ def _enqueue_drive_queue_local(
                 hold_scope,
                 max_fix_rounds,
                 no_acceptance_int,
+                plan_destructive_int,
             ),
             pk_column="id",
         )
@@ -7566,11 +8309,29 @@ def _enqueue_drive_queue_local(
     return entry_id
 
 
-def dequeue_drive_queue(repo_name: str, issue_number: int) -> bool:
-    """Remove an issue from the drive queue, renumbering what's left.
+def dequeue_drive_queue(repo_name: str, issue_number: int) -> dict:
+    """Remove an issue from the drive queue, renumbering what's left — and,
+    #3282, own the live driver session that removal orphans.
 
-    Routes to the daemon when ``board_service`` is set. Returns whether a row
-    was actually removed.
+    Routes to the daemon when ``board_service`` is set. Either way, a
+    successful removal is followed by a
+    :func:`coord.drive.stop_live_driver_session` attempt: the daemon branch
+    lets the daemon's own ``/drive-queue`` ``dequeue`` handler
+    (``coord.serve_app.post_drive_queue``) do it — on the daemon host, the
+    only machine a drive session's tmux server can actually be reached from
+    — and the local branch does it in-process here, since a local
+    (non-daemon) write always executes on that same machine. Neither branch
+    probes for a driver when nothing was removed (an issue never in the
+    queue has nothing to orphan).
+
+    Returns ``{"removed": bool, "driver_ok": bool, "driver_session":
+    str | None, "driver_detail": str | None}``. ``driver_session`` is
+    ``None`` when no live session was found — nothing to report, the exact
+    pre-#3282 behaviour. ``driver_ok`` is only ever ``False`` when a live
+    session existed and could not be confirmed dead; ``driver_detail`` then
+    says why (see :func:`coord.drive.stop_live_driver_session`'s own
+    ``(ok, session, detail)`` contract, which this layers ``removed`` on top
+    of unchanged).
     """
     svc = _board_service()
     resp = _route_write(
@@ -7583,8 +8344,27 @@ def dequeue_drive_queue(repo_name: str, issue_number: int) -> bool:
         },
     )
     if resp is not None:
-        return bool(resp.get("deleted"))
-    return _dequeue_drive_queue_local(repo_name, issue_number)
+        return {
+            "removed": bool(resp.get("deleted")),
+            "driver_ok": bool(resp.get("driver_ok", True)),
+            "driver_session": resp.get("driver_session"),
+            "driver_detail": resp.get("driver_detail"),
+        }
+
+    removed = _dequeue_drive_queue_local(repo_name, issue_number)
+    driver_ok, driver_session, driver_detail = True, None, None
+    if removed:
+        from coord.drive import stop_live_driver_session  # noqa: PLC0415
+
+        driver_ok, driver_session, driver_detail = stop_live_driver_session(
+            repo_name, issue_number
+        )
+    return {
+        "removed": removed,
+        "driver_ok": driver_ok,
+        "driver_session": driver_session,
+        "driver_detail": driver_detail,
+    }
 
 
 def _dequeue_drive_queue_local(repo_name: str, issue_number: int) -> bool:
@@ -7767,6 +8547,32 @@ def _get_drive_queue_entry_local(repo_name: str, issue_number: int) -> dict | No
     return _decode_drive_queue_row(row) if row is not None else None
 
 
+def _get_drive_queue_archive_entry_local(
+    repo_name: str, issue_number: int
+) -> dict | None:
+    """The archived drive-queue entry for one issue, or ``None``.
+
+    #3296: a live-table miss for (repo_name, issue_number) is ambiguous —
+    "never queued" and "archived after going terminal" look identical
+    without this. Callers that want to tell them apart (the `?state=`
+    history read in ``coord.serve_app``) fall back to this. Defensive
+    against ``drive_queue_archive`` not existing yet, same guard as
+    :func:`_drive_queue_archive_rows_local`.
+    """
+    conn = get_connection()
+    try:
+        row = sql.execute(
+            conn,
+            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue_archive "  # noqa: S608 — constant
+            "WHERE repo_name = ? AND issue_number = ?",
+            (repo_name, issue_number),
+        ).fetchone()
+    except sql.driver_errors() as exc:  # #2784: not just sqlite3.OperationalError
+        rollback_after_driver_error(conn, exc)
+        return None
+    return _decode_drive_queue_row(row) if row is not None else None
+
+
 def list_drive_queue(repo_name: str | None = None) -> list[dict]:
     """Every drive-queue entry in run order, optionally filtered to one repo.
 
@@ -7781,19 +8587,67 @@ def list_drive_queue(repo_name: str | None = None) -> list[dict]:
     return _list_drive_queue_local(repo_name)
 
 
-def _list_drive_queue_local(repo_name: str | None = None) -> list[dict]:
+def _list_drive_queue_local(
+    repo_name: str | None = None, *, state: str | None = None
+) -> list[dict]:
+    """Live ``drive_queue`` rows, optionally filtered to one repo and/or one
+    ``state`` value.
+
+    #3296: an explicit ``state`` filter also pulls in matching
+    ``drive_queue_archive`` rows — ``coord.housekeeping.sweep()`` moves
+    terminal drive-queue rows there once they age out of the retention
+    window, and a caller asking "show me every `done` entry" must not have
+    them silently vanish the moment they're archived. Omitting ``state``
+    (the pre-#3296 call shape every other caller in this module still uses)
+    reads only the live table, unchanged.
+    """
     conn = get_connection()
+    where: list[str] = []
+    params: list[object] = []
     if repo_name:
-        rows = sql.execute(conn,
-            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
-            "WHERE repo_name = ? ORDER BY position, id",
-            (repo_name,),
+        where.append("repo_name = ?")
+        params.append(repo_name)
+    if state:
+        where.append("state = ?")
+        params.append(state)
+    clause = f" WHERE {' AND '.join(where)}" if where else ""
+    rows = sql.execute(
+        conn,
+        f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue{clause} "  # noqa: S608 — constant
+        "ORDER BY position, id",
+        params,
+    ).fetchall()
+    entries = [_decode_drive_queue_row(r) for r in rows]
+    if state:
+        entries.extend(_drive_queue_archive_rows_local(repo_name, state))
+    return entries
+
+
+def _drive_queue_archive_rows_local(repo_name: str | None, state: str) -> list[dict]:
+    """``drive_queue_archive`` rows matching *state* (+ optional *repo_name*).
+
+    Defensive against ``drive_queue_archive`` not existing yet — it is only
+    created the first time ``coord.housekeeping.sweep()`` archives a
+    drive-queue row — mirroring
+    :func:`coord.merge_queue._archived_merged_issue_keys`'s guard for the
+    same not-yet-archived case on ``merge_queue_archive``.
+    """
+    conn = get_connection()
+    where = ["state = ?"]
+    params: list[object] = [state]
+    if repo_name:
+        where.append("repo_name = ?")
+        params.append(repo_name)
+    try:
+        rows = sql.execute(
+            conn,
+            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue_archive "  # noqa: S608 — constant
+            f"WHERE {' AND '.join(where)} ORDER BY id",
+            params,
         ).fetchall()
-    else:
-        rows = sql.execute(conn,
-            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
-            "ORDER BY position, id"
-        ).fetchall()
+    except sql.driver_errors() as exc:  # #2784: not just sqlite3.OperationalError
+        rollback_after_driver_error(conn, exc)
+        return []
     return [_decode_drive_queue_row(r) for r in rows]
 
 
@@ -7836,6 +8690,70 @@ def get_issue_titles(keys: Iterable[tuple[str, int]]) -> dict[str, str]:
         ).fetchone()
         if row is not None and row["title"]:
             out[f"{repo}#{number}"] = row["title"]
+    return out
+
+
+def cached_open_issues(repo_names: Iterable[str]) -> list[dict]:
+    """Cached issue rows (``repo_name``, ``number``, ``title``, ``body``,
+    ``state``, ``labels`` — ``labels`` decoded to a plain ``list[str]``) for
+    every ``repo_names`` entry, straight off the locally-cached ``issues``
+    table — backs ``coord plans --lint-epics``'
+    :func:`coord.plans.find_unlabelled_epics` scan (#3227) and
+    ``--lint-stale-epics``' :func:`coord.plans.find_stale_epics` scan
+    (#3228), which needs ``body`` to parse each epic's declared children.
+
+    Routes to the daemon when ``board_service`` is set, else reads the local
+    ``issues`` table directly — the same split as :func:`get_issue_titles`,
+    for the same reason: a thin client (``coord web``/``coord plans`` pointed
+    at a remote daemon) has no local ``issues`` table, so a bare local SELECT
+    here would silently return an empty list and the lint would falsely
+    report "clean" on every machine but the daemon host.
+
+    Fail-soft like :func:`fetch_leg_counts`/``coord.reports._default_completed_source``:
+    an unreadable local DB (or a daemon predating the ``/issues`` route, or
+    any transport failure) degrades to ``[]`` rather than raising — a lint
+    scan should never crash the rest of ``coord plans``' output over this.
+    """
+    names = sorted({r for r in repo_names if r})
+    if not names:
+        return []
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_cached_issues  # noqa: PLC0415
+
+        return fetch_cached_issues(svc, names)
+    return _cached_open_issues_local(names)
+
+
+def _cached_open_issues_local(repo_names: list[str] | None = None) -> list[dict]:
+    """Local-DB half of :func:`cached_open_issues` — also what the daemon's
+    ``GET /issues`` route runs, on the daemon's own DB, to serve a thin
+    client's request. ``repo_names=None`` reads every repo's rows.
+    """
+    try:
+        conn = get_connection()
+        if repo_names:
+            placeholders = ",".join("?" for _ in repo_names)
+            rows = sql.execute(
+                conn,
+                "SELECT repo_name, number, title, body, state, labels FROM issues "  # noqa: S608 — placeholders only
+                f"WHERE repo_name IN ({placeholders})",
+                tuple(repo_names),
+            ).fetchall()
+        else:
+            rows = sql.execute(
+                conn, "SELECT repo_name, number, title, body, state, labels FROM issues"
+            ).fetchall()
+    except Exception:  # noqa: BLE001 — an unreadable cache is an empty scan
+        return []
+    out: list[dict] = []
+    for r in rows:
+        row = dict(r)
+        try:
+            row["labels"] = json.loads(row.get("labels") or "[]")
+        except (TypeError, ValueError):
+            row["labels"] = []
+        out.append(row)
     return out
 
 

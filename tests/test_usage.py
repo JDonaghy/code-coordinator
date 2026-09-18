@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -1517,3 +1518,199 @@ class TestUsageCommandBareViewHonorsWindowFlags:
         assert "plain001" in result.output
         assert "USAGE — window" not in result.output
         assert "Σ" not in result.output
+
+
+# ── #3313: fetch_usage_rows no longer reads the retention-capped /board ──────
+
+
+def _insert_assignment_row(
+    conn,
+    table: str,
+    assignment_id: str,
+    *,
+    dispatched_at: float,
+    finished_at: float | None = None,
+    cost_usd: float = 1.0,
+    repo_name: str = "api",
+    issue_number: int = 1,
+) -> None:
+    conn.execute(
+        f"INSERT INTO {table} (assignment_id, machine_name, repo_name, "  # noqa: S608
+        "issue_number, issue_title, type, status, dispatched_at, finished_at, "
+        "cost_usd) VALUES (?, 'm', ?, ?, 't', 'work', 'done', ?, ?, ?)",
+        (assignment_id, repo_name, issue_number, dispatched_at, finished_at, cost_usd),
+    )
+    conn.commit()
+
+
+class TestLocalUsageRows:
+    """#3313: :func:`coord.usage._local_usage_rows` — the local-DB read
+    backing both ``fetch_usage_rows``'s local branch and the daemon's ``GET
+    /usage-rows`` handler. Replaces the old local branch
+    (``SqliteStore().list_assignments()``), which only read the live
+    ``assignments`` table and silently lost anything ``coord housekeeping``
+    had already archived."""
+
+    def test_spans_assignments_and_archive(self, coord_db) -> None:
+        from coord.usage import _local_usage_rows
+
+        now = time.time()
+        _insert_assignment_row(coord_db, "assignments", "live-1", dispatched_at=now)
+        coord_db.execute(
+            "CREATE TABLE assignments_archive AS SELECT * FROM assignments WHERE 0"
+        )
+        _insert_assignment_row(
+            coord_db, "assignments_archive", "old-1", dispatched_at=now - 90 * 86400
+        )
+
+        rows, truncated = _local_usage_rows()
+        assert truncated is False
+        assert {r["assignment_id"] for r in rows} == {"live-1", "old-1"}
+
+    def test_missing_archive_table_does_not_raise(self, coord_db) -> None:
+        """No ``assignments_archive`` table at all (``coord housekeeping``
+        never ran) must degrade to "just the live table", not a 503 —
+        mirrors ``coord.state._leg_counts_local``'s same guard."""
+        from coord.usage import _local_usage_rows
+
+        _insert_assignment_row(coord_db, "assignments", "live-1", dispatched_at=time.time())
+
+        rows, truncated = _local_usage_rows()
+        assert [r["assignment_id"] for r in rows] == ["live-1"]
+        assert truncated is False
+
+    def test_window_filters_by_dispatched_or_finished(self, coord_db) -> None:
+        from coord.usage import _local_usage_rows
+
+        now = time.time()
+        _insert_assignment_row(coord_db, "assignments", "recent", dispatched_at=now - 3600)
+        _insert_assignment_row(coord_db, "assignments", "old", dispatched_at=now - 30 * 86400)
+
+        rows, _truncated = _local_usage_rows(since=now - 86400, until=None)
+        assert [r["assignment_id"] for r in rows] == ["recent"]
+
+    def test_wider_window_never_returns_fewer_rows_than_narrower_one(self, coord_db) -> None:
+        """The exact non-monotonicity #3313 reported: a longer --since must
+        never yield fewer rows than a shorter one."""
+        from coord.usage import _local_usage_rows
+
+        now = time.time()
+        for i, age_days in enumerate([1, 5, 20]):
+            _insert_assignment_row(
+                coord_db, "assignments", f"a-{i}", dispatched_at=now - age_days * 86400
+            )
+
+        narrow, _ = _local_usage_rows(since=now - 2 * 86400)
+        wide, _ = _local_usage_rows(since=now - 30 * 86400)
+        assert len(wide) >= len(narrow)
+        assert len(narrow) == 1
+        assert len(wide) == 3
+
+    def test_archived_row_gets_the_same_slim_projection_as_a_live_row(self, coord_db) -> None:
+        """Archived rows must decode through the SAME DTO as live rows
+        (``board_schema.BoardAssignment``) rather than falling back to a raw
+        ``dict(row)`` — the fallback would ship every raw column, including
+        ``briefing``, straight back onto the wire (the exact bloat #1849
+        slimmed the live table to avoid)."""
+        from coord.usage import _local_usage_rows
+
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type, status, dispatched_at, briefing) "
+            "VALUES ('old-1', 'm', 'api', 1, 't', 'work', 'done', ?, 'a huge briefing')",
+            (time.time(),),
+        )
+        coord_db.execute(
+            "CREATE TABLE assignments_archive AS SELECT * FROM assignments WHERE 0"
+        )
+        coord_db.execute("INSERT INTO assignments_archive SELECT * FROM assignments")
+        coord_db.execute("DELETE FROM assignments")
+        coord_db.commit()
+
+        rows, _truncated = _local_usage_rows()
+        assert len(rows) == 1
+        assert "briefing" not in rows[0]
+
+    def test_truncates_past_hard_ceiling_and_says_so(self, coord_db, monkeypatch) -> None:
+        from coord import usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "USAGE_ROWS_MAX_ROWS", 1)
+        now = time.time()
+        _insert_assignment_row(coord_db, "assignments", "newer", dispatched_at=now)
+        _insert_assignment_row(coord_db, "assignments", "older", dispatched_at=now - 10)
+
+        rows, truncated = usage_mod._local_usage_rows()
+        assert truncated is True
+        assert len(rows) == 1
+        # Newest-dispatched kept, not an arbitrary/oldest slice.
+        assert rows[0]["assignment_id"] == "newer"
+
+
+class TestFetchUsageRowsRoutesToUsageRowsNotBoard:
+    """#3313: ``fetch_usage_rows``'s remote branch must read the daemon's
+    dedicated ``/usage-rows`` endpoint, never ``/board`` — ``/board`` is
+    capped (#762) to a retention window, which is exactly what made a thin
+    client's ``coord usage`` under-report spend by ~8x."""
+
+    def test_remote_branch_calls_usage_rows_not_board(self, monkeypatch) -> None:
+        from coord import usage as usage_mod
+        from coord.client import ServiceConfig
+
+        monkeypatch.setattr(
+            "coord.client.resolve_board_service",
+            lambda *a, **k: ServiceConfig(url="http://daemon:7435", token=None),
+        )
+
+        calls: list[tuple] = []
+
+        def fake_fetch(svc, *, since=None, until=None, timeout=5.0):
+            calls.append((since, until))
+            return {"rows": [{"assignment_id": "r-1"}], "truncated": False}
+
+        monkeypatch.setattr("coord.client.fetch_usage_rows_from_daemon", fake_fetch)
+
+        def _must_not_be_called(*a, **k):
+            raise AssertionError("fetch_usage_rows must not read the capped /board (#3313)")
+
+        monkeypatch.setattr("coord.client.fetch_board_payload", _must_not_be_called)
+
+        rows = usage_mod.fetch_usage_rows(since=100.0, until=200.0)
+        assert rows == [{"assignment_id": "r-1"}]
+        assert calls == [(100.0, 200.0)]
+
+    def test_remote_branch_warns_when_daemon_reports_truncation(
+        self, monkeypatch, caplog
+    ) -> None:
+        from coord import usage as usage_mod
+        from coord.client import ServiceConfig
+
+        monkeypatch.setattr(
+            "coord.client.resolve_board_service",
+            lambda *a, **k: ServiceConfig(url="http://daemon:7435", token=None),
+        )
+        monkeypatch.setattr(
+            "coord.client.fetch_usage_rows_from_daemon",
+            lambda *a, **k: {"rows": [{"assignment_id": "r-1"}], "truncated": True},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="coord.usage"):
+            rows = usage_mod.fetch_usage_rows()
+
+        assert rows == [{"assignment_id": "r-1"}]
+        assert any("truncated" in rec.message for rec in caplog.records)
+
+    def test_local_branch_warns_when_local_read_is_truncated(
+        self, coord_db, monkeypatch, caplog
+    ) -> None:
+        from coord import usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "USAGE_ROWS_MAX_ROWS", 1)
+        now = time.time()
+        _insert_assignment_row(coord_db, "assignments", "a", dispatched_at=now)
+        _insert_assignment_row(coord_db, "assignments", "b", dispatched_at=now - 5)
+
+        with caplog.at_level(logging.WARNING, logger="coord.usage"):
+            rows = usage_mod.fetch_usage_rows()
+
+        assert len(rows) == 1
+        assert any("truncated" in rec.message for rec in caplog.records)

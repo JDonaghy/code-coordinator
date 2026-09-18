@@ -3,15 +3,16 @@ docs/ORACLE_LOOP.md).
 
 ``coord acceptance`` is a thin, framework-agnostic orchestrator; this module
 is the one seam that varies per medium — TUI (quadraui ``TuiDriver``), CLI
-(pytest), web (Playwright), native, etc. Each driver knows how to *run* a
-repo's declared acceptance suite and *parse* its raw output into a
+(pytest), web (Playwright), Terraform, native, etc. Each driver knows how to
+*run* a repo's declared acceptance suite and *parse* its raw output into a
 normalized list of ``{"id": str, "status": "pass"|"fail"|"skip", "message":
 str}`` dicts (``cli-pytest`` additionally carries ``"expected"``/``"got"``
 on a failing test — see :func:`parse_pytest_junit_xml`). ``tui-tuidriver``,
-``cli-pytest`` (#1125), and ``web-playwright`` (#1539) are implemented;
-other ``kind`` values are declared in ``coordinator.yml`` (see
-:class:`coord.config.AcceptanceConfig`) but rejected here with a clear "not
-yet implemented" error until their issues land (native).
+``cli-pytest`` (#1125), ``web-playwright`` (#1539), and ``terraform``
+(#3232) are implemented; other ``kind`` values are declared in
+``coordinator.yml`` (see :class:`coord.config.AcceptanceConfig`) but
+rejected here with a clear "not yet implemented" error until their issues
+land (native).
 
 ``cli-pytest`` parses pytest's built-in ``--junit-xml`` report (a core
 pytest flag, not a plugin — no extra dependency required in the driven
@@ -31,6 +32,33 @@ command (#1733, ``AcceptanceDriverConfig.setup``) once before its suite —
 e.g. ``npm ci`` for ``web-playwright``, which otherwise fails with a bare
 ``exit 127`` (playwright not found) the first time it runs against ``coord
 acceptance record``'s throwaway, dependency-less worktree.
+
+``terraform`` (#3232, epic #3230's "no cloud account, no credentials, no new
+machine capability" v1 slice) runs *exactly* ``terraform init
+-backend=false`` then ``terraform validate`` — no state backend, no
+provider auth, no ``terraform plan``. It forces terraform validate's own
+built-in ``-json`` structured-diagnostics report the same way
+``_run_cli_pytest``/``_run_web_playwright`` force ``--junit-xml``/
+``--reporter=json``, so a normalized ``tests`` list (one entry per
+diagnostic, or a single failing entry when ``init`` itself never gets far
+enough to run ``validate`` at all) comes out regardless of what the driven
+repo's own terraform version prints to plain stdout. This is a compile
+check, not an acceptance oracle — see :data:`VALIDATE_ONLY_KINDS`.
+
+``terraform`` additionally runs a deterministic policy gate (#3234, epic
+#3230 child 3) whenever the driven repo has opted in by carrying the
+convention files: ``tflint`` (rule-based HCL/provider checks — pinned
+provider versions, etc.) when a ``.tflint.hcl`` exists at the repo root,
+and ``conftest``/OPA (org policy over raw ``.tf`` source — no plaintext
+secrets, required tags, no ``local-exec``, no ``prevent_destroy``
+removal) when a ``policy/`` directory of ``*.rego`` files exists. Like
+``validate``, each forces its own structured JSON report
+(``--format=json`` / ``--output=json``) and is folded into the same
+normalized ``tests`` list — see :func:`parse_tflint_json` /
+:func:`parse_conftest_json`. This still proves only that the config obeys
+a fixed, mechanically-checkable ruleset, never whether the change itself
+is the *right* change — that judgment call stays with the reviewer (epic
+#3230 child 4), not this gate.
 """
 
 from __future__ import annotations
@@ -47,7 +75,7 @@ from pathlib import Path
 # Driver kinds this module knows how to run. Keep in sync with the adapters
 # implemented below — a kind can be *declared* in coordinator.yml ahead of its
 # adapter landing, but running it must fail loudly rather than silently no-op.
-SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright")
+SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright", "terraform")
 
 # #2748 (IL-2): driver kinds whose `run` produces a real pass/fail verdict
 # but NOT yet a deterministic one, because an input they depend on hasn't
@@ -62,6 +90,33 @@ SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright")
 # because it is exactly the kind of "which medium behaves how" fact this
 # module already owns — see the module docstring.
 FIXTURE_SERVER_DEPENDENT_KINDS = frozenset({"web-playwright"})
+
+# #3232: driver kinds whose adapter produces a real, deterministic pass/fail
+# verdict — this is NOT "not yet implemented", `run_driver` runs it for real
+# — but one that is intentionally scoped narrower than a full acceptance
+# oracle by design, not by a missing shared dependency. `terraform` runs
+# `init -backend=false` + `validate` (#3232), plus an opt-in tflint/conftest
+# policy gate (#3234, #3230 child 3) — all of it static analysis over the
+# `.tf` source, proving the config parses/resolves and obeys a fixed
+# ruleset, never that the infrastructure does what was asked (no `terraform
+# plan`, no credentials, no apply — epic #3230's later children). The name
+# refers to that plan/apply/credentials scope, not literally "only
+# `validate` ever runs". Distinct from FIXTURE_SERVER_DEPENDENT_KINDS above
+# — that gap closes once a *shared* dependency (the fixture server, #1538)
+# ships; this one closes only when a *later child issue* (a live plan,
+# #3230's credentialed children) widens what this adapter itself runs.
+# `coord.repo_onboard`'s oracle-readiness layer reads this the same way it
+# reads FIXTURE_SERVER_DEPENDENT_KINDS, so a driver-present repo doesn't
+# silently read as fully oracle-ready.
+VALIDATE_ONLY_KINDS = frozenset({"terraform"})
+
+# #3303 (epic #3237's teardown safety guard, slice 1): the ONLY resource-group
+# name shape the ephemeral-apply probe's teardown is ever allowed to delete.
+# Anchored at both ends deliberately — a prefix match on ``rg-coord-`` would
+# match every resource group the fleet owns, including ``rg-coord-shared``
+# (holds ``stcoordjdbackup``, the off-site restic backup) and
+# ``rg-coord-images``, both of which must never be touched by a teardown.
+EPHEMERAL_RG_PATTERN = re.compile(r"^rg-coord-ephemeral-[0-9a-f]{8}$")
 
 # libtest's ``--format json`` per-line test-event stream (`cargo test -- -Z
 # unstable-options --format json`) event -> our normalized status.
@@ -99,6 +154,41 @@ _PLAYWRIGHT_STATUS = {
 
 class DriverError(Exception):
     """Raised when a driver can't run its suite or the ``kind`` is unknown."""
+
+
+def assert_ephemeral_rg(name: str) -> None:
+    """Raise :class:`DriverError` unless *name* is an ephemeral probe
+    resource group (#3303, epic #3237's teardown safety guard, slice 1).
+
+    The ephemeral-apply probe (a later slice) must route every teardown
+    through this function before deleting anything. It exists because
+    ``rg-coord-shared`` holds ``stcoordjdbackup`` — the off-site restic
+    backup, i.e. the thing that exists to survive everything else failing —
+    and ``rg-coord-images`` is live too. A teardown that computes a
+    resource-group name and deletes it is one bad variable away from taking
+    out the backup; today the only thing standing between those two facts is
+    prose in ``coord-infra/CLAUDE.md``. This makes it a check.
+
+    Fails CLOSED, not open: any *name* this cannot positively confirm
+    matches :data:`EPHEMERAL_RG_PATTERN` — a non-string, ``None``, an empty
+    string, one with leading/trailing whitespace, uppercase hex, or one that
+    merely *contains* a valid ephemeral name rather than being exactly one
+    (anchoring rules that out) — raises. Mirrors
+    :func:`coord.drive_queue.plan_is_destructive`, whose docstring spells out
+    the same reasoning: an unparseable shape is "cannot confirm this is
+    safe", never "probably fine".
+
+    Raises, rather than returning a bool, so a caller that forgets to check
+    a returned ``False`` still can't proceed straight into a delete.
+    """
+    if not isinstance(name, str) or not EPHEMERAL_RG_PATTERN.fullmatch(name):
+        raise DriverError(
+            f"refusing to treat {name!r} as an ephemeral probe resource "
+            "group — it does not match "
+            f"{EPHEMERAL_RG_PATTERN.pattern!r} exactly. Teardown must never "
+            "run against a resource group it cannot positively confirm is "
+            "ephemeral."
+        )
 
 
 @dataclass
@@ -177,6 +267,8 @@ def run_driver(
         return _run_cli_pytest(run_command, cwd, timeout=timeout)
     if kind == "web-playwright":
         return _run_web_playwright(run_command, cwd, timeout=timeout)
+    if kind == "terraform":
+        return _run_terraform(run_command, cwd, timeout=timeout)
     return _run_generic(run_command, cwd, timeout=timeout)
 
 
@@ -334,6 +426,150 @@ def _run_web_playwright(run_command: str, cwd: str, *, timeout: int) -> DriverRe
             tests=tests,
             raw_output=(proc.stdout or "") + (proc.stderr or ""),
         )
+
+
+def _run_terraform(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
+    """The ``terraform`` shape (#3232): *run_command* is this driver's
+    contract fixed to exactly ``terraform init -backend=false && terraform
+    validate`` (no state backend, no provider credentials, no ``terraform
+    plan`` — epic #3230's v1 slice). Forces terraform validate's own
+    built-in ``-json`` structured-diagnostics report by appending ``-json``
+    to *run_command* — the terraform-native analogue of
+    :func:`_run_cli_pytest`'s ``--junit-xml``/:func:`_run_web_playwright`'s
+    ``--reporter=json`` — so a normalized verdict comes out regardless of
+    what a bare ``terraform validate`` would otherwise print to stdout.
+    Since ``&&`` chains ``init`` before ``validate``, the appended flag
+    always lands on the trailing ``validate`` invocation.
+
+    An ``init`` that never gets far enough to run ``validate`` at all (an
+    unresolvable provider version constraint, a missing ``terraform``
+    binary on this machine — the one thing this v1 slice requires be
+    installed, see the module docstring) leaves stdout with no parseable
+    JSON; :func:`parse_terraform_validate_json` turns that into a single
+    explicit failing entry rather than a silent empty list, so a broken
+    ``init`` is never confused with "0 tests, nothing to report".
+
+    After ``validate``, also runs :func:`_run_terraform_policy_gate`
+    (#3234) and folds its entries onto the same ``tests`` list — the
+    deterministic tflint/conftest policy gate is not a separate driver
+    kind, it's this same adapter widened, per :data:`VALIDATE_ONLY_KINDS`'s
+    "closes only when a later child issue widens what this adapter itself
+    runs". Runs regardless of whether ``validate`` itself passed — a repo
+    with a policy violation AND an unrelated syntax error should surface
+    both, not just whichever ran first.
+    """
+    full_command = f"{run_command} -json"
+    try:
+        proc = subprocess.run(
+            full_command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DriverError(
+            f"acceptance run command timed out after {timeout}s: {full_command!r}"
+        ) from e
+    except OSError as e:
+        raise DriverError(f"acceptance run command failed to start: {e}") from e
+
+    tests = parse_terraform_validate_json(
+        proc.stdout, exit_code=proc.returncode, stderr=proc.stderr,
+    )
+    raw_output = (proc.stdout or "") + (proc.stderr or "")
+
+    policy_tests, policy_raw = _run_terraform_policy_gate(cwd, timeout=timeout)
+    tests += policy_tests
+    raw_output += policy_raw
+
+    exit_code = proc.returncode
+    if exit_code == 0 and any(t.get("status") == "fail" for t in policy_tests):
+        # `validate` itself passed but a policy check failed — the overall
+        # command outcome must reflect that too, not just `tests` (#2096:
+        # unconfirmed success is a defect; a caller reading `exit_code`
+        # alone, e.g. `DriverResult.ok`, must not read this run as clean).
+        exit_code = 1
+
+    return DriverResult(exit_code=exit_code, tests=tests, raw_output=raw_output)
+
+
+def _run_terraform_policy_gate(cwd: str, *, timeout: int) -> tuple[list[dict], str]:
+    """The deterministic tflint/conftest policy gate (#3234, epic #3230
+    child 3) — the rule-based half of the terraform oracle, so the
+    reviewer's prose (child 4) is reserved for judgment calls a linter
+    can't make.
+
+    Each tool is opt-in per repo, gated on a convention file's presence so
+    a repo that hasn't adopted either yet keeps getting a plain
+    validate-only verdict rather than a gate it never configured:
+
+    - ``tflint --format=json`` runs when ``<cwd>/.tflint.hcl`` exists
+      (tflint auto-discovers it; no ``--config`` needed). Parsed by
+      :func:`parse_tflint_json`.
+    - ``conftest test --output=json --policy policy --parser hcl2 .`` runs
+      when ``<cwd>/policy/`` exists (conftest's own default policy dir
+      name) — reads raw ``.tf`` source directly, no ``terraform plan``/
+      credentials required, consistent with this driver's whole v1 scope.
+      Parsed by :func:`parse_conftest_json`.
+
+    A configured tool that fails to produce a parseable report (missing
+    binary, crashed invocation) is folded into a **failing** entry by its
+    parse_* function, never silently dropped — an opted-in check that
+    can't run is not the same as "no violations found" (#2096: a gate must
+    be able to fail, and an unconfirmed outcome is not a pass).
+
+    Returns ``(tests, raw_output)`` to be merged onto the caller's own
+    ``validate`` results — mirrors :func:`_run_terraform`'s own
+    ``(tests, raw_output)`` shape so both compose the same way.
+    """
+    tests: list[dict] = []
+    raw_output = ""
+
+    if (Path(cwd) / ".tflint.hcl").is_file():
+        try:
+            proc = subprocess.run(
+                "tflint --format=json",
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise DriverError(
+                f"tflint policy check timed out after {timeout}s"
+            ) from e
+        except OSError as e:
+            raise DriverError(f"tflint policy check failed to start: {e}") from e
+        tests += parse_tflint_json(
+            proc.stdout, exit_code=proc.returncode, stderr=proc.stderr,
+        )
+        raw_output += (proc.stdout or "") + (proc.stderr or "")
+
+    if (Path(cwd) / "policy").is_dir():
+        try:
+            proc = subprocess.run(
+                "conftest test --output=json --policy policy --parser hcl2 .",
+                shell=True,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise DriverError(
+                f"conftest policy check timed out after {timeout}s"
+            ) from e
+        except OSError as e:
+            raise DriverError(f"conftest policy check failed to start: {e}") from e
+        tests += parse_conftest_json(
+            proc.stdout, exit_code=proc.returncode, stderr=proc.stderr,
+        )
+        raw_output += (proc.stdout or "") + (proc.stderr or "")
+
+    return tests, raw_output
 
 
 def parse_test_output(output: str) -> list[dict]:
@@ -633,6 +869,270 @@ def _playwright_skip_reason(annotations: list) -> str:
         if isinstance(a, dict) and a.get("type") in ("skip", "fixme") and a.get("description"):
             return str(a["description"])
     return ""
+
+
+def parse_terraform_validate_json(
+    stdout: str, *, exit_code: int = 0, stderr: str = "",
+) -> list[dict]:
+    """Parse ``terraform validate -json``'s built-in structured-diagnostics
+    report (a core terraform flag, not a plugin) into normalized ``{"id",
+    "status", "message"}`` dicts — the same shape :func:`parse_test_output`
+    and :func:`parse_pytest_junit_xml` already produce, so
+    :func:`coord.acceptance.build_verdict` works unchanged regardless of
+    which driver kind produced the verdicts.
+
+    The report is a single JSON object: ``{"valid": bool, "error_count":
+    int, "warning_count": int, "diagnostics": [{"severity": "error"|
+    "warning", "summary": str, "detail": str, "range": {"filename": str,
+    ...}}, ...]}``. One entry per ``"error"``-severity diagnostic
+    (``status="fail"``, ``id`` prefixed with the offending file when the
+    report carries a ``range``); a clean ``"valid": true`` run collapses to
+    one ``status="pass"`` entry (noting any warnings in its message, since
+    those don't block validity). Warnings are not surfaced as their own
+    entries — they don't fail ``terraform validate`` and this v1 slice's
+    verdict is a pass/fail gate, not a lint report (#3230 child 3 is the
+    dedicated lint/policy gate).
+
+    Never returns ``[]`` on a crash — a *``terraform init``* that never got
+    far enough for ``validate`` to run at all (missing binary, unresolvable
+    provider constraint, no network for an uncached provider) leaves
+    *stdout* empty or non-JSON; that surfaces as a single explicit failing
+    ``"terraform init"`` entry (with ``stderr``'s tail as the reason) rather
+    than a silent "0 tests found" that a `-backend=false`-only smoke net
+    could otherwise be mistaken for. This mirrors
+    :func:`parse_playwright_json_report`'s "a crashed run must surface as a
+    failure, never as an empty pass list" rule — the shape a bare
+    ``build_verdict`` (``green = failed == 0 and len(tests) > 0``) would
+    otherwise treat identically to "legitimately nothing to check".
+    """
+    text = (stdout or "").strip()
+    if not text:
+        tail = "\n".join((stderr or "").splitlines()[-20:])
+        return [{
+            "id": "terraform init",
+            "status": "fail",
+            "message": (
+                f"terraform init/validate produced no output (exit "
+                f"{exit_code}): {tail or '(no stderr captured)'}"
+            ),
+        }]
+
+    report = _try_json(text)
+    if not isinstance(report, dict) or "valid" not in report:
+        tail = "\n".join(text.splitlines()[-20:])
+        return [{
+            "id": "terraform validate",
+            "status": "fail",
+            "message": f"unrecognized `terraform validate -json` output: {tail}",
+        }]
+
+    diagnostics = report.get("diagnostics") or []
+    errors = [
+        d for d in diagnostics
+        if isinstance(d, dict) and d.get("severity") == "error"
+    ]
+
+    if report.get("valid") and not errors:
+        warning_count = report.get("warning_count", 0) or 0
+        message = f"{warning_count} warning(s)" if warning_count else ""
+        return [{"id": "terraform validate", "status": "pass", "message": message}]
+
+    tests = []
+    for d in errors:
+        summary = str(d.get("summary", "") or "")
+        detail = str(d.get("detail", "") or "")
+        rng = d.get("range") if isinstance(d.get("range"), dict) else {}
+        filename = str(rng.get("filename", "")) if rng else ""
+        node_id = f"{filename}: {summary}" if filename and summary else (
+            summary or filename or f"terraform validate diagnostic {len(tests)}"
+        )
+        tests.append({"id": node_id, "status": "fail", "message": detail or summary})
+
+    if not tests:
+        # `"valid": false` with no parseable error-severity diagnostic —
+        # still a real failure, so report it rather than falling through to
+        # an empty list that `build_verdict` would read as "nothing to
+        # check" instead of "invalid".
+        tests.append({
+            "id": "terraform validate",
+            "status": "fail",
+            "message": "terraform validate reported invalid with no parseable diagnostics",
+        })
+    return tests
+
+
+def parse_tflint_json(stdout: str, *, exit_code: int = 0, stderr: str = "") -> list[dict]:
+    """Parse ``tflint --format=json``'s built-in structured report (a core
+    tflint flag, not a plugin) into normalized ``{"id", "status",
+    "message"}`` dicts — the same shape :func:`parse_terraform_validate_json`
+    already produces, so both fold onto one ``tests`` list (#3234).
+
+    The report is ``{"issues": [{"rule": {"name": str, "severity":
+    "error"|"warning"|"notice"}, "message": str, "range": {"filename": str,
+    "start": {"line": int}}}, ...], "errors": [...]}``. ``severity="error"``
+    issues (the ones a repo's ``.tflint.hcl`` promotes to blocking — e.g. a
+    pinned-provider-version rule) each become a ``status="fail"`` entry;
+    ``warning``/``notice`` issues don't block, so — mirroring
+    :func:`parse_terraform_validate_json`'s own warning handling — they're
+    folded into a single ``status="pass"`` entry's message rather than each
+    getting their own failing-looking row. A non-empty top-level
+    ``"errors"`` (tflint's own execution errors — a malformed
+    ``.tflint.hcl``, an unresolvable plugin — distinct from lint *issues*
+    found in the driven repo's ``.tf`` files) always fails the whole check,
+    since it means tflint never got far enough to actually lint anything.
+
+    Never returns ``[]`` on a crash — empty or non-JSON *stdout* (missing
+    ``tflint`` binary, a bare shell "not found") surfaces as a single
+    explicit failing ``"tflint"`` entry with *stderr*'s tail, mirroring
+    :func:`parse_terraform_validate_json`'s "a crashed run must surface as
+    a failure, never as an empty pass list" rule — an opted-in check
+    (``.tflint.hcl`` present) that silently produced nothing is not the
+    same as "no violations found".
+    """
+    text = (stdout or "").strip()
+    if not text:
+        tail = "\n".join((stderr or "").splitlines()[-20:])
+        return [{
+            "id": "tflint",
+            "status": "fail",
+            "message": (
+                f"tflint produced no output (exit {exit_code}): "
+                f"{tail or '(no stderr captured)'}"
+            ),
+        }]
+
+    report = _try_json(text)
+    if not isinstance(report, dict) or "issues" not in report:
+        tail = "\n".join(text.splitlines()[-20:])
+        return [{
+            "id": "tflint",
+            "status": "fail",
+            "message": f"unrecognized `tflint --format=json` output: {tail}",
+        }]
+
+    top_errors = report.get("errors") or []
+    if top_errors:
+        parts = [
+            str(e.get("message", e)) if isinstance(e, dict) else str(e)
+            for e in top_errors
+        ]
+        return [{
+            "id": "tflint",
+            "status": "fail",
+            "message": f"tflint reported execution error(s): {'; '.join(parts)}",
+        }]
+
+    issues = [i for i in (report.get("issues") or []) if isinstance(i, dict)]
+    error_issues = [
+        i for i in issues if (i.get("rule") or {}).get("severity") == "error"
+    ]
+
+    if not error_issues:
+        other_count = len(issues)
+        message = f"{other_count} non-blocking issue(s)" if other_count else ""
+        return [{"id": "tflint", "status": "pass", "message": message}]
+
+    tests = []
+    for issue in error_issues:
+        rule = issue.get("rule") or {}
+        rule_name = str(rule.get("name", "") or "unknown-rule")
+        rng = issue.get("range") if isinstance(issue.get("range"), dict) else {}
+        filename = str(rng.get("filename", "") or "") if rng else ""
+        start = rng.get("start") if isinstance(rng.get("start"), dict) else {}
+        line = start.get("line") if start else None
+        location = f"{filename}:{line}" if filename and line else filename
+        node_id = f"{location}: {rule_name}" if location else rule_name
+        tests.append({
+            "id": node_id,
+            "status": "fail",
+            "message": str(issue.get("message", "") or ""),
+        })
+    return tests
+
+
+def parse_conftest_json(stdout: str, *, exit_code: int = 0, stderr: str = "") -> list[dict]:
+    """Parse ``conftest test --output=json``'s built-in structured report
+    (a core conftest flag, not a plugin) into normalized ``{"id", "status",
+    "message"}`` dicts — the same shape the rest of this module's parse_*
+    functions produce (#3234).
+
+    The report is a JSON array with one object per file conftest evaluated:
+    ``{"filename": str, "namespace": str, "successes": int, "failures":
+    [{"msg": str}, ...], "warnings": [...], "exceptions": [{"msg": str},
+    ...]}``. Each ``failures[]`` entry (a rego policy rule that denied the
+    input) becomes its own ``status="fail"`` entry. Each ``exceptions[]``
+    entry (the *policy itself* erroring — a rego syntax mistake, a missing
+    input field a rule assumed existed) ALSO fails — an exception means the
+    policy never got to render a verdict at all, which is not the same as
+    "no violations found" and must not be read as one. A file with neither
+    collapses to one ``status="pass"`` entry noting its warning count,
+    mirroring :func:`parse_terraform_validate_json`'s/:func:`parse_tflint_json`'s
+    "non-blocking findings fold into the pass message" convention.
+
+    Never returns ``[]`` on a crash — empty or non-JSON *stdout* (missing
+    ``conftest`` binary, an empty/misnamed ``policy/`` dir conftest itself
+    rejects before evaluating anything) surfaces as a single explicit
+    failing ``"conftest"`` entry with *stderr*'s tail, same "crashed run
+    must surface as a failure" rule as this module's other parse_*
+    functions. A well-formed report that is a JSON array with zero entries
+    (conftest given no matching input files) is left as a single
+    ``status="pass"`` entry rather than an empty list — an opted-in check
+    (``policy/`` present) producing a genuinely empty, well-formed report is
+    still a real (if vacuous) observation, distinct from the crash case
+    above.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        tail = "\n".join((stderr or "").splitlines()[-20:])
+        return [{
+            "id": "conftest",
+            "status": "fail",
+            "message": (
+                f"conftest produced no output (exit {exit_code}): "
+                f"{tail or '(no stderr captured)'}"
+            ),
+        }]
+
+    report = _try_json(text)
+    if not isinstance(report, list):
+        tail = "\n".join(text.splitlines()[-20:])
+        return [{
+            "id": "conftest",
+            "status": "fail",
+            "message": f"unrecognized `conftest --output=json` output: {tail}",
+        }]
+
+    tests = []
+    for entry in report:
+        if not isinstance(entry, dict):
+            continue
+        filename = str(entry.get("filename", "") or "conftest")
+        failures = entry.get("failures") or []
+        exceptions = entry.get("exceptions") or []
+        warnings = entry.get("warnings") or []
+
+        for f in failures:
+            msg = str((f.get("msg", "") if isinstance(f, dict) else str(f)) or "")
+            tests.append({
+                "id": f"{filename}: {msg}" if msg else filename,
+                "status": "fail",
+                "message": msg,
+            })
+        for e in exceptions:
+            msg = str((e.get("msg", "") if isinstance(e, dict) else str(e)) or "")
+            tests.append({
+                "id": f"{filename}: policy error: {msg}" if msg else f"{filename}: policy error",
+                "status": "fail",
+                "message": msg,
+            })
+        if not failures and not exceptions:
+            warning_count = len(warnings)
+            message = f"{warning_count} warning(s)" if warning_count else ""
+            tests.append({"id": f"conftest: {filename}", "status": "pass", "message": message})
+
+    if not tests:
+        tests.append({"id": "conftest", "status": "pass", "message": "no input files evaluated"})
+    return tests
 
 
 def _strip_ansi(text: str) -> str:

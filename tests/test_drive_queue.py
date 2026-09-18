@@ -19,6 +19,7 @@ import pytest
 
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_TICK_MAX_FIX_ROUNDS,
     DISPATCH_FAILURE_MIN_BACKOFF_SECONDS,
     DRIVE_STARTUP_GRACE_SECONDS,
     EMPTY_BRANCH_MAX_ATTEMPTS,
@@ -45,6 +46,7 @@ from coord.drive_queue import (
     detect_unreachable_waits,
     compute_leg_counts,
     dispatch_type_for_labels,
+    effective_max_fix_rounds,
     entries_from_rows,
     entry_key,
     find_cycle,
@@ -55,7 +57,9 @@ from coord.drive_queue import (
     parse_after_spec,
     parse_key,
     plan_tick,
+    remaining_fix_rounds,
     render_plan,
+    total_fix_round_budget,
     unreachable_wait_alert,
     validate_enqueue,
 )
@@ -112,9 +116,12 @@ def board(
     sessions: tuple[int, ...] = (),
     ci_pending: tuple[int, ...] = (),
     ci_pending_live: tuple[int, ...] = (),
+    ci_absent: tuple[int, ...] = (),
 ) -> BoardView:
     facts: dict[str, IssueFacts] = {}
-    for issue in {*merged, *closed, *open_, *active, *ci_pending, *ci_pending_live}:
+    for issue in {
+        *merged, *closed, *open_, *active, *ci_pending, *ci_pending_live, *ci_absent,
+    }:
         facts[entry_key(REPO, issue)] = IssueFacts(
             known=True,
             issue_state=(
@@ -134,6 +141,16 @@ def board(
             merge_ci_pending_reason=(
                 "CI running: test (3.12)"
                 if issue in ci_pending or issue in ci_pending_live
+                else ""
+            ),
+            # #3254: the board's current read of this issue's merge gate
+            # names #1904's `checks_absent` — deliberately a SEPARATE fact
+            # from `merge_ci_pending` above; see `IssueFacts.merge_ci_absent`.
+            merge_ci_absent=issue in ci_absent,
+            merge_ci_absent_reason=(
+                "CI never ran: no checks reported for PR #99 though this "
+                "repo declares CI — merging would run untested code"
+                if issue in ci_absent
                 else ""
             ),
         )
@@ -313,6 +330,74 @@ def test_build_board_view_ci_pending_is_false_with_no_merge_sections_at_all():
     never raises."""
     view = build_board_view({"assignments": [], "issues": []}, [])
     assert not view.facts(entry_key(REPO, 1650)).merge_ci_pending
+
+
+# ── #3254: `checks_absent` — terminal, NOT self-refreshing ─────────────────
+
+
+def test_build_board_view_reads_merge_ci_absent_from_the_live_plan_reason():
+    """#3254: `_entry_gate_status` (board-render time) computes #1904's
+    `checks_absent` classification directly — no extra `gh` call needed,
+    unlike #1892's infra classification — so the live `merge_plan` reason
+    already carries it whenever it applies."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 3254,
+                    "reason": (
+                        "CI never ran: no checks reported for PR #99 though "
+                        "this repo declares CI — merging would run untested "
+                        "code"
+                    ),
+                },
+                {
+                    "repo_name": REPO, "issue_number": 3255,
+                    "reason": "CI running: build, lint",
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 3254, "error": None},
+                {"repo_name": REPO, "issue_number": 3255, "error": None},
+            ],
+        },
+        [],
+    )
+    absent = view.facts(entry_key(REPO, 3254))
+    assert absent.merge_ci_absent
+    assert absent.merge_ci_absent_reason.startswith("CI never ran:")
+    # `merge_ci_pending` must NOT also read True for this entry — the two
+    # facts are mutually exclusive and get OPPOSITE treatment downstream.
+    assert not absent.merge_ci_pending
+
+    pending = view.facts(entry_key(REPO, 3255))
+    assert pending.merge_ci_pending
+    assert not pending.merge_ci_absent
+
+
+def test_build_board_view_ci_absent_is_false_with_no_merge_sections_at_all():
+    view = build_board_view({"assignments": [], "issues": []}, [])
+    assert not view.facts(entry_key(REPO, 1650)).merge_ci_absent
+
+
+def test_build_board_view_does_not_flag_a_genuine_checks_failed_entry_as_absent():
+    """Regression: a plain 'checks failed' reason must not be misread as
+    `checks_absent` — the two are distinct #1904/#1892 classifications."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 3256,
+                    "reason": "checks failed: build (failure)",
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 3256, "error": None},
+            ],
+        },
+        [],
+    )
+    assert not view.facts(entry_key(REPO, 3256)).merge_ci_absent
 
 
 # ── #1892: the sibling trigger — a verdictless CI failure ──────────────────
@@ -784,6 +869,188 @@ def test_compute_leg_counts_treats_falsy_type_as_work():
     `coord.models.Assignment.type` both carry."""
     counts = compute_leg_counts([(REPO, 1, ""), (REPO, 1, None)])
     assert counts == {entry_key(REPO, 1): {"work": 2}}
+
+
+# ── #2972: a relaunch resumes the fix-round budget, never restarts it ───────
+#
+# quadraui#625: a drive-queue entry's session died, was relaunched, died
+# again, was relaunched again — and EACH relaunch's `coord drive
+# --max-fix-rounds` was computed from `pipeline.max_fix_rounds` alone, with
+# no memory of what a prior (dead) session had already spent. Four `[work]`
+# legs ran against a nominal budget of `work + 2 fixes = 3`, and the queue
+# row read `running attempts=1` the entire time — nothing about it looked
+# wrong. These tests pin the fix: `IssueFacts.work_leg_count` (fed by #3060's
+# all-time, archive-spanning `leg_counts()`) makes the budget a property of
+# the ENTRY's whole history, not of whichever drive session happens to be
+# running right now.
+
+
+def test_remaining_fix_rounds_is_unchanged_for_a_fresh_entry():
+    """Zero legs ever run — `remaining_fix_rounds` must read back exactly
+    `effective_max_fix_rounds`, the pre-#2972 number, or every entry's FIRST
+    launch would get a narrower budget than it used to."""
+    e = entry(1650, max_fix_rounds=2)
+    facts = IssueFacts(known=True, work_leg_count=0)
+    assert remaining_fix_rounds(e, facts, None) == effective_max_fix_rounds(e, None) == 2
+
+
+def test_remaining_fix_rounds_shrinks_as_legs_accumulate():
+    """`max_fix_rounds=2` ⇒ total budget 3 (1 work + 2 fixes). The one
+    unconditional work leg costs nothing; each leg after that is a spent fix
+    round."""
+    e = entry(1650, max_fix_rounds=2)
+    assert remaining_fix_rounds(e, IssueFacts(known=True, work_leg_count=1), None) == 2
+    assert remaining_fix_rounds(e, IssueFacts(known=True, work_leg_count=2), None) == 1
+    assert remaining_fix_rounds(e, IssueFacts(known=True, work_leg_count=3), None) == 0
+
+
+def test_remaining_fix_rounds_never_negative():
+    """A count that has overshot the budget (a stale re-add against an
+    issue's old history, a hand-edited row) still reads `0`, never negative —
+    `_reconcile_running` treats `<= 0` as the ceiling, not `== 0` alone."""
+    e = entry(1650, max_fix_rounds=2)
+    facts = IssueFacts(known=True, work_leg_count=50)
+    assert remaining_fix_rounds(e, facts, None) == 0
+
+
+def test_total_fix_round_budget_is_work_plus_fix_rounds():
+    e = entry(1650, max_fix_rounds=2)
+    assert total_fix_round_budget(e, None) == 3
+    default_e = entry(1650)
+    assert total_fix_round_budget(default_e, None) == DEFAULT_TICK_MAX_FIX_ROUNDS + 1
+
+
+def test_build_board_view_folds_leg_counts_into_work_leg_count():
+    """Only WORK_LIKE types count as a work leg — a `review`/`smoke` leg on
+    the SAME issue must never inflate the fix-round budget's own count."""
+    key = entry_key(REPO, 1650)
+    view = build_board_view(
+        {},
+        leg_counts={key: {"work": 3, "review": 5, "smoke": 2}},
+    )
+    assert view.facts(key).work_leg_count == 3
+
+
+def test_build_board_view_leg_counts_default_leaves_work_leg_count_at_zero():
+    """No *leg_counts* at all (every pre-#2972 caller) — the field defaults
+    to 0, which `remaining_fix_rounds` reads as "budget untouched"."""
+    view = build_board_view({"assignments": [
+        {"repo_name": REPO, "issue_number": 1650, "type": "work", "status": "running"},
+    ]})
+    assert view.facts(entry_key(REPO, 1650)).work_leg_count == 0
+
+
+def test_build_board_view_leg_counts_covers_an_issue_absent_from_the_rest_of_the_payload():
+    """An issue whose entire history has aged into `assignments_archive`
+    (#3060) — nothing about it in `issues`/`assignments`/`merge_plan` — still
+    gets a slot, so a long-lived entry never loses the ceiling that matters
+    most for it."""
+    key = entry_key(REPO, 1650)
+    view = build_board_view({}, leg_counts={key: {"work": 4}})
+    facts = view.facts(key)
+    assert facts.work_leg_count == 4
+    assert facts.known is True
+
+
+def _dead_running_entry(*, max_fix_rounds: int = 2, attempts: int = 0) -> QueueEntry:
+    return entry(
+        1650,
+        state=STATE_RUNNING,
+        attempts=attempts,
+        max_fix_rounds=max_fix_rounds,
+        launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+    )
+
+
+def test_a_relaunch_within_budget_still_retries_normally():
+    """1 leg spent (the initial work) against a 3-leg budget — comfortably
+    under the ceiling, so the ordinary attempts-based retry fires unchanged."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=1)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick([_dead_running_entry()], view, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.reconciles[0].updates["attempts"] == 1
+
+
+def test_a_relaunch_at_the_ceiling_blocks_instead_of_retrying():
+    """3 legs already run against a `max_fix_rounds=2` (budget 3) entry — the
+    ceiling fires BEFORE the ordinary attempts check ever runs, even though
+    `attempts` (0) is nowhere near `max_attempts`."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=3)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        [_dead_running_entry(attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert plan.reconciles[0].updates == {}  # attempts left untouched
+    assert len(plan.blocked) == 1
+    blocked = plan.blocked[0]
+    assert blocked.updates["state"] == STATE_BLOCKED
+    assert "fix-round ceiling" in blocked.reason
+    assert "3 work leg(s)" in blocked.reason
+    assert "budget of 3" in blocked.reason
+
+
+def test_a_relaunch_past_the_ceiling_also_blocks():
+    """Comfortably over budget (a stale re-add, a hand-edited count) still
+    blocks — the check is `<=`, not `==`."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=9)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick([_dead_running_entry()], view, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "exhausted"
+
+
+def test_the_fix_round_ceiling_reads_pipeline_max_fix_rounds_when_the_entry_has_no_override():
+    """`fix_round_config_default` (the shell's `pipeline.max_fix_rounds`
+    read) resolves the SAME way `effective_max_fix_rounds` always has — an
+    entry with no override and a fleet default of 1 has a 2-leg budget."""
+    facts = IssueFacts(known=True, issue_state="open", work_leg_count=2)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    e = entry(
+        1650,
+        state=STATE_RUNNING,
+        launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+    )
+    plan = plan_tick([e], view, capacity=1, now=NOW, fix_round_config_default=1)
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert "budget of 2" in plan.blocked[0].reason
+
+
+def test_a_relaunched_entry_never_exceeds_its_total_fix_round_budget():
+    """The issue's own acceptance criterion: an entry with `max_fix_rounds=2`
+    (budget 3) that is relaunched twice runs AT MOST 3 work legs total —
+    simulated as three successive tick/death cycles, each seeing one more
+    board-confirmed leg than the last.
+
+    `max_attempts` is generous (5) here so the ordinary attempts ceiling
+    never interferes — this test is isolating the SEPARATE #2972 budget, not
+    re-testing #2273's attempts machinery.
+    """
+    key = entry_key(REPO, 1650)
+    attempts_spent = 0
+    retries = 0
+    outcome = None
+    for legs_so_far in (1, 2, 3):
+        facts = IssueFacts(known=True, issue_state="open", work_leg_count=legs_so_far)
+        view = BoardView(issues={key: facts})
+        e = _dead_running_entry(attempts=attempts_spent)
+        plan = plan_tick([e], view, capacity=1, now=NOW, max_attempts=5)
+        outcome = plan.reconciles[0].outcome
+        if outcome == "retry":
+            retries += 1
+            attempts_spent = plan.reconciles[0].updates["attempts"]
+        else:
+            break
+    # Two legitimate relaunches (legs_so_far=1 and 2), then the third death —
+    # now sitting at the full 3-leg budget — blocks instead of relaunching a
+    # fourth time.
+    assert retries == 2
+    assert outcome == "exhausted"
+    assert plan.blocked[0].updates["state"] == STATE_BLOCKED
 
 
 # ── plan_tick: the launch decision ───────────────────────────────────────────
@@ -1731,6 +1998,38 @@ def test_a_merge_gate_block_retry_does_not_get_the_widened_backoff():
     assert plan.launch is not None and plan.launch.issue == 1650
 
 
+def test_prior_done_work_does_not_get_the_widened_backoff():
+    """claude-coordinator#3239: the retry-pacing sibling of
+    `test_exhausted_prior_done_work_does_not_get_the_dispatch_note` below —
+    `_retry_backoff_reason` and `_reconcile_running` both call the same
+    `_is_dispatch_only_failure` now, so a relaunch that found a PRIOR
+    attempt's work already `done` must not get the widened
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` floor here either, for the
+    identical reason the give-up wording must not name a dispatch failure:
+    nothing about this death is a dispatch-layer problem."""
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=launched_at,
+            # Same 90s elapsed as the widened-backoff test above: clears the
+            # plain RETRY_BACKOFF_SECONDS[0] (60s) but not the widened 660s
+            # floor (#3145) — so this only launches if the floor correctly
+            # does NOT apply.
+            retry_backoff_at=NOW - 90.0,
+            last_reason="drive exited for claude-coordinator#1650 "
+            "(exit_code=3): deadline of 240m exceeded",
+        )
+    ]
+    facts = IssueFacts(known=True, issue_state="open", work_done=True)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
 def test_a_dispatched_run_that_died_later_gets_the_plain_backoff_only():
     """The counterpart: a launch that DID dispatch (an assignment exists,
     created after `launched_at`) is NOT treated as a pure dispatch failure —
@@ -1879,6 +2178,99 @@ def test_exhausted_checks_failed_does_not_get_the_dispatch_note():
     assert plan.reconciles[0].outcome == "exhausted"
     reason = plan.blocked[0].reason
     assert "no assignment was ever created" not in reason
+
+
+def test_exhausted_prior_done_work_does_not_get_the_dispatch_note():
+    """claude-coordinator#3239/#3226: a FOURTH false-positive shape, the same
+    class as #2424/#2334/#2442 above but not keyed off `own_reason` text at
+    all — the real incident died on a bare `"deadline of 240m exceeded"`,
+    which none of those three classifiers can match, while a `done`, pushed,
+    unreviewed `epic-decompose` work row plainly sat on the board (`coord
+    gates` showed `status=done` with a real `branch`, `test_state=None`,
+    `review_state=None`) for the entire 8-hour window this cost.
+
+    `facts.work_done=True` is the positive, independent witness that a PRIOR
+    attempt's dispatch reached `coord assign` and ran the work to
+    completion — so attempt 2 correctly dispatched nothing more (there was
+    nothing left to dispatch), and `_dispatch_produced_nothing`'s bare
+    timestamp comparison must not be read as evidence of a dispatch-layer
+    failure. Getting this backwards is worse than a wasted retry: the
+    "likely an infrastructure/dispatch-layer failure, not a code defect"
+    wording actively misdirects an operator away from the real, complete,
+    reviewable implementation already sitting on the branch."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=3): deadline "
+        "of 240m exceeded"
+    )
+    # No assignment dispatched AFTER `launched_at` (attempt 2 dispatched
+    # nothing — the work was already done), but `work_done=True` witnesses
+    # that an EARLIER attempt's dispatch plainly succeeded.
+    facts = IssueFacts(known=True, issue_state="open", work_done=True)
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
+
+
+def test_exhausted_checks_absent_does_not_get_the_dispatch_note():
+    """#3254 fix: `own_reason` names the FIFTH merge-gate-block shape —
+    `coord/drive.py`'s `_decide_merge` dying immediately on
+    `is_ci_absent_reason(state.merge_reason)` (``checks_absent``: this repo
+    declares CI but the PR reported zero checks). This is exactly the #2424
+    incident class reproduced for that fifth shape: `_reconcile_running`
+    only takes the dedicated zero-attempt `merge_ci_absent` fast path when
+    the BOARD's own read of that fact has already caught up (laggy by this
+    file's own repeated warnings elsewhere, e.g. #2808/#2814/#2858); absent
+    that, this generic `dispatch_only`/`exhausted` path is what actually
+    runs, and `own_reason` — which already names the real cause — must not
+    get the misleading dispatch-failure note layered on top of it."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): CI never "
+        "ran: no checks reported for PR #3250 though this repo declares CI "
+        "— merging would run untested code — push a new commit; this gate "
+        "cannot clear on retry (#3254). No number of `coord merge` attempts "
+        "re-fires the `pull_request` webhook that creates a check suite for "
+        "this branch; only a new commit does. Investigate why CI never "
+        "triggered for this PR, then push a fix (even a trivial commit) for "
+        "a fresh check suite — or, once you have confirmed it is safe: "
+        "coord merge --only claude-coordinator#1650 --force-merge"
+    )
+    # No `merge_ci_absent` fact on this read — mirrors the race where the
+    # board hasn't caught up to the die yet, so only `own_reason` text is
+    # available to classify the death correctly.
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
 
 
 def test_exhausted_immediate_escalation_merge_status_does_not_get_the_dispatch_note():
@@ -2463,6 +2855,75 @@ def test_a_parked_entry_never_reaches_blocked_even_deep_into_the_attempt_budget(
     assert plan.reconciles[0].outcome == "parked"
     assert plan.blocked == ()
     assert plan.alert is None
+
+
+# ── #3254: `checks_absent` blocks (not parks), and never spends an attempt ─
+
+
+def test_a_dead_drive_ci_absent_blocks_without_spending_an_attempt():
+    """Acceptance (#3254): unlike `ci_pending`, `checks_absent` cannot
+    self-refresh — parking on it would be an indefinite livelock — so a dead
+    drive on such an entry goes straight to `blocked`, exactly like
+    `refused`/`dead_end`, without spending a launch attempt."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(ci_absent=(1650,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "ci_absent"
+    assert reconcile.occupies is False
+    # Mirrors the `refused`/`dead_end` contract exactly: NOT `retry`/
+    # `exhausted` — no attempt spent, checked on both the reconcile and the
+    # paired `Blocked` (a bare `0` would also satisfy "attempts == 0" but
+    # wrongly imply a write happened).
+    assert "attempts" not in reconcile.updates
+    assert [b.key for b in plan.blocked] == [entry_key(REPO, 1650)]
+    blocked = plan.blocked[0]
+    assert "attempts" not in blocked.updates
+    assert blocked.updates["state"] == STATE_BLOCKED
+    assert "CI never ran" in blocked.reason
+    assert "push a new commit" in blocked.reason
+    assert blocked.reason == blocked.updates["last_reason"]
+
+
+def test_a_ci_absent_block_never_reaches_exhausted_even_deep_into_the_budget():
+    """Mirrors the #1891 CI-pending park's own equivalent test: an entry
+    that would have exhausted retries (attempts already at
+    max_attempts - 1) still blocks via the dedicated `ci_absent` branch, not
+    the generic `retry`/`exhausted` path — attempts genuinely never move."""
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(entries, board(ci_absent=(1650,)), capacity=1)
+    assert plan.reconciles[0].outcome == "ci_absent"
+    assert plan.blocked[0].updates.get("attempts") is None
+
+
+def test_a_ci_absent_block_is_not_permanent_and_resumes_once_the_gate_clears():
+    """Unlike `refused`/`dead_end` (#1844/#2019), a `checks_absent` block is
+    NOT tagged with a `_PERMANENT_BLOCK_MARKERS` marker — a new commit can
+    genuinely clear the gate, so the entry must still get the ordinary
+    #2230 `_reconcile_blocked` live-gate recheck and resume automatically,
+    the same generic mechanism any other re-evaluable `blocked` entry gets."""
+    from coord.drive_queue import is_permanent_block_reason
+
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(ci_absent=(1650,)), capacity=1)
+    reason = plan.blocked[0].reason
+    assert not is_permanent_block_reason(reason)
+
+    # A LATER tick: the entry is now persisted `blocked` (with that reason),
+    # and a fresh commit has cleared the board's merge gate — the ordinary
+    # #2230 resume path must fire, exactly like any other re-evaluable
+    # `blocked` entry (no bespoke `checks_absent` resume logic needed).
+    blocked_entries = [
+        entry(1650, position=3, state=STATE_BLOCKED, attempts=0, last_reason=reason)
+    ]
+    cleared_board = BoardView(
+        issues={entry_key(REPO, 1650): IssueFacts(known=True, merge_gate_status="READY")}
+    )
+    plan2 = plan_tick(blocked_entries, cleared_board, capacity=1)
+    resumed = [r for r in plan2.reconciles if r.key == entry_key(REPO, 1650)]
+    assert [r.outcome for r in resumed] == ["resumed"]
+    assert resumed[0].updates["state"] == STATE_WAITING
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3981,6 +4442,97 @@ def test_a_blocked_entry_stays_blocked_while_its_prereq_is_still_blocked():
     assert plan.launch is None
 
 
+# ── #3368: an unconfirmed pre-req block must never render as terminal ──────
+#
+# `_reconcile_blocked_unreadable`'s #2806 "gate could not be read this tick"
+# verdict is EXPLICITLY retryable — its own text says so ("NOT a
+# confirmed-still-shut gate, only a failed probe"). Before this,
+# `_resolve_prereqs` collapsed that shape into the SAME "it will never
+# satisfy" verdict a genuinely dead/permanently-blocked pre-req gets,
+# contradicting the very reason it was quoting — the vimcode#1059 incident's
+# second defect: one row called its own state a retryable probe failure,
+# while six dependents rendered that same state as permanent.
+
+
+def test_a_waiting_entry_defers_rather_than_blocks_when_its_prereq_is_blocked_only_on_an_unconfirmed_probe_failure():
+    dep_key = entry_key(REPO, 1059)
+    dep_reason = (
+        f"{dep_key}'s merge gate could not be read this tick (no PR number "
+        "yet) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; #2230's sweep will try again next tick rather than "
+        "guessing (#2806)"
+    )
+    entries = [
+        entry(1059, position=0, state=STATE_BLOCKED, last_reason=dep_reason),
+        entry(1060, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    # An ordinary deferral — NOT a block-and-escalate: the entry keeps its
+    # position, spends no attempt budget, and is free to try again next tick.
+    assert plan.blocked == ()
+    assert len(plan.deferrals) == 1
+    deferral = plan.deferrals[0]
+    assert deferral.key == entry_key(REPO, 1060)
+    assert "it will never satisfy" not in deferral.reason
+    assert "retrying" in deferral.reason
+    assert "unconfirmed probe failure" in deferral.reason
+
+
+def test_a_waiting_entry_still_blocks_when_its_prereq_is_blocked_for_a_confirmed_reason():
+    """The #3368 carve-out is scoped to the #2806 marker text ONLY — an
+    ordinary confirmed-still-shut gate (or any other blocked cause) keeps
+    the pre-#3368 "it will never satisfy" verdict exactly as before."""
+    dep_key = entry_key(REPO, 1059)
+    entries = [
+        entry(
+            1059,
+            position=0,
+            state=STATE_BLOCKED,
+            last_reason="checks_failed: test (3.12) — confirmed still red",
+        ),
+        entry(1060, position=1, after=(dep_key,), state=STATE_WAITING),
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert len(plan.blocked) == 1
+    blocked = plan.blocked[0]
+    assert blocked.key == entry_key(REPO, 1060)
+    assert "it will never satisfy" in blocked.reason
+
+
+def test_a_blocked_entry_resumes_once_its_prereqs_block_turns_out_to_be_an_unconfirmed_probe_failure():
+    """A dependent already `blocked` on the frozen (pre-#3368) "it will
+    never satisfy" verdict must still resume once a FRESH re-derivation
+    (`_reconcile_blocked_after`, #2362) finds the named pre-req's CURRENT
+    block cause is #2806's unconfirmed-probe-failure marker — the same
+    self-heal #2362 already gives a pre-req that landed, extended to a
+    pre-req that merely turned out to be retryable rather than dead."""
+    dep_key = entry_key(REPO, 1059)
+    dep_reason = (
+        f"{dep_key}'s merge gate could not be read this tick (no PR number "
+        "yet) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; #2230's sweep will try again next tick rather than "
+        "guessing (#2806)"
+    )
+    entries = [
+        entry(1059, position=0, state=STATE_BLOCKED, last_reason=dep_reason),
+        entry(
+            1060,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(entries, board(), capacity=2)
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1060))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert "it will never satisfy" not in reconcile.reason
+
+
 def test_a_blocked_entry_with_an_unrelated_cause_is_not_resumed_by_a_landed_prereq():
     """A `blocked` entry that merely HAS an `after=` list, but whose
     `last_reason` names a DIFFERENT cause (exhausted attempts, not an
@@ -5407,6 +5959,187 @@ def test_only_an_already_fired_gate_is_offered_for_probing():
     assert [e.issue for e in pending_probe_targets(entries)] == [2]
 
 
+# ── apply-verdict gate (#3236) ────────────────────────────────────────────────
+#
+# "merged is not applied", the deploy gate's terraform-flavored extension:
+# a fired gate now carries an OBSERVED apply_verdict, distinct from
+# hold_state; and a `plan_destructive` entry must NEVER auto-resume via
+# `resume_when`, no matter what a probe reports — checked both at the
+# probe-offering boundary (`pending_probe_targets`) and again at resolution
+# (`_resolve_holds`/`plan_tick`), so neither enforcement point alone is load
+# bearing.
+
+
+def test_a_destructive_fired_gate_is_never_offered_for_probing():
+    from coord.drive_queue import pending_probe_targets
+
+    entries = [held(1, resume_when="curl -sf x", plan_destructive=True)]
+    assert pending_probe_targets(entries) == []
+
+
+def test_a_destructive_fired_gate_ignores_a_passing_probe_and_stays_held():
+    """THE #3236 hard rule, pinned at the point that matters most: even a
+    `ProbeResult(ok=True)` handed straight to `plan_tick` — the shape
+    `pending_probe_targets` excluding the entry cannot itself prevent, if
+    some other caller built the mapping by hand — must not release a
+    destructive gate. Contrast with `test_a_passing_probe_releases_and_
+    launches_in_the_same_tick` above, the identical setup minus
+    `plan_destructive`, which DOES release."""
+    key = entry_key(REPO, 1)
+    plan = plan_tick(
+        [
+            held(1, resume_when="curl -sf x", plan_destructive=True),
+            entry(2, after=(key,)),
+        ],
+        board(),
+        capacity=4,
+        probes={key: ProbeResult(key, True, "exit 0")},
+    )
+    assert plan.launch is None
+    assert plan.held is not None
+    assert plan.held.outcome == "held"
+    assert "destroy/replace" in plan.held.reason
+    assert "apply-verdict" in plan.held.reason
+    writes = dict(plan.writes())
+    # No hold_state write at all — a destructive gate's probe result never
+    # touches the row, matching the fail-closed "no probe declared" shape.
+    assert key not in writes or writes[key].get("hold_state") != HOLD_RELEASED
+
+
+def test_a_non_destructive_fired_gate_still_releases_on_a_passing_probe():
+    """Same setup, `plan_destructive=False` (the default) — #3236 must not
+    have widened the hard rule to entries that never opted into it."""
+    key = entry_key(REPO, 1)
+    plan = plan_tick(
+        [held(1, resume_when="curl -sf x"), entry(2)],
+        board(open_=(2,)),
+        capacity=1,
+        probes={key: ProbeResult(key, True, "exit 0")},
+    )
+    assert plan.held is None
+    assert plan.launch is not None and plan.launch.issue == 2
+    assert dict(plan.writes())[key]["hold_state"] == HOLD_RELEASED
+
+
+def test_plan_is_destructive_detects_a_bare_delete():
+    from coord.drive_queue import plan_is_destructive
+
+    plan = {
+        "resource_changes": [
+            {"change": {"actions": ["update"]}},
+            {"change": {"actions": ["delete"]}},
+        ]
+    }
+    assert plan_is_destructive(plan) is True
+
+
+def test_plan_is_destructive_detects_both_replace_orderings():
+    from coord.drive_queue import plan_is_destructive
+
+    assert plan_is_destructive(
+        {"resource_changes": [{"change": {"actions": ["delete", "create"]}}]}
+    ) is True
+    assert plan_is_destructive(
+        {"resource_changes": [{"change": {"actions": ["create", "delete"]}}]}
+    ) is True
+
+
+def test_plan_is_destructive_false_for_purely_additive_changes():
+    from coord.drive_queue import plan_is_destructive
+
+    plan = {
+        "resource_changes": [
+            {"change": {"actions": ["no-op"]}},
+            {"change": {"actions": ["create"]}},
+            {"change": {"actions": ["update"]}},
+        ]
+    }
+    assert plan_is_destructive(plan) is False
+
+
+def test_plan_is_destructive_fails_closed_on_unparseable_shapes():
+    """#3236: "cannot confirm this is safe" reads as destructive, never as
+    additive — the same fail-closed posture `ProbeResult`'s own docstring
+    already requires of the ordinary resume-when probe."""
+    from coord.drive_queue import plan_is_destructive
+
+    assert plan_is_destructive({}) is True
+    assert plan_is_destructive({"resource_changes": "not-a-list"}) is True
+    assert plan_is_destructive({"resource_changes": [{"change": "nope"}]}) is True
+    assert plan_is_destructive(
+        {"resource_changes": [{"change": {"actions": "nope"}}]}
+    ) is True
+
+
+def test_validate_apply_gate_refuses_resume_when_with_a_destructive_plan():
+    from coord.drive_queue import QueueError, validate_apply_gate
+
+    with pytest.raises(QueueError, match="resume-when"):
+        validate_apply_gate("curl -sf x", True)
+
+
+def test_validate_apply_gate_allows_resume_when_without_a_destructive_plan():
+    from coord.drive_queue import validate_apply_gate
+
+    validate_apply_gate("curl -sf x", False)  # must not raise
+    validate_apply_gate("", True)  # no resume_when at all — nothing to refuse
+
+
+def test_apply_gate_status_no_gate_declared():
+    from coord.drive_queue import apply_gate_status
+
+    assert apply_gate_status(entry(1)) == ("", "")
+
+
+def test_apply_gate_status_armed_but_not_fired():
+    from coord.drive_queue import apply_gate_status
+
+    state, detail = apply_gate_status(
+        entry(1, hold_after=True, hold_state=HOLD_ARMED)
+    )
+    assert state == "pending"
+    assert "not yet merged" in detail
+
+
+def test_apply_gate_status_merged_not_applied():
+    from coord.drive_queue import apply_gate_status
+
+    state, detail = apply_gate_status(held(1))
+    assert state == "merged_not_applied"
+    assert "not yet applied" in detail
+
+
+def test_apply_gate_status_released_without_a_verdict_still_reads_unapplied():
+    """The #2096 fix in one assertion: a bare `coord drive-queue resume`
+    must never be read as "applied" — that is the exact unconfirmed-success
+    shape #3236 exists to close."""
+    from coord.drive_queue import apply_gate_status
+
+    state, detail = apply_gate_status(held(1, hold_state=HOLD_RELEASED))
+    assert state == "merged_not_applied"
+    assert "without a recorded apply verdict" in detail
+
+
+def test_apply_gate_status_applied():
+    from coord.drive_queue import APPLY_APPLIED, apply_gate_status
+
+    state, detail = apply_gate_status(
+        held(1, apply_verdict=APPLY_APPLIED, apply_verdict_reason="ran clean")
+    )
+    assert state == "applied"
+    assert "ran clean" in detail
+
+
+def test_apply_gate_status_apply_failed():
+    from coord.drive_queue import APPLY_FAILED, apply_gate_status
+
+    state, detail = apply_gate_status(
+        held(1, apply_verdict=APPLY_FAILED, apply_verdict_reason="state lock timeout")
+    )
+    assert state == "apply_failed"
+    assert "state lock timeout" in detail
+
+
 def test_render_plan_says_why_a_fleet_scoped_hold_stopped_everything():
     plan = plan_tick(
         [held(1, hold_scope=HOLD_SCOPE_FLEET), entry(2)],
@@ -5840,6 +6573,27 @@ def test_merge_gate_remedy_command_falls_back_to_inspect_for_opaque_merge_status
     reason = "merge_status=NEEDS_ATTENTION — no number of retries changes this"
     assert is_merge_gate_block_reason(reason) is True
     assert merge_gate_remedy_command(reason, REPO, 1650) == merge_plan_inspect_command(REPO)
+
+
+def test_merge_gate_remedy_command_falls_back_to_inspect_for_checks_absent():
+    """#3254's fifth shape: `checks_absent` (zero checks ever reported for
+    the PR) is a merge-gate block — `is_merge_gate_block_reason` must
+    recognize it — but has no single command that is always both correct
+    and safe to run blind (pushing a commit is a code change, not a `coord`
+    command, and `--force-merge` skips CI outright). Falls back to the same
+    read-only inspect command as the other unresolvable shapes."""
+    reason = (
+        "CI never ran: no checks reported for PR #3250 though this repo "
+        "declares CI — merging would run untested code — push a new "
+        "commit; this gate cannot clear on retry (#3254). No number of "
+        "`coord merge` attempts re-fires the `pull_request` webhook that "
+        "creates a check suite for this branch; only a new commit does."
+    )
+    assert is_merge_gate_block_reason(reason) is True
+    command = merge_gate_remedy_command(reason, REPO, 1650)
+    assert command == merge_plan_inspect_command(REPO)
+    assert "revalidate" not in command
+    assert "drive-queue remove" not in command
 
 
 def test_merge_gate_remedy_command_is_the_safe_inspect_fallback_for_none_and_non_block_reasons():

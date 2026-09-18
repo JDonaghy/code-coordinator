@@ -8,6 +8,21 @@ repos:
     default_branch: develop
     build_command: "cargo build"
     test_command: "cargo test --no-default-features"
+    # #3351 (vimcode#865): `tests/nvim_conformance.rs` (1,436 oracle-backed
+    # cases) hard-fails on EVERY lane — Work and Test alike, since both run
+    # `cargo test` — when `nvim` is missing, unparseable, or older than
+    # vimcode's own MIN_NVIM_VERSION. This is repo-wide, not tied to any
+    # particular changed file, so it cannot be expressed as a
+    # `smoke_tests.capability_rules` entry (those are keyed by PATH PREFIX
+    # across the WHOLE fleet, not by repo — see the sharp-edge comment on
+    # that block below — and vimcode shares Cargo.toml/Cargo.lock/src/ with
+    # every other Rust repo here). `requires:` is the repo-scoped
+    # counterpart: every machine listed under `machines:` for this repo
+    # must also declare `nvim` in its own `capabilities:`, or
+    # `coord.dispatch.route_work_by_capability` /
+    # `coord.smoke.dispatch_smoke` refuse to route here (`coord doctor`
+    # reports which host is missing it — `coord/prereqs.py`'s `nvim` entry).
+    requires: [nvim]
 
   - name: quadraui
     github: JDonaghy/quadraui
@@ -139,7 +154,9 @@ machines:
   # Desktop A — Dell Precision, full GTK builds
   - name: precision
     host: john-precision-3571
-    capabilities: [gtk, rust, python]
+    # #3351: `nvim` backs vimcode's `requires: [nvim]` above — every machine
+    # that carries vimcode needs it, or dispatch refuses to route there.
+    capabilities: [gtk, rust, python, nvim]
     repos: [vimcode, quadraui, code-coordinator, coord-tui]
     repo_paths:
       vimcode: ~/src/vimcode
@@ -153,7 +170,8 @@ machines:
   # Desktop B — HP EliteBook, full GTK builds
   - name: elitebook
     host: john-hp-elitebook-830-g7-notebook-pc
-    capabilities: [gtk, rust, python]
+    # #3351: see the `precision` entry above — same vimcode requirement.
+    capabilities: [gtk, rust, python, nvim]
     repos: [vimcode, quadraui, code-coordinator, coord-tui]
     repo_paths:
       vimcode: ~/src/vimcode
@@ -180,17 +198,23 @@ machines:
   # Server — Dell server, no display (no GTK builds)
   - name: dellserver
     host: dellserver
-    capabilities: [rust, python]
+    # #3351: see the `precision` entry above — same vimcode requirement.
+    capabilities: [rust, python, nvim]
     repos: [vimcode, quadraui, code-coordinator]
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
       code-coordinator: ~/src/claude-coordinator
 
-  # Azure VM — lightweight, small tasks only (needs Claude CLI setup)
+  # Azure VM — lightweight, small tasks only (needs Claude CLI setup).
+  # #3233: this box already carries an `az login` for the fleet's own Azure
+  # subscription (Key Vault + the restic backup storage account), so it's
+  # the natural place to declare the `azure` capability that routes
+  # terraform-lane (`**/*.tf`) work below — see the `capability_rules` entry
+  # and `coord/prereqs.py`'s `_probe_azure_credentials` for what backs it.
   - name: azure-vm
     host: vm-acme-dev-platform
-    capabilities: [python]
+    capabilities: [python, azure]
     repos: [code-coordinator]
     repo_paths:
       code-coordinator: ~/src/claude-coordinator
@@ -268,6 +292,17 @@ smoke_tests:
   capability_rules:
     - files: [Cargo.toml, Cargo.lock, src/app/]
       requires: [rust]
+    # #3233 (epic #3230 child 2): route the terraform lane's `.tf` diffs to
+    # a machine that actually holds Azure credentials — `azure-vm` above —
+    # instead of any capable-for-repo machine at random. `"*.tf"` is a
+    # suffix wildcard (coord.smoke._pattern_matches, #3233) matching at any
+    # depth, not a directory prefix — terraform files aren't confined to
+    # one directory tree the way GTK/browser sources are. A rule only ever
+    # NARROWS the candidate set (#1426: a miss falls back to "any capable
+    # machine", never "skip"), so this is safe even before every repo that
+    # might carry `.tf` files declares one.
+    - files: ["*.tf"]
+      requires: [azure]
     # Worked example for a browser-driven suite in ANOTHER repo — the shape
     # `coord-web` needs now that the webapp is its own repo (#2009). Note the
     # same path-prefix caveat: `src/` here would also match coord-tui.
@@ -300,6 +335,44 @@ pipeline:
   #   model: claude-haiku-4-5   # cheapest current model — fixed-size context keeps cost flat
   #   timeout_seconds: 30
   #   # claude_bin: claude      # override the `claude` binary path/name
+
+# reviews.repo_overrides: project-specific patterns layered onto the generic
+# review checklist (see this repo's own CLAUDE.md, "Review Prompt Assembly").
+# Each entry is a plain list of strings, keyed by repo NAME (validated
+# against `repos:` above — an unknown key is a config error at load time,
+# not a silent no-op).
+#
+# #3112: this SAME list is rendered into both the reviewer's prompt AND the
+# worker's own work briefing (`coord.review.repo_focus_lines`, shared by
+# `build_review_briefing` and `coord.dispatch.dispatch`'s work-briefing
+# chokepoint) — a worker is only ever graded on a rule it was shown up
+# front, never surprised by one at review time.
+#
+# #3235 (epic #3230 child 4): the terraform lane's JUDGMENT half. The
+# deterministic tflint/conftest/`terraform validate` policy gate (#3234,
+# coord/acceptance_drivers.py) already owns everything mechanically
+# checkable — pinned provider versions, no plaintext secrets, required
+# tags, no `local-exec`, no `prevent_destroy` removal. A rule that COULD be
+# a linter/OPA check belongs there, not duplicated here as reviewer prose —
+# these three are the calls a linter structurally can't make: they need the
+# issue's stated intent, a felt sense of proportion, and the diff's actual
+# effect on state, none of which a `.tf` file states about itself.
+reviews:
+  repo_overrides:
+    code-coordinator:
+      - "Does the diff match what the issue actually asked for? A resource
+        rename and a widened security-group range can both leave `terraform
+        validate`/tflint/conftest clean — only the issue's stated intent
+        distinguishes a passing diff from a wrong one."
+      - "Is the blast radius proportionate to the ask? A one-resource fix
+        that also touches unrelated modules, drops or widens a
+        `count`/`for_each`, or removes a `target`/scoping the issue implied
+        is a request-changes even when every policy check is green."
+      - "Is remote state handled correctly? If the diff touches backend
+        config (bucket/key/region), state locking, or workspace selection,
+        confirm that was the actual ask, not an accidental side effect of
+        an unrelated resource edit — and that nothing in the diff could
+        orphan or double-manage existing state."
 
 concurrency:
   max_workers: 2          # max simultaneous claude -p sessions across all machines

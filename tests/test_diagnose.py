@@ -996,6 +996,212 @@ def test_reset_review_wipes_rows_state_and_context(monkeypatch, config) -> None:
     assert calls["purge"] == ("api", 42, "review")
 
 
+# ── #3223: review-reset must stop a live/headless leg BEFORE deleting its
+# row — never fire tmux-only, never delete a row it couldn't confirm dead ──
+
+
+def test_reset_review_stops_live_headless_leg_before_deleting_row(
+    monkeypatch, config
+) -> None:
+    """coord-tui#81: a headless review leg (`interactive=False`, the ordinary
+    auto-loop shape) wedged with `status='running'` must be CANCELLED on the
+    agent (`_kill_session`, which now has a non-tmux branch for exactly this
+    case — #3223) before its row is deleted. The session probed/killed must
+    be the review leg itself (`rv1`), never the work row it reviewed
+    (`w1`) — `w1` is long done and has no process to stop."""
+    calls = _stub(
+        monkeypatch,
+        session=lambda a: "live" if a.assignment_id == "rv1" else "dead",
+    )
+    delete_calls: list = []
+    monkeypatch.setattr(
+        "coord.state.delete_assignments_for_issue",
+        lambda repo, issue, *, types, review_of_assignment_id=None: delete_calls.append(
+            (repo, issue, types, review_of_assignment_id)
+        )
+        or 1,
+    )
+    monkeypatch.setattr("coord.state.reset_work_review_state", lambda *a, **k: 1)
+    monkeypatch.setattr("coord.state.clear_issue_context_by_source", lambda *a, **k: 1)
+    monkeypatch.setattr("coord.state.release_review_dispatch_claim", lambda *a, **k: None)
+    monkeypatch.setattr("coord.state.count_review_rows_for_reset", lambda *a, **k: 0)
+
+    a = _assign(aid="rv1", typ="review", status="running", review_of="w1")
+    board = Board(active=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    # The live session stopped was the review leg, not the reviewed work row.
+    assert calls["kill"] == ["rv1"]
+    assert delete_calls == [("api", 42, ("review",), "w1")]
+    assert res.reset_performed is True
+    assert any("stopped the live review session" in x for x in res.actions_taken)
+
+
+def test_reset_review_failed_stop_leaves_row_intact(monkeypatch, config) -> None:
+    """coord-tui#81 (the reported failure mode): when the stop cannot be
+    confirmed — `_kill_session` returns False, e.g. the agent is unreachable
+    or its own post-cancel status disagrees — the review row must NOT be
+    deleted. Deleting it anyway destroys the only handle `coord stop` has to
+    find the assignment by, turning a visible stall into an invisible orphan
+    that still holds a worker slot forever."""
+    calls = _stub(monkeypatch, session="live")
+    monkeypatch.setattr(diagnose, "_kill_session", lambda a, c: (
+        calls["kill"].append(a.assignment_id) or False
+    ))
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("must not delete/mutate rows when the stop failed")
+
+    monkeypatch.setattr("coord.state.delete_assignments_for_issue", _boom)
+    monkeypatch.setattr("coord.state.reset_work_review_state", _boom)
+    monkeypatch.setattr("coord.state.clear_issue_context_by_source", _boom)
+    monkeypatch.setattr("coord.state.release_review_dispatch_claim", _boom)
+
+    a = _assign(aid="rv1", typ="review", status="running", review_of="w1")
+    board = Board(active=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert calls["kill"] == ["rv1"]
+    assert res.reset_performed is False
+    assert res.needs_reset is True
+    assert any(
+        "could not stop" in f and "rv1" in f and "coord stop" in f
+        for f in res.findings
+    )
+
+
+def _reset_row_stubs(monkeypatch) -> dict:
+    """Stub the four DB writes `_reset_review_stage` performs, recording them."""
+    seen: dict = {}
+    monkeypatch.setattr(
+        "coord.state.delete_assignments_for_issue",
+        lambda repo, issue, *, types, review_of_assignment_id=None: seen.setdefault(
+            "delete", (repo, issue, types, review_of_assignment_id)
+        )
+        or 1,
+    )
+    monkeypatch.setattr("coord.state.count_review_rows_for_reset", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        "coord.state.reset_work_review_state",
+        lambda repo, issue, *, assignment_id=None: seen.setdefault(
+            "reset_state", (repo, issue, assignment_id)
+        )
+        or 1,
+    )
+    monkeypatch.setattr(
+        "coord.state.clear_issue_context_by_source",
+        lambda repo, issue, source: seen.setdefault("purge", (repo, issue, source)) or 1,
+    )
+    monkeypatch.setattr("coord.state.release_review_dispatch_claim", lambda *a, **k: None)
+    return seen
+
+
+def test_reset_review_terminal_leg_is_never_probed_or_stopped(
+    monkeypatch, config
+) -> None:
+    """#3223 follow-up: the stop-before-delete guard must NOT fire for a leg
+    whose row is ALREADY TERMINAL. `notify`'s `review_done_no_verdict` sweep
+    calls `_reset_review_stage` directly on a `status="done"` review, on a
+    schedule, specifically to avoid paying a liveness probe per tick — and an
+    unreachable machine probes `"unknown"`, which the guard treats as "might
+    be live", so probing a finished review would refuse the very reset the
+    sweep exists to perform for as long as that machine stayed down."""
+    probed: list[str] = []
+    killed: list[str] = []
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: (
+        probed.append(a.assignment_id) or "unknown"
+    ))
+    monkeypatch.setattr(diagnose, "_kill_session", lambda a, c: (
+        killed.append(a.assignment_id) or False
+    ))
+    seen = _reset_row_stubs(monkeypatch)
+
+    rv = _assign(aid="rv1", typ="review", status="done", review_of="w1")
+    res = diagnose.DiagnoseResult(repo_name="api", issue_number=42, stage="review")
+    diagnose._reset_review_stage(
+        config, "api", 42, res,
+        dry_run=False, assignment_id="w1", live_assignment=rv,
+    )
+
+    assert probed == []  # terminal row → short-circuit, no ssh/HTTP round trip
+    assert killed == []
+    assert res.reset_performed is True
+    assert seen["delete"] == ("api", 42, ("review",), "w1")
+
+
+def test_reset_review_unknown_liveness_counts_as_possibly_live(
+    monkeypatch, config
+) -> None:
+    """The other half of the same gate: for a NON-terminal leg, an
+    unconfirmed probe (`"unknown"` — agent unreachable) must be treated as
+    "might still be running", so the row survives as `coord stop`'s handle.
+    Without this the gate could only ever pass, since `"unknown"` is what a
+    down machine reports (#2096: a gate must be able to fail)."""
+    probed: list[str] = []
+    monkeypatch.setattr(diagnose, "_session_state", lambda a, c: (
+        probed.append(a.assignment_id) or "unknown"
+    ))
+    monkeypatch.setattr(diagnose, "_kill_session", lambda a, c: False)
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("must not touch rows when liveness is unconfirmed")
+
+    monkeypatch.setattr("coord.state.delete_assignments_for_issue", _boom)
+
+    rv = _assign(aid="rv1", typ="review", status="running", review_of="w1")
+    res = diagnose.DiagnoseResult(repo_name="api", issue_number=42, stage="review")
+    diagnose._reset_review_stage(
+        config, "api", 42, res,
+        dry_run=False, assignment_id="w1", live_assignment=rv,
+    )
+
+    assert probed == ["rv1"]
+    assert res.reset_performed is False
+    assert res.needs_reset is True
+
+
+def test_kill_session_cancels_headless_leg_via_agent(monkeypatch, config) -> None:
+    """Unit-level #3223 regression on `_kill_session` itself: when tmux has
+    no session at all for the assignment (the headless shape), it must fall
+    through to the agent's own `POST /cancel/{id}` — the same seam `coord
+    stop` uses — rather than silently reporting success for a tmux kill
+    that targeted a session which never existed."""
+    from coord.network import CancelResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_running", lambda *a, **k: False)
+    seen: list = []
+
+    def _fake_cancel(machine, assignment_id, **kwargs):
+        seen.append((machine.name, assignment_id))
+        return CancelResult(ok=True, status="cancelled")
+
+    monkeypatch.setattr("coord.network.cancel_assignment", _fake_cancel)
+    a = _assign(aid="rv1", typ="review", status="running")
+
+    assert diagnose._kill_session(a, config) is True
+    assert seen == [("precision", "rv1")]
+
+
+def test_kill_session_headless_cancel_failure_is_not_swallowed(
+    monkeypatch, config
+) -> None:
+    """The headless branch must report False (not silently True) when the
+    agent's own cancel could not be confirmed — e.g. the agent is
+    unreachable, or its post-cancel status isn't 'cancelled'."""
+    from coord.network import CancelResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_running", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "coord.network.cancel_assignment",
+        lambda machine, assignment_id, **kwargs: CancelResult(
+            ok=False, error="connection error"
+        ),
+    )
+    a = _assign(aid="rv1", typ="review", status="running")
+
+    assert diagnose._kill_session(a, config) is False
+
+
 def _record(a: Assignment) -> None:
     """Insert a real DB row.  ``record_dispatched_assignment`` is a dispatch-time
     insert (status='running', no verdict columns), so the completed review
@@ -1294,13 +1500,49 @@ def test_reset_test_clears_test_state(monkeypatch, config) -> None:
     calls: dict = {}
     monkeypatch.setattr(
         "coord.state.reset_work_test_state",
-        lambda repo, issue: calls.setdefault("test", (repo, issue)) or 1,
+        lambda repo, issue, *, assignment_id=None: calls.setdefault(
+            "test", (repo, issue, assignment_id)
+        )
+        or 1,
     )
     a = _assign(aid="w1", typ="work", status="done")  # test verdict rides the work row
     board = Board(completed=[a])
     res = diagnose.diagnose_stage(board, config, "api", 42, "test", reset=True)
     assert res.reset_performed is True
-    assert calls["test"] == ("api", 42)
+    assert calls["test"] == ("api", 42, "w1")
+
+
+def test_reset_test_finds_epic_decompose_row(monkeypatch, config) -> None:
+    """#3305 review: `coord diagnose --stage test --reset` is the gate's own
+    recommended recovery command for a `TEST_STATE_BLOCKED` row — including
+    an `epic-decompose` row, the exact type of the original #3230 incident.
+    Before this fix `STAGE_ASSIGNMENT_TYPES["test"] == ("work", "plan")`
+    meant `stage_assignments` found no row for an `epic-decompose` completion,
+    so `diagnose_stage` took the `latest is None` early return and reported
+    `recovered=True` ("nothing wedged") without ever touching the blocked
+    row. Assert the row is now actually found and its test_state cleared."""
+    _stub(monkeypatch, session="dead")
+    calls: dict = {}
+    monkeypatch.setattr(
+        "coord.state.reset_work_test_state",
+        lambda repo, issue, *, assignment_id=None: calls.setdefault(
+            "test", (repo, issue, assignment_id)
+        )
+        or 1,
+    )
+    a = _assign(aid="ed1", typ="epic-decompose", status="done", issue=3230)
+    a.test_state = "blocked"
+    a.test_reason = "Test stage refused: branch carries 0 commits ahead of its base"
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 3230, "test", reset=True)
+    assert res.reset_performed is True
+    assert res.recovered is True
+    assert calls["test"] == ("api", 3230, "ed1")
+    # Sanity: without --reset, the same row must be *found* too (not the
+    # `latest is None` early return) even though it's already "healthy" —
+    # only the fact that it locates the row matters here.
+    findings_res = diagnose.diagnose_stage(board, config, "api", 3230, "test")
+    assert any("ed1" in f for f in findings_res.findings)
 
 
 # ── #1605: stuck test_state with a terminal smoke child ─────────────────────

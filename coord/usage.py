@@ -365,9 +365,19 @@ def filter_assignments_in_window(assignments: list[Assignment], window) -> list[
 
 # ── Rollup fetch (#1118) ──────────────────────────────────────────────────────
 
+# #3313: hard ceiling on a fully unbounded fetch (no since/until at all) —
+# a windowed call (--today/--week/--month/--since, the common case) is bounded
+# by the window itself and practically never hits this. Exists only so an
+# unbounded "all history" fetch on a very old fleet can't grow forever; if it
+# ever DOES trip, the caller must be told the total undercounts rather than
+# silently rendering a partial read as if it were complete.
+USAGE_ROWS_MAX_ROWS = 50_000
+
 
 def fetch_usage_rows(
     *,
+    since: float | None = None,
+    until: float | None = None,
     flag_url: str | None = None,
     flag_token: str | None = None,
     timeout: float = 5.0,
@@ -384,21 +394,108 @@ def fetch_usage_rows(
     ``tests/test_board_schema.py``) not an ``Assignment`` dataclass field, so
     converting through ``Assignment`` would silently drop it.
 
-    Remote reads the same ``/board`` endpoint ``coord status`` polls. Local
-    reads the sqlite DB directly via ``SqliteStore.list_assignments()``
-    rather than ``board_projection()["assignments"]`` — a usage rollup wants
-    full history, not the retention-capped set ``/board`` serves the TUI.
+    #3313: neither branch reads ``/board`` any more. ``/board`` is capped
+    (#762) to active + pipeline-referenced + ``COORD_BOARD_RETENTION_DAYS``
+    (default 14) of terminal rows — a usage rollup wants full history, so
+    reading it from a thin client made ``coord usage`` under-report spend by
+    ~8x and made a *wider* ``--since`` window sometimes report *less* than a
+    narrower one (whichever slice of history happened to still be resident on
+    ``/board``). Remote now GETs the daemon's dedicated ``/usage-rows``
+    endpoint (own read path, like ``/leg-counts``/``/audit``); local reads
+    ``assignments`` + ``assignments_archive`` directly via
+    :func:`_local_usage_rows` — ``SqliteStore.list_assignments()`` alone
+    would miss any row ``coord housekeeping`` already archived.
+
+    *since*/*until* (Unix-epoch floats, optional) push the resolved
+    ``--today``/``--week``/``--month``/``--since`` window down into the fetch
+    itself, rather than relying on :func:`coord.usage_rollup.aggregate` to
+    filter an already-truncated set — the same window semantics as
+    :func:`coord.usage_rollup.leg_in_window` (in-window if ``dispatched_at``
+    **or** ``finished_at`` falls in ``[since, until)``). Leaving both ``None``
+    (the default) fetches unbounded all-time history, matching every
+    call site's pre-#3313 behaviour.
     """
-    from coord.client import fetch_board_payload, resolve_board_service  # noqa: PLC0415
+    from coord.client import fetch_usage_rows_from_daemon, resolve_board_service  # noqa: PLC0415
 
     svc = resolve_board_service(flag_url, flag_token)
     if svc is not None:
-        payload = fetch_board_payload(svc, timeout=timeout)
-        return list(payload.get("assignments") or [])
+        result = fetch_usage_rows_from_daemon(svc, since=since, until=until, timeout=timeout)
+        rows = list(result.get("rows") or [])
+        if result.get("truncated"):
+            _log.warning(
+                "fetch_usage_rows: daemon /usage-rows read was truncated at "
+                "%d rows (#3313) — the rendered total UNDERCOUNTS actual spend.",
+                len(rows),
+            )
+        return rows
 
-    from coord.dao import SqliteStore  # noqa: PLC0415
+    rows, truncated = _local_usage_rows(since=since, until=until)
+    if truncated:
+        _log.warning(
+            "fetch_usage_rows: local usage-rows read was truncated at %d rows "
+            "(#3313) — the rendered total UNDERCOUNTS actual spend.",
+            len(rows),
+        )
+    return rows
 
-    return SqliteStore().list_assignments()
+
+def _local_usage_rows(
+    *, since: float | None = None, until: float | None = None
+) -> tuple[list[dict], bool]:
+    """Full-history local read spanning ``assignments`` + ``assignments_archive``
+    (#3313) — backs both :func:`fetch_usage_rows`'s local branch and the
+    daemon's ``GET /usage-rows`` handler (``coord/serve_app.py``).
+
+    Mirrors :func:`coord.state._leg_counts_local`'s span: ``coord
+    housekeeping`` MOVES (never deletes) terminal assignments older than
+    ``COORD_ARCHIVE_RETENTION_DAYS`` (default 30) out of the live
+    ``assignments`` table into ``assignments_archive``, so a read of
+    ``assignments`` alone silently loses the tail of any window reaching past
+    that boundary — exactly the "full history, not a retention-capped slice"
+    promise this module's docstring already made and ``/board`` couldn't keep.
+
+    Returns ``(rows, truncated)`` — ``truncated`` is only ``True`` if
+    :data:`USAGE_ROWS_MAX_ROWS` was hit, newest-dispatched rows kept. Callers
+    must surface that rather than silently rendering a partial total as
+    complete (#3313's "a rollup that silently drops rows must say so").
+    """
+    from coord import sql  # noqa: PLC0415
+    from coord.board_schema import decode_row  # noqa: PLC0415
+    from coord.db import get_connection, rollback_after_driver_error  # noqa: PLC0415
+    from coord.usage_rollup import TimeWindow, leg_in_window  # noqa: PLC0415
+
+    conn = get_connection()
+    rows: list[dict] = []
+    for table in ("assignments", "assignments_archive"):
+        try:
+            result = sql.execute(conn, f"SELECT * FROM {table}").fetchall()  # noqa: S608 — literal table name
+        except sql.driver_errors() as exc:
+            # #2983/#2784: continue on the SAME connection rather than raise —
+            # a missing assignments_archive (housekeeping never ran yet) must
+            # not abort the (Postgres) transaction and poison the sibling
+            # `assignments` read that hasn't happened yet in this loop.
+            rollback_after_driver_error(conn, exc)
+            continue  # assignments_archive may not exist yet (housekeeping never ran)
+        # `assignments_archive` is a dumb, unregistered column-mirror of
+        # `assignments` (see coord.housekeeping._ensure_archive_mirror) — it
+        # has no entry of its own in `board_schema.BOARD_PROJECTIONS`, so
+        # decoding it under its own table name would skip DTO projection
+        # entirely (`decode_row` falls back to `dict(row)` for an unknown
+        # table) and ship every raw column, including `briefing` — exactly
+        # the ~8MB-per-row wire bloat #1849 slimmed the live table to avoid.
+        # Decode both tables under the "assignments" key so archived rows get
+        # the identical slim projection live rows do.
+        rows.extend(decode_row("assignments", r) for r in result)
+
+    if since is not None or until is not None:
+        window = TimeWindow(start=since, end=until)
+        rows = [r for r in rows if leg_in_window(r, window)]
+
+    rows.sort(key=lambda r: r.get("dispatched_at") or 0.0, reverse=True)
+    truncated = len(rows) > USAGE_ROWS_MAX_ROWS
+    if truncated:
+        rows = rows[:USAGE_ROWS_MAX_ROWS]
+    return rows, truncated
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────

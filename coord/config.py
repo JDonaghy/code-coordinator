@@ -272,7 +272,10 @@ class SmokeRule:
     `gh pr view --json files`. A trailing `/` makes the prefix explicit; bare
     paths match if the touched path starts with the rule path (so `src/gtk`
     catches `src/gtk/foo.c` and `src/gtk_helpers.c`). Use `src/gtk/` to scope
-    strictly to the directory.
+    strictly to the directory. A `"*.ext"` pattern (#3233) is a suffix
+    wildcard instead — matches by file extension at any depth (`"*.tf"`
+    catches both `main.tf` and `infra/net/main.tf`) — for files that, unlike
+    GTK/browser sources, aren't confined to one directory tree.
 
     `command` (#3056) is an optional override of the Test-stage command for
     a diff this rule matches — routing to the one machine with a capability
@@ -1031,6 +1034,25 @@ class LivenessAuditorConfig:
     model: str = DEFAULT_LIVENESS_MODEL
     timeout_seconds: float = DEFAULT_LIVENESS_TIMEOUT_SECONDS
     claude_bin: str | None = None
+
+
+KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
+"""Gate names the pipeline currently understands, in ``pipeline.default_gates``
+and any ``pipeline.labels[*]`` entry (#3269, S-1 of #3261).
+
+This is a name registry only — validation that a gate name is *known* — not
+yet the gate's real behavioural data (that starts with S-2 of #3261, which
+turns each name into a ``GateSpec``). Mirrors the posture of
+``coord.acceptance_drivers.SUPPORTED_KINDS``: a name may be declared ahead of
+being wired up as real gate data, but naming something that doesn't exist at
+all must fail config load, never parse clean and silently vanish (the
+``"reveiw"`` typo #3269 was filed over — nothing consults it, and
+``"review" in gates`` in ``coord.merge_queue`` never matches it).
+
+Seeded with exactly the four gate names in use fleet-wide today:
+``test``, ``review``, ``uat`` (#2687), ``merge``. Adding a fifth here is a
+separate, deliberate change, not part of this slice.
+"""
 
 
 @dataclass
@@ -2495,6 +2517,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "uat_preview",
         "uat_live_preview",
         "uat_checks",
+        "requires",
     }
 )
 
@@ -2779,6 +2802,17 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
         # without checks (today's behaviour, unchanged).
         uat_checks = _parse_uat_checks(entry.get("uat_checks"), i)
 
+        # #3351: requires — capabilities EVERY leg of this repo needs,
+        # regardless of which files a diff touches. See `Repo.requires`'s
+        # docstring for why this is a repo-scoped field rather than another
+        # `smoke_tests.capability_rules` entry (that mechanism is keyed by
+        # file-path prefix across the WHOLE fleet, not by repo, so it cannot
+        # express "every leg of THIS repo" without risking over-matching
+        # every other repo that happens to share a path prefix).
+        requires = entry.get("requires", []) or []
+        if not isinstance(requires, list) or not all(isinstance(r, str) for r in requires):
+            raise ConfigError(f"repos[{i}].requires must be a list of strings")
+
         repos.append(
             Repo(
                 name=name,
@@ -2800,6 +2834,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 uat_preview=uat_preview,
                 uat_live_preview=uat_live_preview_raw,
                 uat_checks=uat_checks,
+                requires=list(requires),
             )
         )
     return repos, warnings
@@ -3018,6 +3053,19 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
             entry.get("quiet_hours"), machine_index=i, machine_name=name,
         )
 
+        # #3340: optional per-machine floor for the `/health` reachability
+        # probe timeout — see `Machine.health_timeout`'s docstring for why
+        # this exists instead of just raising `network.DEFAULT_TIMEOUT`.
+        machine_health_timeout = entry.get("health_timeout")
+        if machine_health_timeout is not None:
+            if isinstance(machine_health_timeout, bool) or not isinstance(
+                machine_health_timeout, (int, float)
+            ):
+                raise ConfigError(f"machines[{i}].health_timeout must be a number (seconds)")
+            if machine_health_timeout <= 0:
+                raise ConfigError(f"machines[{i}].health_timeout must be greater than 0")
+            machine_health_timeout = float(machine_health_timeout)
+
         machines.append(
             Machine(
                 name=name,
@@ -3027,6 +3075,7 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
                 repo_paths=repo_paths,
                 max_workers=machine_max_workers,
                 quiet_hours=quiet_hours,
+                health_timeout=machine_health_timeout,
             )
         )
     return machines
@@ -3465,6 +3514,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         value = raw["default_gates"]
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ConfigError("pipeline.default_gates must be a list of strings")
+        unknown = [v for v in value if v not in KNOWN_GATE_NAMES]
+        if unknown:
+            raise ConfigError(
+                f"pipeline.default_gates has unknown gate name(s) {unknown!r} "
+                f"(known: {', '.join(KNOWN_GATE_NAMES)})"
+            )
         cfg.default_gates = list(value)
 
     if "labels" in raw:
@@ -3477,6 +3532,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
             if not isinstance(v, list) or not all(isinstance(g, str) for g in v):
                 raise ConfigError(
                     f"pipeline.labels[{k!r}] must be a list of gate name strings"
+                )
+            unknown = [g for g in v if g not in KNOWN_GATE_NAMES]
+            if unknown:
+                raise ConfigError(
+                    f"pipeline.labels[{k!r}] has unknown gate name(s) {unknown!r} "
+                    f"(known: {', '.join(KNOWN_GATE_NAMES)})"
                 )
         cfg.labels = {k: list(v) for k, v in value.items()}
 

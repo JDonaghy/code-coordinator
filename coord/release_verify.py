@@ -510,7 +510,70 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
                 )
             )
 
+    out.extend(_claude_credential_findings(host, health))
+
     return out
+
+
+def _claude_credential_findings(host: str, health: dict | None) -> list[Finding]:
+    """#3371: a host whose `claude` credential is dead — or about to be.
+
+    `coord release verify` is the one command an operator runs across the
+    WHOLE fleet after a deploy, so it is where "nobody is coming" has to
+    show up: the #3367 incident ran for an hour with `coord status` reading
+    `online • idle` because nothing fleet-wide ever looked at credential
+    health. This reuses `coord.prereqs`' single source of truth
+    (`tool_probe_from_dict` / `claude_credential_expiry_warning`) rather
+    than re-deriving an opinion from the raw `/health` dict — the same
+    #2096 hygiene `coord doctor` and `coord plan` already follow.
+
+    Both are `warn`, never `crit`, deliberately: `coord release propagate
+    --rollback-on-red` gates on this report, and an expired OAuth session
+    is not a reason to roll a RELEASE back — the two are unrelated
+    failures that happen to be visible in the same place. WARN still moves
+    the exit code off 0 (`EXIT_WARN`) and still prints a line naming the
+    host, which is the visibility that was missing.
+    """
+    from coord.prereqs import (  # noqa: PLC0415 — keep this module import-light
+        claude_credential_expiry_warning,
+        tool_probe_from_dict,
+    )
+
+    info = (health or {}).get("tool_versions")
+    if not isinstance(info, dict):
+        return []
+    claude_info = info.get("claude")
+    if not isinstance(claude_info, dict):
+        # An agent predating the #3326 probe — "no data", never a green
+        # signal, but also not a defect this command can assert.
+        return []
+    probe = tool_probe_from_dict("claude", claude_info)
+    if not probe.ok:
+        return [
+            Finding(
+                severity="warn",
+                host=host,
+                lane="claude credential",
+                summary="claude credential cannot authenticate — not routable",
+                detail=(
+                    "every claude-provider dispatch to this host fails at "
+                    "turn 1 for $0.00 (#3367/#3371); run `claude` or "
+                    "`claude setup-token` on it"
+                ),
+            )
+        ]
+    warning = claude_credential_expiry_warning(claude_info)
+    if warning:
+        return [
+            Finding(
+                severity="warn",
+                host=host,
+                lane="claude credential",
+                summary=warning,
+                detail="re-authenticate before it expires, not after (#3371)",
+            )
+        ]
+    return []
 
 
 #: The systemd user unit that IS the daemon. A machine whose ``spawned_coord``

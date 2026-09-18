@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,6 +33,7 @@ from click.testing import CliRunner
 
 from coord import state
 from coord.cli import main
+from coord.drive import tmux_session_alive as _REAL_TMUX_SESSION_ALIVE
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
     DISPATCH_FAILURE_MIN_BACKOFF_SECONDS,
@@ -51,6 +54,14 @@ from tests.backends import set_board_meta
 #: (state -> `_apply_issue_labels_local` -> `github_ops`) monkeypatches this
 #: back in; see `test_add_labels_gh_with_the_resolved_slug_...`.
 _REAL_APPLY_ISSUE_LABELS = state.apply_issue_labels
+
+# `_REAL_TMUX_SESSION_ALIVE` (imported above): the genuine
+# `coord.drive.tmux_session_alive`, captured at import time — before
+# `tests/conftest.py`'s suite-wide `_no_live_tmux_driver_probe` (autouse,
+# #3282) defaults it to "nothing is alive". The one test that wants a REAL
+# local tmux probe (`test_remove_stops_a_live_driver_from_dispatching_
+# further`) restores it, same capture-and-restore shape as
+# `_REAL_APPLY_ISSUE_LABELS` above.
 
 REPO = "claude-coordinator"
 # A SECOND repo, so #1972's per-repo capacity has something to be per-repo
@@ -270,19 +281,33 @@ class _Launches(list):
 
 @pytest.fixture
 def launches(monkeypatch) -> _Launches:
-    """Capture the `coord drive --tmux` argv instead of running it."""
+    """Capture the `coord drive --tmux` argv instead of running it.
+
+    `subprocess.run` is a single process-wide symbol, so this stub sees
+    every subprocess call this module makes — not just the drive launch.
+    Since #3282, `remove` also shells out to plain ``tmux`` (``has-session``/
+    ``kill-session``, to stop a driver it is orphaning) — a call this fixture
+    predates and must not swallow into the launch outcome. Bare ``tmux ...``
+    argvs are passed to a fixed "nothing there" default (``has-session``
+    exits 1: no session; ``kill-session`` likewise, though `remove`'s own
+    tests patch `coord.interactive.tmux_session_alive` directly and never
+    reach this path) rather than recorded — `captured` stays exactly what
+    its name says, the launch argv only.
+    """
     captured = _Launches()
     captured.outcome = {"returncode": 0, "stderr": ""}
 
     class _Result:
-        def __init__(self) -> None:
-            self.returncode = captured.outcome["returncode"]
+        def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+            self.returncode = returncode
             self.stdout = ""
-            self.stderr = captured.outcome["stderr"]
+            self.stderr = stderr
 
     def fake_run(argv, **_kw):
+        if argv and argv[0] == "tmux":
+            return _Result(returncode=1)  # no such session — not a launch
         captured.append(list(argv))
-        return _Result()
+        return _Result(captured.outcome["returncode"], captured.outcome["stderr"])
 
     monkeypatch.setattr("coord.commands.drive_queue.subprocess.run", fake_run)
     return captured
@@ -302,6 +327,10 @@ def test_drive_queue_is_registered_with_every_verb():
         "overlap-report", "block-log", "diagnose", "log-intervention",
         # #2607: the roll-pending marker's operator escape hatch.
         "cancel-roll",
+        # #3236: the apply-verdict gate's accountable-release verb.
+        "apply-verdict",
+        # #3339: the refused_premise unblock verb.
+        "clear-refusal",
     }
 
 
@@ -925,6 +954,40 @@ def test_a_directory_declaration_under_the_fanout_threshold_does_not_warn(cli, d
     assert "warning:" not in result.output
 
 
+# ── #3258: a Files heading that parses to zero paths must say so ────────────
+
+
+def test_a_files_heading_that_parses_to_nothing_warns(cli, coord_db):
+    # No bullets, no bare paths, no table — just prose under the heading.
+    # Before #3258 this was byte-identical to declaring nothing at all.
+    backends.upsert_issue(
+        coord_db, repo_name=REPO, number=420, title="issue 420",
+        body="## Files\nSee the PR description for the affected files.\n",
+        state="open",
+    )
+    coord_db.commit()
+
+    result = cli("add", REPO, "420")
+
+    assert result.exit_code == 0, result.output
+    assert "warning:" in result.output
+    assert "#3258" in result.output
+    assert "zero paths" in result.output
+    # ORDER, never REFUSE — the entry still queues with no `after`.
+    assert queued(420)["after_json"] == []
+
+
+def test_a_well_formed_files_heading_does_not_trigger_the_malformed_warning(
+    cli, declare,
+):
+    declare(421, "coord/overlap_predict.py")
+
+    result = cli("add", REPO, "421")
+
+    assert result.exit_code == 0, result.output
+    assert "#3258" not in result.output
+
+
 def test_editing_the_issue_live_narrows_a_stale_bare_directory_declaration(
     cli, declare, monkeypatch,
 ):
@@ -1346,6 +1409,84 @@ def test_blocked_row_purely_by_an_unsatisfiable_prereq_gets_the_2362_note(
     assert "re-checked against the merge gate automatically (#2230)" in block_1650
 
 
+def test_list_cascades_an_unconfirmed_probe_failure_through_a_two_hop_after_chain(
+    cli, seed,
+):
+    """#3369: the vimcode#1059..#1069 incident. #1059 itself is `blocked` on
+    #2806's explicitly-retryable "gate could not be read this tick" verdict
+    — its OWN text says so. #1060 is chained `--after` #1059 and #1061 is
+    chained `--after` #1060 (two hops from the unconfirmed probe failure),
+    both still sitting on disk with the pre-#3368 frozen "it will never
+    satisfy" verdict, exactly as a real queue looks the tick after a probe
+    failure and before the next tick's sweep has re-derived them.
+
+    #3368 already fixed the ONE-hop case (#1060 reading #1059's own text
+    directly). But `list`'s #2183 re-diagnosis computes every row's
+    dependency reason off a single static snapshot of `states`/`last_reason`
+    — so #1061's diagnosis saw #1060 as plain `blocked` with the OLD literal
+    "it will never satisfy" text (which does not itself match #2806's
+    marker), and rendered #1061 as permanently unsatisfiable too, even
+    though a live tick — which mutates `states` as it walks the chain in
+    position order — would resume BOTH #1060 and #1061 to `waiting` in the
+    very same tick. `list` must never show a bleaker verdict than the next
+    real tick would compute."""
+    seed(issues={1059: "open", 1060: "open", 1061: "open"})
+    cli("add", REPO, "1059")
+    root_reason = (
+        f"{REPO}#1059's merge gate could not be read this tick (no "
+        "merge-queue row for this entry, even after the self-heal enqueue "
+        "attempt) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; #2230's sweep will try again next tick rather than "
+        "guessing (#2806)"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 1059, state="blocked", last_reason=root_reason, attempts=2,
+    )
+    cli("add", REPO, "1060", "--after", "1059")
+    state._update_drive_queue_entry_local(
+        REPO,
+        1060,
+        state="blocked",
+        last_reason=f"pre-req {REPO}#1059 is queued but blocked — it will never satisfy",
+        attempts=2,
+    )
+    cli("add", REPO, "1061", "--after", "1060,1059")
+    state._update_drive_queue_entry_local(
+        REPO,
+        1061,
+        state="blocked",
+        last_reason=f"pre-req {REPO}#1060 is queued but blocked — it will never satisfy",
+        attempts=1,
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+
+    row_1060 = _row_for(result.output, f"{REPO}#1060")
+    row_1061 = _row_for(result.output, f"{REPO}#1061")
+    idx_1060 = result.output.index(row_1060)
+    idx_1061 = result.output.index(row_1061)
+    block_1060 = result.output[idx_1060:idx_1061]
+    block_1061 = result.output[idx_1061:]
+
+    # Neither dependent may render the terminal "it will never satisfy"
+    # verdict any more — #1059's own text already says its block is a
+    # retryable probe failure, not a confirmed-still-shut gate, and that
+    # honesty must survive both hops.
+    assert "it will never satisfy" not in block_1060
+    assert "it will never satisfy" not in block_1061
+    # #1060 is one hop from the unconfirmed probe failure, so its own fresh
+    # verdict names it explicitly.
+    assert "retrying" in block_1060 or "unconfirmed probe failure" in block_1060
+    # #1061 is two hops away: its own immediate pre-req (#1060) is no longer
+    # itself `blocked`/`failed` in this same cascaded reading, so its honest
+    # verdict is an ordinary "still waiting on #1060" deferral rather than a
+    # repeat of the specific probe-failure wording — the point is only that
+    # it must never overclaim permanence about a chain that is, in fact,
+    # about to resume on its own.
+    assert "waiting on" in block_1061 and REPO in block_1061
+
+
 def test_a_blocked_entry_resumes_and_launches_once_a_live_recheck_confirms_its_prereq_landed(
     cli, seed, launches, monkeypatch,
 ):
@@ -1438,6 +1579,47 @@ def test_a_dependent_is_released_when_its_prereq_is_wrongly_stuck_running(
     assert prereq["state"] == "done"
 
 
+def test_a_leaf_blocked_entry_with_no_dependents_reconciles_to_done_via_a_live_recheck(
+    cli, seed, launches, monkeypatch,
+):
+    """#3368: the vimcode#1059 incident — a `blocked` row's OWN issue merges
+    out of band (an operator's `coord drive` to completion) while the cached
+    board's `issues` row hasn't caught up yet. #2055's landed-check trusted
+    only `board.facts(key).landed`, the very cache #2602/#2850 already
+    learned NOT to trust unconditionally for a DEPENDENT's view of a
+    pre-req — but nothing gave THIS row's own key the same live re-check
+    unless some OTHER entry's `after=` happened to name it.  A leaf blocked
+    row (nothing queued behind it, exactly #1059's shape — it was the FIRST
+    of a six-long dependent chain, not itself an `after=` dependency of
+    anything already `waiting`/`blocked`) had no live check racing for it at
+    all and stayed `blocked` forever, even after two full ticks."""
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO,
+        1650,
+        state="blocked",
+        last_reason="review 0ef720978ec3 failed 1 retr(ies)",
+        attempts=2,
+    )
+
+    import coord.github_ops as github_ops
+
+    monkeypatch.setattr(
+        github_ops,
+        "work_is_terminal",
+        lambda repo_github, issue_number, branch, **_kw: (
+            repo_github == "john/claude-coordinator" and issue_number == 1650
+        ),
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1650)
+    assert entry["state"] == "done"
+    assert "#3368" in entry["last_reason"]
+
+
 def test_list_with_no_after_is_unaffected_by_the_2183_diagnosis(cli):
     """A `blocked` entry that never declared any `after=` at all keeps
     rendering exactly as it always has — no board dependency, no remedy
@@ -1471,6 +1653,243 @@ def test_remove_of_an_unqueued_issue_exits_non_zero(cli):
     result = cli("remove", REPO, "9999")
     assert result.exit_code != 0
     assert "not in the drive queue" in result.output
+
+
+# ── clear-refusal (#3339) ────────────────────────────────────────────────────
+#
+# `coord retry`/the printed #3164 remedy both used to name `drive-queue
+# remove` as the way to clear a terminal `refused_premise` row — which does
+# nothing, because the block lives on the BOARD work row, not the queue
+# entry. These assert the actual fix: an explicit, auditable assertion
+# ("I rechecked, the premise holds now") recorded on the assignment itself.
+
+
+def test_clear_refusal_records_the_recheck_on_the_refused_assignment(cli, seed, coord_db):
+    seed(assignments=[{"issue_number": 1650, "status": "refused_premise"}])
+    result = cli(
+        "clear-refusal", REPO, "1650", "--reason", "quadraui#971 landed",
+    )
+    assert result.exit_code == 0, result.output
+    assert "recorded premise recheck" in result.output
+    assert "a-claude-coordinator-0" in result.output
+    row = coord_db.execute(
+        "SELECT premise_rechecked_at, premise_rechecked_reason, status "
+        "FROM assignments WHERE assignment_id = ?",
+        ("a-claude-coordinator-0",),
+    ).fetchone()
+    assert row["premise_rechecked_at"] is not None
+    assert row["premise_rechecked_reason"] == "quadraui#971 landed"
+    # The write is additive: it does not itself resurrect the terminal
+    # `refused_premise` status — `decide()` reads BOTH columns together.
+    assert row["status"] == "refused_premise"
+
+
+def test_clear_refusal_of_a_non_refused_assignment_exits_non_zero(cli, seed):
+    seed(assignments=[{"issue_number": 1650, "status": "done"}])
+    result = cli("clear-refusal", REPO, "1650", "--reason", "landed")
+    assert result.exit_code != 0
+    assert "not 'refused_premise'" in result.output
+
+
+def test_clear_refusal_of_an_issue_with_no_work_row_exits_non_zero(cli):
+    result = cli("clear-refusal", REPO, "9999", "--reason", "landed")
+    assert result.exit_code != 0
+    assert "no work assignment found" in result.output
+
+
+def test_clear_refusal_requires_a_nonempty_reason(cli, seed):
+    seed(assignments=[{"issue_number": 1650, "status": "refused_premise"}])
+    result = cli("clear-refusal", REPO, "1650", "--reason", "   ")
+    assert result.exit_code != 0
+    assert "must not be empty" in result.output
+
+
+# ── remove owns the driver it orphans (#3282) ───────────────────────────────
+#
+# Before this fix, `remove` deleted only the queue row: a driver already
+# running for that issue never re-checks whether its own row still exists,
+# so it kept dispatching worker legs — for an issue with no representation
+# left in any queue view — until an operator noticed by accident. These
+# assert that (a) a live session is actually killed and its death confirmed
+# by a FRESH probe taken after the kill (#2096 — never trust the subprocess
+# exit code alone), and (b) a session that can't be confirmed dead makes
+# `remove` fail loudly (non-zero, names the session) instead of printing the
+# same success line the incident's silent case did. The kill itself now
+# lives in `coord.drive.stop_live_driver_session` (moved there in the #3282
+# review so `coord.state.dequeue_drive_queue`'s daemon branch AND the
+# dashboard's local fallback share the exact same seam the CLI uses — see
+# that function's docstring), so these patch `coord.drive.tmux_session_alive`
+# / `coord.drive.subprocess.run` rather than this module's own.
+#
+# `test_remove_stops_a_live_driver_from_dispatching_further` below is the
+# other half the #3282 review asked for by name: "assert no new assignment
+# is created for the issue after a remove — the actual failure here was a
+# dispatch ten minutes later, so assert on that, not just on process
+# absence." A mocked `tmux_session_alive`/`subprocess.run` pair (as every
+# other test here uses) can only prove `remove` ASKED tmux to kill the right
+# name — it says nothing about whether doing so actually stops further work.
+# That test runs a REAL local tmux session standing in for a driver that
+# "dispatches a leg" once per tick, kills it through the real, unmocked
+# `stop_live_driver_session` -> `tmux kill-session` path, and asserts the
+# dispatch marker goes flat afterwards — precisely what a dispatch ten
+# minutes later would have falsified.
+
+
+def test_remove_kills_a_live_driver_session(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    session = f"coord-drive-{REPO}-1650"
+    alive_probes: list[str] = []
+
+    def fake_alive(name, *, host=None):
+        alive_probes.append(name)
+        # Alive on the pre-kill check; confirmed dead on the POST-kill
+        # re-probe (#2096) — never trust `kill-session`'s exit code alone.
+        return len(alive_probes) == 1
+
+    kill_calls: list[list[str]] = []
+
+    def fake_run(argv, **_kw):
+        kill_calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("coord.drive.tmux_session_alive", fake_alive)
+    monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code == 0, result.output
+    assert f"removed {REPO}#1650 from the drive queue" in result.output
+    assert f"killed driver session {session!r}" in result.output
+    assert kill_calls == [["tmux", "kill-session", "-t", session]]
+    assert alive_probes == [session, session]  # pre-kill, then post-kill
+    assert queued(1650) is None
+
+
+def test_remove_with_no_live_driver_is_unchanged(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    # Explicit even though the suite-wide `_no_live_tmux_driver_probe`
+    # default (tests/conftest.py) already makes this the case — this test's
+    # whole point is "nothing alive", so it says so rather than relying on
+    # an ambient default it doesn't otherwise reference.
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: False)
+
+    kill_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "coord.drive.subprocess.run",
+        lambda argv, **_kw: kill_calls.append(list(argv)),
+    )
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == f"removed {REPO}#1650 from the drive queue"
+    assert kill_calls == []  # nothing alive, nothing to kill
+    assert queued(1650) is None
+
+
+def test_remove_reports_failure_loudly_when_the_driver_cannot_be_killed(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    session = f"coord-drive-{REPO}-1650"
+    # Still alive on both the pre-kill check AND the post-kill re-probe: the
+    # `kill-session` call "succeeded" (returncode 0) but nothing died.
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "coord.drive.subprocess.run",
+        lambda argv, **_kw: subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr=""),
+    )
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code != 0
+    assert session in result.output
+    assert "still" in result.output
+    # The bug this closes: never print the bare success line while a driver
+    # may still be dispatching.
+    assert f"removed {REPO}#1650 from the drive queue\n" not in result.output
+    # The row itself is dequeued regardless — that's a separate, cheap, and
+    # idempotent DB write; only the best-effort tmux cleanup failed.
+    assert queued(1650) is None
+
+
+def test_remove_reports_failure_when_kill_session_itself_errors(cli, monkeypatch):
+    cli("add", REPO, "1650")
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: True)
+
+    def boom(argv, **_kw):
+        raise OSError("tmux: command not found")
+
+    monkeypatch.setattr("coord.drive.subprocess.run", boom)
+
+    result = cli("remove", REPO, "1650")
+
+    assert result.exit_code != 0
+    assert "coord-drive-" in result.output
+    assert "tmux: command not found" in result.output
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real local tmux binary")
+def test_remove_stops_a_live_driver_from_dispatching_further(cli, tmp_path, monkeypatch):
+    """#3282 review (blocking): "assert no new assignment is created for the
+    issue after a remove — the actual failure here was a dispatch ten
+    minutes later, so assert on that, not just on process absence."
+
+    Every other test in this section mocks BOTH `tmux_session_alive` and the
+    kill subprocess, which can only prove `remove` ASKED tmux to kill the
+    right name. This one runs a REAL local tmux session standing in for a
+    driver that "dispatches a leg" by appending a line to a marker file once
+    per tick, forever, until killed — then calls `remove` through the real,
+    unmocked `coord.drive.stop_live_driver_session` -> `tmux kill-session`
+    path (restoring the suite-wide `_no_live_tmux_driver_probe` default,
+    same pattern as `_REAL_APPLY_ISSUE_LABELS` above) and asserts the marker
+    file's line count goes flat afterwards — exactly what a dispatch ten
+    minutes later would have falsified.
+    """
+    monkeypatch.setattr("coord.drive.tmux_session_alive", _REAL_TMUX_SESSION_ALIVE)
+
+    cli("add", REPO, "1650")
+    session = f"coord-drive-{REPO}-1650"
+    marker = tmp_path / "dispatches.log"
+    script = (
+        "import pathlib, time\n"
+        f"p = pathlib.Path({str(marker)!r})\n"
+        "while True:\n"
+        "    with p.open('a') as f:\n"
+        "        f.write('leg\\n')\n"
+        "    time.sleep(0.1)\n"
+    )
+    launch = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=10.0,
+    )
+    assert launch.returncode == 0, launch.stderr
+    try:
+        # Give the fake driver a moment to actually start "dispatching" —
+        # at least two legs, so the post-remove check below has a baseline
+        # that could plausibly have kept growing.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if marker.exists() and marker.read_text().count("leg") >= 2:
+                break
+            time.sleep(0.05)
+        assert marker.exists() and marker.read_text().count("leg") >= 2, (
+            "fake driver never dispatched its first legs"
+        )
+
+        result = cli("remove", REPO, "1650")
+        assert result.exit_code == 0, result.output
+        assert f"killed driver session {session!r}" in result.output
+
+        after_remove = marker.read_text().count("leg")
+        time.sleep(0.6)  # several multiples of the fake driver's 0.1s tick
+        assert marker.read_text().count("leg") == after_remove, (
+            "the 'driver' kept dispatching after remove reported it killed "
+            "the session — the exact #3282 incident (a fresh work leg "
+            "dispatched ten minutes after an operator removed the row)"
+        )
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session], capture_output=True, text=True,
+        )
 
 
 def test_move_reorders_the_queue(cli):
@@ -3134,46 +3553,49 @@ def stale_ci_backend(monkeypatch):
     return rerun_calls
 
 
-def test_auto_revalidate_fires_a_ci_rerun_for_an_entry_blocked_solely_on_stale_checks(
+def test_auto_revalidate_surfaces_but_never_reruns_an_entry_blocked_on_stale_checks(
     cli_no_gates, coord_db, stale_ci_backend,
 ):
     """The #2530/#2534 shape, unattended: a PENDING entry with a PR, review
     already satisfied (`cli_no_gates` disables the review requirement —
     the same minimal "sole blocker is CI" shape
     `TestCiRevalidationCandidates` uses in tests/test_merge_queue.py), and
-    CI checks that are green but predate the current base. The tick fires
-    the re-run itself — no drive-queue row, no operator running
-    `coord merge --revalidate` by hand.
+    CI checks that are green but predate the current base.
+
+    #3266: the tick used to fire a `gh run rerun` for this shape — a
+    same-base replay that can never clear a staleness reading (see
+    `MAX_CI_STALE_RERUNS`'s comment in `coord/merge_queue.py`). It now only
+    records the block for an operator to see; no rerun, no queue mutation.
     """
     _seed_pending_merge_row(coord_db, 2534, pr_number=42)
 
     result = cli_no_gates("tick")
     assert result.exit_code == 0, result.output
 
-    assert stale_ci_backend == [("john/claude-coordinator", 42)]
+    assert stale_ci_backend == []  # #3266: never reruns for staleness
     row = coord_db.execute(
         "SELECT ci_stale_reruns, error FROM merge_queue WHERE issue_number = ?",
         (2534,),
     ).fetchone()
-    assert row["ci_stale_reruns"] == 1
-    assert row["error"].startswith("CI running:")
-    assert "#2535" in row["error"]
+    assert row["ci_stale_reruns"] == 0  # never touched by this call site any more
+    assert row["error"] is None  # never mutated — reporting only, see docstring
 
     from coord.audit import query_audit_log
 
-    entries = query_audit_log(event_type="merge_checks_stale_auto_revalidate")["entries"]
+    entries = query_audit_log(event_type="merge_checks_stale_parked")["entries"]
     assert len(entries) == 1
     assert entries[0]["issue"] == 2534
     assert entries[0]["repo"] == REPO
 
 
-def test_auto_revalidate_never_exceeds_the_shared_budget(
+def test_auto_revalidate_keeps_surfacing_an_already_exhausted_entry(
     cli_no_gates, coord_db, stale_ci_backend,
 ):
-    """Budget already spent (whether by a prior tick or a prior live
-    `coord merge` attempt makes no difference — it's the same counter): no
-    NEW rerun fires, but the exhaustion is still recorded so a human
-    watching the audit trail sees it."""
+    """A row that carries a nonzero `ci_stale_reruns` from before #3266
+    (or from a live `process()` attempt on an old build) must still get
+    reported every tick — this call site no longer reads that counter at
+    all, so a pre-existing nonzero value neither blocks nor changes its
+    (always rerun-free) behaviour."""
     from coord.merge_queue import MAX_CI_STALE_RERUNS
 
     _seed_pending_merge_row(
@@ -3183,18 +3605,16 @@ def test_auto_revalidate_never_exceeds_the_shared_budget(
     result = cli_no_gates("tick")
     assert result.exit_code == 0, result.output
 
-    assert stale_ci_backend == []  # no new rerun triggered
+    assert stale_ci_backend == []  # no rerun triggered
     row = coord_db.execute(
         "SELECT ci_stale_reruns FROM merge_queue WHERE issue_number = ?",
         (2534,),
     ).fetchone()
-    assert row["ci_stale_reruns"] == MAX_CI_STALE_RERUNS  # unchanged
+    assert row["ci_stale_reruns"] == MAX_CI_STALE_RERUNS  # unchanged, unread
 
     from coord.audit import query_audit_log
 
-    entries = query_audit_log(
-        event_type="merge_checks_stale_auto_revalidate_exhausted"
-    )["entries"]
+    entries = query_audit_log(event_type="merge_checks_stale_parked")["entries"]
     assert len(entries) == 1
     assert entries[0]["issue"] == 2534
 
@@ -3783,6 +4203,77 @@ def test_a_board_read_still_locked_past_the_retry_budget_aborts_as_before(
     assert calls["n"] == drive_queue_cmd._BOARD_READ_RETRY_ATTEMPTS
     assert launches == []
     assert state._list_drive_queue_local() == before
+
+
+# ── #2972 review: a `leg_counts()` failure must not silently defeat the
+#    fix-round ceiling — lock contention retries, anything else warns loudly
+#    (rather than defaulting `work_leg_count` to 0 indistinguishably from
+#    "this entry's budget is untouched").
+
+
+def test_leg_counts_lock_contention_retries_via_the_board_read_retry_wrapper(
+    cli, seed, launches, monkeypatch
+):
+    """A `database is locked` failure from `leg_counts()` — not just from the
+    rest of the board read — must propagate out of `_fetch_board_view` so
+    `_fetch_board_view_with_retry`'s existing bounded retry actually sees and
+    retries it, instead of being swallowed one layer too early into a
+    default `work_leg_count=0` for the tick (the #2972 review finding)."""
+    import sqlite3
+
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650", "--machine", "dellserver")
+
+    real_leg_counts = state.leg_counts
+    calls = {"n": 0}
+
+    def flaky_leg_counts():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_leg_counts()
+
+    monkeypatch.setattr(state, "leg_counts", flaky_leg_counts)
+    monkeypatch.setattr(drive_queue_cmd.time, "sleep", lambda _s: None)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert calls["n"] == 3
+    assert "recovered after 2 retry" in result.output
+    assert "launched" in result.output
+    assert queued(1650)["state"] == "running"
+
+
+def test_leg_counts_non_lock_failure_warns_and_degrades_to_zero_not_silence(
+    cli, seed, launches, monkeypatch
+):
+    """A `leg_counts()` failure that ISN'T lock contention (e.g. the daemon
+    unreachable on a thin client) can't be fixed by a retry, so the tick
+    still proceeds with `work_leg_count` defaulted to 0 — but it must print a
+    visible warning, so a persistent failure here reads as "ceiling data
+    unreadable" rather than being indistinguishable from a genuinely fresh
+    entry (the #2972 review finding)."""
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650", "--machine", "dellserver")
+
+    def broken_leg_counts():
+        raise RuntimeError("board daemon unreachable")
+
+    monkeypatch.setattr(state, "leg_counts", broken_leg_counts)
+    monkeypatch.setattr(drive_queue_cmd.time, "sleep", lambda _s: None)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "warning: could not read drive-queue leg counts" in result.output
+    assert "board daemon unreachable" in result.output
+    assert "work_leg_count defaulting to 0" in result.output
+    # The tick still did real work — the degrade is fail-soft, not fail-closed.
+    assert "launched" in result.output
+    assert queued(1650)["state"] == "running"
 
 
 def test_a_failed_launch_is_a_consumed_attempt_not_a_running_entry(
@@ -4464,6 +4955,166 @@ def test_dry_run_does_not_run_the_probe(cli, seed, launches, probes):
     assert result.exit_code == 0, result.output
     assert probes.calls == []
     assert "--dry-run" in result.output
+
+
+# ── apply-verdict gate (#3236) ────────────────────────────────────────────────
+#
+# "merged is not applied": the drive-queue's --hold-after primitive, extended
+# with an OBSERVED apply verdict so `coord gates`/`list`/`status` can tell
+# merged-not-applied apart from applied apart from apply-failed — and a
+# destroy/replace terraform plan is refused --resume-when outright, no
+# exceptions.
+
+
+def test_add_refuses_resume_when_with_a_manually_declared_destructive_plan(cli):
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--terraform-destructive", "--resume-when", "true",
+    )
+    assert result.exit_code != 0
+    assert "resume-when" in result.output
+    assert "destructive" in result.output.lower()
+
+
+def test_add_stores_the_destructive_flag_and_list_renders_it(cli):
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--terraform-destructive",
+    )
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["plan_destructive"] == 1
+
+    listed = cli("list")
+    assert listed.exit_code == 0, listed.output
+    assert "DESTRUCTIVE" in listed.output
+    assert "apply-verdict" in listed.output
+
+
+def test_add_refuses_resume_when_with_a_destructive_plan_json(cli, tmp_path):
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "resource_changes": [{"change": {"actions": ["delete"]}}]
+    }))
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--terraform-plan-json", str(plan_path),
+        "--resume-when", "true",
+    )
+    assert result.exit_code != 0
+    assert "resume-when" in result.output
+    assert queued(1753) is None  # refused before the write
+
+
+def test_add_accepts_resume_when_with_a_purely_additive_plan_json(cli, tmp_path):
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "resource_changes": [{"change": {"actions": ["create"]}}]
+    }))
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--terraform-plan-json", str(plan_path), "--resume-when", "true",
+    )
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["plan_destructive"] == 0
+    assert queued(1753)["resume_when"] == "true"
+
+
+def test_a_destructive_gate_ignores_a_passing_resume_when_probe(
+    cli, seed, launches, probes
+):
+    """THE #3236 acceptance test, driven through the real tick: a
+    destructive gate must stay held even though its probe reports success —
+    contrast with the ordinary `--resume-when` auto-release tests above,
+    which DO launch on the very same probe outcome."""
+    key = f"{REPO}#1753"
+    cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--terraform-destructive",
+    )
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    probes.outcomes[key] = True
+
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    entry = queued(1753)
+    assert entry["state"] == "done"
+    assert entry["hold_state"] == "fired"
+    # The probe was never even run for a destructive entry.
+    assert probes.calls == []
+
+
+def test_apply_verdict_applied_records_and_releases_the_gate(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+    assert queued(1753)["hold_state"] == "fired"
+
+    result = cli("apply-verdict", REPO, "1753", "--applied", "--reason", "clean run")
+    assert result.exit_code == 0, result.output
+    entry = queued(1753)
+    assert entry["apply_verdict"] == "applied"
+    assert entry["apply_verdict_reason"] == "clean run"
+    assert entry["apply_verdict_at"] is not None
+    assert entry["hold_state"] == "released"
+
+
+def test_apply_verdict_apply_failed_records_but_does_not_release(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+
+    result = cli(
+        "apply-verdict", REPO, "1753", "--apply-failed", "--reason", "state locked"
+    )
+    assert result.exit_code == 0, result.output
+    entry = queued(1753)
+    assert entry["apply_verdict"] == "apply_failed"
+    assert entry["apply_verdict_reason"] == "state locked"
+    # The gate stays held — a failed apply is not a deploy.
+    assert entry["hold_state"] == "fired"
+
+    # And the queue really does stay held: the dependent does not launch.
+    cli("add", REPO, "1754", "--after", "1753")
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+
+
+def test_apply_verdict_requires_a_verdict_flag(cli):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    result = cli("apply-verdict", REPO, "1753")
+    assert result.exit_code != 0
+    assert "--applied" in result.output
+
+
+def test_apply_verdict_refuses_an_entry_with_no_gate_declared(cli):
+    cli("add", REPO, "1753")
+    result = cli("apply-verdict", REPO, "1753", "--applied")
+    assert result.exit_code != 0
+    assert "no deploy gate" in result.output
+
+
+def test_apply_verdict_refuses_an_entry_not_in_the_queue(cli):
+    result = cli("apply-verdict", REPO, "9999", "--applied")
+    assert result.exit_code != 0
+    assert "not in the drive queue" in result.output
+
+
+def test_status_reports_merged_not_applied_before_any_verdict(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "merged, not yet applied" in result.output
 
 
 # ── the gate never doubles up with the escalation path ───────────────────────

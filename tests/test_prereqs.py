@@ -8,7 +8,9 @@ Mirrors tests/test_github_ops.py's TestGetPrChecks patterns for mocking
 
 from __future__ import annotations
 
+import json
 import subprocess
+import time
 from unittest.mock import patch
 
 from coord import prereqs
@@ -154,7 +156,7 @@ class TestProbeAll:
     def test_baseline_always_probed(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
             probes = prereqs.probe_all([])
-        assert set(probes) == {"git", "gh"}
+        assert set(probes) == {p.tool for p in prereqs.BASELINE_PREREQS}
 
     def test_capability_prereqs_only_probed_when_declared(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
@@ -167,7 +169,7 @@ class TestProbeAll:
     def test_unrecognised_capability_probes_nothing_extra(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
             probes = prereqs.probe_all(["some-future-capability"])
-        assert set(probes) == {"git", "gh"}
+        assert set(probes) == {p.tool for p in prereqs.BASELINE_PREREQS}
 
     def test_tool_versions_summary_is_json_friendly(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
@@ -176,6 +178,7 @@ class TestProbeAll:
         assert summary["git"] == {
             "found": False, "version": None, "min_version": None,
             "meets_floor": None, "capability": None, "ok": False,
+            "expires_at": None,
         }
 
     def test_all_capability_names_probes_every_capability_prereq(self) -> None:
@@ -185,7 +188,9 @@ class TestProbeAll:
         cross-check it exists to unblock would quietly narrow again."""
         with patch("coord.prereqs.shutil.which", return_value=None):
             probes = prereqs.probe_all(prereqs.ALL_CAPABILITY_NAMES)
-        expected_tools = {p.tool for p in prereqs.CAPABILITY_PREREQS} | {"git", "gh"}
+        expected_tools = {p.tool for p in prereqs.CAPABILITY_PREREQS} | {
+            p.tool for p in prereqs.BASELINE_PREREQS
+        }
         assert set(probes) == expected_tools
 
 
@@ -699,9 +704,628 @@ class TestWindowsCapabilityManifest:
         assert "windows" in prereqs.ALL_CAPABILITY_NAMES
 
 
+class TestAzureCapabilityManifest:
+    """#3233: `azure` (epic #3230 — routing terraform `.tf` work to a
+    machine that actually holds Azure credentials) is backed by a single
+    `az` prereq whose probe checks credential *validity*, not just that the
+    CLI binary exists on PATH — see `_probe_azure_credentials`'s module
+    comment for why a bare `az --version` would be a false green, and for
+    why the probe must be `az account get-access-token` (forces real token
+    acquisition against Azure AD) rather than `az account show` (answers
+    from the local cache and never re-validates, so it cannot detect an
+    expired-but-still-cached login — `docs/DISASTER_RECOVERY.md:74-77`)."""
+
+    def _azure_prereqs(self):
+        return [p for p in prereqs.CAPABILITY_PREREQS if p.capability == "azure"]
+
+    def test_backed_by_az(self) -> None:
+        assert {p.tool for p in self._azure_prereqs()} == {"az"}
+
+    def test_probe_is_a_custom_probe_not_a_binary_check(self) -> None:
+        """A plain `--version` probe cannot answer "are the cached
+        credentials still valid" — this prereq must delegate entirely to a
+        custom probe, never fall through to the generic binary-probe path
+        (which would report `found=True` for an `az` that has never been
+        logged into, or whose login has since expired)."""
+        az_prereq = next(p for p in self._azure_prereqs() if p.tool == "az")
+        assert az_prereq.custom_probe is not None
+
+    def test_probe_all_covers_it_only_when_declared(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["azure"])
+        assert "az" in probes
+
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes_undeclared = prereqs.probe_all(["rust"])
+        assert "az" not in probes_undeclared
+
+    def test_missing_az_binary_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is False
+        assert probes["az"].ok is False
+        assert "not found on PATH" in probes["az"].what_breaks
+
+    def test_get_access_token_uses_correct_command(self) -> None:
+        """`az account show` reads the locally cached profile and never
+        forces a token refresh, so it cannot detect an expired-but-still-
+        cached login (`docs/DISASTER_RECOVERY.md:74-77`). The probe must
+        invoke `az account get-access-token`, which forces real token
+        acquisition against Azure AD and so actually fails when the cached
+        refresh token itself has expired."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="{}", returncode=0),
+             ) as mock_run:
+            prereqs.probe_all(["azure"])
+        args = mock_run.call_args[0][0]
+        assert args[:3] == ["az", "account", "get-access-token"]
+
+    def test_get_access_token_failure_reports_credentials_absent_or_expired(self) -> None:
+        """The #3233 crux: `az` installed but either never logged into, or
+        with a login whose refresh token has since expired, must both
+        surface as UNMET — `az account get-access-token` forces a real
+        token acquisition against Azure AD, which is what actually fails
+        (`AADSTS700082`) on the expired case, unlike `az account show`
+        which only reads the local cache and never re-validates."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(
+                     stderr=(
+                         "ERROR: AADSTS700082: The refresh token has "
+                         "expired due to inactivity.\n"
+                     ),
+                     returncode=1,
+                 ),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is False
+        assert probes["az"].ok is False
+        assert "az login" in probes["az"].what_breaks
+
+    def test_get_access_token_hang_degrades_to_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 side_effect=subprocess.TimeoutExpired(cmd="az", timeout=10),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is False
+        assert probes["az"].ok is False
+
+    def test_get_access_token_success_reports_found_and_names_the_subscription(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(
+                     stdout=(
+                         '{"accessToken": "redacted", "subscription": '
+                         '"sub-123", "tenant": "tenant-456"}\n'
+                     ),
+                     returncode=0,
+                 ),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is True
+        assert probes["az"].ok is True
+        assert probes["az"].version == "sub-123"
+
+    def test_get_access_token_success_with_unparsable_json_still_reports_found(self) -> None:
+        """An unparsable response body still proves `az account
+        get-access-token` exited 0 — that's the whole signal (a real token
+        was acquired); the subscription id is only ever a best-effort
+        label on top of it, never a reason to flip found=False."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/az"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="not json", returncode=0),
+             ):
+            probes = prereqs.probe_all(["azure"])
+        assert probes["az"].found is True
+        assert probes["az"].ok is True
+        assert probes["az"].version is None
+
+    def test_unmet_when_az_missing(self) -> None:
+        probes = {
+            "az": prereqs.ToolProbe(
+                tool="az", capability="azure", found=False, version=None,
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["azure"], probes)
+        assert "azure" in unmet
+        assert "az not found" in unmet["azure"][0]
+
+    def test_met_when_az_probe_passes(self) -> None:
+        probes = {
+            "az": prereqs.ToolProbe(
+                tool="az", capability="azure", found=True, version="acme-dev-platform",
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        assert prereqs.unmet_capabilities(["azure"], probes) == {}
+
+    def test_all_capability_names_includes_azure(self) -> None:
+        """#3233 acceptance: `ALL_CAPABILITY_NAMES` is derived from
+        `CAPABILITY_PREREQS`, so adding this entry must pick `azure` up
+        automatically — no separate registration needed for a config-free
+        agent to probe it too (see TestAllCapabilityNames), and no separate
+        wiring needed for `coord doctor` to report it UNMET (it already
+        cross-references every declared capability's probes via the same
+        `unmet_capabilities` this class exercises above)."""
+        assert "azure" in prereqs.ALL_CAPABILITY_NAMES
+
+
 class TestGhFloorIsSingleSourceOfTruth:
     def test_baseline_gh_prereq_imports_the_floor(self) -> None:
         """#1564's constant stays the single source of truth — this module
         must import it, never hardcode a second copy that can drift."""
         gh_prereq = next(p for p in prereqs.BASELINE_PREREQS if p.tool == "gh")
         assert gh_prereq.min_version == GH_PR_CHECKS_JSON_MIN_VERSION
+
+
+class TestClaudeCredentialsPrereq:
+    """#3326: `coord doctor` never probed `claude` at all, so a machine
+    whose OAuth session was dead (empty accessToken/refreshToken, the real
+    state observed on dellserver 2026-09-13) reported fit to be routed work.
+    `claude` is BASELINE (not capability-gated, like `az`/`opencode`) because
+    the default provider has no `capabilities:` string a machine can lack —
+    see the module comment above `_probe_claude_credentials`."""
+
+    def _claude_prereq(self):
+        return next(p for p in prereqs.BASELINE_PREREQS if p.tool == "claude")
+
+    def _write_credentials(self, home, oauth: dict) -> None:
+        creds_dir = home / ".claude"
+        creds_dir.mkdir(parents=True, exist_ok=True)
+        (creds_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": oauth}), encoding="utf-8"
+        )
+
+    def test_backed_by_claude_and_is_baseline(self) -> None:
+        assert self._claude_prereq().capability is None
+        assert "claude" not in {p.tool for p in prereqs.CAPABILITY_PREREQS}
+
+    def test_probe_is_a_custom_probe_not_a_binary_check(self) -> None:
+        """`claude --version` succeeds even with blanked OAuth tokens — the
+        binary being on PATH proves nothing about the credential, so this
+        prereq must never fall through to the generic binary-probe path."""
+        assert self._claude_prereq().custom_probe is not None
+
+    def test_missing_binary_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+        assert "claude CLI not found on PATH" in probe.what_breaks
+
+    def _probe_linux(self, home, monkeypatch):
+        monkeypatch.setenv("HOME", str(home))
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            return prereqs.probe(self._claude_prereq())
+
+    def test_missing_credentials_file_probes_not_met(self, tmp_path, monkeypatch) -> None:
+        probe = self._probe_linux(tmp_path, monkeypatch)
+        assert probe.found is False
+        assert probe.ok is False
+        assert "does not exist" in probe.what_breaks
+
+    def test_unparsable_credentials_file_probes_not_met_distinctly(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Missing file and unparsable-but-present file are different
+        defects with different remedies — both must be UNMET, but the
+        acceptance bar wants them distinguishable in `what_breaks`, unlike
+        the shared "empty or expired tokens" bucket below."""
+        creds_dir = tmp_path / ".claude"
+        creds_dir.mkdir(parents=True)
+        (creds_dir / ".credentials.json").write_text("not json", encoding="utf-8")
+        probe = self._probe_linux(tmp_path, monkeypatch)
+        assert probe.found is False
+        assert probe.ok is False
+        assert "not valid JSON" in probe.what_breaks
+        # Distinct wording from the missing-file case.
+        missing_probe = self._probe_linux(tmp_path / "other-home", monkeypatch)
+        assert missing_probe.what_breaks != probe.what_breaks
+
+    def test_empty_string_tokens_probe_not_met(self, tmp_path, monkeypatch) -> None:
+        """The exact state observed on dellserver: `accessToken` and
+        `refreshToken` both blanked to `""` by a failed background refresh,
+        while `refreshTokenExpiresAt` is still comfortably in the future —
+        so a check that only compares expiry timestamps would call this
+        host healthy. Reading the token strings themselves is the only
+        signal that catches it."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "",
+            "refreshToken": "",
+            "expiresAt": 0,
+            "refreshTokenExpiresAt": (time.time() + 3600 * 24 * 365) * 1000,
+            "subscriptionType": "max",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+        assert "empty or expired" in probe.what_breaks
+        # Distinct wording from the missing/unparsable-file case.
+        assert "does not exist" not in probe.what_breaks
+        assert "not valid JSON" not in probe.what_breaks
+
+    def test_expired_refresh_token_probes_not_met(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": 0,
+            "refreshTokenExpiresAt": 1000,  # long past
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+
+    def test_healthy_credential_probes_met_and_reports_subscription_tier(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": (time.time() + 3600) * 1000,
+            "refreshTokenExpiresAt": (time.time() + 3600 * 24 * 365) * 1000,
+            "subscriptionType": "max",
+            "rateLimitTier": "default_claude_max_20x",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is True
+        assert probe.ok is True
+        assert probe.version == "max"
+
+    def test_healthy_credential_reports_refresh_token_expiry(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """#3371: the operator's complaint was "no insight into when it
+        expires" — `refreshTokenExpiresAt` (the SESSION lifetime) must be
+        surfaced on the probe, not just used internally to decide ok/not-ok."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        expiry_ms = (time.time() + 3600 * 24 * 10) * 1000
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": (time.time() + 3600) * 1000,
+            "refreshTokenExpiresAt": expiry_ms,
+            "subscriptionType": "max",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.expires_at == expiry_ms
+
+    def test_no_expiry_fields_but_live_tokens_still_probes_met(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A credential file with non-empty tokens and no (or non-numeric)
+        expiry fields must not false-negative — degrade to "can't confirm
+        expiry, trust the tokens" rather than false-failing on a format this
+        module hasn't seen."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is True
+        assert probe.ok is True
+        assert probe.expires_at is None
+
+    def test_probe_never_spawns_claude_itself(self, tmp_path, monkeypatch) -> None:
+        """Guard against a future refactor reintroducing a billable `claude
+        -p` call into `coord doctor`, which is documented as costing exactly
+        what `coord status` costs and runs fleet-wide."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        self._write_credentials(tmp_path, {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "sk-ant-ort01-live",
+            "expiresAt": (time.time() + 3600) * 1000,
+            "refreshTokenExpiresAt": (time.time() + 3600 * 24 * 365) * 1000,
+        })
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "linux"), \
+             patch("coord.prereqs.subprocess.run") as mock_run:
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.ok is True
+        mock_run.assert_not_called()
+
+    def test_darwin_uses_keychain_presence_not_the_linux_file(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Claude Code stores OAuth in the login Keychain on darwin, not
+        `~/.claude/.credentials.json` (#3170) — a probe that only checked
+        the file would report every healthy mac as UNMET."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "darwin"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(returncode=0),
+             ) as mock_run:
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is True
+        assert probe.ok is True
+        args = mock_run.call_args[0][0]
+        assert args[:2] == ["security", "find-generic-password"]
+
+    def test_darwin_missing_keychain_item_probes_not_met(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/claude"), \
+             patch("coord.prereqs.sys.platform", "darwin"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(returncode=1),
+             ):
+            probe = prereqs.probe(self._claude_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+
+
+class TestClaudeCredentialOk:
+    """#3371: `claude_credential_ok` is the single function `coord doctor`
+    and `coord.brain.build_prompt`'s routing filter must both call to ask
+    "is this machine's claude credential alive" — see the #2096 "one
+    question, one answer" rule in this function's own docstring."""
+
+    def test_dead_credential_is_not_ok(self) -> None:
+        """The gate must be able to fail: a `tool_versions["claude"]` entry
+        that mirrors a genuinely dead probe (`found=False`) must NOT default
+        to the permissive branch."""
+        tool_versions = {
+            "claude": {
+                "found": False, "version": None, "min_version": None,
+                "meets_floor": None, "capability": None, "ok": False,
+                "expires_at": None,
+            },
+        }
+        assert prereqs.claude_credential_ok(tool_versions) is False
+
+    def test_healthy_credential_is_ok(self) -> None:
+        tool_versions = {
+            "claude": {
+                "found": True, "version": "max", "min_version": None,
+                "meets_floor": None, "capability": None, "ok": True,
+                "expires_at": None,
+            },
+        }
+        assert prereqs.claude_credential_ok(tool_versions) is True
+
+    def test_missing_tool_versions_degrades_to_ok(self) -> None:
+        """An agent whose /health call failed, or that predates #3326's
+        probe entirely, must not be newly treated as broken."""
+        assert prereqs.claude_credential_ok(None) is True
+        assert prereqs.claude_credential_ok({}) is True
+
+    def test_missing_claude_entry_degrades_to_ok(self) -> None:
+        assert prereqs.claude_credential_ok({"git": {"ok": True}}) is True
+
+    def test_reuses_tool_probe_from_dict_not_a_second_opinion(self) -> None:
+        """Both callers must go through the same reconstruction — this pins
+        that `claude_credential_ok` is literally built on
+        `tool_probe_from_dict(...).ok`, not an independent re-derivation
+        that could silently drift from `coord doctor`'s own rendering."""
+        info = {
+            "found": True, "version": "max", "min_version": None,
+            "meets_floor": None, "capability": None, "expires_at": None,
+        }
+        probe = prereqs.tool_probe_from_dict("claude", info)
+        assert prereqs.claude_credential_ok({"claude": info}) == probe.ok
+
+
+class TestClaudeCredentialExpiryWarning:
+    """#3371: forward visibility into a KNOWN expiry — the operator's own
+    complaint was "no insight into when it expires", which `ok`/`found`
+    alone (already-dead vs. not) can never answer."""
+
+    def test_no_expires_at_is_silent(self) -> None:
+        assert prereqs.claude_credential_expiry_warning({"expires_at": None}) is None
+
+    def test_far_future_expiry_is_silent(self) -> None:
+        far_future_ms = (time.time() + 3600 * 24 * 365) * 1000
+        assert prereqs.claude_credential_expiry_warning(
+            {"expires_at": far_future_ms}
+        ) is None
+
+    def test_expiry_within_the_warn_window_warns(self) -> None:
+        soon_ms = (time.time() + 3600 * 24) * 1000  # 1 day out
+        warning = prereqs.claude_credential_expiry_warning({"expires_at": soon_ms})
+        assert warning is not None
+        assert "expires in ~1.0 day" in warning
+
+    def test_already_past_expiry_is_silent_not_double_reported(self) -> None:
+        """An already-expired credential is reported by the ordinary
+        `found=False` -> `✗ claude: ...` line; this must not ALSO fire —
+        that would be a second, weaker name for the same failure."""
+        past_ms = (time.time() - 3600) * 1000
+        assert prereqs.claude_credential_expiry_warning({"expires_at": past_ms}) is None
+
+
+class TestNvimCapabilityManifest:
+    """#3351 (vimcode#865): `nvim` backs the `nvim` capability — vimcode's
+    1,436-case nvim-conformance oracle hard-fails on every lane without a
+    usable Neovim at or above `NVIM_MIN_VERSION`. Unlike every other probe
+    in this module, an unparseable banner must REFUSE rather than degrade
+    to "unknown, assume fine" — see the module comment above
+    `_probe_nvim`/`NVIM_MIN_VERSION` for why this prereq is deliberately
+    stricter than the generic lenient contract `ToolProbe.ok` documents.
+    """
+
+    def _nvim_prereq(self):
+        return next(p for p in prereqs.CAPABILITY_PREREQS if p.tool == "nvim")
+
+    def test_backed_by_nvim_and_gated_by_the_nvim_capability(self) -> None:
+        prereq = self._nvim_prereq()
+        assert prereq.binary == "nvim"
+        assert prereq.capability == "nvim"
+        assert prereq.min_version == prereqs.NVIM_MIN_VERSION
+        assert prereqs.NVIM_MIN_VERSION == "0.12"
+
+    def test_probe_is_a_custom_probe_not_the_generic_lenient_path(self) -> None:
+        """The generic `probe()` path treats an unparseable version as
+        "unknown, assume fine" (`ok=True`) — wrong here, since the whole
+        point of this prereq is to fail closed rather than silently pass a
+        vacuous oracle run (vimcode#865)."""
+        assert self._nvim_prereq().custom_probe is not None
+
+    def test_probe_all_covers_it_only_when_declared(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["nvim"])
+        assert "nvim" in probes
+
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes_undeclared = prereqs.probe_all(["rust"])
+        assert "nvim" not in probes_undeclared
+
+    def test_missing_binary_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+        assert "not found on PATH" in probe.what_breaks
+
+    def test_real_banner_parses_and_meets_the_floor(self) -> None:
+        """The fleet standard: upstream stable v0.12.5, banner shaped
+        exactly like the real `nvim --version` output."""
+        with patch("coord.prereqs.shutil.which", return_value="/opt/homebrew/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(
+                     stdout="NVIM v0.12.5\nBuild type: Release\nLuaJIT ...\n",
+                 ),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is True
+        assert probe.version == "0.12.5"
+        assert probe.meets_floor is True
+        assert probe.ok is True
+
+    def test_below_floor_version_is_refused(self) -> None:
+        """A 0.9.x nvim — old enough to predate vimcode's floor — must read
+        UNMET, not just "old"."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="NVIM v0.9.5\nBuild type: Release\n"),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is True
+        assert probe.version == "0.9.5"
+        assert probe.meets_floor is False
+        assert probe.ok is False
+
+    def test_unparseable_banner_is_refused_not_trusted(self) -> None:
+        """The acceptance bar this prereq exists to meet: unlike every other
+        probe here (see `TestProbe.
+        test_unparseable_version_degrades_to_unknown_not_failure`), an
+        `nvim --version` banner this module can't parse must NOT be
+        silently trusted — that would just move vimcode#865's exact
+        silent-false-green one layer up the stack."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="something unexpected\n"),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is True
+        assert probe.version is None
+        assert probe.meets_floor is False
+        assert probe.ok is False
+
+    def test_nonzero_exit_is_refused(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(returncode=1, stderr="not a real nvim"),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+
+    def test_hang_is_refused_not_degraded_to_found(self) -> None:
+        """Unlike the generic `probe()` path (a hung binary is still
+        "found", version simply unknown), a hung `nvim --version` here must
+        not report `found=True` with an unconfirmed version — see the
+        fail-closed posture documented on `_probe_nvim`."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/nvim"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 side_effect=subprocess.TimeoutExpired(cmd="nvim", timeout=10),
+             ):
+            probe = prereqs.probe(self._nvim_prereq())
+        assert probe.found is False
+        assert probe.ok is False
+
+    def test_machine_not_declaring_nvim_is_never_dinged(self) -> None:
+        """A machine that never claims `nvim` in its `capabilities:` must
+        not be flagged for lacking it — `unmet_capabilities` only reports
+        claims it can actually verify."""
+        assert prereqs.unmet_capabilities(["rust", "gtk"], {}) == {}
+        probes = {
+            "cargo": prereqs.ToolProbe(
+                tool="cargo", capability="rust", found=True, version="1.80.0",
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        assert prereqs.unmet_capabilities(["rust"], probes) == {}
+
+    def test_unmet_when_nvim_missing(self) -> None:
+        probes = {
+            "nvim": prereqs.ToolProbe(
+                tool="nvim", capability="nvim", found=False, version=None,
+                min_version=prereqs.NVIM_MIN_VERSION, meets_floor=None,
+                what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["nvim"], probes)
+        assert "nvim" in unmet
+        assert "not found" in unmet["nvim"][0]
+
+    def test_unmet_when_nvim_below_floor(self) -> None:
+        probes = {
+            "nvim": prereqs.ToolProbe(
+                tool="nvim", capability="nvim", found=True, version="0.9.5",
+                min_version=prereqs.NVIM_MIN_VERSION, meets_floor=False,
+                what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["nvim"], probes)
+        assert "nvim" in unmet
+        assert "0.9.5" in unmet["nvim"][0]
+        assert prereqs.NVIM_MIN_VERSION in unmet["nvim"][0]
+
+    def test_met_when_nvim_probe_passes(self) -> None:
+        probes = {
+            "nvim": prereqs.ToolProbe(
+                tool="nvim", capability="nvim", found=True, version="0.12.5",
+                min_version=prereqs.NVIM_MIN_VERSION, meets_floor=True,
+                what_breaks="",
+            ),
+        }
+        assert prereqs.unmet_capabilities(["nvim"], probes) == {}
+
+    def test_all_capability_names_includes_nvim(self) -> None:
+        """#3351 acceptance: `ALL_CAPABILITY_NAMES` is derived from
+        `CAPABILITY_PREREQS`, so this entry must be picked up automatically
+        — no separate registration needed for a config-free agent to probe
+        it too, and no separate wiring needed for `coord doctor` to report
+        it UNMET."""
+        assert "nvim" in prereqs.ALL_CAPABILITY_NAMES

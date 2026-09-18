@@ -1234,7 +1234,7 @@ def milestone_dispatch_cmd(
             click.echo(f"  {key}: not queued: {exc}", err=True)
             failures += 1
             continue
-        prediction, staleness_note = _predict_overlap(
+        prediction, staleness_note, malformed_note = _predict_overlap(
             config_path, repo_entry.name, qe.issue_number, existing
         )
         auto_after = _applicable_auto_after(
@@ -1249,11 +1249,16 @@ def milestone_dispatch_cmd(
         suffix = f" after {', '.join(after)}" if after else ""
         # #2601: same notes `drive-queue add` surfaces — the applied reason,
         # any high-fanout directory-token warning, and a staleness note when
-        # this entry's own body could only be read from cache.
+        # this entry's own body could only be read from cache. #3258: plus
+        # the same warning when this entry's own `## Files` heading parsed to
+        # zero paths — the whole point of reusing `_predict_overlap` here is
+        # byte-identical behaviour to a manual `add`.
         notes = []
         if auto_after:
             notes.append(prediction.reason)
         notes.extend(fanout_warnings(prediction))
+        if malformed_note:
+            notes.append(malformed_note)
         if staleness_note:
             notes.append(staleness_note)
         overlap_note = ("\n     " + "\n     ".join(notes)) if notes else ""
@@ -1982,7 +1987,10 @@ def milestone_gate_b_cmd(
             click.echo(f"error: unknown machine {machine_name!r}", err=True)
             sys.exit(2)
     else:
-        machine = pick_machine(repo, board, cfg)
+        # #3371: live credential-health check — a production dispatch path.
+        from coord.network import claude_credential_reachable  # noqa: PLC0415
+
+        machine = pick_machine(repo, board, cfg, credential_fetcher=claude_credential_reachable)
         if machine is None:
             click.echo(
                 f"error: no idle, capable, unpaused machine available for {repo!r}",

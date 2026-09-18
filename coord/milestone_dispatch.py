@@ -743,6 +743,7 @@ def pick_machine(
     config: "Config",
     *,
     exclude: frozenset[str] = frozenset(),
+    credential_fetcher=None,
 ) -> Machine | None:
     """Deterministically pick an idle, capable, unpaused machine for *repo_name*.
 
@@ -760,6 +761,18 @@ def pick_machine(
     ``Board.idle_machines()``, which filters ``board.machines`` — a separate
     DB-synced snapshot that isn't guaranteed to be populated on every board
     read path. ``config.machines`` is the authoritative machine list here.
+
+    #3371: *credential_fetcher* is an optional ``(machine: Machine) -> bool``
+    callable — ``True`` means "still routable", matching
+    ``coord.network.claude_credential_reachable``'s contract. `None` (the
+    default) probes nothing and excludes nothing — same opt-in shape as
+    ``coord.dispatch.dispatch``'s *status_fetcher*, so this stays byte-for-
+    byte unaffected for the #1630 advisory-only guard test
+    (`tests/test_fleet_health_snapshot.py::
+    test_health_never_influences_dispatch_routing_or_merge_ordering`, which
+    calls this with no extra kwargs) and for every existing caller/test.
+    Production callers (`coord.milestone_dispatch`'s own frontier dispatch,
+    `coord.mock_author`, `coord milestone dispatch`) wire the real probe.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
 
@@ -775,6 +788,8 @@ def pick_machine(
         if not m.can_work_on(repo_name):
             continue
         if m.repo_path(repo_name) is None:
+            continue
+        if credential_fetcher is not None and not credential_fetcher(m):
             continue
         return m
     return None
@@ -843,10 +858,17 @@ def plan_dispatch(
     terminal_issues: frozenset[int] | set[int],
     *,
     oracle_loop: bool = False,
+    credential_fetcher=None,
 ) -> MilestonePlan:
     """Compute the ready frontier and pick a machine for each ready entry.
 
-    Pure — no GitHub/HTTP calls, no dispatch side effects. Greedily assigns
+    Pure — no GitHub/HTTP calls, no dispatch side effects — UNLESS
+    *credential_fetcher* (#3371) is supplied: `None` (the default) keeps
+    this function exactly as pure as before; a caller that wires
+    `coord.network.claude_credential_reachable` (or a stub) opts into a
+    live probe per candidate via `pick_machine`'s parameter of the same
+    name, trading purity for the #3371 "not routable" guarantee. Greedily
+    assigns
     each :class:`~coord.milestone_order.FrontierEntry` in frontier order to
     the first idle+capable machine not already claimed by an earlier entry
     in *this* call (so a cohort of N ready issues fans out across up to N
@@ -894,7 +916,10 @@ def plan_dispatch(
         if oracle_loop and picks:
             deferred.append(DeferredByOracleLoop(entry))
             continue
-        machine = pick_machine(repo_cfg.name, board, config, exclude=frozenset(used))
+        machine = pick_machine(
+            repo_cfg.name, board, config, exclude=frozenset(used),
+            credential_fetcher=credential_fetcher,
+        )
         if machine is None:
             skipped.append(NoMachineAvailable(entry))
             continue
@@ -1042,6 +1067,7 @@ def dispatch_entry(
     board: Board,
     *,
     tracking_issue: int | None = None,
+    issue_liveness_fetcher=None,
 ) -> DispatchOutcome:
     """Dispatch one ready-frontier entry to its picked machine.
 
@@ -1064,6 +1090,17 @@ def dispatch_entry(
     dispatching (defense-in-depth against the frontier snapshot going stale
     between planning and dispatch — e.g. a race with a manual `coord
     assign`), matching the same check ``_dispatch_headless`` performs.
+
+    *issue_liveness_fetcher* (#3376) is an optional ``(repo_name: str,
+    issue_number: int) -> (issue_closed: bool, branch_merged: bool)``
+    callable threaded straight through to :func:`coord.dispatch.dispatch`'s
+    parameter of the same name — the STRUCTURAL DISPATCH-LIVENESS GATE's
+    other two predicates. ``None`` (the default) performs no check and
+    refuses nothing, same opt-in shape as every other fetcher in this
+    module; the daemon's auto-drain/gate ticks (``coord.serve_app``'s
+    ``_milestone_drain_tick``/``_milestone_gate_tick``) are the production
+    callers that wire ``coord.dispatch_liveness.github_issue_liveness_
+    fetcher(config)`` in.
     """
     from coord import github_ops  # noqa: PLC0415
     from coord.claim import claim_message, find_work_claim  # noqa: PLC0415
@@ -1072,6 +1109,7 @@ def dispatch_entry(
         post_briefing,
         resolve_dispatch_model_alias,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
     from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
@@ -1231,7 +1269,18 @@ def dispatch_entry(
     )
 
     try:
-        response = dispatch(proposal, config)
+        # #3353: this was the third of the three plain-dispatch call sites
+        # this module's own `ASSIGN_POST_TIMEOUT_SECS` comment already
+        # documented as lacking a live pre-probe (the same gap `coord
+        # approve`/`coord assign` had). Wired the same way: opt-in via
+        # `status_fetcher`, so `dispatch()`'s internal liveness-routing
+        # gate excludes an unreachable `machine` in favor of any other
+        # repo-capable, reachable candidate instead of burning a
+        # drive-queue attempt on a dead box.
+        response = dispatch(
+            proposal, config, status_fetcher=fetch_status,
+            issue_liveness_fetcher=issue_liveness_fetcher,
+        )
     except (httpx.HTTPError, ValueError) as e:
         return DispatchOutcome(
             issue_number=issue_number, machine_name=machine.name, ok=False, error=str(e)

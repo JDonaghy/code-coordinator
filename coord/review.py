@@ -1212,6 +1212,8 @@ def pick_reviewer_machine(
     repo_name: str,
     board: Board,
     config: Config,
+    *,
+    credential_fetcher=None,
 ) -> ReviewerChoice | None:
     """Pick a reviewer machine — different from the worker if possible.
 
@@ -1233,6 +1235,17 @@ def pick_reviewer_machine(
     ``pending``/``running`` rows too old to still be believed — a zombie row
     used to make a real machine look occupied indefinitely and push selection
     onto an offline "free" candidate.
+
+    #3371: *credential_fetcher* is an optional ``(host: str) -> bool``
+    callable — ``True`` means "still routable", same contract as
+    :func:`dispatch_review`'s parameter of the same name. Unlike that
+    function this is `None`-opts-out (no live probe at all) by default:
+    this picker commits to a single machine with no fall-through loop to
+    retry on rejection, so nothing calls it for a live dispatch today —
+    :func:`dispatch_review` (via :func:`_ranked_reviewer_candidates`) is
+    the enforced production path (#904's fall-through loop). Kept
+    consistent here anyway so a future caller of this public function
+    isn't silently missing the #3371 gate the wired path has.
     """
     from coord.machine_pause import follow_on_paused_set
     paused = follow_on_paused_set(config.machines)
@@ -1240,6 +1253,8 @@ def pick_reviewer_machine(
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
     ]
+    if credential_fetcher is not None:
+        candidates = [m for m in candidates if credential_fetcher(m.host)]
     if not candidates:
         return None
 
@@ -2677,6 +2692,42 @@ def _fetch_agent_advertised_repos(
     return None
 
 
+def _fetch_agent_claude_credential_ok(
+    host: str, port: int = AGENT_PORT, *, timeout: float = 2.0,
+) -> bool:
+    """Query an agent's ``/health`` and report whether its claude credential
+    can authenticate (#3371) — the review-dispatch default for
+    *credential_fetcher*, mirroring `_fetch_agent_advertised_repos` above
+    byte-for-byte: same endpoint, same short timeout, same fail-open
+    contract (`coord.network.claude_credential_reachable` IS this same
+    probe; a separate copy lives here only because this module already
+    open-codes its own `/health` GET for the repos check and a caller
+    injecting a stub for one should not have to also stub the other).
+
+    Returns ``True`` ("still routable") on any network/parse failure or a
+    `tool_versions` block that's missing/unknown — never exclude a machine
+    solely because its health probe hiccuped. Returns ``False`` only when
+    the probe succeeds and positively reports the credential dead — the
+    live signal `coord doctor` already renders as ``✗ claude: ...``, now
+    consulted BEFORE a review is routed instead of only discovered from
+    the #3367 incident's $0 turn-1 failures.
+    """
+    url = f"http://{host}:{port}/health"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            from coord.prereqs import claude_credential_ok  # noqa: PLC0415
+
+            tool_versions = data.get("tool_versions")
+            return claude_credential_ok(
+                tool_versions if isinstance(tool_versions, dict) else None
+            )
+    except Exception:  # noqa: BLE001 — fail-open: any network or parse error
+        pass
+    return True
+
+
 def _record_mechanical_review_verdict(
     completed: Assignment,
     board: Board,
@@ -2818,6 +2869,7 @@ def dispatch_review(
     remote_branch_checker=None,
     branch_sha_fetcher=None,
     health_checker=None,
+    credential_fetcher=None,
     milestone_fetcher=None,
     patch_id_computer=None,
     diff_fetcher=None,
@@ -2838,6 +2890,20 @@ def dispatch_review(
     that returns the repo names a given agent advertises, or ``None`` to
     fail-open.  When not provided, ``_fetch_agent_advertised_repos`` is called
     directly.  Inject a stub in tests to avoid real network probes.
+
+    *credential_fetcher* is an optional ``(host: str) -> bool`` callable
+    (#3371) — ``True`` means "still routable", mirroring
+    ``_fetch_agent_claude_credential_ok``'s contract exactly (that is also
+    the default when not provided — this is a LIVE probe by default, not
+    opt-in, matching *health_checker*'s own default-to-real convention
+    above rather than *status_fetcher*'s opt-out-by-None one elsewhere in
+    this codebase, because review dispatch already pays a per-candidate
+    ``/health`` GET for *health_checker* and every existing test that
+    exercises this loop already tolerates that). A machine whose probe
+    reports the credential dead is skipped exactly like a repo-advertising
+    drift is — the #3367 incident this closes routed FOUR review dispatches
+    to a dead-credential host before anyone noticed, because nothing
+    upstream of the POST treated a dead credential as disqualifying.
 
     *patch_id_computer* is an optional ``(diff_text: str | None) -> str |
     None`` callable (#1475) that fingerprints the merge-base diff being
@@ -3512,6 +3578,22 @@ def dispatch_review(
                     "[review] skipping candidate %s: /health advertises repos %r "
                     "but repo %r is not listed — possible config drift",
                     machine.name, advertised, completed.repo_name,
+                )
+                had_rejection = True
+                continue
+
+            # #3371: skip a candidate a live probe confirms has a dead
+            # claude credential — the mechanical "not routable" enforcement
+            # #3371 asks for, applied at the exact chokepoint #3367's
+            # incident went through (four review dispatches to precision,
+            # each failing at turn 1 for $0.00). Fail-open on a probe that
+            # can't answer, same as the repos check just above.
+            _cf = credential_fetcher if credential_fetcher is not None else _fetch_agent_claude_credential_ok
+            if not _cf(machine.host):
+                log.warning(
+                    "[review] skipping candidate %s: claude-credential probe "
+                    "failed — not routable (#3371)",
+                    machine.name,
                 )
                 had_rejection = True
                 continue
@@ -4221,6 +4303,8 @@ def dispatch_scoped_review(
     patch_id_computer=None,
     terminal_cache: dict | None = None,
     check_test_coverage: bool = False,
+    parent_claim_held: bool = False,
+    credential_fetcher=None,
 ) -> Assignment | None:
     """Dispatch a SCOPED re-review (#1476, widened by #3161) for a merge
     entry whose approval was voided ONLY by a content-changing conflict-fix
@@ -4260,6 +4344,12 @@ def dispatch_scoped_review(
     code it's judging, mirroring :func:`dispatch_review`'s
     ``completed.machine_name`` contract.
 
+    *credential_fetcher* (#3371): same contract and default (live-probe,
+    not opt-in — see :func:`dispatch_review`'s docstring) as that
+    function's own parameter of the same name; a candidate a live probe
+    confirms has a dead claude credential is skipped before a briefing is
+    even built for it.
+
     *check_test_coverage* (#3161): runs the #2192 "missing test coverage"
     nudge (:func:`diff_missing_test_coverage`, log-only — never gates, never
     denies) against the branch's current full diff when True. The caller
@@ -4272,6 +4362,41 @@ def dispatch_scoped_review(
     :func:`dispatch_scoped_reviews_for_queue` passes ``True`` whenever
     :func:`coord.merge_queue.intervening_work_since_review` found one
     contributing to this delta.
+
+    **Dedupe/anti-double-dispatch (#3310).** This function is the one review
+    entry point that used to carry *no* atomic claim at all — its only
+    dedupe was its callers' in-memory ``already_handled`` board scan, which
+    is a snapshot and therefore exactly as stale-able as the one #3113
+    replaced in :func:`dispatch_review`. That left two live cross-process
+    races, both of which dispatch two metered reviews carrying the *same*
+    ``review_of_assignment_id``:
+
+    * Two producers (the ``coord notify`` driver at a 5-minute cadence and
+      the drive-queue tick at 3) each running
+      :func:`dispatch_scoped_reviews_for_queue` a second apart, each reading
+      "nothing handled this yet" from its own board snapshot.
+    * :func:`maybe_scoped_review_for_completed_fix` racing that sweep. It
+      *does* claim — but keyed on ``completed.assignment_id`` (the just-
+      finished fix leg), which is **not** the id the review it emits
+      carries, so the two never serialized against each other.
+
+    The fix is to key the claim on what the dispatched review will actually
+    record as its parent — ``prior_review.review_of_assignment_id`` — which
+    is also exactly what :func:`coord.state.release_review_claim_if_row_is_
+    review` reads back off the review row at terminal status, so the claim
+    releases itself through the ordinary lifecycle with no new seam. A cheap
+    in-memory :func:`coord.claim.has_active_followup` fast path runs first
+    (skipping the diff fetches in the common case); the DB-level claim
+    immediately before the dispatch POST is the authoritative guard, and is
+    released on every path that does not produce a review.
+
+    *parent_claim_held* tells this function that the CALLER already holds
+    :func:`coord.state.claim_review_dispatch` for that same parent id, so it
+    must not try to take it again (the claim is a conditional insert, not a
+    re-entrant lock — a second attempt on a held key returns ``False`` and
+    would make this function decline its own caller).
+    :func:`maybe_scoped_review_for_completed_fix` passes ``True`` only for
+    the narrow case where its own claim key coincides with this one.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
@@ -4281,6 +4406,27 @@ def dispatch_scoped_review(
     repo = config.repo(entry.repo_name)
     if repo is None:
         return None
+
+    # #3310: the parent this scoped review will carry (see the docstring) —
+    # the claim key, and the key its own terminal-status write releases.
+    parent_id = prior_review.review_of_assignment_id
+
+    # Cheap in-memory fast path, mirroring `dispatch_review`'s. A snapshot
+    # read can be stale (that is the whole #3310 bug), so this is NOT the
+    # guard — it just avoids the expensive compare-diff fetches below in the
+    # common case where the board already agrees a review is in flight.
+    if parent_id:
+        from coord.claim import has_active_followup  # noqa: PLC0415
+
+        if has_active_followup(
+            board, of_assignment_id=parent_id, assignment_type="review"
+        ):
+            log.info(
+                "[review] not dispatching scoped review for merge entry %s: a "
+                "review is already in flight for %s",
+                entry.assignment_id, parent_id,
+            )
+            return None
 
     # #522 (mirrored from dispatch_review): never (re)dispatch a review for
     # work that's already done on GitHub — issue closed OR PR merged. Best
@@ -4397,99 +4543,176 @@ def dispatch_scoped_review(
     except Exception:  # noqa: BLE001
         pass
 
-    client = http_client or httpx
-    for machine, _same_as_worker in candidates:
-        repo_path = machine.repo_path(entry.repo_name)
-        if repo_path is None:
-            continue
+    # #3310: THE guard. A DB-level conditional insert is atomic across the
+    # separate processes (`coord notify` driver, drive-queue tick, a hand-run
+    # `coord` invocation) that all reach this function, unlike the board
+    # snapshot every caller's `already_handled` scan reads. Taken as late as
+    # possible — right before the dispatch POST — so the window between
+    # winning it and persisting the review is as small as it can be; the
+    # duplicated compare-diff fetches a loser pays for are gh calls, not a
+    # metered review leg. Released below on every path that produces no
+    # review; on success it is deliberately RETAINED and handed off to the
+    # dispatched review row's own terminal-status write (`coord.state.
+    # release_review_claim_if_row_is_review`, which keys on exactly the
+    # `review_of_assignment_id` stamped below), the same lifetime
+    # `dispatch_review`'s claim has.
+    from coord.state import (  # noqa: PLC0415
+        claim_review_dispatch,
+        release_review_dispatch_claim,
+    )
 
-        briefing = build_scoped_review_briefing(
-            pr_number=entry.pr_number,
-            pr_url=entry.pr_url,
-            repo_github=repo.github,
-            repo_name=repo.name,
-            issue_number=entry.issue_number,
-            issue_title=entry.issue_title,
-            branch=entry.branch,
-            resolution_delta=delta,
-            default_branch=base_branch,
-        )
-
-        payload = {
-            "repo_name": entry.repo_name,
-            "repo_path": repo_path,
-            "issue_number": entry.issue_number,
-            "issue_title": f"[scoped-review] {entry.issue_title}",
-            "briefing": briefing,
-            "files_allowed": [],
-            "files_forbidden": [],
-            "pull_repos": [],
-            "type": "review",
-            "model": review_model_wire,
-            "system_prompt": REVIEWER_SYSTEM_PROMPT,
-            "review_target": str(entry.pr_number) if entry.pr_number else entry.branch,
-            "branch": base_branch or "main",
-        }
-        # #1811: mirror dispatch_review's wire-provider threading — see its
-        # payload comment for why omitting this silently strands the
-        # resolved provider at the TOS-gate check above.
-        from coord.dispatch import _wire_payload_needs_provider_field  # noqa: PLC0415
-
-        if review_provider_name and _wire_payload_needs_provider_field(
-            review_provider_name, config,
-        ):
-            payload["provider"] = review_provider_name
-
-        url = f"http://{machine.host}:{AGENT_PORT}/assign"
-        try:
-            resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
-            resp.raise_for_status()
-            agent_response = resp.json()
-        except (httpx.HTTPError, httpx.TimeoutException) as exc:
-            log.warning(
-                "[review] scoped-review agent %s unreachable/rejected (%s) — "
-                "trying next candidate",
-                machine.name, exc,
+    _claim_held = False
+    if parent_id and not parent_claim_held:
+        if not claim_review_dispatch(parent_id):
+            log.info(
+                "[review] not dispatching scoped review for merge entry %s: a "
+                "review is already in flight for %s (lost the atomic "
+                "dispatch-claim race — #3310)",
+                entry.assignment_id, parent_id,
             )
-            continue
+            return None
+        _claim_held = True
 
-        review_assignment = Assignment(
-            machine_name=machine.name,
-            repo_name=entry.repo_name,
-            issue_number=entry.issue_number,
-            issue_title=f"[scoped-review] {entry.issue_title}",
-            files_allowed=[],
-            files_forbidden=[],
-            briefing=briefing,
-            assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
-            status="running",
-            branch=entry.branch,
-            pr_url=entry.pr_url,
-            dispatched_at=now if now is not None else time.time(),
-            type="review",
-            review_target=str(entry.pr_number) if entry.pr_number else entry.branch,
-            # Same parent as the review being superseded — keeps the
-            # existing work-chain / fix-loop machinery (has_approved_review,
-            # auto_loop's request-changes dispatch) working unmodified.
-            review_of_assignment_id=prior_review.review_of_assignment_id,
-            model=review_model_alias,
-            provider_name=review_provider_name,
-            review_head_sha=review_head_sha,
-            review_patch_id=review_patch_id,
-            # #1476 audit trail.
-            review_scoped=True,
-            review_scope_base_sha=prior_review.review_head_sha,
-        )
-        board.active.append(review_assignment)
+    def _release_claim() -> None:
+        nonlocal _claim_held
+        if _claim_held:
+            release_review_dispatch_claim(parent_id)
+            _claim_held = False
 
-        from coord.state import record_dispatched_assignment  # noqa: PLC0415
-        record_dispatched_assignment(
-            assignment=review_assignment,
-            repo_github=repo.github,
-        )
+    client = http_client or httpx
+    try:
+        for machine, _same_as_worker in candidates:
+            repo_path = machine.repo_path(entry.repo_name)
+            if repo_path is None:
+                continue
 
-        return review_assignment
+            # #3371: same live credential-health skip as `dispatch_review`'s
+            # candidate loop — see that function's docstring.
+            _cf = credential_fetcher if credential_fetcher is not None else _fetch_agent_claude_credential_ok
+            if not _cf(machine.host):
+                log.warning(
+                    "[review] scoped-review skipping candidate %s: "
+                    "claude-credential probe failed — not routable (#3371)",
+                    machine.name,
+                )
+                continue
 
+            briefing = build_scoped_review_briefing(
+                pr_number=entry.pr_number,
+                pr_url=entry.pr_url,
+                repo_github=repo.github,
+                repo_name=repo.name,
+                issue_number=entry.issue_number,
+                issue_title=entry.issue_title,
+                branch=entry.branch,
+                resolution_delta=delta,
+                default_branch=base_branch,
+            )
+
+            payload = {
+                "repo_name": entry.repo_name,
+                "repo_path": repo_path,
+                "issue_number": entry.issue_number,
+                "issue_title": f"[scoped-review] {entry.issue_title}",
+                "briefing": briefing,
+                "files_allowed": [],
+                "files_forbidden": [],
+                "pull_repos": [],
+                "type": "review",
+                "model": review_model_wire,
+                "system_prompt": REVIEWER_SYSTEM_PROMPT,
+                "review_target": (
+                    str(entry.pr_number) if entry.pr_number else entry.branch
+                ),
+                "branch": base_branch or "main",
+            }
+            # #1811: mirror dispatch_review's wire-provider threading — see its
+            # payload comment for why omitting this silently strands the
+            # resolved provider at the TOS-gate check above.
+            from coord.dispatch import (  # noqa: PLC0415
+                _wire_payload_needs_provider_field,
+            )
+
+            if review_provider_name and _wire_payload_needs_provider_field(
+                review_provider_name, config,
+            ):
+                payload["provider"] = review_provider_name
+
+            url = f"http://{machine.host}:{AGENT_PORT}/assign"
+            try:
+                resp = client.post(
+                    url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS
+                )
+                resp.raise_for_status()
+                agent_response = resp.json()
+            except (httpx.HTTPError, httpx.TimeoutException) as exc:
+                log.warning(
+                    "[review] scoped-review agent %s unreachable/rejected (%s) — "
+                    "trying next candidate",
+                    machine.name, exc,
+                )
+                continue
+
+            review_assignment = Assignment(
+                machine_name=machine.name,
+                repo_name=entry.repo_name,
+                issue_number=entry.issue_number,
+                issue_title=f"[scoped-review] {entry.issue_title}",
+                files_allowed=[],
+                files_forbidden=[],
+                briefing=briefing,
+                assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
+                status="running",
+                branch=entry.branch,
+                pr_url=entry.pr_url,
+                dispatched_at=now if now is not None else time.time(),
+                type="review",
+                review_target=(
+                    str(entry.pr_number) if entry.pr_number else entry.branch
+                ),
+                # Same parent as the review being superseded — keeps the
+                # existing work-chain / fix-loop machinery (has_approved_review,
+                # auto_loop's request-changes dispatch) working unmodified.
+                # #3310: this is also `parent_id`, the key the claim taken
+                # above is held under — so the release hook keyed on this
+                # field (`release_review_claim_if_row_is_review`) clears it
+                # when this review reaches a terminal status.
+                review_of_assignment_id=prior_review.review_of_assignment_id,
+                model=review_model_alias,
+                provider_name=review_provider_name,
+                review_head_sha=review_head_sha,
+                review_patch_id=review_patch_id,
+                # #1476 audit trail.
+                review_scoped=True,
+                review_scope_base_sha=prior_review.review_head_sha,
+            )
+            board.active.append(review_assignment)
+
+            from coord.state import record_dispatched_assignment  # noqa: PLC0415
+            record_dispatched_assignment(
+                assignment=review_assignment,
+                repo_github=repo.github,
+            )
+
+            # #3310: a review row now exists carrying `parent_id` as its
+            # `review_of_assignment_id`, so the claim's release is the
+            # ordinary terminal-status hook's job from here — drop our own
+            # obligation to release it rather than handing it back seconds
+            # after winning it.
+            _claim_held = False
+            return review_assignment
+    except Exception:
+        # #3310 (mirrors dispatch_review's #3113 safety net): an unhandled
+        # exception between winning the claim and recording the review would
+        # otherwise strand it forever — no review row is created for a raised
+        # exception, so the terminal-status release hook never fires either.
+        # Release-then-reraise keeps the caller's view of the failure intact.
+        _release_claim()
+        raise
+
+    # Every candidate was unusable/unreachable — no review was dispatched, so
+    # the next pass must be free to try again (#3310).
+    _release_claim()
     return None
 
 
@@ -4871,7 +5094,21 @@ def maybe_scoped_review_for_completed_fix(
         run_test_coverage_nudge = bool(
             mq.intervening_work_since_review(entry, board, prior_review)
         )
-        return dispatch_scoped_review(
+        # #3310: `dispatch_scoped_review` now takes its own atomic claim, keyed
+        # on the parent the review it emits will actually carry
+        # (`prior_review.review_of_assignment_id`) rather than on `completed`.
+        # That key is normally DIFFERENT from the one claimed above (this
+        # function claims the just-finished fix leg), which is precisely why
+        # this path and the merge-queue sweep never serialized against each
+        # other — so let it claim. Only when the two keys coincide (a prior
+        # review approved THIS very row before a later rebase voided it) must
+        # we tell it not to: the claim is a conditional insert, not a
+        # re-entrant lock, so a second attempt on a key we already hold would
+        # return False and make it decline its own caller.
+        keys_coincide = (
+            prior_review.review_of_assignment_id == completed.assignment_id
+        )
+        result = dispatch_scoped_review(
             entry, prior_review, board, config,
             http_client=http_client,
             now=now,
@@ -4880,7 +5117,20 @@ def maybe_scoped_review_for_completed_fix(
             patch_id_computer=patch_id_computer,
             terminal_cache=terminal_cache,
             check_test_coverage=run_test_coverage_nudge,
+            parent_claim_held=keys_coincide,
         )
+        if result is not None and keys_coincide:
+            # #3310: in this branch the review just dispatched carries
+            # `completed.assignment_id` as its OWN `review_of_assignment_id`,
+            # so `release_review_claim_if_row_is_review` will clear this claim
+            # at terminal status — hand it off rather than releasing it a
+            # split second after winning it (which would reopen exactly the
+            # duplicate-dispatch window this issue is about). When the keys
+            # differ, the claim below stays this function's to release: the
+            # dispatched review's parent is a different id, held separately by
+            # `dispatch_scoped_review` itself.
+            _claim_held = False
+        return result
     finally:
         _release_claim()
 
@@ -4957,6 +5207,8 @@ def dispatch_headless_fix(
         _fix_model_for_iteration,
         _load_review_findings,
         _work_is_terminal,
+        last_fix_model_for_branch,
+        next_fix_iteration,
     )
     from coord.state import issue_context_block  # noqa: PLC0415
 
@@ -4966,7 +5218,9 @@ def dispatch_headless_fix(
     if _work_is_terminal(work, config):
         return None
 
-    next_iteration = (work.review_iteration or 0) + 1
+    # #3322: shared with every other fix door — the max round already spent
+    # on this (repo, issue, branch), not just `work`'s own counter.
+    next_iteration = next_fix_iteration(board, work)
     max_iter = config.pipeline.max_review_iterations
     if next_iteration > max_iter:
         return None
@@ -5026,7 +5280,22 @@ def dispatch_headless_fix(
         issue_context_block(work.repo_name, work.issue_number)
         + _build_fix_briefing(work, findings_obj, next_iteration, max_iter)
     )
-    model = _fix_model_for_iteration(config, next_iteration)
+    # #3360: gate the escalation on what actually failed — a compliance nit
+    # in `findings_obj.body` stays on the current rung instead of climbing.
+    # The rung is the one round N-1 really dispatched at (read off the board),
+    # not one replayed from the iteration counter, so the gate holds for
+    # round 3+ too.
+    model = _fix_model_for_iteration(
+        config, next_iteration,
+        failure_text=findings_obj.body,
+        previous_model=last_fix_model_for_branch(
+            board,
+            repo_name=work.repo_name,
+            issue_number=work.issue_number,
+            branch=work.branch,
+            before_iteration=next_iteration,
+        ),
+    )
     return _dispatch_fix(
         work, briefing, board, config, next_iteration,
         model=model, http_client=http_client,

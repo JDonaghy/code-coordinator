@@ -1195,6 +1195,42 @@ def sqlite_integrity_check(conn: Any) -> str:
     return str(rows[0][0]) if rows else "<no output>"
 
 
+def sqlite_data_version(conn: Any) -> str:
+    """SQLite's ``PRAGMA data_version`` for *conn*, as an opaque string.
+
+    The value changes whenever **another** connection commits to the same
+    database file, which makes it a cheap "has anything been written since I
+    last looked?" signal — see :meth:`coord.dao.SqliteStore.change_token`,
+    its only caller, which backs the ``/board`` read path's write-driven
+    cache invalidation (#3294).
+
+    Two properties the caller depends on, both SQLite's, not this helper's:
+    the value is **relative to the connection that reads it** (a freshly
+    opened connection always reports the same baseline no matter how many
+    commits preceded it, and only starts advancing once *it* has observed a
+    change), so the caller must reuse one long-lived connection; and it does
+    **not** move for this connection's own writes. See
+    https://sqlite.org/pragma.html#pragma_data_version.
+
+    Lives here for the same reason :func:`sqlite_journal_mode`,
+    :func:`sqlite_wal_checkpoint_truncate` and :func:`sqlite_integrity_check`
+    do: ``PRAGMA`` is SQLite-only statement text with no Postgres equivalent
+    to translate to, and this module is the one place in the tree allowed to
+    spell one (enforced by ``tests/test_sql_dialect.py::
+    test_no_sqlite_only_construct_in_statement_text_outside_db_and_seam``).
+    SQLite-only: callers must already know *conn* is a SQLite connection —
+    this helper does not dialect-guard, matching the rest of that family.
+
+    An empty result (which real SQLite never produces, but a stubbed
+    connection in a test can) degrades to ``"0"``. That is a *constant*, so a
+    caller comparing two such tokens sees "unchanged" — callers that cannot
+    tolerate a false "unchanged" must treat an exception here as "assume
+    changed", which is what ``change_token``'s caller does.
+    """
+    row = execute(conn, "PRAGMA data_version").fetchone()
+    return str(row[0]) if row is not None else "0"
+
+
 def driver_error(conn: Any) -> type[BaseException]:
     """The DB-API ``Error`` base class *conn*'s driver raises (#2766).
 

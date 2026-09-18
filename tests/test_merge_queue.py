@@ -216,6 +216,25 @@ class TestPersistence:
             "b": ("", None),
         }
 
+    def test_roundtrip_preserves_ci_seen_check_names(self, coord_db) -> None:
+        # #3263: the persisted half of the check-set shrinkage guard —
+        # same durability requirement as ci_fix_detail_sha/_json above: a
+        # `coord merge` invocation is a fresh CLI process each tick, so
+        # this MUST survive a save/load cycle or the guard could never
+        # compare across ticks at all.
+        a = _q("a")
+        a.ci_seen_checks_sha = "deadbeef"
+        a.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        save_queue([a, _q("b")])
+        again = {
+            x.assignment_id: (x.ci_seen_checks_sha, x.ci_seen_check_names_json)
+            for x in load_queue()
+        }
+        assert again == {
+            "a": ("deadbeef", json.dumps(["cargo-test", "cargo-test-gtk"])),
+            "b": ("", None),
+        }
+
 
 class TestSaveQueueLockContention:
     """#2802: `save_queue`'s DELETE+re-INSERT rewrite must ride out
@@ -4988,6 +5007,52 @@ class TestUatGate:
         )
         assert mq.requires_uat(_q("a"), cfg) is False
 
+    # ── gate-list membership routed through GATE_REGISTRY (#3261 S-3) ──
+
+    def test_registry_gate_name_uses_the_registered_gatespec_name(self) -> None:
+        from coord.pipeline import GATE_REGISTRY
+
+        assert mq._registry_gate_name("uat") == GATE_REGISTRY["uat"].name == "uat"
+
+    def test_registry_gate_name_passes_through_an_unregistered_key(self) -> None:
+        # "review"/"test" have no `GateSpec` row yet — the #3261 epic
+        # explicitly allows deferring them to a later slice — so this must
+        # be a passthrough, not a KeyError or a silent False.
+        assert mq._registry_gate_name("review") == "review"
+        assert mq._registry_gate_name("test") == "test"
+        assert mq._registry_gate_name("nonsense") == "nonsense"
+
+    def test_requires_uat_follows_a_renamed_registry_row(self, monkeypatch) -> None:
+        """#2096: prove `requires_uat`'s gate-list check actually reads
+        `GATE_REGISTRY["uat"].name` rather than a hardcoded ``"uat"``
+        literal that happens to match today — rename the row and confirm
+        the entries that match flip accordingly. A check that can't be
+        swayed by its own registry data isn't really consulting it."""
+        import coord.pipeline as pipeline_mod
+        from dataclasses import replace
+
+        renamed_spec = replace(pipeline_mod.GATE_REGISTRY["uat"], name="uat_v2")
+        monkeypatch.setattr(
+            pipeline_mod, "GATE_REGISTRY",
+            dict(pipeline_mod.GATE_REGISTRY, uat=renamed_spec),
+        )
+
+        # An entry tagged with the OLD gate name no longer matches...
+        cfg_old_name = self._config(gates=["uat"])
+        assert mq.requires_uat(_q("a"), cfg_old_name) is False
+        # ...but one tagged with the renamed row's NEW name does.
+        cfg_new_name = self._config(gates=["uat_v2"])
+        assert mq.requires_uat(_q("a"), cfg_new_name) is True
+
+    def test_gate_in_effective_gates_false_when_no_pipeline(self) -> None:
+        from dataclasses import dataclass
+
+        @dataclass
+        class _NoPipelineCfg:
+            pass
+
+        assert mq._gate_in_effective_gates("uat", _q("a"), _NoPipelineCfg()) is False
+
     # ── evaluate_uat_verdict ──
 
     def test_evaluate_uat_verdict_missing_names_preview_and_command(self) -> None:
@@ -4999,6 +5064,49 @@ class TestUatGate:
         assert "uat verdict missing" in message
         assert "preview: https://preview.example/worker/w1" in message
         assert "coord uat w1 --passed|--failed" in message
+
+    def test_reformatting_the_uat_message_does_not_change_the_merge_gate_kind(
+        self, monkeypatch,
+    ) -> None:
+        """#3272 (S-4 of #3261): before this fix, `coord.drive._merge_gate_
+        kind` recognized a UAT-gate refusal via its OWN private, hardcoded
+        copy of `evaluate_uat_verdict`'s opening words (`_UAT_GATE_MARKERS`)
+        — a second, independent copy of the exact same string this module's
+        `UAT_GATE_REASON_PREFIX` already carried for `_is_recomputable_gate_
+        error`/`display_error`. Rewording the message here (a wording-only
+        change, no semantic change) had nothing forcing the drive.py copy to
+        follow, so the two could silently drift apart and the #3214 UAT
+        fix-up dispatch would stop firing with no error anywhere.
+
+        `_merge_gate_kind` now asks `coord.pipeline.GATE_REGISTRY["uat"]
+        .identifies_reason` — which IS `is_uat_gate_reason`, built off THIS
+        module's `UAT_GATE_REASON_PREFIX` — so moving the identity prefix
+        moves both the message `evaluate_uat_verdict` produces and what
+        `_merge_gate_kind` recognizes, together, in one edit. Proven by
+        actually rewording the identity prefix and watching classification
+        follow it — the regression this slice exists to close.
+        """
+        from coord.drive import _merge_gate_kind
+
+        monkeypatch.setattr(mq, "UAT_GATE_REASON_PREFIX", "UAT preview review outcome")
+
+        cfg = self._config()
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1"), board, cfg)
+
+        assert ok is False
+        # The human-facing wording actually changed...
+        assert message.startswith("UAT preview review outcome")
+        assert "uat verdict" not in message.lower()
+        # ...yet `_merge_gate_kind` still recognizes it as the UAT gate,
+        # because it reads the SAME live identity, not a stale copy.
+        assert _merge_gate_kind(message) == "uat"
+        # And the OLD wording — which a stale, independently-hardcoded
+        # marker would still (wrongly) match — no longer classifies at all,
+        # proving there is exactly one source of truth, not two that
+        # happened to agree before the reword.
+        assert _merge_gate_kind("uat verdict missing — preview: x") is None
 
     def test_evaluate_uat_verdict_passed(self) -> None:
         cfg = self._config()
@@ -5126,6 +5234,55 @@ class TestUatGate:
         assert ok is False
         assert "preview: https://preview.example/worker/w1" in message
         assert "abc123" not in message
+        assert gh.deployment_url_calls == []
+
+    def test_evaluate_uat_verdict_unresolved_override_falls_through_to_live_lookup(
+        self,
+    ) -> None:
+        # #3350: an override template that references `{pr_number}` but has
+        # no value for this entry (grocery-list#36's exact shape) must NOT
+        # stop at a partially-rendered dead link — it falls through to the
+        # live lookup, same as if `uat_preview` were unset entirely.
+        cfg = self._config(
+            uat_preview="https://example.com/pull/{pr_number}", uat_live_preview=True,
+        )
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        gh = FakeGh(deployment_urls={"worker/w1": "https://abc123.example.pages.dev"})
+        ok, message = mq.evaluate_uat_verdict(_q("w1", pr=None), board, cfg, gh)
+        assert ok is False
+        assert "preview: https://abc123.example.pages.dev" in message
+        assert "/pull/" not in message
+
+    def test_evaluate_uat_verdict_unresolved_override_no_live_preview_names_gap(
+        self,
+    ) -> None:
+        # #3350: no `uat_live_preview` to fall through to either — the
+        # message must name the unresolved placeholder, never print a URL
+        # with a trailing empty path segment (the grocery-list#36 bug).
+        cfg = self._config(
+            uat_preview="https://example.com/pull/{pr_number}", uat_live_preview=False,
+        )
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        ok, message = mq.evaluate_uat_verdict(_q("w1", pr=None), board, cfg)
+        assert ok is False
+        assert "/pull/" not in message
+        assert "could not be resolved" in message
+        assert "pr_number" in message
+
+    def test_evaluate_uat_verdict_override_resolves_when_pr_number_known(self) -> None:
+        # Same template as above, but this entry DOES have a pr_number —
+        # renders the real link, not a guess.
+        cfg = self._config(
+            uat_preview="https://example.com/pull/{pr_number}", uat_live_preview=True,
+        )
+        work = self._work("w1", uat_state=None)
+        board = self._board(completed=[work])
+        gh = FakeGh(deployment_urls={"worker/w1": "https://abc123.example.pages.dev"})
+        ok, message = mq.evaluate_uat_verdict(_q("w1", pr=37), board, cfg, gh)
+        assert ok is False
+        assert "preview: https://example.com/pull/37" in message
         assert gh.deployment_url_calls == []
 
     def test_evaluate_uat_verdict_unresolved_preview_says_so(self) -> None:
@@ -7700,6 +7857,10 @@ class TestPlan:
         assert plan[0].status == mq.PLAN_BLOCKED
         assert "CI never ran" in (plan[0].reason or "")
         assert mq.is_ci_absent_reason(plan[0].reason)
+        # #3254: names the actual remedy — retrying cannot clear this gate,
+        # only a new commit can — instead of leaving an operator to infer it
+        # from the generic "merge attempted N times without landing".
+        assert "push a new commit" in plan[0].reason
 
     def test_ready_when_no_workflows_declared_and_checks_empty(self, coord_db) -> None:
         """Companion regression: a repo with no CI configured at all
@@ -8403,6 +8564,92 @@ class TestPlanCiStaleness:
         assert not (plan[0].reason or "").startswith(mq.CI_STALE_PREFIX)
 
 
+class TestEntryGateStatusCiCheckShrinkage:
+    """#3263: `_entry_gate_status` (the board/plan render path, via
+    `entry_gate_status`/`plan()`) applies the same check-set shrinkage
+    guard the live merge path does — read-only, since this path must never
+    mutate persisted state (mirrors every other CI predicate here — see
+    `_ci_seen_check_names`'s docstring).
+
+    Called directly with an already live-anchored `entry` (``branch_head_
+    sha`` set), mirroring `coord.drive_queue._fetch_live_ci_gate`'s real
+    call shape (per `entry_gate_status`'s own docstring) — `plan()`'s own
+    `load_queue()` never populates the transient `branch_head_sha` field
+    itself (see that field's docstring), so a `plan()`-level round trip
+    would just exercise "no SHA available" every time, the same limitation
+    every other SHA-scoped predicate in this function already has from that
+    call site (e.g. the review gate's #821 commit-bound check).
+    """
+
+    @staticmethod
+    def _ci(checks):
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return checks
+        return _Ci()
+
+    class _Gh(FakeGh):
+        """A fixed, current base timestamp so #1851's staleness gate never
+        fires once shrinkage clears — every check below has `started_at`
+        safely after it."""
+
+        def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+            return 1000.0
+
+    @staticmethod
+    def _check(name: str, conclusion: str) -> CheckRun:
+        return CheckRun(
+            name=name, status="completed", conclusion=conclusion,
+            url=f"https://gh/runs/{name}", run_id=name,
+            started_at=1500.0, completed_at=None,
+        )
+
+    def test_blocked_when_a_previously_seen_check_is_missing(self) -> None:
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha1"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        status, reason = mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert status == mq.PLAN_BLOCKED
+        assert reason.startswith(mq.CI_PENDING_PREFIX)
+        assert "cargo-test-gtk" in reason
+
+    def test_never_mutates_the_persisted_seen_set(self) -> None:
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha1"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert entry.ci_seen_check_names_json == json.dumps(
+            ["cargo-test", "cargo-test-gtk"]
+        )
+
+    def test_ready_when_nothing_previously_observed_has_vanished(self) -> None:
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha1"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        status, reason = mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert status == mq.PLAN_READY
+        assert reason is None
+
+    def test_ready_when_seen_sha_differs_from_current(self) -> None:
+        """Tracking recorded against an OLD commit must never gate a NEW
+        one — a fresh push legitimately changes the check set."""
+        entry = _q("w1", pr=99)
+        entry.branch_head_sha = "sha2"
+        entry.ci_seen_checks_sha = "sha1"
+        entry.ci_seen_check_names_json = json.dumps(["cargo-test", "cargo-test-gtk"])
+        ci = self._ci([self._check("cargo-test", "success")])
+        status, reason = mq._entry_gate_status(entry, None, None, ci, self._Gh())
+        assert status == mq.PLAN_READY
+        assert reason is None
+
+
 class TestCiRevalidationCandidates:
     """#1851: the eligibility policy for `coord merge --revalidate`'s CI
     re-run arm — the CI analogue of `revalidation_candidates`."""
@@ -8498,15 +8745,22 @@ class TestProcessCiStaleness:
     both the live path and the `--dry-run` preview — named distinctly
     (`checks_stale`) from `checks_failed`/`checks_pending`.
 
-    #2197: the live path no longer blocks on the FIRST stale reading — it
-    auto-reruns CI first (mirroring #1892's verdictless-failure arm, same
-    `CiStore.rerun_for_pr` call), parking as `checks_stale_rerun`
-    (`CI_PENDING_PREFIX` wording, so `coord drive`'s #1891 "wait, don't
-    spend an attempt" logic applies) up to `MAX_CI_STALE_RERUNS` times.
-    Only once that budget is exhausted does it report the terminal
-    `checks_stale` block a human has to act on. `--dry-run` is unaffected —
-    it only ever previews, never mutates, so it keeps reporting
-    `checks_stale` on the very first pass and never calls `rerun_for_pr`.
+    #2197 used to auto-rerun CI first (mirroring #1892's verdictless-failure
+    arm, same `CiStore.rerun_for_pr` call), parking as `checks_stale_rerun`
+    up to `MAX_CI_STALE_RERUNS` times before reporting the terminal
+    `checks_stale` block.
+
+    #3266: that auto-rerun could never clear the block it was answering — a
+    staleness reading means the base moved, and `CiStore.rerun_for_pr`
+    replays the SAME Actions run against the SAME event payload, so it
+    lands against the SAME base the stale checks already used. Two
+    guaranteed-no-op re-runs (claude-coordinator#2972: ~2 hours of runner
+    time) later, it parked anyway. The live path now reports the terminal
+    `checks_stale` block on the FIRST stale reading — same outcome, no
+    wasted CI cycle, no `checks_stale_rerun` state at all — exactly
+    matching what `--dry-run` already did (it never mutated, so it always
+    previewed `checks_stale` on the first pass and never called
+    `rerun_for_pr`).
     """
 
     @staticmethod
@@ -8540,46 +8794,59 @@ class TestProcessCiStaleness:
         def get_branch_commit_timestamp(self, repo, branch):
             return self.ts
 
-    def test_first_stale_reading_auto_reruns_instead_of_blocking(self) -> None:
-        """The exact #2170 regression: a docs-only base move stales an
-        otherwise-green PR. The first live pass must not escalate — it
-        triggers a CI re-run and parks, unattended."""
+    def test_first_stale_reading_blocks_immediately_without_rerunning(self) -> None:
+        """The exact #2170 regression shape — a docs-only base move stales
+        an otherwise-green PR — but per #3266 the first (and every) live
+        pass must report the terminal block right away: no `rerun_for_pr`
+        call, since a same-base replay can never see the moved base."""
         items = [_q("w1", pr=99)]
         gh = self._Gh()
         ci = self._ci(started_at=500.0)
         events = process(items, gh, ci_store=ci)
         assert items[0].state == PENDING
         assert gh.merge_calls == []
-        assert ci.rerun_calls == [("acme/api", 99)]
-        assert items[0].ci_stale_reruns == 1
+        assert ci.rerun_calls == []
+        assert items[0].ci_stale_reruns == 0
         kinds = [e.kind for e in events]
-        assert "checks_stale_rerun" in kinds
-        assert "checks_stale" not in kinds
+        assert "checks_stale" in kinds
+        assert "checks_stale_rerun" not in kinds
         assert "checks_failed" not in kinds
         assert "checks_pending" not in kinds
-        # #1891: CI_PENDING_PREFIX wording — `coord drive` waits rather
-        # than spending a merge attempt on this.
-        assert items[0].error.startswith("CI running:")
+        stale = [e for e in events if e.kind == "checks_stale"]
+        assert stale[0].message.startswith(mq.CI_STALE_PREFIX)
+        assert items[0].error == stale[0].message
 
-    def test_merges_on_a_later_pass_once_the_rerun_reports_green(self) -> None:
-        """Full #2170 lifecycle, end to end: stale → auto-rerun → a LATER
-        `process()` tick (the re-run having reported back fresh and green,
-        no operator involved) actually merges it. Acceptance criterion,
-        verbatim from #2197: "process() triggers a CI re-run and the entry
-        parks as checks_pending without spending an attempt, then merges on
-        a later pass once green.\""""
+    def test_repeated_ticks_never_call_rerun_for_pr(self) -> None:
+        """#3266's core claim: a same-base rerun can never clear this block,
+        so `process()` must not spend one — not on the first tick, and not
+        on any later tick either, for as long as the base stays stale."""
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        ci = self._ci(started_at=500.0)
+        for _ in range(3):
+            events = process(items, gh, ci_store=ci)
+            assert items[0].state == PENDING
+            assert "checks_stale" in [e.kind for e in events]
+        assert ci.rerun_calls == []
+        assert items[0].ci_stale_reruns == 0
+
+    def test_merges_on_a_later_pass_once_a_manual_rebase_lands(self) -> None:
+        """The only thing #3266 says can actually clear this: a human
+        rebases and pushes, producing a genuinely fresh check — not a
+        `process()`-triggered re-run. Simulated here as the check list
+        simply reporting fresh on a later tick, the same way a real rebase's
+        new run would."""
         items = [_q("w1", pr=99)]
         gh = self._Gh()
         ci = self._ci(started_at=500.0)
 
         first = process(items, gh, ci_store=ci)
         assert items[0].state == PENDING
-        assert "checks_stale_rerun" in [e.kind for e in first]
-        assert ci.rerun_calls == [("acme/api", 99)]
+        assert "checks_stale" in [e.kind for e in first]
+        assert ci.rerun_calls == []
 
-        # The re-run GitHub was asked to trigger has now reported back: a
-        # fresh, green check — the same `ci` object, no new `coord merge`
-        # flag involved.
+        # A human rebased the branch onto current main and pushed — a real
+        # new run, fresh and green.
         from types import SimpleNamespace
         ci.checks = [SimpleNamespace(
             name="build", status="completed", conclusion="success",
@@ -8588,33 +8855,11 @@ class TestProcessCiStaleness:
 
         second = process(items, gh, ci_store=ci)
         assert items[0].state == MERGED
-        assert ci.rerun_calls == [("acme/api", 99)]  # unchanged — no 2nd rerun
+        assert ci.rerun_calls == []
         kinds = [e.kind for e in second]
         assert "merged" in kinds
         assert "checks_stale" not in kinds
         assert "checks_stale_rerun" not in kinds
-
-    def test_reruns_stop_at_the_cap_and_then_reports_checks_stale(self) -> None:
-        from coord.merge_queue import MAX_CI_STALE_RERUNS
-
-        items = [_q("w1", pr=99)]
-        gh = self._Gh()
-        ci = self._ci(started_at=500.0)
-        for expected in range(1, MAX_CI_STALE_RERUNS + 1):
-            events = process(items, gh, ci_store=ci)
-            assert items[0].ci_stale_reruns == expected
-            assert "checks_stale_rerun" in [e.kind for e in events]
-        assert len(ci.rerun_calls) == MAX_CI_STALE_RERUNS
-
-        # Budget exhausted — the next pass reports the terminal block and
-        # triggers no further rerun.
-        events = process(items, gh, ci_store=ci)
-        assert len(ci.rerun_calls) == MAX_CI_STALE_RERUNS  # unchanged
-        assert items[0].ci_stale_reruns == MAX_CI_STALE_RERUNS  # unchanged
-        kinds = [e.kind for e in events]
-        assert "checks_stale" in kinds
-        assert "checks_stale_rerun" not in kinds
-        assert items[0].state == PENDING
 
     def test_live_merge_proceeds_when_checks_fresh(self) -> None:
         items = [_q("w1", pr=99)]
@@ -8627,10 +8872,12 @@ class TestProcessCiStaleness:
         assert "checks_stale" not in kinds
         assert "checks_stale_rerun" not in kinds
 
-    def test_resets_after_a_clean_pass_so_a_later_staleness_starts_fresh(self) -> None:
-        """Mirrors `ci_infra_reruns`'s own reset test (#1892): a later,
-        unrelated base move must not inherit a budget already spent on an
-        earlier staleness streak."""
+    def test_resets_after_a_clean_pass_for_a_row_predating_the_3266_fix(self) -> None:
+        """#3266: `process()` never writes a nonzero `ci_stale_reruns`
+        anymore, but a row persisted before this fix can still carry one
+        from the old auto-rerun behaviour. A genuinely fresh pass must
+        converge it back to 0 rather than leaving a stale count sitting on
+        the entry forever — mirrors `ci_infra_reruns`'s own reset (#1892)."""
         from coord.merge_queue import MAX_CI_STALE_RERUNS
 
         items = [_q("w1", pr=99)]
@@ -8731,11 +8978,13 @@ class TestProcessCiStaleness:
         #1479's Test-verdict staleness" — which names what the verdict was
         recorded against AND what the anchor is now (`coord.gates`'
         "recorded against base X, base is now Y"). The CI anchor is a run
-        timestamp rather than a SHA, but the sentence is the same."""
+        timestamp rather than a SHA, but the sentence is the same.
+
+        #3266: reported on the very first stale reading now — there is no
+        rerun budget left to skip past."""
         items = [_q("w1", pr=99)]
         gh = self._Gh()
         ci = self._ci(started_at=500.0)
-        items[0].ci_stale_reruns = mq.MAX_CI_STALE_RERUNS  # skip to the block
         events = process(items, gh, ci_store=ci)
         stale = [e for e in events if e.kind == "checks_stale"]
         assert stale
@@ -8743,8 +8992,15 @@ class TestProcessCiStaleness:
         assert msg.startswith(mq.CI_STALE_PREFIX)
         assert "ran against main as of 1970-01-01T00:08:20Z" in msg
         assert "main now 1970-01-01T00:16:40Z" in msg
-        # The remedy stays the last thing an operator reads (#1826).
-        assert msg.endswith("re-run CI (`coord merge --revalidate`) before merging")
+        # #3266: the remedy must not point at `--revalidate` — its CI arm is
+        # the exact same-base `rerun_for_pr` replay that cannot clear this.
+        assert "--revalidate" not in msg
+        # The remedy stays the last thing an operator reads (#1826), and now
+        # names the thing that actually works.
+        assert msg.endswith(
+            "rebase onto main and push (`git push --force-with-lease`); "
+            "a CI re-run against the same base cannot see a moved base"
+        )
 
     def test_dry_run_previews_checks_stale_without_rerunning(self) -> None:
         items = [_q("w1", pr=99)]
@@ -8770,11 +9026,12 @@ class TestTwoGreenBranchesOneBaseMove:
     could merge and a release was structurally impossible.
 
     The sequence, exactly: A and B are both green against base X; A merges,
-    making the base Y; B must NOT merge on its X-based checks. It doesn't
-    matter for this test *which* of the two non-merging outcomes B lands in
-    (#2197's unattended auto-rerun, or the terminal block once that budget is
-    spent) — what #1826 is about is that B does not reach `gh pr merge` on
-    evidence that predates the base it would be merging into.
+    making the base Y; B must NOT merge on its X-based checks. #3266: B
+    lands directly in the terminal `checks_stale` block on the very first
+    reading — no unattended auto-rerun in between anymore, since a same-base
+    rerun could never see base Y anyway — what #1826 is about is that B
+    does not reach `gh pr merge` on evidence that predates the base it
+    would be merging into.
     """
 
     @staticmethod
@@ -8818,6 +9075,9 @@ class TestTwoGreenBranchesOneBaseMove:
         ]
 
     def test_the_second_branch_does_not_merge_on_pre_move_checks(self) -> None:
+        """#3266: B blocks terminally on the very first reading — no
+        unattended re-run in between, since a same-base rerun could never
+        see base Y anyway."""
         items = self._items()
         gh = self._MovingBaseGh()
         ci = self._ci(started_at=1500.0)  # green against base X (1000), not Y (2000)
@@ -8830,33 +9090,16 @@ class TestTwoGreenBranchesOneBaseMove:
         # B did NOT merge, and never reached `gh pr merge` at all.
         assert b.state == PENDING
         assert [c[1] for c in gh.merge_calls] == [101]
+        assert ci.rerun_calls == []  # #3266: no wasted re-run for B
         # ...and it is B's CI that is named, not its review/test gates.
         b_events = [e for e in events if e.entry.assignment_id == "B"]
-        assert [e.kind for e in b_events] == ["checks_stale_rerun"]
+        assert [e.kind for e in b_events] == ["checks_stale"]
         assert "predate the current base" in (b.error or "")
-
-    def test_b_blocks_terminally_once_the_rerun_budget_is_spent(self) -> None:
-        """Same sequence, B having already spent #2197's unattended re-runs:
-        the refusal is terminal, names STALE CI, and carries the remedy."""
-        items = self._items()
-        items[1].ci_stale_reruns = mq.MAX_CI_STALE_RERUNS
-        gh = self._MovingBaseGh()
-        ci = self._ci(started_at=1500.0)
-
-        events = process(items, gh, ci_store=ci)
-
-        assert items[0].state == MERGED
-        assert items[1].state == PENDING
-        assert [c[1] for c in gh.merge_calls] == [101]
-        assert ci.rerun_calls == []  # budget spent — no more unattended re-runs
-        stale = [
-            e for e in events
-            if e.entry.assignment_id == "B" and e.kind == "checks_stale"
-        ]
-        assert stale
-        assert stale[0].message.startswith(mq.CI_STALE_PREFIX)
-        # #1826: an actionable remedy, not just a refusal.
-        assert "coord merge --revalidate" in stale[0].message
+        assert b_events[0].message.startswith(mq.CI_STALE_PREFIX)
+        # #1826/#3266: an actionable remedy, not just a refusal — and it
+        # names the thing that actually works, not the `--revalidate` no-op.
+        assert "rebase onto" in b_events[0].message
+        assert "--revalidate" not in b_events[0].message
 
     def test_plan_reports_the_same_block_for_b(self, coord_db) -> None:
         """The board/plan render must agree with the live attempt — an
@@ -8958,6 +9201,9 @@ class TestProcessConflictedEmptyChecks:
             assert "conflict" not in kinds, verdict
             assert items[0].state == PENDING, verdict
             assert mq.is_ci_absent_reason(items[0].error), verdict
+            # #3254: the live `process()` path names the same remedy the
+            # board-render path does.
+            assert "push a new commit" in items[0].error, verdict
 
     def test_failing_checks_still_block_regardless_of_mergeability(self) -> None:
         """Acceptance criterion: a PR with genuinely failing (non-empty)
@@ -9147,6 +9393,179 @@ class TestCiInfraReason:
         ]})
         self._fn(ci, "acme/api", 1, checks)
         assert ci.calls == [("acme/api", "999")]
+
+
+class TestProcessCiCheckShrinkage:
+    """#3263: coord-tui#83 merged 1.3s into a PARTIAL GitHub Actions re-run
+    ("Re-run failed jobs") of its one failing required check
+    (`cargo-test-gtk`). The re-run briefly dropped that check's OWN
+    check-run record out of `list_checks_for_pr` while its already-green
+    siblings (`cargo-test`) stayed put — a non-empty, entirely-passing read
+    that satisfied `failed_checks`/`in_flight_checks` vacuously, #1904's
+    hole on the non-empty side. `process()` now persists the check-run NAME
+    set it has observed per (PR, head SHA) and refuses to treat a read that
+    dropped a previously-seen name as a genuine, resolved answer.
+    """
+
+    class _Gh(FakeGh):
+        """A fixed, current base timestamp so #1851's staleness gate never
+        fires in these tests — every check below is given a `started_at`
+        safely after it (see `_c`)."""
+
+        def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+            return 1000.0
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, checks):
+            self.checks = checks
+            self.rerun_calls: list = []
+
+        def list_checks_for_pr(self, repo, number):
+            return self.checks
+
+        def rerun_for_pr(self, repo, number):
+            self.rerun_calls.append((repo, number))
+            return True
+
+    @staticmethod
+    def _c(name: str, conclusion: str) -> CheckRun:
+        return CheckRun(
+            name=name, status="completed", conclusion=conclusion,
+            url=f"https://gh/runs/{name}", run_id=name,
+            started_at=1500.0, completed_at=None,
+        )
+
+    def test_first_read_with_a_real_failure_is_not_treated_as_shrinkage(self) -> None:
+        """Nothing has been observed yet for this commit — a genuinely
+        failing check on the very FIRST read is `checks_failed`, not
+        shrinkage (there is nothing to have shrunk FROM). This is #3263's
+        own documented gap: the guard needs a prior observation to compare
+        against."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        events = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "checks_pending" not in kinds
+        assert items[0].state == PENDING
+
+    def test_a_previously_seen_check_vanishing_parks_as_pending_not_green(self) -> None:
+        """The #3263 incident, reproduced: a check observed failing on one
+        read is simply ABSENT (not resolved, not failed again) from the
+        next read — the partial-rerun registration window. Must park as
+        `checks_pending`, never fall through to a vacuous merge."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        first = process(items, gh, ci_store=ci)
+        assert "checks_failed" in [e.kind for e in first]
+        assert items[0].state == PENDING
+
+        # The partial re-run's registration window: `cargo-test-gtk`'s own
+        # check-run record has vanished; `cargo-test` (untouched by the
+        # partial re-run) is still there and still green — exactly the
+        # incident's "non-empty, entirely-passing" reading.
+        ci.checks = [self._c("cargo-test", "success")]
+        second = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in second]
+        assert "checks_pending" in kinds
+        assert "merged" not in kinds
+        assert items[0].state == PENDING
+        assert items[0].error.startswith(mq.CI_PENDING_PREFIX)
+        assert "cargo-test-gtk" in items[0].error
+
+    def test_merges_once_the_vanished_check_resolves_green(self) -> None:
+        """End to end: failed -> vanished (parked, no attempt spent) ->
+        reappears green -> merges. The union-tracking must not get stuck
+        blocking forever once the check is genuinely back and resolved."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)
+        ci.checks = [self._c("cargo-test", "success")]
+        process(items, gh, ci_store=ci)
+        assert items[0].state == PENDING
+
+        ci.checks = [
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "success"),
+        ]
+        third = process(items, gh, ci_store=ci)
+        assert items[0].state == MERGED
+        assert "merged" in [e.kind for e in third]
+
+    def test_new_commit_resets_tracking(self) -> None:
+        """A fresh push (a new `branch_head_sha`) must not compare against
+        the previous commit's check set — a workflow legitimately dropping
+        a job on a new commit is not #3263's shrinkage."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha-1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)
+        assert items[0].state == PENDING
+
+        items[0].branch_head_sha = "sha-2"
+        ci.checks = [self._c("cargo-test", "success")]
+        events = process(items, gh, ci_store=ci)
+        assert items[0].state == MERGED
+        assert "checks_pending" not in [e.kind for e in events]
+
+    def test_dry_run_preview_reports_shrinkage_without_recording(self) -> None:
+        """The `--dry-run` preview must warn about the same condition the
+        live path would block on, but never mutate the persisted seen-set —
+        only a live attempt writes it (see `_ci_record_seen_check_names`)."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)  # live: records cargo-test-gtk as seen
+        before = items[0].ci_seen_check_names_json
+        assert before is not None
+
+        ci.checks = [self._c("cargo-test", "success")]
+        events = process(items, gh, ci_store=ci, dry_run=True)
+        kinds = [e.kind for e in events]
+        assert "checks_pending" in kinds
+        # Read-only: the dry run must not have changed the persisted record.
+        assert items[0].ci_seen_check_names_json == before
+
+    def test_force_merge_overrides_shrinkage(self) -> None:
+        """`--force-merge` still skips the whole CI gate, shrinkage included —
+        same override as every other CI block (#240)."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        process(items, gh, ci_store=ci)
+        ci.checks = [self._c("cargo-test", "success")]
+        events = process(items, gh, ci_store=ci, force_merge=True)
+        assert items[0].state == MERGED
+        assert "checks_pending" not in [e.kind for e in events]
 
 
 class TestProcessCiInfraAutoRerun:

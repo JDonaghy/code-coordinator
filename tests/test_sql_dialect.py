@@ -542,6 +542,64 @@ def test_sqlite_integrity_check_degrades_to_a_placeholder_on_an_empty_result(mon
     assert sql.sqlite_integrity_check(object()) == "<no output>"
 
 
+# ── change detection: sqlite_data_version (#3294) ────────────────────────
+#
+# The /board read path's write-driven cache invalidation calls this instead
+# of spelling `PRAGMA data_version` in coord/dao.py, where the SQLite-only
+# statement-text ratchet below would (correctly) reject it.
+
+
+def test_sqlite_data_version_advances_when_another_connection_commits(tmp_path):
+    """The property #3294's cache depends on: the token MOVES on somebody
+    else's commit, and holds still when nobody writes.
+
+    Both halves matter and neither implies the other — a helper that returned
+    a fresh constant every call would pass "it changed" while making the
+    cache useless, and one that returned a hardcoded constant would pass "it
+    held still" while making the cache serve stale boards forever. Driven
+    through two real connections on a file DB because that *is* the semantics
+    under test: `PRAGMA data_version` only reports commits made by a
+    connection other than the reader's own.
+    """
+    db = tmp_path / "dv.db"
+    writer = sqlite3.connect(str(db))
+    reader = sqlite3.connect(str(db))
+    try:
+        writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        writer.commit()
+
+        before = sql.sqlite_data_version(reader)
+        assert sql.sqlite_data_version(reader) == before, (
+            "no write happened between these two reads — the token must not move"
+        )
+
+        writer.execute("INSERT INTO t (id) VALUES (1)")
+        writer.commit()
+
+        assert sql.sqlite_data_version(reader) != before, (
+            "another connection committed — the token must move, or the "
+            "/board cache can never notice an external write"
+        )
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_sqlite_data_version_degrades_to_a_constant_on_an_empty_result(monkeypatch):
+    """Real SQLite always answers with a row, but a stub (or a connection in
+    an exotic state) might not. Degrade to a constant rather than raising:
+    ``change_token``'s caller treats an exception as "assume changed", and an
+    IndexError escaping here would turn a missing PRAGMA row into a permanent
+    rebuild-on-every-request."""
+
+    class _Cursor:
+        def fetchone(self):
+            return None
+
+    monkeypatch.setattr(sql, "execute", lambda conn, statement, params=(): _Cursor())
+    assert sql.sqlite_data_version(object()) == "0"
+
+
 # ── row factory ──────────────────────────────────────────────────────────
 
 

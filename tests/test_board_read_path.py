@@ -186,6 +186,292 @@ def test_board_version_bumps_when_content_changes(
         assert r3.headers["etag"] != r1.headers["etag"]
 
 
+# ── #3294: the cache rebuilds on a write, not on a clock ─────────────────────
+
+
+def test_board_rebuild_trigger_is_a_write_not_the_ttl_clock(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#3294 acceptance: two ``/board`` requests with NO intervening write
+    must produce exactly one ``board_projection()`` build, and a write
+    between them must force a second — asserted on a build counter, never on
+    timing (the issue's own words: "Timing-based assertions will be flaky —
+    count builds").
+
+    The write here is a RAW external SQLite commit — not a POST to
+    ``/board``, which already busted the cache explicitly and always did.
+    This is the case #3294 actually exists for: the drive-queue timer and a
+    concurrent ``coord notify`` write the DB directly, with no daemon POST
+    anywhere in the picture. Before #3294 a write from either of those
+    sources was invisible to the ``/board`` cache until its TTL (1.5 s by
+    default, pre-fix) happened to expire on its own. This test pins the
+    safety-TTL to a deliberately generous 60 s specifically so the *only*
+    thing that can explain the second build is the change-token check
+    noticing the external write — a TTL-only cache would still be showing
+    the stale, pre-write board at that point.
+    """
+    call_count = 0
+    original_projection = SqliteStore.board_projection
+
+    def counting_projection(self):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        return original_projection(self)
+
+    monkeypatch.setattr(SqliteStore, "board_projection", counting_projection)
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "60")  # generous safety ceiling
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        r1 = cli.get("/board")
+        assert r1.status_code == 200
+        assert call_count == 1
+
+        r2 = cli.get("/board")
+        assert r2.status_code == 200
+        assert call_count == 1, "no write happened — must still be exactly one build"
+
+        # A write from OUTSIDE the daemon entirely: no POST /board, no
+        # `_bust_board_cache()` call — the drive-queue-timer / `coord notify`
+        # shape the issue names.
+        conn = sqlite3.connect(str(detail_db))
+        conn.execute(
+            "UPDATE assignments SET status='failed' WHERE assignment_id='work1'"
+        )
+        conn.commit()
+        conn.close()
+
+        r3 = cli.get("/board")
+        assert r3.status_code == 200
+        assert call_count == 2, (
+            "an external write must trigger a rebuild via the change token, "
+            "well before the 60s safety TTL elapses"
+        )
+
+
+def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
+    """#3293 unit-level check on ``_board_digest_projection`` itself: the
+    three named culprits (``audit_recent_count``, ``issues[*].synced_at``,
+    and ``fleet_health``'s clocks + self-referential ``fleet_board_latency``
+    check) are stripped from the digest input, while every other field —
+    including the REST of ``fleet_health`` (severities, results, other
+    checks) — passes through untouched, so a real state change still bumps
+    the ETag.
+    """
+    from coord.serve_app import _board_digest_projection
+
+    result = {
+        "round_number": 3,
+        "assignments": [{"assignment_id": "work1", "status": "done"}],
+        "audit_recent_count": 7,
+        "issues": [
+            {"repo_name": "api", "number": 42, "title": "A", "synced_at": 111.0},
+            {"repo_name": "api", "number": 43, "title": "B", "synced_at": 222.0},
+        ],
+        "fleet_health": {
+            "schema": 1,
+            "refreshed_at": 1000.0,
+            "truncated": False,
+            "machine_health": [
+                {
+                    "machine": "laptop",
+                    "severity": "warn",
+                    "received_at": 1000.0,
+                    "checked_at": 999.0,
+                    "results": [{"check_id": "disk", "severity": "warn", "headroom": "9% free"}],
+                }
+            ],
+            "fleet_checks": [
+                {
+                    "check_id": "fleet_board_latency",
+                    "severity": "ok",
+                    "headroom": "738ms / 3.4M",
+                    "values": {"latency_ms": 738.0, "payload_bytes": 3_400_000},
+                },
+                {
+                    "check_id": "fleet_deploy_lanes",
+                    "severity": "crit",
+                    "headroom": "2 machines behind",
+                    "values": {"behind": 2},
+                },
+            ],
+        },
+    }
+
+    projection = _board_digest_projection(result)
+
+    # The three named culprits are gone from the digest input...
+    assert "audit_recent_count" not in projection
+    assert all("synced_at" not in issue for issue in projection["issues"])
+    assert "refreshed_at" not in projection["fleet_health"]
+    masked_row = projection["fleet_health"]["machine_health"][0]
+    assert "received_at" not in masked_row and "checked_at" not in masked_row
+    masked_latency_check = projection["fleet_health"]["fleet_checks"][0]
+    assert masked_latency_check["check_id"] == "fleet_board_latency"
+    assert "headroom" not in masked_latency_check and "values" not in masked_latency_check
+
+    # ...but real state signal is untouched: severities, other fields on the
+    # issue rows, and a DIFFERENT fleet check's headroom/values all survive,
+    # so a genuine state change still moves the digest.
+    assert projection["assignments"] == result["assignments"]
+    assert projection["issues"][0]["title"] == "A"
+    assert masked_row["severity"] == "warn"
+    assert masked_row["results"] == [{"check_id": "disk", "severity": "warn", "headroom": "9% free"}]
+    other_check = projection["fleet_health"]["fleet_checks"][1]
+    assert other_check == result["fleet_health"]["fleet_checks"][1]
+
+    # And the original `result` passed in is never mutated — it's still the
+    # dict that gets serialized as the wire body, culprits and all.
+    assert result["audit_recent_count"] == 7
+    assert result["issues"][0]["synced_at"] == 111.0
+    assert result["fleet_health"]["refreshed_at"] == 1000.0
+
+
+def test_board_version_stable_across_audit_and_health_tick_noise(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#3293 production-shaped regression test.
+
+    Before #3293 this failed: ``_stamp_board_version`` hashed the wire body
+    directly, which embeds ``audit_recent_count`` (a sliding 900s window
+    count) and ``fleet_health`` (moves on the 60s health tick, including a
+    self-referential ``fleet_board_latency`` check that measures the board
+    response's OWN previous fetch latency/size). An audit row landing inside
+    the window, combined with a fleet-health refresh, bumped the ETag on a
+    rebuild even though nothing a poller should care about — assignments,
+    issues, machine severities — actually changed. That meant a
+    just-issued ETag could never survive to the next poll (#3293's "7 of 7
+    consecutive attempts" live-daemon measurement).
+
+    Reproduces exactly that: seed an audit_log row inside the window and
+    swap in a second, clock-advanced ``fleet_health`` snapshot between two
+    builds, with everything else held identical, and assert the version/ETag
+    survive — a conditional GET after both must still 304.
+    """
+    import time as _time
+
+    from coord.health.fleet_snapshot import FleetHealthRefresher
+
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "0")  # rebuild every request
+
+    now = _time.time()
+
+    def _fleet_health(*, refreshed_at: float, latency_ms: float, payload_bytes: int) -> dict:
+        return {
+            "schema": 1,
+            "refreshed_at": refreshed_at,
+            "truncated": False,
+            "machine_health": [
+                {
+                    "machine": "laptop",
+                    "state": "online",
+                    "reason": "",
+                    "latency_ms": 12.3,
+                    "received_at": refreshed_at,
+                    "stale": False,
+                    "severity": "ok",
+                    "checked_at": refreshed_at - 1.0,
+                    "results": [
+                        {
+                            "key": "disk:/home", "check_id": "disk", "scope": "machine",
+                            "subject": "/home", "title": "disk", "label": "disk",
+                            "severity": "ok", "headroom": "40% free",
+                            "threshold": "warn at 10%", "detail": "", "trend": None,
+                            "values": {"free_pct": 40}, "error": None,
+                        },
+                    ],
+                    "worktree_bytes": 1_048_576,
+                    "agent_runtime_version": "1.2.3",
+                }
+            ],
+            "fleet_checks": [
+                {
+                    "key": "fleet_board_latency", "check_id": "fleet_board_latency",
+                    "scope": "fleet", "subject": None, "title": "board latency+size",
+                    "label": "board latency+size", "severity": "ok",
+                    "headroom": f"{latency_ms:.0f}ms / {payload_bytes}",
+                    "threshold": "warn at 2.0MiB/1500ms, crit at 5.0MiB/4000ms",
+                    "detail": "", "trend": None,
+                    "values": {"latency_ms": latency_ms, "payload_bytes": payload_bytes},
+                    "error": None,
+                },
+            ],
+        }
+
+    # Same real health state both times (machine "laptop", disk 40% free,
+    # severity "ok") — only the clocks and the self-measured board
+    # latency/size (which necessarily differs build-to-build) move.
+    fleet_health_by_build = [
+        _fleet_health(refreshed_at=now, latency_ms=738.0, payload_bytes=3_400_000),
+        _fleet_health(refreshed_at=now + 60.0, latency_ms=812.0, payload_bytes=3_512_000),
+    ]
+    calls = {"i": 0}
+
+    class _FakeSnapshot:
+        def __init__(self, d: dict) -> None:
+            self._d = d
+
+        def to_dict(self) -> dict:
+            return self._d
+
+    def fake_snapshot(self):  # noqa: ANN001
+        i = min(calls["i"], len(fleet_health_by_build) - 1)
+        calls["i"] += 1
+        return _FakeSnapshot(fleet_health_by_build[i])
+
+    monkeypatch.setattr(FleetHealthRefresher, "snapshot", fake_snapshot)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        r1 = cli.get("/board")
+        assert r1.status_code == 200
+        body1 = r1.json()
+        v1 = body1["board_version"]
+        etag1 = r1.headers["etag"]
+        assert etag1
+
+        # Between builds: an audit_log row lands inside the 900s recency
+        # window (the per-build killer named in #3293) AND fleet-health
+        # ticks forward. Nothing else in the DB changes.
+        conn = sqlite3.connect(str(detail_db))
+        conn.execute(
+            "INSERT INTO audit_log (ts, tier, category, event_type, actor, summary) "
+            "VALUES (?,?,?,?,?,?)",
+            (now, "info", "board", "test.event", "tester", "inside the window"),
+        )
+        conn.commit()
+        conn.close()
+
+        # A conditional GET with the first ETag must still 304 — the whole
+        # point of #1336's cache-validated polling, which #3293 says can
+        # "never match" today.
+        r2 = cli.get("/board", headers={"If-None-Match": etag1})
+        assert r2.status_code == 304, (
+            "an audit row inside the window + a fleet-health tick must not "
+            "move the ETag — this is exactly #3293's failure mode"
+        )
+        assert r2.headers.get("etag") == etag1
+        assert not r2.content
+
+        # An unconditional rebuild confirms the underlying fields really DID
+        # move (this test isn't vacuous) while the version/ETag held.
+        r3 = cli.get("/board")
+        body3 = r3.json()
+        assert body3["audit_recent_count"] != body1["audit_recent_count"]
+        assert (
+            body3["fleet_health"]["refreshed_at"]
+            != body1["fleet_health"]["refreshed_at"]
+        )
+        assert (
+            body3["fleet_health"]["fleet_checks"][0]["values"]
+            != body1["fleet_health"]["fleet_checks"][0]["values"]
+        )
+        assert body3["board_version"] == v1
+        assert r3.headers["etag"] == etag1
+
+
 def test_stale_concurrent_rebuild_is_never_published(
     detail_db: Path, valid_config_path: Path, monkeypatch
 ) -> None:
@@ -198,12 +484,22 @@ def test_stale_concurrent_rebuild_is_never_published(
 
     monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "1000")  # cache once published
 
+    # #3294: `_build()` is faked below (it never touches the real store), so
+    # pin `store.change_token()` to a fixed value too — otherwise the
+    # handler's real (unmocked) freshness check would compare the fake
+    # build's canned token against the REAL store's live `PRAGMA
+    # data_version` and never see a match, breaking the cache-hit path this
+    # test relies on for its final 304. Irrelevant to what this test
+    # actually exercises (out-of-order publish, not change detection).
+    store = SqliteStore(detail_db)
+    monkeypatch.setattr(store, "change_token", lambda: "fixed-token")
+
     # Deterministic out-of-order completion: the first request's build
     # carries a NEWER snapshot stamp than the second's (as if the second
     # started earlier but finished later).
     results = iter([
-        (100.0, {"round_number": 1, "marker": "NEW"}),
-        (50.0, {"round_number": 1, "marker": "STALE"}),
+        (100.0, "fixed-token", {"round_number": 1, "marker": "NEW"}),
+        (50.0, "fixed-token", {"round_number": 1, "marker": "STALE"}),
     ])
 
     async def _fake_run_in_threadpool(fn, *args):  # noqa: ANN001, ARG001
@@ -212,7 +508,7 @@ def test_stale_concurrent_rebuild_is_never_published(
     monkeypatch.setattr(sc, "run_in_threadpool", _fake_run_in_threadpool)
 
     cfg = load_config(valid_config_path)
-    app = build_app(SqliteStore(detail_db), cfg)
+    app = build_app(store, cfg)
     with TestClient(app) as cli:
         r1 = cli.get("/board")
         assert r1.json()["marker"] == "NEW"
@@ -575,13 +871,17 @@ def test_board_stamp_raises_on_nan_instead_of_silently_encoding_it(
     assert resp.status_code == 500
 
 
-def test_board_stamp_serializes_payload_once(
+def test_board_stamp_serializes_payload_twice(
     app_client: TestClient, monkeypatch
 ) -> None:
-    """#1597 Part 2: the ~5 MB board payload is JSON-encoded exactly ONCE per
-    build — the same bytes serve as both the ETag's content-hash input and
-    the wire body, instead of once for the hash and again for the response
-    (the "~10 MB of JSON work per rebuild" amplifier named in the issue).
+    """#1597 Part 2 established the wire body is encoded exactly once (no
+    separate render pass for the HTTP response). #3293 deliberately adds a
+    SECOND encode of a stable projection to compute the ETag digest from —
+    hashing the wire bytes directly meant the digest moved on every build
+    (see ``_stamp_board_version``'s docstring), so the two can no longer be
+    the same pass. This test pins the count at exactly 2 (not "however many
+    it happens to be") so a future change that reintroduces extra passes
+    (e.g. re-encoding per retry, or double-hashing) gets caught.
 
     Targets the full-payload dumps() call specifically (its distinctive
     ``separators=(",", ":")`` signature) so per-field encodes elsewhere in
@@ -602,9 +902,9 @@ def test_board_stamp_serializes_payload_once(
     resp = app_client.get("/board")
 
     assert resp.status_code == 200
-    assert len(calls) == 1, (
-        f"the full-board payload was JSON-encoded {len(calls)}x for one "
-        "build — expected exactly 1"
+    assert len(calls) == 2, (
+        f"the board payload was JSON-encoded {len(calls)}x for one build — "
+        "expected exactly 2 (wire body + #3293's digest projection)"
     )
 
 

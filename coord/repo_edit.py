@@ -22,8 +22,35 @@ from __future__ import annotations
 
 import re
 
+import yaml
+
 # A top-level key line: no leading whitespace, ends in a colon.
 _TOP_LEVEL_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*:")
+
+
+def _yaml_kv(indent: str, key: str, value: str) -> str:
+    """Render ``f"{indent}{key}: {value}"`` with *value* quoted/escaped by
+    PyYAML itself rather than hand-rolled ``f'"{value}"'`` wrapping (#3285).
+
+    The hand-rolled form breaks the moment ``value`` contains a literal
+    ``"`` — it terminates the scalar early and the post-write parse check
+    (this module's whole safety net, see the module docstring) correctly
+    refuses to write. A ``\\`` is worse: inside a double-quoted YAML scalar
+    it is an escape character, so it does NOT fail — it silently rewrites
+    the value to something else, and the config parses fine with the wrong
+    ``test_command``/``build_command``/etc. now living in it.
+
+    ``yaml.safe_dump`` already knows the full quoting rules (when plain
+    style is safe, when single- or double-quoting is required, how to
+    escape each), so delegate to it instead of re-deriving them. Dumping a
+    one-key dict — rather than the bare scalar — sidesteps the `...`
+    document-end marker PyYAML appends to a bare top-level scalar, and
+    ``width=float("inf")`` keeps the whole value on one line so this
+    module's line-based block finder (``_find_block``) still sees exactly
+    one line per field.
+    """
+    dumped = yaml.safe_dump({key: value}, default_flow_style=False, width=float("inf"))
+    return indent + dumped.rstrip("\n")
 
 
 class RepoEditError(RuntimeError):
@@ -98,9 +125,9 @@ def render_repo_entry(
         f"    default_branch: {default_branch}",
     ]
     if build_command:
-        lines.append(f'    build_command: "{build_command}"')
+        lines.append(_yaml_kv("    ", "build_command", build_command))
     if test_command:
-        lines.append(f'    test_command: "{test_command}"')
+        lines.append(_yaml_kv("    ", "test_command", test_command))
     if uat_live_preview:
         lines.append("    uat_live_preview: true")
     return "\n".join(lines) + "\n"
@@ -143,10 +170,10 @@ def render_acceptance_driver_entry(
     """
     lines = [f"    {repo_name}:", f"      kind: {kind}"]
     if setup:
-        lines.append(f'      setup: "{setup}"')
-    lines.append(f'      run: "{run}"')
+        lines.append(_yaml_kv("      ", "setup", setup))
+    lines.append(_yaml_kv("      ", "run", run))
     if mock:
-        lines.append(f'      mock: "{mock}"')
+        lines.append(_yaml_kv("      ", "mock", mock))
     if capability:
         lines.append(f"      capability: {capability}")
     if entrypoint:
@@ -217,16 +244,19 @@ def insert_acceptance_driver_entry(text: str, entry: str) -> str:
 def render_portal_project_repo_entry(project_id: str, repos: list[str]) -> str:
     """The ``portal.project_repos`` list entry mapping *project_id* to *repos*.
 
-    ``project_id`` is quoted because the portal's identifiers are opaque
-    (``proj_67deaa6d1291`` today, but nothing promises the next one is not
-    all-digits, ``yes``, or ``on`` — each of which YAML 1.1 would silently
-    parse as a non-string and then fail ``_parse_portal_project_repos``'
-    "must be a non-empty string" check for reasons an operator would have to
-    reverse-engineer). Repo names are already validated against ``repos[]``
-    at load, so they need no quoting.
+    ``project_id`` goes through :func:`_yaml_kv` (#3285) rather than a hand
+    rolled ``f'"{project_id}"'`` wrap, for two independent reasons: the
+    portal's identifiers are opaque (``proj_67deaa6d1291`` today, but nothing
+    promises the next one is not all-digits, ``yes``, or ``on`` — each of
+    which YAML 1.1 would silently parse as a non-string and then fail
+    ``_parse_portal_project_repos``' "must be a non-empty string" check for
+    reasons an operator would have to reverse-engineer), *and* an id
+    containing a literal ``"`` or ``\\`` must not break or silently corrupt
+    the write the way the hand-rolled form did. Repo names are already
+    validated against ``repos[]`` at load, so they need no quoting.
     """
     return (
-        f'    - project_id: "{project_id}"\n'
+        f"{_yaml_kv('    - ', 'project_id', project_id)}\n"
         f"      repos: [{', '.join(repos)}]\n"
     )
 
@@ -361,17 +391,34 @@ def add_repo_to_machine(
     ``repos: [a, b]`` flow list and a block list. Idempotent — a repo already
     listed is left alone rather than duplicated (a duplicate is not a parse
     error, so nothing downstream would ever have told the operator).
+
+    A *wrapped* flow sequence — ``repos: [a, b,`` with the closing ``]`` on a
+    later line, which is what a formatter (or a human) produces once the list
+    outgrows one line — is a third spelling this function cannot rewrite.
+    Rather than fall through and misreport it as a missing `repos:` key
+    (#3284), it is detected explicitly and refused with a message that says
+    what is actually true, before anything is written.
     """
     lines = text.splitlines(keepends=True)
     start, end = _machine_entry_range(lines, machine)
 
     # ── `repos:` list ────────────────────────────────────────────────────
     repos_line = None
+    wrapped_line = None
     for i in range(start, end):
         if re.match(r"^\s*repos:\s*(\[.*\])?\s*$", lines[i]):
             repos_line = i
             break
+        if re.match(r"^\s*repos:\s*\[", lines[i]) and "]" not in lines[i]:
+            wrapped_line = i
+            break
     if repos_line is None:
+        if wrapped_line is not None:
+            raise RepoEditError(
+                f"machine {machine!r} has a multi-line flow sequence for "
+                "`repos:`, which this editor cannot rewrite; reflow it onto "
+                "one line and retry"
+            )
         raise RepoEditError(
             f"machine {machine!r} has no `repos:` key — refusing to guess where "
             "to put one"

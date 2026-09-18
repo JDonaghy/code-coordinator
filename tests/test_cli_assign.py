@@ -34,6 +34,16 @@ machines:
 """
 
 # Config with pipeline.labels defined to test label→gate resolution.
+#
+# #3269: the ``needs-smoke`` label's gate list says ``test``, not ``smoke``.
+# "smoke" is this codebase's *internal stage* name for the smoke-test
+# assignment (``assignment.type == "smoke"``); the *gate* name that
+# ``required_gates``/``default_gates`` speak is "test" — see #1724 and
+# ``coord.pipeline._STAGE_NAME_TO_GATE_NAME``. This fixture carried the
+# stage name until #3269 added the gate-name registry, which is exactly the
+# class of silently-inert config that registry exists to reject: nothing
+# consults "smoke", so ``requires_smoke``'s ``"test" in gates`` never
+# matched and the gate this label was written to *add* was never enforced.
 CONFIG_YAML_WITH_PIPELINE = """\
 repos:
   - name: api
@@ -50,7 +60,7 @@ pipeline:
   labels:
     documentation: [merge]
     hotfix: [merge]
-    needs-smoke: [review, smoke, merge]
+    needs-smoke: [review, test, merge]
 """
 
 
@@ -270,7 +280,8 @@ class TestAssignInteractiveRequiresTty:
 
 class TestAssignDryRun:
     def test_dry_run_does_not_dispatch(self, config_file: Path, coord_dir: Path) -> None:
-        with patch("coord.github_ops.get_issue", return_value={"title": "Add feature X"}):
+        with patch("coord.github_ops.get_issue", return_value={"title": "Add feature X"}), \
+             patch("coord.claim.find_work_claim", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["assign", "laptop", "api", "42", "--config", str(config_file), "--dry-run"],
@@ -285,7 +296,8 @@ class TestAssignDryRun:
         """Dry run should not call dispatch or post_briefing."""
         with patch("coord.github_ops.get_issue", return_value={"title": "t"}) as gi, \
              patch("coord.dispatch.dispatch") as disp, \
-             patch("coord.dispatch.post_briefing") as brief:
+             patch("coord.dispatch.post_briefing") as brief, \
+             patch("coord.claim.find_work_claim", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["assign", "laptop", "api", "1", "--config", str(config_file), "--dry-run"],
@@ -294,6 +306,30 @@ class TestAssignDryRun:
         gi.assert_called_once()
         disp.assert_not_called()
         brief.assert_not_called()
+
+    def test_dry_run_still_runs_the_claim_check(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#3347: a dry run used to skip the claim check entirely (it only ran
+        on the real dispatch path), so an operator previewing a dispatch got
+        a clean bill of health right before the very same command, run for
+        real, refused. `--dry-run` must exercise the same claim check a real
+        dispatch would, so the skip is visible up front."""
+        from coord.claim import Claim
+
+        fake_claim = Claim(
+            issue_number=7, repo_name="api", source="board",
+            machine_name="server", assignment_id="old-1",
+        )
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("coord.claim.find_work_claim", return_value=fake_claim):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(config_file), "--dry-run"],
+            )
+        assert result.exit_code == 0
+        assert "skipping" in result.output
+        assert "dry run" in result.output
 
 
 class TestAssignDispatch:
@@ -431,6 +467,139 @@ class TestAssignDispatch:
             )
         assert result.exit_code == 1
         assert "skipping" in result.output
+
+    def test_remote_branch_claim_adopts_instead_of_failing(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#3347: a `remote_branch` claim (real, pushed work with NO board
+        row — the shape #611's branch-backfill sweep cannot reach because
+        there is no existing row to attach a branch to) must not exit
+        non-zero. A non-zero exit here reads as an infrastructure/dispatch
+        failure to `coord drive`, which burns the queue entry's retry
+        budget and blocks it, cascading to every `after=` dependent — even
+        though the issue's work is already done and pushed. `coord assign`
+        adopts the branch as a `done` work assignment and exits 0 instead,
+        so `coord drive` sees a clean exit and the normal Test/Review
+        auto-dispatch loop can pick the row up on its own."""
+        from coord.claim import Claim
+
+        fake_claim = Claim(
+            issue_number=967, repo_name="api", source="remote_branch",
+            branch="issue-967-fix",
+        )
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix drift"}), \
+             patch("coord.claim.find_work_claim", return_value=fake_claim), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "967", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "skipping" in result.output
+        assert "adopted" in result.output
+        disp.assert_not_called()  # no live worker — the branch already exists
+
+        board = state_mod.build_board()
+        adopted = [
+            a for a in board.completed
+            if a.repo_name == "api" and a.issue_number == 967
+        ]
+        assert len(adopted) == 1
+        assert adopted[0].status == "done"
+        assert adopted[0].type == "work"
+        assert adopted[0].branch == "issue-967-fix"
+        assert adopted[0].review_state == "pending"
+
+    def test_remote_branch_claim_dry_run_previews_without_writing(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """`--dry-run` must preview the adoption, not perform it — the same
+        no-side-effect contract every other `--dry-run` branch keeps."""
+        from coord.claim import Claim
+
+        fake_claim = Claim(
+            issue_number=967, repo_name="api", source="remote_branch",
+            branch="issue-967-fix",
+        )
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix drift"}), \
+             patch("coord.claim.find_work_claim", return_value=fake_claim):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "967", "--config", str(config_file), "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "dry run" in result.output
+        assert "adopt" in result.output
+
+        board = state_mod.build_board()
+        assert not board.active and not board.completed
+
+    def test_remote_branch_claim_does_not_double_adopt_a_completed_row(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#3347 review: `find_work_claim` only scans `board.active` —
+        `Board.mark_done()` moves a finished work row to `board.completed`
+        the moment a Work-stage worker finishes, which is the normal state
+        for every issue between "Work done" and "Test/Review dispatched",
+        not a rare edge case. In that window a `remote_branch` claim still
+        fires (the branch is real and unmerged), but the board is NOT
+        actually empty for this issue — a real row already tracks it. The
+        adopt path must notice that (via `assignments_for_issue`, which
+        unions active + completed) and skip adopting a second, phantom row
+        with a different, fabricated `assignment_id` — otherwise a later
+        bulk review/smoke dispatch loop (keyed on `assignment_id`, not
+        `(repo, issue)`) could double-dispatch against the same PR.
+
+        Deliberately does NOT patch `find_work_claim` — the whole point is
+        to exercise its real board.active-only scan against a `completed`
+        row, only stubbing the remote branch lookup underneath it."""
+        from coord.models import Assignment, Board, Repo
+        from coord.state import save_board
+
+        real_work = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=967,
+            issue_title="Fix drift",
+            assignment_id="real-abc123",
+            status="done",
+            branch="issue-967-fix",
+            type="work",
+            dispatched_at=0.0,
+            finished_at=1.0,
+            review_state="pending",
+        )
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[real_work],
+        )
+        save_board(board)
+
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix drift"}), \
+             patch(
+                 "coord.claim._default_branch_lookup",
+                 return_value=["issue-967-fix"],
+             ), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "967", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "skipping" in result.output
+        assert "already tracked by assignment real-abc123" in result.output
+        assert "adopted" not in result.output
+        disp.assert_not_called()
+
+        after = state_mod.build_board()
+        matching = [
+            a for a in (list(after.active) + list(after.completed))
+            if a.repo_name == "api" and a.issue_number == 967
+        ]
+        assert len(matching) == 1
+        assert matching[0].assignment_id == "real-abc123"
 
     def test_force_bypasses_claim_check_and_sets_fresh_branch(self, config_file: Path, coord_dir: Path) -> None:
         """--force should skip claim detection and pass fresh_branch=True to dispatch."""
@@ -787,7 +956,7 @@ class TestAssignLabelGateResolution:
             )
         assert result.exit_code == 0
         proposal = disp.call_args[0][0]
-        assert proposal.required_gates == ["review", "smoke", "merge"]
+        assert proposal.required_gates == ["review", "test", "merge"]
 
     def test_unrecognized_label_falls_back_to_default_gates(
         self, pipeline_config_file: Path, coord_dir: Path

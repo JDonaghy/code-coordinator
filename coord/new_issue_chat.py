@@ -194,14 +194,29 @@ def dispatch_new_issue_chat(
     )
 
     from coord.dispatch import dispatch_with_retry
+    from coord.network import claude_credential_reachable  # noqa: PLC0415
     from coord.models import Assignment
     from coord.state import record_dispatched_assignment
 
+    # #3371: a dead claude credential on the target host is not a
+    # transient failure backoff can fix — refuse before POSTing an
+    # assignment that would fail at turn 1 for $0 (dispatch()'s
+    # STRUCTURAL CREDENTIAL-HEALTH GATE raises ValueError).
+    # #3376 review round 1: NOT wiring `issue_liveness_fetcher` here on
+    # purpose — this proposal carries the `issue_number=0` sentinel (no
+    # GitHub issue exists yet; that's the whole point of a new-issue-draft
+    # chat), so "is this issue closed / is its branch merged" has no real
+    # question to answer. `coord.dispatch_liveness.github_issue_liveness_
+    # fetcher` fails open for issue #0 (a `gh` 404 just becomes "not
+    # closed"), so wiring it would be harmless but purely wasted `gh` calls
+    # on every message — every OTHER `dispatch_with_retry` site in the
+    # chat/mock-author family that carries a REAL issue number wires it.
     response = dispatch_with_retry(
         proposal,
         config,
         max_retries=config.concurrency.max_retries,
         backoff_base=config.concurrency.backoff_base,
+        credential_fetcher=claude_credential_reachable,
     )
 
     assignment_id = response.get("id") or uuid.uuid4().hex[:12]

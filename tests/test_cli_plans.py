@@ -25,8 +25,11 @@ from coord.plans import (
     PlanEntry,
     aggregate_plan,
     aggregate_repo_plans,
+    find_stale_epics,
     find_tracking_issue,
+    find_unlabelled_epics,
 )
+from coord.state import upsert_open_issues
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -780,3 +783,478 @@ class TestPlansCli:
         # Confirm it's JSON-serialisable.
         round_tripped = json.loads(json.dumps(d))
         assert round_tripped == d
+
+
+# ── find_unlabelled_epics (#3227) ────────────────────────────────────────────
+
+
+def _cached_issue(
+    number: int,
+    title: str,
+    *,
+    repo_name: str = "api",
+    state: str = "open",
+    labels: list[str] | None = None,
+    body: str = "",
+) -> dict:
+    """A local-cache-shaped issue dict, matching what
+    :func:`coord.dao.SqliteStore.list_issues` decodes from the ``issues``
+    table (``labels`` as a plain ``list[str]``, unlike GitHub's raw
+    ``[{"name": ...}]`` shape that :func:`_issue` above builds)."""
+    return {
+        "repo_name": repo_name,
+        "number": number,
+        "title": title,
+        "state": state,
+        "labels": labels or [],
+        "body": body,
+    }
+
+
+class TestFindUnlabelledEpics:
+    def test_title_matches_but_unlabelled_is_flagged(self) -> None:
+        issues = [_cached_issue(837, "[platform] Epic: multi-tenant billing")]
+        hits = find_unlabelled_epics(issues)
+        assert [h["number"] for h in hits] == [837]
+
+    def test_title_matches_and_labelled_is_not_flagged(self) -> None:
+        issues = [
+            _cached_issue(
+                836, "[platform] Epic: something already fixed", labels=["epic"]
+            )
+        ]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_title_doesnt_match_is_not_flagged(self) -> None:
+        issues = [_cached_issue(1, "Fix flaky test in reconcile loop")]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_matches_bare_epic_prefix_case_insensitive(self) -> None:
+        issues = [
+            _cached_issue(380, "Epic: goal-driven autonomous planner"),
+            _cached_issue(531, "EPIC: coordinator<->vimcode integration"),
+        ]
+        hits = find_unlabelled_epics(issues)
+        assert {h["number"] for h in hits} == {380, 531}
+
+    def test_matches_bare_bracket_epic_tag(self) -> None:
+        issues = [_cached_issue(1, "[epic] some big initiative")]
+        hits = find_unlabelled_epics(issues)
+        assert [h["number"] for h in hits] == [1]
+
+    def test_closed_issue_is_not_flagged(self) -> None:
+        issues = [_cached_issue(2, "Epic: dead epic", state="closed")]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_word_epic_mid_title_does_not_false_positive(self) -> None:
+        """ "Epic" appearing later in a title, or without a colon immediately
+        after it, must not trip the lint."""
+        issues = [
+            _cached_issue(3, "Epicurious recipe importer"),
+            _cached_issue(4, "Make the onboarding flow more epic"),
+        ]
+        assert find_unlabelled_epics(issues) == []
+
+    def test_accepts_github_shaped_labels_too(self) -> None:
+        """A GitHub-raw ``[{"name": ...}]`` labels list (as
+        :func:`find_tracking_issue` consumes) is also tolerated."""
+        issues = [
+            _cached_issue(5, "Epic: labelled via github shape")
+            | {"labels": [{"name": "epic"}]}
+        ]
+        assert find_unlabelled_epics(issues) == []
+
+
+# ── find_stale_epics (#3228) ─────────────────────────────────────────────────
+
+
+def _epic_with_sub_issues(
+    number: int,
+    title: str,
+    child_numbers: list[int],
+    *,
+    repo_name: str = "api",
+    state: str = "open",
+) -> dict:
+    """A cached, ``"epic"``-labelled tracking issue whose ``## Sub-issues``
+    checklist names *child_numbers* — every box left unchecked (``[ ]``), so
+    a test asserting a flag/no-flag verdict off this fixture is provably
+    reading the children's REAL cached state, not the checklist's box."""
+    checklist = "\n".join(f"- [ ] #{n}" for n in child_numbers)
+    return _cached_issue(
+        number,
+        title,
+        repo_name=repo_name,
+        state=state,
+        labels=["epic"],
+        body=f"## Sub-issues\n{checklist}\n" if child_numbers else "## Sub-issues\n",
+    )
+
+
+class TestFindStaleEpics:
+    def test_zero_children_is_flagged(self) -> None:
+        issues = [_epic_with_sub_issues(100, "Epic: nothing registered", [])]
+        hits = find_stale_epics(issues)
+        assert [h["number"] for h in hits] == [100]
+        assert hits[0]["child_total"] == 0
+        assert hits[0]["child_open"] == 0
+        assert hits[0]["child_closed"] == 0
+
+    def test_all_children_closed_in_cache_is_flagged_despite_unchecked_boxes(
+        self,
+    ) -> None:
+        """The checklist boxes are `[ ]` (unchecked) but both children are
+        `closed` in the local cache — #1061 stopped keeping the checkbox in
+        sync, so the real cached state must win."""
+        issues = [
+            _epic_with_sub_issues(200, "Epic: fully shipped", [201, 202]),
+            _cached_issue(201, "child one", state="closed"),
+            _cached_issue(202, "child two", state="closed"),
+        ]
+        hits = find_stale_epics(issues)
+        assert [h["number"] for h in hits] == [200]
+        assert hits[0]["child_total"] == 2
+        assert hits[0]["child_open"] == 0
+        assert hits[0]["child_closed"] == 2
+
+    def test_at_least_one_open_child_is_not_flagged(self) -> None:
+        issues = [
+            _epic_with_sub_issues(300, "Epic: still in flight", [301, 302]),
+            _cached_issue(301, "child one", state="closed"),
+            _cached_issue(302, "child two", state="open"),
+        ]
+        assert find_stale_epics(issues) == []
+
+    def test_closed_epic_is_not_flagged(self) -> None:
+        issues = [
+            _epic_with_sub_issues(400, "Epic: already tidied up", [], state="closed"),
+        ]
+        assert find_stale_epics(issues) == []
+
+    def test_non_epic_issue_is_not_flagged(self) -> None:
+        issues = [_cached_issue(1, "Fix flaky test in reconcile loop")]
+        assert find_stale_epics(issues) == []
+
+    def test_falls_back_to_work_order_when_no_sub_issues_checklist(self) -> None:
+        """An epic that predates #1008 has only a `## Work order` block, no
+        separate `## Sub-issues` checklist — must still resolve children via
+        the `fallback_to_work_order=True` path, not report zero children."""
+        body = (
+            "## Work order\n"
+            "- [ ] #501 {group: a}\n"
+            "- [ ] #502 {group: a}\n"
+        )
+        issues = [
+            _cached_issue(500, "Epic: legacy work order", labels=["epic"], body=body),
+            _cached_issue(501, "child one", state="closed"),
+            _cached_issue(502, "child two", state="closed"),
+        ]
+        hits = find_stale_epics(issues)
+        assert [h["number"] for h in hits] == [500]
+        assert hits[0]["child_total"] == 2
+
+    def test_child_missing_from_cache_defaults_to_open_not_flagged(self) -> None:
+        """A declared child absent from the cache entirely (unsynced, or in
+        another repo) is treated as unresolvable/open — the conservative
+        default that avoids flagging a possibly-still-live epic."""
+        issues = [_epic_with_sub_issues(600, "Epic: partially synced", [601])]
+        assert find_stale_epics(issues) == []
+
+    def test_malformed_checklist_is_skipped_not_raised(self) -> None:
+        """A hand-edited checklist with a duplicate ``#N`` entry makes
+        ``parse_sub_issues`` raise ``WorkOrderError`` — that must not blow up
+        the whole scan (one bad epic body must never blank the rest of
+        ``--lint-stale-epics``'s output, matching
+        ``MarkdownParentage.parent()``'s and
+        ``milestone_work_order_membership``'s posture for the same parse
+        call). The malformed epic is silently skipped, not flagged, and a
+        well-formed epic elsewhere in the same batch is still reported."""
+        malformed = _cached_issue(
+            100,
+            "Epic: malformed checklist",
+            labels=["epic"],
+            body="## Sub-issues\n- [ ] #10\n- [ ] #10\n",
+        )
+        healthy = _epic_with_sub_issues(700, "Epic: nothing registered", [])
+        hits = find_stale_epics([malformed, healthy])
+        assert [h["number"] for h in hits] == [700]
+
+
+# ── coord plans --lint-epics CLI integration (#3227) ────────────────────────
+
+
+class TestLintEpicsCli:
+    def test_flags_unlabelled_epic_from_local_cache(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 837,
+                    "title": "[platform] Epic: multi-tenant billing",
+                    "body": "",
+                    "labels": [],
+                },
+                {
+                    "number": 836,
+                    "title": "[platform] Epic: already labelled",
+                    "body": "",
+                    "labels": [{"name": "epic"}],
+                },
+                {
+                    "number": 1,
+                    "title": "Fix flaky test",
+                    "body": "",
+                    "labels": [],
+                },
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "#837" in result.output
+        assert "already labelled" not in result.output
+        assert "Fix flaky test" not in result.output
+        # No GitHub calls happened for the lint itself — get_open_issues was
+        # only ever called with [] (no milestones), confirming the lint read
+        # came from the local cache, not a network fetch.
+
+    def test_no_hits_prints_clean_message(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [{"number": 1, "title": "Fix flaky test", "body": "", "labels": []}],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "No unlabelled epics found." in result.output
+
+    def test_json_output_carries_unlabelled_epics_key(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 380,
+                    "title": "Epic: goal-driven autonomous planner",
+                    "body": "",
+                    "labels": [],
+                }
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--json", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["plans"] == []
+        assert data["unlabelled_epics"] == [
+            {"repo": "api", "number": 380, "title": "Epic: goal-driven autonomous planner"}
+        ]
+
+    def test_without_flag_json_stays_a_plain_array(self, config_file: Path) -> None:
+        """Backward compatibility: omitting --lint-epics keeps --json's
+        historical shape (a bare array), unaffected by the new flag."""
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main, ["plans", "--json", "--config", str(config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data == []
+
+
+# ── coord plans --lint-stale-epics CLI integration (#3228) ──────────────────
+
+
+class TestLintStaleEpicsCli:
+    def test_flags_epic_with_all_children_closed_in_cache(self, config_file: Path) -> None:
+        """Same drift #1085 illustrates: the checklist boxes stay `[ ]` but
+        both children are `closed` in the cache — the lint must flag off the
+        real cached state, not the stale checkbox."""
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 900,
+                    "title": "Epic: fully shipped",
+                    "body": "## Sub-issues\n- [ ] #901\n- [ ] #902\n",
+                    "labels": [{"name": "epic"}],
+                },
+                {"number": 901, "title": "child one", "body": "", "labels": []},
+                {"number": 902, "title": "child two", "body": "", "labels": []},
+            ],
+        )
+        # Close the two children in the cache (upsert_open_issues marks
+        # anything absent from the NEXT sync's open-issue list as closed).
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 900,
+                    "title": "Epic: fully shipped",
+                    "body": "## Sub-issues\n- [ ] #901\n- [ ] #902\n",
+                    "labels": [{"name": "epic"}],
+                }
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-stale-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "#900" in result.output
+        assert "2 open / 0 closed" not in result.output  # sanity: not the not-flagged shape
+        assert "0 open / 2 closed" in result.output
+
+    def test_epic_with_open_child_is_not_flagged(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 910,
+                    "title": "Epic: still in flight",
+                    "body": "## Sub-issues\n- [ ] #911\n",
+                    "labels": [{"name": "epic"}],
+                },
+                {"number": 911, "title": "child one", "body": "", "labels": []},
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-stale-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "No stale epics found." in result.output
+
+    def test_zero_children_epic_is_flagged(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 920,
+                    "title": "Epic: never got children",
+                    "body": "",
+                    "labels": [{"name": "epic"}],
+                }
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-stale-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "#920" in result.output
+        assert "of 0)" in result.output
+
+    def test_json_output_carries_stale_epics_key(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 930,
+                    "title": "Epic: never got children",
+                    "body": "",
+                    "labels": [{"name": "epic"}],
+                }
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-stale-epics", "--json", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["plans"] == []
+        assert "unlabelled_epics" not in data
+        assert data["stale_epics"] == [
+            {
+                "repo": "api",
+                "number": 930,
+                "title": "Epic: never got children",
+                "child_total": 0,
+                "child_open": 0,
+                "child_closed": 0,
+            }
+        ]
+
+    def test_both_flags_together_carry_both_json_keys(self, config_file: Path) -> None:
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 940,
+                    "title": "[platform] Epic: unlabelled one",
+                    "body": "",
+                    "labels": [],
+                },
+                {
+                    "number": 950,
+                    "title": "Epic: stale one",
+                    "body": "",
+                    "labels": [{"name": "epic"}],
+                },
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "plans",
+                    "--lint-epics",
+                    "--lint-stale-epics",
+                    "--json",
+                    "--config",
+                    str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert [i["number"] for i in data["unlabelled_epics"]] == [940]
+        assert [i["number"] for i in data["stale_epics"]] == [950]

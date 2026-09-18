@@ -119,6 +119,13 @@ def row_to_assignment(row: object) -> Assignment:
         # #1629: the toolchain that produced test_state; None for pre-1629
         # rows or an unresolvable toolchain (renders as "unknown").
         test_toolchain=d.get("test_toolchain"),
+        # #3357: machine-readable provenance for test_state — was it actually
+        # confirmed by an out-of-band re-run, or just carried forward from
+        # the worker's own claim? None for pre-3357 rows, a write that never
+        # asked the confirmation question, or (on the daemon-JSON path) a
+        # payload that doesn't carry this column yet — see
+        # coord.models.Assignment.test_confirmation.
+        test_confirmation=d.get("test_confirmation"),
         review_verdict=d.get("review_verdict"),
         # #1456: coordinator-override audit trail; None when the reviewer's
         # verdict stands (the normal case) and for pre-1456 rows.
@@ -181,6 +188,11 @@ def row_to_assignment(row: object) -> Assignment:
         # session's own bash tool). None for a hand or coordinator/brain
         # dispatch, and for rows predating this column.
         dispatched_by_assignment_id=d.get("dispatched_by_assignment_id"),
+        # #3339: the `coord drive-queue clear-refusal` assertion; None for
+        # every row predating this column and for every row nobody has
+        # asserted against.
+        premise_rechecked_at=d.get("premise_rechecked_at"),
+        premise_rechecked_reason=d.get("premise_rechecked_reason"),
     )
 
 

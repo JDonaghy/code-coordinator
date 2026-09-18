@@ -18,10 +18,11 @@ the same completed assignment).
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Callable
 
-from coord.models import Board
+from coord.models import Assignment, Board
 
 
 # A branch_lookup takes (repo_github, issue_number) and returns the matching
@@ -142,6 +143,100 @@ def claim_remedy_hint(claim: Claim, repo_name: str, issue_number: int) -> str:
         f"if its PR already merged, delete the stale branch with `git push "
         f"origin --delete {branch}`, then dispatch again; if the PR is still "
         f"open, wait for it to land (or close it) first"
+    )
+
+
+def adopt_remote_branch_claim(
+    claim: Claim,
+    *,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    issue_title: str,
+    required_gates: list[str] | None = None,
+    driven_by: str | None = None,
+    assignment_type: str = "work",
+) -> Assignment:
+    """Build a `done` work assignment for a `source="remote_branch"` claim (#3347).
+
+    A ``remote_branch`` claim means the board had NO *active* row for this
+    issue, yet ``issue-{N}-*`` already exists on the remote and is genuinely
+    unmerged (``find_work_claim`` already dropped every merged/squash-merged
+    candidate via ``_drop_merged_branches`` before returning this). Most of
+    the time that also means no row *at all* — real, finished Work-stage
+    output with nowhere on the board to attach to — `coord reconcile-merges`'s
+    #611 branch-backfill sweep only fills in a *missing branch* on an
+    *existing* assignment row; it is a no-op here because no row exists at
+    all. (Callers MUST confirm that with `coord.gates.assignments_for_issue`,
+    which unions ``board.active`` *and* ``board.completed``, before calling
+    this — a `completed` row for the same issue is the normal state between
+    "Work done" and "Test/Review dispatched" and is invisible to
+    ``find_work_claim``'s active-only scan; adopting on top of it would write
+    a second, phantom row. See #3347's review.)
+
+    Without this, `coord assign` used to just refuse (correctly refusing to
+    double-dispatch) and exit non-zero, which `coord drive` read as a
+    dispatch failure: the queue entry burned its retry budget and went
+    `blocked`, taking every `after=` dependent down with it — even though
+    the work this issue needed was already done and pushed.
+
+    This is the alternative: adopt the branch as though a work session had
+    just finished normally — `status="done"`, `review_state="pending"` (the
+    same value `coord.reconcile`'s Pass 1 stamps on every finished work row)
+    so the existing review/smoke auto-dispatch loop picks it up on its own,
+    with no new pipeline machinery needed downstream of this row's write.
+
+    *machine_name* names the machine this exact `coord assign` invocation
+    was about to dispatch to — a real, configured machine, so the row passes
+    `coord.state._validate_dispatch_target` the same as any other write
+    through `coord.board_service.write_board`. Nothing actually ran there;
+    the field is purely to satisfy the schema, the same fiction the #611
+    backfill sweep already relies on for a branch pushed by a session whose
+    own board row this repo may since have pruned.
+
+    *assignment_type* defaults to ``"work"`` but should be passed as
+    whatever this exact dispatch attempt would actually have used —
+    ``"plan"`` for a plan-only dispatch, or a labelled epic's
+    `dispatch_type` (e.g. ``"epic-decompose"``) — rather than always
+    hardcoding `"work"`. Downstream `type`-keyed guards (e.g. #1314's
+    epic auto-close guard) read this field, and a mismatched type on the
+    adopted row would fool them about what kind of work actually produced
+    the branch.
+
+    The caller is responsible for appending the returned :class:`Assignment`
+    to a :class:`Board` and calling `coord.board_service.write_board` — this
+    function only builds the row; it never touches storage itself, so it
+    stays a pure, easily-tested constructor like the rest of this module.
+    """
+    if claim.source != "remote_branch":
+        raise ValueError(
+            f"adopt_remote_branch_claim requires a remote_branch claim, got "
+            f"{claim.source!r}"
+        )
+    now = time.time()
+    return Assignment(
+        # A deterministic, legible id rather than leaving it None: #2087's
+        # `write_board` can route to a REMOTE daemon (`coord.board_service`),
+        # which only mutates the daemon's own copy of a fallback-generated
+        # id — never this in-memory object — so a caller printing the id
+        # right after `write_board` must not depend on `coord.state.
+        # save_board`'s local-only "mutates in place" fallback (it would
+        # print `None` on a thin client). Also idempotent: re-adopting the
+        # same (repo, issue) after a board rebuild lands on the same row via
+        # `ON CONFLICT DO UPDATE` instead of piling up duplicates.
+        assignment_id=f"adopted-{repo_name}-{issue_number}",
+        machine_name=machine_name,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        status="done",
+        type=assignment_type,
+        branch=claim.branch,
+        dispatched_at=now,
+        finished_at=now,
+        review_state="pending",
+        required_gates=list(required_gates or []),
+        driven_by=driven_by,
     )
 
 
@@ -308,12 +403,18 @@ def has_active_work_followup(
 # ── Default branch lookup (uses gh) ─────────────────────────────────────────
 
 
-def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
-    """Return remote branches whose name starts with `issue-{N}-`.
+def list_matching_remote_branches(repo_github: str, issue_number: int) -> list[str]:
+    """Every remote branch whose name starts with `issue-{N}-`, merged or not.
 
     Uses `gh api repos/.../git/matching-refs/heads/issue-{N}-`. Empty result
     on any lookup failure — we'd rather wave through a dispatch than block
-    on a transient GH error.
+    on a transient GH error. Public (#3376): `_default_branch_lookup` below
+    is the claim-detection caller that then drops the merged ones; the
+    dispatch-liveness `branch_merged` predicate
+    (`coord.dispatch_liveness.github_issue_liveness_fetcher`, via
+    `any_matching_branch_merged`) needs the UNFILTERED list instead — one
+    raw lookup, two different filters, rather than two independently
+    drifting `gh api matching-refs` call sites (#2096).
     """
     from coord import github_ops
 
@@ -337,11 +438,41 @@ def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
         ref = r.get("ref", "")
         if isinstance(ref, str) and ref.startswith("refs/heads/"):
             branches.append(ref[len("refs/heads/"):])
-    # Drop branches already fully merged into the default branch — a merged
-    # branch is finished work, not an active claim. A stale merged branch (e.g. a
-    # PR head that wasn't auto-deleted on merge) must not block new work on the
-    # issue forever (the chat→work block on a long-merged issue-N-* branch).
+    return branches
+
+
+def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
+    """Return remote branches whose name starts with `issue-{N}-`, with any
+    already fully-merged into the default branch dropped.
+
+    A merged branch is finished work, not an active claim. A stale merged
+    branch (e.g. a PR head that wasn't auto-deleted on merge) must not
+    block new work on the issue forever (the chat→work block on a
+    long-merged issue-N-* branch).
+    """
+    branches = list_matching_remote_branches(repo_github, issue_number)
     return _drop_merged_branches(repo_github, branches)
+
+
+def any_matching_branch_merged(repo_github: str, issue_number: int) -> bool:
+    """#3376: True when at least one remote branch matching `issue-{N}-*`
+    has already merged into the repo's default branch — the `branch_merged`
+    predicate `coord.dispatch_liveness.check_dispatch_liveness` needs,
+    backed by a live GitHub check.
+
+    Reuses the exact merge-detection `_drop_merged_branches` already
+    performs for claim detection (PR-merged OR `ahead_by == 0` ancestry,
+    survives squash merges — #3103): this is just "did filtering drop
+    anything", with the fail-open direction flipped to match a REFUSAL
+    predicate rather than a claim-signal — no matching branch at all, or
+    any lookup failure, returns `False` ("not merged, don't refuse
+    dispatch on this"), never `True`.
+    """
+    branches = list_matching_remote_branches(repo_github, issue_number)
+    if not branches:
+        return False
+    unmerged = set(_drop_merged_branches(repo_github, branches))
+    return any(b not in unmerged for b in branches)
 
 
 def _repo_default_branch(repo_github: str) -> str | None:

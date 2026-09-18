@@ -156,13 +156,41 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "site: it goes through tests.backends.open_named_session().",
     ),
     "test_sql_dialect.py": Classification(
-        7, (BUCKET_A,),
+        9, (BUCKET_A,),
         "The SQLite half of the dialect seam's own tests: dialect detection "
         "from a real sqlite3 connection, journal_mode=WAL, "
         "busy_timeout/query_only pragmas, a `mode=ro` URI connection. These "
         "must hardcode the driver — asserting `detect_dialect(conn) == "
         "'sqlite'` against a connection whose type an env var chooses is "
-        "circular.",
+        "circular. "
+        "+2 for #3294's sqlite_data_version test: `PRAGMA data_version` only "
+        "reports commits made by a connection OTHER than the reader's own, so "
+        "a writer and a reader on one file DB are the unit under test, not "
+        "incidental setup — a single connection (or a `:memory:` one, which "
+        "no second connection can reach) could not observe the property at "
+        "all.",
+    ),
+    "test_smoke_fanout_manifest_3333.py": Classification(
+        4, (BUCKET_A, BUCKET_C),
+        "#3333's cross-process regression: the fan-out manifest merge has to "
+        "be proven safe against two *separate OS processes* (the daemon "
+        "host's `coord notify` and `coord drive-queue tick` systemd units, "
+        "which are exactly the pair that raced in the incident), because a "
+        "process-local threading.Lock passed every sequential test while that "
+        "topology stayed broken. Two subprocesses can only meet on a database "
+        "they each open *by path*, so a real on-disk SQLite file is the unit "
+        "under test's own deployment shape, not incidental setup (A): one "
+        "site seeds the parent work row, the other reads the merged manifest "
+        "back after both children exit. The autouse coord_db fixture's "
+        "`:memory:` database is invisible to a child process, and "
+        "scratch_database() is out for the usual backend-following reason — "
+        "every test here is skipped under COORD_TEST_BACKEND=postgres, where "
+        "a second process would reach the server rather than a file. "
+        "+2 for the daemon half of the same seam (C): the standard "
+        "`rw_db`/`file_db` pair every POST-route test in this tree uses — "
+        "SqliteStore resolves the daemon's database by path, and TestClient "
+        "runs the handler on a worker thread, which is doubly load-bearing "
+        "here because this route now does its merge in a threadpool.",
     ),
     "test_deploy_coord_db_backup.py": Classification(
         2, (BUCKET_A,),
@@ -252,15 +280,25 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "alongside it rather than split across two buckets.",
     ),
     "test_board_schema.py": Classification(
-        3, (BUCKET_A, BUCKET_C),
+        4, (BUCKET_A, BUCKET_C),
         "Judgement call, reclassified from B during review: "
         "test_project_row_reads_sqlite_row_column_names_not_values exists "
         "specifically to pin that `sqlite3.Row` is a *sequence*, so `\"x\" in "
         "row` tests values not keys — the #632-class trap that blanks the "
         "whole board. Handing it a dict_row connection under "
         "COORD_TEST_BACKEND=postgres would silently stop testing the thing it "
-        "was written to test. The other two sites are C: a seeded fixture DB "
-        "for SqliteStore plus a reopen to prove a column really leaked.",
+        "was written to test. The other three sites are C: a seeded fixture DB "
+        "for SqliteStore, a reopen to prove a column really leaked, and the "
+        "`_assignment_written_locally` helper — one site shared by BOTH "
+        "wire-round-trip regressions (#3339's premise_rechecked_*, #3357's "
+        "test_confirmation), which seed a row into the same on-disk "
+        "`_seeded_db` file the TestClient's SqliteStore then reads back over "
+        "HTTP. The autouse `coord_db` connection is `:memory:` and "
+        "`SqliteStore` opens its own `mode=ro` connection BY PATH, so a "
+        "fixture-only version of those tests would assert against an empty "
+        "board. #3357 added the second such test and deliberately added NO "
+        "site: the shared helper is why this count stayed at 4 rather than "
+        "growing one per column-survives-the-wire regression.",
     ),
 
     # ── C: genuinely needs a second / separate connection ─────────────────
@@ -273,10 +311,26 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "checkpoint tick.",
     ),
     "test_board_read_path.py": Classification(
-        8, (BUCKET_C,),
-        "All file DBs for SqliteStore/TestClient; two are deliberate second "
+        10, (BUCKET_C,),
+        "All file DBs for SqliteStore/TestClient; four are deliberate second "
         "connections to an already-existing file DB, asserting "
-        "cross-connection visibility — the definition of bucket C.",
+        "cross-connection visibility — the definition of bucket C. The third "
+        "(#3293, test_board_version_stable_across_audit_and_health_tick_noise) "
+        "is the same shape as the #1336 one above it: it reopens the live "
+        "`detail_db` mid-test to land an audit_log row inside the 900s "
+        "recency window, then asserts the running daemon's next rebuild sees "
+        "it. The fourth (#3294, "
+        "test_board_rebuild_trigger_is_a_write_not_the_ttl_clock) is that "
+        "same shape once more, and is the most load-bearing instance of it: "
+        "the write MUST come from a connection the daemon knows nothing "
+        "about, because the behaviour under test is precisely that an "
+        "external writer (the drive-queue timer, a concurrent `coord notify`) "
+        "invalidates the /board cache without any POST to bust it. Routing it "
+        "through the daemon's own write path would assert the opposite of "
+        "what the test is for. Neither the autouse `coord_db` fixture nor "
+        "tests.backends.scratch_database() fits — both hand back a DIFFERENT "
+        "database than the one SqliteStore is already holding by path, so the "
+        "write would be invisible to the endpoint under test.",
     ),
     "test_needs_attention.py": Classification(
         4, (BUCKET_C,),
@@ -435,6 +489,23 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         2, (BUCKET_C,),
         "A file DB for board_projection, plus a check_same_thread=False "
         "connection for the daemon threadpool sweep.",
+    ),
+    "test_housekeeping.py": Classification(
+        2, (BUCKET_C,),
+        "#3296's drive_queue/plans archival tests, the same two shapes as "
+        "test_board_cap_762.py above (the file this one extends the sweep "
+        "alongside). One is a `file_db` fixture whose *path* is handed to "
+        "SqliteStore(path) for the board_projection read while its *conn* is "
+        "handed to db.override_connection() for the sweep's write, so both "
+        "halves must agree on one on-disk database; the other is a "
+        "check_same_thread=False connection because the /drive-queue route "
+        "runs on a TestClient worker thread. Neither fits the autouse "
+        "coord_db fixture (`:memory:` has no path for SqliteStore to open, "
+        "and it is single-thread-bound) nor tests.backends."
+        "scratch_database() (it yields a connection, not the path "
+        "SqliteStore needs, and SqliteStore is the SQLite arm of the store "
+        "seam by definition — following COORD_TEST_BACKEND to Postgres "
+        "would hand it a database it cannot open).",
     ),
     "test_approved_work_2532.py": Classification(
         2, (BUCKET_C,),

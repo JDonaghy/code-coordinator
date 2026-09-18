@@ -19,11 +19,20 @@ Endpoints:
 * ``GET /assignment/{id}`` — single-assignment detail: the complete row
   (briefing + full free-text fields).  Point lookups get point endpoints.
 * ``GET /issue/{repo_name}/{number}`` — single-issue detail (full body).
+* ``GET /issues``   — cached ``issues`` rows (labels decoded, body included),
+  optionally scoped by repeated ``?repo_name=`` params (#3227/#3228); backs
+  ``coord.state.cached_open_issues``/``coord plans --lint-epics``/
+  ``--lint-stale-epics`` on a thin client. Not part of ``/board`` — the
+  ``Board`` model carries no issues field.
 * ``GET /audit``    — paginated, newest-first read over the append-only
   ``audit_log`` (#1037); keyset cursor, not part of ``/board``.
 * ``GET /leg-counts`` — all-time per-issue assignment leg counts by type,
   keyed ``"repo#N"`` (#3060); spans ``assignments`` + ``assignments_archive``,
   not part of ``/board`` or ``/drive-queue``.
+* ``GET /usage-rows`` — full-history assignment rows for ``coord usage``
+  (#3313), optionally windowed by ``?since=``/``?until=`` (Unix-epoch
+  floats); spans ``assignments`` + ``assignments_archive`` like
+  ``/leg-counts``, deliberately NOT ``/board``'s retention-capped set.
 * ``GET /config``   — the raw ``coordinator.yml`` bytes the daemon owns, so a
   client needs no local config file.
 * ``POST /result``  — record an interactive-session result (#590); body is a
@@ -2021,13 +2030,26 @@ def _milestone_drain_tick(config: Config) -> list:
         # see plan_dispatch's oracle_loop docstring for why (two concurrently
         # dispatched entries under one milestone race on the same shared
         # tests/acceptance/ms-N/manifest.yml).
+        # #3371: wire the credential-health probe here — this tick loop is
+        # a production dispatch path, not a test, so a dead-credential
+        # host must actually be excluded from machine selection.
+        from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
+        from coord.network import claude_credential_reachable  # noqa: PLC0415
+
         plan = md.plan_dispatch(
             ctx.work_order, board, config, repo_cfg, ctx.terminal_issues,
             oracle_loop=config.acceptance.has_driver(repo_name),
+            credential_fetcher=claude_credential_reachable,
         )
+        # #3376 review round 1: this drain tick is a real production
+        # dispatch chokepoint — wire the other two STRUCTURAL
+        # DISPATCH-LIVENESS GATE predicates through to `dispatch_entry` /
+        # `coord.dispatch.dispatch()`, same as the credential probe above.
+        _issue_liveness_fetcher = github_issue_liveness_fetcher(config)
         for pick in plan.to_dispatch:
             outcome = md.dispatch_entry(
-                pick, repo_cfg, config, board, tracking_issue=tracking_issue
+                pick, repo_cfg, config, board, tracking_issue=tracking_issue,
+                issue_liveness_fetcher=_issue_liveness_fetcher,
             )
             outcomes.append(outcome)
             if outcome.ok:
@@ -2210,14 +2232,26 @@ def _milestone_gate_tick(config: Config, *, now: float | None = None) -> list:
                 # validator and plan_queue's chaining alone don't cover: the
                 # gate walk (docs/ORACLE_LOOP.md's "oracle drive", #1453) is
                 # the documented primary driver for an oracle-loop milestone.
+                # #3371: same credential-health wiring as the drain
+                # tick above.
+                from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
+                from coord.network import claude_credential_reachable  # noqa: PLC0415
+
                 plan = md.plan_dispatch(
                     ctx.work_order, board, config, repo_cfg, ctx.terminal_issues,
                     oracle_loop=config.acceptance.has_driver(repo_cfg.name),
+                    credential_fetcher=claude_credential_reachable,
                 )
+                # #3376 review round 1: same issue-liveness wiring as the
+                # drain tick above — this gate-walk dispatch is the OTHER
+                # daemon production chokepoint `md.dispatch_entry` funnels
+                # through.
+                _issue_liveness_fetcher = github_issue_liveness_fetcher(config)
                 for pick in plan.to_dispatch:
                     outcome = md.dispatch_entry(
                         pick, repo_cfg, config, board,
                         tracking_issue=record.tracking_issue,
+                        issue_liveness_fetcher=_issue_liveness_fetcher,
                     )
                     dispatched.append(outcome)
                     if outcome.ok:
@@ -4029,6 +4063,142 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/smoke-claim": {
+            "post": {
+                "summary": (
+                    "Atomically claim the right to dispatch a Test-stage "
+                    "fan-out leg for one capability partition (#3333) — a "
+                    "conditional insert so two racing coordinator passes "
+                    "can never both dispatch the same partition"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "work_assignment_id": {"type": "string"},
+                                    "capability_partition": {"type": "string"},
+                                },
+                                "required": [
+                                    "work_assignment_id",
+                                    "capability_partition",
+                                ],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — `claimed` is true iff this call won",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {
+                        "description": (
+                            "Missing work_assignment_id or capability_partition"
+                        )
+                    },
+                },
+            }
+        },
+        "/smoke-claim-release": {
+            "post": {
+                "summary": (
+                    "Release a claim taken via /smoke-claim (#3333) so a "
+                    "later legitimate retry of the same partition (an "
+                    "environmental death, or an operator `coord stop`) "
+                    "isn't permanently stranded"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "work_assignment_id": {"type": "string"},
+                                    "capability_partition": {"type": "string"},
+                                },
+                                "required": [
+                                    "work_assignment_id",
+                                    "capability_partition",
+                                ],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — idempotent, absent claim is a no-op",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {
+                        "description": (
+                            "Missing work_assignment_id or capability_partition"
+                        )
+                    },
+                },
+            }
+        },
+        "/smoke-fanout-merge": {
+            "post": {
+                "summary": (
+                    "Atomically merge a #3182 fan-out leg into the parent's "
+                    "`[[smoke-fanout:...]]` manifest and re-stamp it "
+                    "'running' (#3333 review) — read-merge-write as one "
+                    "step so two ticks claiming DIFFERENT capability "
+                    "partitions of the same parent never overwrite each "
+                    "other's manifest entry"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "total_partitions": {"type": "integer"},
+                                    "new_entries": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "array",
+                                            "description": (
+                                                "[leg_id, capabilities, "
+                                                "command_or_null]"
+                                            ),
+                                        },
+                                    },
+                                },
+                                "required": [
+                                    "assignment_id",
+                                    "total_partitions",
+                                    "new_entries",
+                                ],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": (
+                            "OK — `test_state`/`test_reason` are the row's "
+                            "own authoritative values after the merge, which "
+                            "may be a terminal verdict rather than 'running' "
+                            "if one landed first"
+                        ),
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {
+                        "description": (
+                            "Missing assignment_id, total_partitions or "
+                            "new_entries"
+                        )
+                    },
+                },
+            }
+        },
         "/needs-attention-notified": {
             "post": {
                 "summary": (
@@ -4795,7 +4965,11 @@ def openapi_spec() -> dict:
                 "summary": (
                     "#1753: read the operator-declared `coord drive` work "
                     "queue in run order. Filter by repo_name (+ optional "
-                    "issue_number); omit both to list the whole queue."
+                    "issue_number); omit both to list the whole queue. "
+                    "#3296: an explicit `state` also pulls in matching rows "
+                    "`coord.housekeeping.sweep()` has since archived, so "
+                    "terminal history stays reachable after it ages out of "
+                    "the live table."
                 ),
                 "parameters": [
                     {
@@ -4805,6 +4979,16 @@ def openapi_spec() -> dict:
                     {
                         "name": "issue_number", "in": "query", "required": False,
                         "schema": {"type": "integer"},
+                    },
+                    {
+                        "name": "state", "in": "query", "required": False,
+                        "schema": {"type": "string"},
+                        "description": (
+                            "#3296: filter by drive_queue.state (e.g. "
+                            "'done'/'blocked'/'failed'). When given, also "
+                            "reads drive_queue_archive so archived rows "
+                            "matching this state are still returned."
+                        ),
                     },
                 ],
                 "responses": {
@@ -4893,6 +5077,58 @@ def openapi_spec() -> dict:
                     "`assignments_archive`. NOT part of `/board` or "
                     "`/drive-queue`."
                 ),
+                "responses": {"200": {"description": "OK"}},
+            },
+        },
+        "/usage-rows": {
+            "get": {
+                "summary": (
+                    "#3313: full-history assignment rows for `coord usage` — "
+                    "spans `assignments` + `assignments_archive` like "
+                    "`/leg-counts`. NOT `/board`'s retention-capped set."
+                ),
+                "parameters": [
+                    {
+                        "name": "since",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "number"},
+                        "description": "Unix-epoch float; unbounded if omitted.",
+                    },
+                    {
+                        "name": "until",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "number"},
+                        "description": "Unix-epoch float; unbounded if omitted.",
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Malformed since/until"},
+                    "503": {"description": "usage-rows read failed"},
+                },
+            },
+        },
+        "/issues": {
+            "get": {
+                "summary": (
+                    "#3227/#3228: cached `issues` rows (labels decoded, body "
+                    "included), optionally scoped by repeated `?repo_name=` "
+                    "params. Backs `coord.state.cached_open_issues` / "
+                    "`coord plans --lint-epics`/`--lint-stale-epics` on a "
+                    "thin client. NOT part of `/board` — the `Board` model "
+                    "carries no issues field."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "array", "items": {"type": "string"}},
+                        "description": "Repeatable; omitted reads every repo's rows.",
+                    }
+                ],
                 "responses": {"200": {"description": "OK"}},
             },
         },
@@ -5638,6 +5874,104 @@ def openapi_spec() -> dict:
     )
 
 
+# #3293: keys whose values are inherently volatile per-build (a sliding
+# window count) but carry no board-state signal of their own — excluded from
+# the ``/board`` ETag DIGEST INPUT only (see ``_board_digest_projection``
+# below and ``_stamp_board_version``'s docstring). Every one of these fields
+# still ships on the wire, unchanged; this only stops them from deciding
+# whether the version bumps.
+_BOARD_DIGEST_VOLATILE_TOP_KEYS = frozenset({"audit_recent_count"})
+
+
+def _board_digest_projection(result: dict) -> dict:
+    """A copy of *result* with digest-irrelevant volatile fields stripped.
+
+    Used ONLY to compute the ``/board`` ETag/version digest (#3293) — the
+    actual wire body is `result` itself, untouched. Three culprits, in order
+    of how often they move (see issue #3293's measurements):
+
+    - ``audit_recent_count``: a sliding 900s window count, changed on
+      essentially every build.
+    - ``issues[*].synced_at``: ~788 rows share one sync timestamp that moves
+      on the issues-sync tick, re-digesting the whole issues section at once.
+    - ``fleet_health``: moves on the 60s health tick. Its ``refreshed_at``
+      clock and its ``fleet_board_latency`` check are excluded — the latter
+      measures THIS /board response's own fetch latency and serialized size
+      and stores that measurement inside the response, which is structurally
+      self-invalidating for a content digest.
+
+    Deliberately narrow: per-machine health severities/results/headrooms are
+    left in the digest, because a real state change there (a machine going
+    offline, a disk filling up) SHOULD bump the ETag — only the fields that
+    move on their own, independent of any real state change, are excluded.
+    """
+    projection = {
+        k: v for k, v in result.items() if k not in _BOARD_DIGEST_VOLATILE_TOP_KEYS
+    }
+
+    issues = projection.get("issues")
+    if isinstance(issues, list):
+        projection["issues"] = [
+            {k: v for k, v in issue.items() if k != "synced_at"}
+            if isinstance(issue, dict) else issue
+            for issue in issues
+        ]
+
+    fleet_health = projection.get("fleet_health")
+    if isinstance(fleet_health, dict):
+        projection["fleet_health"] = _board_digest_fleet_health(fleet_health)
+
+    return projection
+
+
+def _board_digest_fleet_health(fleet_health: dict) -> dict:
+    """Strip ``fleet_health``'s clocks + self-referential latency check.
+
+    See ``_board_digest_projection`` — digest input only, never the wire body.
+    """
+    masked = {k: v for k, v in fleet_health.items() if k != "refreshed_at"}
+
+    machine_health = masked.get("machine_health")
+    if isinstance(machine_health, list):
+        masked["machine_health"] = [
+            _board_digest_health_row(row) if isinstance(row, dict) else row
+            for row in machine_health
+        ]
+
+    fleet_checks = masked.get("fleet_checks")
+    if isinstance(fleet_checks, list):
+        masked["fleet_checks"] = [
+            _board_digest_check_result(c) if isinstance(c, dict) else c
+            for c in fleet_checks
+        ]
+
+    return masked
+
+
+def _board_digest_health_row(row: dict) -> dict:
+    """Drop one machine's poll clocks (``received_at``/``checked_at``) from
+    the digest input — the results/severity/headroom that actually describe
+    the machine's state stay in, per ``_board_digest_projection``'s docstring.
+    """
+    return {k: v for k, v in row.items() if k not in ("received_at", "checked_at")}
+
+
+def _board_digest_check_result(check: dict) -> dict:
+    """Drop ``fleet_board_latency``'s self-measurement from the digest input.
+
+    This one check answers "how fast/big was the /board response that is
+    carrying this very check result?" — its ``headroom`` text and ``values``
+    (``latency_ms``/``payload_bytes``) are a measurement of the response
+    embedded in the response, so they change on every build regardless of
+    whether anything a human/client cares about actually changed. Every
+    other fleet check's headroom/values reflect real, digest-worthy state
+    and are left untouched.
+    """
+    if check.get("check_id") != "fleet_board_latency":
+        return check
+    return {k: v for k, v in check.items() if k not in ("headroom", "values")}
+
+
 def build_app(
     store: CoordStore,
     config: Config,
@@ -5696,14 +6030,30 @@ def build_app(
 
     _machine_metrics_sampler = machine_metrics_sampler or MachineMetricsSampler()
 
-    # Short-TTL cache for the computed /board projection so burst polls from the
-    # TUI don't each pay the full board_projection + merge-plan + stage-projection
+    # Cache for the computed /board projection so burst polls from the TUI
+    # don't each pay the full board_projection + merge-plan + stage-projection
     # recomputation (~465-issue load measured in the issue). Keyed to nothing
-    # (one board per daemon instance). TTL controlled by COORD_BOARD_CACHE_TTL
-    # (default 1.5 s). Busted immediately on board-mutating POSTs so a user
-    # action is visible on the very next poll without waiting out the TTL.
+    # (one board per daemon instance).
+    #
+    # #3294: the cache's PRIMARY invalidation trigger is "has anything
+    # written since this build?" (``store.change_token()``, ``dao.CoordStore``
+    # protocol — SQLite: ``PRAGMA data_version``), not a fixed clock. A 1.5 s
+    # TTL forced a full rebuild on essentially every poll, because pollers
+    # run at 5 s and always missed the window — and the rebuild (the
+    # ``fleet_board_latency`` check's own 0.65-0.8 s measurement) is what
+    # actually held the GIL, not the wire cost the ETag already covers.
+    # ``COORD_BOARD_CACHE_TTL`` (default below) survives only as a SAFETY
+    # UPPER BOUND — a rebuild is forced past that age regardless of the
+    # change token, in case the token's source ever misses a write path —
+    # not as the primary trigger. Busted immediately on board-mutating POSTs
+    # (``_bust_board_cache``, unchanged by #3294) so a user action is visible
+    # on the very next poll without waiting on either signal.
     _board_cache: dict | None = None
     _board_cache_at: float = 0.0
+    # #3294: the ``store.change_token()`` value as of ``_board_cache``'s
+    # build. A poll is served from cache only when the CURRENT token still
+    # equals this one — i.e. nothing has written since.
+    _board_cache_token: str | None = None
     # #1597 Part 2: the fully-rendered JSON bytes for the currently-cached
     # build, shared verbatim by every response that serves ``_board_cache``
     # (a fresh build's own responses, every single-flight follower, and
@@ -5741,13 +6091,31 @@ def build_app(
     _board_inflight: asyncio.Future[tuple] | None = None
 
     def _stamp_board_version(result: dict) -> tuple[str, bytes]:
-        """Serialize *result* to JSON exactly once, bump the version when the
-        content changed, stamp ``board_version`` into the payload, and
-        return ``(etag, body_bytes)`` — the SAME bytes serve as both the
-        content-hash input and the wire body (#1597 Part 2: previously this
-        hashed a separate ``sort_keys=True`` dump and the caller re-encoded
-        the dict a second time via ``JSONResponse`` — ~10 MB of JSON work per
-        build for a 5 MB board).
+        """Serialize *result* to JSON exactly once for the wire body, bump
+        the version when a STABLE PROJECTION of the content changed, stamp
+        ``board_version`` into the payload, and return ``(etag, body_bytes)``.
+
+        #1597 Part 2: the wire ``body`` bytes below are the same bytes
+        published to callers — no second encoder pass for the response
+        itself.
+
+        #3293: the content-hash input is deliberately NOT those same bytes
+        any more. The payload embeds fields that move on every build without
+        any board-state signal of their own — ``audit_recent_count`` (a
+        sliding 900s window count), ``issues[*].synced_at`` (~788 rows
+        re-stamped on one shared sync tick), and ``fleet_health``'s clocks
+        and its self-referential ``fleet_board_latency`` check (which
+        measures THIS response's own fetch latency/size and stores the
+        measurement inside the response being measured). Hashing those made
+        the ETag change on effectively every request, defeating #1336's
+        cache-validated polling entirely. ``_board_digest_projection`` builds
+        a masked copy for hashing only; the wire ``body`` — and every field
+        in it, unchanged — still carries the real values. This does cost a
+        second JSON encode of (most of) the payload on every cache-miss
+        rebuild, which is rare relative to requests (TTL-cached in between);
+        that's the trade #1597 avoided but #3293 requires; a truly stable
+        ETag that lets pollers 304 is worth far more than skipping it on the
+        rebuild path.
 
         ``board_version`` can't be known before the hash is computed (it
         depends on whether the hash changed), so it is deliberately excluded
@@ -5795,7 +6163,19 @@ def build_app(
                 indent=None, separators=(",", ":"), default=str,
             ).encode("utf-8")
         else:
-            digest = hashlib.sha256(body).hexdigest()[:16]
+            # #3293: hash a stable PROJECTION of the content, not the wire
+            # bytes themselves — see the docstring above. The wire `body`
+            # computed just above is untouched and still carries every
+            # field, including the ones excluded here.
+            # No `default=str` needed (unlike the fallback above): reaching
+            # this branch means the strict encode of `result` just SUCCEEDED,
+            # and the projection is a key-subset of those same values, so it
+            # cannot contain a type the strict encoder would reject.
+            digest_body = _json.dumps(
+                _board_digest_projection(result), ensure_ascii=False,
+                allow_nan=False, indent=None, separators=(",", ":"),
+            ).encode("utf-8")
+            digest = hashlib.sha256(digest_body).hexdigest()[:16]
         if digest != _board_hash:
             _board_hash = digest
             _board_version += 1
@@ -5885,17 +6265,34 @@ def build_app(
         # config reloads prompt.
         _refresh_config()
 
-        # Part 2 (cache): serve a cached projection if it's still within the TTL.
-        # Burst polls (TUI polls every ~2 s) hit the cache; the real computation
-        # only runs once per TTL window.  Cache is busted immediately by the
-        # board-mutating POST handlers below so user actions are visible on the
-        # very next poll without waiting out the TTL.
+        # Part 2 (cache): serve the cached projection when nothing has
+        # written since it was built (#3294). Burst polls (TUI polls every
+        # ~2 s) hit the cache; the real computation only runs when a write
+        # actually happened. Cache is also busted immediately by the
+        # board-mutating POST handlers below so user actions are visible on
+        # the very next poll without waiting on either signal.
         import time as _time  # noqa: PLC0415
-        _ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "1.5"))
+        # Safety upper bound only (#3294) — see the comment on
+        # `_board_cache_token` above. Raised from the pre-#3294 1.5 s default
+        # now that the change-token check is the primary trigger.
+        _safety_ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "30"))
         _now = _time.monotonic()
         nonlocal _board_cache, _board_cache_at, _board_cache_built_at, _board_body
-        nonlocal _board_inflight
+        nonlocal _board_cache_token, _board_inflight
         _client_etag = request.headers.get("if-none-match")
+
+        # #3294: cheap "did anything write?" probe — see
+        # `dao.CoordStore.change_token`'s docstring. Run inline (not
+        # threadpooled) like `_refresh_config()`'s stat() just above: a
+        # single PRAGMA on an already-open connection, not I/O of the shape
+        # #1336 invariant 1 guards against. A failure here must never crash
+        # the read path over a cache optimization — treat it as "assume
+        # changed" (a sentinel that can never equal a real cached token) so
+        # the worst case is an extra rebuild, never a wedged/stale cache.
+        try:
+            _current_token: str | None = store.change_token()
+        except Exception:  # noqa: BLE001 — fail toward rebuilding, not crashing
+            _current_token = None
 
         def _respond(result: dict, etag: str | None, body: bytes | None) -> Response:
             if _client_etag and etag and _client_etag == etag:
@@ -5921,7 +6318,18 @@ def build_app(
             _cached_etag = _board_etag
             _cached_at = _board_cache_at
             _cached_body = _board_body
-        if _cached is not None and (_now - _cached_at) < _ttl:
+            _cached_token = _board_cache_token
+        # #3294: fresh iff nothing wrote since this build (token still
+        # matches) AND we're inside the safety-TTL ceiling. `_cached_token
+        # is not None` rules out a `None == None` false match when either
+        # side came from a failed change_token() read (see above).
+        _fresh = (
+            _cached is not None
+            and _cached_token is not None
+            and _cached_token == _current_token
+            and (_now - _cached_at) < _safety_ttl
+        )
+        if _fresh:
             return _respond(_cached, _cached_etag, _cached_body)
 
         # #1597 Part 1: single-flight the rebuild.  On a cache miss, at most
@@ -5967,12 +6375,24 @@ def build_app(
         # concurrent request calls _refresh_config() while _build() is running.
         _cfg = config
 
-        def _build() -> tuple[float, dict]:
+        def _build() -> tuple[float, str | None, dict]:
             # Snapshot-order stamp: captured immediately before the DB read so
             # the publish step below can reject a build whose snapshot is
             # older than the one already cached (concurrent rebuilds can
             # finish out of order).
             _built_at = _time.monotonic()
+            # #3294: the change token AS OF this build's snapshot moment —
+            # published alongside the cache below so the *next* request's
+            # freshness check compares against "what had (or hadn't) written
+            # by the time THIS build started", not some later moment.
+            # `None` (never a real token — see `_current_token` above) if the
+            # read itself fails; that means the published cache below can
+            # never look "fresh" to a later poll, which is the safe direction
+            # to fail in.
+            try:
+                _built_token = store.change_token()
+            except Exception:  # noqa: BLE001 — see `_current_token` above
+                _built_token = None
             # ── board projection ──────────────────────────────────────────────
             try:
                 projection = store.board_projection()
@@ -6438,7 +6858,7 @@ def build_app(
             from coord.board_wire import bound_board_payload as _bound  # noqa: PLC0415
 
             _bound(projection)
-            return _built_at, projection
+            return _built_at, _built_token, projection
 
         # This coroutine is the single-flight leader: it alone runs _build(),
         # then fans its outcome out to every waiter (itself plus every
@@ -6446,7 +6866,7 @@ def build_app(
         # of the acceptance test, and why a failed build must reach every
         # waiter rather than wedging the followers.
         try:
-            built_at, result = await run_in_threadpool(_build)
+            built_at, built_token, result = await run_in_threadpool(_build)
         except _BoardReadError as e:
             _board_inflight = None  # clear FIRST: a retry must build fresh,
             # never see a "done" future and think it must wait on this one.
@@ -6495,7 +6915,9 @@ def build_app(
                     _board_body = body
                     _board_cache_at = _time.monotonic()
                     _board_cache_built_at = built_at
-                    # #1630: feed this build's own latency + wire size to the
+                    _board_cache_token = built_token  # #3294
+                    # #1630/#3294: feed this build's own latency + wire size
+                    # (+ the fact that a build happened at all) to the
                     # fleet-health snapshot's board-latency check — read back
                     # on the health-poll tick's own cadence, never recomputed
                     # inline (see FleetHealthRefresher.record_board_stats).
@@ -7459,6 +7881,9 @@ def build_app(
                 # #1629: absent on a client older than this field — `.get`
                 # defaults to None, same as no toolchain having been resolved.
                 test_toolchain=body.get("test_toolchain"),
+                # #3357: absent on a client older than this field — `.get`
+                # defaults to None, same as "no confirmation attempted".
+                test_confirmation=body.get("test_confirmation"),
             )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
@@ -7686,6 +8111,94 @@ def build_app(
             )
         return JSONResponse({"ok": True})
 
+    async def post_smoke_claim(request: Request) -> Response:
+        # #3333: atomic smoke fan-out dispatch claim on the daemon's
+        # canonical DB — see coord.state.claim_smoke_dispatch's docstring
+        # for the race this closes.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            claimed = state._claim_smoke_dispatch_local(
+                body["work_assignment_id"], body["capability_partition"],
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "smoke-claim write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True, "claimed": claimed})
+
+    async def post_smoke_claim_release(request: Request) -> Response:
+        # #3333: release a claim taken via post_smoke_claim above.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._release_smoke_dispatch_claim_local(
+                body["work_assignment_id"], body["capability_partition"],
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "smoke-claim-release write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_smoke_fanout_merge(request: Request) -> Response:
+        # #3333 review: atomic read-merge-write of a #3182 fan-out's
+        # `[[smoke-fanout:...]]` manifest on the daemon's canonical DB — see
+        # coord.state.merge_smoke_fanout_manifest's docstring for the race
+        # this closes (two ticks racing on DIFFERENT capability partitions
+        # of the SAME work row, each with only its own partial view of the
+        # manifest). Routing it here means a THIN CLIENT never runs the
+        # read-merge-write itself; the local function this delegates to takes
+        # the cross-process `flock` (state.smoke_fanout_manifest_lock_path)
+        # for its duration, so this request also serializes against the
+        # sibling `coord notify` / `coord drive-queue tick` CLI processes
+        # that run on this same DB-owning host and call it directly.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            new_entries = [
+                (entry[0], tuple(entry[1]), entry[2]) for entry in body["new_entries"]
+            ]
+            # `run_in_threadpool` because that cross-process lock acquire can
+            # BLOCK (up to `_SMOKE_FANOUT_MANIFEST_LOCK_TIMEOUT`), and doing
+            # that on the event-loop thread would stall every other daemon
+            # request behind one contended merge — same reason `post_notify`
+            # below runs its own `FileLock`-taking body off the loop.
+            test_state, test_reason = await run_in_threadpool(
+                lambda: state._merge_smoke_fanout_manifest_local(
+                    assignment_id=body["assignment_id"],
+                    new_entries=new_entries,
+                    total_partitions=body["total_partitions"],
+                )
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "smoke-fanout-merge write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(
+            {"ok": True, "test_state": test_state, "test_reason": test_reason}
+        )
+
     async def post_review_posted(request: Request) -> Response:
         # #905: mark a review assignment as posted (sets review_posted_at) on the
         # daemon's DB so thin-client notify runs correctly.
@@ -7849,6 +8362,12 @@ def build_app(
                 # #2316: same endpoint, same reason as the fields above —
                 # one round-trip covers the diagnostic capture too.
                 state._update_assignment_stop_reason_local(aid, body["stop_reason"])
+            if body.get("premise_rechecked_reason"):
+                # #3339: same endpoint, same reason as the fields above —
+                # `coord drive-queue clear-refusal`'s write.
+                state._mark_premise_rechecked_local(
+                    aid, body["premise_rechecked_reason"]
+                )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "assignment-usage write failed", "detail": str(e)},
@@ -8532,9 +9051,16 @@ def build_app(
         # filters to that repo; `repo_name` + `issue_number` narrows to the (at
         # most one) entry for that issue; neither given lists the whole queue
         # (hand-sized by definition — one row per issue an operator queued).
+        #
+        # #3296: `?state=` additionally reads `drive_queue_archive` — the
+        # live table alone would silently lose a terminal entry the moment
+        # `coord.housekeeping.sweep()` ages it out, making archived history
+        # unreachable rather than merely un-shipped-by-default from the
+        # unfiltered list.
         from coord import state  # noqa: PLC0415
 
         repo_name = request.query_params.get("repo_name")
+        state_filter = request.query_params.get("state")
         raw_issue = request.query_params.get("issue_number")
         issue_number = None
         if raw_issue is not None:
@@ -8547,9 +9073,21 @@ def build_app(
         try:
             if repo_name and issue_number is not None:
                 entry = state._get_drive_queue_entry_local(repo_name, issue_number)
+                if entry is None and state_filter:
+                    entry = state._get_drive_queue_archive_entry_local(
+                        repo_name, issue_number
+                    )
+                if (
+                    entry is not None
+                    and state_filter
+                    and entry.get("state") != state_filter
+                ):
+                    entry = None
                 entries = [entry] if entry else []
             else:
-                entries = state._list_drive_queue_local(repo_name)
+                entries = state._list_drive_queue_local(
+                    repo_name, state=state_filter
+                )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "drive-queue read failed", "detail": str(e)},
@@ -8593,13 +9131,37 @@ def build_app(
                     # key (a client predating this feature) means "no
                     # passthrough", same as `bool(None)`.
                     no_acceptance=bool(body.get("no_acceptance")),
+                    # #3236: per-entry destroy/replace-plan declaration.
+                    # Absent key (a client predating this feature) means
+                    # "not destructive", same as `bool(None)`.
+                    plan_destructive=bool(body.get("plan_destructive")),
                 )
                 return JSONResponse({"entry_id": entry_id})
             if action == "dequeue":
                 deleted = state._dequeue_drive_queue_local(
                     body["repo_name"], body["issue_number"]
                 )
-                return JSONResponse({"deleted": bool(deleted)})
+                # #3282: this daemon process runs ON the daemon host — the
+                # only machine `coord drive-queue tick` (and every `coord
+                # drive --tmux` session it launches) ever runs on — so this
+                # is exactly where a dequeue must own the live driver it may
+                # be orphaning. Every dequeue-routed client (the CLI's
+                # `coord drive-queue remove`, the dashboard's `remove`
+                # action) gets this for free without probing its own,
+                # unrelated host.
+                driver_ok, driver_session, driver_detail = True, None, None
+                if deleted:
+                    from coord.drive import stop_live_driver_session  # noqa: PLC0415
+
+                    driver_ok, driver_session, driver_detail = stop_live_driver_session(
+                        body["repo_name"], body["issue_number"]
+                    )
+                return JSONResponse({
+                    "deleted": bool(deleted),
+                    "driver_ok": driver_ok,
+                    "driver_session": driver_session,
+                    "driver_detail": driver_detail,
+                })
             if action == "update":
                 fields = body.get("fields")
                 if not isinstance(fields, dict):
@@ -8653,6 +9215,67 @@ def build_app(
                 status_code=503,
             )
         return JSONResponse(counts)
+
+    async def get_usage_rows(request: Request) -> Response:
+        # #3313: `coord usage`, run from any thin client, under-reported
+        # spend by ~8x because `coord.usage.fetch_usage_rows`'s remote branch
+        # read the SAME `/board` payload `coord status` polls — which #762
+        # caps to active + pipeline-referenced + `COORD_BOARD_RETENTION_DAYS`
+        # (default 14) of terminal rows. A usage rollup wants full history,
+        # so a WIDER `--since` window could report LESS than a narrower one
+        # (whichever board-retention slice happened to be resident). This is
+        # its own endpoint — deliberately, like `/leg-counts`/`/audit`, never
+        # folded into `/board` — spanning `assignments` +
+        # `assignments_archive` via `coord.usage._local_usage_rows`.
+        #
+        # `since`/`until` (optional Unix-epoch floats) push the caller's
+        # resolved window down into the read itself. Same "bad query param
+        # -> 400" convention as `/audit`'s `_ts_param` (one question, one
+        # answer — a malformed timestamp shouldn't be treated differently by
+        # two sibling read endpoints).
+        from coord.usage import _local_usage_rows  # noqa: PLC0415
+
+        def _parse_float(name: str) -> float | None:
+            raw = request.query_params.get(name)
+            if raw is None or raw == "":
+                return None
+            return float(raw)
+
+        try:
+            since = _parse_float("since")
+            until = _parse_float("until")
+        except ValueError as e:
+            return JSONResponse({"error": f"bad query parameter: {e}"}, status_code=400)
+
+        try:
+            rows, truncated = _local_usage_rows(since=since, until=until)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "usage-rows read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"rows": rows, "truncated": truncated})
+
+    async def get_issues_collection(request: Request) -> Response:
+        # #3227: backs `coord plans --lint-epics` on a thin client — the
+        # daemon-routed half of `coord.state.cached_open_issues`. Repeated
+        # `?repo_name=` query params scope the read; omitted entirely reads
+        # every repo's cached rows. Deliberately its own endpoint (like
+        # /leg-counts) rather than folded into /board: the board projection's
+        # `Board` model (coord/models.py) has no `issues` field at all — only
+        # the raw wire payload carries a "issues" key, so there's no board
+        # read to piggyback on here.
+        from coord import state  # noqa: PLC0415
+
+        repo_names = request.query_params.getlist("repo_name") or None
+        try:
+            issues = state._cached_open_issues_local(repo_names)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issues read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"issues": issues})
 
     async def get_pause(request: Request) -> Response:  # noqa: ARG001
         # #1563: the daemon's own view of the paused-machine set. ALWAYS the
@@ -9275,6 +9898,11 @@ def build_app(
             if body.get("failure_reason") is not None:
                 state._set_assignment_failure_reason_local(aid, body["failure_reason"])
                 applied.append("failure_reason")
+            if body.get("premise_rechecked_reason"):
+                state._mark_premise_rechecked_local(
+                    aid, body["premise_rechecked_reason"]
+                )
+                applied.append("premise_rechecked_reason")
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {
@@ -9870,10 +10498,65 @@ def build_app(
         import asyncio  # noqa: PLC0415
         import contextlib  # noqa: PLC0415
         import logging  # noqa: PLC0415
+        import threading  # noqa: PLC0415
 
-        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+        from starlette.concurrency import (  # noqa: PLC0415
+            run_in_threadpool as _real_run_in_threadpool,
+        )
 
         log = logging.getLogger("coord.serve")
+
+        # #3380: every background loop below (``_tick_loop``,
+        # ``_gate_refresh_loop``, ...) calls THIS wrapped ``run_in_threadpool``
+        # — shared with all of them via this closure, shadowing the module
+        # they'd otherwise import directly — rather than Starlette's own, so
+        # ``_ctx``'s shutdown ``finally`` (further down) can wait for
+        # genuinely in-flight thread-pool work to finish instead of merely
+        # cancelling the asyncio task wrapping it. anyio abandons the
+        # underlying OS thread on cancellation rather than joining it —
+        # verified empirically: the awaiting task raises ``CancelledError``
+        # as soon as ``.cancel()`` is requested, while the thread keeps
+        # running the synchronous function to completion in the background,
+        # unobserved by anything still awaiting it. A tick whose
+        # ``run_in_threadpool`` call is still in flight when shutdown fires
+        # can therefore keep running — including reaching
+        # ``coord.db.get_connection()`` — well after ``with TestClient(app):``
+        # has already returned. In a test session that means possibly during
+        # a LATER, unrelated test's setup, after that test's own autouse
+        # ``coord_db`` fixture has (or hasn't yet) installed its own
+        # isolated-DB override, tripping the #1960 guard and misattributing
+        # it to whatever test happens to be running at that moment.
+        _tick_inflight = 0
+        _tick_inflight_lock = threading.Lock()
+
+        def _release_tick_inflight() -> None:
+            nonlocal _tick_inflight
+            with _tick_inflight_lock:
+                _tick_inflight -= 1
+
+        async def run_in_threadpool(func, *args, **kwargs):  # noqa: ANN001,ANN202
+            nonlocal _tick_inflight
+            with _tick_inflight_lock:
+                _tick_inflight += 1
+
+            # The decrement has to happen INSIDE the call that runs on the
+            # real worker thread, not in a `finally` wrapped around the
+            # `await` below — cancelling the awaiting task unwinds THIS
+            # coroutine's own `finally` clauses immediately (same
+            # `CancelledError`-on-`.cancel()` behaviour the module docstring
+            # above describes), well before the abandoned thread actually
+            # finishes running `func`. Releasing from inside `_call` instead
+            # ties the counter to the thread's real completion, which is the
+            # only thing `_ctx`'s drain wait (further down) needs to be
+            # accurate about.
+            def _call():
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    _release_tick_inflight()
+
+            return await _real_run_in_threadpool(_call)
+
         try:
             interval = float(os.environ.get("COORD_RECONCILE_INTERVAL", "30"))
         except ValueError:
@@ -10842,6 +11525,29 @@ def build_app(
                         t.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await t
+                # #3380: cancelling the tasks above only stops each loop's
+                # NEXT `asyncio.sleep` — it does NOT wait for a
+                # `run_in_threadpool` call already in flight (see the
+                # wrapped `run_in_threadpool` defined above for why anyio
+                # abandons that thread rather than joining it). Poll the
+                # shared in-flight counter with a bounded budget so shutdown
+                # does not return — letting a caller like
+                # `TestClient.__exit__` proceed as if every background loop
+                # had genuinely stopped — while one of them might still be
+                # running a thread-pool call, e.g. still able to reach
+                # `coord.db.get_connection()` after this process's test
+                # harness (or a real blue/green restart) has moved on.
+                drain_deadline = _time.monotonic() + 5.0
+                while _tick_inflight > 0 and _time.monotonic() < drain_deadline:
+                    await asyncio.sleep(0.01)
+                if _tick_inflight > 0:
+                    log.error(
+                        "daemon shutdown: %d background tick(s) still running "
+                        "a thread-pool call after a 5s drain budget — "
+                        "abandoning them; they may still touch shared state "
+                        "after this process considers itself stopped",
+                        _tick_inflight,
+                    )
 
         return _ctx(_app)
 
@@ -10917,6 +11623,9 @@ def build_app(
         Route("/review-findings", post_review_findings, methods=["POST"]),
         Route("/review-claim", post_review_claim, methods=["POST"]),
         Route("/review-claim-release", post_review_claim_release, methods=["POST"]),
+        Route("/smoke-claim", post_smoke_claim, methods=["POST"]),
+        Route("/smoke-claim-release", post_smoke_claim_release, methods=["POST"]),
+        Route("/smoke-fanout-merge", post_smoke_fanout_merge, methods=["POST"]),
         Route("/review-posted", post_review_posted, methods=["POST"]),
         Route(
             "/needs-attention-notified",
@@ -10935,6 +11644,7 @@ def build_app(
         Route("/issue-label", post_issue_label, methods=["POST"]),
         Route("/issue-create", post_issue_create, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
+        Route("/issues", get_issues_collection, methods=["GET"]),
         # #2895: single-row issue upsert + purge, the two write paths coord-tui
         # used to perform against coord.db directly.
         Route("/issue-upsert", post_issue_upsert, methods=["POST"]),
@@ -10955,6 +11665,7 @@ def build_app(
         Route("/drive-queue", get_drive_queue, methods=["GET"]),
         Route("/drive-queue", post_drive_queue, methods=["POST"]),
         Route("/leg-counts", get_leg_counts, methods=["GET"]),
+        Route("/usage-rows", get_usage_rows, methods=["GET"]),
         Route("/pause", get_pause, methods=["GET"]),
         Route("/pause", post_pause, methods=["POST"]),
         Route("/github-backoff", get_github_backoff, methods=["GET"]),

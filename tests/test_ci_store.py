@@ -31,6 +31,7 @@ from coord.ci_store import (
     failed_checks,
     in_flight_checks,
     is_verdictless_job,
+    shrunk_check_names,
     summarize,
 )
 
@@ -149,6 +150,57 @@ class TestInFlightChecks:
         ]
         names = {x.name for x in in_flight_checks(items)}
         assert names == {"a", "b"}
+
+
+class TestShrunkCheckNames:
+    """#3263: coord-tui#83 merged 1.3s into a PARTIAL GitHub Actions re-run
+    ("Re-run failed jobs") of its one failing required check —
+    `cargo-test-gtk`'s own check-run record briefly disappeared from
+    `list_checks_for_pr` while its already-green siblings (`cargo-test`,
+    `Generated-artifact drift`) stayed put, so the read was non-empty and
+    entirely completed+success: vacuously green. `shrunk_check_names` is the
+    pure diff that catches a check name present in a caller's "previously
+    observed" set but missing from the CURRENT read.
+    """
+
+    def test_nothing_missing_when_all_seen_names_still_present(self) -> None:
+        seen = {"cargo-test", "cargo-test-gtk"}
+        checks = [_check("cargo-test"), _check("cargo-test-gtk", conclusion="failure")]
+        assert shrunk_check_names(seen, checks) == frozenset()
+
+    def test_reproduces_the_incident_a_seen_check_vanished(self) -> None:
+        """The exact #3263 shape: `cargo-test-gtk` was previously observed
+        (a prior read caught it, e.g. attempt 1's genuine failure) but the
+        partial re-run's registration window drops it from THIS read, which
+        otherwise looks all-green (`cargo-test` alone, completed/success)."""
+        seen = {"cargo-test", "cargo-test-gtk", "Generated-artifact drift"}
+        checks = [_check("cargo-test"), _check("Generated-artifact drift")]
+        assert shrunk_check_names(seen, checks) == frozenset({"cargo-test-gtk"})
+
+    def test_extra_new_check_is_not_shrinkage(self) -> None:
+        """A check appearing that was never seen before (a new job added to
+        the workflow) is growth, not shrinkage — only names dropping OUT of
+        the seen set are ever reported."""
+        seen = {"cargo-test"}
+        checks = [_check("cargo-test"), _check("new-job")]
+        assert shrunk_check_names(seen, checks) == frozenset()
+
+    def test_empty_seen_names_reports_nothing(self) -> None:
+        """The "first observation of this commit" case — nothing to
+        compare against yet, so nothing can have shrunk. The caller's
+        persisted-state layer (coord.merge_queue) is what decides when
+        `seen_names` should be empty (a fresh SHA); this function has no
+        opinion on that."""
+        assert shrunk_check_names(set(), [_check("cargo-test")]) == frozenset()
+
+    def test_all_seen_names_vanished(self) -> None:
+        """Every previously-observed name missing from a non-empty current
+        read still reports fully — this function doesn't special-case an
+        empty *checks* itself; callers that need the #1904 "no checks at
+        all" ambiguity handled differently do that before calling this."""
+        seen = {"a", "b"}
+        checks = [_check("c")]
+        assert shrunk_check_names(seen, checks) == frozenset({"a", "b"})
 
 
 class _FakeClock:

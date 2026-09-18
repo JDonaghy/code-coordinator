@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import tempfile
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -87,11 +88,62 @@ def _headers(svc: ServiceConfig) -> dict[str, str]:
     return headers
 
 
+# #3295: per-service-URL ETag cache for `GET /board`, so a thin client that
+# calls `fetch_board_payload()` repeatedly in a short window (dashboard
+# panels each doing their own read, drive-queue polling, ...) gets a
+# bodyless 304 back and reuses the last body instead of re-shipping and
+# re-parsing the full board (measured at 3.5MB) on every call. The daemon
+# has served `ETag` / honoured `If-None-Match` on `GET /board` since #1336;
+# nothing on the server changes here, only this client now uses it.
+# Process-local and never persisted — like `board_service._RESOURCE_ROUTE_SUPPORT`
+# — so a fresh process (or a test) starts with an empty cache and the very
+# next call is an unconditional GET.
+_board_payload_cache: dict[str, tuple[str, dict]] = {}
+
+
+def reset_board_payload_cache() -> None:
+    """Forget every cached ``(etag, body)`` pair (tests; #3295)."""
+    _board_payload_cache.clear()
+
+
 def fetch_board_payload(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
-    """GET /board → the raw projection dict (also carries machines/merge_queue/…)."""
-    resp = httpx.get(f"{svc.url}/board", headers=_headers(svc), timeout=timeout)
+    """GET /board → the raw projection dict (also carries machines/merge_queue/…).
+
+    #3295: sends ``If-None-Match`` with the ETag from this *svc.url*'s last
+    successful fetch, if any. A ``304`` means the daemon is telling us the
+    board hasn't changed since that ETag was minted — the cached body from
+    that fetch is still exactly correct, so it's returned as-is with no
+    re-parse. A ``200`` (first call for this URL, or the board really did
+    change) refreshes the cache with the new ``ETag``/body pair; a response
+    carrying no ``ETag`` at all clears any stale entry rather than caching
+    something we can't validate next time.
+    """
+    headers = _headers(svc)
+    cached = _board_payload_cache.get(svc.url)
+    if cached is not None:
+        headers["If-None-Match"] = cached[0]
+    resp = httpx.get(f"{svc.url}/board", headers=headers, timeout=timeout)
+    if resp.status_code == 304:
+        if cached is not None:
+            return cached[1]
+        # Should never happen — we only ever send `If-None-Match` when
+        # *cached* is set, so a 304 here means the daemon answered a
+        # conditional response to an unconditional request. Surfacing this
+        # loudly beats silently returning `None`/an empty board that looks
+        # like a real (if suspiciously quiet) fleet.
+        raise RuntimeError(
+            f"GET {svc.url}/board answered 304 but this client sent no "
+            "If-None-Match (no cached ETag for this service) — refusing to "
+            "guess at a board"
+        )
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    etag = resp.headers.get("ETag")
+    if etag:
+        _board_payload_cache[svc.url] = (etag, body)
+    else:
+        _board_payload_cache.pop(svc.url, None)
+    return body
 
 
 def fetch_healthz(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
@@ -763,6 +815,33 @@ def fetch_leg_counts(
     return data if isinstance(data, dict) else {}
 
 
+def fetch_cached_issues(
+    svc: ServiceConfig, repo_names: Iterable[str], *, timeout: float = _DEFAULT_TIMEOUT
+) -> list[dict]:
+    """GET the daemon's locally-cached ``issues`` rows for ``repo_names``
+    (#3227), backing :func:`coord.state.cached_open_issues` — the
+    ``coord plans --lint-epics`` scan's daemon-routed half.
+
+    ``[]`` on ANY failure — including a 404 from a daemon predating this
+    route — fail-soft, mirrors :func:`fetch_leg_counts`: a thin client's
+    lint should just report nothing rather than raise outright because the
+    daemon it's pointed at is older than this feature.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/issues",
+            params=[("repo_name", r) for r in repo_names],
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return []
+    issues = data.get("issues") if isinstance(data, dict) else None
+    return issues if isinstance(issues, list) else []
+
+
 def fetch_drive_queue_entry(
     svc: ServiceConfig,
     repo_name: str,
@@ -1137,6 +1216,46 @@ def fetch_audit_log(
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def fetch_usage_rows_from_daemon(
+    svc: ServiceConfig,
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict:
+    """GET full-history usage rows from the daemon's ``/usage-rows`` (#3313).
+
+    Unlike ``GET /board`` (capped by #762 to active + pipeline-referenced +
+    ``COORD_BOARD_RETENTION_DAYS`` of terminal rows), this spans
+    ``assignments`` + ``assignments_archive`` — a usage rollup wants full
+    history, not the TUI's retention-capped board projection. *since*/
+    *until* (Unix-epoch floats) narrow the daemon-side read; omitting both
+    fetches unbounded all-time history.
+
+    Like :func:`fetch_audit_log`, this does NOT fail-soft: ``coord usage`` is
+    an explicit read the user asked for, so a transport/HTTP error —
+    including a 404 from a daemon that predates this endpoint — raises
+    ``httpx.HTTPError`` for the CLI to report plainly, rather than silently
+    rendering a truncated (or empty) total as if it were complete.
+
+    Returns ``{"rows": [...], "truncated": bool}`` — ``truncated`` is set by
+    the daemon when its own safety ceiling
+    (``coord.usage.USAGE_ROWS_MAX_ROWS``) was hit; the caller (
+    :func:`coord.usage.fetch_usage_rows`) is responsible for surfacing that.
+    """
+    params: dict[str, Any] = {}
+    if since is not None:
+        params["since"] = since
+    if until is not None:
+        params["until"] = until
+    resp = httpx.get(
+        f"{svc.url}/usage-rows", params=params, headers=_headers(svc), timeout=timeout
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, dict) else {"rows": [], "truncated": False}
 
 
 # #1742: the report engine lives on the daemon (the audit trail it folds

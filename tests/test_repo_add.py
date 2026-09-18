@@ -1108,6 +1108,23 @@ class TestPortalProjectRepoYamlEdit:
         )
         assert self._mapping(updated).repos_for_project("12345") == ["api"]
 
+    def test_a_quote_in_the_project_id_does_not_break_the_yaml(self):
+        """#3285: `render_portal_project_repo_entry` hand-wrapped `project_id`
+        in double quotes the same way `test_command` did — a literal `"`
+        would have terminated the scalar early. The portal's ids are opaque
+        strings the fleet does not control the shape of, so this must not
+        assume they stay quote-free."""
+        from coord.repo_edit import (
+            insert_portal_project_repo_entry,
+            render_portal_project_repo_entry,
+        )
+
+        weird_id = 'proj_"weird"'
+        updated = insert_portal_project_repo_entry(
+            CONFIG, render_portal_project_repo_entry(weird_id, ["api"])
+        )
+        assert self._mapping(updated).repos_for_project(weird_id) == ["api"]
+
 
 class TestFreshnessGuardScope:
     def test_a_dev_coordinator_yml_in_an_unrelated_checkout_is_not_guarded(

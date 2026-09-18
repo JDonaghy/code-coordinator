@@ -101,8 +101,12 @@ Order matters loosely; the coord agent goes last.
      server now.
 2. **Xcode Command Line Tools only** — `xcode-select --install` (~1.5GB). Rust does not need full
    Xcode (~15GB+); install it only if notarization or Instruments becomes necessary.
-3. **Homebrew**, then the GUI stack: `brew install gtk4 pango cairo gdk-pixbuf graphene` (~2–3GB).
-   These are vimcode's `gtk4`/`pangocairo` deps — see its `Cargo.toml`.
+3. **Homebrew** (required — `scripts/setup-macmini.sh` refuses to run without it). The GUI stack
+   is **optional**: `brew install gtk4 pango cairo gdk-pixbuf graphene` (~2–3GB). These are
+   vimcode's `gtk4`/`pangocairo` deps — see its `Cargo.toml`. Install them only if you want this
+   box to *build* gui-on targets (a default `cargo build` of vimcode has `gui` on). It does **not**
+   make the box gtk-capable — see "Does not route there" below, which is now measured rather than
+   predicted. As of 2026-09-11 the live mini does have `gtk4` 4.22.4 + `pkgconf` installed.
 4. **Rust** via rustup. Set the build-job cap globally in `~/.cargo/config.toml`:
    ```toml
    [build]
@@ -182,6 +186,26 @@ constraint.
 `gtk` capability on the mac would be a lie for anything visual. Keep GTK work on precision /
 elitebook until macOS GTK is a deliberate target.
 
+This is **measured, not predicted** (2026-09-12). `gtk4` 4.22.4 *is* installed on the mini now, and
+gui-on vimcode builds and runs there — so the question "can it build?" is settled yes and is the
+wrong question. `cargo test --lib gtk::` at vimcode `812bbd9`, same SHA and same filter on both
+sides:
+
+| Machine | Result |
+|---|---|
+| macmini (quartz) | 152 passed, **3 failed** |
+| precision (Linux) | 155 passed, 0 failed |
+
+155 = 152 + 3, and the three are all pixel/paint probes on in-memory Cairo surfaces —
+window-control contrast in `solarized-dark`, absent glyph ink in a minimap probe band, a missing
+split-divider line. On quartz pangocairo rasterises through Core Text rather than freetype, so
+glyph ink and colour compositing genuinely differ. They pass on Linux, so they are not bugs; they
+are the divergence. **Installing `gtk4` did not close this gap and does not earn the capability.**
+
+The fleet consequence: vimcode's `test_command` in `coordinator.yml` keeps its `uname` guard, which
+runs `cargo test --no-default-features` on Darwin. That lane is GTK-blind by design; the unblock for
+per-partition command scoping is #3298, not installing packages here.
+
 ### Two caveats
 
 - **Portable-in-principle is not verified.** The coord pytest suite has never run on macOS. Finding
@@ -207,6 +231,14 @@ locally *before* being added to the config. Start narrow:
     claude-coordinator: ~/src/code-coordinator   # name != directory, on purpose (#2104)
     coord-tui: ~/src/coord-tui
 ```
+
+That block is the **original narrow-start snapshot**, kept because the staging discipline is the
+point. It is no longer what the config says. Today (`coordinator.yml`, 2026-09-12) the mini carries
+`claude-coordinator`, `quadraui`, `vimcode` — `coord-tui` was **removed** 2026-09-10 (#3231, its
+`ci_command` builds the GTK binary and this box cannot satisfy a whole command it can't build), and
+`vimcode` was **added** 2026-09-11 behind the `uname`-guarded `test_command` described above. The
+capability line is the part that has held: still `[python, rust]`, still no `gtk`. Read the live
+config, not this example.
 
 **`coord-tui`, not `quadraui`, is the right first Rust repo** — this changed after the paragraph
 above was written. quadraui's `test_command` now ends in a

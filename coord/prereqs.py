@@ -26,15 +26,22 @@ A prereq's `min_version` is `None` until a floor has actually been confirmed
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from coord.claude_setup_token import (
+    CLAUDE_OAUTH_TOKEN_ENV,
+    MINT_HINT,
+    load_setup_token,
+)
 from coord.config import provider_capability
 from coord.github_ops import GH_PR_CHECKS_JSON_MIN_VERSION
 
@@ -78,6 +85,14 @@ class ToolProbe:
     min_version: str | None
     meets_floor: bool | None  # None: no floor to check, or version unknown
     what_breaks: str
+    # #3371: epoch-milliseconds expiry of whatever credential backs this
+    # probe, when the probe can actually read one — today only the `claude`
+    # baseline prereq on Linux populates this (from
+    # `claudeAiOauth.refreshTokenExpiresAt`; darwin's Keychain-backed probe
+    # is presence-only and leaves this `None`, see the module comment above
+    # `_probe_claude_credentials_darwin`). `None` means "no expiry known",
+    # not "never expires" — never treat it as a green signal.
+    expires_at: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -102,6 +117,7 @@ class ToolProbe:
             "meets_floor": self.meets_floor,
             "capability": self.capability,
             "ok": self.ok,
+            "expires_at": self.expires_at,
         }
 
 
@@ -374,6 +390,391 @@ def _probe_windows_msvc_target(prereq: Prereq, timeout: float) -> ToolProbe:
     )
 
 
+# --- `azure` capability: credential availability, not just the CLI (#3233) --
+#
+# #3230 (epic: infrastructure-as-code as a work target) v1 targets Azure
+# only — the fleet already holds an Azure subscription (Key Vault + the
+# restic backup storage account). This backs the `capability_rules` route
+# for `**/*.tf` (the `terraform` driver kind, #3230 child 1) so the Test
+# stage has somewhere to send `.tf` diffs. Deliberately does NOT probe
+# `terraform` itself or attempt `terraform plan` — that's explicitly out of
+# scope for this child (credential *availability*, not driving a plan).
+#
+# The #1678 lesson this exists to not repeat: `browser` sat UNMET for
+# months with `dispatch_smoke` silently refusing to route and nothing ever
+# saying so. So this must fail LOUDLY and visibly in `coord doctor` (via
+# `unmet_capabilities`, same as every other capability here) whenever
+# credentials are absent OR expired — a bare `az --version` probe would
+# report the capability met on a box where `az` is installed but nobody
+# has ever run `az login` (or the cached login has since expired), which is
+# a false green worse than no probe at all.
+#
+# `az account show` is NOT the right probe here, even though it looks like
+# it should be: it reads the locally cached account profile
+# (`~/.azure/azureProfile.json`) and answers from that cache without making
+# any network call or forcing a token refresh. It only errors when there is
+# no cached account at all (never logged in, or explicitly `az logout`-ed).
+# `docs/DISASTER_RECOVERY.md` already documents the exact failure mode that
+# makes this the wrong command for these fleet boxes: "The az token on
+# these boxes expires often (90 days idle). `az account show` still
+# answers from cache while every ARM call 401s." A box whose cached login
+# expired 91 days ago still has a subscription entry on disk, so
+# `az account show` would report found=True while every real Azure call
+# fails — exactly the silent-false-green the #1678 lesson (below) warns
+# against.
+#
+# `az account get-access-token` is the cheapest call that actually forces
+# real token acquisition/validation against Azure AD: it must either reuse
+# a still-valid cached access token or use the cached refresh token to get
+# a new one, and an expired refresh token fails that exchange with
+# `AADSTS700082` (nonzero exit), exactly as loudly as never having logged
+# in at all. That is the credential-validity signal this probe needs.
+#
+# The #1678 lesson this exists to not repeat: `browser` sat UNMET for
+# months with `dispatch_smoke` silently refusing to route and nothing ever
+# saying so. So this must fail LOUDLY and visibly in `coord doctor` (via
+# `unmet_capabilities`, same as every other capability here) whenever
+# credentials are absent OR expired — a bare `az --version` probe would
+# report the capability met on a box where `az` is installed but nobody
+# has ever run `az login` (or the cached login has since expired), which is
+# a false green worse than no probe at all.
+def _probe_azure_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `azure` capability (#3233).
+
+    Two independent ways this can be unmet: the `az` CLI missing from PATH
+    at all, or present but unable to actually acquire a valid access token
+    (never logged in, or a cached login whose refresh token has since
+    expired). Never raises — degrades to `found=False` with a
+    `what_breaks` naming which of the two failed, same contract as every
+    other probe in this module.
+    """
+    if shutil.which(prereq.binary) is None:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=f"az CLI not found on PATH — {prereq.what_breaks}",
+        )
+    try:
+        result = subprocess.run(
+            [prereq.binary, "account", "get-access-token", "--output", "json"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                "`az account get-access-token` hung or could not run — "
+                f"{prereq.what_breaks}"
+            ),
+        )
+    if result.returncode != 0:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                "`az account get-access-token` failed — credentials absent "
+                "or expired, run `az login` on this machine "
+                f"({prereq.what_breaks})"
+            ),
+        )
+    # Best-effort: name the active subscription so `coord doctor` shows
+    # WHICH account is live, not just that credentials are present. Never a
+    # reason to report found=False — an unparsable response still proves
+    # `az account get-access-token` succeeded (a real token was acquired),
+    # which is the whole signal.
+    subscription: str | None = None
+    try:
+        payload = json.loads(result.stdout or "{}")
+        if isinstance(payload, dict):
+            subscription = payload.get("subscription") or payload.get("tenant")
+    except ValueError:
+        pass
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=subscription, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
+# --- `claude` provider: credential availability, not just the binary (#3326) -
+#
+# Every worker, reviewer, smoke, and fix leg this fleet dispatches is a
+# `claude -p` subprocess (`coord.providers.claude.ClaudeProvider`) unless an
+# assignment/repo/label override picks a different provider — and
+# `providers_cfg.default` is `"claude"` (`coord.providers.__init__.
+# resolve_provider_name`), so a plain repo with no provider config at all
+# still lands here. That default has no matching `capabilities:` string the
+# way `provider:opencode` does (`coord.config.provider_capability`) — a
+# machine cannot opt OUT of being asked to run `claude`, only additionally
+# advertise another provider — so this is a `BASELINE_PREREQS` entry, not a
+# `CAPABILITY_PREREQS` one gated behind a capability nothing ever declares.
+#
+# `claude --version` is useless here, exactly like a bare `az --version`
+# would be for azure (see `_probe_azure_credentials` above, the pattern this
+# copies): it only proves the binary is on `PATH`, and a dead OAuth session
+# leaves the binary perfectly runnable. The 2026-09-13 dellserver incident
+# this closes: a failed background token refresh wrote back an EMPTY
+# `accessToken`/`refreshToken` while leaving `refreshTokenExpiresAt` still in
+# the future — so a naive "is the session expired" check reading only the
+# expiry timestamps would have called this host healthy. The only signal
+# that actually caught it is reading the tokens themselves.
+#
+# Deliberately does NOT spawn `claude -p` to verify the credential — `coord
+# doctor` is documented as costing exactly what `coord status` costs, and
+# runs fleet-wide, so a probe that spawned a billable subprocess per machine
+# would break that contract. Reading and validating
+# `~/.claude/.credentials.json` locally is free and sufficient: it is the
+# exact file (and exact fields) `claude -p` itself reads before opening a
+# session, so a probe that parses it directly cannot diverge from what the
+# real dispatch will see.
+#
+# macOS does not use this file at all — Claude Code stores OAuth in the
+# login Keychain there (`coord.machine_onboard`'s identity check hit this
+# already, #3170). This probe branches the same way: presence-only via
+# `security find-generic-password` on darwin (no `-w`, so it never reads the
+# secret value and never risks a keychain-unlock prompt — same stance
+# `machine_onboard.py` already takes), full token-content validation on
+# every other platform.
+CLAUDE_OAUTH_KEYCHAIN_SERVICE = "Claude Code-credentials"  # macOS only, #3170
+
+
+def _claude_credentials_path() -> Path:
+    return Path("~/.claude/.credentials.json").expanduser()
+
+
+def _claude_not_found(prereq: Prereq, reason: str) -> ToolProbe:
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=False,
+        version=None, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=f"{reason} — {prereq.what_breaks}",
+    )
+
+
+def _probe_claude_credentials_darwin(prereq: Prereq, timeout: float) -> ToolProbe:
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", CLAUDE_OAUTH_KEYCHAIN_SERVICE],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _claude_not_found(
+            prereq, "`security find-generic-password` hung or could not run"
+        )
+    if result.returncode != 0:
+        return _claude_not_found(
+            prereq,
+            f"no {CLAUDE_OAUTH_KEYCHAIN_SERVICE!r} item in the login Keychain "
+            f"and no long-lived credential — {MINT_HINT}",
+        )
+    # Presence only (see module comment above) — no subscription tier is
+    # available on darwin without reading the secret value.
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=None, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
+def _probe_claude_credentials_linux(prereq: Prereq, _timeout: float) -> ToolProbe:
+    path = _claude_credentials_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return _claude_not_found(
+            prereq,
+            f"{path} does not exist or is unreadable and no long-lived "
+            f"credential is configured — {MINT_HINT}",
+        )
+    oauth = None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            oauth = data.get("claudeAiOauth")
+    except ValueError:
+        oauth = None
+    if not isinstance(oauth, dict):
+        return _claude_not_found(
+            prereq,
+            f"{path} is not valid JSON or has no claudeAiOauth block — run "
+            "`claude` (interactive login) on this machine to recreate it",
+        )
+    access_token = oauth.get("accessToken") or ""
+    refresh_token = oauth.get("refreshToken") or ""
+    refresh_expires_at = oauth.get("refreshTokenExpiresAt")
+    now_ms = time.time() * 1000.0
+    refresh_expired = (
+        isinstance(refresh_expires_at, (int, float))
+        and refresh_expires_at > 0
+        and refresh_expires_at < now_ms
+    )
+    if not access_token or not refresh_token or refresh_expired:
+        return _claude_not_found(
+            prereq,
+            f"{path} holds empty or expired OAuth tokens — a failed "
+            "background refresh can blank accessToken/refreshToken while "
+            "leaving refreshTokenExpiresAt looking alive (#3326) — run "
+            "`claude` (or `claude setup-token`) on this machine to "
+            "re-authenticate",
+        )
+    tier = oauth.get("subscriptionType") or oauth.get("rateLimitTier")
+    # #3371: surface "whatever expiry is knowable" — `refreshTokenExpiresAt`
+    # is the SESSION lifetime (weeks), not the short-lived access token's
+    # `expiresAt` (hours, auto-refreshed and therefore not the thing an
+    # operator needs forward visibility into — see this field's own
+    # `refresh_expired` check above, which already treats it as the
+    # authoritative "is this credential dead" signal). Only published when
+    # it parses as a real positive timestamp; a missing/garbled field
+    # degrades to `None` ("no expiry known"), never to a fabricated one.
+    known_expires_at = (
+        float(refresh_expires_at)
+        if isinstance(refresh_expires_at, (int, float)) and refresh_expires_at > 0
+        else None
+    )
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=tier, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks, expires_at=known_expires_at,
+    )
+
+
+def _probe_claude_setup_token(prereq: Prereq) -> ToolProbe | None:
+    """#3371 Part A: report on this host's long-lived `claude setup-token`
+    credential, or `None` when it has not adopted one.
+
+    Ordered AHEAD of the interactive-session probe below because
+    `coord.claude_setup_token.inject_setup_token` — the only place a
+    headless worker's environment is built — resolves the credential in
+    exactly that order too. The probe must report on the credential the
+    next dispatch will actually authenticate with; a probe that ranked the
+    two sources differently from dispatch would be a split-brain answer to
+    one question (#2096), which is precisely the failure #3371 exists to
+    close.
+
+    `expires_at` stays `None`: a minted setup-token publishes no expiry
+    anywhere we can read, and `ToolProbe.expires_at`'s contract is that
+    `None` means "no expiry known", never "does not expire".
+    """
+    status = load_setup_token()
+    if not status.present:
+        return None
+    if not status.usable:
+        return _claude_not_found(prereq, status.problem or "unusable credential")
+    version = "subscription (setup-token)"
+    if status.source == "env":
+        version += f" via ${CLAUDE_OAUTH_TOKEN_ENV}"
+    if status.note:
+        version += f" — {status.note}"
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=version, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
+def _probe_claude_credentials(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the baseline `claude` prereq (#3326).
+
+    Never raises — every failure mode (binary missing, file missing,
+    unparsable file, empty/expired tokens, a hung `security` call on darwin)
+    degrades to `found=False` with a `what_breaks` naming which one and the
+    remedy, same contract as every other probe in this module.
+    """
+    if shutil.which(prereq.binary) is None:
+        return _claude_not_found(prereq, "claude CLI not found on PATH")
+    long_lived = _probe_claude_setup_token(prereq)
+    if long_lived is not None:
+        return long_lived
+    if sys.platform == "darwin":
+        return _probe_claude_credentials_darwin(prereq, timeout)
+    return _probe_claude_credentials_linux(prereq, timeout)
+
+
+# --- `nvim` capability: vimcode's oracle suite hard-fails without one (#3351) -
+#
+# vimcode's `tests/nvim_conformance.rs` (1,436 oracle-backed cases,
+# vimcode#865) hard-fails on EVERY lane — Work and Test alike — when `nvim`
+# is missing, unparseable, or older than vimcode's own `MIN_NVIM_VERSION`.
+# There is no cross-repo import seam for that constant the way
+# `GH_PR_CHECKS_JSON_MIN_VERSION` gives `gh` above (#1564's precedent is
+# INSIDE this repo; vimcode is a different repo entirely) — so
+# `NVIM_MIN_VERSION` below is a comment-linked duplicate, not a shared
+# source of truth, and must be bumped by hand if vimcode's ever moves. A new
+# cross-repo dependency just to import one constant would be a worse trade
+# than a documented duplicate.
+#
+# This is the one prereq in this module that deliberately does NOT follow
+# the "unparseable version degrades to unknown, assume fine" contract
+# `ToolProbe.ok` documents for every other probe here (see `probe`'s
+# nonzero-returncode branch and `test_unparseable_version_degrades_to_
+# unknown_not_failure`). vimcode#865 already made the opposite call for its
+# own in-suite check — fail closed rather than pass 1,436 vacuous cases —
+# specifically because a missing/broken oracle is indistinguishable from a
+# real Vim-compat regression once the suite goes green. Silently trusting
+# an unparseable `nvim --version` banner here would just move that same
+# silent-false-green one layer up the stack, which is the exact failure
+# this prereq exists to catch. So `_probe_nvim` refuses (`meets_floor=False`)
+# rather than shrugs (`meets_floor=None`) when the banner can't be parsed,
+# and reports `found=False` outright on a hang, a nonzero exit, or a
+# missing binary — the same fail-closed posture, applied one layer up.
+NVIM_MIN_VERSION = "0.12"  # vimcode's MIN_NVIM_VERSION (vimcode#865)
+
+
+def _probe_nvim(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `nvim` capability (#3351).
+
+    See the module comment above `NVIM_MIN_VERSION` for why this refuses
+    outright on an unparseable banner rather than degrading to "unknown,
+    assume fine" the way the generic `probe()` path does. Never raises —
+    same contract as every other probe in this module.
+    """
+    if shutil.which(prereq.binary) is None:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=f"nvim not found on PATH — {prereq.what_breaks}",
+        )
+    try:
+        result = subprocess.run(
+            [prereq.binary, *prereq.version_args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"`nvim --version` hung or could not run — {prereq.what_breaks}"
+            ),
+        )
+    if result.returncode != 0:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"`nvim --version` exited nonzero — {prereq.what_breaks}"
+            ),
+        )
+    version = _parse_version(
+        (result.stdout or "") + (result.stderr or ""), prereq.version_re
+    )
+    if version is None:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=True,
+            version=None, min_version=prereq.min_version, meets_floor=False,
+            what_breaks=(
+                "`nvim --version` output did not match the expected 'NVIM "
+                f"v<version>' banner — {prereq.what_breaks}"
+            ),
+        )
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=version, min_version=prereq.min_version,
+        meets_floor=meets_floor(version, prereq.min_version),
+        what_breaks=prereq.what_breaks,
+    )
+
+
 # Required on every machine, no matter its declared capabilities — coord
 # itself doesn't function without these.
 BASELINE_PREREQS: tuple[Prereq, ...] = (
@@ -393,6 +794,20 @@ BASELINE_PREREQS: tuple[Prereq, ...] = (
             "the CI merge gate cannot read check status — see "
             "coord.github_ops.GhTooOldForJsonChecks (#1564)"
         ),
+    ),
+    # #3326: see the module comment above `_probe_claude_credentials` for
+    # why this is baseline (no machine can opt out of being asked to run
+    # the default provider) and why it validates the credential file rather
+    # than spawning `claude -p`.
+    Prereq(
+        tool="claude", binary="claude", version_args=(), version_re="",
+        min_version=None, capability=None,
+        what_breaks=(
+            "every claude-provider dispatch (worker, reviewer, smoke, fix) "
+            "authenticates as api_error at turn 1 and burns zero turns / $0 "
+            "while looking dispatched (#3326)"
+        ),
+        custom_probe=_probe_claude_credentials,
     ),
 )
 
@@ -500,6 +915,35 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
             "toolchain (#2952)"
         ),
         custom_probe=_probe_windows_msvc_target,
+    ),
+    # #3233: backs the `azure` capability routing `**/*.tf` (terraform
+    # driver, #3230 child 1). See the module comment above
+    # `_probe_azure_credentials` for why this cannot be a plain
+    # `az --version` binary probe.
+    Prereq(
+        tool="az", binary="az", version_args=(), version_re="",
+        min_version=None, capability="azure",
+        what_breaks=(
+            "terraform-lane (.tf) work routed to this machine cannot "
+            "authenticate against Azure"
+        ),
+        custom_probe=_probe_azure_credentials,
+    ),
+    # #3351 (vimcode#865): backs the `nvim` capability — vimcode's own
+    # nvim-conformance oracle (1,436 cases) hard-fails on every lane when
+    # `nvim` is absent, unparseable, or below `NVIM_MIN_VERSION`. See the
+    # module comment above `NVIM_MIN_VERSION` for the fail-closed posture
+    # and why this cannot use the generic lenient probe path.
+    Prereq(
+        tool="nvim", binary="nvim", version_args=("--version",),
+        version_re=r"NVIM v(\S+)", min_version=NVIM_MIN_VERSION,
+        capability="nvim",
+        what_breaks=(
+            "the vimcode nvim-conformance suite hard-fails (vimcode#865), "
+            "turning every vimcode leg red with a failure that looks like "
+            "a Vim-compat regression"
+        ),
+        custom_probe=_probe_nvim,
     ),
 )
 
@@ -641,6 +1085,106 @@ def probe_all(
 def tool_versions_summary(probes: dict[str, ToolProbe]) -> dict[str, dict]:
     """JSON-friendly form of `probe_all()`'s result."""
     return {tool: p.to_dict() for tool, p in probes.items()}
+
+
+def tool_probe_from_dict(tool: str, info: dict) -> ToolProbe:
+    """Reconstruct a :class:`ToolProbe` from one entry of a `/health`
+    response's `tool_versions` dict (the shape :meth:`ToolProbe.to_dict`
+    produces).
+
+    #3371 / #2096 ("one question, one answer"): this is the ONE place a
+    `/health` payload's raw probe dict is turned back into a `ToolProbe` so
+    ``.ok`` can be asked of it. Before this existed, `coord doctor` did this
+    reconstruction inline and nothing else could reuse it — a second caller
+    (:func:`claude_credential_ok`, added the same issue) would otherwise
+    have had to re-derive its own opinion of "is this probe OK" from the
+    raw dict fields, which is exactly the split-brain #2096 warns about.
+    `what_breaks` is not part of the wire payload (`to_dict()` omits it —
+    it is prose for a human reading `coord doctor`'s own probe table, not a
+    live probe's `Prereq.what_breaks`), so it is left empty here; nothing
+    downstream reads it off a reconstructed probe.
+    """
+    return ToolProbe(
+        tool=tool,
+        capability=info.get("capability"),
+        found=bool(info.get("found", False)),
+        version=info.get("version"),
+        min_version=info.get("min_version"),
+        meets_floor=info.get("meets_floor"),
+        what_breaks="",
+        expires_at=info.get("expires_at"),
+    )
+
+
+def claude_credential_ok(tool_versions: dict | None) -> bool:
+    """Can this machine's default-provider (`claude`) OAuth credential
+    authenticate right now?
+
+    Single source of truth for that question (#3371, #2096's "one question,
+    one answer"): `coord doctor` and `coord plan`'s routing filter
+    (`coord.brain.build_prompt`) must both answer it by calling THIS, not
+    by maintaining two independent opinions derived from the same
+    `tool_versions["claude"]` dict that could silently drift apart — see
+    #3367/#3368/#3369's incident, where nothing upstream of a failed
+    dispatch treated a dead credential as disqualifying at all.
+
+    Degrades to `True` ("assume healthy") when `tool_versions` is missing
+    entirely, or has no `claude` entry — an agent that predates #3326's
+    probe, or one whose `/health` call itself failed and left this field
+    unset, must not be newly treated as broken. That matches every other
+    `tool_versions` consumer's degrade-to-unknown stance (`coord doctor`'s
+    "no tool_versions in /health" branch; `unmet_capabilities`'s `p is
+    None` skip).
+    """
+    if not tool_versions:
+        return True
+    info = tool_versions.get("claude")
+    if not isinstance(info, dict):
+        return True
+    return tool_probe_from_dict("claude", info).ok
+
+
+#: How far ahead of a KNOWN `claude` credential expiry `coord doctor` warns
+#: (#3371 — the operator's own complaint was "no insight into when it
+#: expires", not just "no insight that it already has"). 3 days: the fleet
+#: table in #3371's evidence shows access-token churn on the order of
+#: hours, but the underlying session/refresh-token lifetime is "a few
+#: weeks" per the same report — 3 days gives a human time to notice a
+#: `coord doctor` run and re-authenticate before the #3367 incident (four
+#: zero-cost dispatch failures before anyone noticed) repeats. Only ever
+#: fires when `expires_at` is actually known (see `ToolProbe.expires_at`'s
+#: docstring) — silence here is "no expiry known", never "not expiring".
+CLAUDE_CREDENTIAL_EXPIRY_WARN_SECONDS = 3 * 24 * 3600.0
+
+
+def claude_credential_expiry_warning(info: dict, *, now: float | None = None) -> str | None:
+    """Human-readable warning when *info* (one `tool_versions["claude"]`
+    entry) names a known expiry within
+    :data:`CLAUDE_CREDENTIAL_EXPIRY_WARN_SECONDS`, else `None`.
+
+    Only meaningful for a probe that is currently `ok` — an already-dead
+    credential is reported by the ordinary `✗ claude: ...` line `coord
+    doctor` already renders (via `tool_probe_from_dict(...).ok`), and
+    re-flagging it here as "expiring soon" would just be a second, weaker
+    name for the same failure. Callers should check `.ok` first.
+
+    *now* defaults to `time.time() * 1000` (`expires_at` is epoch
+    milliseconds, matching `claudeAiOauth.refreshTokenExpiresAt`); overridable
+    for tests.
+    """
+    expires_at = info.get("expires_at") if isinstance(info, dict) else None
+    if not isinstance(expires_at, (int, float)) or expires_at <= 0:
+        return None
+    now_ms = (time.time() if now is None else now) * 1000.0
+    remaining_seconds = (expires_at - now_ms) / 1000.0
+    if remaining_seconds <= 0 or remaining_seconds > CLAUDE_CREDENTIAL_EXPIRY_WARN_SECONDS:
+        return None
+    remaining_days = remaining_seconds / 86400.0
+    return (
+        f"claude credential expires in ~{remaining_days:.1f} day(s) — "
+        "re-authenticate (`claude` or `claude setup-token`) before it does "
+        "(#3371)"
+    )
 
 
 def unmet_capabilities(

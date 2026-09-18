@@ -962,6 +962,17 @@ DEFAULT_DRAIN_INTERVAL_SECONDS = 15.0
               help="Seconds after a #2240 release before cordoning may resume "
                    "(default 1800). Without it the next run re-cordons — the "
                    "hosts are still behind — and the deadlock re-arms.")
+@click.option("--cordon-stall-seconds", default=None, type=float,
+              help="#3336: wall-clock seconds the deferral streak's trailing "
+                   "window must actually SPAN, in addition to "
+                   "--cordon-max-deferrals, before the #2240 release fires "
+                   "(default 2400, i.e. ~40 minutes — what 2 deferrals at "
+                   "the propagate timer's 20-minute cadence already means). "
+                   "A tick count alone means a different duration at every "
+                   "poll cadence; --drain's much faster default poll "
+                   "(--drain-interval, 15s) used to trip the same release "
+                   "after ~75s against a fleet that was not stalled at all. "
+                   "0 disables the floor and restores count-only behaviour.")
 @click.option("--min-behind", "min_behind_override", default=None, type=int,
               help="#2583: hold this run — no cordon, no host touched — below "
                    "this many releases behind PyPI's latest. Default: "
@@ -1009,6 +1020,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     drain_deadline: float | None,
     cordon_max_deferrals: int | None,
     cordon_cooldown: float | None,
+    cordon_stall_seconds: float | None,
     min_behind_override: int | None,
     as_json: bool,
     drain: bool,
@@ -1062,6 +1074,13 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     lives in the propagation journal, because the process holding it is
     restarted by the roll it gates.
 
+    #3336: that count alone means a different duration at every poll cadence
+    — see #3047 immediately below for the caller that made this concrete.
+    ``--cordon-stall-seconds`` (default ~40 minutes) is an elapsed-time floor
+    the deferral streak's trailing window must actually SPAN, checked
+    alongside the count, so the release condition means the same real-world
+    stillness no matter how often this command is invoked.
+
     #3047: ``--drain`` turns the single attempt this docstring describes into
     a resident loop (:func:`_run_drain`) that keeps calling this SAME
     function — one attempt at a time, `deadline_seconds`/`drain_interval_
@@ -1072,7 +1091,10 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     `coord-release-propagate.timer` is masked for a manual roll: one call is
     overwhelmingly likely to land outside the (normally seconds-long) gap and
     report ``deferred``, leaving an operator to re-run this command by hand
-    until a poll finally lands inside it.
+    until a poll finally lands inside it. Its default ``--drain-interval``
+    (15s) is exactly what made #3336 concrete: a tick count calibrated
+    against a 20-minute timer reached the same bound in ~75s under this much
+    faster poll, against a fleet that was not stalled at all.
 
     *_drain_quiet* is internal-only (never a Click option, so an ordinary CLI
     invocation always uses its ``False`` default) — :func:`_run_drain` sets it
@@ -1112,6 +1134,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             drain_deadline=drain_deadline,
             cordon_max_deferrals=cordon_max_deferrals,
             cordon_cooldown=cordon_cooldown,
+            cordon_stall_seconds=cordon_stall_seconds,
             min_behind_override=min_behind_override,
             as_json=as_json,
         )
@@ -1433,6 +1456,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         state_dir=state_dir,
         max_deferrals=cordon_max_deferrals,
         release_cooldown=cordon_cooldown,
+        cordon_stall_seconds=cordon_stall_seconds,
         daemon_host=daemon_name,
         # #2373: lets a blown drain deadline ask the escalated host's own
         # agent to resolve the #1870 cross-host liveness ambiguity locally
@@ -1787,15 +1811,33 @@ def _drain_remaining_hosts(record: "rp.PropagationRecord") -> set[str]:
     — and its stale cordon, no longer renewed once ``--drain`` has walked
     away, would eventually lapse and reopen for new work still on the old
     version.
+
+    #3335: also folds in ``released.hosts`` — the #2240/#2741 deadlock
+    breaker's abandoned set. ``plan_cordons`` builds that set as exactly
+    "cordoned and still behind" (``set(live) - set(to_uncordon)``), so these
+    hosts are behind BY CONSTRUCTION; the breaker gives up on them, it does
+    not confirm them current. ``_apply_cordons`` clears their cordon and
+    appends them to the SAME ``uncordoned`` list a proven-current host's roll
+    appends to — that list cannot tell "rolled and confirmed" apart from
+    "abandoned and released" — so ``released.hosts`` must be added to
+    ``remaining`` and kept out of the ``uncordoned`` subtraction even though
+    it also appears there. Skipping this reproduces the exact "every host
+    reached the target" / exit 0 failure the ``unknown`` carve-out above
+    exists to prevent, except worse: the breaker doesn't even leave a stale
+    cordon behind, it clears it immediately and opens a 30-minute
+    no-cordon cooldown on hosts still on the old version.
     """
     cordons = record.cordons or {}
+    released_hosts = set((cordons.get("released") or {}).get("hosts") or [])
     remaining = (
         set(cordons.get("cordoned") or [])
         | set(cordons.get("collateral_spared") or [])
         | set(cordons.get("stuck_in_cooldown") or [])
         | set(cordons.get("unknown") or [])
+        | released_hosts
     )
-    return remaining - set(cordons.get("uncordoned") or [])
+    uncordoned = set(cordons.get("uncordoned") or []) - released_hosts
+    return remaining - uncordoned
 
 
 def _run_drain(
@@ -2077,6 +2119,7 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     state_dir: Path | None = None,
     max_deferrals: int | None = None,
     release_cooldown: float | None = None,
+    cordon_stall_seconds: float | None = None,
     daemon_host: str | None = None,
     machines=None,
     agent_port: int | None = None,
@@ -2151,6 +2194,15 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     )
     outcome.max_deferrals = resolved_max_deferrals
 
+    # #3336: same pattern, same reason, for the elapsed-time floor alongside
+    # the tick count — see `plan_cordons`'s own docstring.
+    resolved_cordon_stall_seconds = (
+        rc.DEFAULT_CORDON_STALL_SECONDS
+        if cordon_stall_seconds is None
+        else cordon_stall_seconds
+    )
+    outcome.cordon_stall_seconds = resolved_cordon_stall_seconds
+
     plan = rc.plan_cordons(
         target_version=target_version,
         host_versions=_python_lane_versions(report, hosts, target_version),
@@ -2176,6 +2228,7 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
             if release_cooldown is None
             else release_cooldown
         ),
+        cordon_stall_seconds=resolved_cordon_stall_seconds,
         daemon_host=daemon_host,
     )
     if not quiet:
@@ -3129,14 +3182,34 @@ def release_cordon(
                 "routes onto a cordoned host)"
             )
         else:
+            # #3336 review: reaching `max_deferrals` no longer implies release
+            # is imminent — `plan_cordons` also requires the streak to have
+            # SPANNED `cordon_stall_seconds` of real wall-clock time (~40
+            # minutes by default), which a fast poller (e.g. `--drain`'s
+            # 15s default) can take many more than `max_deferrals` attempts
+            # to reach. Naming both the count and the elapsed requirement —
+            # and how much of it has actually elapsed so far — keeps this
+            # line honest about what "outright" depends on, instead of
+            # promising a release that may still be a long wait away.
+            span = pressure.window_span(now)
+            elapsed_note = (
+                f", and has run for ~{span / 60.0:.0f}m of the "
+                f"~{rc.DEFAULT_CORDON_STALL_SECONDS / 60.0:.0f}m required"
+                if span is not None
+                else ""
+            )
             stall_note = (
                 "these cordons have not produced a rollable window, and the "
                 "fleet's busy signal has held identical across every one of "
                 "those runs — a cordon does not itself block follow-on "
                 "dispatch (a review still routes onto a cordoned host), so "
                 "this is read as a genuine stall. `coord release propagate` "
-                f"releases it outright after {rc.DEFAULT_MAX_DEFERRALS} "
-                "(#2240/#2741)"
+                f"releases it outright once BOTH {rc.DEFAULT_MAX_DEFERRALS} "
+                "consecutive deferrals have happened AND the streak has "
+                f"spanned ~{rc.DEFAULT_CORDON_STALL_SECONDS / 60.0:.0f}m of "
+                f"wall-clock time{elapsed_note} (#2240/#2741/#3336) — a fast "
+                "poller (e.g. `--drain`) reaches the count in far fewer "
+                "minutes but still has to wait out the same elapsed floor"
             )
         click.echo(f"\n! {rc.describe_deferral_pressure(pressure)}: {stall_note}.")
     if stuck_hosts:

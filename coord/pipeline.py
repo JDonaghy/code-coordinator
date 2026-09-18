@@ -30,7 +30,14 @@ what the coarse PipelineStage status captures.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
+
+from coord.merge_queue import (
+    evaluate_uat_verdict,
+    is_uat_gate_reason,
+    requires_uat,
+    uat_inapplicable_reason,
+)
 
 if TYPE_CHECKING:
     from coord.config import Config
@@ -107,6 +114,107 @@ class PipelineView:
     # recently made progress) — see compute_pipeline for the derivation.
     # None only when nothing involved has finished yet (still coding).
     finished_at: float | None = None
+
+
+# ── GateSpec registry (#3261 S-2) ────────────────────────────────────────────
+#
+# A `GateSpec` describes one pipeline gate as data: what decides the gate
+# applies to a given queue entry, what decides it currently passes, the
+# vocabulary a human/producer may record as a verdict, and the identity of
+# the fail-route a stuck verdict is escalated/dispatched to. This is a PURE
+# refactor — each field below wraps an already-existing function/constant,
+# never reimplements it (#2096: one question, one answer — `requires_uat`
+# and `evaluate_uat_verdict` stay the single source of truth for "does this
+# entry need UAT" / "does it currently pass").
+#
+# S-3 (`coord/merge_queue.py`'s `_gate_in_effective_gates`) and S-4
+# (`coord/drive.py`'s `_merge_gate_kind`) both now consume this registry —
+# see their own call sites for how. This module is the home for it rather
+# than `coord/merge_queue.py` itself because `drive.py` needs to import the
+# registry too and already imports `coord/merge_queue.py` — putting the
+# registry in `merge_queue.py` would make `drive.py`'s import of it
+# indistinguishable from its existing `merge_queue` import, whereas
+# `coord/pipeline.py` has no runtime dependents in `coord/drive.py`, so
+# `pipeline.py` importing `merge_queue.py` (one-directional) creates no
+# cycle in either direction.
+
+
+@dataclass(frozen=True)
+class GateSpec:
+    """Static description of one pipeline gate, keyed by name in
+    :data:`GATE_REGISTRY`.
+
+    Every field wraps an existing implementation named in the #3261/S-2
+    issue's table — this type does not reimplement gate logic, it just
+    gives the existing functions/constants a shared shape so a future
+    caller (S-3/S-4) can look a gate up by name instead of hardcoding a
+    ``if gate == "uat": ...`` branch at each call site.
+    """
+
+    #: One of ``coord.config.KNOWN_GATE_NAMES``.
+    name: str
+
+    #: ``(entry, config) -> bool`` — True when *entry* must clear this gate
+    #: before it may merge. E.g. :func:`coord.merge_queue.requires_uat`.
+    applies: Callable[["QueuedMerge", "Config"], bool]
+
+    #: ``(entry, board, config, gh_ops=None) -> (ok, message)`` — the gate's
+    #: current pass/fail verdict for *entry*, plus an operator-facing
+    #: ``message`` populated when not ``ok``. E.g.
+    #: :func:`coord.merge_queue.evaluate_uat_verdict`.
+    evaluate: Callable[..., tuple[bool, str]]
+
+    #: The verdict values a producer (human or automation) may record for
+    #: this gate, including ``None`` for "no verdict yet / cleared"
+    #: (:func:`coord.state.record_uat_verdict` accepts ``uat_state=None`` to
+    #: reset a stuck entry). Deliberately narrower than Test's for UAT — no
+    #: ``"skipped"``/``"running"`` — see that function's docstring for why.
+    verdicts: tuple[str | None, ...]
+
+    #: Identity (not a callable — see the module comment above on avoiding
+    #: an import of ``coord/drive.py`` here) of the fail-route a verdict
+    #: that cannot converge is escalated/dispatched to. For ``uat`` this is
+    #: the #3214 fix-up dispatch path,
+    #: ``coord.drive._park_uat_fixup_dispatch_failure``.
+    fail_route: str
+
+    #: ``(reason) -> bool`` — True when a captured/persisted gate-refusal
+    #: string (a board ``merge_reason``/``entry.error``, or a line from a
+    #: captured ``coord merge --only`` diagnostic) names THIS gate (#3272,
+    #: S-4 of #3261). This is how ``coord.drive._merge_gate_kind`` looks a
+    #: gate's identity up structurally instead of hardcoding its own private
+    #: copy of the gate's message vocabulary — the #2096 "one question, one
+    #: answer" fix for the split that let `coord/drive.py`'s
+    #: ``_UAT_GATE_MARKERS`` silently drift out of sync with the message
+    #: :func:`coord.merge_queue.evaluate_uat_verdict` actually produces.
+    #: ``None`` for a gate that hasn't been wired into reason-classification
+    #: yet (only ``uat`` is today — see ``requires_uat``/``evaluate`` above
+    #: for the same allowance).
+    identifies_reason: Callable[[str], bool] | None = None
+
+    #: ``(entry, config) -> str | None`` — a human-readable reason THIS gate
+    #: does not apply to *entry*, populated only when ``applies`` would
+    #: return ``False`` (``None`` on the ``applies=True`` branch). #3273
+    #: (S-5 of #3261): this is what lets a render path (``coord gates``) walk
+    #: every registry gate and give the skipped ones an explicit reason
+    #: ("UAT not configured for this repo", "issue exempt via
+    #: uat_checks.exempt", ...) instead of silently omitting them — the same
+    #: posture ``milestone_gate.plan_sequence`` already takes for the
+    #: Gate-A..D walk. ``None`` for a gate that hasn't grown this yet.
+    explain_inapplicable: Callable[["QueuedMerge", "Config"], str | None] | None = None
+
+
+GATE_REGISTRY: dict[str, GateSpec] = {
+    "uat": GateSpec(
+        name="uat",
+        applies=requires_uat,
+        evaluate=evaluate_uat_verdict,
+        verdicts=("passed", "failed", None),
+        fail_route="coord.drive._park_uat_fixup_dispatch_failure",
+        identifies_reason=is_uat_gate_reason,
+        explain_inapplicable=uat_inapplicable_reason,
+    ),
+}
 
 
 # ── Canonical gate naming (#1724) ────────────────────────────────────────────

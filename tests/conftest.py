@@ -140,6 +140,26 @@ def _fresh_resource_route_support():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_board_payload_cache():
+    """#3295: forget every cached ``GET /board`` ETag/body between tests.
+
+    ``coord.client.fetch_board_payload`` now memoizes ``(etag, body)`` per
+    service URL so a thin client sending a repeat ``If-None-Match`` can reuse
+    the daemon's 304. That memo is module-level — same shape as
+    ``_fresh_resource_route_support`` above — so without a reset a test that
+    populates it for a fake ``http://daemon:7435`` (a URL string reused
+    across dozens of unrelated tests) would leak a stale ``If-None-Match``
+    header, and a stale cached body, into the next test that happens to
+    reuse it.
+    """
+    from coord import client as _cc
+
+    _cc.reset_board_payload_cache()
+    yield
+    _cc.reset_board_payload_cache()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_webapp_bundle(monkeypatch, tmp_path):
     """#2009: never let the HOST's live webapp bundle change a test's answer.
 
@@ -187,6 +207,64 @@ def _no_agent_health_probe(monkeypatch):
     """
     monkeypatch.setattr(
         "coord.review._fetch_agent_advertised_repos", lambda *a, **k: None
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_agent_credential_probe(monkeypatch):
+    """#3371: default the credential-health gate's live ``/health`` probe to
+    fail-open (healthy) so the ~60 ``dispatch_review``/``dispatch`` call
+    sites that don't pass ``credential_fetcher=`` never make a real
+    ``httpx.get(".../health")`` call keyed off a fixture's bogus
+    ``host.tailnet`` hostname.
+
+    Exactly the same reasoning (and exactly the same shape) as
+    ``_no_agent_health_probe`` above: the real fetchers already degrade to
+    "assume healthy" on any probe failure, so this changes no test's
+    OUTCOME — it just stops the suite's default behaviour from depending
+    on network/DNS timing, and removes the second live probe per review
+    candidate that landing the gate would otherwise have added. Tests
+    exercising the gate itself pass an explicit ``credential_fetcher=``
+    (or monkeypatch these names to something stricter), which takes
+    priority and is unaffected.
+
+    BOTH names must be stubbed, and an earlier round of #3371 got this
+    wrong by dropping the second one. It is true that ``dispatch()`` /
+    ``pick_machine()`` / ``pick_machine_choice()`` take the probe as an
+    opt-in ``credential_fetcher=`` defaulting to ``None`` — but their
+    production CALLERS hardcode the real
+    ``coord.network.claude_credential_reachable`` unconditionally:
+    ``coord/mock_author.py``, ``coord/commands/milestone.py``,
+    ``coord/commands/dispatch.py``, ``coord/commands/dispatch_workers.py``,
+    ``coord/commands/plan_followup.py``, ``coord/dashboard/server.py``,
+    ``coord/decomposition_chat.py``, ``coord/milestone_chat.py``,
+    ``coord/new_issue_chat.py``, ``coord/refine_chat.py``,
+    ``coord/reconcile.py``, ``coord/serve_app.py``. So a test that drives
+    one of those commands with only ``coord.dispatch.dispatch_with_retry``
+    (or ``coord.dispatch.dispatch``) mocked — e.g.
+    ``tests/test_mock_author.py``'s dispatch tests,
+    ``tests/test_cli_milestone_dispatch.py`` — still reaches the real probe
+    *through its caller*, one hop before the seam it mocked, and fires a
+    live ``httpx.get("http://laptop.tailnet:7433/health")``.
+
+    Every one of those call sites does a FUNCTION-LOCAL ``from coord.network
+    import claude_credential_reachable``, resolved at call time, so patching
+    the module attribute here reaches all of them. This is the exact sibling
+    of ``fetch_status``'s stub in ``_no_dispatch_liveness_probe`` (#3353),
+    which is wired into these same call sites alongside
+    ``credential_fetcher``.
+
+    ``tests/test_network.py::TestClaudeCredentialReachable`` tests the real
+    function directly; it overrides this stub back to the real callable via
+    its own narrower class-scoped autouse fixture (a closer fixture is
+    instantiated after this one and wins), so the rest of the suite stays
+    hermetic without making the function itself untestable.
+    """
+    monkeypatch.setattr(
+        "coord.review._fetch_agent_claude_credential_ok", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        "coord.network.claude_credential_reachable", lambda *a, **k: True
     )
 
 
@@ -256,6 +334,40 @@ def _no_real_usage_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_dispatch_liveness_probe(monkeypatch):
+    """#3353: `coord approve`, `coord assign`, and `coord milestone dispatch`
+    now opt `coord.dispatch.dispatch()`'s `type="work"` liveness-routing gate
+    (`route_work_by_liveness`) into a REAL `coord.network.fetch_status` probe
+    of the proposed machine before ever POSTing to it — see
+    `route_work_by_liveness`'s docstring. Left unpatched, every CLI-level
+    test in this suite that exercises one of those three commands (almost
+    none of which care about liveness routing at all) would make a real
+    network call against whatever bogus `*.tailnet`/`*.tail` hostname its
+    fixture config uses — exactly the class of non-hermetic dependency
+    `_no_agent_health_probe` (#904) and `_no_assign_repo_drift_probe`
+    (#2219) above already exist to prevent, and measurably slower (~0.5s of
+    DNS-failure overhead per test) even where it doesn't change the result.
+
+    Defaults to "every machine answers" (fail-open — matching this issue's
+    own design goal: an unknown/unprobed machine must never strand work,
+    only a CONFIRMED-down one should), so an untouched test sees
+    `route_work_by_liveness` return `None` (nothing to reroute) exactly as
+    if the caller had never opted in. Tests exercising the liveness gate
+    itself pass their own `status_fetcher=` directly to `dispatch()` /
+    `route_work_by_liveness` (bypassing this default entirely, same as
+    `select_fix_machine`'s (#3208) equivalent tests already do), or
+    monkeypatch `coord.network.fetch_status` themselves after this fixture
+    runs, which wins.
+    """
+    from coord.network import StatusResult
+
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(data={"assignments": []}),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_gh(monkeypatch):
     """#1484: default every ``coord.github_ops`` helper to fail exactly as it
     would on a host where ``gh`` isn't on PATH (raise ``GhError``, a
@@ -313,6 +425,41 @@ def _no_live_gh(monkeypatch):
         return _REAL_GH(*args, **kwargs)
 
     monkeypatch.setattr(github_ops, "_gh", _gh_guard)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_tmux_driver_probe(monkeypatch):
+    """#3282 review (non-blocking): default ``coord.drive.tmux_session_alive``
+    to "nothing is alive" instead of shelling out to a real local tmux
+    server.
+
+    Before #3282, a drive-queue *dequeue* never touched tmux at all — only
+    the dedicated tmux-focused suites (``tests/test_drive_tmux.py``,
+    ``tests/test_cli_reattach_sessions.py``, and friends) reached this seam,
+    and each of those already mocks it deliberately. Since #3282,
+    ``coord.drive.stop_live_driver_session`` — called after EVERY successful
+    drive-queue dequeue, to own the live driver a bare row-delete would
+    otherwise orphan (the CLI's ``coord drive-queue remove``, the board
+    daemon's own ``/drive-queue`` ``dequeue`` route, and the dashboard's
+    local-mode fallback of the same) — probes it first. Without this
+    default, any test anywhere in the suite that exercises a plain dequeue
+    and never seeded a real tmux session (the overwhelming majority — this
+    always resolves to ``False`` for them anyway) would make a real, if fast
+    and harmless, ``tmux has-session`` subprocess call: the exact
+    live-subprocess-in-a-unit-test hazard ``_no_live_gh`` above guards for
+    ``gh``.
+
+    Mirrors that fixture's PURPOSE, not its "guard and raise" strictness:
+    unlike ``_gh``, ``tmux_session_alive`` has no equivalent "the caller
+    already exposes a DI seam for this" escape hatch to detect, so this just
+    defaults it to the safe, common-case answer rather than raising. A test
+    that wants a live (or a still-alive-after-kill) session monkeypatches
+    this back explicitly — its own ``monkeypatch.setattr`` call runs after
+    this fixture's, so it wins — exactly as
+    ``tests/test_cli_drive_queue.py``'s ``test_remove_kills_a_live_driver_
+    session`` and its siblings already do.
+    """
+    monkeypatch.setattr("coord.drive.tmux_session_alive", lambda *a, **k: False)
 
 
 @pytest.fixture(autouse=True)
@@ -739,6 +886,29 @@ def _no_real_github_backoff_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_machine_fault_store(monkeypatch, tmp_path):
+    """#3367: never let a test write the OPERATOR'S real
+    ``~/.coord/machine_faults.json``.
+
+    Same hazard as ``_no_real_github_backoff_store`` immediately above, one
+    file over: this one is ``coord.machine_fault``'s consecutive-fault
+    counter, which `_decide_review`/`_decide_work` (`coord/drive.py`) write
+    on every machine-fault classification and which can trigger a REAL
+    `coord.machine_pause.pause()` call once the streak crosses
+    `AUTO_PAUSE_THRESHOLD`. A leaked test write could plant a stale streak
+    that auto-pauses a real fleet machine the next time any test (or a
+    developer's own local run) happens to exercise this path.
+
+    ``coord.machine_fault._state_path`` reads
+    ``$COORD_MACHINE_FAULT_STATE`` first for exactly this redirect, the
+    same env-var seam ``_no_real_github_backoff_store`` uses.
+    """
+    monkeypatch.setenv(
+        "COORD_MACHINE_FAULT_STATE", str(tmp_path / "machine-fault-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_issues_sync_status_store(monkeypatch, tmp_path):
     """#2858: never let a test write the OPERATOR'S real
     ``~/.coord/issues_sync_status.json``.
@@ -822,6 +992,29 @@ def _no_real_roll_pending_ledger_store(monkeypatch, tmp_path):
     """
     monkeypatch.setenv(
         "COORD_ROLL_PENDING_LEDGER_STATE", str(tmp_path / "roll-pending-ledger-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_smoke_fanout_manifest_lock(monkeypatch, tmp_path):
+    """#3333: never let a test create — or ``flock`` — the OPERATOR'S real
+    ``~/.coord/smoke-fanout-manifest.lock``.
+
+    Same hazard as the ``_no_real_*_store`` fixtures above, one file over,
+    with one twist: this file's *contents* are irrelevant (it is an advisory
+    ``flock`` target, always empty), but *holding* it is not — a test that
+    took it would briefly serialize against a live fleet's real `coord
+    notify` / `coord drive-queue tick` fan-out manifest merges on the same
+    machine.
+
+    ``coord.state.smoke_fanout_manifest_lock_path`` reads
+    ``$COORD_SMOKE_FANOUT_MANIFEST_LOCK`` first for exactly this redirect —
+    the same env-var seam ``_no_real_notifier_state`` uses, not a
+    monkeypatched private function.
+    """
+    monkeypatch.setenv(
+        "COORD_SMOKE_FANOUT_MANIFEST_LOCK",
+        str(tmp_path / "smoke-fanout-manifest.lock"),
     )
 
 

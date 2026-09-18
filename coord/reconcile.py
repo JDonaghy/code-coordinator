@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from coord.config import INTERACTIVE_SESSION_TYPES, Config
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
+from coord.dispatch_liveness import check_dispatch_liveness, record_dispatch_refusal
 from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
@@ -21,6 +22,7 @@ from coord.models import (
 )
 
 if TYPE_CHECKING:
+    from coord.failure_class import FailureClassification
     from coord.merge_queue import QueuedMerge
 
 # #2639: bounds the per-row file-content fetch count in sweep (h)'s
@@ -920,14 +922,80 @@ def reconcile_late_agent_reports(
     return corrected
 
 
+def _environmental_cause_phrase(classification: "FailureClassification") -> str:
+    """A human phrase naming *classification*'s actual cause for the #3315
+    park message — never the fixed "rate limit" string the message used to
+    print unconditionally (#3315 review).
+
+    ``classify_failure`` already tells a usage-limit kill apart from a bare
+    API error and, within an API error, carries the HTTP status when the
+    worker's own output named one — but the park message ignored all of that
+    and always said "an exhausted account usage limit (HTTP 429/5xx rate
+    limit)", even for a genuine ``overloaded_error``/``internal_server_error``
+    5xx that has nothing to do with rate limiting. An operator diagnosing a
+    real provider outage from that wording goes looking for a rate limit that
+    was never there.
+    """
+    from coord.failure_class import (  # noqa: PLC0415
+        KIND_API_ERROR,
+        KIND_NETWORK,
+        KIND_USAGE_LIMIT,
+    )
+
+    if classification.kind == KIND_USAGE_LIMIT:
+        return "an exhausted account usage limit"
+    if classification.kind == KIND_API_ERROR:
+        status = classification.api_status
+        if status == 429:
+            return "a sustained provider rate limit (HTTP 429)"
+        if status is not None and 500 <= status < 600:
+            return f"a sustained provider server error (HTTP {status})"
+        return "a sustained provider API error"
+    if classification.kind == KIND_NETWORK:
+        return "a sustained network/transport failure"
+    return "a sustained environmental failure"  # pragma: no cover — defensive
+
+
 def propagate_smoke_terminal_failure(
     *,
     parent_assignment_id: str | None,
     failure_reason: str | None,
     environmental: bool | None = None,
+    fanout_parent_id: str | None = None,
+    operator_cancelled: bool = False,
 ) -> None:
     """#1605: resolve a work row's ``test_state`` when its Test-stage
     (``type="smoke"``) child dies without ever reporting pass/fail.
+
+    *operator_cancelled* (#3333): set ``True`` when *parent_assignment_id*'s
+    own terminal status came from an operator ``coord stop`` (agent
+    ``/status`` entry ``status == "cancelled"``), never a genuine crash or
+    test failure. For a #3182 fan-out leg (*fanout_parent_id* given) whose
+    OTHER sibling legs are still running or already carry a `"passed"`
+    verdict, this skips the ordinary WORK/environmental classification below
+    entirely and instead clears *this leg's own* ``test_state`` back to
+    ``None`` — never ``"failed"`` — so the leg reads exactly like an
+    unresolved #1605 environmental death: `coord.smoke.finalize_smoke_fanout`
+    treats an unset/`"running"` leg as "not everyone has reported in yet"
+    (never folds it into the aggregate) and
+    `coord.smoke._find_leg_for_partition`'s existing retry criterion (a
+    terminal row with no real verdict) redispatches a fresh leg for the same
+    partition on the next `dispatch_pending_smoke` tick. Without this, a
+    single cancelled leg's terminal write would let `finalize_smoke_fanout`
+    fold `"failed"` into the parent's AND-across-legs aggregate even while a
+    sibling partition is still green or still running — the same
+    parent-keyed over-reach `release_review_claim_if_row_is_review` (#3206)
+    fixed for review claims, here in the Test stage: `coord stop` on a leg is
+    an operator saying "this leg should not exist", never evidence the code
+    under test is broken (the quadraui#952 incident: a still-running
+    `[macos]` leg and an already-PASSED `[gtk+windows]` leg sat next to a
+    `coord stop`-cancelled duplicate `[macos]` leg, and the cancellation
+    alone flipped the parent's verdict to `"failed"`).
+
+    A no leg-manifest sibling (a genuinely solo cancellation, or every
+    sibling already terminal-without-a-real-verdict itself) falls through to
+    the ordinary classification below unchanged — there is nothing live or
+    green left to protect, so recording the classified verdict is correct.
 
     Before this, a smoke assignment landing on ``status="failed"`` (a dead
     agent, a killed process group, a terminal API error — anything short of
@@ -950,7 +1018,14 @@ def propagate_smoke_terminal_failure(
       :func:`coord.smoke.dispatch_pending_smoke` auto-queue picks the work
       row back up on its next tick and re-dispatches a fresh Test stage —
       never spending the bounded ``coord fix`` retry budget on a code defect
-      that never existed.
+      that never existed. #3315: that clear is bounded, not infinite — after
+      :data:`coord.smoke.ENVIRONMENTAL_SMOKE_RETRY_BUDGET` CONSECUTIVE
+      environmental deaths on the same row (tracked the same way #2272's
+      mute-leg budget is, a tally embedded in ``test_reason``) this instead
+      parks the row at :data:`coord.smoke.TEST_STATE_BLOCKED` naming the
+      cause, so a sustained provider outage (an exhausted weekly usage
+      limit, 542 zero-token legs observed on one issue over 12h18m) goes
+      quiet instead of re-dispatching against the wall forever.
     * **work** (an unclassifiable crash, a real defect) — records
       ``test_state="failed"`` exactly like a normal non-zero-exit smoke
       completion already does (`coord/notify.py`'s completion handler), so
@@ -970,15 +1045,84 @@ def propagate_smoke_terminal_failure(
     A no-op when *parent_assignment_id* is falsy (a smoke row somehow
     missing its ``review_of_assignment_id`` — should not happen in practice,
     but this must never raise on it).
+
+    *fanout_parent_id* (#3315 review): set this when *parent_assignment_id*
+    is a #3182 capability-partition FAN-OUT LEG's own row rather than the
+    persistent work parent — i.e. exactly the shape `coord.notify` uses for a
+    dead fan-out leg, which self-records onto the leg's own row (never
+    straight onto the shared parent — see the module note above
+    ``smoke_leg_issue_title`` for why concurrent sibling legs must not race
+    on one field) and folds the aggregate separately via
+    :func:`coord.smoke.finalize_smoke_fanout`.
+
+    A fan-out leg's own row is fresh every round (a brand-new
+    ``uuid.uuid4().hex[:12]`` id minted by `_dispatch_smoke_fanout` each
+    time a partition is re-dispatched), so reading the #3315 tally off
+    *parent_assignment_id* in that shape always finds an empty, history-less
+    row and the budget below could never fire — precisely the gap this
+    parameter closes. When given, the ENVIRONMENTAL branch tracks and
+    enforces the retry budget against *fanout_parent_id* (the one row that
+    persists for the row's whole Test-stage lifetime) instead, and parks
+    *that* row — never the leg — once it is exhausted, which is what stops
+    `dispatch_pending_smoke` from ever re-entering `_dispatch_smoke_fanout`
+    for this work item again (its own-row guard, `coord/smoke.py`'s
+    ``test_state in (TEST_STATE_BLOCKED, "running")`` skip). The leg's own
+    row is still cleared to ``None``/parked exactly as before so
+    `coord.smoke.finalize_smoke_fanout`'s per-leg fold keeps seeing a
+    coherent state for it.
     """
     if not parent_assignment_id:
         return
     from coord.failure_class import classify_failure  # noqa: PLC0415
-    from coord.smoke import mute_smoke_legs, mute_smoke_tally  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
+        TEST_STATE_BLOCKED,
+        _parse_fanout_manifest,
+        environmental_smoke_legs,
+        environmental_smoke_tally,
+        environmental_smoke_tally_reset,
+        mute_smoke_legs,
+        mute_smoke_tally,
+    )
     from coord.state import (  # noqa: PLC0415
         load_assignment_test_reason,
+        load_assignment_test_state,
         record_test_verdict,
     )
+
+    if (
+        operator_cancelled
+        and fanout_parent_id
+        and fanout_parent_id != parent_assignment_id
+    ):
+        manifest = _parse_fanout_manifest(load_assignment_test_reason(fanout_parent_id)) or []
+        siblings_alive_or_passed = any(
+            leg_id != parent_assignment_id
+            and load_assignment_test_state(leg_id) in (None, "running", "passed")
+            for leg_id, _caps, _cmd in manifest
+        )
+        if siblings_alive_or_passed:
+            # #3333: this leg's own status is only "failed" because an
+            # operator cancelled it — not because it (or anything else)
+            # actually failed — and a sibling partition is still live or
+            # already green. Clear this leg's own verdict instead of
+            # recording a failure: `finalize_smoke_fanout` then holds the
+            # aggregate at "running" (an unset leg is "not everyone has
+            # reported in yet", never folded in as "worst") and
+            # `_find_leg_for_partition`'s existing retry criterion picks this
+            # partition back up for a fresh leg on the next dispatch tick.
+            record_test_verdict(
+                assignment_id=parent_assignment_id,
+                test_state=None,
+                test_reason=(
+                    "Test-stage fan-out leg cancelled by an operator "
+                    "(`coord stop`) while a sibling leg was still running "
+                    "or already passed — cleared for a fresh re-dispatch of "
+                    "this partition rather than recorded as a work failure "
+                    "(#3333); the parent's own verdict is unaffected."
+                ),
+            )
+            return
 
     classification = classify_failure(failure_reason=failure_reason)
     if environmental is None:
@@ -988,6 +1132,85 @@ def propagate_smoke_terminal_failure(
         is_environmental = bool(environmental)
         cause = failure_reason or classification.reason
     if is_environmental:
+        if fanout_parent_id and fanout_parent_id != parent_assignment_id:
+            # #3315 review: track + enforce the shared retry budget on the
+            # PERSISTENT fan-out parent row, never on this leg's own
+            # transient one (see the docstring's `fanout_parent_id` section
+            # for why a leg-scoped tally can never reach the budget). The
+            # budget is shared across every partition of the fan-out, not
+            # tracked per-partition — a 429 window hits every in-flight leg
+            # alike, so consecutive deaths of ANY sibling leg are the same
+            # evidence of the same outage.
+            previous_parent_reason = load_assignment_test_reason(fanout_parent_id)
+            env_legs = environmental_smoke_legs(previous_parent_reason) + 1
+            if env_legs >= ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
+                record_test_verdict(
+                    assignment_id=fanout_parent_id,
+                    test_state=TEST_STATE_BLOCKED,
+                    test_reason=(
+                        f"{environmental_smoke_tally(env_legs)}: the "
+                        f"Test-stage environmental retry budget "
+                        f"({ENVIRONMENTAL_SMOKE_RETRY_BUDGET}) is exhausted "
+                        f"after {env_legs} consecutive environmental deaths "
+                        f"across this fan-out's capability-partition legs "
+                        f"(#3182/#3315) — {cause}. This looks like "
+                        f"{_environmental_cause_phrase(classification)}, not "
+                        "a code defect, so the row is parked instead of "
+                        "re-dispatched — the fleet should go quiet, not "
+                        "keep spinning against the wall. Recover with "
+                        "`coord diagnose <repo> <issue> --stage test "
+                        "--reset` once the provider is healthy again, or "
+                        "record the verdict by hand with `coord test "
+                        f"--passed|--fail {fanout_parent_id}`."
+                    ),
+                )
+                # The dying leg's own row is parked too (rather than left at
+                # a plain "cleared for retry" `None`) so it reads
+                # consistently with the parent it just caused to park —
+                # `finalize_smoke_fanout` never revisits a row it finds
+                # already terminal either way.
+                record_test_verdict(
+                    assignment_id=parent_assignment_id,
+                    test_state=TEST_STATE_BLOCKED,
+                    test_reason=(
+                        f"Test-stage fan-out leg died environmentally "
+                        f"({cause}) — the fan-out's shared #3315 retry "
+                        f"budget (tracked on parent {fanout_parent_id}) is "
+                        "now exhausted; see the parent row for the full "
+                        "reason."
+                    ),
+                )
+                return
+            # Preserve — never replace — the parent's existing `test_reason`:
+            # it opens with the `[[smoke-fanout:...]]` manifest
+            # `finalize_smoke_fanout`/`_find_leg_for_partition` need to find
+            # every sibling leg again. `environmental_smoke_tally_reset`
+            # strips only a PRIOR tally marker (so repeated deaths update one
+            # running count instead of piling up duplicates); the manifest
+            # and running-summary text in front of it survive untouched.
+            record_test_verdict(
+                assignment_id=fanout_parent_id,
+                test_state="running",
+                test_reason=(
+                    f"{environmental_smoke_tally_reset(previous_parent_reason)}"
+                    f"\n{environmental_smoke_tally(env_legs)}: {env_legs} of "
+                    f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive "
+                    "environmental fan-out-leg death(s) so far (#3315) — "
+                    f"{cause}."
+                ).strip(),
+            )
+            record_test_verdict(
+                assignment_id=parent_assignment_id,
+                test_state=None,
+                test_reason=(
+                    f"Test-stage fan-out leg died environmentally ({cause}) "
+                    "— cleared for automatic re-dispatch, not recorded as a "
+                    f"work failure (#1605); {env_legs} of "
+                    f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} of the fan-out's "
+                    "shared #3315 retry budget spent so far."
+                ),
+            )
+            return
         # #2272: this clear must CARRY the mute-leg tally, for exactly the
         # reason `dispatch_smoke`'s `running` stamp must. `test_reason` is the
         # only field that survives between Test-stage legs, so any writer that
@@ -998,17 +1221,52 @@ def propagate_smoke_terminal_failure(
         # self-healing cause and #1605's unbounded re-dispatch of it is
         # deliberate) — it is only preserved, so mute legs keep counting
         # across it.
-        carried = mute_smoke_legs(
-            load_assignment_test_reason(parent_assignment_id)
-        )
+        previous_reason = load_assignment_test_reason(parent_assignment_id)
+        carried = mute_smoke_legs(previous_reason)
         prefix = f"{mute_smoke_tally(carried)} — " if carried else ""
+
+        # #3315: unlike the mute-leg tally, THIS one IS incremented here — a
+        # sustained environmental outage (an exhausted usage limit, a 429/5xx
+        # window) is exactly the case #1605's "unbounded re-dispatch is
+        # deliberate" reasoning above does not cover: 542 zero-token legs on
+        # one issue over 12h18m, stopped only when the provider's own window
+        # reset. Bounded at `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` CONSECUTIVE
+        # environmental deaths (mirrors `coord/drive.py`'s WORK-stage
+        # `_ENVIRONMENTAL_WORK_RETRY_BUDGET`, #2360) — a genuine blip clears
+        # in one or two legs, well under budget; a sustained outage parks
+        # instead of spinning against the wall.
+        env_legs = environmental_smoke_legs(previous_reason) + 1
+        if env_legs >= ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
+            record_test_verdict(
+                assignment_id=parent_assignment_id,
+                test_state=TEST_STATE_BLOCKED,
+                test_reason=(
+                    f"{prefix}{environmental_smoke_tally(env_legs)}: the "
+                    f"Test-stage environmental retry budget "
+                    f"({ENVIRONMENTAL_SMOKE_RETRY_BUDGET}) is exhausted "
+                    f"after {env_legs} consecutive environmental deaths — "
+                    f"{cause}. This looks like "
+                    f"{_environmental_cause_phrase(classification)}, not a "
+                    "code defect, so the row is parked instead of "
+                    "re-dispatched (#3315) — the fleet should go quiet, not "
+                    "keep spinning against the wall. Recover with `coord "
+                    "diagnose <repo> <issue> --stage test --reset` once the "
+                    "provider is healthy again, or record the verdict by "
+                    f"hand with `coord test --passed|--fail "
+                    f"{parent_assignment_id}`."
+                ),
+            )
+            return
         record_test_verdict(
             assignment_id=parent_assignment_id,
             test_state=None,
             test_reason=(
-                f"{prefix}Test stage worker died environmentally "
-                f"({cause}) — cleared for automatic "
-                "re-dispatch, not recorded as a work failure (#1605)"
+                f"{prefix}{environmental_smoke_tally(env_legs)}: Test stage "
+                f"worker died environmentally ({cause}) — cleared for "
+                "automatic re-dispatch, not recorded as a work failure "
+                f"(#1605); {ENVIRONMENTAL_SMOKE_RETRY_BUDGET - env_legs} of "
+                f"the {ENVIRONMENTAL_SMOKE_RETRY_BUDGET}-leg retry budget "
+                "left before the row parks instead (#3315)."
             ),
         )
     else:
@@ -1493,11 +1751,38 @@ def _resolve_retry_provider(
     return resolved
 
 
+def _issue_liveness_from_cache(
+    board: Board, repo_name: str, issue_number: int
+) -> tuple[bool, bool]:
+    """#3376: local-only ``issue_liveness_fetcher`` for `_reassign` —
+    "issue closed" from the local `issues` cache table (`coord.state.
+    get_cached_issue_state`, `None` reads as "unknown", never as closed),
+    "branch merged" from this already-fetched *board*'s own completed
+    assignments (mirrors `coord.drive_queue.IssueFacts.merged`'s
+    derivation: a work-like assignment for this issue whose status is
+    ``"merged"``). Neither call touches GitHub — same "no live probe from
+    a passive tick" posture as the ``cached_labels`` lookup beside this
+    function's one caller.
+    """
+    from coord.state import get_cached_issue_state  # noqa: PLC0415
+
+    issue_closed = get_cached_issue_state(repo_name, issue_number) == "closed"
+    branch_merged = any(
+        a.repo_name == repo_name
+        and a.issue_number == issue_number
+        and a.status == "merged"
+        for a in board.completed
+    )
+    return issue_closed, branch_merged
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,
     model: str | None = None,
     issue_labels: list[str] | None = None,
+    credential_fetcher=None,
+    issue_liveness_fetcher=None,
 ) -> Assignment | None:
     """Re-dispatch a failed assignment to a machine with spare capacity.
 
@@ -1514,6 +1799,34 @@ def _reassign(
     retry fell through to the repo/global default regardless of which
     label originally routed the issue.
 
+    *credential_fetcher* (#3371) is an optional ``(machine: Machine) ->
+    bool`` callable — ``True`` means "still routable", matching
+    ``coord.network.claude_credential_reachable``'s contract (that is also
+    the default `reconcile()` wires in at this function's one call site
+    below). `None` (the default here) performs no probe at all and
+    excludes nothing — same opt-in shape as `coord.dispatch.dispatch`'s
+    *status_fetcher*/*credential_fetcher*, kept opt-in on this LOWER-level
+    function specifically so every existing direct caller/test of
+    `_reassign` stays byte-for-byte unaffected; the real wiring happens
+    one level up, at `reconcile()`'s own call site, which IS a production
+    entry point.
+
+    *issue_liveness_fetcher* (#3376) is an optional ``(repo_name: str,
+    issue_number: int) -> (issue_closed: bool, branch_merged: bool)``
+    callable — the other two predicates of the same STRUCTURAL DISPATCH-
+    LIVENESS GATE `coord.dispatch.dispatch()` itself checks (see
+    `coord.dispatch_liveness`). `None` (the default here) performs no
+    check and skips nothing — same opt-in shape as *credential_fetcher*
+    above, for the same reason: the real wiring happens at `reconcile()`'s
+    own call site. Unlike *credential_fetcher* (a machine FILTER — an
+    unhealthy machine is simply excluded from *candidates*), a positive
+    hit here means the auto-reassign attempt itself is pointless — #3367's
+    own incident was exactly this shape one layer up (four auto-retried
+    review dispatches against a dead host); #3376 generalizes it to "is
+    the thing being retried still real at all", so this returns ``None``
+    (skip, exactly like "no candidate machines") rather than trying
+    another machine.
+
     Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
     :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
     non-work row must not be silently re-dispatched as a fresh
@@ -1526,6 +1839,27 @@ def _reassign(
     """
     if failed.type not in WORK_LIKE_TYPES:
         raise UnsupportedRetryType(failed.type, failed.review_of_assignment_id)
+
+    if issue_liveness_fetcher is not None:
+        issue_closed, branch_merged = issue_liveness_fetcher(
+            failed.repo_name, failed.issue_number
+        )
+        refusal = check_dispatch_liveness(
+            repo_name=failed.repo_name,
+            issue_number=failed.issue_number,
+            machine_name=failed.machine_name or "",
+            issue_closed=issue_closed,
+            branch_merged=branch_merged,
+        )
+        if refusal is not None:
+            record_dispatch_refusal(
+                refusal,
+                repo_name=failed.repo_name,
+                issue_number=failed.issue_number,
+                machine_name=failed.machine_name or "",
+                assignment_type=failed.type,
+            )
+            return None
 
     from coord.machine_pause import paused_set
     paused = paused_set(config.machines)
@@ -1575,6 +1909,15 @@ def _reassign(
     def can_run_provider(m: Machine) -> bool:
         return machine_supports_provider(m, resolved_provider_name, config.providers)
 
+    # #3371: STRUCTURAL CREDENTIAL-HEALTH FILTER, same opt-in shape as the
+    # #1711 capability filter just above — a retry must never route BACK
+    # onto a machine a live probe just confirmed can't authenticate. `None`
+    # (the default) excludes nothing, so every existing caller/test of
+    # `_reassign` is unaffected; `reconcile()`'s own call site below wires
+    # `coord.network.claude_credential_reachable`.
+    def credential_ok(m: Machine) -> bool:
+        return credential_fetcher is None or credential_fetcher(m)
+
     candidates = [
         m for m in config.machines
         if m.can_work_on(failed.repo_name)
@@ -1583,11 +1926,12 @@ def _reassign(
         and can_run_provider(m)
         and m.name != failed.machine_name
         and m.name not in paused
+        and credential_ok(m)
     ]
     if not candidates:
         # Fall back to including the same machine that failed last time —
-        # paused machines (and #1711 capability-lacking machines) stay
-        # excluded even from the fallback.
+        # paused machines (and #1711 capability-lacking, #3371 credential-
+        # dead machines) stay excluded even from the fallback.
         candidates = [
             m for m in config.machines
             if m.can_work_on(failed.repo_name)
@@ -1595,6 +1939,7 @@ def _reassign(
             and has_room(m)
             and can_run_provider(m)
             and m.name not in paused
+            and credential_ok(m)
         ]
     if not candidates:
         return None
@@ -2349,9 +2694,15 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # #685 per-issue test-mode gate (test-mode:smoke skips auto-dispatch —
     # the TUI offers the interactive smoke agent instead), and the
     # has_active_followup dedupe.
+    #
+    # #3309: passes the real `github_ops` as *gh_ops* so a #1479-stale
+    # passed/failed/skipped verdict (a rebase moved the base or branch out
+    # from under it) is re-dispatched instead of skipped forever — without
+    # it, the staleness check inside `dispatch_pending_smoke` fails open.
+    from coord import github_ops  # noqa: PLC0415
     from coord.smoke import dispatch_pending_smoke
 
-    for smoke in dispatch_pending_smoke(board, config):
+    for smoke in dispatch_pending_smoke(board, config, gh_ops=github_ops):
         if smoke.assignment_id is not None:
             changed.append(smoke.assignment_id)
 
@@ -2417,8 +2768,26 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 failed_a.repo_name, failed_a.issue_number,
             )
             try:
+                # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH FILTER to a
+                # real live probe — `reconcile()` is the production
+                # auto-reassign path (daemon tick loop / `coord reconcile`
+                # / `coord notify`), not a test, so a dead-credential host
+                # must actually be excluded, not just excludable.
+                from coord.network import claude_credential_reachable  # noqa: PLC0415
+
+                # #3376: wire the other two DISPATCH-LIVENESS predicates —
+                # #3367's own incident was this exact auto-reassign path
+                # burning a retry budget on a dispatch that could never
+                # matter. `_issue_liveness_from_cache` reads only local,
+                # already-fetched state (the local `issues` cache table,
+                # this same in-memory `board`) — no GitHub call from this
+                # passive tick, matching `cached_labels` just above.
                 reassigned = _reassign(
                     failed_a, board, config, issue_labels=cached_labels,
+                    credential_fetcher=claude_credential_reachable,
+                    issue_liveness_fetcher=lambda repo, num: (
+                        _issue_liveness_from_cache(board, repo, num)
+                    ),
                 )
             except RetryProviderMismatch:
                 # Refuse rather than substitute (#2323) — leave the failed
@@ -2551,6 +2920,7 @@ def _try_semantic_escalation(
         dispatch_conflict_fix,
         semantic_escalation_disabled,
     )
+    from coord.network import fetch_status  # noqa: PLC0415
 
     if semantic_escalation_disabled(config):
         return None
@@ -2566,6 +2936,14 @@ def _try_semantic_escalation(
             semantic=True,
             model=model,
             stuck_summary=stuck_summary,
+            # #3353 review: this was the one remaining `dispatch_conflict_fix`
+            # call site with no liveness check — a dead machine with zero
+            # active assignments would still be picked first here too, the
+            # same pre-#3353 bug via a fourth call site. Low real-world
+            # impact only because `pipeline.escalate_semantic_conflicts`
+            # defaults off; wired now so turning it on doesn't reopen the
+            # bug this issue exists to close.
+            status_fetcher=fetch_status,
         )
     except Exception as exc:  # noqa: BLE001 — never break reconcile on this
         import logging  # noqa: PLC0415
@@ -2580,6 +2958,7 @@ def on_conflict_fix_done(
     machine_name: str,
     succeeded: bool,
     semantic: bool = False,
+    stale_rebase_mismatch: bool = False,
     board: Board | None = None,
     config: Config | None = None,
     stuck_summary: str | None = None,
@@ -2591,6 +2970,17 @@ def on_conflict_fix_done(
     ``coord merge`` retries.  On failure: marked HUMAN_REQUIRED so the TUI
     can surface "manual resolution required", and a comment is posted on
     the underlying issue so the user is notified outside the TUI too.
+
+    *stale_rebase_mismatch* (#3349 review): when ``True``, a stale-rebase
+    worker (dispatched for ``merge_gate_checks_stale``, not an ordinary
+    conflict) correctly refused to push per its own briefing's "When NOT to
+    guess" section — its rebase either hit a real conflict marker or
+    produced a different patch-id than the pre-rebase branch, so it is not
+    a pure content-preserving rebase. This is NOT a SEMANTIC give-up (no
+    tier-2 escalation applies — there is nothing to retry with a stronger
+    model; the base and this branch genuinely overlap) and lands directly
+    on HUMAN_REQUIRED with that reason recorded, mirroring the *semantic*
+    handling below but skipping its escalation path entirely.
 
     #2566: when *semantic* is ``True`` and the tier-2 escalation didn't
     fire specifically because ``pipeline.escalate_semantic_conflicts`` is
@@ -2638,6 +3028,25 @@ def on_conflict_fix_done(
                     f"the account's {usage_limit_reason} — not a real "
                     "conflict. Wait for the reset, then re-run `coord "
                     "merge` to retry unchanged."
+                )
+                failed_entry = entry
+            elif stale_rebase_mismatch:
+                # #3349 review: a stale-rebase worker's refusal is a
+                # correct, deliberate stop — not a give-up to retry with a
+                # stronger model — so it goes straight to HUMAN_REQUIRED
+                # with the mismatch reason recorded, skipping the SEMANTIC
+                # tier-2 escalation path entirely.
+                entry.state = mq.HUMAN_REQUIRED
+                detail = stuck_summary or (
+                    "rebase was not content-preserving (a conflict marker "
+                    "appeared, or the resulting patch-id differed from the "
+                    "pre-rebase branch's)"
+                )
+                entry.error = (
+                    f"{existing_error}; stale-rebase worker refused to "
+                    f"push: {detail}. This is a genuine content conflict "
+                    "against the new base, not a pure rebase — manual "
+                    "resolution required."
                 )
                 failed_entry = entry
             else:
@@ -2766,6 +3175,18 @@ def _on_conflict_fix_done(
     diagnose in the transcript — it was cut off, not concluded) and pass the
     reason through so the parked entry gets an accurate message instead of
     "manual rebase required".
+
+    #3349 review: the same "clean exit is not proof of success" problem
+    applies to a stale-rebase dispatch (``dispatch_conflict_fix(...,
+    stale_rebase=True)``, used for ``merge_gate_checks_stale``) — its
+    briefing's own "When NOT to guess" section tells the worker to stop and
+    NOT push when the rebase turns out not to be content-preserving, ending
+    with a clean-looking turn just like a SEMANTIC give-up does. Check for
+    :data:`coord.conflict_fix.STALE_REBASE_MISMATCH_MARKER` alongside the
+    SEMANTIC marker and downgrade *succeeded* the same way — the two
+    markers are mutually exclusive per dispatch, but checking both here
+    means this wrapper doesn't need to know which kind of conflict-fix
+    dispatch it's looking at.
     """
     parent_id = fix_assignment.review_of_assignment_id
     if not parent_id:
@@ -2774,6 +3195,7 @@ def _on_conflict_fix_done(
     usage_limit_reason = (agent_entry or {}).get("usage_limit_reason")
 
     semantic = False
+    stale_rebase_mismatch = False
     stuck_summary: str | None = None
     if (
         not usage_limit_reason
@@ -2785,6 +3207,12 @@ def _on_conflict_fix_done(
         )
         if semantic:
             succeeded = False
+        else:
+            stale_rebase_mismatch, stuck_summary = _stale_rebase_mismatch_verdict(
+                fix_assignment, agent_entry, config,
+            )
+            if stale_rebase_mismatch:
+                succeeded = False
 
     on_conflict_fix_done(
         parent_assignment_id=parent_id,
@@ -2792,6 +3220,7 @@ def _on_conflict_fix_done(
         machine_name=fix_assignment.machine_name or "",
         succeeded=succeeded,
         semantic=semantic,
+        stale_rebase_mismatch=stale_rebase_mismatch,
         board=board,
         config=config,
         stuck_summary=stuck_summary,
@@ -2835,6 +3264,49 @@ def _semantic_verdict(
             except Exception:  # noqa: BLE001
                 stuck_summary = None
     return semantic, stuck_summary
+
+
+def _stale_rebase_mismatch_verdict(
+    fix_assignment: Assignment,
+    agent_entry: dict | None,
+    config: Config,
+) -> tuple[bool, str | None]:
+    """(is_stale_rebase_mismatch, stuck line) for a finished conflict-fix
+    worker. Mirrors :func:`_semantic_verdict` exactly, but reads for
+    :data:`coord.conflict_fix.STALE_REBASE_MISMATCH_MARKER` (#3349) — a
+    stale-rebase worker that hit a real conflict or a patch-id mismatch
+    during its rebase and correctly refused to push, per its own briefing's
+    "When NOT to guess" section.
+
+    Best-effort — any failure to read the log means "not a mismatch", which
+    preserves the pre-#3349 behaviour (reset to PENDING on a clean exit).
+    """
+    from coord.conflict_fix import detect_stale_rebase_mismatch  # noqa: PLC0415
+
+    log_path = (agent_entry or {}).get("log_path")
+    machine = next(
+        (m for m in config.machines if m.name == fix_assignment.machine_name), None,
+    )
+    try:
+        mismatch = detect_stale_rebase_mismatch(
+            log_path=log_path,
+            host=machine.host if machine is not None else None,
+            assignment_id=fix_assignment.assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — never break reconcile on a log read
+        return False, None
+
+    stuck_summary: str | None = None
+    if mismatch:
+        progress = (agent_entry or {}).get("progress") or {}
+        stuck_summary = progress.get("stuck")
+        if not stuck_summary and log_path:
+            try:
+                from coord.progress import parse_progress  # noqa: PLC0415
+                stuck_summary = parse_progress(log_path).stuck
+            except Exception:  # noqa: BLE001
+                stuck_summary = None
+    return mismatch, stuck_summary
 
 
 def _extract_issue_number(branch: str) -> int | None:

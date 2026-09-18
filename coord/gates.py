@@ -1,12 +1,13 @@
 """#1657: ``coord gates <repo> <issue>`` — read a work row's gate columns
-plus the LIVE gate decision (review / test / merge), without a hand-extracted
-bearer token and a raw ``/board`` curl.
+plus the LIVE gate decision (review / test / uat / merge), without a
+hand-extracted bearer token and a raw ``/board`` curl.
 
 Two things were missing before this module existed:
 
 1. A CLI surface for the raw columns every gate reads — ``test_state``,
    ``smoke_test``, ``test_reason``, ``test_toolchain`` (#1629),
-   ``review_state``, ``review_verdict``, ``review_of_assignment_id`` — none
+   ``test_confirmation`` (#3357), ``review_state``, ``review_verdict``,
+   ``review_of_assignment_id`` — none
    of which ``coord status`` or ``coord diagnose --stage test`` prints (see
    #1657's "diagnose --stage test" repro: it reports the *assignment row*'s
    status, never ``test_state`` itself, which was ``"running"`` at the
@@ -24,6 +25,12 @@ reuses ``coord.merge_queue``'s own review/smoke gate functions
 :func:`~coord.merge_queue.evaluate_smoke_verdict`) rather than
 re-implementing the #1479 freshness math a second time, so this can never
 drift from what ``coord merge``/``coord merge --plan`` actually decide.
+#3273 (S-5 of #3261): any OTHER gate described in
+``coord.pipeline.GATE_REGISTRY`` (today just ``"uat"``) is walked generically
+rather than hardcoded here — a gate added to that registry in the future
+needs no further change to this module, and one that doesn't currently
+apply (not configured, an exempt issue, ...) is reported with an explicit
+reason rather than silently omitted.
 
 Read-only by construction: nothing in this module calls ``save_board``,
 ``save_queue``, or any ``gh`` write. The synthetic
@@ -37,6 +44,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
+from coord.confirm_test import (
+    TEST_CONFIRMATION_BASELINE_RED,
+    TEST_CONFIRMATION_UNCONFIRMED,
+)
 from coord.models import WORK_LIKE_TYPES, effective_issue_number
 
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
@@ -78,6 +89,17 @@ class AssignmentGateRow:
     # None for pre-1629 rows or an unresolvable toolchain — rendered as
     # "unknown", never as a mismatch.
     test_toolchain: str | None
+    # #3357: machine-readable provenance for test_state — None | "confirmed"
+    # | "unconfirmed" | "refuted" | "baseline_red" (see
+    # coord.confirm_test.TEST_CONFIRMATION_VALUES). None means no #2464
+    # out-of-band confirmation was ever attempted for this row's current
+    # test_state (a headless smoke failure, a mute-leg park, a row predating
+    # this column, or a fresh `coord test --passed` not yet reaped by a
+    # notify pass) — rendered as no annotation at all, never as either
+    # extreme. This is the field grocery-list#36 (#3357's own evidence) was
+    # filed over: `test_state="passed"` read identically whether a real run
+    # backed it or nobody could even attempt one.
+    test_confirmation: str | None
     review_state: str | None
     review_verdict: str | None
     review_of_assignment_id: str | None
@@ -110,6 +132,12 @@ class GateDecision:
     # dispatched review — re-dispatching just re-derives a conclusion that
     # already exists in the log, per #1956's "Not the fix" section.
     verdict_unparseable: bool = False
+    # #3236: populated ONLY for gate="apply" — the apply-verdict tri-state
+    # (plus "pending") `coord.drive_queue.apply_gate_status` returns:
+    # "" (no gate) / "pending" / "merged_not_applied" / "applied" /
+    # "apply_failed". `None` for every other gate, and for "apply" itself
+    # when there is no deploy gate on this (repo, issue) at all.
+    state: str | None = None
     # #2024: WHICH assignment supplied this gate's verdict. Populated for the
     # "test" gate, where the merge gate is deliberately branch-scoped (a Test
     # run measures the (branch, base) pair, #1819) and so is routinely
@@ -148,6 +176,7 @@ def _row_from_assignment(a: "Assignment") -> AssignmentGateRow:
         smoke_test=a.smoke_test,
         test_reason=a.test_reason,
         test_toolchain=a.test_toolchain,
+        test_confirmation=a.test_confirmation,
         review_state=a.review_state,
         review_verdict=a.review_verdict,
         review_of_assignment_id=a.review_of_assignment_id,
@@ -422,6 +451,53 @@ def _exempt_dependency_notes_for_winner(
         return []
 
 
+def _apply_gate_decision(repo_name: str, issue_number: int) -> GateDecision | None:
+    """The ``"apply"`` :class:`GateDecision` for *(repo_name, issue_number)*,
+    or ``None`` when there is no ``--hold-after`` deploy-gate entry for it in
+    the drive queue at all (#3236).
+
+    Reads the drive_queue row the same way ``coord drive-queue list``/
+    ``status`` do (:func:`coord.state.list_drive_queue` +
+    :func:`coord.drive_queue.entries_from_rows`) and renders its tri-state
+    through the exact same :func:`coord.drive_queue.apply_gate_status`
+    ``coord drive-queue``'s own ``_hold_lines`` calls — one function
+    answering "what is this gate's apply status", never two that could
+    silently drift apart (#2096).
+
+    Fail-open, mirroring :func:`_backfill_is_interactive` immediately above:
+    an unreachable board/DB (or a thin client with no local drive_queue
+    table) degrades to "no apply gate reported" rather than failing the
+    whole ``coord gates`` read — advisory only, exactly like every other
+    best-effort enrichment in this module.
+    """
+    try:
+        from coord.drive_queue import apply_gate_status, entries_from_rows, entry_key  # noqa: PLC0415
+        from coord.state import list_drive_queue  # noqa: PLC0415
+
+        entries = entries_from_rows(list_drive_queue(repo_name))
+        wanted = entry_key(repo_name, issue_number)
+        entry = next((e for e in entries if e.key == wanted), None)
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+    if entry is None or not entry.hold_after:
+        return None
+
+    state, detail = apply_gate_status(entry)
+    if state in ("", "pending"):
+        # "pending" (armed, not yet fired — nothing has merged yet) has
+        # nothing new to say beyond the review/test/merge decisions already
+        # printed: the apply question only becomes meaningful once the gate
+        # has actually fired. Staying silent here keeps every ORDINARY
+        # `--hold-after` deploy gate (a release/restart note with no
+        # apply-verdict use at all — the overwhelming common case, see the
+        # existing hold-after tests) rendering exactly as it did before
+        # #3236, instead of growing a "not yet merged" line that only
+        # restates what "hold-after" already said.
+        return None
+    ok = state == "applied"
+    return GateDecision(gate="apply", required=True, ok=ok, reason=detail or None, state=state)
+
+
 def build_gate_report(
     board: "Board",
     config: "Config",
@@ -627,27 +703,99 @@ def build_gate_report(
             "round has actually been tested (#2024)."
         )
 
+    # #3273 (S-5 of #3261): walk every OTHER registry-backed gate (today just
+    # "uat" — "review"/"test" stay the bespoke blocks above, since they carry
+    # richer per-gate detail — #1479 SHA staleness anchors, #1956 verdict-
+    # unparseable detection — that doesn't fit GateSpec's generic
+    # ``(ok, message)`` evaluator shape; see #3273's epic-closing comment on
+    # #3261 for why that's a real seam, not an oversight). This is what lets
+    # a gate added to `coord.pipeline.GATE_REGISTRY` in the future show up
+    # here with zero further changes to this module, and it's what fixes the
+    # actual #3273 gap: before this, `coord gates` never even asked about
+    # UAT, so it could print "merge READY" for an entry `coord merge` would
+    # refuse outright on `uat_required`.
+    from coord.pipeline import GATE_REGISTRY  # noqa: PLC0415
+
+    registry_decisions: dict[str, GateDecision] = {}
+    for gate_name, spec in GATE_REGISTRY.items():
+        if gate_name in ("review", "test"):
+            continue  # already covered by the bespoke blocks above
+        gate_required = spec.applies(entry, config)
+        if not gate_required:
+            decision = GateDecision(
+                gate=gate_name,
+                required=False,
+                ok=True,
+                reason=spec.explain_inapplicable(entry, config)
+                if spec.explain_inapplicable is not None
+                else None,
+            )
+        else:
+            gate_ok, gate_message = spec.evaluate(entry, board, config, gh_ops)
+            decision = GateDecision(
+                gate=gate_name,
+                required=True,
+                ok=gate_ok,
+                reason=(gate_message or None) if not gate_ok else None,
+            )
+        registry_decisions[gate_name] = decision
+        report.decisions.append(decision)
+
     merge_blocked_gate: str | None = None
     if review_required and not review_ok:
         merge_blocked_gate = REVIEW_REQUIRED
     elif smoke_required and not test_ok:
         merge_blocked_gate = SMOKE_REQUIRED
+    else:
+        for gate_name, decision in registry_decisions.items():
+            if decision.required and not decision.ok:
+                merge_blocked_gate = f"{gate_name}_required"
+                break
     merge_decision = GateDecision(
         gate="merge", required=True, ok=merge_blocked_gate is None, reason=merge_blocked_gate,
     )
     report.decisions.append(merge_decision)
     if merge_decision.ok:
+        gate_names_summary = "/".join(["review", "test", *registry_decisions.keys()])
         report.notes.append(
-            "merge READY reflects the review/test gates only — CI checks and the "
-            "#1318 epic-closing-keyword guard are evaluated live by `coord merge`/"
-            "`coord merge --plan`, not by `coord gates`."
+            f"merge READY reflects the {gate_names_summary} gates only — CI checks "
+            "and the #1318 epic-closing-keyword guard are evaluated live by "
+            "`coord merge`/`coord merge --plan`, not by `coord gates`."
         )
+
+    # #3236: the apply-verdict gate, appended ONLY when a --hold-after entry
+    # actually exists for this (repo, issue) in the drive queue — the
+    # overwhelming common case has no deploy gate at all, and the review/
+    # test/merge decisions above are unconditional per-repo concerns while
+    # this one is opt-in per-entry, so it stays silent rather than printing
+    # a "not required" line on every issue that never used it.
+    apply_decision = _apply_gate_decision(repo_name, issue_number)
+    if apply_decision is not None:
+        report.decisions.append(apply_decision)
 
     return report
 
 
 def _short_sha(sha: str | None) -> str:
     return sha[:7] if sha else "unknown"
+
+
+def _row_test_confirmation(report: "GateReport", assignment_id: str | None) -> str | None:
+    """The ``test_confirmation`` provenance carried by the row *assignment_id*
+    names, or ``None`` when unknown/unset (#3357).
+
+    ``test.assignment_id`` (#2024) already names WHICH row supplied the live
+    test-gate verdict — routinely not ``winner`` on a ``--fix-of`` chain, see
+    the module docstring's #2024 section — so this looks that exact row up in
+    ``report.rows`` rather than re-deriving "the winning row" a second way.
+    ``None`` when *assignment_id* is unset (a gate report built without a
+    live smoke-status lookup) or names a row this report didn't collect —
+    both fail open to "say nothing", never to a wrong confirmation state.
+    """
+    if not assignment_id:
+        return None
+    row = next((r for r in report.rows if r.assignment_id == assignment_id), None)
+    return row.test_confirmation if row is not None else None
 
 
 def format_gate_report(report: GateReport) -> str:
@@ -731,9 +879,28 @@ def format_gate_report(report: GateReport) -> str:
                 # `coord drive` are allowed to answer differently (branch gate
                 # vs per-iteration gate) — they are not allowed to do it
                 # silently.
+                #
+                # #3357: and now say whether that "passed" was ever actually
+                # OBSERVED. A bare "test : passed" reads identically whether
+                # a #2464 out-of-band re-run backed it or nobody could even
+                # attempt one (grocery-list#36: the row's own `test_reason`
+                # said "NOTHING was learned about the branch" underneath an
+                # unqualified "passed" summary line). `confirmed` and `None`
+                # (no confirmation question was ever asked — a self-recorded
+                # verdict this notify pass hasn't reaped yet, a row predating
+                # this column, ...) both stay silent, matching today's output
+                # exactly; only the two cases worth an operator's attention
+                # get an annotation.
+                confirmation = _row_test_confirmation(report, test.assignment_id)
+                suffix = ""
+                if confirmation == TEST_CONFIRMATION_UNCONFIRMED:
+                    suffix = " (UNCONFIRMED — suite never ran)"
+                elif confirmation == TEST_CONFIRMATION_BASELINE_RED:
+                    suffix = " (baseline-red — branch not at fault, #2170)"
                 lines.append(
                     "  test   : passed"
                     + (f" (recorded on {test.assignment_id})" if test.assignment_id else "")
+                    + suffix
                 )
             elif test.anchor:
                 noun = "base" if test.anchor == "base" else "branch"
@@ -745,11 +912,52 @@ def format_gate_report(report: GateReport) -> str:
                 lines.append(f"           {test.reason}")
             else:
                 lines.append(f"  test   : BLOCKED — {test.reason}")
+        # #3273 (S-5 of #3261): any other registry-backed gate (today just
+        # "uat") renders generically here, in `report.decisions`' own
+        # insertion order — a gate GATE_REGISTRY grows in the future needs no
+        # new branch here, and — the actual fix this slice makes — a
+        # skipped/inapplicable one (UAT not configured, or an exempt issue)
+        # gets an explicit reason instead of being silently omitted like it
+        # was before #3273.
+        _KNOWN_GATE_LINES = ("review", "test", "merge", "apply")
+        for decision in report.decisions:
+            if decision.gate in _KNOWN_GATE_LINES:
+                continue
+            label = f"{decision.gate:<6}"
+            if not decision.required:
+                lines.append(
+                    f"  {label} : not required"
+                    + (f" — {decision.reason}" if decision.reason else "")
+                )
+            elif decision.ok:
+                lines.append(
+                    f"  {label} : passed"
+                    + (f" (recorded on {decision.assignment_id})" if decision.assignment_id else "")
+                )
+            else:
+                lines.append(f"  {label} : BLOCKED — {decision.reason}")
         merge = by_gate.get("merge")
         if merge is not None:
             lines.append(
                 "  merge  : READY" if merge.ok else f"  merge  : BLOCKED — {merge.reason}"
             )
+        # #3236: only printed when a --hold-after deploy gate actually
+        # exists for this (repo, issue) — see `_apply_gate_decision`.
+        apply_ = by_gate.get("apply")
+        if apply_ is not None:
+            # `apply_.reason` is `apply_gate_status`'s own detail string
+            # ("applied", "applied — <note>", "apply failed[: <note>]",
+            # "merged, not yet applied[...]", "not yet merged — gate
+            # armed") — already legible on its own, so these labels only
+            # add the at-a-glance severity, never repeat its content.
+            if apply_.ok:
+                lines.append(f"  apply  : {apply_.reason}")
+            elif apply_.state == "apply_failed":
+                lines.append(f"  apply  : FAILED — {apply_.reason}")
+            elif apply_.state == "merged_not_applied":
+                lines.append(f"  apply  : MERGED, NOT APPLIED — {apply_.reason}")
+            else:
+                lines.append(f"  apply  : PENDING — {apply_.reason}")
 
     for note in report.notes:
         lines.append(f"  note: {note}")

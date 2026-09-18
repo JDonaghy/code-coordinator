@@ -258,6 +258,116 @@ class TestStopReason:
         update_assignment_stop_reason("some-id", "")  # must not raise
 
 
+class TestPremiseRechecked:
+    """#3339: premise_rechecked_at/premise_rechecked_reason — the explicit
+    operator assertion that clears a terminal `refused_premise` row.
+
+    Unlike `refused_policy`, a premise refusal has no mechanical staleness
+    check (rewriting the issue's title cannot make a missing prerequisite
+    exist — see coord/drive.py's `decide()`), so this pair of columns is the
+    ONLY signal that can make `decide()` dispatch fresh work instead of
+    dying again on the same old refusal. Written by `coord drive-queue
+    clear-refusal`, read back by `coord.drive_state.project` as
+    `IssueState.work_premise_rechecked_at`/`_reason`.
+    """
+
+    def test_schema_has_premise_rechecked_columns(self, coord_db) -> None:
+        from coord.db import get_connection
+        conn = get_connection()
+        cols = {name for name, _type in sql.table_columns(conn, "assignments")}
+        assert "premise_rechecked_at" in cols, (
+            "assignments table is missing premise_rechecked_at column — "
+            "check _migrate_add_columns in coord/db.py"
+        )
+        assert "premise_rechecked_reason" in cols
+
+    def test_mark_premise_rechecked_persists_the_value(self, coord_db) -> None:
+        from coord.state import mark_premise_rechecked
+
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=3339,
+            issue_title="Premise recheck test",
+            rationale="test",
+            briefing="hello",
+        )
+        assignment_id = "test-premise-recheck-001"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT premise_rechecked_at, premise_rechecked_reason "
+            "FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
+        assert row[1] is None
+
+        mark_premise_rechecked(assignment_id, "quadraui#971 landed")
+
+        row = conn.execute(
+            "SELECT premise_rechecked_at, premise_rechecked_reason "
+            "FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row[0] is not None
+        assert row[1] == "quadraui#971 landed"
+
+    def test_mark_premise_rechecked_overwrites_on_a_second_call(self, coord_db) -> None:
+        """Unlike stop_reason's first-writer-wins, a second assertion (e.g.
+        correcting a typo'd upstream issue reference) must not be silently
+        dropped — the operator's latest word on the matter should stand."""
+        from coord.state import mark_premise_rechecked
+
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=3339,
+            issue_title="Premise recheck test",
+            rationale="test",
+            briefing="hello",
+        )
+        assignment_id = "test-premise-recheck-002"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
+
+        mark_premise_rechecked(assignment_id, "first reason")
+        mark_premise_rechecked(assignment_id, "corrected reason")
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT premise_rechecked_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row[0] == "corrected reason"
+
+    def test_mark_premise_rechecked_noop_on_missing(self, coord_db) -> None:
+        """Calling with a nonexistent assignment_id silently does nothing."""
+        from coord.state import mark_premise_rechecked
+
+        mark_premise_rechecked("no-such-id", "landed")  # must not raise
+
+    def test_mark_premise_rechecked_noop_on_empty(self, coord_db) -> None:
+        """Calling with an empty assignment_id/reason silently does nothing."""
+        from coord.state import mark_premise_rechecked
+
+        mark_premise_rechecked("", "landed")  # must not raise
+        mark_premise_rechecked("some-id", "")  # must not raise
+
+
 class TestDispatchedByAssignmentId:
     """#2417: dispatched_by_assignment_id — the calling worker's own
     assignment id, captured from $COORD_ASSIGNMENT_ID at dispatch time, so a
@@ -2320,6 +2430,127 @@ class TestLegCounts:
             cc, "fetch_leg_counts", lambda svc, **kw: {"api#7": {"work": 3}},
         )
         assert leg_counts() == {"api#7": {"work": 3}}
+
+
+class TestCachedOpenIssues:
+    """`coord.state.cached_open_issues` / `_cached_open_issues_local` (#3227).
+
+    Backs `coord plans --lint-epics`'s scan over the locally-cached `issues`
+    table (`coord/commands/plans.py`) — routes to the daemon when
+    `board_service` is set, exactly like `get_issue_titles`/`leg_counts`, so
+    a thin client's lint doesn't silently report "clean" against an empty
+    local table it never had (review finding on #3227's first iteration).
+    """
+
+    def test_local_read_scoped_to_repo_names(self, coord_db) -> None:
+        from coord.state import cached_open_issues, upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [{"number": 1, "title": "Epic: foo", "body": "", "labels": []}],
+        )
+        upsert_open_issues(
+            "other-repo",
+            [{"number": 2, "title": "Epic: bar", "body": "", "labels": []}],
+        )
+
+        issues = cached_open_issues({"api"})
+
+        assert [(i["repo_name"], i["number"]) for i in issues] == [("api", 1)]
+
+    def test_labels_decoded_to_plain_list(self, coord_db) -> None:
+        from coord.state import cached_open_issues, upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1,
+                    "title": "Epic: foo",
+                    "body": "",
+                    "labels": [{"name": "epic"}],
+                }
+            ],
+        )
+
+        issues = cached_open_issues({"api"})
+
+        assert issues[0]["labels"] == ["epic"]
+
+    def test_body_field_is_carried_through(self, coord_db) -> None:
+        """#3228: `coord plans --lint-stale-epics` needs each epic's own
+        cached body to parse its declared children — the row must carry it,
+        not just the title/state/labels #3227 originally needed."""
+        from coord.state import cached_open_issues, upsert_open_issues
+
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1,
+                    "title": "Epic: foo",
+                    "body": "## Sub-issues\n- [ ] #2\n",
+                    "labels": [],
+                }
+            ],
+        )
+
+        issues = cached_open_issues({"api"})
+
+        assert issues[0]["body"] == "## Sub-issues\n- [ ] #2\n"
+
+    def test_empty_repo_names_short_circuits_to_empty_list(self, coord_db) -> None:
+        from coord.state import cached_open_issues
+
+        assert cached_open_issues(set()) == []
+        assert cached_open_issues([]) == []
+
+    def test_unreadable_db_degrades_to_empty_list_rather_than_raising(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Mirrors `coord.reports._default_completed_source`'s "an unreadable
+        board is an empty report" posture — a corrupt/unreadable local DB
+        must not turn `coord plans --lint-epics` into a traceback."""
+        from coord import state
+
+        def _boom(*_a, **_k):
+            raise sqlite3.OperationalError("no such table: issues")
+
+        monkeypatch.setattr(state.sql, "execute", _boom)
+
+        assert state.cached_open_issues({"api"}) == []
+
+    def test_routes_to_daemon_when_board_service_set(self, coord_db, monkeypatch) -> None:
+        from coord import client as cc
+        from coord.state import cached_open_issues
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc,
+            "fetch_cached_issues",
+            lambda svc, names, **kw: [
+                {
+                    "repo_name": "api",
+                    "number": 1,
+                    "title": "Epic: x",
+                    "state": "open",
+                    "labels": [],
+                }
+            ],
+        )
+
+        assert cached_open_issues({"api"}) == [
+            {
+                "repo_name": "api",
+                "number": 1,
+                "title": "Epic: x",
+                "state": "open",
+                "labels": [],
+            }
+        ]
 
 
 class TestTestVerdictStalenessAnchor:
@@ -4471,6 +4702,386 @@ class TestMarkNotifiedReleasesLeakedReviewClaim:
 
         # Untouched — "rv1:stuck" matched no row, so nothing was released.
         assert state.claim_review_dispatch("w1") is False
+
+
+# ── #3333: atomic smoke fan-out dispatch claim ───────────────────────────────
+
+
+class TestSmokeDispatchClaim:
+    """`claim_smoke_dispatch` / `release_smoke_dispatch_claim`: the
+    per-capability-partition peer of #3113's `claim_review_dispatch`. Closes
+    the quadraui#952 race — two ticks 8 seconds apart both read "no leg
+    dispatched yet" via `coord.smoke._find_leg_for_partition` and both
+    dispatched the same `[smoke:macos]` partition to a `max_workers=1`
+    host."""
+
+    def test_second_claim_for_the_same_partition_loses(self, coord_db) -> None:
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+        # Same DB, same key — simulates a second, concurrent
+        # _dispatch_smoke_fanout call racing the first: it must lose
+        # deterministically.
+        assert state.claim_smoke_dispatch("w1", "macos") is False
+
+    def test_different_partitions_of_the_same_row_both_win(self, coord_db) -> None:
+        """A fan-out legitimately dispatches several legs for ONE parent —
+        one per capability partition — so the claim must be keyed on the
+        PAIR, never on the work assignment id alone."""
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+        assert state.claim_smoke_dispatch("w1", "gtk+windows") is True
+
+    def test_claims_for_different_work_rows_both_win(self, coord_db) -> None:
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+        assert state.claim_smoke_dispatch("w2", "macos") is True
+
+    def test_release_then_reclaim_succeeds(self, coord_db) -> None:
+        """A legitimate later retry of the same partition (an environmental
+        death, or an operator `coord stop`) must not be permanently
+        stranded once the leg that held the claim reaches a terminal
+        status and releases it."""
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+        state.release_smoke_dispatch_claim("w1", "macos")
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+    def test_release_is_idempotent(self, coord_db) -> None:
+        state.release_smoke_dispatch_claim("never-claimed", "macos")  # must not raise
+        assert state.claim_smoke_dispatch("never-claimed", "macos") is True
+
+    def test_empty_ids_always_win(self, coord_db) -> None:
+        # Mirrors claim_review_dispatch's own falsy short-circuit — nothing
+        # to key a claim on, so never block.
+        assert state.claim_smoke_dispatch("", "macos") is True
+        assert state.claim_smoke_dispatch("w1", "") is True
+
+
+# ── #3333: a smoke fan-out leg's terminal write must release its claim ──────
+
+
+def _seed_smoke_leg_row(
+    assignment_id: str,
+    *,
+    review_of_assignment_id: str,
+    capabilities: tuple[str, ...] = ("macos",),
+    status: str = "running",
+) -> None:
+    """Insert a real `type="smoke"` fan-out-leg row FK'd to
+    *review_of_assignment_id*, mirroring how `_dispatch_smoke_fanout`
+    actually creates one — including the `[smoke:<caps>]` issue_title tag
+    `smoke_leg_capabilities` parses back off."""
+    from coord.models import Assignment
+    from coord.smoke import smoke_leg_issue_title
+
+    state.record_dispatched_assignment(
+        assignment=Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=7,
+            issue_title=smoke_leg_issue_title("Some work", capabilities),
+            assignment_id=assignment_id,
+            type="smoke",
+            status=status,
+            review_of_assignment_id=review_of_assignment_id,
+        ),
+        repo_github="acme/api",
+    )
+
+
+class TestReleaseSmokeClaimIfRowIsSmokeLeg:
+    """`release_smoke_claim_if_row_is_smoke_leg` (#3333): the ONE "is this a
+    fan-out leg row, and if so release the partition claim it took" check —
+    mirrors `release_review_claim_if_row_is_review` (#3206) exactly, for the
+    Test stage."""
+
+    def test_releases_claim_for_a_smoke_leg_row(self, coord_db) -> None:
+        _seed_smoke_leg_row("leg1", review_of_assignment_id="w1", capabilities=("macos",))
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+        state.release_smoke_claim_if_row_is_smoke_leg("leg1")
+
+        assert state.claim_smoke_dispatch("w1", "macos") is True  # released, reclaimable
+
+    def test_noop_for_an_untagged_single_leg_smoke_row(self, coord_db) -> None:
+        """An ordinary pre-#3182 single-partition smoke row carries no
+        `[smoke:...]` tag on its issue_title — never claimed, so releasing
+        it must be a pure no-op, never mistakenly release an unrelated
+        partition's claim."""
+        from coord.models import Assignment
+
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[smoke] Some work", assignment_id="leg1",
+                type="smoke", status="running", review_of_assignment_id="w1",
+            ),
+            repo_github="acme/api",
+        )
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+        state.release_smoke_claim_if_row_is_smoke_leg("leg1")
+
+        # Still held — "leg1" carries no capability tag to derive a
+        # partition key from.
+        assert state.claim_smoke_dispatch("w1", "macos") is False
+
+    def test_noop_for_a_non_smoke_row(self, coord_db) -> None:
+        from coord.models import Assignment
+
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="work", assignment_id="w1", type="work", status="done",
+            ),
+            repo_github="acme/api",
+        )
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+        state.release_smoke_claim_if_row_is_smoke_leg("w1")
+
+        # Still held — "w1" itself is the work row, not one of its legs.
+        assert state.claim_smoke_dispatch("w1", "macos") is False
+
+    def test_noop_for_unknown_or_empty_id(self, coord_db) -> None:
+        state.release_smoke_claim_if_row_is_smoke_leg("")  # must not raise
+        state.release_smoke_claim_if_row_is_smoke_leg("does-not-exist")  # must not raise
+
+
+class TestMarkNotifiedReleasesLeakedSmokeClaim:
+    """#3333 regression: a fan-out leg reaped (or `coord stop`-cancelled)
+    writes its terminal `status="failed"` into the board via `coord
+    notify`'s own agent-poll path (`_mark_notified_local`) whenever no
+    daemon reconcile tick observed the completion first. Mirrors
+    `TestMarkNotifiedReleasesLeakedReviewClaim` (#3206) for the Test
+    stage."""
+
+    def test_event_failure_releases_the_claim(self, coord_db) -> None:
+        from coord.comments import EVENT_FAILURE
+
+        _seed_smoke_leg_row("leg1", review_of_assignment_id="w1", status="running")
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+        state.mark_notified(
+            "leg1", EVENT_FAILURE, branch=None, failure_reason=None, exit_code=137,
+        )
+
+        assert state.claim_smoke_dispatch("w1", "macos") is True  # released, reclaimable
+
+    def test_event_completion_releases_the_claim(self, coord_db) -> None:
+        """Sibling case: a leg that finishes cleanly (`EVENT_COMPLETION`)
+        must release the claim through this same seam too — not just the
+        failure path."""
+        from coord.comments import EVENT_COMPLETION
+
+        _seed_smoke_leg_row("leg1", review_of_assignment_id="w1", status="running")
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+        state.mark_notified("leg1", EVENT_COMPLETION, branch="issue-7-foo")
+
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+
+class TestResetWorkTestStateReleasesSmokeClaims:
+    """#3333: `coord diagnose --stage test --reset`'s whole point is forcing
+    a fresh Test-stage dispatch — that must not be silently defeated by a
+    `smoke_claims` row a phantom fan-out leg's own terminal-status write
+    never got a chance to release (the leg died without a clean reap)."""
+
+    def _seed_work_row_with_manifest(
+        self, assignment_id: str = "w1", *, issue_number: int = 7,
+    ) -> None:
+        from coord.models import Assignment
+        from coord.smoke import _encode_fanout_manifest
+
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="api", issue_number=issue_number,
+                issue_title="Some work", assignment_id=assignment_id,
+                type="work", status="done",
+            ),
+            repo_github="acme/api",
+        )
+        manifest = _encode_fanout_manifest(
+            [
+                ("leg-macos", ("macos",), "make smoke"),
+                ("leg-gtk", ("gtk", "windows"), "make smoke"),
+            ]
+        )
+        state.record_test_verdict(
+            assignment_id=assignment_id,
+            test_state="running",
+            test_reason=f"{manifest}\nTest stage running across 2 legs.",
+        )
+
+    def test_reset_releases_every_claimed_partition_in_the_manifest(self, coord_db) -> None:
+        self._seed_work_row_with_manifest()
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+        assert state.claim_smoke_dispatch("w1", "gtk+windows") is True
+
+        state.reset_work_test_state("api", 7, assignment_id="w1")
+
+        # Both partitions reclaimable — a fresh dispatch is never blocked by
+        # a claim the reset itself just orphaned.
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+        assert state.claim_smoke_dispatch("w1", "gtk+windows") is True
+
+    def test_reset_still_clears_the_verdict_when_nothing_is_claimed(self, coord_db) -> None:
+        """The common case — every leg already released its own claim on
+        completion — must be unaffected: the reset still clears
+        test_state/test_reason exactly as before."""
+        self._seed_work_row_with_manifest()
+
+        updated = state.reset_work_test_state("api", 7, assignment_id="w1")
+
+        assert updated == 1
+        assert state.load_assignment_test_state("w1") is None
+
+    def test_reset_without_assignment_id_still_works(self, coord_db) -> None:
+        """The issue_number-only (`assignment_id=None`) path must not raise
+        even though it can't target one specific row's manifest as
+        precisely."""
+        self._seed_work_row_with_manifest()
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+        updated = state.reset_work_test_state("api", 7)
+
+        assert updated == 1
+        assert state.claim_smoke_dispatch("w1", "macos") is True
+
+
+# ── #3333 review: merge_smoke_fanout_manifest's atomic read-merge-write ─────
+
+
+class TestMergeSmokeFanoutManifest:
+    """`merge_smoke_fanout_manifest` (#3333 review): two `_dispatch_smoke_
+    fanout` calls racing on DIFFERENT capability partitions of the SAME
+    parent each reach the final manifest stamp with only their own PARTIAL
+    `leg_manifest`. A plain `record_test_verdict` overwrite there (the
+    pre-review code) let whichever call wrote last silently erase the
+    other's real, live leg from the parent's `[[smoke-fanout:...]]`
+    manifest forever. This is the read-merge-write primitive that closes
+    that gap — tested directly here, independent of `_dispatch_smoke_fanout`
+    itself (see tests/test_smoke.py for the end-to-end regression)."""
+
+    def _seed_work_row(self, assignment_id: str = "w1", *, issue_number: int = 7) -> None:
+        from coord.models import Assignment
+
+        state.record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop", repo_name="api", issue_number=issue_number,
+                issue_title="Some work", assignment_id=assignment_id,
+                type="work", status="done",
+            ),
+            repo_github="acme/api",
+        )
+
+    def test_first_merge_writes_running_with_the_new_entry(self, coord_db) -> None:
+        self._seed_work_row()
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "running"
+        assert "leg-macos" in (test_reason or "")
+        assert state.load_assignment_test_state("w1") == "running"
+        assert "leg-macos" in (state.load_assignment_test_reason("w1") or "")
+
+    def test_second_merge_for_a_different_partition_keeps_the_first_leg(
+        self, coord_db,
+    ) -> None:
+        """The exact quadraui#952-shaped gap: tick A's merge (macos) must
+        survive tick B's later merge (gtk+windows) for the SAME parent —
+        the second call's own `new_entries` never names macos at all, so a
+        plain overwrite would drop it."""
+        self._seed_work_row()
+        state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-gtk-win", ("gtk", "windows"), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "running"
+        assert "leg-macos" in (test_reason or "")
+        assert "leg-gtk-win" in (test_reason or "")
+        from coord.smoke import _parse_fanout_manifest
+
+        legs = _parse_fanout_manifest(state.load_assignment_test_reason("w1"))
+        assert legs is not None
+        assert {leg_id for leg_id, _, _ in legs} == {"leg-macos", "leg-gtk-win"}
+
+    def test_merge_order_does_not_matter(self, coord_db) -> None:
+        """Whichever call runs LAST must still fold in every partition any
+        earlier call already committed — not just the specific two-call
+        ordering exercised above."""
+        self._seed_work_row()
+        state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-gtk-win", ("gtk", "windows"), "make smoke")],
+            total_partitions=2,
+        )
+        state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        from coord.smoke import _parse_fanout_manifest
+
+        legs = _parse_fanout_manifest(state.load_assignment_test_reason("w1"))
+        assert legs is not None
+        assert {leg_id for leg_id, _, _ in legs} == {"leg-macos", "leg-gtk-win"}
+
+    def test_never_clobbers_an_already_terminal_verdict(self, coord_db) -> None:
+        """#1819: a terminal verdict already on the row (a human's `coord
+        test` override, or `finalize_smoke_fanout` beating this call to it)
+        must be returned UNCHANGED, never relaxed back to 'running'."""
+        self._seed_work_row()
+        state.record_test_verdict(
+            assignment_id="w1", test_state="passed", test_reason="all green",
+        )
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "passed"
+        assert test_reason == "all green"
+        assert state.load_assignment_test_state("w1") == "passed"
+        assert state.load_assignment_test_reason("w1") == "all green"
+
+    def test_still_returns_a_computed_value_when_the_row_does_not_exist(
+        self, coord_db,
+    ) -> None:
+        """A caller (or a unit test) that hands in an `assignment_id` with
+        no real DB row yet must still get back a value to mirror onto its
+        own in-memory `Assignment` — mirrors every other verdict writer in
+        this module tolerating a no-op UPDATE against an absent row."""
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="does-not-exist",
+            new_entries=[("leg-macos", ("macos",), "make smoke")],
+            total_partitions=2,
+        )
+
+        assert test_state == "running"
+        assert "leg-macos" in (test_reason or "")
+
+    def test_empty_new_entries_is_a_noop(self, coord_db) -> None:
+        self._seed_work_row()
+
+        test_state, test_reason = state.merge_smoke_fanout_manifest(
+            assignment_id="w1", new_entries=[], total_partitions=2,
+        )
+
+        assert (test_state, test_reason) == (None, None)
+        assert state.load_assignment_test_state("w1") is None
 
 
 # ── #3113: render_issue_context_entries exempts review findings from the

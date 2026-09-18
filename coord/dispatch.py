@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import httpx
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 from coord import github_ops
 from coord.comments import (
@@ -18,7 +21,8 @@ from coord.comments import (
     format_refused_policy,
     format_refused_premise,
 )
-from coord.config import Config
+from coord.config import Config, SmokeRule
+from coord.dispatch_liveness import check_dispatch_liveness, record_dispatch_refusal
 from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo, coordinator_owned_docs
 
 AGENT_PORT = 7433
@@ -50,12 +54,20 @@ AGENT_PORT = 7433
 # Raised well past ordinary worktree-setup latency — this bounds ACTUAL
 # unreachability, not a slow-but-working `/assign`. The `coord fix` callers
 # already screen out unreachability with a live pre-probe before ever
-# reaching this timeout; plain `coord assign`/`coord approve` dispatches
-# (`coord/commands/dispatch.py`, `coord/commands/plan_followup.py`,
-# `coord/milestone_dispatch.py`) do not, so a genuinely dead machine now
-# takes up to 60s to fail there instead of 15s — a real but accepted latency
-# trade-off against a worker that legitimately just needs more time to set
-# up a worktree.
+# reaching this timeout. #3353: `coord approve` (`coord/commands/
+# dispatch.py`) and `coord milestone dispatch` (`coord/milestone_dispatch.
+# py`) now do too — both wire `dispatch()`'s `status_fetcher` param, which
+# turns on `route_work_by_liveness`'s pre-POST reachability check for
+# `type="work"` and reroutes around a dead proposed machine instead of ever
+# reaching this timeout for it. `coord assign` (`coord/commands/
+# dispatch_workers.py`'s `_dispatch_headless`) is wired the same way.
+# `coord/commands/plan_followup.py`'s plain follow-up dispatch does NOT opt
+# in — its callers that care about reachability already resolve a live
+# machine via `select_fix_machine` before ever building the Proposal (see
+# `_dispatch_followup`'s `machine_name` param docstring) — so a genuinely
+# dead machine reached THAT path still takes up to 60s to fail here instead
+# of 15s, an accepted latency trade-off against a worker that legitimately
+# just needs more time to set up a worktree.
 ASSIGN_POST_TIMEOUT_SECS = 60.0
 
 _log = logging.getLogger(__name__)
@@ -64,17 +76,28 @@ _log = logging.getLogger(__name__)
 class DispatchRefused(ValueError):
     """A pre-dispatch guard's refusal — deterministic, not transient (#1844).
 
-    Raised by :func:`enforce_oracle_readiness` and
-    :func:`enforce_epic_dispatch_guard` instead of a plain ``ValueError``:
-    both refuse on a condition that CANNOT change between attempts (no
-    acceptance slice exists yet; a tracking issue carries the epic label),
+    Raised by :func:`enforce_oracle_readiness`, :func:`enforce_epic_
+    dispatch_guard`, and (#3376) the STRUCTURAL DISPATCH-LIVENESS GATE
+    (`coord.dispatch_liveness.check_dispatch_liveness`, covering all three
+    of its predicates — a closed issue, an already-merged branch, or a
+    machine that fails its credential/health probe) instead of a plain
+    ``ValueError``: all of these refuse on a condition that CANNOT change
+    between attempts on this same target (no acceptance slice exists yet;
+    a tracking issue carries the epic label; the issue is already closed;
+    the same dead-credential machine is still dead a moment later),
     unlike the other ``ValueError``s ``dispatch()`` can raise (an unresolved
     machine/repo_path, the #437 TOS gate, a provider/machine capability
     mismatch) which this deliberately leaves alone — those are refusals too,
     but reclassifying their retry-worthiness is outside what this issue
     covers, and several of them ARE operator-fixable in ways a running fleet
     can race (e.g. adding a capability to a machine's config while `coord
-    drive-queue` is ticking).
+    drive-queue` is ticking). Reusing this ONE exception (#2096: "one
+    question, one answer") rather than adding a second, competing
+    "this refusal doesn't count" concept is what makes #3376's charging
+    rule ("a dispatch refused by the liveness precondition costs the issue
+    nothing") a byte-for-byte reuse of the `EXIT_DISPATCH_REFUSED` handling
+    `coord.drive` already built for #1844, instead of a second accounting
+    path that could quietly disagree with it.
 
     A subclass of ``ValueError``, not a new hierarchy: every existing
     ``except ValueError`` catch (CLI error handling, tests asserting the
@@ -257,27 +280,33 @@ than trusting them as written.
 
 Your job, in order:
 
-1. **Decompose fully.** Read the epic's own decomposition/handoff \
-instructions (if it carries them, follow those verbatim) and file every \
-child issue this epic implies. Register each one against this epic with \
-`coord milestone add-child <repo> <this epic's issue number> <new issue \
-number>` (REPO EPIC ISSUE, all positional — no `--child` flag) so the \
-epic's checklist and this epic's tracking stay in sync — never hand-edit \
-the checklist directly.
-2. **Queue the first batch.** At most 6 of the newly-filed children, \
-chained serially so they land one at a time: `coord drive-queue add <repo> \
-<child 1>`, then `coord drive-queue add <repo> <child 2> --after <repo>#\
-<child 1>`, and so on.
-3. **Re-queue this epic behind that batch** — `coord drive-queue add <repo> \
-<this epic's issue number> --after <repo>#<child N>` (the last one queued) \
-— so decomposition continues once the first batch lands, if more children \
-remain.
-4. **Implement only the first slice in this pickup.** Do not attempt the \
+1. **Decompose fully — except the slice you implement below.** Read the \
+epic's own decomposition/handoff instructions (if it carries them, follow \
+those verbatim) and file a child issue for every slice EXCEPT the one you \
+implement in step 2. Register each one against this epic with `coord \
+milestone add-child <repo> <this epic's issue number> <new issue number>` \
+(REPO EPIC ISSUE, all positional — no `--child` flag) so the epic's \
+checklist and this epic's tracking stay in sync — never hand-edit the \
+checklist directly. Do NOT also file the slice from step 2 as a child \
+issue: this PR IS that slice's delivery, and a separate issue for it would \
+be a duplicate nobody needs to work (#3275).
+2. **Implement only the first slice in this pickup.** Do not attempt the \
 whole epic in one PR — that defeats the point of decomposing it.
-5. **Leave this epic open.** Do not close it yourself and do not word your \
+3. **Leave this epic open.** Do not close it yourself and do not word your \
 PR body as "Closes #N" — the coordinator already opens this PR with `Refs \
 #N`, non-closing, for exactly this reason. The epic closes only when its \
 checklist is complete.
+
+Do NOT queue the newly-filed children or touch this epic's own queue row
+yourself — `coord drive-queue add` is coordinator-side once this assignment
+reports `done` (#3246): it reads the checklist you just wrote back off
+GitHub (not your own report of it) and chains the first ready batch,
+serially, BEHIND THIS EPIC — never the other way around, since your PR
+above already implements the slice the rest of the checklist builds on, so
+it must land first (#3275). That step used to be step 2/3 of this same list
+and worked only ~half the time when a one-shot worker session did it —
+moving it here means it happens from an OBSERVATION of the checklist, not
+from trusting this session's own final message.
 """
 
 
@@ -601,11 +630,35 @@ def dispatch(
     *,
     pull_repos: Iterable[str] = (),
     fresh_branch: bool = False,
+    status_fetcher=None,
+    credential_fetcher=None,
+    issue_liveness_fetcher=None,
 ) -> dict:
     """POST an assignment to the agent server on the target machine.
 
     Returns the response JSON from the agent server (which includes the
     server-assigned `id`).
+
+    *status_fetcher* (#3353) opts the `type="work"` liveness-routing gate
+    below into a LIVE reachability probe of `proposal.machine_name` before
+    ever POSTing to it — see `route_work_by_liveness`'s docstring. `None`
+    (the default) performs no probe at all, exactly like every caller that
+    predates this parameter.
+
+    *credential_fetcher* (#3371) is `(machine: Machine) -> bool` — `True`
+    means "still routable", matching `coord.network.claude_credential_
+    reachable`'s contract exactly (that is also its default in
+    production; see the STRUCTURAL DISPATCH-LIVENESS GATE below). `None`
+    (the default) performs no probe at all and refuses nothing, exactly
+    like every caller that predates this parameter — same opt-in shape as
+    *status_fetcher*.
+
+    *issue_liveness_fetcher* (#3376) is `(repo_name: str, issue_number: int)
+    -> (issue_closed: bool, branch_merged: bool)` — the other two
+    predicates of the same STRUCTURAL DISPATCH-LIVENESS GATE. `None` (the
+    default) performs no check at all and refuses nothing, same opt-in
+    shape as *credential_fetcher*. See `coord.dispatch_liveness` for the
+    single function all three predicates funnel through.
     """
     machine = next(
         (m for m in config.machines if m.name == proposal.machine_name), None
@@ -613,12 +666,110 @@ def dispatch(
     if machine is None:
         raise ValueError(f"Unknown machine: {proposal.machine_name!r}")
 
+    # #3241: STRUCTURAL CAPABILITY-ROUTING GATE — a `type="work"` diff whose
+    # declared `## Files` (`proposal.files_likely`) match
+    # `smoke_tests.capability_rules`, OR whose repo unconditionally
+    # `requires` a capability (#3351), gets rerouted to the machine that best
+    # satisfies them, using the SAME function (`coord.smoke.
+    # required_capabilities`) the Test stage's own routing uses. Without
+    # this, work dispatch picked purely by load/name among machines that
+    # merely carry the repo, so a platform-specific diff could land on a
+    # machine that can never run its own suite — the worker then
+    # self-records an UNCONFIRMED `coord test` verdict (#2217/#2464) because
+    # no independent re-run was ever possible there. See
+    # `route_work_by_capability`'s and `CapabilityRouting`'s docstrings for
+    # the multi-capability (never-zero-machines) case.
+    capability_routing: CapabilityRouting | None = None
+    if proposal.type == "work":
+        repo_cfg_for_routing = config.repo(proposal.repo_name)
+        capability_routing = route_work_by_capability(
+            proposed_machine_name=proposal.machine_name,
+            repo_name=proposal.repo_name,
+            files_likely=proposal.files_likely,
+            machines=config.machines,
+            capability_rules=config.smoke_tests.capability_rules,
+            repo_requires=repo_cfg_for_routing.requires if repo_cfg_for_routing else (),
+        )
+        if capability_routing is not None and capability_routing.rerouted:
+            proposal.machine_name = capability_routing.machine_name
+            machine = next(
+                (m for m in config.machines if m.name == capability_routing.machine_name),
+                None,
+            )
+            if machine is None:  # pragma: no cover — route_work_by_capability
+                # only ever names a machine it drew from config.machines.
+                raise ValueError(
+                    f"Unknown machine: {capability_routing.machine_name!r}"
+                )
+
+    # #3241 review: a rerouted machine can never fail this —
+    # `route_work_by_capability`'s candidate filter already requires
+    # `repo_path(repo_name) is not None` before a machine is eligible to be
+    # named, so this only ever fires for the ORIGINALLY proposed machine
+    # (no reroute happened, e.g. no capability rule matched at all).
     repo_path = machine.repo_path(proposal.repo_name)
     if repo_path is None:
         raise ValueError(
             f"No repo_path configured for {proposal.repo_name!r} on machine {machine.name!r}. "
             f"Add it to coordinator.yml under machines[].repo_paths."
         )
+
+    # #3353: STRUCTURAL LIVENESS-ROUTING GATE — the router that sent
+    # #3349/coord-tui#79 to a dead box: `capability_routing` above only
+    # reroutes on a `## Files` capability-rule match, never on whether the
+    # winning machine actually answers. Without this, `dispatch()` POSTed
+    # straight to a machine with zero `pending`/`running` assignments
+    # regardless of whether its agent was reachable at all — the exact
+    # busy-vs-alive confusion #3353 fixed for conflict-fix selection, still
+    # open here (see this module's own `ASSIGN_POST_TIMEOUT_SECS` #3214
+    # comment, which had already documented this gap for `coord approve` /
+    # `coord assign`). Opt-in via *status_fetcher*, same contract as
+    # `coord.conflict_fix.select_conflict_fix_machine`'s parameter of the
+    # same name — every caller that hasn't wired a fetcher in yet is
+    # unaffected byte-for-byte.
+    liveness_routing: LivenessRouting | None = None
+    if proposal.type == "work":
+        liveness_routing = route_work_by_liveness(
+            proposed_machine_name=proposal.machine_name,
+            repo_name=proposal.repo_name,
+            machines=config.machines,
+            # #3353 review round 3: this gate runs AFTER the capability gate
+            # above, so `proposal.machine_name` here is already the
+            # capability-chosen machine. Handing the same diff + rules in
+            # keeps the fallback search from quietly undoing that routing
+            # when the capability-matched machine is the one that's down.
+            files_likely=proposal.files_likely,
+            capability_rules=config.smoke_tests.capability_rules,
+            status_fetcher=status_fetcher,
+        )
+        if liveness_routing is not None:
+            if liveness_routing.machine_name is None:
+                detail = "; ".join(f"{name} ({why})" for name, why in liveness_routing.tried)
+                raise ValueError(
+                    f"no machine can take this {proposal.repo_name!r} dispatch "
+                    f"right now — every capable machine is unreachable, or the "
+                    f"only reachable ones would drop a capability this diff "
+                    f"requires: {detail} — nothing dispatched (#3353)"
+                )
+            if liveness_routing.rerouted:
+                proposal.machine_name = liveness_routing.machine_name
+                machine = next(
+                    (m for m in config.machines if m.name == liveness_routing.machine_name),
+                    None,
+                )
+                if machine is None:  # pragma: no cover — route_work_by_liveness
+                    # only ever names a machine it drew from config.machines.
+                    raise ValueError(
+                        f"Unknown machine: {liveness_routing.machine_name!r}"
+                    )
+                repo_path = machine.repo_path(proposal.repo_name)
+                if repo_path is None:  # pragma: no cover — route_work_by_liveness's
+                    # candidate filter already requires a configured repo_path.
+                    raise ValueError(
+                        f"No repo_path configured for {proposal.repo_name!r} on "
+                        f"machine {machine.name!r}. Add it to coordinator.yml "
+                        "under machines[].repo_paths."
+                    )
 
     # Resolve deny-list from the repo's worker_permissions config.
     repo = config.repo(proposal.repo_name)
@@ -690,6 +841,53 @@ def dispatch(
         providers_cfg=config.providers,
         where="coord approve / dispatch",
     )
+
+    # #3376: STRUCTURAL DISPATCH-LIVENESS GATE — the single precondition
+    # (`coord.dispatch_liveness.check_dispatch_liveness`) that refuses a
+    # dispatch when the work cannot matter (the issue is already closed, or
+    # its branch already merged) or cannot succeed (the target machine
+    # fails its own credential/health probe). This absorbs and generalizes
+    # what used to be a standalone #3371 CREDENTIAL-HEALTH GATE here — the
+    # probe itself (`coord.network.claude_credential_reachable`) and its
+    # opt-in *credential_fetcher* contract are unchanged (`None` = no probe
+    # = no-op, byte-for-byte identical to every pre-#3371 caller); it is
+    # now one of three predicates a single function checks, rather than
+    # its own scattered `if`, so a fourth "did anyone check reality first"
+    # bug has one obvious place to add a fourth predicate instead of a
+    # fourth call site. *issue_liveness_fetcher* is the SAME opt-in shape:
+    # `None` for every caller that hasn't wired one in refuses nothing.
+    # See `coord.dispatch_liveness`'s module docstring for why a refusal
+    # here costs the issue's retry budget nothing (no assignment row is
+    # ever created) and how the refusal itself is still made visible
+    # (`record_dispatch_refusal`, via `coord.audit.record_audit`) rather
+    # than silently vanishing.
+    issue_closed: bool | None = None
+    branch_merged: bool | None = None
+    if issue_liveness_fetcher is not None:
+        issue_closed, branch_merged = issue_liveness_fetcher(
+            proposal.repo_name, proposal.issue_number
+        )
+    machine_healthy: bool | None = None
+    if credential_fetcher is not None:
+        machine_healthy = bool(credential_fetcher(machine))
+    refusal = check_dispatch_liveness(
+        repo_name=proposal.repo_name,
+        issue_number=proposal.issue_number,
+        machine_name=machine.name,
+        issue_closed=issue_closed,
+        branch_merged=branch_merged,
+        machine_healthy=machine_healthy,
+    )
+    if refusal is not None:
+        record_dispatch_refusal(
+            refusal,
+            repo_name=proposal.repo_name,
+            issue_number=proposal.issue_number,
+            machine_name=machine.name,
+            assignment_type=proposal.type,
+        )
+        raise DispatchRefused(refusal.reason)
+
     deny_commands: list[str] = []
     if repo is not None and repo.worker_permissions is not None:
         deny_commands = repo.worker_permissions.deny
@@ -905,6 +1103,19 @@ def dispatch(
             + epic_decompose_briefing(proposal.issue_number)
         )
 
+    # #3241: name the stages this worker cannot verify locally — the
+    # dispatcher already routed to the best-covering machine above
+    # (`capability_routing`), so a non-empty `unmet_capabilities` here means
+    # a genuine multi-capability diff no single configured machine fully
+    # covers, not a routing miss. Appended (not prepended) — this is a
+    # constraint on what the worker may CLAIM, read after the task itself.
+    if (
+        proposal.type == "work"
+        and capability_routing is not None
+        and capability_routing.unmet_capabilities
+    ):
+        briefing_text = briefing_text + capability_routing.briefing_note(machine.name)
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
         "repo_name": proposal.repo_name,
@@ -1070,14 +1281,35 @@ def dispatch_with_retry(
     pull_repos: Iterable[str] = (),
     fresh_branch: bool = False,
     on_retry: callable | None = None,
+    status_fetcher=None,
+    credential_fetcher=None,
+    issue_liveness_fetcher=None,
 ) -> dict:
-    """Dispatch with exponential backoff on transient failures."""
+    """Dispatch with exponential backoff on transient failures.
+
+    *status_fetcher* (#3353) is forwarded to `dispatch()` untouched — see
+    its docstring for the liveness-routing gate it opts into.
+
+    *credential_fetcher* (#3371) and *issue_liveness_fetcher* (#3376) are
+    forwarded to `dispatch()` untouched — see its docstring for the
+    STRUCTURAL DISPATCH-LIVENESS GATE they opt into. A `DispatchRefused`
+    from that gate is NOT retried (it is a `ValueError` subclass, so it
+    hits the same `except ValueError: raise` below unchanged) — a closed
+    issue, an already-merged branch, or a dead credential is not a
+    transient condition backoff can fix.
+    """
     from coord.network import classify_error, is_retryable
 
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return dispatch(proposal, config, pull_repos=pull_repos, fresh_branch=fresh_branch)
+            return dispatch(
+                proposal, config,
+                pull_repos=pull_repos, fresh_branch=fresh_branch,
+                status_fetcher=status_fetcher,
+                credential_fetcher=credential_fetcher,
+                issue_liveness_fetcher=issue_liveness_fetcher,
+            )
         except httpx.HTTPError as exc:
             state, reason = classify_error(exc)
             if not is_retryable(state) or attempt == max_retries:
@@ -1090,6 +1322,495 @@ def dispatch_with_retry(
         except ValueError:
             raise
     raise last_exc  # unreachable, but satisfies type checker
+
+
+@dataclass(frozen=True)
+class CapabilityRouting:
+    """Outcome of routing a `type="work"` dispatch by
+    `smoke_tests.capability_rules` (#3241).
+
+    Before this, work dispatch picked a machine purely by load/name among
+    machines that merely carry the repo — nothing routed a `type="work"`
+    leg the way `capability_rules` already routes the Test stage. A
+    platform-specific diff (e.g. `quadraui/src/macos/backend.rs`) could
+    land on a machine that can never build or run its own suite; the
+    worker then iterates with no local signal and self-records its own
+    `coord test` verdict (#2217), which the board stores as an explicit
+    UNCONFIRMED pass (#2464) — the pipeline knows the verdict is unbacked
+    and proceeds anyway.
+
+    ``machine_name`` is the chosen machine — always one that
+    `Machine.can_work_on(repo_name)`, never left unset: a multi-capability
+    diff that no single configured machine fully covers still gets the
+    machine covering the MOST of the matched capabilities, deterministically
+    (see `route_work_by_capability`), rather than being refused. ANDing the
+    requirements and refusing when no machine satisfies all of them would
+    route to zero machines the instant two matched rules need capabilities
+    no machine ever carries together (gtk+windows vs. macos) — the #1678
+    shape, and the exact mistake #3177 documented for the Test stage's own
+    routing.
+
+    ``unmet_capabilities`` are the matched capabilities `machine_name` does
+    NOT declare — empty when it fully satisfies every matched rule. The
+    caller (`dispatch()`) turns a non-empty tuple into a briefing note
+    naming the stages the worker cannot verify locally, and telling it not
+    to self-record a verdict for one of them — the UNCONFIRMED path must
+    never be reachable for a capability the dispatcher itself could have
+    satisfied by routing correctly in the first place.
+
+    ``rerouted`` is True when `machine_name` differs from the machine the
+    caller originally proposed — i.e. the proposed pick didn't fully cover
+    the matched capabilities and a better (or fully satisfying) one existed.
+    """
+
+    machine_name: str
+    unmet_capabilities: tuple[str, ...]
+    rerouted: bool
+
+    def briefing_note(self, machine_name: str) -> str:
+        """One appended briefing block naming the stages this dispatch
+        cannot verify locally (#3241).
+
+        Only meaningful when `unmet_capabilities` is non-empty — callers
+        guard on that before appending this. Directive, not just
+        informational: self-recording a `coord test` verdict (#2217) for a
+        stage the worker could never actually run is exactly the
+        UNCONFIRMED-pass shape #3241 exists to close off.
+        """
+        caps = ", ".join(self.unmet_capabilities)
+        return (
+            "\n\n## Capabilities you cannot verify locally (#3241)\n\n"
+            f"This machine ({machine_name}) does not declare: {caps}. No "
+            "single configured machine covers every capability this diff's "
+            "`## Files` touch (see `smoke_tests.capability_rules` in "
+            "coordinator.yml), so at least one Test-stage suite cannot be "
+            "built or run here. Do NOT self-record a passing `coord test` "
+            "verdict for a stage you could not actually run — leave those "
+            "to the Test stage's own capability-matched machine. A verdict "
+            "recorded without an independent re-run on the right hardware "
+            "is an UNCONFIRMED pass (#2464), not a real one."
+        )
+
+
+def route_work_by_capability(
+    *,
+    proposed_machine_name: str,
+    repo_name: str,
+    files_likely: list[str],
+    machines: list[Machine],
+    capability_rules: list[SmokeRule],
+    repo_requires: Iterable[str] = (),
+    now: "datetime | None" = None,
+) -> CapabilityRouting | None:
+    """Pick the machine for a `type="work"` dispatch whose declared `##
+    Files` (`files_likely`) match `smoke_tests.capability_rules`, OR whose
+    repo unconditionally `requires` a capability (#3241, #3351).
+
+    Reuses `coord.smoke.required_capabilities` — the SAME function the Test
+    stage's own routing uses to union `repo_requires` (`Repo.requires`,
+    #3351 — e.g. vimcode's repo-wide nvim oracle) with the file-matched
+    `capability_rules` result — rather than a second copy of the "what does
+    this diff need" logic. #2096 ("one question, one answer"): a second copy
+    drifting from the first is how the dead-prefix bugs in #1072 and #2953
+    happened. Deferred import (not a module-level one) because `coord.smoke`
+    imports `AGENT_PORT`/`ASSIGN_POST_TIMEOUT_SECS` from this module — a
+    module-level import here would be circular.
+
+    Returns `None` when neither `repo_requires` nor `files_likely` needs
+    anything (the overwhelmingly common case) or when no machine survives
+    the candidate filter below — both are the caller's signal to leave
+    `proposal.machine_name` exactly as proposed; `dispatch()`'s own
+    unresolved-machine/repo_path checks are the right place for THAT
+    refusal, not a second one here.
+
+    A candidate must satisfy every one of (#3241 review):
+
+    - `can_work_on(repo_name)` — declares the repo at all;
+    - `repo_path(repo_name) is not None` — the SAME check
+      `select_fix_machine`'s `_capable()` applies a few hundred lines below.
+      Without it, a machine that lists the repo under `repos:` but has no
+      `repo_paths` entry configured could be chosen as the reroute target;
+      `dispatch()` sets `proposal.machine_name` from this function's result
+      BEFORE its own pre-existing `repo_path` check runs, so an unfiltered
+      pick here would mutate the proposal to an undispatchable machine
+      before the caller ever sees the `ValueError`;
+    - not in `paused_set(machines)` — the FULL cordon-inclusive set, the
+      same one `coord.brain.propose()` and `coord assign`'s CLI both gate a
+      `type="work"` proposal's machine on before it is ever chosen. This is
+      new work, not the tail of a leg already in flight, so this
+      deliberately does NOT use `follow_on_paused_set()` — that one exists
+      for `select_fix_machine`/`rank_smoke_machines`, which finish work
+      that already started elsewhere (#2240, #2636). A reroute here must
+      not land a `type="work"` leg on a machine the operator explicitly
+      `coord pause`d or that is inside its declared `quiet_hours` window —
+      `dispatch()` itself has no other pause/quiet-hours check anywhere in
+      its body, since that filtering has always been done upstream, and
+      this new gate runs strictly after `coord plan` already did it once.
+
+    *now* is forwarded to `paused_set()` untouched, exactly like
+    `rank_smoke_machines`'s own *now* parameter — `None` (the default, and
+    every production call site) evaluates quiet hours against the real
+    clock; the seam exists purely so a test can pin a specific wall-clock
+    moment instead of depending on whatever instant the suite happens to
+    run at.
+
+    Otherwise, scores every surviving candidate by how many of the matched
+    capabilities it declares. The proposed machine wins ties (no pointless
+    reroute — and its build cache is warm, same reasoning as
+    `coord.smoke.rank_smoke_machines`'s worker preference); otherwise the
+    highest-scoring machine wins, ties broken by `machines` list order
+    (`coordinator.yml` declaration order — deterministic, never dict/set
+    iteration order). A single-capability-rule diff with any fully-capable
+    machine configured always resolves to `unmet_capabilities=()`; see
+    `CapabilityRouting`'s docstring for the multi-capability case where no
+    one machine fully covers it.
+    """
+    from coord.machine_pause import paused_set  # noqa: PLC0415
+    from coord.smoke import required_capabilities  # noqa: PLC0415
+
+    required = required_capabilities(repo_requires, files_likely, capability_rules)
+    if not required:
+        return None
+
+    paused = paused_set(machines, now=now)
+    candidates = [
+        m for m in machines
+        if m.can_work_on(repo_name)
+        and m.repo_path(repo_name) is not None
+        and m.name not in paused
+    ]
+    if not candidates:
+        return None
+
+    def _coverage(m: Machine) -> int:
+        return sum(1 for cap in required if cap in m.capabilities)
+
+    scores = {m.name: _coverage(m) for m in candidates}
+    best_score = max(scores.values())
+
+    proposed = next((m for m in candidates if m.name == proposed_machine_name), None)
+    if proposed is not None and scores[proposed.name] == best_score:
+        best = proposed
+    else:
+        best = max(candidates, key=lambda m: scores[m.name])
+
+    unmet = tuple(cap for cap in required if cap not in best.capabilities)
+    return CapabilityRouting(
+        machine_name=best.name,
+        unmet_capabilities=unmet,
+        rerouted=best.name != proposed_machine_name,
+    )
+
+
+@dataclass(frozen=True)
+class LivenessRouting:
+    """Outcome of routing a `type="work"` dispatch around an unreachable
+    proposed machine (#3353).
+
+    `route_work_by_capability` above reroutes on a capability-rule match;
+    this reroutes on the ONE thing that mattered for #3349 and
+    coord-tui#79 (2026-09-15, both "loud, attempts burned" — see the
+    issue): whether `proposed_machine_name`'s agent actually answers right
+    now. Before this, `dispatch()` POSTed straight to whatever machine the
+    brain proposed or an operator named, with no liveness signal at all —
+    the exact busy-vs-alive confusion #3353 already fixed for conflict-fix
+    machine selection (`coord.conflict_fix.select_conflict_fix_machine`),
+    left open here.
+
+    Same opt-in shape as that function's `status_fetcher` parameter (#2096,
+    "one question, one answer" — both route through the SAME
+    `coord.network.probe_reachable` seam): a caller that hasn't wired a
+    fetcher in gets `None` back from `route_work_by_liveness` and
+    `proposal.machine_name` is left completely untouched.
+
+    `machine_name` is `None` when the proposed machine AND every other
+    eligible candidate all failed a live probe — the caller must not
+    silently fall through to POSTing at the proposed machine (a fresh
+    dead-box timeout that burns a drive-queue attempt, exactly what
+    happened to #3349/#79) — and ALSO (#3353 review round 3) when the only
+    reachable candidates would cover FEWER of the diff's required
+    `capability_rules` capabilities than the proposed machine does. A
+    refusal there is deliberate: silently rerouting a capability-matched
+    diff onto a capability-blind box is the very UNCONFIRMED-verdict hole
+    `route_work_by_capability` exists to close (#2217/#2464), and it would
+    be *worse* than pre-#3353 behaviour, which at least failed loudly with
+    an `httpx` timeout instead of succeeding on the wrong hardware.
+
+    `tried` names every machine considered, in order, paired with why it
+    was skipped — a live-probe reason for the ones actually probed, and a
+    `capability shortfall` note for the ones ruled out before any probe —
+    same shape as `FixMachineSelection.tried` below, so both "why didn't a
+    fix land" and "why didn't a dispatch land" read the same way to an
+    operator.
+
+    `rerouted` is True when `machine_name` differs from what was proposed —
+    i.e. the proposed machine failed its probe and a live fallback existed.
+    """
+
+    machine_name: str | None
+    rerouted: bool
+    tried: tuple[tuple[str, str], ...] = ()
+
+
+def route_work_by_liveness(
+    *,
+    proposed_machine_name: str,
+    repo_name: str,
+    machines: list[Machine],
+    files_likely: "list[str] | None" = None,
+    capability_rules: "list[SmokeRule] | None" = None,
+    status_fetcher=None,
+    now: "datetime | None" = None,
+) -> LivenessRouting | None:
+    """Reroute a `type="work"` dispatch away from `proposed_machine_name`
+    when it fails a LIVE reachability probe, onto any other repo-capable,
+    unpaused machine that passes one (#3353).
+
+    Returns `None` — meaning "nothing for the caller to do, proceed
+    unchanged" — in three cases: *status_fetcher* is `None` (opted out,
+    the default); `proposed_machine_name` isn't in `machines` at all
+    (`dispatch()`'s own "Unknown machine" check is the right place for
+    that refusal, not a second one here); or the proposed machine's probe
+    succeeds (nothing to reroute). Returns a `LivenessRouting` with
+    `machine_name=None` — which the caller MUST treat as a hard refusal,
+    not a "proceed with the original pick" signal — only when the proposed
+    machine is down AND every fallback is too.
+
+    Candidate filter for fallbacks mirrors `route_work_by_capability`'s
+    (#3241 review): `can_work_on(repo_name)`, a configured `repo_path`, and
+    not in the FULL cordon-inclusive `paused_set()` — this is new work
+    being routed for the first time, not the tail of a leg already running
+    elsewhere, so (like that function, and unlike `select_fix_machine`
+    below) it deliberately does NOT use `follow_on_paused_set()`.
+
+    *files_likely* / *capability_rules* make that filter CAPABILITY-AWARE
+    (#3353 review round 3), closing the gap between this gate and the
+    #3241 one it runs after. `dispatch()` runs `route_work_by_capability`
+    first, so by the time this sees `proposed_machine_name` it is already
+    the capability-CHOSEN machine when any rule matched the diff's `##
+    Files`. A capability-blind fallback filter here would therefore undo
+    that routing the instant the capability-matched machine was also down:
+    a GTK diff routed to the one GTK box would silently land on a box with
+    no GTK at all, and the POST would look perfectly successful — the
+    UNCONFIRMED-verdict hole (#2217/#2464) reopened by the very gate that
+    was supposed to make dispatch safer.
+
+    So fallbacks are scored with the SAME `coord.smoke.match_rules` matcher
+    and the same "count the covered capabilities" rule
+    `route_work_by_capability` uses (never a second copy of that logic —
+    #2096), and a fallback is eligible only if it covers at LEAST as many
+    of the matched capabilities as the proposed machine does. Note this is
+    a floor, not an AND over the requirements: it preserves
+    `CapabilityRouting`'s never-zero-machines property (a gtk+windows diff
+    that no single machine fully covers still reroutes, to another machine
+    with the same best-available coverage) while refusing the one case that
+    is strictly a regression — dropping coverage the dispatcher had already
+    secured. Passing neither argument (the default) keeps the old
+    capability-blind behaviour for callers that have no diff to match.
+
+    *status_fetcher* and *now* are forwarded to `probe_reachable`/
+    `paused_set` untouched — see those functions' docstrings.
+    """
+    if status_fetcher is None:
+        return None
+
+    from coord.machine_pause import paused_set  # noqa: PLC0415
+    from coord.network import probe_reachable  # noqa: PLC0415
+
+    proposed = next((m for m in machines if m.name == proposed_machine_name), None)
+    if proposed is None:
+        return None
+
+    reachable, reason = probe_reachable(proposed, status_fetcher=status_fetcher)
+    if reachable:
+        return None
+
+    tried: list[tuple[str, str]] = [(proposed_machine_name, reason or "unreachable")]
+
+    required: tuple[str, ...] = ()
+    if capability_rules:
+        from coord.smoke import match_rules  # noqa: PLC0415
+
+        required = tuple(match_rules(list(files_likely or []), capability_rules))
+
+    def _coverage(m: Machine) -> int:
+        return sum(1 for cap in required if cap in m.capabilities)
+
+    paused = paused_set(machines, now=now)
+    fallbacks = [
+        m for m in machines
+        if m.name != proposed_machine_name
+        and m.can_work_on(repo_name)
+        and m.repo_path(repo_name) is not None
+        and m.name not in paused
+    ]
+
+    skipped: list[tuple[str, str]] = []
+    if required:
+        floor = _coverage(proposed)
+        eligible = [m for m in fallbacks if _coverage(m) >= floor]
+        for m in fallbacks:
+            if _coverage(m) < floor:
+                missing = ", ".join(c for c in required if c not in m.capabilities)
+                skipped.append(
+                    (m.name, f"capability shortfall (does not cover: {missing})")
+                )
+        # Stable sort: better coverage first, `machines` declaration order
+        # preserved within a tier — same determinism rule as
+        # `route_work_by_capability`'s tie-break, never dict/set order.
+        eligible.sort(key=_coverage, reverse=True)
+    else:
+        eligible = fallbacks
+
+    for m in eligible:
+        ok, why = probe_reachable(m, status_fetcher=status_fetcher)
+        if ok:
+            return LivenessRouting(
+                machine_name=m.name, rerouted=True, tried=tuple(tried),
+            )
+        tried.append((m.name, why or "unreachable"))
+
+    tried.extend(skipped)
+    return LivenessRouting(machine_name=None, rerouted=False, tried=tuple(tried))
+
+
+@dataclass(frozen=True)
+class LivenessReroute:
+    """One proposal moved off an unreachable machine by
+    :func:`apply_liveness_reroute` — `proposal_id` is the
+    `Proposal.id` that moved, `from_machine` the machine originally
+    proposed, `to_machine` where it will actually be dispatched.
+
+    Exists so the shared batch helper can stay output-agnostic: `coord
+    approve` renders these as `click.echo` lines on stderr, the dashboard's
+    `POST /api/approve` folds them into its JSON results array, and neither
+    has to re-derive "did this move, and from where".
+    """
+
+    proposal_id: int
+    from_machine: str
+    to_machine: str
+
+
+def caching_status_fetcher(fetcher=None):
+    """Wrap a status fetcher so each machine is probed at most ONCE for the
+    lifetime of the returned callable (#3353 review).
+
+    A single `coord approve` / `POST /api/approve` batch asks "is this
+    machine up" twice for every `type="work"` proposal — once in the
+    caller's own preview reroute (:func:`apply_liveness_reroute`, which has
+    to run early so the freshness pre-check and the operator-facing echo
+    are keyed to the machine the work actually lands on) and again inside
+    :func:`dispatch` a moment later. That is a real second `GET /status`
+    per dispatch, and with N proposals aimed at the same machine it is
+    2N probes for one answer.
+
+    Wrapping the fetcher here collapses them to one probe per machine per
+    batch. It also closes the small TOCTOU window between the two: the
+    preview reroute and `dispatch()`'s own gate now see the SAME verdict,
+    so they cannot disagree about where the work should go and silently
+    re-route it a second time.
+
+    Deliberately scoped to one batch, not module-global: liveness is the
+    thing being measured, and a process-lifetime cache would make a
+    long-running daemon act on a stale up/down reading. Callers construct a
+    fresh one per invocation.
+
+    *fetcher* defaults to :func:`coord.network.fetch_status`. Results are
+    cached by `machine.name`; the wrapper accepts and forwards the same
+    optional `timeout` keyword :func:`coord.network.probe_reachable` may
+    pass, but a differing `timeout` does NOT bust the cache (within one
+    batch every caller uses the default).
+    """
+    from coord.network import fetch_status as _fs  # noqa: PLC0415
+
+    fetch = fetcher or _fs
+    cache: dict[str, object] = {}
+
+    def _cached(machine, **kwargs):
+        key = machine.name
+        if key not in cache:
+            cache[key] = fetch(machine, **kwargs)
+        return cache[key]
+
+    return _cached
+
+
+def apply_liveness_reroute(
+    proposals: "list[Proposal]",
+    *,
+    machines: list[Machine],
+    capability_rules: "list[SmokeRule] | None" = None,
+    status_fetcher=None,
+) -> list[LivenessReroute]:
+    """Move every `type="work"` proposal in *proposals* off an unreachable
+    machine, in place, and report what moved (#3353).
+
+    This is the ONE answer to "before dispatching an approved batch, is each
+    proposal's machine actually alive?" (#2096, "one question, one answer").
+    It exists because that question had grown TWO independent askers:
+    `coord.commands.dispatch.approve` (`coord approve`) and
+    `coord.dashboard.server`'s `POST /api/approve` — the `coord web` phone
+    dashboard, which dispatches the SAME `load_proposals()` set through the
+    SAME :func:`dispatch` chokepoint. When only the first learned to check
+    liveness, the phone dashboard kept POSTing straight at dead boxes, the
+    exact failure (#3349, coord-tui#79 on 2026-09-15) #3353 exists to fix.
+
+    Must be called BEFORE any per-proposal state keyed on
+    `proposal.machine_name` is computed (the freshness pre-check, `coord
+    approve`'s `dispatched_this_batch` #2804 collision guard, the
+    operator-facing echo), for the same reason the #3241 capability reroute
+    runs there: otherwise all of it describes a machine the work never
+    reaches. :func:`dispatch` re-runs :func:`route_work_by_liveness`
+    internally — that call stays, since `dispatch()` has callers that never
+    come through here — and becomes a same-machine no-op once this has run.
+
+    Proposals whose every capable machine is unreachable are left
+    **untouched**: `dispatch()` raises the descriptive
+    "every candidate unreachable" `ValueError` for those, and both callers
+    already have an error path that reports and skips a failed dispatch.
+    Duplicating that refusal here would give two different messages for one
+    condition.
+
+    *status_fetcher* is the opt-in, forwarded verbatim to
+    :func:`route_work_by_liveness`: `None` (the default) means every
+    proposal is left exactly as proposed and this returns `[]`. Pass it
+    through :func:`caching_status_fetcher` and hand the SAME wrapper to
+    `dispatch()` to avoid probing each machine twice per batch.
+
+    *capability_rules* (`config.smoke_tests.capability_rules`) is forwarded
+    alongside each proposal's own `files_likely` so the reroute stays
+    capability-aware (#3353 review round 3) — BOTH callers run their #3241
+    capability reroute immediately before this one, so without it this loop
+    would undo that decision for exactly the diffs that most need it. See
+    :func:`route_work_by_liveness`'s docstring.
+    """
+    if status_fetcher is None:
+        return []
+
+    moved: list[LivenessReroute] = []
+    for p in proposals:
+        if p.type != "work":
+            continue
+        routing = route_work_by_liveness(
+            proposed_machine_name=p.machine_name,
+            repo_name=p.repo_name,
+            machines=machines,
+            files_likely=p.files_likely,
+            capability_rules=capability_rules,
+            status_fetcher=status_fetcher,
+        )
+        if routing is None or routing.machine_name is None or not routing.rerouted:
+            continue
+        moved.append(
+            LivenessReroute(
+                proposal_id=p.id,
+                from_machine=p.machine_name,
+                to_machine=routing.machine_name,
+            )
+        )
+        p.machine_name = routing.machine_name
+    return moved
 
 
 @dataclass
@@ -1150,6 +1871,7 @@ def select_fix_machine(
     """
     from coord.machine_pause import follow_on_paused_set
     from coord.network import fetch_status as _fetch_status
+    from coord.network import probe_reachable
 
     fetch = status_fetcher or _fetch_status
     # #2240: the same follow-on cordon `_dispatch_fix` has always used — a
@@ -1186,10 +1908,14 @@ def select_fix_machine(
         if not _capable(m):
             tried.append((m.name, f"cannot work on repo {repo_name!r}"))
             continue
-        result = fetch(m)
-        if result.ok:
+        # #3353: routed through the shared `coord.network.probe_reachable`
+        # seam (rather than calling `fetch` directly) so this and
+        # `coord.conflict_fix.select_conflict_fix_machine` answer "is this
+        # machine up" identically — see that function's docstring.
+        reachable, reason = probe_reachable(m, status_fetcher=fetch)
+        if reachable:
             return FixMachineSelection(m, tried)
-        tried.append((m.name, result.error or "unreachable"))
+        tried.append((m.name, reason or "unreachable"))
 
     return FixMachineSelection(None, tried)
 

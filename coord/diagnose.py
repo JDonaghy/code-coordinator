@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from coord.models import WORK_LIKE_TYPES
+
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
     from coord.acceptance import ManifestData
     from coord.config import Config
@@ -73,7 +75,20 @@ STAGE_ASSIGNMENT_TYPES: dict[str, tuple[str, ...]] = {
     # number (false "stage looks healthy"/wrong-row confidence) instead of
     # flagging the real wedge.
     "review": ("review", "test-author", "mock-author"),
-    "test": ("work", "plan"),
+    # #3305: the Test-gate's own `test_state`/`test_reason` is written onto
+    # whichever `WORK_LIKE_TYPES` row was actually dispatched to Test —
+    # `dispatch_smoke`'s #3305 zero-commit gate blocks `mock-author`/
+    # `test-author`/`epic-decompose` rows exactly like `work` rows (it's
+    # scoped to all of `WORK_LIKE_TYPES`, not just `work`). Before this, an
+    # operator running the gate's own recommended `coord diagnose --stage
+    # test --reset` against one of those three types found no `("work",
+    # "plan")` row for the issue, took the `latest is None` early return, and
+    # reported `recovered=True` ("nothing wedged") without ever finding, let
+    # alone clearing, the blocked row — a false "healthy" that left the row
+    # stuck at `TEST_STATE_BLOCKED` forever. Widened to match the dispatch
+    # side's own definition of "carries a test_state" instead of a narrower,
+    # silently-inconsistent set.
+    "test": ("plan", *sorted(WORK_LIKE_TYPES)),
     "merge": ("work", "plan"),
     # #2087: previously absent entirely — `--stage smoke` (or an implicit
     # `current_stage()` pick landing on a `type="smoke"` row, e.g. a Test
@@ -512,28 +527,84 @@ def _finalize_dead(assignment: "Assignment", config: "Config") -> str:
 
 
 def _kill_session(assignment: "Assignment", config: "Config") -> bool:
-    """``tmux kill-session`` for *assignment* (local or remote).  Used by reset
-    to stop a live session before finalizing.  Returns True when the kill ran."""
+    """Stop *assignment*'s live session, whichever shape it is, and confirm it
+    actually stopped.  Used by reset to stop a live session before
+    finalizing/deleting its row.
+
+    #3223: a tmux ``kill-session`` alone is blind to HEADLESS workers. A
+    headless assignment (``interactive=False`` — the ordinary shape of an
+    auto-loop review/work leg) is a plain ``claude -p`` subprocess spawned
+    directly by ``AgentServer.assign``; it never has a tmux session, so
+    ``tmux kill-session`` targets a session that never existed, silently
+    does nothing, and (pre-fix) still reported success. This now branches:
+    an interactive tmux pane is killed via tmux as before; anything else is
+    treated as headless and stopped through the agent's own
+    ``POST /cancel/{id}`` — the same seam ``coord stop`` uses (there is
+    exactly one way to ask "did this assignment get cancelled", not two
+    implementations that could disagree).
+
+    Returns True only when a fresh liveness re-probe, taken AFTER the stop
+    attempt, confirms the session is actually gone (#2096) — never from the
+    mere absence of an exception. Callers gating a destructive action (e.g.
+    deleting the only board row `coord stop` can find the assignment by)
+    must treat False as "did not stop, do not proceed."
+    """
     import subprocess  # noqa: PLC0415
 
     from coord.interactive import (  # noqa: PLC0415
         TmuxHost,
         tmux_session_name,
+        tmux_session_running,
     )
 
     if not assignment.assignment_id:
         return False
     host = TmuxHost(ssh_target=_ssh_target_for(assignment, config))
     sname = tmux_session_name(assignment.assignment_id)
+
     try:
-        subprocess.run(
-            host.cmd(["kill-session", "-t", sname]),
-            capture_output=True,
-            timeout=20,
+        was_tmux_live = tmux_session_running(sname, host=host)
+    except Exception:  # noqa: BLE001 — probe error; fall through to the
+        # headless branch rather than claim a tmux session that may or may
+        # not exist — the agent cross-check below is the authoritative one
+        # for anything tmux can't positively confirm.
+        was_tmux_live = False
+
+    if was_tmux_live:
+        try:
+            subprocess.run(
+                host.cmd(["kill-session", "-t", sname]),
+                capture_output=True,
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; the re-probe below is the real verdict
+            log.warning("tmux kill-session failed for %s: %s", assignment.assignment_id, exc)
+        try:
+            return not tmux_session_running(sname, host=host)
+        except Exception as exc:  # noqa: BLE001 — can't confirm; don't claim success
+            log.warning(
+                "could not re-probe tmux session %s after kill: %s", sname, exc
+            )
+            return False
+
+    # No tmux session at all — the headless shape (#3223). The only seam
+    # that can reach it is the agent's own POST /cancel/{id}.
+    machine = _resolve_machine(config, assignment.machine_name)
+    if machine is None:
+        log.warning(
+            "cannot stop headless assignment %s: machine %r not in config",
+            assignment.assignment_id, assignment.machine_name,
         )
-        return True
-    except Exception:  # noqa: BLE001 — best-effort
         return False
+    from coord.network import cancel_assignment  # noqa: PLC0415
+
+    result = cancel_assignment(machine, assignment.assignment_id)
+    if not result.ok:
+        log.warning(
+            "agent cancel failed for headless assignment %s on %s: %s",
+            assignment.assignment_id, machine.name, result.error,
+        )
+    return result.ok
 
 
 def _reconcile_issue_merges(
@@ -1209,7 +1280,10 @@ def _recover_work_like(
             "purpose (retrying reproduces the identical refusal, since "
             "nothing about the premise has changed) — needs the "
             "coordinator: re-scope or close the issue and audit the "
-            "`after=` edges of anything queued behind it (#3164)"
+            "`after=` edges of anything queued behind it (#3164). If the "
+            "prerequisite has since landed, `coord drive-queue "
+            "clear-refusal <repo> <issue> --reason \"...\"` then "
+            "`drive-queue remove` + `add` dispatches fresh work (#3339)"
         )
         res.recovered = False
     else:
@@ -1431,13 +1505,26 @@ def _do_reset(
             if latest.type == "review" and latest.review_of_assignment_id
             else latest.assignment_id
         )
+        # #3223: `latest` — NOT `target_id` — is the row whose SESSION might
+        # still be live. When `latest.type == "review"`, `target_id` is the FK
+        # to the (already-done) work row being reviewed; the live/wedged
+        # process, if any, is the review leg itself (`latest`). Threaded
+        # through separately so `_reset_review_stage` can stop the right
+        # session before touching any row.
         _reset_review_stage(
             config, repo_name, issue_number, res,
-            dry_run=dry_run, assignment_id=target_id,
+            dry_run=dry_run, assignment_id=target_id, live_assignment=latest,
         )
         return
     if stage == "test":
-        _reset_test_stage(repo_name, issue_number, res, dry_run=dry_run)
+        # #3305: thread `latest.assignment_id` through so a `test-author`/
+        # `mock-author` reset — like the `review` reset above — only clears
+        # the ONE JIT-slice row being diagnosed, not every sibling slice that
+        # happens to share `issue_number` (the milestone tracking issue).
+        _reset_test_stage(
+            repo_name, issue_number, res,
+            dry_run=dry_run, assignment_id=latest.assignment_id,
+        )
         return
 
     # work / plan / merge — clear a live/phantom session, KEEP the branch.
@@ -1448,7 +1535,10 @@ def _do_reset(
         res.needs_reset = True
         return
     if _session_state(latest, config) == "live" and _kill_session(latest, config):
-        res.actions_taken.append("stopped the live session (tmux kill-session)")
+        # #3223: `_kill_session` now covers both shapes — tmux for an
+        # interactive pane, agent `POST /cancel/{id}` for a headless leg —
+        # so the message no longer names a single mechanism.
+        res.actions_taken.append("stopped the live session")
     try:
         res.actions_taken.append(f"finalized session ({_finalize_dead(latest, config)})")
     except Exception as exc:  # noqa: BLE001 — fall back to a direct terminal mark
@@ -1461,9 +1551,45 @@ def _do_reset(
     res.actions_taken.append("branch preserved — stage is re-dispatchable")
 
 
+def _session_may_be_live(assignment: "Assignment", config: "Config") -> bool:
+    """Whether *assignment* might still have a running session, asked the way
+    a DESTRUCTIVE reset needs it asked (#3223).
+
+    Deliberately the single implementation both the dry-run preview and the
+    real reset call, so the preview can never describe a different decision
+    than the one that actually runs (#2085: one question, one answer).
+
+    Two-step, in this order:
+
+    1. A row whose ``status`` is already terminal (``dao.TERMINAL_STATUSES``
+       — the canonical set, not a local re-list) has **no session to
+       strand**: its finish was recorded by the agent, or by a reaper that
+       had already confirmed the process was gone. Answer ``False`` without
+       probing. This matters beyond tidiness — ``notify``'s
+       ``review_done_no_verdict`` sweep resets a ``status="done"`` review on
+       a schedule, and calls ``_reset_review_stage`` directly precisely to
+       avoid paying an ssh/HTTP liveness probe per tick. Probing there would
+       also *wedge that recovery*: an unreachable agent probes ``"unknown"``,
+       and step 2 treats ``"unknown"`` as "might be live", so an
+       already-finished review would refuse to reset for as long as its
+       machine stayed down.
+    2. Otherwise probe (:func:`_session_state`, which already covers the
+       headless shape via the agent's own ``/status`` — #1658) and treat
+       anything that is not a confirmed ``"dead"`` as possibly live.
+       ``"unknown"`` counts as possibly-live on purpose: the caller is about
+       to delete the only row ``coord stop`` could find this assignment by,
+       and an unconfirmed guess is not grounds for that (#2096).
+    """
+    from coord.dao import TERMINAL_STATUSES  # noqa: PLC0415
+
+    if assignment.status in TERMINAL_STATUSES:
+        return False
+    return _session_state(assignment, config) != "dead"
+
+
 def _reset_review_stage(
     config, repo_name: str, issue_number: int, res: DiagnoseResult, *,
-    dry_run: bool, assignment_id: str,
+    dry_run: bool, assignment_id: str, live_assignment: "Assignment",
 ) -> None:
     """Wipe a completed review so the stage returns to grey + re-reviewable:
     delete the ``type='review'`` rows, reset the work's ``review_state``, and
@@ -1479,21 +1605,65 @@ def _reset_review_stage(
     guards against. ``work``/``plan`` behavior is unchanged (still issue-wide,
     which is safe for those types).
 
-    Callers must resolve this themselves: the review stage's ``latest`` row can
-    be either the reviewed assignment (test-author/mock-author, no review
-    dispatched yet) or a ``type='review'`` row pointing at it via
-    ``review_of_assignment_id`` — the two cases need different resolution. See
-    ``_do_reset``.
+    ``live_assignment`` is a DIFFERENT id: it's the actual row whose SESSION
+    might still be running — the review leg itself when one was dispatched
+    (``latest.type == "review"``), or the same row as ``assignment_id`` for
+    the JIT test-author/mock-author case. See ``_do_reset``'s #3223 note.
+
+    Callers must resolve ``assignment_id`` themselves: the review stage's
+    ``latest`` row can be either the reviewed assignment (test-author/
+    mock-author, no review dispatched yet) or a ``type='review'`` row
+    pointing at it via ``review_of_assignment_id`` — the two cases need
+    different resolution. See ``_do_reset``.
+
+    #3223: before touching any row, stop ``live_assignment``'s session if it
+    might still be running — a headless review leg (``interactive=False``,
+    the ordinary auto-loop shape) is a plain agent subprocess with no tmux
+    session; the only way to reach it is the agent's own
+    ``POST /cancel/{id}`` (``_kill_session`` now covers this). Order matters:
+    cancel on the agent FIRST, then clear the board — reversing it destroys
+    the only handle ``coord stop`` has to find the assignment by, converting
+    a visible stall into an invisible orphan holding a worker slot forever.
+    When the stop can't be confirmed, this reports why and returns WITHOUT
+    deleting anything, leaving the row as the recovery handle it has to be.
+    An ALREADY-TERMINAL ``live_assignment`` skips the stop (and its probe)
+    entirely — see :func:`_session_may_be_live` for why that short-circuit
+    is load-bearing for ``notify``'s ``review_done_no_verdict`` sweep, not
+    merely an optimization.
     """
     from coord import state  # noqa: PLC0415
 
     if dry_run:
-        res.findings.append(
-            "(dry-run) would DELETE the review rows, reset work review_state → "
-            "pending, and purge #603 review notes (box → grey, re-reviewable)"
+        tail = (
+            "DELETE the review rows, reset work review_state → pending, "
+            "and purge #603 review notes (box → grey, re-reviewable)"
         )
+        if _session_may_be_live(live_assignment, config):
+            msg = (
+                f"(dry-run) would first stop {live_assignment.assignment_id}'s "
+                f"live session, then {tail}"
+            )
+        else:
+            msg = f"(dry-run) would {tail}"
+        res.findings.append(msg)
         res.needs_reset = True
         return
+
+    if _session_may_be_live(live_assignment, config):
+        if _kill_session(live_assignment, config):
+            res.actions_taken.append(
+                f"stopped the live review session ({live_assignment.assignment_id})"
+            )
+        else:
+            res.findings.append(
+                f"could not stop {live_assignment.assignment_id}'s session — "
+                "leaving the review row in place (it's the only handle "
+                "`coord stop` has); resolve manually, e.g. `coord stop "
+                f"{live_assignment.assignment_id}`, then re-run --reset"
+            )
+            res.needs_reset = True
+            return
+
     deleted = state.delete_assignments_for_issue(
         repo_name, issue_number, types=("review",),
         review_of_assignment_id=assignment_id,
@@ -1559,16 +1729,28 @@ def _reset_review_stage(
 
 
 def _reset_test_stage(
-    repo_name: str, issue_number: int, res: DiagnoseResult, *, dry_run: bool
+    repo_name: str, issue_number: int, res: DiagnoseResult, *,
+    dry_run: bool, assignment_id: str | None = None,
 ) -> None:
-    """Clear the Test-gate verdict so the issue is re-testable.  No code touched."""
+    """Clear the Test-gate verdict so the issue is re-testable.  No code touched.
+
+    #3305: *assignment_id* is the row being diagnosed (``latest.assignment_id``).
+    ``state.reset_work_test_state`` blasts by ``issue_number`` alone for
+    ``work``/``plan``/``epic-decompose`` (safe — issue_number uniquely
+    identifies one work chain for those types) but requires *assignment_id*
+    to touch a ``test-author``/``mock-author`` row, since those share
+    ``issue_number`` across sibling JIT-slice assignments for the same
+    milestone tracking issue.
+    """
     from coord import state  # noqa: PLC0415
 
     if dry_run:
         res.findings.append("(dry-run) would clear test_state → re-testable")
         res.needs_reset = True
         return
-    updated = state.reset_work_test_state(repo_name, issue_number)
+    updated = state.reset_work_test_state(
+        repo_name, issue_number, assignment_id=assignment_id
+    )
     res.actions_taken.append(f"cleared Test verdict on {updated} work row(s) (re-testable)")
     res.reset_performed = True
     res.recovered = True

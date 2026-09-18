@@ -51,7 +51,14 @@ class TestIssueIsClosed:
 
 class TestCheckPrMergeable:
     """#1477: check_pr_mergeable() re-tests GitHub's own mergeability
-    computation, used to clear a merge-queue entry's stale CONFLICT verdict."""
+    computation, used to clear a merge-queue entry's stale CONFLICT verdict.
+
+    #3359: a first read of ``UNKNOWN`` is retried a bounded number of times
+    (with a no-op ``sleep`` injected here so these tests pay none of the
+    real wall-clock the production default does) before giving up — GitHub
+    only computes mergeability when something asks, so a caller that reads
+    once and stops can starve the computation forever.
+    """
 
     def test_true_when_mergeable(self) -> None:
         with patch(
@@ -67,23 +74,73 @@ class TestCheckPrMergeable:
         ):
             assert github_ops.check_pr_mergeable("acme/api", 1) is False
 
-    def test_none_when_unknown(self) -> None:
-        """GitHub computes mergeability asynchronously — a very recent push
-        can read back UNKNOWN for a few seconds. Must not be treated as a
-        green light."""
+    def test_no_sleep_paid_on_first_read_resolving(self) -> None:
+        """A first read that already resolves must not sleep at all — the
+        retry budget is only ever spent when GitHub is genuinely still
+        computing (#3359)."""
+        sleep = MagicMock()
         with patch(
             "coord.github_ops._gh",
-            return_value=json.dumps({"mergeable": "UNKNOWN"}),
+            return_value=json.dumps({"mergeable": "MERGEABLE"}),
         ):
-            assert github_ops.check_pr_mergeable("acme/api", 1) is None
+            assert github_ops.check_pr_mergeable(
+                "acme/api", 1, sleep=sleep,
+            ) is True
+        sleep.assert_not_called()
 
-    def test_none_on_gh_error(self) -> None:
-        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
-            assert github_ops.check_pr_mergeable("acme/api", 1) is None
+    def test_none_when_unknown_on_every_attempt(self) -> None:
+        """GitHub computes mergeability asynchronously — a push that never
+        settles inside the retry budget must still surface as inconclusive,
+        never as a green (or red) light."""
+        gh = MagicMock(return_value=json.dumps({"mergeable": "UNKNOWN"}))
+        sleep = MagicMock()
+        with patch("coord.github_ops._gh", gh):
+            assert github_ops.check_pr_mergeable(
+                "acme/api", 1, attempts=3, interval=2.0, sleep=sleep,
+            ) is None
+        assert gh.call_count == 3
+        # One sleep between each pair of attempts — never before the first,
+        # never after the last (there's nothing left to wait for).
+        assert sleep.call_args_list == [((2.0,),), ((2.0,),)]
 
-    def test_none_on_malformed_json(self) -> None:
-        with patch("coord.github_ops._gh", return_value="not json"):
-            assert github_ops.check_pr_mergeable("acme/api", 1) is None
+    def test_resolves_once_a_later_attempt_stops_reading_unknown(self) -> None:
+        """The actual #3359 fix: a PR that reads UNKNOWN on the first probe
+        but has genuinely settled by a later one must resolve within the
+        SAME call — the whole point is not waiting for another tick."""
+        gh = MagicMock(side_effect=[
+            json.dumps({"mergeable": "UNKNOWN"}),
+            json.dumps({"mergeable": "UNKNOWN"}),
+            json.dumps({"mergeable": "CONFLICTING"}),
+        ])
+        sleep = MagicMock()
+        with patch("coord.github_ops._gh", gh):
+            assert github_ops.check_pr_mergeable(
+                "acme/api", 1, attempts=3, interval=2.0, sleep=sleep,
+            ) is False
+        assert gh.call_count == 3
+        assert sleep.call_count == 2
+
+    def test_none_on_gh_error_not_retried(self) -> None:
+        """A real ``gh`` failure is not the async-compute case UNKNOWN
+        retries for — must fail closed immediately, no wasted retries."""
+        gh = MagicMock(side_effect=RuntimeError("gh boom"))
+        sleep = MagicMock()
+        with patch("coord.github_ops._gh", gh):
+            assert github_ops.check_pr_mergeable(
+                "acme/api", 1, sleep=sleep,
+            ) is None
+        assert gh.call_count == 1
+        sleep.assert_not_called()
+
+    def test_none_on_malformed_json_not_retried(self) -> None:
+        gh = MagicMock(return_value="not json")
+        sleep = MagicMock()
+        with patch("coord.github_ops._gh", gh):
+            assert github_ops.check_pr_mergeable(
+                "acme/api", 1, sleep=sleep,
+            ) is None
+        assert gh.call_count == 1
+        sleep.assert_not_called()
 
 
 class TestBranchHasMergeCommit:

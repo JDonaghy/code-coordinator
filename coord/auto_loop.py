@@ -39,6 +39,7 @@ Data model:
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -49,8 +50,14 @@ from coord import sql
 from coord.config import Config
 from coord.db import is_lock_contention_error
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
+from coord.failure_classifier import classify_failure
 from coord import github_ops
-from coord.models import SEALED_PATH_AUTHOR_TYPES, Assignment, Board
+from coord.models import (
+    SEALED_PATH_AUTHOR_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+)
 from coord.review import (
     ReviewFindings,
     blocking_findings_confirmed_absent,
@@ -688,7 +695,190 @@ def _post_advisory_nits_notice(
         )
 
 
-def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
+def next_fix_iteration(board: Board, work: Assignment) -> int:
+    """The fix-round number the NEXT fix worker on *work*'s branch must carry.
+
+    #3322: the ONE answer to "given (repo, issue, branch), what is the next
+    fix iteration?".  Every fix-dispatch door calls this instead of computing
+    ``(work.review_iteration or 0) + 1`` for itself:
+
+    * :func:`_dispatch_fix_for_review` (the headless auto-loop bounce, which
+      the #1478 stalled-pipeline sweep also reaches via
+      :func:`process_review_completion`),
+    * ``coord.commands.dispatch_workers._dispatch_fix_of`` (``coord fix``,
+      human-attended),
+    * ``coord.commands.review.fix`` (the interactive ``coord fix`` twin),
+    * :func:`coord.review.dispatch_headless_fix` (the dashboard/phone
+      "unstick this row" button).
+
+    The old per-call-site expression was only correct when *work* happened to
+    be the NEWEST work-like row on the branch.  It frequently wasn't: the
+    stalled sweep resolves *work* from the stalled detection (typically the
+    ORIGINAL iteration-0 row, not the latest fix), so a third round recomputed
+    ``1`` — a number already spent.  Both consequences were silent:
+    ``_fix_model_for_iteration`` re-resolved iteration 1 to
+    ``models.default`` forever (escalation never reached opus), and
+    ``pipeline.max_review_iterations`` compared against a counter that had
+    stopped climbing, so the "stop and ask a human" guard was unreachable on
+    exactly the stories that needed it.  Observed live on vimcode#940
+    (0 → 1 → 0 → 1) against quadraui#951's correct 0 → 1 → 2 the same day.
+
+    Reads the max ``review_iteration`` across every :data:`~coord.models.
+    WORK_LIKE_TYPES` row for that (repo, issue, branch) — ``active`` and
+    ``completed`` alike, since a fix dispatched moments ago is still active —
+    and returns one more.  Review rows are excluded: they mirror the work
+    row's counter rather than owning one.  Branch matching is exact so a
+    genuinely fresh branch for the same issue starts its own chain; when
+    *work* itself has no branch yet, only equally branchless rows count
+    (nothing else can be proven to be on the same chain).
+
+    Monotonic by construction: the result is always strictly greater than
+    every ``review_iteration`` already present on that chain, so the counter
+    can neither repeat nor go backwards no matter which door dispatched.
+    """
+    return next_fix_iteration_for_branch(
+        board,
+        repo_name=work.repo_name,
+        issue_number=work.issue_number,
+        branch=work.branch,
+        floor=work.review_iteration or 0,
+    )
+
+
+def next_fix_iteration_for_branch(
+    board: Board,
+    *,
+    repo_name: str,
+    issue_number: int,
+    branch: str | None,
+    floor: int = 0,
+) -> int:
+    """:func:`next_fix_iteration` keyed on the (repo, issue, branch) triple
+    directly, for the one caller (``coord rework <branch-name>``) that has a
+    branch but no ``Assignment`` row to hang it on.
+
+    *floor* is a lower bound folded into the max — used to keep a caller's own
+    row counted even in the (impossible-in-practice) case where it isn't on
+    the board it passed in.
+
+    Returns ``floor + 1`` when nothing matches, so a chain with no recorded
+    history still starts at 1.
+    """
+    highest = floor
+    for a in (*board.active, *board.completed):
+        if a.type not in WORK_LIKE_TYPES:
+            continue
+        if a.repo_name != repo_name or a.issue_number != issue_number:
+            continue
+        if a.branch != branch:
+            continue
+        highest = max(highest, a.review_iteration or 0)
+    return highest + 1
+
+
+def last_fix_model_for_branch(
+    board: Board,
+    *,
+    repo_name: str,
+    issue_number: int,
+    branch: str | None,
+    before_iteration: int,
+) -> str | None:
+    """The model alias the most recent fix round on this chain ACTUALLY ran at.
+
+    #3360 (round-2 review): :func:`_fix_model_for_iteration` used to derive
+    the "rung already reached" baseline by replaying the ladder from the
+    iteration counter — i.e. by ASSUMING every earlier bounce escalated. The
+    moment one of them was gated as a compliance nit (the whole point of
+    #3360) that assumption is wrong, and the gate silently evaporated from
+    round 3 onwards: the same ratchet failure repeated at iterations 1..5
+    still reached the top of the ladder by iteration 3, because only the
+    final marginal step was ever classified.
+
+    This is the board-backed answer instead: scan the same (repo, issue,
+    branch) chain :func:`next_fix_iteration_for_branch` scans and report the
+    ``model`` recorded on the highest fix round STRICTLY BELOW
+    *before_iteration* — the rung the previous round really dispatched at,
+    whatever the classifier decided back then.
+
+    Iteration-0 rows (the original work dispatch) are excluded: their model
+    comes from the issue's labels / operator choice, not from the fix ladder,
+    and iteration 1 deliberately restarts at ``models.default`` regardless.
+
+    Returns ``None`` when nothing on the chain carries a usable model — a
+    fresh chain, a board that predates model recording, or a caller with no
+    board at all. Callers then fall back to the old pure-iteration recompute
+    rather than refusing to escalate.
+    """
+    best_key: tuple[int, float] = (0, 0.0)
+    best_model: str | None = None
+    for a in (*board.active, *board.completed):
+        if a.type not in WORK_LIKE_TYPES:
+            continue
+        if a.repo_name != repo_name or a.issue_number != issue_number:
+            continue
+        if a.branch != branch:
+            continue
+        iteration = a.review_iteration or 0
+        if iteration < 1 or iteration >= before_iteration:
+            continue
+        model = (getattr(a, "model", None) or "").strip()
+        if not model:
+            continue
+        # Tie-break equal iterations (a re-dispatch of the same round) on
+        # dispatch time so the answer is deterministic and reflects the row
+        # that actually ran most recently.
+        key = (iteration, float(getattr(a, "dispatched_at", 0.0) or 0.0))
+        if key >= best_key:
+            best_key = key
+            best_model = model
+    return best_model
+
+
+# #3323: matches a leading run of one or more `[fix-N] ` / `[conflict-fix] `
+# markers — the two title tags a fix round can inherit from its parent row.
+_FIX_TITLE_MARKER_RE = re.compile(r"^(?:\[(?:fix-\d+|conflict-fix)\]\s*)+")
+
+
+def fix_round_title(base_title: str, iteration: int) -> str:
+    """The ``issue_title`` a fix round *iteration* worker carries.
+
+    #3323: every fix-dispatch door used to format
+    ``f"[fix-{iteration}] {base_title}"`` straight off the PARENT row's
+    already-prefixed title (the fix or review row this round follows), so
+    each round's marker stacked in front of the previous one instead of
+    replacing it — a round-3 fix row read
+    ``[fix-3] [fix-2] [fix-1] <real title>``, pushing the real issue title
+    off a TUI board column's visible width. This is the ONE place that
+    formats a fix-round title; every call site below routes through it
+    instead of building the f-string itself, so a future dispatch door
+    can't reintroduce the stack:
+
+    * :func:`_dispatch_fix` (headless ``auto_loop`` bounce, two title
+      assignments — the outbound wire payload and the board record),
+    * ``coord.commands.dispatch_workers._dispatch_fix_of`` (``coord fix``,
+      human-attended — spec + board record).
+
+    Stripping any leading run of ``[fix-N] `` / ``[conflict-fix] `` markers
+    before prepending the new one makes the transform idempotent:
+    ``fix_round_title(fix_round_title(t, 1), 2) == fix_round_title(t, 2)``,
+    and applying it to an already-normalised round-N title is a no-op.
+
+    Leg-type prefixes (``[review]``, ``[smoke]``, ``[smoke:macos]``, …) are
+    applied by a different layer, on top of THIS function's output — they
+    are untouched here and remain correct as-is; only the ``[fix-N]`` /
+    ``[conflict-fix]`` run collapses.
+    """
+    stripped = _FIX_TITLE_MARKER_RE.sub("", base_title)
+    return f"[fix-{iteration}] {stripped}"
+
+
+def _fix_model_for_iteration(
+    config: Config,
+    iteration: int,
+    failure_text: str | None = None,
+    previous_model: str | None = None,
+) -> str | None:
     """Choose the model alias for a fix worker on a given bounce *iteration*.
 
     Pure function so the iteration → model mapping is unit-testable.
@@ -699,21 +889,77 @@ def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
 
     When escalation is enabled:
       - iteration 1 → ``config.models.default`` (first fix stays cheap/fast).
-      - iteration 2+ → climb one rung up ``config.models.escalation`` per
-        iteration, capped at the top of the ladder.
+      - iteration 2+ → climb ONE rung up ``config.models.escalation`` from
+        the rung the previous round dispatched at, capped at the top of the
+        ladder — UNLESS *failure_text* (#3360, the review/test-failure text
+        that triggered THIS iteration) classifies as a compliance nit (see
+        ``coord/failure_classifier.py``), in which case this iteration stays
+        on the previous round's rung instead of climbing. Escalating a
+        review's compliance nit — a ratchet, a lint/formatter check, a
+        ``files_forbidden`` violation — mis-prices it exactly like #3357: no
+        model capability difference lets a worker guess a repo-specific fact
+        it was never told. ``failure_text=None`` (the default) preserves the
+        old pure-iteration ladder for callers that have no failure text to
+        offer.
+
+    *previous_model* is the rung the PREVIOUS round actually dispatched at,
+    read off the board by :func:`last_fix_model_for_branch` (#3360 round-2
+    review). It matters because the classifier gate is only sound if the
+    baseline it gates is real: deriving the baseline by replaying the ladder
+    from the iteration counter assumes every earlier bounce escalated, so a
+    compliance failure repeated across three rounds still bought the top of
+    the ladder by round 3 — the gate applied to the last marginal step only
+    and every step before it climbed unconditionally. When *previous_model*
+    is absent (a caller with no board) or off-ladder (an explicit
+    ``--model`` the escalation list does not contain, so there is no rung to
+    step from), the function falls back to that old pure-iteration recompute
+    rather than refusing to escalate.
 
     Example with escalation ``[haiku, sonnet, opus]`` and default ``sonnet``:
-    iter 1 → sonnet, iter 2 → opus, iter 3 → opus (capped).
+    iter 1 → sonnet, iter 2 → opus, iter 3 → opus (capped). With a
+    compliance-classified *failure_text* at every round and the board-backed
+    *previous_model* threaded through: iter 1 → sonnet, iter 2 → sonnet,
+    iter 3 → sonnet, … (never climbs, which is the #3360 acceptance bar).
+
+    #3322: with escalation ENABLED this never returns ``None`` — a fix that
+    dispatches with no model at all leaves no record of what actually ran
+    (observed on quadraui#962). An empty ``models.default`` falls back to the
+    bottom rung of ``models.escalation`` rather than silently disabling the
+    ladder the operator asked for; only a config with BOTH unset can still
+    yield ``None``, and that config has no model to name in the first place.
     """
     if not config.pipeline.escalate_fix_model:
         return None
 
-    model = config.models.default
-    # iteration 1 stays on the base model; each later iteration escalates one
-    # rung (next_model caps at the top of the ladder).
-    for _ in range(max(iteration, 1) - 1):
-        model = config.models.next_model(model)
-    return model
+    model = config.models.default or (
+        config.models.escalation[0] if config.models.escalation else ""
+    )
+    if not model:
+        return None
+    steps = max(iteration, 1) - 1
+    if steps <= 0:
+        return model
+
+    # The rung this bounce starts from.  Prefer the board's record of what the
+    # previous round REALLY ran at (#3360 round-2 review) — replaying the
+    # ladder from the iteration counter assumes every earlier bounce
+    # escalated, which is exactly the assumption the compliance gate breaks.
+    if previous_model and previous_model in config.models.escalation:
+        baseline = previous_model
+    else:
+        # No usable record — an off-ladder explicit --model, a chain with no
+        # model recorded, or a caller with no board.  Fall back to the old
+        # pure-iteration recompute: climb every step EXCEPT the last one
+        # unconditionally, since the last step is the rung THIS iteration's
+        # failure would buy and #3360 gates it below.
+        baseline = model
+        for _ in range(steps - 1):
+            baseline = config.models.next_model(baseline)
+
+    if failure_text is not None and not classify_failure(failure_text).should_escalate:
+        # Compliance nit (or no evidence) — stay on the rung already reached.
+        return baseline
+    return config.models.next_model(baseline)
 
 
 def _merge_blocking_review_findings(
@@ -880,8 +1126,12 @@ def _dispatch_fix_for_review(
             ),
         )]
 
-    # Compute the next iteration number and check the limit.
-    next_iteration = (work.review_iteration or 0) + 1
+    # Compute the next iteration number and check the limit.  #3322: read it
+    # off the WHOLE branch chain, not off `work` alone — the stalled-pipeline
+    # sweep reaches this function with `work` bound to the ORIGINAL
+    # iteration-0 row, so `work.review_iteration + 1` re-issued a number the
+    # chain had already spent (vimcode#940: 0 → 1 → 0 → 1).
+    next_iteration = next_fix_iteration(board, work)
     max_iter = config.pipeline.max_review_iterations
 
     if next_iteration > max_iter:
@@ -890,7 +1140,9 @@ def _dispatch_fix_for_review(
             "— stopping loop and notifying user",
             max_iter, work.assignment_id,
         )
-        _post_max_iterations_notice(work, config)
+        _post_max_iterations_notice(
+            work, config, completed_rounds=next_iteration - 1,
+        )
         return [LoopAction(
             kind="max_iterations",
             assignment_id=review.assignment_id,
@@ -919,7 +1171,24 @@ def _dispatch_fix_for_review(
     briefing = issue_context_block(work.repo_name, work.issue_number) + _build_fix_briefing(
         work, merged_findings, next_iteration, max_iter
     )
-    model = _fix_model_for_iteration(config, next_iteration)
+    # #3360: classify the review findings driving THIS bounce before letting
+    # the iteration counter buy a bigger model — a request-changes review
+    # that flags a compliance nit (ratchet, lint, files_forbidden) must not
+    # climb the ladder just because it landed on a later iteration.  The
+    # baseline rung comes off the board (what round N-1 really dispatched at)
+    # rather than being replayed from the counter, so a compliance nit that
+    # survives three rounds still never climbs.
+    model = _fix_model_for_iteration(
+        config, next_iteration,
+        failure_text=merged_findings.body,
+        previous_model=last_fix_model_for_branch(
+            board,
+            repo_name=work.repo_name,
+            issue_number=work.issue_number,
+            branch=work.branch,
+            before_iteration=next_iteration,
+        ),
+    )
     fix_failure: list[str] = []
     fix = _dispatch_fix(
         work, briefing, board, config, next_iteration,
@@ -1307,7 +1576,7 @@ def _dispatch_fix(
         "repo_name": work.repo_name,
         "repo_path": repo_path,
         "issue_number": work.issue_number,
-        "issue_title": f"[fix-{iteration}] {work.issue_title}",
+        "issue_title": fix_round_title(work.issue_title, iteration),
         "briefing": briefing,
         "files_allowed": work.files_allowed,
         "files_forbidden": work.files_forbidden,
@@ -1362,7 +1631,7 @@ def _dispatch_fix(
         machine_name=machine.name,
         repo_name=work.repo_name,
         issue_number=work.issue_number,
-        issue_title=f"[fix-{iteration}] {work.issue_title}",
+        issue_title=fix_round_title(work.issue_title, iteration),
         files_allowed=list(work.files_allowed),
         files_forbidden=list(work.files_forbidden),
         briefing=briefing,
@@ -1421,15 +1690,28 @@ def _dispatch_fix(
     return fix_assignment
 
 
-def _post_max_iterations_notice(work: Assignment, config: Config) -> None:
-    """Post a GitHub issue comment when the loop hits the iteration limit."""
+def _post_max_iterations_notice(
+    work: Assignment, config: Config, *, completed_rounds: int | None = None,
+) -> None:
+    """Post a GitHub issue comment when the loop hits the iteration limit.
+
+    #3322: *completed_rounds* overrides ``work.review_iteration`` for the
+    "completed N fix round(s)" line. The auto-loop's cap check now reads the
+    round count off the whole branch chain (:func:`next_fix_iteration`), and
+    the ``work`` row it hands us may be the ORIGINAL iteration-0 row rather
+    than the newest fix — reporting *its* counter would tell the human "0 fix
+    rounds, which equals the maximum of 3".
+    """
     from coord import github_ops  # noqa: PLC0415
 
     repo = config.repo(work.repo_name)
     if repo is None:
         return
 
-    completed_rounds = work.review_iteration  # rounds completed so far
+    # rounds completed so far
+    completed_rounds = (
+        work.review_iteration if completed_rounds is None else completed_rounds
+    )
     max_iter = config.pipeline.max_review_iterations
     body = (
         f"<!-- coord:event=auto_loop_stopped assignment={work.assignment_id} -->\n"

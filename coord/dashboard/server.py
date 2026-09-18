@@ -2378,22 +2378,90 @@ def build_app(
         # would take those down to protest a missing frontend.
         logger.warning("coord web: %s", webapp_bundle_missing_message(webapp_dist))
 
+    # #3295: per-process board memo. Before this, EVERY `/api/*` request on
+    # the daemon host (no `board_service` configured — the deployment
+    # actually in use) fell through to `read_board()`: open sqlite, run the
+    # query, walk every row through `assemble_board()`. A single screen load
+    # (a few panels each polling their own endpoint) or one background
+    # `_background_poller()` tick fanned that out into 2-5 independent
+    # builds of the SAME board. In thin-client mode (`board_service`
+    # configured) the equivalent waste was `_read_board_and_machine_health()`
+    # and `_read_fleet_health()` each firing their OWN `fetch_board_payload()`
+    # round trip for the same daemon snapshot.
+    #
+    # `_board_memo` is local to this `build_app()` closure — like
+    # `_seen_terminal`/`_orphaned_since` below — never a module global, so
+    # each dashboard process (and each test's own `build_app()`) gets an
+    # independent memo that can never bleed into another's.
+    _BOARD_MEMO_TTL_S = 2.0
+    _board_memo: dict[str, Any] = {"at": 0.0, "board": None, "payload": None}
+
+    def _fetch_board_and_payload():  # -> tuple[Board, dict | None]
+        """Uncached ``(board, payload)`` build — what the memo below wraps.
+
+        ``payload`` is the raw ``/board`` projection dict when this process
+        is a thin client (``board_service`` configured) — it carries sibling
+        keys (``fleet_health``, ...) a bare :class:`Board` does not — and
+        ``None`` when reading the local DB/daemon-host path directly, since
+        there is no daemon payload to share in that mode.
+        """
+        from coord import board_service  # noqa: PLC0415
+
+        svc = board_service.resolve()
+        if svc is not None:
+            from coord.client import board_from_payload, fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            return board_from_payload(payload), payload
+        return read_board(), None
+
+    def _memoized_board_and_payload():  # -> tuple[Board, dict | None]
+        """``(board, payload)``, rebuilt at most once per ``_BOARD_MEMO_TTL_S``.
+
+        The ONE read every board-shaped handler below goes through —
+        ``_read_board()``, ``_read_board_and_machine_health()`` and
+        ``_read_fleet_health()`` all call this rather than each doing their
+        own ``read_board()``/``fetch_board_payload()`` (#3295: "one question,
+        one answer" applies to *how the data is obtained*, not just what it
+        says). A short TTL rather than invalidate-on-write: long enough to
+        collapse a burst of requests (one screen load, one SSE tick) into a
+        single build, short enough that no panel is ever more than ~2s
+        behind the DB/daemon.
+        """
+        now = time.monotonic()
+        if _board_memo["board"] is not None and (now - _board_memo["at"]) < _BOARD_MEMO_TTL_S:
+            return _board_memo["board"], _board_memo["payload"]
+        board, payload = _fetch_board_and_payload()
+        _board_memo.update(at=now, board=board, payload=payload)
+        return board, payload
+
     def _read_board():
-        """The board for this request — seeded fixture or the live DB/daemon.
+        """The board for this request — seeded fixture or the memoized live DB/daemon.
 
         Fixture mode rebuilds the Board from the raw payload on every call, so
         a handler that mutates what it is handed (``unstick`` →
-        ``mark_failed_by_id``) can't leak that into the next request.
+        ``mark_failed_by_id``) can't leak that into the next request. Live
+        mode goes through :func:`_memoized_board_and_payload` (#3295).
         """
         if _fixture is not None:
             return _fixture.board()
-        return read_board()
+        board, _payload = _memoized_board_and_payload()
+        return board
 
     def _write_board(board) -> None:  # noqa: ANN001
-        """Persist *board* — a no-op in fixture mode (writes never execute)."""
+        """Persist *board* — a no-op in fixture mode (writes never execute).
+
+        Invalidates the #3295 board memo rather than repopulating it with
+        *board*: in thin-client mode the write only carries the mutated
+        `Board`, not a fresh daemon payload (`fleet_health` et al.), so
+        keeping a stale/partial cache entry around risks a subsequent
+        `_read_fleet_health()`/`_read_board_and_machine_health()` call
+        serving an empty block instead of paying for one more real read.
+        """
         if _fixture is not None:
             return
         write_board(board)
+        _board_memo.update(at=0.0, board=None, payload=None)
 
     def _read_board_and_machine_health() -> tuple:  # -> tuple[Board, dict[str, dict]]
         """The board plus every configured machine's latest daemon-tick-
@@ -2423,16 +2491,19 @@ def build_app(
         install, or nothing has ticked the health refresher yet) — callers
         must treat that the same as an ``unknown`` state, never as healthy
         (#1485's failure mode).
+
+        #3295: the thin-client branch now reads through
+        :func:`_memoized_board_and_payload` instead of calling
+        ``fetch_board_payload`` itself — sharing the SAME daemon round trip
+        ``_read_fleet_health()`` (and ``_read_board()``) make within the
+        memo window, rather than each paying for its own.
         """
         from coord import board_service  # noqa: PLC0415
 
         svc = board_service.resolve()
         if svc is not None:
-            from coord.client import board_from_payload, fetch_board_payload  # noqa: PLC0415
-
-            payload = fetch_board_payload(svc)
-            board = board_from_payload(payload)
-            rows = (payload.get("fleet_health") or {}).get("machine_health") or []
+            board, payload = _memoized_board_and_payload()
+            rows = ((payload or {}).get("fleet_health") or {}).get("machine_health") or []
             return board, {row["machine"]: row for row in rows}
 
         from coord.health.fleet_snapshot import machine_health_rows  # noqa: PLC0415
@@ -2494,15 +2565,19 @@ def build_app(
         ``coord status``. Per-machine severities still come from the same
         row-assembly the thin-client path rides (``machine_health_rows``), so
         the two modes can't drift on that half.
+
+        #3295: the thin-client branch reads through
+        :func:`_memoized_board_and_payload` — the same memo
+        ``_read_board_and_machine_health()`` reads through — instead of
+        issuing its own ``fetch_board_payload`` call, so the two no longer
+        double the daemon I/O a single request burst costs.
         """
         from coord import board_service  # noqa: PLC0415
 
         svc = board_service.resolve()
         if svc is not None:
-            from coord.client import fetch_board_payload  # noqa: PLC0415
-
-            payload = fetch_board_payload(svc)
-            return payload.get("fleet_health") or dict(_EMPTY_FLEET_HEALTH_BLOCK)
+            _board, payload = _memoized_board_and_payload()
+            return (payload or {}).get("fleet_health") or dict(_EMPTY_FLEET_HEALTH_BLOCK)
 
         from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
 
@@ -2620,10 +2695,12 @@ def build_app(
         `coord.state` implementation detail.
 
         Returns the daemon's per-action response dict verbatim
-        (``{"moved": bool}`` / ``{"deleted": bool}`` / ``{"updated": bool}``
-        / ``{"entry_id": int}``), whether it came from the wire or from the
-        matching local ``_*_local`` function directly — the same functions
-        ``coord/serve_app.py``'s own ``post_drive_queue`` route calls.
+        (``{"moved": bool}`` / ``{"deleted": bool, "driver_ok": bool,
+        "driver_session": str | None, "driver_detail": str | None}`` (#3282)
+        / ``{"updated": bool}`` / ``{"entry_id": int}``), whether it came
+        from the wire or from the matching local ``_*_local`` function
+        directly — the same functions ``coord/serve_app.py``'s own
+        ``post_drive_queue`` route calls.
         """
         from coord import board_service
 
@@ -2641,10 +2718,29 @@ def build_app(
         )
 
         if action == "dequeue":
-            return {
-                "deleted": _dequeue_drive_queue_local(
+            deleted = _dequeue_drive_queue_local(
+                fields["repo_name"], fields["issue_number"]
+            )
+            # #3282: mirrors `coord/serve_app.py`'s own `dequeue` handler —
+            # this branch only runs when there is no configured board
+            # daemon, i.e. this dashboard process IS writing the local DB
+            # directly, so it is also the machine any live `coord drive
+            # --tmux` session for this row would be running on. Owns the
+            # driver it may be orphaning rather than leaving that to the
+            # (daemon-routed) branch above, which already gets it for free
+            # from `post_drive_queue`.
+            driver_ok, driver_session, driver_detail = True, None, None
+            if deleted:
+                from coord.drive import stop_live_driver_session  # noqa: PLC0415
+
+                driver_ok, driver_session, driver_detail = stop_live_driver_session(
                     fields["repo_name"], fields["issue_number"]
                 )
+            return {
+                "deleted": deleted,
+                "driver_ok": driver_ok,
+                "driver_session": driver_session,
+                "driver_detail": driver_detail,
             }
         if action == "enqueue":
             entry_id = _enqueue_drive_queue_local(
@@ -2725,12 +2821,21 @@ def build_app(
     _sessions_offline_since: dict[str, float] = {}
 
     async def _background_poller() -> None:
-        """Runs forever; polls agents every _POLL_INTERVAL seconds."""
+        """Runs forever; polls agents every _POLL_INTERVAL seconds.
+
+        #3295: passes its own board read through the shared
+        ``_read_board()``/memo rather than letting ``_poll_once`` fall back
+        to its own bare ``read_board()`` — a tick landing inside a client's
+        own ``/api/board`` poll window reuses that build instead of paying
+        for a second one, and the tick's own build is then what the very
+        next client poll reuses.
+        """
         await asyncio.sleep(10)  # Short initial delay so the server is ready
         while True:
             try:
                 possibly_stuck = await _poll_once(
                     config, event_source, _seen_terminal, _orphaned_since,
+                    board=_read_board(),
                     needs_attention_seen=_needs_attention_seen,
                 )
                 event_source.publish(BOARD_UPDATED, {
@@ -3447,7 +3552,38 @@ def build_app(
             return JSONResponse(
                 {"ok": False, "error": "drive-queue entry not found"}, status_code=404
             )
-        return JSONResponse({"ok": True})
+
+        # #3282: `remove` must never report bare success while a live driver
+        # it was supposed to kill may still be dispatching — the exact
+        # silent gap this issue closes. `result` here is `_drive_queue_write
+        # ("dequeue", ...)`'s response, which now always carries `driver_ok`/
+        # `driver_session`/`driver_detail` (#3282) alongside `deleted`,
+        # whether it came from this process's own local write or from the
+        # daemon's `/drive-queue` route.
+        if action == "remove" and result.get("driver_session") and not result.get(
+            "driver_ok", True
+        ):
+            session = result["driver_session"]
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": (
+                        f"removed from the drive queue, but its live driver "
+                        f"session {session!r} could not be confirmed killed "
+                        f"({result.get('driver_detail')}) — it may still be "
+                        "dispatching; kill it manually with `tmux kill-session "
+                        f"-t {session}` and verify with `coord drive-stop "
+                        f"{repo_name} {issue_number}`"
+                    ),
+                    "driver_session": session,
+                },
+                status_code=409,
+            )
+
+        response: dict[str, Any] = {"ok": True}
+        if action == "remove" and result.get("driver_session"):
+            response["driver_session"] = result["driver_session"]
+        return JSONResponse(response)
 
     async def api_report_catalogue(request: Request) -> Response:  # noqa: ARG001 — Starlette handler signature
         """GET /api/report — the report catalogue (#2492).
@@ -3517,7 +3653,15 @@ def build_app(
         )
 
     async def api_approve(request: Request) -> JSONResponse:
-        from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
+        from coord.dispatch import (
+            apply_liveness_reroute,
+            caching_status_fetcher,
+            compute_do_not_touch,
+            dispatch,
+            post_briefing,
+        )
+        from coord.dispatch_liveness import github_issue_liveness_fetcher
+        from coord.network import claude_credential_reachable, fetch_status
         from coord.state import (
             clear_proposals, load_dispatched, load_proposals as load_p,
             record_dispatched,
@@ -3561,6 +3705,46 @@ def build_app(
 
         from coord.claim import claim_message, find_work_claim
 
+        # ── Liveness-based reroute (#3353 review) ───────────────────────
+        # This route is a full production `type="work"` dispatch path — the
+        # `coord web` Phone Control Center approves the SAME
+        # `load_proposals()` set `coord approve` does, through the SAME
+        # `dispatch()` chokepoint — so it needs the same "is the proposed
+        # machine actually alive, not merely un-busy" gate. Until this, it
+        # POSTed straight at whatever machine `coord plan` named, which is
+        # exactly how #3349 and coord-tui#79 were burned on a box that had
+        # been offline for 18 hours.
+        #
+        # Shared helper rather than a second copy of `coord approve`'s
+        # loop: two independent answers to "is this machine up" is the
+        # #2096 violation that let this route fall behind in the first
+        # place. `_status_fetcher` is the per-request caching wrapper,
+        # handed to `dispatch()` below too so each machine is probed once
+        # for the whole batch.
+        #
+        # Runs before the claim/dispatch loop for the same reason `coord
+        # approve` runs it before its freshness pre-check: `p.machine_name`
+        # must already name the machine the work actually lands on when
+        # `record_dispatched` persists it.
+        _status_fetcher = caching_status_fetcher(fetch_status)
+        rerouted = {
+            r.proposal_id: r
+            for r in apply_liveness_reroute(
+                selected,
+                machines=config.machines,
+                # #3353 review round 3: keep the preview reroute
+                # capability-aware, so it can never move a
+                # capability-matched diff onto a box that doesn't cover
+                # it. `dispatch()`'s own #3241 capability gate + #3353
+                # liveness gate (which this route does NOT pre-run, unlike
+                # `coord approve`) remain the authoritative pair — they
+                # run on the cached probe results a moment later and will
+                # refuse rather than drop a capability.
+                capability_rules=config.smoke_tests.capability_rules,
+                status_fetcher=_status_fetcher,
+            )
+        }
+
         in_flight = load_dispatched()
         board_for_claim = _read_board()
         results = []
@@ -3578,7 +3762,31 @@ def build_app(
                     })
                     continue
             try:
-                response = dispatch(p, config)
+                # #3353 review: the preview reroute above already moved
+                # `p.machine_name` onto a live machine when one existed, so
+                # `dispatch()`'s own internal `route_work_by_liveness` gate
+                # is a cache-served no-op in that case. It still matters
+                # when NOTHING was reachable: that's where the descriptive
+                # "every candidate unreachable" refusal is raised, caught
+                # by the `except Exception` below and reported per-proposal
+                # instead of silently becoming a POST timeout.
+                #
+                # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH GATE to a
+                # real live probe here too — the #3353 review's own
+                # "overlooked fourth call site" note above is exactly the
+                # trap a mechanism-but-not-wired credential gate would
+                # repeat.
+                # #3376 review round 1: same "mechanism exists but nothing
+                # calls it" gap the credential probe above closed for
+                # #3371 — wire the other two STRUCTURAL DISPATCH-LIVENESS
+                # GATE predicates so this route (the same `dispatch()`
+                # chokepoint `coord approve` funnels through) refuses on an
+                # already-closed issue or already-merged branch too.
+                response = dispatch(
+                    p, config, status_fetcher=_status_fetcher,
+                    credential_fetcher=claude_credential_reachable,
+                    issue_liveness_fetcher=github_issue_liveness_fetcher(config),
+                )
                 assignment_id = response.get("id", "pending")
                 if repo:
                     record_dispatched(
@@ -3592,7 +3800,18 @@ def build_app(
                     post_briefing(p, config, assignment_id=assignment_id, do_not_touch=do_not_touch)
                 except Exception:
                     pass
-                results.append({"id": p.id, "assignment_id": assignment_id, "ok": True})
+                result = {"id": p.id, "assignment_id": assignment_id, "ok": True}
+                # #3353 review: tell the phone client the work moved, and
+                # where — otherwise a liveness reroute is invisible from
+                # the only surface this route has, and the operator reads
+                # the machine `coord plan` proposed rather than the one
+                # actually running their issue.
+                moved = rerouted.get(p.id)
+                if moved is not None:
+                    result["machine_name"] = moved.to_machine
+                    result["rerouted_from"] = moved.from_machine
+                    result["reroute_reason"] = "liveness"
+                results.append(result)
             except Exception as e:
                 results.append({"id": p.id, "ok": False, "error": str(e)})
 

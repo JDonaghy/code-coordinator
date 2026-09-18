@@ -152,7 +152,8 @@ class StalledDetection:
     issue_number: int
     reason: str  # "review_request_changes_no_fix" | "review_done_no_verdict" |
     # "done_no_review" | "approved_not_queued" | "merge_conflict_unresolved"
-    # (#1478, #1582) | "review_failed_no_verdict" (#1584)
+    # (#1478, #1582) | "review_failed_no_verdict" (#1584) |
+    # "merge_gate_checks_stale" (#3349)
     detail: str
 
 
@@ -611,7 +612,7 @@ def detect_stalled_pipeline(
     """Scan the board for *done* work chains stuck on an unmet precondition
     that a fresh review/fix transition would already have resolved (#1441).
 
-    Five candidate stall states, checked per pipeline "head" (the most
+    Seven candidate stall states, checked per pipeline "head" (the most
     recent work-like assignment for a given (repo, issue) — see
     :func:`_pipeline_heads`):
 
@@ -663,7 +664,24 @@ def detect_stalled_pipeline(
        ``--only``): a ``coord merge`` invocation that dispatched a
        conflict-fix which then failed to actually attempt (no idle
        machine) leaves the entry parked with nothing watching it.
-    5. ``review_failed_no_verdict`` (#1584) — the head's linked review
+    6. ``merge_gate_checks_stale`` (#3349) — the head's merge-queue entry
+       is still ``PENDING`` (never flips to ``CONFLICT`` — staleness is a
+       gate refusal recorded at CI-check time, not a merge-attempt
+       failure) but its stored ``error`` starts with
+       :data:`coord.merge_queue.CI_STALE_PREFIX`: every gate ahead of CI
+       (review, smoke, uat) already passed and the checks themselves are
+       neither failed nor pending, only stale against a base that has
+       moved since they ran. Nothing else in the system can clear this —
+       ``coord merge --revalidate`` deliberately excludes it (a same-base
+       CI re-run can never see a moved base) — so it is the one merge-gate
+       refusal kind with no automatic remedy anywhere until this arm:
+       reuse the same rebase-and-push worker
+       :func:`coord.conflict_fix.dispatch_conflict_fix` already provides
+       for ``merge_conflict_unresolved``, gated by the same
+       :func:`coord.conflict_fix.has_prior_conflict_fix` retry cap so a
+       second staleness block on the same base does not dispatch a second
+       worker.
+    7. ``review_failed_no_verdict`` (#1584) — the head's linked review
        WORKER died (transient API error, network drop, ...) before ever
        producing a verdict — ``status="failed"`` with no
        ``review_verdict``. Before #1584 this could not happen (a dying
@@ -706,7 +724,9 @@ def detect_stalled_pipeline(
     from coord.auto_loop import FIX_DISPATCH_TYPES  # noqa: PLC0415
     from coord.conflict_fix import has_prior_conflict_fix  # noqa: PLC0415
     from coord.merge_queue import (  # noqa: PLC0415
+        CI_STALE_PREFIX,
         CONFLICT,
+        PENDING,
         classify_conflict,
         live_gate_entry,
         load_queue,
@@ -931,6 +951,31 @@ def detect_stalled_pipeline(
                     f"stuck in CONFLICT ({matching_entry.error or 'no error recorded'}) "
                     "with no active or previously-failed conflict-fix attempt."
                 )
+            elif (
+                matching_entry.state == PENDING
+                and (matching_entry.error or "").startswith(CI_STALE_PREFIX)
+                and not has_prior_conflict_fix(
+                    board,
+                    matching_entry.assignment_id,
+                    current_error=matching_entry.error,
+                )
+            ):
+                # #3349: refused SOLELY on stale CI — every gate ahead of CI
+                # (review/smoke/uat) already passed, and the checks
+                # themselves are neither failed nor pending, only stale
+                # against a base that moved since they last ran
+                # (`coord.merge_queue.CI_STALE_PREFIX`, set by
+                # `_entry_gate_status`/`process()`, never `checks_failed`/
+                # `checks_pending` — see `MERGE_GATE_REFUSAL_KINDS`). Unlike
+                # a mechanical conflict, staleness never flips `state` away
+                # from PENDING, so this checks `error`'s prefix directly
+                # rather than `state == CONFLICT`.
+                reason = "merge_gate_checks_stale"
+                detail = (
+                    f"Merge queue entry for branch {matching_entry.branch!r} is "
+                    f"blocked solely on stale CI ({matching_entry.error}) with no "
+                    "active or previously-failed rebase attempt."
+                )
 
         if reason is None:
             continue
@@ -1014,7 +1059,8 @@ class StalledDispatchAction:
       ``enqueue_approved_work`` call already enqueued this one earlier in
       the same sweep tick — see the queue-membership check below).
     - ``"conflict_fix_dispatched"`` — a conflict-fix worker was dispatched
-      for ``merge_conflict_unresolved``.
+      for ``merge_conflict_unresolved``, or (#3349) a stale-rebase-only
+      conflict-fix worker was dispatched for ``merge_gate_checks_stale``.
     - ``"no_action"``               — the reused dispatcher declined (no
       capable machine, already in flight, gate not actually satisfied,
       entry vanished from the board/queue between detection and dispatch).
@@ -1206,6 +1252,12 @@ def dispatch_stalled_pipeline_action(
       again, the SAME call as ``done_no_review`` — the failed review left no
       verdict behind, so recovery is identical to "no review was ever
       dispatched": open a fresh one against the still-``done`` work row.
+    - ``merge_gate_checks_stale`` (#3349) → :func:`coord.conflict_fix.
+      dispatch_conflict_fix` with ``stale_rebase=True`` — the SAME worker
+      ``merge_conflict_unresolved`` dispatches, briefed for a PURE,
+      content-preserving rebase (no conflict expected) rather than the
+      ordinary conflict-resolution briefing. Guarded by the same
+      :func:`coord.conflict_fix.has_prior_conflict_fix` retry cap.
 
     Never re-entrant across ticks: the caller only reaches this after
     :func:`detect_stalled_pipeline` has already filtered out any row whose
@@ -1381,9 +1433,16 @@ def dispatch_stalled_pipeline_action(
         reset_res = DiagnoseResult(
             repo_name=work.repo_name, issue_number=work.issue_number, stage="review",
         )
+        # #3223: `assignment_id` is the FK target (the WORK row the review
+        # points at); `live_assignment` is the row whose SESSION might still
+        # be running — here that's always the review leg itself. Passing
+        # `review` (not `work`) is what lets `_reset_review_stage` cancel a
+        # still-live headless review through the agent BEFORE deleting the
+        # only board row `coord stop` could find it by.
         _reset_review_stage(
             config, work.repo_name, work.issue_number, reset_res,
             dry_run=False, assignment_id=work.assignment_id,
+            live_assignment=review,
         )
         if not reset_res.reset_performed:
             return StalledDispatchAction(
@@ -1524,11 +1583,13 @@ def dispatch_stalled_pipeline_action(
 
     if detection.reason == "merge_conflict_unresolved":
         from coord.conflict_fix import (  # noqa: PLC0415
+            describe_conflict_fix_decline,
             dispatch_conflict_fix,
             has_prior_conflict_fix,
             sealed_conflict_could_touch_manifest,
         )
         from coord.merge_queue import load_queue  # noqa: PLC0415
+        from coord.network import fetch_status  # noqa: PLC0415
 
         entry = next(
             (m for m in load_queue() if m.assignment_id == work.assignment_id), None,
@@ -1594,15 +1655,83 @@ def dispatch_stalled_pipeline_action(
                             "human"
                         ),
                     )
-        fix = dispatch_conflict_fix(entry, board, config, prefer_machine=work.machine_name)
+        # #3353: opt into a live liveness check on machine selection — a
+        # machine with no pending/running assignments otherwise reads as
+        # idle regardless of whether its agent answers at all.
+        # #3353 review (round 3): report the REAL decline reason, read off
+        # the pick `dispatch_conflict_fix` already made, instead of the old
+        # hardcoded "(no machine / no repo_path)" — the same ambiguity item
+        # 4 killed in `coord merge`, still live on this arm. Shared
+        # formatter, not a second copy of the branching (#2096).
+        pick_out: list = []
+        fix = dispatch_conflict_fix(
+            entry, board, config, prefer_machine=work.machine_name,
+            status_fetcher=fetch_status, machine_pick_out=pick_out,
+        )
         if fix is None:
             return StalledDispatchAction(
                 kind="no_action",
-                detail="dispatch_conflict_fix declined (no machine / no repo_path)",
+                detail=(
+                    "dispatch_conflict_fix declined: "
+                    + describe_conflict_fix_decline(pick_out)
+                ),
             )
         return StalledDispatchAction(
             kind="conflict_fix_dispatched",
             detail=f"conflict-fix {fix.assignment_id} dispatched to {fix.machine_name}",
+        )
+
+    if detection.reason == "merge_gate_checks_stale":
+        from coord.conflict_fix import (  # noqa: PLC0415
+            describe_conflict_fix_decline,
+            dispatch_conflict_fix,
+            has_prior_conflict_fix,
+        )
+        from coord.merge_queue import load_queue  # noqa: PLC0415
+        from coord.network import fetch_status  # noqa: PLC0415
+
+        entry = next(
+            (m for m in load_queue() if m.assignment_id == work.assignment_id), None,
+        )
+        if entry is None:
+            return StalledDispatchAction(
+                kind="no_action", detail="merge queue entry no longer found",
+            )
+        if has_prior_conflict_fix(
+            board, entry.assignment_id, current_error=entry.error,
+        ):
+            return StalledDispatchAction(
+                kind="skipped_human_required",
+                detail="conflict-fix already active or its retry cap was already hit",
+            )
+        # #3349: `stale_rebase=True` — no content conflict is expected here
+        # (unlike `merge_conflict_unresolved`), so the worker gets the
+        # narrower briefing that refuses to push anything but a byte-
+        # identical (patch-id-verified) rebase, and escalates to a human
+        # exactly like any other conflict-fix failure the instant a real
+        # conflict or a content change shows up.
+        # #3353 review (round 3): same real-reason reporting as the
+        # `merge_conflict_unresolved` arm above.
+        pick_out: list = []
+        fix = dispatch_conflict_fix(
+            entry, board, config, prefer_machine=work.machine_name,
+            stale_rebase=True, status_fetcher=fetch_status,
+            machine_pick_out=pick_out,
+        )
+        if fix is None:
+            return StalledDispatchAction(
+                kind="no_action",
+                detail=(
+                    "dispatch_conflict_fix declined: "
+                    + describe_conflict_fix_decline(pick_out)
+                ),
+            )
+        return StalledDispatchAction(
+            kind="conflict_fix_dispatched",
+            detail=(
+                f"stale-rebase conflict-fix {fix.assignment_id} dispatched to "
+                f"{fix.machine_name}"
+            ),
         )
 
     return StalledDispatchAction(
@@ -2055,6 +2184,7 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         confirmation_timeout,
         expected_confirmation_seconds,
         record_confirmation_duration,
+        record_inconclusive_confirmation,
         spend_confirmation_budget,
     )
 
@@ -2149,12 +2279,23 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         # and must never overwrite a previously-learned expectation.
         if result is not None and result.kind in RECORDABLE_DURATION_KINDS:
             record_confirmation_duration(transition.repo_name, elapsed)
+        # #3357 item 3: a confirmation that genuinely RAN and came back
+        # inconclusive is evidence about THIS repo's machine/toolchain, not
+        # about the branch — tally it (repo x kind) so a chronic pattern
+        # ("this repo's Test gate has been a rubber stamp for N merges") is
+        # discoverable instead of being rediscovered by a client. Never
+        # counted for the "confirmation wasn't even attempted" short-circuits
+        # above (disabled, budget exhausted, config unloadable) — those say
+        # nothing about whether this repo's toolchain actually works here.
+        if result is not None and result.inconclusive:
+            record_inconclusive_confirmation(transition.repo_name, result.kind)
 
 
 def _confirmed_pass_verdict(
     transition: Transition, entry: dict, parent_id: str, *, claim_reason: str,
-) -> tuple[str, str]:
-    """#2464: the ``(test_state, test_reason)`` to record for a *claimed* pass.
+) -> tuple[str, str, str]:
+    """#2464: the ``(test_state, test_reason, test_confirmation)`` to record
+    for a *claimed* pass.
 
     The Test stage's pass claim — whether it arrived as a ``SMOKE: pass``
     marker or as the worker calling ``coord test --passed`` on itself (#2217) —
@@ -2190,6 +2331,17 @@ def _confirmed_pass_verdict(
       nobody checked. See :mod:`coord.confirm_test` on why a missing toolchain,
       a missing checkout or a timeout must never read as a failing branch.
 
+    #3357: the THIRD element of the returned tuple is the machine-readable
+    counterpart to that same story — one of
+    :data:`~coord.confirm_test.TEST_CONFIRMATION_VALUES`
+    (``"confirmed"`` / ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``),
+    recorded alongside ``test_state`` so a caller (the merge gate, `coord
+    gates`, the dashboard) can finally tell "passed, independently confirmed"
+    from "passed, because nobody could check" WITHOUT parsing the English
+    text of ``test_reason``. This does not change which branch below fires,
+    or what ``test_state`` any branch records — #2464's fallback direction is
+    unchanged; this only stops flattening the distinction on the way out.
+
     #2563: whatever output the run captured — failing node ids, the
     assertion, tracebacks — is also persisted to *parent_id*'s
     ``test_output/<id>.txt`` (:func:`coord.confirm_test.write_confirmation_output`)
@@ -2200,7 +2352,14 @@ def _confirmed_pass_verdict(
     one-line summary — #1337 deliberately keeps unbounded free text out of the
     board upsert, and this does not undo that; the file is the long form.
     """
-    from coord.confirm_test import write_confirmation_output  # noqa: PLC0415
+    from coord.confirm_test import (  # noqa: PLC0415
+        BASELINE_RED_REASON_PREFIX,
+        TEST_CONFIRMATION_BASELINE_RED,
+        TEST_CONFIRMATION_CONFIRMED,
+        TEST_CONFIRMATION_REFUTED,
+        TEST_CONFIRMATION_UNCONFIRMED,
+        write_confirmation_output,
+    )
 
     result = _run_pass_confirmation(transition, entry)
 
@@ -2210,6 +2369,7 @@ def _confirmed_pass_verdict(
             f"{claim_reason} — UNCONFIRMED: no independent re-run was possible "
             "on this machine, so this verdict rests on the worker's own report "
             "(#2464).",
+            TEST_CONFIRMATION_UNCONFIRMED,
         )
 
     # Best-effort and unconditional on *kind*: REFUTED/BASELINE-RED/TIMEOUT/
@@ -2274,6 +2434,7 @@ def _confirmed_pass_verdict(
                 f"{parent_id}` and the confirmation output, recover with "
                 f"`coord fix --force --guidance <what's broken> {parent_id}` "
                 "or re-dispatch the Test stage by hand.",
+                TEST_CONFIRMATION_REFUTED,
             )
 
         return (
@@ -2282,6 +2443,7 @@ def _confirmed_pass_verdict(
             f"Test-stage worker claimed a pass ({claim_reason}), but re-running "
             "the repo's own command out-of-band disagreed — trust the run, not "
             "the report.",
+            TEST_CONFIRMATION_REFUTED,
         )
 
     if result.baseline_red:
@@ -2291,14 +2453,16 @@ def _confirmed_pass_verdict(
         )
         return (
             "skipped",
-            f"baseline-red (#2170), found by an independent re-run (#2464): "
-            f"{result.reason}",
+            f"{BASELINE_RED_REASON_PREFIX}, found by an independent re-run "
+            f"(#2464): {result.reason}",
+            TEST_CONFIRMATION_BASELINE_RED,
         )
 
     if result.confirmed:
         return (
             "passed",
             f"{claim_reason} — independently confirmed (#2464): {result.reason}",
+            TEST_CONFIRMATION_CONFIRMED,
         )
 
     log.warning(
@@ -2309,6 +2473,7 @@ def _confirmed_pass_verdict(
     return (
         "passed",
         f"{claim_reason} — UNCONFIRMED: {result.reason}",
+        TEST_CONFIRMATION_UNCONFIRMED,
     )
 
 
@@ -2349,6 +2514,10 @@ def _record_smoke_verdict(
        the auto-queue and waits for `coord diagnose --stage test --reset`
        rather than re-dispatching forever.
     """
+    from coord.confirm_test import (  # noqa: PLC0415
+        BASELINE_RED_REASON_PREFIX,
+        TEST_CONFIRMATION_BASELINE_RED,
+    )
     from coord.state import (  # noqa: PLC0415
         load_assignment_test_reason,
         load_assignment_test_state,
@@ -2378,7 +2547,7 @@ def _record_smoke_verdict(
             # ran, so a (potentially 20-minute) run that agreed with the
             # claim would leave no trace it ever happened — including on the
             # next reap of the same already-passed parent.
-            state, reason = _confirmed_pass_verdict(
+            state, reason, confirmation = _confirmed_pass_verdict(
                 transition, entry, parent_id,
                 claim_reason="worker self-recorded via `coord test` (#2217)",
             )
@@ -2386,6 +2555,7 @@ def _record_smoke_verdict(
                 assignment_id=parent_id,
                 test_state=state,
                 test_reason=reason,
+                test_confirmation=confirmation,
             )
             if state != "passed":
                 log.warning(
@@ -2416,15 +2586,28 @@ def _record_smoke_verdict(
         # #2170: `skipped`, not `failed` — the merge gate treats a skipped
         # Test stage as satisfied, and neither `coord fix` nor `coord drive`
         # burns an attempt on breakage this branch did not cause.
+        #
+        # #3378: `test_confirmation=TEST_CONFIRMATION_BASELINE_RED` is NOT
+        # optional here — this is the ONE place a headless worker's own
+        # `SMOKE: baseline-red` report reaches this write (#2170's own
+        # convention: "a baseline-red verdict has no `coord test` flag",
+        # `coord/smoke.py`), and before this fix it recorded a bare
+        # `test_state="skipped"` with no provenance at all. `coord gates`'
+        # renderer (`_row_test_confirmation`, #3357) only appends the
+        # "(baseline-red — branch not at fault, #2170)" annotation when this
+        # column is set — omit it and the merge gate renders this bypass as
+        # a plain, unqualified "test : passed", indistinguishable from a
+        # verdict a suite actually validated (#3378).
         record_test_verdict(
             assignment_id=parent_id,
             test_state="skipped",
             test_reason=(
-                f"baseline-red (#2170): {verdict.reason}"
+                f"{BASELINE_RED_REASON_PREFIX}: {verdict.reason}"
                 if verdict.reason
-                else "baseline-red (#2170): every failure reproduces "
+                else f"{BASELINE_RED_REASON_PREFIX}: every failure reproduces "
                 "identically on the merge-base"
             ),
+            test_confirmation=TEST_CONFIRMATION_BASELINE_RED,
         )
         return
 
@@ -2453,7 +2636,7 @@ def _record_smoke_verdict(
         # stopped a worker printing it after a partial or backgrounded run it
         # never finished polling (#2272/#2301). Confirm it against a real run
         # before it becomes a merge-gate-satisfying verdict.
-        state, reason = _confirmed_pass_verdict(
+        state, reason, confirmation = _confirmed_pass_verdict(
             transition, entry, parent_id,
             claim_reason="headless smoke reported SMOKE: pass",
         )
@@ -2461,6 +2644,7 @@ def _record_smoke_verdict(
             assignment_id=parent_id,
             test_state=state,
             test_reason=reason,
+            test_confirmation=confirmation,
         )
         return
 
@@ -3175,6 +3359,86 @@ def _capture_claude_session_id(transition: Transition, entry: dict) -> None:
         )
 
 
+# #3314: how long a still-missing claude_session_id stays worth retrying.
+# The agent's own live /status response only reports a session id for an
+# assignment it still remembers — bounded so `retry_pending_claude_session_id_
+# captures` doesn't keep spending an HTTP round-trip per candidate machine on
+# a row whose window of recoverability (see that function's docstring) has
+# long since closed.
+CLAUDE_SESSION_ID_RETRY_WINDOW_SECONDS = 30 * 60
+
+
+def retry_pending_claude_session_id_captures(config: Config) -> list[str]:
+    """#3314: re-poll agents for a ``claude_session_id`` that
+    :func:`_capture_claude_session_id` missed at completion-transition time.
+
+    That function gets exactly ONE look at an assignment's agent-status
+    entry — the single poll that ``detect_transitions`` first observes it
+    transitioning to a terminal state. ``post_transition`` then marks the
+    assignment notified, which removes it from every future poll's
+    candidate set — so a session id the agent hadn't finished capturing
+    *yet* at that exact instant (a timing/ordering race between the
+    worker's process reap and the agent's own log-tail parse, landing on
+    some machines far more often than others — see #3314's own repro) was
+    silently dropped and never retried, even though the agent's live
+    ``/status`` would go on to report it correctly a poll or two later.
+
+    This mirrors the identical fallback ``coord chat-continue`` already
+    falls back to when its DB read comes back NULL
+    (``coord/commands/dispatch.py``): re-query the agent's live ``/status``
+    for the specific assignment IDs still missing one, and persist whatever
+    it reports now. Grouped by machine so a fleet with many candidates on
+    one host still costs one ``/status`` call per host, not one per row.
+
+    Best-effort and silent on any single-machine failure — this is pure
+    local bookkeeping (no GitHub post, no new dispatch), safe to call every
+    pass. Returns the list of assignment IDs captured this pass, for tests.
+    """
+    from coord.state import (  # noqa: PLC0415
+        list_assignments_missing_claude_session_id,
+        update_assignment_claude_session_id,
+    )
+
+    pending = list_assignments_missing_claude_session_id(
+        max_age_seconds=CLAUDE_SESSION_ID_RETRY_WINDOW_SECONDS,
+    )
+    if not pending:
+        return []
+
+    by_machine: dict[str, set[str]] = {}
+    for row in pending:
+        by_machine.setdefault(row["machine_name"], set()).add(row["assignment_id"])
+
+    machines_by_name = {m.name: m for m in config.machines}
+    captured: list[str] = []
+    for machine_name, wanted in by_machine.items():
+        machine = machines_by_name.get(machine_name)
+        if machine is None:
+            continue
+        try:
+            status = _agent_status(machine.host)
+            if status is None:
+                continue
+            for bucket in ("completed", "active"):
+                for entry in status.get(bucket, []):
+                    aid = entry.get("id")
+                    if aid not in wanted:
+                        continue
+                    session_id = entry.get("claude_session_id")
+                    if not isinstance(session_id, str) or not session_id:
+                        continue
+                    update_assignment_claude_session_id(aid, session_id)
+                    captured.append(aid)
+                    wanted.discard(aid)
+        except Exception as exc:  # noqa: BLE001 — one bad machine must not sink the rest
+            log.warning(
+                "retry_pending_claude_session_id_captures: failed for machine %s: %s",
+                machine_name, exc,
+            )
+            continue
+    return captured
+
+
 def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     """Post the GitHub comment for one transition and mark it notified."""
     started = entry.get("started_at")
@@ -3349,9 +3613,23 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # same HUMAN_REQUIRED/escalation outcome a reported failure would,
         # instead of silently retrying the identical, already-diagnosed
         # conflict.
+        # #3349 review: the same clean-exit ambiguity applies to a
+        # stale-rebase dispatch (`dispatch_conflict_fix(..., stale_rebase=
+        # True)`, used for `merge_gate_checks_stale`) — its briefing tells
+        # the worker to stop and NOT push when the rebase isn't content-
+        # preserving, which ends the turn just as cleanly as a resolved
+        # rebase does. Check for `STALE_REBASE_MISMATCH_MARKER` alongside
+        # the SEMANTIC marker (mutually exclusive per dispatch, so only
+        # checked when semantic is False) and downgrade `succeeded` the
+        # same way, without routing it through the SEMANTIC tier-2
+        # escalation path — see `coord.reconcile.on_conflict_fix_done`'s
+        # `stale_rebase_mismatch` docstring for why that's a separate arm.
         parent_id = record.get("review_of_assignment_id")
         if parent_id:
-            from coord.conflict_fix import detect_semantic_conflict  # noqa: PLC0415
+            from coord.conflict_fix import (  # noqa: PLC0415
+                detect_semantic_conflict,
+                detect_stale_rebase_mismatch,
+            )
             from coord.reconcile import on_conflict_fix_done  # noqa: PLC0415
 
             log_path = entry.get("log_path")
@@ -3364,6 +3642,17 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 )
             except Exception:  # noqa: BLE001 — best-effort, never break notify
                 semantic = False
+
+            stale_rebase_mismatch = False
+            if not semantic:
+                try:
+                    stale_rebase_mismatch = detect_stale_rebase_mismatch(
+                        log_path=log_path,
+                        host=host,
+                        assignment_id=transition.assignment_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    stale_rebase_mismatch = False
 
             stuck_summary: str | None = None
             board = None
@@ -3388,13 +3677,26 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                     config = _load_config()
                 except Exception:  # noqa: BLE001
                     board, config = None, None
+            elif stale_rebase_mismatch:
+                # No board/config needed here — a stale-rebase mismatch has
+                # no tier-2 escalation path, it goes straight to
+                # HUMAN_REQUIRED inside `on_conflict_fix_done`.
+                progress = entry.get("progress") or {}
+                stuck_summary = progress.get("stuck")
+                if not stuck_summary and log_path:
+                    try:
+                        from coord.progress import parse_progress  # noqa: PLC0415
+                        stuck_summary = parse_progress(log_path).stuck
+                    except Exception:  # noqa: BLE001
+                        stuck_summary = None
 
             on_conflict_fix_done(
                 parent_assignment_id=parent_id,
                 fix_assignment_id=transition.assignment_id,
                 machine_name=transition.machine_name,
-                succeeded=not semantic,
+                succeeded=not semantic and not stale_rebase_mismatch,
                 semantic=semantic,
+                stale_rebase_mismatch=stale_rebase_mismatch,
                 board=board,
                 config=config,
                 stuck_summary=stuck_summary,
@@ -3505,12 +3807,27 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             )
             # #3182: same self-record-then-fold split as the EVENT_COMPLETION
             # branch above — a crashed fan-out leg resolves onto ITS OWN row,
-            # never straight onto the shared parent.
+            # never straight onto the shared parent. #3315 review: `parent_id`
+            # is passed too, as `fanout_parent_id`, so the environmental
+            # retry budget is tracked on the PERSISTENT parent row rather
+            # than this leg's own fresh one — see `propagate_smoke_terminal_
+            # failure`'s `fanout_parent_id` docstring for why a leg-scoped
+            # tally could never reach the budget (a fresh leg id is minted
+            # every fan-out round, so it would always read as zero).
             leg_caps = smoke_leg_capabilities(record.get("issue_title"))
             if leg_caps is not None:
+                # #3333: `entry["status"] == "cancelled"` is the agent's own
+                # marker for an operator `coord stop` (coord.agent.CANCELLED)
+                # — distinguishes "this leg should not exist" from a genuine
+                # crash/test failure, so `propagate_smoke_terminal_failure`
+                # can protect a still-live/already-passed sibling partition
+                # from a false aggregate failure instead of folding this
+                # leg's cancellation straight into the parent's verdict.
                 propagate_smoke_terminal_failure(
                     parent_assignment_id=transition.assignment_id,
                     failure_reason=_failure_reason,
+                    fanout_parent_id=parent_id,
+                    operator_cancelled=entry.get("status") == "cancelled",
                 )
                 finalize_smoke_fanout(parent_id)
             else:
@@ -3848,12 +4165,18 @@ def _dispatch_board_pending_smoke(config: Config) -> None:
     local `scripts/coord-test-runner.sh` subprocess (#1395). Mirrors
     :func:`_dispatch_board_pending_reviews` exactly, and is safe to call even
     when the board file doesn't exist.
+
+    #3309: passes the real `github_ops` (already imported at module level)
+    as *gh_ops* so `dispatch_pending_smoke` can detect a #1479-stale
+    passed/failed/skipped verdict and re-dispatch instead of skipping it
+    forever — without it, the staleness check fails open and this call would
+    be no more capable than before that fix.
     """
     from coord.board_service import read_board, write_board
     from coord.smoke import dispatch_pending_smoke
 
     board = read_board()
-    dispatched = dispatch_pending_smoke(board, config)
+    dispatched = dispatch_pending_smoke(board, config, gh_ops=github_ops)
     if dispatched:
         write_board(board)
 
@@ -4256,6 +4579,7 @@ def run_drain(
     ``finished_at`` stamped                     yes      no race, no cost
     completion comment posted                   yes      ``coord:`` markers make it idempotent
     test-gate backfill (#1076/#1152)            yes      no race, no cost
+    claude_session_id retry sweep (#3314)       yes      no race, no cost; idempotent re-poll
     Test-stage smoke dispatch (#1426)           yes      the gate review waits on; see below
     orphaned review findings posted             yes      comment + verdict capture only
     review dispatch                             yes      guarded; see below
@@ -4451,6 +4775,17 @@ def _run_drain_locked(config: Config) -> DrainResult:
                 review_completions.append((transition, record, entry))
     except Exception:  # noqa: BLE001
         log.exception("notify drain: detect_transitions failed")
+
+    # Step 1b (#3314): re-poll agents for any claude_session_id step 1's
+    # transition loop missed — see retry_pending_claude_session_id_captures'
+    # docstring for the timing race this recovers from (the agent's own
+    # log-tail parse racing its process reap, on some machines far more
+    # often than others). No race, no cost if repeated — pure local
+    # bookkeeping, same as `finished_at`/test-gate backfill above.
+    try:
+        retry_pending_claude_session_id_captures(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: retry_pending_claude_session_id_captures failed")
 
     # Step 2 (#2844): open PRs for work-leg completions still missing one —
     # BEFORE the Test-stage dispatch below, so the pull_request CI run starts
@@ -4724,6 +5059,17 @@ def run(
             and (record.get("issue_title") or "").startswith("[fix-")
         ):
             fix_completions.append((transition, record))
+
+    # #3314: re-poll agents for any claude_session_id the transition loop
+    # above missed — see retry_pending_claude_session_id_captures' docstring
+    # for the timing race this recovers from. Pure local bookkeeping (no
+    # GitHub post, no new dispatch), so it isn't gated on `_roll_pending` and
+    # doesn't get its own bucket in this function's return tuple, matching
+    # _capture_cost/_capture_smoke_tests/_capture_completion_summary above.
+    try:
+        retry_pending_claude_session_id_captures(config)
+    except Exception:  # noqa: BLE001
+        log.exception("retry_pending_claude_session_id_captures: unexpected error")
 
     # Also detect and post stuck signals
     stuck_posted: list[StuckDetection] = []

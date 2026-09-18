@@ -152,6 +152,28 @@ class BoardAssignment:
     # for the sibling fields this rides alongside. Appended last, matching
     # DDL order (`_MIGRATE_ADD_COLUMNS` in coord/db.py).
     num_turns: int | None = None
+    # #3339: the explicit operator assertion that clears a terminal
+    # `refused_premise` row (`coord.state.mark_premise_rechecked` /
+    # `coord drive-queue clear-refusal`). Undeclared here, these two columns
+    # would be silently dropped from `/board` per this module's own
+    # docstring — and `coord.drive_state.project()`'s
+    # `work_premise_rechecked_at`/`_reason` read ONLY this wire payload
+    # (`BoardFetcher.fetch()`), so on any daemon-routed fleet `decide()`'s
+    # bypass branch in `coord/drive.py` would never see a recheck a human
+    # just recorded. Appended last, matching DDL order.
+    premise_rechecked_at: float | None = None
+    premise_rechecked_reason: str | None = None
+    # #3357: whether the `test_state` write above was independently confirmed
+    # by an out-of-band suite run — one of
+    # `coord.confirm_test.TEST_CONFIRMATION_VALUES` ("confirmed" /
+    # "unconfirmed" / "refuted" / "baseline_red"), or `None` when no
+    # confirmation was ever attempted for this write
+    # (`coord.state._record_test_verdict_local`). Undeclared here, this
+    # column would be silently dropped from `/board` per this module's own
+    # docstring above — exactly the #3339 mistake this same comment block
+    # was written to prevent, repeated one PR later. Appended last, matching
+    # DDL order (`_MIGRATE_ADD_COLUMNS` in coord/db.py).
+    test_confirmation: str | None = None
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -269,6 +291,12 @@ class BoardDriveQueueEntry:
     retry_backoff_at: float | None = None
     max_fix_rounds: int | None = None
     no_acceptance: int  # 0/1 flag — INTEGER on the wire, never a JSON bool (#1849)
+    # #3236: the apply-verdict gate extension of #1757's --hold-after —
+    # see coord.drive_queue.apply_gate_status / plan_is_destructive.
+    plan_destructive: int  # 0/1 flag — INTEGER on the wire, never a JSON bool (#1849)
+    apply_verdict: str
+    apply_verdict_reason: str
+    apply_verdict_at: float | None = None
 
 
 
@@ -297,7 +325,7 @@ BOARD_PROJECTIONS: dict[str, type] = {
 #: text-scraping check is retired as of #2897 (docs/ADR_COORD_TUI_CI.md) —
 #: this assertion is now the sole remaining guard.
 INTEGER_BACKED_BOOLEANS: frozenset[str] = frozenset(
-    {"is_interactive", "review_scoped", "hold_after", "no_acceptance"}
+    {"is_interactive", "review_scoped", "hold_after", "no_acceptance", "plan_destructive"}
 )
 
 

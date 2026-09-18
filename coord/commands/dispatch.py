@@ -297,8 +297,17 @@ def approve(
     from coord import freshness as fresh
     from coord.board_service import read_board, write_board
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph, transitive_deps
-    from coord.dispatch import compute_do_not_touch, dispatch, dispatch_with_retry, post_briefing
-    from coord.network import classify_error, fetch_repos
+    from coord.dispatch import (
+        compute_do_not_touch,
+        dispatch,
+        apply_liveness_reroute,
+        caching_status_fetcher,
+        dispatch_with_retry,
+        post_briefing,
+        route_work_by_capability,
+    )
+    from coord.dispatch_liveness import github_issue_liveness_fetcher
+    from coord.network import claude_credential_reachable, classify_error, fetch_repos, fetch_status
     from coord.state import (
         clear_proposals,
         load_proposals,
@@ -306,6 +315,11 @@ def approve(
     )
 
     cfg = _load_config(config_path)
+    # #3376 review round 1: `coord approve` is THE production entry point
+    # for approved-proposal dispatch — wire the real issue-liveness fetcher
+    # here the same way `credential_fetcher` is already wired just below,
+    # or the two new predicates stay a mechanism nothing calls.
+    _issue_liveness_fetcher = github_issue_liveness_fetcher(cfg)
     proposals = load_proposals()
     if not proposals:
         click.echo("No pending proposals. Run `coord plan` first.", err=True)
@@ -393,6 +407,97 @@ def approve(
         click.echo("No proposals remain after claim check.", err=True)
         sys.exit(1)
     selected = unclaimed
+
+    # ── Capability-based reroute (#3241) ────────────────────────────────
+    # Must run BEFORE the freshness pre-check right below (which fetches
+    # `machine_repos` and computes staleness/busy keyed to `p.machine_name`)
+    # and before the per-proposal loop further down (whose operator-facing
+    # echo and `dispatched_this_batch` bookkeeping are also keyed to
+    # `p.machine_name`). `dispatch()` performs this SAME reroute again
+    # internally (`route_work_by_capability`, reused here rather than
+    # duplicated) — that call stays, since `dispatch()` has other callers
+    # besides this one — but doing it here FIRST mutates `p.machine_name`
+    # in place before any of THIS caller's own precomputed state is built,
+    # so that state (and the echo below) reflects where the work actually
+    # lands, and the reroute inside `dispatch()` becomes a same-machine
+    # no-op the second time it runs. Without this, a reroute previously
+    # happened silently inside `dispatch()`: the echo told the operator
+    # work went to the originally proposed machine, the freshness/staleness
+    # check and `pull_repos` list were computed for that wrong machine (so
+    # a stale/dirty checkout on the REAL target was never pulled), and the
+    # #2804 same-batch collision guard (`dispatched_this_batch`) recorded
+    # each rerouted proposal under its stale proposed name instead of the
+    # real target — defeating the very race guard it exists to provide for
+    # two proposals in one batch that reroute onto the same machine.
+    for p in selected:
+        if p.type != "work":
+            continue
+        repo_cfg_for_routing = cfg.repo(p.repo_name)
+        routing = route_work_by_capability(
+            proposed_machine_name=p.machine_name,
+            repo_name=p.repo_name,
+            files_likely=p.files_likely,
+            machines=cfg.machines,
+            capability_rules=cfg.smoke_tests.capability_rules,
+            repo_requires=repo_cfg_for_routing.requires if repo_cfg_for_routing else (),
+        )
+        if routing is not None and routing.rerouted:
+            click.echo(
+                f"  [{p.id}] capability-rerouted {p.machine_name} → "
+                f"{routing.machine_name} (#3241 — {p.machine_name} does not "
+                "cover this diff's required capabilities)",
+                err=True,
+            )
+            p.machine_name = routing.machine_name
+
+    # ── Liveness-based reroute (#3353) ──────────────────────────────────
+    # Same reasoning as the capability reroute right above (must run before
+    # the freshness pre-check and the per-proposal loop, both keyed on
+    # `p.machine_name`) applied to the OTHER half of #3241's routing gap:
+    # #3349 and coord-tui#79 (2026-09-15) were sent straight to a machine
+    # that had been offline for hours, because nothing between `coord plan`
+    # and the POST to `/assign` ever asked whether the proposed machine was
+    # actually reachable — only whether it was busy.
+    #
+    # The loop itself lives in `coord.dispatch.apply_liveness_reroute`, NOT
+    # here: the `coord web` dashboard's `POST /api/approve` dispatches the
+    # same `load_proposals()` set through the same `dispatch()` chokepoint
+    # and needs the identical gate (#3353 review round 2 — it was the
+    # overlooked fourth call site), and two hand-rolled copies of "is this
+    # machine alive" is precisely the #2096 violation that let them drift.
+    #
+    # `_status_fetcher` is the per-invocation caching wrapper, shared with
+    # `dispatch_with_retry` below so each machine is probed once for the
+    # whole batch instead of once here and again inside `dispatch()`.
+    #
+    # #3353 review: this runs under `--dry-run` too, unlike the freshness
+    # pre-check right below it. Deliberate — `--dry-run`'s job is to print
+    # where the work WOULD land, and suppressing the reroute would print
+    # the dead machine, which is the bug. `probe_reachable` is a `GET
+    # /status` (a read of in-memory agent state, no side effects, no cold
+    # recompute — see its docstring on why it is not `/health`), so a dry
+    # run stays read-only; the freshness check is gated because it is an
+    # expensive multi-repo fetch plus GitHub API calls, not because
+    # touching the network at all is forbidden. The caching wrapper keeps
+    # it to one probe per machine either way.
+    _status_fetcher = caching_status_fetcher(fetch_status)
+    for reroute in apply_liveness_reroute(
+        selected,
+        machines=cfg.machines,
+        # #3353 review round 3: the capability reroute right above already
+        # moved capability-matched proposals onto the machine that covers
+        # the diff. Handing the same rules in here keeps this loop from
+        # silently moving them back off it when that machine is down.
+        capability_rules=cfg.smoke_tests.capability_rules,
+        status_fetcher=_status_fetcher,
+    ):
+        click.echo(
+            f"  [{reroute.proposal_id}] liveness-rerouted "
+            f"{reroute.from_machine} → {reroute.to_machine} (#3353 — "
+            f"{reroute.from_machine} did not answer a live reachability "
+            "probe)",
+            err=True,
+        )
 
     # ── Freshness pre-check ──────────────────────────────────────────
     machine_repos: dict[str, dict | None] = {}
@@ -676,6 +781,25 @@ def approve(
                 backoff_base=cfg.concurrency.backoff_base,
                 pull_repos=pull_repos,
                 on_retry=_on_retry,
+                # #3353: the preview reroute above already moved
+                # `p.machine_name` onto a live machine when one existed —
+                # this makes `dispatch()`'s own internal check a no-op in
+                # that case, and is what actually raises the "every
+                # candidate unreachable" refusal (caught below) when it
+                # didn't. Same caching wrapper the preview used, so that
+                # no-op is served from the batch cache rather than costing
+                # a second real `GET /status` per proposal (#3353 review).
+                status_fetcher=_status_fetcher,
+                # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH GATE to a real
+                # live probe — `coord approve` is a production entry point,
+                # not a test, so this must not stay opt-in-but-unwired (the
+                # exact gap the #3371 review round found: a mechanism that
+                # exists but nothing actually calls).
+                credential_fetcher=claude_credential_reachable,
+                # #3376 review round 1: the other two STRUCTURAL DISPATCH-
+                # LIVENESS GATE predicates (issue closed / branch already
+                # merged) — see `github_issue_liveness_fetcher`'s docstring.
+                issue_liveness_fetcher=_issue_liveness_fetcher,
             )
         except httpx.HTTPError as e:
             state, reason = classify_error(e)
@@ -1962,7 +2086,12 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
             "prerequisite unmet. Retrying cannot change that verdict. Needs "
             "the coordinator: re-scope or close the issue (no title rewrite "
             "fixes this) and audit the `after=` edges of anything queued "
-            "behind it, then `coord drive-queue remove` once handled (#3164).",
+            "behind it. If the prerequisite has since landed, `coord "
+            "drive-queue clear-refusal <repo> <issue> --reason \"...\"` "
+            "records that on this assignment, then `coord drive-queue "
+            "remove` + `add` dispatches fresh work (#3339) — `remove` alone "
+            "does nothing, since it only clears the queue row, not this "
+            "board verdict.",
             err=True,
         )
         sys.exit(1)
@@ -2097,9 +2226,28 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
 
     original_model = assignment.model or cfg.models.default
     if provider_type_for(resolved_provider_name, cfg.providers) in IMPLICIT_PROVIDER_TYPES:
-        escalated = cfg.models.next_model(original_model)
-        if escalated != original_model:
-            click.echo(f"  escalating model: {original_model} → {escalated}")
+        # #3360: classify what actually failed before climbing the ladder —
+        # a compliance nit (a ratchet, a lint/formatter check, a
+        # files_forbidden violation) re-dispatches at the SAME rung, since no
+        # model-capability difference fixes a repo-specific fact the worker
+        # was never told (#3357 paid for exactly this on the top rung).
+        from coord.failure_classifier import (  # noqa: PLC0415
+            classify_failure,
+            failure_text_for_assignment,
+        )
+
+        classification = classify_failure(failure_text_for_assignment(assignment))
+        if classification.should_escalate:
+            escalated = cfg.models.next_model(original_model)
+            if escalated != original_model:
+                click.echo(f"  escalating model: {original_model} → {escalated}")
+        else:
+            escalated = original_model
+            click.echo(
+                f"  not escalating model (#3360, {classification.category}"
+                + (f": {classification.matched}" if classification.matched else "")
+                + f") — staying on {original_model or 'default'}"
+            )
         retry_model = escalated
     else:
         # Not a claude-family provider — the escalation ladder doesn't

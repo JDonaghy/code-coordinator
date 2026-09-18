@@ -7,6 +7,16 @@ Like the other fleet checks in this package, the daemon's ``/board`` handler
 (``coord.serve_app``) is the thing that actually measures its own latency and
 serialized body size on each rebuild; this probe only judges the numbers it's
 handed.
+
+#3294 added a third, advisory-only number: how many rebuilds actually
+*published* in the last 60s (``board_builds_per_minute`` on ``daemon_host``,
+tracked by ``FleetHealthRefresher.record_board_stats``). The ``/board`` cache
+used to rebuild on a fixed 1.5s TTL regardless of whether anything had
+written — pollers run at 5s, so that meant a rebuild on nearly every poll.
+The cache's primary trigger is now "a write happened" (``dao.CoordStore.
+change_token``); this field is what makes that claim measurable rather than
+assumed. Never affects severity — a burst of real writes legitimately drives
+it up.
 """
 
 from __future__ import annotations
@@ -41,6 +51,13 @@ def probe_board_latency(ctx: HealthContext) -> CheckResult:
     dh = ctx.fleet.daemon_host or {}
     latency_ms = dh.get("board_latency_ms")
     payload_bytes = dh.get("board_payload_bytes")
+    # #3294: how many /board REBUILDS (not requests) published in the last
+    # 60s — the direct measurement of whether the write-triggered cache
+    # (dao.CoordStore.change_token, replacing the old 1.5s TTL) is actually
+    # cutting rebuilds, rather than an assumption. Advisory only: absent on
+    # an older daemon that hasn't published a build yet, and never affects
+    # severity below — a burst of real writes legitimately drives this up.
+    builds_per_minute = dh.get("board_builds_per_minute")
 
     if latency_ms is None and payload_bytes is None:
         return CheckResult(
@@ -72,6 +89,8 @@ def probe_board_latency(ctx: HealthContext) -> CheckResult:
         parts.append(f"{latency_ms:.0f}ms")
     if payload_bytes is not None:
         parts.append(human_bytes(payload_bytes))
+    if builds_per_minute is not None:
+        parts.append(f"{builds_per_minute} build/min")
     headroom = " / ".join(parts) if parts else "no data"
     if severity is not Severity.OK:
         headroom += f" ({', '.join(reasons)})"
@@ -85,5 +104,9 @@ def probe_board_latency(ctx: HealthContext) -> CheckResult:
             f"warn at {human_bytes(_PAYLOAD_WARN_BYTES)}/{_LATENCY_WARN_MS:.0f}ms, "
             f"crit at {human_bytes(_PAYLOAD_CRIT_BYTES)}/{_LATENCY_CRIT_MS:.0f}ms"
         ),
-        values={"latency_ms": latency_ms, "payload_bytes": payload_bytes},
+        values={
+            "latency_ms": latency_ms,
+            "payload_bytes": payload_bytes,
+            "builds_per_minute": builds_per_minute,
+        },
     )

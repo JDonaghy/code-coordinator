@@ -6,6 +6,7 @@ import pytest
 
 from coord.claim import (
     Claim,
+    adopt_remote_branch_claim,
     claim_message,
     claim_remedy_hint,
     find_work_claim,
@@ -177,6 +178,105 @@ def test_claim_remedy_hint_for_remote_branch_names_branch_delete_not_diagnose() 
     # diagnose` inspects board stages and cannot clear a remote_branch claim,
     # so it must not be offered here at all.
     assert "coord diagnose" not in hint
+
+
+# ── adopt_remote_branch_claim (#3347) ────────────────────────────────────────
+# A `remote_branch` claim means real, finished Work-stage output exists with
+# no board row to attach it to (#611's branch-backfill sweep needs an
+# EXISTING row and is a no-op here). Adopting it as a `done` work assignment
+# lets the normal review/smoke auto-dispatch loop pick it up, instead of
+# `coord assign` refusing outright and `coord drive` reading that refusal as
+# a dispatch failure to retry and then block on.
+
+
+def test_adopt_remote_branch_claim_builds_a_done_work_assignment() -> None:
+    claim = Claim(
+        issue_number=967, repo_name="vimcode", source="remote_branch",
+        branch="issue-967-macos-textmetrics-hit-drift",
+    )
+    assignment = adopt_remote_branch_claim(
+        claim,
+        machine_name="macmini",
+        repo_name="vimcode",
+        issue_number=967,
+        issue_title="macOS TextMetrics hit-test drift",
+        required_gates=["review", "merge"],
+        driven_by="drive:vimcode#967",
+    )
+    assert assignment.status == "done"
+    assert assignment.type == "work"
+    assert assignment.branch == "issue-967-macos-textmetrics-hit-drift"
+    assert assignment.machine_name == "macmini"
+    assert assignment.repo_name == "vimcode"
+    assert assignment.issue_number == 967
+    assert assignment.issue_title == "macOS TextMetrics hit-test drift"
+    # #951: the same default a normal finished work row gets, so the
+    # existing review/smoke auto-dispatch loop admits this row too.
+    assert assignment.review_state == "pending"
+    assert assignment.required_gates == ["review", "merge"]
+    assert assignment.driven_by == "drive:vimcode#967"
+    assert assignment.dispatched_at is not None
+    assert assignment.finished_at is not None
+
+
+def test_adopt_remote_branch_claim_id_is_deterministic() -> None:
+    """A stable id (not the `save_board` fallback, which never mutates a
+    thin client's in-memory copy) so a caller can report it immediately
+    after `write_board`, and so re-adopting the same issue upserts the same
+    row instead of piling up duplicates."""
+    claim = Claim(issue_number=42, repo_name="api", source="remote_branch", branch="issue-42-x")
+    a1 = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=42, issue_title="t",
+    )
+    a2 = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=42, issue_title="t",
+    )
+    assert a1.assignment_id == a2.assignment_id
+    assert a1.assignment_id
+
+
+def test_adopt_remote_branch_claim_rejects_a_board_source_claim() -> None:
+    """Adoption only makes sense for a claim with nothing on the board —
+    calling it on a `source="board"` claim would silently paper over a real
+    duplicate-dispatch race instead of refusing it."""
+    claim = Claim(
+        issue_number=7, repo_name="api", source="board",
+        machine_name="server", assignment_id="old-1",
+    )
+    with pytest.raises(ValueError):
+        adopt_remote_branch_claim(
+            claim, machine_name="m", repo_name="api", issue_number=7, issue_title="t",
+        )
+
+
+def test_adopt_remote_branch_claim_defaults_required_gates_to_empty() -> None:
+    claim = Claim(issue_number=1, repo_name="api", source="remote_branch", branch="issue-1-x")
+    assignment = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+    )
+    assert assignment.required_gates == []
+
+
+def test_adopt_remote_branch_claim_defaults_type_to_work() -> None:
+    claim = Claim(issue_number=1, repo_name="api", source="remote_branch", branch="issue-1-x")
+    assignment = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+    )
+    assert assignment.type == "work"
+
+
+def test_adopt_remote_branch_claim_honours_explicit_assignment_type() -> None:
+    """#3347 review (non-blocking): the adopted row's `type` must match what
+    THIS dispatch attempt would actually have used — plan-only or a labelled
+    epic's `dispatch_type` — not always a hardcoded "work", since type-keyed
+    guards elsewhere (e.g. #1314's epic auto-close guard) read this field."""
+    claim = Claim(issue_number=1, repo_name="api", source="remote_branch", branch="issue-1-x")
+    assignment = adopt_remote_branch_claim(
+        claim, machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+        assignment_type="epic-decompose",
+    )
+    assert assignment.type == "epic-decompose"
+    assert assignment.driven_by is None
 
 
 # ── has_active_followup ─────────────────────────────────────────────────────
@@ -669,6 +769,108 @@ def test_find_work_claim_still_blocks_unmerged_remote_branch(monkeypatch) -> Non
     claim = find_work_claim(319, "api", "acme/api", Board())
     assert claim is not None
     assert claim.branch == "issue-319-active"
+
+
+def test_list_matching_remote_branches_includes_merged_and_unmerged(monkeypatch) -> None:
+    """#3376: `list_matching_remote_branches` is the UNFILTERED lookup
+    `any_matching_branch_merged` needs — unlike `_default_branch_lookup`
+    (claim detection), it must NOT drop a branch just because it merged."""
+    import json
+
+    import coord.claim as claim_mod
+
+    def _fake(*args, **kwargs):
+        path = args[1]
+        if "matching-refs" in path:
+            return json.dumps([
+                {"ref": "refs/heads/issue-500-done"},
+                {"ref": "refs/heads/issue-500-followup"},
+            ])
+        return "{}"
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    assert claim_mod.list_matching_remote_branches("acme/api", 500) == [
+        "issue-500-done", "issue-500-followup",
+    ]
+
+
+def test_list_matching_remote_branches_empty_on_gh_error(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr("coord.github_ops._gh", _boom)
+    assert claim_mod.list_matching_remote_branches("acme/api", 500) == []
+
+
+def _gh_stub_with_matching_refs(branches, default_branch, ahead_by):
+    """Like `_gh_stub`, but also answers the `matching-refs` lookup
+    `list_matching_remote_branches` makes first — `_gh_stub` alone only
+    covers `/compare/` and `default_branch`, which is all `_drop_merged_
+    branches` (given an already-known branch list) ever needed."""
+    import json
+
+    def _fake(*args, **kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if "matching-refs" in path:
+            return json.dumps([{"ref": f"refs/heads/{b}"} for b in branches])
+        if "/compare/" in path:
+            head = path.split("...", 1)[1]
+            return json.dumps({"ahead_by": ahead_by.get(head, 1)})
+        return json.dumps({"default_branch": default_branch})
+
+    return _fake
+
+
+def test_any_matching_branch_merged_true_when_pr_merged(monkeypatch) -> None:
+    """#3376: the `branch_merged` predicate `coord.dispatch_liveness.
+    github_issue_liveness_fetcher` needs — a merged `issue-N-*` branch must
+    read `True` even though `_default_branch_lookup`'s own filtered list
+    would come back empty for the same input."""
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(["issue-9-done"], "main", {"issue-9-done": 0}),
+    )
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is True
+
+
+def test_any_matching_branch_merged_false_when_unmerged(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(["issue-9-live"], "main", {"issue-9-live": 3}),
+    )
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is False
+
+
+def test_any_matching_branch_merged_false_when_no_branch_exists(monkeypatch) -> None:
+    """No `issue-N-*` branch on the remote at all — nothing to have merged,
+    must not be confused with "merged" (fail toward NOT refusing dispatch)."""
+    import json
+
+    import coord.claim as claim_mod
+
+    def _fake(*args, **kwargs):
+        if "matching-refs" in args[1]:
+            return json.dumps([])
+        return "{}"
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is False
+
+
+def test_any_matching_branch_merged_false_on_gh_error(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr("coord.github_ops._gh", _boom)
+    assert claim_mod.any_matching_branch_merged("acme/api", 9) is False
 
 
 # ── #1553: has_active_work_followup keys on the EFFECTIVE issue ─────────────

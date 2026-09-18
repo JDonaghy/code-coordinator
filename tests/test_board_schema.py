@@ -29,14 +29,18 @@ changes neither `/board`'s response body nor `GET /openapi.json`.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import sqlite3
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
 
+import coord.db as db_mod
 from coord import board_schema
 from coord.board_schema import (
     BOARD_PROJECTIONS,
@@ -99,6 +103,54 @@ def _seeded_db(path: Path, *, extra_column_on: str | None = None) -> Path:
 
 def _serve_client(db_path: Path) -> TestClient:
     return TestClient(build_serve_app(SqliteStore(db_path), Config(repos=[], machines=[])))
+
+
+@contextlib.contextmanager
+def _assignment_written_locally(
+    db_path: Path, *, assignment_id: str, issue_number: int, status: str
+) -> Iterator[sqlite3.Connection]:
+    """Seed one fresh `assignments` row into the on-disk fixture DB at *db_path*
+    and route `coord.state`'s local write path at that same connection.
+
+    Shared by the two "does this column survive the wire?" regressions below
+    (#3339 and #3357), which are the same test with a different writer: seed a
+    row, call the REAL `coord.state` mutator on it, then read it back over the
+    REAL HTTP `/board`.  Both need the row in the *file* `SqliteStore` opens
+    `mode=ro` BY PATH — the autouse `coord_db` connection is `:memory:`, so a
+    fixture-only version would assert against an empty board — which is why
+    they own a `sqlite3.connect` site at all (bucket C in
+    `tests/test_sqlite_connect_ratchet.py`).  Keeping it to ONE site is the
+    point of this helper: the ratchet counts call sites, not tests.
+
+    `dispatched_at` is *now*, not the #748 fixture's epoch timestamps, so
+    #762's board-retention cap keeps the row — a terminal row past the
+    retention cutoff is dropped from `/board` regardless of the DTO, which
+    would make these tests pass for the wrong reason.
+
+    The autouse `_no_board_service` fixture keeps board-service resolution
+    unset, so `override_connection` here means the mutator takes its *local*
+    branch — exactly what a `coord` command does when run on the daemon host
+    itself, or what the daemon's own handler does on behalf of a worker.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, "
+        " machine_name, type, status, dispatched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            assignment_id, "claude-coordinator", issue_number,
+            f"issue {issue_number}", "precision", "work", status, time.time(),
+        ),
+    )
+    conn.commit()
+    db_mod.override_connection(conn)
+    try:
+        yield conn
+    finally:
+        db_mod.override_connection(None)
+        conn.close()
 
 
 # ── safety: the wire did not move ───────────────────────────────────────────
@@ -410,3 +462,120 @@ def test_every_projected_table_has_a_dto() -> None:
     }
     assert all(dataclasses.is_dataclass(cls) for cls in BOARD_PROJECTIONS.values())
     assert board_schema.decode_row("notifications", {"id": 1}) == {"id": 1}
+
+
+# ── #3339: refused_premise's clear-refusal signal must survive the wire ─────
+
+
+def test_premise_rechecked_fields_reach_the_board_wire_and_project(
+    tmp_path: Path,
+) -> None:
+    """Regression for the #3339 review finding: `BoardAssignment` originally
+    shipped without `premise_rechecked_at`/`premise_rechecked_reason`, so —
+    per this module's own contract — they were silently dropped from
+    `/board` no matter how correctly `coord.state.mark_premise_rechecked`
+    wrote them to the DB.  `coord.drive_state.project()` (what
+    `coord/drive.py`'s `decide()` reads to bypass a stale `refused_premise`
+    refusal) has no other source for these two fields than that wire, so on
+    any daemon-routed fleet `coord drive-queue clear-refusal` would write
+    the column correctly and the drive would never see it.
+
+    Drives the REAL write path (`mark_premise_rechecked`, what
+    `clear-refusal` calls), the REAL HTTP `/board` read path, and the REAL
+    `project()` — so a DTO that forgets to declare a column fails here
+    exactly the way it broke a live fleet.
+    """
+    from coord.config import Repo
+    from coord.drive_state import project
+    from coord.state import mark_premise_rechecked
+
+    db_path = _seeded_db(tmp_path / "coord.db")
+    # Routes straight to `_mark_premise_rechecked_local` — exactly what `coord
+    # drive-queue clear-refusal` does when run on the daemon host itself, or
+    # what the daemon's own PATCH handler does for a worker machine.
+    with _assignment_written_locally(
+        db_path,
+        assignment_id="a-3339-refused",
+        issue_number=947,
+        status="refused_premise",
+    ):
+        mark_premise_rechecked("a-3339-refused", "quadraui#971 landed")
+
+    payload = _serve_client(db_path).get("/board").json()
+    matches = [
+        row for row in payload["assignments"]
+        if row["assignment_id"] == "a-3339-refused"
+    ]
+    assert len(matches) == 1, "the seeded refusal row must round-trip onto /board"
+    wire_row = matches[0]
+    assert wire_row["premise_rechecked_at"] is not None, (
+        "premise_rechecked_at was dropped from /board — BoardAssignment must "
+        "declare it (see coord/board_schema.py)"
+    )
+    assert wire_row["premise_rechecked_reason"] == "quadraui#971 landed"
+
+    config = Config(
+        repos=[Repo(name="claude-coordinator", github="john/claude-coordinator")],
+        machines=[],
+    )
+    state = project(payload, "claude-coordinator", 947, config)
+    assert state.work_aid == "a-3339-refused"
+    assert state.work_status == "refused_premise"
+    assert state.work_premise_rechecked_at == wire_row["premise_rechecked_at"]
+    assert state.work_premise_rechecked_reason == "quadraui#971 landed"
+
+
+# ── #3357: test_confirmation must survive the wire too ──────────────────────
+
+
+def test_test_confirmation_reaches_the_board_wire(tmp_path: Path) -> None:
+    """Regression for the #3357 review finding: `BoardAssignment` originally
+    shipped without `test_confirmation`, so — per this module's own
+    contract — it was silently dropped from `/board` no matter how correctly
+    `coord.state.record_test_verdict` wrote it to the DB.  Any daemon-fronted
+    consumer of the generic `/board` payload (the TUI, `coord gates` if it
+    ever stopped bypassing `/board` via `_gates_via_daemon`, the dashboard's
+    pipeline surfaces) would be structurally blind to the confirmation
+    provenance even though the column held the right value in SQLite.
+
+    This is the identical failure mode `test_premise_rechecked_fields_reach_
+    the_board_wire_and_project` above regression-tests for
+    `premise_rechecked_at`/`_reason` (#3339) — the same mistake landed again
+    one PR later. Drives the REAL write path (`coord.state.record_test_verdict`,
+    what `coord.notify`'s confirmation reap path calls) and the REAL HTTP
+    `/board` read path, so a DTO that forgets to declare the column fails
+    here instead of on a live fleet.
+    """
+    from coord.confirm_test import TEST_CONFIRMATION_UNCONFIRMED
+    from coord.state import record_test_verdict
+
+    db_path = _seeded_db(tmp_path / "coord.db")
+    # Routes straight to `_record_test_verdict_local` — exactly what
+    # `coord.notify`'s confirmation reap path does on the daemon host itself.
+    with _assignment_written_locally(
+        db_path,
+        assignment_id="a-3357-confirm",
+        issue_number=3357,
+        status="test",
+    ):
+        record_test_verdict(
+            assignment_id="a-3357-confirm",
+            test_state="passed",
+            test_reason=(
+                "worker self-recorded via `coord test` (#2217) — "
+                "UNCONFIRMED: confirmation could not run the suite"
+            ),
+            test_confirmation=TEST_CONFIRMATION_UNCONFIRMED,
+        )
+
+    payload = _serve_client(db_path).get("/board").json()
+    matches = [
+        row for row in payload["assignments"]
+        if row["assignment_id"] == "a-3357-confirm"
+    ]
+    assert len(matches) == 1, "the seeded row must round-trip onto /board"
+    wire_row = matches[0]
+    assert wire_row["test_confirmation"] == TEST_CONFIRMATION_UNCONFIRMED, (
+        "test_confirmation was dropped from /board — BoardAssignment must "
+        "declare it (see coord/board_schema.py)"
+    )

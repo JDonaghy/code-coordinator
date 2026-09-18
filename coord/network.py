@@ -14,7 +14,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import httpx
 
@@ -40,6 +40,13 @@ class MachineStatus:
     reason: str = ""
     latency_ms: float | None = None
     health: dict | None = None
+    # #3340: was this verdict reached only after `check_machine` retried a
+    # `ReadTimeout` once? A reader that only cares about the final verdict
+    # can ignore this; one that's trying to characterize *how* flaky a host
+    # is (e.g. deciding whether to raise its `health_timeout`) needs it —
+    # `latency_ms`/`state` alone can't distinguish "answered promptly" from
+    # "answered promptly on the second try".
+    retried: bool = False
 
     @property
     def is_online(self) -> bool:
@@ -71,15 +78,58 @@ def is_retryable(state: str) -> bool:
     return state in (TIMEOUT, RATE_LIMITED, HTTP_ERROR)
 
 
-def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> MachineStatus:
-    """Ping `machine`'s /health endpoint and classify the result."""
+def check_machine(
+    machine: Machine, timeout: float = DEFAULT_TIMEOUT, *, retry_on_slow_reply: bool = True
+) -> MachineStatus:
+    """Ping `machine`'s /health endpoint and classify the result.
+
+    #3340: two independent adjustments on top of a plain GET, both aimed at
+    the same failure mode — a perfectly reachable agent reading as
+    "unreachable" because it happened to answer slowly, not because it
+    didn't answer at all:
+
+    - **Per-machine floor.** `machine.health_timeout`, when set, raises the
+      effective timeout for *this* machine — never lowers it below what the
+      caller asked for (`max()`, not a straight override), so a caller that
+      already requested something longer for its own reasons isn't capped
+      down by a machine's floor. `DEFAULT_TIMEOUT` itself is untouched —
+      every machine without an explicit `health_timeout` behaves exactly as
+      before.
+    - **One retry on a slow-but-connected reply.** `httpx.ReadTimeout` means
+      the TCP connect already succeeded — the agent is there, it just hadn't
+      finished answering within budget. That is materially weaker evidence
+      of "down" than a `ConnectTimeout`/`ConnectError` (which gets no
+      retry): on this codebase's own agents, `/health` computes several
+      TTL-cached sections (`AgentServer.health()`), and an abandoned
+      cold-cache computation from the first attempt keeps running server-side
+      even after the client gives up waiting — so an immediate second GET
+      often lands on an already-warm cache. One retry only: a genuinely wedged
+      agent still ends up reporting TIMEOUT, just after one extra round trip
+      instead of none.
+    """
     url = f"http://{machine.host}:{AGENT_PORT}/health"
-    start = time.perf_counter()
-    try:
-        resp = httpx.get(url, timeout=timeout)
-    except Exception as e:  # noqa: BLE001 — we classify all network errors
-        state, reason = classify_error(e)
-        return MachineStatus(machine=machine, state=state, reason=reason)
+    effective_timeout = (
+        max(timeout, machine.health_timeout)
+        if getattr(machine, "health_timeout", None)
+        else timeout
+    )
+    attempts_left = 2 if retry_on_slow_reply else 1
+    retried = False
+    while True:
+        start = time.perf_counter()
+        try:
+            resp = httpx.get(url, timeout=effective_timeout)
+        except httpx.ReadTimeout as e:
+            attempts_left -= 1
+            if attempts_left > 0:
+                retried = True
+                continue
+            state, reason = classify_error(e)
+            return MachineStatus(machine=machine, state=state, reason=reason, retried=retried)
+        except Exception as e:  # noqa: BLE001 — we classify all other network errors
+            state, reason = classify_error(e)
+            return MachineStatus(machine=machine, state=state, reason=reason, retried=retried)
+        break
 
     latency_ms = (time.perf_counter() - start) * 1000.0
     if resp.status_code != 200:
@@ -88,6 +138,7 @@ def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> Machine
             state=HTTP_ERROR,
             reason=f"HTTP {resp.status_code}",
             latency_ms=latency_ms,
+            retried=retried,
         )
     try:
         health = resp.json()
@@ -97,6 +148,7 @@ def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> Machine
             state=HTTP_ERROR,
             reason="invalid JSON from /health",
             latency_ms=latency_ms,
+            retried=retried,
         )
     return MachineStatus(
         machine=machine,
@@ -104,6 +156,7 @@ def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> Machine
         reason="",
         latency_ms=latency_ms,
         health=health,
+        retried=retried,
     )
 
 
@@ -299,6 +352,101 @@ def fetch_status(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> StatusRe
         return StatusResult(error=str(exc))
 
 
+def probe_reachable(
+    machine: Machine,
+    *,
+    status_fetcher: Callable[..., StatusResult] | None = None,
+    timeout: float | None = None,
+) -> tuple[bool, str]:
+    """Whether *machine*'s agent answers a live liveness probe right now.
+
+    #3353: this is deliberately built on :func:`fetch_status` (``GET
+    /status``, i.e. ``AgentServer.list_assignments()``) rather than
+    :func:`check_machine` (``GET /health``). ``/health`` computes several
+    TTL-cached sections (disk, tool versions, the H-1 check registry) and a
+    cold-cache recompute can run into the seconds (#3344) — exactly the
+    latency/false-negative risk a liveness gate must not bake into a
+    dispatch decision. ``/status`` carries none of that: it is a cheap,
+    synchronous read of in-memory assignment state.
+
+    Returns ``(reachable, reason)`` — *reason* is ``""`` on success, else
+    the classified network failure (:attr:`StatusResult.error`), so a
+    caller can report WHY a candidate was skipped rather than just THAT it
+    was.
+
+    *status_fetcher* defaults to :func:`fetch_status` and exists so a
+    caller — or a test — can substitute a fake without a real network call.
+    This is the ONE seam :func:`coord.dispatch.select_fix_machine` (#3208)
+    and :func:`coord.conflict_fix.select_conflict_fix_machine` (#3353) both
+    probe liveness through, rather than two independently-drifting answers
+    to "is this machine up" (#2096, "one question, one answer").
+
+    *timeout*, when given, is forwarded to the fetcher as a keyword
+    argument; left as ``None`` (the default) it is omitted entirely so a
+    caller-supplied fake fetcher that only accepts ``(machine)`` — like
+    every one of :func:`coord.dispatch.select_fix_machine`'s own tests —
+    keeps working unchanged.
+    """
+    fetch = status_fetcher or fetch_status
+    result = fetch(machine, timeout=timeout) if timeout is not None else fetch(machine)
+    return result.ok, (result.error or "")
+
+
+# #3371: CREDENTIAL-HEALTH TIMEOUT is deliberately much SHORTER than
+# DEFAULT_TIMEOUT/check_machine's own budget. `/health` computes several
+# TTL-cached sections and a cold-cache recompute can run into the seconds
+# (#3344, see `probe_reachable`'s own docstring above for why liveness
+# routing avoids `/health` entirely for that reason) — but THIS probe has
+# an existing, already-accepted precedent for eating that risk anyway:
+# `coord.review._fetch_agent_advertised_repos` has hit `/health` with a
+# short timeout as a "preventative pre-filter, not a blocking gate" since
+# before this issue, fail-open on any timeout. This mirrors that contract
+# exactly rather than inventing a second one.
+CREDENTIAL_PROBE_TIMEOUT = 2.0
+
+
+def claude_credential_reachable(
+    machine: Machine, *, timeout: float = CREDENTIAL_PROBE_TIMEOUT,
+) -> bool:
+    """Live ``GET /health`` probe (#3371): is *machine*'s claude credential
+    NOT confirmed dead right now?
+
+    This is the network half of the single source of truth
+    :func:`coord.prereqs.claude_credential_ok` is the pure half of — a
+    "not routable" gate must ask the same question the free-text `coord
+    plan` hint (`coord.brain.build_prompt`) and `coord doctor` already ask,
+    never a second, independently-drifting one (#2096).
+
+    Returns ``True`` — meaning "still a candidate" — for every case where
+    this CAN'T prove the credential dead: unreachable, timed out, a non-200
+    response, unparsable JSON, or an agent too old to report
+    ``tool_versions`` at all. A probe that can't answer must never itself
+    take a host out of the routing pool; only a probe that answers, and
+    answers "dead", may (matches `claude_credential_ok`'s own degrade-to-
+    healthy contract, just reached over the wire instead of from an
+    already-fetched dict).
+
+    Returns ``False`` only when the probe actually succeeds and
+    ``tool_versions["claude"]`` reads as broken — the same live signal
+    `coord doctor` already renders as ``✗ claude: ...``, now consulted
+    BEFORE a dispatch is routed instead of only discovered from a $0
+    turn-1 failure afterwards (#3367).
+    """
+    try:
+        resp = httpx.get(f"http://{machine.host}:{AGENT_PORT}/health", timeout=timeout)
+        if resp.status_code != 200:
+            return True
+        data = resp.json()
+    except Exception:  # noqa: BLE001 — fail-open: a broken probe never excludes
+        return True
+    if not isinstance(data, dict):
+        return True
+    from coord.prereqs import claude_credential_ok  # noqa: PLC0415 — leaf import
+
+    tool_versions = data.get("tool_versions")
+    return claude_credential_ok(tool_versions if isinstance(tool_versions, dict) else None)
+
+
 def fetch_repos(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> dict | None:
     """GET /repos. Returns None on network error (per-repo errors come back inside the dict)."""
     try:
@@ -344,6 +492,75 @@ def inject_message(
     except Exception:
         body = {"error": "non-json response", "raw": resp.text[:200]}
     return resp.status_code, body
+
+
+@dataclass
+class CancelResult:
+    """Result of ``POST /cancel/{id}`` to an agent — the only mechanism that
+    can stop a HEADLESS worker (#3223).  A ``claude -p`` review/work leg
+    dispatched by the agent (``interactive=False``, the normal shape for an
+    auto-loop review) is a plain subprocess tracked in the agent's own
+    ``_assignments`` dict; it has no tmux session at all, so a tmux
+    ``kill-session`` targets a session that never existed and silently does
+    nothing. This is the same endpoint ``coord stop`` posts to — one seam,
+    so "did this assignment actually get cancelled" has one answer instead
+    of two implementations that could quietly disagree.
+
+    ``ok`` is derived from the agent's own POST-cancel status, not from the
+    absence of an exception (#2096): ``AgentServer.cancel`` blocks on
+    ``proc.wait()`` (SIGTERM then, on timeout, SIGKILL) before returning, so
+    a ``status == "cancelled"`` response is a real post-action observation
+    that the process was reaped — not just proof the request was sent.
+    """
+
+    ok: bool
+    status: str | None = None
+    dirty_worktree_reason: str | None = None
+    error: str | None = None
+
+
+def cancel_assignment(
+    machine: Machine,
+    assignment_id: str,
+    *,
+    rescue: bool = False,
+    push_mode: str | None = None,
+    timeout: float = 20.0,
+) -> CancelResult:
+    """POST /cancel/{id} to `machine` and confirm the agent actually stopped
+    it. Never raises: network/HTTP/decode failures all come back as
+    ``CancelResult(ok=False, error=...)`` so a caller sweeping several
+    assignments can't have one unreachable machine blow up the sweep.
+    """
+    params: dict[str, str] = {}
+    if rescue:
+        params["rescue"] = "1"
+    if push_mode:
+        params["push_mode"] = push_mode
+    url = f"http://{machine.host}:{AGENT_PORT}/cancel/{assignment_id}"
+    try:
+        resp = httpx.post(url, params=params or None, timeout=timeout)
+    except Exception as e:  # noqa: BLE001 — classify uniformly, never propagate
+        _, reason = classify_error(e)
+        return CancelResult(ok=False, error=reason)
+    if resp.status_code == 404:
+        return CancelResult(
+            ok=False, error=f"unknown assignment {assignment_id!r} on {machine.name}"
+        )
+    if resp.status_code != 200:
+        return CancelResult(ok=False, error=f"HTTP {resp.status_code}")
+    try:
+        data = resp.json()
+    except ValueError:
+        return CancelResult(ok=False, error="invalid JSON from /cancel")
+    status = data.get("status")
+    ok = status == "cancelled"
+    return CancelResult(
+        ok=ok,
+        status=status,
+        dirty_worktree_reason=data.get("dirty_worktree_reason"),
+        error=None if ok else f"agent reported status={status!r} after cancel",
+    )
 
 
 def clean_worktrees(

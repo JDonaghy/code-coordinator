@@ -43,8 +43,11 @@ from coord.block_log import INTERVENTION_CATEGORIES, STALL_STATES
 from coord.commands._common import _CONFIG_OPTION, apply_pipeline_track_labels_best_effort
 from coord.drive_state import WORK_LIKE
 from coord.drive_queue import (
+    APPLY_APPLIED,
+    APPLY_FAILED,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_PARALLEL_PER_REPO,
+    HOLD_FIRED,
     HOLD_RELEASED,
     HOLD_SCOPE_ENTRY,
     HOLD_SCOPE_FLEET,
@@ -64,6 +67,7 @@ from coord.drive_queue import (
     STATE_WAITING,
     TERMINAL_QUEUE_STATES,
     BoardView,
+    IssueFacts,
     ProbeResult,
     QueueEntry,
     QueueError,
@@ -71,6 +75,7 @@ from coord.drive_queue import (
     RollPending,
     TickPlan,
     add_preflight_notice,
+    apply_gate_status,
     build_board_view,
     detect_unreachable_waits,
     diagnose_blocked_after,
@@ -89,9 +94,13 @@ from coord.drive_queue import (
     parse_after_spec,
     parse_key,
     pending_probe_targets,
+    plan_is_destructive,
     plan_tick,
+    remaining_fix_rounds,
     render_plan,
+    total_fix_round_budget,
     unreachable_wait_alert,
+    validate_apply_gate,
     validate_enqueue,
 )
 from coord.overlap_predict import (
@@ -106,6 +115,7 @@ from coord.overlap_predict import (
     declared_footprints,
     fanout_warnings,
     inflight_footprints,
+    malformed_files_warning,
     parse_declared_files,
     predict_overlap,
     predictions_from_audit,
@@ -283,7 +293,13 @@ def drive_queue_group() -> None:
         "unattended fix round that goes nowhere costs a queue slot for "
         "hours, not a human a few minutes of noticing). Re-adding an "
         "already-queued entry WITHOUT this flag reverts it to the fleet "
-        "default — it does not leave a previous override in place."
+        "default — it does not leave a previous override in place. NOTE "
+        "(#2972): the ceiling this budgets against is scoped to the ISSUE, "
+        "all-time across every past drive session for it — `remove` + `add` "
+        "resets the queue ROW (attempts=0) but NOT that history, so a "
+        "remove+add on an entry that already burned its budget can still "
+        "land back at the ceiling on its very next relaunch. Pass a larger "
+        "--max-fix-rounds here to actually give it a clean slate."
     ),
 )
 @click.option(
@@ -304,6 +320,34 @@ def drive_queue_group() -> None:
         "does not leave a previous passthrough in place."
     ),
 )
+@click.option(
+    "--terraform-plan-json",
+    "plan_json_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help=(
+        "#3236: path to a `terraform show -json <planfile>` capture for "
+        "this entry's deploy gate. Parsed for destroy/replace "
+        "resource_changes — a plan containing either makes this gate "
+        "destructive (same effect as --terraform-destructive) and refuses "
+        "--resume-when outright; a plan containing neither is stored as "
+        "non-destructive."
+    ),
+)
+@click.option(
+    "--terraform-destructive",
+    "force_destructive",
+    is_flag=True,
+    default=False,
+    help=(
+        "#3236: manually declare this deploy gate as carrying a "
+        "destroy/replace terraform plan (e.g. reviewed by hand, no JSON "
+        "capture available). Refuses --resume-when the same way a parsed "
+        "destructive --terraform-plan-json does — releasing this gate then "
+        "requires a human, via `coord drive-queue apply-verdict --applied` "
+        "or `coord drive-queue resume`, never an automated probe."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_add(
     repo: str,
@@ -319,6 +363,8 @@ def drive_queue_add(
     hold_scope: str,
     max_fix_rounds: int | None,
     no_acceptance: bool,
+    plan_json_path: str | None,
+    force_destructive: bool,
     config_path: Path,
 ) -> None:
     """Queue REPO ISSUE for `coord drive`, or update it if already queued.
@@ -362,6 +408,30 @@ def drive_queue_add(
     except QueueError as exc:
         raise click.ClickException(str(exc)) from None
 
+    # #3236: resolve destructiveness BEFORE the write — a parsed plan wins
+    # over (i.e. ORs with) --terraform-destructive, never overrides it, so a
+    # human's manual declaration can never be silently relaxed by a plan
+    # JSON that happens to parse as additive-only.
+    plan_destructive = bool(force_destructive)
+    if plan_json_path:
+        try:
+            plan_data = _json.loads(Path(plan_json_path).read_text())
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(
+                f"could not parse --terraform-plan-json {plan_json_path}: {exc}"
+            ) from None
+        if not isinstance(plan_data, dict):
+            raise click.ClickException(
+                f"--terraform-plan-json {plan_json_path} is not a JSON object "
+                "(expected `terraform show -json <planfile>` output)"
+            )
+        if plan_is_destructive(plan_data):
+            plan_destructive = True
+    try:
+        validate_apply_gate(resume_when, plan_destructive)
+    except QueueError as exc:
+        raise click.ClickException(str(exc)) from None
+
     # #2186: the UPDATE path in `_enqueue_drive_queue_local` always writes
     # whatever `hold_scope` THIS call passed (default `entry`) — so re-adding
     # an already fleet-scoped gate without repeating `--scope fleet` silently
@@ -389,10 +459,11 @@ def drive_queue_add(
     # the feature existed.
     prediction = Prediction()
     staleness_note = ""
+    malformed_note = ""
     auto_after: list[str] = []
     rejected_after: list[str] = []
     if not no_predict_overlap:
-        prediction, staleness_note = _predict_overlap(
+        prediction, staleness_note, malformed_note = _predict_overlap(
             config_path, repo, issue, existing_entries
         )
         candidate_after = _applicable_auto_after(
@@ -417,6 +488,7 @@ def drive_queue_add(
         hold_scope=hold_scope,
         max_fix_rounds=max_fix_rounds,
         no_acceptance=no_acceptance,
+        plan_destructive=plan_destructive,
     )
     # #2839: queueing a drive is a strictly STRONGER statement than "send to
     # Pipeline" (`coord track`), so it must never leave the issue in a
@@ -444,7 +516,13 @@ def drive_queue_add(
         gate = " · holds the queue when done"
         if hold_scope == HOLD_SCOPE_FLEET:
             gate += " (fleet-wide — nothing anywhere launches)"
-        if resume_when:
+        if plan_destructive:
+            gate += (
+                " · DESTRUCTIVE (destroy/replace) — human release only, via "
+                "`coord drive-queue apply-verdict --applied` or `coord "
+                "drive-queue resume` (#3236)"
+            )
+        elif resume_when:
             gate += f" (auto-resume when `{resume_when}` passes)"
     # #2601: the reason (if an edge was actually applied), any high-fanout
     # directory-token warning (independent of whether the edge stuck — a
@@ -455,6 +533,12 @@ def drive_queue_add(
     # even if that leaves nothing else to report, since a rejection an
     # operator asked for and got no acknowledgement of looks identical to one
     # that silently didn't take.
+    # #3258: plus a warning when THIS candidate's own `## Files` heading
+    # parsed to zero paths — the silent-miss this issue is about. Shown
+    # regardless of whether anything else fired, for the same reason as the
+    # --reject-after confirmation above: an author who wrote a declaration
+    # that never took must not see output byte-identical to "declared
+    # nothing".
     overlap_notes: list[str] = []
     if auto_after:
         overlap_notes.append(prediction.reason)
@@ -464,6 +548,8 @@ def drive_queue_add(
             "rejected via --reject-after (not applied): " + ", ".join(rejected_after)
         )
     overlap_notes.extend(fanout_warnings(prediction))
+    if malformed_note:
+        overlap_notes.append(malformed_note)
     if staleness_note:
         overlap_notes.append(staleness_note)
     overlap_note = ("\n" + "\n".join(overlap_notes)) if overlap_notes else ""
@@ -758,7 +844,7 @@ def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
 
 def _predict_overlap(
     config_path: Path, repo: str, issue: int, existing_entries: list[QueueEntry],
-) -> tuple[Prediction, str]:
+) -> tuple[Prediction, str, str]:
     """Compare this issue's declared files against work already in flight.
 
     Same-repo only: two repos' paths cannot collide, and comparing them would
@@ -766,19 +852,29 @@ def _predict_overlap(
     checked first (ground truth); a queued entry with no branch yet is
     compared declaration-to-declaration, and only when it has one.
 
-    Returns ``(prediction, staleness_note)`` — see `_candidate_body` for when
-    the note is non-empty. Every OTHER body this consults (an in-flight
-    branch's own declaration, an unrelated queued entry's) still comes from
-    the plain cache: re-reading fifteen bodies live on every `add` is exactly
-    the cost the module's docstring rejects, and #2601's own report is about
-    correcting THIS entry's declaration, not anyone else's.
+    Returns ``(prediction, staleness_note, malformed_warning)`` — see
+    `_candidate_body` for when the staleness note is non-empty, and
+    :func:`coord.overlap_predict.malformed_files_warning` (#3258) for the
+    third: a `## Files` heading was present on THIS candidate but parsed to
+    zero paths, so the declaration silently carried no ordering signal.
+    Computed here (not just where `candidate` ends up empty below) because
+    that IS the path a malformed declaration takes — rule 3 treats "no
+    heading" and "an unparsed heading" identically for ordering purposes, but
+    the operator reading `add`'s output must not.
+
+    Every OTHER body this consults (an in-flight branch's own declaration, an
+    unrelated queued entry's) still comes from the plain cache: re-reading
+    fifteen bodies live on every `add` is exactly the cost the module's
+    docstring rejects, and #2601's own report is about correcting THIS
+    entry's declaration, not anyone else's.
     """
     coordinates = _repo_coordinates(config_path, repo)
     if coordinates is None:
-        return Prediction(), ""
+        return Prediction(), "", ""
     repo_github, base_branch = coordinates
 
     candidate_body, staleness_note = _candidate_body(repo, issue, repo_github)
+    malformed_warning = malformed_files_warning(candidate_body)
 
     def body_fetcher(repo_name: str, number: int) -> str:
         if repo_name == repo and number == issue:
@@ -788,8 +884,10 @@ def _predict_overlap(
     candidate = collect_candidate_files(repo, issue, body_fetcher)
     if not candidate:
         # Rule 3: no prediction is a valid answer. Nothing is fetched, nothing
-        # is compared, and the add is byte-identical to the pre-#2247 one.
-        return Prediction(), ""
+        # is compared, and the add is byte-identical to the pre-#2247 one —
+        # except for `malformed_warning`, which fires precisely in this
+        # branch when the empty candidate was a parse failure, not silence.
+        return Prediction(), staleness_note, malformed_warning
 
     key = entry_key(repo, issue)
     footprints = inflight_footprints(
@@ -811,7 +909,11 @@ def _predict_overlap(
             synced_at_fetcher=_issue_body_synced_at,
         )
     )
-    return predict_overlap(candidate, footprints, exclude_keys={key}), staleness_note
+    return (
+        predict_overlap(candidate, footprints, exclude_keys={key}),
+        staleness_note,
+        malformed_warning,
+    )
 
 
 def _applicable_auto_after(
@@ -1086,6 +1188,20 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     now = time.time()
     entries = entries_from_rows(rows)
 
+    # #2972: all-time per-issue leg counts (#3060) so an operator can see the
+    # fix-round ceiling's own count directly on the row — "diagnosable from
+    # the queue rather than from `coord gates`" is the issue's own acceptance
+    # bar. Best-effort, same posture as every other advisory board/DB read in
+    # this command: a failure here must never turn a working `list` into a
+    # broken one, it just leaves `fix_rounds=` off every row.
+    try:
+        from coord.state import leg_counts as _leg_counts  # noqa: PLC0415
+
+        all_leg_counts = _leg_counts()
+    except Exception:  # noqa: BLE001 — advisory read, see comment above
+        all_leg_counts = {}
+    fix_round_config_default = _pipeline_max_fix_rounds_default(config_path)
+
     # #2183: a `blocked`/`failed` row's `after=` graph needs to be re-checked
     # against the FULL queue (cross-repo pre-reqs), not just whatever `--repo`
     # filtered down to — otherwise a `--repo` view would misdiagnose an
@@ -1123,12 +1239,53 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         else {}
     )
     states = {e.key: e.state for e in all_entries}
+    # #3368: `diagnose_blocked_after`'s `dep_reasons` param, threaded through
+    # here too — so `list`/`status`'s re-derived `dependency_reason` (below)
+    # never disagrees with what a live tick would compute for the same
+    # `after=` graph: a dep whose OWN `last_reason` is #2806's "unconfirmed
+    # probe failure" text must read the same way here as it does in
+    # `coord.drive_queue._resolve_prereqs`.
+    dep_reasons = {e.key: e.last_reason for e in all_entries}
     cycle_keys: dict[str, str] = {}
     cycle = find_cycle({e.key: list(e.after) for e in all_entries})
     if cycle is not None:
         message = "dependency cycle: " + " -> ".join(cycle)
         for key in cycle:
             cycle_keys[key] = message
+
+    # #3369: `states` above is a single static snapshot of the raw persisted
+    # rows — sufficient for a dependent whose pre-req is DIRECTLY `blocked`
+    # on #2806's unconfirmed-probe text (that shape is matched straight off
+    # `dep_reasons`), but not for one two or more `after=` hops from it. A
+    # live tick discovers that second hop in the SAME pass — position order
+    # means `states[dep]` is already flipped to `waiting` by the time a
+    # later entry's own verdict is derived (`plan_tick`'s `STATE_BLOCKED`
+    # loop mutates `states` as it walks) — but `list` never runs a tick, so
+    # without this it kept reporting "it will never satisfy" for every
+    # entry beyond the first hop, contradicting what the very next real tick
+    # would compute for the identical graph (the vimcode#1059..#1069
+    # incident: six dependents chained behind one unconfirmed probe
+    # failure). This mirrors `_reconcile_blocked_after`'s own resume guard,
+    # entry by entry, walked in the same position order a real tick uses:
+    # only a row whose OWN `last_reason` is already `_resolve_prereqs`'s
+    # unsatisfiable-`after=` verdict (never a permanent #1844/#2019 refusal
+    # or an unrelated cause) is a candidate, and it only cascades as
+    # `waiting` here if a fresh `diagnose_blocked_after` — against this SAME
+    # progressively-corrected view — agrees it is no longer unsatisfiable.
+    cascaded_states = dict(states)
+    if board is not None:
+        for candidate in sorted(all_entries, key=lambda e: (e.position, e.key)):
+            if candidate.state != STATE_BLOCKED or not candidate.after:
+                continue
+            if is_permanent_block_reason(candidate.last_reason):
+                continue
+            if not is_unsatisfiable_prereq_reason(candidate.last_reason):
+                continue
+            pre_diag = diagnose_blocked_after(
+                candidate, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons
+            )
+            if not pre_diag.unsatisfiable:
+                cascaded_states[candidate.key] = STATE_WAITING
 
     for entry in entries:
         diagnosed = (
@@ -1137,7 +1294,9 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         unsatisfied = entry.after
         dependency_reason = ""
         if diagnosed:
-            diagnosis = diagnose_blocked_after(entry, board, states, cycle_keys)
+            diagnosis = diagnose_blocked_after(
+                entry, board, cascaded_states, cycle_keys, dep_reasons=dep_reasons
+            )
             unsatisfied = diagnosis.unsatisfied
             dependency_reason = diagnosis.dependency_reason
 
@@ -1187,6 +1346,20 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             bits.append(f"attempts={entry.attempts}")
         if entry.deferrals:
             bits.append(f"deferrals={entry.deferrals}")
+        # #2972: the fix-round ceiling's OWN count — total work legs (work +
+        # every fix round) this entry has run across every relaunch, against
+        # the budget `_reconcile_running` actually enforces. Only shown once
+        # at least one leg has been dispatched — a `waiting` entry that has
+        # never launched has nothing to report, same as `attempts`/
+        # `deferrals` above being suppressed at 0.
+        work_legs = sum(
+            count
+            for kind, count in all_leg_counts.get(entry.key, {}).items()
+            if kind in WORK_LIKE
+        )
+        if work_legs:
+            budget = total_fix_round_budget(entry, fix_round_config_default)
+            bits.append(f"fix_rounds={min(work_legs, budget)}/{budget}")
         if entry.resumes:
             # #2230: how many times the merge-gate sweep has auto-resumed
             # THIS row from `blocked` — the churn signal the issue asks to be
@@ -1197,8 +1370,32 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             if entry.hold_scope == HOLD_SCOPE_FLEET:
                 bits.append("scope=fleet")
         click.echo("  ".join(bits))
-        if entry.last_reason:
-            click.echo(f"      last{_reason_age_suffix(entry, now)}: {entry.last_reason}")
+        # #3369: a dependency-caused row's `last:` line is, by default, the
+        # frozen `entry.last_reason` a PAST tick wrote — which can say "it
+        # will never satisfy" about a pre-req whose OWN current state has
+        # since turned out to be a retryable #2806 probe failure rather than
+        # a confirmed-still-shut gate (#3368), or that only became true two
+        # `after=` hops away from where the actual retry is happening (this
+        # row's diagnosis cascades through `cascaded_states` above the same
+        # way a live tick's own position-ordered walk would). `diagnosis.
+        # dependency_reason` is already the CURRENT `_resolve_prereqs`
+        # verdict against that same graph — showing it here instead of the
+        # frozen text is the same "recomputed, never read off the frozen
+        # last_reason" rule #2183 already applies to the `after=` list
+        # itself (see `unsatisfied` above) and to which remedy note prints
+        # below, just closing the one place that rule didn't yet reach: the
+        # dependent's own headline reason. A row that is NOT dependency-
+        # caused (no `after=`, or its real cause is unrelated to it) keeps
+        # showing its own frozen `last_reason` exactly as before.
+        using_fresh_reason = diagnosed and bool(dependency_reason)
+        display_reason = dependency_reason if using_fresh_reason else entry.last_reason
+        # The age suffix (#2133) times how long `entry.last_reason` has sat
+        # unrevalidated — meaningless (and actively misleading, implying the
+        # fresh sentence is itself stale) once that text has been swapped
+        # for a diagnosis computed THIS call.
+        age_suffix = "" if using_fresh_reason else _reason_age_suffix(entry, now)
+        if display_reason:
+            click.echo(f"      last{age_suffix}: {display_reason}")
         if diagnosed:
             # #2183 point 4: `blocked`/`failed` is terminal — say so where the
             # operator is already reading the row, not just in an unrelated
@@ -1295,11 +1492,26 @@ def _hold_lines(entry: QueueEntry) -> list[str]:
         else ""
     )
     lines = [f"      hold-after: {entry.gate_reason}{scope_suffix}"]
+    if entry.plan_destructive:
+        lines.append(
+            "      DESTRUCTIVE (destroy/replace) — resume-when is never "
+            "honored here; release with `coord drive-queue apply-verdict "
+            "--applied` or `coord drive-queue resume` (#3236)"
+        )
     if entry.resume_when:
         probe = f"      resume-when: {entry.resume_when}"
         if entry.hold_probes:
             probe += f"  (failed {entry.hold_probes}×)"
         lines.append(probe)
+    # #3236: the apply-verdict tri-state — the SAME function `coord gates`
+    # renders through (`coord.drive_queue.apply_gate_status`), so the two
+    # surfaces can never disagree about merged-not-applied vs applied vs
+    # apply-failed (#2096). Suppressed for "pending" (armed, not fired) —
+    # nothing has merged yet, so it would only restate the "hold-after:"
+    # line above for every ORDINARY (non-apply-verdict) --hold-after entry.
+    apply_state, apply_detail = apply_gate_status(entry)
+    if apply_state and apply_state != "pending":
+        lines.append(f"      apply: {apply_detail}")
     return lines
 
 
@@ -1468,6 +1680,23 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
     applies — dropping out of the drive queue is not eviction from the
     Pipeline. `coord untrack` stays the only way to evict a card; do not
     "fix" this asymmetry by mirroring `add`'s label write here.
+
+    #3282: also owns the driver it is orphaning. `coord.state.
+    dequeue_drive_queue` dequeues the row AND attempts to kill its live
+    `coord drive --tmux` session (:func:`coord.drive.stop_live_driver_session`
+    — on whichever host actually performed the write: the daemon host for a
+    thin-client dispatch, this machine for a local one; this CLI never probes
+    its own host directly, since that would look for the session on the WRONG
+    machine whenever this is run as a thin client). The row and the tmux
+    session are two different systems that cannot be updated atomically, so
+    the row is dequeued first (unchanged contract — an issue never in the
+    queue still fails exactly as before) and the session-kill is best-effort
+    second. Its failure is reported loudly (non-zero exit, session named)
+    rather than silently claiming success while a driver keeps dispatching —
+    the whole bug this closes. This is also the ONE code path every other
+    "remove this drive-queue entry" surface (the dashboard's `remove` action,
+    the board daemon's own `/drive-queue` `dequeue` route) shares — none of
+    them can independently forget to own the driver they orphan.
     """
     from coord.state import dequeue_drive_queue, get_drive_queue_entry  # noqa: PLC0415
 
@@ -1483,11 +1712,93 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
     except Exception:  # noqa: BLE001 — observability only, never blocks the remove
         before = None
 
-    removed = dequeue_drive_queue(repo, issue)
-    if not removed:
+    removal = dequeue_drive_queue(repo, issue)
+    if not removal["removed"]:
         raise click.ClickException(f"{entry_key(repo, issue)} is not in the drive queue")
     _record_operator_release(before, resolution="operator_removed")
-    click.echo(f"removed {entry_key(repo, issue)} from the drive queue")
+
+    session = removal["driver_session"]
+    if session is None:
+        # No live driver — behaves exactly as before #3282.
+        click.echo(f"removed {entry_key(repo, issue)} from the drive queue")
+        return
+    if removal["driver_ok"]:
+        click.echo(
+            f"removed {entry_key(repo, issue)} from the drive queue "
+            f"(killed driver session {session!r})"
+        )
+        return
+    raise click.ClickException(
+        f"removed {entry_key(repo, issue)} from the drive queue, but its live "
+        f"driver session {session!r} could not be confirmed killed "
+        f"({removal['driver_detail']}) — it may still be dispatching; kill it "
+        f"manually with `tmux kill-session -t {session}` and verify with "
+        f"`coord drive-stop {repo} {issue}`"
+    )
+
+
+@drive_queue_group.command("clear-refusal")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--reason", required=True,
+    help="Why the premise now holds (e.g. \"quadraui#971 landed, re-scoped "
+    "to a pin move\") — recorded on the assignment for the audit trail.",
+)
+@_CONFIG_OPTION
+def drive_queue_clear_refusal(
+    repo: str, issue: int, reason: str, config_path: Path
+) -> None:
+    """Clear a terminal `refused_premise` verdict on REPO#ISSUE (#3339).
+
+    A `refused_premise` row (`coord.agent.REFUSED_PREMISE`, #3164) is a
+    worker's correct, investigated finding that the issue's prerequisite did
+    not exist yet — but that prerequisite CAN land later, and unlike
+    `refused_policy` there is no mechanical way for `coord drive` to notice:
+    a title rewrite cannot make a missing prerequisite exist, so the row
+    blocks forever with no way to clear it. This command is that way: it
+    records your explicit assertion — "I rechecked, the premise holds now" —
+    on the refused assignment, which `coord drive`'s pre-dispatch check
+    (`coord/drive.py`'s `decide()`) reads back and treats as license to
+    dispatch fresh work instead of dying again on the same old verdict.
+
+    This does NOT by itself make anything run: a `parked` drive-queue entry
+    never resumes on its own (`coord.drive_queue`'s premise-refusal pre-pass
+    — same as a `refused_policy` park), so after clearing here you still
+    need `coord drive-queue remove REPO ISSUE` + `add` to get a fresh queue
+    row that will actually tick. Re-scope the issue FIRST if the remaining
+    work has changed — this command only unblocks dispatch, it does not
+    touch the issue body.
+    """
+    from coord.drive_state import WORK_LIKE  # noqa: PLC0415
+    from coord.state import mark_premise_rechecked  # noqa: PLC0415
+
+    reason = reason.strip()
+    if not reason:
+        raise click.ClickException("--reason must not be empty")
+
+    aid, status, _machine = _latest_work_assignment(repo, issue)
+    if not aid:
+        raise click.ClickException(
+            f"no work assignment found for {entry_key(repo, issue)} — "
+            f"nothing to clear (checked the latest {'/'.join(sorted(WORK_LIKE))} row)"
+        )
+    if status != "refused_premise":
+        raise click.ClickException(
+            f"the latest work assignment for {entry_key(repo, issue)} "
+            f"({aid}) is {status!r}, not 'refused_premise' — nothing to "
+            "clear. (`coord gates` shows the current work row.)"
+        )
+
+    mark_premise_rechecked(aid, reason)
+    click.echo(
+        f"recorded premise recheck on {aid} ({entry_key(repo, issue)}): {reason!r}"
+    )
+    click.echo(
+        "the assignment itself is unchanged — this only clears `coord "
+        "drive`'s pre-dispatch refusal. Next: `coord drive-queue remove "
+        f"{repo} {issue}` + `add` to get a fresh queue row dispatching."
+    )
 
 
 @drive_queue_group.command("move")
@@ -2310,6 +2621,91 @@ def drive_queue_resume(repo: str | None, issue: int | None, config_path: Path) -
         click.echo(f"released the deploy gate on {entry.key}")
     _clear_queue_alert()
     click.echo("the next tick will launch the next eligible entry")
+
+
+@drive_queue_group.command("apply-verdict")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--applied", "verdict", flag_value=APPLY_APPLIED,
+    help="Record that `terraform apply` ran and completed — releases the held gate.",
+)
+@click.option(
+    "--apply-failed", "verdict", flag_value=APPLY_FAILED,
+    help="Record that `terraform apply` was attempted and failed — the gate stays held.",
+)
+@click.option(
+    "--reason", default="",
+    help="What happened. Required in spirit for --apply-failed; optional for --applied.",
+)
+@_CONFIG_OPTION
+def drive_queue_apply_verdict(
+    repo: str, issue: int, verdict: str | None, reason: str, config_path: Path
+) -> None:
+    """Record the OBSERVED outcome of a `terraform apply` for a deploy gate (#3236).
+
+    Extends `--hold-after`'s deploy gate with the one thing `hold_state`
+    alone cannot say: whether the apply actually ran. A bare `coord
+    drive-queue resume` releases the gate on an operator's say-so with no
+    evidence attached — this command is the accountable path: `--applied`
+    records a real, after-the-fact observation AND releases the gate in the
+    same write, so a release is never again indistinguishable from a mere
+    "merged". `--apply-failed` records the attempt without releasing
+    anything — the gate stays held until a human fixes it and tries again.
+
+    `coord gates <repo> <issue>` and `coord drive-queue list`/`status` both
+    read this verdict through the SAME function
+    (`coord.drive_queue.apply_gate_status`), so they can never disagree
+    about whether this entry is merged-not-applied, applied, or
+    apply-failed.
+    """
+    if verdict is None:
+        raise click.ClickException("specify --applied or --apply-failed")
+
+    from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
+
+    entries = entries_from_rows(list_drive_queue(repo))
+    wanted = entry_key(repo, issue)
+    entry = next((e for e in entries if e.key == wanted), None)
+    if entry is None:
+        raise click.ClickException(f"{wanted} is not in the drive queue")
+    if not entry.hold_after:
+        raise click.ClickException(
+            f"{wanted} has no deploy gate declared (--hold-after) — nothing "
+            "to record an apply verdict against"
+        )
+
+    fields: dict[str, Any] = {
+        "apply_verdict": verdict,
+        "apply_verdict_reason": reason,
+        "apply_verdict_at": time.time(),
+    }
+    released = False
+    if verdict == APPLY_APPLIED and entry.hold_state == HOLD_FIRED:
+        # The accountable release: this IS the observation #3236 asks for,
+        # so it stands in for a separate `coord drive-queue resume` call —
+        # same `hold_state`/`hold_probes` write that command makes, never a
+        # second, drifting implementation of "how a gate releases" (#2096).
+        fields["hold_state"] = HOLD_RELEASED
+        fields["hold_probes"] = 0
+        released = True
+
+    update_drive_queue_entry(entry.repo, entry.issue, **fields)
+
+    if released:
+        _clear_queue_alert()
+        click.echo(f"{wanted}: recorded apply verdict=applied — gate released")
+        click.echo("the next tick will launch the next eligible entry")
+    elif verdict == APPLY_APPLIED:
+        click.echo(
+            f"{wanted}: recorded apply verdict=applied (gate was not currently "
+            f"fired — hold_state={entry.hold_state or 'none'}, nothing to release)"
+        )
+    else:
+        click.echo(
+            f"{wanted}: recorded apply verdict=apply_failed — gate stays held"
+            + (f" ({reason})" if reason else "")
+        )
 
 
 def _clear_queue_alert() -> None:
@@ -3274,11 +3670,47 @@ def _fetch_board_view() -> BoardView:
     abort.  ``list_drive_sessions()`` is deliberately NOT allowed to fail the
     tick: it returns ``[]`` when tmux is unavailable, and the board's
     ``active_work`` signal still holds the capacity line in that case.
+
+    #2972: also folds in #3060's ``coord.state.leg_counts()`` — the all-time,
+    archive-spanning per-issue leg count `_reconcile_running`'s fix-round
+    ceiling needs (see `IssueFacts.work_leg_count`). A read failure here must
+    not abort a tick that would otherwise succeed, but (2972 review) it must
+    ALSO not be swallowed so quietly that the ceiling silently stops firing:
+
+    - Lock contention (:func:`_is_db_locked_error` — the same signature
+      :func:`_fetch_board_view_with_retry` already retries the whole read
+      for) is deliberately NOT caught here. Catching it at this layer would
+      hand back ``work_leg_count=0`` for the rest of the tick instead of
+      letting the retry wrapper one level up actually retry the read — one
+      layer too early for that machinery to help, per the review. Letting it
+      propagate means a transient lock is either recovered by the existing
+      retry, or (if retries are exhausted) fails the tick closed, same as
+      every other board-read failure — never a silent zero.
+    - Anything else (daemon unreachable, a corrupt table, ...) a retry can't
+      fix, so that part degrades to every `IssueFacts` reading
+      `work_leg_count=0` — same fail-soft posture `effective_max_fix_rounds`
+      already takes for an unreadable `pipeline.max_fix_rounds` — but it
+      logs a visible warning first, so a persistent failure here reads as
+      "ceiling data unreadable" rather than being indistinguishable from
+      "this entry's budget is untouched".
     """
     from coord.drive import list_drive_sessions  # noqa: PLC0415
+    from coord.state import leg_counts  # noqa: PLC0415
 
     payload = _fetch_board_payload()
-    return build_board_view(payload, list_drive_sessions())
+    try:
+        counts = leg_counts()
+    except Exception as exc:  # noqa: BLE001 — advisory read, see docstring
+        if _is_db_locked_error(exc):
+            raise
+        click.echo(
+            f"warning: could not read drive-queue leg counts ({exc}) — "
+            "work_leg_count defaulting to 0 this tick, so the #2972 "
+            "fix-round ceiling cannot fire for any entry until this clears",
+            err=True,
+        )
+        counts = {}
+    return build_board_view(payload, list_drive_sessions(), leg_counts=counts)
 
 
 def _fetch_exit_reasons(
@@ -3850,6 +4282,27 @@ def _fetch_live_prereq_terminal(
         if board.facts(e.key).landed:
             continue
         targets.add(e.key)
+    # #3368: a `parked`/`blocked`/`failed` entry's OWN key gets the same
+    # live re-check, bounded exactly like the #2850 `running` case just
+    # above — the vimcode#1059 incident: a `blocked` row merged out of band
+    # (an operator `coord drive` to completion) and stayed `blocked` forever
+    # because `coord.drive_queue`'s #2055 re-check trusted only the cached
+    # `board.facts(key).landed`, and this key was never added as a live-check
+    # TARGET at all when no OTHER entry's `after=` happened to name it (a
+    # leaf issue with no dependents chained behind it). Every dependent
+    # ALREADY gets a live re-check of its pre-reqs via the loop above; a
+    # `blocked`/`parked`/`failed` entry deserves the identical chance to
+    # notice its OWN issue landed, whether or not anything is chained after
+    # it — same "one question, one answer" reasoning the #2850 widening
+    # above already established for `running`.
+    for e in entries:
+        if e.state not in (STATE_PARKED, STATE_BLOCKED, STATE_FAILED):
+            continue
+        if e.key in targets:
+            continue
+        if board.facts(e.key).landed:
+            continue
+        targets.add(e.key)
     if not targets:
         return {}
 
@@ -4069,7 +4522,28 @@ def _fetch_merge_only_ready(
     return ready
 
 
-def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
+def _pipeline_max_fix_rounds_default(config_path: Path | None) -> int | None:
+    """``pipeline.max_fix_rounds`` off *config_path*, or ``None`` on any read
+    failure (unreadable file, bad YAML) — the fail-soft advisory-read posture
+    every other config peek in this module takes.
+
+    #2972: the ONE place this reads — used by both :func:`_launch_argv` (to
+    build the subprocess's own ``--max-fix-rounds``) and the tick's
+    `plan_tick` call (to give `_reconcile_running`'s fix-round ceiling the
+    identical number) — so a launch and the ceiling that gated it can never
+    read two different config snapshots.
+    """
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+
+        return _load_config(config_path).pipeline.max_fix_rounds
+    except Exception:  # noqa: BLE001 — advisory read, see docstring
+        return None
+
+
+def _launch_argv(
+    entry: QueueEntry, config_path: Path | None, facts: IssueFacts | None = None
+) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
     #1809: this is the argv the tick actually spawns as a subprocess (below,
@@ -4106,24 +4580,29 @@ def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     stores. Unlike ``--max-fix-rounds`` this has no fleet-config fallback:
     it is opt-in-only, so an entry that never set it launches exactly as
     before this column existed.
+
+    #2972: *facts* — when given, THIS entry's :class:`IssueFacts` off the
+    same board read the tick's `plan_tick` call already used — narrows
+    ``--max-fix-rounds`` further, from :func:`effective_max_fix_rounds`'s
+    per-drive figure down to :func:`remaining_fix_rounds`'s REMAINING one:
+    the whole point of #2972 is that a relaunch must get a SMALLER budget
+    than the first launch got, not the same fresh one every time. ``None``
+    (every caller predating this parameter, and any call site with no board
+    read on hand) falls back to the plain per-drive figure — the exact
+    pre-#2972 behaviour.
     """
     from coord.drive import coord_argv  # noqa: PLC0415
 
-    config_default: int | None = None
-    try:
-        from coord.commands._common import _load_config  # noqa: PLC0415
-
-        config_default = _load_config(config_path).pipeline.max_fix_rounds
-    except Exception:  # noqa: BLE001 — advisory read, see docstring
-        config_default = None
-
+    config_default = _pipeline_max_fix_rounds_default(config_path)
+    fix_rounds = (
+        remaining_fix_rounds(entry, facts, config_default)
+        if facts is not None
+        else effective_max_fix_rounds(entry, config_default)
+    )
     argv = coord_argv() + ["drive", entry.repo, str(entry.issue), "--tmux"]
     if entry.machine:
         argv += ["--machine", entry.machine]
-    argv += [
-        "--max-fix-rounds",
-        str(effective_max_fix_rounds(entry, config_default)),
-    ]
+    argv += ["--max-fix-rounds", str(fix_rounds)]
     if entry.no_acceptance:
         argv += ["--no-acceptance"]
     if config_path:
@@ -4262,49 +4741,61 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
 
 
 def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
-    """#2535: best-effort auto-fire of the CI-staleness rerun for merge-queue
-    entries blocked SOLELY on stale CI checks against an already-approved
-    review — closing the gap where nothing periodic ever calls a live
-    ``coord merge`` or ``coord merge --revalidate`` on such an entry's
-    behalf, so it just sits until an operator notices ``--dry-run``'s
-    ``checks_stale`` line and reruns by hand (the trigger: #2530's Gate-A
-    PR #2534 sat blocked 2026-08-21 on nothing but 210 unrelated merges
-    having landed since its CI last ran).
+    """#2535: best-effort surfacing of merge-queue entries blocked SOLELY on
+    stale CI checks against an already-approved review — closing the gap
+    where nothing periodic ever looks at such an entry on an operator's
+    behalf, so it just sits until someone notices ``--dry-run``'s
+    ``checks_stale`` line by hand (the trigger: #2530's Gate-A PR #2534 sat
+    blocked 2026-08-21 on nothing but 210 unrelated merges having landed
+    since its CI last ran).
+
+    #3266: this used to auto-fire a ``gh run rerun`` (``CiStore.
+    rerun_for_pr``) for exactly this shape, up to ``MAX_CI_STALE_RERUNS`` —
+    the SAME primitive, and the SAME broken reasoning, ``merge_queue.
+    process()``'s own #2197 auto-rerun used before that fix removed it
+    there too: a ``gh run rerun`` replays the SAME event payload against
+    the SAME base the stale checks already used, so it can never see a
+    base that has since moved — which is the ONLY thing a staleness
+    reading means. Every tick that found a candidate here was spending a
+    full CI cycle (this repo's median: ~62 minutes) on a guaranteed no-op,
+    twice, before the shared ``ci_stale_reruns`` budget parked the entry
+    anyway (claude-coordinator#2972). Per this repo's "one question, one
+    answer" rule, this tick and ``process()`` must agree on the same
+    question ("should we auto-rerun CI for a checks_stale block?") — they
+    now both answer "no, park and point at a rebase" identically, rather
+    than this call site silently keeping the old answer #2197 already gave
+    up on live. See ``MAX_CI_STALE_RERUNS``'s comment in
+    ``coord/merge_queue.py`` and ``ci_stale_reason``'s docstring for the
+    full reasoning and the actual remedy (rebase onto the target branch,
+    then ``git push --force-with-lease`` — the only thing that produces a
+    check against the CURRENT base).
 
     Deliberately narrow — this is NOT ``merge.auto_drain`` reopened (that
     flag stays ``False`` by design; see ``docs/DRIVE_QUEUE.md`` and the
-    2026-06-07 incident it guards against). This step never merges anything
-    and never touches an entry blocked on review, a real CI failure, or a
-    conflict — it only triggers a ``gh run rerun`` for the exact shape
-    :func:`coord.merge_queue.ci_revalidation_candidates` already scopes
-    ``--revalidate``'s CI arm to (#1851/#1925): ``PENDING``, review
-    approved, smoke fresh, CI checks green but predating the current base.
+    2026-06-07 incident it guards against). This step never merges
+    anything, never mutates the queue, and never touches an entry blocked
+    on review, a real CI failure, or a conflict — it only *reports* the
+    exact shape :func:`coord.merge_queue.ci_revalidation_candidates` scopes
+    ``--revalidate``'s (equally no-op) CI arm to (#1851/#1925): ``PENDING``,
+    review approved, smoke fresh, CI checks green but predating the current
+    base.
 
-    BOUNDED, shared with the live path. Draws from the SAME
-    ``ci_stale_reruns``/``MAX_CI_STALE_RERUNS`` budget
-    :func:`coord.merge_queue.process`'s own #2197 auto-rerun already spends
-    from — a live ``coord merge`` attempt and this tick share one ceiling,
-    never two independent ones that could double the effective retry count.
-    An entry that has already exhausted the budget (on a prior live attempt
-    or a prior tick) is left for a human exactly as #2197 already leaves it;
-    this function never fires a further rerun past the cap, though it does
-    keep recording the escalation (below) for as long as the entry stays
-    stuck, so a human watching the audit trail sees it, not just the first
-    tick that hit the ceiling.
+    ``MAX_CI_STALE_RERUNS``/``ci_stale_reruns`` are read nowhere in this
+    function any more — nothing here increments or checks that budget, so a
+    row already carrying a nonzero count from before this fix is left
+    exactly as ``process()`` leaves it (converges to 0 on the next
+    genuinely-fresh reading, never incremented further by this call site).
 
-    Cost-visible (#1632's posture): every triggered rerun is a real CI run
-    on GitHub's own runners, recorded via :func:`coord.audit.record_audit`
-    (operational tier) so an operator can see the auto-fired count — same
-    spirit as the notifier being advisory rather than silent, never a
-    silent background spend.
+    Cost-visible (#1632's posture) in the opposite direction from before:
+    there is no external spend to report any more, only a
+    :func:`coord.audit.record_audit` (operational tier) row per candidate
+    per tick, so an operator watching the trail still sees the block
+    without this function ever burning a CI cycle trying (and failing) to
+    clear it.
 
-    Deliberately NOT behind a new config flag — this reuses exactly the
-    bound and the counter #2197 already established for "an automatic CI
-    rerun triggered by staleness"; the only thing new here is a periodic
-    caller for the case nothing was already about to call ``process()``
-    live. If that judgment turns out to be wrong in practice, the fix is a
-    ``merge.auto_revalidate_stale_ci`` off-switch, not removing the
-    dedicated budget this already shares.
+    Deliberately NOT behind a new config flag — this is strictly a
+    supplementary read with no external action, so there is nothing new to
+    gate.
 
     Best-effort like every other optional step in this tick (conflict
     reconciliation in ``_auto_drain_tick``, the merge-only fast path above):
@@ -4341,80 +4832,31 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     if not candidates:
         return
 
-    touched: list = []
     for entry in candidates:
         label = f"{entry.repo_name} #{entry.issue_number} ({entry.branch})"
-        if entry.ci_stale_reruns >= _mq.MAX_CI_STALE_RERUNS:
-            # Budget already spent (on a previous tick, or a previous live
-            # `coord merge` attempt) — #2197's own terminal wording is
-            # already on the entry from whichever call last evaluated it.
-            # Nothing new to trigger; still worth one audit row per tick so
-            # an operator watching the trail sees this has been sitting
-            # exhausted, not silently forgotten.
-            record_audit(
-                tier="operational", category="merge",
-                event_type="merge_checks_stale_auto_revalidate_exhausted",
-                actor="drive-queue-tick",
-                summary=(
-                    f"auto-revalidate: {label} still checks_stale after "
-                    f"{entry.ci_stale_reruns}/{_mq.MAX_CI_STALE_RERUNS} "
-                    "auto-reruns — needs a human (`coord merge --revalidate` "
-                    "or `coord merge --only`)"
-                ),
-                repo=entry.repo_name, issue=entry.issue_number,
-                assignment_id=entry.assignment_id,
-                details={
-                    "pr_number": entry.pr_number,
-                    "ci_stale_reruns": entry.ci_stale_reruns,
-                },
-            )
-            continue
-        try:
-            reran = ci_store.rerun_for_pr(entry.repo_github, entry.pr_number)
-        except Exception as exc:  # noqa: BLE001 — one entry's failure must not sink the rest
-            click.echo(
-                f"auto-revalidate: could not re-run CI for {label}: {exc}", err=True
-            )
-            continue
-        entry.ci_stale_reruns += 1
-        entry.error = (
-            f"{_mq.CI_PENDING_PREFIX} re-run triggered for CI checks that "
-            "predate the current base (#2535 auto-revalidate "
-            f"{entry.ci_stale_reruns}/{_mq.MAX_CI_STALE_RERUNS} "
-            f"{'triggered' if reran else 'failed to trigger'})"
-        )
-        touched.append(entry)
+        # #3266: no `gh run rerun` fires here any more — a same-base replay
+        # cannot clear a staleness reading, so this is visibility only, not
+        # a remedy attempt. See the docstring above and
+        # `coord.merge_queue.ci_stale_reason` for why.
         click.echo(
-            f"auto-revalidate: {'triggered' if reran else 'FAILED to trigger'} "
-            f"a CI re-run for {label} (checks_stale, review already approved) "
-            f"— {entry.ci_stale_reruns}/{_mq.MAX_CI_STALE_RERUNS}"
+            f"auto-revalidate: {label} is checks_stale — a CI re-run cannot "
+            "clear it (same base); needs a rebase onto the target branch "
+            "and `git push --force-with-lease`, or a human running `coord "
+            "merge --only` after one"
         )
         record_audit(
             tier="operational", category="merge",
-            event_type="merge_checks_stale_auto_revalidate",
+            event_type="merge_checks_stale_parked",
             actor="drive-queue-tick",
             summary=(
-                f"auto-revalidate: {'triggered' if reran else 'FAILED to trigger'} "
-                f"a CI re-run for {label} — {entry.ci_stale_reruns}/"
-                f"{_mq.MAX_CI_STALE_RERUNS}"
+                f"checks_stale: {label} needs a rebase, not a CI re-run "
+                "(#3266) — a same-base `gh run rerun` can never clear "
+                "staleness"
             ),
             repo=entry.repo_name, issue=entry.issue_number,
             assignment_id=entry.assignment_id,
-            details={"pr_number": entry.pr_number, "reran": reran},
+            details={"pr_number": entry.pr_number},
         )
-
-    if not touched:
-        return
-
-    try:
-        from coord import merge_queue as _mq  # noqa: PLC0415
-
-        fresh = _mq.load_queue()
-        by_id = {e.assignment_id: e for e in touched}
-        merged = [by_id.get(item.assignment_id, item) for item in fresh]
-        _mq.save_queue(merged)
-    except Exception:  # noqa: BLE001 — best-effort persistence; next tick recomputes
-        pass
 
 
 def _run_resume_probe(entry: QueueEntry) -> ProbeResult:
@@ -4517,6 +4959,15 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     remove+add IS the reset (a fresh row is ``waiting`` with ``attempts=0``
     and no ``after``).  Re-adding without the bad ``--after`` is also the fix
     for an unsatisfiable pre-req.
+
+    #2972 NOTE: this resets the queue ROW, not the fix-round ceiling — that
+    budget is tracked against ``coord.state.leg_counts()``, which is scoped
+    to the ISSUE and spans every past drive session for it (``assignments``
+    + ``assignments_archive``), never reset by a remove+add cycle. An entry
+    that previously exhausted its budget comes back looking fresh
+    (``attempts=0``) but can still land on the ceiling on its first
+    relaunch; ``coord drive-queue add --max-fix-rounds`` is the actual reset
+    for that case.
     """
     parsed = parse_key(key)
     if parsed is None:
@@ -4903,6 +5354,11 @@ def drive_queue_tick(
             merge_only_ready=merge_only_ready,
             roll_pending_reason=roll_pending.describe() if roll_pending is not None else "",
             live_prereq_terminal=live_prereq_terminal,
+            # #2972: the SAME `pipeline.max_fix_rounds` reading `_launch_argv`
+            # uses below (see `_pipeline_max_fix_rounds_default`'s docstring)
+            # — so `_reconcile_running`'s fix-round ceiling and the launch it
+            # gates never disagree about the budget.
+            fix_round_config_default=_pipeline_max_fix_rounds_default(config_path),
         )
 
         if roll_pending is not None:
@@ -5047,13 +5503,15 @@ def drive_queue_tick(
             _run_merge_only_candidates(plan, config_path)
 
         # #2535: independent of the drive-queue plan above (this scans the
-        # MERGE queue directly, not drive-queue rows) — a bounded, best-effort
-        # CI re-run for any entry blocked solely on stale-but-green checks
-        # with an already-approved review. Still gated on the FULL
-        # `reconcile_only` (roll-pending included, unlike the merge-only fast
-        # path just above) — a `gh run rerun` is a real external action, and
-        # unlike a direct merge it does not free a queued entry on its own,
-        # so there is no equivalent reason to run it while a roll is pending.
+        # MERGE queue directly, not drive-queue rows) — best-effort
+        # observability for any entry blocked solely on stale-but-green
+        # checks with an already-approved review. #3266: no longer a CI
+        # re-run — a same-base `gh run rerun` can never clear staleness, so
+        # this only records an audit row now, never a `gh` mutation. Left
+        # gated on the FULL `reconcile_only` (roll-pending included, unlike
+        # the merge-only fast path just above) purely to keep this tick's
+        # read-only surfaces consistent with each other while a roll is
+        # pending, not because there is still an external action to defer.
         if not reconcile_only:
             _run_auto_revalidate_checks_stale(config_path)
 
@@ -5199,7 +5657,11 @@ def drive_queue_tick(
         if target is None:
             return
 
-        argv = _launch_argv(target, config_path)
+        # #2972: pass this entry's own board facts so a relaunch's
+        # `--max-fix-rounds` is narrowed to what's actually left (see
+        # `_launch_argv`'s docstring) — `board` is this SAME tick's read, the
+        # one `plan_tick` above already reconciled against.
+        argv = _launch_argv(target, config_path, board.facts(target.key))
         try:
             result = subprocess.run(  # noqa: S603 — argv built from coord_argv + typed row
                 argv,

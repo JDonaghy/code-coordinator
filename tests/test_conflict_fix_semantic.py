@@ -444,6 +444,23 @@ class TestReconcileEscalation:
         assert entry.state != mq.PENDING
 
 
+def _always_reachable(machine, timeout=None):  # noqa: ARG001 — matches fetch_status's shape
+    """Fake `status_fetcher`: every machine reads as live.
+
+    #3353: `coord.reconcile._try_semantic_escalation` now opts machine
+    selection into a LIVE liveness probe (`status_fetcher=coord.network.
+    fetch_status`) — without faking this too, this suite's `laptop`
+    machine (never a real agent) would fail a genuine network probe
+    (DNS/connection failure against `laptop.tail`) and selection would
+    decline with `ALL_CANDIDATES_UNREACHABLE`, breaking every escalation
+    test below for a reason that has nothing to do with what they're
+    actually testing.
+    """
+    from coord.network import StatusResult
+
+    return StatusResult(data={"assignments": []})
+
+
 def _patched_dispatch(client: _FakeClient):
     """Patch the escalation's agent HTTP call to the fake client."""
     import coord.conflict_fix as cf
@@ -452,6 +469,10 @@ def _patched_dispatch(client: _FakeClient):
 
     def _wrapper(entry, board, config, **kwargs):
         kwargs.setdefault("http_client", client)
+        # Override (not setdefault) — `_try_semantic_escalation` always
+        # passes its own real `status_fetcher` explicitly; this fake must
+        # win regardless.
+        kwargs["status_fetcher"] = _always_reachable
         return real(entry, board, config, **kwargs)
 
     return patch("coord.conflict_fix.dispatch_conflict_fix", _wrapper)

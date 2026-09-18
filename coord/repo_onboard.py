@@ -307,6 +307,15 @@ class AcceptanceFacts:
     # deterministic seeded-board fixture server it needs (#1538) has not,
     # so a run against a live fleet is a smoke net, not a pinned oracle.
     fixture_server_dependent: bool = False
+    # #3232: True when ANY kind in play is intrinsically scoped to a
+    # compile/syntax check rather than a full oracle (today, just
+    # `terraform` — see `coord.acceptance_drivers.VALIDATE_ONLY_KINDS`):
+    # `terraform init -backend=false` + `terraform validate` proves the
+    # config parses, not that the infrastructure does what was asked. Unlike
+    # `fixture_server_dependent`, this gap isn't a missing shared dependency
+    # — it closes only when a later child issue (#3230's plan/credentials,
+    # then ephemeral apply) widens what the adapter itself runs.
+    validate_only_scope: bool = False
 
 
 @dataclass
@@ -803,7 +812,10 @@ def gather_acceptance_facts(
     proven-clean pass, mirroring :func:`gather_graph_facts`'s own
     ``probed`` convention.
     """
-    from coord.acceptance_drivers import FIXTURE_SERVER_DEPENDENT_KINDS  # noqa: PLC0415
+    from coord.acceptance_drivers import (  # noqa: PLC0415
+        FIXTURE_SERVER_DEPENDENT_KINDS,
+        VALIDATE_ONLY_KINDS,
+    )
 
     drivers = getattr(acceptance_cfg, "drivers", None) or {}
     entry = drivers.get(repo_name)
@@ -834,6 +846,7 @@ def gather_acceptance_facts(
         entrypoints=entrypoints,
         entrypoints_missing=missing,
         fixture_server_dependent=any(k in FIXTURE_SERVER_DEPENDENT_KINDS for k in kinds),
+        validate_only_scope=any(k in VALIDATE_ONLY_KINDS for k in kinds),
     )
 
 
@@ -1696,6 +1709,33 @@ def evaluate_oracle(facts: RepoFacts) -> list[Finding]:
         out.append(Finding(
             layer="oracle", check="oracle.fixture_server_not_needed", severity=OK,
             summary=f"{kinds_str} run deterministically — no unshipped fixture-server dependency",
+        ))
+
+    if acc.validate_only_scope:
+        out.append(Finding(
+            layer="oracle", check="oracle.validate_only_scope", severity=WARN,
+            summary=(
+                f"{kinds_str} runs `terraform init -backend=false` + "
+                "`terraform validate` (#3232), plus an opt-in tflint/"
+                "conftest policy gate (#3234) — all static analysis that "
+                "proves the config parses, resolves, and obeys a fixed "
+                "ruleset, not that the infrastructure does what was asked. "
+                "No `terraform plan` (needs provider credentials — #3230 "
+                "child 2) and no ephemeral apply (#3230 child 6) yet, so "
+                "this is a smoke net, not a pinned oracle"
+            ),
+            fix=(
+                "none available yet — #3230's child 2 (plan/credentials) "
+                "and child 6 (ephemeral apply) are the follow-on work; "
+                "until they land, treat this driver's verdicts as a "
+                "syntax/compile gate, not a trust gate for real "
+                "infrastructure behavior"
+            ),
+        ))
+    else:
+        out.append(Finding(
+            layer="oracle", check="oracle.validate_only_scope_not_applicable", severity=OK,
+            summary=f"{kinds_str} is not scoped to compile-check-only validation",
         ))
 
     return out

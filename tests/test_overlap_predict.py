@@ -24,8 +24,10 @@ from coord.overlap_predict import (
     collect_candidate_files,
     declared_footprints,
     fanout_warnings,
+    has_files_heading,
     inflight_assignments,
     inflight_footprints,
+    malformed_files_warning,
     parse_declared_files,
     paths_overlap,
     predict_overlap,
@@ -91,6 +93,116 @@ def test_a_missing_or_malformed_body_yields_no_prediction():
 def test_duplicate_declarations_collapse_in_declaration_order():
     body = "## Files\n- coord/a.py\n- coord/a.py\n- coord/b.py\n"
     assert parse_declared_files(body) == ["coord/a.py", "coord/b.py"]
+
+
+# ── #3258: shapes that used to parse to zero paths ──────────────────────────
+
+
+def test_shape_1_prose_before_the_bullets_is_skipped_not_fatal():
+    # claude-coordinator#3246 — seven well-formed bullets, all previously
+    # discarded because an explanatory sentence preceded them.
+    body = (
+        "## Files\n"
+        "This issue touches the queue's overlap prediction and its tests:\n"
+        "- coord/overlap_predict.py\n"
+        "- tests/test_overlap_predict.py\n"
+        "- coord/commands/drive_queue.py\n"
+    )
+    assert parse_declared_files(body) == [
+        "coord/overlap_predict.py",
+        "tests/test_overlap_predict.py",
+        "coord/commands/drive_queue.py",
+    ]
+
+
+def test_prose_after_the_bullets_still_ends_the_block():
+    # The asymmetry that makes shape 1's fix safe: prose BEFORE the first
+    # entry is tolerated, but prose AFTER a real entry still terminates the
+    # block exactly as before #3258 (see the pre-existing swallow test).
+    body = (
+        "## Files\n"
+        "- coord/a.py\n"
+        "This explains why, and then trails off without more paths.\n"
+        "- coord/b.py\n"
+    )
+    assert parse_declared_files(body) == ["coord/a.py"]
+
+
+def test_shape_2_multiple_comma_separated_paths_on_one_touch_bullet():
+    # claude-coordinator#2305 — `_clean_path` took only the first token
+    # ("Touch:") and discarded the five real paths behind it.
+    body = (
+        "## Files\n"
+        "- Touch: `coord/progress.py`, `coord/usage.py`, `coord/failure_class.py`\n"
+    )
+    assert parse_declared_files(body) == [
+        "coord/progress.py",
+        "coord/usage.py",
+        "coord/failure_class.py",
+    ]
+
+
+def test_shape_3_touch_and_forbidden_labels_are_asymmetric():
+    # claude-coordinator#1708 — `Touch:` names files to declare; `Forbidden:`
+    # names the opposite and must NEVER be read as a declaration.
+    body = "## Files\nTouch: coord/a.py\nForbidden: coord/secrets.py\n"
+    assert parse_declared_files(body) == ["coord/a.py"]
+
+
+def test_shape_3_forbidden_only_declares_nothing_but_does_not_break_the_block():
+    body = "## Files\nForbidden: coord/secrets.py\nTouch: coord/a.py\n"
+    assert parse_declared_files(body) == ["coord/a.py"]
+
+
+def test_shape_4_a_markdown_table_reads_the_first_column():
+    # quadraui#192 — a `| File | Why |` table; the block consumer previously
+    # handled bullets, fences and bare paths only.
+    body = (
+        "## Files\n"
+        "| File | Why |\n"
+        "| --- | --- |\n"
+        "| `coord/a.py` | fixes the bug |\n"
+        "| `coord/b.py` | its test |\n"
+    )
+    assert parse_declared_files(body) == ["coord/a.py", "coord/b.py"]
+
+
+def test_an_all_dots_token_is_never_a_path():
+    # A defensive tightening alongside the shape-2 comma split: a bare `...`
+    # left over from a truncated list must not slip through as a path (it has
+    # a "." but is not one).
+    body = "## Files\n- Touch: `coord/a.py`, ...\n"
+    assert parse_declared_files(body) == ["coord/a.py"]
+
+
+# ── #3258: has_files_heading / malformed_files_warning ──────────────────────
+
+
+def test_has_files_heading_true_for_heading_and_inline_forms():
+    assert has_files_heading("## Files\n- a.py\n")
+    assert has_files_heading("Files: a.py, b.py")
+    assert not has_files_heading("This mentions coord/a.py in passing.")
+    assert not has_files_heading(None)
+
+
+def test_malformed_files_warning_fires_only_when_heading_present_but_empty():
+    # The common case (no block at all) must stay silent — rule 3.
+    assert malformed_files_warning("no files block here") == ""
+    # A block that parses fine must also stay silent.
+    assert malformed_files_warning("## Files\n- coord/a.py\n") == ""
+    # A heading present but nothing recognisable beneath it: warn.
+    warning = malformed_files_warning("## Files\nThis is just prose, no list.\n")
+    assert warning != ""
+    assert "#3258" in warning
+
+
+def test_malformed_files_warning_is_silent_once_the_parser_is_widened():
+    # Shapes 1-4 above now parse — so a real-world issue written in any of
+    # those forms must NOT trigger the malformed warning.
+    assert malformed_files_warning("## Files\nTouch: coord/a.py\n") == ""
+    assert (
+        malformed_files_warning("## Files\n| File |\n| --- |\n| coord/a.py |\n") == ""
+    )
 
 
 # ── overlap ──────────────────────────────────────────────────────────────────

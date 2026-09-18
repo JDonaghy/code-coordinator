@@ -12,7 +12,14 @@ from coord.config import Config, PipelineConfig
 from coord.dashboard.server import build_app
 from coord.merge_queue import QueuedMerge, PENDING, MERGED, MERGING
 from coord.models import Assignment, Board, Machine, Repo
-from coord.pipeline import PipelineView, PipelineStage, PipelineGate, compute_pipeline
+from coord.pipeline import (
+    GATE_REGISTRY,
+    GateSpec,
+    PipelineView,
+    PipelineStage,
+    PipelineGate,
+    compute_pipeline,
+)
 from coord.state import save_board
 
 
@@ -1883,3 +1890,38 @@ class TestMergeQueueIgnoresRejectedReview:
 
         review = next(s for s in pv.stages if s.name == "review")
         assert review.status == "completed"
+
+
+class TestGateSpecRegistry:
+    """#3261 S-2: `uat` described as a `GateSpec` data row, wrapping the
+    existing `requires_uat`/`evaluate_uat_verdict` functions rather than
+    reimplementing them. Pure refactor — nothing consumes this registry
+    yet, so these tests only pin the shape of the data itself."""
+
+    def test_uat_registered(self) -> None:
+        assert "uat" in GATE_REGISTRY
+        assert isinstance(GATE_REGISTRY["uat"], GateSpec)
+
+    def test_uat_gate_spec_wraps_existing_functions_not_copies(self) -> None:
+        """#2096 one question, one answer: the registry must point AT
+        `requires_uat`/`evaluate_uat_verdict`, not at lookalike wrappers
+        that could drift from them."""
+        from coord.merge_queue import evaluate_uat_verdict, requires_uat
+
+        spec = GATE_REGISTRY["uat"]
+        assert spec.name == "uat"
+        assert spec.applies is requires_uat
+        assert spec.evaluate is evaluate_uat_verdict
+
+    def test_uat_gate_spec_verdict_vocabulary(self) -> None:
+        assert GATE_REGISTRY["uat"].verdicts == ("passed", "failed", None)
+
+    def test_uat_gate_spec_fail_route_is_a_named_identity_not_a_callable(self) -> None:
+        """The fail-route field names WHERE a stuck verdict is escalated to
+        (coord/drive.py's #3214 fix-up path) without importing coord.drive
+        itself — importing it here would risk the exact cycle S-4 has to
+        avoid (drive.py is the future consumer of this registry)."""
+        fail_route = GATE_REGISTRY["uat"].fail_route
+        assert isinstance(fail_route, str)
+        assert fail_route
+        assert not callable(fail_route)

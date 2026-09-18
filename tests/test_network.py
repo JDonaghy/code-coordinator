@@ -12,9 +12,17 @@ import pytest
 from coord import network
 from coord.models import Machine
 
+# #3371: captured at import time, i.e. before `tests/conftest.py`'s autouse
+# `_no_agent_credential_probe` swaps the module attribute for a fail-open stub.
+# `TestClaudeCredentialReachable` below restores this real callable for its own
+# tests only; see that class's fixture.
+_REAL_CLAUDE_CREDENTIAL_REACHABLE = network.claude_credential_reachable
 
-def _m(name: str = "laptop", host: str = "laptop.tailnet") -> Machine:
-    return Machine(name=name, host=host, repos=["api"])
+
+def _m(
+    name: str = "laptop", host: str = "laptop.tailnet", *, health_timeout: float | None = None
+) -> Machine:
+    return Machine(name=name, host=host, repos=["api"], health_timeout=health_timeout)
 
 
 class TestClassifyError:
@@ -113,6 +121,113 @@ class TestCheckMachine:
             s = network.check_machine(_m())
         assert s.state == network.HTTP_ERROR
         assert "invalid JSON" in s.reason
+
+
+class TestCheckMachineRetryAndTimeoutFloor:
+    """#3340: a cold /health can outrun DEFAULT_TIMEOUT on a healthy agent.
+
+    `check_machine` responds two ways: retry once on a `ReadTimeout` (the
+    connect succeeded — the agent is there, it just hadn't answered yet),
+    and let `machine.health_timeout` raise the effective budget for a
+    machine known to need it. Neither changes behavior for a machine with
+    no override and no slow-but-connected reply — that's what the existing
+    `TestCheckMachine`/`TestClassifyError` cases above still pin down.
+    """
+
+    def test_read_timeout_retries_and_succeeds(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"machine": "laptop", "active": 0}
+        calls = {"n": 0}
+
+        def fake_get(url, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ReadTimeout("cold /health, still computing")
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            s = network.check_machine(_m())
+        assert calls["n"] == 2
+        assert s.is_online
+        assert s.state == network.ONLINE
+        assert s.retried is True
+
+    def test_read_timeout_retries_once_then_still_reports_timeout(self) -> None:
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ReadTimeout("still cold")
+        ) as mock_get:
+            s = network.check_machine(_m())
+        # Exactly one retry — a wedged agent still reports TIMEOUT rather
+        # than being retried forever.
+        assert mock_get.call_count == 2
+        assert s.state == network.TIMEOUT
+        assert not s.is_online
+        assert s.retried is True
+
+    def test_connect_timeout_is_not_retried(self) -> None:
+        """A ConnectTimeout means the TCP handshake itself never completed —
+        materially stronger evidence of "down" than a ReadTimeout, so this
+        gets no retry (matches `TestCheckMachine.test_timeout`'s single-call
+        expectation, now asserted explicitly on call count)."""
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ConnectTimeout("slow")
+        ) as mock_get:
+            s = network.check_machine(_m())
+        assert mock_get.call_count == 1
+        assert s.state == network.TIMEOUT
+        assert s.retried is False
+
+    def test_retry_on_slow_reply_false_disables_retry(self) -> None:
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ReadTimeout("cold")
+        ) as mock_get:
+            s = network.check_machine(_m(), retry_on_slow_reply=False)
+        assert mock_get.call_count == 1
+        assert s.state == network.TIMEOUT
+        assert s.retried is False
+
+    def test_health_timeout_raises_effective_timeout(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}
+        seen_timeouts: list[float] = []
+
+        def fake_get(url, timeout=None):
+            seen_timeouts.append(timeout)
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            network.check_machine(_m(health_timeout=8.0), timeout=network.DEFAULT_TIMEOUT)
+        assert seen_timeouts == [8.0]
+
+    def test_health_timeout_never_shrinks_a_larger_caller_timeout(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}
+        seen_timeouts: list[float] = []
+
+        def fake_get(url, timeout=None):
+            seen_timeouts.append(timeout)
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            network.check_machine(_m(health_timeout=2.0), timeout=10.0)
+        assert seen_timeouts == [10.0]
+
+    def test_no_health_timeout_uses_caller_timeout_unchanged(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}
+        seen_timeouts: list[float] = []
+
+        def fake_get(url, timeout=None):
+            seen_timeouts.append(timeout)
+            return resp
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
+            network.check_machine(_m(), timeout=network.DEFAULT_TIMEOUT)
+        assert seen_timeouts == [network.DEFAULT_TIMEOUT]
 
 
 class TestCheckAll:
@@ -385,3 +500,83 @@ class TestCheckHostResolution:
         with patch.object(network, "resolve_host_ip", return_value="100.118.111.76"):
             result = network.check_host_resolution(machine, ts_map)
         assert result.matches is True
+
+
+class TestClaudeCredentialReachable:
+    """#3371: the live half of the single source of truth — is a machine's
+    claude credential NOT confirmed dead right now."""
+
+    @pytest.fixture(autouse=True)
+    def _real_credential_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Undo `tests/conftest.py`'s global `_no_agent_credential_probe`
+        stub for this class only.
+
+        That stub keeps the ~dozen production call sites that hardcode
+        `claude_credential_reachable` from firing live `/health` GETs at
+        fixture hostnames like `laptop.tailnet`. This class is the one
+        place that must exercise the real function, and it does so
+        hermetically by patching `network.httpx.get`. A class-level autouse
+        fixture is instantiated after the conftest-level one of the same
+        scope, so this re-patch wins.
+        """
+        monkeypatch.setattr(
+            network, "claude_credential_reachable", _REAL_CLAUDE_CREDENTIAL_REACHABLE
+        )
+
+    def test_the_global_stub_is_overridden_here(self) -> None:
+        """Guard the fixture above: if conftest's autouse stub ever won the
+        ordering race, every other test in this class would silently assert
+        against `lambda *a, **k: True` and pass for the wrong reason."""
+        assert network.claude_credential_reachable is _REAL_CLAUDE_CREDENTIAL_REACHABLE
+
+    def test_dead_credential_reports_false(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "tool_versions": {
+                "claude": {"found": False, "ok": False, "capability": None},
+            },
+        }
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is False
+
+    def test_healthy_credential_reports_true(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "tool_versions": {
+                "claude": {"found": True, "ok": True, "capability": None},
+            },
+        }
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_missing_tool_versions_fails_open(self) -> None:
+        """An agent that predates #3326's probe (no `claude` entry at all,
+        or no `tool_versions` key) must not be newly treated as dead."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"machine": "laptop"}
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_network_error_fails_open(self) -> None:
+        """A probe that CAN'T answer must never itself exclude a host —
+        only a probe that answers "dead" may (see the module docstring)."""
+        with patch.object(
+            network.httpx, "get", side_effect=httpx.ConnectTimeout("slow")
+        ):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_non_200_fails_open(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 500
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True
+
+    def test_invalid_json_fails_open(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.side_effect = ValueError("nope")
+        with patch.object(network.httpx, "get", return_value=resp):
+            assert network.claude_credential_reachable(_m()) is True

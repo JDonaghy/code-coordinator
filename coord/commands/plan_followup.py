@@ -13,6 +13,7 @@ import httpx
 
 from coord.config import Config
 from coord.dispatch import DispatchRefused
+from coord.failure_classifier import classify_failure
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 
@@ -137,6 +138,8 @@ def _dispatch_followup(
     """
     from coord.board_service import read_board, write_board
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
+    from coord.dispatch_liveness import github_issue_liveness_fetcher
+    from coord.network import claude_credential_reachable
     from coord.state import record_dispatched
     from coord.models import Proposal
 
@@ -167,7 +170,19 @@ def _dispatch_followup(
         target_branch=(original.branch or None) if inherit_branch else None,
     )
 
-    response = dispatch(proposal, cfg)
+    # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH GATE to a real live
+    # probe — this is the follow-up/fix dispatch chokepoint (`coord fix`,
+    # `coord pr`, conflict-fix, smoke fix-ups), a production path, not a
+    # test.
+    # #3376 review round 1: wire the other two predicates too — a
+    # conflict-fix/smoke-fix-up follow-up can legitimately race a manual
+    # merge of `original`'s own branch/issue between dispatch decision and
+    # this call, and re-fixing an already-merged branch is exactly the
+    # "cannot matter" case this gate exists for.
+    response = dispatch(
+        proposal, cfg, credential_fetcher=claude_credential_reachable,
+        issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
+    )
     assignment_id = response.get("id", "pending")
     record_dispatched(
         assignment_id=assignment_id,
@@ -1044,6 +1059,14 @@ def fix(
             or ""
         )
 
+    # #3360: classify the failure BEFORE deciding whether to escalate the
+    # model — see coord/failure_classifier.py for the "compliance vs
+    # capability vs unknown" split. A ratchet/lint/policy failure (compliance)
+    # re-dispatches at the same rung; only a genuine behavioural failure
+    # (capability) climbs the ladder; no evidence at all (unknown) defaults
+    # to NOT escalating.
+    classification = classify_failure(test_output)
+
     guidance_text = guidance or "Fix the failing tests and push."
     if forced_without_evidence and uat_failed and assignment.uat_reason:
         # #3208: a real, board-recorded UAT failure — not the caller merely
@@ -1065,6 +1088,29 @@ def fix(
         _what = "red CI" if ci_story is not None else "a failed smoke test"
         _failure_heading = "CI failure" if ci_story is not None else "Test failure"
 
+    # #3360: when the failure classifies as a compliance nit (a ratchet, a
+    # lint/formatter check, a files_forbidden/sealed-path violation), say so
+    # explicitly — the worker is on the SAME model rung as the attempt that
+    # tripped it, and the fix is normally "read the failure output, it names
+    # the exact rule and often the exact fix" rather than a design problem.
+    # Both branches end with the blank line the briefing needs before
+    # "## Guidance", so the assembly below interpolates it unconditionally
+    # and never needs a second conditional `\n` next to it.  Written as an
+    # if/else rather than a ternary-into-an-f-string-concat for readability
+    # (nit from the #3360 review).
+    if classification.category == "compliance":
+        _compliance_note = (
+            "\n## Note (#3360)\n"
+            f"This failure classified as a **compliance** check "
+            f"({classification.matched}), not a behavioural bug — the model "
+            "was NOT escalated for this retry. The failure output above "
+            "almost always names the exact repo-specific rule (a pinned "
+            "count, a formatting rule, a forbidden file) and often the fix "
+            "itself. Read it before changing any logic.\n\n"
+        )
+    else:
+        _compliance_note = "\n"
+
     briefing = (
         f"You are fixing {_what} for issue #{assignment.issue_number}: {assignment.issue_title}\n\n"
         f"The previous worker created branch {assignment.branch}. You are already on that branch.\n"
@@ -1074,7 +1120,8 @@ def fix(
         f"Run `git fetch origin && git log --oneline origin/{default_branch}..HEAD` to see what was done.\n"
         f"Run `git diff origin/{default_branch}...HEAD` to see the full diff.\n\n"
         f"## {_failure_heading}\n"
-        f"{test_output}\n\n"
+        f"{test_output}\n"
+        f"{_compliance_note}"
         f"## Guidance\n"
         f"{guidance_text}\n\n"
         f"## Rules\n"
@@ -1144,11 +1191,26 @@ def fix(
             "(#3208; the branch is fetched from the remote)",
         )
 
-    # Determine escalated model for the fix-up.
+    # #3360: classify before escalating. Climbing the model-escalation ladder
+    # on EVERY failed leg mis-prices a compliance failure (a ratchet, a
+    # lint/formatter check, a files_forbidden violation) — no model
+    # capability difference lets a worker guess a repo-specific fact it was
+    # never told, and #3357 shows the top rung can still spin for nothing.
+    # Only a failure classified as "capability" climbs; "compliance" and
+    # "unknown" (no evidence to classify) both stay on the current rung.
     original_model = assignment.model or cfg.models.default
-    escalated = cfg.models.next_model(original_model)
+    if classification.should_escalate:
+        escalated = cfg.models.next_model(original_model)
+    else:
+        escalated = original_model
     if escalated != original_model:
         click.echo(f"  escalating model: {original_model} → {escalated}")
+    elif not classification.should_escalate:
+        click.echo(
+            f"  not escalating model (#3360, {classification.category}"
+            + (f": {classification.matched}" if classification.matched else "")
+            + f") — staying on {original_model or 'default'}"
+        )
 
     try:
         new_id = _dispatch_followup(
@@ -1564,11 +1626,22 @@ def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
         f"- Commit your work and push with git push origin HEAD"
     )
 
-    # Determine escalated model for the continuation worker.
+    # #3360: `resume-stuck` IS the spin scenario — it exists specifically to
+    # recover a worker the stuck-detector flagged (`!! N turns without a git
+    # commit`), which is neither a capability nor a compliance problem. The
+    # issue's own proposal (category 3, "Spin") is explicit: escalating a
+    # spin is the worst case, because a bigger model spins more expensively
+    # without fixing anything a bigger model *can* fix — #3357 is exactly
+    # this: a spin that got escalated to opus and burned 25 turns for zero
+    # commits. So this door never climbs the ladder; the continuation
+    # dispatches on the SAME rung the stuck worker was already running on.
     original_model = assignment.model or cfg.models.default
-    escalated = cfg.models.next_model(original_model)
-    if escalated != original_model:
-        click.echo(f"  escalating model: {original_model} → {escalated}")
+    escalated = original_model
+    click.echo(
+        f"  not escalating model (#3360: resume-stuck is the spin case, "
+        f"escalating buys a more expensive spin, not a fix) — staying on "
+        f"{original_model or 'default'}"
+    )
 
     try:
         new_id = _dispatch_followup(cfg, assignment, briefing, model=escalated)

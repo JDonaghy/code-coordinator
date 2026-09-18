@@ -97,6 +97,12 @@ class IssueState:
     work_provider: str = ""
     work_test_state: str = ""
     work_test_reason: str = ""
+    # #3367: worker-reported turn count / cost for the work row — the
+    # `review_num_turns`/`review_cost_usd` siblings below explain why these
+    # exist; `coord.machine_fault.classify_machine_fault` needs both to
+    # tell "this host is broken" apart from "this work genuinely failed".
+    work_num_turns: int | None = None
+    work_cost_usd: float | None = None
     # #3201: the LATEST work row's own human UAT verdict — "" | "passed" |
     # "failed", mirroring `work_test_state` above. Sourced from the same
     # `Assignment.uat_state`/`uat_reason`/`uat_actor` fields
@@ -138,6 +144,16 @@ class IssueState:
     # (title rewritten) after it finished, and can name the row's age in
     # whatever it reports instead of silently re-quoting stale prose.
     work_finished_at: float | None = None
+    # #3339: the `coord drive-queue clear-refusal` assertion against THIS
+    # work row, if any — ``None``/``""`` (the overwhelming majority) means
+    # nothing has been asserted, read identically to "still blocking" by
+    # `decide()`'s `refused_premise` branch. Unlike `refused_policy`'s
+    # branch-vs-title staleness check, a premise refusal has no mechanical
+    # signal of its own (a title rewrite cannot make a missing prerequisite
+    # exist), so this is the ONLY thing that can make `decide()` bypass the
+    # `_die()` — an explicit, auditable human claim, never inferred.
+    work_premise_rechecked_at: float | None = None
+    work_premise_rechecked_reason: str = ""
 
     review_aid: str = ""
     review_status: str = ""
@@ -148,6 +164,17 @@ class IssueState:
     # `_decide_review` can report *why* a failed review died instead of a
     # bare "failed".
     review_failure_reason: str = ""
+    # #3367: which machine actually ran the (possibly failed) review, and
+    # its worker-reported turn count / cost — the three fields
+    # `coord.machine_fault.classify_machine_fault` needs to tell "the host
+    # is broken" apart from "the work failed". `work_machine` already
+    # existed for the same reason on the work row; these are its review-row
+    # siblings, sourced from the same board wire fields
+    # (`Assignment.machine_name`/`num_turns`/`cost_usd`) every other
+    # `review_*`/`work_*` projection here already reads.
+    review_machine: str = ""
+    review_num_turns: int | None = None
+    review_cost_usd: float | None = None
 
     smoke_aid: str = ""
     smoke_status: str = ""
@@ -410,6 +437,14 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
     except (TypeError, ValueError):
         work_finished_at = None
 
+    premise_rechecked_raw = (work or {}).get("premise_rechecked_at")
+    try:
+        work_premise_rechecked_at = (
+            float(premise_rechecked_raw) if premise_rechecked_raw is not None else None
+        )
+    except (TypeError, ValueError):
+        work_premise_rechecked_at = None
+
     # #1453: oracle-loop JIT slice resolution — both reads are over data
     # already published on /board, no extra I/O (see IssueState's docstring
     # for the two source lists and their TUI-side counterparts).
@@ -500,6 +535,8 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_provider=g(work, "provider_name"),
         work_test_state=g(work, "test_state"),
         work_test_reason=g(work, "test_reason"),
+        work_num_turns=g(work, "num_turns", None),
+        work_cost_usd=g(work, "cost_usd", None),
         work_uat_state=g(work, "uat_state"),
         work_uat_reason=g(work, "uat_reason"),
         work_uat_actor=g(work, "uat_actor"),
@@ -511,10 +548,15 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_acceptance_reason=g(work, "acceptance_reason"),
         work_acceptance_sha=g(work, "acceptance_sha"),
         work_finished_at=work_finished_at,
+        work_premise_rechecked_at=work_premise_rechecked_at,
+        work_premise_rechecked_reason=g(work, "premise_rechecked_reason"),
         review_aid=g(review, "assignment_id"),
         review_status=g(review, "status"),
         review_verdict=g(review, "review_verdict"),
         review_failure_reason=g(review, "failure_reason"),
+        review_machine=g(review, "machine_name"),
+        review_num_turns=g(review, "num_turns", None),
+        review_cost_usd=g(review, "cost_usd", None),
         smoke_aid=g(smoke, "assignment_id"),
         smoke_status=g(smoke, "status"),
         smoke_failure_reason=g(smoke, "failure_reason"),
@@ -794,9 +836,28 @@ def pick_machine_choice(
     config: Any,
     *,
     issue_labels: list[str] | None = None,
+    credential_fetcher=None,
 ) -> MachineChoice:
     """Least-loaded unpaused, reachable, **and capable** machine that hosts
     *repo*.
+
+    #3371: *credential_fetcher* is an optional ``(machine) -> bool``
+    callable — ``True`` means "still routable", matching
+    ``coord.network.claude_credential_reachable``'s contract. ``None``
+    (the default) probes nothing, same as every existing caller — this
+    function runs once PER ISSUE on every drive-queue tick (`project()`
+    below), so unlike the other #3371 call sites a real default here would
+    multiply into one live ``/health`` GET per candidate machine per
+    issue per tick with no batching, an I/O cost this payload-driven
+    module is deliberately built to avoid (see `_unreachable_machine_names`
+    above, which reads an already-polled snapshot instead of a live probe
+    for exactly this reason). The actual dispatch this picks a machine
+    FOR still goes through `coord assign` -> `coord.dispatch.dispatch()`,
+    which structurally refuses a dead-credential host regardless of
+    whether this advisory pick avoided it — so leaving this opt-in-only
+    is a UX/throughput gap (a bad pick gets refused and retried rather
+    than routed around), not a safety one. A caller that wants this
+    filtered proactively (with its own batching/caching) can inject one.
 
     Deliberately simple — this is not ``coord plan``'s brain (which costs an
     LLM call).  Load is counted from the board's non-terminal rows, so a
@@ -863,6 +924,7 @@ def pick_machine_choice(
         if repo in (m.repos or [])
         and m.name not in paused
         and m.name not in unreachable
+        and (credential_fetcher is None or credential_fetcher(m))
     ]
     if not hosts:
         return MachineChoice(pause_read_error=pause_read_error)
@@ -908,14 +970,20 @@ def pick_machine_choice(
 
 def pick_machine(
     payload: dict, repo: str, config: Any, *, issue_labels: list[str] | None = None,
+    credential_fetcher=None,
 ) -> str:
     """Thin string-returning wrapper around :func:`pick_machine_choice`.
 
     Kept for callers (and the pre-#1906 test suite) that only want the
     picked machine's name, not the provider provenance / failure-mode split
     — see that function's docstring for the *issue_labels* contract.
+    *credential_fetcher* (#3371) is forwarded to :func:`pick_machine_choice`
+    untouched — see that function's docstring.
     """
-    return pick_machine_choice(payload, repo, config, issue_labels=issue_labels).name
+    return pick_machine_choice(
+        payload, repo, config, issue_labels=issue_labels,
+        credential_fetcher=credential_fetcher,
+    ).name
 
 
 # ── board fetch (the one I/O boundary) ───────────────────────────────────────

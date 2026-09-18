@@ -41,6 +41,7 @@ def _work(
     test_base_sha: str | None = None,
     test_patch_id: str | None = None,
     test_toolchain: str | None = None,
+    test_confirmation: str | None = None,
     review_state: str | None = None,
     review_verdict: str | None = None,
     required_gates: list[str] | None = None,
@@ -61,6 +62,7 @@ def _work(
         test_base_sha=test_base_sha,
         test_patch_id=test_patch_id,
         test_toolchain=test_toolchain,
+        test_confirmation=test_confirmation,
         review_state=review_state,
         review_verdict=review_verdict,
         required_gates=required_gates or [],
@@ -510,6 +512,282 @@ class TestDecision:
         assert by_gate["review"].verdict_unparseable is False
 
 
+# ── UAT gate, registry-walked (#3273, S-5 of #3261) ─────────────────────────
+#
+# Before this slice `coord gates` never asked about UAT at all — it could
+# print "merge READY" for an entry `coord merge` would refuse outright on
+# `uat_required`, and a repo that opted out of UAT (no uat_preview/
+# uat_live_preview, or an exempt issue) got no line and no reason at all.
+# These pin the fix: the gate is walked from `coord.pipeline.GATE_REGISTRY`,
+# so it always appears, with an explicit reason on every "won't run" branch.
+
+class TestUatGateDecision:
+    def test_uat_not_in_default_gates_is_reported_not_required_with_reason(
+        self, config: Config,
+    ) -> None:
+        # This fixture's `config.pipeline.default_gates` (the PipelineConfig
+        # default) has no "uat" at all — the overwhelming common case today.
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert "uat" in by_gate  # never silently omitted
+        assert by_gate["uat"].required is False
+        assert by_gate["uat"].ok is True
+        assert "effective gate list" in (by_gate["uat"].reason or "")
+
+    def test_uat_in_gates_but_repo_not_opted_in_reports_specific_reason(
+        self, config: Config,
+    ) -> None:
+        config.pipeline = PipelineConfig(default_gates=["test", "review", "uat", "merge"])
+        # `config`'s "api" repo has neither uat_preview nor uat_live_preview.
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["uat"].required is False
+        assert "uat_preview" in by_gate["uat"].reason
+        assert "uat_live_preview" in by_gate["uat"].reason
+        # Not being required, UAT must not be what a green merge is hiding.
+        assert by_gate["merge"].ok is True
+
+    def test_uat_exempt_issue_reports_exempt_reason(self, config: Config) -> None:
+        from coord.uat_checks import UatCheckConfig
+
+        config.repos = [
+            Repo(
+                name="api", github="acme/api", default_branch="main",
+                uat_preview="https://preview.example/{branch}",
+                uat_checks=UatCheckConfig(exempt_issues=frozenset({42})),
+            ),
+        ]
+        config.pipeline = PipelineConfig(default_gates=["test", "review", "uat", "merge"])
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["uat"].required is False
+        assert "exempt" in by_gate["uat"].reason
+        assert by_gate["merge"].ok is True
+
+    def test_uat_required_and_missing_blocks_merge_with_uat_required(
+        self, config: Config,
+    ) -> None:
+        config.repos = [
+            Repo(
+                name="api", github="acme/api", default_branch="main",
+                uat_preview="https://preview.example/{branch}",
+            ),
+        ]
+        config.pipeline = PipelineConfig(default_gates=["test", "review", "uat", "merge"])
+        work = _work(test_state="passed")  # no uat_state recorded at all
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["uat"].required is True
+        assert by_gate["uat"].ok is False
+        assert "uat verdict" in by_gate["uat"].reason
+        # The whole point of #3273: a gate this module never used to ask
+        # about now actually blocks the merge decision, by name.
+        assert by_gate["merge"].ok is False
+        assert by_gate["merge"].reason == "uat_required"
+
+    def test_uat_passed_merge_ready(self, config: Config) -> None:
+        config.repos = [
+            Repo(
+                name="api", github="acme/api", default_branch="main",
+                uat_preview="https://preview.example/{branch}",
+            ),
+        ]
+        config.pipeline = PipelineConfig(default_gates=["test", "review", "uat", "merge"])
+        work = _work(test_state="passed")
+        work.uat_state = "passed"
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["uat"].required is True
+        assert by_gate["uat"].ok is True
+        assert by_gate["merge"].ok is True
+
+    def test_format_gate_report_renders_uat_blocked_line(self, config: Config) -> None:
+        config.repos = [
+            Repo(
+                name="api", github="acme/api", default_branch="main",
+                uat_preview="https://preview.example/{branch}",
+            ),
+        ]
+        config.pipeline = PipelineConfig(default_gates=["test", "review", "uat", "merge"])
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        text = format_gate_report(report)
+        assert "uat" in text
+        assert "BLOCKED" in text
+        assert "merge  : BLOCKED — uat_required" in text
+
+    def test_format_gate_report_renders_uat_not_required_reason(
+        self, config: Config,
+    ) -> None:
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        text = format_gate_report(report)
+        assert "uat" in text
+        assert "not required" in text
+
+
+# ── apply-verdict gate (#3236) ──────────────────────────────────────────────
+#
+# `coord gates` must be able to tell "merged, not yet applied" apart from
+# "applied" apart from "apply-failed" for a terraform-flavored --hold-after
+# entry — reading through the SAME `coord.drive_queue.apply_gate_status`
+# `coord drive-queue list`/`status` renders through (#2096: one question,
+# one answer), never a second, independently-derived reading.
+
+class TestApplyGate:
+    def test_no_drive_queue_entry_means_no_apply_decision_at_all(
+        self, config: Config, coord_db,
+    ) -> None:
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert "apply" not in by_gate
+
+    def test_a_non_gated_drive_queue_entry_reports_no_apply_decision(
+        self, config: Config, coord_db,
+    ) -> None:
+        from coord.state import enqueue_drive_queue
+
+        enqueue_drive_queue("api", 42, hold_after=False)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert "apply" not in by_gate
+
+    def test_a_fired_gate_with_no_verdict_reports_merged_not_applied(
+        self, config: Config, coord_db,
+    ) -> None:
+        from coord.drive_queue import HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue(
+            "api", 42, hold_after=True, hold_reason="terraform apply",
+        )
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].required is True
+        assert by_gate["apply"].ok is False
+        assert by_gate["apply"].state == "merged_not_applied"
+        assert "not yet applied" in by_gate["apply"].reason
+
+    def test_a_bare_release_with_no_verdict_still_reads_unapplied(
+        self, config: Config, coord_db,
+    ) -> None:
+        """#2096: a bare `coord drive-queue resume` (no recorded verdict)
+        must NOT be reported as "applied" — that would be exactly the
+        unconfirmed-success shape #3236 exists to close."""
+        from coord.drive_queue import HOLD_RELEASED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_RELEASED)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].ok is False
+        assert by_gate["apply"].state == "merged_not_applied"
+        assert "without a recorded apply verdict" in by_gate["apply"].reason
+
+    def test_an_applied_verdict_reports_ok(self, config: Config, coord_db) -> None:
+        from coord.drive_queue import APPLY_APPLIED, HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        update_drive_queue_entry(
+            "api", 42, apply_verdict=APPLY_APPLIED, apply_verdict_reason="clean run",
+        )
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].ok is True
+        assert by_gate["apply"].state == "applied"
+        assert "clean run" in by_gate["apply"].reason
+
+    def test_an_apply_failed_verdict_reports_not_ok(self, config: Config, coord_db) -> None:
+        from coord.drive_queue import APPLY_FAILED, HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        update_drive_queue_entry(
+            "api", 42, apply_verdict=APPLY_FAILED, apply_verdict_reason="state locked",
+        )
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["apply"].ok is False
+        assert by_gate["apply"].state == "apply_failed"
+        assert "state locked" in by_gate["apply"].reason
+
+    def test_format_renders_merged_not_applied_apply_failed_and_applied(
+        self, config: Config, coord_db,
+    ) -> None:
+        from coord.drive_queue import APPLY_APPLIED, HOLD_FIRED
+        from coord.state import enqueue_drive_queue, update_drive_queue_entry
+
+        enqueue_drive_queue("api", 42, hold_after=True, hold_reason="terraform apply")
+        update_drive_queue_entry("api", 42, hold_state=HOLD_FIRED)
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+        text = format_gate_report(report)
+        assert "apply  : MERGED, NOT APPLIED" in text
+
+        update_drive_queue_entry(
+            "api", 42, apply_verdict=APPLY_APPLIED, apply_verdict_reason="ok",
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+        text = format_gate_report(report)
+        assert "apply  : applied" in text
+        assert "MERGED, NOT APPLIED" not in text
+
+
 # ── is_interactive enrichment (#748/#632: not an Assignment dataclass field) ─
 
 class TestIsInteractive:
@@ -618,6 +896,50 @@ class TestFormatting:
         report2 = build_gate_report(board2, config, "api", 42)
         assert "test_toolchain=unknown" in format_gate_report(report2)
 
+    def test_format_annotates_an_unconfirmed_pass(self, config: Config) -> None:
+        """#3357: grocery-list#36's exact shape — `test_state="passed"` with
+        nothing on the summary line saying nobody actually observed a run."""
+        work = _work(test_state="passed", test_confirmation="unconfirmed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+
+        text = format_gate_report(report)
+        assert "test   : passed (recorded on w1) (UNCONFIRMED — suite never ran)" in text
+
+    def test_format_annotates_a_baseline_red_pass(self, config: Config) -> None:
+        work = _work(test_state="skipped", test_confirmation="baseline_red")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+
+        text = format_gate_report(report)
+        assert "(baseline-red — branch not at fault, #2170)" in text
+
+    def test_format_does_not_annotate_a_confirmed_pass(self, config: Config) -> None:
+        """A REAL confirmed pass, or a row that never went through the #2464
+        confirmation path at all (test_confirmation=None), must render
+        exactly as it did before #3357 — no noise on the common case."""
+        confirmed = _work(test_state="passed", test_confirmation="confirmed")
+        board = Board(active=[], completed=[confirmed])
+        report = build_gate_report(board, config, "api", 42)
+        text = format_gate_report(report)
+        assert "test   : passed (recorded on w1)" in text
+        assert "UNCONFIRMED" not in text
+        assert "baseline-red" not in text
+
+        never_asked = _work(test_state="passed")
+        board2 = Board(active=[], completed=[never_asked])
+        report2 = build_gate_report(board2, config, "api", 42)
+        text2 = format_gate_report(report2)
+        assert "test   : passed (recorded on w1)" in text2
+        assert "UNCONFIRMED" not in text2
+
+    def test_report_to_dict_carries_test_confirmation(self, config: Config) -> None:
+        work = _work(test_state="passed", test_confirmation="unconfirmed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+        payload = report_to_dict(report)
+        assert payload["rows"][0]["test_confirmation"] == "unconfirmed"
+
     def test_report_to_dict_is_json_serializable(self, config: Config) -> None:
         work = _work(test_state="passed", test_toolchain="node 20.11.0")
         review = _review("w1", verdict="approve")
@@ -631,7 +953,11 @@ class TestFormatting:
         assert reloaded["repo_name"] == "api"
         assert reloaded["issue_number"] == 42
         assert len(reloaded["rows"]) == 2
-        assert len(reloaded["decisions"]) == 3
+        # #3273 (S-5 of #3261): review/test/merge plus the registry-backed
+        # "uat" gate, walked from `coord.pipeline.GATE_REGISTRY` — not
+        # silently omitted just because this fixture's repo has no
+        # uat_preview/uat_live_preview configured.
+        assert len(reloaded["decisions"]) == 4
         assert reloaded["rows"][0]["test_toolchain"] == "node 20.11.0"
 
     def test_never_mutates_board_or_calls_write_seams(

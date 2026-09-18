@@ -116,6 +116,29 @@ class TestPickMachine:
         board = Board()
         assert pick_machine("api", board, cfg) is None
 
+    def test_credential_fetcher_none_is_a_no_op(self) -> None:
+        """#3371: every caller that predates this parameter (omitted, the
+        default) must behave byte-for-byte as before — this is also what
+        the #1630 advisory-only guard test relies on."""
+        cfg = _config([_machine("laptop", ["api"])])
+        board = Board()
+        m = pick_machine("api", board, cfg)
+        assert m is not None and m.name == "laptop"
+
+    def test_excludes_machine_a_credential_fetcher_reports_dead(self) -> None:
+        cfg = _config([_machine("laptop", ["api"]), _machine("server", ["api"])])
+        board = Board()
+        m = pick_machine(
+            "api", board, cfg, credential_fetcher=lambda mm: mm.name != "laptop",
+        )
+        assert m is not None
+        assert m.name == "server"  # laptop skipped despite being first in config order
+
+    def test_returns_none_when_every_candidate_is_credential_dead(self) -> None:
+        cfg = _config([_machine("laptop", ["api"])])
+        board = Board()
+        assert pick_machine("api", board, cfg, credential_fetcher=lambda m: False) is None
+
 
 # ── plan_dispatch ────────────────────────────────────────────────────────────
 
@@ -1084,7 +1107,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-oc-1"}
 
@@ -1131,7 +1154,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-oc-2"}
 
@@ -1179,7 +1202,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-label-1"}
 
@@ -1230,7 +1253,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-1"}
 
@@ -1291,7 +1314,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-1"}
 
@@ -1326,7 +1349,7 @@ class TestDispatchEntry:
 
         proposals = []
 
-        def fake_dispatch(proposal, config):
+        def fake_dispatch(proposal, config, **kwargs):
             proposals.append(proposal)
             return {"id": "asn-1"}
 

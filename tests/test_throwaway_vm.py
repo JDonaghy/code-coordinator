@@ -339,9 +339,27 @@ def test_teardown_fires_on_interrupt(stubs: dict) -> None:
         start_new_session=True,
     )
     try:
-        time.sleep(1.0)  # let it create the RG + VM and enter the wait loop
+        # Wait for OBSERVED evidence that the script reached the SSH-wait loop
+        # -- its first `ssh ... true` probe -- rather than assuming a fixed
+        # sleep was long enough (#2096, applied to the harness: derive the
+        # "it's ready now" verdict from a reading taken after the fact). The
+        # old `time.sleep(1.0)` raced on a loaded box: SIGINT could land
+        # before the script installed its teardown trap, leaving no `az group
+        # delete` and a 50-attempt wait loop still running, which surfaced as
+        # the communicate() timeout rather than an honest failure.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if any(c.endswith(" true") for c in _ssh_calls(stubs)):
+                break
+            if proc.poll() is not None:  # died early -- stop waiting, assert below
+                break
+            time.sleep(0.05)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.communicate(timeout=5)
+            pytest.fail("script never reached its SSH-reachability wait loop")
         os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-        stdout, _ = proc.communicate(timeout=15)
+        stdout, _ = proc.communicate(timeout=30)
     except subprocess.TimeoutExpired:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         proc.communicate(timeout=5)

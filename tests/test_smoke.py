@@ -10,6 +10,8 @@ import pytest
 from coord.config import Config, SmokeRule, SmokeTestsConfig, load
 from coord.models import Assignment, Board, Machine, Repo
 from coord.smoke import (
+    ENVIRONMENTAL_SMOKE_MARKER,
+    ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
     MUTE_SMOKE_LEG_BUDGET,
     NO_SMOKE_VERDICT_MARKER,
     SMOKE_SYSTEM_PROMPT,
@@ -19,12 +21,15 @@ from coord.smoke import (
     build_smoke_briefing,
     dispatch_pending_smoke,
     dispatch_smoke,
+    environmental_smoke_legs,
+    environmental_smoke_tally,
     finalize_smoke_fanout,
     match_rules,
     mute_smoke_legs,
     mute_smoke_tally,
     partition_capability_requirements,
     pick_smoke_machine,
+    required_capabilities,
     resolve_rule_command,
     resolve_smoke_command,
     smoke_leg_capabilities,
@@ -127,6 +132,70 @@ def test_match_rules_no_trailing_slash_matches_files_too() -> None:
     assert match_rules(["src/gtk_helpers.c"], rules) == ["gtk"]
 
 
+def test_match_rules_suffix_wildcard_matches_at_any_depth() -> None:
+    """#3233: `*.tf` is a suffix wildcard, not a directory prefix — terraform
+    files aren't confined to one directory tree the way GTK/browser sources
+    are, so a root-level and a deeply-nested `.tf` file must both match."""
+    rules = [SmokeRule(files=["*.tf"], requires=["azure"])]
+    caps = match_rules(["main.tf", "infra/network/subnet.tf"], rules)
+    assert caps == ["azure"]
+
+
+def test_match_rules_suffix_wildcard_does_not_match_other_extensions() -> None:
+    rules = [SmokeRule(files=["*.tf"], requires=["azure"])]
+    assert match_rules(["main.tfvars", "src/cli.py"], rules) == []
+
+
+def test_match_rules_bare_star_is_never_a_suffix_wildcard() -> None:
+    """A pattern of exactly `"*"` isn't treated specially — `pattern[1:]`
+    would be empty and match everything, which is never what an explicit
+    rule author meant."""
+    rules = [SmokeRule(files=["*"], requires=["azure"])]
+    assert match_rules(["anything.py"], rules) == []
+
+
+# ── required_capabilities (#3351) ────────────────────────────────────────────
+#
+# `Repo.requires` (repo-wide, unconditional on touched files — vimcode's
+# nvim-conformance oracle is the motivating case) UNION `match_rules`'s
+# file-matched result. Both `dispatch_smoke` and `coord.dispatch.
+# route_work_by_capability` call this ONE function (#2096) rather than each
+# computing the union themselves.
+
+
+def test_required_capabilities_includes_repo_requires_with_no_files_matched() -> None:
+    """The whole point: a repo's `requires` must gate a leg even when the
+    diff touches nothing any `capability_rules` entry matches — vimcode has
+    no `capability_rules` entry of its own at all."""
+    caps = required_capabilities(["nvim"], ["src/parser.rs"], [])
+    assert caps == ["nvim"]
+
+
+def test_required_capabilities_unions_repo_requires_and_matched_rules() -> None:
+    rules = [SmokeRule(files=["src/gtk/"], requires=["gtk"])]
+    caps = required_capabilities(["nvim"], ["src/gtk/window.c"], rules)
+    assert set(caps) == {"nvim", "gtk"}
+
+
+def test_required_capabilities_deduplicates_when_both_sides_agree() -> None:
+    rules = [SmokeRule(files=["src/gtk/"], requires=["nvim"])]
+    caps = required_capabilities(["nvim"], ["src/gtk/window.c"], rules)
+    assert caps == ["nvim"]
+
+
+def test_required_capabilities_empty_repo_requires_matches_match_rules_exactly() -> None:
+    """A repo declaring no `requires` at all must behave exactly like
+    `match_rules` alone — no regression for the overwhelming majority of
+    repos that never set this field."""
+    rules = [SmokeRule(files=["src/gtk/"], requires=["gtk"])]
+    touched = ["src/gtk/window.c", "src/lib/util.c"]
+    assert required_capabilities([], touched, rules) == match_rules(touched, rules)
+
+
+def test_required_capabilities_returns_empty_when_neither_side_matches() -> None:
+    assert required_capabilities([], ["docs/README.md"], []) == []
+
+
 # ── Partitioning (#3177) ─────────────────────────────────────────────────────
 #
 # The quadraui shape from the issue: `precision` has gtk, `dell64` has
@@ -163,7 +232,12 @@ def test_partition_merges_rules_one_machine_can_cover_together() -> None:
         _quadraui_capable_for,
     )
     assert unroutable == []
-    assert partitions == [SmokePartition(capabilities=("gtk", "windows"))]
+    assert partitions == [
+        SmokePartition(
+            capabilities=("gtk", "windows"),
+            files=("quadraui/src/gtk/a.rs", "quadraui/src/win/b.rs"),
+        )
+    ]
 
 
 def test_partition_splits_when_no_machine_covers_the_union() -> None:
@@ -191,7 +265,9 @@ def test_partition_macos_only_diff_is_a_single_partition() -> None:
         ["quadraui/src/macos/c.rs"], _QUADRAUI_RULES, _quadraui_capable_for,
     )
     assert unroutable == []
-    assert partitions == [SmokePartition(capabilities=("macos",))]
+    assert partitions == [
+        SmokePartition(capabilities=("macos",), files=("quadraui/src/macos/c.rs",))
+    ]
 
 
 def test_partition_reports_unroutable_when_no_machine_has_the_capability() -> None:
@@ -228,6 +304,69 @@ def test_partition_ignores_unmatched_rules() -> None:
     )
     assert partitions == []
     assert unroutable == []
+
+
+def test_partition_accumulates_files_from_every_rule_sharing_one_requires_set() -> None:
+    """#3298 fix-round-1: `seen` used to key on `frozenset(rule.requires)`
+    and keep only the FIRST matching rule for a given set — so a second rule
+    declaring the identical capability set (a broad rule plus a narrower
+    override for a subdirectory of the same platform, the exact shape the
+    issue wants for vimcode/quadraui) never contributed its OWN files to the
+    partition. Both rules' matched files must appear."""
+    rules = [
+        SmokeRule(files=["a/"], requires=["gtk"]),
+        SmokeRule(files=["b/"], requires=["gtk"], command="test-b-only"),
+    ]
+    touched = ["a/x.rs", "b/y.rs"]
+    partitions, unroutable = partition_capability_requirements(
+        touched, rules, lambda caps: True,
+    )
+    assert unroutable == []
+    assert partitions == [
+        SmokePartition(capabilities=("gtk",), files=("a/x.rs", "b/y.rs")),
+    ]
+
+
+def test_partition_lets_a_shadowed_rules_command_win_for_its_own_partition() -> None:
+    """End-to-end version of the above: with the files correctly accumulated,
+    `resolve_rule_command` scoped to the partition's own files must resolve
+    the SECOND rule's `command` — before the fix this came back `None`
+    because `b/y.rs` never made it into `partition.files` at all."""
+    rules = [
+        SmokeRule(files=["a/"], requires=["gtk"]),
+        SmokeRule(files=["b/"], requires=["gtk"], command="test-b-only"),
+    ]
+    touched = ["a/x.rs", "b/y.rs"]
+    partitions, unroutable = partition_capability_requirements(
+        touched, rules, lambda caps: True,
+    )
+    assert unroutable == []
+    assert len(partitions) == 1
+    resolved = resolve_rule_command(list(partitions[0].files), rules)
+    assert resolved is not None
+    assert resolved.command == "test-b-only"
+
+
+def test_partition_unroutable_reports_files_from_every_rule_sharing_the_set() -> None:
+    """The unroutable-diagnosis path shares the same `seen` accumulation —
+    a second rule sharing an unroutable capability set must still contribute
+    its own DECLARED file pattern to `rule_files`, not just the first rule's
+    (matching pre-fix single-rule behaviour: `rule_files` is the rule's own
+    `files` patterns, not the matched touched paths — see
+    `SmokePartition.files` for that)."""
+    rules = [
+        SmokeRule(files=["src/cuda/kernels/"], requires=["cuda"]),
+        SmokeRule(files=["src/cuda/tests/"], requires=["cuda"]),
+    ]
+    touched = ["src/cuda/kernels/a.cu", "src/cuda/tests/b.cu"]
+    partitions, unroutable = partition_capability_requirements(
+        touched, rules, _quadraui_capable_for,
+    )
+    assert partitions == []
+    assert len(unroutable) == 1
+    bad = unroutable[0]
+    assert bad.capabilities == ("cuda",)
+    assert bad.rule_files == ("src/cuda/kernels/", "src/cuda/tests/")
 
 
 # ── Rule command override (#3056) ───────────────────────────────────────────
@@ -291,6 +430,20 @@ def test_resolve_rule_command_first_declared_match_wins() -> None:
     resolved2 = resolve_rule_command(touched, rules_reordered)
     assert resolved2 is not None
     assert resolved2.command == "cargo xwin test"
+
+
+def test_resolve_rule_command_honours_the_suffix_wildcard_too() -> None:
+    """#3233: `resolve_rule_command` used to re-derive its own prefix-only
+    match instead of calling `_rule_matches` — a second implementation of
+    the same "does this rule apply" question (#2096's split-brain shape).
+    Now that they share one function, a `*.tf` rule with a `command`
+    override must route through here exactly like `match_rules` does."""
+    rules = [
+        SmokeRule(files=["*.tf"], requires=["azure"], command="terraform validate"),
+    ]
+    resolved = resolve_rule_command(["infra/network/subnet.tf"], rules)
+    assert resolved is not None
+    assert resolved.command == "terraform validate"
 
 
 def test_resolve_rule_command_skips_a_matching_rule_with_no_command() -> None:
@@ -997,6 +1150,444 @@ def test_environmental_death_adds_no_tally_when_there_is_none(coord_db) -> None:
     assert mute_smoke_legs(row["test_reason"]) == 0
 
 
+# ── #3315: environmental Test-stage retries — the rate-limit budget ────────
+
+
+@pytest.mark.parametrize(
+    "reason, expected",
+    [
+        (None, 0),
+        ("", 0),
+        ("dispatched: Test stage running (#1426)", 0),
+        ("headless smoke: 5 failed", 0),
+        # Bare marker, no count — one leg.
+        (f"{ENVIRONMENTAL_SMOKE_MARKER}: died environmentally", 1),
+        (f"{ENVIRONMENTAL_SMOKE_MARKER} x2: …", 2),
+        (f"{ENVIRONMENTAL_SMOKE_MARKER} x5: parked", 5),
+        # Case/spacing tolerance, so a hand-edited reason still counts.
+        ("ENVIRONMENTAL-RETRY (#3315) X3", 3),
+    ],
+)
+def test_environmental_smoke_legs_reads_the_tally_back(reason, expected) -> None:
+    assert environmental_smoke_legs(reason) == expected
+
+
+def test_environmental_smoke_tally_round_trips_through_environmental_smoke_legs() -> None:
+    """The writer and the reader must agree, or the budget silently resets."""
+    for count in range(1, 8):
+        assert environmental_smoke_legs(environmental_smoke_tally(count)) == count
+    assert environmental_smoke_tally(1) == ENVIRONMENTAL_SMOKE_MARKER
+
+
+def test_dispatch_smoke_carries_the_environmental_retry_tally_across_the_running_stamp(
+    gtk_and_server_config: Config,
+) -> None:
+    """The #2272 regression, replayed for the #3315 environmental budget.
+
+    `test_reason` is the only field that survives from one Test-stage leg to
+    the next. If `dispatch_smoke`'s own "running" stamp does not re-state the
+    environmental tally, the very next dispatch erases it — and
+    `coord.reconcile.propagate_smoke_terminal_failure`'s budget (bounded at
+    `ENVIRONMENTAL_SMOKE_RETRY_BUDGET`) can never fire, because every
+    intervening dispatch resets the counter it is trying to bound.
+    """
+    parent = _completed(machine="server")
+    parent.test_reason = f"{ENVIRONMENTAL_SMOKE_MARKER} x2: died environmentally"
+    board = Board(completed=[parent])
+
+    result = dispatch_smoke(
+        parent, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-run"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is not None
+    assert parent.test_state == "running"
+    assert environmental_smoke_legs(parent.test_reason) == 2, (
+        "the environmental-retry tally must survive the `running` stamp, or "
+        f"the #3315 budget can never fire — got {parent.test_reason!r}"
+    )
+    assert f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive" in parent.test_reason
+
+
+def test_propagate_smoke_terminal_failure_parks_after_retry_budget_exhausted(
+    coord_db,
+) -> None:
+    """#3315 acceptance core: a SUSTAINED environmental Test-stage death (a
+    429 that never clears) must not clear `test_state` back to NULL forever
+    — the observed incident was 542 such clears, every one a zero-token leg,
+    over 12h18m before the account's weekly usage window reset on its own.
+
+    After `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` CONSECUTIVE environmental
+    deaths on the same row, the row must park instead, with a reason an
+    operator can act on without guessing (names the 429 / rate limit).
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+    )
+
+    work = Assignment(
+        assignment_id="w-429", machine_name="laptop", repo_name="api",
+        issue_number=3315, issue_title="X", type="work", status="done",
+        branch="issue-3315",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    for _ in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET):
+        propagate_smoke_terminal_failure(
+            parent_assignment_id="w-429", failure_reason="api error 429",
+        )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-429",),
+    ).fetchone()
+    assert row["test_state"] == TEST_STATE_BLOCKED, (
+        "a sustained environmental failure must eventually park, not clear "
+        f"forever — got test_state={row['test_state']!r}, "
+        f"test_reason={row['test_reason']!r}"
+    )
+    assert "429" in row["test_reason"]
+    assert "rate limit" in row["test_reason"].lower()
+
+    # Exhausted stays exhausted — one more environmental death must not
+    # un-park the row.
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-429", failure_reason="api error 429",
+    )
+    row2 = get_connection().execute(
+        "SELECT test_state FROM assignments WHERE assignment_id=?", ("w-429",),
+    ).fetchone()
+    assert row2["test_state"] == TEST_STATE_BLOCKED
+
+
+def test_propagate_smoke_terminal_failure_does_not_park_a_transient_blip(
+    coord_db,
+) -> None:
+    """The ordinary #1605 case is unchanged: ONE environmental death well
+    under budget must still clear for automatic re-dispatch, never park."""
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+    )
+
+    work = Assignment(
+        assignment_id="w-blip", machine_name="laptop", repo_name="api",
+        issue_number=3316, issue_title="X", type="work", status="done",
+        branch="issue-3316",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-blip", failure_reason="api error 529",
+    )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-blip",),
+    ).fetchone()
+    assert row["test_state"] is None
+    assert environmental_smoke_legs(row["test_reason"]) == 1
+
+
+def test_sustained_429_caps_smoke_legs_and_parks_the_row(
+    gtk_and_server_config: Config, coord_db,
+) -> None:
+    """#3315 end-to-end acceptance: drive the actual smoke DISPATCH path
+    (`dispatch_smoke`) against a stubbed provider that always fails
+    environmentally (a stand-in for a `claude -p` worker that immediately
+    hits a 429 and never reaches the model, exactly the observed 541-of-542
+    zero-turn/zero-token legs), and assert the number of legs actually
+    dispatched is capped in the single digits rather than spinning for
+    hours.
+
+    Alternates a real `dispatch_smoke` call with the same
+    `propagate_smoke_terminal_failure` outcome `coord.notify` records when a
+    Test-stage worker dies without ever printing a verdict — the two
+    together are exactly the "leg fails -> row clears -> next tick
+    re-dispatches" loop the incident rode for 12h18m.
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+    completed = _completed()
+    record_dispatched_assignment(assignment=completed, repo_github="acme/api")
+    board = Board(completed=[completed])
+    client = _FakeClient({"id": "smoke-run"})
+    diff_lookup = lambda repo, branch: ["src/gtk/window.c"]  # noqa: E731
+
+    dispatched_legs = 0
+    for _ in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET + 3):
+        result = dispatch_smoke(
+            completed, board, gtk_and_server_config,
+            http_client=client, diff_lookup=diff_lookup,
+        )
+        if result is not None:
+            dispatched_legs += 1
+        # The leg that just "ran" is no longer in flight by the next tick —
+        # its own terminal event has already been reconciled, same as the
+        # real board once `coord.notify` posts the failure comment.
+        board.active = []
+        propagate_smoke_terminal_failure(
+            parent_assignment_id=completed.assignment_id,
+            failure_reason="api error 429",
+        )
+        # Simulate the next tick's `read_board()` picking up what was just
+        # persisted — `completed` is the same long-lived work row across
+        # every iteration in production.
+        row = coord_db.execute(
+            "SELECT test_state, test_reason FROM assignments WHERE "
+            "assignment_id=?", (completed.assignment_id,),
+        ).fetchone()
+        completed.test_state = row["test_state"]
+        completed.test_reason = row["test_reason"]
+
+    assert dispatched_legs <= ENVIRONMENTAL_SMOKE_RETRY_BUDGET, (
+        "a sustained 429 must cap the number of dispatched Test-stage legs "
+        f"at {ENVIRONMENTAL_SMOKE_RETRY_BUDGET} (single digits), not spin "
+        f"like the 542-leg incident — dispatched {dispatched_legs}"
+    )
+    assert completed.test_state == TEST_STATE_BLOCKED
+    assert "429" in (completed.test_reason or "")
+    assert "rate limit" in (completed.test_reason or "").lower()
+
+    # And the row stays quiet: one more tick must not dispatch another leg.
+    calls_before = len(client.calls)
+    result = dispatch_smoke(
+        completed, board, gtk_and_server_config,
+        http_client=client, diff_lookup=diff_lookup,
+    )
+    assert result is None
+    assert len(client.calls) == calls_before, (
+        "a parked row must not dispatch another leg — that refusal is what "
+        "actually stops the billing (#3315)"
+    )
+
+
+def test_propagate_smoke_terminal_failure_fanout_tracks_budget_on_the_parent(
+    coord_db,
+) -> None:
+    """#3315 review (blocking finding): a #3182 fan-out leg's death must
+    bound the SAME environmental retry budget the single-leg path already
+    bounds — tracked on the PERSISTENT parent row, never on the leg's own
+    fresh one.
+
+    Before the fix, `coord.notify`'s fan-out branch called
+    `propagate_smoke_terminal_failure(parent_assignment_id=<leg's own id>,
+    ...)` with no way to reach the real parent at all: every fan-out round
+    mints a brand-new leg id (`_dispatch_smoke_fanout`'s
+    `uuid.uuid4().hex[:12]`), so a tally read off that id was always empty
+    and the budget could never fire — reproducing the unbounded-spin
+    incident this issue exists to close, on the ONE call shape (fan-out)
+    the original PR's tests never exercised.
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        TEST_STATE_BLOCKED,
+        _encode_fanout_manifest,
+        _parse_fanout_manifest,
+    )
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+        record_test_verdict,
+    )
+
+    parent = Assignment(
+        assignment_id="w-fanout-429", machine_name="dell64", repo_name="api",
+        issue_number=3315, issue_title="X", type="work", status="done",
+        branch="issue-3315-fanout",
+    )
+    _record_dispatched_assignment_local(assignment=parent, repo_github="acme/api")
+    # Seed the in-flight #3182 fan-out state `_dispatch_smoke_fanout` stamps
+    # on a real dispatch: the manifest naming the two sibling legs, plus the
+    # aggregate "running" verdict. `_record_dispatched_assignment_local`'s
+    # own UPSERT never touches `test_state`/`test_reason` (#1426's dispatch
+    # marker is a SEPARATE write in production too), so this mirrors that
+    # second write explicitly.
+    record_test_verdict(
+        assignment_id="w-fanout-429",
+        test_state="running",
+        test_reason=(
+            f"{_encode_fanout_manifest([('leg-gtk', ('gtk',), None), ('leg-win', ('windows',), None)])}\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    def _row(assignment_id: str) -> dict:
+        return get_connection().execute(
+            "SELECT test_state, test_reason FROM assignments WHERE "
+            "assignment_id=?", (assignment_id,),
+        ).fetchone()
+
+    # Every round mints a FRESH leg id — exactly the #3182 fan-out shape —
+    # so the budget can only ever be reachable if it is tracked on the
+    # parent, never on any one of these transient ids.
+    for i in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET - 1):
+        leg_id = f"leg-gtk-round{i}"
+        _record_dispatched_assignment_local(
+            assignment=Assignment(
+                assignment_id=leg_id, machine_name="dell64", repo_name="api",
+                issue_number=3315, issue_title="[smoke:gtk] X", type="smoke",
+                status="failed", branch="issue-3315-fanout",
+                review_of_assignment_id="w-fanout-429",
+            ),
+            repo_github="acme/api",
+        )
+        propagate_smoke_terminal_failure(
+            parent_assignment_id=leg_id,
+            failure_reason="api error 429",
+            fanout_parent_id="w-fanout-429",
+        )
+        parent_row = _row("w-fanout-429")
+        assert parent_row["test_state"] != TEST_STATE_BLOCKED, (
+            f"parked too early, after only {i + 1} death(s) — got "
+            f"{parent_row['test_reason']!r}"
+        )
+        assert environmental_smoke_legs(parent_row["test_reason"]) == i + 1
+        # The manifest must survive every intermediate re-stamp — losing it
+        # would strand `finalize_smoke_fanout`'s ability to ever find the
+        # sibling legs again.
+        assert _parse_fanout_manifest(parent_row["test_reason"]) is not None
+        # The dying leg's OWN row is cleared for retry, exactly like the
+        # single-leg path — `_find_leg_for_partition` needs this to treat it
+        # as retryable.
+        assert _row(leg_id)["test_state"] is None
+
+    # The BUDGETth death — from a THIRD distinct, never-before-seen leg id —
+    # must exhaust the shared budget and park the PARENT.
+    final_leg_id = "leg-windows-final"
+    _record_dispatched_assignment_local(
+        assignment=Assignment(
+            assignment_id=final_leg_id, machine_name="macmini", repo_name="api",
+            issue_number=3315, issue_title="[smoke:windows] X", type="smoke",
+            status="failed", branch="issue-3315-fanout",
+            review_of_assignment_id="w-fanout-429",
+        ),
+        repo_github="acme/api",
+    )
+    propagate_smoke_terminal_failure(
+        parent_assignment_id=final_leg_id,
+        failure_reason="api error 429",
+        fanout_parent_id="w-fanout-429",
+    )
+
+    parent_row = _row("w-fanout-429")
+    assert parent_row["test_state"] == TEST_STATE_BLOCKED, (
+        "a sustained fan-out-leg 429 must eventually park the PARENT row, "
+        f"not clear forever — got {parent_row!r}"
+    )
+    assert "429" in parent_row["test_reason"]
+    assert "rate limit" in parent_row["test_reason"].lower()
+    # The leg that triggered the park reads consistently parked too.
+    assert _row(final_leg_id)["test_state"] == TEST_STATE_BLOCKED
+
+
+def test_dispatch_smoke_fanout_end_to_end_caps_legs_under_sustained_429(
+    repo: Repo, coord_db,
+) -> None:
+    """#3315 review acceptance: drive the REAL `_dispatch_smoke_legs` fan-out
+    path (not just `propagate_smoke_terminal_failure` in isolation) against a
+    diff that partitions into two capability sets, with every leg dying
+    environmentally — the #3182 shape the issue's own tests never covered.
+    The number of legs dispatched across the whole outage must stay bounded
+    (single digits), and the row must end up parked, not silently stuck
+    `running` forever nor spinning without limit.
+    """
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        TEST_STATE_BLOCKED,
+        _dispatch_smoke_legs,
+        smoke_leg_capabilities,
+    )
+    from coord.state import (  # noqa: PLC0415
+        record_dispatched_assignment,
+        release_smoke_dispatch_claim,
+    )
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["windows"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["src/win/"], requires=["windows"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    record_dispatched_assignment(assignment=completed, repo_github="acme/api")
+    board = Board(completed=[completed])
+    diff = ["src/gtk/a.c", "src/win/b.c"]
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg"}, "macmini.tail": {"id": "macmini-leg"},
+    })
+
+    total_legs = 0
+    for _ in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET + 3):
+        if completed.test_state == TEST_STATE_BLOCKED:
+            break
+        legs = _dispatch_smoke_legs(
+            completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+        )
+        total_legs += len(legs)
+        for leg in legs:
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=leg.assignment_id,
+                failure_reason="api error 429",
+                fanout_parent_id=completed.assignment_id,
+            )
+            # #3333: production always releases a leg's `claim_smoke_
+            # dispatch` claim as part of its own terminal-status write
+            # (`release_smoke_claim_if_row_is_smoke_leg`, called from
+            # `_update_local_state`/`_mark_notified_local` alongside —
+            # never inside — `propagate_smoke_terminal_failure` itself).
+            # This harness calls `propagate_smoke_terminal_failure` in
+            # isolation without going through either chokepoint, so it must
+            # release the claim by hand here or the next round's
+            # `_dispatch_smoke_fanout` call would find every partition still
+            # claimed and dispatch nothing at all.
+            caps = smoke_leg_capabilities(leg.issue_title)
+            if caps is not None:
+                release_smoke_dispatch_claim(
+                    completed.assignment_id or "", "+".join(sorted(caps)),
+                )
+        # Simulate the next tick's fresh `read_board()` — the legs that just
+        # "ran" are no longer in flight, and `completed` (the same long-lived
+        # work row across every iteration in production) reflects whatever
+        # was just persisted.
+        board.active = []
+        row = coord_db.execute(
+            "SELECT test_state, test_reason FROM assignments WHERE "
+            "assignment_id=?", (completed.assignment_id,),
+        ).fetchone()
+        completed.test_state = row["test_state"]
+        completed.test_reason = row["test_reason"]
+
+    assert completed.test_state == TEST_STATE_BLOCKED, (
+        "a sustained fan-out 429 must park the parent row instead of "
+        f"leaving it stuck — got test_state={completed.test_state!r}, "
+        f"test_reason={completed.test_reason!r}"
+    )
+    assert total_legs <= 2 * ENVIRONMENTAL_SMOKE_RETRY_BUDGET, (
+        "a sustained 429 must cap the number of dispatched fan-out legs in "
+        f"the single digits, not spin like the 542-leg incident — "
+        f"dispatched {total_legs}"
+    )
+    assert "429" in (completed.test_reason or "")
+    assert "rate limit" in (completed.test_reason or "").lower()
+
+
 # ── dispatch_smoke (HTTP mocked) ────────────────────────────────────────────
 
 
@@ -1126,6 +1717,104 @@ def test_dispatch_smoke_skipped_for_failed_or_review(
     ) is None
 
 
+# ── #3305: zero-commit gate — port of review.py's #1534 gate one pipeline
+# stage earlier, so a `status="done"` work-like row whose branch was never
+# pushed cannot spin the Test stage forever. ────────────────────────────────
+
+
+def test_dispatch_smoke_blocks_definite_zero_commit_branch(
+    gtk_and_server_config: Config, monkeypatch, coord_db,
+) -> None:
+    """A confirmed `ahead == 0` must refuse to dispatch a Test leg — there is
+    no branch to check out — and record a terminal, self-explaining verdict
+    on the row instead of leaving it to spin every tick (claude-coordinator
+    #3230's 111-failed-leg incident)."""
+    from coord.state import record_dispatched_assignment
+    from coord.smoke import TEST_STATE_BLOCKED
+
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 0
+    )
+    completed = _completed()
+    record_dispatched_assignment(assignment=completed, repo_github="acme/api")
+    board = Board(completed=[completed])
+
+    result = dispatch_smoke(
+        completed, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is None
+    assert completed.test_state == TEST_STATE_BLOCKED
+    reason = completed.test_reason or ""
+    assert completed.branch in reason
+    assert "#3305" in reason
+    assert "coord diagnose" in reason
+
+    row = coord_db.execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        (completed.assignment_id,),
+    ).fetchone()
+    assert row["test_state"] == TEST_STATE_BLOCKED
+    assert completed.branch in row["test_reason"]
+
+
+def test_dispatch_smoke_dispatches_when_commit_count_unconfirmable(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """Fail OPEN: `ahead is None` (a `gh api compare` failure, or a repo
+    missing from config) must dispatch exactly as if the gate didn't exist —
+    a network blip must never strand a real Test run (mirrors review.py's
+    #1534 fail-open polarity)."""
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: None
+    )
+    result = dispatch_smoke(
+        _completed(), Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+
+
+def test_dispatch_smoke_unaffected_when_branch_has_commits(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """The ordinary, well-behaved case — a branch with real commits ahead of
+    base — must dispatch exactly as before the gate existed."""
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 4
+    )
+    result = dispatch_smoke(
+        _completed(), Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+
+
+def test_dispatch_smoke_zero_commit_gate_scopes_to_every_work_like_type(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3305 explicitly scopes the gate to ALL of `WORK_LIKE_TYPES`, not just
+    `epic-decompose` — any killed-mid-session worker of any work-like type
+    reproduces the same unpushed-branch shape."""
+    monkeypatch.setattr(
+        "coord.github_ops.branch_commits_ahead_for_assignment", lambda a, c: 0
+    )
+    decompose = replace(_completed(), type="epic-decompose", assignment_id="ed1")
+    result = dispatch_smoke(
+        decompose, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is None
+    assert decompose.test_state == "blocked"
+
+
 def test_dispatch_smoke_dispatches_for_mock_author_type(
     gtk_and_server_config: Config,
 ) -> None:
@@ -1142,6 +1831,37 @@ def test_dispatch_smoke_dispatches_for_mock_author_type(
     assert result is not None
     assert result.type == "smoke"
     assert result.review_of_assignment_id == "ma1"
+
+
+def test_dispatch_smoke_dispatches_for_epic_decompose_when_no_rule_matches(
+    gtk_and_server_config: Config,
+) -> None:
+    """claude-coordinator#3239/#3226: an `epic-decompose` completion is a
+    REAL implementation diff against ordinary source (the epic's first
+    slice — see `coord.models.CLOSES_ISSUE_TYPES`'s docstring), not a
+    sealed-path contract/fixture like mock-author/test-author. Before this
+    fix, `dispatch_smoke`'s capability-rule-miss branch read
+    `completed.type != "work"` and silently folded `epic-decompose` (added
+    to `WORK_LIKE_TYPES` by #3132, after that line was written) into the
+    SAME skip-on-miss bucket as mock-author/test-author — so a repo like
+    this one, where no `capability_rules` entry ever matches plain
+    `coord/**`-style source, never dispatched a Test-stage leg for an
+    epic-decompose completion at all. `test_state` then sat at `""`
+    forever: nothing downstream resolves it, so `coord drive` polled the
+    already-`done`, pushed, unreviewed work row for a full 240-minute
+    deadline (twice) before giving up. `epic-decompose` must dispatch here
+    exactly like `type="work"` already does."""
+    epic_decompose = replace(
+        _completed(), type="epic-decompose", assignment_id="ed1",
+    )
+    result = dispatch_smoke(
+        epic_decompose, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-ed"}),
+        diff_lookup=lambda repo, branch: ["docs/README.md"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+    assert result.review_of_assignment_id == "ed1"
 
 
 def test_dispatch_smoke_sends_to_capable_different_machine(
@@ -1172,6 +1892,33 @@ def test_dispatch_smoke_sends_to_capable_different_machine(
     assert payload["repo_path"] == "/d/api"
     # Briefing should mention the test_command fallback (make test).
     assert "make test" in payload["briefing"]
+
+
+def test_dispatch_smoke_routes_by_repo_requires_with_no_matching_file_rule(
+    repo: Repo,
+) -> None:
+    """#3351: vimcode's shape — the repo declares `requires: [nvim]` but has
+    NO `capability_rules` entry of its own at all, so the diff's touched
+    files match nothing. The Test-stage leg must still route to the
+    nvim-capable machine, never to "any capable-for-repo machine"."""
+    nvim_repo = replace(repo, requires=["nvim"])
+    cfg = Config(
+        repos=[nvim_repo],
+        machines=[
+            _machine("no-nvim-box", "no-nvim.tail", caps=["python"], path="/srv/api"),
+            _machine("nvim-box", "nvim.tail", caps=["python", "nvim"], path="/d/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(auto_queue=True, capability_rules=[]),
+    )
+    board = Board()
+    client = _FakeClient({"id": "smoke-1"})
+    result = dispatch_smoke(
+        _completed(machine="no-nvim-box"), board, cfg,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["src/parser.rs"],
+    )
+    assert result is not None
+    assert result.machine_name == "nvim-box"
 
 
 def test_dispatch_smoke_pins_model_to_models_default(
@@ -2035,6 +2782,508 @@ def test_dispatch_smoke_fans_out_one_leg_per_partition(repo: Repo) -> None:
     assert "gtk+windows" in reason and "macos" in reason
 
 
+def test_dispatch_smoke_fanout_second_work_row_gets_its_own_legs(repo: Repo) -> None:
+    """#3328 regression: `_find_leg_for_partition`'s dedupe used to match on
+    ``(repo_name, branch, capabilities)`` alone, so a SECOND work row on the
+    same branch (the ordinary shape after a review bounce or a `coord retry`)
+    matched the FIRST row's already-terminal legs, credited them into its own
+    fan-out manifest, and dispatched no legs of its own — wedging the second
+    row's `test_state` at `"running"` with zero real children forever (the
+    #2803 sweep can never find a child to roll a verdict up from).
+
+    Every work row must end up with at least one `type="smoke"` child of its
+    own — either a fresh leg, or a reused one whose `review_of_assignment_id`
+    is re-keyed onto it. This asserts the "fresh leg" half of that contract.
+    """
+    from coord.smoke import _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    branch = "issue-952-fix"
+
+    # The FIRST work row's fan-out already ran to a terminal verdict — both
+    # legs are `board.completed`, exactly the shape a finished Test stage
+    # leaves behind.
+    first_parent_id = "work-first-111"
+    board = Board(
+        completed=[
+            Assignment(
+                machine_name="dell64", repo_name="api", issue_number=952,
+                issue_title="[smoke:gtk+windows] fix", briefing="b",
+                assignment_id="leg-gtk-win-first", status="done",
+                branch=branch, dispatched_at=1.0, finished_at=2.0,
+                type="smoke", review_of_assignment_id=first_parent_id,
+                test_state="passed",
+            ),
+            Assignment(
+                machine_name="macmini", repo_name="api", issue_number=952,
+                issue_title="[smoke:macos] fix", briefing="b",
+                assignment_id="leg-macos-first", status="done",
+                branch=branch, dispatched_at=1.0, finished_at=2.0,
+                type="smoke", review_of_assignment_id=first_parent_id,
+                test_state="passed",
+            ),
+        ],
+    )
+
+    # The SECOND work row — a review bounce / retry landed a new SHA on the
+    # same branch.
+    second_completed = _completed(
+        machine="dell64", branch=branch, repo="api",
+    )
+    second_completed.assignment_id = "work-second-222"
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg-second"},
+        "macmini.tail": {"id": "macmini-leg-second"},
+    })
+
+    legs = _dispatch_smoke_legs(
+        second_completed, board, cfg, http_client=client,
+        diff_lookup=lambda r, b: diff,
+    )
+
+    # The second row must get legs OF ITS OWN — not "zero, because the
+    # first row's legs already looked handled".
+    assert len(legs) == 2
+    assert {a.review_of_assignment_id for a in legs} == {"work-second-222"}
+    assert {a.assignment_id for a in legs} == {
+        "dell64-leg-second", "macmini-leg-second",
+    }
+
+    # The manifest on the second row must name ITS OWN new legs, never the
+    # first row's foreign leg ids.
+    reason = second_completed.test_reason or ""
+    assert "[[smoke-fanout:" in reason
+    assert "dell64-leg-second" in reason and "macmini-leg-second" in reason
+    assert "leg-gtk-win-first" not in reason
+    assert "leg-macos-first" not in reason
+    assert second_completed.test_state == "running"
+
+
+def test_dispatch_smoke_fanout_concurrent_ticks_never_double_dispatch_a_partition(
+    repo: Repo, coord_db,
+) -> None:
+    """#3333 regression (quadraui#952): two coordinator ticks racing each
+    other — both reading a board snapshot BEFORE either has recorded its own
+    dispatch — must not both dispatch the same capability partition for the
+    same work row. Before the atomic claim, `coord-notify.timer` and
+    `coord-drive-queue.timer` both saw "no leg yet" for `[smoke:macos]` on a
+    `max_workers=1` host and both dispatched — overrunning the host and
+    silently corrupting the parent's `[[smoke-fanout:...]]` manifest (the
+    second dispatch's write overwrote the first's).
+
+    `claim_smoke_dispatch` lives on the shared DB (`coord.state`), not on
+    either tick's own in-memory `Board` — so even though this test hands
+    each call its own fresh, empty `Board` (exactly what two racing
+    processes would each observe), the second call must still lose.
+    """
+    from coord.smoke import (
+        _capability_matched_machines,
+        _dispatch_smoke_fanout,
+        partition_capability_requirements,
+    )
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+
+    def _capable_for(caps: list[str]) -> bool:
+        return bool(_capability_matched_machines(caps, "api", cfg))
+
+    partitions, unroutable = partition_capability_requirements(
+        diff, cfg.smoke_tests.capability_rules, _capable_for
+    )
+    assert not unroutable
+
+    client_a = _MultiHostClient(assign={
+        "dell64.tail": {"id": "leg-gtk-win-a"},
+        "macmini.tail": {"id": "leg-macos-a"},
+    })
+    client_b = _MultiHostClient(assign={
+        "dell64.tail": {"id": "leg-gtk-win-b"},
+        "macmini.tail": {"id": "leg-macos-b"},
+    })
+
+    completed_a = _completed(machine="dell64", branch="issue-952-fix", repo="api")
+    completed_a.assignment_id = "work-952"
+    legs_a = _dispatch_smoke_fanout(
+        completed_a, Board(), cfg, touched=diff, partitions=partitions,
+        http_client=client_a,
+    )
+    assert len(legs_a) == 2
+    assert {a.assignment_id for a in legs_a} == {"leg-gtk-win-a", "leg-macos-a"}
+
+    # The second tick: a SEPARATE `Assignment` object (same assignment_id —
+    # the same work row) and a SEPARATE, empty `Board` — it has no idea the
+    # first tick dispatched anything.
+    completed_b = _completed(machine="dell64", branch="issue-952-fix", repo="api")
+    completed_b.assignment_id = "work-952"
+    legs_b = _dispatch_smoke_fanout(
+        completed_b, Board(), cfg, touched=diff, partitions=partitions,
+        http_client=client_b,
+    )
+
+    assert legs_b == []
+    # No machine was ever contacted for the second tick's dispatch — this
+    # loses the atomic claim BEFORE ranking candidates or spending a real
+    # `/assign` call, never after.
+    assert client_b.calls == []
+
+
+def test_dispatch_smoke_fanout_concurrent_ticks_on_different_partitions_never_drop_either(
+    repo: Repo, coord_db,
+) -> None:
+    """#3333 review: the sequential regression above
+    (`..._never_double_dispatch_a_partition`) only proves that a SECOND call
+    for the same work row, running AFTER the first call already finished
+    dispatching (and manifesting) both partitions, is a safe no-op — its own
+    `leg_manifest` ends up empty and it never touches `test_reason` at all.
+
+    It does not exercise the gap the review actually flagged: two ticks
+    racing on DIFFERENT partitions of the SAME parent each win
+    `claim_smoke_dispatch` for their own partition (the claim is scoped
+    per-partition on purpose — a fan-out legitimately dispatches several
+    legs for one parent) and each then reaches the final manifest stamp with
+    only ITS OWN partial `leg_manifest`. Before the #3333-review fix,
+    whichever call's `record_test_verdict` write landed LAST silently
+    overwrote the other's real, live leg out of the parent's
+    `[[smoke-fanout:...]]` manifest forever — nothing else ever re-derives
+    it, so the dropped leg's eventual pass/fail was never folded into the
+    aggregate.
+
+    Simulated deterministically: pre-claim the `macos` partition (as if tick
+    A already won that race and is still mid-flight — a real `/assign` POST
+    hasn't landed yet, so nothing is on the board or in the DB's manifest
+    for `macos`) before running tick B, which can then only ever see (and
+    itself win/dispatch) the `gtk+windows` partition. Tick B's own
+    `leg_manifest` is then a strict SUBSET of the full fan-out — exactly
+    what a call that lost a partition race produces. Once tick A's own
+    (slower) dispatch finally lands its leg through the same merge seam, the
+    parent's manifest must name BOTH partitions, never just whichever call
+    wrote last.
+    """
+    from coord.smoke import (
+        _capability_matched_machines,
+        _dispatch_smoke_fanout,
+        _parse_fanout_manifest,
+        partition_capability_requirements,
+    )
+    from coord.state import (
+        claim_smoke_dispatch,
+        load_assignment_test_reason,
+        merge_smoke_fanout_manifest,
+        record_dispatched_assignment,
+    )
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+
+    def _capable_for(caps: list[str]) -> bool:
+        return bool(_capability_matched_machines(caps, "api", cfg))
+
+    partitions, unroutable = partition_capability_requirements(
+        diff, cfg.smoke_tests.capability_rules, _capable_for
+    )
+    assert not unroutable
+
+    # The parent work row itself must exist on the shared DB for the
+    # manifest merge below to have somewhere real to land — in production
+    # `completed` always already went through `record_dispatched_assignment`
+    # when the work itself was dispatched.
+    record_dispatched_assignment(
+        assignment=replace(
+            _completed(machine="dell64", branch="issue-952-fix", repo="api"),
+            assignment_id="work-952",
+        ),
+        repo_github=repo.github,
+    )
+
+    # Tick A "wins" the macos partition's claim first (as if it read-and-
+    # claimed before tick B ever ran) but is still slow dispatching it —
+    # simulated by taking the claim directly, with no corresponding board/DB
+    # leg yet.
+    assert claim_smoke_dispatch("work-952", "macos") is True
+
+    client_b = _MultiHostClient(assign={
+        "dell64.tail": {"id": "leg-gtk-win-b"},
+        "macmini.tail": {"id": "leg-macos-b"},
+    })
+    completed_b = _completed(machine="dell64", branch="issue-952-fix", repo="api")
+    completed_b.assignment_id = "work-952"
+
+    legs_b = _dispatch_smoke_fanout(
+        completed_b, Board(), cfg, touched=diff, partitions=partitions,
+        http_client=client_b,
+    )
+
+    # Tick B only ever dispatches gtk+windows — it lost the (pre-seeded)
+    # macos claim race before it ever attempted to dispatch it, and never
+    # spent a real /assign call on the partition it lost.
+    assert len(legs_b) == 1
+    assert legs_b[0].assignment_id == "leg-gtk-win-b"
+    assert "macmini.tail" not in client_b.assigned_hosts
+
+    # Tick A now finishes its (slower) dispatch and lands its own leg into
+    # the SAME parent's manifest through the identical #3333-review merge
+    # seam `_dispatch_smoke_fanout` itself uses.
+    merge_smoke_fanout_manifest(
+        assignment_id="work-952",
+        new_entries=[("leg-macos-a", ("macos",), "make smoke")],
+        total_partitions=2,
+    )
+
+    # Whichever call's write landed last, the parent's manifest must name
+    # BOTH legs — never just the last writer's own partial view.
+    reason = load_assignment_test_reason("work-952")
+    legs = _parse_fanout_manifest(reason)
+    assert legs is not None
+    leg_ids = {leg_id for leg_id, _, _ in legs}
+    assert leg_ids == {"leg-gtk-win-b", "leg-macos-a"}
+
+
+# ── #3298: per-partition command resolution ─────────────────────────────────
+
+
+def test_dispatch_smoke_fanout_uses_identical_command_when_no_rule_overrides(
+    repo: Repo,
+) -> None:
+    """#3298 no-op case: when no `capability_rules` entry declares its own
+    `command`, every partition resolves to the SAME repo-wide command it
+    always produced pre-#3298, byte for byte — this must not move for a repo
+    that hasn't opted in."""
+    from coord.smoke import _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    board = Board()
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg"},
+        "macmini.tail": {"id": "macmini-leg"},
+    })
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+    )
+
+    assert len(legs) == 2
+    # `repo`'s fixture declares `test_command="make test"` and nothing else —
+    # both the 2-partition (gtk+windows) leg and the macos leg must run the
+    # identical repo-wide command.
+    for leg in legs:
+        assert "make test" in leg.briefing
+
+
+def test_dispatch_smoke_fanout_scopes_rule_command_to_its_own_partition(
+    repo: Repo,
+) -> None:
+    """#3298 acceptance: a `SmokeRule.command` declared on the rule that
+    creates ONE partition wins for only that partition's leg; the sibling
+    partition still gets the repo's `test_command`, not the override."""
+    from coord.smoke import _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(
+                    files=["quadraui/src/macos/"], requires=["macos"],
+                    command="pytest quadraui/tests/macos_suite",
+                ),
+            ],
+        ),
+    )
+    completed = _completed()
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    board = Board()
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg"},
+        "macmini.tail": {"id": "macmini-leg"},
+    })
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+    )
+
+    assert len(legs) == 2
+    by_machine = {a.machine_name: a for a in legs}
+    assert "pytest quadraui/tests/macos_suite" in by_machine["macmini"].briefing
+    # The rule-command must not leak into the sibling gtk+windows leg — it
+    # still runs the repo-wide command.
+    assert "pytest quadraui/tests/macos_suite" not in by_machine["dell64"].briefing
+    assert "make test" in by_machine["dell64"].briefing
+
+
+def test_partition_command_does_not_leak_into_a_sibling_partition() -> None:
+    """#3298: a `command` on the rule that creates ONE partition must not
+    resolve for a DIFFERENT partition, even though `resolve_rule_command`
+    scans every declared rule — scoping the touched files to just the ones
+    that put each partition on the board is what keeps it out."""
+    rules = [
+        SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+        SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+        SmokeRule(
+            files=["quadraui/src/macos/"], requires=["macos"],
+            command="pytest macos_suite",
+        ),
+    ]
+    touched = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    partitions, unroutable = partition_capability_requirements(
+        touched, rules, _quadraui_capable_for,
+    )
+    assert unroutable == []
+    by_caps = {frozenset(p.capabilities): p for p in partitions}
+    gtk_windows = by_caps[frozenset({"gtk", "windows"})]
+    macos = by_caps[frozenset({"macos"})]
+
+    # The macos rule's command must not leak into the gtk+windows partition —
+    # none of ITS OWN files (scoped by `partition_capability_requirements`)
+    # match that rule.
+    assert resolve_rule_command(list(gtk_windows.files), rules) is None
+
+    resolved_macos = resolve_rule_command(list(macos.files), rules)
+    assert resolved_macos is not None
+    assert resolved_macos.command == "pytest macos_suite"
+
+
+def test_dispatch_smoke_fanout_reports_unconfigured_command_naming_the_partition() -> None:
+    """#3298: a partition whose OWN files resolve to no smoke command at all
+    (no matching rule `command`, and the repo declares no
+    `ci_command`/`test_command`/`smoke_tests.default_command` either) is
+    reported naming THAT capability set — never silently attributed to the
+    whole fan-out — while a sibling partition that DOES resolve a command
+    still dispatches."""
+    from coord.smoke import TEST_STATE_BLOCKED, _dispatch_smoke_legs
+
+    bare_repo = Repo(
+        name="api", github="acme/api", depends_on=[], default_branch="main",
+    )
+    cfg = Config(
+        repos=[bare_repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(
+                    files=["quadraui/src/gtk/"], requires=["gtk"],
+                    command="cargo test --features gtk",
+                ),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        ),
+    )
+    completed = _completed(repo="api")
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    board = Board()
+    client = _MultiHostClient(assign={"dell64.tail": {"id": "dell64-leg"}})
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+    )
+
+    # gtk+windows resolves via the gtk rule's own command and dispatches.
+    assert len(legs) == 1
+    assert legs[0].machine_name == "dell64"
+
+    # macos has no command anywhere and is reported BLOCKED, naming macos —
+    # not gtk/windows, which dispatched fine.
+    assert completed.test_state == TEST_STATE_BLOCKED
+    reason = completed.test_reason or ""
+    assert "[macos]" in reason
+    assert "#3298" in reason
+
+
 def test_dispatch_smoke_unroutable_partition_fails_loudly_at_dispatch(
     repo: Repo,
 ) -> None:
@@ -2573,6 +3822,337 @@ def test_dispatch_pending_smoke_calls_dispatch_smoke_for_eligible_rows(
     call_args = mock_dispatch.call_args
     assert call_args[0][0] is eligible
     assert result == [sentinel]
+
+
+# ── #3309: dispatch_pending_smoke skips on verdict PRESENCE, the merge gate
+# blocks on FRESHNESS — a rebase (moved base) makes a recorded `passed`
+# verdict #1479-stale, and without a re-dispatch here nothing ever produces a
+# fresh one: the row deadlocks (test skips forever, merge reports
+# smoke_required forever). `_test_verdict_is_stale` reuses the SAME predicate
+# `coord merge`/`coord gates` apply (`merge_queue.evaluate_smoke_verdict`),
+# via a `gh_ops` stub mirroring `coord.merge_queue.GhOps`. ──────────────────
+
+
+class _FakeGh:
+    """Stub gh_ops — returns fixed SHAs/patch-id, mirrors tests/test_gates.py's
+    own `FakeGh` for the identical `coord.merge_queue.GhOps` surface."""
+
+    def __init__(self, *, branch_sha="branchsha", base_sha="basesha", patch_id="patchid"):
+        self.branch_sha = branch_sha
+        self.base_sha = base_sha
+        self.patch_id = patch_id
+
+    def get_branch_sha(self, repo: str, branch: str) -> str | None:
+        return self.branch_sha if branch != "main" else self.base_sha
+
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        return self.patch_id
+
+
+def test_dispatch_pending_smoke_redispatches_stale_passed_verdict(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3309 repro: a `passed` verdict recorded against an old base, the base
+    has since moved (a #241 conflict-fix rebase) — must re-dispatch instead of
+    skipping on presence alone forever."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="passed", test_reason="headless smoke",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    sentinel = object()
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert mock_dispatch.called
+    assert mock_dispatch.call_args[0][0] is row
+    assert result == [sentinel]
+
+
+def test_dispatch_pending_smoke_keeps_skipping_a_fresh_passed_verdict(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """Same anchors, but the live base/branch SHAs still match what the
+    verdict was recorded against — genuinely fresh, must stay skipped even
+    though a `gh_ops` is now supplied."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="passed",
+        test_head_sha="branchsha", test_base_sha="basesha",
+        test_patch_id="patchid",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="basesha", patch_id="patchid")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_skips_row_verdicted_after_the_scan_snapshot(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3343 repro: `board.completed`'s row is a snapshot that predates a
+    verdict another smoke leg just recorded on the SAME row's DB record — the
+    in-memory `test_state` still reads `None` ("no verdict yet"), but the
+    persisted row already carries a fresh `passed`.
+
+    Before this fix, this loop trusted the stale in-memory `test_state`
+    unconditionally and dispatched a redundant leg — which then (via
+    `_dispatch_smoke_single_leg`'s own #1819 "never stamp running over a
+    terminal verdict" guard, ALSO reading the same stale snapshot) clobbered
+    the just-recorded `passed` back to `running`, while the legacy
+    `smoke_test` mirror (written together with the terminal verdict) was left
+    untouched — producing exactly the `smoke_test=pass` / `test_state=running`
+    split #3343 reports, and the merge gate reading "no verdict recorded"
+    forever after. The fix re-reads the authoritative single-row `test_state`
+    before evaluating the skip conditions, so a verdict landed by ANY writer
+    since the snapshot was taken is honoured instead of overwritten.
+    """
+    from unittest.mock import patch as _patch
+
+    from coord.state import _record_dispatched_assignment_local, record_test_verdict
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    parent = _completed()
+    _record_dispatched_assignment_local(assignment=parent, repo_github="acme/api")
+    # A verdict lands on the persisted row — e.g. another smoke leg's
+    # completion reap, running concurrently with this scan.
+    record_test_verdict(assignment_id=parent.assignment_id, test_state="passed")
+
+    # The in-memory row this scan is holding was read BEFORE that write —
+    # `test_state` is still unset.
+    stale_row = replace(parent, test_state=None)
+    board = Board(completed=[stale_row])
+
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert result == []
+    assert not mock_dispatch.called
+    # The in-memory row is corrected to match reality...
+    assert stale_row.test_state == "passed"
+    # ...and the persisted verdict was never touched, let alone clobbered.
+    from coord.state import load_assignment_test_state
+
+    assert load_assignment_test_state(parent.assignment_id) == "passed"
+
+
+def test_dispatch_pending_smoke_stale_check_is_off_by_default(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """No `gh_ops` supplied (the default) fails open exactly like before
+    #3309 — never treats a recorded verdict as stale without a live SHA to
+    compare against, so every pre-existing caller that doesn't pass `gh_ops`
+    keeps behaving identically."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="passed",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+@pytest.mark.parametrize("state", ["blocked", "running"])
+def test_dispatch_pending_smoke_keeps_skipping_blocked_and_running_with_gh_ops(
+    gtk_and_server_config: Config, monkeypatch, state: str,
+) -> None:
+    """#1672/#1678: `blocked` (unroutable fleet report, must fire ONCE, never
+    re-probe) and `running` (genuinely in flight) must stay skipped even when
+    a live `gh_ops` is available — staleness is not evaluated for either, by
+    design."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state=state,
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_does_not_redispatch_a_failed_verdict(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """A `failed` verdict carries no #1479 staleness anchor at all (only
+    `passed`/`skipped` get one stamped, `state._record_test_verdict_local`) —
+    `evaluate_smoke_verdict` reports it SMOKE_MISSING, not SMOKE_STALE, so it
+    must NOT be re-dispatched by this fix (a fix round is a NEW work row, not
+    a re-run of the same failed suite)."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(), test_state="failed", test_reason="assertion error")
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_keeps_skipping_skipped_verdict_with_gh_ops(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#1732: `skipped` is a structural claim about the diff, not a
+    measurement at a SHA — it can never go stale, base move or not."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="skipped",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_redispatch_round_trip_records_new_verdict_not_stale_one(
+    gtk_and_server_config: Config, monkeypatch, tmp_path: Path,
+) -> None:
+    """#3309 review round trip: the earlier test suite mocked out
+    `coord.smoke._dispatch_smoke_legs` entirely and only asserted it got
+    *called* — it never exercised the real dispatch → `board.active` →
+    completion path through `coord.notify._record_smoke_verdict`, which is
+    exactly where the reviewer's blocking finding lived: a re-dispatch that
+    never clears the stale verdict first leaves `_dispatch_smoke_single_
+    leg`'s #1819 guard refusing to stamp "running", so the parent sits at
+    the stale `passed` for the whole new run — and when that run completes,
+    `_record_smoke_verdict` reads the still-"passed" row, wrongly credits it
+    to the #2217/#2464 "worker self-recorded" branch, and never looks at the
+    new leg's actual verdict at all.
+
+    This drives the REAL `_dispatch_smoke_legs`/`_dispatch_smoke_single_leg`
+    code (only the network POST and the diff lookup are stubbed — the same
+    seams `dispatch_smoke`'s own direct tests stub), then completes the
+    resulting smoke assignment with a verdict that CONTRADICTS the stale one
+    (`SMOKE: fail` where the stale verdict was `passed`) and asserts the
+    parent ends up `failed`, proving the new leg's verdict — not the
+    laundered old one — is what actually lands.
+    """
+    import coord.smoke as smoke_mod
+    from coord.notify import EVENT_COMPLETION, Transition, _record_smoke_verdict
+    from coord.state import (
+        _record_dispatched_assignment_local,
+        load_assignment_test_reason,
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    # Seed the parent work row exactly as a real drive would have left it
+    # pre-rebase: done, with a `passed` verdict already recorded.
+    parent = Assignment(
+        assignment_id="work-1", machine_name="server", repo_name="api",
+        issue_number=287, issue_title="GTK key routing fix", type="work",
+        status="done", branch="issue-1-fix",
+    )
+    _record_dispatched_assignment_local(assignment=parent, repo_github="acme/api")
+    record_test_verdict(
+        assignment_id="work-1", test_state="passed",
+        test_reason="headless smoke, pre-rebase",
+    )
+
+    row = replace(
+        parent, test_state="passed", test_reason="headless smoke, pre-rebase",
+        test_head_sha="branchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+
+    # Stub only the network-facing seams — everything else (the #1819 guard,
+    # the `board.active` append, the clear-then-stamp this fix adds) runs
+    # for real, through the actual `_dispatch_smoke_legs` implementation.
+    real_dispatch_smoke_legs = smoke_mod._dispatch_smoke_legs
+    fake_client = _FakeClient({"id": "smoke-1"})
+
+    def _stubbed_network(completed, board, config, *, now=None):
+        return real_dispatch_smoke_legs(
+            completed, board, config,
+            http_client=fake_client, diff_lookup=lambda r, b: [], now=now,
+        )
+
+    monkeypatch.setattr(smoke_mod, "_dispatch_smoke_legs", _stubbed_network)
+
+    dispatched = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+
+    assert len(dispatched) == 1
+    smoke_assignment = dispatched[0]
+    assert smoke_assignment.assignment_id == "smoke-1"
+    assert board.active == [smoke_assignment]
+
+    # The blocking finding: the stale "passed" must NOT survive the
+    # dispatch, in memory or persisted — it must read "running" (or unset),
+    # never the old terminal verdict, for the duration of the new run.
+    assert row.test_state != "passed", (
+        "the stale verdict must be cleared before dispatch, not left in "
+        "place for the duration of the new run (#3309 review)"
+    )
+    assert load_assignment_test_state("work-1") != "passed"
+
+    # Complete the NEW smoke leg with a verdict that CONTRADICTS the stale
+    # one. Record it as an in-flight smoke row first (mirrors what the real
+    # dispatch already wrote via `record_dispatched_assignment`).
+    _record_dispatched_assignment_local(
+        assignment=smoke_assignment, repo_github="acme/api",
+    )
+    log_path = tmp_path / "smoke-1.log"
+    log_path.write_text("SMOKE: fail 3 tests failed\n", encoding="utf-8")
+    transition = Transition(
+        assignment_id="smoke-1", machine_name=smoke_assignment.machine_name,
+        repo_name="api", issue_number=287, event=EVENT_COMPLETION, exit_code=0,
+    )
+    entry = {
+        "started_at": 1000.0, "finished_at": 1010.0,
+        "branch": "issue-1-fix", "log_path": str(log_path),
+    }
+
+    _record_smoke_verdict(transition, entry, "work-1")
+
+    # If the stale "passed" had survived the dispatch, this would still read
+    # "passed" (laundered via the #2217/#2464 self-recorded branch, never
+    # having looked at the log above at all). With the fix, the new leg's
+    # own `SMOKE: fail` verdict is what actually gets recorded.
+    assert load_assignment_test_state("work-1") == "failed", (
+        f"expected the NEW leg's verdict to win, got "
+        f"{load_assignment_test_state('work-1')!r} — the stale verdict was "
+        "laundered instead of being overwritten by a real observation"
+    )
+    reason = load_assignment_test_reason("work-1") or ""
+    assert "self-recorded" not in reason, (
+        "a freshly-observed failure must not carry the self-recorded-pass "
+        f"audit trail meant for a different case: {reason!r}"
+    )
 
 
 # ── #3099: an ADVISORY row with confirmed commits is the #1357 false
@@ -3160,6 +4740,72 @@ def test_finalize_smoke_fanout_fails_when_any_leg_fails(coord_db) -> None:
     reason = load_assignment_test_reason("w-fanout") or ""
     assert "[windows] failed" in reason
     assert "2 Win32 unit tests regressed" in reason
+
+
+def test_finalize_smoke_fanout_names_each_failed_legs_own_command(coord_db) -> None:
+    """#3298: once command resolution is scoped per partition, two failing
+    legs can have run DIFFERENT commands — the aggregate report must name
+    which command EACH failing leg ran, or a red macOS leg and a red Windows
+    leg read as identical failures."""
+    from coord.smoke import _encode_fanout_manifest  # noqa: PLC0415
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="failed", reason="2 regressions")
+    _seed_leg(leg_id="leg-b", state="failed", reason="3 regressions")
+    manifest = _encode_fanout_manifest([
+        ("leg-a", ("gtk", "windows"), "cargo xwin test"),
+        ("leg-b", ("macos",), "pytest quadraui/tests/macos_suite"),
+    ])
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            f"{manifest}\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk+windows]; [macos]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    from coord.state import load_assignment_test_reason  # noqa: PLC0415
+
+    reason = load_assignment_test_reason("w-fanout") or ""
+    assert "ran `cargo xwin test`" in reason
+    assert "ran `pytest quadraui/tests/macos_suite`" in reason
+    assert "2 regressions" in reason and "3 regressions" in reason
+
+
+def test_finalize_smoke_fanout_folds_pre_3298_two_field_manifest(coord_db) -> None:
+    """Backward compat: a manifest written before #3298 (no third
+    `=<command_b64>` field) must still fold — `command` reads back as
+    unknown (`None`) rather than raising or misparsing the entry."""
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    _seed_fanout_parent()
+    _seed_leg(leg_id="leg-a", state="passed", reason="ok")
+    _seed_leg(leg_id="leg-b", state="failed", reason="2 Win32 unit tests regressed")
+    record_test_verdict(
+        assignment_id="w-fanout", test_state="running",
+        test_reason=(
+            "[[smoke-fanout:leg-a=gtk,leg-b=windows]]\n"
+            "Test stage running across 2 capability-partition leg(s) (#3182): "
+            "[gtk]; [windows]."
+        ),
+    )
+
+    finalize_smoke_fanout("w-fanout")
+
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_reason,
+        load_assignment_test_state,
+    )
+
+    assert load_assignment_test_state("w-fanout") == "failed"
+    reason = load_assignment_test_reason("w-fanout") or ""
+    assert "[windows] failed" in reason
+    assert "2 Win32 unit tests regressed" in reason
+    assert "ran `" not in reason  # no command known — never fabricated
 
 
 def test_finalize_smoke_fanout_passes_when_every_leg_passes(coord_db) -> None:

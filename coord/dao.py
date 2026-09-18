@@ -78,6 +78,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from pathlib import Path
@@ -185,6 +186,9 @@ class CoordStore(Protocol):
     # ── point reads (#1336/#1337: detail endpoints) ──────────────────────────
     def get_assignment(self, assignment_id: str) -> dict | None: ...
     def get_issue(self, repo_name: str, number: int) -> dict | None: ...
+
+    # ── change detection (#3294) ────────────────────────────────────────────
+    def change_token(self) -> str: ...
 
 
 def compute_board_keep_ids(
@@ -305,10 +309,28 @@ class SqliteStore:
     pooling under real load) and never migrates the DB. ``board_projection``
     opens a single connection so the whole payload is one consistent
     snapshot.
+
+    ``change_token()`` (#3294) is the one exception to "fresh connection per
+    call": ``PRAGMA data_version`` is relative to the connection that reads
+    it — a brand-new SQLite connection always reports the same baseline
+    value no matter how many *other* connections have committed writes
+    before it opened, and only starts advancing once IT has observed a
+    change. So the cheap "did anything write?" signal only works against a
+    connection this store keeps open across calls; see ``_change_conn``
+    below and ``change_token``'s docstring.
     """
 
     def __init__(self, db_path: Path | str | None = None) -> None:
         self._path = Path(db_path) if db_path is not None else DB_PATH
+        # #3294: lazily-opened, kept-open connection dedicated to
+        # `change_token()` — see the class docstring for why this one
+        # connection is the exception to "fresh connection per call".
+        # Guarded by `_change_lock` because it is shared between the event
+        # loop thread (the /board handler's initial freshness check) and a
+        # threadpool worker (the same handler's rebuild leader) — see
+        # coord.serve_app's board().
+        self._change_conn: Any = None
+        self._change_lock = threading.Lock()
 
     # ── connection ────────────────────────────────────────────────────────────
     def _connect(self) -> Any:
@@ -576,3 +598,77 @@ class SqliteStore:
                 # retention cap; `after_json` arrives decoded as a real list.
                 "drive_queue": self._table(conn, "drive_queue", order="position"),
             }
+
+    # ── change detection (#3294) ────────────────────────────────────────────
+    def _open_change_conn(self) -> Any:
+        conn = sql.connect(
+            backend=sql.DIALECT_SQLITE,
+            sqlite_path=self._path,
+            read_only=True,
+            check_same_thread=False,
+        )
+        sql.apply_row_factory(conn)
+        sql.apply_connection_setup(conn, read_only=True)
+        return conn
+
+    def change_token(self) -> str:
+        """A cheap, opaque "has anything been written since I last asked?" token.
+
+        Backs the ``/board`` read path's cache invalidation in
+        ``coord.serve_app`` (the board() handler's cache block): a 1.5 s TTL
+        forced a full board rebuild on essentially every poll even when
+        nothing had changed, because pollers run at 5 s and always missed the
+        window. This token replaces "younger than N seconds" with "no write
+        since this build" as the PRIMARY trigger -- the TTL survives only as
+        a safety upper bound (see serve_app.py) in case this token's source
+        ever misses a write path.
+
+        SQLite: :func:`coord.sql.sqlite_data_version` (``PRAGMA
+        data_version``, spelled in the dialect seam rather than here --
+        ``PRAGMA`` is SQLite-only statement text and ``coord/sql.py`` is the
+        one module allowed to name one, #2782/#1948), which changes whenever
+        ANY connection -- not just this process's own POSTs, but the
+        drive-queue timer and a concurrent ``coord notify`` writing locally
+        too -- commits to the database file. **Unlike every other read in
+        this class, this is NOT a fresh connection per call**: ``data_version``
+        is relative to the connection that reads it, and a brand-new
+        connection always reports the same baseline value regardless of how
+        many other connections committed before it opened -- it only starts
+        advancing once it has personally observed a change. So this method
+        reuses one connection (``_change_conn``, opened lazily, guarded by
+        ``_change_lock`` since it's shared between the event loop thread and
+        a threadpool worker -- see ``coord.serve_app.board()``) across every
+        call for the life of this ``SqliteStore``. See
+        https://sqlite.org/pragma.html#pragma_data_version. A failure (e.g.
+        the connection went stale) reopens once and, failing that, propagates
+        -- callers must treat any exception here as "assume changed, rebuild"
+        rather than crash the read path over a cache optimization.
+
+        Postgres (#827's in-flight lane): TODO(#3294-pg) -- ``data_version``
+        has no Postgres equivalent. A ``board_revision`` sequence bumped at
+        each write choke point (the ``_*_local()`` family in
+        ``coord/state.py``) or a ``LISTEN``/``NOTIFY`` channel are the two
+        candidates the issue names; until one lands, this returns a constant
+        so two calls always compare equal and the cache degrades to
+        "TTL-only" -- exactly today's (pre-#3294) behaviour -- rather than
+        silently caching forever or rebuilding on every request.
+        """
+        target = db_mod._resolve_store_target()
+        if target.backend == sql.DIALECT_POSTGRES:
+            return "pg-change-token-unimplemented"  # TODO(#3294-pg)
+        with self._change_lock:
+            if self._change_conn is None:
+                self._change_conn = self._open_change_conn()
+            try:
+                return sql.sqlite_data_version(self._change_conn)
+            except Exception:  # noqa: BLE001 — reopen-once fallback, see below
+                # Stale/broken connection (e.g. the underlying file was
+                # replaced out from under us) — reopen once. A repeat
+                # failure propagates to the caller, which treats it as
+                # "assume changed" rather than serving a false cache hit.
+                try:
+                    self._change_conn.close()
+                except Exception:  # noqa: BLE001 — already broken, best effort
+                    pass
+                self._change_conn = self._open_change_conn()
+                return sql.sqlite_data_version(self._change_conn)

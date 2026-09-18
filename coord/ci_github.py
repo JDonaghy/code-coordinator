@@ -84,6 +84,14 @@ def _bound_log_excerpt(text: str) -> tuple[str, bool]:
     Returns ``(excerpt, truncated)`` — *truncated* is ``True`` iff either
     bound actually cut something, so the caller can make the cut visible in
     the briefing text rather than silently handing over a partial log.
+
+    Position-based (keeps the TAIL). Superseded as the primary extraction
+    path by :func:`_extract_relevant_log_lines` (#3245) — for any job whose
+    final step is a shell script, the tail is the runner echoing the
+    script's own source and post-job cleanup, not the error. Kept as a
+    small, independently-useful bounding primitive: :func:`_extract_relevant_
+    log_lines` falls back to it for the pathological case of a single
+    matched diagnostic line that alone exceeds the budget.
     """
     lines = text.splitlines()
     truncated = False
@@ -97,6 +105,138 @@ def _bound_log_excerpt(text: str) -> tuple[str, bool]:
         excerpt = encoded.decode("utf-8", errors="replace")
         truncated = True
     return excerpt, truncated
+
+
+# #3245: patterns behind `_extract_relevant_log_lines`'s priority tiers.
+# `##[error]` is GitHub Actions' own annotation syntax — always this exact
+# literal. The Rust diagnostic patterns are intentionally case-sensitive and
+# require a preceding word boundary: `\berror(\[E\d+\])?:` matches rustc's
+# `error:`/`error[E0433]:` but not the runner's OWN (capitalized) "Warning:
+# Node.js 16 actions are deprecated" notices or a word merely ending in
+# "...error:" (no boundary immediately before "error" in e.g. "TypeError:").
+# Same reasoning for `\bwarning:` staying lowercase-only.
+_ERROR_ANNOTATION_RE = re.compile(r"##\[error\]")
+_RUST_ERROR_RE = re.compile(r"\berror(\[E\d+\])?:")
+_RUST_LOCATION_RE = re.compile(r"-->")
+_RUST_WARNING_RE = re.compile(r"\bwarning:")
+
+# How many lines past a matched rust-diagnostic line to look for its `-->`
+# location before giving up — rustc always emits it on the very next
+# non-blank line; a small window tolerates the odd blank line without
+# accidentally stealing a `-->` that belongs to a LATER diagnostic.
+_RUST_LOCATION_LOOKAHEAD = 4
+
+
+def _select_diagnostic_units(lines: list[str]) -> tuple[
+    list[list[str]], list[list[str]], list[list[str]]
+]:
+    """Classify *lines* into (annotation, rust_diagnostic, warning) unit
+    lists, each unit a small list of original line strings kept atomic so
+    budget truncation never splits an `error:`/`-->` pair apart (#3245).
+
+    Each source line is claimed by at most one bucket, checked in priority
+    order, so a line matching a higher-priority pattern is never
+    double-counted by a lower one.
+    """
+    claimed: set[int] = set()
+
+    annotation: list[list[str]] = []
+    for i, line in enumerate(lines):
+        if _ERROR_ANNOTATION_RE.search(line):
+            annotation.append([line])
+            claimed.add(i)
+
+    rust_diag: list[list[str]] = []
+    for i, line in enumerate(lines):
+        if i in claimed or not _RUST_ERROR_RE.search(line):
+            continue
+        claimed.add(i)
+        unit = [line]
+        for j in range(i + 1, min(i + 1 + _RUST_LOCATION_LOOKAHEAD, len(lines))):
+            if j in claimed:
+                break
+            candidate = lines[j]
+            if _ERROR_ANNOTATION_RE.search(candidate) or _RUST_ERROR_RE.search(candidate):
+                # Ran into the next diagnostic without finding a location —
+                # don't steal ITS line as if it were this one's `-->`.
+                break
+            if _RUST_LOCATION_RE.search(candidate):
+                unit.append(candidate)
+                claimed.add(j)
+                break
+        rust_diag.append(unit)
+
+    warning: list[list[str]] = []
+    for i, line in enumerate(lines):
+        if i in claimed or not _RUST_WARNING_RE.search(line):
+            continue
+        claimed.add(i)
+        warning.append([line])
+
+    return annotation, rust_diag, warning
+
+
+def _extract_relevant_log_lines(text: str) -> tuple[str, bool, bool]:
+    """Select the diagnostic-relevant lines out of *text* (a job's full CI
+    log) instead of bounding by tail position (#3245).
+
+    For any GitHub Actions job whose final step is a shell script, the tail
+    is the runner echoing the script's own source plus post-job cleanup —
+    not the error. The real `error[E...]:`/`##[error]` lines can sit
+    hundreds of lines earlier and were being silently dropped by the old
+    position-based :func:`_bound_log_excerpt` cut.
+
+    Extraction is by relevance, in priority order, matching the issue's fix
+    shape:
+
+    1. ``##[error]`` GitHub Actions annotation lines
+    2. Rust diagnostics — ``error[E....]:``/``error:`` paired with the
+       ``-->`` file:line that follows
+    3. ``warning:`` lines, only if budget remains after 1-2
+
+    Everything else — including the runner's own echo of a script step's
+    source and post-job cleanup — is never a candidate, because it can
+    only ever match one of these patterns by (extremely unlikely)
+    coincidence.
+
+    Returns ``(excerpt, truncated, matched)``:
+
+    - *matched* is ``False`` when nothing in any tier matched anywhere in
+      *text* — the caller renders an explicit "no diagnostics" note rather
+      than a misleadingly-empty excerpt.
+    - *truncated* is ``True`` when the matched units together exceed
+      :data:`CI_FIX_LOG_MAX_LINES`/:data:`CI_FIX_LOG_MAX_BYTES` and lower-
+      priority units (warnings first, then any tier-1/2 overflow) had to be
+      dropped to fit — same "make the cut visible" contract as
+      :func:`_bound_log_excerpt`.
+    """
+    lines = text.splitlines()
+    annotation, rust_diag, warning = _select_diagnostic_units(lines)
+    units = annotation + rust_diag + warning
+    if not units:
+        return "", False, False
+
+    kept: list[str] = []
+    truncated = False
+    for unit in units:
+        candidate = kept + unit
+        joined = "\n".join(candidate)
+        if (
+            len(candidate) > CI_FIX_LOG_MAX_LINES
+            or len(joined.encode("utf-8", errors="replace")) > CI_FIX_LOG_MAX_BYTES
+        ):
+            truncated = True
+            break
+        kept = candidate
+
+    if not kept:
+        # Even the single highest-priority unit alone exceeds the budget
+        # (a pathologically long line) — show a bounded slice of it rather
+        # than an empty excerpt next to `matched=True`.
+        excerpt, _ = _bound_log_excerpt("\n".join(units[0]))
+        return excerpt, True, True
+
+    return "\n".join(kept), truncated, True
 
 
 def _failing_step(job: JobRun) -> JobStep | None:
@@ -178,9 +318,16 @@ def build_ci_failure_detail(
         step = _failing_step(job) if job is not None else None
         log_excerpt = ""
         truncated = False
+        no_diagnostics_matched = False
         if job is not None and job.job_id:
             raw_log = github_ops.get_job_log(repo, job.job_id)
-            log_excerpt, truncated = _bound_log_excerpt(raw_log)
+            log_excerpt, truncated, matched = _extract_relevant_log_lines(raw_log)
+            # A fetch that came back with SOME text but nothing that matched
+            # any priority tier is the "tail hides the summary" case this
+            # was built to avoid silently mishandling (#3245) — distinct
+            # from a plain empty/failed fetch, which leaves log_excerpt ""
+            # with nothing to say beyond that (the pre-existing behaviour).
+            no_diagnostics_matched = bool(raw_log) and not matched
         run_url = check.url or (
             f"https://github.com/{repo}/actions/runs/{check.run_id}"
             if check.run_id else ""
@@ -192,6 +339,7 @@ def build_ci_failure_detail(
             log_excerpt=log_excerpt,
             run_url=run_url,
             truncated=truncated,
+            no_diagnostics_matched=no_diagnostics_matched,
         )
     except Exception:  # noqa: BLE001 — best-effort enrichment (#3114), same
         # posture as `_ci_infra_reason`'s classification-only catch: a
@@ -383,10 +531,20 @@ class GitHubCi:
         or a third-party check with no Actions run behind it at all) is
         skipped rather than failing the whole call, and any individual
         ``gh run rerun`` failure is logged into the return value rather than
-        raised — this is the remedy side of a fail-closed *reading*
-        (:func:`coord.ci_store.checks_are_stale`), not itself required to be
-        fail-closed: a rerun that only partially succeeds still helps, but
-        the caller must not be told it fully worked.
+        raised — a rerun that only partially succeeds still helps, but the
+        caller must not be told it fully worked.
+
+        #3266: ``gh run rerun`` replays the SAME run against the SAME event
+        payload it originally fired against — including the SAME base SHA.
+        That makes this the right remedy for "this run's verdict doesn't
+        mean anything" questions (:func:`coord.merge_queue._ci_infra_reason`'s
+        verdictless-failure case, or a suspected flake) where re-observing
+        the identical run is the whole point, but the WRONG one for
+        :func:`coord.ci_store.checks_are_stale`'s base-moved reading: a
+        same-base replay can never produce a check against a base that has
+        since moved, so calling this to "fix" staleness is a guaranteed
+        no-op. See ``coord.merge_queue.MAX_CI_STALE_RERUNS``'s comment for
+        the caller-side fix (park and ask for a rebase instead).
 
         Returns ``True`` only when at least one run id was found *and* every
         rerun call it issued exited zero. Returns ``False`` when there was

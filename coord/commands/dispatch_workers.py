@@ -2052,6 +2052,7 @@ def _dispatch_fix_of(
         _build_fix_briefing,
         _fix_model_for_iteration,
         _load_review_findings,
+        last_fix_model_for_branch as _last_fix_model_fx,
     )
     from coord.agent import (  # noqa: PLC0415
         AssignmentSpec as _AssignmentSpecFx,
@@ -2127,7 +2128,17 @@ def _dispatch_fix_of(
 
     # Iteration accounting mirrors the auto-loop fix path so the merge
     # gate and the next review see an identical work→fix→review chain.
-    next_iteration = (work.review_iteration or 0) + 1
+    # #3322: literally the same function now — `next_fix_iteration` reads the
+    # max round already spent on this (repo, issue, branch) rather than
+    # trusting whichever `work` row `--fix-of` happened to resolve to, so a
+    # `coord fix` interleaved with headless bounces can't re-issue a number
+    # the chain already used (and stall model escalation / the cap with it).
+    from coord.auto_loop import (  # noqa: PLC0415
+        fix_round_title as _fix_round_title,
+        next_fix_iteration as _next_fix_iter,
+    )
+
+    next_iteration = _next_fix_iter(_fx_board, work)
     max_iter = cfg.pipeline.max_review_iterations
     if next_iteration > max_iter:
         if force:
@@ -2207,9 +2218,24 @@ def _dispatch_fix_of(
     # auto-loop path.  Explicit --model always wins; when omitted,
     # _fix_model_for_iteration returns the appropriate tier (or None when
     # pipeline.escalate_fix_model=False), falling back to cfg.models.default.
+    # #3360: gate the per-iteration climb on what actually failed — a
+    # compliance nit in `_findings_body` stays on the current rung.  That rung
+    # is read off the board (what round N-1 really dispatched at), not
+    # replayed from the iteration counter, so a nit that survives three
+    # rounds still never buys a bigger model.
     resolved_model = (
         model
-        or _fix_model_for_iteration(cfg, next_iteration)
+        or _fix_model_for_iteration(
+            cfg, next_iteration,
+            failure_text=_findings_body,
+            previous_model=_last_fix_model_fx(
+                _fx_board,
+                repo_name=work.repo_name,
+                issue_number=work.issue_number,
+                branch=work.branch,
+                before_iteration=next_iteration,
+            ),
+        )
         or cfg.models.default
     )
     assignment_id = _uuid.uuid4().hex[:12]
@@ -2249,7 +2275,7 @@ def _dispatch_fix_of(
         repo_name=repo,
         repo_path=fix_repo_path,
         issue_number=issue,
-        issue_title=f"[fix-{next_iteration}] {issue_title}",
+        issue_title=_fix_round_title(issue_title, next_iteration),
         briefing=effective_briefing,
         model=resolved_model,
         type="work",
@@ -2296,7 +2322,7 @@ def _dispatch_fix_of(
         machine_name=machine,
         repo_name=repo,
         issue_number=issue,
-        issue_title=f"[fix-{next_iteration}] {issue_title}",
+        issue_title=_fix_round_title(issue_title, next_iteration),
         briefing=effective_briefing,
         assignment_id=assignment_id,
         status="running",
@@ -2752,6 +2778,18 @@ def _dispatch_rework_of(
 
     # Resolve branch: try to find a work assignment by ID first, then
     # fall back to treating the argument as a literal branch name.
+    # #3322: `coord rework` writes to the same branch as every other fix door,
+    # so it shares their iteration counter — and shares the bug. Both arms
+    # below used to read the counter off ONE row (`--rework-of`'s own, or the
+    # FIRST completed row on the branch, which is the oldest, not the newest),
+    # which re-issued a round number the chain had already spent. Route both
+    # through the shared helper so the number is strictly greater than every
+    # round already on that (repo, issue, branch).
+    from coord.auto_loop import (  # noqa: PLC0415
+        next_fix_iteration as _next_fix_iter,
+        next_fix_iteration_for_branch as _next_fix_iter_branch,
+    )
+
     _rw_board = _interactive_board(_build_board_rw)
     _rw_work = _rw_board.find_by_id(rework_of)
     if _rw_work is not None:
@@ -2762,14 +2800,14 @@ def _dispatch_rework_of(
             )
             sys.exit(2)
         rw_branch = _rw_work.branch
-        next_rw_iteration = (_rw_work.review_iteration or 0) + 1
+        next_rw_iteration = _next_fix_iter(_rw_board, _rw_work)
         rw_work_id: str | None = _rw_work.assignment_id
     else:
         # Treat the argument as a branch name — useful when the
         # original assignment has aged off the board.
         rw_branch = rework_of
-        # Look for any completed work on that branch to inherit
-        # the iteration counter; default to 1 if none found.
+        # Look for any completed work on that branch to link back to;
+        # the iteration counter comes from the whole chain, not this one row.
         _branch_work = next(
             (
                 a for a in _rw_board.completed
@@ -2777,10 +2815,11 @@ def _dispatch_rework_of(
             ),
             None,
         )
-        next_rw_iteration = (
-            (_branch_work.review_iteration or 0) + 1
-            if _branch_work is not None
-            else 1
+        next_rw_iteration = _next_fix_iter_branch(
+            _rw_board,
+            repo_name=repo,
+            issue_number=issue,
+            branch=rw_branch,
         )
         rw_work_id = (
             _branch_work.assignment_id if _branch_work is not None else None
@@ -4661,6 +4700,8 @@ def _dispatch_headless(
         post_briefing,
         resolve_dispatch_model_alias,
     )
+    from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
+    from coord.network import claude_credential_reachable, fetch_status  # noqa: PLC0415
     from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
@@ -4804,22 +4845,103 @@ def _dispatch_headless(
         )
     )
 
+    # Claim check — #3347: run this even under --dry-run so an operator
+    # checking before queuing sees the same skip a real dispatch would hit,
+    # instead of a clean bill of health followed by a live failure the very
+    # next time this exact command runs for real.
+    from coord.claim import adopt_remote_branch_claim, claim_message, find_work_claim
+    from coord.gates import assignments_for_issue  # noqa: PLC0415
+
+    board = read_board()
+    claim = None if force else find_work_claim(issue, repo, repo_cfg.github, board)
+    if claim is not None:
+        click.echo(f"  skipping: {claim_message(claim)}", err=True)
+        if claim.source == "remote_branch":
+            # The board has no *active* row for this issue, yet an unmerged
+            # `issue-{N}-*` branch already exists on the remote. That is
+            # usually real, finished Work-stage output with nowhere to
+            # attach to (#611's branch-backfill sweep only fills a missing
+            # branch on an EXISTING row; there is no row here at all).
+            # Refusing outright (the pre-#3347 behaviour) was correct about
+            # not double-dispatching, but its non-zero exit read as a
+            # dispatch failure to `coord drive`, which burned the entry's
+            # retry budget and blocked it — cascading to every `after=`
+            # dependent — even though the work this issue needed was
+            # already done and pushed. Adopt it instead: a `dry_run` merely
+            # previews this (no board mutation, same as every other
+            # `--dry-run` branch above), a real run commits it and exits 0
+            # so `coord drive` sees a clean exit rather than a death to
+            # retry.
+            #
+            # BUT: `find_work_claim` only scans `board.active` — the moment
+            # a Work-stage worker finishes, `Board.mark_done()` moves its
+            # row to `board.completed` (the normal state for every issue
+            # between "Work done" and "Test/Review dispatched", not a rare
+            # edge case). In that window there IS already a real board row
+            # for this issue, with a real `uuid.uuid4().hex[:12]`
+            # `assignment_id`, sitting in `board.completed` — invisible to
+            # `find_work_claim`, so this branch fires anyway. Adopting
+            # unconditionally there would write a SECOND completed row with
+            # a fabricated `adopted-{repo}-{issue}` id, and nothing
+            # downstream dedupes review/smoke dispatch by anything but
+            # `assignment_id` — risking a redundant Test/Review run against
+            # a PR that's already been reviewed. So before adopting, check
+            # the full board (active + completed) via `assignments_for_issue`
+            # — the same union `coord gates`' own "no assignments found"
+            # check uses — and only adopt when truly no row exists.
+            existing = assignments_for_issue(board, repo, issue)
+            if existing:
+                current = existing[-1]
+                if dry_run:
+                    click.echo(
+                        f"  (dry run — {claim.branch} already tracked by "
+                        f"assignment {current.assignment_id}; not adopting, "
+                        "not dispatched)"
+                    )
+                    return
+                click.echo(
+                    f"  {claim.branch} already tracked by assignment "
+                    f"{current.assignment_id} — nothing to adopt; the "
+                    "existing Test/Review auto-dispatch loop will pick it "
+                    "up on its own"
+                )
+                return
+            if dry_run:
+                click.echo(
+                    f"  (dry run — would adopt {claim.branch} as a done work "
+                    "assignment instead of failing; not dispatched)"
+                )
+                return
+            adopted = adopt_remote_branch_claim(
+                claim,
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=issue_title,
+                required_gates=resolved_gates,
+                driven_by=driven_by,
+                # #3347 review: match whatever type THIS dispatch attempt
+                # would actually have used (plan-only → "plan", a labelled
+                # epic → its dispatch_type) rather than always "work" — see
+                # `adopt_remote_branch_claim`'s docstring.
+                assignment_type=proposal.type,
+            )
+            board.completed.append(adopted)
+            write_board(board)
+            click.echo(
+                f"  adopted existing branch as work assignment "
+                f"{adopted.assignment_id} — Test/Review can now proceed "
+                "against it without a fresh dispatch"
+            )
+            return
+        if dry_run:
+            click.echo("  (dry run — not dispatched)")
+            return
+        sys.exit(1)
+
     if dry_run:
         click.echo("  (dry run — not dispatched)")
         return
-
-    # Claim check
-    from coord.claim import claim_message, find_work_claim
-
-    board = read_board()
-    if not force:
-        claim = find_work_claim(issue, repo, repo_cfg.github, board)
-        if claim is not None:
-            click.echo(
-                f"  skipping: {claim_message(claim)}",
-                err=True,
-            )
-            sys.exit(1)
 
     # #267: dependency freshness check — same machinery `coord approve`
     # uses.  Default for `coord assign` is `--auto-pull` (the manual /
@@ -4895,6 +5017,25 @@ def _dispatch_headless(
     try:
         response = dispatch(
             proposal, cfg, pull_repos=pull_repos, fresh_branch=force,
+            # #3353: opt `type="work"` dispatch into a live liveness
+            # reroute — without this, `coord assign` (like `coord
+            # approve`, wired the same way) POSTed straight to the named
+            # machine regardless of whether its agent answered at all, the
+            # same busy-vs-alive confusion that sent #3349/coord-tui#79 to
+            # a dead box.
+            status_fetcher=fetch_status,
+            # #3371: wire the STRUCTURAL CREDENTIAL-HEALTH GATE to a real
+            # live probe — `coord assign` is a production dispatch
+            # chokepoint (`coord drive`'s own WORK stage funnels through
+            # here too), so this must actually refuse a dead-credential
+            # host, not just be capable of it.
+            credential_fetcher=claude_credential_reachable,
+            # #3376 review round 1: `coord assign` is a production
+            # dispatch chokepoint (`coord drive`'s WORK stage funnels
+            # through here too) — wire the other two STRUCTURAL
+            # DISPATCH-LIVENESS GATE predicates the same way
+            # `credential_fetcher` just above already is.
+            issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
         )
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)

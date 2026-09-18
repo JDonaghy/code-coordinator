@@ -2384,7 +2384,17 @@ class TestUatStateAndReasonColumns:
 # #3188 bumped this to (13, 87): `assignments.uat_actor`,
 # `assignments.uat_prior`, and the two
 # `portal_sync_state.preview_verdict_watermark_*` columns.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (13, 87)
+# #3236 bumped this to (14, 91): `drive_queue.plan_destructive` /
+# `apply_verdict` / `apply_verdict_reason` / `apply_verdict_at`.
+# #3333 bumped this to (16, 93): a new `smoke_claims` TABLE (not a column —
+# `_MIGRATE_ADD_COLUMNS`'s length is unchanged at 93, so only the version
+# moved, to force `_ensure_schema`'s `CREATE TABLE IF NOT EXISTS` to run once
+# more on an existing database) — same shape as #3113's `review_claims` bump
+# above.
+# #3357 bumped this to (18, 96): `assignments.test_confirmation` —
+# machine-readable provenance for a `test_state` write (confirmed by a real
+# out-of-band re-run, or merely carried forward from the worker's claim).
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (18, 96)
 
 
 class TestMigrateAddColumnsVersionGuard:

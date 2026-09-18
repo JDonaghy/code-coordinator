@@ -17,6 +17,13 @@ Public entry points:
 
 - `match_rules(touched_files, rules)`  — pure: returns the union of required
   capabilities for any rule whose `files` prefix matches a touched file.
+- `required_capabilities(repo_requires, touched_files, rules)` (#3351) —
+  pure: `match_rules`'s result UNION `repo_requires` (`Repo.requires` —
+  capabilities every leg of a repo needs regardless of which files
+  changed, e.g. vimcode's repo-wide nvim-conformance oracle). The single
+  function both this module's own routing and `coord.dispatch.
+  route_work_by_capability`'s Work-leg routing call, so the two answer
+  "what does this diff need" identically.
 - `partition_capability_requirements(touched_files, rules, capable_for)`
   (#3177) — pure: groups matched rules' requirements into the fewest
   capability sets a single configured machine can each satisfy, and reports
@@ -55,23 +62,36 @@ independence; for smoke we want a *capable* machine for hardware, and
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 if TYPE_CHECKING:
     from datetime import datetime
+
+    from coord.merge_queue import GhOps
 
 import httpx
 
 from coord import github_ops
 from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
-from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
+# #3315 review: the shared environmental-retry-budget knob — see
+# `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` below for why this lives in
+# `coord.failure_class` rather than as this module's own literal.
+from coord.failure_class import ENVIRONMENTAL_RETRY_BUDGET
+from coord.models import (
+    SEALED_PATH_AUTHOR_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+    Machine,
+)
 # #2170: the SAME marker/exit-code convention `scripts/coord-test-runner.sh`
 # and `coord.revalidate` use for a red baseline — imported (not re-literalled)
 # so the dispatched smoke agent's instructions can never drift from what the
@@ -199,15 +219,32 @@ A `baseline-red` verdict has no `coord test` flag — print the marker only.
 # ── Rule matching ───────────────────────────────────────────────────────────
 
 
+def _pattern_matches(path: str, pattern: str) -> bool:
+    """Does `path` hit one `rule.files` pattern?
+
+    Two forms: a bare `*.ext` suffix wildcard (#3233 — terraform `.tf` files
+    live at arbitrary depth in a repo, so no single directory prefix can
+    route them the way `src/gtk/` routes GTK work) matches by file
+    extension regardless of directory; anything else is the original
+    path-prefix match (`src/gtk/` matches `src/gtk/foo.c`). A pattern of
+    just `"*"` or empty is never treated as a suffix wildcard — `pattern[1:]`
+    would be empty and match every path, which is never the intent of an
+    explicit rule.
+    """
+    if pattern.startswith("*.") and len(pattern) > 2:
+        return path.endswith(pattern[1:])
+    return path.startswith(pattern)
+
+
 def _rule_matches(touched_files: list[str], rule: SmokeRule) -> bool:
-    """Does any touched path start with any of `rule.files`'s prefixes?
+    """Does any touched path hit any of `rule.files`'s patterns?
 
     The one "does this rule apply" test, shared by `match_rules` and
     `partition_capability_requirements` so the two matchers can't silently
     drift apart (e.g. one growing a case-insensitive or glob match the other
     doesn't) — see the #3177 review note this was factored out to satisfy.
     """
-    return any(path.startswith(pattern) for path in touched_files for pattern in rule.files)
+    return any(_pattern_matches(path, pattern) for path in touched_files for pattern in rule.files)
 
 
 def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
@@ -216,7 +253,11 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
     Matching is path-prefix: a rule with `files=["src/gtk/"]` matches
     `src/gtk/foo.c` but not `src/cli.py`. A rule with `files=["src/gtk"]`
     (no slash) catches both `src/gtk/foo.c` and `src/gtk_helpers.c` — use
-    the trailing slash form to be strict.
+    the trailing slash form to be strict. A pattern of the form `"*.ext"`
+    (#3233) is instead a suffix wildcard matching by file extension at any
+    depth — `files=["*.tf"]` matches `infra/net/main.tf` the same as a
+    root-level `main.tf`, which no directory prefix could express for files
+    scattered across a repo the way terraform's are.
 
     Returns capabilities in deterministic order (first-seen across rules).
 
@@ -232,6 +273,33 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
             continue
         for cap in rule.requires:
             seen.setdefault(cap, None)
+    return list(seen.keys())
+
+
+def required_capabilities(
+    repo_requires: Iterable[str], touched_files: list[str], rules: list[SmokeRule]
+) -> list[str]:
+    """Every capability a diff needs: `repo_requires` (`Repo.requires`,
+    #3351 — capabilities EVERY leg of this repo needs regardless of which
+    files changed, e.g. vimcode's repo-wide nvim-conformance oracle) UNION
+    whichever `capability_rules` a touched file matches (`match_rules`).
+
+    This is the single function both `dispatch_smoke` (Test-stage routing,
+    below) and `coord.dispatch.route_work_by_capability` (#3241, Work-leg
+    routing) call to answer "what does this diff need" — so the two can
+    never drift into disagreeing answers (#2096, "one question, one
+    answer"), the same guarantee `_rule_matches` already gives the
+    file-based half of this question.
+
+    Deterministic order: `repo_requires` first (declaration order), then
+    any additional capability a matched rule contributes that isn't already
+    in `repo_requires`.
+    """
+    seen: dict[str, None] = {}
+    for cap in repo_requires:
+        seen.setdefault(cap, None)
+    for cap in match_rules(touched_files, rules):
+        seen.setdefault(cap, None)
     return list(seen.keys())
 
 
@@ -268,9 +336,21 @@ def match_rules(touched_files: list[str], rules: list[SmokeRule]) -> list[str]:
 class SmokePartition:
     """One capability set that some single configured machine can satisfy —
     i.e. one Test-stage leg, if/when the fan-out described above ships.
+
+    `files` (#3298) are the touched paths that actually put THIS partition on
+    the board — the union of files matched by whichever `capability_rules`
+    entries contributed `capabilities`' requirements — as opposed to the
+    diff's full `touched_files`. Resolving the Test-stage command against
+    *this* narrower set, per partition, is what lets a `SmokeRule.command`
+    declared on the contributing rule win for only its own leg instead of
+    every leg in the fan-out (`coord.smoke.resolve_smoke_command`). Never
+    empty for a partition `partition_capability_requirements` actually
+    returns — every partition is built from at least one rule that matched at
+    least one touched file.
     """
 
     capabilities: tuple[str, ...]
+    files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -328,8 +408,22 @@ def partition_capability_requirements(
     Rules with an empty `requires` never enter this — they mean "no extra
     capability needed", already handled by the existing any-capable-machine
     path in `dispatch_smoke`, not a partition of their own.
+
+    #3298: each returned :class:`SmokePartition` also carries `files` — the
+    touched paths matched by whichever rule(s) contributed its capabilities
+    — so a caller can resolve the Test-stage command per partition, scoped to
+    only the files that put THAT partition on the board, instead of the
+    diff's full `touched_files`.
     """
-    seen: dict[frozenset[str], tuple[int, list[str]]] = {}
+    # #3298 fix-round-1: `seen` used to keep only the FIRST rule matching a
+    # given `requires` set and silently drop every later one with the same
+    # set — so a second rule sharing a capability set (e.g. a broad `gtk`
+    # rule plus a narrower `gtk` override carrying its own `command`) never
+    # entered `order`/`group_rule_indices` at all, and its files never made
+    # it into the partition's `files`, so `resolve_rule_command` could never
+    # see them and its `command` could never win. Every rule matching a
+    # given key must accumulate here, not just the first.
+    seen: dict[frozenset[str], list[int]] = {}
     order: list[frozenset[str]] = []
     for i, rule in enumerate(rules):
         if not rule.requires:
@@ -338,18 +432,31 @@ def partition_capability_requirements(
             continue
         key = frozenset(rule.requires)
         if key not in seen:
-            seen[key] = (i, list(rule.files))
+            seen[key] = []
             order.append(key)
+        seen[key].append(i)
 
     groups: list[set[str]] = []
+    group_rule_indices: list[list[int]] = []
     unroutable: list[UnroutableCapability] = []
     for key in order:
-        rule_index, rule_files = seen[key]
+        rule_indices_for_key = seen[key]
         caps = set(key)
         if not capable_for(sorted(caps)):
+            # `rule_files` here is diagnostic text for `describe()` — the
+            # DECLARED file patterns of every rule sharing this unroutable
+            # capability set (e.g. `["src/cuda/"]`), same as pre-#3298-fix
+            # for a single rule, just unioned (order-preserving, deduped)
+            # across every rule now accumulated under this key instead of
+            # only the first.
+            rule_files: list[str] = []
+            for rule_index in rule_indices_for_key:
+                for f in rules[rule_index].files:
+                    if f not in rule_files:
+                        rule_files.append(f)
             unroutable.append(UnroutableCapability(
                 capabilities=tuple(sorted(caps)),
-                rule_index=rule_index,
+                rule_index=rule_indices_for_key[0],
                 rule_files=tuple(rule_files),
             ))
             continue
@@ -358,12 +465,25 @@ def partition_capability_requirements(
             candidate = group | caps
             if capable_for(sorted(candidate)):
                 groups[i] = candidate
+                group_rule_indices[i].extend(rule_indices_for_key)
                 merged = True
                 break
         if not merged:
             groups.append(caps)
+            group_rule_indices.append(list(rule_indices_for_key))
 
-    partitions = [SmokePartition(capabilities=tuple(sorted(g))) for g in groups]
+    partitions = [
+        SmokePartition(
+            capabilities=tuple(sorted(group)),
+            files=tuple(sorted({
+                path
+                for rule_index in rule_indices
+                for path in touched_files
+                if _rule_matches([path], rules[rule_index])
+            })),
+        )
+        for group, rule_indices in zip(groups, group_rule_indices)
+    ]
     return partitions, unroutable
 
 
@@ -459,51 +579,115 @@ def smoke_leg_capabilities(issue_title: str | None) -> tuple[str, ...] | None:
 _FANOUT_MANIFEST_RE = re.compile(r"^\[\[smoke-fanout:([^\]]*)\]\]\n?")
 
 
-def _encode_fanout_manifest(legs: list[tuple[str, tuple[str, ...]]]) -> str:
+def _encode_fanout_manifest(
+    legs: list[tuple[str, tuple[str, ...], str | None]],
+) -> str:
     """The manifest line stamped at the FRONT of the parent's ``test_reason``
-    for a #3182 fan-out: ``[[smoke-fanout:<id>=<caps>,...]]``, one entry per
-    leg dispatched (or already active/completed) this round. Preserved
-    byte-for-byte across every later rewrite of the parent's ``test_reason``
-    (the running-progress stamp, and the final aggregate) so
+    for a #3182 fan-out: ``[[smoke-fanout:<id>=<caps>=<command_b64>,...]]``,
+    one entry per leg dispatched (or already active/completed) this round.
+    Preserved byte-for-byte across every later rewrite of the parent's
+    ``test_reason`` (the running-progress stamp, and the final aggregate) so
     :func:`finalize_smoke_fanout` can always find its siblings again from
     just the parent's own row — see the module note above for why this, and
     not a new query endpoint.
+
+    ``command_b64`` (#3298) is the partition's own resolved Test-stage
+    command, URL-safe base64-encoded so an arbitrary shell command — commas,
+    brackets, newlines, anything a real ``test_command``/rule ``command`` can
+    contain — can never corrupt this manifest's own ``,``/``=``/``]``
+    delimiters. Encodes as an empty third field when the command is unknown
+    (``None``), which round-trips through :func:`_parse_fanout_manifest` as
+    ``command=None`` rather than raising or misparsing.
     """
-    body = ",".join(
-        f"{leg_id}={'+'.join(sorted(caps))}" for leg_id, caps in legs
-    )
+    def _entry(leg_id: str, caps: tuple[str, ...], command: str | None) -> str:
+        cap_str = "+".join(sorted(caps))
+        cmd_b64 = (
+            base64.urlsafe_b64encode(command.encode()).decode() if command else ""
+        )
+        return f"{leg_id}={cap_str}={cmd_b64}"
+
+    body = ",".join(_entry(leg_id, caps, command) for leg_id, caps, command in legs)
     return f"[[smoke-fanout:{body}]]"
 
 
 def _parse_fanout_manifest(
     test_reason: str | None,
-) -> list[tuple[str, tuple[str, ...]]] | None:
-    """The ``(leg_id, capabilities)`` pairs :func:`_encode_fanout_manifest`
-    wrote, or ``None`` when *test_reason* carries no manifest (not a fan-out
-    row). Tolerates a malformed entry by skipping just that entry, never
-    raising.
+) -> list[tuple[str, tuple[str, ...], str | None]] | None:
+    """The ``(leg_id, capabilities, command)`` triples
+    :func:`_encode_fanout_manifest` wrote, or ``None`` when *test_reason*
+    carries no manifest (not a fan-out row). Tolerates a malformed entry by
+    skipping just that entry, never raising.
+
+    ``command`` is ``None`` for a pre-#3298 two-field entry
+    (``<id>=<caps>``, no trailing ``=<command_b64>``) — an already-in-flight
+    row from before this field existed — as well as for a malformed base64
+    payload; either way the caller gets "unknown command", never a crash.
     """
     if not test_reason:
         return None
     m = _FANOUT_MANIFEST_RE.match(test_reason)
     if not m:
         return None
-    legs: list[tuple[str, tuple[str, ...]]] = []
+    legs: list[tuple[str, tuple[str, ...], str | None]] = []
     for entry in m.group(1).split(","):
         if not entry:
             continue
-        leg_id, _, caps = entry.partition("=")
+        leg_id, _, rest = entry.partition("=")
+        caps, _, cmd_b64 = rest.partition("=")
         if not leg_id or not caps:
             continue
-        legs.append((leg_id, tuple(caps.split("+"))))
+        command: str | None = None
+        if cmd_b64:
+            try:
+                command = base64.urlsafe_b64decode(cmd_b64.encode()).decode()
+            except (ValueError, UnicodeDecodeError):
+                command = None
+        legs.append((leg_id, tuple(caps.split("+")), command))
     return legs
+
+
+def _build_fanout_running_reason(
+    leg_manifest: list[tuple[str, tuple[str, ...], str | None]],
+    *,
+    total_partitions: int,
+    prior_env_legs: int,
+) -> str:
+    """The parent's ``running`` ``test_reason`` text for a #3182 fan-out
+    round: the ``[[smoke-fanout:...]]`` manifest (:func:`_encode_fanout_manifest`)
+    followed by a human-readable summary of every leg *leg_manifest* names,
+    plus the #3315 environmental-retry tally when one is already accruing.
+
+    Factored out of what used to be `_dispatch_smoke_fanout`'s own inline
+    stamp so :func:`coord.state.merge_smoke_fanout_manifest`'s DB-side
+    read-merge-write (#3333 review) can build this exact text from whatever
+    manifest IT just merged — which, under two concurrent ticks each
+    claiming a different capability partition of the same parent, is not
+    necessarily the same as either call's own partial `leg_manifest`.
+    """
+    summary = "; ".join(
+        f"[{'+'.join(sorted(caps))}]" for _, caps, _ in leg_manifest
+    )
+    manifest_line = _encode_fanout_manifest(leg_manifest)
+    running_reason = (
+        f"{manifest_line}\nTest stage running across {total_partitions} "
+        f"capability-partition leg(s) (#3182): {summary}."
+    )
+    if prior_env_legs:
+        running_reason = (
+            f"{running_reason}\n{environmental_smoke_tally(prior_env_legs)} "
+            f"({prior_env_legs} of {ENVIRONMENTAL_SMOKE_RETRY_BUDGET} "
+            "consecutive environmental fan-out-leg death(s) so far, #3315)"
+        )
+    return running_reason
 
 
 def _find_leg_for_partition(
     board: Board, *, repo_name: str, branch: str | None, capabilities: tuple[str, ...],
+    review_of_assignment_id: str | None,
 ) -> Assignment | None:
-    """The most-recently-dispatched smoke leg on ``(repo_name, branch)`` whose
-    capability tag matches *capabilities*, from either ``board.active`` or
+    """The most-recently-dispatched smoke leg belonging to the work row
+    *review_of_assignment_id*, on ``(repo_name, branch)``, whose capability
+    tag matches *capabilities*, from either ``board.active`` or
     ``board.completed``.
 
     The per-partition peer of ``coord.claim.has_active_branch_followup``
@@ -514,6 +698,16 @@ def _find_leg_for_partition(
     sibling partition ever gets a machine — a later tick must still recognise
     the finished one as already handled rather than re-dispatching a
     duplicate for it.
+
+    #3328: matching is scoped to ``review_of_assignment_id`` — i.e. THIS
+    work row's own legs — never just ``(repo_name, branch, capabilities)``.
+    A branch acquires a new work row on every review bounce / retry, and a
+    match on branch alone finds the PRIOR work row's already-terminal legs,
+    wrongly credits them to the new row (writing foreign leg ids into its
+    fan-out manifest) and dispatches nothing of its own — leaving the new
+    row's ``test_state`` stuck at ``"running"`` with zero real children, an
+    unrecoverable (and, via the #2803 sweep, self-re-triggering) wedge. Every
+    work row must get its own legs, one way or another.
 
     A COMPLETED leg with no genuine verdict (``test_state`` still ``None``/
     ``"running"`` — an #1605 environmental death cleared it for retry, same
@@ -528,6 +722,8 @@ def _find_leg_for_partition(
     best: Assignment | None = None
     for a in list(board.active) + list(board.completed):
         if a.type != "smoke" or a.repo_name != repo_name or a.branch != branch:
+            continue
+        if a.review_of_assignment_id != review_of_assignment_id:
             continue
         if smoke_leg_capabilities(a.issue_title) != target:
             continue
@@ -574,33 +770,44 @@ def finalize_smoke_fanout(work_parent_id: str) -> None:
         if not legs:
             return  # not a fan-out row
 
-        leg_states: list[tuple[tuple[str, ...], str | None, str | None]] = [
+        # #3298: carry each leg's own resolved command forward from the
+        # manifest (never re-read from the leg's row — `_record_smoke_verdict`
+        # overwrites a leg's own `test_reason` with its terminal verdict text,
+        # so the command it ran is only ever recoverable from here) into the
+        # failure report, so two failing legs that ran DIFFERENT commands
+        # (possible now that command resolution is scoped per partition) read
+        # as distinguishable instead of two identically-shaped failures.
+        leg_states: list[tuple[tuple[str, ...], str | None, str | None, str | None]] = [
             (
                 caps,
                 load_assignment_test_state(leg_id),
                 load_assignment_test_reason(leg_id),
+                command,
             )
-            for leg_id, caps in legs
+            for leg_id, caps, command in legs
         ]
-        if any(state in (None, "running") for _, state, _ in leg_states):
+        if any(state in (None, "running") for _, state, _, _ in leg_states):
             return  # not everyone has reported in yet
 
         severity = {"failed": 3, TEST_STATE_BLOCKED: 2, "skipped": 1, "passed": 0}
         worst = max(
-            (state for _, state, _ in leg_states if state in severity),
+            (state for _, state, _, _ in leg_states if state in severity),
             key=lambda s: severity[s],
             default="passed",
         )
         summary = "; ".join(
-            f"[{'+'.join(caps)}]={state}" for caps, state, _ in leg_states
+            f"[{'+'.join(caps)}]={state}" for caps, state, _, _ in leg_states
         )
-        manifest_line = _encode_fanout_manifest([(lid, caps) for lid, caps in legs])
+        manifest_line = _encode_fanout_manifest(
+            [(lid, caps, command) for lid, caps, command in legs]
+        )
 
         if worst == "failed":
             named = "; ".join(
                 f"capability set [{'+'.join(caps)}] failed"
+                + (f" (ran `{command}`)" if command else "")
                 + (f" — {reason}" if reason else "")
-                for caps, state, reason in leg_states
+                for caps, state, reason, command in leg_states
                 if state == "failed"
             )
             final_state, headline = "failed", f"Test stage failed (#3182): {named}."
@@ -893,18 +1100,13 @@ def _capability_probe_reasons(
     if not raw_probes:
         return {}
 
-    from coord.prereqs import ToolProbe, unmet_capabilities
+    from coord.prereqs import tool_probe_from_dict, unmet_capabilities
 
+    # #3371: the SAME reconstruction `coord doctor` and `coord.machine_onboard`
+    # use (`tool_probe_from_dict`) — not a fourth independent copy of the same
+    # dict->ToolProbe logic (#2096's "one question, one answer").
     probes = {
-        tool: ToolProbe(
-            tool=tool,
-            capability=info.get("capability"),
-            found=bool(info.get("found", False)),
-            version=info.get("version"),
-            min_version=info.get("min_version"),
-            meets_floor=info.get("meets_floor"),
-            what_breaks="",
-        )
+        tool: tool_probe_from_dict(tool, info)
         for tool, info in raw_probes.items()
         if isinstance(info, dict)
     }
@@ -997,11 +1199,15 @@ def resolve_rule_command(
     for i, rule in enumerate(rules):
         if not rule.command:
             continue
-        if any(
-            path.startswith(pattern)
-            for path in touched_files
-            for pattern in rule.files
-        ):
+        # #3233: reuses `_rule_matches` rather than re-deriving the same
+        # "does this rule apply" test inline — this file used to carry TWO
+        # independent copies of the plain prefix check (this one and
+        # `_rule_matches`, which `match_rules`/`partition_capability_
+        # requirements` share), which is exactly the split-brain #2096 warns
+        # against: adding the `*.ext` suffix wildcard to only one of them
+        # would have made a `.tf` rule that also declares `command` route
+        # correctly but pick no override command, silently.
+        if _rule_matches(touched_files, rule):
             return SmokeCommand(
                 rule.command,
                 f"smoke_tests.capability_rules[{i}] (files={rule.files!r})",
@@ -1245,6 +1451,68 @@ def _fetch_touched_files(repo_github: str, branch: str) -> list[str]:
 TEST_STATE_BLOCKED = "blocked"
 
 
+def _test_verdict_is_stale(
+    completed: Assignment,
+    board: Board,
+    config: Config,
+    gh_ops: "GhOps | None",
+) -> bool:
+    """#3309: True when *completed*'s own recorded Test verdict is
+    #1479-stale — recorded against a base/branch combination that has since
+    moved (typically a #241 conflict-fix rebase).
+
+    ``dispatch_pending_smoke`` used to treat ANY recorded ``test_state`` as
+    "someone is already handling this row" and skip it forever. That is
+    correct for a fresh verdict, but a rebase can make a ``passed`` verdict
+    stale without ever clearing it — from that moment the merge gate reports
+    ``smoke_required`` while this producer, its only automatic source, keeps
+    skipping the row on every tick. Nothing else ever re-asks once the drive
+    that recorded the original verdict has exited (that is what made the
+    rebase necessary in the first place), so the entry deadlocks silently.
+
+    Reuses :func:`coord.merge_queue.evaluate_smoke_verdict` — the SAME
+    function ``coord merge``/``coord gates`` call to decide
+    ``smoke_required`` — rather than a second implementation of the #1479
+    freshness math that could silently drift from it (#2096, "one question,
+    one answer"). Built via :func:`coord.merge_queue.live_gate_entry`, the
+    one shared constructor for gate-checking a raw work
+    :class:`~coord.models.Assignment` before it has gone through a live
+    ``coord merge`` pass (#2085) — mirrors exactly what
+    :func:`coord.gates.build_gate_report` does for the same reason.
+
+    Only a genuinely :data:`~coord.merge_queue.SMOKE_STALE` result returns
+    ``True``. A :data:`~coord.merge_queue.SMOKE_MISSING` result (e.g. a
+    ``"failed"`` verdict — #1479's staleness anchors are stamped only for
+    ``"passed"``/``"skipped"``, ``coord.state._record_test_verdict_local``)
+    or a :data:`~coord.merge_queue.SMOKE_UNKNOWN` result (a live SHA lookup
+    that could not be confirmed — a transient GitHub read failure) both
+    return ``False``: re-dispatching on either would either resurrect a
+    "failed" row nothing asked to re-run, or fire on a probe that never
+    actually observed a discrepancy.
+
+    ``gh_ops=None`` (or no ``repo.github``/``completed.branch``) fails open
+    to ``False`` — the #821/#1475 convention every #1479 staleness check
+    follows: with no live SHA to compare against, every anchor check inside
+    ``evaluate_smoke_verdict`` is a no-op and it reports the verdict fresh,
+    exactly as it did before this function existed.
+    """
+    if gh_ops is None or not completed.branch:
+        return False
+    repo = config.repo(completed.repo_name)
+    if repo is None or not repo.github:
+        return False
+
+    from coord import merge_queue as mq  # noqa: PLC0415
+    from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+
+    target_branch = resolve_base_branch_for_issue_number(
+        repo, repo.github, completed.issue_number,
+    )
+    entry = mq.live_gate_entry(completed, repo.github, target_branch, gh_ops)
+    status = mq.evaluate_smoke_verdict(entry, board, gh_ops)
+    return (not status.ok) and status.kind == mq.SMOKE_STALE
+
+
 # ── Mute Test-stage legs: the retry budget (#2244/#2272) ────────────────────
 #
 # A Test-stage leg that finishes without printing a `SMOKE:` marker records NO
@@ -1328,6 +1596,106 @@ def mute_smoke_tally(count: int) -> str:
     if count <= 1:
         return NO_SMOKE_VERDICT_MARKER
     return f"{NO_SMOKE_VERDICT_MARKER} x{count}"
+
+
+# ── Environmental Test-stage retries: the rate-limit budget (#3315) ─────────
+#
+# A sustained Claude API 429 (the account's weekly usage limit exhausted
+# mid-window, 2026-09-11/12) produced 542 Test-stage legs on one issue over
+# 12h18m — every leg died at zero turns/zero tokens. Each death is correctly
+# classified `environmental` by `coord.reconcile.propagate_smoke_terminal_
+# failure` (#1605) and cleared back to `test_state=None` so the row isn't
+# charged against the work-failure budget — right for a genuine blip, but
+# that clear was UNCONDITIONAL, so `dispatch_pending_smoke` picked the row
+# straight back up on the very next tick and re-dispatched into the same
+# exhausted budget, forever. Nothing ever stopped it; the window resetting on
+# its own is what ended the incident.
+#
+# The fix mirrors `coord/drive.py`'s WORK-stage environmental retry budget
+# (`_ENVIRONMENTAL_WORK_RETRY_BUDGET`, #2360): "environmental" means "don't
+# spend the WORK-failure budget on the provider's fault", never "retry
+# infinitely". Same shape as the mute-leg budget just above — a marker +
+# tally embedded in `test_reason`, the one field that survives across
+# Test-stage legs — because it is the same problem: bound a retry that a
+# naive re-dispatch treats as free.
+#
+# #3315 review: this is `coord.failure_class.ENVIRONMENTAL_RETRY_BUDGET`
+# under a local name, not a second independently-tuned literal — smoke.py
+# already has no reason to depend on `coord.drive` (nothing else here does),
+# but it — like `coord.drive` — already depends on `coord.failure_class` for
+# the environmental/work classification itself, so that leaf module is where
+# the ONE shared number belongs. Importing it directly here (rather than
+# threading it through every caller as a parameter) keeps this module's
+# `_dispatch_smoke_single_leg`/`_dispatch_smoke_fanout` display text able to
+# name the budget without a `coord.reconcile` round-trip.
+ENVIRONMENTAL_SMOKE_RETRY_BUDGET = ENVIRONMENTAL_RETRY_BUDGET
+
+#: The marker left in the parent work row's ``test_reason`` when an
+#: environmental Test-stage death (#1605) is cleared for automatic
+#: re-dispatch. Suffixed with `` xN`` from the second CONSECUTIVE leg on,
+#: exactly like :data:`NO_SMOKE_VERDICT_MARKER` — see :func:`environmental_
+#: smoke_tally`.
+ENVIRONMENTAL_SMOKE_MARKER = "environmental-retry (#3315)"
+
+#: Matches the marker with or without its `` xN`` tally — mirrors
+#: :data:`_MUTE_TALLY_RE`.
+_ENV_RETRY_TALLY_RE = re.compile(
+    re.escape(ENVIRONMENTAL_SMOKE_MARKER) + r"(?:\s*x\s*(\d+))?", re.IGNORECASE
+)
+
+
+def environmental_smoke_legs(test_reason: str | None) -> int:
+    """How many CONSECUTIVE environmental Test-stage deaths *test_reason*
+    records (0 if none) — the reader half of the #3315 budget, mirroring
+    :func:`mute_smoke_legs`.
+
+    Any write that is NOT an environmental-death clear (a mute-leg record, a
+    real pass/fail verdict, a fresh dispatch's plain "running" stamp) does not
+    carry this marker, so the tally naturally resets to 0 the moment the row
+    stops dying environmentally — exactly the behaviour the #3315 budget
+    needs: only *consecutive* environmental deaths count against it.
+    """
+    if not test_reason:
+        return 0
+    match = _ENV_RETRY_TALLY_RE.search(test_reason)
+    if match is None:
+        return 0
+    raw = match.group(1)
+    if raw is None:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:  # pragma: no cover — regex only matches digits
+        return 1
+
+
+def environmental_smoke_tally(count: int) -> str:
+    """The marker for *count* consecutive environmental Test-stage deaths —
+    mirrors :func:`mute_smoke_tally`."""
+    if count <= 1:
+        return ENVIRONMENTAL_SMOKE_MARKER
+    return f"{ENVIRONMENTAL_SMOKE_MARKER} x{count}"
+
+
+def environmental_smoke_tally_reset(test_reason: str | None) -> str:
+    """*test_reason* with any #3315 environmental-tally marker (and its
+    `` xN`` suffix) removed, trailing whitespace trimmed.
+
+    Every OTHER writer of this tally (`_dispatch_smoke_single_leg`,
+    `coord.reconcile.propagate_smoke_terminal_failure`'s single-leg branch)
+    reconstructs its whole `test_reason` from scratch each time, so the old
+    marker is simply never carried into the new string — no stripping
+    needed. The #3182 fan-out PARENT row is the one exception: its
+    `test_reason` starts with the `[[smoke-fanout:...]]` manifest
+    `_parse_fanout_manifest`/`finalize_smoke_fanout` need to find every
+    sibling leg again, so a re-stamp there must APPEND the updated tally
+    onto that existing text rather than replacing it wholesale — and without
+    this, repeated appends would pile up a duplicate marker per death
+    instead of one running count.
+    """
+    if not test_reason:
+        return ""
+    return _ENV_RETRY_TALLY_RE.sub("", test_reason).rstrip()
 
 
 #: Soft (transient) unroutable reports already logged this process, keyed by
@@ -1560,6 +1928,61 @@ def _report_unroutable_partitions(
     completed.test_reason = reason
 
 
+def _report_unconfigured_smoke_command(
+    completed: Assignment, caps: list[str],
+) -> None:
+    """#3298: a capability-partition leg's own files resolve to NO smoke
+    command at all — every source (`smoke_tests.capability_rules[].command`,
+    `repos[].ci_command`, `smoke_tests.default_command`,
+    `repos[].test_command`) came up empty for the files that put THIS
+    partition on the board.
+
+    A `coordinator.yml` config gap, never a routing puzzle — reported exactly
+    like :func:`_report_unroutable_partitions`, but per partition and naming
+    the capability set, so a misconfiguration on one platform (e.g. a repo
+    whose `test_command` needs GTK, with a `macos` rule that carries no
+    `command` override of its own) is never silently attributed to the whole
+    fan-out — a sibling partition that DOES resolve a command still
+    dispatches.
+
+    Never raises: a board-write failure must not take the caller down.
+    """
+    caps_label = "+".join(caps) if caps else "(none)"
+    reason = (
+        f"Test stage cannot run capability-partition leg [{caps_label}] "
+        f"(#3298): no smoke command is configured for repo "
+        f"{completed.repo_name!r} for this partition's own files (checked "
+        "smoke_tests.capability_rules[].command, repos[].ci_command, "
+        "smoke_tests.default_command, and repos[].test_command). Configure "
+        "one — e.g. a `command` on the capability_rules entry that created "
+        "this partition — so it stops silently no-oping."
+    )
+    logger.warning(
+        "dispatch_smoke: %s#%s — %s", completed.repo_name,
+        completed.issue_number, reason,
+    )
+    if completed.test_state == TEST_STATE_BLOCKED:
+        return  # already recorded — the report has been made
+    if completed.assignment_id is None:
+        return
+    try:
+        from coord.state import record_test_verdict
+
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=reason,
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "dispatch_smoke: failed to record the blocked Test verdict for %s",
+            completed.assignment_id,
+        )
+        return
+    completed.test_state = TEST_STATE_BLOCKED
+    completed.test_reason = reason
+
+
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
 
@@ -1730,6 +2153,71 @@ def dispatch_smoke(
     return legs[0] if legs else None
 
 
+def _gate_zero_commit_branch(completed: Assignment, config: Config) -> bool:
+    """#3305: refuse to dispatch a Test leg against a branch that carries no
+    commits over its base — there is nothing to check out, so the leg fails
+    at checkout and the next tick dispatches another, forever (the observed
+    incident: claude-coordinator#3230's `epic-decompose` row spun 111 failed
+    smoke legs, 83% of the fleet's 21-day failures, before an operator
+    intervened by hand).
+
+    This is `coord/review.py`'s #1534 zero-commit gate, ported to the Test
+    stage one pipeline step earlier — same primitive
+    (:func:`coord.github_ops.branch_commits_ahead_for_assignment`), same
+    fail-open polarity: only a definite ``ahead == 0`` blocks. ``None`` (a
+    ``gh api compare`` failure, or a repo missing from *config*) must dispatch
+    exactly as today — a network blip must never strand a real Test run, and
+    review.py already caught the case that matters (`review_state ==
+    "zero_commits"`) independently, so this gate is a backstop, not the
+    primary signal.
+
+    Scoped to every `WORK_LIKE_TYPES` completion, not just `epic-decompose`:
+    nothing about the failure shape is decompose-specific — any worker killed
+    mid-session before its first push reproduces it.
+
+    Returns ``True`` (and records a terminal ``TEST_STATE_BLOCKED`` verdict on
+    the row, same as :func:`_report_unroutable_smoke`) when this completion
+    must NOT be dispatched. The caller is responsible for stopping there.
+    """
+    ahead = github_ops.branch_commits_ahead_for_assignment(completed, config)
+    if ahead != 0:
+        return False
+
+    reason = (
+        f"Test stage refused: branch {completed.branch!r} carries 0 commits "
+        f"ahead of its base — nothing was ever pushed (or the branch was "
+        f"deleted), so a Test leg can only fail at checkout (#3305). "
+        f"Re-dispatch the work instead of retrying Test; clear this with "
+        f"`coord diagnose {completed.repo_name} {completed.issue_number} "
+        f"--stage test --reset` once a real branch exists."
+    )
+    logger.warning(
+        "dispatch_smoke: %s#%s — %s", completed.repo_name,
+        completed.issue_number, reason,
+    )
+    if completed.assignment_id is None:
+        # No row to write to (shouldn't happen for a board completion) — the
+        # log above is the only surface left.
+        return True
+    try:
+        from coord.state import record_test_verdict  # noqa: PLC0415
+
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=reason,
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "dispatch_smoke: failed to record the zero-commit Test verdict "
+            "for %s", completed.assignment_id,
+        )
+        return True
+    completed.test_state = TEST_STATE_BLOCKED
+    completed.test_reason = reason
+    return True
+
+
 def _dispatch_smoke_legs(
     completed: Assignment,
     board: Board,
@@ -1762,6 +2250,9 @@ def _dispatch_smoke_legs(
         # that hand us a row directly (reconcile).
         return []
 
+    if _gate_zero_commit_branch(completed, config):
+        return []
+
     # #1819: a row that a LATER work-like row superseded on the same branch is
     # not a dispatch target at all. It did not produce the branch's current
     # content, so testing it burns a machine on a result the later row's own
@@ -1791,6 +2282,16 @@ def _dispatch_smoke_legs(
     # rules split across capability sets no one machine carries together must
     # dispatch one leg per partition, not silently narrow to (or fail on) the
     # flat union. See `partition_capability_requirements`'s module docstring.
+    #
+    # #3351: `repo.requires` (repo-wide capabilities, unconditional on
+    # `touched`) is NOT folded into this partitioning step — only into the
+    # flat `required_capabilities` union `_dispatch_smoke_single_leg` computes
+    # below. That is exact for every repo declaring `requires` today (vimcode
+    # has zero `capability_rules` entries of its own, so this always yields
+    # `partitions == []` and the single-leg path runs). A future repo that
+    # combines `requires` with its OWN multi-partition-triggering
+    # `capability_rules` would need `repo.requires` folded in here too —
+    # tracked as a known gap, not a silent one.
     def _capable_for(caps: list[str]) -> bool:
         return bool(_capability_matched_machines(caps, completed.repo_name, config))
 
@@ -1868,7 +2369,11 @@ def _dispatch_smoke_single_leg(
     ):
         return None
 
-    required_caps = match_rules(touched, smoke_cfg.capability_rules)
+    # #3351: `repo.requires` (repo-wide, e.g. vimcode's nvim oracle) UNION
+    # whatever `capability_rules` this diff's touched files match — see
+    # `required_capabilities`'s docstring for why this must be the one
+    # function both routing paths call.
+    required_caps = required_capabilities(repo.requires, touched, smoke_cfg.capability_rules)
     # #2091: resolve *with* provenance — the Test verdict this dispatch will
     # produce is only as meaningful as the suite behind it. #3056: pass the
     # touched files so a matching rule's own `command` (routing AND the
@@ -1891,14 +2396,31 @@ def _dispatch_smoke_single_leg(
         # `test_command`) — see `pick_smoke_machine`, which treats an empty
         # `required_caps` as "any capable-for-repo machine".
         #
-        # `mock-author`/`test-author` (#930/#1176) keep the OLD skip-on-miss
-        # behavior: #1076/#1152 established that a rule miss for THOSE types
-        # means "genuinely nothing to smoke-test" (a Gate-A contract/fixture-
-        # only diff), and `dispatch_pending_reviews` back-fills
-        # `test_state="skipped"` for them — dispatching a real suite run
-        # here would duplicate that and burn a full test run on a diff that
-        # never touches source.
-        if completed.type != "work" or smoke_command is None:
+        # `mock-author`/`test-author` (#930/#1176, `SEALED_PATH_AUTHOR_TYPES`)
+        # keep the OLD skip-on-miss behavior: #1076/#1152 established that a
+        # rule miss for THOSE types means "genuinely nothing to smoke-test"
+        # (a Gate-A contract/fixture-only diff), and `dispatch_pending_
+        # reviews` back-fills `test_state="skipped"` for them — dispatching a
+        # real suite run here would duplicate that and burn a full test run
+        # on a diff that never touches source.
+        #
+        # #3239: this used to read `completed.type != "work"`, which silently
+        # folded `epic-decompose` (added to `WORK_LIKE_TYPES` by #3132, after
+        # this line was written) into the same skip-on-miss bucket as
+        # mock-author/test-author — even though an epic-decompose leg is a
+        # REAL implementation diff against ordinary source (the epic's first
+        # slice; see `CLOSES_ISSUE_TYPES`'s docstring), not a sealed-path
+        # contract/fixture. A capability-rule miss on a plain repo like this
+        # one (no `tui/`/`coord/dashboard/webapp/`-style rule ever matches
+        # `coord/**`) meant the Test stage never dispatched at all for that
+        # leg — `coord drive` then polled the completed `done` row forever,
+        # since nothing downstream ever resolves `test_state` from `""`
+        # (claude-coordinator#3226/#3239: 8h burned on an already-finished
+        # leg). The correct predicate is `SEALED_PATH_AUTHOR_TYPES`
+        # membership, not `!= "work"` — every WORK_LIKE_TYPES member that
+        # ISN'T a sealed-path author still dispatches a real Test-stage run
+        # on a miss, exactly like `"work"` always has.
+        if completed.type in SEALED_PATH_AUTHOR_TYPES or smoke_command is None:
             return None
 
     if smoke_command is None:
@@ -2062,15 +2584,55 @@ def _dispatch_smoke_single_leg(
     if completed.assignment_id is not None and completed.test_state not in (
         "passed", "skipped", "failed",
     ):
-        from coord.state import load_assignment_test_reason, record_test_verdict  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            load_assignment_test_reason,
+            load_assignment_test_state,
+            record_test_verdict,
+        )
+
+        # #3343: re-check the authoritative `test_state` ONE MORE TIME, right
+        # before this write. `_dispatch_smoke_legs` (our caller) already
+        # re-read it before choosing to call us at all, but the
+        # `_walk_candidates_and_dispatch` call just above — machine ranking
+        # plus an HTTP dispatch round trip — is exactly the window in which
+        # ANOTHER already-in-flight smoke leg on this same branch can finish
+        # and record a terminal verdict. Trusting `completed.test_
+        # state` here (a snapshot from before that window) would blindly
+        # overwrite a just-landed `passed`/`skipped`/`failed` back to
+        # `running` — the precise defect reported in #3343: `smoke_test`
+        # carries the terminal mirror (set together with the terminal write)
+        # while `test_state` gets clobbered back to `running` by this stamp,
+        # and every gate that reads `test_state` (the canonical column, per
+        # `coord/gates.py`) then reports "no verdict recorded" forever, so
+        # `dispatch_pending_smoke` keeps re-dispatching — one leg fired 4s
+        # after the branch had already merged on the strength of the verdict
+        # this stamp was about to erase.
+        authoritative_state = load_assignment_test_state(completed.assignment_id)
+        if authoritative_state in ("passed", "skipped", "failed"):
+            completed.test_state = authoritative_state
+            return smoke_assignment
 
         # Belt and braces: the authoritative single-row read, falling back to
         # the board-carried value when it is unavailable (thin client, remote
         # read failure). Both are bounded previews at worst and the tally is
         # written at the front of the reason, so either still carries it.
+        authoritative_reason = load_assignment_test_reason(completed.assignment_id)
+        board_reason = getattr(completed, "test_reason", None)
         prior_legs = max(
-            mute_smoke_legs(load_assignment_test_reason(completed.assignment_id)),
-            mute_smoke_legs(getattr(completed, "test_reason", None)),
+            mute_smoke_legs(authoritative_reason), mute_smoke_legs(board_reason),
+        )
+        # #3315: ...and this stamp must ALSO carry the ENVIRONMENTAL-retry
+        # tally forward, for the identical #2272 reason above — a fresh
+        # `record_test_verdict(test_state="running", ...)` call is the same
+        # writer that used to erase the mute-leg count, and it erases this
+        # tally exactly the same way if it isn't re-stated here. Without this,
+        # the #3315 budget below (`coord.reconcile.propagate_smoke_terminal_
+        # failure`) can never fire: every "running" stamp between two
+        # environmental deaths would silently hand the row a fresh budget,
+        # reproducing the 542-leg incident this exists to bound.
+        prior_env_legs = max(
+            environmental_smoke_legs(authoritative_reason),
+            environmental_smoke_legs(board_reason),
         )
         running_reason = "dispatched: Test stage running (#1426)"
         if prior_legs:
@@ -2078,6 +2640,13 @@ def _dispatch_smoke_single_leg(
                 f"{mute_smoke_tally(prior_legs)} — {running_reason}; "
                 f"retry {prior_legs + 1} of {MUTE_SMOKE_LEG_BUDGET} after "
                 f"{prior_legs} Test-stage leg(s) produced no verdict (#2272)"
+            )
+        if prior_env_legs:
+            running_reason = (
+                f"{environmental_smoke_tally(prior_env_legs)} — "
+                f"{running_reason} ({prior_env_legs} of "
+                f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive "
+                "environmental Test-stage death(s) so far, #3315)"
             )
 
         record_test_verdict(
@@ -2120,54 +2689,100 @@ def _dispatch_smoke_fanout(
     probe contradiction, a missing `repo_paths` entry) is reported exactly
     like the single-leg unroutable case (`_report_unroutable_smoke`), naming
     that capability set — never a silent retry (#1678).
+
+    #3298: the Test-stage command is resolved ONCE PER PARTITION, scoped to
+    that partition's own `SmokePartition.files` — not once, up front, against
+    the WHOLE diff's `touched` — so a `SmokeRule.command` declared on the
+    rule that created one partition can win for only that partition's leg
+    instead of leaking into every other leg in the fan-out. A repo with no
+    rule-scoped `command` anywhere is unaffected: every partition then falls
+    through the same `ci_command`/`default_command`/`test_command`
+    precedence it always has, which does not vary with which files are
+    passed, so this is a no-op for every repo that hasn't opted in.
     """
     smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
     repo = config.repo(completed.repo_name)
     if repo is None:
         return []
 
-    resolved = resolve_smoke_command(repo, smoke_cfg, touched_files=touched)
-    smoke_command = resolved.command
-    if smoke_command is None:
-        logger.warning(
-            "dispatch_smoke: %s#%s needs a %d-way capability fan-out %s but "
-            "no smoke command is configured (repos[].ci_command, "
-            "smoke_tests.default_command, or this repo's test_command) — "
-            "skipping. Configure one so the Test stage stops silently "
-            "no-oping for this repo.",
-            completed.repo_name, completed.issue_number, len(partitions),
-            [list(p.capabilities) for p in partitions],
-        )
-        return []
-    if not resolved.ci_equivalent and repo.github:
-        logger.warning(
-            "dispatch_smoke: %s#%s Test verdict will NOT be CI-equivalent — "
-            "running %s (%s) across a %d-way capability fan-out while CI "
-            "runs whatever %s's workflows say. Set repos[%s].ci_command to "
-            "the command CI runs (#2091).",
-            completed.repo_name, completed.issue_number, smoke_command,
-            resolved.source, len(partitions), repo.github, repo.name,
-        )
-
     smoke_model_alias = config.models.default
     smoke_model_wire = config.models.resolve(smoke_model_alias)
 
-    leg_manifest: list[tuple[str, tuple[str, ...]]] = []
+    leg_manifest: list[tuple[str, tuple[str, ...], str | None]] = []
     new_legs: list[Assignment] = []
     blocking: list[tuple[list[str], list[SmokeAttempt]]] = []
+    unconfigured: list[list[str]] = []
 
     for partition in partitions:
         caps = list(partition.capabilities)
 
+        # #3298: scope resolution to the files that put THIS partition on the
+        # board — never the full diff's `touched` — so a rule-scoped command
+        # is attributed to the one leg it was written for. `partition.files`
+        # is never empty for a partition this function actually returned
+        # (see `SmokePartition`'s docstring); the `or touched` is a defensive
+        # fallback, not a path this should ever take.
+        resolved = resolve_smoke_command(
+            repo, smoke_cfg, touched_files=list(partition.files) or touched,
+        )
+        smoke_command = resolved.command
+        if smoke_command is None:
+            # Skip this partition — `_report_unconfigured_smoke_command`
+            # below logs and records the board-visible reason exactly once,
+            # same convention as the `blocking`/`_report_unroutable_smoke`
+            # path just below: no separate log here, or every unconfigured
+            # partition would be logged twice.
+            unconfigured.append(caps)
+            continue
+        if not resolved.ci_equivalent and repo.github:
+            logger.warning(
+                "dispatch_smoke: %s#%s — capability-partition leg %s Test "
+                "verdict will NOT be CI-equivalent — running %s (%s) while "
+                "CI runs whatever %s's workflows say. Set "
+                "repos[%s].ci_command to the command CI runs (#2091).",
+                completed.repo_name, completed.issue_number, caps,
+                smoke_command, resolved.source, repo.github, repo.name,
+            )
+
         existing = _find_leg_for_partition(
             board, repo_name=completed.repo_name, branch=completed.branch,
             capabilities=partition.capabilities,
+            review_of_assignment_id=completed.assignment_id,
         )
         if existing is not None:
             # Already dispatched (still running, or already terminal) by an
             # earlier call for this same row — this tick just fills whatever
             # OTHER partition is still missing, never re-dispatches this one.
-            leg_manifest.append((existing.assignment_id or "", partition.capabilities))
+            leg_manifest.append(
+                (existing.assignment_id or "", partition.capabilities, smoke_command)
+            )
+            continue
+
+        # #3333: `_find_leg_for_partition` above is a READ of the board — two
+        # ticks (`coord notify`, `coord drive-queue`, a drive session) that
+        # both read "nothing dispatched yet" before either writes both fall
+        # through to here and would both dispatch this exact partition. This
+        # atomic `INSERT ... OR IGNORE` closes that window: exactly one
+        # caller ever wins `claim_smoke_dispatch` for a given
+        # `(work_assignment_id, capability_partition)` pair, mirroring
+        # `claim_review_dispatch` (#3113). The loser skips this partition
+        # entirely THIS tick rather than also spending a metered Test-stage
+        # leg — a later tick's `_find_leg_for_partition` will find the
+        # winner's leg once it has actually landed on the board.
+        partition_tag = "+".join(sorted(partition.capabilities))
+        from coord.state import (  # noqa: PLC0415
+            claim_smoke_dispatch,
+            release_smoke_dispatch_claim,
+        )
+
+        if not claim_smoke_dispatch(completed.assignment_id or "", partition_tag):
+            logger.debug(
+                "dispatch_smoke: %s#%s — lost the atomic dispatch-claim "
+                "race for capability partition %s (#3333); another "
+                "in-flight tick is dispatching it, leaving it for a later "
+                "tick to pick up as `existing`.",
+                completed.repo_name, completed.issue_number, caps,
+            )
             continue
 
         candidates = rank_smoke_machines(
@@ -2196,57 +2811,89 @@ def _dispatch_smoke_fanout(
                 parent_assignment_id=None,
             )
 
-        result, attempts = _walk_candidates_and_dispatch(
-            candidates,
-            completed=completed, repo=repo, required_caps=caps,
-            issue_title=smoke_leg_issue_title(completed.issue_title, partition.capabilities),
-            build_briefing=_build_briefing,
-            smoke_model_wire=smoke_model_wire,
-            http_client=http_client,
-        )
+        # #3333 review (non-blocking): everything from here through the
+        # `record_dispatched_assignment` write below runs with the claim
+        # above already held. A `result is None` fall-through releases it
+        # itself (nothing to persist). But an exception ANYWHERE in this
+        # narrow window — a real `/assign` network call, `Assignment(...)`
+        # construction, the DB write — would otherwise leave the claim held
+        # with no assignment row and no manifest entry referencing it:
+        # `release_smoke_claim_if_row_is_smoke_leg` can never find it (no
+        # row exists), and `reset_work_test_state`'s manifest-driven release
+        # can never find it either (it never made it into any manifest).
+        # Recovery would require manual `smoke_claims` table surgery. Wrap
+        # the whole window so any such exception releases the claim before
+        # propagating, same as the ordinary `result is None` path just does
+        # for the "no machine" case.
+        try:
+            result, attempts = _walk_candidates_and_dispatch(
+                candidates,
+                completed=completed, repo=repo, required_caps=caps,
+                issue_title=smoke_leg_issue_title(completed.issue_title, partition.capabilities),
+                build_briefing=_build_briefing,
+                smoke_model_wire=smoke_model_wire,
+                http_client=http_client,
+            )
 
-        if result is None:
-            transient = any(a.transient for a in attempts)
-            if transient or not attempts:
-                logger.warning(
-                    "dispatch_smoke: %s#%s — capability set %s (fan-out leg) "
-                    "found no reachable machine this tick; %d attempt(s): "
-                    "%s. Leaving it for a later tick (#1672).",
-                    completed.repo_name, completed.issue_number, caps,
-                    len(attempts), "; ".join(a.describe() for a in attempts),
-                )
-            else:
-                blocking.append((caps, attempts))
-            continue
+            if result is None:
+                # #3333: won the claim above but dispatched nothing with it —
+                # release it so a LATER tick (this partition still needs a leg
+                # either way) isn't permanently blocked by an orphaned claim
+                # nothing will ever fulfill.
+                release_smoke_dispatch_claim(completed.assignment_id or "", partition_tag)
+                transient = any(a.transient for a in attempts)
+                if transient or not attempts:
+                    logger.warning(
+                        "dispatch_smoke: %s#%s — capability set %s (fan-out leg) "
+                        "found no reachable machine this tick; %d attempt(s): "
+                        "%s. Leaving it for a later tick (#1672).",
+                        completed.repo_name, completed.issue_number, caps,
+                        len(attempts), "; ".join(a.describe() for a in attempts),
+                    )
+                else:
+                    blocking.append((caps, attempts))
+                continue
 
-        choice, briefing, agent_response = result
-        leg_id = agent_response.get("id") or uuid.uuid4().hex[:12]
-        leg_assignment = Assignment(
-            machine_name=choice.machine.name,
-            repo_name=completed.repo_name,
-            issue_number=completed.issue_number,
-            issue_title=smoke_leg_issue_title(completed.issue_title, partition.capabilities),
-            files_allowed=[],
-            files_forbidden=[],
-            briefing=briefing,
-            assignment_id=leg_id,
-            status="running",
-            branch=completed.branch,
-            pr_url=completed.pr_url,
-            dispatched_at=now if now is not None else time.time(),
-            type="smoke",
-            review_target=completed.branch,
-            review_of_assignment_id=completed.assignment_id,
-            model=smoke_model_alias,
-            test_state="running",
-            test_reason=f"Test stage leg running — capability set {caps} (#3182)",
-        )
-        board.active.append(leg_assignment)
+            choice, briefing, agent_response = result
+            leg_id = agent_response.get("id") or uuid.uuid4().hex[:12]
+            # Escape a literal backtick in the resolved command so it cannot
+            # prematurely close the backtick-fenced span below — this
+            # `test_reason` is informational display text only (the manifest
+            # carries the authoritative base64-encoded copy), but a broken
+            # fence is an easy, easily-avoided papercut.
+            escaped_smoke_command = smoke_command.replace("`", "\\`")
+            leg_assignment = Assignment(
+                machine_name=choice.machine.name,
+                repo_name=completed.repo_name,
+                issue_number=completed.issue_number,
+                issue_title=smoke_leg_issue_title(completed.issue_title, partition.capabilities),
+                files_allowed=[],
+                files_forbidden=[],
+                briefing=briefing,
+                assignment_id=leg_id,
+                status="running",
+                branch=completed.branch,
+                pr_url=completed.pr_url,
+                dispatched_at=now if now is not None else time.time(),
+                type="smoke",
+                review_target=completed.branch,
+                review_of_assignment_id=completed.assignment_id,
+                model=smoke_model_alias,
+                test_state="running",
+                test_reason=(
+                    f"Test stage leg running — capability set {caps} using "
+                    f"`{escaped_smoke_command}` (#3182/#3298)"
+                ),
+            )
+            board.active.append(leg_assignment)
 
-        from coord.state import record_dispatched_assignment  # noqa: PLC0415
+            from coord.state import record_dispatched_assignment  # noqa: PLC0415
 
-        record_dispatched_assignment(assignment=leg_assignment, repo_github=repo.github)
-        leg_manifest.append((leg_id, partition.capabilities))
+            record_dispatched_assignment(assignment=leg_assignment, repo_github=repo.github)
+        except Exception:
+            release_smoke_dispatch_claim(completed.assignment_id or "", partition_tag)
+            raise
+        leg_manifest.append((leg_id, partition.capabilities, smoke_command))
         new_legs.append(leg_assignment)
 
     # A partition every candidate durably refused — report it exactly like
@@ -2254,6 +2901,13 @@ def _dispatch_smoke_fanout(
     # per blocked partition; each is independently idempotent.)
     for caps, attempts in blocking:
         _report_unroutable_smoke(completed, caps, attempts)
+
+    # A partition whose own files resolve to NO smoke command at all — a
+    # `coordinator.yml` config gap, never a routing puzzle (#3298). Reported
+    # per partition, naming it, so a misconfiguration on one platform is
+    # never silently attributed to the whole fan-out.
+    for caps in unconfigured:
+        _report_unconfigured_smoke_command(completed, caps)
 
     # Stamp the parent's aggregate "running" — carrying the manifest so
     # `finalize_smoke_fanout` can find every leg again from just this row —
@@ -2280,21 +2934,43 @@ def _dispatch_smoke_fanout(
     if leg_manifest and completed.assignment_id is not None and completed.test_state not in (
         "passed", "skipped", "failed", TEST_STATE_BLOCKED,
     ):
-        from coord.state import record_test_verdict  # noqa: PLC0415
+        from coord.state import merge_smoke_fanout_manifest  # noqa: PLC0415
 
-        summary = "; ".join(f"[{'+'.join(sorted(caps))}]" for _, caps in leg_manifest)
-        manifest_line = _encode_fanout_manifest(leg_manifest)
-        running_reason = (
-            f"{manifest_line}\nTest stage running across {len(partitions)} "
-            f"capability-partition leg(s) (#3182): {summary}."
-        )
-        record_test_verdict(
+        # #3333 review: this call's own `leg_manifest` only ever names the
+        # partitions IT found already-existing or itself claimed-and-
+        # dispatched THIS round — a concurrent call racing on a DIFFERENT
+        # partition of the SAME parent has an equally partial view of its
+        # own (the atomic `claim_smoke_dispatch` above is scoped per
+        # partition, on purpose, precisely so two such calls can each win a
+        # DIFFERENT partition rather than one starving the other). Writing
+        # `leg_manifest` straight to `test_reason` here let whichever call's
+        # write landed LAST silently erase the other's real, live leg from
+        # the parent's manifest forever — nothing else ever re-derives it,
+        # so that leg's eventual pass/fail was never folded into the
+        # aggregate at all. `merge_smoke_fanout_manifest` instead performs
+        # the read-current-manifest / merge-in *this call's* entries /
+        # write-back cycle as ONE atomic step on whichever DB is canonical,
+        # so the LAST call to reach this line always folds in every
+        # partition any concurrent call has already committed.
+        final_test_state, final_test_reason = merge_smoke_fanout_manifest(
             assignment_id=completed.assignment_id,
-            test_state="running",
-            test_reason=running_reason,
+            new_entries=leg_manifest,
+            total_partitions=len(partitions),
         )
-        completed.test_state = "running"
-        completed.test_reason = running_reason
+        # Mirror whatever the row ACTUALLY ends up holding — which may
+        # not be "running" with THIS call's own text: another call may have
+        # already merged a superset (or a human/`finalize_smoke_fanout` may
+        # have landed a terminal verdict in between). `dispatch_pending_
+        # smoke`'s caller (`coord.notify._dispatch_board_pending_smoke`) can
+        # follow this call with a bulk `write_board(board)` upsert of the
+        # WHOLE in-memory board — if `completed.test_reason` here still held
+        # only this call's partial view, that later upsert would silently
+        # re-clobber the just-merged (or terminal) DB row right back down,
+        # reproducing the exact bug this fix closes through a different seam.
+        if final_test_state is not None:
+            completed.test_state = final_test_state
+        if final_test_reason is not None:
+            completed.test_reason = final_test_reason
 
     return new_legs
 
@@ -2356,13 +3032,14 @@ def dispatch_pending_smoke(
     config: Config,
     *,
     now: float | None = None,
+    gh_ops: "GhOps | None" = None,
 ) -> list[Assignment]:
     """Bulk Test-stage dispatch — the smoke analogue of
     :func:`coord.review.dispatch_pending_reviews`.
 
     Scans the FULL completed backlog on `board` (not just rows that just
-    transitioned this pass) for work-like completions with no test verdict
-    yet, and dispatches a smoke assignment for each eligible one via
+    transitioned this pass) for work-like completions with no FRESH test
+    verdict yet, and dispatches a smoke assignment for each eligible one via
     :func:`dispatch_smoke` (which itself enforces `auto_queue`, the #459-style
     dedupe via `has_active_followup`, and capability routing).
 
@@ -2375,6 +3052,32 @@ def dispatch_pending_smoke(
     dispatched the Test stage at all — the gap `drive-issue.sh` had to paper
     over with a local `scripts/coord-test-runner.sh` subprocess (#1395).
 
+    #3309: a row carrying a recorded ``passed``/``failed``/``skipped``
+    verdict is skipped UNLESS :func:`_test_verdict_is_stale` says that
+    verdict is #1479-stale (a rebase moved the base or the branch out from
+    under it) — see that function for why "stale" and "missing"/"unknown"
+    get different treatment. *gh_ops* backs that live SHA comparison; the
+    default ``None`` fails open (no live lookup, a recorded verdict is never
+    treated as stale — identical to this function's behaviour before #3309),
+    matching the #821/#1475 convention every other #1479 staleness check
+    follows. Production callers (`coord.notify`, `coord.reconcile`) pass the
+    real :mod:`coord.github_ops` explicitly, the same module every other
+    live gate check in this codebase hands `merge_queue`'s gate functions.
+
+    A confirmed-stale verdict is **cleared** (``record_test_verdict(...,
+    test_state=None)``, mirrored in-memory on ``completed.test_state``)
+    *before* the re-dispatch, not left in place — so the row reads
+    "running"/unset for the duration of the new leg instead of still showing
+    the old terminal verdict. Leaving the old verdict in place would (a) trip
+    `_dispatch_smoke_single_leg`'s #1819 guard, which refuses to stamp
+    "running" over any terminal verdict, so the new leg would never be
+    recorded as in-flight and every following tick would re-probe and
+    re-dispatch again; and (b) on completion, make
+    `coord.notify._record_smoke_verdict` see the stale verdict as
+    "already terminal", wrongly credit it to the worker's own `coord test`
+    (#2217/#2464), and skip reading the new worker's actual verdict entirely
+    — silently laundering a stale pass into a fresh-anchored one.
+
     Returns the list of smoke `Assignment`s actually dispatched. The caller
     is responsible for persisting the board.
     """
@@ -2382,7 +3085,7 @@ def dispatch_pending_smoke(
     if smoke_cfg is None or not smoke_cfg.auto_queue:
         return []
 
-    from coord.state import get_issue_test_mode
+    from coord.state import get_issue_test_mode, load_assignment_test_state
 
     dispatched: list[Assignment] = []
     for completed in board.completed:
@@ -2416,19 +3119,102 @@ def dispatch_pending_smoke(
                 continue
         if completed.status != "done":
             continue
-        if completed.test_state is not None:
-            # Already has a verdict ("passed"/"failed"/"skipped"), or is
+
+        # #3343: refresh `test_state` from the authoritative single-row store
+        # right before evaluating it below. `completed` is `board`'s
+        # in-memory copy — a snapshot taken once, at the start of whatever
+        # tick called this function — and this loop can run for a while (the
+        # `_test_verdict_is_stale` check a few lines down does live `gh`
+        # round trips per row, and dispatching a leg for an EARLIER row in
+        # this same loop can itself take seconds). A verdict recorded on
+        # THIS row by a smoke leg that finishes while this scan is still
+        # running is invisible to the stale snapshot, so the checks below
+        # would read "no verdict yet" and dispatch a redundant leg — the
+        # #3343 incident: 3 wasted smoke legs on one issue, the last
+        # dispatched 4s after the branch had already merged on the strength
+        # of an earlier leg's verdict. `None` (row unknown, or a remote read
+        # failed) is left as-is — never worse than what this loop already
+        # tolerated before #3343, and `_dispatch_smoke_single_leg`'s own
+        # pre-write re-check is the belt-and-braces backstop if a race still
+        # slips past this one.
+        if completed.assignment_id is not None:
+            fresh_test_state = load_assignment_test_state(completed.assignment_id)
+            if fresh_test_state is not None:
+                completed.test_state = fresh_test_state
+
+        if completed.test_state in (TEST_STATE_BLOCKED, "running"):
             # "running" — someone (an interactive --smoke-of session, or a
-            # smoke assignment already in flight) is already handling it.
+            # smoke assignment already in flight) is genuinely handling this
+            # row right now; skip unconditionally, no re-probing needed.
             #
-            # #1672: this is also what makes the unroutable report fire ONCE.
-            # `dispatch_smoke` records `test_state="blocked"` when no
+            # #1672: "blocked" is also what makes the unroutable report fire
+            # ONCE. `dispatch_smoke` records `test_state="blocked"` when no
             # capability-matched machine can take the stage, so the next tick
             # lands here and skips instead of re-probing a fleet that is
             # still broken and re-logging the identical refusal every 30 s
             # (#1678). Clearing it (`coord diagnose <repo> <issue> --stage
             # test --reset`) puts the row back in this scan.
             continue
+        if completed.test_state is not None:
+            # A terminal verdict exists ("passed"/"failed"/"skipped"). Before
+            # #3309 presence alone was enough to skip forever — but a
+            # "passed" verdict can go #1479-stale the moment the merge base
+            # moves (a #241 conflict-fix rebase), and once the drive that
+            # recorded it has exited nothing else ever asks for a fresh one:
+            # the merge gate then reports `smoke_required` against a row this
+            # producer, its only automatic source, believes is already
+            # handled — and it deadlocks silently forever. Re-dispatch only
+            # when the SAME staleness predicate the merge gate applies
+            # (`_test_verdict_is_stale`, #1479) confirms the recorded verdict
+            # is genuinely stale — never merely because it's missing or
+            # unconfirmable (see that function's docstring).
+            if not _test_verdict_is_stale(completed, board, config, gh_ops):
+                continue
+            logger.info(
+                "dispatch_pending_smoke: %s#%s row %s carries a %r Test "
+                "verdict recorded against a base/branch that has since "
+                "moved (#1479) — re-dispatching instead of deadlocking "
+                "against the merge gate's `smoke_required` (#3309).",
+                completed.repo_name, completed.issue_number,
+                completed.assignment_id, completed.test_state,
+            )
+            # Clear the stale verdict BEFORE dispatching the re-run — both
+            # the persisted row (`record_test_verdict(test_state=None)`, the
+            # same "make this row eligible for re-dispatch" step every other
+            # clearer in this codebase already takes: `coord/reconcile.py`'s
+            # environmental-death clear, `coord/notify.py`'s mute-leg-budget
+            # clear) and the in-memory `completed.test_state` this loop
+            # itself is about to hand to `_dispatch_smoke_legs`.
+            #
+            # Skipping this step left the stale "passed" sitting on the row
+            # for the ENTIRE duration of the new run: `_dispatch_smoke_single_
+            # leg`'s own #1819 guard (never stamp "running" over a terminal
+            # verdict) would refuse to record the new leg as in-flight, so
+            # every subsequent tick still saw "passed" and kept re-dispatching
+            # (re-triggering the live #1479 SHA lookup on every one), AND —
+            # far worse — when the new leg completed,
+            # `coord.notify._record_smoke_verdict` would read the still-
+            # "passed" `current_state`, wrongly conclude the worker
+            # self-recorded it via `coord test` (#2217/#2464's branch), and
+            # never inspect the new worker's actual `SMOKE:` verdict at all —
+            # silently laundering a stale pass into a fresh-anchored one with
+            # no real observation behind it (worse than the deadlock #3309
+            # set out to fix). Clearing it here makes the row read "running"
+            # (or unset) until the new leg's own verdict lands, exactly like
+            # every other re-dispatch path.
+            if completed.assignment_id is not None:
+                from coord.state import record_test_verdict  # noqa: PLC0415
+
+                record_test_verdict(
+                    assignment_id=completed.assignment_id,
+                    test_state=None,
+                    test_reason=(
+                        f"Cleared a #1479-stale {completed.test_state!r} Test "
+                        "verdict for re-dispatch — the recorded verdict was "
+                        "against a base/branch that has since moved (#3309)."
+                    ),
+                )
+            completed.test_state = None
 
         # #685: per-issue test-mode policy gates auto-smoke dispatch.
         #   test-mode:auto  → headless smoke (auto-dispatch here).

@@ -94,9 +94,11 @@ from coord.gate_a import is_gate_a_refusal_reason
 from coord.github_ops import is_throttle_skip_reason, parse_throttle_skip_until
 from coord.issues_sync_status import STALENESS_WARN_SECONDS as ISSUE_CACHE_STALE_CEILING_S
 from coord.merge_queue import (
+    CI_ABSENT_PREFIX,
     CI_STALE_PREFIX,
     PLAN_READY,
     ci_rollup_all_clear,
+    is_ci_absent_reason,
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_terminal_reason,
@@ -343,6 +345,36 @@ HOLD_RELEASED = "released"
 # unrelated repos a day of idle is exactly the incident #2186 closes.
 HOLD_SCOPE_ENTRY = "entry"
 HOLD_SCOPE_FLEET = "fleet"
+
+# ── apply-verdict (#3236) ────────────────────────────────────────────────────
+#
+# `hold_state` says WHETHER a gate is closed; `apply_verdict` says WHAT
+# happened the ONE time it was fired for a terraform-flavored entry —
+# specifically, whether `terraform apply` actually ran. Before this, the only
+# signal a fired gate carried was `hold_state`, and `hold_state == "released"`
+# meant nothing more than "something told the queue to keep going" — a bare
+# `coord drive-queue resume` releases the SAME gate a confirmed, successful
+# apply does, so "merged" and "applied" were indistinguishable from the board
+# alone (the exact #2096 "unconfirmed success" shape: a release inferred from
+# an operator's say-so, never from an observation taken AFTER the apply
+# actually ran). `apply_verdict` is that missing observation, recorded
+# explicitly by `coord drive-queue apply-verdict --applied|--apply-failed`
+# (see `coord.commands.drive_queue.drive_queue_apply_verdict`) — never
+# inferred from `hold_state` alone. `''` (unset) is the default for every row
+# predating this column and for a gate nobody has recorded a verdict against
+# yet; see :func:`apply_gate_status` for the tri-state (plus "not yet merged")
+# reading every surface renders through.
+APPLY_NONE = ""
+APPLY_APPLIED = "applied"
+APPLY_FAILED = "apply_failed"
+
+# Apply-gate tri-state codes `apply_gate_status` returns — distinct from
+# `APPLY_*` above (which are the STORED verdict values): these also cover
+# "no gate at all" and "armed but not fired yet", neither of which is a real
+# verdict.
+APPLY_STATUS_NONE = ""
+APPLY_STATUS_PENDING = "pending"
+APPLY_STATUS_MERGED_NOT_APPLIED = "merged_not_applied"
 
 # Wall-clock ceiling for one `resume_when` run.  The shell enforces it; it
 # lives here so the CLI's help text, the alert prose and the test all quote one
@@ -767,6 +799,33 @@ class QueueEntry:
     # enqueued without `--no-acceptance` — reads identically to "no
     # override", the tick's pre-#2589 behaviour exactly.
     no_acceptance: bool = False
+    # #3236: operator-declared at `add` time (or derived from a
+    # `--terraform-plan-json` capture — see `plan_is_destructive`), same
+    # provenance as `hold_after`/`hold_reason`/`resume_when`. `True` means
+    # THIS entry's terraform plan carries a destroy or replace action, which
+    # makes `resume_when` unconditionally ineligible to auto-release the
+    # gate — see `_resolve_holds` and `pending_probe_targets`, the two
+    # enforcement points (belt-and-suspenders: `add`-time validation already
+    # refuses to store `resume_when` alongside this, but a row that reaches
+    # this state some other way — a hand-edited DB row, a daemon `update`
+    # call — must still never auto-release). `False` for every row predating
+    # this column and for any entry not declared as carrying a destructive
+    # plan — unchanged, pre-#3236 behaviour for every non-terraform
+    # `--hold-after` use of this queue.
+    plan_destructive: bool = False
+    # #3236: the observed outcome of a `terraform apply` against THIS
+    # entry's fired gate — `""` (unset) / `"applied"` / `"apply_failed"`, see
+    # the `APPLY_*` constants above. Written ONLY by `coord drive-queue
+    # apply-verdict`, never inferred from `hold_state` — see that constant
+    # block's comment for why. `""` for every row predating this column and
+    # for a fired gate nobody has recorded a verdict against yet.
+    apply_verdict: str = APPLY_NONE
+    apply_verdict_reason: str = ""
+    # Wall-clock capture time of `apply_verdict`, same "point-in-time
+    # observation, stamp it" discipline #2133's `reason_at` established for
+    # `last_reason`. `None` for a row predating this column or one whose
+    # `apply_verdict` is still unset.
+    apply_verdict_at: float | None = None
 
     @property
     def key(self) -> str:
@@ -856,6 +915,17 @@ class QueueEntry:
             # as `hold_after` above; absent (a row predating this column)
             # reads `False` — no passthrough, the pre-#2589 behaviour.
             no_acceptance=bool(row.get("no_acceptance") or 0),
+            # #3236: same 0/1-or-real-bool acceptance as `hold_after`/
+            # `no_acceptance` above; absent (a row predating this column)
+            # reads `False` — never a silent destructive gate.
+            plan_destructive=bool(row.get("plan_destructive") or 0),
+            apply_verdict=str(row.get("apply_verdict") or APPLY_NONE),
+            apply_verdict_reason=str(row.get("apply_verdict_reason") or ""),
+            apply_verdict_at=(
+                None
+                if row.get("apply_verdict_at") is None
+                else float(row.get("apply_verdict_at"))
+            ),
         )
 
 
@@ -891,6 +961,56 @@ def effective_max_fix_rounds(
     if config_default is not None and config_default >= 1:
         return config_default
     return DEFAULT_TICK_MAX_FIX_ROUNDS
+
+
+def total_fix_round_budget(entry: QueueEntry, config_default: int | None) -> int:
+    """#2972: the TOTAL work legs *entry* is allowed across its whole life —
+    one unconditional initial work leg plus :func:`effective_max_fix_rounds`
+    fix rounds — regardless of how many times its drive session has died and
+    been relaunched.
+
+    This is the number the bug report's evidence table is measured against:
+    "one drive should yield at most work + 2 fixes = 3 legs". Kept as its own
+    tiny function (rather than inlining ``+ 1`` at each call site) so
+    :func:`remaining_fix_rounds` and :func:`_reconcile_running`'s ceiling
+    check are provably reading the SAME number — see this module's "one
+    question, one answer" posture elsewhere (`effective_max_fix_rounds`
+    itself is the sole resolver of the per-drive figure this builds on).
+    """
+    return effective_max_fix_rounds(entry, config_default) + 1
+
+
+def remaining_fix_rounds(
+    entry: QueueEntry, facts: IssueFacts, config_default: int | None
+) -> int:
+    """#2972: fix rounds still available to *entry* — the budget a relaunch
+    resumes rather than restarts.
+
+    ``facts.work_leg_count`` is every work-like assignment `build_board_view`
+    has EVER seen for this issue, across every drive session this entry has
+    had — not just the one that just died. Subtracting the one unconditional
+    initial work leg turns that into "fix rounds already spent"; subtracting
+    THAT from :func:`effective_max_fix_rounds`'s plain per-drive allowance
+    (NOT :func:`total_fix_round_budget` — that figure already has the
+    initial work leg folded in, and folding it in a second time here would
+    hand a brand-new entry, with zero legs spent, a budget one round wider
+    than `coord drive`'s own interactive default ever allows) is what makes
+    a second (or third, or fourth) relaunch get a SMALLER budget than the
+    first, instead of the same fresh one every time — the exact defect
+    quadraui#625 reported: four work legs dispatched against a
+    ``pipeline.max_fix_rounds`` of 2 (budget 3), because each relaunch's
+    ``coord drive --max-fix-rounds`` was computed from `entry` alone, blind
+    to what prior sessions had already spent. A fresh entry (``work_leg_count
+    == 0``) reads back exactly :func:`effective_max_fix_rounds` — unchanged
+    from every pre-#2972 launch.
+
+    Never negative — an entry that has already met or exceeded
+    :func:`total_fix_round_budget` reads ``0`` (no more fix rounds), the
+    signal `_reconcile_running` uses to stop relaunching altogether rather
+    than pass a session a budget it cannot spend down further.
+    """
+    fix_rounds_spent = max(facts.work_leg_count - 1, 0)
+    return max(effective_max_fix_rounds(entry, config_default) - fix_rounds_spent, 0)
 
 
 # ── aggregate summary (#2428 DQW-1) ───────────────────────────────────────────
@@ -1075,6 +1195,17 @@ class IssueFacts:
     issue_synced_at: float | None = None
     merged: bool = False  # a work-like assignment with status == 'merged'
     active_work: bool = False  # a NON-terminal work-like assignment
+    # #3239: a work-like assignment with status == 'done' — completed
+    # successfully but not yet merged (still owed Test/Review/Merge). Unlike
+    # `merged`/`landed`, `True` here does NOT mean the issue is finished; it
+    # means a PRIOR attempt's dispatch definitely reached `coord assign` and
+    # ran the work to completion. See `_dispatch_produced_nothing`'s
+    # docstring for why that is exactly the fact its own timestamp
+    # comparison cannot see: a relaunch after a `done` leg dispatches no NEW
+    # assignment by design (there is nothing left to dispatch), which reads
+    # identically to a genuine pre-`coord assign` crash unless this is
+    # checked separately.
+    work_done: bool = False
     # #1891: this issue's CURRENT merge-queue entry is refused for nothing
     # stronger than "CI checks have not reported yet" — see
     # `build_board_view`'s population of this field for exactly which board
@@ -1106,6 +1237,23 @@ class IssueFacts:
     # A `False` reading cannot refresh itself at all, so `plan_tick` ages it
     # out (:data:`PARK_STALE_SECONDS`) rather than trusting it forever.
     merge_ci_pending_live: bool = False
+    # #3254: this issue's CURRENT merge-queue entry is refused for nothing
+    # stronger than #1904's `checks_absent` (`coord.merge_queue.
+    # is_ci_absent_reason`) — a repo that declares CI reported ZERO checks
+    # for the PR, most commonly because the `pull_request` webhook that would
+    # have created a check suite never fired. Computed the SAME way as
+    # `merge_ci_pending` (the board's own current read of this entry's merge
+    # gate) but deliberately kept SEPARATE from it: `merge_ci_pending`'s four
+    # siblings are self-refreshing (more real time resolves them), so they
+    # park; `checks_absent` cannot self-refresh at all — a merge retry never
+    # re-fires the `pull_request` webhook, only a new commit does — so
+    # `_reconcile_running` gives this fact the OPPOSITE queue-level
+    # treatment (block, not park). See that function's own comment for the
+    # full reasoning.
+    merge_ci_absent: bool = False
+    # The actual board/queue reason text `merge_ci_absent` was derived from —
+    # same purpose as `merge_ci_pending_reason` above.
+    merge_ci_absent_reason: str = ""
     # #2230: this issue's merge-plan STATUS — `coord.merge_queue.PLAN_READY`/
     # `PLAN_BLOCKED`/`PLAN_MERGING`/`PLAN_MERGED`/`PLAN_NEEDS_ATTENTION` — as
     # of the LIVE `merge_plan` section of a `/board` fetch, i.e. served off
@@ -1133,6 +1281,23 @@ class IssueFacts:
     # assignment carrying a `dispatched_at` at all (never dispatched, or
     # every row predates that column).
     last_dispatched_at: float | None = None
+    # #2972: total WORK_LIKE assignment count for this issue, ALL TIME —
+    # across EVERY drive session a relaunched entry has had, not just the one
+    # that just died. Sourced from #3060's `coord.state.leg_counts()` (see
+    # `build_board_view`'s *leg_counts* parameter), the SAME all-time,
+    # archive-spanning count `compute_leg_counts` already builds — not a
+    # fresh count of this function's own kept so there is exactly one
+    # implementation of "how many legs has this issue had" for a caller to
+    # get wrong twice. This is what lets `remaining_fix_rounds` cap an
+    # entry's TOTAL work legs: the bug this closes is that a relaunch after
+    # "session gone, work still active on the board" used to get a FRESH
+    # `--max-fix-rounds` budget every time, so `pipeline.max_fix_rounds`
+    # capped a single drive's fix rounds but never the entry's total —
+    # quadraui#625 ran 4 work legs against a budget of 3. `0` when
+    # *leg_counts* is omitted (every pre-#2972 caller) or names nothing for
+    # this issue (never dispatched) — reads as "budget untouched", never as a
+    # false ceiling trip.
+    work_leg_count: int = 0
 
     @property
     def open(self) -> bool:
@@ -1194,6 +1359,7 @@ class BoardView:
 def build_board_view(
     payload: Mapping[str, Any],
     live_sessions: Iterable[Mapping[str, Any] | str] = (),
+    leg_counts: Mapping[str, Mapping[str, int]] | None = None,
 ) -> BoardView:
     """Reduce a ``/board`` payload + ``drive-sessions --json`` to a :class:`BoardView`.
 
@@ -1201,6 +1367,18 @@ def build_board_view(
     returned and *live_sessions* is whatever ``coord.drive.list_drive_sessions()``
     returned (dicts with ``repo``/``issue``), or a plain iterable of
     ``"repo#N"`` keys for tests.
+
+    *leg_counts* (#3060/#2972) is whatever ``coord.state.leg_counts()``
+    returned — the ALL-TIME, ``assignments`` + ``assignments_archive``-
+    spanning ``"repo#N" -> {assignment_type: count}`` map :func:`compute_leg_counts`
+    builds. Deliberately a SEPARATE parameter rather than folded out of
+    *payload*'s own ``assignments`` list: that list is whatever ``/board``'s
+    live query currently returns, which for a long-lived entry can already
+    have lost its early legs to ``coord housekeeping``'s archive move — see
+    ``coord.state.leg_counts``'s own docstring. ``None`` (the default, and
+    every pre-#2972 caller) leaves every :attr:`IssueFacts.work_leg_count` at
+    its ``0`` default, which reads as "budget untouched" — the exact
+    pre-#2972 behaviour for a caller that never learned about this field.
     """
     facts: dict[str, dict[str, Any]] = {}
 
@@ -1221,6 +1399,11 @@ def build_board_view(
         status = row.get("status") or ""
         if status == "merged":
             entry["merged"] = True
+        if status == "done":
+            # #3239: at least one dispatch for this issue definitely reached
+            # `coord assign` and ran the work to completion — see
+            # `IssueFacts.work_done`'s docstring.
+            entry["work_done"] = True
         if status not in TERMINAL_STATUSES:
             entry["active_work"] = True
         # #2273: high-water mark of `dispatched_at`, regardless of `status` —
@@ -1340,6 +1523,27 @@ def build_board_view(
         # board-build time. `plan_reason` already carries it whenever it
         # applies; the live plan reading and a live `coord merge` attempt's
         # raw reading can never disagree about this one.
+        #
+        # #3254: `checks_absent` (`is_ci_absent_reason`), checked here,
+        # BEFORE the generic `is_ci_terminal_reason` fall-through just below.
+        # `_entry_gate_status` computes this directly too (no extra `gh api
+        # .../jobs` call needed — see that function's own #1904 comment), so
+        # `plan_reason` already carries it whenever it applies; no raw-row
+        # recovery needed, same as the #2347 unreadable case above.
+        # `is_ci_terminal_reason` correctly classifies this as terminal (it
+        # is none of the four self-refreshing siblings), which is exactly
+        # why it must be caught HERE rather than being allowed to fall into
+        # `merge_ci_pending` below: that fact's whole contract is "more real
+        # time resolves this on its own", and nothing about waiting can ever
+        # make a `pull_request` webhook that never fired create a check
+        # suite retroactively. Recorded as its own fact instead, so
+        # `_reconcile_running` can give it the opposite treatment (fail
+        # fast, block, never park) — see `IssueFacts.merge_ci_absent`.
+        if is_ci_absent_reason(reason):
+            got = slot(key)
+            got["merge_ci_absent"] = True
+            got["merge_ci_absent_reason"] = reason
+            continue
         if is_ci_terminal_reason(reason):
             continue
         # #2158: the same plan row that came back with NO reason of its own
@@ -1385,6 +1589,21 @@ def build_board_view(
         number = item.get("issue")
         if repo and number is not None:
             sessions.add(entry_key(repo, int(number)))
+
+    # #2972: fold *leg_counts* into `work_leg_count` — WORK_LIKE types only
+    # (a "work" leg is the unconditional initial dispatch or a fix round;
+    # "review"/"smoke"/every other dispatched type is not one, the same
+    # scoping `active_work`/`merged` above already apply). A key present
+    # ONLY in `leg_counts` (every assignment for the issue has aged into
+    # `assignments_archive` and dropped off the live board's own `issues`/
+    # `merge_plan` sections) still gets a slot — an entry whose whole history
+    # is archived is the LONGEST-lived case this ceiling exists to catch,
+    # not one it can afford to lose sight of.
+    for key, by_type in (leg_counts or {}).items():
+        got = slot(key)
+        got["work_leg_count"] = sum(
+            count for kind, count in by_type.items() if kind in WORK_LIKE
+        )
 
     return BoardView(
         issues={key: IssueFacts(**value) for key, value in facts.items()},
@@ -1436,6 +1655,16 @@ class Reconcile:
       every tick by the pre-pass in :func:`plan_tick`, which flips it back
       to ``waiting`` — no human, no escalation — the moment the board shows
       the gate has cleared.
+    * ``ci_absent`` — #3254: no session, no active work, nothing landed —
+      same evidence as ``retry``/``parked`` — but the board's OWN current
+      read of this entry's merge gate names #1904's `checks_absent`
+      (``IssueFacts.merge_ci_absent``). Unlike ``parked``, this is NOT
+      self-refreshing (no amount of waiting re-fires the ``pull_request``
+      webhook that creates a check suite), so it goes straight to
+      ``blocked`` instead — costs NO attempt, pairs with a :class:`Blocked`
+      — but, unlike ``refused``/``dead_end``, is not marked PERMANENT:
+      ``_reconcile_blocked``'s ordinary live-gate recheck still resumes it
+      automatically once a new commit clears the gate.
     * ``reparked``  — #2347: an ALREADY-``parked`` entry, still CONFIRMED
       blocked by this tick's own fresh re-check — but that fresh check found
       the real cause has become "GitHub could not be reached", distinct from
@@ -1463,7 +1692,7 @@ class Reconcile:
     """
 
     key: str
-    outcome: str  # alive | starting | held | unknown | done | refused | parked | retry | exhausted | merge_only | resumed | oscillating | gate_unreadable
+    outcome: str  # alive | starting | held | unknown | done | refused | dead_end | parked | ci_absent | reparked | retry | exhausted | merge_only | resumed | oscillating | gate_unreadable
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
@@ -2091,6 +2320,7 @@ def _resolve_prereqs(
     cycle_keys: Mapping[str, str],
     held_gates: Mapping[str, Hold] | None = None,
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    dep_reasons: Mapping[str, str] | None = None,
 ) -> _Verdict:
     """Decide whether *entry* may launch now.
 
@@ -2136,6 +2366,22 @@ def _resolve_prereqs(
     all. So it is now ALSO consulted there, for every ``dep_state`` other
     than ``STATE_DONE``: a pre-req that demonstrably landed must satisfy
     the dependent whatever its own queue row happens to claim.
+
+    *dep_reasons* (#3368) maps a dep key to its OWN current ``last_reason`` —
+    the same "prefer this tick's fresh write over the frozen snapshot" map
+    ``plan_tick`` already threads to the backoff check
+    (``effective_last_reason``). Consulted only in the ``dep_state in
+    (STATE_BLOCKED, STATE_FAILED)`` branch below: a dep sitting `blocked` on
+    :func:`is_unconfirmed_block_reason` — #2806's "gate could not be read
+    this tick, not a confirmed-still-shut gate" verdict — is, by that
+    verdict's OWN text, retryable, not terminal. Rendering the dependent's
+    verdict as "it will never satisfy" (unsatisfiable, blocks and escalates)
+    for that shape contradicts the very reason it is quoting; this instead
+    returns an ordinary unsatisfied deferral ("waiting on ... retrying"),
+    which keeps the dependent's position and re-derives a fresh verdict next
+    tick — exactly like waiting on any other still-in-flight dep. A dep
+    ABSENT here, or `blocked`/`failed` for any OTHER reason, keeps the
+    pre-#3368 "it will never satisfy" verdict unchanged.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
@@ -2185,6 +2431,25 @@ def _resolve_prereqs(
                 # landed, whatever its queue row claims.
                 continue
             if dep_state in (STATE_BLOCKED, STATE_FAILED):
+                dep_reason = (dep_reasons or {}).get(dep)
+                if dep_state == STATE_BLOCKED and _is_unconfirmed_block_reason(
+                    dep_reason
+                ):
+                    # #3368: *dep*'s own text already says its block is an
+                    # unconfirmed probe failure, not a confirmed-still-shut
+                    # gate (#2806) — rendering this dependent's verdict as
+                    # permanent would contradict the very reason it quotes.
+                    # An ordinary deferral, not a block: this entry keeps its
+                    # position and re-derives fresh next tick, same as
+                    # waiting on any other still-in-flight dep.
+                    return _Verdict(
+                        False,
+                        False,
+                        f"waiting on {dep} (queued, blocked, but its own gate "
+                        "reading is an unconfirmed probe failure, not a "
+                        "confirmed-still-shut gate — retrying, not blocked "
+                        "permanently, #3368)",
+                    )
                 return _Verdict(
                     False,
                     True,
@@ -2251,6 +2516,7 @@ def diagnose_blocked_after(
     states: Mapping[str, str],
     cycle_keys: Mapping[str, str],
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    dep_reasons: Mapping[str, str] | None = None,
 ) -> BlockedAfterDiagnosis:
     """Re-check a `blocked`/`failed` row's `after=` graph against the CURRENT
     board, fresh on every render (#2183).
@@ -2296,6 +2562,15 @@ def diagnose_blocked_after(
     ``unsatisfied`` here too, for the identical reason: a pre-req that a live
     read just confirmed closed/merged is not a caption worth showing as
     still-pending just because the cached board hasn't caught up yet.
+
+    *dep_reasons* (#3368) is passed straight through to
+    :func:`_resolve_prereqs` — see its own docstring. Threading it through
+    here (not just the launch walk) is what lets :func:`_reconcile_blocked_
+    after` resume a dependent off an "it will never satisfy" verdict the
+    moment the named pre-req's own block turns out to be an unconfirmed
+    probe failure rather than a confirmed-still-shut gate, and what lets
+    `coord drive-queue list`/`status` (#2183's rendering) compute the exact
+    same verdict a live tick would.
     """
     live_terminal = live_prereq_terminal or {}
     unsatisfied = tuple(
@@ -2309,6 +2584,7 @@ def diagnose_blocked_after(
     verdict = _resolve_prereqs(
         entry, board, states, cycle_keys, held_gates={},
         live_prereq_terminal=live_prereq_terminal,
+        dep_reasons=dep_reasons,
     )
     return BlockedAfterDiagnosis(
         unsatisfied,
@@ -2363,6 +2639,43 @@ def is_unsatisfiable_prereq_reason(text: str | None) -> bool:
     ``coord.commands.drive_queue._BLOCKED_AFTER_NOTE``.
     """
     return _is_unsatisfiable_prereq_reason(text)
+
+
+# #3368: the substring unique to `_reconcile_blocked_unreadable`'s #2806
+# verdict — "I probed this entry's merge gate this tick and the probe itself
+# failed" as opposed to "I probed it and it is still shut". A `blocked` dep
+# resting on THIS text is explicitly retryable, not terminal: #2230's sweep
+# tries again next tick rather than having confirmed anything is actually
+# still closed. `_resolve_prereqs` needs to tell the two apart for a
+# DEPENDENT's own verdict — see its `dep_state in (STATE_BLOCKED,
+# STATE_FAILED)` branch — so a chain stuck behind an unconfirmed probe
+# failure reads as "waiting, retrying" rather than "it will never satisfy".
+# Defined once here, and consumed by `_reconcile_blocked_unreadable`'s own
+# f-string below, so the marker text and the check for it can never drift
+# apart (one question, one answer).
+_UNCONFIRMED_BLOCK_MARKER = "NOT a confirmed-still-shut gate, only a failed probe"
+
+
+def _is_unconfirmed_block_reason(text: str | None) -> bool:
+    """Whether *text* is `_reconcile_blocked_unreadable`'s #2806
+    "gate could not be read this tick" verdict — see
+    :data:`_UNCONFIRMED_BLOCK_MARKER`.
+    """
+    if not text:
+        return False
+    return _UNCONFIRMED_BLOCK_MARKER in text
+
+
+def is_unconfirmed_block_reason(text: str | None) -> bool:
+    """Public alias for :func:`_is_unconfirmed_block_reason`.
+
+    #3368: a pre-req's own `blocked` row can be resting on #2806's
+    "gate_unreadable" verdict — an explicitly RETRYABLE probe failure, not a
+    confirmed-still-shut gate. `coord.commands.drive_queue` and tests use
+    this alias the same way they already use
+    :func:`is_unsatisfiable_prereq_reason`.
+    """
+    return _is_unconfirmed_block_reason(text)
 
 
 # ── #2944: the guaranteed-false wait ─────────────────────────────────────────
@@ -2563,6 +2876,7 @@ def _reconcile_blocked_after(
     states: Mapping[str, str],
     cycle_keys: Mapping[str, str],
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    dep_reasons: Mapping[str, str] | None = None,
 ) -> Reconcile | None:
     """#2362: resume a `blocked` entry whose ONLY cause was an unsatisfiable
     `after=` pre-req, once every named pre-req has since landed. #2756:
@@ -2643,7 +2957,7 @@ def _reconcile_blocked_after(
     if not _is_unsatisfiable_prereq_reason(entry.last_reason):
         return None
     diagnosis = diagnose_blocked_after(
-        entry, board, states, cycle_keys, live_prereq_terminal
+        entry, board, states, cycle_keys, live_prereq_terminal, dep_reasons
     )
     if diagnosis.unsatisfiable:
         return None
@@ -2818,7 +3132,7 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
     cycle) instead of the real one-line fix (`coord merge --revalidate`, or
     fixing the failing CI check).
 
-    Four shapes, all written by `coord/drive.py`'s own merge-stage decision
+    Five shapes, all written by `coord/drive.py`'s own merge-stage decision
     functions — none of them a "no assignment created" signal:
 
     * `_die`'s exhausted-merge-attempts wording ("merge attempted N times
@@ -2835,6 +3149,23 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
       ("smoke_required —" / "review_required —" / "merge_status=...") — the
       #1505/#1526 immediate-escalation path, which already recorded its own
       accurate `coord escalate record` before this drive exited.
+    * `is_ci_absent_reason` — #3254's `checks_absent` immediate-die wording
+      (``f"{state.merge_reason} — push a new commit; this gate cannot clear
+      on retry (#3254)..."``, `coord/drive.py`'s `_decide_merge`). Like the
+      four siblings above it is a clean, evidenced merge-gate refusal, not a
+      dispatch failure — and unlike them it is *provably unretryable* rather
+      than merely still-in-flight, which is exactly why `_decide_merge` dies
+      immediately instead of looping. `is_ci_absent_reason` itself is a
+      strict ``str.startswith`` check against `coord.merge_queue`'s
+      ``CI_ABSENT_PREFIX`` (``"CI never ran:"``) — true of the bare
+      `state.merge_reason`, but *this* function is handed the fully wrapped
+      `own_reason` (``f"drive exited for {ident} (exit_code=...): {message}"``
+      — see `_drive_exit_summary`), where that prefix sits mid-string, not
+      at position 0. So this checks for `CI_ABSENT_PREFIX` as a *substring*
+      instead, the same way every other shape above is matched (``"merge
+      attempted"``, ``"checks failed"``, ...) rather than re-using
+      `is_ci_absent_reason` directly against text it was never built to
+      classify.
     """
     if not reason:
         return False
@@ -2847,7 +3178,9 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
         return True
     if "smoke_required —" in lowered or "review_required —" in lowered:
         return True
-    return "merge_status=" in lowered
+    if "merge_status=" in lowered:
+        return True
+    return CI_ABSENT_PREFIX.lower() in lowered
 
 
 def merge_plan_inspect_command(repo: str) -> str:
@@ -2885,14 +3218,16 @@ def merge_gate_remedy_command(reason: str | None, repo: str, issue: int) -> str:
 
     Every other shape this matches — red CI (``checks failed``), a
     review/smoke gate divergence (``review_required —``/``smoke_required
-    —``), an opaque terminal ``merge_status=`` — has no single command that
-    is always both correct and safe to run without a human first reading
-    the actual gate state (fixing a named CI check, recovering or re-running
-    a review, deciding a UAT verdict). Guessing wrong there is worse than
-    not guessing: the menu this feeds runs the command on one click. So
-    every one of those falls back to the read-only inspect command instead
-    — see #3016's design note ("a wrong 'Recommended' is worse than no
-    recommendation").
+    —``), an opaque terminal ``merge_status=``, or #3254's ``checks_absent``
+    (no checks ever reported for the PR) — has no single command that is
+    always both correct and safe to run without a human first reading the
+    actual gate state (fixing a named CI check, recovering or re-running a
+    review, deciding a UAT verdict, or — for ``checks_absent`` — pushing a
+    fresh commit or confirming it is genuinely safe to force-merge). Guessing
+    wrong there is worse than not guessing: the menu this feeds runs the
+    command on one click. So every one of those falls back to the read-only
+    inspect command instead — see #3016's design note ("a wrong
+    'Recommended' is worse than no recommendation").
 
     Callers are expected to gate on :func:`_is_merge_gate_block_reason`
     first; called on a reason that ISN'T a merge-gate block at all, this
@@ -3194,6 +3529,44 @@ def add_preflight_notice(
     return "\n".join(lines)
 
 
+def _is_dispatch_only_failure(
+    entry: QueueEntry, facts: IssueFacts, own_reason: str | None
+) -> bool:
+    """The full "was this actually a dispatch failure" verdict (#3239) used
+    by `_reconcile_running`'s give-up/retry wording: did THIS relaunch's own
+    dispatch fail — as opposed to a later stage (merge) blocking, a
+    deliberate zero-commit decline (#2334), or a relaunch that correctly
+    dispatched nothing because a PRIOR attempt already ran the work to
+    completion (#3239)?
+
+    Deliberately NOT reused by `_retry_backoff_reason`'s narrower backoff-
+    widening check below — that check excludes only the #2424 merge-gate
+    and #3239 `work_done` shapes, not the #2334 empty-branch one. An
+    empty-branch death gets its own WIDENED retry-*count* budget
+    (`EMPTY_BRANCH_MAX_ATTEMPTS`) specifically because the failure mode can
+    need several attempts to clear, and (see
+    `test_the_real_death_cause_survives_multiple_backoff_ticks_2411`) that
+    same shape has always also gotten the widened *backoff* floor between
+    those attempts — a deliberate, tested pairing, not an oversight, so
+    folding this classifier's empty-branch exclusion into the backoff check
+    would change already-relied-upon spacing behaviour that no part of
+    #3239 asks to touch.
+
+    See `_dispatch_produced_nothing` for the base timestamp comparison this
+    starts from, and `_is_merge_gate_block_reason` /
+    `_is_empty_branch_death_reason` / `IssueFacts.work_done` for the three
+    positive-evidence exclusions layered on top of it — each names a shape
+    where the comparison reads exactly like a dispatch failure even though
+    real, evidenced work happened.
+    """
+    return (
+        _dispatch_produced_nothing(entry, facts)
+        and not _is_merge_gate_block_reason(own_reason)
+        and not _is_empty_branch_death_reason(own_reason)
+        and not facts.work_done
+    )
+
+
 def _retry_backoff_reason(
     entry: QueueEntry,
     facts: IssueFacts,
@@ -3244,21 +3617,23 @@ def _retry_backoff_reason(
 
     *own_reason* (#2424 follow-up): the same text the launch-side dispatch
     note is gated on (see the comment above `dispatch_only` in
-    `_reconcile_running`'s retry/exhausted branches). Passed through so the
-    widened `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` spacing below answers the
-    identical "was this actually a dispatch failure" question the launch-side
-    note already answers, rather than recomputing it from
-    `_dispatch_produced_nothing` alone — which, like the note before #2424,
-    cannot tell a genuine pre-`coord assign` crash from a merge-only relaunch
-    that dispatches no new assignment by design. Once `own_reason` already
-    names a merge-gate block (`_is_merge_gate_block_reason`), the widened
-    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` floor would be pure mispacing:
-    the rationale for widening it ("a transient dispatch failure cannot
-    spend the whole retry budget inside one tick cadence") does not apply
-    once the cause is known to be a merge-gate block, not a dispatch
-    failure. ``None`` (the default) degrades to the
-    pre-#2424-follow-up behaviour exactly, for callers that have not been
-    updated to pass it.
+    `_reconcile_running`'s retry/exhausted branches, and
+    `_is_dispatch_only_failure`'s docstring for exactly how this check's own
+    exclusions differ from that one). Passed through so the widened
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` spacing below answers the same
+    "was this actually a dispatch failure" question, for the same two
+    reasons `_reconcile_running`'s wording does: once `own_reason` already
+    names a merge-gate block (`_is_merge_gate_block_reason`), OR *facts*
+    shows a prior attempt's work already reached `status == "done"`
+    (`IssueFacts.work_done`, #3239), the widened floor would be pure
+    mispacing — the rationale for widening it ("a transient dispatch
+    failure cannot spend the whole retry budget inside one tick cadence")
+    does not apply once the cause is known to be something other than a
+    dispatch failure. Deliberately does NOT also exclude the #2334
+    empty-branch shape here — see `_is_dispatch_only_failure`'s docstring
+    for why that shape keeps the widened floor on purpose. ``None`` (the
+    default) degrades to the pre-#2424-follow-up behaviour exactly, for
+    callers that have not been updated to pass it.
     """
     if now is None or attempts <= 0 or retry_backoff_at is None:
         return ""
@@ -3267,8 +3642,10 @@ def _retry_backoff_reason(
         return ""
     idx = min(attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)
     backoff = RETRY_BACKOFF_SECONDS[idx]
-    if _dispatch_produced_nothing(entry, facts) and not _is_merge_gate_block_reason(
-        own_reason
+    if (
+        _dispatch_produced_nothing(entry, facts)
+        and not _is_merge_gate_block_reason(own_reason)
+        and not facts.work_done
     ):
         backoff = max(backoff, DISPATCH_FAILURE_MIN_BACKOFF_SECONDS)
     if age >= backoff:
@@ -3340,6 +3717,7 @@ def _reconcile_running(
     exit_refused: Mapping[str, bool] | None = None,
     exit_dead_end: Mapping[str, bool] | None = None,
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    fix_round_config_default: int | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -3460,6 +3838,18 @@ def _reconcile_running(
       and this tick). Re-checking before ANY requeue — not only the
       literal MERGED-exit-text case — is what makes the class safe rather
       than patching just the one reported instance.
+
+    #2972: right before the ``retry``/``exhausted`` attempts decision below,
+    a SEPARATE ceiling is checked first — :func:`remaining_fix_rounds`
+    against ``facts.work_leg_count``, the entry's TOTAL work legs across
+    every past drive session, not just this one. A relaunch that would push
+    the entry past its fix-round budget goes straight to ``exhausted`` /
+    ``blocked``, ``attempts`` untouched (the same posture ``refused``/
+    ``dead_end`` above take: nothing about spending another attempt can make
+    more budget appear). *fix_round_config_default* is ``pipeline.
+    max_fix_rounds`` — the same value :func:`effective_max_fix_rounds`
+    resolves against for the entry actually being launched, so this check
+    and the launch it gates read the identical number.
     """
     facts = board.facts(entry.key)
 
@@ -3691,7 +4081,9 @@ def _reconcile_running(
             "Re-scope or close the issue, and audit the `after=` edges of "
             "anything queued behind it (`coord drive-queue list`) — "
             "whatever they were waiting on is not landing on the timescale "
-            "they assumed."
+            "they assumed. If the prerequisite has since landed, `coord "
+            "drive-queue clear-refusal <repo> <issue> --reason \"...\"` "
+            "then `remove` + `add` dispatches fresh work (#3339)."
         )
         return (
             Reconcile(
@@ -3879,6 +4271,54 @@ def _reconcile_running(
             None,
         )
 
+    # #3254: the `checks_absent` counterpart to the `merge_ci_pending` park
+    # just above — same evidence source (the board's OWN current read of
+    # this entry's merge gate, independent of `own_reason`/`exit_refused`),
+    # OPPOSITE disposition. The four `merge_ci_pending` siblings are
+    # self-refreshing: relaunching right now would just observe the
+    # identical silence and wait again, so those park — no attempt spent,
+    # and the queue resumes them automatically once CI reports.
+    # `checks_absent` cannot self-refresh at all — a merge retry (or a fresh
+    # `coord drive` launch) never re-fires the `pull_request` webhook that
+    # creates a check suite for a feature branch; only a NEW COMMIT does
+    # (see the issue for the proof: a rebase + force-push produced a check
+    # suite within seconds, on the same branch, same workflow, same
+    # machine). Parking on it would be an indefinite livelock — waiting
+    # forever for an event nothing here can trigger — so this blocks
+    # instead, exactly like `refused`/`dead_end` above: no attempt spent,
+    # `Reconcile.updates` stays empty (the paired `Blocked` carries the
+    # write), and the message names the actual remedy instead of the
+    # generic "merge attempted N times without landing" wording a fall-
+    # through to `retry`/`exhausted` would have produced.
+    #
+    # Unlike `refused`/`dead_end`, this is deliberately NOT tagged with a
+    # `_PERMANENT_BLOCK_MARKERS` marker: those two causes can NEVER change
+    # on retry, full stop, so `_reconcile_blocked`'s sweep must never waste
+    # a live gate probe on them. `checks_absent` genuinely can change — the
+    # moment a human (or anything else) pushes a new commit, the board's own
+    # `merge_gate_status` reads differently on the very next build — so the
+    # entry should still get `_reconcile_blocked`'s ordinary, generic
+    # live-gate recheck every tick, the SAME mechanism that already resumes
+    # any other re-evaluable `blocked` entry. No bespoke resume path needed.
+    if facts.merge_ci_absent:
+        reason = (
+            f"{facts.merge_ci_absent_reason or 'CI never ran for this PR'}"
+            f"{launched} — push a new commit; this gate cannot clear on "
+            "retry (#3254); blocking without spending an attempt"
+        )
+        return (
+            Reconcile(entry.key, "ci_absent", reason, occupies=False),
+            Blocked(
+                entry.key,
+                reason,
+                updates={
+                    "state": STATE_BLOCKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+        )
+
     # #2858: the board's `issues` cache row behind `facts.landed`'s negative
     # half (`facts.closed`) can itself be stale — `coord.serve_app.
     # _sync_issues_tick` runs on a slow (300s default) cadence and can be
@@ -3956,11 +4396,36 @@ def _reconcile_running(
     # itself pointing an operator at `coord retry`/`coord acceptance
     # author`, immediately followed by this note contradicting it with
     # "likely an infrastructure/dispatch-layer failure, not a code defect".
-    dispatch_only = (
-        _dispatch_produced_nothing(entry, facts)
-        and not _is_merge_gate_block_reason(own_reason)
-        and not _is_empty_branch_death_reason(own_reason)
-    )
+    #
+    # #3239: a FOURTH shape, the same class again — `facts.work_done` is
+    # `True` (some past dispatch for this issue reached `coord assign` and
+    # ran a work-like assignment to `status == "done"`). Unlike the three
+    # guards above, this one is NOT keyed off `own_reason` text at all: the
+    # live incident this closes (claude-coordinator#3226) died on
+    # `own_reason="deadline of 240m exceeded"` — a bare timeout with no
+    # reason text any of #2424/#2334/#2442's classifiers could ever match —
+    # while a `done`, pushed, unreviewed work row plainly sat on the board
+    # the entire time. `_dispatch_produced_nothing`'s
+    # `facts.last_dispatched_at < entry.launched_at` comparison cannot tell
+    # "this relaunch's own dispatch crashed" apart from "an EARLIER attempt
+    # already finished the work, so this relaunch correctly dispatched
+    # nothing more" — only a positive, independent witness (a `done` row
+    # existing at all) resolves that ambiguity, the same way `facts.merged`/
+    # `facts.landed` already resolve the analogous "already fully finished"
+    # case elsewhere in this function. Net effect: the note this produces
+    # must never send an operator toward `drive-queue remove && add` (which
+    # would discard a complete, reviewable implementation to re-run it from
+    # scratch) when the real, cheaper fix is running the Test/Review/Merge
+    # gates against the work that already exists — see
+    # `coord/drive.py`'s Work→Test advance for why that work can stall
+    # rather than reaching those gates on its own.
+    #
+    # All four guards now live in one place — `_is_dispatch_only_failure`
+    # (#3239) — so this wording can never drift from itself across future
+    # edits. `_retry_backoff_reason`'s narrower widened-backoff check
+    # answers a related but not identical question; see its own docstring
+    # for exactly how (and why) it diverges.
+    dispatch_only = _is_dispatch_only_failure(entry, facts, own_reason)
     if not dispatch_only:
         dispatch_note = ""
     elif own_reason:
@@ -4008,6 +4473,41 @@ def _reconcile_running(
         if empty_branch
         else ""
     )
+
+    # #2972: the fix-round ceiling is a SEPARATE budget from `max_attempts`
+    # above, checked first — see the docstring's #2972 paragraph. A relaunch
+    # this entry has already earned on the `attempts` count (it may be well
+    # under `effective_max_attempts`) still must not fire once its work legs,
+    # summed across every past drive session, have already spent the whole
+    # `pipeline.max_fix_rounds` budget: giving it another fresh
+    # `--max-fix-rounds` allowance is exactly the silent-reset bug quadraui#625
+    # reported. `attempts` is left UNCHANGED, same posture as `refused`/
+    # `dead_end` above — nothing about spending another attempt can make more
+    # budget appear, so counting one here would only make `blocked
+    # attempts=N` under-report how many drive sessions this entry actually
+    # ran.
+    budget = total_fix_round_budget(entry, fix_round_config_default)
+    if remaining_fix_rounds(entry, facts, fix_round_config_default) <= 0:
+        reason = (
+            f"fix-round ceiling reached across relaunches (#2972): "
+            f"{facts.work_leg_count} work leg(s) already run against a "
+            f"budget of {budget} (1 work dispatch + "
+            f"{effective_max_fix_rounds(entry, fix_round_config_default)} fix "
+            f"round(s)) — giving up rather than relaunching with a fresh "
+            f"budget{dispatch_note}"
+        )
+        return (
+            Reconcile(entry.key, "exhausted", reason, occupies=False),
+            Blocked(
+                entry.key,
+                reason,
+                updates={
+                    "state": STATE_BLOCKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+        )
 
     attempts = entry.attempts + 1
     if attempts < effective_max_attempts:
@@ -4176,7 +4676,7 @@ def _reconcile_blocked_unreadable(
         return None
     reason = (
         f"{entry.key}'s merge gate could not be read this tick ({note}) — "
-        "this is NOT a confirmed-still-shut gate, only a failed probe; "
+        f"this is {_UNCONFIRMED_BLOCK_MARKER}; "
         "#2230's sweep will try again next tick rather than guessing (#2806)"
     )
     return Reconcile(
@@ -4359,7 +4859,120 @@ def _reconcile_blocked(
     )
 
 
-# ── deploy gates (#1757) ─────────────────────────────────────────────────────
+# ── deploy gates (#1757, apply-verdict #3236) ────────────────────────────────
+
+
+def plan_is_destructive(plan: Mapping[str, Any]) -> bool:
+    """``True`` if a ``terraform show -json <planfile>`` document contains any
+    destroy or replace resource change (#3236).
+
+    Terraform's own structured-plan vocabulary (``resource_changes[].
+    change.actions``) is a list drawn from ``"no-op"``, ``"create"``,
+    ``"read"``, ``"update"``, ``"delete"``, or the two-element replace forms
+    ``["delete", "create"]`` / ``["create", "delete"]``. Every one of those
+    replace forms contains ``"delete"`` — so checking for that single token
+    covers both a pure destroy AND a replace without needing to special-case
+    the two orderings terraform emits depending on ``create_before_destroy``.
+
+    Fails CLOSED, not open: any shape this cannot positively parse as
+    containing zero destroy/replace actions — a missing/malformed
+    ``resource_changes`` list, a change with no ``actions`` — is treated as
+    "cannot confirm this is safe" and returns ``True``. A plan JSON is the
+    ONLY mechanical evidence this module ever sees for "is a human required"
+    (#3236's hard rule); trusting an unparseable shape as safe would be
+    exactly the "gate that releases because its probe blew up" failure
+    :class:`ProbeResult`'s own docstring already rejects for the ordinary
+    resume-when probe.
+    """
+    changes = plan.get("resource_changes")
+    if not isinstance(changes, list):
+        return True
+    for rc in changes:
+        if not isinstance(rc, Mapping):
+            return True
+        change = rc.get("change")
+        if not isinstance(change, Mapping):
+            return True
+        actions = change.get("actions")
+        if not isinstance(actions, list):
+            return True
+        if "delete" in actions:
+            return True
+    return False
+
+
+def validate_apply_gate(resume_when: str, plan_destructive: bool) -> None:
+    """#3236 hard rule: a destroy/replace terraform plan is NEVER auto-
+    resumed via ``--resume-when`` — refuse to even PERSIST that combination,
+    rather than silently storing a probe that :func:`pending_probe_targets`/
+    :func:`_resolve_holds` will simply never honor.
+
+    This is the fail-FAST half, called from ``coord drive-queue add`` before
+    the write; the "no exceptions" half lives in those two functions, which
+    re-check ``plan_destructive`` independently at resolution time so a row
+    that reaches this combination some other way (a hand-edited DB row, a
+    daemon ``/drive-queue`` ``update`` call that bypasses this CLI-level
+    check) still can never auto-release. Two enforcement points answering
+    the SAME question, never one that could silently drift from the other
+    (#2096).
+    """
+    if resume_when and plan_destructive:
+        raise QueueError(
+            "--resume-when is refused together with a destructive "
+            "(destroy/replace) terraform plan (#3236): that gate must always "
+            "be released by a human — `coord drive-queue apply-verdict "
+            "--applied` (after confirming the apply) or `coord drive-queue "
+            "resume` — never an automated probe."
+        )
+
+
+def apply_gate_status(entry: QueueEntry) -> tuple[str, str]:
+    """The apply-verdict tri-state (plus "not yet merged") for *entry*'s
+    deploy gate (#3236) — ``(state, detail)``.
+
+    ``state`` is one of:
+
+    * ``""``                    — no deploy gate declared on this entry at all
+    * ``"pending"``              — gate armed, not yet fired (not merged yet)
+    * ``"merged_not_applied"``   — fired; no apply verdict recorded yet
+    * ``"applied"``              — a ``--applied`` verdict is on record
+    * ``"apply_failed"``         — an ``--apply-failed`` verdict is on record
+
+    The ONE function every apply-verdict-reading surface calls —
+    ``coord drive-queue list``/``status`` (:func:`_hold_lines` in
+    ``coord.commands.drive_queue``) and ``coord gates``
+    (``coord.gates.build_gate_report``) both render through this, so the two
+    can never disagree about whether a terraform change is merged-not-
+    applied, applied, or apply-failed (#2096: one question, one answer).
+
+    Deliberately does NOT treat ``hold_state == "released"`` as "applied" —
+    a bare ``coord drive-queue resume`` releases the gate with no apply
+    verdict at all, and collapsing that into "applied" would be exactly the
+    unconfirmed-success shape #3236 exists to close. A gate released without
+    a recorded verdict still reads ``merged_not_applied``, with a detail
+    string that says so.
+    """
+    if not entry.hold_after:
+        return APPLY_STATUS_NONE, ""
+    if entry.apply_verdict == APPLY_APPLIED:
+        detail = "applied"
+        if entry.apply_verdict_reason:
+            detail += f" — {entry.apply_verdict_reason}"
+        return APPLY_APPLIED, detail
+    if entry.apply_verdict == APPLY_FAILED:
+        detail = "apply failed"
+        if entry.apply_verdict_reason:
+            detail += f": {entry.apply_verdict_reason}"
+        return APPLY_FAILED, detail
+    if entry.hold_state in (HOLD_FIRED, HOLD_RELEASED):
+        detail = "merged, not yet applied"
+        if entry.hold_state == HOLD_RELEASED:
+            detail += (
+                " (gate released without a recorded apply verdict — confirm "
+                "with `coord drive-queue apply-verdict`)"
+            )
+        return APPLY_STATUS_MERGED_NOT_APPLIED, detail
+    return APPLY_STATUS_PENDING, "not yet merged — gate armed"
 
 
 def pending_probe_targets(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
@@ -4371,6 +4984,12 @@ def pending_probe_targets(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
     command") and also the honest one — the deploy cannot have happened in the
     microseconds since the merge was observed.
 
+    #3236: a ``plan_destructive`` entry is excluded even when it somehow
+    carries a ``resume_when`` (``add``-time validation refuses to store that
+    combination, but this is the belt to that braces — see
+    :func:`validate_apply_gate`) — the shell must not even SPAWN the probe
+    command for a destroy/replace gate, let alone honor its result.
+
     Pure and position-ordered, so the shell has no decision left to make: it
     runs exactly this list, in this order, and hands the results back to
     :func:`plan_tick`.
@@ -4378,7 +4997,7 @@ def pending_probe_targets(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
     return [
         e
         for e in sorted(entries, key=lambda e: (e.position, e.key))
-        if e.hold_state == HOLD_FIRED and e.resume_when
+        if e.hold_state == HOLD_FIRED and e.resume_when and not e.plan_destructive
     ]
 
 
@@ -4440,15 +5059,34 @@ def _resolve_holds(
             continue
 
         probe = probes.get(entry.key)
+        # #3236 hard rule, enforced here independently of `add`-time
+        # validation and `pending_probe_targets` excluding this entry from
+        # ever being probed in the first place: a destroy/replace plan is
+        # NEVER released by ANYTHING a probe reports. If a `ProbeResult` for
+        # this key somehow arrived anyway (a hand-built caller, a future
+        # code path that stops routing through `pending_probe_targets`),
+        # discard it — this entry is treated exactly as "no probe declared",
+        # i.e. manual-only, no exceptions.
+        if entry.plan_destructive:
+            probe = None
         if probe is None:
-            # No probe declared, or the shell did not run one.  Manual resume
-            # only; the count does not move, so a hold that nobody probes
-            # never grows a fake attempt number.
+            # No probe declared, or the shell did not run one — OR (#3236)
+            # this entry carries a destroy/replace plan, so the probe (if
+            # any) was discarded above. Manual resume only; the count does
+            # not move, so a hold that nobody probes never grows a fake
+            # attempt number.
+            reason = entry.gate_reason
+            if entry.plan_destructive:
+                reason += (
+                    " (destroy/replace plan — #3236 requires a human release: "
+                    "`coord drive-queue apply-verdict --applied` or `coord "
+                    "drive-queue resume`, resume-when is never honored here)"
+                )
             holds.append(
                 Hold(
                     key=entry.key,
                     outcome="held",
-                    reason=entry.gate_reason,
+                    reason=reason,
                     resume_when=entry.resume_when,
                     probes=entry.hold_probes,
                     scope=entry.hold_scope,
@@ -4623,6 +5261,7 @@ def plan_tick(
     merge_only_ready: Mapping[str, bool] | None = None,
     roll_pending_reason: str = "",
     live_prereq_terminal: Mapping[str, bool] | None = None,
+    fix_round_config_default: int | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -4919,6 +5558,14 @@ def plan_tick(
     2026-08-22). A dep ABSENT here (the shell's bounded live check never ran
     for it, or ran and came back inconclusive) leaves both call sites to
     their pre-#2602 behaviour — never a false "satisfied".
+
+    *fix_round_config_default* (#2972) is ``pipeline.max_fix_rounds`` — the
+    SAME value the shell also hands ``_launch_argv`` to compute the actual
+    ``coord drive --max-fix-rounds`` this tick launches. Threaded straight
+    through to :func:`_reconcile_running`'s fix-round ceiling check, so a
+    relaunch decision and the launch it gates always agree on the budget.
+    ``None`` (the default) falls back to :data:`DEFAULT_TICK_MAX_FIX_ROUNDS`,
+    same as every other caller of :func:`effective_max_fix_rounds`.
     """
     ordered = sorted(entries, key=lambda e: (e.position, e.key))
     states: dict[str, str] = {e.key: e.state for e in ordered}
@@ -4986,6 +5633,7 @@ def plan_tick(
             exit_refused=exit_refused,
             exit_dead_end=exit_dead_end,
             live_prereq_terminal=live_prereq_terminal,
+            fix_round_config_default=fix_round_config_default,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:
@@ -5041,13 +5689,45 @@ def plan_tick(
     # have no other re-check, so the board keeps reporting finished work as
     # outstanding until someone notices and runs
     # `coord drive-queue remove`. See #1956 for a live instance.
+    #
+    # #3368: `facts.landed` ALONE is the same periodic `/board` cache
+    # `_resolve_prereqs`'s dependent-side check learned, via #2602/#2850, NOT
+    # to trust unconditionally — a `parked`/`blocked`/`failed` row's OWN
+    # issue can merge out of band (an operator's `coord drive` to
+    # completion, same as the vimcode#1059 incident) and outrun that cache
+    # exactly as easily as a dependent's pre-req can. Before this, the
+    # dependent side had a live recovery path (`live_prereq_terminal`) and
+    # THIS self-check did not — so a leaf `blocked` row with no dependent
+    # naming it in `after=` had no live check racing for it at all, and even
+    # a row WITH a dependent only got saved indirectly, by that dependent's
+    # OWN `after=` re-derivation (`_reconcile_blocked_after`) rather than
+    # this row's own state ever correcting. `live_prereq_terminal` is the
+    # SAME per-tick live re-check both call sites already share — one
+    # question ("has this key's issue actually landed?"), one answer,
+    # whether asked on behalf of the row itself or a dependent chained
+    # `--after` it.
     for entry in ordered:
         if entry.state not in (STATE_PARKED, STATE_BLOCKED, STATE_FAILED):
             continue
         facts = board.facts(entry.key)
-        if facts.landed:
-            witness = "merged" if facts.merged else "closed"
-            reason = f"done — issue already {witness} while {entry.state} (#2055)"
+        live_landed = (live_prereq_terminal or {}).get(entry.key, False)
+        if facts.landed or live_landed:
+            if facts.landed:
+                witness = "merged" if facts.merged else "closed"
+                reason = f"done — issue already {witness} while {entry.state} (#2055)"
+            else:
+                # #3368: the cached board does not (yet) show this landed,
+                # but a live re-check taken THIS tick confirms the issue is
+                # closed or its PR merged — `github_ops.work_is_terminal`
+                # (see `_fetch_live_prereq_terminal`) does not distinguish
+                # which, so neither does this text; the honest claim is "the
+                # live probe confirmed terminal", not a specific witness the
+                # probe never actually observed.
+                reason = (
+                    f"done — a live re-check this tick confirms the issue is "
+                    f"already closed or its PR merged while {entry.state} "
+                    "(#3368), independent of the cached board"
+                )
             reconciles.append(
                 Reconcile(
                     entry.key,
@@ -5082,7 +5762,12 @@ def plan_tick(
             # shapes ("it will never satisfy", and #2602's "not queued, not
             # merged and not open") — see :func:`_reconcile_blocked_after`.
             blocked_reconcile = _reconcile_blocked_after(
-                entry, board, states, cycle_keys, live_prereq_terminal
+                entry,
+                board,
+                states,
+                cycle_keys,
+                live_prereq_terminal,
+                effective_last_reason,
             )
             if blocked_reconcile is None:
                 # #2230: re-examine a `blocked` entry against the CURRENT gate
@@ -5680,7 +6365,13 @@ def plan_tick(
                 )
                 continue
             verdict = _resolve_prereqs(
-                entry, board, states, cycle_keys, held_gates, live_prereq_terminal
+                entry,
+                board,
+                states,
+                cycle_keys,
+                held_gates,
+                live_prereq_terminal,
+                effective_last_reason,
             )
             if not verdict.satisfied:
                 deferrals.append(
@@ -5766,7 +6457,13 @@ def plan_tick(
             landed_keys.add(entry.key)
             continue
         verdict = _resolve_prereqs(
-            entry, board, states, cycle_keys, held_gates, live_prereq_terminal
+            entry,
+            board,
+            states,
+            cycle_keys,
+            held_gates,
+            live_prereq_terminal,
+            effective_last_reason,
         )
         if verdict.unsatisfiable:
             blocked.append(

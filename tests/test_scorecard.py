@@ -136,6 +136,18 @@ def test_classify_human_rescue_by_rework_title():
     assert classify_intervention(row) == "rescue"
 
 
+def test_classify_human_fix_reads_review_iteration_not_the_title_text():
+    """#3323: `classify_intervention` never parses a round number out of the
+    title string (only `review_iteration`'s type == "work" and title tags
+    like "[rework-" for the rescue/fix split matter) — so it classifies
+    correctly whether the title is round 1's `[fix-1] …` or a later,
+    #3323-normalized round's `[fix-3] …`, with no `[fix-1] [fix-2]`
+    residue either way."""
+    row = _human_fix_row(1, root_id="r1", assignment_id="f3", iteration=3)
+    assert row["issue_title"] == "[fix-3] issue 1"
+    assert classify_intervention(row) == "fix"
+
+
 def test_classify_auto_loop_fix_is_not_an_intervention():
     """The #1559 gotcha this module exists to get right: auto_loop's headless
     bounce-fix shares review_of_assignment_id/review_iteration/title-tag shape

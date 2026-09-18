@@ -446,6 +446,54 @@ def test_dispatch_not_blocked_by_stale_chat_session(tmp_path):
     assert machine_name == "laptop"
 
 
+def test_dispatch_makes_no_live_credential_probe(tmp_path):
+    """#3371 review: `dispatch_acceptance_mock` hardcodes the real
+    `coord.network.claude_credential_reachable` as `pick_machine`'s
+    `credential_fetcher=`, so without conftest's autouse
+    `_no_agent_credential_probe` stub this test — which only mocks
+    `dispatch_with_retry` — would fire a real
+    `httpx.get("http://laptop.tailnet:7433/health")` before ever reaching
+    the dispatch seam. The probe fails open, so it would not flip this
+    assertion; it would just make the suite depend on live DNS. Assert the
+    suite is hermetic rather than trusting that it is."""
+    import httpx
+
+    from coord import network
+    from coord.models import Board
+
+    cfg = _cfg_with_driver(tmp_path)
+    issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+
+    # Deliberately RECORD rather than raise: `claude_credential_reachable`
+    # catches bare `Exception` so it can fail open, which would swallow an
+    # `AssertionError` raised from a side_effect and let the regression pass.
+    calls: list[tuple] = []
+
+    def _record(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise httpx.ConnectError("no network in tests")
+
+    with patch("coord.github_ops.get_issue", return_value=issue_data), \
+         patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch("coord.board_service.read_board", return_value=Board()), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-xyz"}), \
+         patch("coord.dispatch.post_briefing"), \
+         patch("coord.state.record_dispatched"), \
+         patch.object(network.httpx, "get", side_effect=_record), \
+         patch.object(network.httpx, "post", side_effect=_record):
+        assignment_id, machine_name = mock_author.dispatch_acceptance_mock("api", 100, cfg)
+
+    assert calls == [], (
+        f"dispatch_acceptance_mock made {len(calls)} real outbound HTTP call(s) "
+        f"({calls!r}) — conftest's _no_agent_credential_probe stub is not in effect"
+    )
+    assert assignment_id == "asg-xyz"
+    assert machine_name == "laptop"
+
+
 def test_dispatch_translates_dispatch_failure_into_clean_runtime_error(tmp_path):
     """#1059 review: dispatch_with_retry can raise ValueError/httpx.HTTPError
     (bad machine config, agent unreachable) — previously uncaught here, so it

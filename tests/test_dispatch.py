@@ -16,9 +16,12 @@ from coord.config import (
     ProviderDef,
     ProvidersConfig,
     ReviewsConfig,
+    SmokeRule,
+    SmokeTestsConfig,
 )
 from coord.dispatch import (
     EPIC_DECOMPOSE_CONTRACT,
+    CapabilityRouting,
     DispatchRefused,
     dispatch,
     enforce_epic_dispatch_guard,
@@ -28,8 +31,13 @@ from coord.dispatch import (
     post_briefing,
     resolve_dispatch_model,
     resolve_dispatch_model_alias,
+    apply_liveness_reroute,
+    caching_status_fetcher,
+    route_work_by_capability,
+    route_work_by_liveness,
 )
 from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo
+from coord.network import StatusResult
 from coord.review import repo_focus_lines
 
 
@@ -1391,26 +1399,33 @@ class TestEpicDispatchGuard:
 
 class TestEpicDecomposeBriefing:
     """#3132 acceptance: dispatching `type="epic-decompose"` against a
-    fixture epic renders a briefing carrying the decompose-and-queue
-    contract — cap of 6, chain serially, leave the epic open — as a durable
-    part of what the worker is told, not just something the epic's own body
-    happens to say.
+    fixture epic renders a briefing carrying the decompose contract — file
+    and register children, implement slice 1, leave the epic open — as a
+    durable part of what the worker is told, not just something the epic's
+    own body happens to say.
+
+    #3246: queuing the first batch of children and re-queuing the epic
+    behind them used to be steps 2/3 of this same contract, worker-executed
+    — and worked only ~half the time, invisibly, because a one-shot
+    worker's own report of having run `coord drive-queue add` was the only
+    evidence it ever happened. Those two steps moved coordinator-side (see
+    `coord.drive`'s post-leg handling), so the contract no longer asks the
+    worker to run them — it explicitly tells the worker NOT to.
     """
 
     def test_contract_text_states_the_full_workflow(self) -> None:
         """Unit-level: the contract text itself names every step #3132's
-        acceptance criteria call out."""
+        acceptance criteria call out, and explicitly hands #3246's two
+        queueing steps to the coordinator rather than asking for them."""
         assert "add-child" in EPIC_DECOMPOSE_CONTRACT
-        assert "At most 6" in EPIC_DECOMPOSE_CONTRACT
-        assert "chained serially" in EPIC_DECOMPOSE_CONTRACT
-        assert "Re-queue this epic" in EPIC_DECOMPOSE_CONTRACT
         assert "Implement only the first slice" in EPIC_DECOMPOSE_CONTRACT
         assert "Leave this epic open" in EPIC_DECOMPOSE_CONTRACT
+        assert "Do NOT queue" in EPIC_DECOMPOSE_CONTRACT
+        assert "coordinator-side" in EPIC_DECOMPOSE_CONTRACT
 
     def test_epic_decompose_briefing_names_the_issue(self) -> None:
         rendered = epic_decompose_briefing(1120)
         assert "#1120" in rendered
-        assert "At most 6" in rendered
         assert "Leave this epic open" in rendered
 
     @patch("coord.dispatch.httpx.post")
@@ -1442,8 +1457,8 @@ class TestEpicDecomposeBriefing:
 
         mock_post.assert_called_once()
         wire_briefing = mock_post.call_args.kwargs["json"]["briefing"]
-        assert "At most 6" in wire_briefing
-        assert "chained serially" in wire_briefing
+        assert "Do NOT queue" in wire_briefing
+        assert "coordinator-side" in wire_briefing
         assert "Leave this epic open" in wire_briefing
         assert "#1120" in wire_briefing
         # The operator/epic-author's own briefing text is preserved too —
@@ -2539,6 +2554,148 @@ class TestProviderMachineCapabilityGate:
         mock_post.assert_called_once()
 
 
+class TestCredentialHealthGate:
+    """#3371: dispatch() refuses to route to a machine a live probe
+    confirms has a dead claude credential, BEFORE any HTTP POST happens —
+    the mechanical "not routable" enforcement, mirroring #1711's shape
+    exactly (opt-in *credential_fetcher*, `None` = untouched behaviour)."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_none_fetcher_is_a_no_op(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Every caller that predates #3371 (credential_fetcher omitted)
+        must behave byte-for-byte as before."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_a_dead_credential_machine(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(ValueError, match="not routable"):
+            dispatch(proposal, config, credential_fetcher=lambda m: False)
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_allows_a_healthy_credential_machine(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config, credential_fetcher=lambda m: True)
+        mock_post.assert_called_once()
+
+
+class TestDispatchLivenessGate:
+    """#3376: the ONE dispatch liveness precondition, consolidated with
+    #3371's credential-health gate above into a single structural check —
+    refuses BEFORE any HTTP POST when the issue is already closed, its
+    branch already merged, or (unchanged from #3371) the machine fails a
+    live credential probe."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_none_fetcher_is_a_no_op(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """A caller that hasn't wired issue_liveness_fetcher in yet is
+        byte-for-byte unaffected — same posture as credential_fetcher."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.record_dispatch_refusal")
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_a_closed_issue(
+        self, mock_post: MagicMock, mock_record: MagicMock,
+        config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(DispatchRefused, match="already closed"):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (True, False),
+            )
+        mock_post.assert_not_called()
+        mock_record.assert_called_once()
+
+    @patch("coord.dispatch.record_dispatch_refusal")
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_an_already_merged_branch(
+        self, mock_post: MagicMock, mock_record: MagicMock,
+        config: Config, proposal: Proposal,
+    ) -> None:
+        with pytest.raises(DispatchRefused, match="already merged"):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, True),
+            )
+        mock_post.assert_not_called()
+        mock_record.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_allows_an_open_unmerged_issue(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(
+            proposal, config,
+            issue_liveness_fetcher=lambda repo, num: (False, False),
+        )
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_still_refuses_dead_credential_via_same_gate(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """#3371's behaviour, now routed through the consolidated gate,
+        must still refuse a dead-credential machine — and the substring
+        every pre-existing caller matches on ("not routable") is
+        preserved."""
+        with pytest.raises(ValueError, match="not routable"):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, False),
+                credential_fetcher=lambda m: False,
+            )
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_all_three_predicates_raise_the_same_deterministic_exception(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """#3376: all three predicates funnel through the SAME
+        `DispatchRefused` #1844 already built — not a second, competing
+        "this doesn't count" concept — so every one of them gets the
+        existing `EXIT_DISPATCH_REFUSED` "don't charge the retry budget"
+        treatment `coord.drive`'s subprocess boundary already applies to
+        `enforce_oracle_readiness`/`enforce_epic_dispatch_guard`."""
+        with pytest.raises(DispatchRefused):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (True, False),
+            )
+        with pytest.raises(DispatchRefused):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, True),
+            )
+        with pytest.raises(DispatchRefused):
+            dispatch(
+                proposal, config,
+                issue_liveness_fetcher=lambda repo, num: (False, False),
+                credential_fetcher=lambda m: False,
+            )
+        mock_post.assert_not_called()
+
+
 class TestProviderAwareModelResolution:
     """#1706 review fix: `config.models.default` is a Claude alias and must
     not silently shadow a non-Claude provider's own pinned `model`. Model
@@ -3067,3 +3224,1171 @@ class TestProviderNamePersistence:
         ).fetchone()
         assert row is not None
         assert row["provider_name"] is None
+
+
+class TestRouteWorkByCapability:
+    """#3241: a `type="work"` dispatch whose declared `## Files` match
+    `smoke_tests.capability_rules` must route to a machine that can
+    actually run the gated suite, reusing `coord.smoke.match_rules` — the
+    same matcher the Test stage's own routing already uses.
+    """
+
+    def test_no_matching_rule_returns_none(self) -> None:
+        """The overwhelmingly common case: no rule matches this diff at
+        all, so the caller must leave `proposal.machine_name` untouched."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["src/cli.py"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["src/macos/"], requires=["macos"])],
+        )
+        assert result is None
+
+    def test_repo_requires_routes_even_when_no_file_rule_matches(self) -> None:
+        """#3351: vimcode's shape — the repo unconditionally `requires` a
+        capability that no `capability_rules` entry (file-keyed) could ever
+        express repo-wide. A diff touching files matching NO rule at all
+        must still reroute to a machine that declares it."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["vimcode"],
+                repo_paths={"vimcode": "/home/user/src/vimcode"},
+                capabilities=["rust"],
+            ),
+            Machine(
+                name="precision", host="precision.tailnet", repos=["vimcode"],
+                repo_paths={"vimcode": "/home/user/src/vimcode"},
+                capabilities=["rust", "nvim"],
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="vimcode",
+            files_likely=["src/parser.rs"],
+            machines=machines,
+            capability_rules=[],
+            repo_requires=["nvim"],
+        )
+        assert result is not None
+        assert result.machine_name == "precision"
+        assert result.rerouted is True
+        assert result.unmet_capabilities == ()
+
+    def test_repo_requires_empty_behaves_exactly_as_before(self) -> None:
+        """No `repo_requires` at all (the default) must match today's
+        behaviour precisely — the overwhelming majority of repos never set
+        `Repo.requires`."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["src/cli.py"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["src/macos/"], requires=["macos"])],
+        )
+        assert result is None
+
+    def test_no_capable_machine_for_repo_returns_none(self) -> None:
+        """No configured machine can even work on this repo at all — that
+        refusal belongs to `dispatch()`'s own unresolved-machine/repo_path
+        checks, not here."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["other-repo"]),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["src/macos/"], requires=["macos"])],
+        )
+        assert result is None
+
+    def test_single_capability_diff_reroutes_to_capable_machine(self) -> None:
+        """quadraui#913's shape: a macOS-only diff proposed onto a Linux
+        box must reroute to the machine that actually declares `macos`."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        assert result is not None
+        assert result.machine_name == "macmini"
+        assert result.unmet_capabilities == ()
+        assert result.rerouted is True
+
+    def test_already_capable_proposed_machine_is_not_rerouted(self) -> None:
+        """No pointless reroute (and lost build cache) when the proposed
+        machine already fully satisfies the matched capabilities."""
+        machines = [
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+            Machine(
+                name="macmini2", host="macmini2.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="macmini",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        assert result is not None
+        assert result.machine_name == "macmini"
+        assert result.rerouted is False
+        assert result.unmet_capabilities == ()
+
+    def test_multi_capability_diff_never_returns_zero_machines(self) -> None:
+        """The #3241 wrinkle: a diff spanning gtk+windows AND macos has no
+        single machine satisfying the union (no AND-the-requirements
+        refusal — that's the #1678 shape). The machine covering the MOST
+        of the matched capabilities wins, and `unmet_capabilities` names
+        what it still can't verify."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        rules = [
+            SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="someone-else",
+            repo_name="quadraui",
+            files_likely=[
+                "quadraui/src/gtk/popup.c",
+                "quadraui/src/macos/backend.rs",
+            ],
+            machines=machines,
+            capability_rules=rules,
+        )
+        assert result is not None
+        assert result.machine_name in ("dell64", "macmini")
+        assert result.unmet_capabilities  # neither machine fully covers it
+        assert len(result.unmet_capabilities) == 1
+
+    def test_multi_capability_tie_break_is_deterministic_by_config_order(self) -> None:
+        """Two machines tied on coverage, and the proposed machine isn't one
+        of them — the FIRST machine in `machines` (coordinator.yml
+        declaration order) wins, not set/dict iteration order."""
+        machines = [
+            Machine(
+                name="first", host="first.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="second", host="second.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        rules = [
+            SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="neither-of-these",
+            repo_name="quadraui",
+            files_likely=[
+                "quadraui/src/gtk/popup.c",
+                "quadraui/src/macos/backend.rs",
+            ],
+            machines=machines,
+            capability_rules=rules,
+        )
+        assert result is not None
+        assert result.machine_name == "first"
+
+    def test_briefing_note_names_unmet_capabilities_and_forbids_self_recording(self) -> None:
+        note = CapabilityRouting(
+            machine_name="dell64", unmet_capabilities=("macos",), rerouted=False,
+        ).briefing_note("dell64")
+        assert "macos" in note
+        assert "dell64" in note
+        assert "Do NOT self-record" in note
+
+    def test_machine_with_no_repo_path_is_never_a_reroute_target(self) -> None:
+        """#3241 review: the sibling `select_fix_machine._capable()` check a
+        few hundred lines below requires `repo_path(repo_name) is not
+        None`. `macmini` declares `quadraui` under `repos:` but has no
+        `repo_paths` entry configured — it must never be picked, even
+        though it's the only machine declaring `macos`. Before this fix,
+        `dispatch()` would set `proposal.machine_name = "macmini"` and only
+        THEN hit its own pre-existing `repo_path` check and raise, leaving
+        the proposal mutated to an undispatchable machine."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                capabilities=["macos"],  # no repo_paths entry
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        assert result is not None
+        # dell64 is the only surviving candidate — macmini is filtered out
+        # before scoring, so it can never win even though it fully covers
+        # the matched capability.
+        assert result.machine_name == "dell64"
+        assert result.unmet_capabilities == ("macos",)
+
+    def test_paused_machine_is_never_a_reroute_target(self) -> None:
+        """#3241 review: every other machine-selection path in this file
+        (`rank_smoke_machines`/`_capability_matched_machines` in
+        coord/smoke.py, #2636; `select_fix_machine`, #2240) cordons via
+        `follow_on_paused_set`. Work dispatch is NEW work, not the tail of
+        a leg already in flight, so it must use the FULL `paused_set()` —
+        the same one `coord.brain.propose()` and `coord assign`'s CLI both
+        gate a `type="work"` proposal's machine on. A reroute must not
+        silently land the work on a machine the operator explicitly
+        `coord pause`d."""
+        from coord.machine_pause import local_pause
+
+        local_pause("macmini")
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        assert result is not None
+        assert result.machine_name == "dell64"
+        assert result.unmet_capabilities == ("macos",)
+
+    def test_quiet_hours_machine_is_never_a_reroute_target(self) -> None:
+        """Same cordon as the pause test above, but via a declared
+        `quiet_hours` window instead of an explicit `coord pause` — both
+        fold into `paused_set()` (#1862). *now* is pinned (the same seam
+        `rank_smoke_machines` exposes, #2636) so this is deterministic
+        rather than depending on the real wall clock."""
+        from datetime import datetime, time, timezone
+
+        from coord.models import QuietHours
+
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk", "windows"],
+            ),
+            dataclasses_replace(
+                Machine(
+                    name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["macos"],
+                ),
+                quiet_hours=QuietHours(start=time(22, 0), end=time(8, 0), tz="UTC"),
+            ),
+        ]
+        # 2026-08-23 04:00 UTC — inside macmini's 22:00-08:00 UTC window.
+        inside_window = datetime(2026, 8, 23, 4, 0, tzinfo=timezone.utc)
+        result = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+            now=inside_window,
+        )
+        assert result is not None
+        assert result.machine_name == "dell64"
+        assert result.unmet_capabilities == ("macos",)
+
+        # Control: OUTSIDE the window, macmini is a normal candidate again
+        # and wins on coverage.
+        outside_window = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
+        result2 = route_work_by_capability(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            files_likely=["quadraui/src/macos/backend.rs"],
+            machines=machines,
+            capability_rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+            now=outside_window,
+        )
+        assert result2 is not None
+        assert result2.machine_name == "macmini"
+        assert result2.unmet_capabilities == ()
+
+
+class TestDispatchCapabilityRouting:
+    """#3241 end-to-end: `dispatch()` itself reroutes a `type="work"`
+    dispatch by `smoke_tests.capability_rules` and annotates the briefing.
+    """
+
+    def _config(self, machines: list[Machine], rules: list[SmokeRule]) -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=machines,
+            smoke_tests=SmokeTestsConfig(capability_rules=rules),
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_reroutes_to_capable_machine_and_updates_proposal(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config(
+            machines=[
+                Machine(
+                    name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["gtk", "windows"],
+                ),
+                Machine(
+                    name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["macos"],
+                ),
+            ],
+            rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=913, issue_title="Fix macOS backend",
+            rationale="best fit", files_likely=["quadraui/src/macos/backend.rs"],
+            briefing="Fix the macOS backend", type="work",
+        )
+
+        dispatch(p, cfg)
+
+        # Posted to the CAPABLE machine, not the originally proposed one.
+        assert "macmini.tailnet" in mock_post.call_args.args[0]
+        # #3241: the proposal itself is updated so post_briefing() (called
+        # right after dispatch() with this SAME object by every caller)
+        # announces the machine the work actually landed on.
+        assert p.machine_name == "macmini"
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "Capabilities you cannot verify locally" not in briefing
+
+    @patch("coord.dispatch.httpx.post")
+    def test_no_rule_match_leaves_machine_untouched(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Regression: the default fixtures (no `smoke_tests.capability_rules`
+        configured) must dispatch exactly as before #3241."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        assert "laptop.tailnet" in mock_post.call_args.args[0]
+        assert proposal.machine_name == "laptop"
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "Capabilities you cannot verify locally" not in briefing
+
+    @patch("coord.dispatch.httpx.post")
+    def test_multi_capability_diff_briefing_names_unverifiable_stage(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config(
+            machines=[
+                Machine(
+                    name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["gtk", "windows"],
+                ),
+                Machine(
+                    name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["macos"],
+                ),
+            ],
+            rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+        )
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=913, issue_title="gtk+macos change",
+            rationale="best fit",
+            files_likely=[
+                "quadraui/src/gtk/popup.c",
+                "quadraui/src/macos/backend.rs",
+            ],
+            briefing="Do the cross-platform fix", type="work",
+        )
+
+        dispatch(p, cfg)
+
+        assert "dell64.tailnet" in mock_post.call_args.args[0]  # stayed (no reroute win)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "Capabilities you cannot verify locally" in briefing
+        assert "macos" in briefing
+        assert "Do NOT self-record" in briefing
+
+    @patch("coord.dispatch.httpx.post")
+    def test_non_work_type_is_never_rerouted(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Only `type="work"` is subject to capability routing — a "plan"
+        proposal (read-only, no test/smoke stage) is dispatched exactly
+        where proposed even if its files_likely happens to match a rule."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config(
+            machines=[
+                Machine(
+                    name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=[],
+                ),
+                Machine(
+                    name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["macos"],
+                ),
+            ],
+            rules=[SmokeRule(files=["quadraui/src/macos/"], requires=["macos"])],
+        )
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=913, issue_title="Plan the macOS backend",
+            rationale="best fit", files_likely=["quadraui/src/macos/backend.rs"],
+            briefing="Plan it", type="plan",
+        )
+
+        dispatch(p, cfg)
+
+        assert "dell64.tailnet" in mock_post.call_args.args[0]
+        assert p.machine_name == "dell64"
+
+
+# ── #3353: liveness-aware work-dispatch routing ─────────────────────────────
+#
+# #3349 and coord-tui#79 (2026-09-15) were each dispatched straight at a
+# machine that had been offline for hours: `route_work_by_capability` above
+# only reroutes on a `## Files` capability-rule match, and `dispatch()`
+# POSTed to `proposal.machine_name` with no reachability signal at all — the
+# same busy-vs-alive confusion #3353 already fixed for conflict-fix machine
+# selection (`coord.conflict_fix.select_conflict_fix_machine`), left open
+# for the router that actually produced those two incidents.
+#
+# Every test below fails against unfixed `main`: `route_work_by_liveness`
+# doesn't exist there, and `dispatch()` has no `status_fetcher` parameter.
+
+
+def _status_fetcher(reachable: set[str]):
+    """Fake `status_fetcher`: online for every machine in *reachable*,
+    unreachable (network timeout) for everyone else. Same fake shape as
+    tests/test_conflict_fix.py's identical helper — both probe through
+    `coord.network.probe_reachable`."""
+
+    def _fetch(machine, timeout=None):  # noqa: ARG001 — matches fetch_status's shape
+        if machine.name in reachable:
+            return StatusResult(data={"assignments": []})
+        return StatusResult(error="timeout")
+
+    return _fetch
+
+
+class TestRouteWorkByLiveness:
+    def test_no_status_fetcher_returns_none(self) -> None:
+        """Opt-in only (#2096, same contract as `coord.conflict_fix.
+        select_conflict_fix_machine`'s `status_fetcher`): no probe at all
+        when a caller hasn't wired a fetcher in, so every existing
+        `dispatch()` call site is unaffected byte-for-byte."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+        )
+        assert result is None
+
+    def test_reachable_proposed_machine_returns_none(self) -> None:
+        """Nothing to reroute — the caller's job is to leave
+        `proposal.machine_name` untouched."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher({"dell64"}),
+        )
+        assert result is None
+
+    def test_unreachable_proposed_machine_reroutes_to_live_fallback(self) -> None:
+        """The exact #3349/coord-tui#79 shape: dell64 has been down for
+        hours, macmini is up and covers the same repo. Selection must not
+        stay pinned on the dead machine."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert result is not None
+        assert result.machine_name == "macmini"
+        assert result.rerouted is True
+        assert ("dell64", "timeout") in result.tried
+
+    def test_all_candidates_unreachable_signals_none_machine_name(self) -> None:
+        """The caller must treat this as a hard refusal, not "proceed with
+        the original pick" — falling through would burn a POST timeout
+        against a box already confirmed dead (#3353 item 3)."""
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher(set()),
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+        assert {name for name, _ in result.tried} == {"dell64", "macmini"}
+
+    def test_unknown_proposed_machine_returns_none(self) -> None:
+        """`dispatch()`'s own "Unknown machine" check is the right place
+        for this refusal, not a second one here."""
+        machines = [
+            Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"]),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="ghost",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher(set()),
+        )
+        assert result is None
+
+    def test_incapable_and_paused_machines_are_never_probed_as_fallbacks(self) -> None:
+        """Same candidate filter as `route_work_by_capability` (#3241
+        review): a machine that doesn't declare this repo, has no
+        `repo_path` configured for it, or is `coord pause`d must never be
+        probed at all, let alone picked."""
+        from coord.machine_pause import local_pause
+
+        local_pause("macmini")
+        machines = [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(name="other-repo-only", host="oro.tailnet", repos=["other"]),
+            Machine(
+                name="no-repo-path", host="nrp.tailnet", repos=["quadraui"],
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="dell64",
+            repo_name="quadraui",
+            machines=machines,
+            status_fetcher=_status_fetcher(set()),  # nobody answers
+        )
+        assert result is not None
+        assert result.machine_name is None
+        # Only dell64 (the proposed machine) was ever probed — the other
+        # three were filtered out of the fallback candidate list before a
+        # single probe ran against them.
+        assert {name for name, _ in result.tried} == {"dell64"}
+
+    # ── #3353 review (round 3): capability-aware fallbacks ──────────────
+    #
+    # This gate runs AFTER the #3241 capability gate, so the machine it is
+    # handed is already the capability-CHOSEN one whenever a rule matched.
+    # A capability-blind fallback search silently undid that: a GTK diff
+    # routed to the one GTK box would land on a box with no GTK at all and
+    # the POST would look perfectly successful — strictly worse than
+    # pre-#3353 behaviour, which at least failed loudly on a timeout.
+    #
+    # These fail against the round-2 commit, where `route_work_by_liveness`
+    # has no `files_likely`/`capability_rules` parameters at all.
+
+    def _capability_machines(self) -> list[Machine]:
+        return [
+            Machine(
+                name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="headless", host="headless.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+
+    def test_refuses_rather_than_dropping_a_required_capability(self) -> None:
+        """The blocking regression: the only GTK machine is down, and the
+        only reachable machine cannot build the diff's own suite. A reroute
+        there is the UNCONFIRMED-verdict hole (#2217/#2464) reopened, so
+        this must refuse (`machine_name is None`) instead."""
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=self._capability_machines(),
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless"}),
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert result.rerouted is False
+        # And it says WHY headless was ruled out, rather than leaving the
+        # operator to guess it was another dead box.
+        reasons = dict(result.tried)
+        assert "capability shortfall" in reasons["headless"]
+        assert "gtk" in reasons["headless"]
+
+    def test_capability_blind_fallback_is_never_even_probed(self) -> None:
+        """A machine ruled out on coverage costs no network probe — the
+        same "filter before probing" property the paused/incapable test
+        above asserts."""
+        probed: list[str] = []
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            probed.append(machine.name)
+            return StatusResult(error="timeout")
+
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=self._capability_machines(),
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_fetch,
+        )
+        assert result is not None
+        assert result.machine_name is None
+        assert probed == ["gtkbox"]
+
+    def test_reroutes_to_another_equally_capable_machine(self) -> None:
+        """Capability awareness must not become a blanket refusal: a
+        SECOND GTK machine that is up still takes the work."""
+        machines = [
+            *self._capability_machines(),
+            Machine(
+                name="gtkbox2", host="gtkbox2.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=machines,
+            files_likely=["quadraui/src/gtk/window.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless", "gtkbox2"}),
+        )
+        assert result is not None
+        assert result.machine_name == "gtkbox2"
+        assert result.rerouted is True
+
+    def test_unmatched_diff_still_reroutes_to_any_live_machine(self) -> None:
+        """`capability_rules` present but nothing in `files_likely`
+        matches: the requirement set is empty, so every repo-capable
+        machine stays eligible exactly as before (no accidental
+        tightening of the common case)."""
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=self._capability_machines(),
+            files_likely=["README.md"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless"}),
+        )
+        assert result is not None
+        assert result.machine_name == "headless"
+
+    def test_never_refuses_when_no_machine_fully_covers_the_diff(self) -> None:
+        """`CapabilityRouting`'s never-zero-machines property (#3177/#1678)
+        is preserved: the floor is "cover at least as much as the proposed
+        machine did", NOT an AND over every requirement. A gtk+macos diff
+        that no single machine fully covers still reroutes to the other
+        one-capability machine rather than stranding the work."""
+        machines = [
+            Machine(
+                name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["macos"],
+            ),
+        ]
+        result = route_work_by_liveness(
+            proposed_machine_name="gtkbox",
+            repo_name="quadraui",
+            machines=machines,
+            files_likely=["quadraui/src/gtk/window.rs", "quadraui/src/macos/x.rs"],
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert result is not None
+        assert result.machine_name == "macmini"
+
+
+class TestDispatchLivenessRouting:
+    """#3353 end-to-end: `dispatch()` itself reroutes a `type="work"`
+    dispatch around an unreachable proposed machine when a caller opts in
+    via `status_fetcher`, and refuses outright — rather than burning a POST
+    timeout against a confirmed-dead box — when nothing is reachable.
+    """
+
+    def _config(self, machines: list[Machine]) -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=machines,
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_reroutes_to_live_machine_and_updates_proposal(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config([
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+
+        dispatch(p, cfg, status_fetcher=_status_fetcher({"macmini"}))
+
+        assert "macmini.tailnet" in mock_post.call_args.args[0]
+        # Mutated in place, same contract as the #3241 capability reroute —
+        # `post_briefing()` (called right after by every caller with this
+        # SAME object) must announce where the work actually landed.
+        assert p.machine_name == "macmini"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_all_candidates_unreachable_raises_instead_of_posting(
+        self, mock_post: MagicMock,
+    ) -> None:
+        cfg = self._config([
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+
+        with pytest.raises(ValueError, match="unreachable"):
+            dispatch(p, cfg, status_fetcher=_status_fetcher(set()))
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_no_status_fetcher_never_probes_and_dispatches_unchanged(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Regression: the default (no opt-in) fixtures dispatch exactly
+        as before #3353 — no probe happens at all, even against a machine
+        a fetcher would call unreachable."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)  # status_fetcher defaults to None
+        assert "laptop.tailnet" in mock_post.call_args.args[0]
+        assert proposal.machine_name == "laptop"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_non_work_type_is_never_liveness_routed(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Only `type="work"` goes through liveness routing — a "plan"
+        proposal is dispatched exactly where proposed even against an
+        unreachable-everywhere fetcher; `dispatch()`'s own POST timeout is
+        that path's existing failure mode, unchanged by #3353."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = self._config([
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ])
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Plan the thing",
+            rationale="best fit", briefing="Plan it", type="plan",
+        )
+
+        dispatch(p, cfg, status_fetcher=_status_fetcher(set()))
+
+        assert "dell64.tailnet" in mock_post.call_args.args[0]
+        assert p.machine_name == "dell64"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_capability_routed_dead_machine_refuses_instead_of_downgrading(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#3353 review (round 3), end to end through `dispatch()`: the
+        #3241 capability gate moves a GTK diff onto the one GTK box; that
+        box is also down. The liveness gate must NOT then hand the work to
+        the reachable-but-GTK-less machine and POST as if all were well —
+        that is a silent UNCONFIRMED-verdict dispatch (#2217/#2464), worse
+        than the loud pre-#3353 timeout. Fails against the round-2 commit,
+        which POSTs happily to `headless.tailnet`."""
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=[
+                Machine(
+                    name="headless", host="headless.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                ),
+                Machine(
+                    name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                    capabilities=["gtk"],
+                ),
+            ],
+            smoke_tests=SmokeTestsConfig(capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ]),
+        )
+        p = Proposal(
+            id=1, machine_name="headless", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the GTK thing",
+            rationale="best fit", files_likely=["quadraui/src/gtk/window.rs"],
+            briefing="Fix it", type="work",
+        )
+
+        with pytest.raises(ValueError, match="capability"):
+            # headless is reachable, but the capability gate ahead of the
+            # liveness gate has already moved this proposal onto gtkbox.
+            dispatch(p, cfg, status_fetcher=_status_fetcher({"headless"}))
+        mock_post.assert_not_called()
+
+
+class TestApplyLivenessReroute:
+    """#3353 review (round 2): the batch-level helper both approve doors —
+    `coord approve` and the `coord web` dashboard's `POST /api/approve` —
+    now share. Two hand-rolled copies of "is this machine alive" is the
+    #2096 violation that let the dashboard path fall a whole round behind.
+    """
+
+    def _machines(self) -> list[Machine]:
+        return [
+            Machine(
+                name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+            Machine(
+                name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+
+    def _proposal(self, pid: int = 1, ptype: str = "work") -> Proposal:
+        return Proposal(
+            id=pid, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type=ptype,
+        )
+
+    def test_no_status_fetcher_is_a_total_no_op(self) -> None:
+        """Opt-in only — a caller that hasn't wired a fetcher must see
+        `machine_name` untouched and no probe at all."""
+        p = self._proposal()
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(), status_fetcher=None,
+        )
+        assert moved == []
+        assert p.machine_name == "dell64"
+
+    def test_unreachable_proposal_is_moved_and_reported(self) -> None:
+        p = self._proposal()
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(),
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert p.machine_name == "macmini"
+        assert len(moved) == 1
+        assert moved[0].proposal_id == 1
+        assert moved[0].from_machine == "dell64"
+        assert moved[0].to_machine == "macmini"
+
+    def test_all_unreachable_leaves_the_proposal_untouched(self) -> None:
+        """Deliberate: `dispatch()` raises the single descriptive "every
+        candidate unreachable" refusal for this case, and both callers
+        already report a failed dispatch per proposal. Mutating or
+        skipping here would give two different messages for one condition.
+        """
+        p = self._proposal()
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(), status_fetcher=_status_fetcher(set()),
+        )
+        assert moved == []
+        assert p.machine_name == "dell64"
+
+    def test_non_work_proposals_are_never_touched(self) -> None:
+        p = self._proposal(ptype="plan")
+        moved = apply_liveness_reroute(
+            [p], machines=self._machines(),
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert moved == []
+        assert p.machine_name == "dell64"
+
+    def test_mixed_batch_moves_only_what_needs_moving(self) -> None:
+        dead = self._proposal(pid=1)
+        live = self._proposal(pid=2)
+        live.machine_name = "macmini"
+        moved = apply_liveness_reroute(
+            [dead, live], machines=self._machines(),
+            status_fetcher=_status_fetcher({"macmini"}),
+        )
+        assert [m.proposal_id for m in moved] == [1]
+        assert dead.machine_name == "macmini"
+        assert live.machine_name == "macmini"
+
+    def test_capability_rules_are_honoured_by_the_batch_helper(self) -> None:
+        """#3353 review (round 3): both approve doors run their #3241
+        capability reroute immediately before this helper, so a
+        capability-blind batch reroute here would undo it. With the rules
+        threaded through, a GTK proposal whose GTK machine is down is left
+        untouched for `dispatch()` to refuse — never quietly moved onto the
+        GTK-less box. Fails against the round-2 commit, which moves it."""
+        machines = [
+            Machine(
+                name="gtkbox", host="gtkbox.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+                capabilities=["gtk"],
+            ),
+            Machine(
+                name="headless", host="headless.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            ),
+        ]
+        p = self._proposal()
+        p.machine_name = "gtkbox"
+        p.files_likely = ["quadraui/src/gtk/window.rs"]
+
+        moved = apply_liveness_reroute(
+            [p], machines=machines,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+            ],
+            status_fetcher=_status_fetcher({"headless"}),
+        )
+        assert moved == []
+        assert p.machine_name == "gtkbox"
+
+
+class TestCachingStatusFetcher:
+    """#3353 review (round 2): `coord approve` / `POST /api/approve` ask
+    "is this machine up" twice per work proposal — once in the preview
+    reroute, once inside `dispatch()`. That is a real second `GET /status`
+    per dispatch, not a free no-op, and the two answers could disagree.
+    """
+
+    def test_repeat_probes_of_one_machine_hit_the_wire_once(self) -> None:
+        calls: list[str] = []
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            calls.append(machine.name)
+            return StatusResult(data={"assignments": []})
+
+        cached = caching_status_fetcher(_fetch)
+        m = Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"])
+        assert cached(m).ok
+        assert cached(m).ok
+        assert cached(m).ok
+        assert calls == ["dell64"]
+
+    def test_distinct_machines_are_each_probed(self) -> None:
+        """Not a blanket "answer once for everything" cache — the cache key
+        is the machine, or a dead box would inherit a live one's verdict."""
+        calls: list[str] = []
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            calls.append(machine.name)
+            return StatusResult(
+                data={"assignments": []} if machine.name == "macmini" else None,
+                error=None if machine.name == "macmini" else "timeout",
+            )
+
+        cached = caching_status_fetcher(_fetch)
+        dell = Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"])
+        mac = Machine(name="macmini", host="macmini.tailnet", repos=["quadraui"])
+        assert cached(dell).ok is False
+        assert cached(mac).ok is True
+        assert cached(dell).ok is False
+        assert calls == ["dell64", "macmini"]
+
+    def test_a_fresh_wrapper_does_not_inherit_a_previous_batch_verdict(self) -> None:
+        """Scoped to one batch on purpose: liveness is the thing being
+        measured, so a process-lifetime cache would make a long-running
+        daemon act on a stale up/down reading."""
+        state = {"up": False}
+
+        def _fetch(machine, timeout=None):  # noqa: ARG001
+            return (
+                StatusResult(data={"assignments": []}) if state["up"]
+                else StatusResult(error="timeout")
+            )
+
+        m = Machine(name="dell64", host="dell64.tailnet", repos=["quadraui"])
+        assert caching_status_fetcher(_fetch)(m).ok is False
+        state["up"] = True
+        assert caching_status_fetcher(_fetch)(m).ok is True
+
+    def test_reroute_and_dispatch_share_one_probe_per_machine(self) -> None:
+        """The end-to-end point of the wrapper: a preview reroute followed
+        by `dispatch()`'s own internal gate costs ONE probe per machine,
+        not two."""
+        calls: list[str] = []
+        live = _status_fetcher({"macmini"})
+
+        def _fetch(machine, timeout=None):
+            calls.append(machine.name)
+            return live(machine, timeout=timeout)
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui")],
+            machines=[
+                Machine(
+                    name="dell64", host="dell64.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                ),
+                Machine(
+                    name="macmini", host="macmini.tailnet", repos=["quadraui"],
+                    repo_paths={"quadraui": "/home/user/src/quadraui"},
+                ),
+            ],
+        )
+        p = Proposal(
+            id=1, machine_name="dell64", repo_name="quadraui",
+            issue_number=3349, issue_title="Fix the thing",
+            rationale="best fit", briefing="Fix it", type="work",
+        )
+        cached = caching_status_fetcher(_fetch)
+
+        apply_liveness_reroute([p], machines=cfg.machines, status_fetcher=cached)
+        with patch("coord.dispatch.httpx.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"ok": True}
+            mock_post.return_value = mock_resp
+            dispatch(p, cfg, status_fetcher=cached)
+
+        assert "macmini.tailnet" in mock_post.call_args.args[0]
+        # dell64 probed once (preview), macmini once (preview fallback).
+        # `dispatch()`'s repeat of both is served from the cache.
+        assert calls == ["dell64", "macmini"]

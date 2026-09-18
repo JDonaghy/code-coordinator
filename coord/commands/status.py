@@ -249,6 +249,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # the flatly wrong "PAUSED". Fetch the effective window map (daemon-aware,
     # fail-soft) and hand it to describe_pause_state, which also names where
     # each window came from — "set here" vs "from coordinator.yml".
+    from coord.machine_fault import describe as _describe_machine_fault  # noqa: PLC0415
     from coord.machine_pause import (  # noqa: PLC0415
         cordons as fetch_cordons,
         describe_pause_state,
@@ -273,10 +274,24 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
 
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
+    # #3376 review round 2: which machines actually ANSWERED `/status` on this
+    # run — i.e. for which machines is `agent_completed` a real fact source
+    # rather than structurally empty. `machines` above is narrowed by
+    # `--machine`, and an unfiltered run can still contain an offline host, so
+    # "this assignment has no remote usage entry" only means something for a
+    # machine in this set. Consumed by the invariant-alarms block below; see
+    # the long note there for why the distinction is load-bearing.
+    polled_ok_machines: set[str] = set()
     click.echo("Machines:")
     for s in statuses:
         m = s.machine
         latency = f" ({s.latency_ms:.0f}ms)" if s.latency_ms is not None else ""
+        # #3340: a verdict reached only after `check_machine` retried a slow
+        # (but connected) /health reply is worth flagging here — the same
+        # machine reading fine on this poll and "timed out" on the next is
+        # otherwise silent and easy for an operator to discount.
+        if s.retried:
+            latency += " retried"
         if s.is_online:
             status_result = fetch_status(m, timeout=timeout)
             if status_result.ok:
@@ -311,6 +326,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 active = []
                 detail = f"status unavailable ({status_result.error})"
             if status_result.ok and status_result.data:
+                polled_ok_machines.add(m.name)
                 for entry in status_result.data.get("completed", []):
                     eid = entry.get("id") or entry.get("assignment_id")
                     if eid:
@@ -396,6 +412,18 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         if degraded:
             for repo_name, reason in degraded.items():
                 click.echo(f"    ⚠ degraded: {repo_name} — {reason}")
+
+        # #3367: a machine whose Claude credentials are dead (or that keeps
+        # producing 1-turn/$0 "never actually ran" failures) used to render
+        # as a plain `online • idle` here — the exact blind spot that let
+        # precision eat four identical dispatches before a human noticed.
+        # `coord.machine_fault.describe` is local-only (see that module's
+        # own scope note), so this renders whatever THIS box has recorded;
+        # the pause itself (if the streak crossed the auto-pause threshold)
+        # is fleet-wide and already visible via the `PAUSED —` label above.
+        fault_desc = _describe_machine_fault(m.name)
+        if fault_desc:
+            click.echo(f"    ⚠ machine fault: {fault_desc}")
 
         # #2490: this host is behind the release, was idle last tick, and
         # nothing is cordoning it because a #2240 deadlock-release cooldown
@@ -950,6 +978,170 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     except (ImportError, OSError, ValueError, KeyError):
         pass  # Never let usage tracking break the status command.
 
+    # #3376: invariant alarms — every one of #3367/#3368/#3369/#3375 was
+    # visible only after a human happened to notice something looked odd,
+    # because every existing status surface said `alert: (none)` the whole
+    # time. Best-effort, same "never let an observability add-on break the
+    # command it's riding on" posture as the usage/burn-rate block above —
+    # see `coord.invariant_alarms` for the checks themselves (pure,
+    # independently unit-tested) and why #2/#4 are still not wired here:
+    # #2 (queue stalled) and #4 (host staged stale) both need CROSS-TICK
+    # history (a persisted "last seen shape" + a consecutive-occurrence
+    # counter) that nothing in this codebase tracks today — a genuine new
+    # piece of persisted state, not just a missing call site, and out of
+    # scope for this pass; `coord drive-queue status` / a future
+    # daemon-side tracker owns adding that. #1, #3, #5 need no such
+    # history and are wired below.
+    try:
+        from coord.invariant_alarms import (
+            check_gate_done_without_verdict,
+            check_machines_busy_while_queue_empty,
+            check_zero_turn_zero_cost_terminal,
+        )
+        from coord.state import list_drive_queue
+        from coord.usage import build_session_usage
+
+        alarms = []
+        busy_machines = sorted(
+            {a.machine_name for a in board.active if a.status == "running"}
+        )
+        try:
+            queue_row_count = len(list_drive_queue())
+        except Exception:  # noqa: BLE001 — a queue read must not hide the rest
+            queue_row_count = None
+        if queue_row_count is not None:
+            alarm = check_machines_busy_while_queue_empty(
+                busy_machines=busy_machines, queue_row_count=queue_row_count,
+            )
+            if alarm is not None:
+                alarms.append(alarm)
+        # Alarm 3 — #3375's own loop condition: a stage reached a
+        # terminal-success status WITHOUT ever recording the verdict its
+        # own gate requires. Scoped here to the two row/verdict-field pairs
+        # that need no per-repo gate-configuration resolution to check
+        # correctly (unlike "test", where `test_state is None` on a `done`
+        # work row is the ORDINARY waiting-for-`coord test` state, not an
+        # anomaly — that mapping is exactly what this command doesn't
+        # resolve, per the note above):
+        #   - a `type="review"` row that reached `status="done"` with no
+        #     parseable `review_verdict` at all (#1956's own defect shape —
+        #     `coord gates`' `review : ERROR` line surfaces this per-issue
+        #     already; this is the SAME fact, fleet-wide, unprompted).
+        #   - a `type="smoke"` row that reached `status="done"` with no
+        #     `smoke_test` ever recorded — a smoke worker that ran to
+        #     completion without ever writing pass/fail, #3375's own
+        #     "5 smoke dispatches, 4 fully completed" shape.
+        for a in list(board.active) + list(board.completed):
+            if a.status != "done":
+                continue
+            if a.type == "review" and a.review_verdict is None:
+                alarm = check_gate_done_without_verdict(
+                    stage=f"review ({a.assignment_id or '?'})",
+                    status=a.status,
+                    has_required_verdict=False,
+                )
+            elif a.type == "smoke" and a.smoke_test is None:
+                alarm = check_gate_done_without_verdict(
+                    stage=f"smoke ({a.assignment_id or '?'})",
+                    status=a.status,
+                    has_required_verdict=False,
+                )
+            else:
+                alarm = None
+            if alarm is not None:
+                alarms.append(alarm)
+        # #2786's `num_turns`/`total_cost_usd` live on `AssignmentUsage`
+        # (`coord.usage.collect_usage`'s output), not on the plain
+        # `coord.models.Assignment` rows `board.completed` holds — reuse
+        # the SAME builder the burn-rate line above already calls rather
+        # than re-deriving "how many turns did this leg take" a second way
+        # (#2096: one question, one answer).
+        #
+        # #3376 review round 1: this MUST pass `remote_by_id`, or every
+        # assignment whose log lives on a DIFFERENT fleet machine (the
+        # ordinary case for a completed row on a multi-machine coordinator)
+        # falls through `_assignment_to_usage`'s "neither local nor remote"
+        # branch — `cost_unknown=True` but `num_turns` stays at its
+        # dataclass default of `0`, not `None`. Without a real
+        # `remote_by_id`, `check_zero_turn_zero_cost_terminal` below then
+        # sees `num_turns=0, cost_usd=None` — indistinguishable from a
+        # genuine instant $0 failure — and alarm 5 fires on essentially
+        # every remote-machine row, turning "alert: (none)" into "alert:
+        # (always)". `agent_completed` (above, populated for free while
+        # this same command was already polling every online machine's
+        # `/status` for the "Machines:" section) is the exact `assignment_id
+        # -> agent_status_dict` shape `build_session_usage`'s `remote_by_id`
+        # expects — the same shape `coord usage --remote` builds via its own
+        # (extra) `fetch_status` round trip. No second network call needed.
+        #
+        # #3376 review round 2: `agent_completed` is only a fact source for
+        # the machines this run actually POLLED and got an answer from, and
+        # the board it is being matched against is fleet-wide — `board =
+        # read_board()` is never narrowed by `machine_filter`. So on
+        # `coord status --machine dellserver`, `agent_completed` is
+        # structurally empty for every OTHER machine's rows (they were never
+        # fetched), each falls through the "neither local nor remote" branch
+        # to `cost_unknown=True` + `num_turns=0`, and alarm 5 fires on
+        # perfectly ordinary completed work fleet-wide — the round-1 false
+        # positive again, just behind a flag. Same hole for an *offline*
+        # machine on an unfiltered run. Hence `polled_ok_machines` below:
+        # an unmeasured row only counts as "0 turns" when its own machine
+        # was actually asked and had nothing to say.
+        rows = list(board.active) + list(board.completed)
+        # AssignmentUsage carries no `machine_name`, so keep the board's own
+        # id -> machine mapping to scope the check by.
+        machine_by_aid = {
+            a.assignment_id: a.machine_name for a in rows if a.assignment_id
+        }
+        usage = build_session_usage(rows, remote_by_id=agent_completed or None)
+        for au in usage.assignments:
+            # #3376 review round 2: `cost_unknown` means no local log AND no
+            # remote entry. That is the ghost-dispatch signal ONLY if this
+            # run actually consulted the machine that row ran on; otherwise
+            # it just means "not asked", and `num_turns`' dataclass default
+            # of `0` is an artifact, not a measurement. Rows WITH real usage
+            # data (`cost_unknown` False — local log or remote entry) are
+            # still checked unconditionally: a locally-confirmed 0-turn/$0
+            # terminal row is a genuine instant failure no matter which
+            # machine it names.
+            if au.cost_unknown and (
+                machine_by_aid.get(au.assignment_id) not in polled_ok_machines
+            ):
+                continue
+            # #3376 review round 1: deliberately NOT nulling `num_turns`
+            # the same way `cost_usd` is nulled below — `coord.machine_
+            # fault.is_instant_zero_cost_failure` documents `num_turns=None`
+            # as "never measured, don't flag" (unlike `cost_usd=None`,
+            # which it treats the same as a real `$0`), so nulling both
+            # would make this alarm NEVER fire for a genuinely-never-
+            # captured row (a machine that WAS reachable and answered
+            # `/status`, yet has no record of this assignment at all) —
+            # exactly the "ghost dispatch that never actually ran" shape
+            # this alarm exists to
+            # catch (`tests/test_cli_status_invariant_alarms.py::
+            # test_fires_on_a_done_row_with_no_measurable_work`). The
+            # `remote_by_id` wiring above is the actual fix for the false
+            # positive: a REACHABLE remote machine's real `num_turns` now
+            # gets used instead of the `0` default, so this only still
+            # reads "0 turns" when that is either locally confirmed or
+            # nothing anywhere (local, remote, or now-fetched) could say
+            # otherwise — which is the alarm's whole point.
+            alarm = check_zero_turn_zero_cost_terminal(
+                assignment_id=au.assignment_id or "?",
+                status=au.status,
+                num_turns=au.num_turns,
+                cost_usd=(None if au.cost_unknown else au.total_cost_usd),
+            )
+            if alarm is not None:
+                alarms.append(alarm)
+        if alarms:
+            click.echo("")
+            click.echo("INVARIANT ALARMS (#3376):")
+            for alarm in alarms:
+                click.echo(f"  [{alarm.severity.upper()}] {alarm.summary}")
+    except Exception:  # noqa: BLE001 — never let this break `coord status`
+        pass
+
     # #1631 (H-4): the always-visible fleet-health footer. Printed
     # unconditionally, every run — including the all-OK case ("OK states its
     # OK-ness rather than printing nothing": a check nobody ever sees run is
@@ -1484,7 +1676,11 @@ def doctor(
 ) -> None:
     from coord import network
     from coord.network import check_all
-    from coord.prereqs import ToolProbe, unmet_capabilities
+    from coord.prereqs import (
+        claude_credential_expiry_warning,
+        tool_probe_from_dict,
+        unmet_capabilities,
+    )
 
     cfg = _load_config(config_path)
     machines = cfg.machines
@@ -1591,16 +1787,13 @@ def doctor(
             any_problem = True
             continue
 
+        # #3371: reconstruct via the shared helper (not inline) so this and
+        # `claude_credential_ok` (the routing-eligibility check `coord
+        # plan` runs, `coord.brain.build_prompt`) can never silently
+        # disagree about what one `/health` probe entry means — #2096's
+        # "one question, one answer".
         probes = {
-            tool: ToolProbe(
-                tool=tool,
-                capability=info.get("capability"),
-                found=bool(info.get("found", False)),
-                version=info.get("version"),
-                min_version=info.get("min_version"),
-                meets_floor=info.get("meets_floor"),
-                what_breaks="",
-            )
+            tool: tool_probe_from_dict(tool, info)
             for tool, info in raw_probes.items()
             if isinstance(info, dict)
         }
@@ -1614,6 +1807,22 @@ def doctor(
                 detail = p.version or "found (version unknown)"
             floor = f"  (>= {p.min_version} required)" if p.min_version else ""
             click.echo(f"  {marker} {tool}: {detail}{floor}")
+            # #3371: forward visibility into a KNOWN credential expiry, not
+            # just "already dead" — the operator's own complaint ("I have
+            # no insight into when it expires") was about foresight, and
+            # `p.ok` above only ever answers the already-dead half. Only
+            # checked when the probe is currently `ok` (an already-failing
+            # probe already printed the `✗` line above; re-flagging it here
+            # too would just be a second, weaker name for the same thing).
+            if tool == "claude" and p.ok:
+                raw = raw_probes.get(tool)
+                warning = (
+                    claude_credential_expiry_warning(raw)
+                    if isinstance(raw, dict) else None
+                )
+                if warning:
+                    click.echo(f"  ⚠ WARN {warning}")
+                    any_problem = True
 
         unmet = unmet_capabilities(m.capabilities, probes)
         for cap, reasons in unmet.items():
@@ -2913,7 +3122,11 @@ def _usage_by_issue(
 
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
-    rows = fetch_usage_rows()
+    # #3313: push the resolved window down into the fetch itself — filtering
+    # only in `aggregate()` below let a thin client's truncated fetch (see
+    # `coord.usage.fetch_usage_rows`) silently under-report, and a WIDER
+    # window could report LESS than a narrower one.
+    rows = fetch_usage_rows(since=window.start, until=window.end)
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by="issue", window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
@@ -2933,6 +3146,12 @@ def _usage_issue_drill(
     cfg = _load_config(config_path)
     has_window_flag = today or week or month or since_spec
     window = _usage_resolve_window(today, week, month, since_spec) if has_window_flag else None
+    # #3313: push the resolved window down into the fetch itself (None/None
+    # when no window flag was given, i.e. unbounded all-history — unchanged
+    # from before). See `_usage_by_issue` above for why this can't be left to
+    # client-side filtering alone.
+    since = window.start if window is not None else None
+    until = window.end if window is not None else None
     # #1553: select by the *attributed* issue, matching the `--by issue`
     # summary above. Selecting on the raw `issue_number` while the summary
     # groups on `for_issue_number` would make the two views disagree — the
@@ -2940,7 +3159,7 @@ def _usage_issue_drill(
     # the child, and the child's drill would be empty.
     rows = [
         row
-        for row in fetch_usage_rows()
+        for row in fetch_usage_rows(since=since, until=until)
         if row_issue_number(row) == issue_number
         and (window is None or leg_in_window(row, window))
     ]
@@ -2967,7 +3186,8 @@ def _usage_by_dim(
 
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
-    rows = fetch_usage_rows()
+    # #3313: see `_usage_by_issue` above.
+    rows = fetch_usage_rows(since=window.start, until=window.end)
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by=by_dim, window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
@@ -2997,7 +3217,8 @@ def _usage_by_time(
 
     cfg = _load_config(config_path)
     window = _usage_resolve_window(today, week, month, since_spec)
-    rows = fetch_usage_rows()
+    # #3313: see `_usage_by_issue` above.
+    rows = fetch_usage_rows(since=window.start, until=window.end)
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by=dim, window=window, pricing=pricing)
     result["groups"].sort(key=_usage_sort_key(resolved_sort), reverse=True)

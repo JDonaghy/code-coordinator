@@ -154,6 +154,65 @@ def test_machine_max_workers_rejects_zero_or_negative(tmp_path: Path) -> None:
         load(p)
 
 
+# ── #3340: per-machine /health reachability-probe timeout floor ────────────
+
+
+def test_machine_health_timeout_parsed(tmp_path: Path) -> None:
+    """#3340: machines[].health_timeout raises the effective
+    `network.check_machine` budget for one machine (e.g. a macOS agent whose
+    cold /health outruns DEFAULT_TIMEOUT) without touching every other
+    machine's default."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: slow\n    host: h\n    repos: [api]\n    health_timeout: 8.5\n"
+        "  - name: normal\n    host: h2\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    by_name = {m.name: m for m in cfg.machines}
+    assert by_name["slow"].health_timeout == 8.5
+    # Unset stays None — callers fall back to network.DEFAULT_TIMEOUT.
+    assert by_name["normal"].health_timeout is None
+
+
+def test_machine_health_timeout_accepts_integer(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    health_timeout: 10\n"
+    )
+    cfg = load(p)
+    assert cfg.machines[0].health_timeout == 10.0
+
+
+def test_machine_health_timeout_rejects_non_number(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    health_timeout: \"slow\"\n"
+    )
+    with pytest.raises(ConfigError, match="health_timeout must be a number"):
+        load(p)
+
+
+def test_machine_health_timeout_rejects_zero_or_negative(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    health_timeout: 0\n"
+    )
+    with pytest.raises(ConfigError, match="health_timeout must be greater than 0"):
+        load(p)
+
+
 # ── #1862: per-machine quiet hours ──────────────────────────────────────────
 
 
@@ -566,6 +625,75 @@ def test_artifact_paths_non_string_element(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="artifact_paths\\[0\\] must be a string"):
         load(p)
+
+
+# ── requires (#3351) ─────────────────────────────────────────────────────────
+
+
+def test_repo_requires_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: vimcode\n"
+        "    github: a/vimcode\n"
+        "    requires: [nvim]\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [vimcode]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("vimcode").requires == ["nvim"]
+
+
+def test_repo_requires_default_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").requires == []
+
+
+def test_repo_requires_not_a_list_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n    requires: nvim\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="requires must be a list of strings"):
+        load(p)
+
+
+def test_repo_requires_non_string_element_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "    requires:\n"
+        "      - 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="requires must be a list of strings"):
+        load(p)
+
+
+def test_repo_requires_unrecognised_key_not_warned(tmp_path: Path) -> None:
+    """`requires` must be in `_KNOWN_REPO_KEYS`, else it would raise a
+    spurious "unrecognised key" warning for every repo that declares it."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: vimcode\n    github: a/vimcode\n    requires: [nvim]\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [vimcode]\n"
+    )
+    cfg = load(p)
+    assert cfg.warnings == []
 
 
 # ── uat_preview (#2687) ──────────────────────────────────────────────────────
@@ -1121,6 +1249,63 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
     # Default default_gates: Test comes before Review (smoke before PR/review).
     assert cfg.pipeline.gates_for_label("coord") == ["test", "review", "merge"]
     assert cfg.pipeline.gates_for_label(None) == ["test", "review", "merge"]
+
+
+# ── #3269: gate-name registry (S-1 of #3261) ────────────────────────────────
+
+
+def test_pipeline_default_gates_rejects_unknown_name(tmp_path: Path) -> None:
+    """A typo'd gate name in default_gates fails config load rather than
+    parsing clean and silently dropping that gate fleet-wide (#3269)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  default_gates: [test, reveiw, merge]\n"
+    )
+    with pytest.raises(ConfigError, match="default_gates"):
+        load(p)
+
+
+def test_pipeline_labels_rejects_unknown_gate_name(tmp_path: Path) -> None:
+    """An unknown gate name in a label's gate list fails config load and
+    names which label it came from (#3269)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  labels:\n"
+        "    hotfix: [merge, uatt]\n"
+    )
+    with pytest.raises(ConfigError, match="hotfix"):
+        load(p)
+
+
+def test_pipeline_all_known_gate_names_still_load(tmp_path: Path) -> None:
+    """Every currently-known gate name (test/review/uat/merge), in both
+    default_gates and labels, still loads exactly as before (#3269)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  default_gates: [test, review, uat, merge]\n"
+        "  labels:\n"
+        "    hotfix: [test, merge]\n"
+        "    full: [test, review, uat, merge]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.default_gates == ["test", "review", "uat", "merge"]
+    assert cfg.pipeline.gates_for_label("hotfix") == ["test", "merge"]
+    assert cfg.pipeline.gates_for_label("full") == ["test", "review", "uat", "merge"]
 
 
 # ── #846: attention_thresholds / convergence_rounds ─────────────────────────

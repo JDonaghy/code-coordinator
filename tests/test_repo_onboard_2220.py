@@ -836,6 +836,62 @@ acceptance:
         report = ro.evaluate(ro.RepoFacts(name="ghost", configured=False))
         assert "oracle.no_driver" not in _checks(report)
 
+    def test_terraform_flags_validate_only_scope(self):
+        """#3232: a `terraform`-kind driver produces a real, deterministic
+        verdict — this must not read the same as `oracle.no_driver` — but
+        it's a compile check, not a full oracle, so it gets a WARN naming
+        the gap rather than reading as fully oracle-ready."""
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(
+                configured=True, kinds=["terraform"],
+                validate_only_scope=True,
+            ),
+        )
+        report = ro.evaluate(facts)
+        f = next(f for f in report.findings if f.check == "oracle.validate_only_scope")
+        assert f.severity == ro.WARN
+        assert "3232" in f.summary
+        assert "terraform plan" in f.summary
+        assert report.ok  # a smoke net is a WARN, not a hard gate
+
+    def test_cli_pytest_does_not_flag_validate_only_scope(self):
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            machines=[_healthy_machine()],
+            acceptance=ro.AcceptanceFacts(configured=True, kinds=["cli-pytest"]),
+        )
+        report = ro.evaluate(facts)
+        assert "oracle.validate_only_scope" not in _checks(report)
+        assert "oracle.validate_only_scope_not_applicable" in _checks(report)
+
+    def test_gather_acceptance_facts_derives_validate_only_scope_from_kind(
+        self, tmp_path
+    ):
+        """`validate_only_scope` must be DERIVED from the driver's `kind`
+        (via `coord.acceptance_drivers.VALIDATE_ONLY_KINDS`) by
+        `gather_acceptance_facts`, not left for every caller to guess —
+        mirrors the equivalent `fixture_server_dependent` test above."""
+        config = SEEDED_CONFIG + """\
+
+acceptance:
+  drivers:
+    newrepo:
+      kind: terraform
+      run: "terraform init -backend=false && terraform validate"
+"""
+        p = tmp_path / "coordinator.yml"
+        p.write_text(config)
+        cfg = load_config(p)
+
+        facts = ro.gather_facts(cfg, "newrepo", statuses=[], probe_github=False)
+        assert facts.acceptance.validate_only_scope is True
+        assert facts.acceptance.fixture_server_dependent is False
+
+        report = ro.evaluate(facts)
+        assert "oracle.validate_only_scope" in _checks(report)
+
 
 class TestDoctorFolding:
     """``coord doctor`` folds in the LIVE layer only — see

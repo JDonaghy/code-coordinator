@@ -216,6 +216,36 @@ class TestBuildBriefingWithDetail:
         )
         assert "truncated" not in briefing.lower()
 
+    def test_no_diagnostics_matched_renders_explicit_note_not_empty_excerpt(self) -> None:
+        """#3245 acceptance: a log with no matching diagnostics must say so
+        explicitly in the briefing, rather than silently omitting the
+        excerpt or (worse) rendering an empty, misleadingly-substantive-
+        looking "Log excerpt" code block."""
+        detail = CIFailureDetail(
+            check_name="lint", job_name="lint", step_name="Run lint",
+            log_excerpt="",
+            run_url="https://github.com/acme/api/actions/runs/1",
+            truncated=False,
+            no_diagnostics_matched=True,
+        )
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1, detail=detail,
+        )
+        assert "no diagnostic lines matched" in briefing.lower()
+        assert "https://github.com/acme/api/actions/runs/1" in briefing
+        assert "```" not in briefing
+
+    def test_no_diagnostics_matched_without_run_url_still_notes_it(self) -> None:
+        detail = CIFailureDetail(
+            check_name="lint", job_name="lint", step_name="Run lint",
+            log_excerpt="", run_url="", truncated=False,
+            no_diagnostics_matched=True,
+        )
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1, detail=detail,
+        )
+        assert "no diagnostic lines matched" in briefing.lower()
+
 
 # ── #3011: no-op leg detection/refund ────────────────────────────────────────
 
@@ -812,9 +842,14 @@ class TestDispatchCiFixesWithCiStore:
         )
         ci_store = _StubCiStoreForDetail(checks=[check], jobs_by_run={"999": [job]})
 
+        # #3245: the log fixture uses a `##[error]` annotation line — the
+        # line GitHub Actions itself always appends to a failing step — so
+        # this exercises the relevance-based extraction rather than a
+        # tail-position cut. Plain unstructured text would no longer
+        # survive into `log_excerpt` at all.
         with patch(
             "coord.ci_github.github_ops.get_job_log",
-            return_value="line1\nAssertionError: boom\n",
+            return_value="line1\n##[error]AssertionError: boom\n",
         ), patch("coord.ci_fix.dispatch_ci_fix") as dispatch:
             merge_cmd._dispatch_ci_fixes(
                 events, two_machine_config, ci_store, dry_run=False,

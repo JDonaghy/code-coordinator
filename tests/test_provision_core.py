@@ -451,6 +451,26 @@ def test_the_base_package_list_is_shared_and_deduplicated() -> None:
         assert required in packages, f"{required} fell out of the shared base list"
 
 
+# #3326: `claude` is BASELINE in `coord/prereqs.py` (see the module comment
+# above `_probe_claude_credentials` for why), but it cannot be verified
+# through the generic `COORD_PREREQ_CHECKS` loop the way every other entry
+# is: that loop only ever runs in the image lane's step 9/9, as ROOT, and
+# `claude` is installed as the `coord` user with `npm`'s global prefix
+# redirected to `~/.local` (provision-worker.sh: `as_coord "npm install -g
+# @anthropic-ai/claude-code"`) — invisible from root's PATH by construction.
+# `cargo` and `node`, by contrast, are deliberately installed SYSTEM-WIDE for
+# exactly the opposite reason (provision-core.sh's rust-install comment).
+# Registering `claude` into `COORD_PREREQ_CHECKS` would make the generic
+# root-context loop report a false MISSING on every image build. So the
+# image lane instead verifies it with its own bespoke
+# `as_coord "command -v claude"` block, immediately after calling
+# `coord_core_verify_baseline_prereqs` — this set names that exemption, and
+# `test_the_coord_user_scoped_prereqs_are_verified_in_the_image_lane` below
+# still requires that bespoke block to exist and name the tool, so the
+# cross-check stays a real gate rather than a silent skip.
+PROVISIONING_VERIFIED_VIA_COORD_USER = {"claude"}
+
+
 def test_the_prereq_check_list_covers_every_python_baseline_prereq() -> None:
     """The image lane's step 9/9 says it *"mirrors coord/prereqs.py"*. Make that
     a real link too: a prereq added to ``BASELINE_PREREQS`` must not silently
@@ -463,10 +483,31 @@ def test_the_prereq_check_list_covers_every_python_baseline_prereq() -> None:
     checked = {line.split("|", 1)[0] for line in listing.stdout.splitlines() if "|" in line}
     assert checked, "the core defines no prereq checks"
     for prereq in BASELINE_PREREQS:
+        if prereq.tool in PROVISIONING_VERIFIED_VIA_COORD_USER:
+            continue
         assert prereq.tool in checked, (
             f"coord.prereqs.BASELINE_PREREQS names {prereq.tool!r} but the shared "
             "provisioning core never verifies it. What breaks: "
             f"{prereq.what_breaks}"
+        )
+
+
+def test_the_coord_user_scoped_prereqs_are_verified_in_the_image_lane() -> None:
+    """The tools exempted above from the generic root-context
+    ``COORD_PREREQ_CHECKS`` loop (because they would false-negative there)
+    must not have silently stopped being verified at all — each needs its
+    own ``as_coord``-scoped presence check in the image lane."""
+    code = _strip_comments(IMAGE_LANE.read_text(encoding="utf-8"))
+    for tool in PROVISIONING_VERIFIED_VIA_COORD_USER:
+        assert tool in {p.tool for p in BASELINE_PREREQS}, (
+            f"{tool!r} is listed as coord-user-scoped but is no longer in "
+            "BASELINE_PREREQS at all — drop the now-stale exemption"
+        )
+        assert re.search(rf'as_coord "command -v {re.escape(tool)}', code), (
+            f"{tool!r} is exempted from COORD_PREREQ_CHECKS as coord-user-"
+            "scoped, but the image lane no longer verifies it via as_coord "
+            "either — it would silently stop being checked at provisioning "
+            "time at all"
         )
 
 

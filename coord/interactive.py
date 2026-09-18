@@ -4366,6 +4366,7 @@ def reap_stale_interactive_sessions(
         COORD_DIR,
         get_connection,
         release_review_claim_if_row_is_review,
+        release_smoke_claim_if_row_is_smoke_leg,
     )
 
     if worktrees_dir is None:
@@ -4504,6 +4505,10 @@ def reap_stale_interactive_sessions(
             # Safe to call unconditionally: it's a no-op for any row whose
             # type isn't "review".
             release_review_claim_if_row_is_review(a.assignment_id)
+            # #3333: same reasoning, for a #3182 fan-out leg's own
+            # smoke-dispatch claim (coord.state.claim_smoke_dispatch) — a
+            # no-op for any row that isn't a capability-tagged fan-out leg.
+            release_smoke_claim_if_row_is_smoke_leg(a.assignment_id)
         except Exception:  # noqa: BLE001
             pass  # non-fatal — the board update below still releases the claim
 
@@ -4587,6 +4592,7 @@ def _mark_stale_reap_in_db(assignment_id: str, status: str, finished_at: float) 
         from coord.state import (  # noqa: PLC0415
             get_connection,
             release_review_claim_if_row_is_review,
+            release_smoke_claim_if_row_is_smoke_leg,
         )
         conn = get_connection()
         sql.execute(
@@ -4603,6 +4609,10 @@ def _mark_stale_reap_in_db(assignment_id: str, status: str, finished_at: float) 
         # interactive review doesn't leak its `review_claims` row. No-op
         # for any row whose type isn't "review".
         release_review_claim_if_row_is_review(assignment_id)
+        # #3333: same reasoning, for a #3182 fan-out leg's own smoke-dispatch
+        # claim — a no-op for any row that isn't a capability-tagged fan-out
+        # leg.
+        release_smoke_claim_if_row_is_smoke_leg(assignment_id)
     except Exception:  # noqa: BLE001
         pass
 

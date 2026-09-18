@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from coord import cargo_cache
+from coord.claude_setup_token import inject_setup_token
 from coord.config_reload import reload_config_if_stale
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
@@ -66,6 +67,13 @@ def __getattr__(name: str) -> Path:
 # events (e.g. #1295 "sweep would touch a live worktree", "stash copied 0
 # files") are visible without having to open the per-assignment log file.
 _log = logging.getLogger(__name__)
+
+# #3340: how slow `AgentServer.health()` has to be, in this process's own
+# measurement, before it's worth a log line. Set comfortably below
+# `coord.network.DEFAULT_TIMEOUT` (3000ms) — the budget a *caller* probes
+# with — so an operator sees the warning here before (or instead of) the
+# caller-side "timed out" verdict, not only after one already landed.
+_SLOW_HEALTH_WARN_MS = 1000.0
 
 
 def _dir_size(path: Path) -> int:
@@ -1763,6 +1771,23 @@ def _worker_subprocess_env(
 
     if assignment_id is not None:
         env["COORD_ASSIGNMENT_ID"] = assignment_id
+
+    # #3371 Part A: adopt this host's long-lived, SUBSCRIPTION-backed
+    # `claude setup-token` credential when the operator has minted one.
+    # This is the only place a headless worker's environment is built, so
+    # it is the only place the credential has to be threaded through.
+    #
+    # NOT `ANTHROPIC_API_KEY` — `CLAUDE_CODE_OAUTH_TOKEN` is the OAuth
+    # channel (`claude setup-token --help`: "long-lived authentication
+    # token (requires Claude subscription)"), so billing and entitlements
+    # stay on the Max subscription exactly as CLAUDE.md requires. An
+    # API-key-shaped token is refused rather than injected; see
+    # `coord.claude_setup_token` for the #2462 scar tissue in full.
+    #
+    # No-ops entirely on a host that has not opted in (no token file, no
+    # inherited token), so an interactive `claude login` host keeps
+    # authenticating exactly as it does today.
+    inject_setup_token(env)
 
     return env
 
@@ -5972,7 +5997,32 @@ class AgentServer:
         # critically — the `repos` list published below is the post-reload one,
         # so `coord repo doctor`'s `machines.agent_repo_skew` clears itself
         # instead of instructing an operator to restart a busy agent.
+        #
+        # #3340: a cold /health on the fleet's macOS host was observed taking
+        # 2-7s against `coord.network.check_machine`'s fixed (at the time)
+        # 3.0s budget — long enough to flip a perfectly reachable agent to
+        # "timed out" in `coord status`/`coord doctor`/`coord release verify`.
+        # Every previously-suspected section (tool-version probes, the
+        # worktree/artifact byte scans) measured well under 200ms on the
+        # affected host, which leaves most of the 2-7s unaccounted for. Rather
+        # than guess again, every section below is individually timed; the
+        # breakdown is logged here (visible in THIS agent's own log) and also
+        # returned as `health_timing_ms` in the response body, so a caller on
+        # a different machine — `coord doctor`, a `coord release verify` run —
+        # can see exactly which section is slow without SSHing in. This is a
+        # diagnostic, not a fix for the underlying cost: whichever section it
+        # points at is the next thing to actually fix.
+        _timing: dict[str, float] = {}
+        _t0 = _prev = time.perf_counter()
+
+        def _mark(section: str) -> None:
+            nonlocal _prev
+            now = time.perf_counter()
+            _timing[section] = round((now - _prev) * 1000.0, 1)
+            _prev = now
+
         self._maybe_reload_config()
+        _mark("reload_config")
         with self._lock:
             active = sum(1 for a in self._assignments.values() if a.status == RUNNING)
             completed = sum(
@@ -5982,13 +6032,36 @@ class AgentServer:
                     DONE, FAILED, CANCELLED, ADVISORY, REFUSED_POLICY, REFUSED_PREMISE,
                 )
             )
+        _mark("assignment_tally")
         worktree_bytes = self._cached_worktree_bytes()
+        _mark("worktree_bytes")
         artifact_bytes = self._cached_artifact_bytes()
+        _mark("artifact_bytes")
         servable_repos, degraded_repos = self._servable_repos()
+        _mark("servable_repos")
+        tool_versions = self._cached_tool_versions()
+        _mark("tool_versions")
+        local_health = self._cached_local_health()
+        _mark("local_health")
         # #2299: the coordinator.yml this agent re-reads on every poll, or
         # None when there is nothing local to watch (config-free / thin-client).
         watched_config = getattr(self._health_config, "path", None)
+        _timing["total"] = round((_prev - _t0) * 1000.0, 1)
+        if _timing["total"] >= _SLOW_HEALTH_WARN_MS:
+            _log.warning(
+                "coord agent: /health on %s took %.0fms — a cold reply above "
+                "network.DEFAULT_TIMEOUT (3000ms, the budget callers probe "
+                "with) reads as unreachable even though this agent is up. "
+                "breakdown(ms)=%s",
+                self.machine_name, _timing["total"], _timing,
+            )
         return {
+            # #3340 diagnostic: per-section wall time for this exact /health
+            # call, in the order the sections actually ran. `total` includes
+            # everything timed above (and is what a caller's own wall-clock
+            # measurement should roughly match); it does NOT include time
+            # spent serializing/transmitting the JSON response itself.
+            "health_timing_ms": _timing,
             "machine": self.machine_name,
             "capabilities": self.capabilities,
             # #1712: None on the normal path; a human-readable reason when
@@ -6031,7 +6104,7 @@ class AgentServer:
             # for gtk, ...). Makes version skew observable fleet-wide
             # (`coord doctor`) instead of only discoverable by SSHing in
             # after a mysterious failure, the way #1564's gh skew was.
-            "tool_versions": self._cached_tool_versions(),
+            "tool_versions": tool_versions,
             # #1630: this machine's own H-1 check-registry results (disk,
             # worktrees, cargo target dirs, repo state, agent venv, ...),
             # cache-refreshed on a timer (see `_local_health_ttl`) rather than
@@ -6043,7 +6116,7 @@ class AgentServer:
             # a health engine that raises produces an `unknown`-severity
             # block (`_cached_local_health`'s own try/except) rather than
             # omitting the key, so an old/new client can always find it.
-            "health": self._cached_local_health(),
+            "health": local_health,
             # #2237 item 7: how often the graph self-heal pass has actually
             # run on this machine, and how often guard 1 (the idle-gate)
             # turned it away because an assignment was RUNNING. The busiest
@@ -6117,18 +6190,43 @@ class AgentServer:
         anywhere in the registry (or in building its HealthContext) becomes
         an `unknown`-severity block carrying the error, never a missing key
         or a crashed /health poll.
+
+        #3344: this whole method is `health()`'s `local_health` section, and
+        #3340's own instrumentation of the *outer* handler found that on a
+        cold macOS agent this section alone was 97% of `/health`'s cost —
+        an opaque ~2.4s with nothing inside it timed. The breakdown below
+        does for THIS method's phases what `health()`'s `_mark` does for
+        the outer sections: every phase timed, published as `timing_ms` in
+        the returned block, and the run-registry's own per-check timings
+        (`HealthReport.check_durations_ms`, #3344) folded in under
+        `check_durations_ms` so a slow individual check — not just "the
+        registry ran slow" — is visible from a caller on a different
+        machine, the same way `health_timing_ms` already is.
         """
         now = time.time()
         cached = self._local_health_cache
         if cached is not None and (now - cached[0]) < self._local_health_ttl:
             return cached[1]
 
+        _timing: dict[str, float] = {}
+        _t0 = _prev = time.perf_counter()
+
+        def _mark(phase: str) -> None:
+            nonlocal _prev
+            _now = time.perf_counter()
+            _timing[phase] = round((_now - _prev) * 1000.0, 1)
+            _prev = _now
+
+        check_durations_ms: dict[str, float] = {}
         try:
             from coord.health.context import build_context
             from coord.health.registry import run_all
 
             ctx = build_context(self._health_config, allow_network=False, now=now)
+            _mark("build_context")
             report = run_all(ctx, scopes=("machine", "checkout"))
+            _mark("run_checks")
+            check_durations_ms = report.check_durations_ms
             try:
                 # #1729 (H-6): best-effort and deliberately its own
                 # try/except — a bug in the self-heal pass must never
@@ -6137,12 +6235,14 @@ class AgentServer:
                 self._self_heal_stale_graphs(ctx, report)
             except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
                 _log.warning("graph self-heal pass failed: %s", exc)
+            _mark("self_heal_graphs")
             try:
                 # Same isolation as the graph pass above: a skills-sync bug
                 # must never blind this whole health block.
                 self._self_heal_missing_skills()
             except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
                 _log.warning("skills self-heal pass failed: %s", exc)
+            _mark("self_heal_skills")
             report_dict = report.to_dict()
             payload = {
                 "schema": report_dict["schema"],
@@ -6159,6 +6259,7 @@ class AgentServer:
                     {**r, "checked_at": now} for r in report_dict["results"]
                 ],
             }
+            _mark("serialize")
         except Exception as exc:  # noqa: BLE001 — fail soft, never break /health
             payload = {
                 "schema": 1,
@@ -6169,6 +6270,30 @@ class AgentServer:
                 "results": [],
                 "error": f"{type(exc).__name__}: {exc}",
             }
+            _mark("error")
+
+        _timing["total"] = round((_prev - _t0) * 1000.0, 1)
+        payload["timing_ms"] = _timing
+        # #3344: per-check breakdown from the registry run, rounded like
+        # every other timing published here. Empty when the run never
+        # reached `run_all` (e.g. `build_context` itself raised) — absence
+        # here means "no checks ran", not "checks ran instantly".
+        payload["check_durations_ms"] = {
+            k: round(v, 1) for k, v in check_durations_ms.items()
+        }
+        if _timing["total"] >= _SLOW_HEALTH_WARN_MS:
+            slowest = sorted(
+                check_durations_ms.items(), key=lambda kv: kv[1], reverse=True
+            )[:5]
+            _log.warning(
+                "coord agent: local_health on %s took %.0fms — this is the "
+                "`local_health` section of AgentServer.health() "
+                "(see that call's own health_timing_ms for how much of the "
+                "total /health cost this section was). "
+                "breakdown(ms)=%s slowest_checks(ms)=%s",
+                self.machine_name, _timing["total"],
+                _timing, [(k, round(v, 1)) for k, v in slowest],
+            )
 
         self._local_health_cache = (now, payload)
         return payload
