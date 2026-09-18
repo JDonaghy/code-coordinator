@@ -4752,18 +4752,38 @@ class TestReviewDispatchClaimLockContention:
         reproducing COMMIT itself hitting contention after the statement
         before it already applied. Every other `_FlakyConn` in this file
         fails at `execute()` instead, simulating a statement that never got
-        to write anything — a different, already-handled shape."""
+        to write anything — a different, already-handled shape.
+
+        `cursor()` returns a thin tracking proxy (not the real cursor
+        directly) so tests can assert on the exact SAVEPOINT/`ROLLBACK TO
+        SAVEPOINT`/`RELEASE SAVEPOINT` statements #3382's savepoint-scoped
+        `coord.db.rollback_pending_write` issues, the same way
+        `commit_calls`/`rollback_calls` already let them assert on
+        `commit()`/`rollback()`."""
 
         __module__ = "sqlite3"
+
+        class _TrackingCursor:
+            def __init__(self, outer, real_cursor) -> None:
+                self._outer = outer
+                self._real_cursor = real_cursor
+
+            def execute(self, sql_text, params=()):  # noqa: ANN001
+                self._outer.executed_sql.append(sql_text)
+                return self._real_cursor.execute(sql_text, params)
+
+            def __getattr__(self, name):  # noqa: ANN001,ANN204
+                return getattr(self._real_cursor, name)
 
         def __init__(self, real_conn, fail_times: int) -> None:
             self._real = real_conn
             self._fail_times = fail_times
             self.commit_calls = 0
             self.rollback_calls = 0
+            self.executed_sql: list[str] = []
 
         def cursor(self):
-            return self._real.cursor()
+            return self._TrackingCursor(self, self._real.cursor())
 
         def commit(self):
             self.commit_calls += 1
@@ -4789,7 +4809,73 @@ class TestReviewDispatchClaimLockContention:
 
         assert state.claim_review_dispatch("w1") is True
         assert flaky.commit_calls == 2  # one failed commit, one that landed
-        assert flaky.rollback_calls == 1
+        # #3382 review: the recovery is now a SAVEPOINT-scoped undo, not a
+        # whole-connection `conn.rollback()` — `rollback_calls` stays 0 (the
+        # old unconditional-rollback shape this replaces would have been 1),
+        # and the executed SQL shows the savepoint opened once per attempt
+        # plus exactly one `ROLLBACK TO SAVEPOINT`/`RELEASE SAVEPOINT` pair
+        # for the single failed attempt.
+        assert flaky.rollback_calls == 0
+        savepoints_opened = [s for s in flaky.executed_sql if s.startswith("SAVEPOINT ")]
+        rollbacks_to_savepoint = [
+            s for s in flaky.executed_sql if s.startswith("ROLLBACK TO SAVEPOINT ")
+        ]
+        releases = [s for s in flaky.executed_sql if s.startswith("RELEASE SAVEPOINT ")]
+        assert len(savepoints_opened) == 2  # one per attempt
+        assert len(rollbacks_to_savepoint) == 1  # only the failed attempt
+        assert len(releases) == 1
+
+    def test_does_not_discard_a_genuinely_concurrent_writers_pending_row(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """#3382 review, blocking finding: `coord.db.get_connection()`'s
+        connection is shared with every OTHER `_*_local` writer this
+        process dispatches through `run_in_threadpool` on a real OS worker
+        thread — not just this one. Simulates that: a second writer's own
+        statement lands on the SAME shared connection BEFORE this claim
+        write ever starts, standing in for another thread's own in-flight,
+        not-yet-committed INSERT at the exact moment this write's own
+        `conn.commit()` fails. The earlier unconditional `conn.rollback()`
+        this PR replaced would have discarded that writer's row along with
+        this write's own abandoned insert — a caller who already got
+        `sql.insert_ignore`'s success back would then see their OWN later
+        `conn.commit()` either no-op or raise `cannot commit - no
+        transaction is active` (this issue's own second logged symptom).
+        Fails against a version of `rollback_pending_write` that calls
+        `conn.rollback()` unconditionally instead of scoping to a
+        savepoint."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        # A concurrent, unrelated writer's own statement — pending,
+        # uncommitted — on the SAME shared connection, applied BEFORE the
+        # claim write below ever touches it.
+        sql.execute(
+            coord_db,
+            "INSERT OR IGNORE INTO review_claims (of_assignment_id, claimed_at) "
+            "VALUES (?, ?)",
+            ("concurrent-writer-row", 2.0),
+        )
+
+        flaky = self._CommitFlakyConn(coord_db, fail_times=999)
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.claim_review_dispatch("w1")
+
+        # The concurrent writer's own row is untouched by our failed
+        # attempts and retries — its own later commit (standing in for the
+        # next Starlette handler thread reusing this process-wide
+        # singleton) durably persists it exactly as if this claim write had
+        # never touched the connection.
+        coord_db.commit()
+
+        rows = {
+            r["of_assignment_id"]
+            for r in sql.execute(
+                coord_db, "SELECT of_assignment_id FROM review_claims"
+            ).fetchall()
+        }
+        assert rows == {"concurrent-writer-row"}
 
     def test_exhausted_retries_leave_no_phantom_row_for_a_later_commit(
         self, coord_db, monkeypatch,
@@ -5093,6 +5179,39 @@ class TestSmokeDispatchClaimLockContention:
             ("w1", "macos"),
         ).fetchone()
         assert row["n"] == 0
+
+    def test_does_not_discard_a_genuinely_concurrent_writers_pending_row(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """Smoke-claim sibling of `TestReviewDispatchClaimLockContention.
+        test_does_not_discard_a_genuinely_concurrent_writers_pending_row` —
+        see that test's docstring for the #3382 review finding this pins."""
+        monkeypatch.setattr("coord.db.time.sleep", lambda s: None)
+
+        sql.execute(
+            coord_db,
+            "INSERT OR IGNORE INTO smoke_claims "
+            "(work_assignment_id, capability_partition, claimed_at) VALUES (?, ?, ?)",
+            ("concurrent-writer-row", "gtk", 2.0),
+        )
+
+        flaky = TestReviewDispatchClaimLockContention._CommitFlakyConn(
+            coord_db, fail_times=999
+        )
+        monkeypatch.setattr("coord.state.get_connection", lambda: flaky)
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            state.claim_smoke_dispatch("w1", "macos")
+
+        coord_db.commit()
+
+        rows = {
+            (r["work_assignment_id"], r["capability_partition"])
+            for r in sql.execute(
+                coord_db, "SELECT work_assignment_id, capability_partition FROM smoke_claims"
+            ).fetchall()
+        }
+        assert rows == {("concurrent-writer-row", "gtk")}
 
 
 # ── #3333: a smoke fan-out leg's terminal write must release its claim ──────
