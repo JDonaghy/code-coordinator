@@ -2969,6 +2969,47 @@ class TestRecordTestVerdictBaselineRedStreak:
 
         assert baseline_red_streak("api") == 0
 
+    def test_an_unconfirmed_passed_verdict_does_not_clear_the_streak(
+        self, coord_db,
+    ) -> None:
+        """#3386 review: `test_confirmation="unconfirmed"` (#2464's
+        no-independent-re-run-was-possible fallback, stamped by
+        `coord.notify._confirmed_pass_verdict`) is a self-report, not
+        evidence the merge base is clean. Clearing the streak on one of
+        these would let an ordinary environmental hiccup (missing
+        toolchain, timeout) on a later, unrelated assignment silently
+        reset a repo already at the #3386 limit back to 0 — reproducing
+        the exact silent bypass #3386 exists to close."""
+        from coord.state import baseline_red_streak, record_baseline_red_classification
+
+        self._seed_assignment(coord_db, assignment_id="aid-1")
+        record_baseline_red_classification("api")
+        record_baseline_red_classification("api")
+        assert baseline_red_streak("api") == 2
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="passed",
+            test_confirmation="unconfirmed",
+        )
+
+        assert baseline_red_streak("api") == 2
+
+    def test_a_confirmed_passed_verdict_clears_the_streak(self, coord_db) -> None:
+        """The positive case for the fix above: a genuinely confirmed
+        `passed` (`test_confirmation="confirmed"`) is real evidence and
+        must still clear the streak."""
+        from coord.state import baseline_red_streak, record_baseline_red_classification
+
+        self._seed_assignment(coord_db, assignment_id="aid-1")
+        record_baseline_red_classification("api")
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="passed",
+            test_confirmation="confirmed",
+        )
+
+        assert baseline_red_streak("api") == 0
+
     def test_a_failed_verdict_does_not_clear_the_streak(self, coord_db) -> None:
         """A `failed` verdict says the BRANCH is broken, not that the base
         is clean — must not reset a chronic baseline-red streak."""
@@ -3008,6 +3049,17 @@ class TestRecordTestVerdictBaselineRedStreak:
         from coord.confirm_test import TEST_CONFIRMATION_BASELINE_RED
 
         assert TEST_CONFIRMATION_BASELINE_RED == "baseline_red"
+
+    def test_unconfirmed_literal_matches_the_canonical_confirm_test_constant(
+        self,
+    ) -> None:
+        """Same circular-import constraint as the sibling pin above, for the
+        `test_confirmation != "unconfirmed"` guard added on review: pin the
+        literal against `coord.confirm_test.TEST_CONFIRMATION_UNCONFIRMED`
+        so the two can never silently drift apart (#2096)."""
+        from coord.confirm_test import TEST_CONFIRMATION_UNCONFIRMED
+
+        assert TEST_CONFIRMATION_UNCONFIRMED == "unconfirmed"
 
 
 class TestRecordUatVerdict:

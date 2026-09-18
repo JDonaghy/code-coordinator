@@ -574,10 +574,22 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         # command that records the bypass is the one place a human is
         # already looking.
         if test_confirmation == "baseline_red":
-            from coord.state import BASELINE_RED_STREAK_LIMIT, baseline_red_streak
+            from coord.state import (
+                BASELINE_RED_STREAK_LIMIT,
+                baseline_red_merge_blocked,
+                baseline_red_streak,
+            )
 
+            # #3386 review: `baseline_red_merge_blocked` is the ONE predicate
+            # both the real merge refusal (`coord.merge_queue.
+            # evaluate_smoke_verdict`) and any repo-level alert surface must
+            # call — never a second, independently-derived comparison
+            # against `BASELINE_RED_STREAK_LIMIT` (#2096). This echo used to
+            # re-derive `streak >= BASELINE_RED_STREAK_LIMIT` itself; now it
+            # asks the same function the merge gate asks, so the two can
+            # never silently disagree.
             streak = baseline_red_streak(assignment.repo_name)
-            if streak >= BASELINE_RED_STREAK_LIMIT:
+            if baseline_red_merge_blocked(assignment.repo_name):
                 click.echo(
                     f"  WARNING: {assignment.repo_name} has now recorded {streak} "
                     f"consecutive baseline-red (#2170) classifications — "

@@ -1471,6 +1471,18 @@ def _record_test_verdict_local(
     conn = get_connection()
 
     def _write() -> None:
+        # #3386 review: fetched INSIDE `_write` (not just in the post-write
+        # SELECT below) so the repo_name needed for the streak update is
+        # available in the SAME transaction/`retry_on_locked` attempt as the
+        # verdict UPDATE — see the comment on that fold just below for why a
+        # separate transaction was worth closing. Harmless to look up twice:
+        # this one is never used for anything the post-write SELECT below
+        # doesn't already redo for the staleness anchor / audit-log fields.
+        streak_row = sql.execute(conn,
+            "SELECT repo_name FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+
         sql.execute(conn,
             "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=?, "
             "test_confirmation=? WHERE assignment_id=?",
@@ -1484,6 +1496,57 @@ def _record_test_verdict_local(
                 "WHERE assignment_id=?",
                 (smoke_test, smoke_test_reason, assignment_id),
             )
+
+        # #3386 (item 3 of #3378): keep the per-repo consecutive
+        # baseline-red streak in lockstep with the verdict this function is
+        # the SINGLE write choke point for (#1337) — both the automatic
+        # `SMOKE: baseline-red` path (`coord.notify._confirmed_pass_verdict`)
+        # and the human-attended `coord test --skipped ... --reason
+        # "baseline-red (#2170): ..."` remedy (`coord.commands.test_gate`)
+        # funnel through here, so incrementing here (rather than at either
+        # call site) means neither can silently dodge the count the way
+        # each independently rendered as an indistinguishable "passed"
+        # before #3378 item 2. A genuine (non-baseline-red) `passed` resets
+        # the streak: real, positive evidence the CURRENT merge base is not
+        # red.
+        #
+        # #3386 review: folded into THIS `_write` (one `retry_on_locked`
+        # call, one `conn.commit()`) rather than calling the public
+        # `record_baseline_red_classification`/`clear_baseline_red_streak`
+        # (each its own transaction) after the fact — a crash between two
+        # separate commits would leave a recorded skip whose classification
+        # never got counted (or a `passed` verdict whose streak-clear never
+        # landed), undercounting the streak rather than breaking
+        # correctness, but there was no reason to accept even that once
+        # both writes are already on the same connection.
+        if streak_row is not None and streak_row["repo_name"]:
+            # Mirrors `coord.confirm_test.TEST_CONFIRMATION_BASELINE_RED` —
+            # kept as a literal (not an import) because `coord.confirm_test`
+            # imports `coord.revalidate`, which imports `coord.merge_queue`,
+            # which imports THIS module (for `COORD_DIR`), so a module-level
+            # import of `coord.confirm_test` here would be circular. Pinned
+            # against drift by `tests/test_state.py::
+            # TestRecordTestVerdictBaselineRedStreak::
+            # test_literal_matches_the_canonical_confirm_test_constant`.
+            if test_state == "skipped" and test_confirmation == "baseline_red":
+                _record_baseline_red_classification_raw(conn, streak_row["repo_name"])
+            elif test_state == "passed" and test_confirmation != "unconfirmed":
+                # #3386 review: an UNCONFIRMED "passed" (`coord.confirm_test`'s
+                # #2464 fallback — `coord.notify._confirmed_pass_verdict`
+                # stamps this whenever no independent re-run was possible on
+                # this machine, e.g. missing toolchain or a confirmation
+                # timeout) is zero evidence the merge base is clean.
+                # Clearing the streak on one of these would let an ordinary
+                # environmental hiccup on an unrelated, later assignment
+                # silently reset a repo already at the #3386 limit back to
+                # 0 — reproducing the exact silent bypass this streak
+                # exists to close, just gated on a flaky runner instead of
+                # permanent silence. Only a genuinely confirmed (or
+                # unattended-but-real, i.e. `None`/`"confirmed"`) `passed`
+                # counts as real, positive evidence the CURRENT merge base
+                # is not, in fact, red.
+                _clear_baseline_red_streak_raw(conn, streak_row["repo_name"])
+
         conn.commit()
 
     # #2802: ride out transient `database is locked` contention the same way
@@ -1513,31 +1576,6 @@ def _record_test_verdict_local(
             issue_number=row["issue_number"],
             branch=row["branch"],
         )
-
-    # #3386 (item 3 of #3378): keep the per-repo consecutive baseline-red
-    # streak in lockstep with the verdict this function is the SINGLE write
-    # choke point for (#1337) — both the automatic `SMOKE: baseline-red`
-    # path (`coord.notify._confirmed_pass_verdict`) and the human-attended
-    # `coord test --skipped ... --reason "baseline-red (#2170): ..."` remedy
-    # (`coord.commands.test_gate`) funnel through here, so incrementing here
-    # (rather than at either call site) means neither can silently dodge the
-    # count the way each independently rendered as an indistinguishable
-    # "passed" before #3378 item 2. A genuine (non-baseline-red) `passed`
-    # resets the streak: real, positive evidence the CURRENT merge base is
-    # not red.
-    if row is not None and row["repo_name"]:
-        # Mirrors `coord.confirm_test.TEST_CONFIRMATION_BASELINE_RED` — kept
-        # as a literal (not an import) because `coord.confirm_test` imports
-        # `coord.revalidate`, which imports `coord.merge_queue`, which
-        # imports THIS module (for `COORD_DIR`), so a module-level import of
-        # `coord.confirm_test` here would be circular. Pinned against drift
-        # by `tests/test_state.py::
-        # TestRecordTestVerdictBaselineRedStreak::
-        # test_literal_matches_the_canonical_confirm_test_constant`.
-        if test_state == "skipped" and test_confirmation == "baseline_red":
-            record_baseline_red_classification(row["repo_name"])
-        elif test_state == "passed":
-            clear_baseline_red_streak(row["repo_name"])
 
     if row is not None and test_state is not None:
         # #1605: `test_state=None` (clearing a verdict for re-dispatch, not
@@ -1649,6 +1687,34 @@ def _save_baseline_red_streaks_raw(conn, streaks: dict[str, int]) -> None:
     )
 
 
+def _record_baseline_red_classification_raw(conn, repo_name: str) -> int:
+    """Increment *repo_name*'s streak on *conn* — no commit, no locking retry.
+
+    Shared by :func:`record_baseline_red_classification` (its own commit)
+    and :func:`_record_test_verdict_local` (folded into the SAME commit as
+    the verdict UPDATE, per the #3386 review — see that function's docstring
+    for why they must not be two separate transactions).
+    """
+    streaks = _load_baseline_red_streaks_raw(conn)
+    new_count = int(streaks.get(repo_name, 0)) + 1
+    streaks[repo_name] = new_count
+    _save_baseline_red_streaks_raw(conn, streaks)
+    return new_count
+
+
+def _clear_baseline_red_streak_raw(conn, repo_name: str) -> None:
+    """Reset *repo_name*'s streak on *conn* — no commit, no locking retry.
+
+    Shared by :func:`clear_baseline_red_streak` (its own commit) and
+    :func:`_record_test_verdict_local` (folded into the SAME commit as the
+    verdict UPDATE) — see :func:`_record_baseline_red_classification_raw`.
+    """
+    streaks = _load_baseline_red_streaks_raw(conn)
+    if repo_name in streaks:
+        del streaks[repo_name]
+        _save_baseline_red_streaks_raw(conn, streaks)
+
+
 def record_baseline_red_classification(repo_name: str | None) -> int:
     """Increment and persist *repo_name*'s consecutive baseline-red streak (#3386).
 
@@ -1663,6 +1729,10 @@ def record_baseline_red_classification(repo_name: str | None) -> int:
 
     Returns the new streak so a caller can log/escalate inline without a
     second read. A falsy *repo_name* is a no-op returning ``0``.
+
+    Standalone caller (e.g. a test, or a future direct call site) — not the
+    one `_record_test_verdict_local` uses internally, which folds the raw
+    write into its own transaction instead of calling this.
     """
     if not repo_name:
         return 0
@@ -1671,10 +1741,7 @@ def record_baseline_red_classification(repo_name: str | None) -> int:
 
     def _write() -> None:
         nonlocal new_count
-        streaks = _load_baseline_red_streaks_raw(conn)
-        new_count = int(streaks.get(repo_name, 0)) + 1
-        streaks[repo_name] = new_count
-        _save_baseline_red_streaks_raw(conn, streaks)
+        new_count = _record_baseline_red_classification_raw(conn, repo_name)
         conn.commit()
 
     # #2802: ride out transient `database is locked` contention the same
@@ -1693,23 +1760,37 @@ def clear_baseline_red_streak(repo_name: str | None) -> None:
     accumulating no longer describes reality. A `"failed"` verdict
     deliberately does **not** reset it: it says the branch under test is
     broken, not that the base is clean.
+
+    Standalone caller — see the note on :func:`record_baseline_red_classification`.
     """
     if not repo_name:
         return
     conn = get_connection()
 
     def _write() -> None:
-        streaks = _load_baseline_red_streaks_raw(conn)
-        if repo_name in streaks:
-            del streaks[repo_name]
-            _save_baseline_red_streaks_raw(conn, streaks)
-            conn.commit()
+        _clear_baseline_red_streak_raw(conn, repo_name)
+        conn.commit()
 
     retry_on_locked(_write)
 
 
 def baseline_red_streak(repo_name: str) -> int:
-    """*repo_name*'s persisted consecutive baseline-red streak (0 if none) (#3386)."""
+    """*repo_name*'s persisted consecutive baseline-red streak (0 if none) (#3386).
+
+    **Local-DB read only** — like :func:`has_review_claim`, this does NOT
+    route to the daemon via ``board_service``: ``board_meta`` lives on the
+    canonical board (the ``coord serve`` daemon's DB), so a thin client's
+    local ``~/.coord/coord.db`` copy is empty/stale for it exactly like it
+    is for ``build_board()`` (#615). The real merge refusal
+    (:func:`baseline_red_merge_blocked`, called from
+    ``coord.merge_queue.evaluate_smoke_verdict``) always runs on the
+    daemon/coordinator host where the local DB IS canonical, so this
+    limitation never affects an actual merge decision — only an advisory
+    echo (e.g. ``coord.commands.test_gate``'s streak note) read from a thin
+    client, which is why :func:`_thin_client_local_board_guard` fires here:
+    it flags exactly that case instead of silently printing a stale count.
+    """
+    _thin_client_local_board_guard("baseline_red_streak")
     return _load_baseline_red_streaks_raw(get_connection()).get(repo_name, 0)
 
 
@@ -1722,7 +1803,11 @@ def baseline_red_streaks(repo_name: str | None = None) -> dict[str, int]:
     reads to surface a chronically-red merge base without an operator
     having to go looking for it one issue at a time, the way #3378 itself
     was only found (33 days late, on #3383).
+
+    Same **local-DB read only** limitation as :func:`baseline_red_streak`
+    above — see its docstring.
     """
+    _thin_client_local_board_guard("baseline_red_streaks")
     streaks = _load_baseline_red_streaks_raw(get_connection())
     if repo_name is not None:
         return {repo_name: streaks[repo_name]} if repo_name in streaks else {}
