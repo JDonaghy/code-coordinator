@@ -32,10 +32,35 @@ machines:
 """
 
 
+TWO_MACHINE_CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+  - name: dellserver
+    host: dellserver.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+"""
+
+
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"
     p.write_text(CONFIG_YAML)
+    return p
+
+
+@pytest.fixture
+def two_machine_config(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator-two.yml"
+    p.write_text(TWO_MACHINE_CONFIG_YAML)
     return p
 
 
@@ -58,6 +83,22 @@ def _one_online_machine() -> list[network.MachineStatus]:
     st.machine.repos = ["api"]
     st.machine.quiet_hours = None
     return [st]
+
+
+def _online_machine_status(name: str) -> network.MachineStatus:
+    st = network.MachineStatus(
+        machine=MagicMock(host=f"{name}.tailnet", repos=["api"]),
+        state=network.ONLINE, latency_ms=12.0, health=_online_health(name),
+    )
+    st.machine.name = name
+    st.machine.host = f"{name}.tailnet"
+    st.machine.repos = ["api"]
+    st.machine.quiet_hours = None
+    return st
+
+
+def _two_online_machines() -> list[network.MachineStatus]:
+    return [_online_machine_status("laptop"), _online_machine_status("dellserver")]
 
 
 class TestMachinesBusyWhileQueueEmptyAlarm:
@@ -184,6 +225,95 @@ class TestZeroTurnZeroCostTerminalAlarm:
 
         assert result.exit_code == 0, result.output
         assert "INVARIANT ALARMS" not in result.output
+
+
+class TestZeroTurnAlarmOnlyJudgesMachinesItActuallyAsked:
+    """#3376 review round 2. Alarm 5's only fact source for a row that has
+    no local log is `agent_completed`, which `coord status` fills from the
+    machines it polled for the "Machines:" section — and `--machine NAME`
+    narrows that to one, while the board it is matched against is always
+    fleet-wide (`read_board()` is never filtered). Without scoping, every
+    OTHER machine's ordinary completed work reads as `cost_unknown` +
+    `num_turns=0` (the dataclass default, not a measurement) and trips the
+    alarm — the round-1 false positive, just behind a flag. Same hole for an
+    offline machine on an unfiltered run.
+    """
+
+    def _board_with_a_done_row_on(self, machine_name: str) -> None:
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        save_board(Board(completed=[
+            Assignment(
+                machine_name=machine_name, repo_name="api", issue_number=7,
+                issue_title="Ordinary completed work",
+                assignment_id=f"{machine_name}-1", status="done", type="work",
+            ),
+        ]))
+
+    def _run(self, config_file: Path, statuses, extra_args: list[str]):
+        def _check_all(machines, **_kw):
+            names = {m.name for m in machines}
+            return [s for s in statuses if s.machine.name in names]
+
+        with patch("coord.network.check_all", side_effect=_check_all), \
+             patch(
+                 "coord.network.fetch_status",
+                 return_value=network.StatusResult(data={"active": [], "completed": []}),
+             ), \
+             patch("coord.state.list_drive_queue", return_value=[]):
+            return CliRunner().invoke(
+                main, ["status", "--config", str(config_file), *extra_args],
+            )
+
+    def test_silent_on_another_machines_row_under_machine_filter(
+        self, two_machine_config: Path, coord_dir: Path,
+    ) -> None:
+        """`coord status --machine dellserver` must not alarm on laptop's
+        perfectly ordinary completed work — dellserver's `/status` was never
+        going to mention it."""
+        self._board_with_a_done_row_on("laptop")
+
+        result = self._run(
+            two_machine_config, _two_online_machines(), ["--machine", "dellserver"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "laptop-1" not in result.output
+        assert "invisible to spend accounting" not in result.output
+
+    def test_still_fires_for_the_filtered_machines_own_ghost_row(
+        self, two_machine_config: Path, coord_dir: Path,
+    ) -> None:
+        """Scoping must not defang the alarm: the named machine answered
+        `/status` and had no record of its own `done` row — a ghost."""
+        self._board_with_a_done_row_on("dellserver")
+
+        result = self._run(
+            two_machine_config, _two_online_machines(), ["--machine", "dellserver"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "INVARIANT ALARMS" in result.output
+        assert "dellserver-1" in result.output
+        assert "invisible to spend accounting" in result.output
+
+    def test_silent_on_a_row_whose_machine_is_offline(
+        self, two_machine_config: Path, coord_dir: Path,
+    ) -> None:
+        """Unfiltered run, but laptop is down: "no remote usage entry" means
+        "nobody asked it", not "it never ran"."""
+        self._board_with_a_done_row_on("laptop")
+        statuses = _two_online_machines()
+        statuses[0].state = network.OFFLINE
+        statuses[0].reason = "connection refused"
+        statuses[0].health = None
+
+        result = self._run(two_machine_config, statuses, [])
+
+        assert result.exit_code == 0, result.output
+        assert "laptop-1" not in result.output
+        assert "invisible to spend accounting" not in result.output
 
 
 class TestGateDoneWithoutVerdictAlarm:

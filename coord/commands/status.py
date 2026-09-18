@@ -274,6 +274,14 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
 
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
+    # #3376 review round 2: which machines actually ANSWERED `/status` on this
+    # run — i.e. for which machines is `agent_completed` a real fact source
+    # rather than structurally empty. `machines` above is narrowed by
+    # `--machine`, and an unfiltered run can still contain an offline host, so
+    # "this assignment has no remote usage entry" only means something for a
+    # machine in this set. Consumed by the invariant-alarms block below; see
+    # the long note there for why the distinction is load-bearing.
+    polled_ok_machines: set[str] = set()
     click.echo("Machines:")
     for s in statuses:
         m = s.machine
@@ -318,6 +326,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 active = []
                 detail = f"status unavailable ({status_result.error})"
             if status_result.ok and status_result.data:
+                polled_ok_machines.add(m.name)
                 for entry in status_result.data.get("completed", []):
                     eid = entry.get("id") or entry.get("assignment_id")
                     if eid:
@@ -1064,20 +1073,51 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         # -> agent_status_dict` shape `build_session_usage`'s `remote_by_id`
         # expects — the same shape `coord usage --remote` builds via its own
         # (extra) `fetch_status` round trip. No second network call needed.
-        usage = build_session_usage(
-            list(board.active) + list(board.completed),
-            remote_by_id=agent_completed or None,
-        )
+        #
+        # #3376 review round 2: `agent_completed` is only a fact source for
+        # the machines this run actually POLLED and got an answer from, and
+        # the board it is being matched against is fleet-wide — `board =
+        # read_board()` is never narrowed by `machine_filter`. So on
+        # `coord status --machine dellserver`, `agent_completed` is
+        # structurally empty for every OTHER machine's rows (they were never
+        # fetched), each falls through the "neither local nor remote" branch
+        # to `cost_unknown=True` + `num_turns=0`, and alarm 5 fires on
+        # perfectly ordinary completed work fleet-wide — the round-1 false
+        # positive again, just behind a flag. Same hole for an *offline*
+        # machine on an unfiltered run. Hence `polled_ok_machines` below:
+        # an unmeasured row only counts as "0 turns" when its own machine
+        # was actually asked and had nothing to say.
+        rows = list(board.active) + list(board.completed)
+        # AssignmentUsage carries no `machine_name`, so keep the board's own
+        # id -> machine mapping to scope the check by.
+        machine_by_aid = {
+            a.assignment_id: a.machine_name for a in rows if a.assignment_id
+        }
+        usage = build_session_usage(rows, remote_by_id=agent_completed or None)
         for au in usage.assignments:
+            # #3376 review round 2: `cost_unknown` means no local log AND no
+            # remote entry. That is the ghost-dispatch signal ONLY if this
+            # run actually consulted the machine that row ran on; otherwise
+            # it just means "not asked", and `num_turns`' dataclass default
+            # of `0` is an artifact, not a measurement. Rows WITH real usage
+            # data (`cost_unknown` False — local log or remote entry) are
+            # still checked unconditionally: a locally-confirmed 0-turn/$0
+            # terminal row is a genuine instant failure no matter which
+            # machine it names.
+            if au.cost_unknown and (
+                machine_by_aid.get(au.assignment_id) not in polled_ok_machines
+            ):
+                continue
             # #3376 review round 1: deliberately NOT nulling `num_turns`
             # the same way `cost_usd` is nulled below — `coord.machine_
             # fault.is_instant_zero_cost_failure` documents `num_turns=None`
             # as "never measured, don't flag" (unlike `cost_usd=None`,
             # which it treats the same as a real `$0`), so nulling both
             # would make this alarm NEVER fire for a genuinely-never-
-            # captured row (a machine that's offline right now, so even
-            # `remote_by_id` above has nothing for it) — exactly the "ghost
-            # dispatch that never actually ran" shape this alarm exists to
+            # captured row (a machine that WAS reachable and answered
+            # `/status`, yet has no record of this assignment at all) —
+            # exactly the "ghost dispatch that never actually ran" shape
+            # this alarm exists to
             # catch (`tests/test_cli_status_invariant_alarms.py::
             # test_fires_on_a_done_row_with_no_measurable_work`). The
             # `remote_by_id` wiring above is the actual fix for the false
