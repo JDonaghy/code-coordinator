@@ -2835,6 +2835,49 @@ class TestRollbackAfterDriverError:
         assert conn.rollbacks == 1
 
 
+class TestRollbackPendingWrite:
+    """#3382's `db.rollback_pending_write` — the unconditional sibling of
+    `rollback_after_driver_error`, for a writer whose own `conn.commit()`
+    call (not just the statement before it) can raise. Unlike that
+    function, this must roll back for a PLAIN SQLite error too: that shape
+    is exactly what it exists to cover (see its docstring)."""
+
+    def test_rolls_back_for_a_plain_sqlite_lock_error(self) -> None:
+        """The behaviour `rollback_after_driver_error` deliberately does
+        NOT have — `TestRollbackAfterDriverError.
+        test_plain_sqlite_error_is_left_completely_alone` pins that
+        function's `rollbacks == 0` for the exact same exception shape."""
+        conn = _RollbackRecorder()
+
+        db_mod.rollback_pending_write(conn, sqlite3.OperationalError("database is locked"))
+
+        assert conn.rollbacks == 1
+
+    def test_rolls_back_for_a_postgres_style_sqlstate_too(self) -> None:
+        """Unconditional means unconditional — a Postgres-shaped exception
+        still rolls back, same as `rollback_after_driver_error` would do on
+        its own (redundant here, but harmless)."""
+        conn = _RollbackRecorder()
+
+        db_mod.rollback_pending_write(
+            conn, PostgresStyleDriverError("no such table", SQLSTATE_UNDEFINED_TABLE)
+        )
+
+        assert conn.rollbacks == 1
+
+    def test_none_connection_is_a_no_op(self) -> None:
+        db_mod.rollback_pending_write(
+            None, sqlite3.OperationalError("database is locked")
+        )  # must not raise
+
+    def test_a_failing_rollback_never_masks_the_caught_error(self) -> None:
+        conn = _RollbackRecorder(fail=True)
+
+        db_mod.rollback_pending_write(conn, sqlite3.OperationalError("database is locked"))
+
+        assert conn.rollbacks == 1
+
+
 class TestBoardConnectionIfOpen:
     """`retry_on_locked`'s default connection resolution — it must never
     *open* one from inside an error handler."""
