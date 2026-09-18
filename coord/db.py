@@ -470,6 +470,69 @@ def _is_release_build(version: str) -> bool:
     return _RELEASE_VERSION_RE.fullmatch(version) is not None
 
 
+class _NoActiveTestConnectionSentinel:
+    """Installed as the ``_conn`` singleton whenever pytest is running but no
+    test's ``coord_db`` fixture currently holds an active override (#3385).
+
+    ``tests/conftest.py``'s autouse ``coord_db`` fixture is function-scoped:
+    it only guarantees an isolated in-memory connection while ONE test's
+    setup/call/teardown phases are running. Before this sentinel existed,
+    that fixture's teardown called :func:`close`, which resets the module
+    singleton to plain ``None`` -- reopening the exact gap #1960's guard was
+    built to close, just one layer up: ANY caller of :func:`get_connection`
+    during that gap (between one test's teardown finishing and the next
+    test's setup starting, or before the very first test's setup has run at
+    all) fell through :func:`get_connection` into :func:`_open`, which
+    resolves the REAL ``~/.coord/coord.db`` (#1960, #3385). #1960's own guard
+    inside :func:`_open` only fires while ``PYTEST_CURRENT_TEST`` happens to
+    be set, which is not guaranteed across that specific gap -- exactly the
+    seam #3385 was filed to close after #3380's daemon-lifespan-shutdown fix
+    left the reported failure count unchanged.
+
+    Installed once at ``pytest_configure`` (before collection even starts,
+    closing the pre-first-test window) and reinstalled by ``coord_db``'s own
+    teardown after every test (closing the inter-test window), so ``_conn``
+    is never plain ``None`` for the life of a pytest process:
+    :func:`get_connection` always hands back either a real per-test override
+    or this sentinel -- it can no longer fall through to :func:`_open` while
+    pytest is running, regardless of what races ahead of the next test's
+    setup or what runs before the first one.
+
+    Any attempt to use it -- ``.execute()``, ``.cursor()``, ``.commit()``,
+    even the ``.closed`` probe :func:`_connection_is_closed` runs on every
+    cached connection -- raises :class:`ProductionDatabaseGuardError`
+    immediately via ``__getattr__``, so a caller that reaches this gets a
+    clear, correctly-attributed error instead of a real database file
+    quietly being opened (or silently reused) underneath it.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        raise ProductionDatabaseGuardError(
+            "coord.db.get_connection() was reached while no test's `coord_db` "
+            "fixture held an active override (#3385) -- this is the gap "
+            "between one test's teardown and the next test's setup, or "
+            "before the very first test's setup has run at all. A caller "
+            f"tried to access {name!r} on the connection singleton in that "
+            "gap. Likely causes: a background thread a prior test spawned "
+            "and never joined, or a fixture that reaches coord.db before "
+            "the autouse `coord_db` fixture has installed its override. See "
+            "#1960 (the guard this generalizes) and #3385 (this sentinel)."
+        )
+
+
+def _pytest_gap_sentinel() -> Any:
+    """Factory for :class:`_NoActiveTestConnectionSentinel` (#3385).
+
+    A function rather than a bare module-level instance so every install
+    site (``tests/conftest.py``'s ``pytest_configure`` and ``coord_db``
+    teardown) gets its own object -- cheap, and it means a traceback's
+    ``id()`` never accidentally suggests two installs shared state they
+    don't (the sentinel is stateless, but nothing here should rely on that
+    by sharing one instance).
+    """
+    return _NoActiveTestConnectionSentinel()
+
+
 def override_connection(conn: Any) -> None:
     """Replace the singleton connection.  Used in tests to inject :memory: DBs.
 

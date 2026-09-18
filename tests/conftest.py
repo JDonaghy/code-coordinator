@@ -87,10 +87,26 @@ def pytest_configure(config):
 
     A no-op on the default SQLite path: it neither imports a driver nor opens
     a socket, so a plain ``pytest`` is unaffected.
+
+    #3385: also installs ``coord.db``'s pytest-gap sentinel as the initial
+    connection singleton, before collection (and therefore every test
+    module's import-time code) ever runs. See
+    :func:`coord.db._pytest_gap_sentinel` for what this closes: without it,
+    ``coord.db._conn`` starts life as plain ``None`` and stays that way until
+    the FIRST test's autouse ``coord_db`` fixture installs its override --
+    anything that calls ``coord.db.get_connection()`` before that point (e.g.
+    module-level code a test file runs at import/collection time) could fall
+    through to the real ``~/.coord/coord.db``. Installing the sentinel here
+    closes that window the same way ``coord_db``'s own teardown closes the
+    inter-test one.
     """
     from tests.backends import preflight
 
     preflight()
+
+    from coord import db as db_mod
+
+    db_mod.override_connection(db_mod._pytest_gap_sentinel())
 
 
 @pytest.fixture(autouse=True)
@@ -1111,6 +1127,18 @@ def coord_db():
         # already-closed connection is a no-op on both drivers).
         session.close()
         db.close()
+        # #3385: `db.close()` just reset the singleton to plain `None` --
+        # reopening the gap #1960's guard exists to close, one layer up.
+        # Anything that calls `coord.db.get_connection()` between THIS
+        # test's teardown finishing and the NEXT test's `coord_db` setup
+        # installing its own override (a background thread a prior test
+        # spawned and never joined, a fixture that reaches coord.db before
+        # this one runs) would otherwise fall through to `_open()` and could
+        # reach the real `~/.coord/coord.db`. Installing the sentinel here
+        # closes that window; the next test's `coord_db` setup overwrites it
+        # with a fresh real override before that test's body ever runs, same
+        # as always.
+        db.override_connection(db._pytest_gap_sentinel())
 
 
 # Every module-attribute name that coord.db / coord.state / coord.config /
