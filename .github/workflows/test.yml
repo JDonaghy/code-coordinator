@@ -111,12 +111,34 @@ jobs:
   # — the matrix axis there is Python versions on Linux; this job's axis is
   # the platform. See docs/CROSS_PLATFORM.md §9.
   windows:
-    # #2039: on `push` (i.e. merges to main) only. On a `pull_request` event
-    # this evaluates false and the job is SKIPPED — conclusion `skipped`,
-    # which is already in `ci_store._PASSING_CONCLUSIONS`, so the merge gate
-    # is satisfied rather than merely tolerant. `windows` is not a required
-    # status check either, so branch protection is unaffected.
-    if: github.event_name == 'push'
+    # #3394, 2026-09-18: taken out of automatic CI by operator decision —
+    # Windows is not current work. Everything in the block above about this
+    # being a real gate (#2000) remains true of the job's SHAPE and is
+    # deliberately left intact; what changed is WHEN it runs.
+    #
+    # Why: it has failed every run sampled back to 2026-09-10 (~614
+    # AssertionError plus WinError / BackupError / FileNotFoundError / OSError,
+    # concentrated in tests/test_dr_azure_scripts.py and tests/test_agent.py).
+    # A gate that is always red gates nothing — it only kept `main` permanently
+    # red, at ~85 min of runner time per push, and that permanent redness is
+    # what made coord mark every branch baseline-red and SKIP its test stage
+    # while the gate still reported `test: passed`. #3378 item 1, #3380 and
+    # #3385 were all scoped as "make main green" and all misattributed that
+    # redness to the (advisory) postgres job.
+    #
+    # The #2039 note this replaces still describes the restore target: on
+    # `push` only, so the job is SKIPPED on `pull_request` — conclusion
+    # `skipped`, already in `ci_store._PASSING_CONCLUSIONS`, so a red Windows
+    # run surfaces on main and never blocks a PR. `windows` is not a required
+    # status check either, so branch protection is unaffected in either shape.
+    #
+    # RESTORE by putting `github.event_name == 'push'` back here when Windows
+    # becomes active work — THEN fix the ~614 failures. Only once it is green
+    # is it a gate again. Do NOT add `continue-on-error` as a shortcut: #2026
+    # found that softens the run conclusion while the check still reports
+    # `failure` to the Checks API, which stalled the whole drive queue
+    # overnight on 2026-08-08.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
