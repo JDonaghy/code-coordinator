@@ -480,7 +480,10 @@ def drive_queue_add(
         )
         effective_position = _resolve_effective_new_position(position, previous)
         forward_keys, all_reverse = _partition_overlap_after(
-            existing_entries, effective_position, prediction,
+            existing_entries,
+            effective_position,
+            prediction,
+            previous_position=previous.position if previous is not None else None,
         )
         # #2603's --reject-after is the same narrower escape hatch for a
         # REVERSED edge too — it names the OTHER entry's key either way, so
@@ -528,7 +531,7 @@ def drive_queue_add(
     reverse_applied: list[tuple[QueueEntry, Overlap]] = []
     if reverse_candidates:
         reverse_applied = _apply_reversed_overlap_after(
-            existing_entries, entry_key(repo, issue), reverse_candidates,
+            existing_entries, entry_key(repo, issue), after, reverse_candidates,
         )
     # #2839: queueing a drive is a strictly STRONGER statement than "send to
     # Pipeline" (`coord track`), so it must never leave the issue in a
@@ -983,12 +986,14 @@ def _applicable_auto_after(
     a typo worth reporting.
 
     #3395: *candidate_keys* narrows which of `prediction.after_keys` this
-    call even considers — `None` (every other caller) keeps the pre-#3395
-    behaviour of trying all of them. `drive_queue_add` passes the FORWARD
-    subset only: `_partition_overlap_after` has already routed the REVERSED
-    ones (a newcomer positioned ahead of an overlapping, not-yet-dispatched
-    entry) to `_apply_reversed_overlap_after` instead, and chaining this
-    entry after them TOO would apply rule 2's edge twice, in both directions.
+    call even considers — `None` (the default, unused by `drive_queue_add`'s
+    own call today but kept for a caller that wants pre-#3395 behaviour, or
+    a future direct test) keeps the pre-#3395 behaviour of trying all of
+    them. `drive_queue_add` passes the FORWARD subset only:
+    `_partition_overlap_after` has already routed the REVERSED ones (a
+    newcomer positioned ahead of an overlapping, not-yet-dispatched entry) to
+    `_apply_reversed_overlap_after` instead, and chaining this entry after
+    them TOO would apply rule 2's edge twice, in both directions.
     """
     keys = prediction.after_keys if candidate_keys is None else tuple(candidate_keys)
     applied: list[str] = []
@@ -1029,6 +1034,8 @@ def _partition_overlap_after(
     existing_entries: list[QueueEntry],
     effective_position: int | None,
     prediction: Prediction,
+    *,
+    previous_position: int | None = None,
 ) -> tuple[list[str], list[tuple[QueueEntry, Overlap]]]:
     """#3395 rule 2: split predicted overlaps by which direction the
     ``--after`` edge belongs in.
@@ -1049,6 +1056,16 @@ def _partition_overlap_after(
     An overlap naming a key with no matching `QueueEntry` (the declared
     footprint disappeared between prediction and this call — a `remove` race,
     vanishingly rare) falls back to FORWARD: the safe, pre-#3395 default.
+
+    ``previous_position`` is the target's OWN position before this call —
+    `None` for a brand-new entry, the row's current position when this
+    `add` is REPOSITIONING an already-queued entry. Passed straight through
+    to `overlap_would_run_before`, which needs it to account for
+    `_move_drive_queue_entry_local`'s remove-then-reinsert shift: without
+    it, the direction decision compares `other`'s stale pre-removal
+    position and can pick the REVERSE edge when FORWARD is actually correct
+    (or vice versa) — see that function's docstring for the full case
+    analysis.
     """
     entries_by_key = {e.key: e for e in existing_entries}
     forward: list[str] = []
@@ -1058,7 +1075,11 @@ def _partition_overlap_after(
         if (
             overlap.source == SOURCE_DECLARED
             and other is not None
-            and overlap_would_run_before(effective_position, other.position)
+            and overlap_would_run_before(
+                effective_position,
+                other.position,
+                previous_position=previous_position,
+            )
         ):
             reverse.append((other, overlap))
         else:
@@ -1069,6 +1090,7 @@ def _partition_overlap_after(
 def _apply_reversed_overlap_after(
     existing_entries: list[QueueEntry],
     new_key: str,
+    new_key_after: Sequence[str],
     reverse_candidates: list[tuple[QueueEntry, Overlap]],
 ) -> list[tuple[QueueEntry, Overlap]]:
     """#3395: apply the REVERSED edges `_partition_overlap_after` identified
@@ -1084,18 +1106,37 @@ def _apply_reversed_overlap_after(
     `enqueue_drive_queue` fully replaces those columns on every call, so
     omitting one here would silently clear it off a row this `add` was never
     asked to touch.
+
+    ``new_key_after`` is the newcomer's OWN final ``--after`` list from this
+    same `add` (operator-declared plus rule 1's forward auto-chains). The
+    cycle check below builds its own edge graph rather than reusing
+    `validate_enqueue` directly, because `existing_entries` is the pre-write
+    snapshot: it never contains the newcomer's row (a brand-new entry) and,
+    on a reposition, contains only its STALE pre-`add` edges — so a
+    `validate_enqueue` call scoped to just the incumbent's candidate edge
+    cannot see the newcomer's own outgoing edges and would miss a two-node
+    cycle this single `add` invocation introduces (rule 1 chains the
+    newcomer after an overlapping incumbent, rule 2 separately wants that
+    same incumbent chained after the newcomer). Including `new_key_after` as
+    the newcomer's node in the graph here closes that gap; the tick's own
+    full-graph `find_cycle` would otherwise be the only thing to catch it,
+    after the fact.
     """
     from coord.state import enqueue_drive_queue  # noqa: PLC0415
 
     applied: list[tuple[QueueEntry, Overlap]] = []
+    base_edges: dict[str, list[str]] = {
+        e.key: list(e.after) for e in existing_entries if e.key != new_key
+    }
+    base_edges[new_key] = [str(a) for a in new_key_after]
     for entry, overlap in reverse_candidates:
         if new_key in entry.after:
             applied.append((entry, overlap))
             continue
         new_after = [*entry.after, new_key]
-        try:
-            validate_enqueue(existing_entries, entry.repo, entry.issue, new_after)
-        except QueueError:
+        trial_edges = dict(base_edges)
+        trial_edges[entry.key] = new_after
+        if find_cycle(trial_edges) is not None:
             continue
         enqueue_drive_queue(
             entry.repo,
