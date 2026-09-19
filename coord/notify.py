@@ -4171,12 +4171,26 @@ def _dispatch_board_pending_smoke(config: Config) -> None:
     passed/failed/skipped verdict and re-dispatch instead of skipping it
     forever — without it, the staleness check fails open and this call would
     be no more capable than before that fix.
+
+    #3375: also passes a real *issue_liveness_fetcher*
+    (`coord.dispatch_liveness.github_issue_liveness_fetcher`) so the Test
+    stage — which dispatches over `httpx` directly rather than through
+    `coord.dispatch.dispatch()` — gets the SAME "is this issue closed / has
+    this branch already merged" precondition #3376 wired into every other
+    dispatch chokepoint. Without it, this stage stays the one path #3376
+    missed, and the five-smoke-agents-after-merge incident can still recur.
     """
     from coord.board_service import read_board, write_board
+    from coord.dispatch_liveness import github_issue_liveness_fetcher
     from coord.smoke import dispatch_pending_smoke
 
     board = read_board()
-    dispatched = dispatch_pending_smoke(board, config, gh_ops=github_ops)
+    dispatched = dispatch_pending_smoke(
+        board,
+        config,
+        gh_ops=github_ops,
+        issue_liveness_fetcher=github_issue_liveness_fetcher(config),
+    )
     if dispatched:
         write_board(board)
 

@@ -3898,6 +3898,116 @@ def test_dispatch_pending_smoke_keeps_skipping_a_fresh_passed_verdict(
     assert not mock_dispatch.called
 
 
+# ── #3375: the Test stage dispatches over `httpx` directly
+# (`_dispatch_smoke_legs` -> `_walk_candidates_and_dispatch`), bypassing
+# `coord.dispatch.dispatch()` entirely — so #3376's dispatch-liveness gate
+# (issue closed / branch already merged) never reached it. These pin the
+# opt-in `issue_liveness_fetcher` parameter this fix adds: a refusal must
+# record a `skipped` verdict (never leave the row silent) AND never reach
+# candidate walking; an "alive" answer must dispatch exactly as before. ──────
+
+
+def test_dispatch_pending_smoke_refuses_when_issue_already_closed(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    from unittest.mock import patch as _patch
+
+    from coord.state import _record_dispatched_assignment_local, load_assignment_test_state
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(), assignment_id="closed-issue-1")
+    _record_dispatched_assignment_local(assignment=row, repo_github="acme/api")
+    board = Board(completed=[row])
+
+    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+        return True, False  # issue closed, branch not (necessarily) merged
+
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(
+            board, gtk_and_server_config, issue_liveness_fetcher=fetcher,
+        )
+    assert result == []
+    assert not mock_dispatch.called, (
+        "a closed issue must never reach candidate walking (#3375)"
+    )
+    assert load_assignment_test_state(row.assignment_id) == "skipped", (
+        "a refused dispatch must record a verdict, not leave the gate "
+        "silent — a silent gate is the #3375 loop condition"
+    )
+
+
+def test_dispatch_pending_smoke_refuses_when_branch_already_merged(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    from unittest.mock import patch as _patch
+
+    from coord.state import _record_dispatched_assignment_local, load_assignment_test_state
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(), assignment_id="merged-branch-1")
+    _record_dispatched_assignment_local(assignment=row, repo_github="acme/api")
+    board = Board(completed=[row])
+
+    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+        return False, True  # branch already merged
+
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(
+            board, gtk_and_server_config, issue_liveness_fetcher=fetcher,
+        )
+    assert result == []
+    assert not mock_dispatch.called
+    assert load_assignment_test_state(row.assignment_id) == "skipped"
+
+
+def test_dispatch_pending_smoke_dispatches_when_liveness_fetcher_says_alive(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """The opt-in fetcher reporting an open issue and an unmerged branch
+    must not change ordinary dispatch behaviour at all."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(), assignment_id="alive-1")
+    board = Board(completed=[row])
+    sentinel = object()
+
+    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+        return False, False
+
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
+        result = dispatch_pending_smoke(
+            board, gtk_and_server_config, issue_liveness_fetcher=fetcher,
+        )
+    assert mock_dispatch.called
+    assert result == [sentinel]
+
+
+def test_dispatch_pending_smoke_default_fetcher_none_is_unaffected(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """No *issue_liveness_fetcher* wired in (the pre-#3375 default) refuses
+    nothing — byte-for-byte the old behaviour."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(), assignment_id="no-fetcher-1")
+    board = Board(completed=[row])
+    sentinel = object()
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+    assert mock_dispatch.called
+    assert result == [sentinel]
+
+
 def test_dispatch_pending_smoke_skips_row_verdicted_after_the_scan_snapshot(
     gtk_and_server_config: Config, monkeypatch,
 ) -> None:
