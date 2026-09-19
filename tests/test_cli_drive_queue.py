@@ -6179,6 +6179,50 @@ def test_reject_after_drops_a_reversed_edge_too(cli, declare):
     assert f"rejected via --reject-after (not applied): {REPO}#1090" in result.output
 
 
+def test_repositioning_an_already_queued_entry_reevaluates_the_direction(
+    cli, declare,
+):
+    # #3395 review: none of the tests above reposition an entry that is
+    # ALREADY queued — they only insert a brand-new one at `--position 0`,
+    # where there is nothing to remove first. Repositioning is exactly rule
+    # 3's case, and it needs its own comparison: `_move_drive_queue_entry_
+    # local` removes the target from its OLD slot before reinserting it,
+    # shifting every entry originally after it down by one — a comparison
+    # against the other entry's STALE, pre-removal position picks the WRONG
+    # direction here.
+    #
+    # T queued first (position 0), O queued second (position 1), same
+    # declared file. O's own `add` would normally auto-chain `O --after T`
+    # (the ordinary forward case, correct at the time — T ran first) —
+    # `--reject-after` skips that here so the queue starts with NO edge
+    # between them, isolating what this test is actually about: the
+    # direction rule 2 picks when T is repositioned, not whatever edge O's
+    # own earlier `add` happened to leave behind.
+    #
+    # Re-adding T with `--position 1` is a SWAP, not "T stays ahead of O": O
+    # ends up dispatching FIRST, T SECOND. The correct edge is therefore the
+    # ordinary forward one (T --after O). Unfixed code compares T's
+    # requested --position (1) against O's raw pre-move position (also 1),
+    # calls that a tie, and reverses it (O --after T) — ordering the entry
+    # that actually dispatches first to wait on the one that actually
+    # dispatches second.
+    declare(2001, "src/shared.rs")
+    assert cli("add", REPO, "2001").exit_code == 0  # T, lands at position 0
+
+    declare(2002, "src/shared.rs")
+    assert (
+        cli("add", REPO, "2002", "--reject-after", "2001").exit_code == 0
+    )  # O, lands at position 1, no edge yet
+
+    result = cli("add", REPO, "2001", "--position", "1")
+
+    assert result.exit_code == 0, result.output
+    positions = {r["issue_number"]: r["position"] for r in state._list_drive_queue_local()}
+    assert positions[2002] < positions[2001]  # O genuinely runs first now
+    assert queued(2001)["after_json"] == [f"{REPO}#2002"]  # forward: T after O
+    assert queued(2002)["after_json"] == []
+
+
 def test_a_reversed_edge_is_never_applied_against_an_in_flight_branch(
     cli, declare, seed, branch_diff,
 ):

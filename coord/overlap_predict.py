@@ -563,7 +563,12 @@ def paths_overlap(left: str, right: str) -> bool:
     return bool(right.endswith("/") and left.startswith(right))
 
 
-def overlap_would_run_before(new_position: int | None, other_position: int) -> bool:
+def overlap_would_run_before(
+    new_position: int | None,
+    other_position: int,
+    *,
+    previous_position: int | None = None,
+) -> bool:
     """#3395: would the entry landing at *new_position* dispatch BEFORE the
     already-queued entry sitting at *other_position*?
 
@@ -584,9 +589,28 @@ def overlap_would_run_before(new_position: int | None, other_position: int) -> b
     ``True``: inserting AT an occupied slot pushes the incumbent back one
     (`coord.state._move_drive_queue_entry_local`'s renumbering), so the
     newcomer is the one that ends up running first.
+
+    ``previous_position`` is the entry's OWN position before this call, when
+    it is already queued and being repositioned (``None`` for a brand-new
+    entry). `_move_drive_queue_entry_local` implements a reposition as
+    remove-then-reinsert: removing the entry from its old slot shifts every
+    entry that was originally AFTER it down by one index, before the entry
+    is reinserted at the clamped destination. `other_position` (taken from
+    the pre-write snapshot) does not reflect that shift, so comparing it
+    directly against `new_position` is only correct when nothing was
+    removed first — i.e. a brand-new entry, where `previous_position` is
+    `None`. When repositioning, and `other_position` was originally after
+    `previous_position` (the entry's own old slot), the removal already
+    moved `other` one slot earlier — accounted for here by comparing against
+    ``other_position - 1`` instead. Getting this backwards does not just
+    miss an edge (the pre-#3395 failure mode) — it applies the REVERSE edge,
+    ordering the entry that will actually dispatch first to wait on the one
+    that dispatches second.
     """
     if new_position is None:
         return False
+    if previous_position is not None and other_position > previous_position:
+        other_position -= 1
     return int(new_position) <= int(other_position)
 
 

@@ -236,6 +236,31 @@ def test_overlap_would_run_before_compares_explicit_positions():
     assert overlap_would_run_before(1, 1) is True
 
 
+def test_overlap_would_run_before_accounts_for_the_targets_own_removal_when_repositioning():
+    # #3395 review: `coord.state._move_drive_queue_entry_local` implements a
+    # reposition as remove-then-reinsert — removing the target from its OLD
+    # slot shifts every entry originally after it down by one index, before
+    # the target is reinserted at the (clamped) destination. The raw
+    # comparison above (no `previous_position`) is only correct for a
+    # brand-new entry, where nothing was removed first.
+    #
+    # T at position 0, O at position 1, both declare the same file. Re-adding
+    # T with --position 1 is a SWAP: O ends up dispatching first, T second —
+    # so the correct edge is the ordinary forward one (T --after O), i.e.
+    # this must resolve to False, even though the brand-new-entry (no
+    # `previous_position`) comparison of the same two raw numbers says True.
+    assert overlap_would_run_before(1, 1) is True  # brand-new entry: reverse
+    assert overlap_would_run_before(1, 1, previous_position=0) is False
+
+    # When `other`'s old slot was already AHEAD of the target's own old
+    # slot, the target's removal never shifted it — the raw, unshifted
+    # comparison already has the right answer baked in, so a non-`None`
+    # `previous_position` changes nothing here. O at position 0, target's
+    # own old slot at 2, target repositioned to 0: both end up wanting to
+    # run first, so O (now pushed to second) must wait on the target.
+    assert overlap_would_run_before(0, 0, previous_position=2) is True
+
+
 def test_overlap_describe_reversed_names_the_incumbent_and_the_newcomer():
     overlap = Overlap(
         key=f"{REPO}#1090",
