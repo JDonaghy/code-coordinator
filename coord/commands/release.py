@@ -1722,8 +1722,32 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # never touched would undo somebody else's deliberate state.
         from coord.agent_update import cli_initiator  # noqa: PLC0415
 
+        # #3364: narrow further, to the hosts the RED GATE ITSELF names.
+        # `--rollback-on-red` used to revert every host this run updated
+        # the moment ANY of them went red — four hosts that rolled and
+        # verified clean, reverted because a fifth could not roll at all.
+        # A host that rolled and verified is not part of the failure just
+        # because a sibling host's roll was; partial fleet convergence is
+        # strictly better than reverting everyone plus the fifth's own
+        # damage. `blocking_hosts` is `None` when the gate cannot attribute
+        # to specific hosts (a fleet-wide finding) — that must fail toward
+        # rolling back every updated host, the previous (safe) behavior,
+        # never toward rolling back none of them.
+        implicated = gate.blocking_hosts
+        targets = (
+            updated_hosts if implicated is None
+            else [h for h in updated_hosts if h in implicated]
+        )
+        spared = [h for h in updated_hosts if h not in targets]
+        if spared:
+            record.spared_rollback = spared
+            _out(
+                "  spared (rolled and verified, not named by the red gate): "
+                + ", ".join(spared)
+            )
+
         down: list[str] = []
-        for host in updated_hosts:
+        for host in targets:
             machine = by_name.get(host)
             if machine is None:
                 continue
@@ -2948,6 +2972,20 @@ def _rollback_host(
     take under systemd), and only then gives up — loudly, naming the host as
     DOWN rather than reporting a tidy "rolling back".
 
+    #3364: the agent answering ``/health`` again is not the end of the job
+    either. ``POST /rollback`` (``agent_app.py``'s ``rollback`` handler)
+    flips ``~/.coord-venv`` back and re-execs the AGENT — and, same gap
+    #2069 closed for the forward ``/update`` path, nothing about that
+    restarts ``coord-serve``/``coord-web``/``coord-drive-queue``. Left as
+    they were, those siblings keep running out of the slot the rollback
+    just deactivated — permanently orphaned on the slot the next ``/update``
+    must delete and rebuild, which is exactly the #2121 occupied-slot
+    deadlock this issue is about. So a confirmed agent restart here also
+    triggers the same ``_restart_sibling_services`` call `_roll_python` uses,
+    and a sibling that fails to come back on the reverted slot fails this
+    rollback's own verdict — "the venv flipped back" is not "the host is
+    back", same reasoning as #2095 for the forward roll.
+
     #2121: *initiator* names this call on the target host's audit trail, the
     same as ``_roll_python``'s own ``/update`` POST a few lines up — both are
     automation that fires during a fleet roll with nobody at a keyboard, so
@@ -2968,9 +3006,23 @@ def _rollback_host(
     if status != 202:
         return False, str(body.get("error") or f"HTTP {status}")
 
+    def _back_on_target(note: str) -> tuple[bool, str]:
+        """The agent answered ``/health`` on the reverted slot — re-home the
+        siblings onto it too (#3364) before this counts as done."""
+        sib_ok, sib_detail, _sib_failed = _restart_sibling_services(
+            machine, agent_port=agent_port
+        )
+        if sib_ok is False:
+            return False, f"{note}, but {sib_detail}"
+        # True (nothing failed) and None (this agent predates
+        # /restart-services — no channel to have restarted anything
+        # through) both still count as a rollback success: neither is a
+        # service THIS call took down.
+        return True, f"{note}; {sib_detail}"
+
     back, version = _wait_agent_back(machine, agent_port=agent_port, timeout=timeout)
     if back:
-        return True, f"rolled back; agent is serving again on v{version}"
+        return _back_on_target(f"rolled back; agent is serving again on v{version}")
 
     # The re-exec did not take. This is the documented systemd stall, and it
     # has a documented fix — apply it rather than handing the operator a
@@ -2981,7 +3033,7 @@ def _rollback_host(
             machine, agent_port=agent_port, timeout=min(timeout, 60.0)
         )
         if back:
-            return True, (
+            return _back_on_target(
                 f"rolled back; agent needed an SSH `systemctl --user restart "
                 f"coord-agent` but is serving again on v{version}"
             )
