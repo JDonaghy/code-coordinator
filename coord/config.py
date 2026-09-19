@@ -3071,6 +3071,23 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
             entry.get("quiet_hours"), machine_index=i, machine_name=name,
         )
 
+        # #3366: optional fact about which init system supervises this
+        # host's `coord agent` — see `Machine.supervisor`'s docstring for
+        # why it isn't inferred. Validated against the two names
+        # `coord.restart_cmd` actually knows rather than left free-form,
+        # so a typo (`launchD`, `Systemd`) fails config load loudly
+        # instead of silently falling through to the systemd default the
+        # same way an unset field does.
+        machine_supervisor = entry.get("supervisor")
+        if machine_supervisor is not None:
+            if not isinstance(machine_supervisor, str) or machine_supervisor not in (
+                "systemd", "launchd",
+            ):
+                raise ConfigError(
+                    f"machines[{i}].supervisor must be 'systemd' or 'launchd', "
+                    f"got {machine_supervisor!r}"
+                )
+
         # #3340: optional per-machine floor for the `/health` reachability
         # probe timeout — see `Machine.health_timeout`'s docstring for why
         # this exists instead of just raising `network.DEFAULT_TIMEOUT`.
@@ -3094,6 +3111,7 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
                 max_workers=machine_max_workers,
                 quiet_hours=quiet_hours,
                 health_timeout=machine_health_timeout,
+                supervisor=machine_supervisor,
             )
         )
     return machines

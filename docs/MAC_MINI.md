@@ -328,6 +328,16 @@ hostname default. And the tailnet peer's `HostName` is the literal "John's Mac m
 apostrophe, so `coord machine add`'s short-name tailnet lookup misses and reports
 `host_resolution_unknown` (`?`, not `✓`). The FQDN is correct; it writes anyway.
 
+**9. If the agent's self-restart ever wedges (#3363/#3366), the manual fix is
+`launchctl kickstart -k gui/$(id -u)/com.jdonaghy.coord-agent`** — the launchd equivalent of
+`systemctl --user restart coord-agent`, and every remediation string in the codebase now names it
+correctly on this host instead of the systemd command (#3366). `coord release propagate`'s SSH
+escalation (`coord.commands.agent_ops._escalate_restart`) tries this automatically as a fallback,
+in the same run, before ever reporting the host DOWN — no manual step needed unless that
+escalation itself fails. Optionally set `supervisor: launchd` on this machine's entry in
+`coordinator.yml` (`Machine.supervisor`) so every message that can't reach a live `/health` (an
+already-down host) still names the right command instead of falling back to the systemd default.
+
 ## Ongoing hygiene
 
 - Watch memory pressure before raising concurrency past 1.

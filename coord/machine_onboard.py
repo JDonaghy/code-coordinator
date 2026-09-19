@@ -96,6 +96,7 @@ from typing import TYPE_CHECKING
 # vocabulary is imported rather than restated so a third role added there
 # needs no edit here, and so no second default can drift into existence.
 from coord.deploy_manifest import ROLE_DAEMON, ROLE_WORKER
+from coord import restart_cmd
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
@@ -419,6 +420,11 @@ class MachineFacts:
     #: Diagnostic only — the verdict comes from the agent's own probes, never
     #: from re-deriving a lookup against this string.
     agent_path: str | None = None
+    #: #3366: "systemd" / "launchd" / None (unprobed, or neither finder
+    #: found the agent) — which init system supervises this host's agent,
+    #: read straight off the SSH probe above (`ShellProbe.supervisor`).
+    #: Only known when :attr:`shell_probed` is True.
+    supervisor: str | None = None
 
     # ── Layer 8: identity ────────────────────────────────────────────────
     identity: IdentityFacts = field(default_factory=IdentityFacts)
@@ -656,14 +662,27 @@ def _agent_path_from_launchd():
     return declared
 
 
+#: #3366: which finder actually answered the last `discover_agent_path()`
+#: call — "systemd", "launchd", or None (neither found anything). Same
+#: side-channel shape as `_LAUNCHD_LIVE_PATH` above: `discover_agent_path()`
+#: must keep returning a single string (it's shared by two scripts, see the
+#: module comment), so a caller that wants to know WHICH supervisor found
+#: the agent (`OUT["agent_supervisor"]` below, ultimately
+#: `MachineFacts.supervisor`) reads this global right after calling it.
+_AGENT_PATH_SOURCE = None
+
+
 def discover_agent_path():
     \"\"\"The PATH the coord agent process on THIS host runs with, or None.\"\"\"
-    for finder in (_agent_path_from_systemd, _agent_path_from_launchd):
+    global _AGENT_PATH_SOURCE
+    _AGENT_PATH_SOURCE = None
+    for source, finder in (("systemd", _agent_path_from_systemd), ("launchd", _agent_path_from_launchd)):
         try:
             found = finder()
         except Exception:
             found = None
         if found:
+            _AGENT_PATH_SOURCE = source
             return found
     return None
 
@@ -961,6 +980,11 @@ OUT["login_path"] = so.strip() or None
 # of the #1671 comparison works on a launchd host too, instead of silently
 # reporting None on every mac.
 OUT["agent_path"] = discover_agent_path()
+# #3366: which of the two finders above actually found it — "systemd",
+# "launchd", or null. Lets a PATH-fix remediation on the coordinator side
+# name the right override mechanism (a systemd drop-in vs. the plist's
+# EnvironmentVariables) instead of only ever describing the systemd one.
+OUT["agent_supervisor"] = _AGENT_PATH_SOURCE
 
 # ── role: #3128's resolver, on the host that owns the declaration ──────
 try:
@@ -1112,6 +1136,10 @@ class ShellProbe:
     login_path_tools: dict[str, str | None] = field(default_factory=dict)
     login_path: str | None = None
     agent_path: str | None = None
+    #: #3366: "systemd" / "launchd" / None — which finder in
+    #: `_AGENT_PATH_DISCOVERY` actually resolved `agent_path` above, i.e.
+    #: which supervisor is running the agent on the probed host.
+    supervisor: str | None = None
     role: str = ROLE_WORKER
     role_source: str = "default"
     role_valid: bool = True
@@ -1235,11 +1263,13 @@ def parse_shell_probe(stdout: str) -> ShellProbe:
         board_reason=_reason("board_reason"),
         backup_env_present=_tri("backup_env_present"),
     )
+    supervisor_raw = payload.get("agent_supervisor")
     return ShellProbe(
         role_error=redact(str(role_error)) if role_error else None,
         login_path_tools=tools,
         login_path=str(payload["login_path"]) if payload.get("login_path") else None,
         agent_path=str(payload["agent_path"]) if payload.get("agent_path") else None,
+        supervisor=str(supervisor_raw) if supervisor_raw in ("systemd", "launchd") else None,
         role=role,
         role_source=str(role_block.get("source") or "default"),
         role_valid=bool(role_block.get("valid", True)),
@@ -1443,6 +1473,7 @@ def gather_facts(
         facts.login_path_tools = probe.login_path_tools
         facts.login_path = probe.login_path
         facts.agent_path = probe.agent_path
+        facts.supervisor = probe.supervisor
         facts.identity = (
             probe.identity if probe.error is None
             else IdentityFacts(probed=False, error=probe.error)
@@ -2313,12 +2344,30 @@ def _toolchain_finding(facts: MachineFacts, prereq: "Prereq") -> Finding:
                     "retries forever, and no board readout says why"
                 ),
                 subject=prereq.tool,
+                # #3366: the override mechanism itself is supervisor-specific
+                # (a systemd drop-in vs. the launchd plist's own
+                # EnvironmentVariables), not just the trailing restart
+                # command — a launchd host has no `~/.config/systemd/user/`
+                # to write a drop-in into at all. `facts.supervisor` comes
+                # from the same SSH probe that found `agent_path` above, so
+                # this can only be `None` when that probe didn't run
+                # (`--ssh` omitted) or found neither — in which case the
+                # pre-#3366 systemd-only text is exactly right for every
+                # machine that predates this fix.
                 fix=(
+                    f"put {login}'s directory on the AGENT's PATH — edit this "
+                    "host's launchd plist's `EnvironmentVariables/PATH` "
+                    "(`~/Library/LaunchAgents/*coord-agent*.plist`), then "
+                    f"{restart_cmd.restart_hint(restart_cmd.LAUNCHD)}. Fixing "
+                    "your login shell's PATH changes nothing: the agent "
+                    "never reads it."
+                    if facts.supervisor == "launchd"
+                    else
                     f"put {login}'s directory on the AGENT's PATH — a `PATH=` line "
                     "in ~/.config/systemd/user/coord-agent.service.d/*.conf (or a "
                     "~/.local/bin shim, as deploy/node-shim.sh does for Node), then "
-                    "`systemctl --user restart coord-agent`. Fixing your login "
-                    "shell's PATH changes nothing: the agent never reads it."
+                    f"{restart_cmd.restart_hint(restart_cmd.SYSTEMD)}. Fixing your "
+                    "login shell's PATH changes nothing: the agent never reads it."
                 ),
             )
         where = (

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from coord import __version__, github_ops
+from coord import __version__, github_ops, restart_cmd
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
 
@@ -375,6 +375,16 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 version_line = f"  agent-version: {agent_version} ⚠ (coord is {__version__})"
             else:
                 version_line = f"  agent-version: {agent_version}"
+        # #3366: surface the non-default supervisor (launchd) up front,
+        # before it matters — "this agent is not running under systemd"
+        # used to only ever show up mid-incident, buried in a propagate
+        # run's output. Silent for the systemd case: that's every other
+        # machine in the fleet today, and naming it there would just be
+        # noise on every `coord status`.
+        live_supervisor = s.health.get("supervisor") if s.is_online and s.health else None
+        supervisor = restart_cmd.resolve_supervisor(m, live=live_supervisor)
+        if supervisor == restart_cmd.LAUNCHD:
+            version_line += "  supervisor: launchd"
         click.echo(f"    host: {m.host}  repos: {repos}{version_line}")
 
         # #1886 Path B: `/health` exposes `installed_version` (a disk read
@@ -399,7 +409,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 click.echo(
                     f"    ⚠ running v{running_version} but installed "
                     f"v{installed_version} — process hasn't restarted since "
-                    "its last update (`systemctl --user restart coord-agent` "
+                    f"its last update ({restart_cmd.restart_hint(supervisor)} "
                     "on that machine, or `coord agent update` to retry)"
                 )
 

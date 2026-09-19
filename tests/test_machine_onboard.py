@@ -1173,6 +1173,32 @@ def test_tool_on_login_path_but_not_the_agents_path_crits_naming_both_paths():
     assert "coord-agent" in (finding.fix or "")
 
 
+def test_path_trap_fix_names_launchd_plist_not_systemd_on_a_mac(monkeypatch):
+    """#3366: the #1671 fix text used to unconditionally point at a systemd
+    drop-in and `systemctl --user restart coord-agent` — the wrong file AND
+    the wrong command on a launchd host, which has no
+    `~/.config/systemd/user/` to write a drop-in into at all. When the SSH
+    probe identified this host's agent as launchd-supervised
+    (`facts.supervisor`), the fix must name the plist and
+    `launchctl kickstart`, not the systemd machinery."""
+    facts = _tc_facts(
+        tool_probes={"cargo": _probe("cargo", found=False, capability="rust")},
+        shell_probed=True,
+        login_path_tools={"cargo": "/Users/j/.cargo/bin/cargo"},
+        login_path="/Users/j/.cargo/bin:/usr/bin",
+        agent_path="/Users/j/.coord-venv/bin:/usr/bin",
+        supervisor="launchd",
+    )
+    finding = _find(machine_onboard.evaluate_toolchain(facts), "toolchain.tool_off_agent_path")
+    assert finding is not None
+    fix = finding.fix or ""
+    assert "launchctl kickstart" in fix
+    assert "LaunchAgents" in fix
+    # The systemd-only remedy must not leak into a launchd host's fix text.
+    assert "systemctl" not in fix
+    assert "coord-agent.service.d" not in fix
+
+
 def test_a_genuinely_absent_tool_is_not_reported_as_the_path_trap():
     """The counterweight: if the login shell cannot find it either, this is an
     ordinary missing tool and must not be dressed up as a PATH problem —

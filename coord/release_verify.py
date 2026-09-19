@@ -60,6 +60,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
+from coord import restart_cmd
+
 # Lane severities, deliberately the same vocabulary as coord.health so a
 # reader moving between `coord health` and `coord release verify` never has
 # to translate. UNKNOWN outranks OK (an unverified lane is not a verified
@@ -342,8 +344,8 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
                     "is not a host that is merely behind: a blue/green swap "
                     "never produces this, so something wrote into the venv "
                     "colour a live process was executing from (#2121). "
-                    "Restart it (`systemctl --user restart coord-agent`) and "
-                    "find the install in `coord audit --type venv_install`."
+                    f"Restart it ({restart_cmd.restart_hint((health or {}).get('supervisor'))}) "
+                    "and find the install in `coord audit --type venv_install`."
                 ),
             )
         )

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import click
 import httpx
 
-from coord import __version__
+from coord import __version__, restart_cmd
 # Aliased: `agent_update` is also the name of this module's click command.
 from coord.agent_update import cli_initiator as _cli_initiator
 from coord.config import Config
@@ -726,10 +726,12 @@ def agent_update(
                 err = outcome.get("error") or "pip failed; see ~/.coord/last_update.log"
                 click.echo(f"  {machine.name}: ✗ failed — {err}", err=True)
             elif outcome.get("escalated"):
+                hint = restart_cmd.resolve_supervisor(machine, live=outcome.get("supervisor"))
                 click.echo(
                     f"  {machine.name}: ✗ pip upgraded to {target_version} but the "
-                    f"process is stuck reporting {version_now} even after a "
-                    "`systemctl --user restart` — needs manual investigation",
+                    f"process is stuck reporting {version_now} even after a driven "
+                    f"restart ({restart_cmd.restart_shell_command(hint)}) — needs "
+                    "manual investigation",
                     err=True,
                 )
             elif not outcome.get("came_online"):
@@ -743,12 +745,15 @@ def agent_update(
                     # Distinguishing this from a bare "still reporting X"
                     # is the whole point: it says the process needs a
                     # restart, not another pip attempt.
+                    hint = restart_cmd.resolve_supervisor(
+                        machine, live=outcome.get("supervisor")
+                    )
                     click.echo(
                         f"  {machine.name}: ✗ installed {installed_now} but the "
                         f"running process still reports {version_now} (expected "
                         f"{target_version}) — it hasn't restarted since the "
-                        "update; try `systemctl --user restart coord-agent` "
-                        "on that machine",
+                        f"update; try {restart_cmd.restart_hint(hint)} on that "
+                        "machine",
                         err=True,
                     )
                 else:
@@ -1169,6 +1174,7 @@ def _wait_agents_updated(
             "result": None,
             "error": None,
             "escalated": False,
+            "supervisor": None,
         }
         for m in machines
     }
@@ -1199,6 +1205,11 @@ def _wait_agents_updated(
         info["result"] = last.get("result")
         info["error"] = last.get("error")
         info["version_before"] = last.get("version_before")
+        # #3366: the agent's own live self-report — when this ever
+        # disagrees with the machine's static `supervisor:` config, this
+        # wins (see `restart_cmd.resolve_supervisor`), because it's the
+        # host answering right now, not a fact someone typed once.
+        info["supervisor"] = health.get("supervisor")
 
         if machine.name in pre:
             pre_val = pre[machine.name]
@@ -1255,7 +1266,8 @@ def _wait_agents_updated(
 
 
 def _escalate_restart(machine) -> bool:
-    """Best-effort ``systemctl --user restart coord-agent`` over SSH.
+    """Best-effort driven restart of ``coord-agent`` over SSH — systemd or
+    launchd, whichever the target host actually runs (#3366).
 
     #404 / #1568: ``/update``'s ``os.execv`` self-restart does not take
     under systemd — same PID, stale version.  ``XDG_RUNTIME_DIR=/run/user/
@@ -1263,17 +1275,44 @@ def _escalate_restart(machine) -> bool:
     silently no-ops in a non-interactive SSH session.  See
     docs/AGENT_OPERATIONS.md for the manual runbook this automates.
 
-    Returns True if the ssh command itself exited 0 — NOT whether the
-    agent actually came back on the new version; the caller re-polls
-    /health afterwards to confirm that.
+    #3366: macOS ships no systemd at all, so the command above always
+    failed there — this was the whole escalation channel, and a fleet mac
+    (``docs/MAC_MINI.md``) simply had none: no automated recovery, and
+    every operator-facing message also only ever named ``systemctl``. The
+    working command is ``launchctl kickstart -k gui/<uid>/<label>``
+    (:mod:`coord.restart_cmd`). Rather than branching ahead of time on
+    possibly-stale config, the remote shell tries systemd FIRST — zero
+    behaviour change for the rest of the fleet — and only falls back to
+    launchd when ``systemctl`` genuinely isn't there to ask, discovering
+    the real launchd Label from the host's own plist (falling back to
+    :data:`coord.restart_cmd.LAUNCHD_LABEL` only if that read fails) so
+    this keeps working even if a second mac ever uses a different label.
+
+    Returns True if a restart command itself exited 0 on the target host —
+    NOT whether the agent actually came back on the new version; the
+    caller re-polls /health afterwards to confirm that.
     """
+    from coord.restart_cmd import LAUNCHD_LABEL  # noqa: PLC0415
+
+    remote_script = (
+        "if command -v systemctl >/dev/null 2>&1 && "
+        "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent "
+        "2>/dev/null; then exit 0; fi; "
+        'plist=$(ls "$HOME/Library/LaunchAgents"/*coord-agent*.plist 2>/dev/null | head -1); '
+        'if [ -n "$plist" ]; then '
+        "label=$(/usr/libexec/PlistBuddy -c 'Print :Label' \"$plist\" 2>/dev/null); "
+        f'label="${{label:-{LAUNCHD_LABEL}}}"; '
+        'exec launchctl kickstart -k "gui/$(id -u)/$label"; '
+        "fi; "
+        "exit 1"
+    )
     cmd = [
         "ssh",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
         "-o", "StrictHostKeyChecking=accept-new",
         machine.host,
-        "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent",
+        remote_script,
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)

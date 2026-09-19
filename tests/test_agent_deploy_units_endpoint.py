@@ -275,3 +275,37 @@ def test_a_bodyless_post_is_accepted(client, lane):
 def test_the_endpoint_is_in_the_served_openapi_spec(client):
     spec = client.get("/openapi.json").json()
     assert "/deploy-units" in spec["paths"]
+
+
+def test_no_systemd_on_this_host_is_an_honest_nop_not_22_new_units(
+    client, lane, monkeypatch
+):
+    """#3366: this lane is systemd-unit management. On a host with no
+    `systemctl` at all (every macOS agent) every packaged unit reads as
+    "new"/"not installed here" forever — that's the platform, not drift,
+    and reporting it as noise on every propagation run trains the operator
+    to ignore this lane. The endpoint must short-circuit BEFORE calling
+    `du.install_units` at all, so the response never claims to have looked
+    at units it structurally cannot manage here."""
+    dest, reloads = lane
+    monkeypatch.setattr("shutil.which", lambda name: None if name == "systemctl" else "/bin/true")
+    resp = client.post("/deploy-units", json={})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["units"] == []
+    assert "n/a" in body["detail"]
+    assert "no systemd" in body["detail"]
+    # Never touched the filesystem lane at all.
+    assert reloads == []
+    assert (dest / "coord-agent.service").read_text() == "[Service]\nExecStart=stale\n"
+
+
+def test_no_systemd_detail_names_the_known_supervisor(client, monkeypatch):
+    """A launchd host's n/a response should say so, not just "unknown" —
+    the whole point of #3366 is naming the actual supervisor everywhere."""
+    monkeypatch.setattr("shutil.which", lambda name: None if name == "systemctl" else "/bin/true")
+    monkeypatch.setattr("coord.restart_cmd.local_supervisor", lambda: "launchd")
+    resp = client.post("/deploy-units", json={})
+    assert resp.status_code == 200
+    assert "launchd" in resp.json()["detail"]

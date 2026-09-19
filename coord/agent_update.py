@@ -85,6 +85,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from coord import restart_cmd
 from coord.platform_paths import venv_exe, venv_pip, venv_python
 
 _log = logging.getLogger(__name__)
@@ -698,8 +699,8 @@ def perform_update(
             f"and rebuild — {listed}. Replacing a running process's "
             "site-packages leaves it executing a mix of two versions (the "
             "2026-08-11 dellserver incident, #2121). Restart or stop those "
-            "processes — `systemctl --user restart coord-agent` for the "
-            "agent — and retry.",
+            f"processes — {restart_cmd.restart_hint(restart_cmd.local_supervisor())} "
+            "for the agent — and retry.",
             holders=[
                 {"pid": h.pid, "source": h.source, "cmdline": h.cmdline}
                 for h in holders[:20]

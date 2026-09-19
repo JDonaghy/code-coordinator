@@ -982,6 +982,39 @@ class TestEscalateRestart:
 
         assert ok is False
 
+    def test_the_remote_script_falls_back_to_launchd_kickstart(self) -> None:
+        """#3366: macOS has no systemd at all, so the systemctl branch above
+        always failed there with no fallback — the whole escalation channel
+        was missing for a launchd host. The remote shell must try systemd
+        FIRST (unchanged behaviour for the rest of the fleet) and fall back
+        to discovering the host's own launchd Label from its plist and
+        running `launchctl kickstart -k`, rather than requiring the caller
+        to know ahead of time which supervisor the target runs."""
+        from coord.commands.agent_ops import _escalate_restart
+        from coord.restart_cmd import LAUNCHD_LABEL
+
+        machine = MagicMock()
+        machine.host = "macmini.tailnet"
+
+        with patch("coord.commands.agent_ops.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            ok = _escalate_restart(machine)
+
+        assert ok is True
+        cmd = mock_run.call_args[0][0]
+        script = cmd[-1]
+        # systemd is tried first — a no-op change for every existing host.
+        assert script.index("systemctl --user restart coord-agent") < script.index(
+            "launchctl kickstart"
+        )
+        assert "LaunchAgents" in script
+        assert "launchctl kickstart -k" in script
+        assert 'gui/$(id -u)/"$label"' in script or 'gui/$(id -u)/$label' in script
+        # The fleet-wide constant is the fallback if the plist's own Label
+        # can't be read — never the ONLY source, so a differently-labelled
+        # mac still works.
+        assert LAUNCHD_LABEL in script
+
 
 # ── #1886: PyPI-resolved target version ────────────────────────────────────
 
