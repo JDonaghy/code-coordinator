@@ -2017,13 +2017,18 @@ def build_app(
                     break
                 time.sleep(1)
 
-            # Cancel any workers that are still running.
-            with server._lock:
-                pending_ids = [
-                    aid
-                    for aid, a in server._assignments.items()
-                    if a.status in (PENDING, RUNNING)
-                ]
+            # Cancel any workers that are still running. #3363 review: reuse
+            # the shared predicate rather than re-deriving PENDING/RUNNING
+            # via a second raw scan over `server._assignments` — by now any
+            # true phantom (confirmed-dead process, no terminal status) has
+            # already been finalized to FAILED by the `active_assignment_count()`
+            # polls above, so a raw scan would agree with this today, but a
+            # second copy of the same question right next to the shared
+            # predicate is exactly the split `active_assignment_count()` was
+            # introduced to eliminate — and `_active_assignment_ids()` is the
+            # one that also knows to leave a still-alive process's record
+            # alone rather than mis-scan it as gone.
+            pending_ids = list(server._active_assignment_ids())
             for aid in pending_ids:
                 try:
                     # #1567: this is an infra-triggered restart, not an
