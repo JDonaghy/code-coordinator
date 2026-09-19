@@ -46,6 +46,7 @@ from coord.drive_queue import (
     APPLY_APPLIED,
     APPLY_FAILED,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_PARALLEL,
     DEFAULT_MAX_PARALLEL_PER_REPO,
     HOLD_FIRED,
     HOLD_RELEASED,
@@ -77,6 +78,7 @@ from coord.drive_queue import (
     add_preflight_notice,
     apply_gate_status,
     build_board_view,
+    default_max_parallel,
     detect_unreachable_waits,
     diagnose_blocked_after,
     effective_max_fix_rounds,
@@ -5248,12 +5250,25 @@ def _blocked_escalation_command(entry: QueueEntry | None, key: str, reason: str)
 @click.option(
     "--max-parallel",
     type=int,
-    default=1,
-    show_default=True,
+    default=None,
     help=(
-        "Concurrency ceiling. Capacity is counted from BOARD state, not from a "
-        "session count, so a drive whose observer hit its deadline (#1660) "
-        "still occupies a slot."
+        "Global concurrency ceiling. Capacity is counted from BOARD state, "
+        "not from a session count, so a drive whose observer hit its "
+        "deadline (#1660) still occupies a slot. Omit this flag to use "
+        "pipeline.max_parallel from coordinator.yml (or, absent that, a "
+        "derivation from the fleet's own shape — repo count times the "
+        "resolved --max-parallel-per-repo, clamped to "
+        "concurrency.max_workers, see coord.drive_queue."
+        "default_max_parallel; falling back further, if the config itself "
+        f"can't be read, to {DEFAULT_MAX_PARALLEL}, #3388) — passing it "
+        "explicitly always wins over both. #3388: a hardcoded constant here "
+        "(coord-drive-queue.service used to pin --max-parallel 4) silently "
+        "starves every repo but the first couple once "
+        "--max-parallel-per-repo can exceed 1 — prefer the config setting "
+        "over a systemd drop-in for the same reason #2573 gives for "
+        "--max-parallel-per-repo: a drop-in has to restate the packaged "
+        "unit's whole ExecStart= to change just this flag, and that copy "
+        "silently drifts from the packaged unit's other flags over time."
     ),
 )
 @click.option(
@@ -5301,7 +5316,7 @@ def _blocked_escalation_command(entry: QueueEntry | None, key: str, reason: str)
 )
 @_CONFIG_OPTION
 def drive_queue_tick(
-    max_parallel: int,
+    max_parallel: int | None,
     max_parallel_per_repo: int | None,
     dry_run: bool,
     reconcile_only: bool,
@@ -5338,6 +5353,20 @@ def drive_queue_tick(
     reverted #2314's pinned-venv `ExecStart=` right back to a
     worker-overwritable path as an unnoticed side effect).
 
+    #3388: `--max-parallel` resolves the SAME way, one level up — the flag on
+    THIS invocation, when given; else `pipeline.max_parallel` from
+    `coordinator.yml`; else `coord.drive_queue.default_max_parallel`'s
+    derivation from the fleet's own shape (repo count times the
+    ALREADY-RESOLVED `--max-parallel-per-repo` above, clamped to
+    `concurrency.max_workers`); else, only if the config itself could not be
+    read at all, `coord.drive_queue.DEFAULT_MAX_PARALLEL` (1). A hardcoded
+    `--max-parallel` on the deployed systemd unit is exactly the failure mode
+    this closes: #2012 set it to the repo count when `--max-parallel-per-repo`
+    always defaulted to 1, #2057 raised it once by hand for a fifth repo, and
+    neither update survived #2573 letting the per-repo ceiling exceed 1 — two
+    repos alone then reach a stale global ceiling and starve every other repo
+    in the fleet, forever, however deep their own queues are.
+
     `--max-parallel 0` (or `--reconcile-only`, the readable spelling of the
     same thing — #2110) reconciles every `running` entry against the board and
     then stops: no capacity walk, no deferrals, no queue-level alert, no
@@ -5369,24 +5398,37 @@ def drive_queue_tick(
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
 
-    if max_parallel < 0:
-        raise click.ClickException(
-            "--max-parallel must be at least 0 (0 = reconcile-only, launch "
-            "nothing this run — see --reconcile-only)"
-        )
+    # Loaded at most once, shared by both ceilings' config-default resolution
+    # below (#3388's `max_parallel` derivation needs the same config
+    # `max_parallel_per_repo` already reads, plus `repos`/`concurrency`) —
+    # `None` on the documented fail-open path, same posture as every other
+    # best-effort config read on this path (an unreadable config must never
+    # abort the tick).
+    _resolved_config: Config | None = None
+    _config_load_attempted = False
+
+    def _config_for_defaults() -> Config | None:
+        nonlocal _resolved_config, _config_load_attempted
+        if not _config_load_attempted:
+            _config_load_attempted = True
+            try:
+                from coord.commands._common import _load_config  # noqa: PLC0415
+
+                _resolved_config = _load_config(config_path)
+            except Exception:  # noqa: BLE001 — an unreadable config must not abort the tick
+                _resolved_config = None
+        return _resolved_config
 
     # #2573: an explicit `--max-parallel-per-repo` always wins; otherwise
     # fall back to the fleet-wide `pipeline.max_parallel_per_repo` in
     # coordinator.yml, and only then to the hardcoded default. Resolved
-    # BEFORE validation below so a bad value from either source is caught
-    # the same way regardless of which one supplied it.
+    # BEFORE `--max-parallel` (#3388's derivation multiplies BY this
+    # already-resolved value) and before validation below, so a bad value
+    # from either source is caught the same way regardless of which one
+    # supplied it.
     if max_parallel_per_repo is None:
-        try:
-            from coord.commands._common import _load_config  # noqa: PLC0415
-
-            config_default = _load_config(config_path).pipeline.max_parallel_per_repo
-        except Exception:  # noqa: BLE001 — an unreadable config must not abort the tick
-            config_default = None
+        _cfg = _config_for_defaults()
+        config_default = None if _cfg is None else _cfg.pipeline.max_parallel_per_repo
         max_parallel_per_repo = (
             DEFAULT_MAX_PARALLEL_PER_REPO if config_default is None else config_default
         )
@@ -5394,6 +5436,35 @@ def drive_queue_tick(
     if max_parallel_per_repo < 0:
         raise click.ClickException(
             "--max-parallel-per-repo must be 0 (no per-repo ceiling) or more"
+        )
+
+    # #3388: an explicit `--max-parallel` always wins; otherwise
+    # `pipeline.max_parallel` from coordinator.yml; otherwise derive it from
+    # the fleet's own shape (repo count * the per-repo ceiling just resolved
+    # above, clamped to the fleet's real worker capacity) rather than fall
+    # back to a hand-maintained constant that goes stale the moment either
+    # side changes — see `coord.drive_queue.default_max_parallel`. Only when
+    # the config itself could not be read at all (so neither the fleet
+    # default nor the fleet shape is known) does this fall back to the
+    # hardcoded `DEFAULT_MAX_PARALLEL`.
+    if max_parallel is None:
+        _cfg = _config_for_defaults()
+        config_max_parallel = None if _cfg is None else _cfg.pipeline.max_parallel
+        if config_max_parallel is not None:
+            max_parallel = config_max_parallel
+        elif _cfg is not None:
+            max_parallel = default_max_parallel(
+                repo_count=len(_cfg.repos),
+                max_parallel_per_repo=max_parallel_per_repo,
+                max_workers_cap=_cfg.concurrency.max_workers,
+            )
+        else:
+            max_parallel = DEFAULT_MAX_PARALLEL
+
+    if max_parallel < 0:
+        raise click.ClickException(
+            "--max-parallel must be at least 0 (0 = reconcile-only, launch "
+            "nothing this run — see --reconcile-only)"
         )
 
     # #2110: `--reconcile-only` and `--max-parallel 0` are the same request —
