@@ -218,7 +218,25 @@ Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:
 # override directory cannot drift.
 ExecStart=%h/.coord-venv/bin/coord drive-queue tick --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
-# (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
-# the timer's 15-minute cadence (coord-drive-queue.timer) so a genuinely
-# wedged tick can't run into the next fire.
+# (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py). #3413: the
+# second half of that sentence USED to read "but well below the timer's
+# 15-minute cadence" — the timer has fired every 3 minutes
+# (`OnUnitActiveSec=3min`, coord-drive-queue.timer) for a long time, so 300s
+# is roughly 1.7 timer periods, NOT a fraction of one. A wedged tick can and
+# does run past the next fire; the overlapping invocation simply loses the
+# race for the tick's flock and exits 0.
+#
+# That is load-bearing for the #3413 guard, so state it once here where an
+# operator editing this value will see it: because `flock` is released by the
+# KERNEL when the holder dies (coord/filelock.py's module docstring), this
+# timeout means no systemd-invoked tick can hold the drive-queue lock much
+# past ~300s — it gets SIGTERM/SIGKILLed and the lock drops. Any detector
+# keyed on "how long has ONE unbroken lock-contention streak run" is
+# therefore blind to the repeating case (hang -> killed at 300s -> fresh tick
+# hangs the same way), which is why
+# `DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS` in
+# coord/commands/drive_queue.py measures time since any tick last COMPLETED
+# an evaluation instead, and sizes its window off this value plus the timer's
+# cadence. If you change TimeoutStartSec, re-check that arithmetic — it is
+# written out in full at that constant.
 TimeoutStartSec=300
