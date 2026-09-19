@@ -32,6 +32,8 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
     _COMPLETED_HISTORY_CAP,
+    _DEFAULT_RUNTIME_CEILING_S,
+    _PHANTOM_AGE_MARGIN_S,
     _PHANTOM_ASSIGNMENT_MAX_AGE_S,
     _WIP_RESCUE_TYPES,
     _ZERO_COMMIT_TYPES,
@@ -5656,6 +5658,119 @@ class TestActiveAssignmentCount:
             started_at=now - _PHANTOM_ASSIGNMENT_MAX_AGE_S,
         )
         assert server.active_assignment_count(now=now) == 1
+
+    def test_stale_but_confirmed_alive_process_is_never_finalized(
+        self, tmp_path: Path
+    ) -> None:
+        """#3363 review: a stale timestamp is not proof of death. A record
+        whose `self._processes` entry is still alive (`proc.poll() is
+        None`) must stay active and untouched no matter how far past the
+        age ceiling it looks — finalizing it here would orphan the real
+        subprocess with no WIP push (see `cancel()`'s push_mode handling),
+        since a FAILED record no longer shows up in `/restart`'s
+        `pending_ids` scan that would otherwise gracefully cancel it."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 1_000_000.0
+        server._assignments["stuck-but-alive"] = AgentAssignment(
+            id="stuck-but-alive", spec=spec, status=RUNNING,
+            started_at=now - _PHANTOM_ASSIGNMENT_MAX_AGE_S - 3600.0,
+        )
+        server._processes["stuck-but-alive"] = _FakeProc(alive=True)
+
+        assert server.active_assignment_count(now=now) == 1
+        assert server._assignments["stuck-but-alive"].status == RUNNING, (
+            "a confirmed-alive process must never be force-finalized"
+        )
+
+    def test_stale_and_confirmed_exited_process_is_finalized(
+        self, tmp_path: Path
+    ) -> None:
+        """The mirror case: a `self._processes` entry that HAS exited
+        (`proc.poll()` returns a real code) is confirmed dead, so a stale
+        record for it is still a genuine phantom and gets finalized exactly
+        like the no-process-at-all case."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 1_000_000.0
+        server._assignments["dead-proc"] = AgentAssignment(
+            id="dead-proc", spec=spec, status=RUNNING,
+            started_at=now - _PHANTOM_ASSIGNMENT_MAX_AGE_S - 3600.0,
+        )
+        server._processes["dead-proc"] = _FakeProc(alive=False)
+
+        assert server.active_assignment_count(now=now) == 0
+        assert server._assignments["dead-proc"].status == FAILED
+
+    def test_ceiling_scales_with_agent_configured_runtime_ceiling_s(
+        self, tmp_path: Path
+    ) -> None:
+        """#3363 review: an operator-raised fleet-wide
+        `runtime_ceiling_s` must raise the phantom-age ceiling to match,
+        not get silently overridden by the hardcoded
+        `_DEFAULT_RUNTIME_CEILING_S`. A record aged past the OLD
+        (default-derived) ceiling but within the new, higher one must
+        still count as active."""
+        repo = _init_repo(tmp_path / "repo")
+        raised_ceiling = _DEFAULT_RUNTIME_CEILING_S * 3
+        server = _server(tmp_path, repo_path=repo, runtime_ceiling_s=raised_ceiling)
+        spec = self._make_spec(repo)
+        now = 1_000_000.0
+        # Older than the old hardcoded 7h ceiling, but well inside the
+        # raised one — with no live process, so the only thing that could
+        # keep it active is the ceiling resolution itself.
+        server._assignments["long-runner"] = AgentAssignment(
+            id="long-runner", spec=spec, status=RUNNING,
+            started_at=now - _PHANTOM_ASSIGNMENT_MAX_AGE_S - 3600.0,
+        )
+        assert server.active_assignment_count(now=now) == 1
+        assert server._assignments["long-runner"].status == RUNNING
+
+        # But it's still finite: well past the RAISED ceiling, it's a
+        # phantom again.
+        now2 = now + raised_ceiling + _PHANTOM_AGE_MARGIN_S + 3600.0
+        assert server.active_assignment_count(now=now2) == 0
+        assert server._assignments["long-runner"].status == FAILED
+
+    def test_ceiling_scales_with_per_assignment_spec_override(
+        self, tmp_path: Path
+    ) -> None:
+        """Same as above, but the override comes from
+        `AssignmentSpec.runtime_ceiling_s` (a per-leg override) rather than
+        the agent's own default — mirroring `_reap`'s own resolution order,
+        where a positive per-leg value wins."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        raised_ceiling = _DEFAULT_RUNTIME_CEILING_S * 3
+        spec = AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo),
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+            runtime_ceiling_s=raised_ceiling,
+        )
+        now = 1_000_000.0
+        server._assignments["long-runner"] = AgentAssignment(
+            id="long-runner", spec=spec, status=RUNNING,
+            started_at=now - _PHANTOM_ASSIGNMENT_MAX_AGE_S - 3600.0,
+        )
+        assert server.active_assignment_count(now=now) == 1
+        assert server._assignments["long-runner"].status == RUNNING
+
+
+class _FakeProc:
+    """Minimal stand-in for `subprocess.Popen` exercising only `.poll()`,
+    for `_active_assignment_ids`'s liveness check (#3363 review)."""
+
+    def __init__(self, *, alive: bool) -> None:
+        self._alive = alive
+
+    def poll(self) -> int | None:
+        return None if self._alive else 0
 
 
 # ── #1421: _persist() must not race on a shared tmp file, and a corrupt
