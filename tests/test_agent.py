@@ -32,6 +32,7 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
     _COMPLETED_HISTORY_CAP,
+    _PHANTOM_ASSIGNMENT_MAX_AGE_S,
     _WIP_RESCUE_TYPES,
     _ZERO_COMMIT_TYPES,
     _base_checkout_write_guard_tools,
@@ -5534,6 +5535,127 @@ class TestCompletedHistoryCap:
             f"list_assignments() returned {len(listing['completed'])} completed items, "
             f"expected ≤ {_COMPLETED_HISTORY_CAP}"
         )
+
+
+# ── #3363: a PENDING/RUNNING assignment that never reaches a terminal
+# status must not be trusted as "busy" forever — `active_assignment_count`
+# is the one shared predicate every restart path in `coord/agent_app.py`
+# now calls, and it ages out (and finalizes) any such phantom entry ─────────
+
+class TestActiveAssignmentCount:
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def test_genuinely_running_assignment_counts_as_active(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 10_000.0
+        server._assignments["fresh"] = AgentAssignment(
+            id="fresh", spec=spec, status=RUNNING, started_at=now - 60.0,
+        )
+        assert server.active_assignment_count(now=now) == 1
+        assert server._assignments["fresh"].status == RUNNING, (
+            "a genuinely fresh RUNNING assignment must not be touched"
+        )
+
+    def test_genuinely_pending_assignment_counts_as_active(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 10_000.0
+        server._assignments["fresh"] = AgentAssignment(
+            id="fresh", spec=spec, status=PENDING, created_at=now - 5.0,
+        )
+        assert server.active_assignment_count(now=now) == 1
+
+    def test_phantom_running_assignment_ages_out_and_is_finalized(
+        self, tmp_path: Path
+    ) -> None:
+        """#3363: macmini's actual shape — a RUNNING record that outlived
+        even the runtime-ceiling watchdog by a wide margin, with no
+        terminal status ever written back. Must stop counting as busy AND
+        get flipped to a terminal status so it stops looking active on
+        every other surface (`/status`, `coord usage`) too — not merely
+        excluded from this one count."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 1_000_000.0
+        stale_started_at = now - _PHANTOM_ASSIGNMENT_MAX_AGE_S - 1.0
+        server._assignments["phantom"] = AgentAssignment(
+            id="phantom", spec=spec, status=RUNNING, started_at=stale_started_at,
+        )
+        assert server.active_assignment_count(now=now) == 0
+
+        finalized = server._assignments["phantom"]
+        assert finalized.status == FAILED
+        assert finalized.finished_at == now
+        assert "phantom assignment" in (finalized.error or "")
+        assert "#3363" in (finalized.error or "")
+
+        # And the finalization must actually be durable, not just in-memory
+        # bookkeeping this one call happened to mutate.
+        persisted = json.loads(server.state_path.read_text())
+        persisted_entry = next(
+            a for a in persisted["assignments"] if a["id"] == "phantom"
+        )
+        assert persisted_entry["status"] == FAILED
+
+    def test_phantom_pending_assignment_ages_out(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 1_000_000.0
+        stale_created_at = now - _PHANTOM_ASSIGNMENT_MAX_AGE_S - 1.0
+        server._assignments["phantom-pending"] = AgentAssignment(
+            id="phantom-pending", spec=spec, status=PENDING,
+            created_at=stale_created_at,
+        )
+        assert server.active_assignment_count(now=now) == 0
+        assert server._assignments["phantom-pending"].status == FAILED
+
+    def test_mixed_real_and_phantom_only_counts_the_real_one(
+        self, tmp_path: Path
+    ) -> None:
+        """The exact macmini shape: `coord usage`/the board show zero real
+        work, but a phantom sat in the map — count must reflect ONLY
+        genuine activity, never the phantom, while still finalizing it."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 1_000_000.0
+        server._assignments["real"] = AgentAssignment(
+            id="real", spec=spec, status=RUNNING, started_at=now - 30.0,
+        )
+        server._assignments["phantom"] = AgentAssignment(
+            id="phantom", spec=spec, status=RUNNING,
+            started_at=now - _PHANTOM_ASSIGNMENT_MAX_AGE_S - 1.0,
+        )
+        assert server.active_assignment_count(now=now) == 1
+        assert server._assignments["real"].status == RUNNING
+        assert server._assignments["phantom"].status == FAILED
+
+    def test_assignment_right_at_the_ceiling_still_counts(self, tmp_path: Path) -> None:
+        """Boundary: exactly at the max age is still trusted — only
+        strictly older is a phantom. Guards against an off-by-one flipping
+        a worker that is running right up against its own runtime ceiling."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        now = 1_000_000.0
+        server._assignments["boundary"] = AgentAssignment(
+            id="boundary", spec=spec, status=RUNNING,
+            started_at=now - _PHANTOM_ASSIGNMENT_MAX_AGE_S,
+        )
+        assert server.active_assignment_count(now=now) == 1
 
 
 # ── #1421: _persist() must not race on a shared tmp file, and a corrupt
