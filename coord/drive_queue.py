@@ -686,6 +686,15 @@ QUEUE_ALERT_REPO = "(drive-queue)"
 QUEUE_ALERT_ISSUE = 0
 QUEUE_ALERT_STAGE = "drive-queue"
 
+#: #3413: a DISPLAY hint only — production's `coord-drive-queue.timer` fires
+#: every 3 minutes (`OnUnitActiveSec=3min`, `deploy/coord-drive-queue.timer`),
+#: not a value this module reads from the deployed unit (there is no seam to
+#: read it through: the timer is systemd config on the daemon host, not
+#: `coordinator.yml`). `coord drive-queue status`'s stale-alert caveat quotes
+#: this so "longer than the tick interval" names a concrete number instead of
+#: sending the operator to go look one up — see the caveat's own call site.
+PRODUCTION_TICK_INTERVAL_HINT_SECONDS = 180.0
+
 
 class QueueError(ValueError):
     """A queue mutation was refused before it was written.

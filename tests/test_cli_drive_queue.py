@@ -4276,6 +4276,84 @@ def test_tick_with_a_held_flock_exits_zero_without_touching_the_queue(
     assert state._list_drive_queue_local() == before
 
 
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="FileLock is backed by fcntl.flock() (coord/filelock.py) — POSIX-only "
+    "advisory locking, no Windows lock backend implemented yet",
+)
+def test_a_lock_held_far_longer_than_a_launch_verification_fails_the_tick(
+    cli, seed, launches, tick_lock, monkeypatch, tmp_path
+):
+    """#3413 defect 2: the timer-driven tick silently stopped launching while
+    reporting success.
+
+    `coord-drive-queue.timer` fired every ~3 minutes, its
+    `coord-drive-queue.service` run reported `Result=success` every time, and
+    yet queue rows went 23-60 minutes without a single re-evaluation — every
+    one of those "successful" runs must have hit `LockBusy` against a
+    previous tick that never released (the documented cause: a hung `coord
+    drive --tmux` liveness wait) and quietly exited 0, exactly what
+    `test_tick_with_a_held_flock_exits_zero_without_touching_the_queue`
+    (immediately above) confirms is CORRECT for a single, fresh contention —
+    that is the routine "previous tick still verifying a launch" case and
+    must stay quiet.
+
+    This is the other side: once the SAME contention streak has already run
+    well past any real verification (simulated here by seeding the #3413
+    contention marker with an old `first_busy_at`, rather than actually
+    blocking for ten minutes), the tick must stop reporting success — a
+    no-op tick must not exit 0 silently — and must leave a durable, visible
+    record of why, so an operator (or the notifier) has something to act on
+    beyond a queue that has simply gone quiet.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+    from coord.filelock import FileLock
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+
+    contention_path = tmp_path / "lock-contention.json"
+    monkeypatch.setenv("COORD_DRIVE_QUEUE_LOCK_CONTENTION_STATE", str(contention_path))
+    contention_path.write_text(
+        json.dumps(
+            {
+                "first_busy_at": (
+                    time.time()
+                    - drive_queue_cmd.DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS
+                    - 1.0
+                ),
+                "escalated_at": None,
+            }
+        )
+    )
+
+    lock = FileLock(tick_lock)
+    lock.acquire(timeout=0.0)
+    try:
+        result = cli("tick")
+    finally:
+        lock.release()
+
+    assert result.exit_code != 0, result.output
+    assert "another drive-queue tick is running" in result.output
+    assert launches == []
+    assert state._get_drive_queue_entry_local(REPO, 1650)["state"] == "waiting"
+
+    escalation = state._get_drive_escalation_local(
+        drive_queue_cmd.LOCK_STUCK_ALERT_REPO, drive_queue_cmd.LOCK_STUCK_ALERT_ISSUE
+    )
+    assert escalation is not None
+    assert "lock" in escalation["reason"].lower()
+
+    # A tick that WINS the lock afterwards must clear the streak rather than
+    # inheriting it — the very next successful tick is a fresh start, not a
+    # continuation of a hang that has already resolved.
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert launches and "1650" in " ".join(launches[0])
+
+
 def test_an_unreadable_board_aborts_without_launching(
     cli, seed, launches, monkeypatch
 ):

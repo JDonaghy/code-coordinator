@@ -53,6 +53,7 @@ from coord.drive_queue import (
     HOLD_SCOPE_ENTRY,
     HOLD_SCOPE_FLEET,
     MAX_BLOCKED_RESUMES,
+    PRODUCTION_TICK_INTERVAL_HINT_SECONDS,
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
@@ -2262,9 +2263,11 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
             # incident this closes.
             click.echo(
                 f"  (this exact reason has held {_age_str(alert_age_seconds)} "
-                "straight — if that is longer than the tick interval, "
-                "distrust it and cross-check with "
-                "`coord drive-queue tick --dry-run`)"
+                "straight — if that is longer than "
+                f"~{_age_str(PRODUCTION_TICK_INTERVAL_HINT_SECONDS)} "
+                "(production's tick cadence, "
+                "deploy/coord-drive-queue.timer), distrust it and "
+                "cross-check with `coord drive-queue tick --dry-run`)"
             )
         for detail in (alert.get("gate_readings") or "").split(" | "):
             if detail:
@@ -3957,6 +3960,258 @@ def _escalate_persistent_self_cordon(
     state = dict(state)
     state["escalated_at"] = now
     _write_self_cordon_state(state)
+
+
+# ── #3413 defect 2: a STUCK drive-queue lock must not report success ────────
+#
+# The incident's second, more dangerous half: `coord-drive-queue.timer` was
+# `active`, fired every ~3 minutes, and every `coord-drive-queue.service` run
+# reported `Result=success` — yet queue rows went 23-60 minutes without a
+# single re-evaluation, and a hand-run `coord drive-queue tick` launched on
+# the first attempt the moment someone tried it by hand.
+#
+# The LockBusy branch just below this section is the one place in this
+# module a tick returns *before ever calling `plan_tick`* — a previous tick
+# still holds `drive_queue_lock_path()` (`coord/filelock.py`'s `flock`-backed
+# `FileLock`), so this attempt echoes a quiet one-liner and exits 0 without
+# touching the board, the queue, or a single row's `reason_at`. That is
+# CORRECT for the routine case this branch was built for: two ticks a few
+# seconds apart while the earlier one is still confirming a `coord drive
+# --tmux` launch actually started a live tmux session (`_verify_launch`,
+# a few seconds under normal conditions). It stops being correct the moment
+# the process holding the lock is not "still verifying a launch" but hung —
+# `_verify_launch`'s own live-session poll has no long-hang guard of its own
+# — because then EVERY tick for as long as the hang lasts takes this exact
+# branch, `Result=success` every time, and nothing downstream (`status`'s
+# alert included — see `_cordon_alert`'s "resumes automatically" claim) has
+# any way to tell "a launch is being confirmed" from "the queue has not been
+# evaluated in three quarters of an hour".
+#
+# This tracks how long the SAME contention streak has run, unbroken, in a
+# plain JSON marker (identical shape/pattern to `_SELF_CORDON_STATE_FILENAME`
+# above): the FIRST LockBusy in a streak starts the clock and stays quiet —
+# indistinguishable from routine overlap, and must stay that way (see
+# `test_tick_with_a_held_flock_exits_zero_without_touching_the_queue`, which
+# this must never break). Once that SAME streak crosses
+# `DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS` — far longer than any real launch
+# verification takes — every further tick in the streak (a) pushes one
+# durable, visible escalation (fired once per streak, like the self-cordon
+# escalation above) and (b) raises instead of returning quietly, so the
+# SYSTEMD UNIT ITSELF FAILS (`Result=exit-code`, not `Result=success`) for as
+# long as the hang persists. A no-op tick must not exit 0 silently — this is
+# that rule applied to the one branch in this module that can no-op before
+# `plan_tick` ever runs.
+#
+# Ruling in/out the systemd-vs-thin-client difference the issue also asks
+# about: `_fetch_cordons()` (`coord.machine_pause.cordons()`) is
+# daemon-aware — a thin client routes over HTTP to the daemon's `/pause`
+# endpoint, which itself calls the identical `local_cordons()` this systemd
+# unit calls in-process when it IS the daemon host (no `board_service`
+# configured for itself, per `coord.machine_pause`'s own module docstring).
+# Both paths resolve to the SAME on-disk cordon store on the SAME host with
+# no divergent view possible — so a stale CORDON READ is ruled out as the
+# cause; a tick that never reaches the cordon check at all (this branch) is
+# not.
+DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS = 600.0
+
+_DRIVE_QUEUE_LOCK_CONTENTION_FILENAME = "drive_queue_lock_contention.json"
+
+#: #3413's own escalation key — distinct from `QUEUE_ALERT_REPO` (the
+#: routine per-tick `plan.alert`, never written by a tick that lost the race
+#: for the lock — it returns before `plan_tick` runs at all) and from
+#: `SELF_CORDON_ALERT_REPO`/`ROLL_PENDING_ALERT_REPO`: one slot per
+#: independent "this must be loud" condition, same pattern as both.
+LOCK_STUCK_ALERT_REPO = "(drive-queue-lock-stuck)"
+LOCK_STUCK_ALERT_ISSUE = 0
+LOCK_STUCK_ALERT_STAGE = "lock-stuck"
+
+
+def _drive_queue_lock_contention_path() -> Path:
+    """Absolute path to the lock-contention persistence marker (#3413).
+
+    ``$COORD_DRIVE_QUEUE_LOCK_CONTENTION_STATE`` overrides it — same
+    test-isolation seam as :func:`roll_pending_path`/`_self_cordon_state_path`;
+    never let a test touch the operator's real
+    ``~/.coord/drive_queue_lock_contention.json``.
+    """
+    import os  # noqa: PLC0415
+
+    from coord.platform_paths import default_coord_dir  # noqa: PLC0415
+
+    override = os.environ.get("COORD_DRIVE_QUEUE_LOCK_CONTENTION_STATE")
+    if override:
+        return Path(override).expanduser()
+    return default_coord_dir() / _DRIVE_QUEUE_LOCK_CONTENTION_FILENAME
+
+
+def _read_drive_queue_lock_contention() -> dict | None:
+    """The current marker, or ``None``.
+
+    Fail-soft on anything unreadable — same posture as
+    :func:`_read_self_cordon_state`: a marker this can't parse must read as
+    "no contention streak tracked yet", never as a reason to change the
+    tick's exit code.
+    """
+    path = _drive_queue_lock_contention_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not raw.strip():
+        return None
+    try:
+        data = _json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_drive_queue_lock_contention(data: dict) -> None:
+    path = _drive_queue_lock_contention_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(data, sort_keys=True), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_drive_queue_lock_contention() -> None:
+    """Called the instant a tick actually WINS the lock (#3413).
+
+    A successful acquire means whatever held it before has released — the
+    contention streak, if any, is over, unbroken or not — so the next time
+    this tick (or another) loses the race, that is a BRAND NEW streak and
+    must start its own clock, not inherit one from a hang that has already
+    resolved.
+    """
+    try:
+        _drive_queue_lock_contention_path().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _note_drive_queue_lock_busy(now: float) -> float:
+    """Record one more LockBusy and return how long the SAME contention
+    streak has run, unbroken (#3413).
+
+    The FIRST observation in a streak starts the clock at *now* and reports
+    age ``0.0`` — the routine "previous tick is still verifying a launch"
+    case the LockBusy branch has always handled quietly, and must go on
+    handling quietly. Every later observation in the SAME streak (the marker
+    already exists) reports the age since that first observation, without
+    rewriting it — the clock measures the streak's start, not its most
+    recent tick, exactly the "renewal preserves the origin" contract
+    `_record_drive_escalation_local` and `local_set_cordon` already use
+    elsewhere in this incident's fix.
+    """
+    state = _read_drive_queue_lock_contention()
+    first_busy_at = state.get("first_busy_at") if isinstance(state, dict) else None
+    if not isinstance(first_busy_at, (int, float)):
+        _write_drive_queue_lock_contention({"first_busy_at": now, "escalated_at": None})
+        return 0.0
+    return max(0.0, now - first_busy_at)
+
+
+def _escalate_stuck_drive_queue_lock(
+    *, age_seconds: float, now: float, config_path: Path | None
+) -> None:
+    """Push a durable, visible escalation once a contention streak crosses
+    :data:`DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS` (#3413).
+
+    Mirrors `_escalate_persistent_self_cordon`'s shape, one condition
+    earlier: that function escalates a `plan_tick` finding that keeps
+    recomputing to the same answer tick after tick; this one escalates a
+    tick that never reaches `plan_tick` at all, because every attempt loses
+    the race for the lock. Fires once per streak (`escalated_at` gates
+    re-firing) — the caller (the LockBusy branch below) still raises on
+    EVERY subsequent tick in the streak regardless, so the systemd unit
+    keeps failing for as long as the hang persists; only the durable
+    record/notification is deduplicated, the same "once per persisted
+    incident" rule #2572 uses for the self-cordon escalation.
+    """
+    from coord.filelock import drive_queue_lock_path  # noqa: PLC0415
+    from coord.state import record_drive_escalation  # noqa: PLC0415
+
+    state = _read_drive_queue_lock_contention() or {}
+    if state.get("escalated_at") is not None:
+        return
+    detail = (
+        f"the drive-queue lock ({drive_queue_lock_path()}) has been held by "
+        f"another process for {age_seconds / 60:.0f}+ minutes without "
+        "releasing. coord-drive-queue.timer's own ~3-minute cadence "
+        "(deploy/coord-drive-queue.timer) means every tick in that window "
+        "hit LockBusy and exited 0 without evaluating a single queue row "
+        "(#3413) — the queue reads as idle-but-fine while it is actually "
+        "not being re-evaluated at all. Check whether the process holding "
+        "the lock is hung (a `coord drive --tmux` liveness wait that never "
+        "returns is the documented cause) and restart "
+        "coord-drive-queue.service if so."
+    )
+    try:
+        record_drive_escalation(
+            LOCK_STUCK_ALERT_REPO,
+            LOCK_STUCK_ALERT_ISSUE,
+            stage=LOCK_STUCK_ALERT_STAGE,
+            reason=detail,
+            gate_readings=f"age_seconds={age_seconds:.0f}",
+            proposed_command="systemctl --user restart coord-drive-queue.service",
+        )
+    except Exception as exc:  # noqa: BLE001 — an escalation table that cannot
+        # be written must not take the message down with it, same guard
+        # `_escalate_roll_pending_expired`/`_push_self_cordon_escalation` use.
+        click.echo(f"  (could not record the lock-stuck escalation: {exc})", err=True)
+    click.echo(f"warning: {detail}", err=True)
+
+    # Best-effort live push, same transport/isolation contract
+    # `_push_self_cordon_escalation` uses just above — a broken/unconfigured
+    # notifier must never take the tick down with it, but a genuinely failed
+    # send (as opposed to "nothing configured") must leave `escalated_at`
+    # unset so the NEXT tick in this same streak retries rather than
+    # forfeiting the one channel most likely to actually reach someone while
+    # unattended.
+    pushed = True
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.notifier.models import Message  # noqa: PLC0415
+        from coord.notifier.transport import build_transport, safe_send  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        notif = getattr(cfg, "notifications", None)
+        if notif is not None and getattr(notif, "enabled", False):
+            transport = build_transport(notif)
+            result = safe_send(
+                transport,
+                Message(
+                    title="coord drive-queue: stuck lock",
+                    body=detail,
+                    tags=("rotating_light",),
+                    priority=4,
+                ),
+            )
+            if not result.ok:
+                pushed = False
+                click.echo(
+                    "  (lock-stuck escalation push failed, will retry next "
+                    f"tick: {result.error or 'unknown transport failure'})",
+                    err=True,
+                )
+    except Exception as exc:  # noqa: BLE001 — this is an ADDITION on top of
+        # the drive_escalations record above (already attempted); a broken
+        # import/config here must never take the tick down with it, but it
+        # also means the push never happened, so treat it like a failed
+        # send: retry next tick.
+        pushed = False
+        click.echo(f"  (could not push the lock-stuck escalation: {exc})", err=True)
+
+    if not pushed:
+        return
+    state = dict(state)
+    state["escalated_at"] = now
+    _write_drive_queue_lock_contention(state)
 
 
 def _fetch_board_payload() -> dict:
@@ -5655,6 +5910,12 @@ def drive_queue_tick(
     slow tick must never stack, and two ticks seconds apart are safe: a drive
     launched inside the startup grace window reconciles as `starting`
     (occupying a slot, attempts untouched) rather than as a death (#1794).
+    #3413: that quiet exit-0 no-op holds only while the contention is FRESH —
+    once the SAME lock has stayed busy far longer than a launch verification
+    ever takes (`DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS`, below), this raises
+    instead, because the previous tick is no longer "in progress", it is
+    hung, and a hung tick reporting `Result=success` forever is the incident
+    this closes.
     Two ticks on DIFFERENT machines are also safe: liveness is always a local
     `tmux` read, so a tick reconciles only the entries it itself launched —
     one launched elsewhere reads as `unknown`, occupying its slot but never
@@ -5811,13 +6072,35 @@ def drive_queue_tick(
     try:
         lock.acquire(timeout=0.0)
     except LockBusy:
-        # Quiet by design: this is the normal outcome when a timer fires while
-        # the previous tick is still verifying a launch.  Noise here would
-        # train the operator to ignore the log.
+        # Quiet by design ONLY for a fresh contention streak: this is the
+        # normal outcome when a timer fires while the previous tick is still
+        # verifying a launch, and noise here would train the operator to
+        # ignore the log. #3413: it stops being quiet once the SAME streak
+        # has run far longer than any real verification takes — see the
+        # "#3413 defect 2" section above `DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS`
+        # for the incident (a hung holder, every tick reporting
+        # `Result=success`, rows unevaluated for the better part of an hour)
+        # this closes.
+        now = time.time()
+        age_seconds = _note_drive_queue_lock_busy(now)
         click.echo("another drive-queue tick is running — skipping")
-        return
+        if age_seconds < DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS:
+            return
+        _escalate_stuck_drive_queue_lock(
+            age_seconds=age_seconds, now=now, config_path=config_path
+        )
+        raise click.ClickException(
+            f"the drive-queue lock has been held by another process for "
+            f"{age_seconds / 60:.0f}+ minutes — treating this as a hung tick "
+            "rather than reporting success silently (#3413); see the "
+            f"recorded {LOCK_STUCK_ALERT_STAGE!r} escalation for next steps"
+        ) from None
     except OSError as exc:
         raise click.ClickException(f"could not take the drive-queue lock: {exc}") from None
+
+    # #3413: a successful acquire means whatever held the lock before (if
+    # anything) has released — any tracked contention streak is over.
+    clear_drive_queue_lock_contention()
 
     try:
         # FAIL CLOSED. An unreadable board is not "nothing is running"; it is
