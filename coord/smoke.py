@@ -3033,6 +3033,7 @@ def dispatch_pending_smoke(
     *,
     now: float | None = None,
     gh_ops: "GhOps | None" = None,
+    issue_liveness_fetcher: Callable[[str, int], tuple[bool, bool]] | None = None,
 ) -> list[Assignment]:
     """Bulk Test-stage dispatch — the smoke analogue of
     :func:`coord.review.dispatch_pending_reviews`.
@@ -3063,6 +3064,23 @@ def dispatch_pending_smoke(
     follows. Production callers (`coord.notify`, `coord.reconcile`) pass the
     real :mod:`coord.github_ops` explicitly, the same module every other
     live gate check in this codebase hands `merge_queue`'s gate functions.
+
+    #3375: *issue_liveness_fetcher* is the SAME opt-in
+    ``(repo_name, issue_number) -> (issue_closed, branch_merged)`` contract
+    `coord.dispatch_liveness.check_dispatch_liveness` already gates
+    `coord.dispatch.dispatch()` with (#3376) — but this stage never went
+    through that call path. `dispatch_smoke`/`_dispatch_smoke_legs` POST
+    straight to a machine's `/assign` over `httpx`, so #3376's dispatch-time
+    gate never saw a Test-stage dispatch at all, and the five-smoke-agents
+    incident that motivated both issues could still reproduce after #3376
+    landed. Checked once per eligible row here, BEFORE any candidate is
+    walked or any machine chosen (`_dispatch_smoke_legs` needs no machine
+    name to know the issue is closed or the branch already merged) — a hit
+    records a `skipped` verdict (there is nothing left to gate) via
+    `record_test_verdict` and an audit row via
+    `coord.dispatch_liveness.record_dispatch_refusal`, and the row is left
+    alone rather than walking the candidate list for nothing. Default
+    ``None`` refuses nothing — identical to every pre-#3375 caller.
 
     A confirmed-stale verdict is **cleared** (``record_test_verdict(...,
     test_state=None)``, mirrored in-memory on ``completed.test_state``)
@@ -3263,6 +3281,59 @@ def dispatch_pending_smoke(
                 completed.assignment_id,
             )
             continue
+
+        # #3375: refuse to dispatch a Test stage for a row whose issue has
+        # already closed or whose branch has already merged — the liveness
+        # precondition #3376 built for `coord.dispatch.dispatch()` but never
+        # reached this stage, because smoke dispatch never calls it (see the
+        # docstring above). Checked here, right before candidate walking,
+        # because it needs no machine selection to answer. A hit records a
+        # `skipped` verdict (there is nothing left for a Test verdict to
+        # gate) instead of `None`/leaving it unset — leaving it unset would
+        # re-enter this exact row on the very next tick and re-probe GitHub
+        # forever for an answer that cannot change back.
+        if issue_liveness_fetcher is not None:
+            from coord.dispatch_liveness import (  # noqa: PLC0415
+                check_dispatch_liveness,
+                record_dispatch_refusal,
+            )
+
+            issue_closed, branch_merged = issue_liveness_fetcher(
+                completed.repo_name, completed.issue_number
+            )
+            refusal = check_dispatch_liveness(
+                repo_name=completed.repo_name,
+                issue_number=completed.issue_number,
+                machine_name="(smoke: no machine selected yet)",
+                issue_closed=issue_closed,
+                branch_merged=branch_merged,
+            )
+            if refusal is not None:
+                if completed.assignment_id is not None:
+                    from coord.state import record_test_verdict  # noqa: PLC0415
+
+                    record_test_verdict(
+                        assignment_id=completed.assignment_id,
+                        test_state="skipped",
+                        test_reason=(
+                            f"Test stage skipped — {refusal.reason} (#3375)"
+                        ),
+                    )
+                    completed.test_state = "skipped"
+                record_dispatch_refusal(
+                    refusal,
+                    repo_name=completed.repo_name,
+                    issue_number=completed.issue_number,
+                    machine_name="(smoke: no machine selected yet)",
+                    assignment_type="smoke",
+                )
+                logger.info(
+                    "dispatch_pending_smoke: refused to dispatch for %s#%s "
+                    "row %s — %s",
+                    completed.repo_name, completed.issue_number,
+                    completed.assignment_id, refusal.reason,
+                )
+                continue
 
         # #3182: the full-list implementation — a capability fan-out
         # dispatches more than one leg per completion, so this loop cannot

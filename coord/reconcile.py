@@ -2699,10 +2699,22 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # passed/failed/skipped verdict (a rebase moved the base or branch out
     # from under it) is re-dispatched instead of skipped forever — without
     # it, the staleness check inside `dispatch_pending_smoke` fails open.
+    #
+    # #3375: also passes a real *issue_liveness_fetcher* so `coord resume`
+    # gets the same "issue closed / branch already merged" precondition
+    # #3376 wired into every other dispatch chokepoint — the Test stage
+    # bypasses `coord.dispatch.dispatch()` entirely (a direct `httpx` POST
+    # to `/assign`), so it was the one path #3376 didn't reach.
     from coord import github_ops  # noqa: PLC0415
+    from coord.dispatch_liveness import github_issue_liveness_fetcher  # noqa: PLC0415
     from coord.smoke import dispatch_pending_smoke
 
-    for smoke in dispatch_pending_smoke(board, config, gh_ops=github_ops):
+    for smoke in dispatch_pending_smoke(
+        board,
+        config,
+        gh_ops=github_ops,
+        issue_liveness_fetcher=github_issue_liveness_fetcher(config),
+    ):
         if smoke.assignment_id is not None:
             changed.append(smoke.assignment_id)
 
