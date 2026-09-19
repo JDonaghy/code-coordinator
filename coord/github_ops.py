@@ -2542,6 +2542,18 @@ PR_CHECKS_JSON_FIELDS: tuple[str, ...] = (
     "name", "state", "bucket", "link", "startedAt", "completedAt",
 )
 
+# #3405: fields requested from `gh run list --json` by :func:`get_runs_for_branch`
+# — the branch/event-scoped counterpart to `PR_CHECKS_JSON_FIELDS` above.
+# Pinned in the same style of regression test
+# (tests/test_github_ops.py::TestRunListJsonFieldsAreValid), which shells out
+# to `gh run list --help` and asserts every field here is one `gh` actually
+# advertises, so a `gh` schema change fails a test instead of silently
+# breaking `coord ci runs`.
+RUN_LIST_JSON_FIELDS: tuple[str, ...] = (
+    "databaseId", "displayTitle", "workflowName", "status", "conclusion",
+    "event", "headBranch", "url", "createdAt",
+)
+
 # #1564 Addendum 2: the fleet that surfaced this issue runs `gh` versions that
 # disagree about whether `gh pr checks` even *has* a `--json` flag —
 # dellserver's 2.45.0 (Ubuntu's apt package) does not: `gh pr checks --json
@@ -2713,6 +2725,38 @@ def get_pr_checks(repo: str, number: int) -> list[dict]:
     # is a deliberate default here — that's ``gh``'s normal "zero checks
     # configured" response, not a decode failure.
     return json.loads(stdout or "[]")
+
+
+def get_runs_for_branch(
+    repo: str, branch: str, *, event: str | None = None, limit: int = 20,
+) -> list[dict]:
+    """Return ``gh run list``'s raw run list for *branch* on *repo* (#3405).
+
+    The branch/event-scoped sink :meth:`coord.ci_github.GitHubCi.
+    list_runs_for_branch` needs and :func:`get_pr_checks` structurally
+    cannot provide — a push-to-`main` run belongs to no PR, so there is no
+    PR number to key a ``gh pr checks`` read on. Backs the question that
+    actually recurs (#3378 item 1, #3380, #3385): "what happened on the last
+    N pushes to `main`, and which job failed" — previously answerable only
+    via raw ``gh run list --workflow=... --event=push``.
+
+    Uses ``_gh_json`` (not the hand-rolled subprocess call ``get_pr_checks``
+    needs for its exit-code nuance) since ``gh run list`` exits 0 with an
+    empty JSON array when nothing matches — there is no "exited non-zero but
+    still has usable stdout" case to special-case here. Raises
+    ``RuntimeError``/:class:`GhError` on a genuine read failure (bad repo,
+    auth, rate-limit); callers on the read-only surfacing path
+    (:meth:`~coord.ci_github.GitHubCi.list_runs_for_branch`) treat that the
+    same as "no runs to show", never as evidence either way — this is
+    visibility, not a gate.
+    """
+    args = [
+        "run", "list", "--repo", repo, "--branch", branch,
+        "--limit", str(limit), "--json", ",".join(RUN_LIST_JSON_FIELDS),
+    ]
+    if event:
+        args += ["--event", event]
+    return _gh_json(*args, default=[], caller="github_ops.get_runs_for_branch")
 
 
 def get_run_jobs(repo: str, run_id: str) -> list[dict]:

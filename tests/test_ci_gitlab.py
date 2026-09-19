@@ -462,6 +462,75 @@ class TestGitLabCiListJobsForRun:
         assert store.list_jobs_for_run("acme/api", "55") == []
 
 
+def _pipeline(pid: int, *, ref: str = "main", source: str = "push",
+              status: str = "success", web_url: str = "",
+              created_at: str | None = None) -> dict:
+    return {
+        "id": pid, "ref": ref, "source": source, "status": status,
+        "web_url": web_url, "created_at": created_at,
+    }
+
+
+class TestGitLabCiListRunsForBranch:
+    """#3405: the branch/event-scoped read — GitLab's own concept of a
+    push-to-`main` run is a pipeline with ``ref == branch``, which no
+    existing (PR-scoped) `GitLabCi` method could express."""
+
+    def test_maps_pipeline_fields(self, monkeypatch) -> None:
+        store = GitLabCi(token_env="GL_TOK")
+        monkeypatch.setenv("GL_TOK", "secret")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/pipelines"):
+                assert request.url.params["ref"] == "main"
+                return httpx.Response(200, json=[
+                    _pipeline(123, status="failed", web_url="https://gl/p/123",
+                              created_at="2026-09-19T00:00:00.000Z"),
+                    _pipeline(124, status="skipped"),
+                ])
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        _install_transport(monkeypatch, store, handler)
+        runs = store.list_runs_for_branch("acme/api", "main")
+
+        assert [r.run_id for r in runs] == ["123", "124"]
+        failed_run = runs[0]
+        assert failed_run.conclusion == "failure"
+        assert failed_run.event == "push"
+        assert failed_run.branch == "main"
+        assert failed_run.url == "https://gl/p/123"
+        assert failed_run.created_at is not None
+        assert runs[1].conclusion == "skipped"
+
+    def test_event_forwarded_as_source_param(self, monkeypatch) -> None:
+        store = GitLabCi(token_env="GL_TOK")
+        monkeypatch.setenv("GL_TOK", "secret")
+        seen_params: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_params.update(request.url.params)
+            return httpx.Response(200, json=[])
+
+        _install_transport(monkeypatch, store, handler)
+        store.list_runs_for_branch("acme/api", "main", event="push")
+        assert seen_params.get("source") == "push"
+
+    def test_no_token_returns_empty(self, monkeypatch) -> None:
+        store = GitLabCi(token_env="GL_TOK_UNSET")
+        monkeypatch.delenv("GL_TOK_UNSET", raising=False)
+        assert store.list_runs_for_branch("acme/api", "main") == []
+
+    def test_read_error_returns_empty(self, monkeypatch) -> None:
+        store = GitLabCi(token_env="GL_TOK")
+        monkeypatch.setenv("GL_TOK", "secret")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("down", request=request)
+
+        _install_transport(monkeypatch, store, handler)
+        assert store.list_runs_for_branch("acme/api", "main") == []
+
+
 # ── build_ci_store / config ──────────────────────────────────────────────────
 
 class TestBuildCiStoreGitlab:

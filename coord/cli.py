@@ -173,6 +173,11 @@ from coord.commands.plan_followup import (
 # completed assignment) — see coord/commands/pr.py's `_PrGroup`.
 from coord.commands.pr import pr_group
 
+# #3405: `coord ci` — the branch/event-scoped CI-history seam over CiStore
+# (`runs`/`jobs`/`checks`), so diagnosing a red `main` never has to fall back
+# to raw `gh run list`/`gh run view`.
+from coord.commands.ci import ci_group
+
 
 # #1182: thresholds past which a stale non-editable install escalates from the
 # mild "edits won't reach the CLI" note to a loud STALE INSTALL banner.
@@ -489,6 +494,7 @@ main.add_command(drive_queue_group)
 main.add_command(escalate_group)
 main.add_command(decide)
 main.add_command(pr_group)
+main.add_command(ci_group)
 main.add_command(fix)
 main.add_command(review)
 main.add_command(approve_plan)
