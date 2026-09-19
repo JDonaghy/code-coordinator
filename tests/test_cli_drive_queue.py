@@ -244,6 +244,34 @@ def tick_lock(monkeypatch, tmp_path) -> Path:
     return path
 
 
+@pytest.fixture
+def evaluation_marker(tmp_path):
+    """Seed #3413's last-completed-evaluation clock at a chosen age.
+
+    The real thing only advances when a tick reaches the far side of
+    `plan_tick`, so simulating "the queue has not been evaluated in 20
+    minutes" by actually waiting 20 minutes is not an option. This writes the
+    marker directly (the same JSON `_note_drive_queue_evaluation` writes) and
+    returns the absolute timestamp it used, so a test can assert the clock
+    later moved PAST it.
+
+    Redirection to `tmp_path` is already guaranteed by conftest's autouse
+    `_no_real_drive_queue_evaluation_state`; this fixture only sets the
+    marker's CONTENTS, never its location.
+    """
+
+    def _seed(*, age_seconds: float) -> float:
+        from coord.commands import drive_queue as drive_queue_cmd
+
+        stamped_at = time.time() - age_seconds
+        drive_queue_cmd._write_drive_queue_evaluation(
+            {"last_evaluated_at": stamped_at, "escalated_at": None}
+        )
+        return stamped_at
+
+    return _seed
+
+
 @pytest.fixture(autouse=True)
 def block_log(monkeypatch, tmp_path) -> Path:
     """Give every test its own #2235 Phase-0 stall log.
@@ -4282,30 +4310,34 @@ def test_tick_with_a_held_flock_exits_zero_without_touching_the_queue(
     reason="FileLock is backed by fcntl.flock() (coord/filelock.py) — POSIX-only "
     "advisory locking, no Windows lock backend implemented yet",
 )
-def test_a_lock_held_far_longer_than_a_launch_verification_fails_the_tick(
-    cli, seed, launches, tick_lock, monkeypatch, tmp_path
+def test_a_queue_that_has_gone_unevaluated_fails_a_tick_that_cannot_take_the_lock(
+    cli, seed, launches, tick_lock, evaluation_marker
 ):
     """#3413 defect 2: the timer-driven tick silently stopped launching while
     reporting success.
 
     `coord-drive-queue.timer` fired every ~3 minutes, its
     `coord-drive-queue.service` run reported `Result=success` every time, and
-    yet queue rows went 23-60 minutes without a single re-evaluation — every
-    one of those "successful" runs must have hit `LockBusy` against a
-    previous tick that never released (the documented cause: a hung `coord
-    drive --tmux` liveness wait) and quietly exited 0, exactly what
+    yet queue rows went 23-60 minutes without a single re-evaluation. A tick
+    that merely LOSES the race for the lock must stay quiet — that is the
+    routine "previous tick still working" case
     `test_tick_with_a_held_flock_exits_zero_without_touching_the_queue`
-    (immediately above) confirms is CORRECT for a single, fresh contention —
-    that is the routine "previous tick still verifying a launch" case and
-    must stay quiet.
+    (immediately above) pins down, and this must never break it.
 
-    This is the other side: once the SAME contention streak has already run
-    well past any real verification (simulated here by seeding the #3413
-    contention marker with an old `first_busy_at`, rather than actually
-    blocking for ten minutes), the tick must stop reporting success — a
-    no-op tick must not exit 0 silently — and must leave a durable, visible
-    record of why, so an operator (or the notifier) has something to act on
-    beyond a queue that has simply gone quiet.
+    What must NOT stay quiet is a tick that cannot take the lock while the
+    queue has ALREADY gone a full window without any tick completing an
+    evaluation. That combination is a provable no-op stacked on a provably
+    unevaluated queue, and it must fail rather than adding one more
+    `Result=success` — plus leave a durable record, so an operator (or the
+    notifier) has something to act on beyond a queue that has gone quiet.
+
+    Note what is measured: seconds since the last COMPLETED EVALUATION, a
+    single cross-process timestamp. Deliberately not an unbroken
+    lock-contention streak — `deploy/coord-drive-queue.service` sets
+    `TimeoutStartSec=300` and `flock` is kernel-released on process death
+    (`coord/filelock.py`), so a streak keyed on one holder resets every time
+    systemd kills a hung tick and a fresh (possibly equally doomed) one
+    acquires, and would never accumulate past a few minutes.
     """
     from coord.commands import drive_queue as drive_queue_cmd
     from coord.filelock import FileLock
@@ -4313,19 +4345,8 @@ def test_a_lock_held_far_longer_than_a_launch_verification_fails_the_tick(
     seed(issues={1650: "open"})
     cli("add", REPO, "1650")
 
-    contention_path = tmp_path / "lock-contention.json"
-    monkeypatch.setenv("COORD_DRIVE_QUEUE_LOCK_CONTENTION_STATE", str(contention_path))
-    contention_path.write_text(
-        json.dumps(
-            {
-                "first_busy_at": (
-                    time.time()
-                    - drive_queue_cmd.DRIVE_QUEUE_LOCK_STUCK_AFTER_SECONDS
-                    - 1.0
-                ),
-                "escalated_at": None,
-            }
-        )
+    evaluation_marker(
+        age_seconds=drive_queue_cmd.DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS + 1.0
     )
 
     lock = FileLock(tick_lock)
@@ -4341,17 +4362,168 @@ def test_a_lock_held_far_longer_than_a_launch_verification_fails_the_tick(
     assert state._get_drive_queue_entry_local(REPO, 1650)["state"] == "waiting"
 
     escalation = state._get_drive_escalation_local(
-        drive_queue_cmd.LOCK_STUCK_ALERT_REPO, drive_queue_cmd.LOCK_STUCK_ALERT_ISSUE
+        drive_queue_cmd.EVALUATION_STALE_ALERT_REPO,
+        drive_queue_cmd.EVALUATION_STALE_ALERT_ISSUE,
     )
     assert escalation is not None
-    assert "lock" in escalation["reason"].lower()
+    assert "evaluation" in escalation["reason"].lower()
 
-    # A tick that WINS the lock afterwards must clear the streak rather than
-    # inheriting it — the very next successful tick is a fresh start, not a
-    # continuation of a hang that has already resolved.
+    # And the recovery side: a tick that CAN take the lock evaluates, stamps
+    # the clock, and goes back to exiting 0 — the escalation is a report on
+    # the gap, never a latch that keeps failing once it has fired.
     result = cli("tick")
     assert result.exit_code == 0, result.output
     assert launches and "1650" in " ".join(launches[0])
+
+
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="FileLock is backed by fcntl.flock() (coord/filelock.py) — POSIX-only "
+    "advisory locking, no Windows lock backend implemented yet",
+)
+def test_a_fresh_evaluation_clock_keeps_a_lock_miss_quiet_and_exit_zero(
+    cli, seed, launches, tick_lock, evaluation_marker
+):
+    """#3413: the guard must not make routine contention loud.
+
+    Two ticks seconds apart — the timer firing while the previous tick is
+    still working — is normal and must stay a quiet exit-0 no-op. Only the
+    combination "cannot take the lock AND the queue has gone a full window
+    unevaluated" fails. This pins the other side of that condition: with a
+    FRESH evaluation clock, losing the lock is silent success, exactly as
+    before #3413.
+    """
+    from coord.filelock import FileLock
+
+    seed(issues={1651: "open"})
+    cli("add", REPO, "1651")
+
+    evaluation_marker(age_seconds=5.0)
+
+    lock = FileLock(tick_lock)
+    lock.acquire(timeout=0.0)
+    try:
+        result = cli("tick")
+    finally:
+        lock.release()
+
+    assert result.exit_code == 0, result.output
+    assert "another drive-queue tick is running" in result.output
+    assert launches == []
+
+
+def test_a_stale_evaluation_clock_is_reported_even_when_the_tick_then_succeeds(
+    cli, seed, launches, evaluation_marker
+):
+    """#3413: the hand-run tick that "fixed it" must not erase the evidence.
+
+    In the incident the operator eventually ran `coord drive-queue tick` by
+    hand; it launched immediately and the alert cleared "in the same breath",
+    leaving nothing behind to say the queue had just spent the better part of
+    an hour un-evaluated. A tick that DOES take the lock while the clock is
+    stale therefore records the gap and warns — but still does its work and
+    still exits 0, because failing a run that is actively fixing the problem
+    would be the wrong signal.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1652: "open"})
+    cli("add", REPO, "1652")
+
+    evaluation_marker(
+        age_seconds=drive_queue_cmd.DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS + 1.0
+    )
+
+    result = cli("tick")
+
+    assert result.exit_code == 0, result.output
+    assert launches and "1652" in " ".join(launches[0])
+
+    escalation = state._get_drive_escalation_local(
+        drive_queue_cmd.EVALUATION_STALE_ALERT_REPO,
+        drive_queue_cmd.EVALUATION_STALE_ALERT_ISSUE,
+    )
+    assert escalation is not None
+    assert "15+ minutes" in escalation["reason"]
+
+
+def test_a_tick_that_completes_an_evaluation_stamps_the_clock(
+    cli, seed, launches, evaluation_marker
+):
+    """#3413: the clock advances on EVALUATION, not on "the process ran".
+
+    This is the property that makes the guard survive across separate holder
+    PIDs, which is the whole reason it replaced an unbroken-contention
+    streak: a tick that dies (or is killed by `TimeoutStartSec=300`) before
+    `plan_tick` returns leaves the previous stamp untouched, so the gap this
+    guard measures keeps growing across as many doomed processes as it takes.
+    Only reaching the far side of `plan_tick` moves it.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1653: "open"})
+    cli("add", REPO, "1653")
+
+    stale_at = evaluation_marker(age_seconds=4000.0)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+
+    stamped = drive_queue_cmd._read_drive_queue_evaluation()
+    assert stamped is not None
+    assert stamped["last_evaluated_at"] > stale_at
+    # A completed evaluation also ends the escalation episode, so a LATER
+    # staleness window escalates afresh instead of being deduplicated
+    # against one that has already been resolved.
+    assert stamped["escalated_at"] is None
+
+
+def test_dry_run_reports_the_stale_clock_without_resetting_or_recording_it(
+    cli, seed, launches, evaluation_marker
+):
+    """#3413: the diagnostic must not paper over what it was run to find.
+
+    `coord drive-queue tick --dry-run` is precisely what the operator
+    reached for during the incident ("capacity: 1/8 occupied... would launch
+    claude-coordinator#3405"). It applies no writes, so no row's `reason_at`
+    moves — which means it must NOT stamp the last-completed-evaluation
+    clock either. If it did, running the diagnostic would silently reset the
+    very staleness it was invoked to investigate, and the next real tick
+    would go back to looking healthy.
+
+    It must still *say* so, though: warning on stderr is the single most
+    useful thing this command can tell someone whose queue has gone quiet.
+    And per `--dry-run`'s contract it records nothing durable.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1654: "open"})
+    cli("add", REPO, "1654")
+
+    stale_at = evaluation_marker(
+        age_seconds=drive_queue_cmd.DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS + 1.0
+    )
+
+    result = cli("tick", "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert launches == []
+    assert "has completed an evaluation" in result.output
+
+    # The clock is untouched — the staleness survives the diagnostic.
+    stamped = drive_queue_cmd._read_drive_queue_evaluation()
+    assert stamped is not None
+    assert stamped["last_evaluated_at"] == stale_at
+
+    # And nothing durable was written, so a real tick still escalates.
+    assert (
+        state._get_drive_escalation_local(
+            drive_queue_cmd.EVALUATION_STALE_ALERT_REPO,
+            drive_queue_cmd.EVALUATION_STALE_ALERT_ISSUE,
+        )
+        is None
+    )
 
 
 def test_an_unreadable_board_aborts_without_launching(

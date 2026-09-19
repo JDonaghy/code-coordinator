@@ -1054,6 +1054,28 @@ def _no_real_self_cordon_state(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_drive_queue_evaluation_state(monkeypatch, tmp_path):
+    """#3413: never let a test write the OPERATOR'S real
+    ``~/.coord/drive_queue_evaluation.json``.
+
+    Same hazard as ``_no_real_self_cordon_state`` immediately above, one file
+    over, and load-bearing in BOTH directions: this marker is the only record
+    of when a drive-queue tick last completed a real evaluation, so a leaked
+    test write could either fabricate a 20-minute-old evaluation out of
+    nothing (making the operator's very next real tick fail loudly and
+    escalate for no reason) or mask a genuinely wedged queue by stamping it
+    fresh out from under a fleet that has not evaluated anything in an hour.
+
+    ``coord.commands.drive_queue._drive_queue_evaluation_path`` reads
+    ``$COORD_DRIVE_QUEUE_EVALUATION_STATE`` first for exactly this redirect.
+    """
+    monkeypatch.setenv(
+        "COORD_DRIVE_QUEUE_EVALUATION_STATE",
+        str(tmp_path / "drive-queue-evaluation-state.json"),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_dispatch_target_validation(monkeypatch):
     """#2087: default the dispatch-target gate (`record_dispatched` /
     `record_dispatched_assignment` refusing an assignment whose repo/machine
