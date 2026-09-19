@@ -93,6 +93,39 @@ class JobRun:
 
 
 @dataclass
+class RunSummary:
+    """One CI run (a GitHub Actions run / GitLab pipeline) scoped to a
+    *branch*, not a PR (#3405).
+
+    ``CheckRun``/``JobRun`` are both PR-scoped (``list_checks_for_pr``/
+    ``list_jobs_for_run(repo, run_id)`` where ``run_id`` itself is only ever
+    discovered via a PR's checks) — there was no way to express "what
+    happened on the last N pushes to `main`", because a push-to-main run
+    belongs to no PR at all. That blind spot is what let a real `windows`
+    job failure on `main` get misattributed to the (advisory,
+    ``continue-on-error``) `postgres` job for weeks (#3378 item 1, #3380,
+    #3385): diagnosing "is trunk healthy, and why not" required raw
+    ``gh run list``/``gh run view``, with no `coord` seam to go through.
+
+    ``conclusion`` follows the same vocabulary as :class:`CheckRun`'s own
+    field (success/failure/cancelled/skipped/... while ``status ==
+    "completed"``, ``None`` while still in flight) — this is a read-only
+    surfacing view, so unlike ``CheckRun`` there is no allow-list/fail-closed
+    posture to preserve here; nothing in :mod:`coord.merge_queue`'s gate
+    reads a ``RunSummary``.
+    """
+
+    run_id: str
+    name: str
+    status: str
+    conclusion: str | None
+    event: str
+    branch: str
+    url: str
+    created_at: float | None
+
+
+@dataclass
 class CIFailureDetail:
     """Structured detail behind a CONFIRMED CI failure (#3114) — the failing
     job/step/log-excerpt a ci-fix briefing can use in place of a bare
@@ -326,6 +359,23 @@ class CiStore(Protocol):
         """
         ...
 
+    def list_runs_for_branch(
+        self, repo: str, branch: str, *, event: str | None = None, limit: int = 20,
+    ) -> list[RunSummary]:
+        """The last *limit* CI runs pushed to *branch* on *repo* (#3405),
+        newest first — the branch/event-scoped read every method above this
+        one lacks (see :class:`RunSummary`'s docstring for why that gap
+        mattered).
+
+        *event* narrows to one GitHub Actions/GitLab pipeline trigger event
+        (``"push"``, ``"pull_request"``, ...) when given; ``None`` returns
+        every event. Purely a visibility read, same posture as
+        :meth:`list_jobs_for_run` — best-effort, returns ``[]`` on any read
+        failure rather than raising or synthesizing a failing placeholder,
+        since nothing here gates a merge.
+        """
+        ...
+
 
 class NoOpCi:
     """Always-available fallback that returns no checks and reruns nothing.
@@ -366,6 +416,13 @@ class NoOpCi:
         """No-op: CI gating is disabled entirely, so there is nothing to
         re-run (#2252)."""
         return False
+
+    def list_runs_for_branch(
+        self, repo: str, branch: str, *, event: str | None = None, limit: int = 20,
+    ) -> list[RunSummary]:
+        """No-op: CI gating is disabled entirely, so there is no run
+        history to report (#3405)."""
+        return []
 
 
 # ── Classification helpers ──────────────────────────────────────────────────

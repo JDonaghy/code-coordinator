@@ -49,7 +49,7 @@ from datetime import datetime
 
 import httpx
 
-from coord.ci_store import CheckRun, JobRun, failed_checks
+from coord.ci_store import CheckRun, JobRun, RunSummary, failed_checks
 from coord.forge_availability import record_ci_check_fetch
 
 DEFAULT_HOST = "gitlab.com"
@@ -364,6 +364,57 @@ class GitLabCi:
                 runner_name="", steps=[],
             ))
         return out
+
+    def list_runs_for_branch(
+        self, repo: str, branch: str, *, event: str | None = None, limit: int = 20,
+    ) -> list[RunSummary]:
+        """The last *limit* pipelines run against *branch* on *repo* (#3405),
+        newest first, via GitLab's project pipelines list API.
+
+        *event* maps to GitLab's pipeline ``source`` field (``"push"``,
+        ``"web"``, ``"schedule"``, ``"merge_request_event"``, ...) — the
+        closest GitLab concept to GitHub Actions' ``event``. Best-effort like
+        :meth:`list_jobs_for_run`: any read failure (missing token, network
+        error, malformed JSON) degrades to ``[]`` rather than raising, since
+        this is a visibility read, not a gate.
+        """
+        token = self._token
+        if not token:
+            return []
+        params: dict[str, object] = {
+            "ref": branch, "per_page": limit, "order_by": "id", "sort": "desc",
+        }
+        if event:
+            params["source"] = event
+        try:
+            with self._client() as client:
+                resp = client.get(
+                    f"/projects/{_project_path(repo)}/pipelines", params=params,
+                )
+                resp.raise_for_status()
+                pipelines = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return []
+        if not isinstance(pipelines, list):
+            return []
+        runs: list[RunSummary] = []
+        for pipeline in pipelines:
+            if not isinstance(pipeline, dict):
+                continue
+            status, conclusion = _map_status(str(pipeline.get("status", "")))
+            runs.append(
+                RunSummary(
+                    run_id=str(pipeline.get("id", "") or ""),
+                    name=str(pipeline.get("name") or pipeline.get("source") or ""),
+                    status=status,
+                    conclusion=conclusion,
+                    event=str(pipeline.get("source") or ""),
+                    branch=str(pipeline.get("ref") or branch),
+                    url=str(pipeline.get("web_url") or ""),
+                    created_at=_parse_ts(pipeline.get("created_at")),
+                )
+            )
+        return runs
 
     # ── writes ───────────────────────────────────────────────────────────
 

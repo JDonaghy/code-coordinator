@@ -3053,6 +3053,81 @@ class TestPrChecksJsonFieldsAreValid:
         )
 
 
+class TestGetRunsForBranch:
+    """#3405: `get_runs_for_branch` is the single `gh` sink for
+    `coord.ci_github.GitHubCi.list_runs_for_branch` — the branch/event-scoped
+    read `CiStore` never had, needed to answer "what happened on the last N
+    pushes to `main`" without falling back to raw `gh run list`."""
+
+    def test_builds_the_expected_gh_invocation(self) -> None:
+        with patch("coord.github_ops._gh", return_value="[]") as gh:
+            github_ops.get_runs_for_branch("acme/api", "main", event="push", limit=5)
+        gh.assert_called_once()
+        args = gh.call_args.args
+        assert args == (
+            "run", "list", "--repo", "acme/api", "--branch", "main",
+            "--limit", "5", "--json", ",".join(github_ops.RUN_LIST_JSON_FIELDS),
+            "--event", "push",
+        )
+
+    def test_event_flag_omitted_when_not_given(self) -> None:
+        with patch("coord.github_ops._gh", return_value="[]") as gh:
+            github_ops.get_runs_for_branch("acme/api", "main")
+        assert "--event" not in gh.call_args.args
+
+    def test_returns_parsed_json(self) -> None:
+        payload = [
+            {
+                "databaseId": 123, "workflowName": "test", "status": "completed",
+                "conclusion": "failure", "event": "push", "headBranch": "main",
+                "url": "https://github.com/acme/api/actions/runs/123",
+                "createdAt": "2026-09-19T00:00:00Z",
+            },
+        ]
+        with patch("coord.github_ops._gh", return_value=json.dumps(payload)):
+            assert github_ops.get_runs_for_branch("acme/api", "main") == payload
+
+    def test_empty_result_returns_empty_list(self) -> None:
+        with patch("coord.github_ops._gh", return_value=""):
+            assert github_ops.get_runs_for_branch("acme/api", "main") == []
+
+    def test_gh_failure_raises(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            with pytest.raises(RuntimeError):
+                github_ops.get_runs_for_branch("acme/api", "main")
+
+
+class TestRunListJsonFieldsAreValid:
+    """#3405 regression, mirroring `TestPrChecksJsonFieldsAreValid`:
+    `coord.github_ops.RUN_LIST_JSON_FIELDS` must stay a subset of what the
+    installed `gh` actually advertises via `gh run list --help`'s "JSON
+    FIELDS" section, so a `gh` schema change fails a test instead of
+    silently breaking `coord ci runs`.
+    """
+
+    def test_requested_fields_are_advertised_by_gh(self) -> None:
+        gh = shutil.which("gh")
+        if gh is None:
+            pytest.skip("gh not installed in this environment")
+        result = subprocess.run(
+            ["gh", "run", "list", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        help_text = f"{result.stdout}\n{result.stderr}"
+        # Unlike `gh pr checks --help`'s single-line section, `gh run list
+        # --help`'s JSON FIELDS wraps across several lines — capture
+        # everything up to the next blank line, not just the first line.
+        match = re.search(r"JSON FIELDS\s*\n(.*?)\n\n", help_text, re.DOTALL)
+        assert match, f"could not find a JSON FIELDS section in gh help:\n{help_text}"
+        advertised = {f.strip() for f in match.group(1).replace("\n", " ").split(",")}
+        requested = set(github_ops.RUN_LIST_JSON_FIELDS)
+        missing = requested - advertised
+        assert not missing, (
+            f"{sorted(missing)} requested by github_ops.RUN_LIST_JSON_FIELDS "
+            f"but not advertised by this gh's `--json` help ({sorted(advertised)})"
+        )
+
+
 class TestDiffPureRenames:
     """#2896 review: coord.review's sealed-tamper carve-out needs to tell a
     byte-identical `git mv` apart from an ordinary two-sided edit — this is

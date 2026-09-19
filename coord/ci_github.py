@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from coord import github_ops
-from coord.ci_store import CheckRun, CIFailureDetail, JobRun, JobStep, failed_checks
+from coord.ci_store import CheckRun, CIFailureDetail, JobRun, JobStep, RunSummary, failed_checks
 from coord.forge_availability import record_ci_check_fetch
 
 
@@ -670,6 +670,42 @@ class GitHubCi:
                 )
             )
         return jobs
+
+    def list_runs_for_branch(
+        self, repo: str, branch: str, *, event: str | None = None, limit: int = 20,
+    ) -> list["RunSummary"]:
+        """The last *limit* Actions runs pushed to *branch* on *repo* (#3405)
+        via ``gh run list``, newest first.
+
+        Best-effort like :meth:`list_jobs_for_run` — never gates a merge, so
+        any read failure (missing ``gh``, timeout, malformed JSON, an
+        unknown repo/branch) degrades to ``[]`` rather than raising or
+        synthesizing a failing placeholder (#1525's fail-closed posture is
+        specific to the merge *gate*; this is a visibility read only).
+        """
+        try:
+            raw = github_ops.get_runs_for_branch(repo, branch, event=event, limit=limit)
+        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        runs: list[RunSummary] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            runs.append(
+                RunSummary(
+                    run_id=str(entry.get("databaseId", "") or ""),
+                    name=str(entry.get("workflowName") or entry.get("displayTitle") or ""),
+                    status=str(entry.get("status") or ""),
+                    conclusion=entry.get("conclusion") or None,
+                    event=str(entry.get("event") or ""),
+                    branch=str(entry.get("headBranch") or branch),
+                    url=str(entry.get("url") or ""),
+                    created_at=_parse_ts(entry.get("createdAt")),
+                )
+            )
+        return runs
 
     # ── Internal ────────────────────────────────────────────────────────────
 

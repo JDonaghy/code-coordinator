@@ -20,6 +20,7 @@ from coord.ci_github import GitHubCi
 from coord.forge_availability import _flush_all_ok_aggregates
 from coord.ci_store import (
     CheckRun,
+    CiStore,
     CIFailureDetail,
     JobRun,
     JobStep,
@@ -82,6 +83,20 @@ class TestNoOpCi:
         no CI" opt-out — an empty check list from `NoOpCi` must never read
         as `checks_absent`."""
         assert NoOpCi().expects_checks("acme/api", 1) is False
+
+    def test_list_runs_for_branch_returns_empty(self) -> None:
+        """#3405: the branch/event-scoped read is just as much a no-op as
+        every PR-scoped read when CI gating is opted out entirely."""
+        assert NoOpCi().list_runs_for_branch("acme/api", "main") == []
+
+    def test_satisfies_the_widened_ci_store_protocol(self) -> None:
+        """#3405: pins that `NoOpCi` — the always-available fallback used
+        whenever no backend is configured — was updated in lockstep with
+        `CiStore` when the protocol grew `list_runs_for_branch`. `CiStore`
+        is `@runtime_checkable`, so `isinstance` performs an honest
+        structural check (method presence, not signature) against every
+        method the protocol declares."""
+        assert isinstance(NoOpCi(), CiStore)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -981,6 +996,73 @@ class TestGitHubCiRequiredContexts:
             "coord.github_ops.get_required_status_check_contexts", return_value=[],
         ):
             assert store._required_contexts("acme/api") is None
+
+
+class TestGitHubCiListRunsForBranch:
+    """#3405: `list_runs_for_branch` is the branch/event-scoped read that
+    closes the gap every PR-scoped `CiStore` method left open — diagnosing
+    "what happened on the last N pushes to `main`" used to require raw
+    `gh run list`."""
+
+    _RUN_PAYLOAD = [
+        {
+            "databaseId": 123, "workflowName": "test", "status": "completed",
+            "conclusion": "failure", "event": "push", "headBranch": "main",
+            "url": "https://github.com/acme/api/actions/runs/123",
+            "createdAt": "2026-09-19T00:00:00Z",
+        },
+        {
+            "databaseId": 124, "workflowName": "postgres", "status": "completed",
+            "conclusion": "skipped", "event": "push", "headBranch": "main",
+            "url": "https://github.com/acme/api/actions/runs/124",
+            "createdAt": "2026-09-19T00:01:00Z",
+        },
+    ]
+
+    def test_parses_run_fields(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.github_ops.get_runs_for_branch", return_value=self._RUN_PAYLOAD,
+        ):
+            runs = store.list_runs_for_branch("acme/api", "main")
+        assert [r.run_id for r in runs] == ["123", "124"]
+        windows_run = runs[0]
+        assert windows_run.name == "test"
+        assert windows_run.status == "completed"
+        assert windows_run.conclusion == "failure"
+        assert windows_run.event == "push"
+        assert windows_run.branch == "main"
+        assert windows_run.url == "https://github.com/acme/api/actions/runs/123"
+        assert windows_run.created_at is not None
+        assert runs[1].conclusion == "skipped"
+
+    def test_forwards_branch_event_and_limit(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.github_ops.get_runs_for_branch", return_value=[],
+        ) as fetch:
+            store.list_runs_for_branch("acme/api", "main", event="push", limit=5)
+        fetch.assert_called_once_with("acme/api", "main", event="push", limit=5)
+
+    def test_read_failure_returns_empty_not_raises(self) -> None:
+        """Visibility-only read (#3405) — never gates a merge, so a read
+        failure degrades to `[]` rather than raising or synthesizing a
+        failing placeholder, unlike the PR-scoped checks path (#1525)."""
+        store = GitHubCi()
+        with patch(
+            "coord.github_ops.get_runs_for_branch", side_effect=RuntimeError("gh boom"),
+        ):
+            assert store.list_runs_for_branch("acme/api", "main") == []
+
+    def test_malformed_entries_are_skipped(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.github_ops.get_runs_for_branch",
+            return_value=["not a dict", {"databaseId": 1}],
+        ):
+            runs = store.list_runs_for_branch("acme/api", "main")
+        assert len(runs) == 1
+        assert runs[0].run_id == "1"
 
 
 class TestGitHubCiListAllChecksForPr:
