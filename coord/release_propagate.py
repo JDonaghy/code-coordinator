@@ -419,6 +419,14 @@ OUT_OF_REACH_LANES: frozenset[str] = frozenset({"~/.coord-cli-venv", "webapp bun
 #: for a lane, and the only form a grouped finding names its lanes by.
 _LANE_LABEL = re.compile(r"^(?P<lane>.+?)\s+\((?P<host>[^()]+)\)$")
 
+#: The pseudo-host ``coord/release_verify.py``'s ``verify()`` stamps on a
+#: finding it cannot pin to one machine (a fleet-wide version-skew or
+#: no-data finding — every ``host="(fleet)"`` call there). Named here so
+#: :attr:`GateVerdict.blocking_hosts` recognises it as "not a real host" the
+#: same way :func:`lane_is_out_of_reach`'s allow-list keeps a lane's gaps
+#: explicit rather than inferred.
+_UNATTRIBUTABLE_HOST = "(fleet)"
+
 
 def parse_lane_label(label: str) -> tuple[str, str] | None:
     """``"~/.coord-venv (precision)"`` -> ``("precision", "~/.coord-venv")``.
@@ -486,6 +494,36 @@ class GateVerdict:
     @property
     def red(self) -> bool:
         return self.severity == "crit"
+
+    @property
+    def blocking_hosts(self) -> frozenset[str] | None:
+        """Real hosts a BLOCKING finding actually names (#3364).
+
+        ``--rollback-on-red`` used to revert every host a run updated the
+        instant ANY of them went red — a fifth host's failure rolling back
+        four that verified clean. This is what lets a caller narrow to just
+        the hosts the red gate is actually about, the same way
+        :func:`attempted_scope` already narrows which lanes count.
+
+        ``None`` means "could not attribute to specific hosts" — a
+        fleet-wide finding like the no-``--expected``-given skew case
+        (``host="(fleet)"``, see ``coord/release_verify.py``'s ``verify()``)
+        or a finding with no host at all. A caller must fail toward that
+        meaning "implicates everyone this run touched", never toward
+        "implicates nobody" — the same "an unattributable signal blocks
+        every host, never none of them" rule :attr:`Quiescence.
+        fleet_wide_busy` already follows for busy signals. A concrete
+        (possibly empty, when there are no blocking findings at all) set
+        means every blocking finding named a real host, and rollback may
+        scope to exactly those.
+        """
+        hosts: set[str] = set()
+        for finding in self.blocking:
+            for host, _lane in _finding_pairs(finding):
+                if not host or host == _UNATTRIBUTABLE_HOST:
+                    return None
+                hosts.add(host)
+        return frozenset(hosts)
 
     def to_dict(self) -> dict:
         return {
@@ -1485,6 +1523,12 @@ class PropagationRecord:
     #: done so, or the resulting quiet fleet is indistinguishable from #2082.
     cordons: dict = field(default_factory=dict)
     rolled_back: list[str] = field(default_factory=list)
+    #: #3364: hosts this run updated and verified clean but did NOT roll back
+    #: even though the gate went red — because the red gate's blocking
+    #: findings (:attr:`GateVerdict.blocking_hosts`) named some OTHER host,
+    #: not this one. A host that rolled and verified is not part of the
+    #: failure just because a sibling host's roll was.
+    spared_rollback: list[str] = field(default_factory=list)
     released_holds: list[str] = field(default_factory=list)
     #: #2583: the min-releases-behind gate's own readings for this run —
     #: ``min_releases_behind`` is whatever this run resolved (flag > config >
@@ -1763,6 +1807,11 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
 
     if data.get("rolled_back"):
         lines.append(f"    rolled back: {', '.join(data['rolled_back'])}")
+    if data.get("spared_rollback"):
+        lines.append(
+            "    spared (rolled and verified, not named by the red gate): "
+            + ", ".join(data["spared_rollback"])
+        )
     if data.get("released_holds"):
         lines.append(f"    released deploy gates: {', '.join(data['released_holds'])}")
     if data.get("error"):

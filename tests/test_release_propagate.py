@@ -1112,6 +1112,68 @@ def test_no_verification_at_all_is_not_a_pass_or_a_failure():
     assert set(verdict.unrollable) == {"tui@precision", "tui@elitebook"}
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# #3364: `--rollback-on-red` must scope to the hosts the red gate actually
+# names, not to every host the run happened to update
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_blocking_hosts_names_only_the_host_a_finding_blames():
+    """A per-host crit finding (the common case: `coord release verify`
+    stamping ``lane (host)`` for one offending machine) must scope
+    `--rollback-on-red` to exactly that host — not every host this run
+    updated. #3364's second defect was rolling back four clean hosts because
+    a fifth went red."""
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "dellserver", "~/.coord-venv (dellserver)")],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert verdict.red
+    assert verdict.blocking_hosts == frozenset({"dellserver"})
+
+
+def test_blocking_hosts_unions_a_grouped_finding():
+    """The grouped ``--expected`` mismatch names several real lanes at once
+    (see `test_a_grouped_finding_blocks_when_ANY_lane_in_it_is_in_scope`) —
+    `blocking_hosts` must pick every real host out of it, not just the first."""
+    verification = {
+        "severity": "crit",
+        "findings": [
+            _finding("crit", "elitebook, precision",
+                     "~/.coord-cli-venv (elitebook), ~/.coord-venv (precision)"),
+        ],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert verdict.red
+    assert verdict.blocking_hosts == frozenset({"elitebook", "precision"})
+
+
+def test_blocking_hosts_is_none_for_a_fleet_wide_finding():
+    """A skew/no-data finding `coord release verify` cannot pin to one
+    machine is stamped ``host="(fleet)"`` (see ``release_verify.verify``'s
+    ``"(version skew)"``/``"(expected version)"`` findings). `blocking_hosts`
+    must read that as "cannot attribute" (``None``), not as a literal host
+    named "(fleet)" — a caller must fail toward rolling back every host it
+    touched, never toward a rollback that silently touches nobody."""
+    verification = {
+        "severity": "crit",
+        "findings": [
+            {"severity": "crit", "host": "(fleet)", "lane": "(version skew)",
+             "summary": "2 versions live across the fleet", "detail": ""},
+        ],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert verdict.red
+    assert verdict.blocking_hosts is None
+
+
+def test_blocking_hosts_is_empty_when_the_gate_is_clean():
+    verdict = rp.scope_verification(None, lanes=_run_lanes())
+    assert not verdict.red
+    assert verdict.blocking_hosts == frozenset()
+
+
 def test_the_gate_verdict_is_rendered_so_a_scoped_gate_is_never_invisible():
     """Scoping the gate is only safe if the scoping is legible afterwards —
     a check that quietly stopped checking is the failure this whole module
