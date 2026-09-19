@@ -2331,7 +2331,14 @@ def test_back_to_back_ticks_launch_exactly_one_drive(cli, seed, launches):
     assert "died without landing the work" not in second.output
     assert "retry" not in second.output
     assert "starting" in second.output
-    assert "1/1 occupied" in second.output
+    # #3388: no `--max-parallel` given, so the global ceiling is derived from
+    # this config's fleet shape — 2 repos * the default 1/repo ceiling,
+    # clamped to `concurrency.max_workers` (2) — rather than the old
+    # hardcoded 1. One entry occupying a slot out of that derived capacity
+    # of 2 is exactly what "exactly one drive, and the ceiling did not
+    # collapse to 1 just because only one repo has anything queued" looks
+    # like; see coord.drive_queue.default_max_parallel.
+    assert "1/2 occupied" in second.output
 
 
 def test_a_still_starting_drive_is_reported_not_escalated(cli, seed, launches):

@@ -1232,6 +1232,21 @@ class PipelineConfig:
     :data:`_DEFAULT_STALL_THRESHOLDS` for the shape and the evidence behind
     its two seeded entries, and :meth:`stall_threshold_secs` for how a type
     absent from the table falls back to the drive's flat ``--stall`` value.
+
+    ``max_parallel`` (#3388) is the fleet-wide default for ``coord
+    drive-queue tick``'s GLOBAL concurrency ceiling (``--max-parallel``) —
+    the sibling of ``max_parallel_per_repo`` above, added for the same
+    reason: a systemd unit's hardcoded ``--max-parallel 4`` encoded a fact
+    about the fleet (repo count times per-repo ceiling) that nobody revisited
+    when either side changed, and two repos alone starved the other twelve
+    once ``max_parallel_per_repo`` could exceed 1 (#2012, #2057, #2573).
+    ``None`` (the default) leaves the ceiling at
+    ``coord.drive_queue.default_max_parallel``'s derivation — ``repo_count *
+    max_parallel_per_repo``, clamped to ``concurrency.max_workers`` — rather
+    than a hand-maintained constant. An explicit ``coord drive-queue tick
+    --max-parallel N`` on the command line always wins over this, exactly
+    mirroring ``max_parallel_per_repo``'s own resolution order — see
+    ``coord.commands.drive_queue.drive_queue_tick``.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -1267,6 +1282,9 @@ class PipelineConfig:
     stall_thresholds: dict[str, float] = field(
         default_factory=lambda: dict(_DEFAULT_STALL_THRESHOLDS)
     )
+    # #3388 — None means "derive from the fleet shape", see
+    # coord.drive_queue.default_max_parallel. See the class docstring.
+    max_parallel: int | None = None
 
     def attention_threshold_for(
         self,
@@ -3640,6 +3658,17 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
                 "integer or null (0 disables the per-repo ceiling)"
             )
         cfg.max_parallel_per_repo = value
+
+    if "max_parallel" in raw:
+        value = raw["max_parallel"]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ConfigError(
+                "pipeline.max_parallel must be a non-negative integer or "
+                "null (0 = reconcile-only, launch nothing)"
+            )
+        cfg.max_parallel = value
 
     if "stall_thresholds" in raw:
         value = raw["stall_thresholds"]

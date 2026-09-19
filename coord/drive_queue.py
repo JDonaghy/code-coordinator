@@ -538,6 +538,64 @@ DISPATCH_FAILURE_MIN_BACKOFF_SECONDS = 660.0
 # why `render_plan` prints the per-repo breakdown and says where it came from.
 DEFAULT_MAX_PARALLEL_PER_REPO = 1
 
+# ── the global ceiling's own fleet-shape default (#3388) ────────────────────
+#
+# `--max-parallel` (the OTHER ceiling, applied before the per-repo one above)
+# used to be a constant an operator hand-set in `coord-drive-queue.service` —
+# #2012 set it to 3 (the repo count at the time), #2057 raised it to 4 when a
+# fourth repo joined and was never touched again. That was tolerable only
+# because `--max-parallel-per-repo` defaulted to 1: with one slot per repo,
+# `global == repo_count` was the whole invariant, and it was self-evidently
+# wrong the moment a repo count changed (a quick `git log` question).
+#
+# #2573 gave the per-repo ceiling its own `coordinator.yml` knob, which can
+# now be raised past 1 — and the invariant silently became
+# `global >= repo_count * max_parallel_per_repo` without any constant
+# anywhere saying so. At 14 repos and `max_parallel_per_repo=2` against a
+# `--max-parallel` still stuck at 4, two repos alone reach the global
+# ceiling and every other repo in the fleet is starved, permanently,
+# regardless of what is queued (the exact fleet state observed 2026-09-18).
+#
+# `default_max_parallel` below is that invariant computed fresh every tick
+# instead of remembered by a human: enough global room for every repo to
+# reach its OWN per-repo ceiling at once. See
+# `coord.commands.drive_queue.drive_queue_tick` for where this feeds into
+# the flag's actual resolution order (explicit flag > `coordinator.yml`
+# `pipeline.max_parallel` > this derivation > `DEFAULT_MAX_PARALLEL` as a
+# last-resort fallback when the config itself can't be read).
+DEFAULT_MAX_PARALLEL = 1
+
+
+def default_max_parallel(
+    *, repo_count: int, max_parallel_per_repo: int, max_workers_cap: int
+) -> int:
+    """Derive the drive-queue tick's global ceiling from the fleet's shape.
+
+    ``repo_count * max_parallel_per_repo`` is the smallest global ceiling
+    that lets every repo reach its own per-repo ceiling at the same time —
+    the invariant #2012/#2057 tried to maintain by hand and lost each time
+    either the fleet or the per-repo ceiling changed (see the module-level
+    comment above this function for the incident, #3388).
+
+    ``max_parallel_per_repo <= 0`` means the per-repo ceiling is itself
+    disabled (one global counter, pre-#1972 behaviour) — there is no
+    per-repo figure to multiply by, so this falls back to *max_workers_cap*
+    alone. Either way the result is clamped to *max_workers_cap*
+    (``concurrency.max_workers``, the fleet's actual worker capacity across
+    every stage, not just drive-queue launches) so a large fleet gets a
+    saner DEFAULT, not a promise the machines behind it can't keep — a
+    ``max_workers_cap`` of 0 or less is "no cap known" and is not applied.
+    Always at least 1: a derivation must never produce a ceiling that
+    admits nothing.
+    """
+    if max_parallel_per_repo > 0 and repo_count > 0:
+        derived = repo_count * max_parallel_per_repo
+    else:
+        derived = max_workers_cap
+    if max_workers_cap > 0:
+        derived = min(derived, max_workers_cap)
+    return max(1, derived)
+
 # ── the startup grace window (#1794) ─────────────────────────────────────────
 #
 # A drive is NOT established the instant `coord drive --tmux` exits 0.  #1606's

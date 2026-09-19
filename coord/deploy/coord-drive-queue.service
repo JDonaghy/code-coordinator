@@ -165,46 +165,58 @@ KillMode=process
 # stays so nobody re-derives the (wrong) theory that narrowing THIS PATH
 # would have prevented it.
 Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
-# --max-parallel 4 (#2012, raised from 3 in #2057) — the global ceiling,
-# ONE SLOT PER REPO IN THE FLEET: claude-coordinator, quadraui, vimcode,
-# coord-portal. It was 3 because the fleet had three repos when #2012 set
-# it; coord-portal joined afterwards and the number was never revisited, so
-# the fourth repo could never drive concurrently no matter what was queued.
+# --max-parallel USED TO be hardcoded here (#2012 set it to 3 — the repo
+# count at the time, one slot per repo; #2057 raised it to 4 when a fourth
+# repo joined and it was never revisited again). #3388: that invariant
+# (global == repo count) only held while --max-parallel-per-repo always
+# defaulted to 1. Once #2573 gave the per-repo ceiling its own
+# coordinator.yml knob and an operator raised it past 1, the real invariant
+# became `global >= repo_count * max_parallel_per_repo` — and at 14 repos
+# with max_parallel_per_repo=2 against a global ceiling still stuck at 4,
+# TWO repos alone reached the global ceiling and every other repo in the
+# fleet was starved, permanently, no matter what was queued (2026-09-18).
 #
-# KEEP THIS EQUAL TO THE REPO COUNT. It is not a tuning knob for how hard
-# the fleet works — that is what the per-repo ceiling and machine capacity
-# decide. Set it lower and a repo silently loses its lane; set it higher
-# and it does nothing, because the per-repo ceiling still admits only one
-# drive per repo.
+# So --max-parallel is deliberately ABSENT below, the same way
+# --max-parallel-per-repo already is (#2573's rationale, restated below
+# applies verbatim here). Omitting it lets `coord drive-queue tick` resolve
+# it itself, in this order: an explicit --max-parallel on this ExecStart=
+# (none is set here on purpose) > `pipeline.max_parallel` in
+# ~/.coord/coordinator.yml, if an operator wants to pin a fleet-wide value >
+# `coord.drive_queue.default_max_parallel`'s DERIVATION from the fleet's own
+# shape — repo count times the (already-resolved) per-repo ceiling, clamped
+# to `concurrency.max_workers` — which is self-maintaining across repo
+# additions instead of a constant nobody remembers to revisit. See
+# `coord.commands.drive_queue.drive_queue_tick` for the exact order and
+# `coord.config.PipelineConfig.max_parallel` for the field.
 #
-# #1972 added the SECOND ceiling, --max-parallel-per-repo (default 1),
-# which is what keeps two drives off the same repo; without raising this
-# outer one the per-repo ceiling can never bind, because the walk stops at
-# the global limit first and never reaches an entry from a different repo.
+# #1972's SECOND ceiling, --max-parallel-per-repo, is what keeps two drives
+# off the same repo once the global ceiling admits more than one launch at
+# once; the derived global ceiling above only ever multiplies BY whatever
+# that ceiling resolves to, so raising --max-parallel-per-repo in
+# coordinator.yml raises this fleet's derived global ceiling right along
+# with it — no separate edit needed here.
 #
-# Raise this ONLY on a host whose coord actually enforces the per-repo
-# ceiling (>= the release carrying #1972). A higher global ceiling on an
-# older coord launches two same-repo drives, which stale each other's
-# Test verdicts (#1479) — the exact collision #1972 exists to prevent.
+# Raise pipeline.max_parallel_per_repo (or let it stay derived) ONLY on a
+# fleet whose coord actually enforces the per-repo ceiling (>= the release
+# carrying #1972). A higher global ceiling on an older coord launches two
+# same-repo drives, which stale each other's Test verdicts (#1479) — the
+# exact collision #1972 exists to prevent.
 #
 # #2573: the per-repo ceiling deliberately does NOT appear as a
-# --max-parallel-per-repo flag below. It has a THIRD source now — set it as
-# `pipeline.max_parallel_per_repo` in ~/.coord/coordinator.yml instead of a
-# `systemctl --user edit` drop-in. A drop-in has to restate this entire
+# --max-parallel-per-repo flag below either, for the identical reason: set it
+# as `pipeline.max_parallel_per_repo` in ~/.coord/coordinator.yml instead of
+# a `systemctl --user edit` drop-in. A drop-in has to restate this entire
 # ExecStart= line to change one flag on it, and that restated copy silently
 # drifts from THIS file forever after — dellserver's live drop-in, built
 # solely to carry --max-parallel-per-repo 2, was found resetting ExecStart=
 # back to %h/.local/bin/coord, silently reverting #2314's pinned-venv path
 # above as an unnoticed side effect (see docs/DRIVE_QUEUE.md §9 and #2573).
-# coordinator.yml has no such coupling — it is read fresh by the flag's own
-# resolution (an explicit --max-parallel-per-repo on this ExecStart= would
-# still win, but none is set here on purpose) — see
-# `coord.commands.drive_queue.drive_queue_tick` for the exact order and
-# `coord.config.PipelineConfig.max_parallel_per_repo` for the field. If a
-# `coord-drive-queue.service.d/override.conf` still exists on a host purely
-# to carry --max-parallel-per-repo, move that value into coordinator.yml and
-# delete the drop-in — an empty override directory cannot drift.
-ExecStart=%h/.coord-venv/bin/coord drive-queue tick --max-parallel 4 --config %h/.coord/coordinator.yml
+# coordinator.yml has no such coupling — it is read fresh by each flag's own
+# resolution. If a `coord-drive-queue.service.d/override.conf` still exists
+# on a host purely to carry --max-parallel/--max-parallel-per-repo, move
+# that value into coordinator.yml and delete the drop-in — an empty
+# override directory cannot drift.
+ExecStart=%h/.coord-venv/bin/coord drive-queue tick --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
 # (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
 # the timer's 15-minute cadence (coord-drive-queue.timer) so a genuinely
