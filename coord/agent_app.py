@@ -593,11 +593,12 @@ def _idle_restart_target(server: "AgentServer", venv_dir: Path) -> Path | None:
         # or it's already running the slot the symlink points at — no swap
         # is waiting.
         return None
-    with server._lock:
-        active_count = sum(
-            1 for a in server._assignments.values() if a.status in (PENDING, RUNNING)
-        )
-    if active_count:
+    # #3363: shared predicate — see `AgentServer.active_assignment_count`'s
+    # docstring for why this must never be re-derived independently here.
+    # It also ages out (and finalizes) any phantom PENDING/RUNNING entry,
+    # so a leaked bookkeeping record can no longer keep this watcher —
+    # the deferred restart's own advertised fallback — permanently idle.
+    if server.active_assignment_count():
         return None
     if _host_has_live_interactive_session():
         # #2139 blocking review fix: an interactive pane is not an
@@ -1538,12 +1539,14 @@ def build_app(
                 # started. Re-read fresh: `perform_update` above can take
                 # tens of seconds (venv creation, pip, smoke check), so the
                 # count at the top of this request is stale by now.
-                with server._lock:
-                    still_active = sum(
-                        1
-                        for a in server._assignments.values()
-                        if a.status in (PENDING, RUNNING)
-                    )
+                #
+                # #3363: `active_assignment_count()` is the single shared
+                # predicate (also used by `/rollback` and the idle
+                # watcher's `_idle_restart_target`) — it ages out and
+                # finalizes any phantom PENDING/RUNNING entry instead of
+                # trusting raw status forever, which is what let a single
+                # leaked assignment defer this restart for six days.
+                still_active = server.active_assignment_count()
                 if still_active and not force:
                     payload["result"] = "staged"
                     payload["error"] = (
@@ -1815,12 +1818,9 @@ def build_app(
             body = {}
         force = bool(body.get("force"))
 
-        with server._lock:
-            active_count = sum(
-                1
-                for a in server._assignments.values()
-                if a.status in (PENDING, RUNNING)
-            )
+        # #3363: shared predicate with `/update` and the idle watcher — see
+        # `AgentServer.active_assignment_count`'s docstring.
+        active_count = server.active_assignment_count()
         if active_count and not force:
             payload = {
                 "mode": "rollback",
@@ -1999,34 +1999,36 @@ def build_app(
         cancel_timeout = float(body.get("cancel_timeout", 30))
         saved_argv = list(sys.argv)
 
-        with server._lock:
-            active_count = sum(
-                1
-                for a in server._assignments.values()
-                if a.status in (PENDING, RUNNING)
-            )
+        # #3363: shared predicate with `/update`/`/rollback`/the idle
+        # watcher — see `AgentServer.active_assignment_count`'s docstring.
+        # A side benefit here specifically: a phantom entry gets finalized
+        # (flipped to FAILED) the first time this is called, so it no
+        # longer shows up in `pending_ids` below either — this restart
+        # stops trying to `cancel()` a record with no real process behind
+        # it.
+        active_count = server.active_assignment_count()
 
         def _do_restart() -> None:
             # Wait for workers to drain.
             deadline = time.time() + cancel_timeout
             while time.time() < deadline:
-                with server._lock:
-                    still_active = sum(
-                        1
-                        for a in server._assignments.values()
-                        if a.status in (PENDING, RUNNING)
-                    )
+                still_active = server.active_assignment_count()
                 if still_active == 0:
                     break
                 time.sleep(1)
 
-            # Cancel any workers that are still running.
-            with server._lock:
-                pending_ids = [
-                    aid
-                    for aid, a in server._assignments.items()
-                    if a.status in (PENDING, RUNNING)
-                ]
+            # Cancel any workers that are still running. #3363 review: reuse
+            # the shared predicate rather than re-deriving PENDING/RUNNING
+            # via a second raw scan over `server._assignments` — by now any
+            # true phantom (confirmed-dead process, no terminal status) has
+            # already been finalized to FAILED by the `active_assignment_count()`
+            # polls above, so a raw scan would agree with this today, but a
+            # second copy of the same question right next to the shared
+            # predicate is exactly the split `active_assignment_count()` was
+            # introduced to eliminate — and `_active_assignment_ids()` is the
+            # one that also knows to leave a still-alive process's record
+            # alone rather than mis-scan it as gone.
+            pending_ids = list(server._active_assignment_ids())
             for aid in pending_ids:
                 try:
                     # #1567: this is an infra-triggered restart, not an

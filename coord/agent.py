@@ -450,6 +450,45 @@ HOST_SLEEP_EXIT = 127
 # #2638.
 _DEFAULT_RUNTIME_CEILING_S = 6.0 * 60.0 * 60.0  # 6 hours
 
+# #3363: safety margin added on top of the resolved runtime ceiling before
+# `AgentServer._phantom_age_ceiling_s` treats a PENDING/RUNNING record's
+# timestamp as stale enough to investigate. Kept as its own constant so the
+# margin itself doesn't have to be re-derived at both the class-default and
+# per-instance/per-assignment call sites.
+_PHANTOM_AGE_MARGIN_S = 60.0 * 60.0  # 1 hour
+
+# #3363: DEFAULT max age a PENDING/RUNNING assignment record is trusted at
+# face value before it is even a *candidate* for phantom finalization —
+# i.e. the floor `AgentServer._phantom_age_ceiling_s` applies when neither
+# this agent's own configured `runtime_ceiling_s` nor the assignment's own
+# `spec.runtime_ceiling_s` raises it further. Nothing but a process restart
+# ever clears `_assignments` — so an entry that never reaches a terminal
+# status (worker killed out from under it, dispatch crashed between insert
+# and spawn, a stop that didn't write back) stays "active" forever, which
+# is exactly what makes it dangerous: every restart path (`/update`,
+# `/rollback`, the #2139 idle watcher) refuses to act while ANY assignment
+# looks active, so a single phantom permanently blocks the one thing — a
+# restart — that would clear it.
+#
+# #3363 review: this constant alone is NOT the last word on whether a
+# record is a phantom, for two reasons `_phantom_age_ceiling_s` and
+# `AgentServer._active_assignment_ids` handle explicitly:
+#   1. An operator can legitimately raise or disable the runtime ceiling
+#      per agent (`self.runtime_ceiling_s`) or per leg
+#      (`AssignmentSpec.runtime_ceiling_s`) — both documented, supported
+#      overrides (`coord/config.py:252-263`). A hardcoded module constant
+#      here would silently override that choice and finalize a real,
+#      healthy, still-running leg. `_phantom_age_ceiling_s` resolves the
+#      actual per-assignment ceiling instead of trusting this default
+#      unconditionally.
+#   2. Age is unconfirmed death, never proof of it. `_active_assignment_ids`
+#      only finalizes a record whose process is CONFIRMED not alive
+#      (`self._processes.get(aid)` is missing or `proc.poll() is not None`)
+#      — a record whose process is still alive is left alone regardless of
+#      how stale its timestamp looks, exactly the ground-truth check
+#      `cancel()`/`_reap` already use elsewhere in this class.
+_PHANTOM_ASSIGNMENT_MAX_AGE_S = _DEFAULT_RUNTIME_CEILING_S + _PHANTOM_AGE_MARGIN_S  # 7 hours
+
 # Minimum wall-vs-monotonic divergence measured over a SINGLE poll interval
 # that is unambiguously a host suspend rather than ordinary thread-scheduling
 # jitter, a GC pause, or a loaded box briefly starving this thread. Comfortably
@@ -3402,6 +3441,15 @@ class AgentAssignment:
     spec: AssignmentSpec
     status: str = PENDING
     pid: int | None = None
+    # #3363: stamped once, at construction, so a PENDING assignment (no
+    # `started_at` yet — that's only set once it reaches RUNNING) still has
+    # an age `active_assignment_count()`'s phantom check can measure.
+    # Reloaded PENDING/RUNNING entries from a persisted state file never
+    # keep this value in practice: `_load_state` already force-fails any
+    # PENDING/RUNNING record it finds (the owning subprocess is provably
+    # gone across a restart), so a missing/stale `created_at` on an old
+    # state file is harmless.
+    created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
     exit_code: int | None = None
@@ -7355,6 +7403,146 @@ class AgentServer:
             )
         cargo_cache.write_gc_status(self.state_dir, result)
         return result
+
+    def active_assignment_count(self, *, now: float | None = None) -> int:
+        """How many assignments are genuinely still in flight right now.
+
+        #3363: the ONE predicate every "is this host busy" surface must
+        call. Before this, `_idle_restart_target`, `/update`'s post-swap
+        busy check, and `/rollback`'s busy check (all in
+        `coord/agent_app.py`) each independently re-derived
+        ``status in (PENDING, RUNNING)`` straight off ``self._assignments``
+        — three copies of the same question, agreeing right up until one of
+        them needed to disagree. A PENDING/RUNNING entry that never reaches
+        a terminal status (worker killed out from under it, a dispatch that
+        crashed between insert and spawn, a stop that didn't write back) is
+        "active" by that raw predicate forever, since nothing but a process
+        restart clears ``_assignments`` — and every restart path above
+        refuses to act while count > 0, so the phantom permanently blocks
+        the one thing that would clear it (see #3363's six-day macmini
+        deadlock).
+
+        Delegates the actual scan (and phantom finalization) to
+        :meth:`_active_assignment_ids`.
+        """
+        return len(self._active_assignment_ids(now=now))
+
+    def _phantom_age_ceiling_s(self, assignment: AgentAssignment) -> float:
+        """Resolve the phantom-age ceiling for *this specific* assignment.
+
+        #3363 review: the ceiling used to be the hardcoded module constant
+        ``_PHANTOM_ASSIGNMENT_MAX_AGE_S``, sized only off the compile-time
+        ``_DEFAULT_RUNTIME_CEILING_S``. That ignored an operator who
+        legitimately raised (or disabled) the runtime ceiling — either
+        fleet-wide (``self.runtime_ceiling_s``) or for this one leg
+        (``AssignmentSpec.runtime_ceiling_s``), both documented, supported
+        overrides (`coord/config.py:252-263`). Mirrors ``_reap``'s own
+        per-leg resolution (~line 9588): a positive ``spec.runtime_ceiling_s``
+        raises the base above this agent's own configured default, then the
+        result is floored at ``_DEFAULT_RUNTIME_CEILING_S`` and the same
+        margin is added — so a higher configured ceiling only ever pushes
+        this watchdog further OUT, never in.
+
+        This only bounds how stale a record is allowed to look before it
+        even becomes a *candidate* for phantom finalization — a record
+        whose process is confirmed still alive is never finalized by
+        ``_active_assignment_ids`` regardless of this value (see there), so
+        a leg that legitimately disables its own runtime ceiling is still
+        protected even though this method always returns a finite number.
+        """
+        base = self.runtime_ceiling_s or 0.0
+        raw_spec_ceiling = getattr(
+            getattr(assignment, "spec", None), "runtime_ceiling_s", None
+        )
+        if isinstance(raw_spec_ceiling, (int, float)) and raw_spec_ceiling > 0:
+            base = max(base, float(raw_spec_ceiling))
+        return max(base, _DEFAULT_RUNTIME_CEILING_S) + _PHANTOM_AGE_MARGIN_S
+
+    def _active_assignment_ids(self, *, now: float | None = None) -> list[str]:
+        """IDs of assignments still genuinely active, aging out phantoms.
+
+        A PENDING/RUNNING entry older than
+        :meth:`_phantom_age_ceiling_s` (measured from ``started_at`` once
+        RUNNING, ``created_at`` while still PENDING) is a *candidate* for
+        being a leaked bookkeeping record rather than live work — but age
+        alone is never proof of death (#2096: an unconfirmed verdict, in
+        either direction, is a defect). Before finalizing, this consults
+        the same ground truth ``cancel()``/``_reap`` already use elsewhere
+        in this class: ``self._processes.get(aid)``. Only when the process
+        is CONFIRMED not alive (no entry, or ``proc.poll()`` returns a real
+        exit code) is the record excluded from the returned IDs AND
+        finalized in place (flipped to FAILED with an explanatory
+        ``error``, ``finished_at`` stamped) so it stops looking active on
+        every other surface too — `/status`, `coord usage`, the board
+        reconciler — not merely in this count. A stale-looking record whose
+        process is still confirmed alive is left completely alone (still
+        counted active, status untouched) — force-finalizing it here would
+        orphan the real subprocess with no WIP push, since a FAILED record
+        no longer shows up in `/restart`'s `pending_ids` scan that would
+        otherwise `cancel(aid, push_mode="branch")` it gracefully.
+
+        Logged at ERROR so it shows up in the agent's own log, since
+        finalizing a phantom is itself a symptom worth an operator noticing
+        (see #3363 suggested fix item 3 — persistent phantoms should
+        eventually surface in `coord release verify`, not just here).
+        """
+        now = time.time() if now is None else now
+        active: list[str] = []
+        # #3363 review: iterate `.items()` and key off the DICT key, not
+        # `a.id` — a couple of existing tests plant a bare status-only stand-
+        # in object straight into `_assignments` (no `id`/`started_at`/
+        # `created_at` at all) to exercise the busy-veto in isolation.
+        # `getattr(..., None)` below is the same defensiveness applied to
+        # the timestamp reads: a stand-in with no age info reads as age 0
+        # (never a phantom), which preserves every pre-#3363 test's
+        # "PENDING/RUNNING always counts as busy" expectation unchanged.
+        to_finalize: list[tuple[str, AgentAssignment, str, float]] = []
+        with self._lock:
+            for aid, a in self._assignments.items():
+                if a.status not in (PENDING, RUNNING):
+                    continue
+                age_ref = (
+                    getattr(a, "started_at", None) if a.status == RUNNING
+                    else getattr(a, "created_at", None)
+                )
+                age = now - age_ref if age_ref is not None else 0.0
+                if age <= self._phantom_age_ceiling_s(a):
+                    active.append(aid)
+                    continue
+                # #3363 review: unconfirmed death is the same anti-pattern
+                # (epic #2096) as unconfirmed success — consult the actual
+                # process before declaring this record dead. A live PID
+                # here means real work is still in flight no matter how
+                # stale the bookkeeping timestamp looks, so it stays active
+                # and untouched; the normal `_reap` thread watching that
+                # same process (with its own correctly-resolved runtime
+                # ceiling) remains the one path that ever finalizes it.
+                proc = self._processes.get(aid)
+                if proc is not None and proc.poll() is None:
+                    active.append(aid)
+                    continue
+                to_finalize.append((aid, a, a.status, age))
+            for _aid, a, _prior_status, age in to_finalize:
+                ceiling = self._phantom_age_ceiling_s(a)
+                a.status = FAILED
+                a.finished_at = now
+                a.error = (
+                    f"phantom assignment (#3363): stuck in {_prior_status!r} "
+                    f"for {age / 3600.0:.1f}h with no live process behind it, "
+                    f"past the {ceiling / 3600.0:.1f}h bookkeeping ceiling "
+                    "with no terminal status update — finalized "
+                    "automatically so it stops blocking restart"
+                )
+        if to_finalize:
+            for aid, a, prior_status, age in to_finalize:
+                _log.error(
+                    "finalizing phantom assignment %s (was %s for %.0fs, "
+                    "repo=%s) so it stops blocking restart (#3363)",
+                    aid, prior_status, age,
+                    getattr(getattr(a, "spec", None), "repo_name", "?"),
+                )
+            self._persist()
+        return active
 
     def list_assignments(self) -> dict:
         from coord.worker_events import is_stream_json, parse_log
