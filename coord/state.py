@@ -8276,11 +8276,14 @@ def record_drive_escalation(
     proposed_command: str,
     assignment_id: str | None = None,
 ) -> int | None:
-    """Write (or replace) the escalation record for an issue.
+    """Write (or renew) the escalation record for an issue.
 
     Routes to the daemon when ``board_service`` is set, else writes the
     local DB.  Returns the local row id on the local path; ``None`` when
-    routed (the daemon owns the id).
+    routed (the daemon owns the id). See
+    :func:`_record_drive_escalation_local` for the #3413 "renewal preserves
+    created_at" contract this applies on both paths (the daemon's own
+    ``/drive-escalations`` POST handler calls that same local function).
     """
     svc = _board_service()
     resp = _route_write(
@@ -8320,6 +8323,23 @@ def _record_drive_escalation_local(
     proposed_command: str,
     assignment_id: str | None = None,
 ) -> int:
+    """Write (or renew) the escalation record for an issue.
+
+    A renewal — the SAME ``reason`` re-recorded by a later tick, which is
+    exactly what a persistent condition (a release cordon, a HELD gate)
+    produces every cycle it stays true — preserves ``created_at`` (#3413).
+    Only a materially DIFFERENT ``reason`` resets it. This mirrors
+    ``coord.machine_pause.local_set_cordon``'s identical "renewal preserves
+    created_at" contract, and for the identical reason: without it,
+    ``created_at`` answers "when was this last re-recorded" rather than
+    "when did this condition start", which is indistinguishable from a
+    tick that is doing nothing except re-stamping the same stale finding —
+    the exact ambiguity that let a cleared release cordon's alert read as
+    current for ~20 minutes after the cordon itself had lifted (claude-
+    coordinator#3413). Callers reading ``created_at`` (``coord drive-queue
+    status``'s age display) get "how long has THIS exact reason held,
+    unbroken" instead.
+    """
     conn = get_connection()
     now = time.time()
     sql.execute(conn,
@@ -8330,7 +8350,9 @@ def _record_drive_escalation_local(
         "ON CONFLICT(repo_name, issue_number) DO UPDATE SET "
         "stage=excluded.stage, assignment_id=excluded.assignment_id, "
         "reason=excluded.reason, gate_readings=excluded.gate_readings, "
-        "proposed_command=excluded.proposed_command, created_at=excluded.created_at",
+        "proposed_command=excluded.proposed_command, "
+        "created_at=CASE WHEN drive_escalations.reason = excluded.reason "
+        "THEN drive_escalations.created_at ELSE excluded.created_at END",
         (
             repo_name, issue_number, stage, assignment_id, reason,
             gate_readings, proposed_command, now,

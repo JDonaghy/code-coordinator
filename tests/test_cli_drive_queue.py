@@ -5064,6 +5064,46 @@ def test_a_cleared_cordon_drops_its_stale_queue_alert(cli, seed, launches, monke
     assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
 
 
+def test_status_shows_how_long_a_persistent_cordon_alert_has_held(
+    cli, seed, launches, monkeypatch
+):
+    """#3413: a cordon alert that survives several ticks unbroken must say
+    so — presenting the stored reason bare, with no age at all, is what let
+    a cleared cordon's alert read as current for ~20 minutes after the real
+    cordon had lifted (nothing distinguished "just noticed" from "been true
+    the whole time"). Two ticks that both still see the SAME cordon must
+    report an age that reflects the FIRST tick, not the most recent one.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+
+    monkeypatch.setattr(drive_queue_cmd, "_local_host_id", lambda: "testhost")
+    monkeypatch.setattr(
+        drive_queue_cmd, "_fetch_cordons",
+        lambda: {"testhost": "cordoned: draining for v0.9.9"},
+    )
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+
+    time.sleep(0.05)
+    result = cli("tick")  # same cordon, second tick — a renewal, not new
+    assert result.exit_code == 0, result.output
+    assert launches == []
+
+    status_json = json.loads(cli("status", "--json").output)
+    assert status_json["alert"] is not None
+    assert status_json["alert_age_seconds"] is not None
+    # Measured from the FIRST tick's `created_at`, not reset by the second.
+    assert status_json["alert_age_seconds"] >= 0.05
+
+    text = cli("status").output
+    assert "alert:" in text
+    assert "held" in text and "straight" in text
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="_run_resume_probe's timeout kill goes through os.killpg/getpgid + "

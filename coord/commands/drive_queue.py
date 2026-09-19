@@ -2164,6 +2164,24 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
     # nothing to say (the common, dangerous case a queue with free slots
     # sits in for hours) does the guaranteed-false-wait check get to speak.
     alert = _queue_alert() or _unreachable_wait_alert_dict(rows)
+    # #3413: `alert["created_at"]` (present only for a tick-raised record —
+    # `_unreachable_wait_alert_dict` is computed fresh on every call and
+    # carries no timestamp of its own) now survives an unbroken same-reason
+    # renewal (`_record_drive_escalation_local`'s #3413 fix) rather than
+    # being rewritten to "now" every tick that still finds it true. That
+    # makes its age mean "how long has THIS EXACT reason held, unbroken" —
+    # a `dellserver is cordoned` alert reading 23m old while the timer fires
+    # every 3 minutes is the tell that the tick is either not reaching this
+    # check or evaluating a cordon view that disagrees with reality, exactly
+    # the ambiguity that let a cleared release cordon's alert read as
+    # current for the incident this issue is named after. Presenting the
+    # STORED reason bare, with no age at all, is what let it read as live
+    # state instead.
+    alert_age_seconds: float | None = None
+    if alert is not None:
+        created_at = alert.get("created_at")
+        if isinstance(created_at, (int, float)):
+            alert_age_seconds = max(0.0, time.time() - created_at)
     held = fired_holds(entries_from_rows(rows))
     # #2587: read directly from the marker file, not from the last tick's
     # `TickPlan` — `status` may run between ticks (or on a machine that never
@@ -2178,6 +2196,11 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
                     "total": len(rows),
                     "counts": counts,
                     "alert": alert,
+                    # #3413: how long the CURRENT alert reason has held,
+                    # unbroken — `None` when there is no alert, or the
+                    # alert is the synthetic #2944 wait-check (always fresh,
+                    # never latched, so it has nothing to measure).
+                    "alert_age_seconds": alert_age_seconds,
                     # #1757: typed, so a client (or a test) reads the gate
                     # without parsing the rendered sentence back out.
                     "held": [
@@ -2232,6 +2255,17 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
         )
     if alert is not None:
         click.echo(f"alert: {alert.get('reason') or ''}")
+        if alert_age_seconds is not None:
+            # #3413: bare text reads as current state even when it is a
+            # tick's stale, unbroken-since-last-time finding — see this
+            # block's own comment above `alert_age_seconds` for the
+            # incident this closes.
+            click.echo(
+                f"  (this exact reason has held {_age_str(alert_age_seconds)} "
+                "straight — if that is longer than the tick interval, "
+                "distrust it and cross-check with "
+                "`coord drive-queue tick --dry-run`)"
+            )
         for detail in (alert.get("gate_readings") or "").split(" | "):
             if detail:
                 click.echo(f"  {detail}")
@@ -3675,6 +3709,16 @@ def _escalate_roll_pending_expired(pending: RollPending, *, now: float) -> None:
 # self-cordon reason is ever active at a time, keyed by a wall-clock
 # `first_seen_at` this module controls directly rather than trusting
 # `drive_escalations.created_at`.
+#
+# #3413 update: `record_drive_escalation`'s `created_at=excluded.created_at`
+# above is no longer unconditional — an unbroken same-reason renewal now
+# PRESERVES it (`_record_drive_escalation_local`'s #3413 fix), so
+# `drive_escalations.created_at` itself now answers "how long has this
+# reason held" too, and `coord drive-queue status` shows it. This marker
+# file stays: it exists to DRIVE a one-time push past a threshold with its
+# own retry bookkeeping (`escalated_at`), which a bare timestamp field
+# cannot do on its own — but the excuse for not trusting
+# `drive_escalations.created_at` at all, given above, no longer holds.
 _SELF_CORDON_STATE_FILENAME = "self_cordon_escalation.json"
 
 #: How long the SAME drift reason must persist, unbroken, before this tick
@@ -6236,12 +6280,17 @@ def drive_queue_tick(
             # alert-free tick is safe and cheap.
             _clear_queue_alert()
 
-        # #2572: independent of the routine alert record just above (which
-        # `record_drive_escalation` overwrites — including its own
-        # timestamp — every tick this stays true), track how long THIS
-        # SPECIFIC self-cordon reason has held and push a direct escalation
-        # once it crosses `SELF_CORDON_ESCALATE_AFTER_SECONDS`. See that
-        # function's own docstring for the incident this closes.
+        # #2572: independent of the routine alert record just above.
+        # `record_drive_escalation`'s `created_at` now survives an unbroken
+        # same-reason renewal (#3413), so `status` can show how long this
+        # exact drift reason has held — but that is a passive READ an
+        # operator has to go look at. This function tracks the identical
+        # "how long has THIS SPECIFIC reason held" quantity independently
+        # (its own marker file, not `drive_escalations.created_at`) so it
+        # can additionally push a direct escalation once it crosses
+        # `SELF_CORDON_ESCALATE_AFTER_SECONDS`, without an operator needing
+        # to have been watching `status` at all. See that function's own
+        # docstring for the incident this closes.
         _escalate_persistent_self_cordon(
             plan.drift_reason, now=now, config_path=config_path
         )
