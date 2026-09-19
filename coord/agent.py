@@ -450,6 +450,22 @@ HOST_SLEEP_EXIT = 127
 # #2638.
 _DEFAULT_RUNTIME_CEILING_S = 6.0 * 60.0 * 60.0  # 6 hours
 
+# #3363: max age a PENDING/RUNNING assignment record is trusted at face
+# value before `AgentServer.active_assignment_count()` treats it as a
+# leaked bookkeeping entry ("phantom") instead of live work. Nothing but a
+# process restart ever clears `_assignments` — so an entry that never
+# reaches a terminal status (worker killed out from under it, dispatch
+# crashed between insert and spawn, a stop that didn't write back) stays
+# "active" forever, which is exactly what makes it dangerous: every
+# restart path (`/update`, `/rollback`, the #2139 idle watcher) refuses to
+# act while ANY assignment looks active, so a single phantom permanently
+# blocks the one thing — a restart — that would clear it. Set comfortably
+# above `_DEFAULT_RUNTIME_CEILING_S`: a genuine RUNNING leg is already
+# killed by that watchdog well before this fires, so anything still
+# PENDING/RUNNING past this ceiling was never going to reach a terminal
+# status on its own.
+_PHANTOM_ASSIGNMENT_MAX_AGE_S = _DEFAULT_RUNTIME_CEILING_S + 60.0 * 60.0  # 7 hours
+
 # Minimum wall-vs-monotonic divergence measured over a SINGLE poll interval
 # that is unambiguously a host suspend rather than ordinary thread-scheduling
 # jitter, a GC pause, or a loaded box briefly starving this thread. Comfortably
@@ -3402,6 +3418,15 @@ class AgentAssignment:
     spec: AssignmentSpec
     status: str = PENDING
     pid: int | None = None
+    # #3363: stamped once, at construction, so a PENDING assignment (no
+    # `started_at` yet — that's only set once it reaches RUNNING) still has
+    # an age `active_assignment_count()`'s phantom check can measure.
+    # Reloaded PENDING/RUNNING entries from a persisted state file never
+    # keep this value in practice: `_load_state` already force-fails any
+    # PENDING/RUNNING record it finds (the owning subprocess is provably
+    # gone across a restart), so a missing/stale `created_at` on an old
+    # state file is harmless.
+    created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
     exit_code: int | None = None
@@ -7355,6 +7380,90 @@ class AgentServer:
             )
         cargo_cache.write_gc_status(self.state_dir, result)
         return result
+
+    def active_assignment_count(self, *, now: float | None = None) -> int:
+        """How many assignments are genuinely still in flight right now.
+
+        #3363: the ONE predicate every "is this host busy" surface must
+        call. Before this, `_idle_restart_target`, `/update`'s post-swap
+        busy check, and `/rollback`'s busy check (all in
+        `coord/agent_app.py`) each independently re-derived
+        ``status in (PENDING, RUNNING)`` straight off ``self._assignments``
+        — three copies of the same question, agreeing right up until one of
+        them needed to disagree. A PENDING/RUNNING entry that never reaches
+        a terminal status (worker killed out from under it, a dispatch that
+        crashed between insert and spawn, a stop that didn't write back) is
+        "active" by that raw predicate forever, since nothing but a process
+        restart clears ``_assignments`` — and every restart path above
+        refuses to act while count > 0, so the phantom permanently blocks
+        the one thing that would clear it (see #3363's six-day macmini
+        deadlock).
+
+        Delegates the actual scan (and phantom finalization) to
+        :meth:`_active_assignment_ids`.
+        """
+        return len(self._active_assignment_ids(now=now))
+
+    def _active_assignment_ids(self, *, now: float | None = None) -> list[str]:
+        """IDs of assignments still genuinely active, aging out phantoms.
+
+        Any PENDING/RUNNING entry older than
+        :data:`_PHANTOM_ASSIGNMENT_MAX_AGE_S` (measured from
+        ``started_at`` once RUNNING, ``created_at`` while still PENDING) is
+        treated as a leaked bookkeeping record rather than live work: it is
+        excluded from the returned IDs AND finalized in place (flipped to
+        FAILED with an explanatory ``error``, ``finished_at`` stamped) so it
+        stops looking active on every other surface too — `/status`,
+        `coord usage`, the board reconciler — not merely in this count.
+        Logged at ERROR so it shows up in the agent's own log, since
+        finalizing a phantom is itself a symptom worth an operator noticing
+        (see #3363 suggested fix item 3 — persistent phantoms should
+        eventually surface in `coord release verify`, not just here).
+        """
+        now = time.time() if now is None else now
+        active: list[str] = []
+        # #3363 review: iterate `.items()` and key off the DICT key, not
+        # `a.id` — a couple of existing tests plant a bare status-only stand-
+        # in object straight into `_assignments` (no `id`/`started_at`/
+        # `created_at` at all) to exercise the busy-veto in isolation.
+        # `getattr(..., None)` below is the same defensiveness applied to
+        # the timestamp reads: a stand-in with no age info reads as age 0
+        # (never a phantom), which preserves every pre-#3363 test's
+        # "PENDING/RUNNING always counts as busy" expectation unchanged.
+        to_finalize: list[tuple[str, AgentAssignment, str, float]] = []
+        with self._lock:
+            for aid, a in self._assignments.items():
+                if a.status not in (PENDING, RUNNING):
+                    continue
+                age_ref = (
+                    getattr(a, "started_at", None) if a.status == RUNNING
+                    else getattr(a, "created_at", None)
+                )
+                age = now - age_ref if age_ref is not None else 0.0
+                if age <= _PHANTOM_ASSIGNMENT_MAX_AGE_S:
+                    active.append(aid)
+                else:
+                    to_finalize.append((aid, a, a.status, age))
+            for _aid, a, _prior_status, age in to_finalize:
+                a.status = FAILED
+                a.finished_at = now
+                a.error = (
+                    f"phantom assignment (#3363): stuck in {_prior_status!r} "
+                    f"for {age / 3600.0:.1f}h, past the "
+                    f"{_PHANTOM_ASSIGNMENT_MAX_AGE_S / 3600.0:.1f}h bookkeeping "
+                    "ceiling with no terminal status update — finalized "
+                    "automatically so it stops blocking restart"
+                )
+        if to_finalize:
+            for aid, a, prior_status, age in to_finalize:
+                _log.error(
+                    "finalizing phantom assignment %s (was %s for %.0fs, "
+                    "repo=%s) so it stops blocking restart (#3363)",
+                    aid, prior_status, age,
+                    getattr(getattr(a, "spec", None), "repo_name", "?"),
+                )
+            self._persist()
+        return active
 
     def list_assignments(self) -> dict:
         from coord.worker_events import is_stream_json, parse_log
