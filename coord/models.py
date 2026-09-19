@@ -446,6 +446,19 @@ class Machine:
     # caller's requested timeout and this value — a per-machine floor, never
     # a ceiling that could silently shrink a caller's own longer request.
     health_timeout: float | None = None
+    # #3366: optional operator-set fact about which init system supervises
+    # `coord agent` on this host — "systemd" or "launchd" (see
+    # `coord.restart_cmd`). `None` (the default, and every config that
+    # predates this field) means "unknown, assume systemd" — the exact
+    # pre-#3366 behaviour, never a guess: launchd hosts do not reliably
+    # carry any other distinguishing config (macmini's own capabilities
+    # are `[python, rust]`, not `macos` — `docs/MAC_MINI.md`), so this is
+    # deliberately a fact an operator states, not one inferred. Only
+    # consulted as a FALLBACK behind a live `/health` "supervisor"
+    # self-report — see `coord.restart_cmd.resolve_supervisor` — and never
+    # by the SSH escalation itself, which auto-detects on the target host
+    # regardless of what this says.
+    supervisor: str | None = None
 
     def can_work_on(self, repo_name: str) -> bool:
         return repo_name in self.repos

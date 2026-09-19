@@ -213,6 +213,42 @@ def test_machine_health_timeout_rejects_zero_or_negative(tmp_path: Path) -> None
         load(p)
 
 
+# ── #3366: per-machine init-system override ─────────────────────────────────
+
+
+def test_machine_supervisor_parsed(tmp_path: Path) -> None:
+    """#3366: `supervisor: launchd` on a machine's config entry is the
+    fallback `coord.restart_cmd.resolve_supervisor` uses whenever a live
+    `/health` self-report isn't available (an already-down host, which is
+    exactly the case the SSH escalation and its remediation text need it
+    for)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: mac\n    host: h\n    repos: [api]\n    supervisor: launchd\n"
+        "  - name: linux\n    host: h2\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    by_name = {m.name: m for m in cfg.machines}
+    assert by_name["mac"].supervisor == "launchd"
+    # Unset stays None — every config that predates this field, unchanged.
+    assert by_name["linux"].supervisor is None
+
+
+def test_machine_supervisor_rejects_unknown_value(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    supervisor: launchD\n"
+    )
+    with pytest.raises(ConfigError, match="supervisor must be 'systemd' or 'launchd'"):
+        load(p)
+
+
 # ── #1862: per-machine quiet hours ──────────────────────────────────────────
 
 

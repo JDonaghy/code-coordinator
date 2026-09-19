@@ -2257,6 +2257,30 @@ def test_roll_units_names_a_timer_it_started(monkeypatch):
     assert "enabled timer(s): coord-agent.timer" in detail
 
 
+def test_roll_units_on_a_non_systemd_host_is_unrollable_not_a_pile_of_new_units(monkeypatch):
+    """#3366: `agent_app.py`'s `deploy_units` handler short-circuits with an
+    `n/a` detail on a host with no `systemctl` at all (every macOS agent
+    today) rather than reporting every packaged unit as "new"/"not
+    installed here" — that reads as noise every single run, not drift. This
+    lane must treat that the same way it already treats a pre-#1835 agent
+    build (the 404 branch, see the test above): `ok=None`, "there is no
+    channel for this lane here," never a failure and never a plain success
+    either — see #2052's `unrollable` convention, exercised end-to-end in
+    `test_an_agent_without_deploy_units_is_a_next_run_fact_not_a_red_gate`."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "dry_run": False, "reloaded": False,
+            "reload_detail": "", "timers_enabled": {},
+            "detail": "n/a — no systemd on this host (supervisor: launchd)",
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok is None
+    assert "n/a" in detail
+    assert "launchd" in detail
+
+
 def test_roll_units_names_a_timer_it_left_alone(monkeypatch):
     """#2124's acceptance item 3: the exact text an operator greps for after
     a roll to confirm the timer they stopped is still stopped."""

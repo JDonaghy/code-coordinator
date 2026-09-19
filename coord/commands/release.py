@@ -24,6 +24,7 @@ from typing import Any
 
 import click
 
+from coord import restart_cmd
 from coord.commands._common import _CONFIG_OPTION
 
 
@@ -1779,9 +1780,11 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
                 "ROLLBACK LEFT AGENTS DOWN: "
                 + ", ".join(down)
                 + " — these hosts answered the rollback but never came back "
-                "on /health, and an SSH `systemctl --user restart "
-                "coord-agent` did not revive them either. Recover by hand "
-                "before anything else."
+                "on /health, and a driven SSH restart (systemd "
+                f"({restart_cmd.restart_shell_command(restart_cmd.SYSTEMD)}) or "
+                f"launchd ({restart_cmd.restart_shell_command(restart_cmd.LAUNCHD)}), "
+                "whichever applies) did not revive them either. Recover by "
+                "hand before anything else."
             )
             click.echo(f"error: {record.error}", err=True)
         _finish(rp.STATUS_ROLLED_BACK, 2)
@@ -2715,6 +2718,16 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     # report" / a false-positive success.
     if status != 200 and not (status == 500 and "units" in body):
         return False, str(body.get("error") or body.get("summary") or f"HTTP {status}")
+    # #3366: the agent itself already told us this host has no systemd to
+    # deploy units onto (see `agent_app.py`'s `deploy_units` handler) —
+    # every packaged unit reading as "new"/"not installed here" on THAT
+    # host, every run, is the platform, not drift, so this is a structural
+    # gap like the pre-#1835 404 branch above, not a failed lane: `None`,
+    # same "not accountable for a lane it cannot roll" verdict #2052
+    # already established for that case.
+    detail = str(body.get("detail") or "")
+    if detail.startswith("n/a"):
+        return None, detail
     units = body.get("units") or []
     changed = [u.get("name") for u in units if u.get("action") == "updated"]
     new = [u.get("name") for u in units if u.get("action") == "new"]
@@ -3111,8 +3124,9 @@ def _rollback_host(
         )
         if back:
             return _back_on_target(
-                f"rolled back; agent needed an SSH `systemctl --user restart "
-                f"coord-agent` but is serving again on v{version}"
+                "rolled back; agent needed a driven SSH restart "
+                f"({restart_cmd.restart_hint(restart_cmd.resolve_supervisor(machine))}) "
+                f"but is serving again on v{version}"
             )
     return False, (
         "rolled back the venv but the agent is DOWN — it never came back on "
@@ -3120,8 +3134,9 @@ def _rollback_host(
         + (
             "the SSH restart did not revive it"
             if escalated
-            else "the SSH `systemctl --user restart coord-agent` escalation "
-            "could not run"
+            else "the SSH "
+            f"{restart_cmd.restart_hint(restart_cmd.resolve_supervisor(machine))} "
+            "escalation could not run"
         )
         + f". Recover by hand on {machine.name}."
     )

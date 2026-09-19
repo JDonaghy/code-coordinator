@@ -74,6 +74,23 @@ def test_health_endpoint(tmp_path: Path) -> None:
     assert body["repos"] == ["api"]
 
 
+def test_health_reports_supervisor(tmp_path: Path, monkeypatch) -> None:
+    """#3366: /health's live self-report of what supervises this process —
+    the freshest possible answer, ahead of any static coordinator.yml
+    override (see `coord.restart_cmd.resolve_supervisor`)."""
+    from coord import agent_app
+
+    client, _ = _client(tmp_path)
+
+    monkeypatch.setattr(agent_app.restart_cmd, "local_supervisor", lambda: "launchd")
+    body = client.get("/health").json()
+    assert body["supervisor"] == "launchd"
+
+    monkeypatch.setattr(agent_app.restart_cmd, "local_supervisor", lambda: None)
+    body = client.get("/health").json()
+    assert body["supervisor"] is None
+
+
 def test_assign_then_status(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     client, server = _client(tmp_path, repo_path=repo)
