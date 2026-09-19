@@ -35,7 +35,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import click
 
@@ -111,6 +111,7 @@ from coord.overlap_predict import (
     EVENT_SCORED,
     OUTCOME_UNKNOWN,
     SOURCE_DECLARED,
+    Overlap,
     Prediction,
     classify_outcome,
     collect_candidate_files,
@@ -118,6 +119,7 @@ from coord.overlap_predict import (
     fanout_warnings,
     inflight_footprints,
     malformed_files_warning,
+    overlap_would_run_before,
     parse_declared_files,
     predict_overlap,
     predictions_from_audit,
@@ -465,12 +467,35 @@ def drive_queue_add(
     malformed_note = ""
     auto_after: list[str] = []
     rejected_after: list[str] = []
+    # #3395 rule 2: overlaps against an already-queued, not-yet-dispatched
+    # entry that THIS add is positioning ahead of — the edge for those goes
+    # on the INCUMBENT (`entry --after this add`), applied further down once
+    # this add's own row exists, never on `after` above (that would chain
+    # this add behind an entry it is about to run in front of).
+    reverse_candidates: list[tuple[QueueEntry, Overlap]] = []
+    reverse_rejected: list[str] = []
     if not no_predict_overlap:
         prediction, staleness_note, malformed_note = _predict_overlap(
             config_path, repo, issue, existing_entries
         )
+        effective_position = _resolve_effective_new_position(position, previous)
+        forward_keys, all_reverse = _partition_overlap_after(
+            existing_entries, effective_position, prediction,
+        )
+        # #2603's --reject-after is the same narrower escape hatch for a
+        # REVERSED edge too — it names the OTHER entry's key either way, so
+        # an operator does not need to know which direction rule 2 picked to
+        # veto it.
+        reverse_candidates = [
+            (entry, overlap) for entry, overlap in all_reverse
+            if entry.key not in reject_after
+        ]
+        reverse_rejected = [
+            entry.key for entry, _overlap in all_reverse if entry.key in reject_after
+        ]
         candidate_after = _applicable_auto_after(
-            existing_entries, repo, issue, after, prediction
+            existing_entries, repo, issue, after, prediction,
+            candidate_keys=forward_keys,
         )
         # #2603: --reject-after is the narrower escape hatch — it drops only
         # the named edge(s) from what actually gets applied, never the whole
@@ -493,6 +518,18 @@ def drive_queue_add(
         no_acceptance=no_acceptance,
         plan_destructive=plan_destructive,
     )
+    # #3395: apply the REVERSED edges rule 2 selected — writing to the
+    # INCUMBENT entry's own row, now that this add's row exists to name as
+    # its `--after`. Must run after the write above: it names `entry_key
+    # (repo, issue)` as a pre-req, and while nothing here checks the row for
+    # existence, doing this first keeps the audit trail (both events land in
+    # enqueue order, not out of order relative to `queued ...`) intuitive to
+    # read back.
+    reverse_applied: list[tuple[QueueEntry, Overlap]] = []
+    if reverse_candidates:
+        reverse_applied = _apply_reversed_overlap_after(
+            existing_entries, entry_key(repo, issue), reverse_candidates,
+        )
     # #2839: queueing a drive is a strictly STRONGER statement than "send to
     # Pipeline" (`coord track`), so it must never leave the issue in a
     # weaker label state — apply the same `coord` + `status:ready` labels
@@ -542,13 +579,22 @@ def drive_queue_add(
     # --reject-after confirmation above: an author who wrote a declaration
     # that never took must not see output byte-identical to "declared
     # nothing".
+    # #3395: plus, for every REVERSED edge rule 2 applied, a line naming the
+    # INCUMBENT entry and why the direction is flipped from #2247's usual
+    # "ordered --after" reading — an unexplained edge on a row OTHER than
+    # the one this `add` named is exactly the kind of surprise an operator
+    # needs the reason for immediately, not by going and reading that row's
+    # own `last_reason` separately.
     overlap_notes: list[str] = []
     if auto_after:
         overlap_notes.append(prediction.reason)
         overlap_notes.extend(_declared_overlap_age_notes(prediction, auto_after))
-    if rejected_after:
+    for entry, overlap in reverse_applied:
+        overlap_notes.append(_reverse_overlap_reason(entry_key(repo, issue), overlap))
+    all_rejected = [*rejected_after, *reverse_rejected]
+    if all_rejected:
         overlap_notes.append(
-            "rejected via --reject-after (not applied): " + ", ".join(rejected_after)
+            "rejected via --reject-after (not applied): " + ", ".join(all_rejected)
         )
     overlap_notes.extend(fanout_warnings(prediction))
     if malformed_note:
@@ -925,6 +971,8 @@ def _applicable_auto_after(
     issue: int,
     after: list[str],
     prediction: Prediction,
+    *,
+    candidate_keys: Sequence[str] | None = None,
 ) -> list[str]:
     """The predicted pre-reqs that are actually safe to add.
 
@@ -933,9 +981,18 @@ def _applicable_auto_after(
     dropped if it would self-edge or close a cycle — the opposite posture to
     `validate_enqueue`'s treatment of an operator-declared `--after`, which is
     a typo worth reporting.
+
+    #3395: *candidate_keys* narrows which of `prediction.after_keys` this
+    call even considers — `None` (every other caller) keeps the pre-#3395
+    behaviour of trying all of them. `drive_queue_add` passes the FORWARD
+    subset only: `_partition_overlap_after` has already routed the REVERSED
+    ones (a newcomer positioned ahead of an overlapping, not-yet-dispatched
+    entry) to `_apply_reversed_overlap_after` instead, and chaining this
+    entry after them TOO would apply rule 2's edge twice, in both directions.
     """
+    keys = prediction.after_keys if candidate_keys is None else tuple(candidate_keys)
     applied: list[str] = []
-    for candidate_key in prediction.after_keys:
+    for candidate_key in keys:
         if candidate_key in after or candidate_key in applied:
             continue
         try:
@@ -946,6 +1003,190 @@ def _applicable_auto_after(
             continue
         applied.append(candidate_key)
     return applied
+
+
+def _resolve_effective_new_position(
+    position: int | None, previous: QueueEntry | None,
+) -> int | None:
+    """#3395: the position this `add` actually leaves the entry at, for
+    :func:`coord.overlap_predict.overlap_would_run_before` to compare against.
+
+    An explicit ``--position`` wins outright. Otherwise, re-adding an
+    already-queued entry keeps its CURRENT position — `enqueue_drive_queue`
+    never moves a row unless `position` is given — so that position is what
+    the entry will actually run at. A brand-new entry with no `--position`
+    appends at the tail (``None``, `overlap_would_run_before`'s own "never
+    ahead of anything" case) — there is no meaningful position yet.
+    """
+    if position is not None:
+        return position
+    if previous is not None:
+        return previous.position
+    return None
+
+
+def _partition_overlap_after(
+    existing_entries: list[QueueEntry],
+    effective_position: int | None,
+    prediction: Prediction,
+) -> tuple[list[str], list[tuple[QueueEntry, Overlap]]]:
+    """#3395 rule 2: split predicted overlaps by which direction the
+    ``--after`` edge belongs in.
+
+    FORWARD (returned as plain keys, same shape `_applicable_auto_after`
+    always took) is correct whenever the other side either is already
+    running (`[branch]` — it started before this `add` regardless of queue
+    position) or is queued but will still dispatch no earlier than this
+    newcomer. REVERSE (returned paired with the other side's own
+    `QueueEntry`, since applying it means writing to THAT row, not this one)
+    is the case the issue is about: a `[declared]` overlap against an entry
+    that is still queued but is about to be pushed BEHIND this newcomer in
+    dispatch order. Chaining the newcomer after it there would force the
+    newcomer to run last despite the operator's own `--position`, while the
+    incumbent — now scheduled first — would carry no edge stopping it from
+    colliding with the newcomer's fresher files.
+
+    An overlap naming a key with no matching `QueueEntry` (the declared
+    footprint disappeared between prediction and this call — a `remove` race,
+    vanishingly rare) falls back to FORWARD: the safe, pre-#3395 default.
+    """
+    entries_by_key = {e.key: e for e in existing_entries}
+    forward: list[str] = []
+    reverse: list[tuple[QueueEntry, Overlap]] = []
+    for overlap in prediction.overlaps:
+        other = entries_by_key.get(overlap.key)
+        if (
+            overlap.source == SOURCE_DECLARED
+            and other is not None
+            and overlap_would_run_before(effective_position, other.position)
+        ):
+            reverse.append((other, overlap))
+        else:
+            forward.append(overlap.key)
+    return forward, reverse
+
+
+def _apply_reversed_overlap_after(
+    existing_entries: list[QueueEntry],
+    new_key: str,
+    reverse_candidates: list[tuple[QueueEntry, Overlap]],
+) -> list[tuple[QueueEntry, Overlap]]:
+    """#3395: apply the REVERSED edges `_partition_overlap_after` identified
+    — chain each incumbent entry ``--after`` the newcomer, since the
+    newcomer is the one that will actually dispatch first.
+
+    Same fail-safe posture as `_applicable_auto_after`: a would-be cycle is
+    silently dropped rather than failing this `add` (an INFERRED edge must
+    never be able to refuse an operator's own `--position`), and an edge that
+    already exists on the incumbent is left alone (no redundant write).
+    Every OTHER operator-declared field on the incumbent's row (`machine`,
+    the hold gate, `max_fix_rounds`, ...) is carried through unchanged —
+    `enqueue_drive_queue` fully replaces those columns on every call, so
+    omitting one here would silently clear it off a row this `add` was never
+    asked to touch.
+    """
+    from coord.state import enqueue_drive_queue  # noqa: PLC0415
+
+    applied: list[tuple[QueueEntry, Overlap]] = []
+    for entry, overlap in reverse_candidates:
+        if new_key in entry.after:
+            applied.append((entry, overlap))
+            continue
+        new_after = [*entry.after, new_key]
+        try:
+            validate_enqueue(existing_entries, entry.repo, entry.issue, new_after)
+        except QueueError:
+            continue
+        enqueue_drive_queue(
+            entry.repo,
+            entry.issue,
+            machine=entry.machine or None,
+            after=new_after,
+            position=None,
+            hold_after=entry.hold_after,
+            hold_reason=entry.hold_reason,
+            resume_when=entry.resume_when,
+            hold_scope=entry.hold_scope,
+            max_fix_rounds=entry.max_fix_rounds,
+            no_acceptance=entry.no_acceptance,
+            plan_destructive=entry.plan_destructive,
+        )
+        applied.append((entry, overlap))
+        _record_reverse_overlap_prediction(entry.repo, entry.issue, new_key, overlap)
+    return applied
+
+
+def _reverse_overlap_reason(new_key: str, overlap: Overlap) -> str:
+    """#3395: the one sentence shared by `add`'s stdout, the audit summary,
+    and the INCUMBENT's own `last_reason` for a REVERSED edge — so all three
+    surfaces agree on why a row this `add` never named got a new `after=`.
+    """
+    return (
+        "predicted file overlap (#2247) — ordered "
+        + overlap.describe_reversed(new_key)
+        + " (#3395: this add was positioned ahead of an existing queued entry)"
+    )
+
+
+def _record_reverse_overlap_prediction(
+    repo: str, issue: int, new_key: str, overlap: Overlap,
+) -> None:
+    """#3395: the audit + `last_reason` twin of `_record_overlap_prediction`
+    for a REVERSED edge — recorded against *repo*/*issue*, the INCUMBENT
+    entry that actually got the new `after=` write, not the entry `add` was
+    called for. Mirrors `_record_overlap_prediction`'s two sinks (a durable
+    audit row, plus the `last_reason` column an operator reading `coord
+    drive-queue list` sees immediately) for the same reason: a `last_reason`
+    the next tick attempt will overwrite is not durable, so the claim also
+    needs a permanent home to be scored later.
+
+    Kept as its own event rather than reusing `Prediction.audit_details()`
+    verbatim: that payload's `after` list and `predicted_files` are framed
+    from the CANDIDATE's point of view (`_predict_overlap` computed them
+    that way), and reusing it here unedited would misrepresent whose files
+    were actually being ordered against whose.
+    """
+    reason = _reverse_overlap_reason(new_key, overlap)
+    details = {
+        "predicted_files": list(overlap.files),
+        "overlaps": [
+            {
+                "key": new_key,
+                "source": overlap.source,
+                "branch": overlap.branch,
+                "head_sha": overlap.head_sha,
+                "synced_at": overlap.synced_at,
+                "liveness_checked": overlap.liveness_checked,
+                "files": list(overlap.files),
+            }
+        ],
+        "after": [new_key],
+        # #3395: the one field with no forward-edge equivalent — lets a later
+        # reader (a human, `overlap-report`) tell this row's `after=` was
+        # rule 2's reversal, not an ordinary same-direction prediction.
+        "reversed": True,
+    }
+    try:
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category=AUDIT_CATEGORY,
+            event_type=EVENT_PREDICTED,
+            actor="drive-queue",
+            summary=reason,
+            repo=repo,
+            issue=issue,
+            details=details,
+        )
+    except Exception:  # noqa: BLE001 — recording must never fail the enqueue
+        pass
+    try:
+        from coord.state import update_drive_queue_entry  # noqa: PLC0415
+
+        update_drive_queue_entry(repo, issue, last_reason=reason)
+    except Exception:  # noqa: BLE001 — same
+        pass
 
 
 def _record_overlap_prediction(
