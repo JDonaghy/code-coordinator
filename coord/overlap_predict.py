@@ -92,6 +92,23 @@ detail because it is pure data with no wall-clock dependency; the cached-body
 age is a relative-time string and is therefore the CLI layer's job (see
 ``coord.commands.drive_queue``), the same split that module already draws
 for the candidate's own staleness note.
+
+#3395: this module already predicted against every non-terminal QUEUED entry,
+not just in-flight branches (:func:`coord.commands.drive_queue._predict_overlap`
+builds :class:`Footprint`\\ s from both) — the gap was DIRECTION, not
+coverage. Chaining every overlap the newcomer's own ``--after`` is only
+correct when the newcomer runs SECOND. When it is inserted ahead of an
+already-queued, not-yet-dispatched entry it overlaps with (``--position``
+placing it before that entry's slot), chaining it after that entry as well
+would force it to run LAST despite the operator's own ordering — while the
+incumbent, now scheduled to run FIRST, sails past the newcomer's fresher
+files with no edge stopping it, exactly vimcode#1117/#1090's shape.
+:func:`overlap_would_run_before` answers "who runs first" as a pure position
+comparison; :meth:`Overlap.describe_reversed` renders the edge the other way
+round when the answer says to reverse it. The decision of WHICH overlaps to
+reverse still lives in ``coord.commands.drive_queue`` (it needs the queue's
+positions and the write path to apply an edge onto an entry other than the
+one being added), so this module only supplies the pure primitives.
 """
 
 from __future__ import annotations
@@ -444,6 +461,24 @@ class Overlap:
         stale = ", liveness check failed" if not self.liveness_checked else ""
         return f" ({self.branch}{sha}{stale})"
 
+    def describe_reversed(self, new_key: str) -> str:
+        """#3395: the same rendering as :meth:`describe`, but for the
+        REVERSED chaining direction rule 2 requires when a newcomer is
+        positioned AHEAD of the entry this overlap names.
+
+        :meth:`describe` reads as "the OTHER entry, which the candidate is
+        chained after" — correct when the candidate runs second. Here it is
+        the other way around: ``self.key`` (the entry already sitting in the
+        queue) is the one that must now wait, and *new_key* is the newcomer
+        it waits ON. Only ever called for a :data:`SOURCE_DECLARED` overlap
+        (see :func:`overlap_would_run_before`'s caller) — a `[branch]` edge
+        is already running and can never be the one reversed.
+        """
+        shown = ", ".join(f"`{f}`" for f in self.files[:3])
+        if len(self.files) > 3:
+            shown += f" (+{len(self.files) - 3} more)"
+        return f"{self.key} --after {new_key} [{self.source}]{self._provenance()}: {shown}"
+
 
 @dataclass(frozen=True)
 class Prediction:
@@ -526,6 +561,33 @@ def paths_overlap(left: str, right: str) -> bool:
     if left.endswith("/") and right.startswith(left):
         return True
     return bool(right.endswith("/") and left.startswith(right))
+
+
+def overlap_would_run_before(new_position: int | None, other_position: int) -> bool:
+    """#3395: would the entry landing at *new_position* dispatch BEFORE the
+    already-queued entry sitting at *other_position*?
+
+    This is rule 2 of the issue's fix, in its testable pure form: an overlap
+    against a `[declared]` (still-queued, not-yet-dispatched) entry must be
+    chained the NORMAL way (newcomer ``--after`` the incumbent) UNLESS the
+    newcomer is being inserted ahead of it in queue order — in which case the
+    edge has to run the other way, or the incumbent's stale files would
+    collide with a newcomer that starts first. The caller
+    (`coord.commands.drive_queue._partition_overlap_after`) is what decides
+    WHICH direction to apply based on this answer; this function only answers
+    "who runs first".
+
+    ``new_position=None`` means "appends at the tail" — `coord.state.
+    enqueue_drive_queue`'s own contract for an omitted ``--position`` — which
+    can never be ahead of anything already queued, so this is unconditionally
+    ``False``. A tie (``new_position == other_position``) resolves to
+    ``True``: inserting AT an occupied slot pushes the incumbent back one
+    (`coord.state._move_drive_queue_entry_local`'s renumbering), so the
+    newcomer is the one that ends up running first.
+    """
+    if new_position is None:
+        return False
+    return int(new_position) <= int(other_position)
 
 
 def _intersect(candidate: Sequence[str], other: Sequence[str]) -> tuple[str, ...]:

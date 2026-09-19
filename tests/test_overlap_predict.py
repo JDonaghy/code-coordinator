@@ -28,6 +28,7 @@ from coord.overlap_predict import (
     inflight_assignments,
     inflight_footprints,
     malformed_files_warning,
+    overlap_would_run_before,
     parse_declared_files,
     paths_overlap,
     predict_overlap,
@@ -214,6 +215,36 @@ def test_paths_overlap_is_exact_plus_declared_directories():
     assert paths_overlap("coord/dashboard/", "coord/dashboard/app.py")
     assert paths_overlap("coord/dashboard/app.py", "coord/dashboard/")
     assert not paths_overlap("coord/a.py", "")
+
+
+# ── #3395: direction ─────────────────────────────────────────────────────────
+
+
+def test_overlap_would_run_before_is_false_when_appending_at_the_tail():
+    # `new_position=None` is `enqueue_drive_queue`'s own "no --position given,
+    # appends at the tail" contract — that can never be ahead of an entry
+    # already sitting somewhere in the queue.
+    assert overlap_would_run_before(None, 0) is False
+    assert overlap_would_run_before(None, 99) is False
+
+
+def test_overlap_would_run_before_compares_explicit_positions():
+    assert overlap_would_run_before(0, 1) is True
+    assert overlap_would_run_before(2, 1) is False
+    # A tie resolves to "runs before": inserting AT an occupied slot pushes
+    # the incumbent back one, so the newcomer is the one that ends up first.
+    assert overlap_would_run_before(1, 1) is True
+
+
+def test_overlap_describe_reversed_names_the_incumbent_and_the_newcomer():
+    overlap = Overlap(
+        key=f"{REPO}#1090",
+        source=SOURCE_DECLARED,
+        files=("src/harness.rs", "src/tui_main/shell_app.rs"),
+    )
+    rendered = overlap.describe_reversed(f"{REPO}#1117")
+    assert rendered.startswith(f"{REPO}#1090 --after {REPO}#1117 [declared]")
+    assert "src/harness.rs" in rendered
 
 
 def test_predicts_an_overlap_against_a_live_branch_footprint():

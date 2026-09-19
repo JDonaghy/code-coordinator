@@ -6097,3 +6097,108 @@ def test_diagnose_does_not_call_a_never_polled_machine_unreachable(
     assert "agent-unreachable" not in result.output
     assert "dead-leg" not in result.output
     assert "/health dellserver: not read" in result.output
+
+
+# ── #3395: direction-aware overlap ordering against a QUEUED entry ──────────
+#
+# vimcode#1117 / vimcode#1090: both declared `src/harness.rs` and
+# `src/tui_main/shell_app.rs`. #1090 was queued first and sat `waiting`
+# behind a chain; #1117 was added later at `--position 0`, ahead of it. The
+# predictor found the overlap but chained #1117 `--after` #1090 — the normal
+# direction, correct only when the newcomer runs SECOND. Here it runs FIRST
+# (that is the whole point of `--position 0`), so #1090 carried no edge
+# naming #1117 and both ran concurrently: #1117 merged first and emptied a
+# list in `src/harness.rs`; #1090's stale copy conflicted on merge (PR #1121,
+# `HUMAN_REQUIRED`). These assert the edge lands on the INCUMBENT (#1090)
+# instead, fixing the direction rather than merely detecting the collision
+# (which unfixed `main` already does — see the module docstring's #3395
+# paragraph).
+
+
+def test_inserting_ahead_of_a_queued_overlap_orders_the_incumbent_after_it(
+    cli, declare,
+):
+    # Queue A (files X, Y) — queued first, sits at position 0.
+    declare(1090, "src/harness.rs", "src/tui_main/shell_app.rs")
+    assert cli("add", REPO, "1090").exit_code == 0
+
+    # Queue B (files X, Z) at --position 0, ahead of A. Fails against
+    # unfixed main: the edge previously landed on B (`1117 after 1090`), not
+    # on A — the newcomer positioned to run FIRST was the one made to wait.
+    declare(1117, "src/harness.rs", "src/tui_main/shell_app.rs")
+    result = cli("add", REPO, "1117", "--position", "0")
+
+    assert result.exit_code == 0, result.output
+    # The edge exists, and on the correct side: A (already queued, now
+    # pushed behind B in dispatch order) waits on B, not the other way
+    # around.
+    assert queued(1090)["after_json"] == [f"{REPO}#1117"]
+    assert queued(1117)["after_json"] == []
+    # B is genuinely positioned first.
+    positions = {r["issue_number"]: r["position"] for r in state._list_drive_queue_local()}
+    assert positions[1117] < positions[1090]
+    # The reason is recorded on the row that actually changed, and names why
+    # the direction is reversed.
+    assert "predicted file overlap (#2247)" in result.output
+    assert f"ordered {REPO}#1090 --after {REPO}#1117" in result.output
+    assert "positioned ahead of an existing queued entry" in result.output
+    assert "predicted file overlap (#2247)" in queued(1090)["last_reason"]
+
+
+def test_appending_after_a_queued_overlap_keeps_the_normal_forward_direction(
+    cli, declare,
+):
+    # Same two declarations, but B appended at the tail (no --position) —
+    # the ordinary case #2247's original tests already cover. Direction must
+    # stay forward: B waits on A, since B genuinely runs second.
+    declare(1090, "src/harness.rs", "src/tui_main/shell_app.rs")
+    assert cli("add", REPO, "1090").exit_code == 0
+
+    declare(1117, "src/harness.rs", "src/tui_main/shell_app.rs")
+    result = cli("add", REPO, "1117")
+
+    assert result.exit_code == 0, result.output
+    assert queued(1117)["after_json"] == [f"{REPO}#1090"]
+    assert queued(1090)["after_json"] == []
+
+
+def test_reject_after_drops_a_reversed_edge_too(cli, declare):
+    declare(1090, "src/harness.rs")
+    assert cli("add", REPO, "1090").exit_code == 0
+
+    declare(1117, "src/harness.rs")
+    result = cli(
+        "add", REPO, "1117", "--position", "0", "--reject-after", "1090",
+    )
+
+    assert result.exit_code == 0, result.output
+    # Named by the OTHER entry's key either way — the operator doesn't need
+    # to know which direction rule 2 picked to veto it.
+    assert queued(1090)["after_json"] == []
+    assert queued(1117)["after_json"] == []
+    assert f"rejected via --reject-after (not applied): {REPO}#1090" in result.output
+
+
+def test_a_reversed_edge_is_never_applied_against_an_in_flight_branch(
+    cli, declare, seed, branch_diff,
+):
+    # A `[branch]` overlap (already running) must never reverse — it started
+    # before this add regardless of queue position, so the newcomer always
+    # waits on it, exactly like before #3395.
+    seed(
+        issues={2230: "open"},
+        assignments=[{"issue_number": 2230, "status": "running"}],
+    )
+    from coord.db import get_connection
+
+    get_connection().execute(
+        "UPDATE assignments SET branch = 'issue-2230' WHERE issue_number = 2230"
+    )
+    get_connection().commit()
+    branch_diff({"issue-2230": ["coord/drive_queue.py"]})
+    declare(2234, "coord/drive_queue.py")
+
+    result = cli("add", REPO, "2234", "--position", "0")
+
+    assert result.exit_code == 0, result.output
+    assert queued(2234)["after_json"] == [f"{REPO}#2230"]
