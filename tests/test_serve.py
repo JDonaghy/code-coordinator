@@ -3410,6 +3410,66 @@ def test_record_drive_escalation_local_upserts_by_repo_and_issue(coord_db):
     assert rows[0]["reason"] == "second"
 
 
+def test_record_drive_escalation_local_preserves_created_at_on_same_reason_renewal(
+    coord_db,
+):
+    """#3413: a tick that re-records the SAME reason (a persistent condition
+    like a release cordon, still true on this tick) must not reset
+    `created_at` to "now" — that is exactly what made a cordon alert read as
+    fresh/current every 3 minutes for the ~20 minutes it outlived the real
+    cordon, because every re-record looked indistinguishable from "just
+    noticed". `created_at` must instead answer "how long has this EXACT
+    reason held, unbroken" — mirrors `coord.machine_pause.local_set_cordon`'s
+    identical "renewal preserves created_at" contract.
+    """
+    import time as _time
+
+    from coord import state
+
+    state._record_drive_escalation_local(
+        "api", 7, stage="tick", reason="no launch — api is cordoned",
+        gate_readings="", proposed_command="coord release cordon --clear api",
+    )
+    first = state._get_drive_escalation_local("api", 7)
+    assert first is not None
+    first_created_at = first["created_at"]
+
+    _time.sleep(0.01)
+    state._record_drive_escalation_local(
+        "api", 7, stage="tick", reason="no launch — api is cordoned",
+        gate_readings="", proposed_command="coord release cordon --clear api",
+    )
+    renewed = state._get_drive_escalation_local("api", 7)
+    assert renewed["created_at"] == first_created_at
+
+
+def test_record_drive_escalation_local_resets_created_at_on_reason_change(coord_db):
+    """#3413's flip side: a GENUINELY new reason (the condition changed, not
+    just re-observed) must still reset `created_at` — only a same-reason
+    renewal is a "still true" signal, never a materially different one.
+    """
+    import time as _time
+
+    from coord import state
+
+    state._record_drive_escalation_local(
+        "api", 7, stage="tick", reason="no launch — api is cordoned",
+        gate_readings="", proposed_command="c1",
+    )
+    first_created_at = state._get_drive_escalation_local("api", 7)["created_at"]
+
+    _time.sleep(0.01)
+    before = _time.time()
+    state._record_drive_escalation_local(
+        "api", 7, stage="tick", reason="no launch — HELD by the fleet-wide deploy gate",
+        gate_readings="", proposed_command="c2",
+    )
+    after = _time.time()
+    changed = state._get_drive_escalation_local("api", 7)
+    assert changed["created_at"] != first_created_at
+    assert before <= changed["created_at"] <= after
+
+
 def test_dismiss_drive_escalation_local_reports_whether_a_row_existed(coord_db):
     from coord import state
 
