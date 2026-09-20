@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from coord import github_ops
+from coord.milestone_order import WorkOrderError
 from coord.parentage import (
     Child,
     MarkdownParentage,
@@ -59,6 +60,32 @@ class TestMarkdownParentageChildren:
     def test_empty_body_returns_empty(self) -> None:
         store = MarkdownParentage()
         assert store.children("acme/api", 500) == []
+
+
+class TestMarkdownParentageChildrenErrorPropagation:
+    """#3426: `children()` does NOT catch `WorkOrderError` itself — it is
+    every CALLER's job to decide whether to surface or swallow it (the board
+    payload now surfaces it as `children_errors`; `coord plans --lint-epics`
+    surfaces it too; the #1196 close-guard deliberately still swallows it).
+    Pinning that `children()` itself raises, rather than silently returning
+    `[]`, is what makes "no children" and "unparseable" distinguishable at
+    all for those callers."""
+
+    def test_malformed_sub_issues_block_raises(self) -> None:
+        store = MarkdownParentage()
+        body = "## Sub-issues\n- [ ] #1\n- this is not a sub-issue item\n"
+        with pytest.raises(WorkOrderError, match="unparseable line"):
+            store.children("acme/api", 500, body=body)
+
+    def test_bold_prefixed_issue_number_parses_like_a_plain_line(self) -> None:
+        """#3426 grammar widening: bolding the lead item (`- [ ]
+        **#1206 — ...**`) is normal markdown and must not raise — this is
+        the vimcode#1170 regression."""
+        store = MarkdownParentage()
+        body = "## Sub-issues\n- [ ] **#1206 — tranche 2 of #1191**: prose\n"
+        assert store.children("acme/api", 500, body=body) == [
+            Child(number=1206, state="open"),
+        ]
 
 
 _WORK_ORDER_ONLY_BODY = """\
