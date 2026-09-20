@@ -2270,6 +2270,26 @@ class TickPlan:
     # rule the other two follow. Reconciliation is unaffected by this field —
     # see `RollPending`'s own docstring for why that is the whole mechanism.
     roll_pending_reason: str = ""
+    # #3413: did this tick reach step 4 — the `waiting` walk — at all?
+    #
+    # This is the ONE quantity the incident was defined by. Step 4 is the
+    # only step that re-stamps a `waiting` entry's `reason_at`/`last_reason`
+    # (see `_update_drive_queue_entry_local`), and the incident's headline
+    # evidence was exactly those ages: 1401s/3609s/3609s while a 3-minute
+    # timer kept reporting `Result=success`. EVERY early return above step 4
+    # — a fleet-scoped HELD gate (step 2), a local cordon (2b), editable
+    # drift (2c), a pending roll (2d), and `free <= 0` (step 3, which is
+    # also where `--reconcile-only`/`--max-parallel 0` lands, since both
+    # force capacity to 0) — leaves this False, because none of them walk a
+    # single row.
+    #
+    # Carried as a field rather than re-derived by the shell from
+    # `reconcile_only` because the shell cannot see all five paths: it knows
+    # about its own `--reconcile-only` and the roll marker, but a fleet gate
+    # and an at-capacity queue are decided in here. Deriving it in one place
+    # — the function that actually does or does not walk — is what keeps the
+    # shell's staleness clock honest as new early returns are added.
+    walked_queue: bool = False
 
     @property
     def free_slots(self) -> int:
@@ -5289,12 +5309,26 @@ def _cordon_alert(host: str, reason: str) -> QueueAlert:
     return QueueAlert(
         reason=(
             f"no launch — {host} is {reason}. In-flight drives are draining; "
-            "the queue resumes automatically the moment this host is rolled "
-            "and uncordoned (#2101)."
+            "the queue resumes on the NEXT TICK THAT ACTUALLY RUNS after this "
+            "host is uncordoned (#2101)."
         ),
         details=(
             "release cordons expire on their own if the propagate run that "
             "set one dies, so this can never wedge the queue permanently",
+            # #3413: the original text said the queue "resumes automatically
+            # the moment this host is rolled and uncordoned", which is what
+            # made the incident so expensive to read: the host WAS uncordoned,
+            # the alert's own stated precondition was satisfied, and the queue
+            # still did not resume — so the sentence told the operator to keep
+            # waiting for something that had already happened. Resumption is
+            # not an event that fires on uncordon; it is whatever the next
+            # tick decides. Naming the tick as the actor points at the thing
+            # that can actually be checked (and run by hand), which is how
+            # this incident was in fact recovered.
+            "resumption is not triggered by the uncordon itself — a tick has "
+            "to run and walk the queue; if this alert outlives the tick "
+            "interval, check `systemctl --user status coord-drive-queue."
+            "service` and run `coord drive-queue tick` by hand",
         ),
         command=f"coord release cordon --clear {host}",
     )
@@ -6686,6 +6720,11 @@ def plan_tick(
         deferrals=tuple(deferrals),
         alert=alert,
         launch=launch,
+        # #3413: the ONLY return that sets this. Everything above returned
+        # before step 4's walk; reaching here means every `waiting` entry was
+        # visited and its `reason_at` re-stamped, which is the claim the
+        # shell's evaluation clock is allowed to make.
+        walked_queue=True,
     )
 
 

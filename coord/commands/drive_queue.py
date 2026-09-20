@@ -4038,7 +4038,52 @@ def _escalate_persistent_self_cordon(
 #: 23-60 minutes of row staleness the incident actually ran up. Unlike a
 #: contention streak, nothing resets this short of an evaluation that really
 #: completed, so the repeated-hang pattern crosses it on schedule.
+#:
+#: RECONCILED AGAINST `ROLL_PENDING_DEFAULT_TTL_SECONDS` (3600s) TOO, which
+#: is the other deployed bound this has to survive and the one that makes
+#: the naive version of this guard unable to fail at all.
+#:
+#: An active `RollPending` marker forces `reconcile_only` on EVERY periodic
+#: tick (`coord.commands.drive_queue`'s tick body) for up to a full hour
+#: before `_escalate_roll_pending_expired` treats it as stuck — and a
+#: capacity-0 tick returns at `plan_tick`'s step 3, BEFORE the step-4
+#: `waiting` walk that is the only thing that re-stamps a row's `reason_at`.
+#: That window (up to 3600s) covers the incident's entire observed staleness
+#: range (1401-3609s) almost exactly, and the incident happened during a live
+#: roll to v0.5.502 with the daemon host itself cordoned for it — precisely
+#: the condition that arms a marker. So a first cut of this guard that
+#: stamped the clock on every completed tick would have been reset by each of
+#: those roll-held ticks and could never have crossed a 900s bar, for what is
+#: at least as plausible a cause as anything else considered here.
+#:
+#: Rather than inflate 900s past 3600s — which would have thrown away the
+#: fast detection this exists for, in every non-roll case — the clock PAUSES
+#: for deliberate holds instead of resetting: `_note_drive_queue_hold`
+#: credits held time, `_note_drive_queue_evaluation` (a real step-4 walk) is
+#: the only thing that zeroes it. See `_drive_queue_evaluation_staleness`.
+#: A roll can therefore hold the queue for its full hour without tripping
+#: this, and the instant the hold lifts the clock RESUMES from where it
+#: paused rather than starting over — so a queue that comes out of a roll
+#: and then silently fails to walk still trips 900s later, not 900s after a
+#: hold it has already left.
+#:
+#: The holds themselves stay bounded by their OWN, louder guards rather than
+#: by this one: `ROLL_PENDING_DEFAULT_TTL_SECONDS` + `_escalate_roll_pending_
+#: expired` + the cumulative `RollLedger` bound for a pending roll,
+#: `_escalate_persistent_self_cordon` (30 min) for a fleet-scoped HELD gate
+#: or self-cordon. Being at capacity is not bounded at all, because it is
+#: the queue working exactly as intended.
 DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS = 900.0
+
+#: The most "the queue was deliberately held" one tick may excuse (#3413).
+#:
+#: A hold is only ever OBSERVED at the instant a tick completes under it, so
+#: only the gap BETWEEN two observed-held ticks is ever credited at all (see
+#: `_note_drive_queue_hold`). Capping even that keeps a single held tick from
+#: excusing an unbounded silence: if two consecutive held ticks are more than
+#: a full window apart, ticks were MISSING in between, and missing ticks are
+#: not a hold — that is the very defect this measures.
+DRIVE_QUEUE_HOLD_CREDIT_CAP_SECONDS = DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS
 
 _DRIVE_QUEUE_EVALUATION_FILENAME = "drive_queue_evaluation.json"
 
@@ -4103,27 +4148,110 @@ def _write_drive_queue_evaluation(data: dict) -> None:
         pass
 
 
+def _fresh_evaluation_state(now: float) -> dict:
+    """The marker as it looks right after a real walk (#3413)."""
+    return {
+        "last_evaluated_at": now,
+        "escalated_at": None,
+        # Held-time accounting, all relative to `last_evaluated_at` above and
+        # therefore all zeroed by the same walk that sets it.
+        "held_seconds": 0.0,
+        "held_since": None,
+        "held_reason": "",
+    }
+
+
 def _note_drive_queue_evaluation(now: float) -> None:
-    """Stamp "a tick just completed a real evaluation of the queue" (#3413).
+    """Stamp "a tick just completed a real WALK of the queue" (#3413).
 
-    Called immediately after :func:`coord.drive_queue.plan_tick` returns —
-    NOT on entry, and NOT merely on "the process started". `plan_tick` is
-    the step that walks every queue row and produces the writes that
-    re-stamp their `reason_at`, so its return is the earliest moment the
-    claim is actually true. A tick that dies (or hangs until
-    `TimeoutStartSec` kills it) before reaching that point deliberately
-    leaves the previous stamp in place, which is what lets the NEXT tick —
-    a different process entirely — see the gap.
+    Called after :func:`coord.drive_queue.plan_tick` returns AND ONLY WHEN
+    ``plan.walked_queue`` is true — not on entry, not merely on "the process
+    started", and (the #3413 review's blocking finding) not on a tick that
+    completed without reaching the walk at all. Step 4 is the step that
+    visits every ``waiting`` row and produces the writes that re-stamp their
+    ``reason_at``, so ``walked_queue`` is the earliest point the claim in
+    this function's name is actually true. A tick that dies, hangs until
+    `TimeoutStartSec` kills it, or returns early from one of `plan_tick`'s
+    five pre-walk exits deliberately leaves the previous stamp in place,
+    which is what lets the NEXT tick — a different process entirely — see
+    the gap.
 
-    Also drops ``escalated_at``: a completed evaluation ends whatever
-    staleness episode was in progress, so a later episode escalates afresh
-    instead of being deduplicated against a resolved one.
+    Also drops ``escalated_at`` and the held-time accounting: a completed
+    walk ends whatever staleness episode was in progress, so a later episode
+    escalates afresh instead of being deduplicated against a resolved one.
     """
-    _write_drive_queue_evaluation({"last_evaluated_at": now, "escalated_at": None})
+    _write_drive_queue_evaluation(_fresh_evaluation_state(now))
+
+
+def _note_drive_queue_hold(now: float, reason: str) -> None:
+    """Record "a tick completed, but deliberately did not walk the queue".
+
+    #3413's answer to the review finding that the old unconditional stamp was
+    blind to `reconcile_only` — most importantly the roll-pending-forced kind,
+    which can hold every tick for up to `ROLL_PENDING_DEFAULT_TTL_SECONDS`
+    (3600s, a full hour) while rows' `reason_at` ages exactly as it did in the
+    incident.
+
+    The distinction this draws is the honest one, and it is deliberately NOT
+    "did the tick succeed": these ticks succeeded, and they did real work
+    (`plan_tick` steps 1/1b reconcile under every one of these holds). What
+    they did not do is walk the `waiting` rows, so they may not claim the
+    queue was evaluated.
+
+    Crediting rather than stamping is the whole point. The clock PAUSES for
+    the held window instead of restarting, so:
+
+    * a legitimate hour-long roll never trips
+      :data:`DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS`, and
+    * the moment the hold lifts, the clock resumes from where it paused —
+      a queue that comes out of a roll and then silently stops walking is
+      caught one window later, not one window after a hold it has left.
+
+    An unbroken reset (what a naive "stamp a different key" fix would do)
+    would restore exactly the blindness the review rejected.
+    """
+    state = _read_drive_queue_evaluation()
+    if not isinstance(state, dict) or not isinstance(
+        state.get("last_evaluated_at"), (int, float)
+    ):
+        # No baseline to pause against — seed one, same posture as
+        # `_drive_queue_evaluation_staleness`. A hold is not evidence the
+        # queue is broken, so it must not manufacture staleness either.
+        _write_drive_queue_evaluation(_fresh_evaluation_state(now))
+        return
+    state = dict(state)
+    accrued = state.get("held_seconds")
+    if not isinstance(accrued, (int, float)) or accrued < 0:
+        accrued = 0.0
+    previous = state.get("held_since")
+    if isinstance(previous, (int, float)):
+        # A hold was already observed; the gap since that observation is
+        # credibly held time.
+        credit = min(max(0.0, now - float(previous)), DRIVE_QUEUE_HOLD_CREDIT_CAP_SECONDS)
+    else:
+        # FIRST tick to observe this hold: it establishes the epoch and
+        # excuses NOTHING. Only time between two observed-held ticks is
+        # credited, never the gap back to the last walk — that gap is
+        # exactly where a queue that silently stopped walking BEFORE a roll
+        # was armed would hide, and crediting it would re-open the blindness
+        # this whole mechanism exists to close. The cost is that the first
+        # ~one tick interval of every genuine hold counts against the clock,
+        # which is far inside the 900s bar.
+        credit = 0.0
+    state["held_seconds"] = float(accrued) + credit
+    state["held_since"] = now
+    state["held_reason"] = reason
+    _write_drive_queue_evaluation(state)
 
 
 def _drive_queue_evaluation_staleness(now: float) -> float:
-    """Seconds since the last completed evaluation (#3413).
+    """Seconds the queue has gone UNWALKED, excluding deliberate holds (#3413).
+
+    ``(now - last_evaluated_at) - held_seconds``: wall-clock since the last
+    real walk, minus the time a tick actually observed the queue to be
+    deliberately held (see :func:`_note_drive_queue_hold`). Held time is
+    subtracted rather than resetting the baseline, so a hold pauses this
+    clock and never rewinds it.
 
     Seeds the marker at *now* (returning ``0.0``) when there is none — a
     fresh install, or a host whose marker was wiped, has no baseline to
@@ -4135,9 +4263,12 @@ def _drive_queue_evaluation_staleness(now: float) -> float:
     state = _read_drive_queue_evaluation()
     last = state.get("last_evaluated_at") if isinstance(state, dict) else None
     if not isinstance(last, (int, float)):
-        _write_drive_queue_evaluation({"last_evaluated_at": now, "escalated_at": None})
+        _write_drive_queue_evaluation(_fresh_evaluation_state(now))
         return 0.0
-    return max(0.0, now - last)
+    held = state.get("held_seconds") if isinstance(state, dict) else None
+    if not isinstance(held, (int, float)) or held < 0:
+        held = 0.0
+    return max(0.0, (now - float(last)) - float(held))
 
 
 def _escalate_stale_drive_queue_evaluation(
@@ -4201,12 +4332,16 @@ def _escalate_stale_drive_queue_evaluation(
             "window above went unevaluated."
         )
     detail = (
-        f"no drive-queue tick has completed an evaluation in "
+        f"no drive-queue tick has walked the queue in "
         f"{age_seconds / 60:.0f}+ minutes, while coord-drive-queue.timer "
         "fires every ~3 minutes (deploy/coord-drive-queue.timer) — so "
         "ticks have been running and returning without evaluating a single "
         "queue row, which reads from every operator surface as a queue that "
-        f"is simply idle (#3413). {tail} Check `systemctl --user status "
+        "is simply idle (#3413). Time the queue was DELIBERATELY held (a "
+        "pending roll, a release cordon, a fleet-scoped deploy gate, being "
+        "at capacity, --reconcile-only) is already excluded from that "
+        f"figure, so this is not a roll in progress. {tail} Check "
+        "`systemctl --user status "
         "coord-drive-queue.service` for Result=timeout/signal (a tick "
         "hanging past TimeoutStartSec=300 and being killed), `coord "
         "drive-queue status` for a queue alert whose age exceeds the tick "
@@ -5978,7 +6113,7 @@ def drive_queue_tick(
     (occupying a slot, attempts untouched) rather than as a death (#1794).
     #3413: that quiet exit-0 no-op holds only while the QUEUE ITSELF is still
     being evaluated on schedule. Every tick first reads how long it has been
-    since any tick last completed an evaluation
+    since any tick last WALKED THE QUEUE
     (`DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS`, below) — a cross-process
     timestamp, not a per-process streak — and once that exceeds one full
     hang-and-recover cycle of the deployed unit, a tick that ALSO cannot take
@@ -6182,7 +6317,7 @@ def drive_queue_tick(
             # that has to be able to fail still can.
             return
         raise click.ClickException(
-            f"no drive-queue tick has completed an evaluation in "
+            f"no drive-queue tick has walked the queue in "
             f"{_evaluation_age / 60:.0f}+ minutes and this one could not take "
             "the lock either — failing rather than reporting success silently "
             f"(#3413); see the recorded {EVALUATION_STALE_ALERT_STAGE!r} "
@@ -6413,15 +6548,28 @@ def drive_queue_tick(
 
         _apply_writes(plan)
 
-        # #3413: the writes have LANDED, so every queue row's `reason_at` has
-        # just been re-stamped — the exact quantity whose 23-60-minute ages
-        # were the incident's core evidence. This is the earliest point at
-        # which "a tick completed an evaluation" is a true claim, and
-        # stamping it here rather than on entry is the whole mechanism: a
-        # tick that dies, hangs, or is killed by `TimeoutStartSec=300` before
-        # reaching this line leaves the PREVIOUS stamp untouched, which is
-        # how the next tick — a different process entirely — sees a gap that
-        # keeps growing across as many doomed processes as it takes.
+        # #3413: the writes have LANDED — but ONLY a tick that reached
+        # `plan_tick`'s step-4 walk actually re-stamped every queue row's
+        # `reason_at`, the exact quantity whose 23-60-minute ages were the
+        # incident's core evidence. `plan.walked_queue` is that fact,
+        # reported by the function that either walked or did not; see its
+        # field comment for the five pre-walk exits that leave it False.
+        #
+        # The review round that rejected the first cut of this guard was
+        # right about why an unconditional stamp here is worthless: a
+        # roll-pending marker forces `reconcile_only` (just above) on EVERY
+        # periodic tick for up to `ROLL_PENDING_DEFAULT_TTL_SECONDS` (3600s),
+        # each of which reaches this line reporting `Result=success` while
+        # walking nothing. Stamping on those would reset the clock every 3
+        # minutes for an hour and the 900s bar could never be crossed — for
+        # the cause the incident's own timeline fits best, since it happened
+        # during a live roll with this very host cordoned for it.
+        #
+        # Holds are credited instead of stamped, so the clock PAUSES for a
+        # legitimate roll and RESUMES — rather than restarting — the moment
+        # it lifts. Every hold is separately bounded by its own louder guard
+        # (see `DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS`), so nothing here
+        # needs to re-litigate how long a roll may take.
         #
         # Deliberately AFTER the `dry_run` return above: `tick --dry-run` is
         # the command the operator reached for to DIAGNOSE this incident, and
@@ -6430,8 +6578,36 @@ def drive_queue_tick(
         # very staleness it was run to investigate. Equally deliberately
         # BEFORE the launch subprocess below: launching is not what this
         # measures, and a queue with nothing launchable is still being
-        # evaluated perfectly well.
-        _note_drive_queue_evaluation(time.time())
+        # walked perfectly well.
+        if plan.walked_queue:
+            _note_drive_queue_evaluation(time.time())
+        else:
+            # Name the hold honestly, in the operator's own vocabulary, so a
+            # recorded pause can be traced back to the thing that caused it.
+            # The three `*_reason` fields are mutually exclusive by
+            # construction — each of `plan_tick`'s early returns sets only
+            # its own, and none of them is part of `plan_base` — so the
+            # order between them is presentation, not precedence. `plan.held`
+            # is checked LAST of the specific cases because, unlike those, it
+            # is derived from `holds` (which IS in `plan_base`) and so can be
+            # populated on a return that stopped for some other reason
+            # entirely. `at capacity` is the residual: step 3 with a real,
+            # non-zero ceiling, which is the queue working as intended.
+            if plan.roll_pending_reason:
+                _hold_reason = plan.roll_pending_reason
+            elif plan.cordon_reason:
+                _hold_reason = f"host cordoned: {plan.cordon_reason}"
+            elif plan.drift_reason:
+                _hold_reason = f"editable checkout {plan.drift_reason}"
+            elif explicit_reconcile_only:
+                _hold_reason = "--reconcile-only (or --max-parallel 0)"
+            elif plan.held is not None and plan.held.stops_fleet:
+                _hold_reason = f"fleet-scoped deploy gate held: {plan.held.key}"
+            else:
+                _hold_reason = (
+                    f"at capacity: {plan.occupied}/{plan.capacity} occupied"
+                )
+            _note_drive_queue_hold(time.time(), _hold_reason)
 
         # #2587: this tick's own reconciliation (just applied above) may have
         # been the very thing that emptied the queue out — `plan.occupied` is
