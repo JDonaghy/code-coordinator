@@ -313,6 +313,27 @@ def no_tmux(monkeypatch):
     monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
 
 
+@pytest.fixture(autouse=True)
+def no_real_systemd_unit(monkeypatch, tmp_path: Path):
+    """Isolate `_print_effective_concurrency` from whatever `--max-parallel`
+    flag (if any) the REAL machine's
+    `~/.config/systemd/user/coord-drive-queue.service` happens to hardcode.
+
+    Without this, these black-box tests read the actual host's unit file —
+    on a fleet host wired the way #3408 itself describes (a hardcoded
+    `--max-parallel` flag, e.g. dellserver), that silently overrides the
+    `pipeline.max_parallel` fixture value under test and injects an
+    unexpected `flag_shadows_config_warning` line, breaking the exact-output
+    assertions below. Point `default_systemd_user_unit_path` at a file that
+    is guaranteed not to exist so every test starts from "no unit installed"
+    unless it explicitly stubs something else.
+    """
+    absent = tmp_path / "no-such-unit" / "coord-drive-queue.service"
+    monkeypatch.setattr(
+        "coord.drive_queue.default_systemd_user_unit_path", lambda *a, **k: absent
+    )
+
+
 def test_effective_renders_the_winning_source_and_no_losing_value(cli):
     """Config-only: no flag was given, so there is nothing to lose against."""
     run = cli(pipeline_max_parallel=7)
