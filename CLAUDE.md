@@ -2,20 +2,21 @@
 
 CLI tool + per-machine agent server that coordinates Claude Code workers across multiple machines and repos over Tailscale.
 
-> **Scope of this file (#2195).** This is the **worker- and reviewer-facing** rulebook: it is
-> loaded into every worker leg, every review leg, and every coordinator session — and re-read on
-> every turn of each — so it holds only what someone *editing this repo* must act on. Operator
-> runbooks live in [`docs/`](docs/), indexed by
-> [`docs/OPERATOR_GUIDES.md`](docs/OPERATOR_GUIDES.md). Settled design rationale lives in
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-rationale).
-> Keep it that way: **if a new rule does not change what a worker does, it belongs in `docs/`.**
-> Operator sessions — the "dispatch, don't do" rule now lives in
-> [`docs/COST_DISCIPLINE.md`](docs/COST_DISCIPLINE.md); read it before hand-editing any tracked
-> repo. If you're a worker or reviewer leg, that one isn't for you.
-
-## Current Goal — read first
-
-**[`GOAL.md`](GOAL.md) holds the current north-star objective** — the living, cross-repo / cross-machine goal that should bias all planning, triage, and dispatch. It is meta-level (above any single issue, repo, or session) and changes as priorities evolve: read it first, plan against it, and keep it current. `coordinator.yml` is the source of truth for *topology*; `GOAL.md` is the source of truth for *intent*.
+> **Scope of this file (#2195, #2817).** This is the **worker- and reviewer-facing**
+> rulebook: it is loaded into every worker leg, every review leg and every coordinator
+> session — and re-read on **every turn** of each, so every byte here is a recurring
+> fleet-wide cost. It holds only what someone *editing this repo* must act on.
+> **If a new rule does not change what a worker does, it belongs in [`docs/`](docs/).**
+> `tests/test_claude_md_budget.py` enforces that with a byte cap — move a section out
+> rather than raise it.
+>
+> Not here: operator runbooks ([`docs/OPERATOR_GUIDES.md`](docs/OPERATOR_GUIDES.md)) ·
+> settled design rationale
+> ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-rationale)) ·
+> the `coord` command reference (`coord <cmd> --help`) · operator cost rules and
+> "dispatch, don't do" ([`docs/COST_DISCIPLINE.md`](docs/COST_DISCIPLINE.md)) ·
+> the current north-star objective ([`GOAL.md`](GOAL.md) — read it in a coordinator
+> session when planning or triaging; a worker or reviewer leg does not need it).
 
 ## Codebase navigation — query the graph first
 
@@ -64,22 +65,11 @@ Query the **graphify graph** (`graphify-out/`) for the full module map + relatio
 
 ## Commands
 
-`coord <cmd> --help` documents every command + flags. The core loop:
-
-```bash
-coord plan                 # Brain proposes assignments for idle machines
-coord approve 1,3          # Dispatch approved proposals (comma-separated IDs)
-coord assign <machine> <repo> <issue> [--briefing TEXT | --briefing-file F] [--dry-run]  # Direct dispatch
-coord status [--freshness] # Machines, assignments, connectivity (+ repo freshness vs GitHub HEADs)
-coord log <id> [-f] [--machine NAME]            # claude -p output (remote logs need --machine)
-coord notify               # Poll agents, post completion/failure comments to GitHub
-coord test --passed|--fail|--skipped <id>       # Record the Test-gate verdict (bare `coord test <id>` builds+tests locally)
-coord merge [--dry-run] [--repo NAME] [--method rebase|squash|merge] [--order IDs] [--force-merge]
-coord reconcile-merges     # Backfill missing branches + record out-of-band merges (#609/#611)
-coord retry|stop|resume <id>                    # Recovery; `coord done` ends the session
-```
-
-Setup / diagnostics (discoverable via `--help`): `coord init`, `coord config`, `coord agent`, `coord serve`, `coord web`, `coord diagnose`, `coord sessions [--remote]`, `coord split`, `coord notifier`, `coord repo add` / `coord repo doctor`.
+`coord <cmd> --help` documents every command and flag — that is the reference, not this
+file. The operator-facing core loop (`plan`/`approve`/`assign`/`status`/`merge`/...) is in
+[`docs/OPERATOR_GUIDES.md`](docs/OPERATOR_GUIDES.md#the-core-loop). The one `coord` command
+a **worker** runs is `coord acceptance run --issue N`, in an oracle-loop round (see Testing
+below).
 
 ## Development
 
@@ -133,34 +123,22 @@ computes the routing without actually building or testing anything.
 
 ## Key Design Decisions
 
-One line each — the reasoning behind them is in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-rationale).
+These are the ones a **diff** can violate. The full set, with the reasoning behind each, is
+in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-rationale).
 
-- **No API key needed.** Everything uses `claude -p`, which runs on a Max/Pro subscription via OAuth.
-- **Agent servers are dumb dispatchers.** They spawn `claude -p` and track the subprocess; all intelligence is in the coordinator brain.
-- **GitHub issue comments are the message bus.** Briefings, completion notices and failure reports are comments, carrying `<!-- coord:... -->` markers for machine parsing.
-- **`coordinator.yml` is the single source of truth** for repo topology, machine capabilities, dependencies, concurrency limits, review settings, smoke-test rules, and the pipeline gate order (`pipeline.default_gates`). It lives in `~/.coord/`, **not** the repo checkout.
-- **User approves everything.** `coord plan` proposes, the user reviews, `coord approve` dispatches. No autonomous dispatch.
-- **Claim detection prevents duplicate work.** Before dispatching, the coordinator checks the board for active assignments and the remote for `issue-{N}-*` branches.
-- **Conflict rules are inferred, not configured.** There is no `file_groups`/`exclusive_files` config and never will be. `coord drive-queue add` compares an issue's own `## Files` declaration against the **real diffs** of in-flight branches in that repo (`coord/overlap_predict.py`, #2247) and, on an overlap, chains the newcomer `--after` the incumbent. **It ORDERS, never refuses** — a false positive costs latency, a refusal costs work. Accuracy is measured, not assumed: `coord drive-queue overlap-report`.
-- **Adversarial reviews are rule-enforcing, not rubber-stamping.** On worker completion a fresh `claude -p` session on a *different* machine reviews the PR diff against this file and the review checklist, with zero shared context with the worker — that's the whole point.
-- **The pipeline order is `Work → Test → Review → Merge`.** Test precedes Review; the headless auto-loop holds review dispatch until there is a `passed`/`skipped` test verdict.
-- **Merge is gated on CI checks (#240).** `coord merge` refuses when a check failed or is still running — and a PR with *zero* reported checks is not automatically clear either (#1904).
-- **Mechanical merge conflicts auto-rebase (#241).** A `type="conflict-fix"` worker rebases and resolves additive merges; semantic conflicts are left for a human.
-- **Smoke tests validate on capable hardware.** `smoke_tests.capability_rules` map changed files to required machine capabilities (e.g. GTK changes → a machine with GTK).
-- **Progress streaming from workers.** Workers emit `STATUS:` and `STUCK:` lines; the coordinator parses these for real-time progress in `coord status` and the dashboard.
-- **The notifier tells you when NOBODY IS COMING — and nothing else (#1632).** Advisory, isolated, off by default; it is not an error channel and not a progress feed.
-
-## Review Prompt Assembly
-
-The reviewer gets a prompt built from:
-1. **Repo's CLAUDE.md** — the project rules (source of truth, not duplicated)
-2. **Generic checklist** — "did you add tests?", "did you stay in file scope?", "any security issues?"
-3. **Repo overrides** — project-specific patterns from `coordinator.yml` `reviews.repo_overrides`
-4. **The diff** — `gh pr diff` of the worker's branch vs base
-5. **The issue** — title and body for intent verification
-
-The reviewer reads the rules and enforces them against the diff. It does not have the worker's session context — genuinely independent.
+- **`coordinator.yml` is the single source of truth** for repo topology, machine
+  capabilities, dependencies, concurrency limits, review settings, smoke-test rules and the
+  pipeline gate order (`pipeline.default_gates`). It lives in `~/.coord/`, **not** the repo
+  checkout.
+- **Conflict rules are inferred, not configured.** There is no `file_groups` /
+  `exclusive_files` config and never will be — `coord drive-queue add` compares an issue's
+  own `## Files` declaration against the **real diffs** of in-flight branches
+  (`coord/overlap_predict.py`, #2247). **It ORDERS, never refuses.** Do not add such config.
+- **The pipeline order is `Work → Test → Review → Merge`.** Test precedes Review; the
+  headless auto-loop holds review dispatch until there is a `passed`/`skipped` verdict.
+- **Adversarial reviews are rule-enforcing, not rubber-stamping.** A fresh `claude -p`
+  session on a *different* machine reviews your diff against this file, with **zero shared
+  context with you** — so your diff and final message must stand on their own.
 
 ## Rules for workers
 
@@ -212,7 +190,5 @@ versus keep in the coordinator session, and the coordinator session's own
 
 ## Operating the fleet — operator-facing
 
-**Not needed to work on this repo.** A worker or reviewer can stop reading here. Every operator
-runbook — the pre-flight gotchas, agent installs and releases, the drive queue, the customer
-portal, and the two deploy facts that bite most often — is indexed in
+**Not needed to work on this repo.** Every operator runbook is indexed in
 [`docs/OPERATOR_GUIDES.md`](docs/OPERATOR_GUIDES.md).
