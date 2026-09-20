@@ -2477,6 +2477,114 @@ def _confirmed_pass_verdict(
     )
 
 
+def _mechanical_mute_verdict(
+    transition: Transition, entry: dict, parent_id: str,
+) -> tuple[str, str, str] | None:
+    """#3415: for a MUTE Test-stage leg (no `SMOKE:` marker at all, clean
+    session exit), attempt the same out-of-band mechanical re-run #2464 uses
+    to double-check a *claimed* pass — except here there is no claim to
+    confirm, so a decisive result becomes the verdict directly.
+
+    Why this exists: sampling every #3376 "reached done with no verdict"
+    alarm found the identical shape 7 times out of 7 — a headless Test-stage
+    worker backgrounds a suite that exceeds the Bash ceiling, correctly
+    states the rule ("I'll poll with bounded waits"), and then ends its turn
+    anyway. That is not a coord bug to patch around with a sterner prompt;
+    ending a one-shot `claude -p` turn ends the session permanently, so no
+    notification the backgrounded suite eventually produces can ever reach
+    it. The prompt already spends two capitalized bullets on this (#2272,
+    #2301) and the observed compliance rate is 0/7 — more emphasis cannot
+    raise a structural non-starter to a rate the Test gate can depend on.
+
+    `coord.confirm_test.confirm_branch` needs no LLM and no waiting: it
+    re-runs the repo's own build/test command in a throwaway worktree and
+    reads the real exit code. Reusing it here — instead of only as the
+    pass-claim backstop — deletes the mute leg's reason to exist for every
+    repo whose suite this machine can actually run, rather than bounding it
+    with a bigger retry budget.
+
+    Returns ``None`` when the run is inconclusive or unavailable (disabled,
+    no local checkout, no test_command, a timeout, ...) — the existing
+    mute-leg tally (count the leg, clear for one retry, then park at the
+    budget) is exactly the right fallback for "still no answer either way",
+    and this never invents one it doesn't have.
+    """
+    from coord.confirm_test import (  # noqa: PLC0415
+        BASELINE_RED_REASON_PREFIX,
+        TEST_CONFIRMATION_BASELINE_RED,
+        TEST_CONFIRMATION_CONFIRMED,
+        TEST_CONFIRMATION_REFUTED,
+        write_confirmation_output,
+    )
+    from coord.state import load_assignment_review_verdict  # noqa: PLC0415
+
+    result = _run_pass_confirmation(transition, entry)
+    if result is None or result.inconclusive:
+        return None  # no decisive answer — fall back to the mute-leg tally
+
+    try:
+        write_confirmation_output(parent_id, result)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "smoke %s: could not persist mechanical confirmation output for "
+            "parent %s (%s) — a later fix briefing will fall back to the "
+            "one-line reason (#2563/#3415).",
+            transition.assignment_id, parent_id, exc,
+        )
+
+    if result.refuted:
+        log.warning(
+            "smoke %s: mute Test-stage leg for %s — the mechanical fallback "
+            "re-run (#3415) says FAILED: %s\n%s",
+            transition.assignment_id, transition.repo_name, result.reason,
+            result.output,
+        )
+        # #2579: same race as `_confirmed_pass_verdict` — a review can
+        # approve before this out-of-band run lands (review dispatch gates
+        # on `test_state`, not on confirmation). Plain "failed" would then
+        # be indistinguishable from an ordinary Test-stage failure and
+        # silently bounce an already-approved branch to a fix worker.
+        _review_state, _review_verdict = load_assignment_review_verdict(parent_id)
+        if _review_verdict == "approve":
+            return (
+                TEST_STATE_CONTESTED,
+                f"CONTESTED (#2579/#3415): the Test-stage worker "
+                f"{transition.assignment_id} ended mute (no verdict marker "
+                "line), and the mechanical fallback re-run REFUTED the "
+                f"branch AFTER its review had already approved it "
+                f"(review_state={_review_state!r}) — {result.reason}. The "
+                "merge gate stays shut, but no fix round is auto-dispatched "
+                f"— recover with `coord fix --force --guidance <what's "
+                f"broken> {parent_id}` or re-dispatch the Test stage by "
+                "hand.",
+                TEST_CONFIRMATION_REFUTED,
+            )
+        return (
+            "failed",
+            "headless smoke ended mute (no verdict marker line) — the "
+            f"mechanical fallback re-run (#3415) ran the real suite and it "
+            f"FAILED: {result.reason}",
+            TEST_CONFIRMATION_REFUTED,
+        )
+
+    if result.baseline_red:
+        return (
+            "skipped",
+            f"{BASELINE_RED_REASON_PREFIX}, found by the mechanical fallback "
+            f"re-run after a mute Test-stage leg (#3415): {result.reason}",
+            TEST_CONFIRMATION_BASELINE_RED,
+        )
+
+    # result.confirmed
+    return (
+        "passed",
+        "headless smoke ended mute (no verdict marker line), but the "
+        f"mechanical fallback re-run (#3415) independently ran the real "
+        f"suite and it passed: {result.reason}",
+        TEST_CONFIRMATION_CONFIRMED,
+    )
+
+
 def _record_smoke_verdict(
     transition: Transition, entry: dict, parent_id: str,
 ) -> None:
@@ -2658,6 +2766,29 @@ def _record_smoke_verdict(
 
     # No verdict line, clean session exit. NOT a pass.
     #
+    # #3415: before treating this as "no answer, retry", ask the mechanical
+    # fallback (`coord.confirm_test.confirm_branch`, no LLM, no waiting) for
+    # a real one. 7/7 sampled mute legs backgrounded the suite, correctly
+    # stated the polling rule, and ended their turn anyway — that is a
+    # structural property of a one-shot session, not something a bigger
+    # retry budget fixes. A decisive mechanical result is recorded straight
+    # away, with no leg spent and no tally incremented.
+    mechanical = _mechanical_mute_verdict(transition, entry, parent_id)
+    if mechanical is not None:
+        state, reason, confirmation = mechanical
+        record_test_verdict(
+            assignment_id=parent_id,
+            test_state=state,
+            test_reason=reason,
+            test_confirmation=confirmation,
+        )
+        log.info(
+            "smoke %s: mute Test-stage leg — the #3415 mechanical fallback "
+            "reached a decisive verdict %r with no retry needed.",
+            transition.assignment_id, state,
+        )
+        return
+
     # #2272: count the legs, don't just test for the marker's presence. The
     # tally lives at the FRONT of `test_reason` so a bounded `/board` preview
     # still carries it, and `dispatch_smoke` re-states it across the `running`
