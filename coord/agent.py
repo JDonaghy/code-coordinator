@@ -5062,6 +5062,67 @@ def _claude_md_system_prompt_suffix(repo_path: str) -> str:
     return "\n\n## Project rules (from CLAUDE.md)\n\n" + claude_md.strip() + "\n"
 
 
+# #3420: every `claude -p` leg loads the full JSON schema for all built-in
+# tools regardless of `--allowedTools`, which is a *permission* filter, not a
+# tool-surface one — a leg with `Read,Bash` in `--allowedTools` still pays
+# the prompt-token cost of the `Workflow`/`Skill`/etc. schemas it can never
+# call. Measured with controlled `claude -p` probes on this repo's own
+# `default_worker_command` flags (Claude Code 2.1.278, `type="work"`): the
+# schemas for these tools cost 12,134 tokens/turn (44% of the static
+# prefix), re-read at cache-read rates on every turn of every leg. None of
+# them has a legitimate use from a headless coord leg:
+#   - `Workflow`: requires explicit user opt-in; a headless leg has no user.
+#   - `Skill`: all `coord` skills are operator-only runbooks.
+#   - `ScheduleWakeup`: every leg is one-shot (WORKER_SYSTEM_PROMPT's
+#     ONE-SHOT section, #1394) — there is no future turn to wake up into.
+#   - `Task`: CLAUDE.md mandates `graphify query` + grep for navigation
+#     instead of spawning a subagent.
+#   - `ReportFindings`, `ListAgents`: unreferenced by any coord system
+#     prompt; no fleet-messaging or review-findings-reporting surface is
+#     exposed to a leg.
+#   - The remainder (`Cron*`, `DesignSync`, `EnterWorktree`/`ExitWorktree`,
+#     `NotebookEdit`, `PushNotification`, `RemoteTrigger`, `SendMessage`):
+#     operator/coordinator-session tools with no worker-leg counterpart —
+#     already deferred behind `ToolSearch` so each costs only ~6-9 tokens,
+#     but included for a consistent, minimal tool surface.
+#
+# Deliberately EXCLUDED, despite being equally unusable:
+#   - `Monitor`: 0 marginal token cost, and WORKER_SYSTEM_PROMPT's ONE-SHOT
+#     polling guidance depends on it (it's the sanctioned way to await a
+#     backgrounded command in bounded steps).
+#   - `ToolSearch`: cheap on its own, and removing it is untested — it's the
+#     mechanism that resolves every deferred tool name at all.
+#   - `TaskOutput`/`TaskStop`: look like `Task`'s output/cancel pair at
+#     first glance, but WORKER_SYSTEM_PROMPT's ONE-SHOT section and
+#     coord/smoke.py's SMOKE_SYSTEM_PROMPT both explicitly teach
+#     `TaskOutput` as the bounded-poll alternative to `Monitor` for a
+#     backgrounded Bash command (`run_in_background`) — disallowing it
+#     would make that documented guidance a dead end. `TaskStop` is kept
+#     alongside it since it's the same background-job-management pair.
+#   - `WebFetch`/`WebSearch`: ~6 tokens each either way (negligible), and a
+#     worker may legitimately need to look up library docs or an error
+#     message mid-task — kept allowed rather than trading real capability
+#     for a rounding error in prompt size.
+UNUSABLE_TOOL_SCHEMAS: list[str] = [
+    "Workflow",
+    "Skill",
+    "ScheduleWakeup",
+    "Task",
+    "ReportFindings",
+    "ListAgents",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "EnterWorktree",
+    "ExitWorktree",
+    "NotebookEdit",
+    "PushNotification",
+    "RemoteTrigger",
+    "SendMessage",
+]
+
+
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment.
 
@@ -5347,8 +5408,19 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     ]
     if spec.model:
         argv.extend(["--model", spec.model])
+    # #3420: strip the unusable-tool schemas from every spec type, including
+    # the Read/Bash-only chat legs (plan, refinement, test-chat,
+    # new-issue-chat, smoke, review) — they carry the same
+    # Workflow/Skill/Task/etc. schemas as a work leg and benefit identically.
+    # This must be the FIRST thing to populate disallowed_tools (rather than
+    # a bare assignment further down) so the #1315 sealed-write guard, the
+    # #1642 base-checkout guard, and #2461's REVIEW_DENY_COMMANDS — each of
+    # which appends to this same list below — keep working unchanged.
+    disallowed_tools = list(UNUSABLE_TOOL_SCHEMAS)
     # #1315: structural sealing enforcement — see _sealed_write_guard_tools.
-    disallowed_tools = _sealed_write_guard_tools(spec.files_forbidden)
+    for pattern in _sealed_write_guard_tools(spec.files_forbidden):
+        if pattern not in disallowed_tools:
+            disallowed_tools.append(pattern)
     # #1642: block Edit/Write on the shared base checkout for any spec.type
     # that actually gets Edit/Write in --allowedTools — the Read/Bash-only
     # chat types above can't touch files regardless, and adding the guard

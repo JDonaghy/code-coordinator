@@ -26,6 +26,7 @@ from coord.agent import (
     REVIEW_DENY_COMMANDS,
     RUNNING,
     RUNTIME_CEILING_EXIT,
+    UNUSABLE_TOOL_SCHEMAS,
     MOCK_AUTHOR_SYSTEM_PROMPT,
     WORKER_SYSTEM_PROMPT,
     AgentAssignment,
@@ -1862,8 +1863,10 @@ def test_default_worker_command_blocks_base_checkout_writes() -> None:
     disallowed = argv[idx + 1]
     assert "Edit(//tmp/repo/**)" in disallowed
     assert "Write(//tmp/repo/**)" in disallowed
-    # Read-only spec types (no Edit in --allowedTools) get no guard at all —
-    # they can't write anywhere so the flag would be a no-op.
+    # Read-only spec types (no Edit in --allowedTools) get no base-checkout
+    # guard entries — they can't write anywhere so those patterns would be a
+    # no-op. --disallowedTools itself is still present, though (#3420: the
+    # unusable-tool-schema list applies unconditionally to every spec type).
     plan_spec = AssignmentSpec(
         repo_name="api",
         repo_path="/tmp/repo",
@@ -1872,7 +1875,11 @@ def test_default_worker_command_blocks_base_checkout_writes() -> None:
         briefing="b",
         type="plan",
     )
-    assert "--disallowedTools" not in default_worker_command(plan_spec)
+    plan_argv = default_worker_command(plan_spec)
+    assert "--disallowedTools" in plan_argv
+    plan_disallowed = plan_argv[plan_argv.index("--disallowedTools") + 1]
+    assert "Edit(" not in plan_disallowed
+    assert "Write(" not in plan_disallowed
 
 
 def test_default_worker_command_blocks_sealed_oracle_writes() -> None:
@@ -1925,6 +1932,119 @@ def test_default_worker_command_mock_author_not_sealed() -> None:
     assert "tests/acceptance/" not in disallowed
     assert "Edit(//tmp/repo/**)" in disallowed
     assert "Write(//tmp/repo/**)" in disallowed
+
+
+# ── #3420: strip unusable tool schemas from every leg ────────────────────────
+
+
+@pytest.mark.parametrize(
+    "spec_type",
+    [
+        "plan",
+        "refinement",
+        "test-chat",
+        "new-issue-chat",
+        "milestone-chat",
+        "decomposition-chat",
+        "mock-author",
+        "smoke",
+        "review",
+        "work",
+    ],
+)
+def test_default_worker_command_disallows_unusable_tool_schemas_for_every_spec_type(
+    spec_type: str,
+) -> None:
+    """Every tool schema Claude Code still loads even though a worker/chat
+    leg can never legitimately call it (Workflow needs a user, Skill is
+    operator-only, etc. — see UNUSABLE_TOOL_SCHEMAS' docstring comment) must
+    land in --disallowedTools for EVERY spec type, not just work legs — the
+    Read/Bash-only chat types pay the exact same schema cost and benefit
+    identically (#3420)."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        type=spec_type,
+    )
+    argv = default_worker_command(spec)
+    assert "--disallowedTools" in argv
+    disallowed = argv[argv.index("--disallowedTools") + 1].split(",")
+    for tool in UNUSABLE_TOOL_SCHEMAS:
+        assert tool in disallowed, f"{tool} missing from --disallowedTools for type={spec_type}"
+
+
+def test_unusable_tool_schemas_keeps_the_one_shot_polling_tools() -> None:
+    """Monitor and TaskOutput/TaskStop must NOT be disallowed: both
+    WORKER_SYSTEM_PROMPT's ONE-SHOT section and coord.smoke.SMOKE_SYSTEM_PROMPT
+    explicitly teach `Monitor` / `TaskOutput` as the sanctioned bounded-poll
+    pattern for a backgrounded Bash command. Disallowing either would turn
+    documented guidance into a dead end. ToolSearch (resolves every deferred
+    tool name) and WebFetch/WebSearch (kept for real capability — see the
+    comment above UNUSABLE_TOOL_SCHEMAS) must not be disallowed either."""
+    for tool in ("Monitor", "ToolSearch", "TaskOutput", "TaskStop", "WebFetch", "WebSearch"):
+        assert tool not in UNUSABLE_TOOL_SCHEMAS
+
+
+def test_default_worker_command_unusable_tool_schemas_coexist_with_sealed_write_guard() -> None:
+    """Regression for #3420: disallowed_tools must be BUILT UP (append), not
+    overwritten, by the new unusable-tool-schema seed — a bare `disallowed_tools
+    = list(UNUSABLE_TOOL_SCHEMAS)` placed after the #1315 sealed-write guard
+    populated it would silently discard that guard. Confirms both the new
+    entries and the existing sealed-oracle guard appear together in the same
+    --disallowedTools value for a sealed work spec."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1120,
+        issue_title="t",
+        briefing="please fix tests/acceptance/ms-38/contract.md",
+        files_forbidden=["tests/acceptance/"],
+    )
+    argv = default_worker_command(spec)
+    disallowed = argv[argv.index("--disallowedTools") + 1]
+    assert "Edit(tests/acceptance/**)" in disallowed
+    assert "Write(tests/acceptance/**)" in disallowed
+    for tool in UNUSABLE_TOOL_SCHEMAS:
+        assert tool in disallowed.split(",")
+
+
+@pytest.mark.posix_only
+@_posix_repo_path_skip
+def test_default_worker_command_unusable_tool_schemas_coexist_with_base_checkout_guard() -> None:
+    """Regression for #3420: confirms the #1642 base-checkout guard (which
+    appends to disallowed_tools AFTER the new seed) still lands alongside the
+    unusable-tool-schema entries for an Edit-capable spec — the seed must not
+    have clobbered what the base-checkout guard adds next."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        files_forbidden=[],
+    )
+    argv = default_worker_command(spec)
+    disallowed = argv[argv.index("--disallowedTools") + 1]
+    assert "Edit(//tmp/repo/**)" in disallowed
+    assert "Write(//tmp/repo/**)" in disallowed
+    for tool in UNUSABLE_TOOL_SCHEMAS:
+        assert tool in disallowed.split(",")
+
+
+def test_default_worker_command_unusable_tool_schemas_coexist_with_review_deny_commands() -> None:
+    """Regression for #3420: confirms #2461's REVIEW_DENY_COMMANDS (appended
+    to disallowed_tools last, for spec.type == "review") still lands
+    alongside the unusable-tool-schema entries — a bare overwrite anywhere in
+    the chain would silently disable the review mutating-command guard."""
+    argv = default_worker_command(_review_spec())
+    disallowed = argv[argv.index("--disallowedTools") + 1].split(",")
+    for pattern in REVIEW_DENY_COMMANDS:
+        assert pattern in disallowed
+    for tool in UNUSABLE_TOOL_SCHEMAS:
+        assert tool in disallowed
 
 
 # ── #1445: worktree-writability preflight ───────────────────────────────────
