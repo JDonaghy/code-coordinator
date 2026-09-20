@@ -4479,6 +4479,218 @@ def test_a_tick_that_completes_an_evaluation_stamps_the_clock(
     assert stamped["escalated_at"] is None
 
 
+def test_a_roll_held_tick_does_not_stamp_the_clock_as_an_evaluation(
+    cli, seed, launches, evaluation_marker, live_sessions
+):
+    """#3413 review: the hold that made the first cut of this guard blind.
+
+    An active `RollPending` marker forces `reconcile_only` on EVERY periodic
+    tick, and a capacity-0 tick returns at `plan_tick`'s step 3 — BEFORE the
+    step-4 `waiting` walk that is the only thing re-stamping a row's
+    `reason_at`. Such a tick still reaches the far side of `plan_tick`,
+    applies its writes and exits 0 (`Result=success`), which is exactly what
+    the incident's journal showed while rows aged 23-60 minutes.
+
+    The earlier implementation stamped the evaluation clock unconditionally
+    right there, so a roll — whose default TTL is a full hour — reset the
+    clock every ~3 minutes for that entire window and the 900s bar could
+    never be crossed. This asserts the clock does NOT move for a tick that
+    walked nothing, which is what makes the guard able to fail at all for
+    the cause the incident's own timeline fits best.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+    from coord.drive_queue import RollPending
+
+    # A BUSY queue: 1659 is genuinely running, so the pending roll waits for
+    # the inter-drive gap instead of firing immediately (#2587) — which is
+    # what keeps the marker armed and the tick held, the state under test.
+    seed(issues={1655: "open", 1659: "open"})
+    cli("add", REPO, "1659")
+    cli("add", REPO, "1655")
+    state._update_drive_queue_entry_local(REPO, 1659, state="running")
+    live_sessions(1659)
+
+    stale_at = evaluation_marker(age_seconds=300.0)
+    drive_queue_cmd.write_roll_pending(
+        RollPending(target_version="0.5.502", set_at=time.time(), reason="propagate")
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    # The defining property of the hold: nothing was launched, nothing walked.
+    assert launches == []
+    assert queued(1655)["state"] == "waiting"
+
+    stamped = drive_queue_cmd._read_drive_queue_evaluation()
+    assert stamped is not None
+    # THE assertion. Pre-fix this had advanced to ~now.
+    assert stamped["last_evaluated_at"] == stale_at
+    # ...and the hold is recorded honestly instead, under its own name.
+    assert "0.5.502" in stamped["held_reason"]
+    # The FIRST observed held tick establishes the epoch and excuses nothing,
+    # so the 300s that elapsed before the roll was armed still count.
+    assert stamped["held_seconds"] == 0.0
+    assert (
+        drive_queue_cmd._drive_queue_evaluation_staleness(time.time()) >= 300.0
+    )
+
+
+def test_a_long_roll_pauses_the_clock_but_the_gap_before_it_still_counts(
+    cli, seed, launches, evaluation_marker, live_sessions
+):
+    """#3413 review: a hold PAUSES the clock; it never rewinds it.
+
+    Two halves, both load-bearing, and they pull in opposite directions —
+    which is why neither a plain "stamp it" nor a plain "skip it" is right:
+
+    * A roll may legitimately hold the queue for up to
+      `ROLL_PENDING_DEFAULT_TTL_SECONDS` (3600s). Ticks held across that
+      window must not accumulate staleness, or every roll longer than 15
+      minutes would escalate — so the gap between successive held ticks is
+      credited.
+    * Time before the hold was ever observed is NOT credited. A queue that
+      had already silently stopped walking, and only then had a roll armed
+      over the top of it, must still be caught — otherwise the hold becomes
+      a laundering path for exactly the defect being measured.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+    from coord.drive_queue import RollPending
+
+    seed(issues={1656: "open", 1660: "open"})
+    cli("add", REPO, "1660")
+    cli("add", REPO, "1656")
+    state._update_drive_queue_entry_local(REPO, 1660, state="running")
+    live_sessions(1660)
+
+    # The queue had ALREADY gone a full window without being walked before
+    # the roll was armed — the laundering case.
+    evaluation_marker(
+        age_seconds=drive_queue_cmd.DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS + 60.0
+    )
+    drive_queue_cmd.write_roll_pending(
+        RollPending(target_version="0.5.502", set_at=time.time(), reason="propagate")
+    )
+
+    first = cli("tick")
+    assert first.exit_code == 0, first.output
+    assert launches == []
+
+    # The pre-hold staleness survived the held tick and is still reported.
+    assert (
+        drive_queue_cmd._drive_queue_evaluation_staleness(time.time())
+        >= drive_queue_cmd.DRIVE_QUEUE_EVALUATION_STALE_AFTER_SECONDS
+    )
+    escalation = state._get_drive_escalation_local(
+        drive_queue_cmd.EVALUATION_STALE_ALERT_REPO,
+        drive_queue_cmd.EVALUATION_STALE_ALERT_ISSUE,
+    )
+    assert escalation is not None, "a hold must not launder pre-hold staleness"
+
+    # Now the other half: pretend the hold has been observed for a while, and
+    # confirm that elapsed held time IS credited rather than counted against
+    # the queue. Back-date `held_since` by 10 minutes — the shape two held
+    # ticks 10 minutes apart produce.
+    marker = drive_queue_cmd._read_drive_queue_evaluation()
+    before_held = marker["held_seconds"]
+    marker["held_since"] = time.time() - 600.0
+    drive_queue_cmd._write_drive_queue_evaluation(marker)
+
+    second = cli("tick")
+    assert second.exit_code == 0, second.output
+    assert launches == []
+
+    after = drive_queue_cmd._read_drive_queue_evaluation()
+    assert after["held_seconds"] >= before_held + 599.0, (
+        "the gap between two observed-held ticks must be credited, or a "
+        "legitimate hour-long roll would escalate"
+    )
+
+
+def test_the_clock_resumes_after_a_roll_lifts_instead_of_starting_over(
+    cli, seed, launches, evaluation_marker, live_sessions
+):
+    """#3413: coming out of a hold must not hand the queue a fresh start.
+
+    This is the incident's own shape end to end. dellserver was rolled to
+    v0.5.502 — a hold — and when the roll finished the queue still did not
+    resume; `coord drive-queue status` kept reporting a cordon that had been
+    cleared, every row's `reason_at` kept aging, and the timer kept
+    reporting success every 3 minutes.
+
+    If leaving a hold reset the clock, the post-roll silence would start
+    counting from zero and the guard would be 15 minutes late on every roll
+    — or, if the queue never walked again, permanently blind. Instead the
+    clock resumes from where the hold paused it, so a post-roll queue that
+    fails to walk is caught on the normal schedule.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+    from coord.drive_queue import RollPending
+
+    seed(issues={1657: "open", 1661: "open"})
+    cli("add", REPO, "1661")
+    cli("add", REPO, "1657")
+    state._update_drive_queue_entry_local(REPO, 1661, state="running")
+    live_sessions(1661)
+
+    evaluation_marker(age_seconds=600.0)
+    drive_queue_cmd.write_roll_pending(
+        RollPending(target_version="0.5.502", set_at=time.time(), reason="propagate")
+    )
+
+    held = cli("tick")
+    assert held.exit_code == 0, held.output
+    assert launches == []
+
+    # The roll completes and the marker is cleared — the real "uncordoned
+    # and rolled" moment from the incident report.
+    drive_queue_cmd.clear_roll_pending()
+
+    paused_age = drive_queue_cmd._drive_queue_evaluation_staleness(time.time())
+    assert paused_age >= 600.0, "leaving a hold must not rewind the clock"
+
+    # And the queue really does resume: free the slot the busy row held, and
+    # the very next tick walks, launches the waiting row, and only THEN is
+    # the clock allowed to reset. This is the half the incident never got to
+    # — the alert promised it and it did not happen.
+    cli("remove", REPO, "1661")
+    live_sessions()
+    resumed = cli("tick")
+    assert resumed.exit_code == 0, resumed.output
+    assert launches and "1657" in " ".join(launches[0])
+
+    after = drive_queue_cmd._read_drive_queue_evaluation()
+    assert after["held_seconds"] == 0.0
+    assert after["held_since"] is None
+    assert drive_queue_cmd._drive_queue_evaluation_staleness(time.time()) < 60.0
+
+
+def test_an_explicit_reconcile_only_tick_does_not_claim_an_evaluation(
+    cli, seed, launches, evaluation_marker
+):
+    """#3413 review: `--reconcile-only` walks nothing either.
+
+    Same step-3 early return as the roll-pending hold above, reached by the
+    operator's own flag rather than by a marker (`--reconcile-only` and
+    `--max-parallel 0` are the same request). It reconciles, it exits 0, and
+    it must not claim the queue was evaluated.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1658: "open"})
+    cli("add", REPO, "1658")
+
+    stale_at = evaluation_marker(age_seconds=200.0)
+
+    result = cli("tick", "--reconcile-only")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+
+    stamped = drive_queue_cmd._read_drive_queue_evaluation()
+    assert stamped is not None
+    assert stamped["last_evaluated_at"] == stale_at
+    assert "reconcile-only" in stamped["held_reason"]
+
+
 def test_dry_run_reports_the_stale_clock_without_resetting_or_recording_it(
     cli, seed, launches, evaluation_marker
 ):
@@ -4509,7 +4721,7 @@ def test_dry_run_reports_the_stale_clock_without_resetting_or_recording_it(
 
     assert result.exit_code == 0, result.output
     assert launches == []
-    assert "has completed an evaluation" in result.output
+    assert "has walked the queue" in result.output
 
     # The clock is untouched — the staleness survives the diagnostic.
     stamped = drive_queue_cmd._read_drive_queue_evaluation()
