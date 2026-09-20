@@ -303,12 +303,14 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
 
     # ── C: genuinely needs a second / separate connection ─────────────────
     "test_serve.py": Classification(
-        14, (BUCKET_C, BUCKET_A),
-        "12 C: file DBs handed to SqliteStore/TestClient, reopen-to-mutate "
+        15, (BUCKET_C, BUCKET_A),
+        "13 C: file DBs handed to SqliteStore/TestClient, reopen-to-mutate "
         "checks, and the thread-safe `rw_db` override (two of them carry "
         "docstrings already stating the autouse conn is unusable from the "
-        "TestClient worker thread). 2 A: PRAGMA journal_mode=WAL + the WAL "
-        "checkpoint tick.",
+        "TestClient worker thread). #3426 added one more: "
+        "_make_bold_prefixed_sub_issues_db seeds a file DB read back over "
+        "HTTP by SqliteStore/TestClient, same shape as the rest of this "
+        "bucket. 2 A: PRAGMA journal_mode=WAL + the WAL checkpoint tick.",
     ),
     "test_board_read_path.py": Classification(
         10, (BUCKET_C,),
