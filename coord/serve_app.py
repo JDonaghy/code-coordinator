@@ -2485,6 +2485,12 @@ def _board_response_schema(components: dict) -> dict:
 
     planned_merge_ref = dataclass_schema(PlannedMerge, components)
     staging_item_ref = dataclass_schema(StagingItem, components)
+    # #3428: registers BoardConcurrency + its nested BoardCeiling/
+    # BoardCeilingSource (dataclass_schema walks nested dataclass fields
+    # recursively, including the `dict[str, BoardCeiling]` on
+    # `repo_overrides` and the `list[BoardCeilingSource]` on
+    # `BoardCeiling.losing`) — see the `concurrency` property below.
+    concurrency_ref = dataclass_schema(board_schema.BoardConcurrency, components)
 
     def _list_of(key: str) -> dict:
         return {"type": "array", "items": {"$ref": f"#/components/schemas/{key}"}}
@@ -2720,6 +2726,25 @@ def _board_response_schema(components: dict) -> dict:
                     "deferrals": {"type": "integer"},
                 },
                 "required": ["target_version", "set_at"],
+            },
+            "concurrency": {
+                **concurrency_ref,
+                "nullable": True,
+                "description": (
+                    "#3428 (#3408 item 3): every concurrency ceiling `coord "
+                    "drive-queue tick` actually enforces — `max_parallel`, "
+                    "`max_parallel_per_repo`, `max_workers` — resolved on "
+                    "THIS daemon host (the systemd-flag source is "
+                    "machine-local and invisible to a thin client), plus "
+                    "current occupancy against each "
+                    "(`coord.drive_queue.compute_running_occupancy`, the "
+                    "SAME verdict `plan_tick` itself enforces — never a "
+                    "second, independently-counted number). `null` when it "
+                    "could not be resolved this build (advisory-only, never "
+                    "blanks the rest of the board); ABSENT on a daemon "
+                    "older than #3428, which never emitted this key at all "
+                    "— a client must tolerate both."
+                ),
             },
             "milestone_work_orders": {
                 "type": "array",
@@ -5900,6 +5925,79 @@ def openapi_spec() -> dict:
     )
 
 
+def _compute_board_concurrency(cfg: Config, projection: dict) -> dict | None:
+    """#3428 (#3408 item 3): the `/board` payload's `concurrency` sibling
+    key — every ceiling `coord drive-queue tick` enforces, resolved on THIS
+    (the daemon) host, plus current occupancy.
+
+    Calls `coord.drive_queue.resolve_concurrency_report`, the SAME
+    resolution `coord config --effective`
+    (`coord.commands.setup._print_effective_concurrency`) already applies —
+    never a second, independently-derived answer (#2085 "one question, one
+    answer"). The systemd-flag source it reads is machine-local: resolving
+    it HERE, server-side, is the entire point (#3408's reported incident —
+    a thin client cannot see this host's own installed unit).
+
+    *projection* is the board dict already built so far in `_build()` below
+    — `assignments` and `drive_queue` are read straight off it (both are
+    wire-shaped dicts `coord.drive_queue.build_board_view`/
+    `entries_from_rows` already accept, per their own docstrings) rather
+    than re-querying the DB a second time in the same request.
+
+    Best-effort / fail-open, matching `roll_pending`/`fleet_health`'s own
+    posture elsewhere in this file: ANY failure (an unreadable systemd unit,
+    a queue-row parse error, a missing `concurrency` config section) returns
+    ``None`` rather than raising, so a broken read here can never blank the
+    rest of the board — an absent-tolerant client already has to handle a
+    daemon too old to emit this key at all.
+    """
+    try:
+        from dataclasses import asdict as _asdict  # noqa: PLC0415
+
+        from coord.board_schema import (  # noqa: PLC0415
+            BoardConcurrency,
+            board_ceiling_from_resolution,
+        )
+        from coord.drive_queue import (  # noqa: PLC0415
+            DEFAULT_MAX_ATTEMPTS,
+            build_board_view,
+            entries_from_rows,
+            resolve_concurrency_report,
+        )
+        from coord.drive import list_drive_sessions  # noqa: PLC0415
+
+        repo_overrides = {r.name: r.max_parallel for r in cfg.repos}
+        entries = entries_from_rows(projection.get("drive_queue") or [])
+        board_view = build_board_view(projection, list_drive_sessions())
+
+        report = resolve_concurrency_report(
+            repo_overrides=repo_overrides,
+            pipeline_max_parallel=cfg.pipeline.max_parallel,
+            pipeline_max_parallel_per_repo=cfg.pipeline.max_parallel_per_repo,
+            max_workers_cap=cfg.concurrency.max_workers,
+            entries=entries,
+            board=board_view,
+            max_attempts=DEFAULT_MAX_ATTEMPTS,
+        )
+        return _asdict(
+            BoardConcurrency(
+                max_parallel=board_ceiling_from_resolution(report.max_parallel),
+                max_parallel_per_repo=board_ceiling_from_resolution(
+                    report.max_parallel_per_repo
+                ),
+                max_workers=board_ceiling_from_resolution(report.max_workers),
+                repo_overrides={
+                    name: board_ceiling_from_resolution(report.repo_resolutions[name])
+                    for name in sorted(report.repo_overrides)
+                },
+                occupied=report.occupied,
+                repo_occupied=report.repo_occupied,
+            )
+        )
+    except Exception:  # noqa: BLE001 — advisory-only; never blank the board
+        return None
+
+
 # #3293: keys whose values are inherently volatile per-build (a sliding
 # window count) but carry no board-state signal of their own — excluded from
 # the ``/board`` ETag DIGEST INPUT only (see ``_board_digest_projection``
@@ -6886,6 +6984,13 @@ def build_app(
                 )
             except Exception:  # noqa: BLE001 — advisory-only; never blank the board
                 projection["roll_pending"] = None
+            # #3428 (#3408 item 3): effective concurrency ceilings +
+            # provenance + occupancy, resolved on THIS daemon host — see
+            # `_compute_board_concurrency`'s own docstring. Sibling key, same
+            # fail-open/absent-tolerant posture as `roll_pending` above:
+            # `None` when it could not be resolved this build, never a
+            # blanked board.
+            projection["concurrency"] = _compute_board_concurrency(_cfg, projection)
             # #1337 invariant 2: no collection endpoint returns unbounded text.
             # #1791 adds a second bound — collection CARDINALITY, not just
             # per-row width — dropping old terminal `assignments` rows (and

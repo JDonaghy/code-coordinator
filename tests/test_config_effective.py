@@ -40,6 +40,7 @@ from coord.drive_queue import (
     flag_shadows_config_warning,
     parse_max_parallel_flags_from_execstart,
     read_systemd_max_parallel_flags,
+    resolve_concurrency_report,
     resolve_max_parallel,
     resolve_max_parallel_per_repo,
 )
@@ -283,6 +284,101 @@ def test_occupancy_excludes_a_dead_running_entry():
     )
     assert occupied == 0
     assert repo_occupied == {}
+
+
+# ── resolve_concurrency_report (pure, #3428) ─────────────────────────────────
+#
+# The one-call wrapper `/board`'s `concurrency` block (coord.serve_app) and
+# any other daemon-host caller should use rather than re-deriving the same
+# wiring `coord config --effective` above already exercises piecemeal.
+
+
+def test_resolve_concurrency_report_names_repo_override_and_losing_fleet_value():
+    report = resolve_concurrency_report(
+        repo_overrides={REPO: 1, "shared": None},
+        pipeline_max_parallel=None,
+        pipeline_max_parallel_per_repo=3,
+        max_workers_cap=8,
+        systemd_flags={},
+    )
+    assert report.max_parallel_per_repo.value == 3
+    assert report.max_parallel_per_repo.source == "coordinator.yml pipeline.max_parallel_per_repo"
+    assert report.repo_overrides == {REPO: 1}
+    repo_resolution = report.repo_resolutions[REPO]
+    assert repo_resolution.value == 1
+    assert repo_resolution.source == f"coordinator.yml repos[{REPO}].max_parallel"
+    assert repo_resolution.losing == (("coordinator.yml pipeline.max_parallel_per_repo", 3),)
+    # `shared` never overrode the fleet default — its own resolution just
+    # mirrors the fleet answer, with nothing of its own to report.
+    assert report.repo_resolutions["shared"].value == 3
+    assert report.repo_resolutions["shared"].losing == ()
+
+
+def test_resolve_concurrency_report_systemd_flag_wins_outright():
+    report = resolve_concurrency_report(
+        repo_overrides={REPO: None},
+        pipeline_max_parallel=4,
+        pipeline_max_parallel_per_repo=2,
+        max_workers_cap=8,
+        systemd_flags={"max_parallel": 9},
+    )
+    assert report.max_parallel.value == 9
+    assert report.max_parallel.source == "systemd ExecStart --max-parallel"
+    assert report.max_parallel.losing == (("coordinator.yml pipeline.max_parallel", 4),)
+
+
+def test_resolve_concurrency_report_max_workers_has_no_losing_source():
+    """`concurrency.max_workers` has exactly one source today — nothing can
+    beat `coordinator.yml`'s own value — but the report shape stays uniform
+    with the other two ceilings (#3428's own contract)."""
+    report = resolve_concurrency_report(
+        repo_overrides={REPO: None},
+        pipeline_max_parallel=None,
+        pipeline_max_parallel_per_repo=None,
+        max_workers_cap=6,
+        systemd_flags={},
+    )
+    assert report.max_workers.value == 6
+    assert report.max_workers.source == "coordinator.yml concurrency.max_workers"
+    assert report.max_workers.losing == ()
+
+
+def test_resolve_concurrency_report_occupancy_uses_compute_running_occupancy():
+    """The occupancy half of the report is `compute_running_occupancy`'s own
+    verdict, not a second count (#2085) — proved by feeding it the identical
+    board/entries the pure test above already exercises directly."""
+    entries = [_running(REPO, 1, 0), _running(REPO, 2, 1)]
+    board = _board_with_sessions((entry_key(REPO, 1), entry_key(REPO, 2)))
+
+    report = resolve_concurrency_report(
+        repo_overrides={REPO: None},
+        pipeline_max_parallel=2,
+        pipeline_max_parallel_per_repo=1,
+        max_workers_cap=8,
+        systemd_flags={},
+        entries=entries,
+        board=board,
+        max_attempts=DEFAULT_MAX_ATTEMPTS,
+    )
+    expected_occupied, expected_repo_occupied = compute_running_occupancy(
+        entries, board, DEFAULT_MAX_ATTEMPTS
+    )
+    assert report.occupied == expected_occupied == 2
+    assert report.repo_occupied == expected_repo_occupied == {REPO: 2}
+
+
+def test_resolve_concurrency_report_no_board_skips_occupancy_rather_than_raising():
+    """A caller that only wants the ceilings (no live queue state) does not
+    need to fabricate an empty `BoardView`."""
+    report = resolve_concurrency_report(
+        repo_overrides={REPO: None},
+        pipeline_max_parallel=2,
+        pipeline_max_parallel_per_repo=1,
+        max_workers_cap=8,
+        systemd_flags={},
+    )
+    assert report.occupied == 0
+    assert report.repo_occupied == {}
 
 
 # ── `coord config --effective` — black-box CLI ───────────────────────────────

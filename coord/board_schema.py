@@ -310,6 +310,208 @@ class BoardDriveQueueEntry:
     apply_verdict_at: float | None = None
 
 
+# ── #3428 (#3408 item 3): concurrency ceilings + provenance + occupancy ──────
+#
+# The three dataclasses below are NOT a table projection — there is no
+# `concurrency` table — so they are absent from `BOARD_PROJECTIONS` and
+# `decode_row()` never touches them. They exist to give the *computed*
+# `coord.drive_queue.CeilingResolution` (already resolved on the daemon host
+# by `coord config --effective`'s own machinery — see that command's
+# docstring) an explicit wire shape, the same way `BoardAssignment` etc. give
+# one to a raw DB row. `coord/serve_app.py`'s `board()` handler builds a
+# `BoardConcurrency` per request (never persisted) and adds it to the
+# `/board` payload as the sibling key ``concurrency`` — same posture as
+# ``roll_pending``/``goal_header``: additive, absent-tolerant, never required.
+#
+# Deliberately does NOT import `coord.drive_queue` at module scope:
+# `coord.drive_queue` transitively imports THIS module (via
+# `coord.merge_queue` -> `coord.state` -> `coord.board_schema`), so a
+# top-level `from coord.drive_queue import CeilingResolution` here would be a
+# real import cycle, not just an ugly one. `CeilingResolution` is referenced
+# only for typing (`from __future__ import annotations` makes the annotation
+# itself lazy) and duck-typed at runtime by :func:`board_ceiling_from_resolution`.
+if typing.TYPE_CHECKING:  # pragma: no cover — typing only
+    from coord.drive_queue import CeilingResolution
+
+
+#: `BoardCeiling.source_kind` / `BoardCeilingSource.source_kind`'s closed
+#: value set (#3428) — a machine-readable classification of
+#: `CeilingResolution.source`'s free-text prose (written for `coord config
+#: --effective`'s human-readable output), so a client can style/filter a
+#: ceiling's provenance without string-matching wording that is free to
+#: change. See :func:`classify_ceiling_source` for the mapping.
+CEILING_SOURCE_KIND_SYSTEMD_FLAG = "systemd_flag"
+CEILING_SOURCE_KIND_CLI_FLAG = "cli_flag"
+CEILING_SOURCE_KIND_COORDINATOR_YML_REPO = "coordinator_yml_repo"
+CEILING_SOURCE_KIND_COORDINATOR_YML_PIPELINE = "coordinator_yml_pipeline"
+CEILING_SOURCE_KIND_COORDINATOR_YML_CONCURRENCY = "coordinator_yml_concurrency"
+CEILING_SOURCE_KIND_DERIVED = "derived"
+CEILING_SOURCE_KIND_DEFAULT = "default"
+#: A `CeilingResolution.source` this classifier doesn't recognise — should
+#: never actually appear on a real `/board` payload (every source string
+#: `coord.drive_queue`'s resolvers produce is covered below), but a client
+#: must still be able to parse it rather than choke: unlike the DTOs above,
+#: `source_kind` degrading to "unknown" is a display nit, not a #632-class
+#: parse failure.
+CEILING_SOURCE_KIND_UNKNOWN = "unknown"
+
+CEILING_SOURCE_KINDS: frozenset[str] = frozenset(
+    {
+        CEILING_SOURCE_KIND_SYSTEMD_FLAG,
+        CEILING_SOURCE_KIND_CLI_FLAG,
+        CEILING_SOURCE_KIND_COORDINATOR_YML_REPO,
+        CEILING_SOURCE_KIND_COORDINATOR_YML_PIPELINE,
+        CEILING_SOURCE_KIND_COORDINATOR_YML_CONCURRENCY,
+        CEILING_SOURCE_KIND_DERIVED,
+        CEILING_SOURCE_KIND_DEFAULT,
+        CEILING_SOURCE_KIND_UNKNOWN,
+    }
+)
+
+
+def classify_ceiling_source(source: str) -> str:
+    """Map one `CeilingResolution.source` (or one of its `losing` entries'
+    source names) prose string to a :data:`CEILING_SOURCE_KINDS` enum value.
+
+    Ordered by specificity, matching the exact strings
+    `coord.drive_queue`'s resolvers / `coord.commands.setup._print_effective_
+    concurrency` actually construct today:
+
+    * ``"systemd ExecStart --max-parallel..."`` (`read_systemd_max_parallel_
+      flags` via `coord.commands.setup`'s ``per_repo_source``/
+      ``max_parallel_source``) -> ``systemd_flag`` — the #3408 incident
+      source: a machine-local flag a thin client can never see for itself.
+    * ``"--max-parallel[-per-repo] flag"`` (an explicit CLI override on
+      `coord drive-queue tick`'s own invocation) -> ``cli_flag``.
+    * ``"coordinator.yml repos[<name>].max_parallel"`` (#3423 per-repo
+      override) -> ``coordinator_yml_repo``.
+    * ``"coordinator.yml pipeline.max_parallel..."`` -> ``coordinator_yml_pipeline``.
+    * ``"coordinator.yml concurrency.max_workers"`` (this module's own
+      synthetic resolution for the fleet worker cap — see
+      :func:`board_ceiling_from_resolution`'s caller in `coord/serve_app.py`)
+      -> ``coordinator_yml_concurrency``.
+    * ``"derived (...)"`` (`default_max_parallel`'s repo-shape derivation)
+      -> ``derived``.
+    * ``"default (...)"`` (the hardcoded fallback, config unreadable) ->
+      ``default``.
+    * anything else -> ``unknown`` (fail-soft; see that constant's docstring).
+    """
+    if source.startswith("systemd ExecStart"):
+        return CEILING_SOURCE_KIND_SYSTEMD_FLAG
+    if source.startswith("coordinator.yml repos["):
+        return CEILING_SOURCE_KIND_COORDINATOR_YML_REPO
+    if source.startswith("coordinator.yml pipeline."):
+        return CEILING_SOURCE_KIND_COORDINATOR_YML_PIPELINE
+    if source.startswith("coordinator.yml concurrency."):
+        return CEILING_SOURCE_KIND_COORDINATOR_YML_CONCURRENCY
+    if source.startswith("derived"):
+        return CEILING_SOURCE_KIND_DERIVED
+    if source.startswith("default"):
+        return CEILING_SOURCE_KIND_DEFAULT
+    if source.startswith("--") and source.endswith("flag"):
+        return CEILING_SOURCE_KIND_CLI_FLAG
+    return CEILING_SOURCE_KIND_UNKNOWN
+
+
+@dataclasses.dataclass(kw_only=True)
+class BoardCeilingSource:
+    """One LOSING source's own opinion for a :class:`BoardCeiling` (#3428) —
+    the wire twin of one ``(name, value)`` pair in a
+    `coord.drive_queue.CeilingResolution.losing` tuple. This is the whole
+    point of shipping provenance at all: it is what tells an operator that
+    editing ``coordinator.yml``/``coord-settings`` is futile while a
+    machine-local systemd flag outranks it (#3408's reported incident).
+    """
+
+    source: str
+    source_kind: str
+    value: int
+
+
+@dataclasses.dataclass(kw_only=True)
+class BoardCeiling:
+    """One resolved concurrency ceiling + provenance (#3428) — the `/board`
+    wire twin of `coord.drive_queue.CeilingResolution`, the exact resolution
+    `coord config --effective` and `coord drive-queue tick` itself already
+    use (#2085 "one question, one answer": this block is never a second,
+    independently-derived answer).
+
+    ``source`` carries the same free-text `CeilingResolution.source` a human
+    reads in `coord config --effective`'s output; ``source_kind`` is the
+    machine-readable classification of it (:func:`classify_ceiling_source`)
+    a client should actually branch on. ``losing`` is ``None`` (not ``[]``)
+    when nothing else was configured, matching `CeilingResolution.losing`'s
+    own "empty means nobody else had an opinion" contract.
+    """
+
+    name: str
+    value: int
+    source: str
+    source_kind: str
+    losing: list[BoardCeilingSource] | None = None
+
+
+def board_ceiling_from_resolution(resolution: "CeilingResolution") -> BoardCeiling:
+    """`coord.drive_queue.CeilingResolution` -> its `/board` wire shape.
+
+    Duck-typed on purpose (reads ``.name``/``.value``/``.source``/``.losing``
+    rather than importing the real class) — see the module note above this
+    section for why `coord.drive_queue` cannot be imported here at runtime.
+    """
+    losing = [
+        BoardCeilingSource(
+            source=name, source_kind=classify_ceiling_source(name), value=value
+        )
+        for name, value in resolution.losing
+    ] or None
+    return BoardCeiling(
+        name=resolution.name,
+        value=resolution.value,
+        source=resolution.source,
+        source_kind=classify_ceiling_source(resolution.source),
+        losing=losing,
+    )
+
+
+@dataclasses.dataclass(kw_only=True)
+class BoardConcurrency:
+    """The `/board` payload's ``concurrency`` block (#3428, #3408 item 3):
+    every ceiling `coord drive-queue tick` actually enforces, resolved on
+    THIS (the daemon) host, plus current occupancy against each.
+
+    **Resolved server-side, always** — the systemd-flag source
+    (:data:`CEILING_SOURCE_KIND_SYSTEMD_FLAG`) is machine-local and invisible
+    to a thin client (a Rust TUI, a phone webapp) by construction; a client
+    deriving ceilings from its own cached ``coordinator.yml`` would
+    confidently print the config value while a host-local flag silently
+    outranked it — the exact #3408 failure this block exists to end.
+
+    ``repo_overrides`` carries only the repos whose OWN ``repos[].max_parallel``
+    (#3423) actually differs from ``max_parallel_per_repo``'s fleet-wide
+    value — mirroring `coord.drive_queue.effective_repo_capacities`'s own
+    "only the repos that disagree" trim (see that function's docstring):
+    listing every repo would bury the ones that matter and make an
+    all-default fleet look like something was overridden everywhere.
+
+    ``occupied``/``repo_occupied`` are `coord.drive_queue.
+    compute_running_occupancy`'s own output, verbatim — the SAME "is this
+    entry still occupying a slot" verdict `plan_tick` enforces, never a
+    second, independently-recounted number (#2085 "one question, one
+    answer").
+
+    Absent-tolerant in both directions (#3428 acceptance): an older daemon
+    simply omits the ``concurrency`` key entirely (never ships it as e.g. an
+    empty object), and a newer client must not require the key to parse an
+    otherwise-valid board.
+    """
+
+    max_parallel: BoardCeiling
+    max_parallel_per_repo: BoardCeiling
+    max_workers: BoardCeiling
+    repo_overrides: dict[str, BoardCeiling]
+    occupied: int
+    repo_occupied: dict[str, int]
+
 
 #: ``table name`` → the DTO that defines its ``/board`` wire shape.  These are
 #: exactly the seven projections ``coord/serve_app.py`` publishes under
