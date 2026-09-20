@@ -2,9 +2,13 @@
 
 CLAUDE.md is loaded into every worker leg, every review leg, and every
 coordinator session -- and re-read on every turn of each, at cache-read
-rates. It has already been cut twice for size (#2195: 41,506 -> 24,219
+rates. It had already been cut twice for size (#2195: 41,506 -> 24,219
 bytes; #2787: ~29,732 -> 19,622 bytes) because nothing watched its size in
 between, and it drifted back up at roughly 500 bytes/day both times.
+#3422 cut it a third time (18,605 -> 15,001) by moving the `## Commands`
+reference, the explanatory Key-Design bullets and the review-prompt-assembly
+note out to docs/ -- the first cut made with this guard already in place, so
+the cap came down with the file rather than leaving room to drift back into.
 
 This test is that watch. It is deliberately dumb: a byte count, nothing
 more -- no parsing, no section analysis, no escape hatch. See #2817 for the
