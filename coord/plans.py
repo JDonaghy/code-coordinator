@@ -84,7 +84,6 @@ from coord.issue_store import diff_audit_goals
 from coord.milestone_order import (
     TRACKING_ISSUE_LABEL,
     WorkOrder,
-    parse_sub_issues,
     parse_work_order,
     ready_frontier,
 )
@@ -307,11 +306,24 @@ def find_unparseable_epics(issues: list[dict]) -> list[dict]:
     children while two were in flight, with nothing reporting it anywhere.
 
     This lint is the one place that surfaces the failure instead of
-    swallowing it: it re-parses each epic's own cached ``body`` with
-    :func:`coord.milestone_order.parse_sub_issues` and reports the ones that
+    swallowing it: it re-derives each epic's children through the exact same
+    seam the board payload uses — :class:`coord.parentage.MarkdownParentage`
+    .children(..., fallback_to_work_order=True) — and reports the ones that
     still raise, each hit carrying the original issue dict plus an
     ``"error"`` key with the exact :class:`~coord.milestone_order.
     WorkOrderError` message (names the offending line).
+
+    Deliberately *not* a direct call to :func:`coord.milestone_order.
+    parse_sub_issues` (#3426 review finding): ``coord/serve_app.py``'s board
+    payload additionally falls back to ``## Work order`` when ``##
+    Sub-issues`` is absent/empty (common for epics that predate #1008, per
+    the #1197 fix-iteration finding), and that fallback parse can itself
+    raise. Calling ``parse_sub_issues`` alone here would let this lint and
+    the board payload disagree about whether the same epic is parseable —
+    the "one question, one answer" split-brain this repo's #2096 calls out.
+    Going through :class:`~coord.parentage.MarkdownParentage` with the same
+    ``fallback_to_work_order=True`` keeps the two consumers from being able
+    to diverge.
 
     ``issues`` is the same local-cache shape :func:`find_unlabelled_epics` /
     :func:`find_stale_epics` consume (``labels`` as a plain ``list[str]``,
@@ -319,6 +331,7 @@ def find_unparseable_epics(issues: list[dict]) -> list[dict]:
     --lint-epics``) is what turns a non-empty result into a non-zero exit
     code.
     """
+    parentage = MarkdownParentage()
     hits: list[dict] = []
     for issue in issues:
         state = (issue.get("state") or "open").lower()
@@ -330,8 +343,16 @@ def find_unparseable_epics(issues: list[dict]) -> list[dict]:
         }
         if TRACKING_ISSUE_LABEL not in label_names:
             continue
+        number = issue.get("number")
+        if number is None:
+            continue
         try:
-            parse_sub_issues(issue.get("body") or "")
+            parentage.children(
+                issue.get("repo_name", ""),
+                int(number),
+                body=issue.get("body") or "",
+                fallback_to_work_order=True,
+            )
         except Exception as exc:  # noqa: BLE001 — #3426: report it, don't swallow it
             hits.append({**issue, "error": str(exc)})
     return hits

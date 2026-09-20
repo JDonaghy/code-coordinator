@@ -937,6 +937,27 @@ class TestFindUnparseableEpics:
         ]
         assert find_unparseable_epics(issues) == []
 
+    def test_malformed_work_order_fallback_is_flagged_when_sub_issues_absent(
+        self,
+    ) -> None:
+        """Non-blocking review finding on #3426: the board payload's
+        `MarkdownParentage.children(..., fallback_to_work_order=True)` falls
+        back to `## Work order` when `## Sub-issues` is absent/empty (#1197 —
+        common for epics that predate #1008), and that fallback parse can
+        itself raise. This lint must go through the same seam so it can't
+        report "clean" for an epic the board payload reports as broken."""
+        issues = [
+            _cached_issue(
+                1170,
+                "Epic: predates sub-issues",
+                labels=["epic"],
+                body="## Work order\n- [ ] #10\n- [ ] #10\n",
+            )
+        ]
+        hits = find_unparseable_epics(issues)
+        assert [h["number"] for h in hits] == [1170]
+        assert "more than once" in hits[0]["error"]
+
     def test_one_malformed_epic_does_not_suppress_a_sibling_epic(self) -> None:
         """The reason this bug survived: a parse failure used to hide
         EVERYTHING for that epic, silently. The lint itself must not let one

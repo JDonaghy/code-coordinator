@@ -591,6 +591,25 @@ Epic intro prose.
         assert parse_sub_issues("## Sub-issues\n- [ ] *#7 — prose*\n").issue_numbers == (7,)
         assert parse_sub_issues("## Sub-issues\n- [ ] _#7 — prose_\n").issue_numbers == (7,)
 
+    def test_bold_wrapped_number_with_trailing_annotation_keeps_the_after_edge(
+        self,
+    ) -> None:
+        """Review finding on #3426: a line that bolds *only* the issue number
+        and then carries an annotation right after the closing `**` (e.g.
+        `- [ ] **#765** {after: #762,#763}`) must not silently drop the
+        `after` edge. Before the fix, `.match()` (not `.fullmatch()`) still
+        matched just the `- [ ] **#765` prefix and returned `after=()` —
+        parsing "successfully" while quietly discarding a real dependency
+        edge, which `ready_frontier` consumes for dispatch ordering."""
+        body = (
+            "## Work order\n"
+            "- [ ] #762\n"
+            "- [ ] #763\n"
+            "- [ ] **#765** {after: #762,#763}\n"
+        )
+        wo = parse_work_order(body)
+        assert wo.node(765).after == (762, 763)
+
     def test_a_line_that_is_still_malformed_still_raises(self) -> None:
         """Widening the grammar removes ONE failure class, not all of them —
         a genuinely malformed line (no `#N` at all) still raises, and it
