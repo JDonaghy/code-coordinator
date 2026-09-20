@@ -23,6 +23,28 @@ repos:
     # `coord.smoke.dispatch_smoke` refuse to route here (`coord doctor`
     # reports which host is missing it — `coord/prereqs.py`'s `nvim` entry).
     requires: [nvim]
+    # #3423: THIS repo's drive-queue concurrency ceiling, overriding the
+    # fleet-wide `pipeline.max_parallel_per_repo` (default 1) for vimcode
+    # alone. One number for the whole fleet has to be set for the most
+    # serialisation-sensitive repo in it — code-coordinator, where two
+    # drives editing `coord/` at once conflict constantly — which pinned
+    # every other repo to 1 as well. vimcode's issues are routinely
+    # disjoint, so it can safely run two.
+    #
+    # Precedence, deliberately UNLIKE every other ceiling in `coord config
+    # --effective`'s table: this wins over an explicit
+    # `--max-parallel-per-repo` flag too, including a systemd unit's
+    # hardcoded one (#3408's incident was exactly such a flag silently
+    # outranking coordinator.yml). The flag still sets the default for every
+    # repo that declares nothing here. `coord config --effective` prints
+    # both, per repo, naming whichever source lost.
+    #
+    # The GLOBAL `--max-parallel` derivation accounts for this
+    # automatically: it sums the per-repo ceilings rather than multiplying
+    # by the fleet default (#3388), so raising one repo here can never
+    # starve the others against a stale global ceiling. `0` means "no
+    # ceiling for this repo"; the global one still applies.
+    max_parallel: 2
 
   - name: quadraui
     github: JDonaghy/quadraui

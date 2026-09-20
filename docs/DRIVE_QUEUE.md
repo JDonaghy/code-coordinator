@@ -706,6 +706,55 @@ there is nothing here to drift. If a host still carries an
 `override.conf` that exists only to set this flag, move the value into
 `coordinator.yml` and delete the drop-in.
 
+**Raise it for ONE repo with `repos[].max_parallel` (#3423).** The fleet-wide
+number above has to be set for the most serialisation-sensitive repo in the
+fleet — code-coordinator, where two drives editing `coord/` at once conflict
+constantly, has to stay at 1 — which pinned every other repo to 1 with it. A
+repo's own entry overrides it:
+
+```yaml
+repos:
+  - name: vimcode
+    github: JDonaghy/vimcode
+    max_parallel: 2        # this repo only
+
+pipeline:
+  max_parallel_per_repo: 1 # everything else, unchanged
+```
+
+Three things this changes, all visible rather than implicit:
+
+* **It outranks the flag.** Unlike every other ceiling in `coord config
+  --effective`'s table, `repos[].max_parallel` wins over an explicit
+  `--max-parallel-per-repo` — including a systemd unit's hardcoded one, which
+  is #3408's incident (a machine-local drop-in silently outranking
+  `coordinator.yml`) with a wider blast radius. The flag still supplies the
+  default for every repo that declares nothing. Whatever lost is named in the
+  report, so the inversion is never silent.
+* **The global ceiling follows it.** `--max-parallel`'s #3388 derivation now
+  **sums** the per-repo ceilings instead of multiplying by the fleet default,
+  so raising one repo to 2 widens the global ceiling to match rather than
+  letting that repo eat a neighbour's slot.
+* **Every readout counts each repo against its own ceiling** — the tick's
+  `per-repo:` line, its deferral reasons, and `coord config --effective`'s "in
+  flight" line. A repo reporting `2/1` would read as a bug; it reports `2/2`
+  and names where the 2 came from.
+
+```
+$ coord config --effective
+Effective concurrency ceilings (#3408):
+  max_parallel             15  <- derived (sum of per-repo ceilings, clamped to concurrency.max_workers)
+  max_parallel_per_repo    1  <- coordinator.yml pipeline.max_parallel_per_repo
+    vimcode                2  <- coordinator.yml repos[vimcode].max_parallel  (losing: coordinator.yml pipeline.max_parallel_per_repo: 1)
+  concurrency.max_workers  16  <- coordinator.yml concurrency.max_workers
+
+in flight  3/15 global · code-coordinator 1/1 · vimcode 2/2
+```
+
+`max_parallel: 0` on a repo disables the per-repo ceiling for that repo alone
+(the global one still bounds it), the same meaning `0` has on the fleet-wide
+knob.
+
 Two things to know:
 
 * **A repo-limited queue raises no alert.** Every remaining entry waiting on
