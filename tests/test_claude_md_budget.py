@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 # ~6% headroom over the 15,001-byte size CLAUDE.md was at immediately after
-# the operator-split. Raising this constant is a deliberate, reviewable act
+# the #3422 operator-split. Raising this constant is a deliberate, reviewable act
 # -- not something to do reflexively to make this test pass. If CLAUDE.md
 # has grown past the cap, the fix is almost always to MOVE a section to
 # docs/ (leaving a one-line pointer behind), not to raise this number. Per
@@ -37,7 +37,7 @@ def test_claude_md_stays_within_byte_budget() -> None:
         "Its size is a direct, per-turn, fleet-wide cost, not a one-time "
         "reading-time cost.\n\n"
         "This file has already been cut twice for exactly this reason "
-        "(#2195, #2787) and drifted back up each time because nothing "
+        "(#2195, #2787, #3422) and drifted back up each time because nothing "
         "enforced a cap -- that is what this test is for.\n\n"
         "The fix is almost always to MOVE a section out to docs/ (leaving "
         "a short pointer line in CLAUDE.md), per the file's own scope "

@@ -261,7 +261,7 @@ The reviewer gets a prompt built from:
 
 The reviewer reads the rules and enforces them against the diff. It does not have the worker's session context — genuinely independent.
 
-Moved here from [`CLAUDE.md`](../CLAUDE.md). The reviewer does not need a description
+Moved here from [`CLAUDE.md`](../CLAUDE.md) (#3422). The reviewer does not need a description
 of how its own prompt was built, and neither does a worker — this is for someone editing
 `coord/review.py`.
 

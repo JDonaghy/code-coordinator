@@ -21,7 +21,7 @@ in `docs/`.*
 
 ## The core loop
 
-Moved here from [`CLAUDE.md`](../CLAUDE.md): a worker cannot run any of these —
+Moved here from [`CLAUDE.md`](../CLAUDE.md) (#3422): a worker cannot run any of these —
 the coordinator owns dispatch and GitHub — so it was pure operator surface being re-read
 on every turn of every leg. `coord <cmd> --help` remains the authoritative reference.
 
