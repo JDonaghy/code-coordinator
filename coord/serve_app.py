@@ -2785,6 +2785,32 @@ def _board_response_schema(components: dict) -> dict:
                     "required": ["repo_name", "tracking_issue", "children"],
                 },
             },
+            "children_errors": {
+                "type": "array",
+                "description": (
+                    "#3426: per-epic parse failures for the same `## "
+                    "Sub-issues`/`## Work order` checklist `children` above "
+                    "resolves — one entry per tracking issue whose checklist "
+                    "raised coord.milestone_order.WorkOrderError (e.g. a "
+                    "duplicate `#N`, an `after` edge to an undeclared issue, "
+                    "a dependency cycle) instead of yielding zero/some "
+                    "children. Surfaces the failure instead of the silent "
+                    "'zero children' `children` would otherwise report for "
+                    "the same epic (vimcode#1170)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string"},
+                        "tracking_issue": {"type": "integer"},
+                        "error": {
+                            "type": "string",
+                            "description": "the WorkOrderError message, naming the offending line",
+                        },
+                    },
+                    "required": ["repo_name", "tracking_issue", "error"],
+                },
+            },
         },
         "required": [
             "schema_version", "round_number", "assignments", "machines",
