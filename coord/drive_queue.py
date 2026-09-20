@@ -988,6 +988,109 @@ def compute_running_occupancy(
     return occupied, repo_occupied
 
 
+@dataclass(frozen=True)
+class ConcurrencyReport:
+    """Every concurrency ceiling `coord drive-queue tick` enforces, resolved
+    together in the SAME order + SAME primitives ``coord config --effective``
+    (`coord.commands.setup._print_effective_concurrency`) already applies
+    (#3408), plus current occupancy against each — the one call a daemon-host
+    caller should make rather than re-deriving the wiring itself (#3428,
+    #2085 "one question, one answer").
+
+    ``repo_resolutions`` is EVERY repo's own :class:`CeilingResolution`
+    (#3423), keyed by name — :func:`resolve_repo_ceilings`'s full table.
+    ``repo_overrides`` is the trimmed subset that actually differs from
+    ``max_parallel_per_repo``'s fleet-wide value —
+    :func:`effective_repo_capacities`'s own shape, and also what
+    ``max_parallel``'s own resolution is computed against (a repo with no
+    override contributes the fleet figure to that sum, not its own name).
+    """
+
+    max_parallel: CeilingResolution
+    max_parallel_per_repo: CeilingResolution
+    max_workers: CeilingResolution
+    repo_resolutions: dict[str, CeilingResolution]
+    repo_overrides: dict[str, int]
+    occupied: int
+    repo_occupied: dict[str, int]
+
+
+def resolve_concurrency_report(
+    *,
+    repo_overrides: Mapping[str, int | None],
+    pipeline_max_parallel: int | None,
+    pipeline_max_parallel_per_repo: int | None,
+    max_workers_cap: int,
+    systemd_flags: Mapping[str, int] | None = None,
+    entries: Sequence["QueueEntry"] = (),
+    board: "BoardView | None" = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    now: float | None = None,
+    local_host: str | None = None,
+) -> ConcurrencyReport:
+    """Resolve every concurrency ceiling in one call (#3428).
+
+    *repo_overrides* is ``{repo_name: repos[].max_parallel or None}`` for
+    EVERY repo in the fleet (not just the overridden ones — see
+    :func:`resolve_repo_ceilings`). *systemd_flags* defaults to a fresh
+    :func:`read_systemd_max_parallel_flags` read of THIS machine's own
+    installed unit when not given (a caller with an already-read dict, e.g.
+    a test, passes it explicitly rather than touching the filesystem).
+
+    *board*/*entries* are `compute_running_occupancy`'s own arguments;
+    *board* left ``None`` (the default) skips occupancy entirely
+    (``occupied=0``, ``repo_occupied={}``) rather than raising — a caller
+    that only wants the ceilings (no live queue state) does not need to
+    fabricate an empty :class:`BoardView`.
+    """
+    flags = systemd_flags if systemd_flags is not None else read_systemd_max_parallel_flags()
+
+    per_repo_resolution = resolve_max_parallel_per_repo(
+        override_value=flags.get("max_parallel_per_repo"),
+        override_source="systemd ExecStart --max-parallel-per-repo",
+        config_value=pipeline_max_parallel_per_repo,
+    )
+    repo_resolutions = resolve_repo_ceilings(repo_overrides, fleet=per_repo_resolution)
+    effective_repo_overrides = effective_repo_capacities(
+        repo_resolutions, fleet_value=per_repo_resolution.value
+    )
+
+    global_resolution = resolve_max_parallel(
+        override_value=flags.get("max_parallel"),
+        override_source="systemd ExecStart --max-parallel",
+        config_value=pipeline_max_parallel,
+        repo_count=len(repo_overrides),
+        max_parallel_per_repo=per_repo_resolution.value,
+        max_workers_cap=max_workers_cap,
+        repo_overrides=effective_repo_overrides,
+    )
+    # `concurrency.max_workers` has exactly one source today — nothing can
+    # beat `coordinator.yml`'s own value — but the wire/report shape stays
+    # uniform across all three ceilings (#3428's own contract), so it is
+    # wrapped in the same `CeilingResolution` shape the other two use, with
+    # an always-empty `losing`.
+    max_workers_resolution = CeilingResolution(
+        "max_workers", max_workers_cap, "coordinator.yml concurrency.max_workers"
+    )
+
+    if board is not None:
+        occupied, repo_occupied = compute_running_occupancy(
+            entries, board, max_attempts, now=now, local_host=local_host
+        )
+    else:
+        occupied, repo_occupied = 0, {}
+
+    return ConcurrencyReport(
+        max_parallel=global_resolution,
+        max_parallel_per_repo=per_repo_resolution,
+        max_workers=max_workers_resolution,
+        repo_resolutions=repo_resolutions,
+        repo_overrides=effective_repo_overrides,
+        occupied=occupied,
+        repo_occupied=repo_occupied,
+    )
+
+
 # ── the startup grace window (#1794) ─────────────────────────────────────────
 #
 # A drive is NOT established the instant `coord drive --tmux` exits 0.  #1606's

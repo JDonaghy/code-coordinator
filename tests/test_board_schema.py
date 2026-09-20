@@ -44,8 +44,21 @@ import coord.db as db_mod
 from coord import board_schema
 from coord.board_schema import (
     BOARD_PROJECTIONS,
+    CEILING_SOURCE_KIND_CLI_FLAG,
+    CEILING_SOURCE_KIND_COORDINATOR_YML_CONCURRENCY,
+    CEILING_SOURCE_KIND_COORDINATOR_YML_PIPELINE,
+    CEILING_SOURCE_KIND_COORDINATOR_YML_REPO,
+    CEILING_SOURCE_KIND_DEFAULT,
+    CEILING_SOURCE_KIND_DERIVED,
+    CEILING_SOURCE_KIND_SYSTEMD_FLAG,
+    CEILING_SOURCE_KIND_UNKNOWN,
     INTEGER_BACKED_BOOLEANS,
     BoardAssignment,
+    BoardCeiling,
+    BoardCeilingSource,
+    BoardConcurrency,
+    board_ceiling_from_resolution,
+    classify_ceiling_source,
     json_fields,
     project_row,
 )
@@ -579,3 +592,112 @@ def test_test_confirmation_reaches_the_board_wire(tmp_path: Path) -> None:
         "test_confirmation was dropped from /board — BoardAssignment must "
         "declare it (see coord/board_schema.py)"
     )
+
+
+# ── #3428: concurrency ceilings + provenance wire shape ─────────────────────
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("systemd ExecStart --max-parallel 4", CEILING_SOURCE_KIND_SYSTEMD_FLAG),
+        (
+            "systemd ExecStart --max-parallel-per-repo 2",
+            CEILING_SOURCE_KIND_SYSTEMD_FLAG,
+        ),
+        ("--max-parallel flag", CEILING_SOURCE_KIND_CLI_FLAG),
+        ("--max-parallel-per-repo flag", CEILING_SOURCE_KIND_CLI_FLAG),
+        (
+            "coordinator.yml repos[claude-coordinator].max_parallel",
+            CEILING_SOURCE_KIND_COORDINATOR_YML_REPO,
+        ),
+        (
+            "coordinator.yml pipeline.max_parallel",
+            CEILING_SOURCE_KIND_COORDINATOR_YML_PIPELINE,
+        ),
+        (
+            "coordinator.yml pipeline.max_parallel_per_repo",
+            CEILING_SOURCE_KIND_COORDINATOR_YML_PIPELINE,
+        ),
+        (
+            "coordinator.yml concurrency.max_workers",
+            CEILING_SOURCE_KIND_COORDINATOR_YML_CONCURRENCY,
+        ),
+        (
+            "derived (repo_count × max_parallel_per_repo, clamped to concurrency.max_workers)",
+            CEILING_SOURCE_KIND_DERIVED,
+        ),
+        ("default (DEFAULT_MAX_PARALLEL, config unreadable)", CEILING_SOURCE_KIND_DEFAULT),
+        ("default (DEFAULT_MAX_PARALLEL_PER_REPO)", CEILING_SOURCE_KIND_DEFAULT),
+        ("some future prose nobody wrote yet", CEILING_SOURCE_KIND_UNKNOWN),
+    ],
+)
+def test_classify_ceiling_source_covers_every_real_string(source: str, expected: str) -> None:
+    """Every `CeilingResolution.source` string `coord.drive_queue`'s
+    resolvers (and `coord.commands.setup`'s systemd override sources)
+    actually construct today classifies to the right machine-readable enum
+    — plus one deliberately unrecognised string proving the fail-soft
+    `unknown` branch, rather than a KeyError, on anything new."""
+    assert classify_ceiling_source(source) == expected
+
+
+def test_board_ceiling_from_resolution_carries_losing_sources() -> None:
+    """`board_ceiling_from_resolution` mirrors `CeilingResolution` field for
+    field, classifying both the winner and every loser."""
+    from coord.drive_queue import CeilingResolution
+
+    resolution = CeilingResolution(
+        "max_parallel_per_repo",
+        3,
+        "coordinator.yml pipeline.max_parallel_per_repo",
+        (("systemd ExecStart --max-parallel-per-repo 2", 2),),
+    )
+    ceiling = board_ceiling_from_resolution(resolution)
+    assert ceiling == BoardCeiling(
+        name="max_parallel_per_repo",
+        value=3,
+        source="coordinator.yml pipeline.max_parallel_per_repo",
+        source_kind=CEILING_SOURCE_KIND_COORDINATOR_YML_PIPELINE,
+        losing=[
+            BoardCeilingSource(
+                source="systemd ExecStart --max-parallel-per-repo 2",
+                source_kind=CEILING_SOURCE_KIND_SYSTEMD_FLAG,
+                value=2,
+            )
+        ],
+    )
+
+
+def test_board_ceiling_from_resolution_losing_is_none_not_empty_list() -> None:
+    """`losing=None` (not `[]`) when nothing else was configured — matching
+    `CeilingResolution.losing`'s own "empty means nobody else had an
+    opinion" contract, and letting a client tell "nothing to report" apart
+    from "the resolver forgot to fill this in"."""
+    from coord.drive_queue import CeilingResolution
+
+    resolution = CeilingResolution("max_parallel", 4, "coordinator.yml pipeline.max_parallel")
+    ceiling = board_ceiling_from_resolution(resolution)
+    assert ceiling.losing is None
+
+
+def test_board_concurrency_registers_nested_dataclasses_in_openapi() -> None:
+    """`BoardConcurrency`'s nested `BoardCeiling`/`BoardCeilingSource` (a
+    `dict[str, BoardCeiling]` and a `list[BoardCeilingSource]` respectively)
+    both register into `components/schemas` via `dataclass_schema`'s
+    recursive walk — proving the #3428 wire shape actually reaches
+    `/openapi.json`, not just this module's own dataclasses."""
+    components: dict = {}
+    ref = dataclass_schema(BoardConcurrency, components)
+    assert ref == {"$ref": "#/components/schemas/BoardConcurrency"}
+    assert "BoardCeiling" in components
+    assert "BoardCeilingSource" in components
+    ceiling_props = components["BoardCeiling"]["properties"]
+    assert ceiling_props["losing"]["nullable"] is True
+    assert ceiling_props["losing"]["items"] == {
+        "$ref": "#/components/schemas/BoardCeilingSource"
+    }
+    concurrency_props = components["BoardConcurrency"]["properties"]
+    assert concurrency_props["repo_overrides"] == {
+        "type": "object",
+        "additionalProperties": {"$ref": "#/components/schemas/BoardCeiling"},
+    }

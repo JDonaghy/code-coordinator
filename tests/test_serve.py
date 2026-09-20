@@ -1870,6 +1870,199 @@ def test_roll_pending_read_failure_does_not_blank_board(
     assert board["round_number"] == 7  # rest of the board is untouched
 
 
+# ── #3428 (#3408 item 3): concurrency ceilings + provenance + occupancy ─────
+
+
+def _concurrency_config_text(*, pipeline_max_parallel_per_repo: int = 3) -> str:
+    """One repo (`api`) with its own #3423 `max_parallel` override, one
+    (`shared`) without — enough to exercise the "repo override wins, fleet
+    value listed as losing" acceptance bar without touching the shared
+    `VALID_CONFIG` every other test in this file relies on."""
+    return (
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "    max_parallel: 1\n"
+        "  - name: shared\n"
+        "    github: acme/shared\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    capabilities: [python]\n"
+        "    repos: [api, shared]\n"
+        "pipeline:\n"
+        f"  max_parallel_per_repo: {pipeline_max_parallel_per_repo}\n"
+    )
+
+
+@pytest.fixture
+def concurrency_config_path(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(_concurrency_config_text())
+    return p
+
+
+@pytest.fixture
+def no_real_systemd_unit(monkeypatch, tmp_path: Path):
+    """Isolate these tests from whatever `--max-parallel` flag (if any) the
+    REAL machine running the suite happens to have hardcoded on its own
+    installed `coord-drive-queue.service` — mirrors
+    `tests/test_config_effective.py`'s fixture of the same name. Without
+    this, a fleet host wired the way #3408 itself describes would silently
+    inject an unexpected `systemd_flag` winner into these assertions.
+    """
+    absent = tmp_path / "no-such-unit" / "coord-drive-queue.service"
+    monkeypatch.setattr(
+        "coord.drive_queue.default_systemd_user_unit_path", lambda *a, **k: absent
+    )
+
+
+def test_concurrency_absent_from_board_payload_when_resolution_fails(
+    file_db: Path, valid_config_path: Path, monkeypatch
+):
+    """#3428: same fail-open posture as `roll_pending`/`goal_header` above —
+    a broken resolution degrades to `concurrency: null`, never blanks (or
+    503s) the rest of the board."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("systemd unit read exploded")
+
+    monkeypatch.setattr("coord.drive_queue.read_systemd_max_parallel_flags", _boom)
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "concurrency" in board
+    assert board["concurrency"] is None
+    assert board["round_number"] == 7  # rest of the board is untouched
+
+
+def test_concurrency_reports_repo_override_and_losing_fleet_value(
+    file_db: Path, concurrency_config_path: Path, no_real_systemd_unit
+):
+    """The #3428 acceptance bar: a repo with its own #3423
+    `repos[].max_parallel` reports ITS ceiling and names `coordinator_yml_repo`
+    as the winner, with the fleet-wide `max_parallel_per_repo` value listed
+    as losing — machine-readable `source_kind`, not prose a client has to
+    string-match."""
+    cfg = load_config(concurrency_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    concurrency = board["concurrency"]
+    assert concurrency is not None
+
+    fleet = concurrency["max_parallel_per_repo"]
+    assert fleet["value"] == 3
+    assert fleet["source_kind"] == "coordinator_yml_pipeline"
+
+    api_ceiling = concurrency["repo_overrides"]["api"]
+    assert api_ceiling["value"] == 1
+    assert api_ceiling["source_kind"] == "coordinator_yml_repo"
+    assert api_ceiling["losing"] == [
+        {
+            "source": "coordinator.yml pipeline.max_parallel_per_repo",
+            "source_kind": "coordinator_yml_pipeline",
+            "value": 3,
+        }
+    ]
+    # `shared` never overrode the fleet default — #3423's own "only the
+    # repos that differ" contract — so it must not appear in the map at all.
+    assert "shared" not in concurrency["repo_overrides"]
+
+
+def test_concurrency_occupancy_matches_compute_running_occupancy(
+    tmp_path: Path, concurrency_config_path: Path, rw_db, monkeypatch, no_real_systemd_unit
+):
+    """#3428 acceptance: occupancy must be the SAME verdict
+    `coord.drive_queue.compute_running_occupancy` gives for the equivalent
+    board state — never a second, independently-counted number (#2085 "one
+    question, one answer"). Asserted against a fresh call to that function
+    over the SERVED board, not a hand-count."""
+    from coord.drive_queue import (
+        DEFAULT_MAX_ATTEMPTS,
+        STATE_RUNNING,
+        build_board_view,
+        compute_running_occupancy,
+        entries_from_rows,
+        entry_key,
+    )
+
+    cfg = load_config(concurrency_config_path)
+    app = build_app(SqliteStore(tmp_path / "rw.db"), cfg)
+    with TestClient(app) as cli:
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 1650,
+        })
+        cli.post("/drive-queue", json={
+            "action": "update", "repo_name": "api", "issue_number": 1650,
+            "fields": {"state": STATE_RUNNING},
+        })
+        monkeypatch.setattr(
+            "coord.drive.list_drive_sessions", lambda *a, **k: [entry_key("api", 1650)]
+        )
+
+        board = cli.get("/board").json()
+
+        concurrency = board["concurrency"]
+        assert concurrency is not None
+        assert concurrency["occupied"] == 1
+        assert concurrency["repo_occupied"] == {"api": 1}
+
+        # Independently recompute the same verdict from the served board's
+        # own `drive_queue` rows — proves agreement with the real function
+        # rather than trusting the served numbers on faith.
+        entries = entries_from_rows(board["drive_queue"])
+        board_view = build_board_view(board, [entry_key("api", 1650)])
+        occupied, repo_occupied = compute_running_occupancy(
+            entries, board_view, DEFAULT_MAX_ATTEMPTS
+        )
+    assert concurrency["occupied"] == occupied
+    assert concurrency["repo_occupied"] == repo_occupied
+
+
+def test_concurrency_systemd_flag_wins_and_is_labeled(
+    file_db: Path, concurrency_config_path: Path, monkeypatch, tmp_path: Path
+):
+    """#3428 / companion #3429 fix: a systemd unit's own `ExecStart=
+    --max-parallel` flag outranks `coordinator.yml` outright and reports as
+    `systemd_flag` — a machine-readable label, never the free-text prose a
+    client would otherwise have to string-match."""
+    unit_path = tmp_path / "coord-drive-queue.service"
+    unit_path.write_text(
+        "[Service]\nExecStart=/usr/bin/coord drive-queue tick --max-parallel 9\n"
+    )
+    monkeypatch.setattr(
+        "coord.drive_queue.default_systemd_user_unit_path", lambda *a, **k: unit_path
+    )
+    cfg = load_config(concurrency_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    max_parallel = board["concurrency"]["max_parallel"]
+    assert max_parallel["value"] == 9
+    assert max_parallel["source_kind"] == "systemd_flag"
+
+
+def test_concurrency_no_systemd_unit_never_reports_systemd_flag(
+    file_db: Path, concurrency_config_path: Path, no_real_systemd_unit
+):
+    """The companion negative case (#3429's own bug report): with no unit
+    installed at all, nothing reports `systemd_flag` — inventing a flag from
+    unit-file prose that was never a live ExecStart= override must not
+    resurface here."""
+    cfg = load_config(concurrency_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    concurrency = board["concurrency"]
+    assert concurrency["max_parallel"]["source_kind"] != "systemd_flag"
+    assert concurrency["max_parallel_per_repo"]["source_kind"] != "systemd_flag"
+
+
 def _make_finished_milestone_db(path: Path) -> None:
     """Seed a milestone (#7, "Wrapped up") whose tracking epic AND every
     work-order child are closed, but the milestone itself is still open on
