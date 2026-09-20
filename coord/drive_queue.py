@@ -874,10 +874,24 @@ def default_systemd_user_unit_path(unit_name: str = DRIVE_QUEUE_UNIT_NAME) -> Pa
 
 def parse_max_parallel_flags_from_execstart(unit_text: str) -> dict[str, int]:
     """Extract a hardcoded ``--max-parallel``/``--max-parallel-per-repo``
-    integer from a systemd unit's ``ExecStart=`` line (or, harmlessly, from
-    the whole unit file's text) (#3408). Pure and independently testable —
-    the sole reason this is split out from :func:`read_systemd_max_parallel_flags`,
-    which does the actual (unstubbable) file read.
+    integer from a systemd unit's ``ExecStart=`` line — and ONLY that line
+    (#3429). Pure and independently testable — the sole reason this is split
+    out from :func:`read_systemd_max_parallel_flags`, which does the actual
+    (unstubbable) file read.
+
+    #3429: this used to regex the WHOLE unit file's text, which its own
+    docstring called "harmless". It was not — a #2573 explanatory comment in
+    the packaged unit (`coord/deploy/coord-drive-queue.service`) mentions
+    "--max-parallel-per-repo 2" in prose, describing a drop-in that USED to
+    exist and should be deleted, and that comment's `2` was being read back
+    as a live systemd override, inventing a flag nobody set, outranking a
+    real `coordinator.yml` value, suppressing the real per-repo override
+    line, and firing a false "your config has no effect" warning — on the
+    one host (the daemon host) where this function's output is trusted.
+    Scoping the scan to the `ExecStart=` line only is the fix: systemd
+    itself only ever reads flags from there, and comments (whether inline
+    `#...` above/around it or, in principle, a stray `#` mid-line) cannot
+    masquerade as part of it because they live on other lines entirely.
 
     ``--max-parallel-per-repo`` is checked before ``--max-parallel``: both
     regexes require the character right after the flag name to be a space
@@ -885,20 +899,28 @@ def parse_max_parallel_flags_from_execstart(unit_text: str) -> dict[str, int]:
     ``--max-parallel`` with a stray ``-per-repo`` suffix — but per-repo is
     still matched first here for readability, not correctness.
 
-    Returns ``{}`` when neither flag appears — indistinguishable, on
-    purpose, from "this text was not a real unit at all"; the caller
-    (:func:`read_systemd_max_parallel_flags`) folds an unreadable/missing
-    file into the same empty result, since both mean "no override known" to
-    every consumer of this function.
+    Returns ``{}`` when there is no ``ExecStart=`` line, or it carries
+    neither flag — indistinguishable, on purpose, from "this text was not a
+    real unit at all"; the caller (:func:`read_systemd_max_parallel_flags`)
+    folds an unreadable/missing file into the same empty result, since both
+    mean "no override known" to every consumer of this function.
     """
+    execstart_line = None
+    for line in unit_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ExecStart="):
+            execstart_line = stripped
+            break
+    if execstart_line is None:
+        return {}
     result: dict[str, int] = {}
-    per_repo_match = re.search(r"--max-parallel-per-repo[ =](\d+)", unit_text)
+    per_repo_match = re.search(r"--max-parallel-per-repo[ =](\d+)", execstart_line)
     if per_repo_match:
         result["max_parallel_per_repo"] = int(per_repo_match.group(1))
     # `--max-parallel` must not also match the `--max-parallel-per-repo`
     # occurrence above — requiring a space/`=` right after `max-parallel`
     # means the character there is `-` for the per-repo flag, never a match.
-    max_parallel_match = re.search(r"--max-parallel[ =](\d+)", unit_text)
+    max_parallel_match = re.search(r"--max-parallel[ =](\d+)", execstart_line)
     if max_parallel_match:
         result["max_parallel"] = int(max_parallel_match.group(1))
     return result

@@ -204,6 +204,37 @@ def test_parse_execstart_with_neither_flag_is_empty():
     assert parse_max_parallel_flags_from_execstart(text) == {}
 
 
+def test_parse_execstart_ignores_the_flag_mentioned_only_in_a_comment():
+    """#3429: a #2573 explanatory comment in the packaged unit mentions
+    "--max-parallel-per-repo 2" in prose (describing a drop-in that should
+    be DELETED, not restated), while the real `ExecStart=` line carries no
+    such flag. The whole-file regex this used to be read that comment back
+    as a live override; scoping the scan to the `ExecStart=` line fixes it.
+    """
+    text = (
+        "# was found resetting ExecStart= back to %h/.local/bin/coord, silently\n"
+        "# reverting #2314's pinned-venv path above as an unnoticed side\n"
+        "# effect — dellserver's live drop-in, built solely to carry\n"
+        "# --max-parallel-per-repo 2, was found resetting ExecStart=\n"
+        "[Service]\n"
+        "ExecStart=%h/.coord-venv/bin/coord drive-queue tick "
+        "--config %h/.coord/coordinator.yml\n"
+    )
+    assert parse_max_parallel_flags_from_execstart(text) == {}
+
+
+def test_parse_execstart_uses_the_packaged_unit_as_its_own_fixture():
+    """The repo's own `coord/deploy/coord-drive-queue.service` IS the #3429
+    repro (its header carries the offending comment verbatim) — read it and
+    confirm the parser now returns {} instead of the phantom
+    `{'max_parallel_per_repo': 2}`."""
+    unit_path = (
+        Path(__file__).resolve().parent.parent / "coord" / "deploy" / "coord-drive-queue.service"
+    )
+    text = unit_path.read_text()
+    assert parse_max_parallel_flags_from_execstart(text) == {}
+
+
 def test_read_systemd_flags_from_a_stubbed_unit_path(tmp_path: Path):
     """`unit_path` is the seam a test (or an operator with a non-default
     install layout) uses instead of the real
