@@ -3404,6 +3404,158 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         assert row["test_reason"] == "worker: 5 failed"
 
 
+class TestMuteLegMechanicalFallback(TestSmokeVerdictFailsClosed):
+    """#3415: a MUTE Test-stage leg (no `SMOKE:` marker, clean exit) must
+    try the mechanical fallback (`coord.confirm_test.confirm_branch`, no LLM,
+    no waiting) BEFORE falling into the mute-leg retry/park tally — sampling
+    every #3376 alarm found 7/7 mute legs backgrounded the suite, stated the
+    polling rule correctly, and ended their turn anyway, which is a
+    structural property of a one-shot session no prompt wording fixes.
+
+    Reuses ``TestSmokeVerdictFailsClosed``'s ``_setup``/``_reap``/``_row``
+    helpers — the scenario (mute leg: ``exit_code=0``, ``log=None``) is
+    identical; only what the stubbed mechanical run reports differs.
+    """
+
+    def test_decisive_confirmed_result_records_passed_with_no_retry(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-3415a", "smoke-3415a", exit_code=0, log=None,
+        )
+        confirmed = ct.ConfirmationResult(
+            kind=ct.KIND_OK,
+            reason="independently re-ran `pytest -q` at origin/x and it passed",
+            command="pytest -q",
+            returncode=0,
+        )
+        with (
+            patch("coord.notify._agent_host", return_value=None),
+            patch("coord.notify._run_pass_confirmation", return_value=confirmed),
+        ):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-3415a")
+        assert row["test_state"] == "passed", (
+            "a mute leg with a decisive mechanical PASS must record 'passed' "
+            f"directly, no retry — got {row['test_state']!r}"
+        )
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_CONFIRMED
+        assert "mechanical fallback" in (row["test_reason"] or "")
+        assert "no-verdict" not in (row["test_reason"] or "").lower(), (
+            "a decisive mechanical result must not read like the old "
+            "unresolved mute-leg tally text"
+        )
+
+    def test_decisive_refuted_result_records_failed_with_no_retry(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-3415b", "smoke-3415b", exit_code=0, log=None,
+        )
+        refuted = ct.ConfirmationResult(
+            kind=ct.KIND_SUITE,
+            reason="`pytest -q` exited 1 at origin/x",
+            output="FAILED tests/test_thing.py::test_it",
+            command="pytest -q",
+            returncode=1,
+        )
+        with (
+            patch("coord.notify._agent_host", return_value=None),
+            patch("coord.notify._run_pass_confirmation", return_value=refuted),
+        ):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-3415b")
+        assert row["test_state"] == "failed", (
+            "a mute leg with a decisive mechanical FAILURE must record "
+            f"'failed' directly, no retry — got {row['test_state']!r}"
+        )
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_REFUTED
+        # #1384: the legacy `smoke_test` mirror is derived from `test_state`
+        # by the writer regardless of provenance — same as every other
+        # 'failed' write in this module.
+        assert row["smoke_test"] == "fail"
+
+    def test_decisive_baseline_red_result_records_skipped_with_no_retry(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-3415c", "smoke-3415c", exit_code=0, log=None,
+        )
+        baseline_red = ct.ConfirmationResult(
+            kind=ct.KIND_BASELINE_RED,
+            reason="every failure reproduces identically on the merge-base",
+            command="pytest -q",
+            returncode=1,
+        )
+        with (
+            patch("coord.notify._agent_host", return_value=None),
+            patch("coord.notify._run_pass_confirmation", return_value=baseline_red),
+        ):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-3415c")
+        assert row["test_state"] == "skipped"
+        assert row["test_confirmation"] == ct.TEST_CONFIRMATION_BASELINE_RED
+
+    def test_inconclusive_mechanical_result_falls_back_to_mute_tally(
+        self, coord_db, tmp_path
+    ) -> None:
+        """The safety property: an inconclusive mechanical run (no checkout,
+        no test_command, a timeout, ...) must never invent an answer — it
+        falls back to exactly today's mute-leg tally/retry behaviour."""
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.smoke import mute_smoke_legs  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-3415d", "smoke-3415d", exit_code=0, log=None,
+        )
+        inconclusive = ct.ConfirmationResult(
+            kind=ct.KIND_SETUP,
+            reason="no local checkout of 'api' on this machine",
+        )
+        with (
+            patch("coord.notify._agent_host", return_value=None),
+            patch("coord.notify._run_pass_confirmation", return_value=inconclusive),
+        ):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-3415d")
+        assert row["test_state"] is None, (
+            "an inconclusive mechanical run must fall back to the mute-leg "
+            f"tally (NO verdict, cleared for retry), got {row['test_state']!r}"
+        )
+        assert mute_smoke_legs(row["test_reason"]) == 1
+
+    def test_no_confirmation_available_falls_back_to_mute_tally(
+        self, coord_db, tmp_path
+    ) -> None:
+        """`_run_pass_confirmation` returning `None` (disabled, config
+        unloadable, budget exhausted) is exactly the pre-#3415 shape and must
+        degrade to the existing mute-leg tally, unchanged."""
+        from coord.smoke import mute_smoke_legs  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-3415e", "smoke-3415e", exit_code=0, log=None,
+        )
+        with (
+            patch("coord.notify._agent_host", return_value=None),
+            patch("coord.notify._run_pass_confirmation", return_value=None),
+        ):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-3415e")
+        assert row["test_state"] is None
+        assert mute_smoke_legs(row["test_reason"]) == 1
+
+
 # ── #1176 review: fix-completion → re-review handoff type coverage ─────────
 
 
