@@ -79,7 +79,6 @@ from coord.drive_queue import (
     add_preflight_notice,
     apply_gate_status,
     build_board_view,
-    default_max_parallel,
     detect_unreachable_waits,
     diagnose_blocked_after,
     effective_max_fix_rounds,
@@ -87,6 +86,7 @@ from coord.drive_queue import (
     entry_key,
     find_cycle,
     fired_holds,
+    flag_shadows_config_warning,
     is_dispatch_failure_reason,
     is_merge_gate_block_reason,
     is_permanent_block_reason,
@@ -101,6 +101,8 @@ from coord.drive_queue import (
     plan_tick,
     remaining_fix_rounds,
     render_plan,
+    resolve_max_parallel,
+    resolve_max_parallel_per_repo,
     total_fix_round_budget,
     unreachable_wait_alert,
     validate_apply_gate,
@@ -6210,26 +6212,40 @@ def drive_queue_tick(
                 _resolved_config = None
         return _resolved_config
 
-    # #2573: an explicit `--max-parallel-per-repo` always wins; otherwise
+    # #2573/#3408: an explicit `--max-parallel-per-repo` always wins; otherwise
     # fall back to the fleet-wide `pipeline.max_parallel_per_repo` in
     # coordinator.yml, and only then to the hardcoded default. Resolved
     # BEFORE `--max-parallel` (#3388's derivation multiplies BY this
     # already-resolved value) and before validation below, so a bad value
     # from either source is caught the same way regardless of which one
-    # supplied it.
-    if max_parallel_per_repo is None:
-        _cfg = _config_for_defaults()
-        config_default = None if _cfg is None else _cfg.pipeline.max_parallel_per_repo
-        max_parallel_per_repo = (
-            DEFAULT_MAX_PARALLEL_PER_REPO if config_default is None else config_default
-        )
+    # supplied it. `resolve_max_parallel_per_repo` is the SAME function
+    # `coord config --effective` calls to report this ceiling's provenance
+    # (#3408) — one resolution order lives in `coord.drive_queue`, not two
+    # that could drift apart (#2085's "one question, one answer").
+    _cfg = _config_for_defaults()
+    _config_max_parallel_per_repo = (
+        None if _cfg is None else _cfg.pipeline.max_parallel_per_repo
+    )
+    _shadow_warning = flag_shadows_config_warning(
+        flag_name="max-parallel-per-repo",
+        override_value=max_parallel_per_repo,
+        config_key="pipeline.max_parallel_per_repo",
+        config_value=_config_max_parallel_per_repo,
+    )
+    if _shadow_warning:
+        click.echo(_shadow_warning)
+    max_parallel_per_repo = resolve_max_parallel_per_repo(
+        override_value=max_parallel_per_repo,
+        override_source="--max-parallel-per-repo flag",
+        config_value=_config_max_parallel_per_repo,
+    ).value
 
     if max_parallel_per_repo < 0:
         raise click.ClickException(
             "--max-parallel-per-repo must be 0 (no per-repo ceiling) or more"
         )
 
-    # #3388: an explicit `--max-parallel` always wins; otherwise
+    # #3388/#3408: an explicit `--max-parallel` always wins; otherwise
     # `pipeline.max_parallel` from coordinator.yml; otherwise derive it from
     # the fleet's own shape (repo count * the per-repo ceiling just resolved
     # above, clamped to the fleet's real worker capacity) rather than fall
@@ -6237,20 +6253,26 @@ def drive_queue_tick(
     # side changes — see `coord.drive_queue.default_max_parallel`. Only when
     # the config itself could not be read at all (so neither the fleet
     # default nor the fleet shape is known) does this fall back to the
-    # hardcoded `DEFAULT_MAX_PARALLEL`.
-    if max_parallel is None:
-        _cfg = _config_for_defaults()
-        config_max_parallel = None if _cfg is None else _cfg.pipeline.max_parallel
-        if config_max_parallel is not None:
-            max_parallel = config_max_parallel
-        elif _cfg is not None:
-            max_parallel = default_max_parallel(
-                repo_count=len(_cfg.repos),
-                max_parallel_per_repo=max_parallel_per_repo,
-                max_workers_cap=_cfg.concurrency.max_workers,
-            )
-        else:
-            max_parallel = DEFAULT_MAX_PARALLEL
+    # hardcoded `DEFAULT_MAX_PARALLEL`. Same shared function `coord config
+    # --effective` reports through (#3408) — see the note above.
+    _config_max_parallel = None if _cfg is None else _cfg.pipeline.max_parallel
+    _shadow_warning = flag_shadows_config_warning(
+        flag_name="max-parallel",
+        override_value=max_parallel,
+        config_key="pipeline.max_parallel",
+        config_value=_config_max_parallel,
+    )
+    if _shadow_warning:
+        click.echo(_shadow_warning)
+    max_parallel = resolve_max_parallel(
+        override_value=max_parallel,
+        override_source="--max-parallel flag",
+        config_value=_config_max_parallel,
+        repo_count=0 if _cfg is None else len(_cfg.repos),
+        max_parallel_per_repo=max_parallel_per_repo,
+        max_workers_cap=0 if _cfg is None else _cfg.concurrency.max_workers,
+        config_readable=_cfg is not None,
+    ).value
 
     if max_parallel < 0:
         raise click.ClickException(
