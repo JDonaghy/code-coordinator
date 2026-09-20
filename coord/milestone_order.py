@@ -181,7 +181,15 @@ _SUB_ISSUES_HEADING_RE = re.compile(r"^#{1,6}\s*Sub-issues\s*$", re.IGNORECASE)
 # grammar is migrating to drop it (`- #N {...}` instead of `- [ ] #N {...}`).
 # Both forms parse identically during the migration; `coord milestone sync`
 # is what rewrites existing bodies to the checkbox-free form.
-_ITEM_RE = re.compile(r"^-\s*(?:\[([ xX])\]\s*)?#(\d+)\s*(\{([^}]*)\})?")
+# #3426: a leading emphasis marker (`**`, `*`, `_`) between the checkbox and
+# `#N` is stripped before matching — `- [ ] **#1206 — tranche 2 of
+# #1191**: ...` is a reasonable thing for a human to type (bolding the lead
+# item is normal markdown) and used to raise `WorkOrderError` on the whole
+# section, silently voiding every sibling line too (vimcode#1170). Only the
+# marker immediately after the checkbox is stripped — the rest of the line
+# (including a later closing `**`) was already ignored by `.match` (not
+# `.fullmatch`), so nothing else about the grammar changes.
+_ITEM_RE = re.compile(r"^-\s*(?:\[([ xX])\]\s*)?(?:\*\*|\*|_)?#(\d+)\s*(\{([^}]*)\})?")
 # Splits `key: value` pairs on commas that precede the *next* key, so an
 # `after: #762,#763` value (itself comma-separated) isn't cut mid-list.
 _PAIR_RE = re.compile(r"(\w+)\s*:\s*(.*?)(?=,\s*\w+\s*:|$)")

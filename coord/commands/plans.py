@@ -41,6 +41,16 @@ declared children (:func:`coord.plans.find_stale_epics`, parsed from the
 epic's own cached body) are either unregistered (zero children) or all
 already closed in the cache. Like ``--lint-epics``, this only reports —
 never auto-closes the epic (out of scope per #3226).
+
+``--lint-epics`` also folds in :func:`coord.plans.find_unparseable_epics`
+(#3426): an open, ``"epic"``-labelled issue whose ``## Sub-issues`` checklist
+itself fails to parse — a genuinely different failure from "title reads as
+an epic but isn't labelled". Unlike every other lint here, a hit is not
+merely informational: the board-payload ``children`` projection and every
+other :class:`~coord.parentage.MarkdownParentage` consumer silently reports
+"zero children" for that epic (indistinguishable from one that genuinely has
+none — vimcode#1170), so this command exits non-zero when it finds one,
+naming the offending issue, repo and the unparseable line.
 """
 
 from __future__ import annotations
@@ -174,6 +184,7 @@ def plans_cmd(
     # milestones). Both flags share a single cache fetch when both are
     # passed, rather than reading the table twice.
     unlabelled_epics: list[dict] = []
+    unparseable_epics: list[dict] = []
     stale_epics: list[dict] = []
     if lint_epics or lint_stale_epics:
         from coord import state  # noqa: PLC0415
@@ -182,10 +193,23 @@ def plans_cmd(
         cached_issues = state.cached_open_issues(target_repo_names)
 
         if lint_epics:
-            from coord.plans import find_unlabelled_epics  # noqa: PLC0415
+            from coord.plans import (  # noqa: PLC0415
+                find_unlabelled_epics,
+                find_unparseable_epics,
+            )
 
             unlabelled_epics = sorted(
                 find_unlabelled_epics(cached_issues),
+                key=lambda i: (i.get("repo_name", ""), i.get("number", 0)),
+            )
+            # #3426: a genuinely unparseable `## Sub-issues` checklist is a
+            # different, more serious failure than "title reads as an epic
+            # but isn't labelled" — every other consumer of this checklist
+            # (the board payload, find_stale_epics, github_ops's close-guard)
+            # silently reports "zero children" for it, so this is the one
+            # place it surfaces. Drives the non-zero exit below.
+            unparseable_epics = sorted(
+                find_unparseable_epics(cached_issues),
                 key=lambda i: (i.get("repo_name", ""), i.get("number", 0)),
             )
 
@@ -214,6 +238,15 @@ def plans_cmd(
                     }
                     for i in unlabelled_epics
                 ]
+                combined["unparseable_epics"] = [
+                    {
+                        "repo": i.get("repo_name"),
+                        "number": i.get("number"),
+                        "title": i.get("title"),
+                        "error": i.get("error"),
+                    }
+                    for i in unparseable_epics
+                ]
             if lint_stale_epics:
                 combined["stale_epics"] = [
                     {
@@ -229,6 +262,11 @@ def plans_cmd(
             click.echo(json.dumps(combined, indent=2))
         else:
             click.echo(json.dumps(payload, indent=2))
+        # #3426: a genuinely unparseable epic must not exit 0 — that's the
+        # whole reason this survived undetected on vimcode#1170 (every
+        # consumer failed open AND the lint printed nothing).
+        if unparseable_epics:
+            sys.exit(1)
         return
 
     # Human-readable table.
@@ -268,6 +306,21 @@ def plans_cmd(
         else:
             click.echo("No unlabelled epics found.")
 
+        click.echo("")
+        if unparseable_epics:
+            click.echo(
+                "Unparseable epics (`## Sub-issues` checklist fails to "
+                "parse — every child of this epic is invisible everywhere "
+                "until the line below is fixed by hand):"
+            )
+            for i in unparseable_epics:
+                click.echo(
+                    f"  {i.get('repo_name')}  #{i.get('number')}  {i.get('title')!r}\n"
+                    f"    {i.get('error')}"
+                )
+        else:
+            click.echo("No unparseable epics found.")
+
     if lint_stale_epics:
         click.echo("")
         if stale_epics:
@@ -283,3 +336,8 @@ def plans_cmd(
                 )
         else:
             click.echo("No stale epics found.")
+
+    # #3426: see the json_out branch above — same non-zero-exit rule for the
+    # human-readable path.
+    if unparseable_epics:
+        sys.exit(1)

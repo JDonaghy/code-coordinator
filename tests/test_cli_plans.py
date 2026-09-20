@@ -28,6 +28,7 @@ from coord.plans import (
     find_stale_epics,
     find_tracking_issue,
     find_unlabelled_epics,
+    find_unparseable_epics,
 )
 from coord.state import upsert_open_issues
 
@@ -865,6 +866,92 @@ class TestFindUnlabelledEpics:
         assert find_unlabelled_epics(issues) == []
 
 
+# ── find_unparseable_epics (#3426) ───────────────────────────────────────────
+
+
+class TestFindUnparseableEpics:
+    def test_malformed_sub_issues_block_is_flagged_with_error_message(self) -> None:
+        """The real vimcode#1170 shape: a bold-prefixed issue number used to
+        make the whole `## Sub-issues` block unparseable (before #3426
+        widened the grammar to strip a leading `**`/`*`/`_`). Pin an entry
+        that IS still genuinely malformed (a duplicate `#N`) so this lint
+        keeps a live regression even after the bold case itself stops
+        failing."""
+        issues = [
+            _cached_issue(
+                1170,
+                "Epic: vimcode integration",
+                labels=["epic"],
+                body="## Sub-issues\n- [ ] #10\n- [ ] #10\n",
+            )
+        ]
+        hits = find_unparseable_epics(issues)
+        assert [h["number"] for h in hits] == [1170]
+        assert "#10" in hits[0]["error"]
+        assert "more than once" in hits[0]["error"]
+
+    def test_bold_prefixed_issue_number_is_not_flagged(self) -> None:
+        """#3426's grammar widening means the common case (bolding the lead
+        item) is no longer even a hit for this lint."""
+        issues = [
+            _cached_issue(
+                1170,
+                "Epic: vimcode integration",
+                labels=["epic"],
+                body=(
+                    "## Sub-issues\n"
+                    "- [ ] **#1206 — tranche 2 of #1191**: the 8 remaining "
+                    "value options\n"
+                ),
+            )
+        ]
+        assert find_unparseable_epics(issues) == []
+
+    def test_well_formed_checklist_is_not_flagged(self) -> None:
+        issues = [_epic_with_sub_issues(700, "Epic: healthy", [701, 702])]
+        assert find_unparseable_epics(issues) == []
+
+    def test_no_sub_issues_block_is_not_flagged(self) -> None:
+        """No `## Sub-issues` heading at all just parses empty — that's a
+        different, non-error state from a present-but-broken block."""
+        issues = [_cached_issue(1, "Epic: no checklist yet", labels=["epic"])]
+        assert find_unparseable_epics(issues) == []
+
+    def test_non_epic_issue_is_not_flagged(self) -> None:
+        issues = [
+            _cached_issue(
+                1, "Fix flaky test", body="## Sub-issues\n- [ ] #10\n- [ ] #10\n"
+            )
+        ]
+        assert find_unparseable_epics(issues) == []
+
+    def test_closed_epic_is_not_flagged(self) -> None:
+        issues = [
+            _cached_issue(
+                2,
+                "Epic: closed",
+                labels=["epic"],
+                state="closed",
+                body="## Sub-issues\n- [ ] #10\n- [ ] #10\n",
+            )
+        ]
+        assert find_unparseable_epics(issues) == []
+
+    def test_one_malformed_epic_does_not_suppress_a_sibling_epic(self) -> None:
+        """The reason this bug survived: a parse failure used to hide
+        EVERYTHING for that epic, silently. The lint itself must not let one
+        bad epic blank out a well-formed sibling's result either."""
+        malformed = _cached_issue(
+            100,
+            "Epic: malformed checklist",
+            labels=["epic"],
+            body="## Sub-issues\n- [ ] #10\n- [ ] #10\n",
+        )
+        healthy = _epic_with_sub_issues(700, "Epic: healthy", [701, 702])
+        hits = find_unparseable_epics([malformed, healthy])
+        assert [h["number"] for h in hits] == [100]
+
+
 # ── find_stale_epics (#3228) ─────────────────────────────────────────────────
 
 
@@ -1084,6 +1171,111 @@ class TestLintEpicsCli:
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         assert data == []
+
+    def test_unparseable_sub_issues_block_exits_non_zero_and_names_the_line(
+        self, config_file: Path
+    ) -> None:
+        """#3426: this is the whole point of the lint — before this fix,
+        an epic body that couldn't be parsed (vimcode#1170) produced NO
+        output anywhere and exit 0, which is why the failure went
+        undetected. Now the offending issue, repo and line must all be
+        named, and the process must exit non-zero."""
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1170,
+                    "title": "Epic: vimcode integration",
+                    "body": "## Sub-issues\n- [ ] #10\n- [ ] #10\n",
+                    "labels": [{"name": "epic"}],
+                },
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--config", str(config_file)],
+            )
+        assert result.exit_code != 0
+        assert "api" in result.output
+        assert "#1170" in result.output
+        assert "#10" in result.output
+        assert "more than once" in result.output
+
+    def test_unparseable_epic_does_not_suppress_an_unrelated_repo(
+        self, config_file: Path
+    ) -> None:
+        """Fail-open, per the acceptance bar: one malformed epic must not
+        blank another, well-formed epic's lint output (still non-zero exit,
+        but the healthy epic's absence from `unlabelled_epics`/other output
+        is unaffected, and it never appears in `unparseable_epics`)."""
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1170,
+                    "title": "Epic: vimcode integration",
+                    "body": "## Sub-issues\n- [ ] #10\n- [ ] #10\n",
+                    "labels": [{"name": "epic"}],
+                },
+                {
+                    "number": 900,
+                    "title": "Epic: healthy",
+                    "body": "## Sub-issues\n- [ ] #901\n",
+                    "labels": [{"name": "epic"}],
+                },
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--json", "--config", str(config_file)],
+            )
+        assert result.exit_code != 0
+        data = json.loads(result.output)
+        assert [e["number"] for e in data["unparseable_epics"]] == [1170]
+
+    def test_bold_prefixed_issue_number_does_not_trip_the_lint(
+        self, config_file: Path
+    ) -> None:
+        """#3426's grammar widening: the common case (bolding the lead item)
+        must parse cleanly and exit 0 — it's the genuinely-malformed case
+        above that must fail."""
+        upsert_open_issues(
+            "api",
+            [
+                {
+                    "number": 1170,
+                    "title": "Epic: vimcode integration",
+                    "body": (
+                        "## Sub-issues\n"
+                        "- [ ] **#1206 — tranche 2 of #1191**: the 8 "
+                        "remaining value options\n"
+                    ),
+                    "labels": [{"name": "epic"}],
+                },
+            ],
+        )
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plans", "--lint-epics", "--json", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["unparseable_epics"] == []
 
 
 # ── coord plans --lint-stale-epics CLI integration (#3228) ──────────────────

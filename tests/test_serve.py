@@ -1455,6 +1455,108 @@ def test_children_falls_back_to_work_order_when_no_sub_issues(
     assert by_num[102]["state"] == "closed"
 
 
+# ── #3426: `## Sub-issues` bold-prefixed lines + surfaced parse errors ───────
+
+_BOLD_PREFIXED_SUB_ISSUES_BODY = """\
+Tracking issue for the milestone — the real vimcode#1170 text.
+
+## Sub-issues
+- [ ] #101  {group: A}
+- [ ] **#1206 — tranche 2 of #1191**: the 8 remaining value options land here
+- [x] #102  {group: A}
+"""
+
+
+def _make_bold_prefixed_sub_issues_db(path: Path) -> None:
+    """Seed a DB with a tracking issue whose `## Sub-issues` block bolds one
+    lead item (`- [ ] **#1206 — ...**`) — the exact vimcode#1170 shape that
+    used to raise `WorkOrderError` and hide every sibling line too."""
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute("INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
+                 ("laptop", "laptop.tailnet", '["python"]', '["api"]'))
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?, 0)",
+        ("api", 1170, "Milestone tracking", _BOLD_PREFIXED_SUB_ISSUES_BODY, '["epic", "coord"]'),
+    )
+    set_board_meta(conn, "board_initialized", "1")
+    conn.commit()
+    conn.close()
+
+
+def test_children_bold_prefixed_issue_number_parses_like_a_plain_line(
+    tmp_path: Path, valid_config_path: Path,
+):
+    """#3426: bolding the lead item is normal markdown and must parse — the
+    bold-prefixed line yields a child just like a plain line would, and no
+    sibling line in the same block is hidden by it."""
+    db_path = tmp_path / "coord.db"
+    _make_bold_prefixed_sub_issues_db(db_path)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(db_path), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    entries = board["children"]
+    assert len(entries) == 1, f"expected 1 children entry, got {len(entries)}: {entries}"
+    entry = entries[0]
+    assert entry["tracking_issue"] == 1170
+    by_num = {c["number"]: c for c in entry["children"]}
+    assert set(by_num) == {101, 102, 1206}
+    assert by_num[1206]["state"] == "open"
+    # A genuinely malformed epic elsewhere must never appear in the error
+    # list either, when there isn't one.
+    assert board.get("children_errors") == []
+
+
+def test_children_errors_reports_a_genuinely_malformed_epic(
+    tmp_path: Path, valid_config_path: Path,
+):
+    """#3426: an epic body that still cannot be parsed (a stray non-checklist
+    line under `## Sub-issues`, as opposed to the now-fixed bold-prefix case)
+    must appear on the board payload as an explicit `children_errors` entry
+    — naming the repo and tracking issue — rather than silently reading as
+    zero children."""
+    db_path = tmp_path / "coord.db"
+    _make_sub_issues_db_with_malformed_epic(db_path)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(db_path), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "children_errors" in board, "children_errors key missing from /board"
+    errors = board["children_errors"]
+    assert len(errors) == 1, f"expected 1 children_errors entry, got {len(errors)}: {errors}"
+    err = errors[0]
+    assert err["repo_name"] == "api"
+    assert err["tracking_issue"] == 600
+    assert "unparseable line" in err["error"]
+
+    # The well-formed epic (#500) must still report its children normally —
+    # the same fail-open isolation `children` already gets, now doubled for
+    # `children_errors`.
+    entries = board["children"]
+    by_tracking_issue = {e["tracking_issue"]: e for e in entries}
+    assert 500 in by_tracking_issue
+    assert 600 not in by_tracking_issue
+
+
+def test_children_errors_empty_when_all_epics_well_formed(
+    sub_issues_db: Path, valid_config_path: Path,
+):
+    """#3426: the common, healthy case — no parse failures anywhere — must
+    report an explicitly empty `children_errors`, not omit the key."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(sub_issues_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert board.get("children_errors") == []
+
+
 # ── #975: plan_roster in /board payload ──────────────────────────────────────
 
 def _make_plan_roster_db(path: Path) -> None:

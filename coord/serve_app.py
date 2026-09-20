@@ -6672,6 +6672,7 @@ def build_app(
 
                 _parentage = _MarkdownParentage()
                 _epic_children: list[dict] = []
+                _epic_children_errors: list[dict] = []
                 for _ci_ti in projection.get("issues", []):
                     _ci_labels = _ci_ti.get("labels") or []
                     if _TRACKING_LABEL not in _ci_labels:
@@ -6684,7 +6685,19 @@ def build_app(
                             "", _ci_ti["number"], body=_ci_ti.get("body") or "",
                             fallback_to_work_order=True,
                         )
-                    except Exception:  # noqa: BLE001 — bad sub-issues block: skip this epic only
+                    except Exception as _ci_exc:  # noqa: BLE001 — #3426: surface, don't swallow
+                        # A malformed `## Sub-issues` (or, via the fallback,
+                        # `## Work order`) block on THIS epic must not blank
+                        # ITS children nor any sibling epic's — fail this one
+                        # epic open (report it, zero children) rather than
+                        # letting the exception mean "silently no children"
+                        # (vimcode#1170: three bad lines hid all 24 real
+                        # children with nothing reporting it anywhere).
+                        _epic_children_errors.append({
+                            "repo_name": _ci_repo_name,
+                            "tracking_issue": _ci_ti["number"],
+                            "error": str(_ci_exc),
+                        })
                         continue
                     if _ci_kids:
                         _epic_children.append({
@@ -6695,8 +6708,10 @@ def build_app(
                             ],
                         })
                 projection["children"] = _epic_children
+                projection["children_errors"] = _epic_children_errors
             except Exception:  # noqa: BLE001 — children failure must not blank the board
                 projection["children"] = []
+                projection["children_errors"] = []
             # #975: milestone plan-roster — reuse coord.plans.aggregate_repo_plans
             # server-side so the Plans TUI panel gets one row per milestone/epic
             # (ready / blocked / in-flight / done counts, needs_you attention
