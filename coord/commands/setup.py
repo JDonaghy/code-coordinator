@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 import httpx
@@ -17,6 +18,10 @@ from coord import __version__
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
 import json
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from coord.config import Config
+    from coord.drive_queue import CeilingResolution
 
 
 @click.command(help="Print the coord version.")
@@ -78,9 +83,55 @@ def store_backend_cmd() -> None:
 
 
 @click.command("config", help="Load coordinator.yml and pretty-print the parsed config.")
+@click.option(
+    "--effective",
+    "effective",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print every concurrency ceiling's EFFECTIVE value and provenance "
+        "instead of the parsed config (#3408): which source won (a "
+        "machine-local systemd unit's hardcoded flag, an explicit CLI "
+        "flag, coordinator.yml, or a derived default), what any losing "
+        "source said, and current usage against each ceiling. Answers "
+        "'why isn't this issue being worked' without an SSH in, a "
+        "`systemctl --user cat`, and a coordinator.yml grep."
+    ),
+)
+@click.option(
+    "--max-parallel",
+    "sim_max_parallel",
+    type=int,
+    default=None,
+    help=(
+        "Only with --effective: report as though `coord drive-queue tick` "
+        "were invoked with this explicit --max-parallel (wins outright, "
+        "even over a detected systemd override) -- 'what would tick "
+        "resolve to if I passed this flag'. Resolves nothing by itself."
+    ),
+)
+@click.option(
+    "--max-parallel-per-repo",
+    "sim_max_parallel_per_repo",
+    type=int,
+    default=None,
+    help="Only with --effective: the same simulation for --max-parallel-per-repo.",
+)
 @_CONFIG_OPTION
-def config_cmd(config_path: Path) -> None:
+def config_cmd(
+    config_path: Path,
+    effective: bool,  # noqa: FBT001
+    sim_max_parallel: int | None,
+    sim_max_parallel_per_repo: int | None,
+) -> None:
     cfg = _load_config(config_path)
+    if effective:
+        _print_effective_concurrency(
+            cfg,
+            sim_max_parallel=sim_max_parallel,
+            sim_max_parallel_per_repo=sim_max_parallel_per_repo,
+        )
+        return
     click.echo(f"# {cfg.path}")
     click.echo("")
     click.echo("Repos:")
@@ -103,6 +154,150 @@ def config_cmd(config_path: Path) -> None:
         click.echo("Warnings:")
         for w in cfg.warnings:
             click.echo(f"  ! {w}")
+
+
+def _print_effective_concurrency(
+    cfg: "Config",
+    *,
+    sim_max_parallel: int | None,
+    sim_max_parallel_per_repo: int | None,
+) -> None:
+    """`coord config --effective` (#3408): print every concurrency ceiling
+    coord actually enforces, its resolved value, which source won, and what
+    any losing source said. This is the whole point — a bare effective
+    number would not have told #3408's operator that pushing
+    `pipeline.max_parallel` to `coord-settings` was futile while a
+    machine-local systemd unit's hardcoded ``--max-parallel`` outranks it.
+
+    Calls the SAME `coord.drive_queue.resolve_max_parallel`/
+    `resolve_max_parallel_per_repo` functions
+    `coord.commands.drive_queue.drive_queue_tick` uses to decide what it
+    actually launches, so this can never show a different answer than the
+    tick that enforces it (#2085's "one question, one answer").
+
+    *sim_max_parallel*/*sim_max_parallel_per_repo* let an operator ask "what
+    would tick resolve to if I passed this flag" without actually running
+    one — they win outright, even over a detected systemd override, exactly
+    as an explicit CLI flag would on the real `coord drive-queue tick`
+    invocation. Left `None` (the default), this instead reports the real
+    machine's own installed systemd unit, if any.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        flag_shadows_config_warning,
+        read_systemd_max_parallel_flags,
+        resolve_max_parallel,
+        resolve_max_parallel_per_repo,
+    )
+
+    systemd_flags = read_systemd_max_parallel_flags()
+
+    per_repo_override = sim_max_parallel_per_repo
+    per_repo_source = "--max-parallel-per-repo flag"
+    if per_repo_override is None and "max_parallel_per_repo" in systemd_flags:
+        per_repo_override = systemd_flags["max_parallel_per_repo"]
+        per_repo_source = "systemd ExecStart --max-parallel-per-repo"
+
+    per_repo_resolution = resolve_max_parallel_per_repo(
+        override_value=per_repo_override,
+        override_source=per_repo_source,
+        config_value=cfg.pipeline.max_parallel_per_repo,
+    )
+    per_repo_warning = flag_shadows_config_warning(
+        flag_name="max-parallel-per-repo",
+        override_value=per_repo_override,
+        config_key="pipeline.max_parallel_per_repo",
+        config_value=cfg.pipeline.max_parallel_per_repo,
+    )
+
+    max_parallel_override = sim_max_parallel
+    max_parallel_source = "--max-parallel flag"
+    if max_parallel_override is None and "max_parallel" in systemd_flags:
+        max_parallel_override = systemd_flags["max_parallel"]
+        max_parallel_source = "systemd ExecStart --max-parallel"
+
+    global_resolution = resolve_max_parallel(
+        override_value=max_parallel_override,
+        override_source=max_parallel_source,
+        config_value=cfg.pipeline.max_parallel,
+        repo_count=len(cfg.repos),
+        max_parallel_per_repo=per_repo_resolution.value,
+        max_workers_cap=cfg.concurrency.max_workers,
+    )
+    global_warning = flag_shadows_config_warning(
+        flag_name="max-parallel",
+        override_value=max_parallel_override,
+        config_key="pipeline.max_parallel",
+        config_value=cfg.pipeline.max_parallel,
+    )
+
+    click.echo(f"# {cfg.path}")
+    click.echo("")
+    click.echo("Effective concurrency ceilings (#3408):")
+    _echo_ceiling(global_resolution)
+    if global_warning:
+        click.echo(f"  {global_warning}")
+    _echo_ceiling(per_repo_resolution)
+    if per_repo_warning:
+        click.echo(f"  {per_repo_warning}")
+    click.echo(
+        f"  {'concurrency.max_workers':<24} {cfg.concurrency.max_workers}"
+        "  <- coordinator.yml concurrency.max_workers"
+    )
+    click.echo("")
+    click.echo(_effective_usage_line(cfg, global_resolution, per_repo_resolution))
+
+
+def _echo_ceiling(resolution: "CeilingResolution") -> None:
+    line = f"  {resolution.name:<24} {resolution.value}  <- {resolution.source}"
+    if resolution.losing:
+        losers = ", ".join(f"{name}: {value}" for name, value in resolution.losing)
+        line += f"  (losing: {losers})"
+    click.echo(line)
+
+
+def _effective_usage_line(
+    cfg: "Config",
+    global_resolution: "CeilingResolution",
+    per_repo_resolution: "CeilingResolution",
+) -> str:
+    """Current in-flight usage against the two resolved ceilings above
+    (#3408 acceptance: "a queue at its global ceiling reports N/N rather
+    than rendering as idle"). Best-effort — a board/queue read needs a
+    reachable daemon or a readable local DB, neither of which this command
+    otherwise depends on, so any failure here is reported inline rather
+    than failing the whole command; the ceilings above are the answer that
+    matters most and must still print.
+
+    Uses `coord.drive_queue.compute_running_occupancy`, the SAME
+    "is this entry still occupying a slot" verdict `plan_tick` itself
+    computes (via `_reconcile_running`) — not a second, independently
+    counted number that could disagree with it (#2085).
+    """
+    try:
+        from coord.commands.drive_queue import _fetch_board_view_with_retry  # noqa: PLC0415
+        from coord.drive_queue import (  # noqa: PLC0415
+            DEFAULT_MAX_ATTEMPTS,
+            compute_running_occupancy,
+            entries_from_rows,
+        )
+        from coord.state import list_drive_queue  # noqa: PLC0415
+
+        board = _fetch_board_view_with_retry()
+        entries = entries_from_rows(list_drive_queue())
+        occupied, repo_occupied = compute_running_occupancy(
+            entries, board, DEFAULT_MAX_ATTEMPTS
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; ceilings above still print
+        return f"in flight  unavailable ({exc})"
+
+    line = f"in flight  {occupied}/{global_resolution.value} global"
+    per_repo_bits = " · ".join(
+        f"{repo} {count}/{per_repo_resolution.value}"
+        for repo, count in sorted(repo_occupied.items())
+    )
+    if per_repo_bits:
+        line += f" · {per_repo_bits}"
+    return line
 
 
 def _ensure_coord_permissions(cwd: Path) -> None:
