@@ -101,8 +101,10 @@ from coord.drive_queue import (
     plan_tick,
     remaining_fix_rounds,
     render_plan,
+    effective_repo_capacities,
     resolve_max_parallel,
     resolve_max_parallel_per_repo,
+    resolve_repo_ceilings,
     total_fix_round_budget,
     unreachable_wait_alert,
     validate_apply_gate,
@@ -6226,24 +6228,44 @@ def drive_queue_tick(
     _config_max_parallel_per_repo = (
         None if _cfg is None else _cfg.pipeline.max_parallel_per_repo
     )
-    _shadow_warning = flag_shadows_config_warning(
-        flag_name="max-parallel-per-repo",
-        override_value=max_parallel_per_repo,
-        config_key="pipeline.max_parallel_per_repo",
-        config_value=_config_max_parallel_per_repo,
-    )
-    if _shadow_warning:
-        click.echo(_shadow_warning)
-    max_parallel_per_repo = resolve_max_parallel_per_repo(
+    _flag_max_parallel_per_repo = max_parallel_per_repo
+    _per_repo_resolution = resolve_max_parallel_per_repo(
         override_value=max_parallel_per_repo,
         override_source="--max-parallel-per-repo flag",
         config_value=_config_max_parallel_per_repo,
-    ).value
+    )
+    max_parallel_per_repo = _per_repo_resolution.value
 
     if max_parallel_per_repo < 0:
         raise click.ClickException(
             "--max-parallel-per-repo must be 0 (no per-repo ceiling) or more"
         )
+
+    # #3423: each repo's OWN ceiling (`repos[].max_parallel`), layered on the
+    # fleet-wide answer just resolved. Only the repos that actually DIFFER
+    # are carried into the tick, so a fleet with no overrides produces the
+    # identical `TickPlan` (and identical `render_plan` output) it did
+    # before. `resolve_repo_ceilings` is the SAME function `coord config
+    # --effective` reports through, for the same reason as the two ceilings
+    # above: one resolution order, not two that could drift (#2085).
+    _repo_ceilings = resolve_repo_ceilings(
+        {} if _cfg is None else {r.name: r.max_parallel for r in _cfg.repos},
+        fleet=_per_repo_resolution,
+    )
+    repo_max_parallel = effective_repo_capacities(
+        _repo_ceilings, fleet_value=max_parallel_per_repo
+    )
+    # Emitted after the per-repo table exists so the #3408 warning can name
+    # the repos whose own ceiling beats the flag anyway (#3423).
+    _shadow_warning = flag_shadows_config_warning(
+        flag_name="max-parallel-per-repo",
+        override_value=_flag_max_parallel_per_repo,
+        config_key="pipeline.max_parallel_per_repo",
+        config_value=_config_max_parallel_per_repo,
+        overridden_repos=sorted(repo_max_parallel),
+    )
+    if _shadow_warning:
+        click.echo(_shadow_warning)
 
     # #3388/#3408: an explicit `--max-parallel` always wins; otherwise
     # `pipeline.max_parallel` from coordinator.yml; otherwise derive it from
@@ -6272,6 +6294,11 @@ def drive_queue_tick(
         max_parallel_per_repo=max_parallel_per_repo,
         max_workers_cap=0 if _cfg is None else _cfg.concurrency.max_workers,
         config_readable=_cfg is not None,
+        # #3423: the derivation must sum the per-repo ceilings, not multiply
+        # by the fleet default — raising one repo to 2 without widening the
+        # global ceiling to match re-creates exactly the starvation #3388
+        # was opened for.
+        repo_overrides=repo_max_parallel,
     ).value
 
     if max_parallel < 0:
@@ -6522,6 +6549,7 @@ def drive_queue_tick(
             board,
             effective_capacity,
             max_parallel_per_repo=max_parallel_per_repo,
+            repo_max_parallel=repo_max_parallel,
             probes=probes,
             now=now,
             local_host=_local_host_id(),

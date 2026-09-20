@@ -569,31 +569,53 @@ DEFAULT_MAX_PARALLEL = 1
 
 
 def default_max_parallel(
-    *, repo_count: int, max_parallel_per_repo: int, max_workers_cap: int
+    *,
+    repo_count: int,
+    max_parallel_per_repo: int,
+    max_workers_cap: int,
+    repo_overrides: Mapping[str, int] | None = None,
 ) -> int:
     """Derive the drive-queue tick's global ceiling from the fleet's shape.
 
-    ``repo_count * max_parallel_per_repo`` is the smallest global ceiling
-    that lets every repo reach its own per-repo ceiling at the same time —
-    the invariant #2012/#2057 tried to maintain by hand and lost each time
-    either the fleet or the per-repo ceiling changed (see the module-level
-    comment above this function for the incident, #3388).
+    The smallest global ceiling that lets every repo reach its OWN per-repo
+    ceiling at the same time — the invariant #2012/#2057 tried to maintain
+    by hand and lost each time either the fleet or the per-repo ceiling
+    changed (see the module-level comment above this function for the
+    incident, #3388). With no per-repo overrides that is simply
+    ``repo_count * max_parallel_per_repo``.
 
-    ``max_parallel_per_repo <= 0`` means the per-repo ceiling is itself
-    disabled (one global counter, pre-#1972 behaviour) — there is no
-    per-repo figure to multiply by, so this falls back to *max_workers_cap*
-    alone. Either way the result is clamped to *max_workers_cap*
-    (``concurrency.max_workers``, the fleet's actual worker capacity across
-    every stage, not just drive-queue launches) so a large fleet gets a
-    saner DEFAULT, not a promise the machines behind it can't keep — a
-    ``max_workers_cap`` of 0 or less is "no cap known" and is not applied.
-    Always at least 1: a derivation must never produce a ceiling that
-    admits nothing.
+    *repo_overrides* (#3423) maps a repo name to its OWN ceiling
+    (``repos[].max_parallel``), which outranks *max_parallel_per_repo* for
+    that repo. The sum is then per repo rather than a single multiplication:
+    each overridden repo contributes its own figure and every other repo
+    contributes *max_parallel_per_repo*. Getting this wrong is not cosmetic
+    — the whole point of #3388's derivation is that the global ceiling must
+    be at least the sum of the per-repo ones, or the repos that reach it
+    first starve the rest (the 2026-09-18 fleet state), and raising ONE
+    repo's ceiling to 2 is exactly the kind of change that would otherwise
+    re-introduce that gap.
+
+    A ceiling of ``0`` — whether *max_parallel_per_repo* itself or any one
+    repo's override — means that ceiling is disabled (one global counter,
+    pre-#1972 behaviour). There is then no finite per-repo figure to sum, so
+    this falls back to *max_workers_cap* alone. Either way the result is
+    clamped to *max_workers_cap* (``concurrency.max_workers``, the fleet's
+    actual worker capacity across every stage, not just drive-queue
+    launches) so a large fleet gets a saner DEFAULT, not a promise the
+    machines behind it can't keep — a ``max_workers_cap`` of 0 or less is
+    "no cap known" and is not applied. Always at least 1: a derivation must
+    never produce a ceiling that admits nothing.
     """
-    if max_parallel_per_repo > 0 and repo_count > 0:
-        derived = repo_count * max_parallel_per_repo
-    else:
+    # An override for a repo outside the fleet count (a stale `repos[]`
+    # entry the caller filtered out, say) cannot contribute a slot — at most
+    # `repo_count` of them are summed, so the total can never exceed what the
+    # fleet could actually run.
+    overrides = [v for v in (repo_overrides or {}).values() if v is not None][:repo_count]
+    disabled = max_parallel_per_repo <= 0 or any(v <= 0 for v in overrides)
+    if disabled or repo_count <= 0:
         derived = max_workers_cap
+    else:
+        derived = sum(overrides) + (repo_count - len(overrides)) * max_parallel_per_repo
     if max_workers_cap > 0:
         derived = min(derived, max_workers_cap)
     return max(1, derived)
@@ -673,6 +695,80 @@ def resolve_max_parallel_per_repo(
     )
 
 
+def resolve_repo_max_parallel(
+    repo_name: str,
+    *,
+    repo_override: int | None,
+    fleet: CeilingResolution,
+) -> CeilingResolution:
+    """Resolve ONE repo's effective drive-queue ceiling (#3423).
+
+    *repo_override* is that repo's own ``repos[].max_parallel`` from
+    coordinator.yml (``None`` when it has no opinion); *fleet* is the
+    already-resolved fleet-wide answer from
+    :func:`resolve_max_parallel_per_repo` — flag, then
+    ``pipeline.max_parallel_per_repo``, then the hardcoded default.
+
+    The repo's own value wins whenever it is set, **including over an
+    explicit ``--max-parallel-per-repo`` flag** — the one place in #3408's
+    table where a flag does not win outright, because a flag (or worse, one
+    machine's systemd drop-in, #3408's actual incident) silently nullifying
+    every deliberate per-repo setting is the same failure mode #3408 exists
+    to stop, with a wider blast radius. The flag still supplies the default
+    for every repo that has NOT declared one, so ``tick
+    --max-parallel-per-repo 3`` still throttles (or raises) the rest of the
+    fleet. Whatever loses is carried in ``losing`` and printed by
+    ``coord config --effective``, so the inversion is never silent.
+    """
+    if repo_override is None:
+        return CeilingResolution(repo_name, fleet.value, fleet.source, fleet.losing)
+    return CeilingResolution(
+        repo_name,
+        repo_override,
+        f"coordinator.yml repos[{repo_name}].max_parallel",
+        ((fleet.source, fleet.value), *fleet.losing),
+    )
+
+
+def resolve_repo_ceilings(
+    repo_overrides: Mapping[str, int | None],
+    *,
+    fleet: CeilingResolution,
+) -> dict[str, CeilingResolution]:
+    """:func:`resolve_repo_max_parallel` across the whole fleet (#3423), in
+    ``repo_overrides`` iteration order (coordinator.yml's ``repos[]`` order).
+
+    The caller passes EVERY repo, not just the overridden ones — a repo
+    mapped to ``None`` resolves to the fleet answer, which is what makes
+    this dict usable directly as ``coord config --effective``'s per-repo
+    table and as the source of :func:`effective_repo_capacities`.
+    """
+    return {
+        name: resolve_repo_max_parallel(name, repo_override=override, fleet=fleet)
+        for name, override in repo_overrides.items()
+    }
+
+
+def effective_repo_capacities(
+    resolutions: Mapping[str, CeilingResolution],
+    *,
+    fleet_value: int,
+) -> dict[str, int]:
+    """The subset of *resolutions* that actually DIFFERS from the fleet-wide
+    ceiling, as plain ints — the shape :func:`plan_tick` wants (#3423).
+
+    Trimmed to the differing repos on purpose: `plan_tick` already treats an
+    absent repo as "use the fleet ceiling", so passing the full table would
+    make an all-default fleet produce a `TickPlan` that renders every repo's
+    ceiling individually and reads as though something were overridden.
+    """
+    return {
+        name: resolution.value
+        for name, resolution in resolutions.items()
+        if resolution.value != fleet_value
+    }
+
+
 def resolve_max_parallel(
     *,
     override_value: int | None,
@@ -682,13 +778,15 @@ def resolve_max_parallel(
     max_parallel_per_repo: int,
     max_workers_cap: int,
     config_readable: bool = True,
+    repo_overrides: Mapping[str, int] | None = None,
 ) -> CeilingResolution:
     """Resolve `--max-parallel` (#3388), one level above
     :func:`resolve_max_parallel_per_repo` in the SAME order: *override_value*
     wins outright when given; else *config_value* (`coordinator.yml`
     `pipeline.max_parallel`); else :func:`default_max_parallel`'s derivation
     from the fleet's own shape (*repo_count* times the ALREADY-RESOLVED
-    *max_parallel_per_repo*, clamped to *max_workers_cap*); else, only when
+    *max_parallel_per_repo*, with any #3423 *repo_overrides* counted at
+    their own figure instead, clamped to *max_workers_cap*); else, only when
     *config_readable* is ``False`` (the config itself could not be loaded at
     all), :data:`DEFAULT_MAX_PARALLEL`. Mirrors
     `coord.commands.drive_queue.drive_queue_tick`'s own resolution exactly.
@@ -709,13 +807,16 @@ def resolve_max_parallel(
             repo_count=repo_count,
             max_parallel_per_repo=max_parallel_per_repo,
             max_workers_cap=max_workers_cap,
+            repo_overrides=repo_overrides,
         )
-        return CeilingResolution(
-            "max_parallel",
-            derived,
-            "derived (repo_count × max_parallel_per_repo, clamped to "
-            "concurrency.max_workers)",
+        source = (
+            "derived (sum of per-repo ceilings, clamped to "
+            "concurrency.max_workers)"
+            if repo_overrides
+            else "derived (repo_count × max_parallel_per_repo, clamped to "
+            "concurrency.max_workers)"
         )
+        return CeilingResolution("max_parallel", derived, source)
     return CeilingResolution(
         "max_parallel",
         DEFAULT_MAX_PARALLEL,
@@ -729,6 +830,7 @@ def flag_shadows_config_warning(
     override_value: int | None,
     config_key: str,
     config_value: int | None,
+    overridden_repos: Sequence[str] = (),
 ) -> str | None:
     """#3408 item 2: a latent-surprise combination — an explicit override
     (a CLI flag on `coord drive-queue tick`'s own invocation, or a systemd
@@ -737,11 +839,19 @@ def flag_shadows_config_warning(
     `coordinator.yml`. Both flag-only and config-only are ordinary,
     unremarkable configurations and return ``None`` — only the combination,
     where the config value is silently dead weight, is worth a warning.
+
+    *overridden_repos* (#3423) names the repos whose own
+    ``repos[].max_parallel`` beats the flag anyway, so "always wins" is not
+    left standing as a claim this warning's own report contradicts two lines
+    below it.
     """
     if override_value is None or config_value is None:
         return None
+    scope = "always wins"
+    if overridden_repos:
+        scope = "wins for every repo except " + ", ".join(sorted(overridden_repos))
     return (
-        f"warning: --{flag_name} {override_value} always wins, but "
+        f"warning: --{flag_name} {override_value} {scope}, but "
         f"{config_key} is also set to {config_value} in coordinator.yml — "
         "that value has no effect while the flag is given."
     )
@@ -2507,6 +2617,14 @@ class TickPlan:
     # original single-line capacity render.
     repo_occupied: Mapping[str, int] = field(default_factory=dict)
     repo_capacity: int = 0
+    # #3423: per-repo ceilings that DIFFER from `repo_capacity` above
+    # (`repos[].max_parallel`).  Absent repo ⇒ `repo_capacity` applies, which
+    # is why a fleet with no overrides leaves this empty and renders exactly
+    # as it did before #3423.  Carried on the plan rather than recomputed by
+    # `render_plan` so the line an operator reads names the SAME ceiling the
+    # walk enforced (#2085), including when the two ceilings disagree about
+    # why nothing launched.
+    repo_capacities: Mapping[str, int] = field(default_factory=dict)
     # #2101: non-empty when THIS host is under a release cordon, in which case
     # nothing launched this tick and `launch` is guaranteed None.  Carried as
     # the cordon's own sentence ("cordoned: draining for v0.5.31") rather than
@@ -5639,6 +5757,7 @@ def plan_tick(
     *,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_parallel_per_repo: int = DEFAULT_MAX_PARALLEL_PER_REPO,
+    repo_max_parallel: Mapping[str, int] | None = None,
     probes: Mapping[str, ProbeResult] | None = None,
     now: float | None = None,
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
@@ -5672,6 +5791,17 @@ def plan_tick(
     single-repo queue at ``--max-parallel 1`` is exactly what the queue did
     before.  See :data:`DEFAULT_MAX_PARALLEL_PER_REPO` for why repo is the
     right axis and what the board-derived counting means for a wedged drive.
+
+    *repo_max_parallel* (#3423) overrides that ceiling for the named repos
+    only — ``{"vimcode": 2}`` lets vimcode hold two slots while every other
+    repo stays at *max_parallel_per_repo*.  A repo absent from the mapping
+    (or the mapping being ``None``) is the pre-#3423 behaviour exactly.
+    ``0`` for a repo disables the ceiling for THAT repo, the same meaning
+    ``0`` has for *max_parallel_per_repo*; the global *capacity* still
+    bounds it.  The values are already-resolved ints, not config: the
+    resolution order (repo override > flag > ``coordinator.yml`` > default)
+    lives in :func:`resolve_repo_max_parallel`, so this function stays a
+    pure decision over numbers it is handed.
 
     *probes* maps an entry key to the :class:`ProbeResult` the shell got from
     running that entry's ``resume_when`` (see :func:`pending_probe_targets`);
@@ -6000,6 +6130,20 @@ def plan_tick(
     # the per-repo view can never claim a slot the global view does not.
     repo_occupied: dict[str, int] = {}
     repo_capacity = max(0, int(max_parallel_per_repo))
+    # #3423: per-repo overrides, normalised the same way as the fleet
+    # default above, and trimmed to the ones that actually differ from it so
+    # `TickPlan.repo_capacities` keeps its "an entry here means an override
+    # applied" meaning.
+    repo_capacities: dict[str, int] = {
+        repo: max(0, int(limit))
+        for repo, limit in (repo_max_parallel or {}).items()
+        if max(0, int(limit)) != repo_capacity
+    }
+
+    def _capacity_for(repo: str) -> int:
+        """This repo's effective ceiling: its own override, else the
+        fleet-wide one.  `0` (either source) means no ceiling at all."""
+        return repo_capacities.get(repo, repo_capacity)
 
     # Cycles are re-checked here, not just at `add` time: `remove` can leave
     # the surviving edges in a shape `add` never validated, and a hand-edited
@@ -6523,6 +6667,7 @@ def plan_tick(
         # report the reading that `occupied` was taken from.
         "repo_occupied": dict(repo_occupied),
         "repo_capacity": repo_capacity,
+        "repo_capacities": dict(repo_capacities),
         # #2350: fixed by the time reconciliation (steps 1/1b) finishes —
         # nothing below this point (holds, capacity, the launch walk) ever
         # adds to it — so, unlike `reconciles`, every return site can share
@@ -6698,13 +6843,14 @@ def plan_tick(
         that what it is waiting on is its own repo's in-flight drive rather
         than a named pre-req.
         """
-        if not repo_capacity:
+        limit = _capacity_for(candidate.repo)
+        if not limit:
             return ""
         used = repo_slots.get(candidate.repo, 0)
-        if used < repo_capacity:
+        if used < limit:
             return ""
         return (
-            f"repo {candidate.repo} at its limit ({used}/{repo_capacity}) — "
+            f"repo {candidate.repo} at its limit ({used}/{limit}) — "
             "deferring so a different repo can launch"
         )
 
@@ -6991,6 +7137,22 @@ def plan_tick(
 # ── rendering (pure, so `--dry-run` is testable without a CLI) ───────────────
 
 
+def _repo_limit_summary(plan: TickPlan) -> str:
+    """How `render_plan`'s "no launch, everything is repo-limited" lines name
+    the ceiling that held (#1972, per-repo overrides since #3423).
+
+    With no overrides this is the original ``"N/repo"``.  With them, a bare
+    number would be a lie for at least one of the deferred entries, so the
+    differing repos are named individually after it.
+    """
+    if not plan.repo_capacities:
+        return f"{plan.repo_capacity}/repo"
+    overrides = ", ".join(
+        f"{repo} {value}" for repo, value in sorted(plan.repo_capacities.items())
+    )
+    return f"{plan.repo_capacity}/repo; overridden: {overrides}"
+
+
 def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
     """The human-readable form of a :class:`TickPlan`, one line per element."""
     prefix = "would " if dry_run else ""
@@ -6998,7 +7160,7 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         f"capacity: {plan.occupied}/{plan.capacity} occupied, "
         f"{plan.free_slots} free"
     ]
-    if plan.repo_capacity:
+    if plan.repo_capacity or plan.repo_capacities:
         # #1972: "1/3 occupied" alone cannot answer "so why didn't item 2 go?"
         # — the answer is per-repo, so print the breakdown rather than making
         # the operator read the code.  The provenance is spelled out because
@@ -7006,13 +7168,26 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         # drive whose observer died still holds its repo's slot, and after
         # #1972 that wedges ONE repo instead of the whole queue, which is
         # better but also much quieter.
+        #
+        # #3423: each repo is counted against ITS OWN ceiling, which is the
+        # only way "vimcode 2/2" and "code-coordinator 1/1" can both be true
+        # in one line.  The trailing "(limit N/repo)" names the FLEET
+        # default and then the overrides, because an operator reading
+        # "vimcode 1/2" needs to know whether the 2 came from the fleet knob
+        # they just changed or from that repo's own entry.
         detail = ", ".join(
-            f"{repo} {count}/{plan.repo_capacity}"
+            f"{repo} {count}/{plan.repo_capacities.get(repo, plan.repo_capacity)}"
             for repo, count in sorted(plan.repo_occupied.items())
         )
+        limit = f"{plan.repo_capacity}/repo"
+        if plan.repo_capacities:
+            overrides = ", ".join(
+                f"{repo} {value}" for repo, value in sorted(plan.repo_capacities.items())
+            )
+            limit += f"; overridden: {overrides}"
         lines.append(
             f"  per-repo: {detail or 'no repo occupied'} (limit "
-            f"{plan.repo_capacity}/repo, counted from board state — a drive "
+            f"{limit}, counted from board state — a drive "
             "whose observer died still holds its repo's slot)"
         )
     for item in plan.reconciles:
@@ -7120,7 +7295,7 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
                     "(draining to be rolled)"
                 )
             if repo_limited:
-                parts.append(f"repo-limited ({plan.repo_capacity}/repo)")
+                parts.append(f"repo-limited ({_repo_limit_summary(plan)})")
             if backing_off:
                 parts.append("pacing a retry after a recent failure (#2273)")
             lines.append(
@@ -7135,7 +7310,7 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         elif repo_limited:
             lines.append(
                 f"  no launch — every waiting entry's repo is at its per-repo "
-                f"limit ({plan.repo_capacity}/repo)"
+                f"limit ({_repo_limit_summary(plan)})"
             )
         else:
             lines.append(

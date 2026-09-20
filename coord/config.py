@@ -2536,6 +2536,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "uat_live_preview",
         "uat_checks",
         "requires",
+        "max_parallel",
     }
 )
 
@@ -2831,6 +2832,28 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
         if not isinstance(requires, list) or not all(isinstance(r, str) for r in requires):
             raise ConfigError(f"repos[{i}].requires must be a list of strings")
 
+        # #3423: max_parallel — THIS repo's own drive-queue concurrency
+        # ceiling, overriding the fleet-wide `pipeline.max_parallel_per_repo`.
+        # Absent (None) means "no opinion", i.e. exactly the pre-#3423
+        # behaviour for that repo. See `Repo.max_parallel`'s docstring for
+        # why this one override outranks an explicit CLI/systemd flag, and
+        # `coord.drive_queue.resolve_repo_max_parallel` for the resolution.
+        # `bool` is rejected explicitly: YAML's `max_parallel: true` parses
+        # as a bool, which `isinstance(x, int)` would otherwise wave through
+        # as 1 — a silently-wrong ceiling rather than a config error.
+        repo_max_parallel = entry.get("max_parallel")
+        if repo_max_parallel is not None:
+            if isinstance(repo_max_parallel, bool) or not isinstance(repo_max_parallel, int):
+                raise ConfigError(
+                    f"repos[{i}].max_parallel must be an integer "
+                    "(omit the key entirely to use pipeline.max_parallel_per_repo)"
+                )
+            if repo_max_parallel < 0:
+                raise ConfigError(
+                    f"repos[{i}].max_parallel must be 0 (no per-repo ceiling "
+                    "for this repo) or more"
+                )
+
         repos.append(
             Repo(
                 name=name,
@@ -2853,6 +2876,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 uat_live_preview=uat_live_preview_raw,
                 uat_checks=uat_checks,
                 requires=list(requires),
+                max_parallel=repo_max_parallel,
             )
         )
     return repos, warnings

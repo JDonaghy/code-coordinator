@@ -20,6 +20,8 @@ from coord.commands._common import _CONFIG_OPTION, _load_config
 import json
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
+    from collections.abc import Mapping
+
     from coord.config import Config
     from coord.drive_queue import CeilingResolution
 
@@ -183,10 +185,12 @@ def _print_effective_concurrency(
     machine's own installed systemd unit, if any.
     """
     from coord.drive_queue import (  # noqa: PLC0415
+        effective_repo_capacities,
         flag_shadows_config_warning,
         read_systemd_max_parallel_flags,
         resolve_max_parallel,
         resolve_max_parallel_per_repo,
+        resolve_repo_ceilings,
     )
 
     systemd_flags = read_systemd_max_parallel_flags()
@@ -202,11 +206,26 @@ def _print_effective_concurrency(
         override_source=per_repo_source,
         config_value=cfg.pipeline.max_parallel_per_repo,
     )
+    # #3423: each repo's own `repos[].max_parallel`, layered on the
+    # fleet-wide answer above. Reported per repo below — a single
+    # `max_parallel_per_repo` line stopped being the whole truth the moment
+    # one repo could disagree with it, and "which ceiling actually applies
+    # to MY repo" is the same question #3408 was opened to answer.
+    repo_resolutions = resolve_repo_ceilings(
+        {r.name: r.max_parallel for r in cfg.repos}, fleet=per_repo_resolution
+    )
+    repo_overrides = effective_repo_capacities(
+        repo_resolutions, fleet_value=per_repo_resolution.value
+    )
     per_repo_warning = flag_shadows_config_warning(
         flag_name="max-parallel-per-repo",
         override_value=per_repo_override,
         config_key="pipeline.max_parallel_per_repo",
         config_value=cfg.pipeline.max_parallel_per_repo,
+        # #3423: computed after the per-repo table above so the warning can
+        # name the repos that beat the flag — "always wins" would otherwise
+        # be contradicted by the very next line this function prints.
+        overridden_repos=sorted(repo_overrides),
     )
 
     max_parallel_override = sim_max_parallel
@@ -222,6 +241,7 @@ def _print_effective_concurrency(
         repo_count=len(cfg.repos),
         max_parallel_per_repo=per_repo_resolution.value,
         max_workers_cap=cfg.concurrency.max_workers,
+        repo_overrides=repo_overrides,
     )
     global_warning = flag_shadows_config_warning(
         flag_name="max-parallel",
@@ -239,16 +259,26 @@ def _print_effective_concurrency(
     _echo_ceiling(per_repo_resolution)
     if per_repo_warning:
         click.echo(f"  {per_repo_warning}")
+    # #3423: only the repos that actually override the fleet default are
+    # listed. Printing all fourteen would bury the two that differ, which is
+    # the opposite of what this report is for.
+    for name in sorted(repo_overrides):
+        _echo_ceiling(repo_resolutions[name], indent="    ")
     click.echo(
         f"  {'concurrency.max_workers':<24} {cfg.concurrency.max_workers}"
         "  <- coordinator.yml concurrency.max_workers"
     )
     click.echo("")
-    click.echo(_effective_usage_line(cfg, global_resolution, per_repo_resolution))
+    click.echo(
+        _effective_usage_line(
+            cfg, global_resolution, per_repo_resolution, repo_overrides
+        )
+    )
 
 
-def _echo_ceiling(resolution: "CeilingResolution") -> None:
-    line = f"  {resolution.name:<24} {resolution.value}  <- {resolution.source}"
+def _echo_ceiling(resolution: "CeilingResolution", *, indent: str = "  ") -> None:
+    width = 26 - len(indent)
+    line = f"{indent}{resolution.name:<{width}} {resolution.value}  <- {resolution.source}"
     if resolution.losing:
         losers = ", ".join(f"{name}: {value}" for name, value in resolution.losing)
         line += f"  (losing: {losers})"
@@ -259,6 +289,7 @@ def _effective_usage_line(
     cfg: "Config",
     global_resolution: "CeilingResolution",
     per_repo_resolution: "CeilingResolution",
+    repo_overrides: "Mapping[str, int] | None" = None,
 ) -> str:
     """Current in-flight usage against the two resolved ceilings above
     (#3408 acceptance: "a queue at its global ceiling reports N/N rather
@@ -291,8 +322,11 @@ def _effective_usage_line(
         return f"in flight  unavailable ({exc})"
 
     line = f"in flight  {occupied}/{global_resolution.value} global"
+    # #3423: count each repo against ITS OWN ceiling — against the fleet
+    # default, an overridden repo reports "2/1" and reads as a bug.
+    overrides = repo_overrides or {}
     per_repo_bits = " · ".join(
-        f"{repo} {count}/{per_repo_resolution.value}"
+        f"{repo} {count}/{overrides.get(repo, per_repo_resolution.value)}"
         for repo, count in sorted(repo_occupied.items())
     )
     if per_repo_bits:

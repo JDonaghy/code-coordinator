@@ -189,6 +189,32 @@ class Repo:
     # call it, so the two can never drift into disagreeing answers about
     # what a diff needs (#2096, "one question, one answer").
     requires: list[str] = field(default_factory=list)
+    # #3423: this repo's OWN per-repo drive-queue concurrency ceiling — the
+    # per-repo override of `pipeline.max_parallel_per_repo` (#2573), which is
+    # a single fleet-wide number every repo shares. One number for the whole
+    # fleet forces the ceiling down to the most serialisation-sensitive repo
+    # in it: code-coordinator must stay at 1 (two drives editing the
+    # coordinator's own `coord/` at once conflict constantly), which pinned
+    # vimcode — whose issues are routinely disjoint — to 1 as well.
+    #
+    # `None` (the default) means "no opinion": that repo uses whatever
+    # `coord.drive_queue.resolve_repo_max_parallel` resolves as the fleet
+    # default, so an unset repo behaves EXACTLY as it did before #3423. An
+    # explicit value here is the MOST SPECIFIC source and wins over both
+    # `pipeline.max_parallel_per_repo` and an explicit
+    # `--max-parallel-per-repo` flag (including a systemd unit's hardcoded
+    # one) — deliberately unlike every other ceiling in #3408's table, where
+    # the flag wins outright. The reason is #3408's own incident inverted: a
+    # hardcoded flag on one machine's unit silently outranking coordinator.yml
+    # is exactly the failure mode that wasted an operator's afternoon, and a
+    # fleet-wide flag nullifying every deliberate per-repo setting would be
+    # the same bug with a wider blast radius. `coord config --effective`
+    # prints both, per repo, with the losing source named.
+    #
+    # `0` is "no ceiling for this repo" (the same meaning `0` has for
+    # `max_parallel_per_repo`), NOT "never launch" — the global
+    # `--max-parallel` still bounds it.
+    max_parallel: int | None = None
 
     def unresolved_uat_preview_placeholder(
         self,
