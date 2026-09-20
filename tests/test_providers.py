@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from coord.agent import (
+    UNUSABLE_TOOL_SCHEMAS,
     AssignmentSpec,
     default_worker_command,
 )
@@ -344,6 +345,109 @@ def test_custom_binary() -> None:
     spec = _make_spec(type="work")
     result = ClaudeProvider(binary="my-claude").build_command(spec)
     assert result[0] == "my-claude"
+
+
+# ── #3420: unusable tool schemas, via the provider path ──────────────────────
+
+
+def _disallowed(argv: list[str]) -> list[str]:
+    """Return the ``--disallowedTools`` entries in *argv* (empty if absent)."""
+    if "--disallowedTools" not in argv:
+        return []
+    return argv[argv.index("--disallowedTools") + 1].split(",")
+
+
+@pytest.mark.parametrize(
+    "spec_type",
+    [
+        "plan",
+        "refinement",
+        "test-chat",
+        "new-issue-chat",
+        "milestone-chat",
+        "mock-author",
+        "smoke",
+        "review",
+        "work",
+    ],
+)
+def test_claude_provider_disallows_unusable_tool_schemas(spec_type: str) -> None:
+    """#3420 must hold on the PROVIDER path too, for every spec type.
+
+    ``ClaudeProvider.build_command`` is a second argv builder for the same
+    ``claude -p`` leg, and it is the one the agent actually calls once
+    provider wiring is in play — a fix that only landed in
+    ``default_worker_command`` would strip nothing from a real dispatch.
+    """
+    argv = ClaudeProvider().build_command(_make_spec(type=spec_type))
+    disallowed = _disallowed(argv)
+    assert disallowed, f"no --disallowedTools emitted for type={spec_type}"
+    for tool in UNUSABLE_TOOL_SCHEMAS:
+        assert tool in disallowed, f"{tool} missing for type={spec_type}"
+
+
+def test_claude_provider_and_legacy_read_the_same_unusable_tool_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two argv builders must be ONE implementation, not two that agree.
+
+    Both ``default_worker_command`` and ``ClaudeProvider.build_command``
+    answer the same question — "what goes in ``--disallowedTools``?" — and
+    #3420 landed in one but not the other precisely because each had its own
+    transcription of the logic. A same-argv parity assertion catches that
+    only for tool names someone remembered to add to both; this asserts the
+    stronger property that there is a single source of truth, by injecting a
+    sentinel into ``UNUSABLE_TOOL_SCHEMAS`` at runtime and requiring BOTH
+    builders to pick it up. If the provider ever re-grows its own copy of the
+    list, the sentinel appears in the legacy argv only and this fails.
+    """
+    sentinel = "CoordSentinelTool3420"
+    monkeypatch.setattr(
+        "coord.agent.UNUSABLE_TOOL_SCHEMAS",
+        [*UNUSABLE_TOOL_SCHEMAS, sentinel],
+    )
+    spec = _make_spec(type="work")
+    assert sentinel in _disallowed(default_worker_command(spec))
+    assert sentinel in _disallowed(ClaudeProvider().build_command(spec))
+
+
+def test_claude_provider_unusable_tool_schemas_coexist_with_review_deny(
+) -> None:
+    """The provider's later deny layers must still land alongside #3420's.
+
+    #2461's ``REVIEW_DENY_COMMANDS`` and #1315's sealed-write guard both
+    append to the same list that #3420 now seeds. This is the overwrite
+    regression on the provider side: a seeding bug that clobbered either
+    guard would leave a review leg able to run mutating git commands.
+    """
+    spec = _make_spec(type="review", files_forbidden=["tests/acceptance/"])
+    disallowed = _disallowed(ClaudeProvider().build_command(spec))
+    from coord.agent import REVIEW_DENY_COMMANDS  # noqa: PLC0415
+
+    for pattern in REVIEW_DENY_COMMANDS:
+        assert pattern in disallowed
+    assert "Edit(tests/acceptance/**)" in disallowed
+    assert "Write(tests/acceptance/**)" in disallowed
+    for tool in UNUSABLE_TOOL_SCHEMAS:
+        assert tool in disallowed
+
+
+def test_claude_provider_disallowed_tools_honours_allowed_tools_override() -> None:
+    """The #1642 base-checkout guard keys off THIS call's ``allowed_tools``.
+
+    ``build_command`` lets a caller override ``--allowedTools``; the
+    disallowed list must be computed from that override, not from what the
+    spec type would have produced. A ``type="work"`` spec forced to
+    ``Read,Bash`` can't write, so the base-checkout ``Edit(...)`` patterns
+    must not appear — while #3420's unconditional entries still must.
+    """
+    spec = _make_spec(type="work")
+    disallowed = _disallowed(
+        ClaudeProvider().build_command(spec, allowed_tools="Read,Bash")
+    )
+    assert not [p for p in disallowed if p.startswith("Edit(/")]
+    for tool in UNUSABLE_TOOL_SCHEMAS:
+        assert tool in disallowed
 
 
 # ── #2301: the smoke branch, across every call site of the same logic ────────

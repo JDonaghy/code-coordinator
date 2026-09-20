@@ -2,10 +2,13 @@
 
 Parity requirement: ``ClaudeProvider().build_command(spec)`` produces the
 **same argv** as ``coord.agent.default_worker_command(spec)`` for the same
-inputs.  The logic is a direct transcription of that function's body with
-the ``resolved_model`` / ``system_prompt`` / ``allowed_tools`` /
-``permission_mode`` kwargs spliced in; the parity tests in
-``tests/test_providers.py`` enforce this mechanically.
+inputs.  The ``spec.type`` → prompt/allowed-tools branches are a direct
+transcription of that function's body with the ``resolved_model`` /
+``system_prompt`` / ``allowed_tools`` / ``permission_mode`` kwargs spliced
+in; the parity tests in ``tests/test_providers.py`` enforce this
+mechanically.  The ``--disallowedTools`` stack is **not** transcribed —
+both builders call the shared ``coord.agent.worker_disallowed_tools``, so
+a new deny layer lands in both without a sync step (#3420).
 
 Imports from ``coord.agent`` are **deferred** (inside method bodies) to keep
 the import cycle latent until the wiring issue lands.  At that point
@@ -119,10 +122,9 @@ class ClaudeProvider(Provider):
             TEST_CHAT_SYSTEM_PROMPT,
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
-            _base_checkout_write_guard_tools,
             _claude_md_system_prompt_suffix,
-            _sealed_write_guard_tools,
             build_deny_prompt,
+            worker_disallowed_tools,
         )
         from coord.review import REVIEWER_SYSTEM_PROMPT  # noqa: PLC0415
         from coord.smoke import SMOKE_SYSTEM_PROMPT  # noqa: PLC0415
@@ -285,20 +287,16 @@ class ClaudeProvider(Provider):
         ]
         if effective_model:
             argv.extend(["--model", effective_model])
-        # #1315 / #1642: same structural write guards as
-        # default_worker_command — sealed-oracle prefix plus (for any type
-        # with Edit in --allowedTools) the shared base checkout.
-        disallowed_tools = _sealed_write_guard_tools(spec.files_forbidden)
-        if "Edit" in allowed_tools:
-            for pattern in _base_checkout_write_guard_tools(spec.repo_path):
-                if pattern not in disallowed_tools:
-                    disallowed_tools.append(pattern)
-        # #2461: same CLI-enforced hard block as default_worker_command —
-        # see REVIEW_DENY_COMMANDS.
-        if spec.type == "review":
-            for pattern in REVIEW_DENY_COMMANDS:
-                if pattern not in disallowed_tools:
-                    disallowed_tools.append(pattern)
+        # #3420 / #1315 / #1642 / #2461: NOT transcribed from
+        # default_worker_command like the branches above — both builders call
+        # the one shared `worker_disallowed_tools`, so a new deny layer lands
+        # in both by construction. It previously WAS transcribed here, and
+        # #3420's unusable-tool-schema layer went into default_worker_command
+        # only; the parity suite caught the drift, but the shared call means
+        # there is nothing left to keep in sync. Pass this method's own
+        # `allowed_tools` (possibly a caller override) so the two flags stay
+        # consistent.
+        disallowed_tools = worker_disallowed_tools(spec, allowed_tools)
         if disallowed_tools:
             argv.extend(["--disallowedTools", ",".join(disallowed_tools)])
         if spec.resume_session_id:
