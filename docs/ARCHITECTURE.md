@@ -250,6 +250,21 @@ which is why it lives here rather than in the file every worker leg loads. The o
 statements of these rules remain in `CLAUDE.md`'s "Key Design Decisions"; the reasoning is
 here.
 
+### How the review prompt is assembled
+
+The reviewer gets a prompt built from:
+1. **Repo's CLAUDE.md** — the project rules (source of truth, not duplicated)
+2. **Generic checklist** — "did you add tests?", "did you stay in file scope?", "any security issues?"
+3. **Repo overrides** — project-specific patterns from `coordinator.yml` `reviews.repo_overrides`
+4. **The diff** — `gh pr diff` of the worker's branch vs base
+5. **The issue** — title and body for intent verification
+
+The reviewer reads the rules and enforces them against the diff. It does not have the worker's session context — genuinely independent.
+
+Moved here from [`CLAUDE.md`](../CLAUDE.md) (#3422). The reviewer does not need a description
+of how its own prompt was built, and neither does a worker — this is for someone editing
+`coord/review.py`.
+
 ### Agent servers are dumb dispatchers
 
 They spawn `claude -p` and track the subprocess. All intelligence is in the coordinator

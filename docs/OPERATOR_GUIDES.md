@@ -19,6 +19,29 @@ in `docs/`.*
   still manual. Epic #3117.
 - [`DRIVE_QUEUE.md`](DRIVE_QUEUE.md) — the durable, board-backed driver (`coord drive-queue`, #1750). **Read the top section before queuing more than ~2 issues on one repo.**
 
+## The core loop
+
+Moved here from [`CLAUDE.md`](../CLAUDE.md) (#3422): a worker cannot run any of these —
+the coordinator owns dispatch and GitHub — so it was pure operator surface being re-read
+on every turn of every leg. `coord <cmd> --help` remains the authoritative reference.
+
+`coord <cmd> --help` documents every command + flags. The core loop:
+
+```bash
+coord plan                 # Brain proposes assignments for idle machines
+coord approve 1,3          # Dispatch approved proposals (comma-separated IDs)
+coord assign <machine> <repo> <issue> [--briefing TEXT | --briefing-file F] [--dry-run]  # Direct dispatch
+coord status [--freshness] # Machines, assignments, connectivity (+ repo freshness vs GitHub HEADs)
+coord log <id> [-f] [--machine NAME]            # claude -p output (remote logs need --machine)
+coord notify               # Poll agents, post completion/failure comments to GitHub
+coord test --passed|--fail|--skipped <id>       # Record the Test-gate verdict (bare `coord test <id>` builds+tests locally)
+coord merge [--dry-run] [--repo NAME] [--method rebase|squash|merge] [--order IDs] [--force-merge]
+coord reconcile-merges     # Backfill missing branches + record out-of-band merges (#609/#611)
+coord retry|stop|resume <id>                    # Recovery; `coord done` ends the session
+```
+
+Setup / diagnostics (discoverable via `--help`): `coord init`, `coord config`, `coord agent`, `coord serve`, `coord web`, `coord diagnose`, `coord sessions [--remote]`, `coord split`, `coord notifier`, `coord repo add` / `coord repo doctor`.
+
 ## Reference
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — how it all fits together, plus the settled design rationale. Two diagnostic entry points: [why a merge/review isn't happening](ARCHITECTURE.md#when-a-merge-isnt-happening) (**check here first when "Go does nothing"**) and [why an issue is in the Pipeline you never dispatched](ARCHITECTURE.md#when-an-issue-is-sitting-in-the-pipeline-you-never-dispatched).
