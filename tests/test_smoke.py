@@ -4008,6 +4008,97 @@ def test_dispatch_pending_smoke_default_fetcher_none_is_unaffected(
     assert result == [sentinel]
 
 
+# ── #3416: a liveness refusal must fill an EMPTY verdict, never overwrite an
+# existing terminal one. `test_dispatch_pending_smoke_refuses_when_*` above
+# already pin the "empty -> skipped" half (the #3375 fix itself, which must
+# keep working). These pin the other half: a refusal that fires while the
+# persisted row already carries `passed`/`failed`/`blocked` must record the
+# refusal as an audit-only log line and leave `test_state` exactly as it
+# was — never destroy the only evidence a suite actually ran (#3357), and
+# never turn a gate-BLOCKING `failed` into a gate-SATISFYING `skipped`.
+#
+# Reachability mirrors the #3343 repro just below: the liveness fetcher call
+# happens strictly after this loop's top-of-row DB refresh, so a terminal
+# verdict landed by a concurrent writer (another smoke leg's completion reap,
+# or the operator's own `coord test`) WHILE the fetcher call is in flight is
+# invisible to the in-memory snapshot but must still win over `skipped`. ──
+
+
+@pytest.mark.parametrize("terminal_state", ["passed", "failed", "blocked"])
+def test_dispatch_pending_smoke_liveness_refusal_preserves_existing_terminal_verdict(
+    gtk_and_server_config: Config, monkeypatch, terminal_state: str,
+) -> None:
+    from unittest.mock import patch as _patch
+
+    from coord.state import (
+        _record_dispatched_assignment_local,
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    parent = _completed(branch="issue-287-fix")
+    parent = replace(parent, assignment_id=f"liveness-preserve-{terminal_state}")
+    _record_dispatched_assignment_local(assignment=parent, repo_github="acme/api")
+
+    # In-memory row predates any verdict — mirrors the top-of-loop refresh
+    # finding nothing yet (`test_state=None`), exactly like the #3343 repro.
+    stale_row = replace(parent, test_state=None)
+    board = Board(completed=[stale_row])
+
+    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+        # Simulate a concurrent writer landing a real, evidence-backed
+        # terminal verdict on the persisted row WHILE this liveness lookup
+        # is in flight — then report the issue closed, exactly like #1032
+        # (merging the PR closed the issue in the same window).
+        record_test_verdict(
+            assignment_id=parent.assignment_id, test_state=terminal_state,
+        )
+        return True, False
+
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(
+            board, gtk_and_server_config, issue_liveness_fetcher=fetcher,
+        )
+
+    assert result == []
+    assert not mock_dispatch.called
+    assert load_assignment_test_state(parent.assignment_id) == terminal_state, (
+        "a liveness refusal must never overwrite an existing terminal Test "
+        "verdict with 'skipped' (#3416)"
+    )
+
+
+def test_dispatch_pending_smoke_liveness_refusal_still_fills_empty_verdict(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """The #3375 fix itself must keep working: a row with NO verdict at all
+    still gets `skipped` recorded on a liveness refusal — only an already-
+    terminal row is left alone (#3416)."""
+    from unittest.mock import patch as _patch
+
+    from coord.state import _record_dispatched_assignment_local, load_assignment_test_state
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(), assignment_id="liveness-fill-empty-1")
+    _record_dispatched_assignment_local(assignment=row, repo_github="acme/api")
+    board = Board(completed=[row])
+
+    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+        return True, False
+
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
+        result = dispatch_pending_smoke(
+            board, gtk_and_server_config, issue_liveness_fetcher=fetcher,
+        )
+
+    assert result == []
+    assert not mock_dispatch.called
+    assert load_assignment_test_state(row.assignment_id) == "skipped"
+
+
 def test_dispatch_pending_smoke_skips_row_verdicted_after_the_scan_snapshot(
     gtk_and_server_config: Config, monkeypatch,
 ) -> None:

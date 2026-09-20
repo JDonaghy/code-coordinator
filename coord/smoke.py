@@ -3292,6 +3292,23 @@ def dispatch_pending_smoke(
         # gate) instead of `None`/leaving it unset — leaving it unset would
         # re-enter this exact row on the very next tick and re-probe GitHub
         # forever for an answer that cannot change back.
+        #
+        # #3416: that `skipped` write is only correct when the row has NO
+        # verdict yet. A liveness refusal fires on "issue closed OR branch
+        # already merged" — a row can reach here carrying a real, terminal
+        # verdict (`passed`/`failed`/`blocked`) recorded moments earlier by
+        # `coord test`, and stamping `skipped` over it would destroy the
+        # only evidence a suite was ever run (#3357 exists precisely so
+        # `passed` reads differently from "nobody checked"), and — worse —
+        # would silently turn a gate-BLOCKING `failed` into a gate-
+        # SATISFYING `skipped`. Re-read the authoritative persisted state
+        # right here rather than trusting `completed.test_state` (a
+        # snapshot taken at the top of this loop, refreshed once at #3343
+        # but not since): fill `skipped` only when that read comes back
+        # empty; a terminal verdict is left exactly as it is, and the
+        # refusal is still recorded via `record_dispatch_refusal` below so
+        # it stays visible in the audit trail even when it changes nothing
+        # on the row.
         if issue_liveness_fetcher is not None:
             from coord.dispatch_liveness import (  # noqa: PLC0415
                 check_dispatch_liveness,
@@ -3312,14 +3329,28 @@ def dispatch_pending_smoke(
                 if completed.assignment_id is not None:
                     from coord.state import record_test_verdict  # noqa: PLC0415
 
-                    record_test_verdict(
-                        assignment_id=completed.assignment_id,
-                        test_state="skipped",
-                        test_reason=(
-                            f"Test stage skipped — {refusal.reason} (#3375)"
-                        ),
+                    current_state = load_assignment_test_state(
+                        completed.assignment_id
                     )
-                    completed.test_state = "skipped"
+                    if current_state is None:
+                        record_test_verdict(
+                            assignment_id=completed.assignment_id,
+                            test_state="skipped",
+                            test_reason=(
+                                f"Test stage skipped — {refusal.reason} "
+                                "(#3375)"
+                            ),
+                        )
+                        completed.test_state = "skipped"
+                    else:
+                        logger.info(
+                            "dispatch_pending_smoke: %s#%s row %s already "
+                            "carries a terminal test_state=%r — the #3375 "
+                            "liveness refusal is logged/audited only and "
+                            "leaves it untouched (#3416).",
+                            completed.repo_name, completed.issue_number,
+                            completed.assignment_id, current_state,
+                        )
                 record_dispatch_refusal(
                     refusal,
                     repo_name=completed.repo_name,
