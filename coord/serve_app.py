@@ -86,6 +86,11 @@ if TYPE_CHECKING:
     import asyncio
     import logging
 
+    from coord.drive_sessions_snapshot import (
+        DriveSessionsRefresher,
+        DriveSessionsSnapshot,
+    )
+
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -2739,7 +2744,14 @@ def _board_response_schema(components: dict) -> dict:
                     "current occupancy against each "
                     "(`coord.drive_queue.compute_running_occupancy`, the "
                     "SAME verdict `plan_tick` itself enforces — never a "
-                    "second, independently-counted number). `null` when it "
+                    "second, independently-counted number). Occupancy comes "
+                    "from the tick-refreshed live-session snapshot "
+                    "(`coord.drive_sessions_snapshot`), never an inline "
+                    "`tmux` call on this read path: when no reading has been "
+                    "taken yet, or the last one has gone stale, "
+                    "`occupied`/`repo_occupied` are `null` and "
+                    "`occupancy_state` says which — the ceilings stay "
+                    "populated regardless. `null` (the whole block) when it "
                     "could not be resolved this build (advisory-only, never "
                     "blanks the rest of the board); ABSENT on a daemon "
                     "older than #3428, which never emitted this key at all "
@@ -5925,7 +5937,11 @@ def openapi_spec() -> dict:
     )
 
 
-def _compute_board_concurrency(cfg: Config, projection: dict) -> dict | None:
+def _compute_board_concurrency(
+    cfg: Config,
+    projection: dict,
+    sessions: "DriveSessionsSnapshot | None" = None,
+) -> dict | None:
     """#3428 (#3408 item 3): the `/board` payload's `concurrency` sibling
     key — every ceiling `coord drive-queue tick` enforces, resolved on THIS
     (the daemon) host, plus current occupancy.
@@ -5943,6 +5959,19 @@ def _compute_board_concurrency(cfg: Config, projection: dict) -> dict | None:
     wire-shaped dicts `coord.drive_queue.build_board_view`/
     `entries_from_rows` already accept, per their own docstrings) rather
     than re-querying the DB a second time in the same request.
+
+    *sessions* is the tick-refreshed `coord.drive_sessions_snapshot.
+    DriveSessionsSnapshot` — the live-tmux-session reading occupancy needs.
+    It is a parameter, not a call, because taking that reading is a
+    ``tmux list-sessions`` SUBPROCESS and this function runs on the `/board`
+    read path, where invariant 1 (`tests/test_board_read_path.py::
+    test_board_read_makes_zero_gh_calls`) forbids third-party I/O outright —
+    same reason the CI gate is served from `GateSnapshotRefresher` here
+    rather than fetched inline. When the snapshot is absent or too stale to
+    be evidence about now (#2862's unsupervised-loop failure), the CEILINGS
+    are still resolved and reported; only `occupied`/`repo_occupied` go
+    ``None``, labelled by `occupancy_state` — never a fabricated ``0``
+    (#2096: a number nobody observed is not a measurement).
 
     Best-effort / fail-open, matching `roll_pending`/`fleet_health`'s own
     posture elsewhere in this file: ANY failure (an unreadable systemd unit,
@@ -5964,11 +5993,22 @@ def _compute_board_concurrency(cfg: Config, projection: dict) -> dict | None:
             entries_from_rows,
             resolve_concurrency_report,
         )
-        from coord.drive import list_drive_sessions  # noqa: PLC0415
+        from coord.drive_sessions_snapshot import (  # noqa: PLC0415
+            DriveSessionsSnapshot as _Snapshot,
+        )
+
+        snapshot = sessions if sessions is not None else _Snapshot()
+        observed = snapshot.is_current()
 
         repo_overrides = {r.name: r.max_parallel for r in cfg.repos}
         entries = entries_from_rows(projection.get("drive_queue") or [])
-        board_view = build_board_view(projection, list_drive_sessions())
+        # Occupancy is computed ONLY from a current reading: feeding an empty
+        # `live_sessions` set into `compute_running_occupancy` would not
+        # abstain, it would answer — reporting every live drive's slot as
+        # free, which is the 2026-08-01 stacking incident's exact input.
+        board_view = (
+            build_board_view(projection, snapshot.keys) if observed else None
+        )
 
         report = resolve_concurrency_report(
             repo_overrides=repo_overrides,
@@ -5990,8 +6030,10 @@ def _compute_board_concurrency(cfg: Config, projection: dict) -> dict | None:
                     name: board_ceiling_from_resolution(report.repo_resolutions[name])
                     for name in sorted(report.repo_overrides)
                 },
-                occupied=report.occupied,
-                repo_occupied=report.repo_occupied,
+                occupied=report.occupied if observed else None,
+                repo_occupied=report.repo_occupied if observed else None,
+                occupancy_state=snapshot.state(),
+                occupancy_observed_at=snapshot.observed_at,
             )
         )
     except Exception:  # noqa: BLE001 — advisory-only; never blank the board
@@ -6102,6 +6144,7 @@ def build_app(
     *,
     token: str | None = None,
     machine_metrics_sampler: MachineMetricsSampler | None = None,
+    drive_sessions_refresher: "DriveSessionsRefresher | None" = None,
 ) -> Starlette:
     """Build the read-only control-center Starlette app bound to *store* + *config*.
 
@@ -6113,6 +6156,13 @@ def build_app(
     omitted, exactly as before. Passing a pre-seeded instance lets a test
     drive ``GET /machines/metrics`` against known ring-buffer contents
     without waiting on the tick loop or a live agent poll.
+
+    *drive_sessions_refresher* — same shape, for #3428's ``concurrency``
+    block: a fresh (never-refreshed, so "occupancy unobserved")
+    :class:`~coord.drive_sessions_snapshot.DriveSessionsRefresher` is created
+    when omitted. Passing a pre-refreshed instance lets a test assert on real
+    occupancy numbers without the tick loop — and without a ``tmux``
+    subprocess on the read path, which invariant 1 forbids.
     """
     # #1081: track the backing coordinator.yml's mtime so the handlers below
     # can swap in a freshly-reloaded Config when it changes on disk, instead
@@ -6153,6 +6203,19 @@ def build_app(
     from coord.machine_metrics import MachineMetricsSampler  # noqa: PLC0415
 
     _machine_metrics_sampler = machine_metrics_sampler or MachineMetricsSampler()
+
+    # #3428: same invariant one more time — the live-drive-session reading
+    # behind the `concurrency` block's occupancy numbers is a `tmux
+    # list-sessions` subprocess, so it runs on the tick loop's cadence
+    # (`_drive_sessions_refresh_loop` below) and /board only ever reads the
+    # last-published snapshot. Until one has been published (or once it has
+    # gone stale) the board reports occupancy as unknown rather than zero —
+    # see `coord.drive_sessions_snapshot`'s module docstring.
+    from coord.drive_sessions_snapshot import (  # noqa: PLC0415
+        DriveSessionsRefresher as _DriveSessionsRefresher,
+    )
+
+    _drive_sessions_refresher = drive_sessions_refresher or _DriveSessionsRefresher()
 
     # Cache for the computed /board projection so burst polls from the TUI
     # don't each pay the full board_projection + merge-plan + stage-projection
@@ -6990,7 +7053,9 @@ def build_app(
             # fail-open/absent-tolerant posture as `roll_pending` above:
             # `None` when it could not be resolved this build, never a
             # blanked board.
-            projection["concurrency"] = _compute_board_concurrency(_cfg, projection)
+            projection["concurrency"] = _compute_board_concurrency(
+                _cfg, projection, _drive_sessions_refresher.snapshot()
+            )
             # #1337 invariant 2: no collection endpoint returns unbounded text.
             # #1791 adds a second bound — collection CARDINALITY, not just
             # per-row width — dropping old terminal `assignments` rows (and
@@ -10868,6 +10933,30 @@ def build_app(
                 except Exception:  # noqa: BLE001 — keep serving the old snapshot
                     log.warning("fleet-health refresh failed", exc_info=True)
 
+        # #3428: live-drive-session reading for the `concurrency` block's
+        # occupancy — default 15s (env COORD_DRIVE_SESSIONS_REFRESH_INTERVAL;
+        # 0 disables, which leaves occupancy permanently "unobserved" rather
+        # than silently reporting 0). Own loop for the same reason as the two
+        # above: `tmux list-sessions` is a subprocess with a 5s timeout, and
+        # neither it nor the reconcile/enqueue/drain steps may hold up the
+        # other. Interval stays well under
+        # `drive_sessions_snapshot.STALE_AFTER_SECONDS` so an ordinary slow
+        # pass does not flap the freshness label.
+        try:
+            drive_sessions_refresh_interval = float(
+                os.environ.get("COORD_DRIVE_SESSIONS_REFRESH_INTERVAL", "15")
+            )
+        except ValueError:
+            drive_sessions_refresh_interval = 15.0
+
+        async def _drive_sessions_refresh_loop() -> None:
+            while True:
+                await asyncio.sleep(drive_sessions_refresh_interval)
+                try:
+                    await run_in_threadpool(_drive_sessions_refresher.refresh)
+                except Exception:  # noqa: BLE001 — keep serving the old snapshot
+                    log.warning("drive-sessions refresh failed", exc_info=True)
+
         # #3020: CPU/mem sampler for the coord-web Machines panel — default
         # 15s (env COORD_METRICS_POLL_INTERVAL; 0 disables). Own loop, not a
         # `_tick_loop` step, for the identical reason as `_health_refresh_loop`
@@ -11660,12 +11749,19 @@ def build_app(
                 else None,
                 "machine-metrics",
             )
+            drive_sessions_task = _watch(
+                asyncio.create_task(_drive_sessions_refresh_loop())
+                if interval > 0 and drive_sessions_refresh_interval > 0
+                else None,
+                "drive-sessions-refresh",
+            )
             try:
                 yield
             finally:
                 for t in (
                     task, gate_task, health_task, phantom_heal_task,
                     auto_revalidate_task, machine_metrics_task,
+                    drive_sessions_task,
                 ):
                     if t is not None:
                         t.cancel()

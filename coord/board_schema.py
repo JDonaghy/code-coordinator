@@ -62,6 +62,11 @@ import typing
 from collections.abc import Mapping
 from typing import Any, Union
 
+# #3428: the `concurrency` block's `occupancy_state` value set — owned by the
+# snapshot module that produces it (see `BoardConcurrency` below).  Safe at
+# module scope: that module imports nothing from `coord` at import time.
+from coord.drive_sessions_snapshot import OCCUPANCY_UNOBSERVED
+
 #: What the read path actually hands the projection.  ``sqlite3.Row`` is *not*
 #: a ``Mapping`` (see :func:`_as_dict`), so it has to be named explicitly.
 RowLike = Union[Mapping[str, Any], sqlite3.Row]
@@ -330,6 +335,11 @@ class BoardDriveQueueEntry:
 # real import cycle, not just an ugly one. `CeilingResolution` is referenced
 # only for typing (`from __future__ import annotations` makes the annotation
 # itself lazy) and duck-typed at runtime by :func:`board_ceiling_from_resolution`.
+# (`coord.drive_sessions_snapshot`, which owns the `occupancy_state` value
+# set `BoardConcurrency` below defaults to, is by contrast imported at the
+# TOP of this file: it imports nothing from `coord` at module scope — its own
+# tmux/queue imports are deferred into `refresh()` — so it cannot close a
+# cycle back through here.)
 if typing.TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.drive_queue import CeilingResolution
 
@@ -499,6 +509,24 @@ class BoardConcurrency:
     second, independently-recounted number (#2085 "one question, one
     answer").
 
+    **Occupancy is nullable, and says why (#2096).** That verdict's first
+    question about a `running` entry is "is its drive session live?", which
+    only a ``tmux list-sessions`` reading can answer — and that reading is a
+    SUBPROCESS, so it is taken on the daemon's tick cadence
+    (`coord.drive_sessions_snapshot`), never inline off this read path (the
+    `/board` invariant 1 that `tests/test_board_read_path.py` enforces). When
+    the daemon has not taken a reading yet, or its refresh loop has stalled
+    (#2862) and the last one is too old to be evidence about now,
+    ``occupied``/``repo_occupied`` are ``None`` and ``occupancy_state`` says
+    which — never a confidently-wrong ``0`` that a client would render as
+    "all slots free". ``occupancy_observed_at`` is the wall-clock moment of
+    the reading behind the numbers (``None`` when there has never been one),
+    so a client can show — and age out — the numbers itself.
+
+    The CEILINGS are unaffected by any of that: they are resolved from
+    config + this host's systemd unit on every build, so they stay populated
+    even when occupancy is unknown.
+
     Absent-tolerant in both directions (#3428 acceptance): an older daemon
     simply omits the ``concurrency`` key entirely (never ships it as e.g. an
     empty object), and a newer client must not require the key to parse an
@@ -509,8 +537,13 @@ class BoardConcurrency:
     max_parallel_per_repo: BoardCeiling
     max_workers: BoardCeiling
     repo_overrides: dict[str, BoardCeiling]
-    occupied: int
-    repo_occupied: dict[str, int]
+    #: ``None`` unless ``occupancy_state`` is
+    #: :data:`~coord.drive_sessions_snapshot.OCCUPANCY_OBSERVED`.
+    occupied: int | None = None
+    repo_occupied: dict[str, int] | None = None
+    #: One of :data:`~coord.drive_sessions_snapshot.OCCUPANCY_STATES`.
+    occupancy_state: str = OCCUPANCY_UNOBSERVED
+    occupancy_observed_at: float | None = None
 
 
 #: ``table name`` → the DTO that defines its ``/board`` wire shape.  These are
