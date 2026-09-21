@@ -539,6 +539,25 @@ CI_RERUN_POLL_INTERVAL_SECONDS = 10.0
 CI_RERUN_MAX_WAIT_SECONDS = 360.0
 
 
+def is_unreadable_check_name(name: str) -> bool:
+    """The name-only half of :func:`is_unreadable_check` (#3438).
+
+    Split out so a caller holding only a bare check *name* — not a full
+    ``CheckRun`` with a ``.conclusion`` — can still recognize the #1525
+    synthetic stand-in. This is exactly the shape of
+    ``QueuedMerge.ci_seen_check_names_json`` (:mod:`coord.merge_queue`'s
+    #3263 shrinkage guard persists names, not whole ``CheckRun`` objects),
+    so a row poisoned before #3438's write-side fix — one whose stored JSON
+    already contains a synthetic name — can be filtered on *read* too,
+    recovering in place rather than needing manual DB repair.
+
+    One question, one answer: :func:`is_unreadable_check` delegates here for
+    its own name check rather than re-deriving the same prefix/substring
+    test, so the two can never drift apart.
+    """
+    return name.startswith("coord: ") and "read CI status" in name
+
+
 def is_unreadable_check(check) -> bool:
     """True for the #1525 synthetic "could not read CI status" / "gh too
     old" stand-ins (``coord.ci_github._unreadable_check`` /
@@ -570,11 +589,7 @@ def is_unreadable_check(check) -> bool:
     than the prose these three call sites already commit to.
     """
     name = str(getattr(check, "name", ""))
-    return (
-        getattr(check, "conclusion", None) == "unknown"
-        and name.startswith("coord: ")
-        and "read CI status" in name
-    )
+    return getattr(check, "conclusion", None) == "unknown" and is_unreadable_check_name(name)
 
 
 @dataclass

@@ -38,6 +38,7 @@ from coord.ci_store import (
     failed_checks,
     in_flight_checks,
     is_unreadable_check,
+    is_unreadable_check_name,
     is_verdictless_job,
     shrunk_check_names,
     summarize,
@@ -2442,7 +2443,11 @@ def _ci_seen_check_names(entry: "QueuedMerge") -> frozenset[str]:
         return frozenset()
     if not isinstance(names, list):
         return frozenset()
-    return frozenset(str(n) for n in names)
+    # #3438: filter defensively on READ too, not just at the #3438 write-side
+    # fix in `_ci_record_seen_check_names` — a row already poisoned in the
+    # wild (written before this fix) recovers on its very next read here,
+    # rather than being stuck until someone hand-edits the DB.
+    return frozenset(str(n) for n in names if not is_unreadable_check_name(str(n)))
 
 
 def _ci_record_seen_check_names(entry: "QueuedMerge", checks: list[CheckRun]) -> None:
@@ -2462,9 +2467,20 @@ def _ci_record_seen_check_names(entry: "QueuedMerge", checks: list[CheckRun]) ->
     that disappears for more than one consecutive tick keeps being flagged
     rather than being silently dropped from the record the moment it first
     vanishes.
+
+    #3438: the #1525 synthetic "could not read CI status" stand-in
+    (:func:`coord.ci_store.is_unreadable_check`) is excluded from
+    *current_names* on BOTH branches. That stand-in only ever appears in a
+    read where the real checks could not be fetched at all; memoizing its
+    name would poison this entry permanently, because the only read that
+    could ever re-supply it (another failed fetch) would simultaneously
+    fail to report every real check name too, which the #3263 guard would
+    also reject as shrinkage — a closed loop with no exit. Filtering here,
+    at the point of record, means it never enters
+    ``ci_seen_check_names_json`` in the first place, on either branch.
     """
     sha = entry.branch_head_sha or ""
-    current_names = {c.name for c in checks}
+    current_names = {c.name for c in checks if not is_unreadable_check(c)}
     if entry.ci_seen_checks_sha != sha:
         entry.ci_seen_checks_sha = sha
         entry.ci_seen_check_names_json = json.dumps(sorted(current_names))

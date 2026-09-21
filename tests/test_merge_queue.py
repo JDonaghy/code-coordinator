@@ -9568,6 +9568,142 @@ class TestProcessCiCheckShrinkage:
         assert "checks_pending" not in [e.kind for e in events]
 
 
+class TestProcessCiCheckShrinkageIgnoresSyntheticUnreadableStandIn:
+    """#3438: the #1525 synthetic "could not read CI status" stand-in must
+    never be memoized into the #3263 shrinkage guard's seen-name set. It
+    only ever appears in a read where the real checks could not be fetched,
+    so recording it would close a loop with no exit: the only read that
+    could ever re-supply it (another failed fetch) would simultaneously
+    fail to report every real check name too, which the guard would also
+    reject as shrinkage. `quadraui#1043` deadlocked exactly this way for
+    ~9 hours (2026-09-21) with all 10 real checks green the whole time.
+    """
+
+    class _Gh(FakeGh):
+        """A fixed, current base timestamp so #1851's staleness gate never
+        fires once the real checks resolve — every check below has
+        `started_at` safely after it."""
+
+        def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+            return 1000.0
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, checks):
+            self.checks = checks
+
+        def list_checks_for_pr(self, repo, number):
+            return self.checks
+
+    @staticmethod
+    def _c(name: str, conclusion: str) -> CheckRun:
+        return CheckRun(
+            name=name, status="completed", conclusion=conclusion,
+            url=f"https://gh/runs/{name}", run_id=name,
+            started_at=1500.0, completed_at=None,
+        )
+
+    @staticmethod
+    def _synthetic(repo: str, number: int, detail: str = "HTTP 503") -> CheckRun:
+        from coord.ci_github import _unreadable_check
+        return _unreadable_check(repo, number, detail)
+
+    def test_synthetic_stand_in_is_never_recorded_as_seen(self) -> None:
+        """A read with N real (green) checks plus the synthetic stand-in
+        must not persist the synthetic's name — only the real ones."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        real = [
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "success"),
+        ]
+        ci = self._Ci(real + [self._synthetic("acme/api", 99)])
+
+        first = process(items, gh, ci_store=ci)
+        assert "checks_unreadable" in [e.kind for e in first]
+        assert items[0].state == PENDING
+
+        seen = json.loads(items[0].ci_seen_check_names_json)
+        assert set(seen) == {"cargo-test", "cargo-test-gtk"}
+        assert not any(str(n).startswith("coord: ") for n in seen)
+
+    def test_a_later_clean_read_of_only_the_real_checks_merges(self) -> None:
+        """The acceptance scenario end to end: a read with the synthetic
+        plus N real checks, then a read with only the N real checks — the
+        shrinkage guard must report nothing missing and the entry must
+        become merge-eligible, not deadlock forever."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        real = [
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "success"),
+        ]
+        ci = self._Ci(real + [self._synthetic("acme/api", 99)])
+        process(items, gh, ci_store=ci)
+        assert items[0].state == PENDING
+
+        ci.checks = real
+        second = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in second]
+        assert "checks_pending" not in kinds
+        assert items[0].state == MERGED
+        assert "merged" in kinds
+
+    def test_recovers_a_row_poisoned_before_this_fix(self) -> None:
+        """An entry whose PERSISTED `ci_seen_check_names_json` already
+        contains a synthetic name — simulating a row poisoned by a
+        pre-#3438 write — must resolve normally on the next real-check
+        read, with no manual DB repair (the read-side filter in
+        `_ci_seen_check_names`)."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        items[0].ci_seen_checks_sha = "sha1"
+        items[0].ci_seen_check_names_json = json.dumps([
+            "cargo-test",
+            "cargo-test-gtk",
+            "coord: could not read CI status for acme/api#99 (HTTP 503)",
+        ])
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "success"),
+        ])
+
+        events = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in events]
+        assert "checks_pending" not in kinds
+        assert items[0].state == MERGED
+        assert "merged" in kinds
+
+    def test_a_genuinely_vanished_real_check_still_trips_the_guard(self) -> None:
+        """Regression guard: this fix must not blunt #3263 itself — a REAL
+        check name that actually vanishes (no synthetic involved) still
+        parks the entry as pending with the CI_PENDING_PREFIX reason."""
+        items = [_q("w1", pr=99)]
+        items[0].branch_head_sha = "sha1"
+        gh = self._Gh()
+        ci = self._Ci([
+            self._c("cargo-test", "success"),
+            self._c("cargo-test-gtk", "failure"),
+        ])
+        first = process(items, gh, ci_store=ci)
+        assert "checks_failed" in [e.kind for e in first]
+        assert items[0].state == PENDING
+
+        # `cargo-test-gtk` (a REAL check, not the synthetic stand-in)
+        # vanishes from the next read — must still be caught.
+        ci.checks = [self._c("cargo-test", "success")]
+        second = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in second]
+        assert "checks_pending" in kinds
+        assert "merged" not in kinds
+        assert items[0].error.startswith(mq.CI_PENDING_PREFIX)
+        assert "cargo-test-gtk" in items[0].error
+
+
 class TestProcessCiInfraAutoRerun:
     """#1892: `process()`'s live merge path auto-reruns CI (instead of just
     blocking) when every failing check is verdictless, capped at
