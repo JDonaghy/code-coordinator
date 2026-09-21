@@ -1972,8 +1972,24 @@ def test_concurrency_reports_repo_override_and_losing_fleet_value(
     assert "shared" not in concurrency["repo_overrides"]
 
 
+def _refresher_seeded_with(*keys: str, age: float = 0.0):
+    """A `DriveSessionsRefresher` publishing a reading of *keys* taken *age*
+    seconds ago — the tick-side snapshot `/board` consumes, without a `tmux`
+    subprocess (#3428: the reading is NEVER taken on the read path)."""
+    import time as _t
+
+    from coord.drive_sessions_snapshot import (
+        DriveSessionsRefresher,
+        DriveSessionsSnapshot,
+    )
+
+    return DriveSessionsRefresher(
+        DriveSessionsSnapshot(keys=frozenset(keys), observed_at=_t.time() - age)
+    )
+
+
 def test_concurrency_occupancy_matches_compute_running_occupancy(
-    tmp_path: Path, concurrency_config_path: Path, rw_db, monkeypatch, no_real_systemd_unit
+    tmp_path: Path, concurrency_config_path: Path, rw_db, no_real_systemd_unit
 ):
     """#3428 acceptance: occupancy must be the SAME verdict
     `coord.drive_queue.compute_running_occupancy` gives for the equivalent
@@ -1990,7 +2006,11 @@ def test_concurrency_occupancy_matches_compute_running_occupancy(
     )
 
     cfg = load_config(concurrency_config_path)
-    app = build_app(SqliteStore(tmp_path / "rw.db"), cfg)
+    app = build_app(
+        SqliteStore(tmp_path / "rw.db"),
+        cfg,
+        drive_sessions_refresher=_refresher_seeded_with(entry_key("api", 1650)),
+    )
     with TestClient(app) as cli:
         cli.post("/drive-queue", json={
             "action": "enqueue", "repo_name": "api", "issue_number": 1650,
@@ -1999,9 +2019,6 @@ def test_concurrency_occupancy_matches_compute_running_occupancy(
             "action": "update", "repo_name": "api", "issue_number": 1650,
             "fields": {"state": STATE_RUNNING},
         })
-        monkeypatch.setattr(
-            "coord.drive.list_drive_sessions", lambda *a, **k: [entry_key("api", 1650)]
-        )
 
         board = cli.get("/board").json()
 
@@ -2009,6 +2026,10 @@ def test_concurrency_occupancy_matches_compute_running_occupancy(
         assert concurrency is not None
         assert concurrency["occupied"] == 1
         assert concurrency["repo_occupied"] == {"api": 1}
+        # The numbers are labelled as actually observed, and carry the
+        # moment of the reading behind them (#2096).
+        assert concurrency["occupancy_state"] == "observed"
+        assert concurrency["occupancy_observed_at"] is not None
 
         # Independently recompute the same verdict from the served board's
         # own `drive_queue` rows — proves agreement with the real function
@@ -2020,6 +2041,112 @@ def test_concurrency_occupancy_matches_compute_running_occupancy(
         )
     assert concurrency["occupied"] == occupied
     assert concurrency["repo_occupied"] == repo_occupied
+
+
+def test_board_never_takes_a_tmux_reading_on_the_read_path(
+    tmp_path: Path, concurrency_config_path: Path, rw_db, monkeypatch,
+    no_real_systemd_unit,
+):
+    """Invariant 1 (`tests/test_board_read_path.py`): the live-session
+    reading behind occupancy is a `tmux list-sessions` SUBPROCESS, so a
+    board build must never take it — it consumes the tick-refreshed
+    snapshot instead. Regression guard: computing occupancy inline was the
+    first cut of #3428 and it put a process spawn (5s timeout) on the
+    hottest read path in the daemon."""
+    from coord.drive_queue import STATE_RUNNING, entry_key
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("tmux reading taken on the /board read path")
+
+    monkeypatch.setattr("coord.drive.list_drive_sessions", _boom)
+
+    cfg = load_config(concurrency_config_path)
+    app = build_app(
+        SqliteStore(tmp_path / "rw.db"),
+        cfg,
+        drive_sessions_refresher=_refresher_seeded_with(entry_key("api", 1650)),
+    )
+    with TestClient(app) as cli:
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 1650,
+        })
+        cli.post("/drive-queue", json={
+            "action": "update", "repo_name": "api", "issue_number": 1650,
+            "fields": {"state": STATE_RUNNING},
+        })
+        board = cli.get("/board").json()
+
+    # Served from the snapshot, not from `_boom`.
+    assert board["concurrency"]["occupied"] == 1
+
+
+def test_concurrency_occupancy_is_unknown_before_any_reading(
+    tmp_path: Path, concurrency_config_path: Path, rw_db, no_real_systemd_unit
+):
+    """#2096: a daemon that has never taken a session reading — a fresh
+    start, or `COORD_DRIVE_SESSIONS_REFRESH_INTERVAL=0` — reports occupancy
+    as UNKNOWN, never as `0`. A running drive whose slot got reported free
+    is the 2026-08-01 stacking incident's input; "nobody looked" must not
+    render as "all slots free". The CEILINGS are unaffected."""
+    from coord.drive_queue import STATE_RUNNING
+
+    cfg = load_config(concurrency_config_path)
+    app = build_app(SqliteStore(tmp_path / "rw.db"), cfg)  # never refreshed
+    with TestClient(app) as cli:
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 1650,
+        })
+        cli.post("/drive-queue", json={
+            "action": "update", "repo_name": "api", "issue_number": 1650,
+            "fields": {"state": STATE_RUNNING},
+        })
+        board = cli.get("/board").json()
+
+    concurrency = board["concurrency"]
+    assert concurrency["occupancy_state"] == "unobserved"
+    assert concurrency["occupied"] is None
+    assert concurrency["repo_occupied"] is None
+    assert concurrency["occupancy_observed_at"] is None
+    # The ceilings are resolved from config + this host's unit on every
+    # build, so they stay populated while occupancy is unknown.
+    assert concurrency["max_parallel_per_repo"]["value"] == 3
+
+
+def test_concurrency_occupancy_goes_stale_when_the_refresh_loop_stalls(
+    tmp_path: Path, concurrency_config_path: Path, rw_db, no_real_systemd_unit
+):
+    """The failing verdict is REACHABLE (#2096): the refresh loops are bare
+    `asyncio.create_task`s with no supervisor (#2862), so one that dies
+    stays dead — and its last reading must stop counting as current instead
+    of being served as the truth forever."""
+    from coord.drive_queue import STATE_RUNNING, entry_key
+    from coord.drive_sessions_snapshot import STALE_AFTER_SECONDS
+
+    cfg = load_config(concurrency_config_path)
+    app = build_app(
+        SqliteStore(tmp_path / "rw.db"),
+        cfg,
+        drive_sessions_refresher=_refresher_seeded_with(
+            entry_key("api", 1650), age=STALE_AFTER_SECONDS + 60
+        ),
+    )
+    with TestClient(app) as cli:
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 1650,
+        })
+        cli.post("/drive-queue", json={
+            "action": "update", "repo_name": "api", "issue_number": 1650,
+            "fields": {"state": STATE_RUNNING},
+        })
+        board = cli.get("/board").json()
+
+    concurrency = board["concurrency"]
+    assert concurrency["occupancy_state"] == "stale"
+    assert concurrency["occupied"] is None
+    assert concurrency["repo_occupied"] is None
+    # The age of the abandoned reading is still on the wire, so a client
+    # can say HOW stale rather than just "unknown".
+    assert concurrency["occupancy_observed_at"] is not None
 
 
 def test_concurrency_systemd_flag_wins_and_is_labeled(
