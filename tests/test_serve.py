@@ -2043,6 +2043,76 @@ def test_concurrency_occupancy_matches_compute_running_occupancy(
     assert concurrency["repo_occupied"] == repo_occupied
 
 
+def test_board_version_stable_across_occupancy_refresh_with_same_sessions(
+    tmp_path: Path, concurrency_config_path: Path, rw_db, no_real_systemd_unit,
+    monkeypatch,
+):
+    """Review finding on #3428: `DriveSessionsRefresher.refresh()` stamps a
+    fresh `time.time()` into `occupancy_observed_at` on EVERY tick pass
+    (default 15s) even when the live-session set read is byte-identical to
+    the previous one. That timestamp must not move the `/board` ETag on its
+    own — the same #3293 failure class `fleet_health.refreshed_at` was
+    already excluded for. `occupied`/`repo_occupied`/the ceilings are real
+    state and DO belong in the digest; only the clock is excluded."""
+    import time as _t
+
+    from coord.drive_queue import STATE_RUNNING, entry_key
+    from coord.drive_sessions_snapshot import DriveSessionsSnapshot
+
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "0")  # rebuild every request
+
+    now = _t.time()
+    refresher = _refresher_seeded_with(entry_key("api", 1650))
+
+    cfg = load_config(concurrency_config_path)
+    app = build_app(
+        SqliteStore(tmp_path / "rw.db"), cfg, drive_sessions_refresher=refresher,
+    )
+    with TestClient(app) as cli:
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 1650,
+        })
+        cli.post("/drive-queue", json={
+            "action": "update", "repo_name": "api", "issue_number": 1650,
+            "fields": {"state": STATE_RUNNING},
+        })
+
+        r1 = cli.get("/board")
+        assert r1.status_code == 200
+        body1 = r1.json()
+        etag1 = r1.headers["etag"]
+        assert etag1
+        assert body1["concurrency"]["occupancy_state"] == "observed"
+
+        # Simulate a second tick pass with the SAME live-session set but a
+        # later reading — mirrors a real `DriveSessionsRefresher.refresh()`
+        # whose `list_drive_sessions()` answer did not change (no DB write
+        # happens here, matching that: only the tick-owned snapshot moves).
+        refresher._snapshot = DriveSessionsSnapshot(
+            keys=frozenset({entry_key("api", 1650)}), observed_at=now + 30.0,
+        )
+
+        r2 = cli.get("/board", headers={"If-None-Match": etag1})
+        assert r2.status_code == 304, (
+            "an occupancy refresh with an unchanged session set must not "
+            "move the ETag — occupancy_observed_at is a self-moving clock, "
+            "same class as fleet_health.refreshed_at (#3293)"
+        )
+        assert r2.headers.get("etag") == etag1
+
+        # Confirm the clock really did move on the wire while the version
+        # held, so this isn't vacuous.
+        r3 = cli.get("/board")
+        body3 = r3.json()
+        assert (
+            body3["concurrency"]["occupancy_observed_at"]
+            != body1["concurrency"]["occupancy_observed_at"]
+        )
+        assert body3["concurrency"]["occupied"] == body1["concurrency"]["occupied"]
+        assert body3["board_version"] == body1["board_version"]
+        assert r3.headers["etag"] == etag1
+
+
 def test_board_never_takes_a_tmux_reading_on_the_read_path(
     tmp_path: Path, concurrency_config_path: Path, rw_db, monkeypatch,
     no_real_systemd_unit,
