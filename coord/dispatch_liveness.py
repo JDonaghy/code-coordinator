@@ -148,8 +148,8 @@ def check_dispatch_liveness(
 
 def github_issue_liveness_fetcher(
     config: "Config",
-) -> Callable[[str, int], tuple[bool, bool]]:
-    """Build a REAL `(repo_name, issue_number) -> (issue_closed,
+) -> Callable[[str, int, str | None], tuple[bool, bool]]:
+    """Build a REAL `(repo_name, issue_number, branch) -> (issue_closed,
     branch_merged)` fetcher, backed by live GitHub calls — the piece #3376
     review round 1 found missing: `check_dispatch_liveness`'s two new
     predicates existed and were unit-tested, but every actual dispatch
@@ -165,30 +165,37 @@ def github_issue_liveness_fetcher(
 
     Resolves `repo_name` (coordinator.yml's internal name) to `owner/repo`
     via *config* — every fetcher call inside `coord.dispatch.dispatch()`
-    only ever hands this `(proposal.repo_name, proposal.issue_number)`, so
-    the GitHub-repo mapping has to happen inside the closure, not at the
-    call site.
+    only ever hands this `(proposal.repo_name, proposal.issue_number,
+    proposal.target_branch)`, so the GitHub-repo mapping has to happen
+    inside the closure, not at the call site.
 
     issue_closed: `coord.github_ops.issue_is_closed` — one `gh` call.
-    branch_merged: `coord.claim.any_matching_branch_merged` — is there a
-    remote `issue-{N}-*` branch (any slug, not a title-guessed one — a
-    dispatch site has no reliable way to know which title a PRIOR dispatch
-    used to slugify its branch, and issue titles can be edited after the
-    fact) whose current tip has already merged. Both fail open (`False`) on
-    any GitHub/network hiccup — same "never refuse on evidence we don't
-    have" posture `claude_credential_reachable` documents for the third
-    predicate, and matching `issue_is_closed`'s/`pr_is_merged`'s own
-    documented fail-open contracts.
+    branch_merged: `coord.claim.any_matching_branch_merged` — #3436: when
+    *branch* is given (the dispatch's actual target — e.g. `Assignment.
+    branch`/`Proposal.target_branch`), asks whether THAT branch has merged
+    and ignores every other `issue-{N}-*` sibling, so a zero-commit
+    review-leg branch cut from the default-branch tip can no longer
+    permanently refuse dispatch for the issue's real, unmerged work
+    branch. `branch=None` (a caller with nothing dispatched yet) falls
+    back to the original issue-scoped "any matching branch merged" check.
+    Both fail open (`False`) on any GitHub/network hiccup — same "never
+    refuse on evidence we don't have" posture `claude_credential_reachable`
+    documents for the third predicate, and matching `issue_is_closed`'s/
+    `pr_is_merged`'s own documented fail-open contracts.
     """
 
-    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+    def fetcher(
+        repo_name: str, issue_number: int, branch: str | None = None
+    ) -> tuple[bool, bool]:
         from coord import github_ops  # noqa: PLC0415
         from coord.claim import any_matching_branch_merged  # noqa: PLC0415
 
         repo_cfg = config.repo(repo_name)
         repo_github = repo_cfg.github if repo_cfg is not None else repo_name
         issue_closed = github_ops.issue_is_closed(repo_github, issue_number)
-        branch_merged = any_matching_branch_merged(repo_github, issue_number)
+        branch_merged = any_matching_branch_merged(
+            repo_github, issue_number, branch=branch
+        )
         return issue_closed, branch_merged
 
     return fetcher

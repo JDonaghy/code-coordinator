@@ -2610,6 +2610,28 @@ class TestDispatchLivenessGate:
         dispatch(proposal, config)
         mock_post.assert_called_once()
 
+    @patch("coord.dispatch.httpx.post")
+    def test_passes_proposal_target_branch_to_the_fetcher(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """#3436: the fetcher must see the DISPATCH'S OWN target branch, not
+        just `(repo_name, issue_number)` — the whole point being that a
+        merged, zero-commit `issue-{N}-*` sibling (e.g. a review-leg
+        branch) must not be able to answer for the real work branch this
+        exact dispatch is about to land on."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        proposal.target_branch = "issue-10-fix-auth"
+        seen: list[tuple] = []
+
+        def fetcher(repo, num, branch=None):
+            seen.append((repo, num, branch))
+            return False, False
+
+        dispatch(proposal, config, issue_liveness_fetcher=fetcher)
+        assert seen == [("api", 10, "issue-10-fix-auth")]
+
     @patch("coord.dispatch.record_dispatch_refusal")
     @patch("coord.dispatch.httpx.post")
     def test_refuses_a_closed_issue(
@@ -2619,7 +2641,7 @@ class TestDispatchLivenessGate:
         with pytest.raises(DispatchRefused, match="already closed"):
             dispatch(
                 proposal, config,
-                issue_liveness_fetcher=lambda repo, num: (True, False),
+                issue_liveness_fetcher=lambda repo, num, branch=None: (True, False),
             )
         mock_post.assert_not_called()
         mock_record.assert_called_once()
@@ -2633,7 +2655,7 @@ class TestDispatchLivenessGate:
         with pytest.raises(DispatchRefused, match="already merged"):
             dispatch(
                 proposal, config,
-                issue_liveness_fetcher=lambda repo, num: (False, True),
+                issue_liveness_fetcher=lambda repo, num, branch=None: (False, True),
             )
         mock_post.assert_not_called()
         mock_record.assert_called_once()
@@ -2647,7 +2669,7 @@ class TestDispatchLivenessGate:
         mock_post.return_value = mock_resp
         dispatch(
             proposal, config,
-            issue_liveness_fetcher=lambda repo, num: (False, False),
+            issue_liveness_fetcher=lambda repo, num, branch=None: (False, False),
         )
         mock_post.assert_called_once()
 
@@ -2662,7 +2684,7 @@ class TestDispatchLivenessGate:
         with pytest.raises(ValueError, match="not routable"):
             dispatch(
                 proposal, config,
-                issue_liveness_fetcher=lambda repo, num: (False, False),
+                issue_liveness_fetcher=lambda repo, num, branch=None: (False, False),
                 credential_fetcher=lambda m: False,
             )
         mock_post.assert_not_called()
@@ -2680,17 +2702,17 @@ class TestDispatchLivenessGate:
         with pytest.raises(DispatchRefused):
             dispatch(
                 proposal, config,
-                issue_liveness_fetcher=lambda repo, num: (True, False),
+                issue_liveness_fetcher=lambda repo, num, branch=None: (True, False),
             )
         with pytest.raises(DispatchRefused):
             dispatch(
                 proposal, config,
-                issue_liveness_fetcher=lambda repo, num: (False, True),
+                issue_liveness_fetcher=lambda repo, num, branch=None: (False, True),
             )
         with pytest.raises(DispatchRefused):
             dispatch(
                 proposal, config,
-                issue_liveness_fetcher=lambda repo, num: (False, False),
+                issue_liveness_fetcher=lambda repo, num, branch=None: (False, False),
                 credential_fetcher=lambda m: False,
             )
         mock_post.assert_not_called()

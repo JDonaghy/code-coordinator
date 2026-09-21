@@ -653,12 +653,16 @@ def dispatch(
     like every caller that predates this parameter — same opt-in shape as
     *status_fetcher*.
 
-    *issue_liveness_fetcher* (#3376) is `(repo_name: str, issue_number: int)
-    -> (issue_closed: bool, branch_merged: bool)` — the other two
-    predicates of the same STRUCTURAL DISPATCH-LIVENESS GATE. `None` (the
-    default) performs no check at all and refuses nothing, same opt-in
-    shape as *credential_fetcher*. See `coord.dispatch_liveness` for the
-    single function all three predicates funnel through.
+    *issue_liveness_fetcher* (#3376) is `(repo_name: str, issue_number: int,
+    branch: str | None) -> (issue_closed: bool, branch_merged: bool)` — the
+    other two predicates of the same STRUCTURAL DISPATCH-LIVENESS GATE.
+    `None` (the default) performs no check at all and refuses nothing, same
+    opt-in shape as *credential_fetcher*. `branch` (#3436) is
+    `proposal.target_branch` — the exact branch THIS dispatch would land
+    on, not merely some `issue-{N}-*` sibling — so a zero-commit review-leg
+    branch cut from the default branch never masquerades as "this issue's
+    work already merged". See `coord.dispatch_liveness` for the single
+    function all three predicates funnel through.
     """
     machine = next(
         (m for m in config.machines if m.name == proposal.machine_name), None
@@ -865,7 +869,7 @@ def dispatch(
     branch_merged: bool | None = None
     if issue_liveness_fetcher is not None:
         issue_closed, branch_merged = issue_liveness_fetcher(
-            proposal.repo_name, proposal.issue_number
+            proposal.repo_name, proposal.issue_number, proposal.target_branch
         )
     machine_healthy: bool | None = None
     if credential_fetcher is not None:

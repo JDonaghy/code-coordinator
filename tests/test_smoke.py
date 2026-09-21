@@ -3920,7 +3920,9 @@ def test_dispatch_pending_smoke_refuses_when_issue_already_closed(
     _record_dispatched_assignment_local(assignment=row, repo_github="acme/api")
     board = Board(completed=[row])
 
-    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+    def fetcher(
+        repo_name: str, issue_number: int, branch: str | None = None
+    ) -> tuple[bool, bool]:
         return True, False  # issue closed, branch not (necessarily) merged
 
     with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
@@ -3950,7 +3952,9 @@ def test_dispatch_pending_smoke_refuses_when_branch_already_merged(
     _record_dispatched_assignment_local(assignment=row, repo_github="acme/api")
     board = Board(completed=[row])
 
-    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+    def fetcher(
+        repo_name: str, issue_number: int, branch: str | None = None
+    ) -> tuple[bool, bool]:
         return False, True  # branch already merged
 
     with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
@@ -3975,7 +3979,9 @@ def test_dispatch_pending_smoke_dispatches_when_liveness_fetcher_says_alive(
     board = Board(completed=[row])
     sentinel = object()
 
-    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+    def fetcher(
+        repo_name: str, issue_number: int, branch: str | None = None
+    ) -> tuple[bool, bool]:
         return False, False
 
     with _patch(
@@ -3986,6 +3992,35 @@ def test_dispatch_pending_smoke_dispatches_when_liveness_fetcher_says_alive(
         )
     assert mock_dispatch.called
     assert result == [sentinel]
+
+
+def test_dispatch_pending_smoke_passes_completed_branch_to_the_fetcher(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3436: the fetcher must see the ROW'S OWN branch, not just
+    `(repo_name, issue_number)` — otherwise a merged, zero-commit
+    `issue-{N}-*` sibling (e.g. a review-leg branch) can answer for a
+    completely different, unmerged work branch on the same issue."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(_completed(branch="issue-287-real-work"), assignment_id="branch-fwd-1")
+    board = Board(completed=[row])
+    sentinel = object()
+    seen: list[tuple] = []
+
+    def fetcher(repo_name, issue_number, branch=None):
+        seen.append((repo_name, issue_number, branch))
+        return False, False
+
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ):
+        dispatch_pending_smoke(
+            board, gtk_and_server_config, issue_liveness_fetcher=fetcher,
+        )
+    assert seen == [("api", 287, "issue-287-real-work")]
 
 
 def test_dispatch_pending_smoke_default_fetcher_none_is_unaffected(
@@ -4047,7 +4082,9 @@ def test_dispatch_pending_smoke_liveness_refusal_preserves_existing_terminal_ver
     stale_row = replace(parent, test_state=None)
     board = Board(completed=[stale_row])
 
-    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+    def fetcher(
+        repo_name: str, issue_number: int, branch: str | None = None
+    ) -> tuple[bool, bool]:
         # Simulate a concurrent writer landing a real, evidence-backed
         # terminal verdict on the persisted row WHILE this liveness lookup
         # is in flight — then report the issue closed, exactly like #1032
@@ -4086,7 +4123,9 @@ def test_dispatch_pending_smoke_liveness_refusal_still_fills_empty_verdict(
     _record_dispatched_assignment_local(assignment=row, repo_github="acme/api")
     board = Board(completed=[row])
 
-    def fetcher(repo_name: str, issue_number: int) -> tuple[bool, bool]:
+    def fetcher(
+        repo_name: str, issue_number: int, branch: str | None = None
+    ) -> tuple[bool, bool]:
         return True, False
 
     with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:

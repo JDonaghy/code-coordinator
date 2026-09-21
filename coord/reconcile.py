@@ -1752,7 +1752,10 @@ def _resolve_retry_provider(
 
 
 def _issue_liveness_from_cache(
-    board: Board, repo_name: str, issue_number: int
+    board: Board,
+    repo_name: str,
+    issue_number: int,
+    branch: str | None = None,
 ) -> tuple[bool, bool]:
     """#3376: local-only ``issue_liveness_fetcher`` for `_reassign` —
     "issue closed" from the local `issues` cache table (`coord.state.
@@ -1763,6 +1766,14 @@ def _issue_liveness_from_cache(
     ``"merged"``). Neither call touches GitHub — same "no live probe from
     a passive tick" posture as the ``cached_labels`` lookup beside this
     function's one caller.
+
+    #3436: when *branch* is given (the failed row's own `Assignment.
+    branch` — the branch a retry would actually land on), the "merged"
+    scan is additionally scoped to rows on THAT branch, not merely any
+    completed row for the issue — a merged review-leg row for the same
+    issue on a *different*, zero-commit branch must not read as "this
+    issue's work already merged" and block a retry of the real, unmerged
+    work branch. `branch=None` keeps the original issue-scoped behaviour.
     """
     from coord.state import get_cached_issue_state  # noqa: PLC0415
 
@@ -1771,6 +1782,7 @@ def _issue_liveness_from_cache(
         a.repo_name == repo_name
         and a.issue_number == issue_number
         and a.status == "merged"
+        and (branch is None or a.branch == branch)
         for a in board.completed
     )
     return issue_closed, branch_merged
@@ -1812,20 +1824,23 @@ def _reassign(
     entry point.
 
     *issue_liveness_fetcher* (#3376) is an optional ``(repo_name: str,
-    issue_number: int) -> (issue_closed: bool, branch_merged: bool)``
-    callable — the other two predicates of the same STRUCTURAL DISPATCH-
-    LIVENESS GATE `coord.dispatch.dispatch()` itself checks (see
-    `coord.dispatch_liveness`). `None` (the default here) performs no
-    check and skips nothing — same opt-in shape as *credential_fetcher*
-    above, for the same reason: the real wiring happens at `reconcile()`'s
-    own call site. Unlike *credential_fetcher* (a machine FILTER — an
-    unhealthy machine is simply excluded from *candidates*), a positive
-    hit here means the auto-reassign attempt itself is pointless — #3367's
-    own incident was exactly this shape one layer up (four auto-retried
-    review dispatches against a dead host); #3376 generalizes it to "is
-    the thing being retried still real at all", so this returns ``None``
-    (skip, exactly like "no candidate machines") rather than trying
-    another machine.
+    issue_number: int, branch: str | None) -> (issue_closed: bool,
+    branch_merged: bool)`` callable — the other two predicates of the same
+    STRUCTURAL DISPATCH-LIVENESS GATE `coord.dispatch.dispatch()` itself
+    checks (see `coord.dispatch_liveness`). `None` (the default here)
+    performs no check and skips nothing — same opt-in shape as
+    *credential_fetcher* above, for the same reason: the real wiring
+    happens at `reconcile()`'s own call site. Unlike *credential_fetcher*
+    (a machine FILTER — an unhealthy machine is simply excluded from
+    *candidates*), a positive hit here means the auto-reassign attempt
+    itself is pointless — #3367's own incident was exactly this shape one
+    layer up (four auto-retried review dispatches against a dead host);
+    #3376 generalizes it to "is the thing being retried still real at
+    all", so this returns ``None`` (skip, exactly like "no candidate
+    machines") rather than trying another machine. #3436: *branch* is
+    ``failed.branch`` — the exact branch a retry would land on — so a
+    merged sibling branch for the same issue no longer masquerades as
+    "this issue's work already merged".
 
     Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
     :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
@@ -1842,7 +1857,7 @@ def _reassign(
 
     if issue_liveness_fetcher is not None:
         issue_closed, branch_merged = issue_liveness_fetcher(
-            failed.repo_name, failed.issue_number
+            failed.repo_name, failed.issue_number, failed.branch
         )
         refusal = check_dispatch_liveness(
             repo_name=failed.repo_name,
@@ -2797,8 +2812,8 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 reassigned = _reassign(
                     failed_a, board, config, issue_labels=cached_labels,
                     credential_fetcher=claude_credential_reachable,
-                    issue_liveness_fetcher=lambda repo, num: (
-                        _issue_liveness_from_cache(board, repo, num)
+                    issue_liveness_fetcher=lambda repo, num, branch=None: (
+                        _issue_liveness_from_cache(board, repo, num, branch)
                     ),
                 )
             except RetryProviderMismatch:

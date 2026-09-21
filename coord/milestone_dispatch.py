@@ -1092,10 +1092,12 @@ def dispatch_entry(
     assign`), matching the same check ``_dispatch_headless`` performs.
 
     *issue_liveness_fetcher* (#3376) is an optional ``(repo_name: str,
-    issue_number: int) -> (issue_closed: bool, branch_merged: bool)``
-    callable threaded straight through to :func:`coord.dispatch.dispatch`'s
-    parameter of the same name — the STRUCTURAL DISPATCH-LIVENESS GATE's
-    other two predicates. ``None`` (the default) performs no check and
+    issue_number: int, branch: str | None) -> (issue_closed: bool,
+    branch_merged: bool)`` callable threaded straight through to
+    :func:`coord.dispatch.dispatch`'s parameter of the same name — the
+    STRUCTURAL DISPATCH-LIVENESS GATE's other two predicates (#3436:
+    ``dispatch()`` itself supplies the branch, from ``proposal.
+    target_branch``). ``None`` (the default) performs no check and
     refuses nothing, same opt-in shape as every other fetcher in this
     module; the daemon's auto-drain/gate ticks (``coord.serve_app``'s
     ``_milestone_drain_tick``/``_milestone_gate_tick``) are the production

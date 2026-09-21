@@ -3033,7 +3033,9 @@ def dispatch_pending_smoke(
     *,
     now: float | None = None,
     gh_ops: "GhOps | None" = None,
-    issue_liveness_fetcher: Callable[[str, int], tuple[bool, bool]] | None = None,
+    issue_liveness_fetcher: (
+        Callable[[str, int, str | None], tuple[bool, bool]] | None
+    ) = None,
 ) -> list[Assignment]:
     """Bulk Test-stage dispatch — the smoke analogue of
     :func:`coord.review.dispatch_pending_reviews`.
@@ -3066,10 +3068,15 @@ def dispatch_pending_smoke(
     live gate check in this codebase hands `merge_queue`'s gate functions.
 
     #3375: *issue_liveness_fetcher* is the SAME opt-in
-    ``(repo_name, issue_number) -> (issue_closed, branch_merged)`` contract
-    `coord.dispatch_liveness.check_dispatch_liveness` already gates
-    `coord.dispatch.dispatch()` with (#3376) — but this stage never went
-    through that call path. `dispatch_smoke`/`_dispatch_smoke_legs` POST
+    ``(repo_name, issue_number, branch) -> (issue_closed, branch_merged)``
+    contract `coord.dispatch_liveness.check_dispatch_liveness` already
+    gates `coord.dispatch.dispatch()` with (#3376) — but this stage never
+    went through that call path. #3436: *branch* is `completed.branch` —
+    the row's own branch, not merely some `issue-{N}-*` sibling — so a
+    zero-commit review-leg branch cut from the default branch can no
+    longer masquerade as "this issue's work already merged" and
+    permanently skip the Test stage for the real, unmerged work branch.
+    `dispatch_smoke`/`_dispatch_smoke_legs` POST
     straight to a machine's `/assign` over `httpx`, so #3376's dispatch-time
     gate never saw a Test-stage dispatch at all, and the five-smoke-agents
     incident that motivated both issues could still reproduce after #3376
@@ -3316,7 +3323,7 @@ def dispatch_pending_smoke(
             )
 
             issue_closed, branch_merged = issue_liveness_fetcher(
-                completed.repo_name, completed.issue_number
+                completed.repo_name, completed.issue_number, completed.branch
             )
             refusal = check_dispatch_liveness(
                 repo_name=completed.repo_name,

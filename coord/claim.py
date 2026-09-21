@@ -454,20 +454,38 @@ def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
     return _drop_merged_branches(repo_github, branches)
 
 
-def any_matching_branch_merged(repo_github: str, issue_number: int) -> bool:
-    """#3376: True when at least one remote branch matching `issue-{N}-*`
-    has already merged into the repo's default branch — the `branch_merged`
-    predicate `coord.dispatch_liveness.check_dispatch_liveness` needs,
-    backed by a live GitHub check.
+def any_matching_branch_merged(
+    repo_github: str, issue_number: int, *, branch: str | None = None
+) -> bool:
+    """#3376: True when the branch a dispatch is about to act on has already
+    merged into the repo's default branch — the `branch_merged` predicate
+    `coord.dispatch_liveness.check_dispatch_liveness` needs, backed by a
+    live GitHub check.
 
-    Reuses the exact merge-detection `_drop_merged_branches` already
-    performs for claim detection (PR-merged OR `ahead_by == 0` ancestry,
-    survives squash merges — #3103): this is just "did filtering drop
-    anything", with the fail-open direction flipped to match a REFUSAL
-    predicate rather than a claim-signal — no matching branch at all, or
-    any lookup failure, returns `False` ("not merged, don't refuse
+    #3436: when *branch* is given — the exact branch the dispatch targets,
+    e.g. an `Assignment.branch` or `Proposal.target_branch` — this checks
+    ONLY that branch and ignores every other `issue-{N}-*` sibling. Without
+    this, the issue-scoped fallback below answers "has ANY branch for this
+    issue merged", which a single zero-commit review-leg branch (cut from
+    the then-current default-branch tip and never diverged — routine
+    residue of a review/scoped-review leg, not evidence the real work
+    landed) trips forever, permanently refusing dispatch for an issue whose
+    actual work branch sits unmerged with real commits on it.
+
+    Falls back to the original issue-scoped "has ANY matching branch
+    merged" behaviour only when *branch* is `None` — a caller with nothing
+    assigned yet (a pre-dispatch check before any branch exists) has no
+    single branch to ask about, so the issue-scoped signal is the best one
+    available. Reuses the exact merge-detection `_drop_merged_branches`
+    already performs for claim detection (PR-merged OR `ahead_by == 0`
+    ancestry, survives squash merges — #3103): this is just "did filtering
+    drop anything", with the fail-open direction flipped to match a
+    REFUSAL predicate rather than a claim-signal — no matching branch at
+    all, or any lookup failure, returns `False` ("not merged, don't refuse
     dispatch on this"), never `True`.
     """
+    if branch is not None:
+        return not _drop_merged_branches(repo_github, [branch])
     branches = list_matching_remote_branches(repo_github, issue_number)
     if not branches:
         return False
