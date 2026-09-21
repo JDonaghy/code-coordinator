@@ -218,6 +218,46 @@ class TestShrunkCheckNames:
         assert shrunk_check_names(seen, checks) == frozenset({"a", "b"})
 
 
+class TestIsUnreadableCheckName:
+    """#3438: the name-only half of `is_unreadable_check`, split out so a
+    caller holding only a bare check NAME (e.g. `coord.merge_queue`'s
+    persisted `ci_seen_check_names_json`, which stores names, not whole
+    `CheckRun` objects) can still recognize the #1525 synthetic stand-in."""
+
+    def test_matches_the_unreadable_check_stand_in_name(self) -> None:
+        from coord.ci_store import is_unreadable_check_name
+        name = "coord: could not read CI status for acme/api#99 (HTTP 503)"
+        assert is_unreadable_check_name(name) is True
+
+    def test_matches_the_gh_too_old_stand_in_name(self) -> None:
+        from coord.ci_store import is_unreadable_check_name
+        name = "coord: gh is too old to read CI status for acme/api#99 (v1.0)"
+        assert is_unreadable_check_name(name) is True
+
+    def test_does_not_match_a_real_check_name(self) -> None:
+        from coord.ci_store import is_unreadable_check_name
+        assert is_unreadable_check_name("cargo-test") is False
+
+    def test_does_not_match_the_gate_snapshot_stale_stand_in(self) -> None:
+        """A different `coord: `-prefixed synthetic, for a different local
+        condition (#2347's own documented distinction) — must not match
+        just because it shares the prefix."""
+        from coord.ci_store import is_unreadable_check_name
+        name = "coord: gate snapshot stale (120s)"
+        assert is_unreadable_check_name(name) is False
+
+    def test_agrees_with_is_unreadable_check_on_full_check_objects(self) -> None:
+        """One question, one answer: `is_unreadable_check` must delegate
+        here rather than re-deriving the same test, so the two can never
+        drift apart."""
+        from coord.ci_github import _unreadable_check
+        from coord.ci_store import is_unreadable_check, is_unreadable_check_name
+
+        check = _unreadable_check("acme/api", 99, "HTTP 503")
+        assert is_unreadable_check(check) is True
+        assert is_unreadable_check_name(check.name) is True
+
+
 class _FakeClock:
     """Deterministic (clock, sleep) pair for `wait_for_ci_settle` tests
     (#1925) — `sleep` advances the same counter `clock` reads, so a bounded
