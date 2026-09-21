@@ -252,12 +252,13 @@ def test_board_rebuild_trigger_is_a_write_not_the_ttl_clock(
 
 def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
     """#3293 unit-level check on ``_board_digest_projection`` itself: the
-    three named culprits (``audit_recent_count``, ``issues[*].synced_at``,
-    and ``fleet_health``'s clocks + self-referential ``fleet_board_latency``
-    check) are stripped from the digest input, while every other field —
-    including the REST of ``fleet_health`` (severities, results, other
-    checks) — passes through untouched, so a real state change still bumps
-    the ETag.
+    named culprits (``audit_recent_count``, ``issues[*].synced_at``,
+    ``fleet_health``'s clocks + self-referential ``fleet_board_latency``
+    check, and — per #3428's review — ``concurrency.occupancy_observed_at``)
+    are stripped from the digest input, while every other field —
+    including the REST of ``fleet_health``/``concurrency`` (severities,
+    results, other checks, occupied counts, ceilings) — passes through
+    untouched, so a real state change still bumps the ETag.
     """
     from coord.serve_app import _board_digest_projection
 
@@ -297,6 +298,13 @@ def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
                 },
             ],
         },
+        "concurrency": {
+            "max_parallel": {"value": 4, "source": "coordinator.yml", "losing": []},
+            "occupied": 2,
+            "repo_occupied": {"api": 2},
+            "occupancy_state": "observed",
+            "occupancy_observed_at": 1000.0,
+        },
     }
 
     projection = _board_digest_projection(result)
@@ -310,22 +318,29 @@ def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
     masked_latency_check = projection["fleet_health"]["fleet_checks"][0]
     assert masked_latency_check["check_id"] == "fleet_board_latency"
     assert "headroom" not in masked_latency_check and "values" not in masked_latency_check
+    assert "occupancy_observed_at" not in projection["concurrency"]
 
     # ...but real state signal is untouched: severities, other fields on the
     # issue rows, and a DIFFERENT fleet check's headroom/values all survive,
-    # so a genuine state change still moves the digest.
+    # so a genuine state change still moves the digest. Same for
+    # `concurrency`'s occupied counts and ceilings.
     assert projection["assignments"] == result["assignments"]
     assert projection["issues"][0]["title"] == "A"
     assert masked_row["severity"] == "warn"
     assert masked_row["results"] == [{"check_id": "disk", "severity": "warn", "headroom": "9% free"}]
     other_check = projection["fleet_health"]["fleet_checks"][1]
     assert other_check == result["fleet_health"]["fleet_checks"][1]
+    assert projection["concurrency"]["occupied"] == 2
+    assert projection["concurrency"]["repo_occupied"] == {"api": 2}
+    assert projection["concurrency"]["max_parallel"] == result["concurrency"]["max_parallel"]
+    assert projection["concurrency"]["occupancy_state"] == "observed"
 
     # And the original `result` passed in is never mutated — it's still the
     # dict that gets serialized as the wire body, culprits and all.
     assert result["audit_recent_count"] == 7
     assert result["issues"][0]["synced_at"] == 111.0
     assert result["fleet_health"]["refreshed_at"] == 1000.0
+    assert result["concurrency"]["occupancy_observed_at"] == 1000.0
 
 
 def test_board_version_stable_across_audit_and_health_tick_noise(

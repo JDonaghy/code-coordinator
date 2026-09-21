@@ -6065,11 +6065,18 @@ def _board_digest_projection(result: dict) -> dict:
       measures THIS /board response's own fetch latency and serialized size
       and stores that measurement inside the response, which is structurally
       self-invalidating for a content digest.
+    - ``concurrency.occupancy_observed_at``: stamped fresh by
+      ``DriveSessionsRefresher.refresh()`` on every tick pass (default 15s,
+      ``COORD_DRIVE_SESSIONS_REFRESH_INTERVAL``) even when the live-session
+      set read is byte-identical to the previous one — the same
+      self-moving-clock shape as ``fleet_health.refreshed_at`` above.
 
     Deliberately narrow: per-machine health severities/results/headrooms are
     left in the digest, because a real state change there (a machine going
     offline, a disk filling up) SHOULD bump the ETag — only the fields that
     move on their own, independent of any real state change, are excluded.
+    Likewise ``concurrency``'s ``occupied``/``repo_occupied``/ceilings stay in
+    the digest — those ARE real state and should bump the version.
     """
     projection = {
         k: v for k, v in result.items() if k not in _BOARD_DIGEST_VOLATILE_TOP_KEYS
@@ -6086,6 +6093,10 @@ def _board_digest_projection(result: dict) -> dict:
     fleet_health = projection.get("fleet_health")
     if isinstance(fleet_health, dict):
         projection["fleet_health"] = _board_digest_fleet_health(fleet_health)
+
+    concurrency = projection.get("concurrency")
+    if isinstance(concurrency, dict):
+        projection["concurrency"] = _board_digest_concurrency(concurrency)
 
     return projection
 
@@ -6120,6 +6131,20 @@ def _board_digest_health_row(row: dict) -> dict:
     the machine's state stay in, per ``_board_digest_projection``'s docstring.
     """
     return {k: v for k, v in row.items() if k not in ("received_at", "checked_at")}
+
+
+def _board_digest_concurrency(concurrency: dict) -> dict:
+    """Drop ``concurrency``'s own self-moving clock, ``occupancy_observed_at``.
+
+    See ``_board_digest_projection`` — digest input only, never the wire
+    body. ``occupied``/``repo_occupied``/the ceilings + their provenance all
+    stay in the digest: those are real state and a genuine change SHOULD bump
+    the ETag. Only the wall-clock stamp of *when* the last tick took its
+    tmux reading is excluded, since it moves every refresh pass regardless of
+    whether the live-session set actually changed (#3428 review finding,
+    same class as #3293).
+    """
+    return {k: v for k, v in concurrency.items() if k != "occupancy_observed_at"}
 
 
 def _board_digest_check_result(check: dict) -> dict:
