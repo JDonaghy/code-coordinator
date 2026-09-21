@@ -165,6 +165,52 @@ def milestone_edit_cmd(
     click.echo(f"milestone #{number} updated ({repo_entry.github})")
 
 
+class MilestoneResolutionError(Exception):
+    """Raised by :func:`resolve_milestone_ref` when MILESTONE can't be
+    resolved to a number."""
+
+
+def resolve_milestone_ref(repo_github: str, milestone: str) -> tuple[int, str | None]:
+    """Resolve a milestone CLI argument (number or title) to ``(number,
+    title)`` against ``repo_github``'s open milestones.
+
+    Shared by `coord milestone assign` and `coord issue create --milestone`
+    (#3432) so there is exactly one place milestone-reference resolution
+    happens — raises :class:`MilestoneResolutionError` (never exits) on any
+    failure: an unfetchable numeric milestone, an unmatched title, or an
+    ambiguous title. Callers decide how to report/exit.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        milestone_number = int(milestone)
+    except ValueError:
+        try:
+            all_ms = github_ops.get_repo_milestones(repo_github)
+        except RuntimeError as e:
+            raise MilestoneResolutionError(f"could not list milestones: {e}") from e
+        matches = [m for m in all_ms if m.get("title") == milestone]
+        if not matches:
+            raise MilestoneResolutionError(
+                f"no open milestone with title {milestone!r} in {repo_github}"
+            )
+        if len(matches) > 1:
+            raise MilestoneResolutionError(
+                f"multiple open milestones match {milestone!r} — use the "
+                "milestone number instead"
+            )
+        return matches[0]["number"], matches[0].get("title")
+
+    # Resolve the title from the number so the cache can store it.
+    try:
+        ms_data = github_ops.get_milestone(repo_github, milestone_number)
+    except RuntimeError as e:
+        raise MilestoneResolutionError(
+            f"could not fetch milestone #{milestone_number}: {e}"
+        ) from e
+    return milestone_number, ms_data.get("title")
+
+
 @milestone_group.command(
     "assign",
     help=(
@@ -194,47 +240,15 @@ def milestone_assign_cmd(
         click.echo(f"error: unknown repo {repo!r}", err=True)
         sys.exit(2)
 
-    from coord import github_ops  # noqa: PLC0415
     from coord.state import assign_issue_milestone  # noqa: PLC0415
 
-    # Resolve milestone argument: numeric → number, string → title lookup.
-    milestone_number: int
-    milestone_title: str | None
-
     try:
-        milestone_number = int(milestone)
-        # Resolve the title from the number so the cache can store it.
-        try:
-            ms_data = github_ops.get_milestone(repo_entry.github, milestone_number)
-            milestone_title = ms_data.get("title")
-        except RuntimeError as e:
-            click.echo(
-                f"error: could not fetch milestone #{milestone_number}: {e}", err=True
-            )
-            sys.exit(1)
-    except ValueError:
-        # Treat the argument as a title and resolve to a number.
-        try:
-            all_ms = github_ops.get_repo_milestones(repo_entry.github)
-        except RuntimeError as e:
-            click.echo(f"error: could not list milestones: {e}", err=True)
-            sys.exit(1)
-        matches = [m for m in all_ms if m.get("title") == milestone]
-        if not matches:
-            click.echo(
-                f"error: no open milestone with title {milestone!r} in {repo_entry.github}",
-                err=True,
-            )
-            sys.exit(1)
-        if len(matches) > 1:
-            click.echo(
-                f"error: multiple open milestones match {milestone!r} — "
-                "use the milestone number instead",
-                err=True,
-            )
-            sys.exit(1)
-        milestone_number = matches[0]["number"]
-        milestone_title = matches[0].get("title")
+        milestone_number, milestone_title = resolve_milestone_ref(
+            repo_entry.github, milestone
+        )
+    except MilestoneResolutionError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
 
     try:
         assign_issue_milestone(
