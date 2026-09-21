@@ -418,7 +418,13 @@ def issue_comment_cmd(
         "instead of a single freeform paragraph, so a later contract.md "
         "author (hand or agent) doesn't have to re-derive them from prose. "
         "All four are required together, and mutually exclusive with "
-        "--body/--body-file."
+        "--body/--body-file.\n\n"
+        "--milestone (number or title, resolved the same way as `coord "
+        "milestone assign`) attaches the new issue to a milestone in the "
+        "same step, routed through the same daemon seam "
+        "(`POST /issue-milestone`) so the local issues cache is updated "
+        "immediately. An unresolvable milestone is reported *before* the "
+        "issue is created (#3432)."
     ),
 )
 @click.argument("repo")
@@ -435,6 +441,16 @@ def issue_comment_cmd(
     "labels",
     multiple=True,
     help="Label to add (repeatable). The label must already exist in the repo.",
+)
+@click.option(
+    "--milestone",
+    default=None,
+    help=(
+        "Milestone number or title to attach the new issue to. Resolved "
+        "before the issue is created — an unresolvable milestone (bad "
+        "number, unmatched or ambiguous title) is an error and no issue is "
+        "created."
+    ),
 )
 @click.option(
     "--expected", default=None,
@@ -462,6 +478,7 @@ def issue_create_cmd(
     body: str | None,
     body_file: Path | None,
     labels: tuple[str, ...],
+    milestone: str | None,
     expected: str | None,
     actual: str | None,
     repro: str | None,
@@ -496,6 +513,26 @@ def issue_create_cmd(
     slug = _resolve_repo_slug(cfg, repo)
     if body_file is not None:
         body = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
+
+    # Resolve --milestone *before* creating the issue (#3432) — creating the
+    # issue and then failing to attach it would silently reproduce the bug
+    # this closes (an issue that looks healthy but is unreachable from
+    # `coord.plans.aggregate_repo_plans`, which keys on milestone
+    # membership).
+    milestone_number: int | None = None
+    milestone_title: str | None = None
+    if milestone is not None:
+        from coord.commands.milestone import (  # noqa: PLC0415
+            MilestoneResolutionError,
+            resolve_milestone_ref,
+        )
+
+        try:
+            milestone_number, milestone_title = resolve_milestone_ref(slug, milestone)
+        except MilestoneResolutionError as e:
+            click.echo(f"error: {e}", err=True)
+            sys.exit(1)
+
     from coord.state import create_issue as _create_issue  # noqa: PLC0415
 
     try:
@@ -508,6 +545,31 @@ def issue_create_cmd(
         click.echo(f"error: issue create failed: {e}", err=True)
         sys.exit(1)
     click.echo(f"#{result['number']} ({slug}) created")
+
+    if milestone_number is not None:
+        from coord.state import assign_issue_milestone  # noqa: PLC0415
+
+        try:
+            assign_issue_milestone(
+                repo,
+                result["number"],
+                milestone_number,
+                milestone_title=milestone_title,
+                repo_github=slug,
+            )
+        except Exception as e:  # noqa: BLE001
+            click.echo(
+                f"error: issue #{result['number']} created but milestone "
+                f"assign failed: {e}",
+                err=True,
+            )
+            sys.exit(1)
+        ms_label = (
+            f"{milestone_title!r} (#{milestone_number})"
+            if milestone_title
+            else f"#{milestone_number}"
+        )
+        click.echo(f"#{result['number']} ({slug}) assigned to milestone {ms_label}")
 
 
 @issue_group.command(
