@@ -873,6 +873,40 @@ def test_any_matching_branch_merged_false_on_gh_error(monkeypatch) -> None:
     assert claim_mod.any_matching_branch_merged("acme/api", 9) is False
 
 
+def test_any_matching_branch_merged_scoped_branch_ignores_merged_siblings(
+    monkeypatch,
+) -> None:
+    """#3436: reproduces vimcode#1156's shape — several MERGED, zero-commit
+    `issue-{N}-*` review-leg branches (cut from the default-branch tip,
+    never diverged) alongside the one real, unmerged work branch. The
+    issue-scoped (no ``branch=``) check is tripped by the merged siblings —
+    the documented fallback behaviour for a caller with nothing dispatched
+    yet — but a caller that names the ACTUAL branch in play must get an
+    answer scoped to just that branch, not "did anything for this issue
+    ever merge"."""
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(
+            ["issue-1156-review-fix-1", "issue-1156-real-work"],
+            "main",
+            {"issue-1156-review-fix-1": 0, "issue-1156-real-work": 5},
+        ),
+    )
+    # No branch named: falls back to the issue-scoped check, which still
+    # trips on the merged sibling (unchanged pre-#3436 fallback behaviour).
+    assert claim_mod.any_matching_branch_merged("acme/api", 1156) is True
+    # Scoped to the real, unmerged work branch: must NOT report merged.
+    assert claim_mod.any_matching_branch_merged(
+        "acme/api", 1156, branch="issue-1156-real-work"
+    ) is False
+    # Scoped to the merged sibling itself: correctly reports merged.
+    assert claim_mod.any_matching_branch_merged(
+        "acme/api", 1156, branch="issue-1156-review-fix-1"
+    ) is True
+
+
 # ── #1553: has_active_work_followup keys on the EFFECTIVE issue ─────────────
 
 

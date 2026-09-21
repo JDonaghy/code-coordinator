@@ -140,7 +140,7 @@ class TestGithubIssueLivenessFetcher:
         assert issue_closed is True
         assert branch_merged is False
         mock_closed.assert_called_once_with("acme/api", 42)
-        mock_merged.assert_called_once_with("acme/api", 42)
+        mock_merged.assert_called_once_with("acme/api", 42, branch=None)
 
     @patch("coord.claim.any_matching_branch_merged", return_value=True)
     @patch("coord.github_ops.issue_is_closed", return_value=False)
@@ -167,4 +167,22 @@ class TestGithubIssueLivenessFetcher:
         assert issue_closed is False
         assert branch_merged is False
         mock_closed.assert_called_once_with("ghost", 1)
-        mock_merged.assert_called_once_with("ghost", 1)
+        mock_merged.assert_called_once_with("ghost", 1, branch=None)
+
+    @patch("coord.claim.any_matching_branch_merged", return_value=False)
+    @patch("coord.github_ops.issue_is_closed", return_value=False)
+    def test_passes_the_target_branch_through(
+        self, mock_closed: MagicMock, mock_merged: MagicMock,
+    ) -> None:
+        """#3436: a caller that names a specific branch (the dispatch's
+        actual target — e.g. `Proposal.target_branch`/`Assignment.branch`)
+        must have it forwarded to `any_matching_branch_merged`'s
+        branch-scoped check, not silently dropped in favour of the
+        issue-scoped fallback."""
+        fetcher = github_issue_liveness_fetcher(self._config())
+        issue_closed, branch_merged = fetcher("api", 42, "issue-42-real-work")
+        assert issue_closed is False
+        assert branch_merged is False
+        mock_merged.assert_called_once_with(
+            "acme/api", 42, branch="issue-42-real-work"
+        )

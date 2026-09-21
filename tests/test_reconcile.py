@@ -412,7 +412,7 @@ class TestReassignLivenessGate:
     ) -> None:
         result = _reassign(
             _failed(), Board(), _plain_cfg(),
-            issue_liveness_fetcher=lambda repo, num: (True, False),
+            issue_liveness_fetcher=lambda repo, num, branch=None: (True, False),
         )
         assert result is None
         mock_post.assert_not_called()
@@ -425,7 +425,7 @@ class TestReassignLivenessGate:
     ) -> None:
         result = _reassign(
             _failed(), Board(), _plain_cfg(),
-            issue_liveness_fetcher=lambda repo, num: (False, True),
+            issue_liveness_fetcher=lambda repo, num, branch=None: (False, True),
         )
         assert result is None
         mock_post.assert_not_called()
@@ -438,10 +438,33 @@ class TestReassignLivenessGate:
         mock_post.return_value = resp
         result = _reassign(
             _failed(), Board(), _plain_cfg(),
-            issue_liveness_fetcher=lambda repo, num: (False, False),
+            issue_liveness_fetcher=lambda repo, num, branch=None: (False, False),
         )
         assert result is not None
         mock_post.assert_called_once()
+
+    @patch("coord.reconcile.httpx.post")
+    def test_passes_failed_branch_to_the_fetcher(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#3436: the fetcher must see the FAILED ROW'S OWN branch, not
+        just `(repo_name, issue_number)` — a merged, zero-commit
+        `issue-{N}-*` sibling must not be able to answer for a retry that
+        would actually land on a different, unmerged branch."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        seen: list[tuple] = []
+
+        def fetcher(repo, num, branch=None):
+            seen.append((repo, num, branch))
+            return False, False
+
+        _reassign(
+            _failed(branch="issue-1-real-work"), Board(), _plain_cfg(),
+            issue_liveness_fetcher=fetcher,
+        )
+        assert seen == [("api", 1, "issue-1-real-work")]
 
 
 class TestIssueLivenessFromCache:
@@ -477,6 +500,36 @@ class TestIssueLivenessFromCache:
         )
         closed, merged = _issue_liveness_from_cache(board, "api", 42)
         assert closed is False
+        assert merged is True
+
+    def test_merged_scoped_to_branch_ignores_merged_sibling(self) -> None:
+        """#3436: a merged completed row for the same issue but on a
+        DIFFERENT branch (e.g. a review-leg branch cut from the default
+        branch) must not report "merged" for a retry that targets the
+        issue's real, unmerged work branch."""
+        from coord.reconcile import _issue_liveness_from_cache
+
+        board = Board(
+            completed=[
+                _failed(
+                    status="merged", issue_number=42, type="review",
+                    branch="issue-42-review-fix-1",
+                ),
+            ]
+        )
+        # No branch given: falls back to the issue-scoped check, which
+        # still reports the merged sibling (unchanged fallback behaviour).
+        closed, merged = _issue_liveness_from_cache(board, "api", 42)
+        assert merged is True
+        # Scoped to the real work branch: must NOT report merged.
+        closed, merged = _issue_liveness_from_cache(
+            board, "api", 42, "issue-42-real-work"
+        )
+        assert merged is False
+        # Scoped to the merged sibling itself: correctly reports merged.
+        closed, merged = _issue_liveness_from_cache(
+            board, "api", 42, "issue-42-review-fix-1"
+        )
         assert merged is True
 
 

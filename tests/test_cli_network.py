@@ -480,7 +480,7 @@ class TestApproveProviderAwareModel:
         with patch("coord.dispatch.httpx.post", return_value=mock_resp) as mock_post, \
              patch(
                  "coord.dispatch_liveness.github_issue_liveness_fetcher",
-                 return_value=lambda _repo, _issue: (False, False),
+                 return_value=lambda _repo, _issue, _branch=None: (False, False),
              ), \
              patch("coord.github_ops.get_issue") as mock_get_issue, \
              patch("coord.github_ops.post_issue_comment"):
