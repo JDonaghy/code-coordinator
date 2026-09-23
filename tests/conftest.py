@@ -176,6 +176,43 @@ def _fresh_board_payload_cache():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_tailscale_probe(monkeypatch):
+    """#3440: default this host's Tailscale identity to "unknown" so no test
+    ever shells out to the real ``tailscale`` binary.
+
+    ``coord.config.resolve_local_machine`` is the single "is this host local?"
+    answer, and its third tier runs ``tailscale status --self --json`` (up to
+    a 3s timeout) whenever the OS short hostname matches no configured
+    machine — which is the default state under pytest, where every fixture
+    config names machines like ``laptop.tailnet``. Dozens of tests reach that
+    resolver indirectly (``coord test-plan``, the reap ticks, ``coord
+    diagnose``), so without this the suite's behaviour depends on whether the
+    machine running it happens to have Tailscale installed, and at least one
+    test that counts subprocess calls (``test_serve.py``'s ``claude``-path
+    round trip, which patches ``subprocess.run`` globally) sees a second,
+    unrelated call. Exactly the hermeticity reasoning as
+    ``_no_real_usage_probe`` (#1466) below.
+
+    Also clears the resolver's process-wide memo of the answer (see
+    ``_cached_tailscale_self_dns_name``) on the way in and out, so one test's
+    stubbed identity can't leak into the next — same shape as
+    ``_fresh_resource_route_support`` above.
+
+    Tests that need the real probe (``tests/test_config.py``'s
+    ``TestTailscaleSelfDnsName``, which stubs ``subprocess.run`` instead) undo
+    this with a narrower class-scoped autouse fixture, which is instantiated
+    after this one and therefore wins — the same escape hatch
+    ``tests/test_network.py::TestClaudeCredentialReachable`` uses.
+    """
+    from coord import config as _config
+
+    _config.reset_tailscale_self_dns_cache()
+    monkeypatch.setattr(_config, "_tailscale_self_dns_name", lambda **kw: None)
+    yield
+    _config.reset_tailscale_self_dns_cache()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_webapp_bundle(monkeypatch, tmp_path):
     """#2009: never let the HOST's live webapp bundle change a test's answer.
 
