@@ -9,6 +9,9 @@ import re
 import socket
 import subprocess
 import sys
+# `from datetime import time` below shadows the stdlib `time` module in this
+# namespace, so the monotonic clock is imported under an explicit alias.
+import time as time_module
 from dataclasses import dataclass, field, fields
 from datetime import time
 from pathlib import Path
@@ -2458,6 +2461,67 @@ def _tailscale_self_dns_name(*, timeout: float = 3.0) -> str | None:
     return dns_name.rstrip(".").lower()
 
 
+# #3440: memo for :func:`_cached_tailscale_self_dns_name` — ``(monotonic
+# deadline | None, answer)``. A ``None`` deadline means "never expires".
+_TS_SELF_DNS_MEMO: tuple[float | None, str | None] | None = None
+
+# How long a FAILED probe is remembered. Deliberately short and finite: see
+# :func:`_cached_tailscale_self_dns_name`.
+TS_SELF_DNS_NEGATIVE_TTL = 60.0
+
+
+def reset_tailscale_self_dns_cache() -> None:
+    """Forget the memoized Tailscale self-identity.
+
+    Exported for tests (``tests/conftest.py`` resets it between tests, the
+    same shape as ``reset_resource_route_support``): a module-level memo
+    would otherwise leak one test's stubbed identity into the next.
+    """
+    global _TS_SELF_DNS_MEMO
+    _TS_SELF_DNS_MEMO = None
+
+
+def _cached_tailscale_self_dns_name(
+    *, now: float | None = None,
+) -> str | None:
+    """:func:`_tailscale_self_dns_name`, memoized — the accessor
+    :func:`resolve_local_machine` actually calls.
+
+    Why memoize at all: ``resolve_local_machine`` is called on a timer by
+    long-lived processes (``coord serve``'s reap ticks, every few seconds).
+    On a host that matches no machine by hostname — precisely the #3440 host,
+    and every thin client — the Tailscale tier is reached on EVERY call, so
+    an unmemoized probe is a ``tailscale`` subprocess (up to a 3s timeout)
+    every few seconds, forever.
+
+    Why a SUCCESS is cached forever but a FAILURE is not (#2096): a host's
+    Tailscale DNS name is a stable fact for the lifetime of a process, so
+    re-probing after a successful answer buys nothing. A failed probe is
+    *not* a fact about the host — it is a fact about the last 3 seconds
+    (``tailscaled`` not up yet, the daemon started at boot before the network
+    did). Caching that forever would turn a transient miss into a permanent,
+    uncontradictable "this host is not in the fleet" verdict for a daemon
+    that runs for days, which is the same class of bug as the one #3440 is
+    fixing. So a negative answer is retried after
+    ``TS_SELF_DNS_NEGATIVE_TTL`` seconds — bounded cost, self-healing.
+    """
+    global _TS_SELF_DNS_MEMO
+
+    now = time_module.monotonic() if now is None else now
+    memo = _TS_SELF_DNS_MEMO
+    if memo is not None:
+        expires_at, answer = memo
+        if expires_at is None or now < expires_at:
+            return answer
+
+    answer = _tailscale_self_dns_name()
+    _TS_SELF_DNS_MEMO = (
+        None if answer else now + TS_SELF_DNS_NEGATIVE_TTL,
+        answer,
+    )
+    return answer
+
+
 def resolve_local_machine(
     config: "Config", *, env: "dict[str, str] | None" = None,
 ) -> "Machine | None":
@@ -2483,13 +2547,15 @@ def resolve_local_machine(
        already answers the question, is both wasteful and, in one
        audited path, breaks a ToS no-unexpected-subprocess guardrail
        (`tests/test_reap_merged_sessions.py`).
-    3. This host's Tailscale identity (:func:`_tailscale_self_dns_name`)
-       against ``machine.host``'s full DNS name, not just its first label —
-       ``host:`` is set FROM the Tailscale DNS name in this fleet, so this
-       is the tier that actually fixes #3440: it catches exactly the hosts
-       step 2 cannot (an OS hostname with nothing to do with the fleet
-       name). Only reached when steps 1–2 found nothing, so the one-time
-       subprocess cost is paid only by the hosts that actually need it.
+    3. This host's Tailscale identity
+       (:func:`_cached_tailscale_self_dns_name`) against ``machine.host``'s
+       full DNS name, not just its first label — ``host:`` is set FROM the
+       Tailscale DNS name in this fleet, so this is the tier that actually
+       fixes #3440: it catches exactly the hosts step 2 cannot (an OS
+       hostname with nothing to do with the fleet name). Only reached when
+       steps 1–2 found nothing, AND memoized per process, so the subprocess
+       cost is paid once by the hosts that actually need it rather than on
+       every reap tick.
     4. ``$COORD_LOCAL_MACHINE`` (or *env*'s override) naming a machine by
        ``name`` exactly — the last-resort override for when none of the
        above can match at all.
@@ -2516,7 +2582,7 @@ def resolve_local_machine(
         ):
             return machine
 
-    ts_dns = _tailscale_self_dns_name()
+    ts_dns = _cached_tailscale_self_dns_name()
     if ts_dns:
         for machine in config.machines:
             host = (machine.host or "").rstrip(".").lower()

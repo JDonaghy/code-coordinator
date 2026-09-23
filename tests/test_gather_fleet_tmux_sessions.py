@@ -30,9 +30,11 @@ def _local_hostname(monkeypatch):
     """Pin "the local machine" to a name no test machine names below share
     accidentally, so local/remote attribution is deterministic. Routed
     through the shared `coord.config.resolve_local_machine` seam (#3440) —
-    `gather_fleet_tmux_sessions` no longer computes locality itself."""
+    `gather_fleet_tmux_sessions` no longer computes locality itself. That
+    resolver's Tailscale tier is already stubbed out suite-wide by
+    conftest's `_no_real_tailscale_probe`, so only the hostname tier needs
+    pinning here."""
     monkeypatch.setattr(coord_config, "_local_short_hostname", lambda: "thishost")
-    monkeypatch.setattr(coord_config, "_tailscale_self_dns_name", lambda **kw: None)
 
 
 def test_local_sessions_are_attributed_to_the_local_config_machine(monkeypatch):

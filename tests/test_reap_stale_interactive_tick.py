@@ -23,16 +23,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _no_real_tailscale_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Locality is resolved through `coord.config.resolve_local_machine`
-    (#3440), whose Tailscale-identity tier shells out to the real
-    `tailscale` binary when present. Keep these unit tests hermetic and
-    fast by short-circuiting that tier — the tests below drive the
-    hostname-fallback tier explicitly via `_local_short_hostname`."""
-    monkeypatch.setattr("coord.config._tailscale_self_dns_name", lambda **kw: None)
-
-
 _CONFIG_YAML = """\
 repos:
   - name: myrepo
