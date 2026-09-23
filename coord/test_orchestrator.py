@@ -19,7 +19,6 @@ import logging
 import os
 import re
 import shutil
-import socket
 import subprocess
 from pathlib import Path
 
@@ -284,23 +283,20 @@ def _get_issue_body(repo_github: str, issue_number: int) -> str:
 
 
 def local_machine(config: Config) -> Machine | None:
-    """The configured ``Machine`` (if any) whose ``name`` or ``host`` prefix
-    matches this process's hostname.
+    """The configured ``Machine`` (if any) that IS the host this process is
+    running on.
 
     Extracted out of :func:`find_local_repo_path`'s hostname-matching so
     callers that need the ``Machine`` object itself (e.g. #966's acceptance
     capability check, which needs ``.capabilities``, not just a repo path)
-    don't have to re-derive the match. Returns ``None`` when this host isn't
-    a recognized machine in ``coordinator.yml``.
+    don't have to re-derive the match. Thin wrapper around the shared
+    :func:`coord.config.resolve_local_machine` (#3440) — see its docstring
+    for the full alias/Tailscale/hostname/env resolution order. Returns
+    ``None`` when this host isn't a recognized machine in ``coordinator.yml``.
     """
-    local_hostname = socket.gethostname().split(".")[0].lower()
-    for machine in config.machines:
-        if (
-            machine.name.lower() == local_hostname
-            or machine.host.split(".")[0].lower() == local_hostname
-        ):
-            return machine
-    return None
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
+    return resolve_local_machine(config)
 
 
 def find_local_repo_path(repo_name: str, config: Config) -> Path | None:

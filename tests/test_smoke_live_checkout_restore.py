@@ -46,6 +46,16 @@ from coord.models import Assignment, Board, Machine, Repo
 from tests.test_issue_store_seam import _seed_running_assignment
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tailscale_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Locality is resolved through `coord.config.resolve_local_machine`
+    (#3440), whose Tailscale-identity tier shells out to the real
+    `tailscale` binary when present. Keep these unit tests hermetic and
+    fast by short-circuiting that tier — the tests below drive the
+    hostname-fallback tier explicitly via `_local_short_hostname`."""
+    monkeypatch.setattr("coord.config._tailscale_self_dns_name", lambda **kw: None)
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -358,7 +368,7 @@ class TestReapRestoresDeadSmokeSession:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"):
+             patch("coord.config._local_short_hostname", return_value="mymachine"):
             reaped = reap_stale_interactive_sessions(board, cfg)
 
         assert aid in reaped
@@ -393,7 +403,7 @@ class TestReapRestoresDeadSmokeSession:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"), \
              patch(
                  "coord.interactive.restore_live_checkout_from_smoke_snapshot"
@@ -424,7 +434,7 @@ class TestReapRestoresDeadSmokeSession:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch(
                  "coord.interactive.restore_live_checkout_from_smoke_snapshot",
                  return_value=([], "boom"),

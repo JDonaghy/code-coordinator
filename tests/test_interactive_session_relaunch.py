@@ -27,6 +27,16 @@ from coord.models import Assignment, Board
 from .conftest import output_and_stderr
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tailscale_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Locality is resolved through `coord.config.resolve_local_machine`
+    (#3440), whose Tailscale-identity tier shells out to the real
+    `tailscale` binary when present. Keep these unit tests hermetic and
+    fast by short-circuiting that tier — the tests below drive the
+    hostname-fallback tier explicitly via `_local_short_hostname`."""
+    monkeypatch.setattr("coord.config._tailscale_self_dns_name", lambda **kw: None)
+
+
 # ── Minimal coordinator.yml shared by CLI tests ───────────────────────────────
 
 _CONFIG_YAML = """\
@@ -168,7 +178,7 @@ class TestReapStaleInteractiveSessions:
         cfg = _minimal_config()
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reaped = reap_stale_interactive_sessions(board, cfg)
         assert aid in reaped
@@ -187,7 +197,7 @@ class TestReapStaleInteractiveSessions:
         # When the worktree does not exist, commits is None → terminal_status="failed"
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
         done = next((a for a in board.completed if a.assignment_id == aid), None)
@@ -205,7 +215,7 @@ class TestReapStaleInteractiveSessions:
         # When the worktree does not exist, commits is None → terminal_status="failed"
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
         row = coord_db.execute(
@@ -249,7 +259,7 @@ class TestReapStaleInteractiveSessions:
         cfg = _minimal_config()
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
         # DB status must not be changed back to failed
@@ -279,7 +289,7 @@ class TestReapStaleInteractiveSessions:
         cfg = _minimal_config()
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reaped = reap_stale_interactive_sessions(board, cfg)
         assert set(reaped) == set(aids)
@@ -302,7 +312,7 @@ class TestReapStaleInteractiveSessions:
         # Local host is "localmachine"; config has "remotemachine.tailnet"
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="localmachine"):
+             patch("coord.config._local_short_hostname", return_value="localmachine"):
             reaped = reap_stale_interactive_sessions(board, cfg)
 
         assert reaped == [], "remote session must not be reaped"
@@ -326,7 +336,7 @@ class TestReapStaleInteractiveSessions:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"):
+             patch("coord.config._local_short_hostname", return_value="mymachine"):
             reaped = reap_stale_interactive_sessions(board, cfg)
 
         assert reaped == [], "unknown-machine session must not be reaped"
@@ -347,7 +357,7 @@ class TestReapStaleInteractiveSessions:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"), \
              patch("coord.agent._commits_ahead", return_value=0):
             reaped = reap_stale_interactive_sessions(board, cfg, worktrees_dir=tmp_path)
@@ -388,7 +398,7 @@ class TestClaimReleasedAfterReap:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
 
@@ -408,7 +418,7 @@ class TestClaimReleasedAfterReap:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
-             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.config._local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"), \
              patch("coord.reconcile._query_agent", return_value=None):
             changed = reconcile(board, cfg)

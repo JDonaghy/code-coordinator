@@ -21,11 +21,13 @@ from coord.health.checks import (
     disk,
     graph,
     index_lock,
+    local_machine_identity,
     plan_usage,
     repo_state,
     worktrees,
 )
 from coord.health.models import Checkout, HealthContext, Severity
+from coord.models import Machine
 
 NOW = 1_800_000_000.0
 
@@ -1202,3 +1204,68 @@ def test_graph_check_publishes_whether_the_repo_ships_the_hooks(
 
     assert result.values["hooks_shipped"] is False
     assert result.values["hooks_ok"] is False
+
+
+# ── local_machine_identity (#3440) ──────────────────────────────────────────
+
+
+def _machine(name: str, host: str, **kwargs) -> Machine:
+    return Machine(name=name, host=host, **kwargs)
+
+
+def test_local_machine_identity_no_config_is_ok(tmp_path) -> None:
+    ctx = make_ctx(tmp_path, config=None)
+    result = local_machine_identity.probe_local_machine_identity(ctx)
+    assert result.severity is Severity.OK
+
+
+def test_local_machine_identity_no_machines_is_ok(tmp_path) -> None:
+    ctx = make_ctx(tmp_path, config=SimpleNamespace(machines=[]))
+    result = local_machine_identity.probe_local_machine_identity(ctx)
+    assert result.severity is Severity.OK
+
+
+def test_local_machine_identity_resolved_is_ok(tmp_path, monkeypatch) -> None:
+    m = _machine("macmini", "macmini.tailf46ef8.ts.net", repos=["vimcode"])
+    monkeypatch.setattr("coord.config.resolve_local_machine", lambda cfg: m)
+    ctx = make_ctx(tmp_path, config=SimpleNamespace(machines=[m]))
+
+    result = local_machine_identity.probe_local_machine_identity(ctx)
+
+    assert result.severity is Severity.OK
+    assert result.headroom == "macmini"
+
+
+def test_local_machine_identity_unresolved_with_no_local_evidence_is_ok(
+    tmp_path, monkeypatch
+) -> None:
+    """A plain operator laptop with no local checkout of a fleet repo has
+    no evidence it's meant to be a machine at all — stay silent (same
+    "absence is the common case" convention as every other check here)."""
+    m = _machine("macmini", "macmini.tailf46ef8.ts.net", repos=["vimcode"])
+    monkeypatch.setattr("coord.config.resolve_local_machine", lambda cfg: None)
+    ctx = make_ctx(tmp_path, config=SimpleNamespace(machines=[m]), checkouts=())
+
+    result = local_machine_identity.probe_local_machine_identity(ctx)
+
+    assert result.severity is Severity.OK
+
+
+def test_local_machine_identity_unresolved_with_matching_checkout_is_warn(
+    tmp_path, monkeypatch
+) -> None:
+    """#3440's macmini incident, reproduced: `resolve_local_machine` comes
+    back empty, but this host has a real local checkout of a repo a
+    configured machine also declares — the gate must be able to fail."""
+    m = _machine("macmini", "macmini.tailf46ef8.ts.net", repos=["vimcode"])
+    monkeypatch.setattr("coord.config.resolve_local_machine", lambda cfg: None)
+    ctx = make_ctx(
+        tmp_path, config=SimpleNamespace(machines=[m]),
+        checkouts=(_checkout(tmp_path, name="vimcode"),),
+    )
+
+    result = local_machine_identity.probe_local_machine_identity(ctx)
+
+    assert result.severity is Severity.WARN
+    assert "vimcode" in result.detail
+    assert result.values["overlapping_repos"] == ["vimcode"]

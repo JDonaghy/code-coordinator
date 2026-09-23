@@ -465,18 +465,13 @@ def local_repo_dir(config, repo_name: str) -> Path | None:
     Same resolution ``coord test`` uses (``coord.commands.test_gate.
     _local_repo_dir``): this machine's ``repo_paths`` first, then any machine
     in the config that knows the repo. Returns an expanded :class:`Path`, or
-    ``None`` when no path is configured.
+    ``None`` when no path is configured. Locality is resolved through the
+    shared :func:`coord.config.resolve_local_machine` (#3440) — not a
+    private, case-sensitive hostname comparison.
     """
-    import socket
+    from coord.config import resolve_local_machine  # noqa: PLC0415
 
-    hostname = socket.gethostname().split(".")[0]
-    local_machine = next(
-        (
-            m for m in getattr(config, "machines", [])
-            if m.name == hostname or m.host.split(".")[0] == hostname
-        ),
-        None,
-    )
+    local_machine = resolve_local_machine(config)
     repo_path = None
     if local_machine is not None:
         repo_path = local_machine.repo_path(repo_name)

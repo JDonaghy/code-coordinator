@@ -485,6 +485,13 @@ class Machine:
     # by the SSH escalation itself, which auto-detects on the target host
     # regardless of what this says.
     supervisor: str | None = None
+    # #3440: operator-set alias list of OS short hostnames that identify THIS
+    # machine as the local host — the escape hatch for when the OS hostname
+    # (e.g. macOS's default `Johns-Mac-mini`) matches neither `name` nor the
+    # first label of `host`. Consulted by `coord.config.resolve_local_machine`
+    # before the Tailscale-identity and name/host fallbacks; empty (the
+    # default) means "no alias, behave exactly as before this field existed".
+    local_hostnames: list[str] = field(default_factory=list)
 
     def can_work_on(self, repo_name: str) -> bool:
         return repo_name in self.repos

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from coord import config as coord_config
 from coord import interactive as ia
 from coord.models import Machine
 
@@ -27,8 +28,11 @@ def _config(*machines: Machine) -> SimpleNamespace:
 @pytest.fixture(autouse=True)
 def _local_hostname(monkeypatch):
     """Pin "the local machine" to a name no test machine names below share
-    accidentally, so local/remote attribution is deterministic."""
-    monkeypatch.setattr(ia, "_get_local_short_hostname", lambda: "thishost")
+    accidentally, so local/remote attribution is deterministic. Routed
+    through the shared `coord.config.resolve_local_machine` seam (#3440) —
+    `gather_fleet_tmux_sessions` no longer computes locality itself."""
+    monkeypatch.setattr(coord_config, "_local_short_hostname", lambda: "thishost")
+    monkeypatch.setattr(coord_config, "_tailscale_self_dns_name", lambda **kw: None)
 
 
 def test_local_sessions_are_attributed_to_the_local_config_machine(monkeypatch):
