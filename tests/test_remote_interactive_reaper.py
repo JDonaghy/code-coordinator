@@ -16,6 +16,16 @@ import pytest
 from coord.models import Assignment, Board
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tailscale_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Locality is resolved through `coord.config.resolve_local_machine`
+    (#3440), whose Tailscale-identity tier shells out to the real
+    `tailscale` binary when present. Keep these unit tests hermetic and
+    fast by short-circuiting that tier — the tests below drive the
+    hostname-fallback tier explicitly via `_local_short_hostname`."""
+    monkeypatch.setattr("coord.config._tailscale_self_dns_name", lambda **kw: None)
+
+
 # ── Shared config helpers ─────────────────────────────────────────────────────
 
 _CONFIG_YAML_WITH_REMOTE = """\
@@ -246,7 +256,7 @@ class TestReapStaleRemoteInteractiveSessions:
         cfg = _load_config(_CONFIG_YAML_WITH_REMOTE)
 
         with patch("coord.interactive._probe_remote_tmux_alive") as mock_probe, \
-             patch("coord.interactive._get_local_short_hostname",
+             patch("coord.config._local_short_hostname",
                    return_value="localmachine"):
             reaped = reap_stale_remote_interactive_sessions(board, cfg)
 

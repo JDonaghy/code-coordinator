@@ -350,8 +350,7 @@ def _session_state(assignment: "Assignment", config: "Config") -> str:
     own subprocesses. An unreachable agent still returns "unknown" rather than
     "dead", preserving the never-finalize-on-a-probe-failure guarantee.
     """
-    import socket  # noqa: PLC0415
-
+    from coord.config import resolve_local_machine  # noqa: PLC0415
     from coord.interactive import (  # noqa: PLC0415
         TmuxHost,
         tmux_session_name,
@@ -363,11 +362,8 @@ def _session_state(assignment: "Assignment", config: "Config") -> str:
     machine = _resolve_machine(config, assignment.machine_name)
     ssh_target = None
     if machine is not None:
-        local_hn = socket.gethostname().split(".")[0].lower()
-        is_local = (
-            machine.name.lower() == local_hn
-            or machine.host.split(".")[0].lower() == local_hn
-        )
+        resolved_local = resolve_local_machine(config)
+        is_local = resolved_local is not None and resolved_local.name == machine.name
         if not is_local:
             ssh_target = machine.host
     elif assignment.machine_name:
@@ -416,13 +412,13 @@ def _agent_liveness(assignment: "Assignment", machine: "Machine | None") -> str:
 
 def _ssh_target_for(assignment: "Assignment", config: "Config") -> str | None:
     """The ssh host for *assignment*'s machine, or ``None`` when it's local."""
-    import socket  # noqa: PLC0415
+    from coord.config import resolve_local_machine  # noqa: PLC0415
 
     machine = _resolve_machine(config, assignment.machine_name)
     if machine is None:
         return None
-    local_hn = socket.gethostname().split(".")[0].lower()
-    if machine.name.lower() == local_hn or machine.host.split(".")[0].lower() == local_hn:
+    resolved_local = resolve_local_machine(config)
+    if resolved_local is not None and resolved_local.name == machine.name:
         return None
     return machine.host
 

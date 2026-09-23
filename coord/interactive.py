@@ -551,15 +551,14 @@ def gather_fleet_tmux_sessions(
     """
     import concurrent.futures as _cf  # noqa: PLC0415
 
-    local_hn = _get_local_short_hostname()
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
+    _resolved_local = resolve_local_machine(config)
 
     def _is_local(machine: "Machine") -> bool:
-        return (
-            machine.name.lower() == local_hn
-            or machine.host.split(".")[0].lower() == local_hn
-        )
+        return _resolved_local is not None and machine.name == _resolved_local.name
 
-    local_machine = next((m.name for m in config.machines if _is_local(m)), None)
+    local_machine = _resolved_local.name if _resolved_local is not None else None
 
     sessions: list[dict] = [
         {**s, "machine": local_machine} for s in list_coord_tmux_sessions()
@@ -4372,9 +4371,11 @@ def reap_stale_interactive_sessions(
     if worktrees_dir is None:
         worktrees_dir = COORD_DIR / "worktrees"
 
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
     machines_by_name = {m.name: m for m in config.machines}
     repos_by_name = {r.name: r for r in config.repos}
-    _local_hn = _get_local_short_hostname()
+    _resolved_local = resolve_local_machine(config)
     reaped: list[str] = []
     now = time.time()
 
@@ -4412,10 +4413,7 @@ def reap_stale_interactive_sessions(
         # Skip the reap entirely so we don't falsely stamp a live remote
         # session as failed and release its dispatch claim.
         if machine is not None:
-            _is_local = (
-                machine.name.lower() == _local_hn
-                or machine.host.split(".")[0].lower() == _local_hn
-            )
+            _is_local = _resolved_local is not None and machine.name == _resolved_local.name
             if not _is_local:
                 continue  # remote session — leave it alone
         elif a.machine_name:
@@ -4695,10 +4693,12 @@ def reap_stale_remote_interactive_sessions(
     if timeout_hours <= 0:
         return []  # sweep disabled by config
 
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
     timeout_secs = timeout_hours * 3600
     machines_by_name = {m.name: m for m in config.machines}
     repos_by_name = {r.name: r for r in config.repos}
-    _local_hn = _get_local_short_hostname()
+    _resolved_local = resolve_local_machine(config)
     reaped: list[str] = []
     now = time.time()
 
@@ -4715,10 +4715,7 @@ def reap_stale_remote_interactive_sessions(
         machine = machines_by_name.get(a.machine_name or "")
         if machine is None:
             continue
-        _is_local = (
-            machine.name.lower() == _local_hn
-            or machine.host.split(".")[0].lower() == _local_hn
-        )
+        _is_local = _resolved_local is not None and machine.name == _resolved_local.name
         if _is_local:
             continue
 

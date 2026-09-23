@@ -994,7 +994,7 @@ def dispatch_test_author_interactive(
 
     setup = _build_interactive_launch_setup(
         machine=machine.name, repo=repo_name, issue=tracking_issue, machine_obj=machine,
-        dry_run=dry_run,
+        dry_run=dry_run, config=config,
     )
     provider = setup.provider
     is_local = setup.is_local

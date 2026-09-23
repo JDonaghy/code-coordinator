@@ -6,7 +6,6 @@ Extracted from coord/cli.py (#747)."""
 from __future__ import annotations
 
 import dataclasses
-import socket
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1498,7 +1497,7 @@ def assign(
     if interactive:
         setup = _build_interactive_launch_setup(
             machine=machine, repo=repo, issue=issue, machine_obj=machine_obj,
-            dry_run=dry_run,
+            dry_run=dry_run, config=cfg,
         )
         provider = setup.provider
         _is_local = setup.is_local
@@ -1635,6 +1634,7 @@ def _build_interactive_launch_setup(
     issue: int,
     machine_obj: object,
     dry_run: bool,
+    config: object,
 ) -> _InteractiveLaunchSetup:
     # #2086: the authoritative gate — see _require_interactive_tty's
     # docstring. Every --interactive flavour in BOTH callers (assign()'s
@@ -1668,13 +1668,13 @@ def _build_interactive_launch_setup(
         )
 
     # Detect whether the target machine is the local machine so we can
-    # choose the local TTY path vs the remote SSH+tmux path (#494).
-    # Mirrors the hostname-matching logic in _save_config_snapshot.
-    _local_hn = socket.gethostname().split(".")[0].lower()
-    _is_local = (
-        machine_obj.name.lower() == _local_hn
-        or machine_obj.host.split(".")[0].lower() == _local_hn
-    )
+    # choose the local TTY path vs the remote SSH+tmux path (#494). Routed
+    # through the single shared resolver (#3440) — alias list, Tailscale
+    # identity, then hostname fallback, not a private hostname comparison.
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
+    _resolved_local = resolve_local_machine(config)
+    _is_local = _resolved_local is not None and _resolved_local.name == machine_obj.name
 
     # #590/#749: on a thin client the local board/DB is empty, so resolve the
     # interactive-launch target (--review-of/--fix-of/--rework-of/--smoke-of/
