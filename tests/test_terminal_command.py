@@ -62,8 +62,14 @@ def config_file(tmp_path: Path) -> Path:
 def _local_is_laptop(monkeypatch):
     """Pin "local machine" resolution to `laptop` for every test in this
     module, so `server` is always treated as remote (ssh) regardless of the
-    actual machine running the test suite."""
-    monkeypatch.setattr("coord.commands.terminal._local_short_hostname", lambda: "laptop")
+    actual machine running the test suite.
+
+    ``coord.commands.terminal._is_local_machine`` now routes through
+    :func:`coord.config.resolve_local_machine` (#3440), so the OS-hostname
+    stub lives on ``coord.config`` — the shared resolver's own lowest-priority
+    tier — rather than a private copy in this module.
+    """
+    monkeypatch.setattr("coord.config._local_short_hostname", lambda: "laptop")
 
 
 def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:

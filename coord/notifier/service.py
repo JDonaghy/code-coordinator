@@ -229,7 +229,7 @@ def diagnose_pass(
                     evidence=d.evidence,
                     contradicts_stated=d.contradicts_stated,
                     trigger=d.trigger,
-                    host=_local_host(),
+                    host=_local_host(config),
                     now=now,
                 )
                 for d in diagnoses
@@ -243,16 +243,30 @@ def diagnose_pass(
         return []
 
 
-def _local_host() -> str:
+def _local_host(config: Any = None) -> str:
     """This machine's identity, stamped on every diagnosis record.
 
-    Same normalisation as ``coord.commands.drive_queue._local_host_id`` and
-    every other host-locality check in this codebase — short hostname,
-    lowercased, domain suffix dropped.  Diverging would split a two-host
-    corpus into ``dellserver`` and ``dellserver.local`` buckets that are the
-    same machine, which is precisely the kind of quiet data defect that makes
-    Phase 2's scoping wrong.
+    Prefers :func:`coord.config.resolve_local_machine` (#3440) — the shared
+    "which configured machine is this host?" answer — over a private
+    hostname comparison, so this bucketing key agrees with every other
+    local-vs-remote decision in the codebase rather than risking a quiet
+    split (e.g. a macOS host whose OS hostname matches no fleet member by
+    the raw-hostname comparison alone). Falls back to the raw short hostname
+    when *config* is absent or resolves to no configured machine — still
+    normalised (lowercased, domain suffix dropped) so a two-host corpus
+    doesn't split into ``dellserver`` / ``dellserver.local`` buckets for the
+    same machine, which is precisely the kind of quiet data defect that
+    would make Phase 2's scoping wrong.
     """
+    if config is not None:
+        try:
+            from coord.config import resolve_local_machine  # noqa: PLC0415
+
+            resolved = resolve_local_machine(config)
+        except Exception:  # noqa: BLE001 — advisory; fall through to hostname
+            resolved = None
+        if resolved is not None:
+            return resolved.name.lower()
     try:
         return socket.gethostname().split(".")[0].lower()
     except Exception:  # noqa: BLE001 — pragma: no cover

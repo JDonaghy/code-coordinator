@@ -176,7 +176,7 @@ class TestTerminalBridge:
         client = _client(attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123") as ws:
                 ws.send_bytes(b"echo hi\n")
@@ -239,7 +239,7 @@ class TestTerminalBridge:
         client = _client(token="s3cret", attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123?token=s3cret") as ws:
                 ws.send_bytes(b"x")
@@ -328,7 +328,7 @@ class TestResolveSessionTarget:
         # config's machine.host also won't match -- exercised via the
         # dedicated local-hostname patch below for a deterministic assertion.
         with patch(
-            "coord.dashboard.terminal._local_short_hostname",
+            "coord.config._local_short_hostname",
             return_value="laptop",
         ):
             result = resolve_session_target("abc123", _board(), _config())
@@ -336,7 +336,7 @@ class TestResolveSessionTarget:
 
     def test_remote_machine_resolves_to_its_host(self) -> None:
         with patch(
-            "coord.dashboard.terminal._local_short_hostname",
+            "coord.config._local_short_hostname",
             return_value="some-other-box",
         ):
             result = resolve_session_target("abc123", _board(), _config())
@@ -682,7 +682,7 @@ class TestCopyModeControl:
         client = _client(attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123") as ws:
                 ws.send_text(json.dumps({"type": "copy-mode", "action": "enter"}))
@@ -699,7 +699,7 @@ class TestCopyModeControl:
         client = _client(attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123") as ws:
                 for action in actions:
@@ -721,7 +721,7 @@ class TestCopyModeControl:
         client = _client(attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123") as ws:
                 ws.send_text(json.dumps({"type": "copy-mode", "action": "dance"}))
@@ -738,7 +738,7 @@ class TestCopyModeControl:
         client = _client(attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123") as ws:
                 ws.send_text("not json {{{{")
@@ -754,7 +754,7 @@ class TestCopyModeControl:
         client = _client(attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123") as ws:
                 ws.send_text(json.dumps({"type": "copy-mode", "action": 42}))
@@ -771,7 +771,7 @@ class TestCopyModeControl:
         client = _client(attacher=attacher)
         with (
             patch("coord.dashboard.server.read_board", return_value=_board()),
-            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+            patch("coord.config._local_short_hostname", return_value="laptop"),
         ):
             with client.websocket_connect("/ws/terminal/abc123") as ws:
                 ws.send_text(json.dumps({"type": "copy-mode"}))
