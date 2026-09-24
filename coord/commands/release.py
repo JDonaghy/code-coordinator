@@ -2461,16 +2461,15 @@ def _uncordon_hosts(hosts: list[str], journal: dict, *, quiet: bool = False) -> 
 
 
 def _local_machine_name(config) -> str | None:
-    """This host's name in ``coordinator.yml``, if it is in there at all."""
-    import socket  # noqa: PLC0415
+    """This host's name in ``coordinator.yml``, if it is in there at all.
 
-    here = socket.gethostname().split(".")[0].lower()
-    for machine in getattr(config, "machines", ()) or ():
-        if machine.name.lower() == here:
-            return machine.name
-        if str(getattr(machine, "host", "")).split(".")[0].lower() == here:
-            return machine.name
-    return None
+    Routes through :func:`coord.config.resolve_local_machine` (#3440) rather
+    than a private hostname comparison — "one question, one answer".
+    """
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
+    resolved = resolve_local_machine(config)
+    return resolved.name if resolved is not None else None
 
 
 def _roll_python(machine, *, target_version: str, agent_port: int, timeout: float,

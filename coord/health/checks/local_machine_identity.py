@@ -33,7 +33,7 @@ from coord.health.registry import check
     id="local_machine_identity",
     scope="machine",
     title="local machine identity",
-    order=51,
+    order=52,
     description=(
         "This host resolves to a machine entry in coordinator.yml — the "
         "single answer every local/remote decision in the fleet depends on."

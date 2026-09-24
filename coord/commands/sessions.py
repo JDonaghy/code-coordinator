@@ -6,7 +6,6 @@ from __future__ import annotations
 import fnmatch
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -561,11 +560,10 @@ def pull_artifact(
     # rsync-over-ssh to our own hostname FAILS ("Permission denied" — no
     # self-ssh key), which surfaced as a meaningless pull error in the TUI.
     # Copy locally if the destination differs; otherwise it is a no-op.
-    local_hostname = socket.gethostname().split(".")[0].lower()
-    is_local = (
-        machine.name.lower() == local_hostname
-        or machine.host.split(".")[0].lower() == local_hostname
-    )
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
+    _resolved_local = resolve_local_machine(cfg)
+    is_local = _resolved_local is not None and _resolved_local.name == machine.name
     if is_local:
         src_dir = Path.home() / ".coord" / "artifacts" / repo_name / sanitized
         # Nothing to copy when the destination IS the stash directory
@@ -678,8 +676,8 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
     from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
     from coord.agent import _commits_ahead  # noqa: PLC0415
     from coord.interactive import tmux_session_name  # noqa: PLC0415
+    from coord.config import resolve_local_machine  # noqa: PLC0415
 
-    _local_hn = socket.gethostname().split(".")[0].lower()
     worktrees_dir = COORD_DIR / "worktrees"
     now = time.time()
 
@@ -688,9 +686,11 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
         cfg = _load_config(config_path)
         machines_by_name = {m.name: m for m in cfg.machines}
         repos_by_name = {r.name: r for r in cfg.repos}
+        _resolved_local = resolve_local_machine(cfg)
     except Exception:  # noqa: BLE001
         machines_by_name = {}
         repos_by_name = {}
+        _resolved_local = None
 
     pruned = 0
     for s in enriched:
@@ -703,8 +703,7 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
             mobj = machines_by_name.get(raw_machine)
             if mobj is not None:
                 _is_local = (
-                    mobj.name.lower() == _local_hn
-                    or mobj.host.split(".")[0].lower() == _local_hn
+                    _resolved_local is not None and _resolved_local.name == mobj.name
                 )
             else:
                 # Machine name set but not in config — treat as remote to be safe.
@@ -887,14 +886,13 @@ def sessions_cmd(
         import concurrent.futures as _cf  # noqa: PLC0415
 
         try:
+            from coord.config import resolve_local_machine  # noqa: PLC0415
+
             _cfg = _load_config(config_path)
-            _local_hn = socket.gethostname().split(".")[0].lower()
+            _resolved_local = resolve_local_machine(_cfg)
             _remotes = [
                 m for m in _cfg.machines
-                if not (
-                    m.name.lower() == _local_hn
-                    or m.host.split(".")[0].lower() == _local_hn
-                )
+                if _resolved_local is None or m.name != _resolved_local.name
             ]
         except Exception:  # noqa: BLE001
             _remotes = []
@@ -1275,10 +1273,12 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                         else ("$HOME" if rp == "~" else rp)
                     )
                 ssh_target_val = machine_obj.host
-                _local_hn = socket.gethostname().split(".")[0].lower()
+                from coord.config import resolve_local_machine  # noqa: PLC0415
+
+                _resolved_local = resolve_local_machine(cfg)
                 is_local_session = (
-                    machine_obj.name.lower() == _local_hn
-                    or machine_obj.host.split(".")[0].lower() == _local_hn
+                    _resolved_local is not None
+                    and _resolved_local.name == machine_obj.name
                 )
     except Exception:  # noqa: BLE001
         pass
@@ -1904,12 +1904,13 @@ def watch(
         sys.exit(2)
 
     # ── Detect whether the assignment lives on a remote agent ────────────
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
     machine_name = record.get("machine_name", "")
     machine = next((m for m in cfg.machines if m.name == machine_name), None)
-    hostname = socket.gethostname().split(".")[0]
+    _resolved_local = resolve_local_machine(cfg)
     is_remote = machine is not None and (
-        machine.name != hostname
-        and machine.host.split(".")[0] != hostname
+        _resolved_local is None or _resolved_local.name != machine.name
     )
 
     if is_remote:

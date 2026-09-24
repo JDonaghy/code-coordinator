@@ -3234,21 +3234,18 @@ def build_app(
             # Seeded roster — no tmux, no ssh fan-out in fixture mode.
             return JSONResponse(_fixture.sessions())
 
+        from coord.config import resolve_local_machine
         from coord.interactive import (
             TMUX_SESSION_PREFIX,
             TmuxHost,
-            _get_local_short_hostname,
             list_coord_tmux_sessions,
         )
 
         loop = asyncio.get_running_loop()
-        local_hn = _get_local_short_hostname()
+        _resolved_local = resolve_local_machine(config)
 
         def _is_local_machine(machine) -> bool:
-            return (
-                machine.name.lower() == local_hn
-                or machine.host.split(".")[0].lower() == local_hn
-            )
+            return _resolved_local is not None and _resolved_local.name == machine.name
 
         def _sweep_one(machine):
             is_local = _is_local_machine(machine)

@@ -29,11 +29,16 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.interactive import TERM_SESSION_PREFIX, TmuxHost, tmux_available, tmux_session_alive
+
+if TYPE_CHECKING:
+    from coord.config import Config
+    from coord.models import Machine
 
 __all__ = [
     "terminal_group",
@@ -129,9 +134,17 @@ def _local_short_hostname() -> str:
     return socket.gethostname().split(".")[0].lower()
 
 
-def _is_local_machine(name: str, host: str) -> bool:
-    local_hn = _local_short_hostname()
-    return name.lower() == local_hn or host.split(".")[0].lower() == local_hn
+def _is_local_machine(cfg: "Config", machine: "Machine") -> bool:
+    """Is *machine* the host this process is running on?
+
+    Routes through :func:`coord.config.resolve_local_machine` (#3440) — the
+    shared "is this the local machine or must I SSH?" answer — rather than a
+    private hostname comparison.
+    """
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
+    resolved = resolve_local_machine(cfg)
+    return resolved is not None and resolved.name == machine.name
 
 
 def _resolve_machine_host(
@@ -153,7 +166,7 @@ def _resolve_machine_host(
         click.echo(f"error: machine {machine_name!r} not in config", err=True)
         sys.exit(1)
 
-    if _is_local_machine(machine.name, machine.host):
+    if _is_local_machine(cfg, machine):
         return TmuxHost(ssh_target=None), machine.name
     return TmuxHost(ssh_target=machine.host), machine.name
 
@@ -261,7 +274,7 @@ def terminal_list(output_json: bool, remote: bool, config_path: Path) -> None:
     local_host_str = local_hn
     if cfg is not None:
         m = next(
-            (mm for mm in cfg.machines if _is_local_machine(mm.name, mm.host)), None
+            (mm for mm in cfg.machines if _is_local_machine(cfg, mm)), None
         )
         if m is not None:
             local_machine_name = m.name
@@ -274,7 +287,7 @@ def terminal_list(output_json: bool, remote: bool, config_path: Path) -> None:
 
     if remote and cfg is not None:
         remotes = [
-            m for m in cfg.machines if not _is_local_machine(m.name, m.host)
+            m for m in cfg.machines if not _is_local_machine(cfg, m)
         ]
         if remotes:
             import concurrent.futures as _cf  # noqa: PLC0415

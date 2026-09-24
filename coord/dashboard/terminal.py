@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import socket
 import struct
 import subprocess
 from pathlib import Path
@@ -55,12 +54,6 @@ def resolve_web_token(flag_token: str | None = None) -> str | None:
     return None
 
 
-def _local_short_hostname() -> str:
-    """Same two-line idiom used inline in coord/interactive.py and
-    coord/commands/sessions.py -- there is no shared public helper for it."""
-    return socket.gethostname().split(".")[0].lower()
-
-
 def resolve_session_target(
     session_id: str, board: Board, config: Config
 ) -> tuple[str | None, str] | None:
@@ -93,11 +86,10 @@ def resolve_session_target(
     if machine is None:
         return None, session_name
 
-    local_hn = _local_short_hostname()
-    is_local = (
-        machine.name.lower() == local_hn
-        or machine.host.split(".")[0].lower() == local_hn
-    )
+    from coord.config import resolve_local_machine  # noqa: PLC0415
+
+    resolved_local = resolve_local_machine(config)
+    is_local = resolved_local is not None and resolved_local.name == machine.name
     return (None if is_local else machine.host), session_name
 
 
