@@ -941,12 +941,44 @@ def test_any_matching_branch_merged_issue_scoped_ignores_review_and_smoke_legs(
     assert claim_mod.any_matching_branch_merged("acme/vimcode", 523) is False
 
 
-def test_is_observer_leg_branch_matches_review_scoped_review_and_smoke() -> None:
-    """#3442: the exact prefixes review/smoke legs mint, and nothing else —
-    a bare `issue-N-review` (no trailing content) and the slugified
-    `issue-N-review-...`/`issue-N-scoped-review-...`/`issue-N-smoke-...`
-    shapes all match; an unrelated branch, or one that merely CONTAINS
-    "review" past the issue-number prefix, must not."""
+def test_any_matching_branch_merged_issue_scoped_ignores_gate_b_leg(
+    monkeypatch,
+) -> None:
+    """#3442 review follow-up: a milestone tracking issue with a completed
+    Gate B verdict (`coord.gate_b`'s dispatch is `type="review"`, doesn't
+    pin `target_branch`, and mints its own throwaway
+    `issue-{N}-gate-b-...` branch exactly like a `[review]`/`[smoke]`
+    leg) sitting at `ahead_by == 0` alongside the real, unmerged
+    milestone work branch. `any_matching_branch_merged` with no *branch*
+    (the `coord assign`/dispatch-liveness fallback that trips before any
+    branch is known — the exact path a fresh dispatch on a tracking issue
+    hits) must not treat the gate-b leg as evidence the real work
+    merged."""
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(
+            [
+                "issue-900-gate-b-ms-900-milestone-verdict",
+                "issue-900-track-a-phase-1-milestone-work",
+            ],
+            "develop",
+            {
+                "issue-900-gate-b-ms-900-milestone-verdict": 0,
+                "issue-900-track-a-phase-1-milestone-work": 3,
+            },
+        ),
+    )
+    assert claim_mod.any_matching_branch_merged("acme/vimcode", 900) is False
+
+
+def test_is_observer_leg_branch_matches_review_scoped_review_smoke_and_gate_b() -> None:
+    """#3442: the exact prefixes review/smoke/gate-b legs mint, and nothing
+    else — a bare `issue-N-review` (no trailing content) and the slugified
+    `issue-N-review-...`/`issue-N-scoped-review-...`/`issue-N-smoke-...`/
+    `issue-N-gate-b-...` shapes all match; an unrelated branch, or one that
+    merely CONTAINS "review" past the issue-number prefix, must not."""
     import coord.claim as claim_mod
 
     assert claim_mod._is_observer_leg_branch("issue-9-review", 9) is True
@@ -955,6 +987,9 @@ def test_is_observer_leg_branch_matches_review_scoped_review_and_smoke() -> None
         "issue-9-scoped-review-sealed-path", 9
     ) is True
     assert claim_mod._is_observer_leg_branch("issue-9-smoke-track-a", 9) is True
+    assert claim_mod._is_observer_leg_branch(
+        "issue-9-gate-b-ms-9-milestone-verdict", 9
+    ) is True
     assert claim_mod._is_observer_leg_branch("issue-9-real-work", 9) is False
     assert claim_mod._is_observer_leg_branch(
         "issue-9-reviewer-onboarding", 9
