@@ -14,6 +14,7 @@ from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.gates import (
     HUMAN_REQUIRED_BLOCKED,
     REVIEW_REQUIRED,
+    SKIPPED_BLOCKED,
     SMOKE_REQUIRED,
     build_gate_report,
     format_gate_report,
@@ -931,6 +932,104 @@ class TestMergeQueueHumanRequired:
         assert "no reason recorded" in by_gate["merge_queue"].reason
         assert "latched time unknown" in by_gate["merge_queue"].reason
         assert by_gate["merge"].reason.startswith(HUMAN_REQUIRED_BLOCKED)
+
+    def test_skipped_entry_also_outranks_smoke_required(
+        self, config: Config, coord_db,
+    ) -> None:
+        """#3445 review: SKIPPED is the sibling terminal, needs-attention
+        state to HUMAN_REQUIRED (unlike CONFLICT, which self-heals via
+        `dispatch_conflict_fix`) — it must outrank `smoke_required` as the
+        merge gate's headline reason too, not just HUMAN_REQUIRED."""
+        work = _work(test_state=None)
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-42-foo", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.SKIPPED,
+                error="closed as duplicate of #99",
+            )
+        ])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        mq_decision = by_gate["merge_queue"]
+        assert mq_decision.state == "SKIPPED"
+        assert mq_decision.ok is False
+
+        merge = by_gate["merge"]
+        assert merge.ok is False
+        assert merge.reason != SMOKE_REQUIRED
+        assert merge.reason.startswith(SKIPPED_BLOCKED)
+        assert "SKIPPED" in merge.reason
+
+        text = format_gate_report(report)
+        assert "merge-queue : SKIPPED" in text
+        assert "smoke_required" not in text
+
+    def test_conflict_entry_does_not_outrank_smoke_required(
+        self, config: Config, coord_db,
+    ) -> None:
+        """CONFLICT is excluded from the headline override on purpose — it
+        self-heals via a `coord merge --only` retry (`dispatch_conflict_fix`,
+        #1474), so `smoke_required` stays the accurate headline reason."""
+        work = _work(test_state=None)
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-42-foo", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.CONFLICT,
+                error="merge conflict in foo.py",
+            )
+        ])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["merge_queue"].state == "CONFLICT"
+        assert by_gate["merge_queue"].ok is False
+        assert by_gate["merge"].reason == SMOKE_REQUIRED
+
+    def test_multiple_rows_for_same_issue_picks_first_match_in_list_order(
+        self, config: Config, coord_db,
+    ) -> None:
+        """#3445 review: when more than one `merge_queue` row matches
+        `(repo_name, issue_number)` and none matches the winning work row's
+        assignment id, `coord gates` must pick the SAME row every other
+        `merge_queue` consumer would — `coord.drive_state._merge_entry`
+        takes the first match in list order (oldest/lowest id), not the most
+        recent, so this mirrors that instead of silently disagreeing with
+        `coord drive-queue block-log`/`coord status`/`_decide_merge` about
+        which row is "the" entry for this issue."""
+        work = _work(test_state=None)
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="stale-aid", repo_name="api", repo_github="acme/api",
+                branch="issue-42-old-branch", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.HUMAN_REQUIRED,
+                error="first (older) row — left behind by a retarget",
+            ),
+            mq.QueuedMerge(
+                assignment_id="other-stale-aid", repo_name="api", repo_github="acme/api",
+                branch="issue-42-newer-branch", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.PENDING,
+                error="second (newer) row",
+            ),
+        ])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        mq_decision = by_gate["merge_queue"]
+        # Neither row's assignment_id matches the winning work row ("w1"),
+        # so the fallback-by-assignment-id narrowing never kicks in — the
+        # first (oldest) row in insertion order wins.
+        assert mq_decision.assignment_id == "stale-aid"
+        assert mq_decision.state == "HUMAN_REQUIRED"
+        assert "first (older) row" in mq_decision.reason
 
 
 # ── is_interactive enrichment (#748/#632: not an Assignment dataclass field) ─
