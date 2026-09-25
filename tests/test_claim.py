@@ -876,14 +876,15 @@ def test_any_matching_branch_merged_false_on_gh_error(monkeypatch) -> None:
 def test_any_matching_branch_merged_scoped_branch_ignores_merged_siblings(
     monkeypatch,
 ) -> None:
-    """#3436: reproduces vimcode#1156's shape — several MERGED, zero-commit
-    `issue-{N}-*` review-leg branches (cut from the default-branch tip,
-    never diverged) alongside the one real, unmerged work branch. The
-    issue-scoped (no ``branch=``) check is tripped by the merged siblings —
-    the documented fallback behaviour for a caller with nothing dispatched
-    yet — but a caller that names the ACTUAL branch in play must get an
+    """#3436/#3442: reproduces vimcode#1156's shape — several MERGED,
+    zero-commit `issue-{N}-*` review-leg branches (cut from the
+    default-branch tip, never diverged) alongside the one real, unmerged
+    work branch. A caller that names the ACTUAL branch in play must get an
     answer scoped to just that branch, not "did anything for this issue
-    ever merge"."""
+    ever merge" — and #3442: the issue-scoped fallback (no ``branch=``)
+    must ALSO see past a review-leg sibling now, since it's the fallback a
+    plain `coord assign` (nothing dispatched yet, no branch to scope to)
+    actually hits."""
     import coord.claim as claim_mod
 
     monkeypatch.setattr(
@@ -894,17 +895,70 @@ def test_any_matching_branch_merged_scoped_branch_ignores_merged_siblings(
             {"issue-1156-review-fix-1": 0, "issue-1156-real-work": 5},
         ),
     )
-    # No branch named: falls back to the issue-scoped check, which still
-    # trips on the merged sibling (unchanged pre-#3436 fallback behaviour).
-    assert claim_mod.any_matching_branch_merged("acme/api", 1156) is True
+    # No branch named: falls back to the issue-scoped check, which now
+    # excludes the review-leg sibling as not-evidence-of-anything (#3442)
+    # and finds the real work branch unmerged.
+    assert claim_mod.any_matching_branch_merged("acme/api", 1156) is False
     # Scoped to the real, unmerged work branch: must NOT report merged.
     assert claim_mod.any_matching_branch_merged(
         "acme/api", 1156, branch="issue-1156-real-work"
     ) is False
-    # Scoped to the merged sibling itself: correctly reports merged.
+    # Scoped to the merged sibling itself: correctly reports merged (an
+    # explicit ask about that exact branch is unaffected by the leg-branch
+    # exclusion the issue-scoped fallback applies).
     assert claim_mod.any_matching_branch_merged(
         "acme/api", 1156, branch="issue-1156-review-fix-1"
     ) is True
+
+
+def test_any_matching_branch_merged_issue_scoped_ignores_review_and_smoke_legs(
+    monkeypatch,
+) -> None:
+    """#3442: vimcode#523/#526's exact shape — an `issue-{N}-review-*` leg
+    branch (and an `issue-{N}-smoke-*` leg branch) at `ahead_by == 0`,
+    alongside the real, unmerged work branch. `any_matching_branch_merged`
+    with no *branch* (the `coord assign`/dispatch-liveness fallback that
+    trips before any branch is known) must refuse to treat either leg as
+    evidence the issue's real work merged."""
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr(
+        "coord.github_ops._gh",
+        _gh_stub_with_matching_refs(
+            [
+                "issue-523-review-track-a-phase-0b-wire-board-actio",
+                "issue-523-smoke-track-a-phase-0b-wire-board-action",
+                "issue-523-track-a-phase-0b-wire-board-actions-to-p",
+            ],
+            "develop",
+            {
+                "issue-523-review-track-a-phase-0b-wire-board-actio": 0,
+                "issue-523-smoke-track-a-phase-0b-wire-board-action": 2,
+                "issue-523-track-a-phase-0b-wire-board-actions-to-p": 2,
+            },
+        ),
+    )
+    assert claim_mod.any_matching_branch_merged("acme/vimcode", 523) is False
+
+
+def test_is_observer_leg_branch_matches_review_scoped_review_and_smoke() -> None:
+    """#3442: the exact prefixes review/smoke legs mint, and nothing else —
+    a bare `issue-N-review` (no trailing content) and the slugified
+    `issue-N-review-...`/`issue-N-scoped-review-...`/`issue-N-smoke-...`
+    shapes all match; an unrelated branch, or one that merely CONTAINS
+    "review" past the issue-number prefix, must not."""
+    import coord.claim as claim_mod
+
+    assert claim_mod._is_observer_leg_branch("issue-9-review", 9) is True
+    assert claim_mod._is_observer_leg_branch("issue-9-review-fix-1", 9) is True
+    assert claim_mod._is_observer_leg_branch(
+        "issue-9-scoped-review-sealed-path", 9
+    ) is True
+    assert claim_mod._is_observer_leg_branch("issue-9-smoke-track-a", 9) is True
+    assert claim_mod._is_observer_leg_branch("issue-9-real-work", 9) is False
+    assert claim_mod._is_observer_leg_branch(
+        "issue-9-reviewer-onboarding", 9
+    ) is False
 
 
 # ── #1553: has_active_work_followup keys on the EFFECTIVE issue ─────────────

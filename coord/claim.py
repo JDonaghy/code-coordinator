@@ -454,6 +454,35 @@ def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
     return _drop_merged_branches(repo_github, branches)
 
 
+# #3442: bracket-tag issue_title prefixes (`f"[{tag}] {title}"`, see
+# `coord.review.dispatch_review` / `coord.review._dispatch_scoped_review` /
+# `coord.smoke.dispatch_pending_smoke`) that a review/smoke leg dispatch
+# uses when it does NOT pin `target_branch` to the real work branch — the
+# agent then derives its own throwaway branch name by slugifying that
+# bracketed title (`coord.agent._slugify`), landing on
+# `issue-{N}-{tag}-...`. These legs are read-only observers: a review posts
+# a verdict comment, a smoke run executes a command — neither ever commits
+# to its own checkout, so that branch sits at `ahead_by == 0` against the
+# default branch from the moment it's created, forever, regardless of
+# whether the issue's REAL work has landed. It is not evidence of anything.
+# Every OTHER dispatcher that continues real work on an issue (conflict-fix,
+# retry, fix-N) pins `target_branch` to the actual work branch instead of
+# letting one of these get minted, so this list is deliberately just the
+# observer legs, not every bracket tag in the codebase.
+_OBSERVER_LEG_TAGS = ("review", "scoped-review", "smoke")
+
+
+def _is_observer_leg_branch(branch: str, issue_number: int) -> bool:
+    """True when *branch* is a review/smoke leg's own throwaway checkout,
+    not a branch that could ever carry real work (see `_OBSERVER_LEG_TAGS`).
+    """
+    for tag in _OBSERVER_LEG_TAGS:
+        prefix = f"issue-{issue_number}-{tag}"
+        if branch == prefix or branch.startswith(prefix + "-"):
+            return True
+    return False
+
+
 def any_matching_branch_merged(
     repo_github: str, issue_number: int, *, branch: str | None = None
 ) -> bool:
@@ -476,17 +505,29 @@ def any_matching_branch_merged(
     merged" behaviour only when *branch* is `None` — a caller with nothing
     assigned yet (a pre-dispatch check before any branch exists) has no
     single branch to ask about, so the issue-scoped signal is the best one
-    available. Reuses the exact merge-detection `_drop_merged_branches`
-    already performs for claim detection (PR-merged OR `ahead_by == 0`
-    ancestry, survives squash merges — #3103): this is just "did filtering
-    drop anything", with the fail-open direction flipped to match a
-    REFUSAL predicate rather than a claim-signal — no matching branch at
-    all, or any lookup failure, returns `False` ("not merged, don't refuse
-    dispatch on this"), never `True`.
+    available. #3442: that fallback first drops every known
+    `_is_observer_leg_branch` candidate — #3436 only fixed the case where
+    the dispatch's OWN branch was already known; a plain `coord assign`
+    (or any other caller with no branch recorded yet, which is exactly when
+    this fallback runs) has no branch of its own to scope to, so without
+    this filter a single zero-commit `issue-{N}-review-*`/`issue-{N}-smoke-
+    *` leg branch still reads the WHOLE issue as merged and permanently
+    refuses dispatch — the same bug #3436 fixed for the branch-known case,
+    reopened for the branch-unknown one. Reuses the exact merge-detection
+    `_drop_merged_branches` already performs for claim detection (PR-merged
+    OR `ahead_by == 0` ancestry, survives squash merges — #3103): this is
+    just "did filtering drop anything", with the fail-open direction
+    flipped to match a REFUSAL predicate rather than a claim-signal — no
+    matching branch at all, or any lookup failure, returns `False` ("not
+    merged, don't refuse dispatch on this"), never `True`.
     """
     if branch is not None:
         return not _drop_merged_branches(repo_github, [branch])
-    branches = list_matching_remote_branches(repo_github, issue_number)
+    branches = [
+        b
+        for b in list_matching_remote_branches(repo_github, issue_number)
+        if not _is_observer_leg_branch(b, issue_number)
+    ]
     if not branches:
         return False
     unmerged = set(_drop_merged_branches(repo_github, branches))
