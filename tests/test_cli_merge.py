@@ -2887,9 +2887,12 @@ class TestGateBlockedRowEntersQueueBlocked:
         assert mq.load_queue() == []
 
         def fake_get_branch_sha(repo, branch):
-            # The base moved since the verdict was recorded; the branch
-            # itself did not.
-            return "newbase111" if branch == "main" else "branchsha000"
+            # The base moved since the verdict was recorded, AND the branch
+            # itself was rebased (its head moved too) — #3443: a base move
+            # alone, with the branch head confirmed unchanged, no longer
+            # stales the verdict, so this needs both to still exercise a
+            # genuine STALE for the #1926 fallback-agreement check below.
+            return "newbase111" if branch == "main" else "branchsha111"
 
         with patch(
             "coord.github_ops.get_branch_sha", side_effect=fake_get_branch_sha

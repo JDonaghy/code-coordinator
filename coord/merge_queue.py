@@ -3169,6 +3169,19 @@ def evaluate_smoke_verdict(
     #821/#1475's existing convention), so rows/entries predating this
     feature behave exactly as before.
 
+    #3443: "the merge base moved" is not, by itself, "a rebase happened" —
+    the smoke runner tests the branch checked out as-is, never a merge with
+    the base, so a base that merely advanced underneath an UNREBASED branch
+    changed nothing the suite could see. Before consulting the #1738/#1778/
+    #1847 file-compare escape hatches below, a confirmed-unchanged branch
+    head (``test_head_sha == current_branch_sha``) spares the base move
+    outright — cheaper than any file compare, and exactly the signal that a
+    rebase (which always changes the branch's head SHA) did *not* happen.
+    Without it, `dispatch_pending_smoke` (#3309) re-tested an identical,
+    un-rebased branch head on every single commit landing on an active
+    target branch, converging on nothing but flakiness (vimcode#523/#526,
+    2026-09-24/25: ~20 re-runs of an unchanged branch head in a few hours).
+
     #1732: ``skipped`` is deliberately excluded from all of the above. It is
     not a measurement of code at a SHA the way ``passed`` is — it is a
     structural claim about the diff itself ("contract/fixture-only, nothing
@@ -3385,6 +3398,7 @@ def evaluate_smoke_verdict(
 
         base_move_spare_reason: str | None = None
         test_base_sha = getattr(a, "test_base_sha", None)
+        test_head_sha = getattr(a, "test_head_sha", None)
         if test_state == "passed":
             # Merge base moved: the tested combination (this branch + that
             # base) no longer exists, even if the branch's own diff is
@@ -3425,32 +3439,78 @@ def evaluate_smoke_verdict(
                     )
                 continue
 
-            # #1738/#1778/#1847: the base moved, but a moved SHA doesn't
-            # necessarily mean a content change that could affect a test
-            # result. `_base_move_spared` tries, in order: is the base move
-            # itself provably inert content (docs/scripts/issue-template
-            # only, #1738); failing that, is *this branch*'s entire diff (as
-            # actually tested, test_base_sha..test_head_sha) provably inert
-            # (#1778); failing that, do the two diffs simply touch disjoint
-            # files (#1847) — a substantive base move and a substantive
-            # branch that have nothing to do with each other. Any one being
-            # true means the tested combination is still covered — fall
-            # through to the branch-content check below instead of staling
-            # here. If the branch has since gained real content, that check
-            # still catches it independently via the patch-id compare
-            # (#1847 doesn't short-circuit it).
+            # #3443: before even asking whether the base move is content-
+            # relevant, ask the cheaper, load-bearing question first — did
+            # THIS branch actually move? The smoke runner checks the branch
+            # out as-is; it does not merge or rebase onto the base before
+            # testing (see the module-level #1479 note above), so a moved
+            # target tip only invalidates a `passed` verdict when the
+            # branch itself picked up new commits since the test ran (a
+            # rebase). A branch head confirmed identical to what was tested
+            # means its merge-base with the target cannot have changed
+            # either — the target only grows forward; it never rewrites the
+            # history the branch forked from — so re-dispatching a
+            # byte-identical branch head every time the target advances
+            # (#3309 looping against develop, vimcode#523/#526) is pure
+            # spend, not a re-test of anything new. Probed here, ahead of
+            # the base-move check, so a confirmed-unchanged branch spares it
+            # before `_base_move_spared`'s file-compare hatches even run;
+            # those stay as the fallback for what this can't confirm (probe
+            # unavailable) or the case where the branch genuinely moved.
+            if (
+                test_head_sha is not None
+                and current_branch_sha is None
+                and not branch_sha_attempted
+                and gh_ops is not None
+                and repo_github
+                and entry_branch
+            ):
+                current_branch_sha, branch_sha_probe_failed, branch_sha_probe_error = (
+                    _gh_get_branch_sha(gh_ops, repo_github, entry_branch)
+                )
+                branch_sha_attempted = True
+
             if (
                 test_base_sha is not None
                 and current_base_sha is not None
                 and test_base_sha != current_base_sha
             ):
-                spared, base_move_spare_reason = _base_move_spared(
-                    gh_ops,
-                    repo_github,
-                    test_base_sha,
-                    current_base_sha,
-                    getattr(a, "test_head_sha", None),
-                )
+                if (
+                    test_head_sha is not None
+                    and current_branch_sha is not None
+                    and test_head_sha == current_branch_sha
+                ):
+                    spared, base_move_spare_reason = (
+                        True,
+                        "branch head unchanged since test — no rebase, "
+                        "base move alone does not stale (#3443)",
+                    )
+                else:
+                    # #1738/#1778/#1847: the base moved AND the branch head
+                    # also moved (or couldn't be confirmed unchanged), but a
+                    # moved base SHA still doesn't necessarily mean a content
+                    # change that could affect a test result.
+                    # `_base_move_spared` tries, in order: is the base move
+                    # itself provably inert content (docs/scripts/issue-
+                    # template only, #1738); failing that, is *this
+                    # branch*'s entire diff (as actually tested,
+                    # test_base_sha..test_head_sha) provably inert (#1778);
+                    # failing that, do the two diffs simply touch disjoint
+                    # files (#1847) — a substantive base move and a
+                    # substantive branch that have nothing to do with each
+                    # other. Any one being true means the tested combination
+                    # is still covered — fall through to the branch-content
+                    # check below instead of staling here. If the branch has
+                    # since gained real content, that check still catches it
+                    # independently via the patch-id compare (#1847 doesn't
+                    # short-circuit it).
+                    spared, base_move_spare_reason = _base_move_spared(
+                        gh_ops,
+                        repo_github,
+                        test_base_sha,
+                        current_base_sha,
+                        test_head_sha,
+                    )
                 if not spared:
                     # stale: re-verify against the new base
                     if stale is None:
@@ -3467,7 +3527,11 @@ def evaluate_smoke_verdict(
         # Branch content changed since the test ran. Same SHA-then-patch-id
         # fallback as has_approved_review: a content-identical rebase (SHA
         # moved, patch-id didn't) does not invalidate the verdict.
-        test_head_sha = getattr(a, "test_head_sha", None)
+        # `test_head_sha` was already read above (#3443's branch-probe
+        # reordering); the probe below is a no-op here whenever the
+        # `passed` branch already ran it (`branch_sha_attempted` guards it),
+        # and is the FIRST attempt for a `skipped`/`baseline_red` row, which
+        # never enters that block.
         if (
             test_head_sha is not None
             and current_branch_sha is None

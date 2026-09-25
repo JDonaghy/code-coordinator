@@ -353,9 +353,15 @@ class TestDecision:
         assert by_gate["test"].anchor is None  # MISSING, not STALE
         assert by_gate["merge"].reason == SMOKE_REQUIRED
 
-    def test_stale_base_names_1479_and_shas(self, config: Config) -> None:
-        # #1479: the verdict was recorded against an old base SHA; the base
-        # has since moved. The branch's own head/patch-id are unchanged.
+    def test_base_move_alone_does_not_stale_1479(self, config: Config) -> None:
+        """#3443: the verdict was recorded against an old base SHA and the
+        base has since moved, but the branch's own head/patch-id are
+        CONFIRMED unchanged — no rebase happened, so the base move alone
+        must not stale a `passed` verdict (see
+        ``test_stale_base_names_1479_and_shas_when_branch_also_moved``
+        below for the case where the branch DID move). Superseded
+        ``test_stale_base_names_1479_and_shas``, which asserted the
+        opposite (the #3443 bug itself) before this fix."""
         work = _work(
             test_state="passed", test_reason="headless smoke",
             test_head_sha="branchsha", test_base_sha="oldbase",
@@ -363,6 +369,36 @@ class TestDecision:
         review = _review("w1", verdict="approve", review_head_sha="branchsha")
         board = Board(active=[], completed=[work, review])
         gh = FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh)
+
+        by_gate = {d.gate: d for d in report.decisions}
+        test_decision = by_gate["test"]
+        assert test_decision.ok is True
+        assert by_gate["merge"].reason != SMOKE_REQUIRED
+        # gh_ops was actually consulted for both the branch and the base —
+        # the #3443 spare is a POSITIVE confirmation, not a skipped check.
+        assert ("acme/api", "issue-42-foo") in gh.sha_calls
+        assert ("acme/api", "main") in gh.sha_calls
+
+    def test_stale_base_names_1479_and_shas_when_branch_also_moved(
+        self, config: Config,
+    ) -> None:
+        # #1479: the verdict was recorded against an old base SHA; the base
+        # has since moved, AND the branch itself was rebased (its head moved
+        # too) — #3443 spares a base move alone, so this needs both to still
+        # exercise the stale-verdict report.
+        work = _work(
+            test_state="passed", test_reason="headless smoke",
+            test_head_sha="branchsha-old", test_base_sha="oldbase",
+        )
+        # review_head_sha matches the CURRENT (post-rebase) branch head, so
+        # the review gate stays fresh and only the test/smoke gate is under
+        # test here.
+        review = _review("w1", verdict="approve", review_head_sha="branchsha-new")
+        board = Board(active=[], completed=[work, review])
+        gh = FakeGh(
+            branch_sha="branchsha-new", base_sha="newbase", patch_id="samepatch",
+        )
         report = build_gate_report(board, config, "api", 42, gh_ops=gh)
 
         by_gate = {d.gate: d for d in report.decisions}
@@ -813,12 +849,18 @@ class TestIsInteractive:
 
 class TestFormatting:
     def test_format_includes_stale_wording(self, config: Config) -> None:
+        """#3443: the branch must also have moved (a rebase) — a base move
+        alone, with the branch head confirmed unchanged, no longer stales
+        the verdict at all, so this has nothing to render as STALE."""
         work = _work(
-            test_state="passed", test_head_sha="branchsha", test_base_sha="oldbase",
+            test_state="passed",
+            test_head_sha="branchsha-old", test_base_sha="oldbase",
         )
-        review = _review("w1", verdict="approve", review_head_sha="branchsha")
+        review = _review("w1", verdict="approve", review_head_sha="branchsha-new")
         board = Board(active=[], completed=[work, review])
-        gh = FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+        gh = FakeGh(
+            branch_sha="branchsha-new", base_sha="newbase", patch_id="samepatch",
+        )
         report = build_gate_report(board, config, "api", 42, gh_ops=gh)
 
         text = format_gate_report(report)

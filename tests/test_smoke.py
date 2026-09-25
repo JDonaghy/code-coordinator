@@ -3852,9 +3852,45 @@ class _FakeGh:
 def test_dispatch_pending_smoke_redispatches_stale_passed_verdict(
     gtk_and_server_config: Config, monkeypatch,
 ) -> None:
-    """#3309 repro: a `passed` verdict recorded against an old base, the base
-    has since moved (a #241 conflict-fix rebase) — must re-dispatch instead of
-    skipping on presence alone forever."""
+    """#3309 repro: a `passed` verdict recorded against an old base, and the
+    branch itself was ALSO rebased onto the new base since (test_head_sha !=
+    the live branch head) — must re-dispatch instead of skipping on presence
+    alone forever.
+
+    #3443: the branch head must actually differ here — a base move alone,
+    with the branch head confirmed unchanged, is exactly the case that must
+    NOT re-dispatch (see
+    ``test_dispatch_pending_smoke_keeps_skipping_a_base_move_alone``); this
+    test would otherwise silently stop exercising the genuine-rebase path
+    #3309 was written for."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    row = replace(
+        _completed(), test_state="passed", test_reason="headless smoke",
+        test_head_sha="oldbranchsha", test_base_sha="oldbase",
+    )
+    board = Board(completed=[row])
+    sentinel = object()
+    gh = _FakeGh(branch_sha="newbranchsha", base_sha="newbase", patch_id="samepatch")
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
+    assert mock_dispatch.called
+    assert mock_dispatch.call_args[0][0] is row
+    assert result == [sentinel]
+
+
+def test_dispatch_pending_smoke_keeps_skipping_a_base_move_alone(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#3443 repro (vimcode#523/#526): the target branch tip advances but
+    THIS branch was never rebased (its head is confirmed identical to what
+    was tested) — the smoke runner checks the branch out as-is, so an
+    un-rebased branch head is not re-tested just because develop moved.
+    Must stay skipped, never re-dispatch against an identical branch head."""
     from unittest.mock import patch as _patch
 
     monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
@@ -3864,15 +3900,11 @@ def test_dispatch_pending_smoke_redispatches_stale_passed_verdict(
         test_head_sha="branchsha", test_base_sha="oldbase",
     )
     board = Board(completed=[row])
-    sentinel = object()
     gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
-    with _patch(
-        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
-    ) as mock_dispatch:
+    with _patch("coord.smoke._dispatch_smoke_legs") as mock_dispatch:
         result = dispatch_pending_smoke(board, gtk_and_server_config, gh_ops=gh)
-    assert mock_dispatch.called
-    assert mock_dispatch.call_args[0][0] is row
-    assert result == [sentinel]
+    assert result == []
+    assert not mock_dispatch.called
 
 
 def test_dispatch_pending_smoke_keeps_skipping_a_fresh_passed_verdict(
@@ -4323,12 +4355,18 @@ def test_dispatch_pending_smoke_redispatch_round_trip_records_new_verdict_not_st
         test_reason="headless smoke, pre-rebase",
     )
 
+    # #3443: the branch head must actually move here too (not just the
+    # base) — a base move alone, with the branch head confirmed unchanged,
+    # is no longer treated as stale (the smoke runner tests the branch
+    # as-is; see `test_dispatch_pending_smoke_keeps_skipping_a_base_move_
+    # alone`), so this round-trip needs a genuine rebase to still exercise
+    # the #3309 re-dispatch path it was written for.
     row = replace(
         parent, test_state="passed", test_reason="headless smoke, pre-rebase",
-        test_head_sha="branchsha", test_base_sha="oldbase",
+        test_head_sha="oldbranchsha", test_base_sha="oldbase",
     )
     board = Board(completed=[row])
-    gh = _FakeGh(branch_sha="branchsha", base_sha="newbase", patch_id="samepatch")
+    gh = _FakeGh(branch_sha="newbranchsha", base_sha="newbase", patch_id="samepatch")
 
     # Stub only the network-facing seams — everything else (the #1819 guard,
     # the `board.active` append, the clear-then-stamp this fix adds) runs
