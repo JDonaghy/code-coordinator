@@ -69,6 +69,13 @@ SMOKE_REQUIRED = "smoke_required"
 # — see `_merge_queue_state_decision` and its call site in
 # `build_gate_report`.
 HUMAN_REQUIRED_BLOCKED = "human_required"
+# #3445 review: SKIPPED is `_merge_queue_state_decision`'s own comment's
+# other "parked, needs-attention" state alongside HUMAN_REQUIRED (and
+# `coord/drive.py`'s `_RETRYABLE_MERGE_STATUSES` docstring independently
+# documents it as equally terminal, unlike CONFLICT, which self-heals via
+# `dispatch_conflict_fix` and is deliberately NOT in this override) — so it
+# gets the same headline-outranking treatment, not just HUMAN_REQUIRED.
+SKIPPED_BLOCKED = "skipped"
 
 
 @dataclass
@@ -517,14 +524,31 @@ def _merge_queue_state_decision(
         by_aid = [e for e in matches if e.assignment_id == fallback_assignment_id]
         if by_aid:
             matches = by_aid
-    entry = matches[-1]
+    # First match in list order — not the most recent — mirroring
+    # `coord.drive_state._merge_entry` (the docstring's own cited
+    # precedent for matching on this same `(repo_name, issue_number)` pair):
+    # when more than one row matches and none matches *fallback_assignment_id*
+    # (e.g. a retarget/new branch for the same issue left an old row behind),
+    # `coord gates` must agree with the other `merge_queue` consumers
+    # (`coord drive-queue block-log`, `coord status`, `_decide_merge`) on
+    # which row is "the" entry, or the same issue reads differently on
+    # different surfaces (#3445 review).
+    entry = matches[0]
 
     state = (entry.state or "").upper()
-    # PENDING/MERGING/MERGED/READY (and any future non-terminal state) read
-    # as "nothing to escalate here" — the raw state name is still shown, but
+    # PENDING/MERGING/MERGED (and any future non-terminal state) read as
+    # "nothing to escalate here" — the raw state name is still shown, but
     # unadorned. CONFLICT/HUMAN_REQUIRED/SKIPPED are the parked, needs-
-    # attention states.
-    ok = state not in ("CONFLICT", "HUMAN_REQUIRED", "SKIPPED")
+    # attention states. Delegated to `mq._state_to_plan_status` — the
+    # CANONICAL classifier for this exact question (`PENDING`->READY,
+    # `MERGING`->MERGING, `MERGED`->MERGED, anything else, including any
+    # future/unknown state -> NEEDS_ATTENTION) — rather than a second,
+    # hand-maintained tuple of "which states need attention" that could
+    # silently drift from it (#2096, #3445 review). That classifier fails
+    # CLOSED on an unrecognized state; re-deriving the tri-state locally
+    # would fail open instead, exactly the "gate must be able to fail"
+    # pattern this repo's review checklist calls out.
+    ok = mq._state_to_plan_status(entry.state or "") != mq.PLAN_NEEDS_ATTENTION
 
     reason: str | None = None
     if state == "HUMAN_REQUIRED":
@@ -856,8 +880,11 @@ def build_gate_report(
     # `_merge_queue_state_decision`'s docstring). Read AFTER the registry
     # gates so it can be reported alongside them, but consulted FIRST below
     # when deciding the merge gate's headline reason: a latched
-    # HUMAN_REQUIRED entry is the actual reason nothing is moving, and no
-    # amount of review/smoke/registry-gate clearing can unstick it.
+    # HUMAN_REQUIRED (or SKIPPED, #3445 review) entry is the actual reason
+    # nothing is moving, and no amount of review/smoke/registry-gate
+    # clearing can unstick it. CONFLICT is deliberately NOT in this set — it
+    # self-heals via `dispatch_conflict_fix` (#1474), so it does not outrank
+    # the normal review/smoke headline.
     mq_state_decision = _merge_queue_state_decision(
         repo_name, issue_number, winner.assignment_id,
     )
@@ -865,13 +892,24 @@ def build_gate_report(
         report.decisions.append(mq_state_decision)
 
     merge_blocked_gate: str | None = None
-    if mq_state_decision is not None and mq_state_decision.state == "HUMAN_REQUIRED":
-        human_required_detail = (mq_state_decision.reason or "").split("\n", 1)[0]
-        merge_blocked_gate = (
-            f"{HUMAN_REQUIRED_BLOCKED} — HUMAN_REQUIRED: {human_required_detail} "
-            "(see the merge-queue line above for the latched time and the "
-            "override command)"
+    if mq_state_decision is not None and mq_state_decision.state in (
+        "HUMAN_REQUIRED", "SKIPPED",
+    ):
+        # #3445 review: the full detail (reason, latched-time caveat,
+        # override command) is already rendered on the "merge-queue" line
+        # `format_gate_report` prints alongside this one — keep the
+        # presentation cross-reference ("see the merge-queue line above...")
+        # OUT of this data field, since `merge.reason` is also consumed
+        # verbatim by non-CLI-rendering readers with no such line above it
+        # (`coord.queue_diagnose`'s `_gates()` probe). This field stays a
+        # short, state-only headline; `format_gate_report` adds the
+        # cross-reference itself, only where the referent actually exists.
+        token = (
+            HUMAN_REQUIRED_BLOCKED
+            if mq_state_decision.state == "HUMAN_REQUIRED"
+            else SKIPPED_BLOCKED
         )
+        merge_blocked_gate = f"{token} — {mq_state_decision.state}"
     elif review_required and not review_ok:
         merge_blocked_gate = REVIEW_REQUIRED
     elif smoke_required and not test_ok:
@@ -1091,9 +1129,27 @@ def format_gate_report(report: GateReport) -> str:
                 lines.append(f"  {label} : BLOCKED — {decision.reason}")
         merge = by_gate.get("merge")
         if merge is not None:
-            lines.append(
-                "  merge  : READY" if merge.ok else f"  merge  : BLOCKED — {merge.reason}"
-            )
+            if merge.ok:
+                lines.append("  merge  : READY")
+            else:
+                lines.append(f"  merge  : BLOCKED — {merge.reason}")
+                # #3445 review: the cross-reference belongs only in THIS
+                # rendering, right after the "merge-queue" line it actually
+                # points at — not baked into `merge.reason` itself, which
+                # `coord.queue_diagnose`'s `_gates()` probe also surfaces
+                # verbatim with no such line above it.
+                if (
+                    merge_queue_decision is not None
+                    and merge_queue_decision.state in ("HUMAN_REQUIRED", "SKIPPED")
+                ):
+                    lines.append(
+                        "           (see the merge-queue line above for detail"
+                        + (
+                            " — the latched time and the override command)"
+                            if merge_queue_decision.state == "HUMAN_REQUIRED"
+                            else ")"
+                        )
+                    )
         # #3236: only printed when a --hold-after deploy gate actually
         # exists for this (repo, issue) — see `_apply_gate_decision`.
         apply_ = by_gate.get("apply")
