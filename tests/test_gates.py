@@ -12,6 +12,7 @@ import pytest
 from coord import merge_queue as mq
 from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.gates import (
+    HUMAN_REQUIRED_BLOCKED,
     REVIEW_REQUIRED,
     SMOKE_REQUIRED,
     build_gate_report,
@@ -822,6 +823,114 @@ class TestApplyGate:
         text = format_gate_report(report)
         assert "apply  : applied" in text
         assert "MERGED, NOT APPLIED" not in text
+
+
+# ── merge-queue latched state (#3445) ────────────────────────────────────────
+# `mq.live_gate_entry` (used for the review/test/registry gates above) is a
+# SYNTHETIC, never-persisted QueuedMerge — it always reads state=PENDING, so
+# it was blind to a latched CONFLICT/HUMAN_REQUIRED/SKIPPED row. These tests
+# cover the REAL, persisted `merge_queue` table read this issue adds.
+
+class TestMergeQueueHumanRequired:
+    def test_no_merge_queue_entry_means_no_merge_queue_line(
+        self, config: Config, coord_db,
+    ) -> None:
+        work = _work(test_state=None)
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert "merge_queue" not in by_gate
+        assert by_gate["merge"].reason == SMOKE_REQUIRED
+
+    def test_pending_merge_queue_entry_does_not_override_smoke_required(
+        self, config: Config, coord_db,
+    ) -> None:
+        work = _work(test_state=None)
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-42-foo", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.PENDING,
+            )
+        ])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["merge_queue"].state == "PENDING"
+        assert by_gate["merge_queue"].ok is True
+        assert by_gate["merge"].reason == SMOKE_REQUIRED
+        assert "merge-queue : PENDING" in format_gate_report(report)
+
+    def test_human_required_entry_outranks_smoke_required(
+        self, config: Config, coord_db,
+    ) -> None:
+        # #3445 repro (vimcode#523/#526): smoke never ran (test_state=None)
+        # AND the merge-queue entry already latched HUMAN_REQUIRED — a
+        # stale-rebase worker refused to push a non-content-preserving
+        # rebase. Clearing the smoke gate cannot unstick that, so it must be
+        # the merge gate's HEADLINE reason, not "smoke_required".
+        work = _work(test_state=None)
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-42-foo", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.HUMAN_REQUIRED,
+                error=(
+                    "stale-rebase worker refused to push: rebase was not "
+                    "content-preserving — manual resolution required"
+                ),
+                last_attempt=1_700_000_000.0,
+            )
+        ])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        mq_decision = by_gate["merge_queue"]
+        assert mq_decision.state == "HUMAN_REQUIRED"
+        assert mq_decision.ok is False
+        assert "stale-rebase worker refused to push" in mq_decision.reason
+        assert "--override-human-required" in mq_decision.reason
+
+        merge = by_gate["merge"]
+        assert merge.ok is False
+        assert merge.reason != SMOKE_REQUIRED
+        assert merge.reason.startswith(HUMAN_REQUIRED_BLOCKED)
+        assert "HUMAN_REQUIRED" in merge.reason
+
+        text = format_gate_report(report)
+        assert "HUMAN_REQUIRED" in text
+        assert "stale-rebase worker refused to push" in text
+        assert "--override-human-required" in text
+        assert "merge-queue : HUMAN_REQUIRED" in text
+        assert "smoke_required" not in text
+
+    def test_human_required_with_no_recorded_error_still_reports(
+        self, config: Config, coord_db,
+    ) -> None:
+        """A HUMAN_REQUIRED entry with no `error` text at all (shouldn't
+        normally happen, but the reader must not crash or go silent)."""
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w1", repo_name="api", repo_github="acme/api",
+                branch="issue-42-foo", target_branch="main", issue_number=42,
+                issue_title="t", state=mq.HUMAN_REQUIRED,
+            )
+        ])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert "no reason recorded" in by_gate["merge_queue"].reason
+        assert "latched time unknown" in by_gate["merge_queue"].reason
+        assert by_gate["merge"].reason.startswith(HUMAN_REQUIRED_BLOCKED)
 
 
 # ── is_interactive enrichment (#748/#632: not an Assignment dataclass field) ─

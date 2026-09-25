@@ -42,6 +42,7 @@ duck-typed shape they expect.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from coord.confirm_test import (
@@ -60,6 +61,14 @@ if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
 # "smoke_required" finds both a live merge attempt AND a `coord gates` read.
 REVIEW_REQUIRED = "review_required"
 SMOKE_REQUIRED = "smoke_required"
+# #3445: distinct from the two tokens above — a latched HUMAN_REQUIRED
+# merge-queue entry (an automated conflict-fix that already gave up, #1291)
+# is not "review/smoke unmet", it is "the merge itself already failed and
+# needs a human (or `--override-human-required`)". Clearing review or smoke
+# cannot unstick it, so it outranks both as the merge gate's headline reason
+# — see `_merge_queue_state_decision` and its call site in
+# `build_gate_report`.
+HUMAN_REQUIRED_BLOCKED = "human_required"
 
 
 @dataclass
@@ -451,6 +460,107 @@ def _exempt_dependency_notes_for_winner(
         return []
 
 
+def _iso(ts: float | None) -> str | None:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _merge_queue_state_decision(
+    repo_name: str, issue_number: int, fallback_assignment_id: str | None,
+) -> GateDecision | None:
+    """The REAL, persisted ``merge_queue`` row's state for
+    ``(repo_name, issue_number)``, or ``None`` when no such row exists
+    (#3445).
+
+    This is deliberately a *second* read, distinct from the synthetic
+    ``QueuedMerge`` :func:`build_gate_report` builds via
+    ``mq.live_gate_entry`` to feed the review/test/registry gate checks:
+    that object is constructed fresh on every call and never persisted, so
+    it always carries the dataclass default ``state=PENDING`` — it was
+    never going to surface a *latched* CONFLICT/HUMAN_REQUIRED/SKIPPED.
+    Before this, ``coord gates`` had no read of the real merge-queue table
+    at all, so an issue whose entry had already given up (an automated
+    conflict-fix exhausting its one retry, #1291, or a stale-rebase worker
+    refusing to push a non-content-preserving rebase) reported
+    ``merge : BLOCKED — smoke_required`` — true in isolation, but not the
+    reason nothing is moving: clearing the smoke gate cannot unstick a
+    HUMAN_REQUIRED entry, only a human (or ``coord merge --only <aid>
+    --override-human-required``) can.
+
+    Matched on ``(repo_name, issue_number)`` — the same two facts
+    :func:`coord.drive_state._merge_entry` matches the raw ``merge_queue``
+    row against for exactly the same reason (a fix-chain may have re-keyed
+    the entry's ``assignment_id`` to a newer work row) — with
+    *fallback_assignment_id* (the winning work row `build_gate_report`
+    already selected) preferred when more than one row matches.
+
+    Fail-open like every other best-effort DB read in this module
+    (``_backfill_is_interactive``, ``_apply_gate_decision``): an
+    unreachable DB degrades to "no merge-queue line" rather than failing
+    the whole ``coord gates`` read.
+    """
+    try:
+        from coord import merge_queue as mq  # noqa: PLC0415
+
+        entries = mq.load_queue()
+    except Exception:  # noqa: BLE001 — advisory only, see docstring
+        return None
+
+    matches = [
+        e for e in entries
+        if e.repo_name == repo_name and e.issue_number == issue_number
+    ]
+    if not matches:
+        return None
+    if fallback_assignment_id:
+        by_aid = [e for e in matches if e.assignment_id == fallback_assignment_id]
+        if by_aid:
+            matches = by_aid
+    entry = matches[-1]
+
+    state = (entry.state or "").upper()
+    # PENDING/MERGING/MERGED/READY (and any future non-terminal state) read
+    # as "nothing to escalate here" — the raw state name is still shown, but
+    # unadorned. CONFLICT/HUMAN_REQUIRED/SKIPPED are the parked, needs-
+    # attention states.
+    ok = state not in ("CONFLICT", "HUMAN_REQUIRED", "SKIPPED")
+
+    reason: str | None = None
+    if state == "HUMAN_REQUIRED":
+        aid = entry.assignment_id or fallback_assignment_id or "<assignment-id>"
+        detail_lines = [entry.error or "no reason recorded"]
+        latched = _iso(entry.last_attempt)
+        if latched:
+            detail_lines.append(
+                f"as of last merge-queue write {latched} — this timestamp "
+                "does not advance while the entry is parked, so treat it as "
+                "a LOWER BOUND on when it latched, not necessarily still "
+                "current (#3445)"
+            )
+        else:
+            detail_lines.append(
+                "latched time unknown — no merge-queue attempt timestamp "
+                "recorded on this entry"
+            )
+        detail_lines.append(
+            f"override: coord merge --only {aid} --override-human-required "
+            "'<reason>'"
+        )
+        reason = "\n".join(detail_lines)
+    elif not ok:
+        reason = entry.error or None
+
+    return GateDecision(
+        gate="merge_queue",
+        required=False,
+        ok=ok,
+        reason=reason,
+        state=state or None,
+        assignment_id=entry.assignment_id or None,
+    )
+
+
 def _apply_gate_decision(repo_name: str, issue_number: int) -> GateDecision | None:
     """The ``"apply"`` :class:`GateDecision` for *(repo_name, issue_number)*,
     or ``None`` when there is no ``--hold-after`` deploy-gate entry for it in
@@ -741,8 +851,28 @@ def build_gate_report(
         registry_decisions[gate_name] = decision
         report.decisions.append(decision)
 
+    # #3445: the REAL, persisted merge-queue row — distinct from the
+    # synthetic `entry` above, which always reads state=PENDING (see
+    # `_merge_queue_state_decision`'s docstring). Read AFTER the registry
+    # gates so it can be reported alongside them, but consulted FIRST below
+    # when deciding the merge gate's headline reason: a latched
+    # HUMAN_REQUIRED entry is the actual reason nothing is moving, and no
+    # amount of review/smoke/registry-gate clearing can unstick it.
+    mq_state_decision = _merge_queue_state_decision(
+        repo_name, issue_number, winner.assignment_id,
+    )
+    if mq_state_decision is not None:
+        report.decisions.append(mq_state_decision)
+
     merge_blocked_gate: str | None = None
-    if review_required and not review_ok:
+    if mq_state_decision is not None and mq_state_decision.state == "HUMAN_REQUIRED":
+        human_required_detail = (mq_state_decision.reason or "").split("\n", 1)[0]
+        merge_blocked_gate = (
+            f"{HUMAN_REQUIRED_BLOCKED} — HUMAN_REQUIRED: {human_required_detail} "
+            "(see the merge-queue line above for the latched time and the "
+            "override command)"
+        )
+    elif review_required and not review_ok:
         merge_blocked_gate = REVIEW_REQUIRED
     elif smoke_required and not test_ok:
         merge_blocked_gate = SMOKE_REQUIRED
@@ -912,6 +1042,29 @@ def format_gate_report(report: GateReport) -> str:
                 lines.append(f"           {test.reason}")
             else:
                 lines.append(f"  test   : BLOCKED — {test.reason}")
+        # #3445: the REAL, persisted merge-queue row's state — distinct from
+        # the review/test/merge decisions above, which are all evaluated
+        # against a synthetic, never-persisted entry (see
+        # `_merge_queue_state_decision`'s docstring). Only printed when a
+        # row actually exists for this (repo, issue) — the common case for
+        # an issue that never reached the merge queue at all is silence,
+        # same convention as the "apply" line below. A HUMAN_REQUIRED row
+        # gets its full multi-line detail (reason, latched-time caveat,
+        # override command); every other state is a single unadorned line.
+        merge_queue_decision = by_gate.get("merge_queue")
+        if merge_queue_decision is not None:
+            state_label = merge_queue_decision.state or "UNKNOWN"
+            detail_lines = (
+                merge_queue_decision.reason.split("\n")
+                if merge_queue_decision.reason
+                else []
+            )
+            if not detail_lines:
+                lines.append(f"  merge-queue : {state_label}")
+            else:
+                lines.append(f"  merge-queue : {state_label} — {detail_lines[0]}")
+                for extra in detail_lines[1:]:
+                    lines.append(f"                {extra}")
         # #3273 (S-5 of #3261): any other registry-backed gate (today just
         # "uat") renders generically here, in `report.decisions`' own
         # insertion order — a gate GATE_REGISTRY grows in the future needs no
@@ -919,7 +1072,7 @@ def format_gate_report(report: GateReport) -> str:
         # skipped/inapplicable one (UAT not configured, or an exempt issue)
         # gets an explicit reason instead of being silently omitted like it
         # was before #3273.
-        _KNOWN_GATE_LINES = ("review", "test", "merge", "apply")
+        _KNOWN_GATE_LINES = ("review", "test", "merge_queue", "merge", "apply")
         for decision in report.decisions:
             if decision.gate in _KNOWN_GATE_LINES:
                 continue
