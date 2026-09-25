@@ -4582,9 +4582,17 @@ class TestSmokeGate:
 
     # ── #1479: test-verdict staleness (base-moved vs content-changed) ──
 
-    def test_has_smoke_verdict_stale_when_base_moved(self) -> None:
-        """Base moved, branch diff identical → test verdict is stale even
-        though the branch's own content fingerprint didn't change."""
+    def test_has_smoke_verdict_fresh_when_base_moved_but_branch_unrebased(
+        self,
+    ) -> None:
+        """#3443: base moved, branch head CONFIRMED unchanged → the verdict
+        stays fresh. The smoke runner checks the branch out as-is (it never
+        merges/rebases onto the base before testing), so a target branch
+        that merely advances underneath a branch that was never rebased
+        changed nothing the suite could see — re-testing it on every base
+        commit (vimcode#523/#526) is pure spend, not new evidence.
+        Superseded ``test_has_smoke_verdict_stale_when_base_moved``, which
+        asserted the opposite (the #3443 bug itself) before this fix."""
         work = self._work("w1", test_state="passed")
         work.test_head_sha = "branch-sha-1"
         work.test_patch_id = "patch-1"
@@ -4592,11 +4600,11 @@ class TestSmokeGate:
         board = self._board(completed=[work])
 
         entry = _q("w1")
-        entry.branch_head_sha = "branch-sha-1"       # unchanged
+        entry.branch_head_sha = "branch-sha-1"       # unchanged — no rebase
         entry.branch_patch_id = "patch-1"             # unchanged — identical content
         entry.target_branch_head_sha = "main-sha-new"  # main advanced since the test ran
 
-        assert mq.has_smoke_verdict(entry, board) is False
+        assert mq.has_smoke_verdict(entry, board) is True
 
     def test_has_smoke_verdict_stale_when_branch_content_changed(self) -> None:
         """Branch content changed (new commit) → test verdict is stale."""
@@ -11013,6 +11021,15 @@ class TestStaleSmokeVerdictReporting:
 
         base_sha: str = "base-new"
         branch_sha: str = "branch-sha"
+        # #3443: the recorded `test_head_sha` `_tested_work()` always stamps
+        # ("branch-sha") — kept as its OWN field, independent of `branch_sha`
+        # above, so `get_compare_files`'s routing below stays correct even
+        # when a test sets `branch_sha` to a DIFFERENT value to simulate the
+        # branch itself having moved (a rebase) since the test ran. Before
+        # #3443 the two always coincided (nothing needed the branch to have
+        # actually moved), so routing on `branch_sha` and on the recorded
+        # head were indistinguishable; they no longer are.
+        recorded_head_sha: str = "branch-sha"
         # #1738: files the base-move compare (`test_base_sha`..`base_sha`)
         # reports as changed. None (default) means "compare unavailable" —
         # the inert-base check fails closed, same as the pre-#1738 behaviour.
@@ -11021,8 +11038,8 @@ class TestStaleSmokeVerdictReporting:
         # reports as changed — a distinct fixture from `compare_files` so a
         # test can make the base move non-inert while the branch itself is
         # (or vice versa). Discriminated by `head` below: the branch check
-        # always asks for `head == branch_sha`, the base-move check for
-        # whatever the current base SHA is.
+        # always asks for `head == recorded_head_sha`, the base-move check
+        # for whatever the current base SHA is.
         branch_compare_files: list[str] | None = None
         # #1847: every (base, head) pair passed to `get_compare_files`, in
         # call order — lets a test assert the fetch-once-per-side budget
@@ -11039,7 +11056,7 @@ class TestStaleSmokeVerdictReporting:
 
         def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
             self.compare_files_calls.append((base, head))
-            if head == self.branch_sha:
+            if head == self.recorded_head_sha:
                 return self.branch_compare_files
             return self.compare_files
 
@@ -11300,10 +11317,18 @@ class TestStaleSmokeVerdictReporting:
 
     def test_base_move_touching_coord_stays_stale(self) -> None:
         """Must not regress: a base move that touches `coord/**` is exactly
-        the case #1479 exists to catch — stays stale."""
+        the case #1479 exists to catch — stays stale.
+
+        #3443: the branch head must also differ here — a confirmed-
+        unchanged branch spares a base move outright (see
+        ``TestStaleSmokeVerdictReporting``'s new #3443 tests), so this
+        exercises the #1738 file-compare hatch specifically for the case
+        where the branch itself moved too (e.g. a #241 conflict-fix
+        rebase) and the base move alone is what must still be judged."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"  # branch also moved (rebase)
         gh = self._Gh(compare_files=["coord/merge_queue.py"])
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -11314,10 +11339,14 @@ class TestStaleSmokeVerdictReporting:
 
     def test_base_move_touching_docs_and_coord_stays_stale(self) -> None:
         """The allowlist is all-or-nothing — one non-inert file in the diff
-        stales the whole move, even alongside inert ones."""
+        stales the whole move, even alongside inert ones.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(compare_files=["docs/README.md", "coord/drive.py"])
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -11329,10 +11358,14 @@ class TestStaleSmokeVerdictReporting:
         """Extension alone never qualifies: a `.md` nested under a
         non-allowlisted directory (e.g. a test contract, #1738) is NOT
         inert just because it ends in `.md` — only a top-level `*.md`
-        (README.md, CONTRIBUTING.md, ...) is."""
+        (README.md, CONTRIBUTING.md, ...) is.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(compare_files=["tests/acceptance/contract.md"])
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -11342,10 +11375,14 @@ class TestStaleSmokeVerdictReporting:
 
     def test_base_move_with_unreadable_compare_stays_stale(self) -> None:
         """`get_compare_files` returning None (compare unreadable) fails
-        closed — #1738's "bias hard toward staling"."""
+        closed — #1738's "bias hard toward staling".
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(compare_files=None)
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -11383,12 +11420,18 @@ class TestStaleSmokeVerdictReporting:
         assert mq.has_smoke_verdict(fresh_entry, board) is True
 
     def test_process_error_string_names_the_moved_base(self) -> None:
-        """`coord merge --only`'s wording — the string the operator reads."""
+        """`coord merge --only`'s wording — the string the operator reads.
+
+        #3443: `branch_sha="branch-new"` — the branch must also differ from
+        `test_head_sha` ("branch-sha") here, or a confirmed-unchanged branch
+        spares the base move outright and this refusal never fires."""
         cfg = self._config()
         board = self._board(completed=[self._tested_work()])
         items = [_q("w1", target="main", size=10)]
 
-        events = process(items, self._Gh(), config=cfg, board=board)
+        events = process(
+            items, self._Gh(branch_sha="branch-new"), config=cfg, board=board
+        )
 
         blocked = [e for e in events if e.kind == "smoke_required"]
         assert len(blocked) == 1
@@ -11397,12 +11440,15 @@ class TestStaleSmokeVerdictReporting:
         assert items[0].error is not None and "stale" in items[0].error
 
     def test_dry_run_uses_the_same_stale_wording(self) -> None:
+        """#3443: `branch_sha="branch-new"` — see the comment on
+        ``test_process_error_string_names_the_moved_base``."""
         cfg = self._config()
         board = self._board(completed=[self._tested_work()])
         items = [_q("w1", target="main", size=10)]
 
         events = process(
-            items, self._Gh(), config=cfg, board=board, dry_run=True
+            items, self._Gh(branch_sha="branch-new"),
+            config=cfg, board=board, dry_run=True,
         )
 
         blocked = [e for e in events if e.kind == "smoke_required"]
@@ -11419,10 +11465,15 @@ class TestStaleSmokeVerdictReporting:
         the SAME entry: `plan()` (what `coord merge --plan` renders) and
         `process()` (what `coord merge --only` runs). Before #1640 the former
         said READY and the latter refused.
+
+        #3443: `branch_sha="branch-new"` — the branch must also differ from
+        `test_head_sha`, or a confirmed-unchanged branch spares the base
+        move outright and both readers agree READY instead.
         """
         cfg = self._config()
         board = self._board(completed=[self._tested_work()])
-        gh = self._Gh()  # main now reads base-new; the verdict says base-old
+        # main now reads base-new; the verdict says base-old
+        gh = self._Gh(branch_sha="branch-new")
         save_queue([_q("w1", target="main", size=10)])
 
         planned = mq.plan(board, cfg, gh_ops=gh)
@@ -11470,7 +11521,10 @@ class TestStaleSmokeVerdictReporting:
 
     def test_staging_item_blocks_on_a_stale_verdict(self, coord_db) -> None:
         """#1640 defect 2, staging half: the section used to read the raw
-        `test_state` column with no freshness check and show READY."""
+        `test_state` column with no freshness check and show READY.
+
+        #3443: `branch_sha="branch-new"` — see the comment on
+        ``test_process_error_string_names_the_moved_base``."""
         from types import SimpleNamespace
 
         cfg = self._config()
@@ -11480,7 +11534,9 @@ class TestStaleSmokeVerdictReporting:
         board = self._board(completed=[self._tested_work()])
         save_queue([])
 
-        items = mq.staging_items(board, cfg, gh_ops=self._Gh())
+        items = mq.staging_items(
+            board, cfg, gh_ops=self._Gh(branch_sha="branch-new")
+        )
 
         assert len(items) == 1
         assert items[0].status == mq.STAGING_BLOCKED
@@ -11556,6 +11612,12 @@ class TestStaleSmokeVerdictReporting:
         AttributeError and every staleness check became a no-op, so the plan
         rendered READY for the entry `--only` refused. The snapshot now
         serves the anchors from its own refreshed data.
+
+        #3443: the snapshot's branch SHA must also differ from
+        `test_head_sha` ("branch-sha") — a confirmed-unchanged branch
+        spares a base move outright, so this needs the branch to have
+        moved too (e.g. a #241 conflict-fix rebase) to still exercise the
+        #1640 staleness block this test is named for.
         """
         from coord.gate_snapshot import GateSnapshot
 
@@ -11566,7 +11628,7 @@ class TestStaleSmokeVerdictReporting:
         snapshot = GateSnapshot(
             branch_shas={
                 ("acme/api", "main"): "base-new",       # a sibling merge landed
-                ("acme/api", "worker/w1"): "branch-sha",
+                ("acme/api", "worker/w1"): "branch-new",  # branch also moved
             },
             branch_patch_ids={("acme/api", "main", "worker/w1"): "patch-1"},
         )
@@ -11625,10 +11687,14 @@ class TestStaleSmokeVerdictReporting:
 
     def test_branch_touching_coord_stays_stale_on_base_move(self) -> None:
         """The whole safety story: a branch that touches `coord/**` stales
-        exactly as before a non-inert base move, regardless of #1778."""
+        exactly as before a non-inert base move, regardless of #1778.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
             branch_compare_files=["coord/merge_queue.py", "docs/README.md"],
@@ -11644,10 +11710,14 @@ class TestStaleSmokeVerdictReporting:
         """The branch's own diff also touches the base-moved file — #1847's
         disjointness escape hatch must not fire on an *overlapping* pair, so
         this is deliberately not disjoint from `compare_files` (that shape is
-        covered separately by the #1847 tests below)."""
+        covered separately by the #1847 tests below).
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
             branch_compare_files=["coord/merge_queue.py", "tests/test_merge_queue.py"],
@@ -11660,10 +11730,14 @@ class TestStaleSmokeVerdictReporting:
 
     def test_branch_touching_tui_stays_stale_on_base_move(self) -> None:
         """Overlapping with the base move (see the docstring above) — #1847
-        must not spare a branch that shares a file with the base's diff."""
+        must not spare a branch that shares a file with the base's diff.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
             branch_compare_files=["coord/merge_queue.py", "tui/app.py"],
@@ -11676,10 +11750,14 @@ class TestStaleSmokeVerdictReporting:
 
     def test_branch_touching_pyproject_stays_stale_on_base_move(self) -> None:
         """Overlapping with the base move (see the docstring above) — #1847
-        must not spare a branch that shares a file with the base's diff."""
+        must not spare a branch that shares a file with the base's diff.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
             branch_compare_files=["coord/merge_queue.py", "pyproject.toml"],
@@ -11696,10 +11774,14 @@ class TestStaleSmokeVerdictReporting:
         runner inert and skip its gate. Overlapping with the base move (see
         the docstring above `test_branch_touching_tui_stays_stale_on_base_move`)
         so #1847's disjointness hatch can't spare it either — the point of
-        this test is the deny-list, not disjointness."""
+        this test is the deny-list, not disjointness.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
             branch_compare_files=[
@@ -11715,10 +11797,14 @@ class TestStaleSmokeVerdictReporting:
     def test_base_move_editing_the_test_runner_is_not_inert(self) -> None:
         """Same hole, base side: a base move consisting solely of an edit to
         the composed test runner must not be treated as inert either — it IS
-        the thing the Test stage executes."""
+        the thing the Test stage executes.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(compare_files=["scripts/coord-test-runner.sh"])
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -11797,11 +11883,15 @@ class TestStaleSmokeVerdictReporting:
 
     def test_seeded_board_same_branch_plus_coord_file_blocks(self) -> None:
         """The negative case, which matters more: the same branch with one
-        `coord/**` file added flips straight back to blocked."""
+        `coord/**` file added flips straight back to blocked.
+
+        #3443: `branch_sha="branch-new"` — see the comment on
+        ``test_process_error_string_names_the_moved_base``."""
         cfg = self._config()
         board = self._board(completed=[self._tested_work()])
         items = [_q("w1", target="main", size=10)]
         gh = self._Gh(
+            branch_sha="branch-new",
             compare_files=["coord/merge_queue.py"],
             branch_compare_files=["docs/README.md", "coord/merge_queue.py"],
         )
@@ -11824,10 +11914,16 @@ class TestStaleSmokeVerdictReporting:
     def test_disjoint_base_move_and_branch_spares_the_verdict(self) -> None:
         """The issue's acceptance case 1: base move touches `coord/state.py`,
         branch touches `tui/src/app/render.rs` — no overlap, neither side is
-        on the #1738/#1778 allowlist, and the verdict still survives."""
+        on the #1738/#1778 allowlist, and the verdict still survives.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``) — otherwise the
+        confirmed-unchanged branch spares the base move before #1847 is
+        even consulted, and `spared_reason` would name #3443, not #1847."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/state.py"],
             branch_compare_files=["tui/src/app/render.rs"],
@@ -11846,10 +11942,14 @@ class TestStaleSmokeVerdictReporting:
         `coord/state.py`, branch touches `coord/state.py` and
         `coord/drive.py` — the shared file means the two diffs are NOT
         disjoint, so #1847 does not apply and the verdict stales exactly as
-        today."""
+        today.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/state.py"],
             branch_compare_files=["coord/state.py", "coord/drive.py"],
@@ -11877,10 +11977,14 @@ class TestStaleSmokeVerdictReporting:
     def test_disjoint_check_fails_closed_when_compare_returns_none(self) -> None:
         """`get_compare_files` answering ``None`` (unreadable compare) on
         either side must not be read as "disjoint" — that would let an
-        unproven combination merge."""
+        unproven combination merge.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(compare_files=None, branch_compare_files=None)
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -11890,7 +11994,10 @@ class TestStaleSmokeVerdictReporting:
 
     def test_disjoint_check_fails_closed_when_compare_raises(self) -> None:
         """A raising compare call must degrade to stale, not to "disjoint by
-        default"."""
+        default".
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         class _Raising(self._Gh):
             def get_compare_files(self, repo, base, head):
                 raise RuntimeError("gh api boom")
@@ -11898,6 +12005,7 @@ class TestStaleSmokeVerdictReporting:
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
 
         verdict = mq.evaluate_smoke_verdict(entry, board, _Raising())
 
@@ -11926,10 +12034,16 @@ class TestStaleSmokeVerdictReporting:
         """#1847's net-I/O promise: even though three disjuncts are now
         consulted (#1738, #1778, #1847), `get_compare_files` is called at
         most twice total — once per side — because the disjointness check
-        reuses the two lists the first two checks already fetched."""
+        reuses the two lists the first two checks already fetched.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``) — otherwise the
+        confirmed-unchanged branch spares the base move before any
+        `get_compare_files` call, which would make this bound vacuous."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/state.py"],
             branch_compare_files=["tui/src/app/render.rs"],
@@ -11945,10 +12059,14 @@ class TestStaleSmokeVerdictReporting:
     ) -> None:
         """Ordering is preserved: the #1738 base-inert check is tried first
         and, when it alone settles the question, the branch side is never
-        fetched at all — one call, not two."""
+        fetched at all — one call, not two.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(compare_files=["docs/README.md"])
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -11961,10 +12079,14 @@ class TestStaleSmokeVerdictReporting:
         self,
     ) -> None:
         """The plain-stale path (no disjunct fires) is still bounded at two
-        calls — the pre-#1847 worst case, unchanged."""
+        calls — the pre-#1847 worst case, unchanged.
+
+        #3443: the branch head must also differ (see the comment on
+        ``test_base_move_touching_coord_stays_stale``)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"
         gh = self._Gh(
             compare_files=["coord/state.py"],
             branch_compare_files=["coord/state.py", "coord/drive.py"],
@@ -12003,11 +12125,15 @@ class TestStaleSmokeVerdictReporting:
     ) -> None:
         """`coord merge --dry-run`'s "would merge" preview names *why* a
         base move didn't stale the verdict, and the #1847 wording is
-        distinguishable from the #1738/#1778 inert wordings."""
+        distinguishable from the #1738/#1778 inert wordings.
+
+        #3443: `branch_sha="branch-new"` — see the comment on
+        ``test_process_error_string_names_the_moved_base``."""
         cfg = self._config()
         board = self._board(completed=[self._tested_work()])
         items = [_q("w1", target="main", size=10)]
         gh = self._Gh(
+            branch_sha="branch-new",
             compare_files=["coord/state.py"],
             branch_compare_files=["tui/src/app/render.rs"],
         )
@@ -12023,11 +12149,14 @@ class TestStaleSmokeVerdictReporting:
 
     def test_dry_run_names_the_1738_inert_reason_distinctly(self) -> None:
         """Same preview, but spared via the #1738 inert-base-move hatch
-        instead — the wording must differ from the #1847 one above."""
+        instead — the wording must differ from the #1847 one above.
+
+        #3443: `branch_sha="branch-new"` — see the comment on
+        ``test_process_error_string_names_the_moved_base``."""
         cfg = self._config()
         board = self._board(completed=[self._tested_work()])
         items = [_q("w1", target="main", size=10)]
-        gh = self._Gh(compare_files=["docs/README.md"])
+        gh = self._Gh(branch_sha="branch-new", compare_files=["docs/README.md"])
 
         events = process(items, gh, config=cfg, board=board, dry_run=True)
 
@@ -12613,8 +12742,12 @@ class TestStaleSmokeConflictProbe:
 
     @staticmethod
     def _stale_setup(*, mergeable: bool | None):
-        """One PENDING entry whose passed verdict was staled by a base move,
-        plus a `gh` stub with a definite answer about mergeability."""
+        """One PENDING entry whose passed verdict was staled by a base move
+        AND a rebase (the branch head also moved — #3443: a base move alone,
+        with the branch head confirmed unchanged, no longer stales at all,
+        so this scenario needs both to still exercise the stale-verdict
+        path a #241 conflict-fix rebase would actually produce), plus a
+        `gh` stub with a definite answer about mergeability."""
         work = TestSmokeGate._work("w1", test_state="passed")
         work.test_head_sha = "branch-sha-1"
         work.test_patch_id = "patch-1"
@@ -12622,7 +12755,7 @@ class TestStaleSmokeConflictProbe:
         board = TestSmokeGate._board(completed=[work])
 
         entry = _q("w1", size=10, pr=100)
-        entry.branch_head_sha = "branch-sha-1"
+        entry.branch_head_sha = "branch-sha-2"          # branch also moved
         entry.branch_patch_id = "patch-1"
         entry.target_branch_head_sha = "main-sha-new"   # base moved under it
         gh = FakeGh(mergeable_results={100: mergeable})
