@@ -456,20 +456,25 @@ def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
 
 # #3442: bracket-tag issue_title prefixes (`f"[{tag}] {title}"`, see
 # `coord.review.dispatch_review` / `coord.review._dispatch_scoped_review` /
-# `coord.smoke.dispatch_pending_smoke`) that a review/smoke leg dispatch
-# uses when it does NOT pin `target_branch` to the real work branch — the
-# agent then derives its own throwaway branch name by slugifying that
-# bracketed title (`coord.agent._slugify`), landing on
-# `issue-{N}-{tag}-...`. These legs are read-only observers: a review posts
-# a verdict comment, a smoke run executes a command — neither ever commits
-# to its own checkout, so that branch sits at `ahead_by == 0` against the
-# default branch from the moment it's created, forever, regardless of
-# whether the issue's REAL work has landed. It is not evidence of anything.
-# Every OTHER dispatcher that continues real work on an issue (conflict-fix,
-# retry, fix-N) pins `target_branch` to the actual work branch instead of
-# letting one of these get minted, so this list is deliberately just the
-# observer legs, not every bracket tag in the codebase.
-_OBSERVER_LEG_TAGS = ("review", "scoped-review", "smoke")
+# `coord.smoke.dispatch_pending_smoke` / `coord.gate_b`'s tracking-issue
+# dispatch) that a review/smoke/gate-b leg dispatch uses when it does NOT
+# pin `target_branch` to the real work branch — the agent then derives its
+# own throwaway branch name by slugifying that bracketed title
+# (`coord.agent._slugify`), landing on `issue-{N}-{tag}-...`. These legs
+# are read-only observers: a review posts a verdict comment, a smoke run
+# executes a command, gate-b posts a milestone verdict — none of them ever
+# commits to its own checkout, so that branch sits at `ahead_by == 0`
+# against the default branch from the moment it's created, forever,
+# regardless of whether the issue's REAL work has landed. It is not
+# evidence of anything. Every OTHER dispatcher that continues real work on
+# an issue (conflict-fix, retry, fix-N) pins `target_branch` to the actual
+# work branch instead of letting one of these get minted, so this list is
+# deliberately just the observer legs, not every bracket tag in the
+# codebase — though as #3442's own review round found for gate-b, that
+# distinction has to be verified per-dispatcher, not assumed; see the
+# issue's suggested structural alternative (branch never had commits, ever)
+# for a fix that wouldn't require keeping this list exhaustive by hand.
+_OBSERVER_LEG_TAGS = ("review", "scoped-review", "smoke", "gate-b")
 
 
 def _is_observer_leg_branch(branch: str, issue_number: int) -> bool:
