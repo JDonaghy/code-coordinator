@@ -3809,9 +3809,14 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 except Exception:  # noqa: BLE001
                     board, config = None, None
             elif stale_rebase_mismatch:
-                # No board/config needed here — a stale-rebase mismatch has
-                # no tier-2 escalation path, it goes straight to
-                # HUMAN_REQUIRED inside `on_conflict_fix_done`.
+                # #3444: board/config ARE needed here now — a stale-rebase
+                # mismatch escalates to the ORDINARY conflict-fix path
+                # (`_try_ordinary_escalation_after_stale_mismatch`) inside
+                # `on_conflict_fix_done`, not straight to HUMAN_REQUIRED.
+                # Without them that escalation call returns `None`
+                # immediately and this — the operationally dominant path,
+                # per the comment above — would reproduce #3444's exact bug
+                # on every stale-rebase-mismatch it sees.
                 progress = entry.get("progress") or {}
                 stuck_summary = progress.get("stuck")
                 if not stuck_summary and log_path:
@@ -3820,6 +3825,13 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                         stuck_summary = parse_progress(log_path).stuck
                     except Exception:  # noqa: BLE001
                         stuck_summary = None
+                try:
+                    from coord.board_service import read_board  # noqa: PLC0415
+                    from coord.config import load as _load_config  # noqa: PLC0415
+                    board = read_board()
+                    config = _load_config()
+                except Exception:  # noqa: BLE001
+                    board, config = None, None
 
             on_conflict_fix_done(
                 parent_assignment_id=parent_id,

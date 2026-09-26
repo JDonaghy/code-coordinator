@@ -1160,6 +1160,153 @@ class TestDispatch:
         assert client.calls == []
 
 
+class TestAfterStaleRebaseMismatchEscalation:
+    """#3444: a `stale-rebase-mismatch` verdict must escalate to the
+    ORDINARY conflict-fix path — `dispatch_conflict_fix(...,
+    after_stale_rebase_mismatch=True)` — not straight to HUMAN_REQUIRED.
+    That flag changes nothing about the dispatched briefing/title (same as
+    the plain `else` branch) — it only carves the just-failed stale-rebase
+    attempt out of the retry cap, since that attempt never even tried a
+    mechanical resolution.
+    """
+
+    def test_sends_the_ordinary_briefing_and_title(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        client = _FakeHTTPClient({"id": "fix-id-ordinary-after-mismatch"})
+        entry = _entry(error=f"{CI_STALE_PREFIX} checks predate the current base")
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+            after_stale_rebase_mismatch=True,
+        )
+        assert result is not None
+        assert not result.issue_title.startswith(STALE_REBASE_FIX_TITLE_PREFIX)
+        assert result.issue_title.startswith("[conflict-fix]")
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] == CONFLICT_FIX_SYSTEM_PROMPT
+
+    def test_a_failed_stale_rebase_attempt_does_not_consume_the_cap(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """The just-finished stale-rebase attempt is recorded on the board
+        as a `[stale-rebase]`-titled conflict-fix row whose dispatch-time
+        `Reason:` line is the SAME `entry.error` this escalation call
+        carries (both dispatches read straight off `entry.error`) — without
+        `ignore_stale_rebase_attempts`, the #2475 identical-error check
+        would misread that as a recurring, already-failed mechanical
+        attempt and block this escalation before it ever tries."""
+        board = Board()
+        error = f"{CI_STALE_PREFIX} checks predate the current base"
+        board.completed.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title=f"{STALE_REBASE_FIX_TITLE_PREFIX} Fix the thing",
+            assignment_id="stale-fix-1", status="done",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            briefing=f"# Stale-CI rebase\nReason: {error}\n",
+        ))
+        entry = _entry(error=error)
+        client = _FakeHTTPClient({"id": "fix-id-escalated"})
+        result = dispatch_conflict_fix(
+            entry, board, two_machine_config,
+            http_client=client, prefer_machine="laptop",
+            after_stale_rebase_mismatch=True,
+        )
+        assert result is not None
+        assert len(client.calls) == 1
+
+    def test_a_prior_ordinary_conflict_fix_failure_still_blocks(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """The carve-out is narrow: only stale-rebase-titled rows are
+        ignored. A genuinely failed ORDINARY conflict-fix attempt for the
+        same entry still consumes the cap exactly like any other retry."""
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="[conflict-fix] Fix the thing",
+            assignment_id="ordinary-fix-1", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        entry = _entry()
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            entry, board, two_machine_config,
+            http_client=client, prefer_machine="laptop",
+            after_stale_rebase_mismatch=True,
+        )
+        assert result is None
+        assert client.calls == []
+
+    def test_no_double_dispatch_while_a_conflict_fix_is_already_active(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """Acceptance: no double-dispatch while one is active, regardless
+        of which flavor is running."""
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="[conflict-fix] Fix the thing",
+            assignment_id="running-fix-1", status="running",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        entry = _entry()
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            entry, board, two_machine_config,
+            http_client=client, prefer_machine="laptop",
+            after_stale_rebase_mismatch=True,
+        )
+        assert result is None
+        assert client.calls == []
+
+
+class TestHasPriorConflictFixIgnoresStaleRebaseAttempts:
+    """Direct coverage of `has_prior_conflict_fix`'s
+    `ignore_stale_rebase_attempts` carve-out (#3444)."""
+
+    def test_failed_stale_rebase_row_ignored_when_flag_set(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1,
+            issue_title=f"{STALE_REBASE_FIX_TITLE_PREFIX} x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="failed",
+        ))
+        assert has_prior_conflict_fix(
+            board, "abc123", ignore_stale_rebase_attempts=True,
+        ) is False
+
+    def test_failed_stale_rebase_row_still_counts_by_default(self) -> None:
+        """Every OTHER caller (default `ignore_stale_rebase_attempts=False`)
+        is byte-for-byte unaffected."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1,
+            issue_title=f"{STALE_REBASE_FIX_TITLE_PREFIX} x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="failed",
+        ))
+        assert has_prior_conflict_fix(board, "abc123") is True
+
+    def test_failed_ordinary_row_still_counts_even_with_flag_set(self) -> None:
+        """The carve-out is narrow: it names the stale-rebase title prefix
+        specifically, not "any prior conflict-fix"."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1,
+            issue_title="[conflict-fix] x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="failed",
+        ))
+        assert has_prior_conflict_fix(
+            board, "abc123", ignore_stale_rebase_attempts=True,
+        ) is True
+
+
 class TestSemanticEscalationDisabled:
     """#2566: the predicate that lets HUMAN_REQUIRED messaging say *why*
     the tier-2 semantic escalation didn't run, rather than reading as

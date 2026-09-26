@@ -2978,6 +2978,67 @@ def _try_semantic_escalation(
         return None
 
 
+def _try_ordinary_escalation_after_stale_mismatch(
+    entry: mq.QueuedMerge,
+    *,
+    board: Board | None,
+    config: Config | None,
+    machine_name: str,
+    stuck_summary: str | None,
+) -> "Assignment | None":
+    """Dispatch the ordinary conflict-fix path after a stale-rebase
+    worker's ``stale-rebase-mismatch`` refusal (#3444).
+
+    A ``stale-rebase-mismatch`` verdict means the ``checks_stale`` premise
+    that triggered the stale-rebase dispatch was wrong — the rebase hit a
+    genuine content conflict, not just a moved base. That makes this an
+    ORDINARY conflict, so it deserves the ordinary #241 conflict-fix
+    worker's mechanical/additive attempt (and its own
+    ``SEMANTIC_STUCK_MARKER`` → escalation-or-HUMAN_REQUIRED handling on a
+    second failure) before anything goes to a human — not an immediate
+    HUMAN_REQUIRED, which is what happened before this fix.
+
+    Returns the dispatched Assignment, or ``None`` when the plumbing isn't
+    available or dispatch declined for any of the ordinary reasons (no
+    capable machine, already active, retry cap already consumed by a prior
+    *ordinary* attempt, …) — every ``None`` case falls through to the
+    caller's pre-#3444 HUMAN_REQUIRED behaviour.
+
+    Deliberately does NOT gate on a config flag the way
+    :func:`_try_semantic_escalation` gates on
+    ``pipeline.escalate_semantic_conflicts`` — unlike a semantic escalation
+    to a stronger model, this is just the ordinary conflict-fix path that
+    every other conflict already gets; there is no reason to withhold it
+    here specifically.
+    """
+    if board is None or config is None:
+        return None
+
+    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
+    from coord.network import fetch_status  # noqa: PLC0415
+
+    try:
+        return dispatch_conflict_fix(
+            entry,
+            board,
+            config,
+            prefer_machine=machine_name or None,
+            after_stale_rebase_mismatch=True,
+            stuck_summary=stuck_summary,
+            # #3353: same liveness-aware selection every other call site
+            # here uses — a dead machine with zero active assignments must
+            # not be picked first just because it looks idle on the board.
+            status_fetcher=fetch_status,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break reconcile on this
+        import logging  # noqa: PLC0415
+        logging.warning(
+            "stale-rebase-mismatch → ordinary conflict-fix escalation "
+            "dispatch failed: %s", exc,
+        )
+        return None
+
+
 def on_conflict_fix_done(
     *,
     parent_assignment_id: str,
@@ -2998,16 +3059,21 @@ def on_conflict_fix_done(
     can surface "manual resolution required", and a comment is posted on
     the underlying issue so the user is notified outside the TUI too.
 
-    *stale_rebase_mismatch* (#3349 review): when ``True``, a stale-rebase
-    worker (dispatched for ``merge_gate_checks_stale``, not an ordinary
-    conflict) correctly refused to push per its own briefing's "When NOT to
-    guess" section — its rebase either hit a real conflict marker or
-    produced a different patch-id than the pre-rebase branch, so it is not
-    a pure content-preserving rebase. This is NOT a SEMANTIC give-up (no
-    tier-2 escalation applies — there is nothing to retry with a stronger
-    model; the base and this branch genuinely overlap) and lands directly
-    on HUMAN_REQUIRED with that reason recorded, mirroring the *semantic*
-    handling below but skipping its escalation path entirely.
+    *stale_rebase_mismatch* (#3349 review, escalation added #3444): when
+    ``True``, a stale-rebase worker (dispatched for
+    ``merge_gate_checks_stale``, not an ordinary conflict) correctly
+    refused to push per its own briefing's "When NOT to guess" section —
+    its rebase either hit a real conflict marker or produced a different
+    patch-id than the pre-rebase branch, so it is not a pure
+    content-preserving rebase. That means the *just-stale* premise behind
+    the stale-rebase dispatch was wrong — this is an ORDINARY conflict, so
+    it gets the ordinary #241 conflict-fix worker's mechanical/additive
+    attempt (:func:`_try_ordinary_escalation_after_stale_mismatch`) before
+    anything reaches a human, exactly like any other conflict. Only when
+    THAT dispatch itself declines (no capable machine, already active,
+    retry cap consumed, …) does the entry land on HUMAN_REQUIRED — #3349's
+    safety property (the stale-rebase worker itself never resolves
+    anything) is unaffected either way.
 
     #2566: when *semantic* is ``True`` and the tier-2 escalation didn't
     fire specifically because ``pipeline.escalate_semantic_conflicts`` is
@@ -3058,24 +3124,54 @@ def on_conflict_fix_done(
                 )
                 failed_entry = entry
             elif stale_rebase_mismatch:
-                # #3349 review: a stale-rebase worker's refusal is a
-                # correct, deliberate stop — not a give-up to retry with a
-                # stronger model — so it goes straight to HUMAN_REQUIRED
-                # with the mismatch reason recorded, skipping the SEMANTIC
-                # tier-2 escalation path entirely.
-                entry.state = mq.HUMAN_REQUIRED
+                # #3444: a stale-rebase worker's refusal means the
+                # "just-stale" premise was wrong — this is a genuine
+                # content conflict, i.e. an ORDINARY conflict, so it gets
+                # the ordinary #241 conflict-fix worker's mechanical
+                # attempt before anything reaches a human (previously this
+                # skipped straight to HUMAN_REQUIRED — #3444's bug).
                 detail = stuck_summary or (
                     "rebase was not content-preserving (a conflict marker "
                     "appeared, or the resulting patch-id differed from the "
                     "pre-rebase branch's)"
                 )
-                entry.error = (
-                    f"{existing_error}; stale-rebase worker refused to "
-                    f"push: {detail}. This is a genuine content conflict "
-                    "against the new base, not a pure rebase — manual "
-                    "resolution required."
+                fix = _try_ordinary_escalation_after_stale_mismatch(
+                    entry,
+                    board=board,
+                    config=config,
+                    machine_name=machine_name,
+                    stuck_summary=stuck_summary,
                 )
-                failed_entry = entry
+                if fix is not None:
+                    # Stay in CONFLICT, not HUMAN_REQUIRED — the ordinary
+                    # conflict-fix worker is now in flight. If it also
+                    # fails (or itself judges the conflict SEMANTIC), this
+                    # hook runs again with `stale_rebase_mismatch=False`
+                    # and the ordinary/semantic-escalation-or-HUMAN_REQUIRED
+                    # logic below applies exactly as it does for any other
+                    # conflict.
+                    entry.state = mq.CONFLICT
+                    entry.error = (
+                        f"{existing_error}; stale-rebase worker refused to "
+                        f"push: {detail}. Not a stale-base mismatch after "
+                        "all — this is a genuine content conflict, "
+                        f"escalated to an ordinary conflict-fix (assignment "
+                        f"{fix.assignment_id}) on {fix.machine_name}."
+                    )
+                else:
+                    # The ordinary escalation itself declined (no capable
+                    # machine, already active, retry cap already consumed
+                    # by a prior ordinary attempt, …) — fall through to
+                    # HUMAN_REQUIRED exactly like the pre-#3444 behaviour.
+                    entry.state = mq.HUMAN_REQUIRED
+                    entry.error = (
+                        f"{existing_error}; stale-rebase worker refused to "
+                        f"push: {detail}. This is a genuine content conflict "
+                        "against the new base, not a pure rebase, and the "
+                        "ordinary conflict-fix escalation could not be "
+                        "dispatched either — manual resolution required."
+                    )
+                    failed_entry = entry
             else:
                 # #1291: a SEMANTIC give-up gets ONE escalated attempt from a
                 # stronger model before the entry is parked.  Everything
