@@ -1070,15 +1070,31 @@ class TestReconcileConflictFixStaleRebaseMismatchMarker:
     `reconcile()`'s "done" branch only checked for the SEMANTIC marker, so
     this correct refusal was misread as a resolved rebase and the entry was
     silently reset to PENDING, discarding the escalation the worker itself
-    asked for."""
+    asked for.
 
+    #3444: a `stale-rebase-mismatch` verdict must escalate to an ORDINARY
+    conflict-fix dispatch (the mechanical/additive #241 worker) rather than
+    escalating straight to HUMAN_REQUIRED — the mismatch means the
+    "just-stale" premise was wrong, so this is a genuine but ordinary
+    conflict, not a give-up that calls for a human. HUMAN_REQUIRED is only
+    reached if that ordinary dispatch itself declines.
+    """
+
+    @patch("coord.network.fetch_status")
+    @patch("coord.conflict_fix.httpx.post")
     @patch("coord.reconcile._query_agent")
-    def test_done_conflict_fix_with_stale_rebase_marker_does_not_reset_to_pending(
-        self, mock_query: MagicMock, tmp_path: Path, coord_db,
+    def test_mismatch_escalates_to_ordinary_conflict_fix_not_human_required(
+        self,
+        mock_query: MagicMock,
+        mock_post: MagicMock,
+        mock_fetch_status: MagicMock,
+        tmp_path: Path,
+        coord_db,
     ) -> None:
         from coord import merge_queue as mq
         from coord.conflict_fix import STALE_REBASE_MISMATCH_MARKER
-        from coord.merge_queue import HUMAN_REQUIRED, PENDING, QueuedMerge
+        from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING, QueuedMerge
+        from coord.network import StatusResult
 
         cfg = Config(
             repos=[Repo(name="api", github="acme/api")],
@@ -1122,11 +1138,94 @@ class TestReconcileConflictFixStaleRebaseMismatchMarker:
                 "log_path": str(log),
             }],
         }
+        mock_fetch_status.return_value = StatusResult(data={"assignments": []})
+        mock_post.return_value = MagicMock(
+            json=lambda: {"id": "ordinary-fix-1"},
+            raise_for_status=lambda: None,
+        )
 
         reconcile(board, cfg)
 
         entry = mq.load_queue()[0]
         assert entry.state != PENDING
+        assert entry.state != HUMAN_REQUIRED
+        assert entry.state == CONFLICT
+        assert "patch-id before abc123, after def456 differ" in (entry.error or "")
+        assert "escalated to an ordinary conflict-fix" in (entry.error or "")
+
+        # The dispatched worker is the ORDINARY conflict-fix (not another
+        # stale-rebase attempt) — same title/system-prompt any other
+        # mechanical conflict gets.
+        _, payload = mock_post.call_args
+        assert payload["json"]["issue_title"].startswith("[conflict-fix]")
+
+    @patch("coord.network.fetch_status")
+    @patch("coord.reconcile._query_agent")
+    def test_mismatch_falls_back_to_human_required_when_escalation_cannot_dispatch(
+        self,
+        mock_query: MagicMock,
+        mock_fetch_status: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        """When the ordinary conflict-fix escalation itself can't be
+        dispatched (here: no candidate machine is reachable), the entry
+        still lands on HUMAN_REQUIRED — exactly like before #3444 — instead
+        of silently dropping the merge entry."""
+        from coord import merge_queue as mq
+        from coord.conflict_fix import STALE_REBASE_MISMATCH_MARKER
+        from coord.merge_queue import HUMAN_REQUIRED, PENDING, QueuedMerge
+        from coord.network import StatusResult
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=PENDING,
+                error="CI stale: checks predate the current base",
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ\n"
+        )
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[stale-rebase] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        # Every candidate machine confirmed unreachable -> selection can't
+        # pick anyone -> dispatch declines -> escalation returns None.
+        mock_fetch_status.return_value = StatusResult(error="timeout")
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
         assert entry.state == HUMAN_REQUIRED
         assert "manual resolution required" in (entry.error or "").lower()
         assert "patch-id before abc123, after def456 differ" in (entry.error or "")

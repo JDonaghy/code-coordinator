@@ -4395,6 +4395,84 @@ class TestConflictFixCompletionStaleRebaseMismatch:
         assert kwargs["semantic"] is False
         assert kwargs["stale_rebase_mismatch"] is False
 
+    def test_now_loads_board_and_config_for_the_ordinary_escalation(
+        self, tmp_path: Path,
+    ) -> None:
+        """#3444: a `stale-rebase-mismatch` verdict now escalates to the
+        ORDINARY conflict-fix path inside `on_conflict_fix_done`
+        (`_try_ordinary_escalation_after_stale_mismatch`), which needs
+        `board`/`config` to dispatch. Before this fix this arm passed
+        `board=None, config=None` unconditionally (comment: "no board/
+        config needed here... goes straight to HUMAN_REQUIRED") — on
+        `coord notify`'s post_transition path (the "operationally
+        dominant" path per the #2565 comment above), that alone would have
+        reproduced #3444's exact bug even after `reconcile.py` was fixed."""
+        from coord.conflict_fix import STALE_REBASE_MISMATCH_MARKER
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ\n"
+        )
+
+        sentinel_board = object()
+        sentinel_config = object()
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.board_service.read_board", return_value=sentinel_board),
+            patch("coord.config.load", return_value=sentinel_config),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["stale_rebase_mismatch"] is True
+        assert kwargs["board"] is sentinel_board
+        assert kwargs["config"] is sentinel_config
+
+    def test_swallows_board_load_failure_for_the_ordinary_escalation(
+        self, tmp_path: Path,
+    ) -> None:
+        """A board/config load failure here must not crash `coord notify` —
+        it falls back to `None`/`None`, which makes the escalation attempt
+        inside `on_conflict_fix_done` a no-op and the entry still lands on
+        HUMAN_REQUIRED, exactly like before #3444."""
+        from coord.conflict_fix import STALE_REBASE_MISMATCH_MARKER
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ\n"
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.board_service.read_board", side_effect=Exception("no board")),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["stale_rebase_mismatch"] is True
+        assert kwargs["board"] is None
+        assert kwargs["config"] is None
+
     def test_semantic_marker_takes_precedence_and_skips_stale_rebase_check(
         self, tmp_path: Path,
     ) -> None:

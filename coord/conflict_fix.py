@@ -928,6 +928,7 @@ def has_prior_conflict_fix(
     merge_entry_id: str | None,
     *,
     current_error: str | None = None,
+    ignore_stale_rebase_attempts: bool = False,
 ) -> bool:
     """True when a second conflict-fix dispatch for *merge_entry_id* is blocked.
 
@@ -952,6 +953,21 @@ def has_prior_conflict_fix(
     recurring unchanged — not a fresh conflict — so it now consumes the cap
     too. Callers that don't pass *current_error* keep the pre-#2475 behaviour
     (``done`` never blocks) since they have no error text to compare.
+
+    *ignore_stale_rebase_attempts* (#3444): a stale-rebase dispatch
+    (``dispatch_conflict_fix(..., stale_rebase=True)``, title prefixed
+    :data:`STALE_REBASE_FIX_TITLE_PREFIX`) never even attempts a mechanical
+    resolution — it is authorized ONLY for a pure, content-preserving
+    rebase, and its own briefing embeds the SAME ``entry.error`` as its
+    "Reason:" line. Without this flag, its refusal (agent-reported ``done``,
+    downgraded to a give-up by the ``stale-rebase-mismatch`` marker — see
+    :func:`detect_stale_rebase_mismatch`) would trip the #2475
+    identical-error check above and block the ordinary conflict-fix #3444
+    escalates to right after, even though the ordinary path hasn't been
+    tried yet. Set by the one caller doing that escalation
+    (:func:`coord.reconcile._try_ordinary_escalation_after_stale_mismatch`)
+    to skip every stale-rebase-titled row entirely — active or not — so
+    ONLY prior *ordinary* conflict-fix attempts count against the cap.
     """
     if merge_entry_id is None:
         return False
@@ -959,6 +975,10 @@ def has_prior_conflict_fix(
         if a.type != "conflict-fix":
             continue
         if a.review_of_assignment_id != merge_entry_id:
+            continue
+        if ignore_stale_rebase_attempts and (a.issue_title or "").startswith(
+            STALE_REBASE_FIX_TITLE_PREFIX,
+        ):
             continue
         # Active attempt in flight — prevent duplicate dispatch.
         if a.status in ("running", "pending"):
@@ -1254,6 +1274,7 @@ def dispatch_conflict_fix(
     model: str | None = None,
     stuck_summary: str | None = None,
     stale_rebase: bool = False,
+    after_stale_rebase_mismatch: bool = False,
     status_fetcher: Callable[..., StatusResult] | None = None,
     machine_pick_out: "list[ConflictFixMachinePick] | None" = None,
 ) -> Assignment | None:
@@ -1357,6 +1378,23 @@ def dispatch_conflict_fix(
     (non-``semantic``) path below — a staleness-only block that recurs
     against the same error after a prior conflict-fix attempt escalates to
     a human exactly like a recurring mechanical conflict would.
+
+    ``after_stale_rebase_mismatch=True`` (#3444) dispatches the ORDINARY
+    conflict-fix path (same briefing/system-prompt/title as the plain
+    ``else`` branch below — this is not a distinct dispatch kind, just a
+    retry-cap carve-out) right after a stale-rebase worker's
+    ``stale-rebase-mismatch`` refusal: that verdict means the *just-stale*
+    premise was wrong — the rebase hit a genuine content conflict, so this
+    is an ordinary conflict that deserves the ordinary mechanical attempt,
+    not an immediate HUMAN_REQUIRED. Passes
+    ``ignore_stale_rebase_attempts=True`` to :func:`has_prior_conflict_fix`
+    so the just-failed stale-rebase attempt — which never even tried a
+    mechanical resolution — doesn't itself consume this cap; only a prior
+    *ordinary* conflict-fix attempt does, capping this escalation at one
+    per entry same as everything else here. #3349's safety property is
+    unaffected: the stale-rebase worker itself still never resolves
+    anything — only this ordinary worker (or its own semantic-escalation
+    tier) may.
     """
     if semantic:
         if has_prior_semantic_escalation(board, entry.assignment_id):
@@ -1365,6 +1403,7 @@ def dispatch_conflict_fix(
             return None
     elif has_prior_conflict_fix(
         board, entry.assignment_id, current_error=entry.error,
+        ignore_stale_rebase_attempts=after_stale_rebase_mismatch,
     ):
         return None
 
@@ -1576,6 +1615,11 @@ def dispatch_conflict_fix(
             # rebase dispatch from an ordinary conflict-fix without
             # re-deriving it from the assignment title prefix.
             "stale_rebase": stale_rebase,
+            # #3444: distinguishes an ordinary conflict-fix dispatched
+            # normally from one escalated right after a stale-rebase
+            # worker's mismatch refusal — same title/briefing either way,
+            # so this is the only durable trace of which path led here.
+            "after_stale_rebase_mismatch": after_stale_rebase_mismatch,
         },
     )
 
