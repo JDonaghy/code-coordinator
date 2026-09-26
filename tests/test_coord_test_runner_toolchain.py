@@ -279,7 +279,7 @@ def test_a_genuinely_failing_fallback_suite_is_still_a_failure(
 
 
 def test_coordinator_route_never_invokes_cargo_or_a_quadraui_sibling(
-    tui_repo: Path, tmp_path: Path, full_bin: Path
+    tui_repo: Path, tmp_path: Path
 ) -> None:
     """#2899 (keeping #2804's guard alive after the arm it guarded left).
 
@@ -294,14 +294,17 @@ def test_coordinator_route_never_invokes_cargo_or_a_quadraui_sibling(
     runner does not call one it *could* have found is stronger than proving it
     fails without one.
     """
+    # A private mirror with any real `cargo` omitted: on a host with a system
+    # cargo (dell64's /usr/bin/cargo -> rustup) the shared `full_bin` already
+    # holds a symlink named `cargo`, and write_text() would follow it into the
+    # real binary — PermissionError when root owns it, a clobbered toolchain
+    # when the user does.
+    bin_dir = _mirror_bin_dir(tmp_path / "bin", omit_prefixes=("cargo",))
     marker = tmp_path / "cargo-was-invoked"
-    cargo = full_bin / "cargo"
+    cargo = bin_dir / "cargo"
     cargo.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
     cargo.chmod(0o755)
-    try:
-        result = _run(tui_repo, tmp_path, full_bin, "--repo", "claude-coordinator")
-    finally:
-        cargo.unlink()
+    result = _run(tui_repo, tmp_path, bin_dir, "--repo", "claude-coordinator")
 
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
