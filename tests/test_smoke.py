@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from coord.config import Config, SmokeRule, SmokeTestsConfig, load
+from coord.config import (
+    Config,
+    SmokeRule,
+    SmokeTestsConfig,
+    load,
+    native_execution_capability,
+)
 from coord.models import Assignment, Board, Machine, Repo
 from coord.smoke import (
     ENVIRONMENTAL_SMOKE_MARKER,
@@ -34,6 +40,7 @@ from coord.smoke import (
     resolve_smoke_command,
     smoke_leg_capabilities,
     smoke_leg_issue_title,
+    unverified_native_capabilities,
 )
 
 
@@ -194,6 +201,170 @@ def test_required_capabilities_empty_repo_requires_matches_match_rules_exactly()
 
 def test_required_capabilities_returns_empty_when_neither_side_matches() -> None:
     assert required_capabilities([], ["docs/README.md"], []) == []
+
+
+# ── Native-execution verification (#3455) ────────────────────────────────────
+#
+# quadraui#1077 / claude-coordinator#3455: `dell64` declared `windows` while
+# its coord agent ran inside WSL (Linux). Its `windows` declaration has
+# always only meant "some build for this succeeds here" — a WSL/Linux agent
+# satisfies it exactly as readily as a real Windows box — so
+# `#[cfg(target_os = "windows")]` tests compiled out and the Test stage
+# reported `pass` for a failure that only exists on native hardware.
+
+
+def test_unverified_native_capabilities_flags_bare_declaration() -> None:
+    """`windows` alone (no paired `windows-native`) is unverified."""
+    machine = _machine("dell64", "dell64.tail", caps=["gtk", "windows"])
+    assert unverified_native_capabilities(
+        ["gtk", "windows"], machine, native_execution_capabilities=["windows"],
+    ) == ["windows"]
+
+
+def test_unverified_native_capabilities_empty_when_native_declared() -> None:
+    """A machine that ALSO declares `windows-native` is verified — the gate
+    can pass, and must, when the operator states the fact honestly."""
+    machine = _machine(
+        "realwin", "realwin.tail", caps=["gtk", "windows", "windows-native"],
+    )
+    assert unverified_native_capabilities(
+        ["gtk", "windows"], machine, native_execution_capabilities=["windows"],
+    ) == []
+
+
+def test_unverified_native_capabilities_ignores_non_native_only_caps() -> None:
+    """A capability outside `native_execution_capabilities` (e.g. `gtk`)
+    never needs a paired `-native` declaration — only #3455's own list does."""
+    machine = _machine("desktop", "desktop.tail", caps=["gtk"])
+    assert unverified_native_capabilities(
+        ["gtk"], machine, native_execution_capabilities=["windows"],
+    ) == []
+
+
+def test_unverified_native_capabilities_empty_when_not_required_at_all() -> None:
+    machine = _machine("server", "server.tail", caps=["python"])
+    assert unverified_native_capabilities(
+        [], machine, native_execution_capabilities=["windows"],
+    ) == []
+
+
+def test_unverified_native_capabilities_sorted_and_deduplicated_shape() -> None:
+    """Two native-only caps required, neither declared natively — both come
+    back, sorted (deterministic for a caller building a log/briefing line)."""
+    machine = _machine("dell64", "dell64.tail", caps=["windows", "macos"])
+    assert unverified_native_capabilities(
+        ["macos", "windows"], machine,
+        native_execution_capabilities=["windows", "macos"],
+    ) == ["macos", "windows"]
+
+
+def test_native_execution_capability_naming_convention() -> None:
+    assert native_execution_capability("windows") == "windows-native"
+
+
+def test_build_smoke_briefing_flags_unverified_native_capability() -> None:
+    """The briefing must say, explicitly, that a `pass` on this leg would not
+    be Windows-verified — never let the worker print a bare `SMOKE: pass`
+    indistinguishable from a real Windows run."""
+    briefing = build_smoke_briefing(
+        repo_github="acme/quadraui",
+        repo_name="quadraui",
+        branch="issue-1-fix",
+        issue_number=1077,
+        issue_title="Windows dialog fix",
+        smoke_command="cargo test -p quadraui --features win",
+        required_caps=["gtk", "windows"],
+        timeout_seconds=600,
+        is_worker=False,
+        native_unverified=["windows"],
+    )
+    assert "NOT NATIVELY VERIFIED" in briefing
+    assert "#3455" in briefing
+    assert "NOT windows-verified" in briefing
+
+
+def test_build_smoke_briefing_omits_native_caveat_when_verified() -> None:
+    """No `native_unverified` (the default, and every pre-#3455 call site) —
+    the briefing carries none of the new caveat text at all."""
+    briefing = build_smoke_briefing(
+        repo_github="acme/quadraui",
+        repo_name="quadraui",
+        branch="issue-1-fix",
+        issue_number=1077,
+        issue_title="Windows dialog fix",
+        smoke_command="cargo test -p quadraui --features win",
+        required_caps=["gtk", "windows"],
+        timeout_seconds=600,
+        is_worker=False,
+    )
+    assert "NOT NATIVELY VERIFIED" not in briefing
+    assert "#3455" not in briefing
+
+
+def test_dispatch_smoke_briefs_wsl_windows_leg_with_native_caveat(
+    repo: Repo,
+) -> None:
+    """Integration shape: the exact quadraui#1077 fleet (dell64 declares
+    `gtk`+`windows`, no `windows-native`) dispatches, but the briefing the
+    machine actually receives tells it not to report a bare `SMOKE: pass`."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/win/"], requires=["gtk", "windows"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    client = _MultiHostClient(assign={"dell64.tail": {"id": "dell64-leg"}})
+    result = dispatch_smoke(
+        completed, Board(), cfg,
+        http_client=client,
+        diff_lookup=lambda r, b: ["quadraui/src/win/dialog.rs"],
+    )
+    assert result is not None
+    assert len(client.calls) == 1
+    _url, payload = client.calls[0]
+    assert "NOT NATIVELY VERIFIED: windows" in payload["briefing"]
+    assert "#3455" in payload["briefing"]
+
+
+def test_dispatch_smoke_briefing_has_no_native_caveat_for_declared_native_machine(
+    repo: Repo,
+) -> None:
+    """A machine that HONESTLY declares `windows-native` gets no caveat — the
+    gate must be able to both fire and not fire, not just always fire."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine(
+                "realwin", "realwin.tail",
+                caps=["gtk", "windows", "windows-native"], path="/r/api",
+            ),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/win/"], requires=["gtk", "windows"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    client = _MultiHostClient(assign={"realwin.tail": {"id": "realwin-leg"}})
+    result = dispatch_smoke(
+        completed, Board(), cfg,
+        http_client=client,
+        diff_lookup=lambda r, b: ["quadraui/src/win/dialog.rs"],
+    )
+    assert result is not None
+    assert len(client.calls) == 1
+    _url, payload = client.calls[0]
+    assert "NOT NATIVELY VERIFIED" not in payload["briefing"]
+    assert "#3455" not in payload["briefing"]
 
 
 # ── Partitioning (#3177) ─────────────────────────────────────────────────────

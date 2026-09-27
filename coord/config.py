@@ -307,12 +307,28 @@ class SmokeTestsConfig:
     `default_command` is the shell command the smoke agent runs (e.g.
     `make smoke` or `pytest tests/smoke`). Per-repo overrides flow through
     `Repo.test_command` already; this is the fallback when none is set.
+
+    `native_execution_capabilities` (#3455) lists which bare capabilities
+    (e.g. `"windows"`) merely mean "some machine can build/cross-compile
+    for this" and do NOT by themselves prove a Test leg runs on that OS
+    natively. `dell64` declared `windows` while its coord agent ran inside
+    WSL (Linux); a #[cfg(target_os = "windows")] test compiled out and the
+    Test stage reported `pass` for a failure GitHub's `windows-latest`
+    runner caught every time (quadraui#1077). A machine must ALSO declare
+    `coord.config.native_execution_capability(cap)` (e.g. `windows-native`)
+    to certify it runs *that* capability's suite natively — see
+    `coord.smoke.unverified_native_capabilities`, which every dispatch path
+    consults before letting a leg's verdict read as a plain, unqualified
+    `pass`. Defaults to `["windows"]`, the one capability the incident this
+    exists for actually involved; add more here (e.g. a future `"macos"`
+    cross-build path) without any code change.
     """
 
     auto_queue: bool = False
     default_command: str | None = None
     timeout_seconds: int = 600
     capability_rules: list[SmokeRule] = field(default_factory=list)
+    native_execution_capabilities: list[str] = field(default_factory=lambda: ["windows"])
 
 
 @dataclass
@@ -1902,6 +1918,25 @@ def provider_capability(provider_type: str) -> str:
     call sites.
     """
     return f"provider:{provider_type}"
+
+
+def native_execution_capability(capability: str) -> str:
+    """The ``capabilities:`` string a machine must ALSO declare, alongside
+    *capability* itself, to certify it runs *capability*'s tests on a
+    genuinely native host rather than merely building/cross-compiling for
+    it (#3455).
+
+    ``native_execution_capability("windows") == "windows-native"``. Same
+    config-only-declaration shape as :func:`provider_capability` — a
+    machine that lists ``windows`` in ``capabilities:`` can build for
+    Windows (a WSL/Linux agent satisfies that today), but only one that
+    ALSO lists ``windows-native`` has told the coordinator its Test-stage
+    runs actually execute there. Single source of truth for the naming
+    convention: `coord.smoke.unverified_native_capabilities` is the only
+    caller, so the two can never disagree about the string (#2096, "one
+    question, one answer").
+    """
+    return f"{capability}-native"
 
 
 def model_plausible_for_provider_type(model: str, provider_type: str) -> bool:
@@ -3497,6 +3532,14 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
         if not isinstance(value, int) or value <= 0:
             raise ConfigError("smoke_tests.timeout_seconds must be a positive integer")
         cfg.timeout_seconds = value
+
+    if "native_execution_capabilities" in raw:
+        value = raw["native_execution_capabilities"]
+        if not isinstance(value, list) or not all(isinstance(c, str) for c in value):
+            raise ConfigError(
+                "smoke_tests.native_execution_capabilities must be a list of strings"
+            )
+        cfg.native_execution_capabilities = value
 
     rules_raw = raw.get("capability_rules", []) or []
     if not isinstance(rules_raw, list):
