@@ -120,19 +120,50 @@ _RUST_ERROR_RE = re.compile(r"\berror(\[E\d+\])?:")
 _RUST_LOCATION_RE = re.compile(r"-->")
 _RUST_WARNING_RE = re.compile(r"\bwarning:")
 
+# #3456: GitHub Actions appends this EXACT line to every failing step's log,
+# regardless of what actually failed — it is the annotation `_ERROR_
+# ANNOTATION_RE` would otherwise happily match as tier-1 signal, and on a
+# job whose real failure produces no OTHER `##[error]` line (e.g. a `cargo
+# test` failure — rustc's own test-harness panic output carries no `##[
+# error]` prefix at all), this generic wrapper line was the ONLY thing
+# selected: "exit code 1", not the failing test. Excluded from the
+# `annotation` tier entirely so the more specific `rust_test_failure` tier
+# below (or, failing that, `no_diagnostics_matched`) wins instead.
+_EXIT_CODE_ANNOTATION_RE = re.compile(r"##\[error\]Process completed with exit code \d+\.?\s*$")
+
+# #3456: a rust test-harness failure never carries a `##[error]` prefix, so
+# none of it was reachable by any tier before this — the harness prints a
+# per-test `---- <test path> stdout ----` header immediately followed by the
+# `panicked at ...` message, then (once every test has run) a `failures:`
+# roll-up naming every failing test, then a final `test result: FAILED. ...`
+# summary line. All four are treated as one priority tier: whichever of
+# them shows up is unambiguously more useful than the generic exit-code
+# annotation above.
+_RUST_TEST_STDOUT_HEADER_RE = re.compile(r"^-+\s.*\sstdout\s-+\s*$")
+_RUST_PANICKED_RE = re.compile(r"panicked at")
+_RUST_TEST_RESULT_RE = re.compile(r"\btest result: FAILED\b")
+_RUST_FAILURES_HEADER_RE = re.compile(r"^failures:\s*$")
+
 # How many lines past a matched rust-diagnostic line to look for its `-->`
 # location before giving up — rustc always emits it on the very next
 # non-blank line; a small window tolerates the odd blank line without
 # accidentally stealing a `-->` that belongs to a LATER diagnostic.
 _RUST_LOCATION_LOOKAHEAD = 4
 
+# How many lines past a `---- <test> stdout ----` header to sweep into the
+# same unit — enough to capture the `thread '...' panicked at ...:LINE:COL:`
+# line plus a short assertion message, without running so far that a SECOND
+# test's header (or unrelated harness noise) gets swept in too.
+_RUST_TEST_FAILURE_LOOKAHEAD = 6
+
 
 def _select_diagnostic_units(lines: list[str]) -> tuple[
-    list[list[str]], list[list[str]], list[list[str]]
+    list[list[str]], list[list[str]], list[list[str]], list[list[str]]
 ]:
-    """Classify *lines* into (annotation, rust_diagnostic, warning) unit
-    lists, each unit a small list of original line strings kept atomic so
-    budget truncation never splits an `error:`/`-->` pair apart (#3245).
+    """Classify *lines* into (annotation, rust_test_failure, rust_diagnostic,
+    warning) unit lists, each unit a small list of original line strings
+    kept atomic so budget truncation never splits an `error:`/`-->` pair —
+    or a rust test panic header/message pair — apart (#3245, #3456).
 
     Each source line is claimed by at most one bucket, checked in priority
     order, so a line matching a higher-priority pattern is never
@@ -142,9 +173,46 @@ def _select_diagnostic_units(lines: list[str]) -> tuple[
 
     annotation: list[list[str]] = []
     for i, line in enumerate(lines):
+        # #3456: the generic "step failed" wrapper line is deliberately
+        # never claimed here (see `_EXIT_CODE_ANNOTATION_RE`'s comment) —
+        # left unclaimed (not even added to `claimed`) since nothing else
+        # matches it anyway.
+        if _EXIT_CODE_ANNOTATION_RE.search(line):
+            continue
         if _ERROR_ANNOTATION_RE.search(line):
             annotation.append([line])
             claimed.add(i)
+
+    # #3456: rust test-harness failures — a stdout header sweeps in the
+    # panic message that follows it; a bare `panicked at`/`test result:
+    # FAILED`/`failures:` line (no preceding header, e.g. a `cargo run`
+    # panic outside the test harness) stands alone as its own unit.
+    rust_test_failure: list[list[str]] = []
+    for i, line in enumerate(lines):
+        if i in claimed:
+            continue
+        if _RUST_TEST_STDOUT_HEADER_RE.match(line.strip()):
+            claimed.add(i)
+            unit = [line]
+            end = min(i + 1 + _RUST_TEST_FAILURE_LOOKAHEAD, len(lines))
+            for j in range(i + 1, end):
+                if j in claimed:
+                    break
+                candidate = lines[j]
+                if not candidate.strip() or _RUST_TEST_STDOUT_HEADER_RE.match(candidate.strip()):
+                    # Blank line or the next test's header — stop before
+                    # sweeping in unrelated content.
+                    break
+                unit.append(candidate)
+                claimed.add(j)
+            rust_test_failure.append(unit)
+        elif (
+            _RUST_PANICKED_RE.search(line)
+            or _RUST_TEST_RESULT_RE.search(line)
+            or _RUST_FAILURES_HEADER_RE.match(line.strip())
+        ):
+            claimed.add(i)
+            rust_test_failure.append([line])
 
     rust_diag: list[list[str]] = []
     for i, line in enumerate(lines):
@@ -173,7 +241,7 @@ def _select_diagnostic_units(lines: list[str]) -> tuple[
         claimed.add(i)
         warning.append([line])
 
-    return annotation, rust_diag, warning
+    return annotation, rust_test_failure, rust_diag, warning
 
 
 def _extract_relevant_log_lines(text: str) -> tuple[str, bool, bool]:
@@ -189,30 +257,42 @@ def _extract_relevant_log_lines(text: str) -> tuple[str, bool, bool]:
     Extraction is by relevance, in priority order, matching the issue's fix
     shape:
 
-    1. ``##[error]`` GitHub Actions annotation lines
-    2. Rust diagnostics — ``error[E....]:``/``error:`` paired with the
-       ``-->`` file:line that follows
-    3. ``warning:`` lines, only if budget remains after 1-2
+    1. ``##[error]`` GitHub Actions annotation lines — EXCEPT the generic
+       ``Process completed with exit code N.`` wrapper GitHub Actions
+       appends to every failing step regardless of cause (#3456): it
+       carries zero diagnostic value, and on a job whose real failure
+       never emits any OTHER ``##[error]`` line (a rust test panic, say),
+       it used to be the ONLY thing this function ever surfaced.
+    2. Rust test-harness failures (#3456) — a ``---- <test> stdout ----``
+       header (with the ``panicked at ...`` message that follows it), a
+       bare ``panicked at`` line, a ``failures:`` roll-up, or the final
+       ``test result: FAILED`` summary line
+    3. Rust compiler diagnostics — ``error[E....]:``/``error:`` paired with
+       the ``-->`` file:line that follows
+    4. ``warning:`` lines, only if budget remains after 1-3
 
     Everything else — including the runner's own echo of a script step's
-    source and post-job cleanup — is never a candidate, because it can
-    only ever match one of these patterns by (extremely unlikely)
-    coincidence.
+    source and post-job cleanup, and the excluded exit-code wrapper line —
+    is never a candidate, because it can only ever match one of these
+    patterns by (extremely unlikely) coincidence.
 
     Returns ``(excerpt, truncated, matched)``:
 
     - *matched* is ``False`` when nothing in any tier matched anywhere in
       *text* — the caller renders an explicit "no diagnostics" note rather
-      than a misleadingly-empty excerpt.
+      than a misleadingly-empty excerpt. Note this can now be ``False`` for
+      a log whose ONLY `##[error]` line was the excluded exit-code wrapper —
+      correctly so, since that line alone told the caller nothing a
+      "no diagnostics matched" note doesn't already convey just as well.
     - *truncated* is ``True`` when the matched units together exceed
       :data:`CI_FIX_LOG_MAX_LINES`/:data:`CI_FIX_LOG_MAX_BYTES` and lower-
-      priority units (warnings first, then any tier-1/2 overflow) had to be
-      dropped to fit — same "make the cut visible" contract as
+      priority units (warnings first, then any earlier-tier overflow) had
+      to be dropped to fit — same "make the cut visible" contract as
       :func:`_bound_log_excerpt`.
     """
     lines = text.splitlines()
-    annotation, rust_diag, warning = _select_diagnostic_units(lines)
-    units = annotation + rust_diag + warning
+    annotation, rust_test_failure, rust_diag, warning = _select_diagnostic_units(lines)
+    units = annotation + rust_test_failure + rust_diag + warning
     if not units:
         return "", False, False
 

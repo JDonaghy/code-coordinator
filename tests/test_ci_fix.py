@@ -25,6 +25,7 @@ from coord.ci_fix import (
     dispatch_was_noop,
     refund_noop_ci_fix,
 )
+from coord.ci_github import _extract_relevant_log_lines
 from coord.ci_store import CheckRun, CIFailureDetail, JobRun, JobStep
 from coord.config import Config, ReviewsConfig
 from coord.merge_queue import HUMAN_REQUIRED, PENDING, MergeEvent, QueuedMerge
@@ -245,6 +246,114 @@ class TestBuildBriefingWithDetail:
             entry=_entry(), checks_summary="x", attempt=1, detail=detail,
         )
         assert "no diagnostic lines matched" in briefing.lower()
+
+
+class TestBuildBriefingWithIssueBody:
+    """#3456: the CI-fix briefing must carry the issue body — the only way
+    an operator's diagnosis (recorded on the issue after reading the real
+    CI logs by hand) ever reaches a ci-fix worker, since workers can't run
+    `gh` themselves to read it any other way."""
+
+    def test_no_issue_body_is_byte_identical_to_pre_3456(self) -> None:
+        """`issue_body=None` (the default) must not change the briefing at
+        all — every pre-#3456 caller (and every un-updated call site) keeps
+        getting exactly what it always got."""
+        without_kw = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1,
+        )
+        with_explicit_none = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1, issue_body=None,
+        )
+        assert without_kw == with_explicit_none
+
+    def test_blank_issue_body_adds_no_section(self) -> None:
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1, issue_body="   ",
+        )
+        assert "## Issue body" not in briefing
+
+    def test_issue_body_appears_in_briefing(self) -> None:
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1,
+            issue_body="## Root cause\n\nDirectWrite word-wrap/clip bug in "
+            "dialog.rs — see panic at dialog.rs:236:9.",
+        )
+        assert "## Issue body" in briefing
+        assert "DirectWrite word-wrap/clip bug" in briefing
+        assert "dialog.rs:236:9" in briefing
+
+    def test_long_issue_body_is_truncated_keeping_the_tail(self) -> None:
+        """Operator diagnosis is appended to the BOTTOM of the issue body
+        after the original description — truncation must keep the tail so
+        that diagnosis survives, even if the (often title-redundant)
+        original description at the top gets cut."""
+        from coord.ci_fix import ISSUE_BODY_MAX_CHARS
+
+        original = "x" * (ISSUE_BODY_MAX_CHARS + 500)
+        diagnosis = "\n\n## Root cause\n\nThe actual bug is a DirectWrite clip issue."
+        body = original + diagnosis
+
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1, issue_body=body,
+        )
+        assert "The actual bug is a DirectWrite clip issue." in briefing
+        assert "truncated" in briefing.lower()
+
+    def test_short_issue_body_is_not_marked_truncated(self) -> None:
+        briefing = build_ci_fix_briefing(
+            entry=_entry(), checks_summary="x", attempt=1, issue_body="short body",
+        )
+        assert "## Issue body" in briefing
+        assert "truncated to the last" not in briefing.lower()
+
+
+class TestDispatchCiFixFetchesIssueBody:
+    """#3456: `dispatch_ci_fix` fetches the issue body itself (best-effort)
+    and threads it into the briefing — a worker has no other path to an
+    operator's diagnosis recorded on the issue."""
+
+    def test_fetched_issue_body_lands_in_the_dispatched_briefing(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        board = Board()
+        board.completed.append(_work_assignment())
+        client = _FakeHTTPClient({"id": "ci-fix-body"})
+
+        with patch(
+            "coord.ci_fix.github_ops.get_issue",
+            return_value={"body": "## Root cause\n\nDirectWrite clip bug."},
+        ) as get_issue:
+            dispatch_ci_fix(
+                _entry(), board, two_machine_config,
+                checks_summary="acceptance (failure)", http_client=client,
+            )
+
+        get_issue.assert_called_once_with("acme/api", 1)
+        _, payload = client.calls[0]
+        assert "DirectWrite clip bug" in payload["briefing"]
+
+    def test_issue_fetch_failure_is_fail_soft(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A failed issue-body fetch (rate-limited, `gh` unreachable, ...)
+        must never block the dispatch — same posture as the #3114 detail
+        fetch."""
+        board = Board()
+        board.completed.append(_work_assignment())
+        client = _FakeHTTPClient({"id": "ci-fix-body-fail"})
+
+        with patch(
+            "coord.ci_fix.github_ops.get_issue",
+            side_effect=RuntimeError("gh throttled"),
+        ):
+            result = dispatch_ci_fix(
+                _entry(), board, two_machine_config,
+                checks_summary="acceptance (failure)", http_client=client,
+            )
+
+        assert result is not None
+        _, payload = client.calls[0]
+        assert "## Issue body" not in payload["briefing"]
 
 
 # ── #3011: no-op leg detection/refund ────────────────────────────────────────
@@ -975,3 +1084,73 @@ class TestDispatchCiFixesWithCiStore:
             )
             second_detail = dispatch.call_args.kwargs["detail"]
             assert second_detail == first_detail
+
+
+# ── #3456: excerpt selection prefers the failing rust test over the ─────────
+# ── generic "exit code" wrapper line ─────────────────────────────────────────
+
+
+class TestExcerptPrefersFailingRustTestOverExitCode:
+    """quadraui#1077: both ci-fix legs were briefed with nothing but
+    `##[error]Process completed with exit code 1.` — the least useful line
+    in the log — instead of the failing test name and panic message
+    (`panicked at ... dialog.rs:236:9: tinted button label should paint
+    ...`). `_extract_relevant_log_lines` must prefer the rust test-harness
+    failure lines over that generic wrapper."""
+
+    def test_exit_code_line_alone_is_not_matched(self) -> None:
+        """The generic wrapper line carries no diagnostic value on its
+        own — it must not be treated as a match at all (#3456), so the
+        caller renders the explicit "no diagnostics matched" note instead
+        of a briefing that looks substantive but says nothing."""
+        text = (
+            "running tests...\n"
+            "##[error]Process completed with exit code 1.\n"
+        )
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is False
+        assert excerpt == ""
+
+    def test_panic_and_test_result_preferred_over_exit_code(self) -> None:
+        text = "\n".join([
+            "running 42 tests",
+            "---- dialog::tests::tinted_button_label_paints stdout ----",
+            "thread 'main' panicked at dialog.rs:236:9:",
+            "tinted button label should paint with the theme's accent color",
+            "",
+            "failures:",
+            "    dialog::tests::tinted_button_label_paints",
+            "",
+            "test result: FAILED. 41 passed; 1 failed; 0 ignored",
+            "##[error]Process completed with exit code 1.",
+        ])
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert "panicked at dialog.rs:236:9" in excerpt
+        assert "tinted button label should paint" in excerpt
+        assert "test result: FAILED" in excerpt
+        assert "Process completed with exit code" not in excerpt
+
+    def test_bare_panic_line_without_test_harness_header_still_matches(self) -> None:
+        text = (
+            "starting up...\n"
+            "thread 'main' panicked at src/main.rs:10:5:\n"
+            "index out of bounds\n"
+            "##[error]Process completed with exit code 101.\n"
+        )
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert "panicked at src/main.rs:10:5" in excerpt
+        assert "Process completed with exit code" not in excerpt
+
+    def test_real_error_annotation_still_takes_priority(self) -> None:
+        """A genuinely diagnostic `##[error]` line (not the generic exit-
+        code wrapper) is still top priority, unaffected by this change."""
+        text = (
+            "##[error]coord-tui fails to compile against this PR's quadraui\n"
+            "##[error]Process completed with exit code 1.\n"
+        )
+        excerpt, truncated, matched = _extract_relevant_log_lines(text)
+        assert matched is True
+        assert "coord-tui fails to compile" in excerpt
+        assert "Process completed with exit code" not in excerpt
