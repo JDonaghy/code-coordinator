@@ -143,6 +143,172 @@ def test_recovers_done_smoke_child_as_lost_write(monkeypatch, config) -> None:
     assert "lost write" in calls[0]["failure_reason"] or "2803" in calls[0]["failure_reason"]
 
 
+# ── #3453: don't discard a done child's already-recorded verdict ────────────
+
+
+def test_done_child_with_recorded_verdict_propagates_it_not_environmental(
+    monkeypatch, config,
+) -> None:
+    """#3453 headline defect: a Test-stage child that finished `status='done'`
+    AND already carries its own recorded verdict (`test_state='passed'` on
+    its own row — e.g. a #3182 fan-out leg that self-recorded, or any other
+    shape whose FOLD onto the parent was the write that got lost, #2802)
+    must have that verdict PROPAGATED to the parent — never discarded for a
+    fresh dispatch, and never tallied as a #3315 environmental death, since
+    nothing died."""
+    now = time.time()
+
+    def _boom(**kw):
+        raise AssertionError(
+            "a done child with its own recorded verdict must never be "
+            "routed through the environmental/work classifier — nothing "
+            "died, there is a real verdict to propagate"
+        )
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "coord.state.record_test_verdict",
+        lambda **kw: recorded.append(kw),
+    )
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
+    smoke.test_state = "passed"
+    smoke.smoke_test = "pass"
+    board = Board(completed=[work, smoke])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(healed) == 1
+    assert healed[0].assignment_id == "w1"
+    assert "s1" in healed[0].detail
+    assert recorded == [
+        {
+            "assignment_id": "w1",
+            "test_state": "passed",
+            "test_reason": recorded[0]["test_reason"],
+        }
+    ]
+    assert "s1" in recorded[0]["test_reason"]
+    assert "propagated" in healed[0].action
+
+
+def test_done_child_with_recorded_failed_verdict_propagates_failed(
+    monkeypatch, config,
+) -> None:
+    """Same as above but for a `failed` verdict — the propagation must carry
+    whatever terminal state the child itself recorded, not just `passed`."""
+    now = time.time()
+
+    def _boom(**kw):
+        raise AssertionError("must not classify environmentally")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "coord.state.record_test_verdict",
+        lambda **kw: recorded.append(kw),
+    )
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
+    smoke.test_state = "failed"
+    smoke.smoke_test = "fail"
+    board = Board(completed=[work, smoke])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(healed) == 1
+    assert recorded[0]["test_state"] == "failed"
+
+
+def test_dry_run_reports_propagation_without_writing(monkeypatch, config) -> None:
+    now = time.time()
+
+    def _boom(**kw):
+        raise AssertionError("dry-run must not write")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    monkeypatch.setattr("coord.state.record_test_verdict", _boom)
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
+    smoke.test_state = "passed"
+    board = Board(completed=[work, smoke])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now, dry_run=True)
+
+    assert len(healed) == 1
+    assert healed[0].action.startswith("(dry-run)")
+    assert "propagate" in healed[0].action
+
+
+def test_second_sweep_does_not_reheal_the_same_already_healed_child(
+    monkeypatch, config,
+) -> None:
+    """#3453's second defect: the grace-window anchor is the (unchanging)
+    finished_at of the latest smoke child, so a parent whose `test_state`
+    reads `'running'` again — whatever re-stamps it without ever dispatching
+    a fresh Test-stage child, quadraui#1077 — must not be healed a second
+    time against the identical child. Simulates the persisted result of the
+    first heal (the marker embedded in the parent's own `test_reason`) since
+    `propagate_smoke_terminal_failure` is mocked out and never actually
+    writes to the board in this test module."""
+    now = time.time()
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "coord.reconcile.propagate_smoke_terminal_failure",
+        lambda **kw: calls.append(kw),
+    )
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
+    board = Board(completed=[work, smoke])
+
+    healed_first = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+    assert len(healed_first) == 1
+    assert len(calls) == 1
+
+    # Simulate what a real `propagate_smoke_terminal_failure` write would
+    # have left on the parent row: `test_reason` carrying the #3453 marker
+    # naming the child just healed. Then simulate the reported bug: something
+    # re-stamps `test_state` back to `'running'` without ever dispatching a
+    # fresh Test-stage child — `s1` is still `_latest_smoke_child`'s answer.
+    work.test_reason = calls[0]["failure_reason"]
+    work.test_state = "running"
+
+    healed_second = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert healed_second == []
+    assert len(calls) == 1, "must not re-heal (and re-tally #3315) the same child twice"
+
+
+def test_second_sweep_does_not_repropagate_after_marker_persists(
+    monkeypatch, config,
+) -> None:
+    """The same idempotency guard, for the recorded-verdict propagation path
+    rather than the environmental-clear path."""
+    now = time.time()
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "coord.state.record_test_verdict",
+        lambda **kw: recorded.append(kw),
+    )
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
+    smoke.test_state = "passed"
+    board = Board(completed=[work, smoke])
+
+    healed_first = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+    assert len(healed_first) == 1
+    assert len(recorded) == 1
+
+    work.test_reason = recorded[0]["test_reason"]
+    work.test_state = "running"
+
+    healed_second = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert healed_second == []
+    assert len(recorded) == 1
+
+
 def test_recovers_missing_smoke_child(monkeypatch, config) -> None:
     """No Test-stage assignment exists at all for the work row — the
     `dispatch_smoke`-stamped marker with nothing behind it. Also resolved
