@@ -314,8 +314,21 @@ INCONCLUSIVE_KINDS = frozenset({
 # * ``TEST_CONFIRMATION_BASELINE_RED`` — `ConfirmationResult.baseline_red`
 #   (#2170): the suite failed identically on the merge-base, so nothing was
 #   learned about the BRANCH specifically, but a real run did happen.
+# * ``TEST_CONFIRMATION_NATIVE_UNVERIFIED`` (#3455) — the claimed pass ran on
+#   a machine that declares only the bare/build side of a capability this
+#   leg required (`coord.smoke.SmokeTestsConfig.native_execution_
+#   capabilities`, e.g. `"windows"`), not the paired `coord.config.
+#   native_execution_capability` proof it runs that suite on genuinely native
+#   hardware — a WSL-hosted `windows` machine being the canonical case
+#   (`dell64` / quadraui#1077). Distinct from `UNCONFIRMED`: a confirmation
+#   run may well have executed and even agreed with the claim, but "agreed"
+#   here still means "on a non-native host", so platform-conditional code the
+#   real target OS would exercise never ran anywhere in this leg. Recorded
+#   by `coord.notify._record_smoke_verdict`'s PASS branches regardless of
+#   what the worker's own `SMOKE:` marker text says — see `coord.smoke.
+#   native_unverified_for_verdict`.
 #
-# ``None`` (the column default) is a fifth, implicit state: no confirmation
+# ``None`` (the column default) is a sixth, implicit state: no confirmation
 # question was ever asked about this write at all — a headless smoke
 # FAILURE, a human `coord test --passed` write that has not yet been reaped
 # by a notify pass, a mute-leg park, ``TEST_STATE_BLOCKED``, ... None of
@@ -326,6 +339,7 @@ TEST_CONFIRMATION_CONFIRMED = "confirmed"
 TEST_CONFIRMATION_UNCONFIRMED = "unconfirmed"
 TEST_CONFIRMATION_REFUTED = "refuted"
 TEST_CONFIRMATION_BASELINE_RED = "baseline_red"
+TEST_CONFIRMATION_NATIVE_UNVERIFIED = "native_unverified"
 
 #: Every value `test_confirmation` may hold — for validation / display sites
 #: that want to assert exhaustiveness rather than silently falling through.
@@ -334,6 +348,7 @@ TEST_CONFIRMATION_VALUES = frozenset({
     TEST_CONFIRMATION_UNCONFIRMED,
     TEST_CONFIRMATION_REFUTED,
     TEST_CONFIRMATION_BASELINE_RED,
+    TEST_CONFIRMATION_NATIVE_UNVERIFIED,
 })
 
 #: #3378: the canonical prefix a ``test_reason`` carries when a ``skipped``
@@ -1464,6 +1479,7 @@ __all__ = [
     "STALE_WORKTREE_MAX_AGE_HOURS",
     "TEST_CONFIRMATION_BASELINE_RED",
     "TEST_CONFIRMATION_CONFIRMED",
+    "TEST_CONFIRMATION_NATIVE_UNVERIFIED",
     "TEST_CONFIRMATION_REFUTED",
     "TEST_CONFIRMATION_UNCONFIRMED",
     "TEST_CONFIRMATION_VALUES",

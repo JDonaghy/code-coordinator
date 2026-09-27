@@ -2358,11 +2358,113 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
             record_inconclusive_confirmation(transition.repo_name, result.kind)
 
 
-def _confirmed_pass_verdict(
+def _native_unverified_capabilities(transition: Transition, entry: dict) -> list[str]:
+    """#3455: which of this smoke leg's required capabilities the machine
+    that ran it declares only the bare/build side of, not the paired
+    native-execution proof — recomputed HERE, independently of whatever the
+    worker's own ``SMOKE:`` marker text says, so a claimed pass can be
+    downgraded even when the worker never prints the caveat
+    `coord.smoke.build_smoke_briefing` asks for (a purely advisory,
+    worker-cooperation-dependent fix would leave that gap wide open — see
+    the #3455 review).
+
+    Best-effort and fail-open, matching every other diagnostic in this
+    module (`_run_pass_confirmation` et al.): a config load failure, an
+    unknown repo/machine, or a PR/diff lookup failure returns ``[]`` — this
+    must never turn "couldn't tell" into a false downgrade, and must never
+    abandon the caller's verdict-recording transition over a network blip.
+    """
+    from coord.config import load as _load_config  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        _fetch_touched_files,
+        native_unverified_for_verdict,
+    )
+
+    try:
+        config = _load_config()
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "smoke %s: could not load config for the #3455 native-"
+            "verification check (%s) — skipping it.",
+            transition.assignment_id, exc,
+        )
+        return []
+
+    repo = config.repo(transition.repo_name)
+    machine = next(
+        (m for m in config.machines if m.name == transition.machine_name), None
+    )
+    if repo is None or machine is None:
+        return []
+
+    branch = entry.get("branch")
+    if not branch:
+        return []
+
+    try:
+        touched_files = _fetch_touched_files(repo.github, branch)
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "smoke %s: could not fetch touched files for the #3455 native-"
+            "verification check (%s) — skipping it.",
+            transition.assignment_id, exc,
+        )
+        return []
+
+    return native_unverified_for_verdict(
+        repo=repo, machine=machine, smoke_cfg=config.smoke_tests,
+        touched_files=touched_files,
+    )
+
+
+def _downgrade_for_native_unverified(
+    state: str,
+    reason: str,
+    confirmation: str,
+    native_unverified: list[str] | None,
+) -> tuple[str, str, str]:
+    """#3455: a claimed pass on a leg whose machine declares only the bare
+    (build/cross-compile) side of a required capability — never the paired
+    native-execution proof (`coord.smoke.native_unverified_for_verdict`) —
+    must not read as a plain confirmed/unconfirmed pass. This is what
+    actually closes the loop the #3455 review found open: it fires
+    regardless of what the worker's own ``SMOKE:`` marker text says, so a
+    worker that never prints the caveat `coord.smoke.build_smoke_briefing`
+    asks for still gets a genuinely distinct, machine-readable
+    ``test_confirmation`` on the row.
+
+    Only applies to a ``state == "passed"`` result — a real ``failed``,
+    the #2579 ``TEST_STATE_CONTESTED``, or a ``baseline_red`` skip already
+    carry more urgent, more specific information and must never be
+    overwritten by this.
+    """
+    if state != "passed" or not native_unverified:
+        return state, reason, confirmation
+    from coord.confirm_test import (  # noqa: PLC0415
+        TEST_CONFIRMATION_NATIVE_UNVERIFIED,
+    )
+
+    caps = ", ".join(native_unverified)
+    return (
+        state,
+        f"{reason} — NOT NATIVELY VERIFIED for {caps} (#3455): this leg ran "
+        "on a machine that declares the bare capability but not native "
+        "execution for it, so a platform-conditional failure specific to "
+        f"real {caps} hardware would not have shown up here.",
+        TEST_CONFIRMATION_NATIVE_UNVERIFIED,
+    )
+
+
+def _confirmed_pass_verdict_core(
     transition: Transition, entry: dict, parent_id: str, *, claim_reason: str,
 ) -> tuple[str, str, str]:
     """#2464: the ``(test_state, test_reason, test_confirmation)`` to record
     for a *claimed* pass.
+
+    Callers should use the public :func:`_confirmed_pass_verdict` wrapper,
+    not this directly — it additionally applies the #3455 native-
+    verification downgrade (:func:`_downgrade_for_native_unverified`) this
+    core function knows nothing about.
 
     The Test stage's pass claim — whether it arrived as a ``SMOKE: pass``
     marker or as the worker calling ``coord test --passed`` on itself (#2217) —
@@ -2541,6 +2643,38 @@ def _confirmed_pass_verdict(
         "passed",
         f"{claim_reason} — UNCONFIRMED: {result.reason}",
         TEST_CONFIRMATION_UNCONFIRMED,
+    )
+
+
+def _confirmed_pass_verdict(
+    transition: Transition,
+    entry: dict,
+    parent_id: str,
+    *,
+    claim_reason: str,
+    native_unverified: list[str] | None = None,
+) -> tuple[str, str, str]:
+    """#2464/#3455: the ``(test_state, test_reason, test_confirmation)`` to
+    record for a *claimed* pass — :func:`_confirmed_pass_verdict_core`'s
+    out-of-band confirmation, with the #3455 native-verification downgrade
+    (:func:`_downgrade_for_native_unverified`) applied on top.
+
+    *native_unverified* — non-empty means this leg's machine declares only
+    the bare/build side of one or more of its required capabilities, not
+    the paired native-execution proof (`coord.smoke.native_unverified_for_
+    verdict`). This downgrade is unconditional on the worker's own
+    ``SMOKE:`` marker text: it fires purely from the machine/capability
+    facts, so a claimed pass this leg cannot actually back with native
+    hardware never records as a plain ``confirmed``/``unconfirmed`` pass —
+    see the #3455 review that made this the mandatory second half of the
+    fix (the briefing-text caveat alone changes nothing this repo's own
+    gates/merge-queue code ever reads back).
+    """
+    state, reason, confirmation = _confirmed_pass_verdict_core(
+        transition, entry, parent_id, claim_reason=claim_reason,
+    )
+    return _downgrade_for_native_unverified(
+        state, reason, confirmation, native_unverified,
     )
 
 
@@ -2725,6 +2859,7 @@ def _record_smoke_verdict(
             state, reason, confirmation = _confirmed_pass_verdict(
                 transition, entry, parent_id,
                 claim_reason="worker self-recorded via `coord test` (#2217)",
+                native_unverified=_native_unverified_capabilities(transition, entry),
             )
             record_test_verdict(
                 assignment_id=parent_id,
@@ -2814,6 +2949,7 @@ def _record_smoke_verdict(
         state, reason, confirmation = _confirmed_pass_verdict(
             transition, entry, parent_id,
             claim_reason="headless smoke reported SMOKE: pass",
+            native_unverified=_native_unverified_capabilities(transition, entry),
         )
         record_test_verdict(
             assignment_id=parent_id,
@@ -2842,7 +2978,9 @@ def _record_smoke_verdict(
     # away, with no leg spent and no tally incremented.
     mechanical = _mechanical_mute_verdict(transition, entry, parent_id)
     if mechanical is not None:
-        state, reason, confirmation = mechanical
+        state, reason, confirmation = _downgrade_for_native_unverified(
+            *mechanical, _native_unverified_capabilities(transition, entry),
+        )
         record_test_verdict(
             assignment_id=parent_id,
             test_state=state,

@@ -48,9 +48,21 @@ Public entry points:
   declares only the build/cross-compile side of, not the paired
   `coord.config.native_execution_capability` proof it runs that capability's
   suite on a genuinely native host (e.g. a WSL-hosted `windows` machine).
-  Every dispatch path calls it before letting a leg's own briefing tell the
-  worker to print an unqualified `SMOKE: pass` — see `build_smoke_briefing`'s
-  `native_unverified` parameter.
+  Called twice: at DISPATCH time (`_walk_candidates_and_dispatch`, below) so
+  the briefing tells the worker to caveat its own `SMOKE: pass` line — see
+  `build_smoke_briefing`'s `native_unverified` parameter — and again at
+  VERDICT-RECORDING time via `native_unverified_for_verdict`, which
+  `coord.notify._record_smoke_verdict`'s PASS branches consult so the
+  recorded `test_confirmation` reflects this leg's native-verification
+  status regardless of whether the worker's own marker text carried the
+  caveat.
+- `native_unverified_for_verdict(repo, machine, smoke_cfg, touched_files)`
+  (#3455) — pure: composes `required_capabilities` and
+  `unverified_native_capabilities` for a leg that has already completed, so
+  a caller with only the finished assignment's repo/machine/touched-files in
+  hand (no live dispatch context) can ask the identical question
+  `_walk_candidates_and_dispatch` asked at dispatch time. The single caller
+  today is `coord.notify._record_smoke_verdict`.
 
 #1819: the unit a Test run measures is the **(branch, base)** pair, not the
 work row that asked for it. Three guards in `dispatch_smoke` follow from that
@@ -334,12 +346,12 @@ def unverified_native_capabilities(
     hardware (quadraui#1077 / claude-coordinator#3455: `dell64` declared
     `windows`, ran in WSL, and three Test legs all read `SMOKE: pass —
     UNCONFIRMED` while `windows-latest` failed the identical SHA every
-    time). Every dispatch path that picks a machine for a leg needing one
-    of *native_execution_capabilities* MUST call this and, when it returns
-    non-empty, make sure the leg's own verdict says so rather than reading
-    as an unqualified pass — see `build_smoke_briefing`'s
-    ``native_unverified`` parameter, the only place this list is threaded
-    to next.
+    time). Two callers thread this list onward: `build_smoke_briefing`'s
+    ``native_unverified`` parameter (dispatch time — tells the worker to
+    caveat its own marker) and `native_unverified_for_verdict` below
+    (verdict-recording time — lets `coord.notify._record_smoke_verdict`
+    downgrade `test_confirmation` to ``TEST_CONFIRMATION_NATIVE_UNVERIFIED``
+    on its own, without depending on the worker's marker text at all).
 
     Returns the sorted subset that is unverified — empty whenever
     *required_caps* needs no native-only capability at all, which is every
@@ -351,6 +363,45 @@ def unverified_native_capabilities(
         cap for cap in required_caps
         if cap in native_only
         and native_execution_capability(cap) not in machine.capabilities
+    )
+
+
+def native_unverified_for_verdict(
+    *,
+    repo,
+    machine: Machine,
+    smoke_cfg: SmokeTestsConfig,
+    touched_files: list[str],
+) -> list[str]:
+    """The #3455 native-verification gap for a leg that has already
+    completed, computed from the finished assignment's own repo/machine/
+    diff rather than from live dispatch context.
+
+    This asks `unverified_native_capabilities` the identical question
+    `_walk_candidates_and_dispatch` asks at dispatch time — recomputed here
+    because that leg's own dispatch-time answer isn't persisted anywhere a
+    later verdict-recording pass can read back; recomputing from the same
+    inputs (`repo.requires`, `smoke_cfg.capability_rules` matched against
+    *touched_files*, `smoke_cfg.native_execution_capabilities`) gives the
+    identical answer without a schema change.
+
+    The single caller is `coord.notify._record_smoke_verdict`, which uses a
+    non-empty result to downgrade a claimed pass's `test_confirmation` to
+    `TEST_CONFIRMATION_NATIVE_UNVERIFIED` regardless of whether the worker's
+    own `SMOKE:` marker carried the caveat this module's briefing asks for
+    — closing the gap a purely advisory, worker-cooperation-dependent fix
+    would leave open.
+
+    Returns ``[]`` whenever *touched_files* needs no native-only capability
+    at all (every diff/repo predating #3455).
+    """
+    required_caps = required_capabilities(
+        repo.requires, touched_files, smoke_cfg.capability_rules
+    )
+    if not required_caps:
+        return []
+    return unverified_native_capabilities(
+        required_caps, machine, smoke_cfg.native_execution_capabilities,
     )
 
 
@@ -938,6 +989,17 @@ def rank_smoke_machines(
     3. The worker's own machine, if capable (busy — smoke will queue)
     4. Busy, capable, different from worker (config order; smoke will queue)
 
+    #3455 review: when *required_caps* needs native execution
+    (`config.smoke_tests.native_execution_capabilities`) AND the worker
+    machine itself is only bare-declared for it (not native-verified — see
+    `unverified_native_capabilities`) AND some OTHER capability-matched
+    machine genuinely IS native-verified, tier 1/3's worker-preference boost
+    above is suppressed for this call — the worker still appears (last
+    resort, same as `prefer_worker=False`), but a native alternative is
+    tried first regardless of idle/busy state parity within its own tier.
+    Every other leg (no native-only capability required, or no native
+    alternative exists in the fleet) is completely unaffected by this.
+
     Every candidate appears exactly once; the head of the list is exactly what
     :func:`pick_smoke_machine` used to return on its own.
 
@@ -1005,6 +1067,39 @@ def rank_smoke_machines(
     busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
 
     same = next((m for m in candidates if m.name == worker_machine_name), None)
+
+    # #3455 review: a genuinely native-verified machine must be preferred
+    # over one that only declares the bare/build side of a capability THIS
+    # leg needs native execution for — otherwise the #1402 warm-cache
+    # preference below can pick a WSL-hosted `windows` worker over an idle
+    # native `windows` box sitting right next to it, even though a native
+    # alternative was available the whole time. Only engages when this leg
+    # actually needs native execution (`native_required`) — every other leg,
+    # including every config that predates #3455, is completely unaffected.
+    native_caps = set(config.smoke_tests.native_execution_capabilities)
+    native_required = bool(set(required_caps) & native_caps)
+    if native_required:
+        def _native_ok(m: Machine) -> bool:
+            return not unverified_native_capabilities(required_caps, m, native_caps)
+
+        # Stable sort: native-verified candidates first, config order
+        # preserved within each group — so a caller with two idle native
+        # candidates still gets #1672's original best-first tie-break.
+        candidates = sorted(candidates, key=lambda m: not _native_ok(m))
+        if (
+            prefer_worker
+            and same is not None
+            and not _native_ok(same)
+            and any(_native_ok(m) for m in candidates if m.name != same.name)
+        ):
+            # The worker's warm build cache is not worth dispatching a leg
+            # that structurally cannot catch a platform-conditional failure
+            # when a genuinely native machine is idle/available for it —
+            # fall back to the pre-#1402 different-machine-first ordering
+            # (the exact mechanism `prefer_worker=False` already uses; the
+            # worker is never dropped, only demoted to the last-resort tier
+            # below).
+            prefer_worker = False
 
     ranked: list[SmokeMachineChoice] = []
     seen: set[str] = set()

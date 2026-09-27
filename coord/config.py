@@ -317,11 +317,17 @@ class SmokeTestsConfig:
     runner caught every time (quadraui#1077). A machine must ALSO declare
     `coord.config.native_execution_capability(cap)` (e.g. `windows-native`)
     to certify it runs *that* capability's suite natively — see
-    `coord.smoke.unverified_native_capabilities`, which every dispatch path
-    consults before letting a leg's verdict read as a plain, unqualified
-    `pass`. Defaults to `["windows"]`, the one capability the incident this
-    exists for actually involved; add more here (e.g. a future `"macos"`
-    cross-build path) without any code change.
+    `coord.smoke.unverified_native_capabilities`, consulted at THREE points
+    so the gap can't be closed by prompt-cooperation alone: routing
+    (`coord.smoke.rank_smoke_machines` prefers a native-verified candidate
+    over a bare one when both exist), dispatch (the briefing tells the
+    worker to caveat its own marker), and verdict-recording
+    (`coord.notify._record_smoke_verdict`'s PASS branches independently
+    recompute this and record `test_confirmation="native_unverified"`
+    regardless of what the worker's marker text says). Defaults to
+    `["windows"]`, the one capability the incident this exists for actually
+    involved; add more here (e.g. a future `"macos"` cross-build path)
+    without any code change.
     """
 
     auto_queue: bool = False

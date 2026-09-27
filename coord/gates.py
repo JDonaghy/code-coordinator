@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING
 
 from coord.confirm_test import (
     TEST_CONFIRMATION_BASELINE_RED,
+    TEST_CONFIRMATION_NATIVE_UNVERIFIED,
     TEST_CONFIRMATION_UNCONFIRMED,
 )
 from coord.models import WORK_LIKE_TYPES, effective_issue_number
@@ -1065,6 +1066,13 @@ def format_gate_report(report: GateReport) -> str:
                     suffix = " (UNCONFIRMED — suite never ran)"
                 elif confirmation == TEST_CONFIRMATION_BASELINE_RED:
                     suffix = " (baseline-red — branch not at fault, #2170)"
+                elif confirmation == TEST_CONFIRMATION_NATIVE_UNVERIFIED:
+                    # #3455: this leg ran on a machine that declares only the
+                    # bare/build side of a required capability (e.g. a
+                    # WSL-hosted `windows` machine) — a plain "passed" here
+                    # would read exactly like a genuinely native-hardware
+                    # green, which this is not.
+                    suffix = " (NOT NATIVELY VERIFIED — #3455)"
                 lines.append(
                     "  test   : passed"
                     + (f" (recorded on {test.assignment_id})" if test.assignment_id else "")

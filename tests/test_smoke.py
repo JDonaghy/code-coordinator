@@ -262,6 +262,76 @@ def test_native_execution_capability_naming_convention() -> None:
     assert native_execution_capability("windows") == "windows-native"
 
 
+# ── `native_unverified_for_verdict` (#3455 review) ───────────────────────────
+#
+# The review found the whole #3455 fix advisory-only: `coord.notify.
+# _record_smoke_verdict`'s PASS branches never actually consulted
+# `unverified_native_capabilities` at verdict-recording time, so a leg's
+# recorded `test_confirmation` stayed exactly what it would have been before
+# #3455 regardless of the machine. `native_unverified_for_verdict` is the
+# composition `coord.notify._native_unverified_capabilities` now calls to
+# close that gap — these tests pin its pure behaviour independent of the
+# notify-side wiring (covered in tests/test_notify.py).
+
+
+def test_native_unverified_for_verdict_flags_a_wsl_windows_machine(
+    repo: Repo,
+) -> None:
+    from coord.smoke import native_unverified_for_verdict  # noqa: PLC0415
+
+    repo = replace(repo, requires=["windows"])
+    machine = _machine("dell64", "dell64.tail", caps=["gtk", "windows"])
+    smoke_cfg = SmokeTestsConfig(native_execution_capabilities=["windows"])
+    assert native_unverified_for_verdict(
+        repo=repo, machine=machine, smoke_cfg=smoke_cfg, touched_files=["src/x.rs"],
+    ) == ["windows"]
+
+
+def test_native_unverified_for_verdict_empty_for_a_native_machine(
+    repo: Repo,
+) -> None:
+    from coord.smoke import native_unverified_for_verdict  # noqa: PLC0415
+
+    repo = replace(repo, requires=["windows"])
+    machine = _machine(
+        "realwin", "realwin.tail", caps=["gtk", "windows", "windows-native"],
+    )
+    smoke_cfg = SmokeTestsConfig(native_execution_capabilities=["windows"])
+    assert native_unverified_for_verdict(
+        repo=repo, machine=machine, smoke_cfg=smoke_cfg, touched_files=["src/x.rs"],
+    ) == []
+
+
+def test_native_unverified_for_verdict_empty_when_no_capability_required(
+    repo: Repo,
+) -> None:
+    from coord.smoke import native_unverified_for_verdict  # noqa: PLC0415
+
+    machine = _machine("dell64", "dell64.tail", caps=["gtk", "windows"])
+    smoke_cfg = SmokeTestsConfig(native_execution_capabilities=["windows"])
+    assert native_unverified_for_verdict(
+        repo=repo, machine=machine, smoke_cfg=smoke_cfg, touched_files=["docs/x.md"],
+    ) == []
+
+
+def test_native_unverified_for_verdict_via_matched_capability_rule(
+    repo: Repo,
+) -> None:
+    """A file-matched rule (not just `repo.requires`) also feeds the check —
+    the same union `required_capabilities` computes for dispatch."""
+    from coord.smoke import native_unverified_for_verdict  # noqa: PLC0415
+
+    smoke_cfg = SmokeTestsConfig(
+        capability_rules=[SmokeRule(files=["win/"], requires=["windows"])],
+        native_execution_capabilities=["windows"],
+    )
+    machine = _machine("dell64", "dell64.tail", caps=["windows"])
+    assert native_unverified_for_verdict(
+        repo=repo, machine=machine, smoke_cfg=smoke_cfg,
+        touched_files=["win/dialog.rs"],
+    ) == ["windows"]
+
+
 def test_build_smoke_briefing_flags_unverified_native_capability() -> None:
     """The briefing must say, explicitly, that a `pass` on this leg would not
     be Windows-verified — never let the worker print a bare `SMOKE: pass`
@@ -2446,6 +2516,78 @@ def test_rank_smoke_machines_empty_when_capability_unmatched(
     from coord.smoke import rank_smoke_machines
 
     assert rank_smoke_machines(["cuda"], "api", "server", Board(), three_gtk_config) == []
+
+
+# ── #3455 review: prefer a native candidate over the warm-cache worker ──────
+
+
+@pytest.fixture
+def wsl_and_native_windows_config(repo: Repo) -> Config:
+    """`dell64` declares the bare `windows` capability from inside WSL (the
+    quadraui#1077 incident shape); `realwin` declares the paired
+    `windows-native` proof too."""
+    return Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine(
+                "realwin", "realwin.tail",
+                caps=["gtk", "windows", "windows-native"], path="/r/api",
+            ),
+        ],
+        smoke_tests=SmokeTestsConfig(native_execution_capabilities=["windows"]),
+    )
+
+
+def test_rank_smoke_machines_prefers_native_over_the_wsl_worker(
+    wsl_and_native_windows_config: Config,
+) -> None:
+    """The #3455 review's own scenario: the fleet has BOTH a genuinely
+    native machine and a WSL-only one satisfying the bare `windows`
+    capability — dispatch must prefer the native one even though the WSL
+    machine is the (idle) worker with the warm build cache."""
+    from coord.smoke import rank_smoke_machines
+
+    ranked = rank_smoke_machines(
+        ["windows"], "api", "dell64", Board(), wsl_and_native_windows_config,
+    )
+    assert [c.machine.name for c in ranked] == ["realwin", "dell64"], (
+        "a native-verified machine must outrank the non-native worker for a "
+        "leg that needs native execution (#3455)"
+    )
+
+
+def test_rank_smoke_machines_still_falls_back_to_the_wsl_worker_alone(
+    repo: Repo,
+) -> None:
+    """No native alternative exists anywhere in the fleet — the WSL worker
+    must still be dispatched (the #3455 fix downstream, `coord.notify.
+    _record_smoke_verdict`, is what flags the resulting verdict; routing has
+    nothing better to offer here)."""
+    from coord.smoke import rank_smoke_machines
+
+    cfg = Config(
+        repos=[repo],
+        machines=[_machine("dell64", "dell64.tail", caps=["gtk", "windows"])],
+        smoke_tests=SmokeTestsConfig(native_execution_capabilities=["windows"]),
+    )
+    ranked = rank_smoke_machines(["windows"], "api", "dell64", Board(), cfg)
+    assert [c.machine.name for c in ranked] == ["dell64"]
+
+
+def test_rank_smoke_machines_native_preference_does_not_affect_other_caps(
+    three_gtk_config: Config,
+) -> None:
+    """A leg that needs no `native_execution_capabilities` member at all
+    (the overwhelming majority, including every pre-#3455 config) must rank
+    exactly as before — `gtk` isn't in `native_execution_capabilities`."""
+    from coord.smoke import rank_smoke_machines
+
+    ranked = rank_smoke_machines(["gtk"], "api", "desktop-a", Board(), three_gtk_config)
+    assert [c.machine.name for c in ranked][0] == "desktop-a", (
+        "the idle worker's warm-cache preference must be untouched when "
+        "native execution isn't even in question"
+    )
 
 
 # ── #2636: rank_smoke_machines consults pause state ─────────────────────────
