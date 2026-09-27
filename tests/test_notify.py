@@ -4269,6 +4269,255 @@ class TestConfirmedPassVerdictConfirmationField:
         )
 
 
+class TestNativeUnverifiedDowngrade3455:
+    """#3455 review: the whole prior fix was advisory-only — it never
+    changed the recorded verdict, only the briefing text the worker was
+    asked (but not required) to echo back. `_downgrade_for_native_
+    unverified` and `_native_unverified_capabilities` are what actually
+    close that gap: a PASS claim on a machine that only declares the bare
+    side of a required native-only capability must record a genuinely
+    distinct, machine-readable `test_confirmation`
+    (`TEST_CONFIRMATION_NATIVE_UNVERIFIED`) regardless of the worker's own
+    marker text.
+    """
+
+    def test_downgrade_overrides_a_confirmed_pass(self) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _downgrade_for_native_unverified  # noqa: PLC0415
+
+        state, reason, confirmation = _downgrade_for_native_unverified(
+            "passed", "independently confirmed", ct.TEST_CONFIRMATION_CONFIRMED,
+            ["windows"],
+        )
+        assert state == "passed"
+        assert confirmation == ct.TEST_CONFIRMATION_NATIVE_UNVERIFIED
+        assert "NOT NATIVELY VERIFIED" in reason
+        assert "windows" in reason
+        # #2464's own story must not be silently discarded — it's appended,
+        # not replaced.
+        assert "independently confirmed" in reason
+
+    def test_downgrade_is_a_noop_without_native_unverified_caps(self) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _downgrade_for_native_unverified  # noqa: PLC0415
+
+        result = _downgrade_for_native_unverified(
+            "passed", "confirmed", ct.TEST_CONFIRMATION_CONFIRMED, [],
+        )
+        assert result == ("passed", "confirmed", ct.TEST_CONFIRMATION_CONFIRMED)
+
+        result_none = _downgrade_for_native_unverified(
+            "passed", "confirmed", ct.TEST_CONFIRMATION_CONFIRMED, None,
+        )
+        assert result_none == ("passed", "confirmed", ct.TEST_CONFIRMATION_CONFIRMED)
+
+    def test_downgrade_never_touches_a_non_passed_state(self) -> None:
+        """A real failure/contest/baseline-red already carries more urgent,
+        more specific information — this must never overwrite it."""
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _downgrade_for_native_unverified  # noqa: PLC0415
+
+        for state, confirmation in (
+            ("failed", ct.TEST_CONFIRMATION_REFUTED),
+            (notify_mod.TEST_STATE_CONTESTED, ct.TEST_CONFIRMATION_REFUTED),
+            ("skipped", ct.TEST_CONFIRMATION_BASELINE_RED),
+        ):
+            result = _downgrade_for_native_unverified(
+                state, "some reason", confirmation, ["windows"],
+            )
+            assert result == (state, "some reason", confirmation)
+
+    def test_native_unverified_capabilities_fails_open_without_config(self) -> None:
+        """No loadable `coordinator.yml` (the default test environment) must
+        never invent a downgrade — see every other diagnostic in this
+        module's fail-open convention."""
+        from coord.notify import (  # noqa: PLC0415
+            Transition, EVENT_COMPLETION, _native_unverified_capabilities,
+        )
+
+        transition = Transition(
+            assignment_id="smoke-1", machine_name="dell64", repo_name="quadraui",
+            issue_number=1, event=EVENT_COMPLETION, exit_code=0,
+        )
+        with patch(
+            "coord.config.load",
+            side_effect=FileNotFoundError("no coordinator.yml"),
+        ):
+            assert _native_unverified_capabilities(
+                transition, {"branch": "issue-1-fix"},
+            ) == []
+
+    def test_native_unverified_capabilities_flags_a_wsl_windows_machine(
+        self,
+    ) -> None:
+        from coord.config import SmokeTestsConfig  # noqa: PLC0415
+        from coord.notify import (  # noqa: PLC0415
+            Transition, EVENT_COMPLETION, _native_unverified_capabilities,
+        )
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", requires=["windows"])],
+            machines=[
+                Machine(
+                    name="dell64", host="dell64.tail", repos=["quadraui"],
+                    capabilities=["gtk", "windows"],
+                ),
+            ],
+            smoke_tests=SmokeTestsConfig(native_execution_capabilities=["windows"]),
+        )
+        transition = Transition(
+            assignment_id="smoke-1", machine_name="dell64", repo_name="quadraui",
+            issue_number=1, event=EVENT_COMPLETION, exit_code=0,
+        )
+        with (
+            patch("coord.config.load", return_value=cfg),
+            patch("coord.smoke._fetch_touched_files", return_value=["src/x.rs"]),
+        ):
+            assert _native_unverified_capabilities(
+                transition, {"branch": "issue-1-fix"},
+            ) == ["windows"]
+
+    def test_native_unverified_capabilities_empty_for_a_native_machine(
+        self,
+    ) -> None:
+        from coord.config import SmokeTestsConfig  # noqa: PLC0415
+        from coord.notify import (  # noqa: PLC0415
+            Transition, EVENT_COMPLETION, _native_unverified_capabilities,
+        )
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", requires=["windows"])],
+            machines=[
+                Machine(
+                    name="realwin", host="realwin.tail", repos=["quadraui"],
+                    capabilities=["gtk", "windows", "windows-native"],
+                ),
+            ],
+            smoke_tests=SmokeTestsConfig(native_execution_capabilities=["windows"]),
+        )
+        transition = Transition(
+            assignment_id="smoke-1", machine_name="realwin", repo_name="quadraui",
+            issue_number=1, event=EVENT_COMPLETION, exit_code=0,
+        )
+        with (
+            patch("coord.config.load", return_value=cfg),
+            patch("coord.smoke._fetch_touched_files", return_value=["src/x.rs"]),
+        ):
+            assert _native_unverified_capabilities(
+                transition, {"branch": "issue-1-fix"},
+            ) == []
+
+    def test_smoke_pass_marker_on_wsl_windows_machine_records_native_unverified(
+        self, coord_db,
+    ) -> None:
+        """End-to-end (#3455 review's own bar: "exercise the actual recorded
+        outcome, not just the briefing text"): a `SMOKE: pass` marker from a
+        machine that is native-unverified for a required capability must
+        land on the board as `test_confirmation=native_unverified`, NOT a
+        plain `confirmed`/`unconfirmed` — even though the worker here prints
+        a bare `SMOKE: pass` with no caveat at all, proving the fix does not
+        depend on worker cooperation."""
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.config import SmokeTestsConfig  # noqa: PLC0415
+        from coord.models import Assignment
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            _record_dispatched_assignment_local,
+            load_assignment_test_confirmation,
+            load_assignment_test_state,
+        )
+
+        work = Assignment(
+            assignment_id="work-3455",
+            machine_name="dell64",
+            repo_name="quadraui",
+            issue_number=1077,
+            issue_title="win dialog fix",
+            type="work",
+            status="done",
+            branch="issue-1077-fix",
+        )
+        _record_dispatched_assignment_local(assignment=work, repo_github="acme/quadraui")
+        smoke = Assignment(
+            assignment_id="smoke-3455",
+            machine_name="dell64",
+            repo_name="quadraui",
+            issue_number=1077,
+            issue_title="[smoke] win dialog fix",
+            type="smoke",
+            status="running",
+            review_of_assignment_id="work-3455",
+            branch="issue-1077-fix",
+        )
+        _record_dispatched_assignment_local(assignment=smoke, repo_github="acme/quadraui")
+
+        from coord.notify import Transition, EVENT_COMPLETION  # noqa: PLC0415
+
+        transition = Transition(
+            assignment_id="smoke-3455",
+            machine_name="dell64",
+            repo_name="quadraui",
+            issue_number=1077,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+        record = {
+            "repo_github": "acme/quadraui",
+            "type": "smoke",
+            "review_of_assignment_id": "work-3455",
+        }
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": "issue-1077-fix",
+            "log_path": None,
+        }
+
+        from coord.progress import SmokeVerdict  # noqa: PLC0415
+
+        cfg = Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", requires=["windows"])],
+            machines=[
+                Machine(
+                    name="dell64", host="dell64.tail", repos=["quadraui"],
+                    capabilities=["gtk", "windows"],
+                ),
+            ],
+            smoke_tests=SmokeTestsConfig(native_execution_capabilities=["windows"]),
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch(
+                "coord.notify._smoke_worker_verdict",
+                return_value=SmokeVerdict(kind="pass", reason=""),
+            ),
+            patch("coord.config.load", return_value=cfg),
+            patch("coord.smoke._fetch_touched_files", return_value=["src/win.rs"]),
+            # #2464's own out-of-band re-run is irrelevant to what THIS test
+            # checks (the #3455 native-verification downgrade) — force the
+            # "no confirmation possible" arm so the base test_confirmation
+            # would otherwise be UNCONFIRMED, making the downgrade
+            # unambiguous in the assertion below.
+            patch("coord.notify._run_pass_confirmation", return_value=None),
+        ):
+            post_transition(transition, record, entry)
+
+        assert load_assignment_test_state("work-3455") == "passed"
+        assert (
+            load_assignment_test_confirmation("work-3455")
+            == ct.TEST_CONFIRMATION_NATIVE_UNVERIFIED
+        ), (
+            "a SMOKE: pass from a WSL-hosted `windows` machine must never "
+            "record as a plain confirmed/unconfirmed pass (#3455)"
+        )
+
+
 class _FakeAssignClient:
     """Minimal agent stand-in for `dispatch_smoke`: /health has no
     `tool_versions` (the #1570 D probe fails open) and /assign returns an id."""

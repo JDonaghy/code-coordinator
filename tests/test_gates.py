@@ -1156,6 +1156,19 @@ class TestFormatting:
         text = format_gate_report(report)
         assert "test   : passed (recorded on w1) (UNCONFIRMED — suite never ran)" in text
 
+    def test_format_annotates_a_native_unverified_pass(self, config: Config) -> None:
+        """#3455 review: a claimed pass from a machine that only declares
+        the bare (non-native) side of a required capability (e.g. a
+        WSL-hosted `windows` machine) must render distinctly from both a
+        plain pass and an UNCONFIRMED one — never a silent, unqualified
+        "passed"."""
+        work = _work(test_state="passed", test_confirmation="native_unverified")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+
+        text = format_gate_report(report)
+        assert "test   : passed (recorded on w1) (NOT NATIVELY VERIFIED — #3455)" in text
+
     def test_format_annotates_a_baseline_red_pass(self, config: Config) -> None:
         work = _work(test_state="skipped", test_confirmation="baseline_red")
         board = Board(active=[], completed=[work])
@@ -1199,6 +1212,7 @@ class TestFormatting:
         assert "test   : passed (recorded on w1)" in text
         assert "UNCONFIRMED" not in text
         assert "baseline-red" not in text
+        assert "NATIVELY VERIFIED" not in text
 
         never_asked = _work(test_state="passed")
         board2 = Board(active=[], completed=[never_asked])

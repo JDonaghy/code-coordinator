@@ -199,6 +199,35 @@ def checkout(tmp_path: Path) -> Path:
     return base
 
 
+# ── #3455: a fifth `test_confirmation` value ────────────────────────────────
+
+
+class TestNativeUnverifiedConfirmationValue:
+    """#3455: a claimed pass on a machine that only declares the bare/build
+    side of a required capability (e.g. a WSL-hosted `windows` machine) must
+    be recordable with its own distinct, machine-readable
+    `test_confirmation` value — never folded into `UNCONFIRMED` (which reads
+    as "nobody could check" when a real run may well have happened, just not
+    on native hardware) or a plain `CONFIRMED`."""
+
+    def test_native_unverified_is_a_real_value(self) -> None:
+        assert ct.TEST_CONFIRMATION_NATIVE_UNVERIFIED == "native_unverified"
+
+    def test_native_unverified_is_included_in_the_exhaustive_set(self) -> None:
+        assert (
+            ct.TEST_CONFIRMATION_NATIVE_UNVERIFIED in ct.TEST_CONFIRMATION_VALUES
+        )
+
+    def test_native_unverified_is_distinct_from_every_other_value(self) -> None:
+        others = {
+            ct.TEST_CONFIRMATION_CONFIRMED,
+            ct.TEST_CONFIRMATION_UNCONFIRMED,
+            ct.TEST_CONFIRMATION_REFUTED,
+            ct.TEST_CONFIRMATION_BASELINE_RED,
+        }
+        assert ct.TEST_CONFIRMATION_NATIVE_UNVERIFIED not in others
+
+
 # ── #3378: recognizing a baseline-red `--skipped` reason ────────────────────
 
 

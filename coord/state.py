@@ -1384,7 +1384,8 @@ def record_test_verdict(
     ``test_confirmation`` (#3357) is **optional and machine-readable
     provenance** for *this* ``test_state`` write — one of
     ``coord.confirm_test.TEST_CONFIRMATION_VALUES`` (``"confirmed"`` /
-    ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``), supplied by
+    ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"`` /
+    ``"native_unverified"``, #3455), supplied by
     :func:`coord.notify._confirmed_pass_verdict` when a #2464 out-of-band
     confirmation actually ran. ``None`` — the default, and every caller that
     isn't reporting a confirmation outcome — records no provenance; nothing
