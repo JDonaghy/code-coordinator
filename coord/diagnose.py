@@ -2473,7 +2473,12 @@ def sweep_stuck_test_state_rows(
     ``coord.state.record_test_verdict`` (directly, or via
     ``propagate_smoke_terminal_failure``'s own use of it) rather than
     ``save_board``, so this function never mutates *board* and the caller
-    does not need to persist it.
+    does not need to persist it. That propagation is then **confirmed by a
+    re-read** (``coord.state.load_assignment_test_state``) before it is
+    reported as healed (#2096) — a write that raised nothing but left no
+    observable verdict on the parent yields no
+    :class:`StuckTestStateHeal`, because the lost-write class this watchdog
+    exists for (#2802) is exactly the one that raises nothing.
 
     Returns one :class:`StuckTestStateHeal` per row actually healed (or, when
     *dry_run*, per row that WOULD be healed). A row whose recovery write
@@ -2596,7 +2601,10 @@ def sweep_stuck_test_state_rows(
                 ))
                 continue
 
-            from coord.state import record_test_verdict  # noqa: PLC0415
+            from coord.state import (  # noqa: PLC0415
+                load_assignment_test_state,
+                record_test_verdict,
+            )
 
             propagated_reason = (
                 f"{cause}. {_stuck_test_state_heal_marker(smoke.assignment_id)}"
@@ -2613,6 +2621,46 @@ def sweep_stuck_test_state_rows(
                     "%s (%s) — leaving test_state='running' for the next "
                     "tick",
                     w.assignment_id, exc,
+                )
+                continue
+
+            # #2096: a returning `record_test_verdict` proves the write was
+            # ISSUED, not that it LANDED — and the whole reason this row is
+            # here is that a Test verdict write silently vanished once
+            # already (#2802: DB-lock contention, a daemon that accepted the
+            # POST and died before committing, a degraded remote write that
+            # fell back to a local DB nothing else reads). Re-read the parent
+            # row and only report a heal when the propagated verdict is
+            # actually observable on it. `load_assignment_test_state` is the
+            # same single-row reader `coord notify`'s smoke reap uses to ask
+            # this exact question (#2244) — one question, one answer — and it
+            # returns `None` for "absent row / NULL / degraded read", all of
+            # which mean "I cannot see the verdict", so this confirmation
+            # fails CLOSED: no `StuckTestStateHeal`, hence no "auto-healed"
+            # GitHub comment claiming a propagation nobody can observe. The
+            # repair itself still stands if it did land, and the #3453 marker
+            # in `test_reason` still suppresses a duplicate attempt next tick.
+            #
+            # The environmental branch below deliberately has no equivalent
+            # check: its recovery writes `test_state=NULL`, which this reader
+            # cannot distinguish from "row absent" or "read failed", so a
+            # re-read there could only produce a verdict that is always
+            # ambiguous — never a gate that can genuinely fail.
+            try:
+                observed = load_assignment_test_state(w.assignment_id)
+            except Exception as exc:  # noqa: BLE001 — never sink the sweep
+                log.warning(
+                    "sweep_stuck_test_state_rows: could not confirm the "
+                    "propagated verdict for %s (%s) — not reporting a heal",
+                    w.assignment_id, exc,
+                )
+                continue
+            if observed != recorded_verdict:
+                log.warning(
+                    "sweep_stuck_test_state_rows: propagated "
+                    "test_state=%r to %s but a re-read shows %r — the write "
+                    "did not land; not reporting a heal",
+                    recorded_verdict, w.assignment_id, observed,
                 )
                 continue
 
