@@ -5327,6 +5327,44 @@ def _blocked_gate_reading(
     return None
 
 
+# #3460: the separator this module uses whenever it needs to layer a
+# fresh, THIS-TICK-ONLY note (the #2806 "could not be read" verdict below,
+# or :func:`_reconcile_blocked`'s own "confirmed still shut" gate detail) on
+# top of a `blocked` entry's ORIGINAL block cause, without ever destroying
+# that cause the way a bare ``last_reason: reason`` overwrite used to
+# (claude-coordinator#3460, quadraui#1081: the #2806 write below replaced a
+# #2972 fix-round-ceiling give-up's own text outright, and every later
+# tick's `is_permanent_block_reason`/`is_fix_round_ceiling_reason`/
+# `is_pre_dispatch_block_reason` classification — which reads ONLY
+# `last_reason` — could then never recognise the row again).
+# :func:`_strip_blocked_gate_probe_note` removes any note a PREVIOUS tick
+# appended this same way before a new one is computed, so an unchanged
+# verdict across many ticks rewrites the identical string rather than
+# growing it forever.
+_BLOCKED_GATE_PROBE_NOTE_SEP = " — this tick's merge-gate probe: "
+
+
+def _strip_blocked_gate_probe_note(text: str | None) -> str:
+    """*text* with any :data:`_BLOCKED_GATE_PROBE_NOTE_SEP`-delimited note a
+    previous tick appended (via :func:`_with_blocked_gate_probe_note`)
+    removed, leaving only the entry's original block cause."""
+    base, _sep, _note = (text or "").partition(_BLOCKED_GATE_PROBE_NOTE_SEP)
+    return base.rstrip()
+
+
+def _with_blocked_gate_probe_note(original: str | None, note: str) -> str:
+    """*original* (an entry's ``last_reason``) with *note* — this tick's
+    gate-probe finding — appended, after first stripping any note an
+    earlier tick appended the same way (see :data:`_BLOCKED_GATE_PROBE_NOTE_SEP`).
+
+    The entry's own original cause is NEVER discarded: when there is one,
+    *note* is layered on top of it, never in place of it; when there is
+    none (``original`` empty), *note* stands alone.
+    """
+    base = _strip_blocked_gate_probe_note(original)
+    return f"{base}{_BLOCKED_GATE_PROBE_NOTE_SEP}{note}" if base else note
+
+
 def _reconcile_blocked_unreadable(
     entry: QueueEntry, live_blocked_unreadable: Mapping[str, str] | None
 ) -> Reconcile | None:
@@ -5374,15 +5412,27 @@ def _reconcile_blocked_unreadable(
     `oscillating` outcome's own channel — #2230's "no second alert channel"
     posture) every tick the condition holds, the same posture `oscillating`
     already takes for its own distinct-from-silence signal.
+
+    #3460: this write no longer REPLACES `last_reason` wholesale — it
+    layers the probe note on top of whatever cause was already recorded
+    (:func:`_with_blocked_gate_probe_note`), so a #2972 fix-round-ceiling
+    give-up (or any other marker/classifier text a later tick needs to
+    recognise this row by) survives an unreadable probe intact. Before this,
+    the incident's own root cause — the #2806 self-heal above can never
+    enqueue a row whose Work fails the review/smoke gates, so exactly the
+    entries most worth confirming "still shut" were the ones perpetually
+    reported "unreadable" — compounded with a SECOND bug: every such tick
+    also erased the real cause it was reporting on.
     """
     note = (live_blocked_unreadable or {}).get(entry.key)
     if not note:
         return None
-    reason = (
+    probe_note = (
         f"{entry.key}'s merge gate could not be read this tick ({note}) — "
         f"this is {_UNCONFIRMED_BLOCK_MARKER}; "
         "#2230's sweep will try again next tick rather than guessing (#2806)"
     )
+    reason = _with_blocked_gate_probe_note(entry.last_reason, probe_note)
     return Reconcile(
         entry.key,
         "gate_unreadable",
@@ -5398,14 +5448,16 @@ def _reconcile_blocked(
     live_blocked_gate: Mapping[str, bool] | None,
     merge_only_ready: Mapping[str, bool] | None = None,
     live_blocked_unreadable: Mapping[str, str] | None = None,
+    live_blocked_gate_reason: Mapping[str, str] | None = None,
 ) -> Reconcile | None:
     """Re-examine ONE `blocked` entry against the current gate reading.
 
     Returns ``None`` — nothing to report, nothing to write — in every case
-    except a CONFIRMED-clear reading OR a probe that came back unreadable
-    (#2806), which is deliberate: a `blocked` entry this sweep cannot say
-    anything new about must render EXACTLY as it did before #2230 existed.
-    Four ways to land there:
+    except a CONFIRMED-clear reading, a probe that came back unreadable
+    (#2806), or a CONFIRMED-still-shut reading that ALSO carries a fresh
+    *live_blocked_gate_reason* (#3460), which is deliberate: a `blocked`
+    entry this sweep cannot say anything NEW about must render EXACTLY as it
+    did before #2230 existed. Four ways to land on plain ``None``:
 
     * the block is PERMANENT (:func:`is_permanent_block_reason`) — #1844's
       guard refusal or #2019's dead end — neither of which any amount of
@@ -5428,8 +5480,12 @@ def _reconcile_blocked(
       nothing this sweep can cheaply re-check, and guessing would be
       exactly the "worse than nothing" sweep the issue warns a naive
       "retry everything" pass would be;
-    * the gate is CONFIRMED still shut — the common, honest outcome for a
-      `blocked` entry that has not in fact recovered yet.
+    * the gate is CONFIRMED still shut, but *live_blocked_gate_reason*
+      carries no fresh reason for it (either the reading came off the
+      cached board's own `facts.merge_gate_status`/`merge_ci_pending`, or
+      the shell's live re-check simply had nothing new to say) — the
+      common, honest outcome for a `blocked` entry that has not in fact
+      recovered yet, with nothing new worth writing.
 
     #2806: when there is no evidence either way BUT the shell's live probe
     was actually attempted against this entry and came back empty (as
@@ -5437,6 +5493,20 @@ def _reconcile_blocked(
     unreadable` reports THAT distinctly — "could not read", never silently
     folded into "still shut". See its own docstring for why the two must
     not render identically to an operator.
+
+    #3460: when the gate IS confirmed still shut AND *live_blocked_gate_
+    reason* carries a fresh reason for this key — the shell's live
+    ``entry_gate_status``/direct-evaluation read named WHICH gate(s) are
+    still failing and why — this writes `last_reason` too, layering that
+    reason on top of the entry's existing cause
+    (:func:`_with_blocked_gate_probe_note`, never replacing it). Before
+    this, a confirmed-still-shut reading was reported identically to "no
+    evidence at all" (plain silence), which is how the #3460 incident's
+    root cause hid: the SHELL was misclassifying a genuinely
+    confirmed-still-shut gate as an unconfirmed probe failure, and once
+    fixed there, this half makes the correct classification visible on
+    `coord drive-queue list`/`status` too, instead of leaving the entry's
+    possibly-stale original `last_reason` as the only thing shown.
 
     Only a confirmed-clear reading does anything else, and even then only up
     to :data:`MAX_BLOCKED_RESUMES` — past that ceiling the entry stays
@@ -5514,7 +5584,28 @@ def _reconcile_blocked(
     if reading is None:
         return _reconcile_blocked_unreadable(entry, live_blocked_unreadable)
     if reading:
-        return None
+        # #3460: confirmed still shut. Silent (render exactly as before
+        # #2230/#2806) unless the shell's live re-check also named WHY —
+        # see the docstring above and `_with_blocked_gate_probe_note` for
+        # why this layers the reason on top of `last_reason` rather than
+        # replacing it.
+        live_reason = (live_blocked_gate_reason or {}).get(entry.key)
+        if not live_reason:
+            return None
+        probe_note = (
+            f"{entry.key}'s merge gate is confirmed still shut this tick: "
+            f"{live_reason} (#3460)"
+        )
+        reason = _with_blocked_gate_probe_note(entry.last_reason, probe_note)
+        if reason == entry.last_reason:
+            return None
+        return Reconcile(
+            entry.key,
+            "gate_confirmed_shut",
+            reason,
+            occupies=False,
+            updates={"last_reason": reason},
+        )
 
     if entry.resumes >= MAX_BLOCKED_RESUMES:
         reason = (
@@ -5975,6 +6066,7 @@ def plan_tick(
     live_ci_gate: Mapping[str, bool] | None = None,
     live_ci_gate_reason: Mapping[str, str] | None = None,
     live_blocked_gate: Mapping[str, bool] | None = None,
+    live_blocked_gate_reason: Mapping[str, str] | None = None,
     live_blocked_unreadable: Mapping[str, str] | None = None,
     editable_drift: tuple[str, str] | None = None,
     merge_only_ready: Mapping[str, bool] | None = None,
@@ -6136,6 +6228,17 @@ def plan_tick(
     still finds it blocked. Same authority rule as *live_ci_gate*: present
     beats the cached board's `IssueFacts.merge_gate_status`; absent falls
     through to it. See :func:`_blocked_gate_reading`.
+
+    *live_blocked_gate_reason* (#3460) is *live_blocked_gate*'s own
+    `live_ci_gate_reason` counterpart: the reason text behind whichever way
+    the SAME fresh read came back, for a key also present in
+    *live_blocked_gate*. Used only when that reading is CONFIRMED still
+    shut (`True`) — :func:`_reconcile_blocked` surfaces it so a `blocked`
+    entry whose gate the #3460 incident's sweep bug used to misreport as an
+    "unconfirmed probe failure" now shows the real cause (which gate, and
+    why) instead, without discarding the entry's own original block reason.
+    A key ABSENT here changes nothing: exactly the pre-#3460 silent
+    "confirmed shut, nothing new to say" rendering.
 
     *live_blocked_unreadable* (#2806) maps a `blocked` entry's key to a
     short human-readable reason the shell's live probe for THAT entry was
@@ -6526,6 +6629,7 @@ def plan_tick(
                     live_blocked_gate,
                     merge_only_ready,
                     live_blocked_unreadable,
+                    live_blocked_gate_reason,
                 )
             if blocked_reconcile is not None:
                 reconciles.append(blocked_reconcile)
