@@ -37,6 +37,7 @@ import logging
 
 import httpx
 
+from coord import github_ops
 from coord.ci_store import CIFailureDetail
 from coord.config import Config
 from coord.merge_queue import QueuedMerge, _chain_work_ids
@@ -144,12 +145,87 @@ def _format_ci_failure_detail(detail: CIFailureDetail) -> list[str]:
     return lines
 
 
+# #3456: cap on the issue body threaded into a ci-fix briefing. Large
+# enough that a typical issue description plus an operator's follow-up
+# diagnosis both fit without truncation in the common case — only a
+# genuinely long body (or a long back-and-forth of appended notes) hits
+# the cap at all.
+ISSUE_BODY_MAX_CHARS = 6000
+
+
+def _bound_issue_body(body: str) -> tuple[str, bool]:
+    """Truncate *body* to the last :data:`ISSUE_BODY_MAX_CHARS` characters
+    when it exceeds that cap (#3456).
+
+    Keeps the TAIL, not the head: an operator's diagnosis on a CI-fix
+    streak is written INTO the issue body after the failure is understood
+    — i.e. appended below the original description (see the issue's own
+    evidence: "After the root cause was written into the issue body,
+    requeueing would have routed the next attempt through the same ci-fix
+    path"). Keeping the tail is what makes sure that operator-added
+    content survives a cut; the cost is that the original description
+    (often already echoed by the issue title anyway) is what gets dropped
+    for a body long enough to need cutting at all.
+
+    Returns ``(text, truncated)`` — mirrors
+    :func:`coord.ci_github._bound_log_excerpt`'s contract: *truncated* is
+    ``True`` iff the cut actually removed content, so the caller can make
+    the cut visible in the briefing text rather than silently handing over
+    a partial body.
+    """
+    if len(body) <= ISSUE_BODY_MAX_CHARS:
+        return body, False
+    return body[-ISSUE_BODY_MAX_CHARS:], True
+
+
+def _format_issue_body(issue_body: str) -> list[str]:
+    """Render *issue_body* into briefing lines (#3456) — see
+    :func:`_bound_issue_body` for the truncation contract.
+    """
+    body, truncated = _bound_issue_body(issue_body)
+    lines: list[str] = ["## Issue body", ""]
+    if truncated:
+        lines.append(
+            f"(truncated to the last {ISSUE_BODY_MAX_CHARS} characters — "
+            "operator notes are typically appended below the original "
+            "description, so keeping the tail keeps those over the part "
+            "already echoed by the issue title)"
+        )
+        lines.append("")
+    lines.append(body)
+    lines.append("")
+    return lines
+
+
+def _fetch_issue_body(entry: QueuedMerge) -> str:
+    """Best-effort fetch of *entry*'s issue body for the ci-fix briefing
+    (#3456) — the same body a Work-stage dispatch already auto-includes
+    (``coord.commands.dispatch``'s auto-briefing, ``coord.commands.
+    dispatch_workers``' smoke briefing) but a ci-fix dispatch never did:
+    any diagnosis an operator records on the issue (e.g. after reading the
+    real CI logs by hand) was invisible to the worker most likely to need
+    it, since workers can't run ``gh`` themselves to read it any other way.
+
+    Fails soft to ``""`` on any read failure (``gh`` missing, rate-limited,
+    a network blip, a malformed response) — same posture as
+    :func:`coord.ci_github.build_ci_failure_detail`: this is enrichment,
+    never a dispatch precondition, and a body fetch failure must never
+    block or delay the actual fix dispatch.
+    """
+    try:
+        issue_data = github_ops.get_issue(entry.repo_github, entry.issue_number)
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        return ""
+    return str(issue_data.get("body") or "")
+
+
 def build_ci_fix_briefing(
     *,
     entry: QueuedMerge,
     checks_summary: str,
     attempt: int,
     detail: CIFailureDetail | None = None,
+    issue_body: str | None = None,
 ) -> str:
     """Assemble the CI-fix worker's briefing. Pure function — testable.
 
@@ -159,6 +235,11 @@ def build_ci_fix_briefing(
     empty of anything beyond the check name (see :func:`_detail_has_content`),
     the briefing is byte-identical to before #3114, still carrying
     ``checks_summary``.
+
+    *issue_body* (#3456) is the issue's current body, fetched by
+    :func:`_fetch_issue_body` at dispatch time — optional and additive,
+    same shape as *detail*: ``None`` or blank leaves the briefing
+    byte-identical to before #3456.
     """
     lines: list[str] = [
         f"# CI failure fix: {entry.repo_github} branch `{entry.branch}`",
@@ -172,6 +253,8 @@ def build_ci_fix_briefing(
         f"    {checks_summary}",
         "",
     ]
+    if issue_body is not None and issue_body.strip():
+        lines.extend(_format_issue_body(issue_body))
     if detail is not None and _detail_has_content(detail):
         lines.extend(_format_ci_failure_detail(detail))
     lines += [
@@ -353,9 +436,10 @@ def dispatch_ci_fix(
         return None
 
     summary = checks_summary or entry.error or "CI checks failed"
+    issue_body = _fetch_issue_body(entry)
     briefing = build_ci_fix_briefing(
         entry=entry, checks_summary=summary, attempt=entry.ci_fix_dispatches + 1,
-        detail=detail,
+        detail=detail, issue_body=issue_body,
     )
 
     from coord.auto_loop import _dispatch_fix  # noqa: PLC0415
