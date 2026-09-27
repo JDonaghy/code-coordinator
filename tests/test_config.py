@@ -20,6 +20,7 @@ from coord.config import (
     _parse_merge,
     _parse_store,
     load,
+    native_execution_capability,
     resolve_local_machine,
 )
 from coord.uat_checks import HeaderAssertion
@@ -2608,6 +2609,77 @@ def test_capability_rule_command_index_named_for_second_rule(tmp_path: Path) -> 
                 "      command: false\n",
             )
         )
+
+
+# ── smoke_tests.native_execution_capabilities (#3455) ───────────────────────
+
+
+def test_native_execution_capabilities_defaults_to_windows(tmp_path: Path) -> None:
+    """#3455: the default must cover the incident this exists for
+    (quadraui#1077, a WSL-hosted `windows` declaration) without any operator
+    action — every pre-#3455 `coordinator.yml` gets this for free."""
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['src/win/']\n      requires: [windows]\n",
+        )
+    )
+    assert cfg.smoke_tests.native_execution_capabilities == ["windows"]
+
+
+def test_native_execution_capabilities_round_trips(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  native_execution_capabilities: [windows, macos]\n"
+    )
+    cfg = load(p)
+    assert cfg.smoke_tests.native_execution_capabilities == ["windows", "macos"]
+
+
+def test_native_execution_capabilities_rejects_non_list(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  native_execution_capabilities: windows\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match="native_execution_capabilities must be a list of strings",
+    ):
+        load(p)
+
+
+def test_native_execution_capabilities_rejects_non_string_entries(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  native_execution_capabilities: [42]\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match="native_execution_capabilities must be a list of strings",
+    ):
+        load(p)
+
+
+def test_native_execution_capability_naming_helper() -> None:
+    """Single source of truth for the `<cap>-native` convention — mirrors
+    `provider_capability`'s `provider:<type>` (#1711)."""
+    assert native_execution_capability("windows") == "windows-native"
+    assert native_execution_capability("macos") == "macos-native"
 
 
 # ── #3440: resolve_local_machine — the single shared "is this host local?"
