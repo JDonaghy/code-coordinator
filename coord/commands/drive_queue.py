@@ -35,7 +35,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 import click
 
@@ -88,6 +88,7 @@ from coord.drive_queue import (
     fired_holds,
     flag_shadows_config_warning,
     is_dispatch_failure_reason,
+    is_fix_round_ceiling_reason,
     is_merge_gate_block_reason,
     is_permanent_block_reason,
     is_pre_dispatch_block_reason,
@@ -5576,6 +5577,28 @@ def _record_checks_stale_escalation(entry: "QueuedMerge", *, reason: str) -> Non
         click.echo(f"  (could not record the checks_stale escalation: {exc})")
 
 
+def _fix_round_ceiling_blocked_keys(
+    queue_entries: Iterable[QueueEntry],
+) -> set[tuple[str, int]]:
+    """#3454: ``(repo, issue)`` keys whose drive-queue row has already given
+    up on the #2972 fix-round ceiling (:func:`coord.drive_queue.
+    is_fix_round_ceiling_reason`) — a block means stop: nothing this module
+    auto-dispatches should fire again for one of these until an operator
+    runs ``coord drive-queue remove`` + ``add``.
+
+    Pure, over an already-fetched entry list, so
+    ``_run_auto_revalidate_checks_stale``'s use of it (skip a
+    stale-rebase conflict-fix candidate whose OWN entry gave up this way) is
+    testable without mocking the live board/ci_store/conflict_fix stack that
+    function otherwise needs.
+    """
+    return {
+        (e.repo, e.issue)
+        for e in queue_entries
+        if e.state == STATE_BLOCKED and is_fix_round_ceiling_reason(e.last_reason)
+    }
+
+
 def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     """#2535: unattended remedy for merge-queue entries blocked SOLELY on
     stale CI checks against an already-approved review — closing the gap
@@ -5720,6 +5743,7 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
         from coord.state import (  # noqa: PLC0415
             dismiss_drive_escalation,
             list_drive_escalations,
+            list_drive_queue,
             load_board as _load_board,
         )
 
@@ -5743,6 +5767,30 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
             return
         items = _mq.load_queue()
         candidates = _mq.ci_revalidation_candidates(items, board, cfg, ci_store, _gh_ops)
+        # #3454: an entry whose drive-queue row already gave up on the #2972
+        # fix-round ceiling is PARKED — a block means stop, not "the driver
+        # stopped but the pipeline is still live" (quadraui#1077: a
+        # stale-rebase conflict-fix from THIS mechanism fired 6h07m after the
+        # ceiling block, one of the paid legs the block's own "giving up"
+        # wording told the operator would not happen). Filtered out of
+        # `candidates` itself, not just the dispatch loop below, so the
+        # escalation-cleanup pass right above also treats a newly-parked
+        # entry as no-longer-live and dismisses any open `checks_stale`
+        # escalation for it — the ceiling block's own reason is the one
+        # surface an operator needs, not a second "needs a human" this
+        # mechanism would otherwise keep alive for a row that already has
+        # one. `is_fix_round_ceiling_reason` (not the broader
+        # `is_permanent_block_reason`) so a #1844/#2019 permanent block —
+        # neither of which this mechanism has ever been asked to change —
+        # keeps its pre-#3454 behaviour exactly.
+        ceiling_blocked_keys = _fix_round_ceiling_blocked_keys(
+            entries_from_rows(list_drive_queue())
+        )
+        candidates = [
+            c
+            for c in candidates
+            if (c.repo_name, c.issue_number) not in ceiling_blocked_keys
+        ]
     except Exception:  # noqa: BLE001 — best-effort, see docstring
         return
 
