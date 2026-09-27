@@ -4246,6 +4246,155 @@ def test_an_unreadable_note_never_overrides_a_confirmed_still_shut_reading():
     assert plan.launch is None
 
 
+# ── #3460: a CONFIRMED still-shut reading must show its reason, and must ────
+# never clobber the entry's original block cause doing so
+#
+# claude-coordinator#3460 (quadraui#1081): the #2806 sweep's shell used to
+# misreport a genuinely still-shut merge gate as an "unconfirmed probe
+# failure" (no merge-queue row exists for an entry whose Work fails the
+# review/smoke gates — `enqueue_approved_work`'s self-heal can never
+# enqueue it). Once the shell correctly classifies this as confirmed-shut
+# (`live_blocked_gate[key] is True`) and names why (`live_blocked_gate_
+# reason[key]`), `_reconcile_blocked` must show that reason — but the
+# original `last_reason` (a #2972 fix-round-ceiling marker, an ordinary
+# "exhausted" text, ...) must survive, since later ticks' classifiers read
+# only that field.
+
+
+def test_a_confirmed_still_shut_reading_with_a_reason_surfaces_it_without_dropping_the_original_cause():
+    original = (
+        "drive session died without landing the work, launched 90s ago "
+        "(attempt 2/2) — giving up"
+    )
+    entries = [_blocked_entry(555, position=1, last_reason=original)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={entry_key(REPO, 555): True},
+        live_blocked_gate_reason={
+            entry_key(REPO, 555): "review gate — review required but not "
+            "approved; smoke gate — test verdict missing"
+        },
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "gate_confirmed_shut"
+    assert "state" not in reconcile.updates
+    # The original cause is still there, verbatim...
+    assert original in reconcile.updates["last_reason"]
+    # ...with the fresh gate reason layered on top, not replacing it.
+    assert "review gate" in reconcile.updates["last_reason"]
+    assert "smoke gate" in reconcile.updates["last_reason"]
+    assert plan.launch is None
+
+
+def test_a_confirmed_still_shut_reading_with_no_reason_stays_exactly_silent():
+    """No `live_blocked_gate_reason` entry for this key (the pre-#3460
+    shape, or a reading that came off the cached board rather than a fresh
+    live re-check) — nothing new to say, so nothing is written, exactly as
+    before #3460."""
+    entries = [_blocked_entry(309, position=3)]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={entry_key(REPO, 309): True}
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_confirmed_still_shut_reading_does_not_repeat_the_same_write_every_tick():
+    """An unchanged gate reason across two consecutive ticks must not grow
+    `last_reason` without bound — the second tick's write, computed against
+    the FIRST tick's already-annotated `last_reason`, must equal the first
+    tick's write byte for byte."""
+    original = (
+        "drive session died without landing the work, launched 90s ago "
+        "(attempt 2/2) — giving up"
+    )
+    reason_map = {
+        entry_key(REPO, 555): "review gate — review required but not approved"
+    }
+    entries = [_blocked_entry(555, position=1, last_reason=original)]
+    plan1 = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={entry_key(REPO, 555): True},
+        live_blocked_gate_reason=reason_map,
+    )
+    first_write = plan1.reconciles[0].updates["last_reason"]
+
+    entries2 = [_blocked_entry(555, position=1, last_reason=first_write)]
+    plan2 = plan_tick(
+        entries2,
+        board(),
+        capacity=1,
+        live_blocked_gate={entry_key(REPO, 555): True},
+        live_blocked_gate_reason=reason_map,
+    )
+    # Same reason, same tick's-worth of new information -> no new write at
+    # all (idempotent), not a second copy of the same note appended.
+    assert plan2.reconciles == ()
+
+
+def test_the_confirmed_still_shut_last_reason_is_never_an_unconfirmed_probe_reason():
+    """#3368's own dependent-verdict logic reads `is_unconfirmed_block_
+    reason` off a pre-req's `last_reason` to tell "probe merely failed,
+    retrying" apart from "confirmed still shut". The text
+    `_reconcile_blocked` writes for a CONFIRMED reading must never trip that
+    check — the exact #3460 incident: quadraui#1081's dependents all quoted
+    "retrying, not blocked permanently" about a gate this sweep HAD in fact
+    already confirmed shut."""
+    from coord.drive_queue import is_unconfirmed_block_reason
+
+    original = "drive session died without landing the work — giving up"
+    entries = [_blocked_entry(555, position=1, last_reason=original)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={entry_key(REPO, 555): True},
+        live_blocked_gate_reason={
+            entry_key(REPO, 555): "review gate — review required but not approved"
+        },
+    )
+    written = plan.reconciles[0].updates["last_reason"]
+    assert not is_unconfirmed_block_reason(written)
+
+
+def test_an_unreadable_probe_note_layers_on_top_of_the_original_cause_not_over_it():
+    """#3460's other half: `_reconcile_blocked_unreadable`'s write must not
+    replace `last_reason` wholesale — a marker classifier (`is_permanent_
+    block_reason`/`is_dispatch_failure_reason`/...) on a LATER tick reads
+    only that field, so overwriting it destroys the only signal those
+    classifiers have. Uses the #2273 dispatch-failure marker — a marker
+    that (unlike `(#2972)`, permanently excluded from this sweep since
+    #3454) is still a live #2230 sweep target, so this exercises the
+    ACTUAL write path rather than the early permanent-block return."""
+    original = (
+        "drive exited for claude-coordinator#1077 (exit_code=3): deadline "
+        "of 240m exceeded (2/2 attempts) — giving up — no assignment was "
+        "ever created for this run (#2273): likely an infrastructure/"
+        "dispatch-layer failure, not a code defect"
+    )
+    entries = [_blocked_entry(1077, position=1, last_reason=original)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={
+            entry_key(REPO, 1077): "no merge-queue row for this entry, even "
+            "after the self-heal enqueue attempt"
+        },
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "gate_unreadable"
+    written = reconcile.updates["last_reason"]
+    assert original in written
+    assert "could not be read" in written
+    assert "#2273" in written
+
+
 def test_a_pre_dispatch_reason_text_does_not_suppress_a_real_unreadable_note():
     """#2635's own lesson, applied to #2806: `is_pre_dispatch_block_reason`'s
     text match is per-RUN, not per-ENTRY, and can be wrong — a retry's own
