@@ -576,6 +576,77 @@ def test_parity_failure_names_both_board_comparands_not_a_table_count(lane):
     assert "/board (live)" in message
 
 
+def _seed_recent_terminal_assignments(path: Path, *, count: int) -> None:
+    """*count* RECENT terminal rows — inside #762's retention window, but
+    when *count* exceeds `coord.board_wire.MAX_TERMINAL_ASSIGNMENTS`, past
+    #1791's tighter cardinality cap the `/board` route applies on top of
+    retention. This is the #3451 shape: a store where the 14-day window keeps
+    everything, yet `/board` still trims — the case
+    `live_board_assignment_count` silently skipped before this fix.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_schema(conn)
+        now = time.time()
+        conn.executemany(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "repo_github, issue_number, issue_title, status, type, "
+            "dispatched_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    f"recent-term-{i}",
+                    "precision",
+                    "claude-coordinator",
+                    "JDonaghy/claude-coordinator",
+                    500_000 + i,
+                    f"recent issue {i}",
+                    "done",
+                    "work",
+                    now - i,
+                    now - i,
+                )
+                for i in range(count)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_live_board_assignment_count_matches_the_real_board_route_past_the_cap(
+    tmp_path, valid_config_path, coord_db,
+):
+    """#3451: the live side must count exactly what a real `/board` route
+    would serve for the same file — including #1791's `MAX_TERMINAL_ASSIGNMENTS`
+    cardinality cap, not just #762's retention window (#3135's fix stopped
+    short of it). Pins the two paths together with the real route, not a
+    reimplementation of it, so a future cap cannot drift between them again.
+    """
+    pytest.importorskip("uvicorn")
+    from starlette.testclient import TestClient  # noqa: PLC0415
+
+    from coord.board_wire import MAX_TERMINAL_ASSIGNMENTS  # noqa: PLC0415
+    from coord.config import load as load_config  # noqa: PLC0415
+    from coord.dao import SqliteStore  # noqa: PLC0415
+    from coord.serve_app import build_app  # noqa: PLC0415
+
+    db_path = tmp_path / "live-shaped.db"
+    _seed_recent_terminal_assignments(db_path, count=MAX_TERMINAL_ASSIGNMENTS + 150)
+
+    app = build_app(SqliteStore(db_path), load_config(valid_config_path))
+    with TestClient(app) as client:
+        resp = client.get("/board")
+    assert resp.status_code == 200
+    route_served = resp.json()["assignments"]
+
+    # Sanity: the seed really is past the cap — otherwise this test cannot
+    # tell the #3451 fix apart from the bug it regression-tests.
+    assert len(route_served) < MAX_TERMINAL_ASSIGNMENTS + 150
+
+    assert dr_verify.live_board_assignment_count(db_path) == len(route_served)
+
+
 # ==========================================================================
 # Acceptance: the scratch copy is removed on EVERY exit path
 # ==========================================================================

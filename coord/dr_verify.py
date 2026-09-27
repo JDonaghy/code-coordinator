@@ -714,13 +714,26 @@ def live_board_assignment_count(live_db_path: Path) -> int:
     count, which is always larger once a board has any history (#762's
     retention cap). There is no need to *boot* a second daemon to answer this:
     the live daemon (if one is even running) is not what is being tested here
-    — only "what would `/board` report for this file" is needed, and that is
-    exactly :meth:`coord.dao.SqliteStore.board_projection`, the same function
-    `coord/serve_app.py`'s `/board` route calls. Calling it directly, read-only,
-    against the live file is the "one question, one answer" version of asking
-    a second daemon to boot just to answer a question the daemon already
-    knows how to answer without booting.
+    — only "what would `/board` report for this file" is needed.
+
+    That answer is **not** simply :meth:`coord.dao.SqliteStore.board_projection`
+    — #762's retention window is only the first of two filters the route
+    applies. ``coord/serve_app.py``'s `/board` route also runs the projection
+    through :func:`coord.board_wire.bound_board_payload`, which caps terminal
+    assignments to :data:`coord.board_wire.MAX_TERMINAL_ASSIGNMENTS` (#1791) on
+    top of the retention window — a *second*, tighter cut a board with any
+    real history will always hit before the 14-day window ever does (#3451).
+    Skipping that second cut here made this function's own docstring claim —
+    "the same function `/board` route calls" — false: it counted a raw,
+    unbounded-by-cardinality projection while the restored side (a real
+    daemon's `/board`) counted the capped one, so parity failed on every real
+    fleet board regardless of whether the restore was actually fine.
+    :func:`coord.board_wire.bound_board_payload` mutates ``payload`` in place,
+    so applying it here before counting is the "one question, one answer"
+    version of asking a second daemon to boot just to answer a question the
+    daemon already knows how to answer without booting.
     """
+    from coord.board_wire import bound_board_payload  # noqa: PLC0415
     from coord.dao import SqliteStore  # noqa: PLC0415
 
     try:
@@ -730,6 +743,7 @@ def live_board_assignment_count(live_db_path: Path) -> int:
             f"parity check failed: could not read the live board's /board "
             f"count from {live_db_path}: {exc}"
         ) from None
+    bound_board_payload(payload)
     rows = payload.get("assignments")
     if not isinstance(rows, list):
         raise DRVerifyError(
