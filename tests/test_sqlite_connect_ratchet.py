@@ -220,7 +220,7 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "it.",
     ),
     "test_dr_verify.py": Classification(
-        4, (BUCKET_A,),
+        5, (BUCKET_A,),
         "#3119's DR-verify lane — the restore half of test_backup.py directly "
         "above, and filed A for the same reason. All four sites build or "
         "mutate a real on-disk SQLite *file* that is then snapshotted, "
@@ -239,6 +239,15 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "restore it. (The zero-assignments parity case reuses "
         "hollow_out_assignments() rather than opening its own connection, so "
         "#3135 added one site, not two.) "
+        "+1 for #3451's _seed_recent_terminal_assignments(), which bulk-"
+        "inserts RECENT terminal rows past #1791's MAX_TERMINAL_ASSIGNMENTS "
+        "cardinality cap into a real on-disk file so the live side can be "
+        "pinned against a genuine /board TestClient response — the case "
+        "live_board_assignment_count silently skipped before this fix, "
+        "because #3135's retention window alone was not enough to trigger "
+        "the cap. Same file, same reason: it has to be an on-disk file "
+        "because the very next thing the test does is open it through both "
+        "SqliteStore(by path) and dr_verify.live_board_assignment_count(). "
         "The autouse coord_db fixture cannot serve any of them — there "
         "is no file to restic — and scratch_database() is out for the usual "
         "backend-following reason: under COORD_TEST_BACKEND=postgres these "
