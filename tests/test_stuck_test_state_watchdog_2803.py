@@ -146,6 +146,37 @@ def test_recovers_done_smoke_child_as_lost_write(monkeypatch, config) -> None:
 # ── #3453: don't discard a done child's already-recorded verdict ────────────
 
 
+def _fake_verdict_store(monkeypatch, *, lands: bool = True) -> tuple[list[dict], dict]:
+    """Stand in for the persisted board's single-row verdict seam.
+
+    `record_test_verdict` appends its kwargs to the returned list AND (when
+    *lands*) commits them to the returned store; `load_assignment_test_state`
+    reads back out of that same store. This keeps the #2096 post-write
+    confirmation the sweep performs honest — a test that only stubbed the
+    WRITE would make the re-read read the real (empty) DB, and a test that
+    stubbed the read to always agree would make the confirmation
+    unfalsifiable.
+
+    *lands=False* models the #2802 failure this watchdog exists for: the
+    write call returns perfectly normally and raises nothing, but nothing is
+    committed, so the verdict is not observable afterwards.
+    """
+    recorded: list[dict] = []
+    store: dict[str, str | None] = {}
+
+    def _record(**kw) -> None:
+        recorded.append(kw)
+        if lands:
+            store[kw["assignment_id"]] = kw["test_state"]
+
+    monkeypatch.setattr("coord.state.record_test_verdict", _record)
+    monkeypatch.setattr(
+        "coord.state.load_assignment_test_state",
+        lambda assignment_id: store.get(assignment_id),
+    )
+    return recorded, store
+
+
 def test_done_child_with_recorded_verdict_propagates_it_not_environmental(
     monkeypatch, config,
 ) -> None:
@@ -166,11 +197,7 @@ def test_done_child_with_recorded_verdict_propagates_it_not_environmental(
         )
 
     monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
-    recorded: list[dict] = []
-    monkeypatch.setattr(
-        "coord.state.record_test_verdict",
-        lambda **kw: recorded.append(kw),
-    )
+    recorded, store = _fake_verdict_store(monkeypatch)
     work = _work(finished_at=now - 3600)
     smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
     smoke.test_state = "passed"
@@ -179,6 +206,7 @@ def test_done_child_with_recorded_verdict_propagates_it_not_environmental(
 
     healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
 
+    assert store == {"w1": "passed"}
     assert len(healed) == 1
     assert healed[0].assignment_id == "w1"
     assert "s1" in healed[0].detail
@@ -204,11 +232,7 @@ def test_done_child_with_recorded_failed_verdict_propagates_failed(
         raise AssertionError("must not classify environmentally")
 
     monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
-    recorded: list[dict] = []
-    monkeypatch.setattr(
-        "coord.state.record_test_verdict",
-        lambda **kw: recorded.append(kw),
-    )
+    recorded, store = _fake_verdict_store(monkeypatch)
     work = _work(finished_at=now - 3600)
     smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
     smoke.test_state = "failed"
@@ -219,6 +243,67 @@ def test_done_child_with_recorded_failed_verdict_propagates_failed(
 
     assert len(healed) == 1
     assert recorded[0]["test_state"] == "failed"
+    assert store == {"w1": "failed"}
+
+
+def test_propagation_that_silently_does_not_land_is_not_reported_as_healed(
+    monkeypatch, config, caplog,
+) -> None:
+    """#2096 — the confirmation gate must be able to FAIL.
+
+    `record_test_verdict` returns normally but commits nothing: exactly the
+    #2802 lost-write class this whole watchdog exists to route around (a
+    daemon that accepted the POST and died before committing, a degraded
+    remote write that landed in a local DB nothing else reads). The sweep
+    must NOT report a heal off the mere absence of an exception — a
+    `StuckTestStateHeal` here would make `coord notify` post an
+    "auto-healed" comment for a propagation no reader can observe, while the
+    parent stays wedged at `test_state='running'`."""
+    now = time.time()
+    recorded, store = _fake_verdict_store(monkeypatch, lands=False)
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
+    smoke.test_state = "passed"
+    board = Board(completed=[work, smoke])
+
+    with caplog.at_level("WARNING"):
+        healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(recorded) == 1, "the write must still have been attempted"
+    assert store == {}, "…and must have silently committed nothing"
+    assert healed == [], "an unobservable propagation is not a heal"
+    assert "did not land" in caplog.text
+
+
+def test_propagation_is_not_reported_when_the_confirming_read_fails(
+    monkeypatch, config, caplog,
+) -> None:
+    """A re-read that cannot answer (daemon unreachable, DB locked) is "I
+    cannot see the verdict", never "it landed" — the confirmation fails
+    closed, so no heal is reported even though the write itself raised
+    nothing."""
+    now = time.time()
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "coord.state.record_test_verdict",
+        lambda **kw: recorded.append(kw),
+    )
+
+    def _unreadable(assignment_id):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("coord.state.load_assignment_test_state", _unreadable)
+    work = _work(finished_at=now - 3600)
+    smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
+    smoke.test_state = "passed"
+    board = Board(completed=[work, smoke])
+
+    with caplog.at_level("WARNING"):
+        healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(recorded) == 1
+    assert healed == []
+    assert "could not confirm" in caplog.text
 
 
 def test_dry_run_reports_propagation_without_writing(monkeypatch, config) -> None:
@@ -286,11 +371,7 @@ def test_second_sweep_does_not_repropagate_after_marker_persists(
     """The same idempotency guard, for the recorded-verdict propagation path
     rather than the environmental-clear path."""
     now = time.time()
-    recorded: list[dict] = []
-    monkeypatch.setattr(
-        "coord.state.record_test_verdict",
-        lambda **kw: recorded.append(kw),
-    )
+    recorded, _store = _fake_verdict_store(monkeypatch)
     work = _work(finished_at=now - 3600)
     smoke = _smoke(aid="s1", status="done", finished_at=now - 3600)
     smoke.test_state = "passed"
