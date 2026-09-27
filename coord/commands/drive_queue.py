@@ -88,7 +88,7 @@ from coord.drive_queue import (
     fired_holds,
     flag_shadows_config_warning,
     is_dispatch_failure_reason,
-    is_fix_round_ceiling_reason,
+    is_fix_round_ceiling_blocked,
     is_merge_gate_block_reason,
     is_permanent_block_reason,
     is_pre_dispatch_block_reason,
@@ -1387,10 +1387,10 @@ _BLOCKED_AFTER_NOTE = (
 # ships doesn't have to go read the issue to learn their remove+add might be
 # about to race an automatic resume.
 _BLOCKED_GATE_NOTE = (
-    "note: a re-evaluable blocked cause (i.e. not a #1844/#2019 permanent "
-    "refusal) IS re-checked against the merge gate automatically (#2230) — "
-    "see `resumes=` above if this row has already self-resumed and "
-    "re-blocked"
+    "note: a re-evaluable blocked cause (i.e. not a #1844/#2019/#2972 "
+    "permanent refusal) IS re-checked against the merge gate automatically "
+    "(#2230) — see `resumes=` above if this row has already self-resumed "
+    "and re-blocked"
 )
 
 # #2589: `_BLOCKED_GATE_NOTE` above is flatly wrong for a row whose cause is
@@ -5581,10 +5581,16 @@ def _fix_round_ceiling_blocked_keys(
     queue_entries: Iterable[QueueEntry],
 ) -> set[tuple[str, int]]:
     """#3454: ``(repo, issue)`` keys whose drive-queue row has already given
-    up on the #2972 fix-round ceiling (:func:`coord.drive_queue.
-    is_fix_round_ceiling_reason`) — a block means stop: nothing this module
-    auto-dispatches should fire again for one of these until an operator
-    runs ``coord drive-queue remove`` + ``add``.
+    up on the #2972 fix-round ceiling — a block means stop: nothing this
+    module auto-dispatches should fire again for one of these until an
+    operator runs ``coord drive-queue remove`` + ``add``.
+
+    Delegates the actual predicate to :func:`coord.drive_queue.
+    is_fix_round_ceiling_blocked` — the #3454 review's "one question, one
+    answer" fix: ``coord.notify``'s stalled-pipeline sweep (a second,
+    independent ``dispatch_conflict_fix`` caller) asks this SAME function
+    per-row rather than re-deriving the ``state == blocked AND
+    is_fix_round_ceiling_reason`` check here a second time.
 
     Pure, over an already-fetched entry list, so
     ``_run_auto_revalidate_checks_stale``'s use of it (skip a
@@ -5595,7 +5601,7 @@ def _fix_round_ceiling_blocked_keys(
     return {
         (e.repo, e.issue)
         for e in queue_entries
-        if e.state == STATE_BLOCKED and is_fix_round_ceiling_reason(e.last_reason)
+        if is_fix_round_ceiling_blocked(e.state, e.last_reason)
     }
 
 
@@ -5779,10 +5785,13 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
         # escalation for it — the ceiling block's own reason is the one
         # surface an operator needs, not a second "needs a human" this
         # mechanism would otherwise keep alive for a row that already has
-        # one. `is_fix_round_ceiling_reason` (not the broader
+        # one. `is_fix_round_ceiling_blocked` (not the broader
         # `is_permanent_block_reason`) so a #1844/#2019 permanent block —
         # neither of which this mechanism has ever been asked to change —
-        # keeps its pre-#3454 behaviour exactly.
+        # keeps its pre-#3454 behaviour exactly. `coord.notify`'s stalled-
+        # pipeline sweep — the THIRD, independent `dispatch_conflict_fix`
+        # caller the #3454 review found unfiltered — now calls this exact
+        # same predicate per-row rather than a separately-derived check.
         ceiling_blocked_keys = _fix_round_ceiling_blocked_keys(
             entries_from_rows(list_drive_queue())
         )

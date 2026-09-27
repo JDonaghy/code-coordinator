@@ -4375,9 +4375,10 @@ def test_a_fix_round_ceiling_blocked_entry_is_never_resumed():
                 "fix-round ceiling reached across relaunches (#2972): 3 "
                 "work leg(s) already run against a budget of 3 (1 work "
                 "dispatch + 2 fix round(s)) — giving up rather than "
-                "relaunching with a fresh budget. Parked (#3454): no "
+                "relaunching with a fresh budget. Stopped (#3454): no "
                 "further relaunch, gate-clear resume, or auto-dispatched "
-                "stale-rebase conflict-fix will fire for this entry — "
+                "stale-rebase conflict-fix (from any of this fleet's "
+                "independent dispatchers) will fire for this entry — "
                 "`coord drive-queue remove claude-coordinator 1077` + "
                 "`add` (a fresh row) is the only way to give it another "
                 "attempt."
@@ -5304,6 +5305,24 @@ def test_is_fix_round_ceiling_reason_matches_only_the_2972_marker():
     )
     assert not is_fix_round_ceiling_reason("")
     assert not is_fix_round_ceiling_reason(None)
+
+
+def test_is_fix_round_ceiling_blocked_requires_both_state_and_reason():
+    """#3454 review: `is_fix_round_ceiling_blocked` is the ONE predicate
+    `coord.commands.drive_queue` (via `_fix_round_ceiling_blocked_keys`) AND
+    `coord.notify` (via `_fix_round_ceiling_blocked_for_work`) now both
+    call — must require the LIVE `blocked` state, not just a reason string
+    that merely mentions #2972 (e.g. a stale/archived one from a row an
+    operator already removed and re-added)."""
+    from coord.drive_queue import STATE_BLOCKED, STATE_WAITING, is_fix_round_ceiling_blocked
+
+    ceiling_reason = "fix-round ceiling reached across relaunches (#2972): giving up"
+    assert is_fix_round_ceiling_blocked(STATE_BLOCKED, ceiling_reason)
+    assert not is_fix_round_ceiling_blocked(STATE_WAITING, ceiling_reason)
+    assert not is_fix_round_ceiling_blocked(
+        STATE_BLOCKED, "... (#1844); blocking without spending an attempt"
+    )
+    assert not is_fix_round_ceiling_blocked(STATE_BLOCKED, None)
 
 
 def test_a_genuinely_dead_drive_without_ci_pending_still_retries_normally():
