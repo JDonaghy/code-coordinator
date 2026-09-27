@@ -1595,6 +1595,138 @@ class TestDispatchPerReason:
         _, call_kwargs = stub.call_args
         assert call_kwargs["stale_rebase"] is True
 
+    def test_merge_conflict_unresolved_skips_a_fix_round_ceiling_blocked_row(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#3454 review: `coord.notify` is a THIRD, independent
+        `dispatch_conflict_fix` caller the review found unfiltered — a
+        (repo, issue) whose drive-queue row already gave up on the #2972
+        fix-round ceiling must not get a brand-new conflict-fix leg from
+        THIS sweep either, exactly like `coord.commands.drive_queue`'s
+        stale-rebase auto-revalidation already refuses it."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            state_mod,
+            "get_drive_queue_entry",
+            lambda repo_name, issue_number: {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "state": "blocked",
+                "last_reason": (
+                    "fix-round ceiling reached across relaunches (#2972): "
+                    "3 work leg(s) already run against a budget of 3 — "
+                    "giving up rather than relaunching with a fresh budget"
+                ),
+            },
+        )
+        stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "skipped_fix_round_ceiling_blocked"
+        assert "#2972" in action.detail
+        stub.assert_not_called()
+
+    def test_merge_gate_checks_stale_skips_a_fix_round_ceiling_blocked_row(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Same #3454 gate on the `merge_gate_checks_stale` arm — the
+        review named both `coord.notify` call sites."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_gate_checks_stale"
+
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            state_mod,
+            "get_drive_queue_entry",
+            lambda repo_name, issue_number: {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "state": "blocked",
+                "last_reason": (
+                    "fix-round ceiling reached across relaunches (#2972): "
+                    "3 work leg(s) already run against a budget of 3 — "
+                    "giving up rather than relaunching with a fresh budget"
+                ),
+            },
+        )
+        stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "skipped_fix_round_ceiling_blocked"
+        assert "#2972" in action.detail
+        stub.assert_not_called()
+
+    def test_merge_conflict_unresolved_still_dispatches_when_no_drive_queue_row(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """No drive-queue row at all for this (repo, issue) (an issue can be
+        worked with no `coord drive-queue add`) must read as "nothing to
+        block on", same as before #3454 — not silently swallow every
+        conflict-fix dispatch that has no queue entry."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[conflict-fix] t", assignment_id="cf-1", status="pending",
+            type="conflict-fix",
+        )
+        stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            state_mod, "get_drive_queue_entry", lambda repo_name, issue_number: None,
+        )
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        stub.assert_called_once()
+
     def test_conflict_fix_decline_reports_the_real_reason(
         self, config: Config, monkeypatch
     ) -> None:

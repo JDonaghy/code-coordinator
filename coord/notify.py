@@ -1069,6 +1069,14 @@ class StalledDispatchAction:
       (#602).
     - ``"skipped_human_required"``  — the conflict-fix retry cap was already
       hit; surfacing to a human, not auto-retrying.
+    - ``"skipped_fix_round_ceiling_blocked"`` (#3454) — ``merge_conflict_
+      unresolved`` or ``merge_gate_checks_stale`` on a (repo, issue) whose
+      drive-queue row already gave up on the #2972 fix-round ceiling (see
+      :func:`coord.drive_queue.is_fix_round_ceiling_blocked`) — a block
+      means stop, so this sweep leaves it parked exactly like ``coord.
+      commands.drive_queue``'s stale-rebase auto-revalidation already does,
+      rather than handing it a third independent path to a fresh
+      conflict-fix leg (quadraui#1077).
     - ``"skipped_sealed_conflict"`` (#2537, narrowed by #2555) —
       ``merge_conflict_unresolved`` on a
       :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row whose conflict was
@@ -1136,6 +1144,35 @@ def _stalled_row_has_live_session(board: "Board", work: "Assignment") -> bool:
         if a.repo_name == work.repo_name and a.issue_number == work.issue_number:
             return True
     return False
+
+
+def _fix_round_ceiling_blocked_for_work(work: "Assignment") -> bool:
+    """#3454 review: true when *work*'s (repo, issue) has a drive-queue row
+    that has already given up on the #2972 fix-round ceiling.
+
+    This module's ``merge_conflict_unresolved`` and ``merge_gate_checks_
+    stale`` arms are a THIRD, independent caller of :func:`coord.
+    conflict_fix.dispatch_conflict_fix` — the review found them unfiltered
+    while ``coord.commands.drive_queue``'s stale-rebase auto-revalidation
+    (the second caller) already skipped a ceiling-blocked candidate,
+    letting quadraui#1077's "giving up" block get a brand-new conflict-fix
+    leg anyway via THIS path 6h07m later. Both callers now ask the exact
+    same question — :func:`coord.drive_queue.is_fix_round_ceiling_blocked`
+    — rather than each re-deriving it (#2096's "one question, one answer").
+
+    A drive-queue row is optional infrastructure (an issue can be worked
+    with no ``coord drive-queue add`` at all), so "no row for this (repo,
+    issue)" reads as "nothing to block on" — ``False`` — same as it always
+    implicitly has for every OTHER stalled-pipeline reason.
+    """
+    from coord.drive_queue import QueueEntry, is_fix_round_ceiling_blocked  # noqa: PLC0415
+    from coord.state import get_drive_queue_entry  # noqa: PLC0415
+
+    row = get_drive_queue_entry(work.repo_name, work.issue_number)
+    if row is None:
+        return False
+    dq_entry = QueueEntry.from_row(row)
+    return is_fix_round_ceiling_blocked(dq_entry.state, dq_entry.last_reason)
 
 
 def _conflict_confined_to_sealed_paths(
@@ -1230,7 +1267,11 @@ def dispatch_stalled_pipeline_action(
       the same bulk gate-checked enqueue the daemon passive tick already
       runs on every interval.
     - ``merge_conflict_unresolved`` → :func:`coord.conflict_fix.dispatch_conflict_fix`,
-      the #1474 ``_dispatch_conflict_fixes`` path — UNLESS (#2537) *work* is a
+      the #1474 ``_dispatch_conflict_fixes`` path — UNLESS (#3454) the
+      (repo, issue)'s drive-queue row already gave up on the #2972
+      fix-round ceiling (:func:`_fix_round_ceiling_blocked_for_work`),
+      which returns ``"skipped_fix_round_ceiling_blocked"`` instead, or
+      (#2537) *work* is a
       :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row AND the conflict can
       be confirmed (via :func:`_conflict_confined_to_sealed_paths`, a
       compare-API-only check) to be confined to the repo's sealed
@@ -1257,7 +1298,9 @@ def dispatch_stalled_pipeline_action(
       ``merge_conflict_unresolved`` dispatches, briefed for a PURE,
       content-preserving rebase (no conflict expected) rather than the
       ordinary conflict-resolution briefing. Guarded by the same
-      :func:`coord.conflict_fix.has_prior_conflict_fix` retry cap.
+      :func:`coord.conflict_fix.has_prior_conflict_fix` retry cap, and
+      (#3454) the same fix-round-ceiling park as ``merge_conflict_
+      unresolved`` above.
 
     Never re-entrant across ticks: the caller only reaches this after
     :func:`detect_stalled_pipeline` has already filtered out any row whose
@@ -1598,6 +1641,18 @@ def dispatch_stalled_pipeline_action(
             return StalledDispatchAction(
                 kind="no_action", detail="merge queue entry no longer found",
             )
+        # #3454: a #2972 fix-round-ceiling give-up parks the row — no further
+        # auto-dispatched conflict-fix for it from ANY caller, this sweep
+        # included. See `_fix_round_ceiling_blocked_for_work`'s docstring.
+        if _fix_round_ceiling_blocked_for_work(work):
+            return StalledDispatchAction(
+                kind="skipped_fix_round_ceiling_blocked",
+                detail=(
+                    "drive-queue row already gave up on the #2972 fix-round "
+                    "ceiling (#3454) — parked; needs `coord drive-queue "
+                    "remove` + `add`, not another auto-dispatched conflict-fix"
+                ),
+            )
         if has_prior_conflict_fix(
             board, entry.assignment_id, current_error=entry.error,
         ):
@@ -1696,6 +1751,18 @@ def dispatch_stalled_pipeline_action(
         if entry is None:
             return StalledDispatchAction(
                 kind="no_action", detail="merge queue entry no longer found",
+            )
+        # #3454: same park as the `merge_conflict_unresolved` arm above — a
+        # #2972 fix-round-ceiling give-up means stop, including the stale-
+        # rebase conflict-fix this arm dispatches.
+        if _fix_round_ceiling_blocked_for_work(work):
+            return StalledDispatchAction(
+                kind="skipped_fix_round_ceiling_blocked",
+                detail=(
+                    "drive-queue row already gave up on the #2972 fix-round "
+                    "ceiling (#3454) — parked; needs `coord drive-queue "
+                    "remove` + `add`, not another auto-dispatched conflict-fix"
+                ),
             )
         if has_prior_conflict_fix(
             board, entry.assignment_id, current_error=entry.error,

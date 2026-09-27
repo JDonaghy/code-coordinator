@@ -160,9 +160,10 @@ def dispatch_type_for_labels(issue_labels: Iterable[str] | None) -> str:
 #
 # #2230 qualifies "terminal" for `blocked` specifically: it still means "no
 # `coord drive` launches from this row again on its own" and "stays in the
-# table for history" for a PERMANENT cause (#1844/#2019) or one the sweep has
-# no evidence about. It no longer means "nothing ever writes to this row
-# again" — a `blocked` entry whose cause was a re-evaluable gate reading may
+# table for history" for a PERMANENT cause (#1844/#2019/#2972 — see
+# `_PERMANENT_BLOCK_MARKERS`) or one the sweep has no evidence about. It no
+# longer means "nothing ever writes to this row again" — a `blocked` entry
+# whose cause was a re-evaluable gate reading may
 # be moved straight back to `waiting` by `plan_tick`'s own reconcile pass,
 # with no operator action, the moment that reading clears. See
 # `is_permanent_block_reason` and `_reconcile_blocked` below for exactly
@@ -325,6 +326,31 @@ def is_fix_round_ceiling_reason(reason: str | None) -> bool:
     if not reason:
         return False
     return "(#2972)" in reason
+
+
+def is_fix_round_ceiling_blocked(state: str | None, last_reason: str | None) -> bool:
+    """#3454 review: the ONE predicate every auto-dispatcher must consult
+    before firing against a (repo, issue) — "has this row's drive-queue
+    entry already given up on the #2972 fix-round ceiling".
+
+    The review that opened this function found TWO independent
+    ``dispatch_conflict_fix`` callers deciding this question with different
+    logic: ``coord.commands.drive_queue``'s stale-rebase auto-revalidation
+    checked it, ``coord.notify``'s stalled-pipeline sweep (a third,
+    pre-existing caller of the same worker) did not — so a
+    ``(#2972)``-blocked entry could still receive a brand-new conflict-fix
+    leg via the second path, entirely unaffected by the first fix. Both now
+    call this one function instead of each re-deriving "blocked AND
+    :func:`is_fix_round_ceiling_reason`" — the "one question, one answer"
+    rule this module already applies elsewhere (#2096/#2085).
+
+    ``state`` must be the LIVE state (:data:`STATE_BLOCKED`, not merely "the
+    reason string looks like a ceiling give-up") — a row that has since been
+    removed/re-added by an operator (the documented remedy) has a fresh
+    ``last_reason`` from a NEW life, but a stale caller that only checked the
+    reason string could still misfire against the archived one.
+    """
+    return state == STATE_BLOCKED and is_fix_round_ceiling_reason(last_reason)
 
 
 def is_permanent_block_reason(text: str | None) -> bool:
@@ -5167,11 +5193,12 @@ def _reconcile_running(
             f"budget of {budget} (1 work dispatch + "
             f"{effective_max_fix_rounds(entry, fix_round_config_default)} fix "
             f"round(s)) — giving up rather than relaunching with a fresh "
-            f"budget{dispatch_note}. Parked (#3454): no further relaunch, "
+            f"budget{dispatch_note}. Stopped (#3454): no further relaunch, "
             f"gate-clear resume, or auto-dispatched stale-rebase conflict-fix "
-            f"will fire for this entry — `coord drive-queue remove "
-            f"{entry.repo} {entry.issue}` + `add` (a fresh row) is the only "
-            f"way to give it another attempt."
+            f"(from any of this fleet's independent dispatchers) will fire "
+            f"for this entry — `coord drive-queue remove {entry.repo} "
+            f"{entry.issue}` + `add` (a fresh row) is the only way to give "
+            f"it another attempt."
         )
         return (
             Reconcile(entry.key, "exhausted", reason, occupies=False),
