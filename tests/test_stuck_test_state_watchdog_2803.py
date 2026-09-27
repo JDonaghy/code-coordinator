@@ -109,14 +109,42 @@ def test_recovers_terminal_failed_smoke_child(monkeypatch, config) -> None:
     assert len(healed) == 1
     assert healed[0].assignment_id == "w1"
     assert "s1" in healed[0].detail
-    assert calls == [
-        {
-            "parent_assignment_id": "w1",
-            "failure_reason": "api_error: aborted_streaming",
-            "environmental": None,
-        }
-    ]
+    assert len(calls) == 1
+    assert calls[0]["parent_assignment_id"] == "w1"
+    assert calls[0]["environmental"] is None
+    # #3453: the child's own failure text is preserved verbatim, with the
+    # re-heal-guard marker appended so a later `_already_healed_against`
+    # check (keyed on this same child) can find it if the write survives
+    # into the parent's `test_reason`.
+    assert calls[0]["failure_reason"] == (
+        "api_error: aborted_streaming. [[stuck-test-state-healed:s1]]"
+    )
     assert "cleared test_state" in healed[0].action
+
+
+def test_does_not_reheal_against_same_failed_smoke_child(monkeypatch, config) -> None:
+    """#3453: the re-heal guard generalizes to the `failed`/`cancelled`
+    classification too — a parent whose `test_reason` already carries the
+    marker for THIS exact child must not be resolved again."""
+    now = time.time()
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "coord.reconcile.propagate_smoke_terminal_failure",
+        lambda **kw: calls.append(kw),
+    )
+    work = _work(finished_at=now - 3600)
+    work.test_reason = "api_error: aborted_streaming. [[stuck-test-state-healed:s1]]"
+    smoke = _smoke(
+        status="failed",
+        failure_reason="api_error: aborted_streaming",
+        finished_at=now - 3600,
+    )
+    board = Board(completed=[work, smoke])
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert healed == []
+    assert calls == []
 
 
 def test_recovers_done_smoke_child_as_lost_write(monkeypatch, config) -> None:
@@ -180,13 +208,16 @@ def _fake_verdict_store(monkeypatch, *, lands: bool = True) -> tuple[list[dict],
 def test_done_child_with_recorded_verdict_propagates_it_not_environmental(
     monkeypatch, config,
 ) -> None:
-    """#3453 headline defect: a Test-stage child that finished `status='done'`
-    AND already carries its own recorded verdict (`test_state='passed'` on
-    its own row — e.g. a #3182 fan-out leg that self-recorded, or any other
-    shape whose FOLD onto the parent was the write that got lost, #2802)
-    must have that verdict PROPAGATED to the parent — never discarded for a
-    fresh dispatch, and never tallied as a #3315 environmental death, since
-    nothing died."""
+    """#3453 headline defect, for a SINGLE-LEG (non-fan-out) row: a
+    Test-stage child that finished `status='done'` AND already carries its
+    own recorded verdict (`test_state='passed'` on its own row — some shape
+    whose FOLD onto the parent was the write that got lost, #2802) must have
+    that verdict PROPAGATED to the parent — never discarded for a fresh
+    dispatch, and never tallied as a #3315 environmental death, since
+    nothing died. (The #3182 fan-out case — where the latest child is only
+    ONE of several legs — is covered separately below: it must NEVER
+    propagate a single leg's verdict this way; see
+    `test_fanout_leg_recorded_verdict_is_not_propagated_alone`.)"""
     now = time.time()
 
     def _boom(**kw):
@@ -244,6 +275,168 @@ def test_done_child_with_recorded_failed_verdict_propagates_failed(
     assert len(healed) == 1
     assert recorded[0]["test_state"] == "failed"
     assert store == {"w1": "failed"}
+
+
+# ── #3453 review: a fan-out parent's latest leg is never the whole answer ──
+
+
+def _fanout_store(
+    monkeypatch, *, states: dict[str, str | None], reasons: dict[str, str | None],
+) -> list[dict]:
+    """Fake the `coord.state` single-row verdict seam with BOTH a leg-state
+    and a leg-reason store, keyed by assignment id — what
+    `coord.smoke.finalize_smoke_fanout`'s own manifest read
+    (`load_assignment_test_reason`) and per-leg fold
+    (`load_assignment_test_state`) need, plus what the sweep's own
+    confirm-by-re-read (#2096) checks afterwards. `record_test_verdict`
+    commits into both dicts and is recorded for assertions.
+    """
+    recorded: list[dict] = []
+
+    def _record(**kw) -> None:
+        recorded.append(kw)
+        states[kw["assignment_id"]] = kw["test_state"]
+        reasons[kw["assignment_id"]] = kw["test_reason"]
+
+    monkeypatch.setattr("coord.state.record_test_verdict", _record)
+    monkeypatch.setattr("coord.state.load_assignment_test_state", lambda aid: states.get(aid))
+    monkeypatch.setattr("coord.state.load_assignment_test_reason", lambda aid: reasons.get(aid))
+    return recorded
+
+
+def test_fanout_leg_recorded_verdict_is_not_propagated_alone(monkeypatch, config) -> None:
+    """#3453 review (blocking): the exact regression the review caught. A
+    #3182 fan-out parent's latest-dispatched leg (`s1`, e.g. a fast `macos`
+    suite) self-records `passed` while an EARLIER-dispatched sibling (`s2`,
+    e.g. a still-running `windows` suite) has not reported in yet. Naively
+    propagating `s1`'s verdict onto the parent — as the single-leg path
+    correctly does — would mask `s2` if it later comes back `failed`, and
+    `finalize_smoke_fanout`'s own terminal-verdict guard means that mistake
+    can never self-correct. This must be a complete no-op: no write, no
+    #3315 tally, no reported heal, while any sibling is still outstanding."""
+    now = time.time()
+
+    def _boom(**kw):
+        raise AssertionError(
+            "a fan-out parent must never be routed through the plain "
+            "environmental/work classifier off a single leg"
+        )
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+
+    from coord.smoke import _encode_fanout_manifest  # noqa: PLC0415
+
+    manifest = _encode_fanout_manifest(
+        [("s1", ("macos",), None), ("s2", ("windows",), None)]
+    )
+    work = _work(finished_at=now - 3600)
+    work.test_reason = (
+        f"{manifest}\nTest stage running across 2 capability-partition "
+        "leg(s) (#3182): [macos]; [windows]."
+    )
+    # s1: dispatched LAST (fastest suite), already finished and self-recorded.
+    s1 = _smoke(aid="s1", status="done", dispatched_at=now - 3000, finished_at=now - 3600)
+    s1.test_state = "passed"
+    # s2: dispatched FIRST (slower suite), still genuinely running.
+    s2 = _smoke(aid="s2", status="running", dispatched_at=now - 7000, finished_at=None)
+    board = Board(completed=[work, s1], active=[s2])
+
+    states: dict[str, str | None] = {"s1": "passed", "s2": None}
+    reasons: dict[str, str | None] = {"w1": work.test_reason}
+    recorded = _fanout_store(monkeypatch, states=states, reasons=reasons)
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert healed == []
+    assert recorded == []
+    assert states.get("w1") is None  # the parent's own verdict was never written
+
+
+def test_fanout_finalizes_worst_wins_once_every_leg_reports(monkeypatch, config) -> None:
+    """Once every leg named in the manifest IS terminal, the sweep defers
+    entirely to `finalize_smoke_fanout`'s own worst-wins fold — `failed` >
+    `blocked` > `skipped` > `passed` — never a naive copy of whichever leg
+    happened to be dispatched last (here, the PASSING one)."""
+    now = time.time()
+    monkeypatch.setattr(
+        "coord.reconcile.propagate_smoke_terminal_failure",
+        lambda **kw: (_ for _ in ()).throw(
+            AssertionError("must not classify environmentally/work for a fan-out row")
+        ),
+    )
+
+    from coord.smoke import _encode_fanout_manifest  # noqa: PLC0415
+
+    manifest = _encode_fanout_manifest(
+        [("s1", ("macos",), None), ("s2", ("windows",), None)]
+    )
+    work = _work(finished_at=now - 3600)
+    work.test_reason = (
+        f"{manifest}\nTest stage running across 2 capability-partition "
+        "leg(s) (#3182): [macos]; [windows]."
+    )
+    # `_latest_smoke_child` finds s1 (the only leg with a board row) —
+    # the leg that happened to pass.
+    s1 = _smoke(aid="s1", status="done", dispatched_at=now - 3000, finished_at=now - 3600)
+    s1.test_state = "passed"
+    board = Board(completed=[work, s1])
+
+    # But BOTH legs have now reported into the state store — s2 (never a
+    # board row of its own here, exactly like `finalize_smoke_fanout`'s own
+    # id-keyed reads) came back `failed`.
+    states: dict[str, str | None] = {"s1": "passed", "s2": "failed"}
+    reasons: dict[str, str | None] = {
+        "w1": work.test_reason, "s1": "macos suite green", "s2": "windows suite red",
+    }
+    recorded = _fanout_store(monkeypatch, states=states, reasons=reasons)
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now)
+
+    assert len(healed) == 1
+    assert healed[0].assignment_id == "w1"
+    assert "finalized" in healed[0].action
+    assert len(recorded) == 1  # `finalize_smoke_fanout`'s own single write
+    # worst-wins: s2 failed, so the aggregate MUST be "failed" — never
+    # "passed" just because s1 is the leg this sweep's own
+    # `_latest_smoke_child` would otherwise have picked.
+    assert states["w1"] == "failed"
+
+
+def test_fanout_dry_run_reports_without_writing(monkeypatch, config) -> None:
+    """A ready-to-finalize fan-out parent in `--dry-run` mode is reported,
+    but nothing is actually written."""
+    now = time.time()
+
+    def _boom(**kw):
+        raise AssertionError("dry-run must not write")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    monkeypatch.setattr("coord.state.record_test_verdict", _boom)
+
+    from coord.smoke import _encode_fanout_manifest  # noqa: PLC0415
+
+    manifest = _encode_fanout_manifest(
+        [("s1", ("macos",), None), ("s2", ("windows",), None)]
+    )
+    work = _work(finished_at=now - 3600)
+    work.test_reason = (
+        f"{manifest}\nTest stage running across 2 capability-partition "
+        "leg(s) (#3182): [macos]; [windows]."
+    )
+    s1 = _smoke(aid="s1", status="done", dispatched_at=now - 3000, finished_at=now - 3600)
+    s1.test_state = "passed"
+    board = Board(completed=[work, s1])
+
+    monkeypatch.setattr(
+        "coord.state.load_assignment_test_state",
+        lambda aid: {"s1": "passed", "s2": "failed"}.get(aid),
+    )
+
+    healed = diagnose.sweep_stuck_test_state_rows(board, config, now=now, dry_run=True)
+
+    assert len(healed) == 1
+    assert healed[0].action.startswith("(dry-run)")
+    assert "finalize_smoke_fanout" in healed[0].action
 
 
 def test_propagation_that_silently_does_not_land_is_not_reported_as_healed(
