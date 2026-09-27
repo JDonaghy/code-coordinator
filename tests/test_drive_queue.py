@@ -4355,6 +4355,77 @@ def test_a_dead_end_blocked_entry_is_never_resumed():
     assert plan.launch is None
 
 
+def test_a_fix_round_ceiling_blocked_entry_is_never_resumed():
+    """#3454: same posture as the #1844/#2019 permanent blocks above — a
+    #2972 fix-round-ceiling give-up must not auto-resume just because the
+    merge gate reads clear again. Before this fix, `_reconcile_blocked`
+    treated this reason as an ordinary re-checkable `exhausted` (#309's
+    shape) and would have relaunched with `attempts` reset to 0 — handing
+    the entry a fresh work-leg budget the ceiling exists to deny, exactly
+    the quadraui#625 silent-reset bug #2972 itself closed for the ordinary
+    retry path. Contrast with
+    test_a_blocked_entry_whose_live_gate_reads_clear_resumes_with_attempts_reset,
+    where an entry blocked for an ordinary reason DOES resume on identical
+    gate evidence."""
+    entries = [
+        _blocked_entry(
+            1077,
+            position=1,
+            last_reason=(
+                "fix-round ceiling reached across relaunches (#2972): 3 "
+                "work leg(s) already run against a budget of 3 (1 work "
+                "dispatch + 2 fix round(s)) — giving up rather than "
+                "relaunching with a fresh budget. Parked (#3454): no "
+                "further relaunch, gate-clear resume, or auto-dispatched "
+                "stale-rebase conflict-fix will fire for this entry — "
+                "`coord drive-queue remove claude-coordinator 1077` + "
+                "`add` (a fresh row) is the only way to give it another "
+                "attempt."
+            ),
+        )
+    ]
+    key = entry_key(REPO, 1077)
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={key: False},  # gate reads clear
+        merge_only_ready={key: True},  # even Merge-only-ready must not fire
+    )
+    assert plan.reconciles == ()
+    assert plan.blocked == ()
+    assert plan.merge_only == ()
+    assert plan.launch is None
+
+
+def test_fix_round_ceiling_blocked_keys_finds_only_2972_blocked_rows():
+    """#3454: `coord.commands.drive_queue._fix_round_ceiling_blocked_keys` —
+    the filter `_run_auto_revalidate_checks_stale` uses so it never
+    re-dispatches a stale-rebase conflict-fix for an entry that already gave
+    up on the ceiling (quadraui#1077: this mechanism fired one 6h07m after
+    the block). A `waiting`/`running` row and a `blocked` row for an
+    UNRELATED (#1844) reason must both be left out — only a genuinely
+    #2972-blocked row counts."""
+    from coord.commands.drive_queue import _fix_round_ceiling_blocked_keys
+
+    ceiling_reason = (
+        "fix-round ceiling reached across relaunches (#2972): 3 work "
+        "leg(s) already run against a budget of 3 — giving up"
+    )
+    entries = [
+        entry(1077, state=STATE_BLOCKED, last_reason=ceiling_reason),
+        entry(
+            70,
+            state=STATE_BLOCKED,
+            last_reason=(
+                "... (#1844); blocking without spending an attempt"
+            ),
+        ),
+        entry(309, state=STATE_WAITING, last_reason=""),
+    ]
+    assert _fix_round_ceiling_blocked_keys(entries) == {(REPO, 1077)}
+
+
 def test_a_blocked_entry_that_has_hit_the_resume_ceiling_stays_blocked_and_says_so():
     """#2230's churn bound: an entry already resumed MAX_BLOCKED_RESUMES times
     must not oscillate forever — it stays `blocked`, but `last_reason` is
@@ -5194,16 +5265,45 @@ def test_a_parked_entry_with_review_still_pending_falls_through_to_the_ordinary_
     assert plan.launch is not None and plan.launch.issue == 2350
 
 
-def test_is_permanent_block_reason_recognises_both_markers_and_nothing_else():
+def test_is_permanent_block_reason_recognises_all_three_markers_and_nothing_else():
     from coord.drive_queue import is_permanent_block_reason
 
     assert is_permanent_block_reason("... (#1844); blocking without spending an attempt")
     assert is_permanent_block_reason("... (#2019); blocking without spending an attempt")
+    # #3454: the #2972 fix-round ceiling joined the permanent set — see
+    # test_a_fix_round_ceiling_block_never_auto_resumes below for why.
+    assert is_permanent_block_reason(
+        "fix-round ceiling reached across relaunches (#2972): 3 work leg(s) "
+        "already run against a budget of 3 — giving up"
+    )
     assert not is_permanent_block_reason(
         "drive session died without landing the work 2/2 times — giving up"
     )
     assert not is_permanent_block_reason("")
     assert not is_permanent_block_reason(None)
+
+
+def test_is_fix_round_ceiling_reason_matches_only_the_2972_marker():
+    """#3454: the narrower predicate `coord.commands.drive_queue` uses to
+    also stop its OWN independent stale-rebase auto-dispatch — must not
+    fire for the OTHER two permanent-block markers, or that other call site
+    would silently widen to #1844/#2019 rows too."""
+    from coord.drive_queue import is_fix_round_ceiling_reason
+
+    assert is_fix_round_ceiling_reason(
+        "fix-round ceiling reached across relaunches (#2972): giving up"
+    )
+    assert not is_fix_round_ceiling_reason(
+        "... (#1844); blocking without spending an attempt"
+    )
+    assert not is_fix_round_ceiling_reason(
+        "... (#2019); blocking without spending an attempt"
+    )
+    assert not is_fix_round_ceiling_reason(
+        "drive session died without landing the work 2/2 times — giving up"
+    )
+    assert not is_fix_round_ceiling_reason("")
+    assert not is_fix_round_ceiling_reason(None)
 
 
 def test_a_genuinely_dead_drive_without_ci_pending_still_retries_normally():

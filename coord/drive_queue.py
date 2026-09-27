@@ -282,7 +282,49 @@ PARK_STALE_SECONDS = 45 * 60.0
 # clear (see `_reconcile_blocked` and the `live_blocked_gate` parameter of
 # `plan_tick`). No evidence either way leaves the entry exactly as untouched
 # as it was before this feature existed.
-_PERMANENT_BLOCK_MARKERS: tuple[str, ...] = ("(#1844)", "(#2019)")
+#
+# #3454: `(#2972)` joined this tuple after quadraui#1077 (2026-09-27) showed
+# the gap a THIRD marker was needed for — a #2972 fix-round-ceiling give-up
+# is not like #309's ordinary `exhausted`: relaunching cannot produce more
+# budget no matter how the merge gate reads, so treating it as merely
+# "unlucky, re-check later" let #2230's own sweep silently resume it back to
+# `waiting` (attempts reset to 0!) the moment the gate cleared — handing the
+# exact fresh budget the ceiling exists to deny, from inside the mechanism
+# built to respect it. Marking it permanent here closes that specific hole:
+# `_reconcile_blocked` returns `None` for it unconditionally, same as
+# #1844/#2019, and only an operator's `coord drive-queue remove` + `add`
+# (a fresh row) ever gives this entry another attempt. This
+# does NOT stop the row from being noticed if the issue lands anyway
+# out-of-band — `plan_tick`'s own step-1b `facts.landed` check (#2055/#3368)
+# runs unconditionally for every `blocked` entry regardless of this marker,
+# exactly as it always has; what stops is only the AUTOMATIC relaunch/
+# merge-only paths #2230 gates. See :func:`is_fix_round_ceiling_reason` for
+# the narrower predicate `coord.commands.drive_queue` uses to also stop its
+# OWN independent auto-dispatch (the stale-rebase conflict-fix revalidation)
+# from re-firing against a row that has already given up this way.
+_PERMANENT_BLOCK_MARKERS: tuple[str, ...] = ("(#1844)", "(#2019)", "(#2972)")
+
+
+def is_fix_round_ceiling_reason(reason: str | None) -> bool:
+    """#3454: does *reason* name the #2972 fix-round-ceiling give-up — the
+    ``_reconcile_running`` "giving up rather than relaunching with a fresh
+    budget" branch, below?
+
+    Marker-based, same convention as :func:`is_permanent_block_reason` (whose
+    ``_PERMANENT_BLOCK_MARKERS`` this reuses the same ``(#2972)`` text for):
+    the branch that writes this reason stamps the marker unconditionally, so
+    a substring check is exact, not a heuristic guess. A dedicated predicate
+    rather than reusing ``is_permanent_block_reason`` directly because a
+    caller outside this module (``coord.commands.drive_queue``'s stale-rebase
+    auto-revalidation, #3454) wants to ask SPECIFICALLY "did this entry give
+    up on the fix-round ceiling", not the broader "is this blocked for any
+    permanent reason" — conflating the two would silently widen that other
+    caller's behaviour to #1844/#2019 rows too, which nothing in #3454 asked
+    for and nothing has verified is safe.
+    """
+    if not reason:
+        return False
+    return "(#2972)" in reason
 
 
 def is_permanent_block_reason(text: str | None) -> bool:
@@ -5112,13 +5154,24 @@ def _reconcile_running(
     # ran.
     budget = total_fix_round_budget(entry, fix_round_config_default)
     if remaining_fix_rounds(entry, facts, fix_round_config_default) <= 0:
+        # #3454: this block now DOES mean "stop" — see
+        # `_PERMANENT_BLOCK_MARKERS`'s `(#2972)` entry and
+        # `is_fix_round_ceiling_reason` above for the mechanics. Say so
+        # explicitly rather than leaving an operator to infer it: quadraui#1077
+        # showed a bare "giving up" read as "nothing more will happen or be
+        # spent" while the fleet kept dispatching paid legs against the same
+        # branch for hours.
         reason = (
             f"fix-round ceiling reached across relaunches (#2972): "
             f"{facts.work_leg_count} work leg(s) already run against a "
             f"budget of {budget} (1 work dispatch + "
             f"{effective_max_fix_rounds(entry, fix_round_config_default)} fix "
             f"round(s)) — giving up rather than relaunching with a fresh "
-            f"budget{dispatch_note}"
+            f"budget{dispatch_note}. Parked (#3454): no further relaunch, "
+            f"gate-clear resume, or auto-dispatched stale-rebase conflict-fix "
+            f"will fire for this entry — `coord drive-queue remove "
+            f"{entry.repo} {entry.issue}` + `add` (a fresh row) is the only "
+            f"way to give it another attempt."
         )
         return (
             Reconcile(entry.key, "exhausted", reason, occupies=False),
