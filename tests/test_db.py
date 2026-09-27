@@ -2468,7 +2468,7 @@ class TestUatStateAndReasonColumns:
 # #3384 bumped this to (19, 97): `issues.state_reason` — GitHub's own witness
 # that an issue was explicitly reopened, distinguishing that from an issue
 # that merged without ever auto-closing.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (19, 97)
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (20, 98)
 
 
 class TestMigrateAddColumnsVersionGuard:

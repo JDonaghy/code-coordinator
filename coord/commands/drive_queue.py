@@ -106,7 +106,6 @@ from coord.drive_queue import (
     resolve_max_parallel,
     resolve_max_parallel_per_repo,
     resolve_repo_ceilings,
-    total_fix_round_budget,
     unreachable_wait_alert,
     validate_apply_gate,
     validate_enqueue,
@@ -1637,20 +1636,35 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             bits.append(f"attempts={entry.attempts}")
         if entry.deferrals:
             bits.append(f"deferrals={entry.deferrals}")
-        # #2972: the fix-round ceiling's OWN count — total work legs (work +
-        # every fix round) this entry has run across every relaunch, against
-        # the budget `_reconcile_running` actually enforces. Only shown once
-        # at least one leg has been dispatched — a `waiting` entry that has
-        # never launched has nothing to report, same as `attempts`/
+        # #2972/#3463: the fix-round ceiling's OWN count, rendered with the
+        # SAME meaning `coord drive`'s own `fix round N/M` lines use
+        # (`coord/drive.py`) — fix rounds SPENT against `max_fix_rounds`, not
+        # "every work-like leg including the initial one" against "budget +
+        # 1". `lifetime_legs` is every WORK_LIKE leg `leg_counts()` has ever
+        # seen for this issue, all-time, across every predecessor row; #3463
+        # narrows that to `row_legs` — legs run since THIS row was last
+        # (re-)declared by `enqueue_drive_queue` (`entry.legs_at_enqueue`),
+        # the SAME baseline `remaining_fix_rounds` subtracts. Only shown once
+        # this row has itself dispatched at least one leg — a `waiting`
+        # entry that has never launched (or a freshly re-added row that
+        # hasn't relaunched yet) has nothing to report, same as `attempts`/
         # `deferrals` above being suppressed at 0.
-        work_legs = sum(
+        lifetime_legs = sum(
             count
             for kind, count in all_leg_counts.get(entry.key, {}).items()
             if kind in WORK_LIKE
         )
-        if work_legs:
-            budget = total_fix_round_budget(entry, fix_round_config_default)
-            bits.append(f"fix_rounds={min(work_legs, budget)}/{budget}")
+        row_legs = max(lifetime_legs - entry.legs_at_enqueue, 0)
+        if row_legs:
+            effective_max = effective_max_fix_rounds(entry, fix_round_config_default)
+            fix_rounds_spent = max(row_legs - 1, 0)
+            # #3463: an overrun (the #3454 leak: a row that dispatched past
+            # its own ceiling before the fix landed) must stay VISIBLE as an
+            # overrun, not silently clamp back down to a reassuring `N/N` —
+            # a gate that can never show its own failure state is not a
+            # gate (epic #2096).
+            overrun = "!" if fix_rounds_spent > effective_max else ""
+            bits.append(f"fix_rounds={fix_rounds_spent}/{effective_max}{overrun}")
         if entry.resumes:
             # #2230: how many times the merge-gate sweep has auto-resumed
             # THIS row from `blocked` — the churn signal the issue asks to be

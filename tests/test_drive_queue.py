@@ -956,6 +956,52 @@ def test_total_fix_round_budget_is_work_plus_fix_rounds():
     assert total_fix_round_budget(default_e, None) == DEFAULT_TICK_MAX_FIX_ROUNDS + 1
 
 
+# ── #3463: a re-added row's budget is measured from ITS OWN baseline ────────
+#
+# `IssueFacts.work_leg_count` is a LIFETIME, cross-row count — every
+# predecessor row this (repo, issue) has ever had contributes to it. Before
+# #3463, `remaining_fix_rounds` compared that raw lifetime figure against
+# `max_fix_rounds`, so a fresh row re-added (`coord drive-queue remove` +
+# `add`) after its issue had already burned through 5 lifetime legs read
+# back almost no budget at all — exactly the opposite of what the #3454
+# ceiling message promises ("remove + add ... is the only way to give it
+# another attempt"). `entry.legs_at_enqueue` is the lifetime count AS OF the
+# row's own `enqueue_drive_queue` call — see `coord.state.
+# _enqueue_drive_queue_local` for where it is stamped — so a row's own spend
+# is `work_leg_count - legs_at_enqueue`, never the raw lifetime total.
+
+
+def test_remaining_fix_rounds_gives_a_re_added_row_its_full_budget():
+    """quadraui#1081's exact shape: `--max-fix-rounds 5`, re-added when the
+    issue already has 5 lifetime work legs. Current main (pre-#3463) reads
+    this back as `1` (`5 - 4` against `effective_max_fix_rounds`) — this
+    pins the fix: a freshly re-added row (no legs of its OWN yet) gets its
+    full `max_fix_rounds` back, not a near-exhausted one inherited from
+    every predecessor row's history."""
+    e = entry(1081, max_fix_rounds=5, legs_at_enqueue=5)
+    facts = IssueFacts(known=True, work_leg_count=5)
+    assert remaining_fix_rounds(e, facts, None) == 5
+
+
+def test_remaining_fix_rounds_still_shrinks_across_relaunches_of_the_re_added_row():
+    """The #2972 no-fresh-budget-on-relaunch guarantee is unchanged for the
+    re-added row ITSELF: two more legs run against it (still no new `add`,
+    so `legs_at_enqueue` does not move) shrinks its remaining budget by the
+    one fix round actually spent, same as any other row."""
+    e = entry(1081, max_fix_rounds=5, legs_at_enqueue=5)
+    facts = IssueFacts(known=True, work_leg_count=7)
+    assert remaining_fix_rounds(e, facts, None) == 4
+
+
+def test_remaining_fix_rounds_legs_at_enqueue_default_matches_pre_3463_behaviour():
+    """A row predating the `legs_at_enqueue` column (or one that has never
+    been re-added) reads `legs_at_enqueue == 0` — reproducing the pre-#3463
+    `work_leg_count - 1` formula exactly, byte for byte."""
+    e = entry(1650, max_fix_rounds=2)
+    assert e.legs_at_enqueue == 0
+    assert remaining_fix_rounds(e, IssueFacts(known=True, work_leg_count=2), None) == 1
+
+
 def test_build_board_view_folds_leg_counts_into_work_leg_count():
     """Only WORK_LIKE types count as a work leg — a `review`/`smoke` leg on
     the SAME issue must never inflate the fix-round budget's own count."""

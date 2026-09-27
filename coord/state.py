@@ -8473,7 +8473,7 @@ _DRIVE_QUEUE_COLUMNS = (
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
     "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at, "
     "max_fix_rounds, no_acceptance, plan_destructive, apply_verdict, "
-    "apply_verdict_reason, apply_verdict_at"
+    "apply_verdict_reason, apply_verdict_at, legs_at_enqueue"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -8655,6 +8655,42 @@ def enqueue_drive_queue(
     )
 
 
+def _work_leg_count_for_issue_local(conn, repo_name: str, issue_number: int) -> int:
+    """All-time WORK_LIKE assignment count for ONE issue, right now (#3463).
+
+    Same scope as :func:`_leg_counts_local` (both ``assignments`` and
+    ``assignments_archive``, so a long-lived issue's early legs don't drop
+    out of the count as they age past the archive retention window) but
+    narrowed to a single ``(repo_name, issue_number)`` and run on the
+    CALLER's own connection — so ``_enqueue_drive_queue_local`` can stamp
+    ``legs_at_enqueue`` atomically with the very write that declares the
+    row, rather than racing a second connection's transaction.
+
+    A NULL/empty ``type`` counts as ``"work"`` — same convention
+    :func:`coord.drive_queue.compute_leg_counts` uses (``t = assignment_type
+    or "work"``) — which is always in ``WORK_LIKE_TYPES``, so a bare
+    ``type IS NULL`` row is counted, never silently dropped.
+    """
+    placeholders = ",".join("?" for _ in WORK_LIKE_TYPES)
+    total = 0
+    for table in ("assignments", "assignments_archive"):
+        try:
+            row = sql.execute(conn,
+                f"SELECT COUNT(*) AS n FROM {table} WHERE repo_name = ? "  # noqa: S608 — constant
+                f"AND issue_number = ? AND (type IS NULL OR type IN ({placeholders}))",
+                (repo_name, issue_number, *WORK_LIKE_TYPES),
+            ).fetchone()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            # Mirrors `_leg_counts_local`: `continue` on the SAME connection
+            # so a missing `assignments_archive` (housekeeping never ran)
+            # doesn't poison the transaction the caller's write is still
+            # inside of (#2983).
+            rollback_after_driver_error(conn, exc)
+            continue
+        total += int(row["n"]) if row is not None else 0
+    return total
+
+
 def _enqueue_drive_queue_local(
     repo_name: str,
     issue_number: int,
@@ -8705,6 +8741,21 @@ def _enqueue_drive_queue_local(
             "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
             (repo_name, issue_number),
         ).fetchone()
+        # #3463: the all-time WORK_LIKE leg count for THIS issue, read on
+        # THIS connection right before the write below commits it as the
+        # row's new baseline. Recomputed on every `enqueue_drive_queue` call
+        # — insert AND update-in-place — never carried forward from a prior
+        # `legs_at_enqueue`, so an explicit `add` (whether it lands on a
+        # brand-new row after `remove`, or refreshes an already-queued one)
+        # always measures this row's spend from "legs as of right now",
+        # which is what lets `remaining_fix_rounds` hand out the fresh
+        # budget the #3454 ceiling message promises. A bare relaunch never
+        # reaches this function at all (it goes through
+        # `update_drive_queue_entry` instead), so the #2972 "no fresh
+        # budget from a relaunch" guarantee is untouched.
+        legs_at_enqueue = _work_leg_count_for_issue_local(
+            conn, repo_name, issue_number
+        )
         if existing is not None:
             # Already queued → update the operator-declared fields in place
             # rather than creating a second row for the same issue.  Run
@@ -8720,7 +8771,7 @@ def _enqueue_drive_queue_local(
                 "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
                 "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
                 "hold_scope = ?, max_fix_rounds = ?, no_acceptance = ?, "
-                "plan_destructive = ? WHERE id = ?",
+                "plan_destructive = ?, legs_at_enqueue = ? WHERE id = ?",
                 (
                     machine,
                     after_json,
@@ -8732,6 +8783,7 @@ def _enqueue_drive_queue_local(
                     max_fix_rounds,
                     no_acceptance_int,
                     plan_destructive_int,
+                    legs_at_enqueue,
                     existing["id"],
                 ),
             )
@@ -8746,8 +8798,8 @@ def _enqueue_drive_queue_local(
             "INSERT INTO drive_queue "
             "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
             " hold_after, hold_reason, resume_when, hold_state, hold_scope, "
-            " max_fix_rounds, no_acceptance, plan_destructive) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " max_fix_rounds, no_acceptance, plan_destructive, legs_at_enqueue) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo_name,
                 issue_number,
@@ -8763,6 +8815,7 @@ def _enqueue_drive_queue_local(
                 max_fix_rounds,
                 no_acceptance_int,
                 plan_destructive_int,
+                legs_at_enqueue,
             ),
             pk_column="id",
         )
