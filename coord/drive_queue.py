@@ -1456,6 +1456,19 @@ class QueueEntry:
     # `last_reason`. `None` for a row predating this column or one whose
     # `apply_verdict` is still unset.
     apply_verdict_at: float | None = None
+    # #3463: the all-time WORK_LIKE leg count (the SAME per-issue figure
+    # `IssueFacts.work_leg_count` carries) this row saw at the moment
+    # `enqueue_drive_queue` last declared it — see
+    # `coord.state._enqueue_drive_queue_local` for where it is stamped, on
+    # every `add` (insert OR update-in-place), never carried forward.
+    # `remaining_fix_rounds` subtracts this off `facts.work_leg_count`
+    # before comparing spend against `max_fix_rounds`, so a row's own
+    # budget is measured from ITS OWN baseline — "legs since THIS row was
+    # last (re-)declared" — rather than the lifetime total every
+    # predecessor row for this issue ever spent. `0` for every row
+    # predating this column, which reproduces the pre-#3463
+    # `work_leg_count - 1` formula exactly for that row.
+    legs_at_enqueue: int = 0
 
     @property
     def key(self) -> str:
@@ -1556,6 +1569,7 @@ class QueueEntry:
                 if row.get("apply_verdict_at") is None
                 else float(row.get("apply_verdict_at"))
             ),
+            legs_at_enqueue=int(row.get("legs_at_enqueue") or 0),
         )
 
 
@@ -1617,29 +1631,46 @@ def remaining_fix_rounds(
     resumes rather than restarts.
 
     ``facts.work_leg_count`` is every work-like assignment `build_board_view`
-    has EVER seen for this issue, across every drive session this entry has
-    had — not just the one that just died. Subtracting the one unconditional
-    initial work leg turns that into "fix rounds already spent"; subtracting
-    THAT from :func:`effective_max_fix_rounds`'s plain per-drive allowance
-    (NOT :func:`total_fix_round_budget` — that figure already has the
-    initial work leg folded in, and folding it in a second time here would
-    hand a brand-new entry, with zero legs spent, a budget one round wider
-    than `coord drive`'s own interactive default ever allows) is what makes
-    a second (or third, or fourth) relaunch get a SMALLER budget than the
+    has EVER seen for this issue, across every drive session this entry (and
+    every predecessor row for the same issue) has ever had. #3463: what this
+    row has itself SPENT is that lifetime total minus
+    ``entry.legs_at_enqueue`` — the lifetime count as of the moment THIS row
+    was last (re-)declared by `enqueue_drive_queue` — not the raw lifetime
+    total. Subtracting the one unconditional initial work leg turns that
+    into "fix rounds already spent"; subtracting THAT from
+    :func:`effective_max_fix_rounds`'s plain per-drive allowance (NOT
+    :func:`total_fix_round_budget` — that figure already has the initial
+    work leg folded in, and folding it in a second time here would hand a
+    brand-new entry, with zero legs spent, a budget one round wider than
+    `coord drive`'s own interactive default ever allows) is what makes a
+    second (or third, or fourth) relaunch get a SMALLER budget than the
     first, instead of the same fresh one every time — the exact defect
     quadraui#625 reported: four work legs dispatched against a
     ``pipeline.max_fix_rounds`` of 2 (budget 3), because each relaunch's
     ``coord drive --max-fix-rounds`` was computed from `entry` alone, blind
     to what prior sessions had already spent. A fresh entry (``work_leg_count
-    == 0``) reads back exactly :func:`effective_max_fix_rounds` — unchanged
-    from every pre-#2972 launch.
+    == legs_at_enqueue``) reads back exactly :func:`effective_max_fix_rounds`
+    — unchanged from every pre-#2972 launch, and unchanged by #3463 for a row
+    predating the ``legs_at_enqueue`` column (``0``, reproducing the old
+    ``work_leg_count - 1`` formula exactly).
+
+    #3463: this is also what makes an explicit ``coord drive-queue remove``
+    + ``add`` actually hand out a fresh budget, as the #3454 ceiling message
+    promises — the re-added row's own ``legs_at_enqueue`` is stamped at
+    THAT ``add``, not inherited from a predecessor row. It does NOT change
+    the #2972 guarantee that a bare relaunch (no `add` in between) gets no
+    fresh budget: a relaunch never calls `enqueue_drive_queue` at all, only
+    `update_drive_queue_entry`, so `legs_at_enqueue` never moves between
+    relaunches of the SAME row.
 
     Never negative — an entry that has already met or exceeded
     :func:`total_fix_round_budget` reads ``0`` (no more fix rounds), the
     signal `_reconcile_running` uses to stop relaunching altogether rather
     than pass a session a budget it cannot spend down further.
     """
-    fix_rounds_spent = max(facts.work_leg_count - 1, 0)
+    fix_rounds_spent = max(
+        facts.work_leg_count - entry.legs_at_enqueue - 1, 0
+    )
     return max(effective_max_fix_rounds(entry, config_default) - fix_rounds_spent, 0)
 
 
@@ -5187,9 +5218,14 @@ def _reconcile_running(
         # showed a bare "giving up" read as "nothing more will happen or be
         # spent" while the fleet kept dispatching paid legs against the same
         # branch for hours.
+        # #3463: legs run against THIS row's own baseline, not the raw
+        # lifetime count — see `remaining_fix_rounds`'s docstring. Reporting
+        # the raw `facts.work_leg_count` here would misstate a re-added
+        # row's spend as its predecessors' lifetime total.
+        row_legs = max(facts.work_leg_count - entry.legs_at_enqueue, 0)
         reason = (
             f"fix-round ceiling reached across relaunches (#2972): "
-            f"{facts.work_leg_count} work leg(s) already run against a "
+            f"{row_legs} work leg(s) already run against this row's own "
             f"budget of {budget} (1 work dispatch + "
             f"{effective_max_fix_rounds(entry, fix_round_config_default)} fix "
             f"round(s)) — giving up rather than relaunching with a fresh "
@@ -5197,8 +5233,8 @@ def _reconcile_running(
             f"gate-clear resume, or auto-dispatched stale-rebase conflict-fix "
             f"(from any of this fleet's independent dispatchers) will fire "
             f"for this entry — `coord drive-queue remove {entry.repo} "
-            f"{entry.issue}` + `add` (a fresh row) is the only way to give "
-            f"it another attempt."
+            f"{entry.issue}` + `add` (a fresh row, #3463: with its own fresh "
+            f"budget) is the only way to give it another attempt."
         )
         return (
             Reconcile(entry.key, "exhausted", reason, occupies=False),

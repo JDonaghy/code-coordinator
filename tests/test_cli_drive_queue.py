@@ -5035,6 +5035,70 @@ def test_leg_counts_non_lock_failure_warns_and_degrades_to_zero_not_silence(
     assert queued(1650)["state"] == "running"
 
 
+# ── #3463: `list`'s `fix_rounds=` renders spend, not "every leg incl. the
+#    initial one against budget+1" — and never clamps an overrun back to a
+#    reassuring `N/N`.
+
+
+def test_list_renders_fix_rounds_as_spent_over_max_not_legs_over_budget_plus_one(
+    cli, seed
+):
+    """`--max-fix-rounds 4` — a row that has run 1 work + 4 fix legs (5 legs
+    total) must render `fix_rounds=4/4` (4 fix rounds spent of 4 allowed),
+    never the pre-#3463 `5/5` (every leg, including the unconditional
+    initial one, against `max_fix_rounds + 1`)."""
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650", "--max-fix-rounds", "4").exit_code == 0
+    # The row's own history accrues AFTER it is declared — `legs_at_enqueue`
+    # was stamped at 0 by the `add` above, so every one of these counts as
+    # this row's own spend.
+    seed(assignments=[
+        {"issue_number": 1650, "type": "work", "status": "done"}
+        for _ in range(5)
+    ])
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "fix_rounds=4/4" in result.output
+    assert "fix_rounds=5/5" not in result.output
+
+
+def test_list_renders_zero_spent_for_a_fresh_row_with_only_its_initial_leg(
+    cli, seed
+):
+    """A fresh `--max-fix-rounds 5` row with only its initial (unconditional)
+    work leg has spent NO fix rounds yet — `fix_rounds=0/5`, never the
+    pre-#3463 `1/6`."""
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650", "--max-fix-rounds", "5").exit_code == 0
+    seed(assignments=[{"issue_number": 1650, "type": "work", "status": "running"}])
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "fix_rounds=0/5" in result.output
+    assert "fix_rounds=1/6" not in result.output
+
+
+def test_list_marks_an_overrun_row_rather_than_clamping_to_n_over_n(cli, seed):
+    """A row that dispatched PAST its own ceiling (the #3454 leak this issue
+    also reports) must stay visibly an overrun — never silently clamp back
+    down to a reassuring `budget/budget`."""
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650", "--max-fix-rounds", "2").exit_code == 0
+    # 1 work + 5 more legs = 6 total, 5 fix rounds spent against a 2-round
+    # allowance — well past the ceiling.
+    seed(assignments=[
+        {"issue_number": 1650, "type": "work", "status": "done"}
+        for _ in range(6)
+    ])
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "fix_rounds=5/2!" in result.output
+    assert "fix_rounds=2/2" not in result.output
+    assert "fix_rounds=3/3" not in result.output
+
+
 def test_a_failed_launch_is_a_consumed_attempt_not_a_running_entry(
     cli, seed, launches
 ):

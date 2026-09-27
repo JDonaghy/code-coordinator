@@ -1058,7 +1058,14 @@ def retry_on_locked(
 # first place" (a quadraui-style merge into a non-default branch) — both
 # read identically as `merged=True, issue_state="open"` otherwise. See
 # `coord.drive_queue.IssueFacts.landed`'s docstring.
-_DB_SCHEMA_VERSION = 19
+#
+# #3463: bumped 19 -> 20 for the new `drive_queue.legs_at_enqueue` column
+# appended to `_MIGRATE_ADD_COLUMNS` below — the all-time WORK_LIKE leg
+# count a row saw at `enqueue_drive_queue` time, so `remaining_fix_rounds`
+# can measure a row's own spend from ITS baseline rather than every
+# predecessor row's lifetime total. See `coord.drive_queue.QueueEntry.
+# legs_at_enqueue`.
+_DB_SCHEMA_VERSION = 20
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1592,6 +1599,24 @@ _SCHEMA_SQL = """
             -- point-in-time observation" discipline #2133's reason_at
             -- established for last_reason. NULL until a verdict is recorded.
             apply_verdict_at REAL,
+            -- #3463: the all-time WORK_LIKE leg count (coord.state.
+            -- leg_counts()'s per-issue figure) THIS ROW saw at the moment it
+            -- was declared by `enqueue_drive_queue` — the baseline
+            -- `coord.drive_queue.remaining_fix_rounds` subtracts off before
+            -- comparing against `max_fix_rounds`, so a row's own spend is
+            -- "legs since THIS row was enqueued", not "legs this issue has
+            -- ever had across every predecessor row". Re-stamped on every
+            -- `enqueue_drive_queue` call (insert OR update-in-place), which
+            -- is what makes an explicit `remove` + `add` actually hand out a
+            -- fresh budget as the #3454 ceiling message promises, while
+            -- leaving the #2972 "no fresh budget from a bare relaunch"
+            -- guarantee untouched — a relaunch never calls
+            -- `enqueue_drive_queue` at all, only `update_drive_queue_entry`.
+            -- 0 (NOT NULL) for every row predating this column: subtracting
+            -- 0 reproduces the pre-#3463 `work_leg_count - 1` formula
+            -- exactly, so an existing row's already-computed remaining
+            -- budget does not change under this migration.
+            legs_at_enqueue INTEGER NOT NULL DEFAULT 0,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -2510,6 +2535,13 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # auto-close the linked issue at all — both look identical as
     # `merged=True, issue_state="open"` without it.
     "ALTER TABLE issues ADD COLUMN state_reason TEXT NOT NULL DEFAULT ''",
+    # #3463: see the CREATE TABLE comment above — the all-time WORK_LIKE leg
+    # count a row saw at `enqueue_drive_queue` time, so a re-added row's fix
+    # budget is measured from ITS OWN baseline rather than every
+    # predecessor's lifetime spend. 0 for every row predating this
+    # migration, which reproduces the pre-#3463 `work_leg_count - 1` formula
+    # unchanged for that row.
+    "ALTER TABLE drive_queue ADD COLUMN legs_at_enqueue INTEGER NOT NULL DEFAULT 0",
 ]
 
 

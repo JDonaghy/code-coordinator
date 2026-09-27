@@ -313,6 +313,13 @@ class BoardDriveQueueEntry:
     apply_verdict: str
     apply_verdict_reason: str
     apply_verdict_at: float | None = None
+    # #3463: the all-time WORK_LIKE leg count this row saw when
+    # `enqueue_drive_queue` last (re-)declared it — see
+    # `coord.drive_queue.QueueEntry.legs_at_enqueue` for what it feeds.
+    # Default 0 — both for a row predating this column and for a thin client
+    # talking to a daemon that predates it — reproduces the pre-#3463
+    # `work_leg_count - 1` fix-round formula exactly.
+    legs_at_enqueue: int = 0
 
 
 # ── #3428 (#3408 item 3): concurrency ceilings + provenance + occupancy ──────

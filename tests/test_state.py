@@ -4398,6 +4398,67 @@ class TestDriveQueueLocalWritesRetryLockContention:
             _enqueue_drive_queue_local("api", 9, position=1)
 
 
+class TestEnqueueDriveQueueStampsLegsAtEnqueue:
+    """#3463: `enqueue_drive_queue` must stamp the row's OWN baseline —
+    the all-time WORK_LIKE leg count as of THIS `add` call — not leave it at
+    `0` forever (which would make a re-added row read its predecessors'
+    entire lifetime spend as its own, the exact quadraui#1081 misreport)."""
+
+    @staticmethod
+    def _seed_work_legs(coord_db, *, repo="api", issue=9, count=1, kind="work") -> None:
+        for i in range(count):
+            coord_db.execute(
+                "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+                "issue_number, issue_title, type) VALUES (?, 'm1', ?, ?, 't', ?)",
+                (f"aid-{repo}-{issue}-{kind}-{i}", repo, issue, kind),
+            )
+        coord_db.commit()
+
+    def test_fresh_row_with_no_history_stamps_zero(self, coord_db) -> None:
+        from coord.state import _enqueue_drive_queue_local, _get_drive_queue_entry_local
+
+        _enqueue_drive_queue_local("api", 9)
+        assert _get_drive_queue_entry_local("api", 9)["legs_at_enqueue"] == 0
+
+    def test_re_added_row_stamps_the_current_lifetime_count(self, coord_db) -> None:
+        """The quadraui#1081 shape: 5 lifetime work legs already exist for
+        this issue (from a predecessor row's history) before the row is
+        (re-)declared — the new row's baseline must be 5, not 0."""
+        from coord.state import _enqueue_drive_queue_local, _get_drive_queue_entry_local
+
+        self._seed_work_legs(coord_db, count=5)
+        _enqueue_drive_queue_local("api", 9)
+        assert _get_drive_queue_entry_local("api", 9)["legs_at_enqueue"] == 5
+
+    def test_updating_an_already_queued_row_re_stamps_the_baseline(
+        self, coord_db
+    ) -> None:
+        """A second `enqueue_drive_queue` call against an already-queued row
+        (the UPDATE branch, not INSERT) re-stamps `legs_at_enqueue` to
+        whatever the lifetime count is NOW — an operator's explicit `add`
+        always measures from "right now", never a stale baseline."""
+        from coord.state import _enqueue_drive_queue_local, _get_drive_queue_entry_local
+
+        _enqueue_drive_queue_local("api", 9)
+        assert _get_drive_queue_entry_local("api", 9)["legs_at_enqueue"] == 0
+
+        self._seed_work_legs(coord_db, count=3)
+        _enqueue_drive_queue_local("api", 9, machine="m2")
+        assert _get_drive_queue_entry_local("api", 9)["legs_at_enqueue"] == 3
+
+    def test_only_work_like_types_count_toward_the_baseline(self, coord_db) -> None:
+        """A `review`/`smoke` leg on the same issue must never inflate the
+        baseline — same WORK_LIKE-only scoping `IssueFacts.work_leg_count`
+        uses."""
+        from coord.state import _enqueue_drive_queue_local, _get_drive_queue_entry_local
+
+        self._seed_work_legs(coord_db, count=2, kind="work")
+        self._seed_work_legs(coord_db, count=4, kind="review")
+        self._seed_work_legs(coord_db, count=1, kind="smoke")
+        _enqueue_drive_queue_local("api", 9)
+        assert _get_drive_queue_entry_local("api", 9)["legs_at_enqueue"] == 2
+
+
 class TestMilestoneLocalLockContention:
     """Same shape, for `_assign_issue_milestone_local` /
     `_unassign_issue_milestone_local`."""
