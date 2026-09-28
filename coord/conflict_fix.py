@@ -895,7 +895,7 @@ def detect_stale_rebase_mismatch(
 ) -> bool:
     """True when a finished stale-rebase conflict-fix worker refused to push
     because its rebase was not content-preserving (a real conflict, or a
-    patch-id mismatch it caught in step 5 of :func:`build_stale_rebase_briefing`).
+    patch-id mismatch it caught in step 7 of :func:`build_stale_rebase_briefing`).
 
     Mirrors :func:`detect_semantic_conflict` exactly (same local-log-then-
     agent-endpoint lookup, same best-effort ``False`` on any read/transport

@@ -1302,6 +1302,7 @@ class TestReconcileConflictFixAlreadyUpstreamMarker:
     resolve).
     """
 
+    @patch("coord.github_ops.post_issue_comment")
     @patch("coord.network.fetch_status")
     @patch("coord.conflict_fix.httpx.post")
     @patch("coord.reconcile._query_agent")
@@ -1310,6 +1311,7 @@ class TestReconcileConflictFixAlreadyUpstreamMarker:
         mock_query: MagicMock,
         mock_post: MagicMock,
         mock_fetch_status: MagicMock,
+        mock_post_comment: MagicMock,
         tmp_path: Path,
         coord_db,
     ) -> None:
@@ -1373,6 +1375,20 @@ class TestReconcileConflictFixAlreadyUpstreamMarker:
 
         # Never dispatched an ordinary conflict-fix — nothing to resolve.
         mock_post.assert_not_called()
+
+        # #3462 review: the posted GitHub comment itself — not just
+        # `entry.error` — must not carry the generic "rebase and re-run
+        # `coord merge`" closing sentence. That sentence directly
+        # contradicts "nothing to merge; close the issue" in the same
+        # paragraph, which is exactly the quadraui#1174 misdirection this
+        # issue exists to fix.
+        mock_post_comment.assert_called_once()
+        posted_body = mock_post_comment.call_args.args[2]
+        assert "already present on" in posted_body
+        assert "genuine content conflict" not in posted_body
+        assert "rebase the branch locally" not in posted_body
+        assert "re-run `coord merge`" not in posted_body
+        assert "close the issue" in posted_body
 
     @patch("coord.reconcile._query_agent")
     def test_already_upstream_marker_takes_priority_over_mismatch_marker(

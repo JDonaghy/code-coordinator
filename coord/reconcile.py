@@ -2845,6 +2845,7 @@ def _post_human_required_comment_raw(
     machine_name: str,
     *,
     semantic_escalation_note: str | None = None,
+    closing_note: str | None = None,
 ) -> None:
     """Notify the user on GitHub that a conflict-fix worker gave up.
 
@@ -2853,9 +2854,22 @@ def _post_human_required_comment_raw(
     off, callers pass a short explanation so the comment says *why* there
     was no tier-2 attempt instead of reading as though escalation ran and
     failed.
+
+    *closing_note* (#3462): the default closing sentence below tells the
+    operator to rebase and re-run ``coord merge`` — correct for an actual
+    conflict, but flatly wrong (self-contradicting, in fact) for the
+    already-upstream verdict, where there is nothing to rebase or merge.
+    Callers whose verdict doesn't call for "manual resolution" in that
+    sense pass their own closing sentence instead of the default.
     """
     from coord import github_ops  # noqa: PLC0415
 
+    default_closing_note = (
+        "Manual resolution required: rebase the branch locally and "
+        "`git push --force-with-lease`, then re-run `coord merge`. The "
+        "coordinator will not re-dispatch a conflict-fix for this entry "
+        "in the current session."
+    )
     body = (
         "## Conflict-fix worker could not auto-resolve\n\n"
         f"Worker `{fix_assignment_id}` on "
@@ -2864,10 +2878,7 @@ def _post_human_required_comment_raw(
         "non-zero. The merge queue entry is now `HUMAN_REQUIRED`.\n\n"
         f"**Last error:** `{entry.error or 'unknown'}`\n\n"
         + (f"{semantic_escalation_note}\n\n" if semantic_escalation_note else "")
-        + "Manual resolution required: rebase the branch locally and "
-        "`git push --force-with-lease`, then re-run `coord merge`. The "
-        "coordinator will not re-dispatch a conflict-fix for this entry "
-        "in the current session."
+        + (closing_note if closing_note is not None else default_closing_note)
     )
     try:
         github_ops.post_issue_comment(entry.repo_github, entry.issue_number, body)
@@ -3124,6 +3135,7 @@ def on_conflict_fix_done(
     changed = False
     failed_entry: mq.QueuedMerge | None = None
     failed_entry_note: str | None = None
+    failed_entry_closing_note: str | None = None
     escalated: tuple[mq.QueuedMerge, str, str, str] | None = None
     for entry in items:
         if entry.assignment_id != parent_assignment_id:
@@ -3165,6 +3177,16 @@ def on_conflict_fix_done(
                     "drive-queue remove`."
                 )
                 failed_entry = entry
+                # #3462 review: the default closing sentence ("rebase the
+                # branch locally... then re-run `coord merge`") directly
+                # contradicts the "nothing to merge" verdict above — don't
+                # send the operator to resolve a conflict that isn't there.
+                failed_entry_closing_note = (
+                    "No action needed beyond closing the issue or running "
+                    "`coord drive-queue remove` — there is nothing to "
+                    "rebase or merge. The coordinator will not re-dispatch "
+                    "a conflict-fix for this entry in the current session."
+                )
             elif stale_rebase_mismatch:
                 # #3444: a stale-rebase worker's refusal means the
                 # "just-stale" premise was wrong — the rebase was not
@@ -3304,6 +3326,7 @@ def on_conflict_fix_done(
             fix_assignment_id=fix_assignment_id,
             machine_name=machine_name,
             semantic_escalation_note=failed_entry_note,
+            closing_note=failed_entry_closing_note,
         )
 
 
