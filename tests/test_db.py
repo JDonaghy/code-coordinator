@@ -2468,7 +2468,11 @@ class TestUatStateAndReasonColumns:
 # #3384 bumped this to (19, 97): `issues.state_reason` — GitHub's own witness
 # that an issue was explicitly reopened, distinguishing that from an issue
 # that merged without ever auto-closing.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (20, 98)
+# #3463 bumped this to (20, 98): `drive_queue.legs_at_enqueue`.
+# #3470 bumped this to (21, 98): two new `assignments` indexes appended to
+# `_SCHEMA_SQL` (not a column — `_MIGRATE_ADD_COLUMNS`'s length is
+# unchanged), for the `issue-cost` report's full-history scan.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (21, 98)
 
 
 class TestMigrateAddColumnsVersionGuard:

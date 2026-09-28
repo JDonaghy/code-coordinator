@@ -37,6 +37,10 @@ from coord.gate_a import park_marker
 from coord.models import POLICY_REFUSAL_MARKER
 from coord.reports import (
     COMPLETED_COLUMNS,
+    ISSUE_COST_COLUMN_META,
+    ISSUE_COST_COLUMNS,
+    ISSUE_COST_SINCE_CHOICES,
+    ISSUE_COST_STATUS_CHOICES,
     REPORTS,
     TREND_COLUMN_META,
     TREND_COLUMNS,
@@ -56,6 +60,7 @@ from coord.reports import (
     fold_deprecated_routes,
     fold_drive_queue_status,
     fold_issue_activity,
+    fold_issue_cost,
     fold_queue_outcomes,
     fold_trend,
     parse_duration,
@@ -67,6 +72,7 @@ from coord.reports import (
     run_decisions,
     run_deprecated_routes,
     run_drive_queue_status,
+    run_issue_cost,
     run_queue_outcomes,
     run_report,
     run_trend,
@@ -1567,14 +1573,14 @@ class TestCatalogue:
     def test_the_registered_reports(self) -> None:
         assert set(REPORTS) == {
             "issue-activity", "completed", "drive-queue-status", "decisions",
-            "usage", "queue-outcomes", "trend", "deprecated-routes",
+            "usage", "queue-outcomes", "trend", "deprecated-routes", "issue-cost",
         }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
-            "issue-activity", "queue-outcomes", "trend", "usage",
+            "issue-activity", "issue-cost", "queue-outcomes", "trend", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -1745,7 +1751,7 @@ class TestCli:
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
-            "issue-activity", "queue-outcomes", "trend", "usage",
+            "issue-activity", "issue-cost", "queue-outcomes", "trend", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -2204,7 +2210,7 @@ class TestDaemonEndpoints:
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
-            "issue-activity", "queue-outcomes", "trend", "usage",
+            "issue-activity", "issue-cost", "queue-outcomes", "trend", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
@@ -5211,3 +5217,455 @@ class TestTrendCatalogue:
     def test_row_identity_is_none_rows_are_buckets_not_issues(self) -> None:
         rep = next(r for r in catalogue()["reports"] if r["id"] == "trend")
         assert rep["row_identity"] is None
+
+
+# ── #3470: the `issue-cost` report ──────────────────────────────────────────
+#
+# A round window with plenty of room either side of the fixture timestamps —
+# same convention as `completed`'s C_START/C_END.
+IC_END = 10_000.0
+IC_START = 0.0
+
+
+def _issue_cost_issues() -> list[dict]:
+    return [
+        {"repo_name": "myrepo", "number": 7, "title": "Closed, mixed stages", "state": "closed"},
+        {"repo_name": "myrepo", "number": 9, "title": "Merged, no legs", "state": "open"},
+        {"repo_name": "myrepo", "number": 20, "title": "Still in flight", "state": "open"},
+        {"repo_name": "other", "number": 13, "title": "Closed, another repo", "state": "closed"},
+    ]
+
+
+def _issue_cost_assignments() -> list[dict]:
+    """myrepo#7 exercises every stage bucket and all three coverage buckets:
+
+      * dispatched 100->200, `work`, 1M sonnet input tokens, no captured cost
+        -> the first work-like leg (`work` stage), `estimated` coverage
+        ($3.00 at the default PricingConfig rate).
+      * dispatched 150->250, `work`, captured $2.00 -> the SECOND work-like
+        leg, so it's a `fix-rounds` leg, `captured` coverage.
+      * dispatched 210->220, `review`, captured $0.10 -> `review` stage,
+        `captured` coverage.
+      * dispatched 230->240, `smoke`, captured $0.05 -> `test` stage,
+        `captured` coverage.
+      * dispatched 260->270, `work`, `cost_capture_state="unmeasured"`, no
+        tokens at all -> a THIRD work-like leg (another `fix-rounds`),
+        `unmeasured` coverage — #3158's tri-state, explicitly.
+
+    Total: 5 legs, cost_total = 3.00 + 2.00 + 0.10 + 0.05 + 0 = 5.15,
+    agent_time_secs = 100 + 100 + 10 + 10 + 10 = 230, coverage = 4/5 = 80%.
+    """
+    return [
+        {"repo_name": "myrepo", "issue_number": 7, "type": "work",
+         "dispatched_at": 100.0, "finished_at": 200.0,
+         "model": "sonnet", "input_tokens": 1_000_000, "output_tokens": 0},
+        {"repo_name": "myrepo", "issue_number": 7, "type": "work",
+         "dispatched_at": 150.0, "finished_at": 250.0,
+         "model": "sonnet", "cost_usd": 2.0},
+        {"repo_name": "myrepo", "issue_number": 7, "type": "review",
+         "dispatched_at": 210.0, "finished_at": 220.0,
+         "model": "sonnet", "cost_usd": 0.10},
+        {"repo_name": "myrepo", "issue_number": 7, "type": "smoke",
+         "dispatched_at": 230.0, "finished_at": 240.0,
+         "model": "sonnet", "cost_usd": 0.05},
+        {"repo_name": "myrepo", "issue_number": 7, "type": "work",
+         "dispatched_at": 260.0, "finished_at": 270.0,
+         "cost_capture_state": "unmeasured"},
+        # myrepo#20: still in-flight — dispatched, never finished.
+        {"repo_name": "myrepo", "issue_number": 20, "type": "work",
+         "dispatched_at": 900.0, "finished_at": None,
+         "model": "sonnet", "input_tokens": 500, "output_tokens": 500},
+        # other#13: a different repo, must not leak into myrepo's rows.
+        {"repo_name": "other", "issue_number": 13, "type": "work",
+         "dispatched_at": 50.0, "finished_at": 300.0,
+         "model": "sonnet", "cost_usd": 0.5},
+    ]
+
+
+def _issue_cost_merge_queue() -> list[dict]:
+    return [
+        {"repo_name": "myrepo", "issue_number": 7, "state": "merged", "last_attempt": 280.0},
+        {"repo_name": "myrepo", "issue_number": 9, "state": "merged", "last_attempt": 400.0},
+    ]
+
+
+def _fold_issue_cost(window=(IC_START, IC_END), **kw) -> ReportResult:
+    return fold_issue_cost(
+        _issue_cost_issues(),
+        _issue_cost_assignments(),
+        _issue_cost_merge_queue(),
+        window,
+        generated_at=IC_END,
+        **kw,
+    )
+
+
+class TestIssueCostFold:
+    def test_columns_are_the_wire_contract(self) -> None:
+        result = _fold_issue_cost()
+        assert result.report_id == "issue-cost"
+        assert result.columns == ISSUE_COST_COLUMNS
+        assert [m.id for m in result.column_meta] == result.columns
+        assert [m.id for m in ISSUE_COST_COLUMN_META] == ISSUE_COST_COLUMNS
+
+    def test_default_status_is_merged_only(self) -> None:
+        """myrepo#20 (in-flight) and other#13 (closed, no merge_queue row)
+        are excluded by the default `status="merged"`."""
+        rows = _fold_issue_cost().rows
+        assert {(r["repo"], r["issue"]) for r in rows} == {("myrepo", 7), ("myrepo", 9)}
+
+    def test_status_closed_adds_hand_closed_issues(self) -> None:
+        rows = _fold_issue_cost(status="closed").rows
+        assert {(r["repo"], r["issue"]) for r in rows} == {
+            ("myrepo", 7), ("myrepo", 9), ("other", 13),
+        }
+
+    def test_status_all_adds_the_in_flight_issue(self) -> None:
+        rows = _fold_issue_cost(status="all").rows
+        assert {(r["repo"], r["issue"]) for r in rows} == {
+            ("myrepo", 7), ("myrepo", 9), ("myrepo", 20), ("other", 13),
+        }
+        in_flight = next(r for r in rows if r["issue"] == 20)
+        assert in_flight["status"] == "open"
+        assert in_flight["ended_at"] is None
+        assert in_flight["wall_clock_secs"] is None
+        assert in_flight["started_at"] == 900.0
+
+    def test_an_invalid_status_is_a_clean_error(self) -> None:
+        with pytest.raises(ReportError, match="status"):
+            _fold_issue_cost(status="bogus")
+
+    def test_wall_clock_is_first_dispatch_to_merged(self) -> None:
+        row = next(r for r in _fold_issue_cost().rows if r["issue"] == 7)
+        assert row["started_at"] == 100.0
+        assert row["ended_at"] == 280.0
+        assert row["wall_clock_secs"] == pytest.approx(180.0)
+
+    def test_agent_time_is_the_sum_of_leg_runtimes_not_the_wall_clock(self) -> None:
+        """230s of ACTUAL agent runtime inside a 180s WALL-CLOCK span — the
+        legs overlap-free in this fixture but still sum independently of it,
+        proving the two numbers are computed separately, not one derived
+        from the other."""
+        row = next(r for r in _fold_issue_cost().rows if r["issue"] == 7)
+        assert row["agent_time_secs"] == pytest.approx(230.0)
+        assert row["wall_clock_secs"] != pytest.approx(row["agent_time_secs"])
+
+    def test_legs_by_stage_splits_work_from_fix_rounds(self) -> None:
+        row = next(r for r in _fold_issue_cost().rows if r["issue"] == 7)
+        assert row["legs_by_stage"] == {
+            "work": 1, "fix-rounds": 2, "test": 1, "review": 1, "other": 0,
+        }
+        assert row["legs"] == 5
+
+    def test_cost_by_stage_sums_to_cost_total(self) -> None:
+        row = next(r for r in _fold_issue_cost().rows if r["issue"] == 7)
+        assert row["cost_total"] == pytest.approx(5.15)
+        assert sum(row["cost_by_stage"].values()) == pytest.approx(row["cost_total"])
+        assert row["cost_by_stage"]["work"] == pytest.approx(3.0)
+        assert row["cost_by_stage"]["review"] == pytest.approx(0.10)
+        assert row["cost_by_stage"]["test"] == pytest.approx(0.05)
+        # The captured $2.00 retry plus the $0 unmeasured leg.
+        assert row["cost_by_stage"]["fix-rounds"] == pytest.approx(2.0)
+
+    def test_model_mix_is_sorted_by_cost_descending(self) -> None:
+        row = next(r for r in _fold_issue_cost().rows if r["issue"] == 7)
+        models = {m["model"]: m for m in row["models"]}
+        assert models["sonnet"]["legs"] == 4
+        assert models["sonnet"]["cost_total"] == pytest.approx(5.15)
+        assert models["(unknown)"]["legs"] == 1
+        assert models["(unknown)"]["cost_total"] == pytest.approx(0.0)
+        assert row["models"][0]["model"] == "sonnet"
+
+    def test_coverage_below_100_percent_is_reported_and_noted(self) -> None:
+        """The #3470 acceptance bullet: one unmeasured leg -> coverage < 100%
+        and a note says so."""
+        row = next(r for r in _fold_issue_cost().rows if r["issue"] == 7)
+        assert row["captured_legs"] == 3
+        assert row["estimated_legs"] == 1
+        assert row["unmeasured_legs"] == 1
+        assert row["coverage_pct"] == pytest.approx(80.0)
+        note = next(n for n in _fold_issue_cost().notes if "coverage" in n)
+        assert "myrepo#7" in note
+        assert "80.0%" in note
+
+    def test_a_fully_captured_issue_is_not_named_in_the_coverage_note(self) -> None:
+        """other#13 is fully captured (one leg, real cost_usd) — it must not
+        be named in the coverage note even though myrepo#7 (80%) is."""
+        note = next(n for n in _fold_issue_cost(status="closed").notes if "coverage" in n)
+        assert "myrepo#7" in note
+        assert "other#13" not in note
+
+    def test_a_zero_leg_row_reads_zero_not_blank(self) -> None:
+        row = next(r for r in _fold_issue_cost().rows if r["issue"] == 9)
+        assert row["legs"] == 0
+        assert row["cost_total"] == 0.0
+        assert row["coverage_pct"] is None
+        assert row["started_at"] is None
+        assert row["wall_clock_secs"] is None
+        for column in ISSUE_COST_COLUMNS:
+            assert column in row
+
+    def test_repo_filter_restricts_to_one_coord_local_repo(self) -> None:
+        rows = _fold_issue_cost(status="closed", repo="other").rows
+        assert [(r["repo"], r["issue"]) for r in rows] == [("other", 13)]
+
+    def test_the_window_is_applied_to_ended_not_started(self) -> None:
+        rows = _fold_issue_cost(window=(290.0, IC_END)).rows
+        # #7 ended at 280 — outside; #9 (400) is inside.
+        assert [r["issue"] for r in rows] == [9]
+
+    def test_spend_is_lifetime_not_windowed(self) -> None:
+        row_wide = next(r for r in _fold_issue_cost().rows if r["issue"] == 7)
+        row_narrow = next(
+            r for r in _fold_issue_cost(window=(275.0, IC_END)).rows if r["issue"] == 7
+        )
+        assert row_narrow["cost_total"] == row_wide["cost_total"] == pytest.approx(5.15)
+        assert row_narrow["legs"] == row_wide["legs"] == 5
+
+    def test_totals_sum_legs_and_cost_but_not_wall_clock(self) -> None:
+        result = _fold_issue_cost()
+        assert result.totals is not None
+        assert result.totals["legs"] == 5  # myrepo#9 contributes 0
+        assert result.totals["cost_total"] == pytest.approx(5.15)
+        assert result.totals["agent_time_secs"] == pytest.approx(230.0)
+        assert "wall_clock_secs" not in result.totals
+
+    def test_rows_come_back_newest_ended_first(self) -> None:
+        ends = [r["ended_at"] for r in _fold_issue_cost().rows]
+        assert ends == sorted(ends, reverse=True)
+
+    def test_in_flight_rows_sort_last(self) -> None:
+        rows = _fold_issue_cost(status="all").rows
+        assert rows[-1]["issue"] == 20
+
+    def test_an_unpriced_model_is_noted_rather_than_shown_as_zero(self) -> None:
+        result = fold_issue_cost(
+            [{"repo_name": "myrepo", "number": 7, "title": "t", "state": "closed"}],
+            [{"repo_name": "myrepo", "issue_number": 7, "type": "work",
+              "dispatched_at": 100.0, "finished_at": 200.0,
+              "model": "gpt-hypothetical", "input_tokens": 500, "output_tokens": 500}],
+            [{"repo_name": "myrepo", "issue_number": 7, "state": "merged", "last_attempt": 300.0}],
+            (IC_START, IC_END),
+            generated_at=IC_END,
+        )
+        row = result.rows[0]
+        assert row["cost_total"] == 0.0
+        note = next(n for n in result.notes if "pricing" in n)
+        assert "myrepo#7" in note
+
+    def test_the_result_is_json_serialisable(self) -> None:
+        json.dumps(_fold_issue_cost().to_dict())
+
+    def test_the_chart_is_a_scatter_of_cost_vs_wall_clock(self) -> None:
+        result = _fold_issue_cost()
+        assert result.chart is not None
+        assert result.chart.kind == "scatter"
+        assert result.chart.x == "wall_clock_secs"
+        assert [s.column for s in result.chart.series] == ["cost_total"]
+
+    def test_no_chart_when_there_are_no_rows(self) -> None:
+        result = _fold_issue_cost(repo="does-not-exist")
+        assert result.chart is None
+
+
+class TestIssueCostRunner:
+    def test_since_and_until_bound_the_window(self) -> None:
+        seen: list[tuple] = []
+
+        def source():
+            seen.append(())
+            return (
+                _issue_cost_issues(),
+                _issue_cost_assignments(),
+                _issue_cost_merge_queue(),
+            )
+
+        result = run_issue_cost(since="1h", until="400", source=source)
+        assert seen, "the source seam must actually be used"
+        assert result.window == (400.0 - 3600.0, 400.0)
+        assert any(r["issue"] == 7 for r in result.rows)
+
+    def test_since_all_means_no_lower_bound(self) -> None:
+        result = run_issue_cost(
+            since="all", now=IC_END,
+            source=lambda: (
+                _issue_cost_issues(), _issue_cost_assignments(), _issue_cost_merge_queue(),
+            ),
+        )
+        assert result.window == (0.0, IC_END)
+        assert any(r["issue"] == 7 for r in result.rows)
+
+    def test_an_empty_until_means_now(self) -> None:
+        result = run_issue_cost(since="1h", now=IC_END, source=lambda: ([], [], []))
+        assert result.window == (IC_END - 3600.0, IC_END)
+
+    def test_run_report_routes_to_it_with_defaults(self) -> None:
+        result = run_report(
+            "issue-cost", {}, source=lambda: ([], [], []), now=IC_END
+        )
+        assert result.report_id == "issue-cost"
+        assert result.window == (IC_END - 30 * 86400.0, IC_END)
+
+    def test_a_bad_since_is_a_clean_error(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_params(REPORTS["issue-cost"], {"since": "banana"})
+        assert "since" in str(exc.value)
+
+    def test_a_bad_status_is_a_clean_error(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_params(REPORTS["issue-cost"], {"status": "bogus"})
+        assert "status" in str(exc.value)
+
+
+def _ic_insert_assignment(
+    conn,
+    table: str,
+    assignment_id: str,
+    *,
+    repo_name: str = "api",
+    issue_number: int = 1629,
+    assignment_type: str = "work",
+    dispatched_at: float,
+    finished_at: float | None,
+    model: str = "sonnet",
+    cost_usd: float | None = None,
+    cost_capture_state: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> None:
+    conn.execute(
+        f"INSERT INTO {table} (assignment_id, machine_name, repo_name, "  # noqa: S608
+        "issue_number, issue_title, type, status, dispatched_at, finished_at, "
+        "model, cost_usd, cost_capture_state, input_tokens, output_tokens) "
+        "VALUES (?, 'precision', ?, ?, 't', ?, 'done', ?, ?, ?, ?, ?, ?, ?)",
+        (assignment_id, repo_name, issue_number, assignment_type, dispatched_at,
+         finished_at, model, cost_usd, cost_capture_state, input_tokens, output_tokens),
+    )
+    conn.commit()
+
+
+class TestIssueCostAgainstTheRealSchema:
+    """The `source` seam above lets every rule be tested without a DB — which
+    is exactly why the *default* source needs its own test: #3470's whole
+    point is a FULL-HISTORY scan, spanning `assignments` +
+    `assignments_archive`, and that span only exists in the real schema."""
+
+    def _seed(self, coord_db) -> None:
+        with coord_db:
+            coord_db.execute(
+                "INSERT INTO issues (repo_name, number, title, state) "
+                "VALUES ('api', 1629, 'Closed and archived-plus-live', 'closed')"
+            )
+            coord_db.execute(
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state, last_attempt) "
+                "VALUES ('a1', 'api', 'acme/api', 'b', 'main', 1629, "
+                "'Closed and archived-plus-live', 'merged', 2500.0)"
+            )
+            # The LIVE leg: a captured $1.25.
+            _ic_insert_assignment(
+                coord_db, "assignments", "a1", issue_number=1629,
+                dispatched_at=1000.0, finished_at=2000.0, cost_usd=1.25,
+            )
+            # The ARCHIVED leg: coord.housekeeping already moved it out of
+            # `assignments` — an issue-cost read of the live table alone
+            # would silently drop it from the sum.
+            coord_db.execute(
+                "CREATE TABLE assignments_archive AS SELECT * FROM assignments WHERE 0"
+            )
+            _ic_insert_assignment(
+                coord_db, "assignments_archive", "a0", issue_number=1629,
+                dispatched_at=500.0, finished_at=900.0,
+                cost_capture_state="unmeasured",
+            )
+
+    def test_cost_sums_across_live_and_archived_legs(self, coord_db) -> None:
+        """The #3470 acceptance bullet: per-issue cost equals the sum over
+        that issue's legs across BOTH tables."""
+        self._seed(coord_db)
+        result = run_issue_cost(since="all", repo="api")
+        assert [r["issue"] for r in result.rows] == [1629]
+        row = result.rows[0]
+        assert row["legs"] == 2
+        assert row["cost_total"] == pytest.approx(1.25)
+        assert row["started_at"] == 500.0, "the archived leg dispatched first"
+        assert row["ended_at"] == 2500.0
+
+    def test_an_archived_unmeasured_leg_drops_coverage_below_100_percent(
+        self, coord_db
+    ) -> None:
+        self._seed(coord_db)
+        row = run_issue_cost(since="all", repo="api").rows[0]
+        assert row["captured_legs"] == 1
+        assert row["unmeasured_legs"] == 1
+        assert row["coverage_pct"] == pytest.approx(50.0)
+        note = next(n for n in run_issue_cost(since="all", repo="api").notes if "coverage" in n)
+        assert "api#1629" in note
+
+    def test_missing_archive_table_does_not_raise(self, coord_db) -> None:
+        """No `assignments_archive` at all (`coord housekeeping` never ran)
+        must degrade to "just the live table", not an empty/broken report."""
+        with coord_db:
+            coord_db.execute(
+                "INSERT INTO issues (repo_name, number, title, state) "
+                "VALUES ('api', 1, 't', 'closed')"
+            )
+            coord_db.execute(
+                "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+                "branch, target_branch, issue_number, issue_title, state, last_attempt) "
+                "VALUES ('a1', 'api', 'acme/api', 'b', 'main', 1, 't', 'merged', 300.0)"
+            )
+            _ic_insert_assignment(
+                coord_db, "assignments", "a1", issue_number=1,
+                dispatched_at=100.0, finished_at=200.0, cost_usd=1.0,
+            )
+        result = run_issue_cost(since="all", repo="api")
+        assert [r["issue"] for r in result.rows] == [1]
+        assert result.rows[0]["cost_total"] == pytest.approx(1.0)
+
+    def test_it_runs_through_the_cli(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "issue-cost", "--param", "since=all",
+             "--param", "repo=api", "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["report_id"] == "issue-cost"
+        assert [r["issue"] for r in body["rows"]] == [1629]
+
+    def test_it_runs_through_the_daemon_route(self, report_client, rw_db) -> None:
+        # `rw_db`, not `coord_db` — the ASGI worker thread runs the handler,
+        # and the autouse `:memory:` conn is thread-bound (see that fixture).
+        self._seed(rw_db)
+        resp = report_client.get("/report/issue-cost?since=all&repo=api")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["report_id"] == "issue-cost"
+        assert [r["issue"] for r in body["rows"]] == [1629]
+
+
+class TestIssueCostCatalogue:
+    def test_issue_cost_is_a_real_catalogue_entry(self) -> None:
+        ids = [r["id"] for r in catalogue()["reports"]]
+        assert "issue-cost" in ids
+
+    def test_its_params_are_since_until_repo_and_status(self) -> None:
+        rep = next(r for r in catalogue()["reports"] if r["id"] == "issue-cost")
+        assert rep["title"] == "Issue Cost"
+        assert rep["description"]
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"since", "until", "repo", "status"}
+        assert params["since"]["kind"] == "choice"
+        assert params["since"]["choices"] == list(ISSUE_COST_SINCE_CHOICES)
+        assert "all" in params["since"]["choices"]
+        assert params["since"]["default"] == "30d"
+        assert params["since"]["free_form"] is True
+        assert params["status"]["kind"] == "choice"
+        assert params["status"]["choices"] == list(ISSUE_COST_STATUS_CHOICES)
+        assert params["status"]["default"] == "merged"
+
+    def test_row_identity_names_repo_and_issue(self) -> None:
+        rep = next(r for r in catalogue()["reports"] if r["id"] == "issue-cost")
+        assert rep["row_identity"] == {"repo_column": "repo", "issue_column": "issue"}

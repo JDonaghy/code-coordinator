@@ -1065,7 +1065,29 @@ def retry_on_locked(
 # can measure a row's own spend from ITS baseline rather than every
 # predecessor row's lifetime total. See `coord.drive_queue.QueueEntry.
 # legs_at_enqueue`.
-_DB_SCHEMA_VERSION = 20
+#
+# #3470: bumped 20 -> 21 for the two new indexes appended to `_SCHEMA_SQL`
+# below — not a column, same shape as #3113/#3333's table-only bumps (
+# `_MIGRATE_ADD_COLUMNS`'s length is unchanged): `idx_assignments_repo_issue`
+# on `(repo_name, issue_number)` and `idx_assignments_dispatched_at` on
+# `dispatched_at`, for the `issue-cost` report's full-history scan of
+# `assignments` + `assignments_archive` (`coord.reports.
+# _default_issue_cost_source`). `CREATE INDEX IF NOT EXISTS` in `_SCHEMA_SQL`
+# is what actually creates them on an existing database, and that only runs
+# when `_ensure_schema` runs, which is gated on this version bump.
+#
+# `assignments_archive`'s own two matching indexes are NOT here:
+# `_ensure_schema`/`_SCHEMA_SQL` only ever runs against tables that exist at
+# schema-init time, and `assignments_archive` is created lazily by `coord
+# housekeeping` (`coord.housekeeping._ensure_archive_mirror`) — a database
+# that reaches this version before its first housekeeping sweep has no such
+# table yet, so a schema-version-gated `CREATE INDEX ... ON
+# assignments_archive(...)` here could never reliably retrofit onto every
+# database. They're created instead at the one chokepoint that actually
+# knows the table exists: `_ensure_archive_mirror` itself, unconditionally
+# and idempotently (`CREATE INDEX IF NOT EXISTS`) on every housekeeping
+# sweep — see that function's own comment in coord/housekeeping.py.
+_DB_SCHEMA_VERSION = 21
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1961,6 +1983,18 @@ _SCHEMA_SQL = """
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
+        -- #3470: the `issue-cost` report's full-history scan groups every
+        -- leg by (repo_name, issue_number) and orders by dispatched_at —
+        -- see coord.reports._default_issue_cost_source /
+        -- coord.usage_rollup.rollup's IssueKey grouping. `assignments_archive`
+        -- gets the same two indexes via `_migrate_archive_indexes` below,
+        -- since that table is created dynamically by `coord housekeeping`
+        -- (coord.housekeeping._ensure_archive_mirror) rather than by this
+        -- script, and may not exist yet on a fresh database.
+        CREATE INDEX IF NOT EXISTS idx_assignments_repo_issue
+            ON assignments(repo_name, issue_number);
+        CREATE INDEX IF NOT EXISTS idx_assignments_dispatched_at
+            ON assignments(dispatched_at);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
         CREATE INDEX IF NOT EXISTS idx_issue_context_issue
             ON issue_context(repo_name, issue_number);

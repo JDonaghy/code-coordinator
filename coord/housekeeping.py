@@ -130,9 +130,36 @@ def _columns(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
     return sql.table_columns(conn, table)
 
 
+# #3470: index(es) to create once a given archive table's mirror exists,
+# keyed by DESTINATION table name so `_ensure_archive_mirror`'s generic
+# column-mirroring below stays generic across every archive table this
+# module knows about — only `assignments_archive` needs these, for the
+# `issue-cost` report's full-history scan
+# (`coord.reports._default_issue_cost_source`, which groups every leg by
+# `(repo_name, issue_number)` and orders by `dispatched_at`). Same two
+# columns `coord/db.py`'s `_SCHEMA_SQL` already indexes on the LIVE
+# `assignments` table — see that module's `_DB_SCHEMA_VERSION` bump comment
+# for why the archive side can't just live there too: this table is created
+# lazily, by this module, not at `_ensure_schema` time.
+_ARCHIVE_INDEXES: dict[str, tuple[str, ...]] = {
+    _ASSIGNMENTS_ARCHIVE: (
+        "CREATE INDEX IF NOT EXISTS idx_assignments_archive_repo_issue "
+        "ON assignments_archive(repo_name, issue_number)",
+        "CREATE INDEX IF NOT EXISTS idx_assignments_archive_dispatched_at "
+        "ON assignments_archive(dispatched_at)",
+    ),
+}
+
+
 def _ensure_archive_mirror(conn: sqlite3.Connection, src: str, dst: str) -> list[str]:
     """Create/extend *dst* so it has every column of *src* (no constraints — the
     archive is dumb storage).  Robust to future ``ALTER TABLE`` on *src*.
+
+    Also applies :data:`_ARCHIVE_INDEXES` for *dst*, if any — idempotent
+    (``CREATE INDEX IF NOT EXISTS``) and cheap, so this runs on every sweep
+    that touches *dst*, not just the one that creates it: an archive table
+    that already existed before #3470 shipped still converges on the next
+    sweep, and a fresh one is indexed from its very first row.
 
     Returns the shared column-name list to use for the copy.
     """
@@ -145,6 +172,8 @@ def _ensure_archive_mirror(conn: sqlite3.Connection, src: str, dst: str) -> list
         for name, ctype in src_cols:
             if name not in dst_existing:
                 sql.execute(conn, f'ALTER TABLE {dst} ADD COLUMN "{name}" {ctype}')  # noqa: S608
+    for ddl in _ARCHIVE_INDEXES.get(dst, ()):
+        sql.execute(conn, ddl)
     return [name for name, _ in src_cols]
 
 

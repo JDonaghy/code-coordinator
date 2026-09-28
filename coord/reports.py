@@ -19,7 +19,7 @@ Three layers, deliberately separated so the interesting one is testable:
    window is covered and reports ``truncated=True`` if it genuinely could
    not finish.  Never silently drops the tail (#1742: "no silent caps").
 3. :data:`REPORTS` + :func:`run_report` — the registry and its parameter
-   validation.  Seven entries: ``issue-activity``; ``completed`` (#2454 /
+   validation.  Eight entries: ``issue-activity``; ``completed`` (#2454 /
    #2472), one row per issue that FINISHED in a window rather than one row
    per audit event, joined with each issue's lifetime legs/tokens/cost;
    ``drive-queue-status`` (#1805), a **live snapshot** of ``drive_queue`` (no
@@ -42,7 +42,15 @@ Three layers, deliberately separated so the interesting one is testable:
    an empty bucket reads as a gap, never a false cost collapse to `$0`. It
    reuses ``completed``'s own merged-issue rows rather than a second cost
    calculator, and reuses its exact definition of "merged" so the two can
-   never silently disagree on what counts.
+   never silently disagree on what counts; and ``issue-cost`` (#3470),
+   ``completed``'s full-history sibling — one row per issue spanning
+   ``assignments`` + ``assignments_archive`` (never just the retention-capped
+   live table), adding wall-clock vs agent time, legs/cost by pipeline stage
+   and model mix, and #3158's captured/estimated/unmeasured cost-capture
+   coverage so a partial number is never shown as a whole one. Shares
+   ``completed``'s exact "merged" definition (:func:`_merged_at_by_issue`)
+   and its :func:`~coord.usage_rollup.rollup` per-issue aggregator, rather
+   than a third reimplementation of either.
 
 The :class:`ReportResult` field names are the **wire contract** the coord-tui
 Reports panel (#1741) renders against, and the CLI's ``--json`` and the
@@ -112,6 +120,12 @@ __all__ = [
     "resolve_trend_range",
     "fold_trend",
     "run_trend",
+    "ISSUE_COST_COLUMNS",
+    "ISSUE_COST_COLUMN_META",
+    "ISSUE_COST_SINCE_CHOICES",
+    "ISSUE_COST_STATUS_CHOICES",
+    "fold_issue_cost",
+    "run_issue_cost",
     "parse_duration",
     "result_to_csv",
     "csv_filename",
@@ -2806,6 +2820,39 @@ def _completed_spend(
     return spend
 
 
+def _merged_at_by_issue(
+    merge_rows: Iterable[Mapping[str, Any]],
+) -> dict[tuple[str, int], float]:
+    """The newest ``merged`` ``merge_queue.last_attempt`` per issue, keyed
+    ``(repo_name, issue_number)`` — "when did this issue END" (#2472).
+
+    Shared by :func:`fold_completed` and :func:`fold_issue_cost` (#3470) so
+    the two reports can never silently disagree on what "merged" means: one
+    question ("is this issue merged, and when"), one function answering it,
+    per this repo's own #2096 rule.  ``merge_queue`` may hold several rows
+    for one issue (a re-queue after a failed merge attempt) — the newest
+    MERGED one wins, since ``last_attempt`` is when that merge actually
+    landed.
+    """
+    merged_at: dict[tuple[str, int], float] = {}
+    for m in merge_rows:
+        if str(m.get("state") or "") != "merged":
+            continue
+        name = str(m.get("repo_name") or "")
+        number = m.get("issue_number")
+        stamp = m.get("last_attempt")
+        if not name or number is None or stamp is None:
+            continue
+        try:
+            key = (name, int(number))
+            value = float(stamp)
+        except (TypeError, ValueError):
+            continue
+        if value > merged_at.get(key, float("-inf")):
+            merged_at[key] = value
+    return merged_at
+
+
 #: What a row gets when the rollup saw no legs at all for its issue — a real
 #: zero, not a missing key. An issue can be closed with no assignment ever
 #: dispatched against it (closed by hand, or fixed as a drive-by in someone
@@ -2861,25 +2908,7 @@ def fold_completed(
     assignment_rows = list(assignments)
     merge_rows = list(merge_queue)
 
-    # `merge_queue` may hold several rows for one issue (a re-queue after a
-    # failed merge). Keep the newest MERGED one — `last_attempt` is when the
-    # merge landed, which is exactly the ENDED value we want.
-    merged_at: dict[tuple[str, int], float] = {}
-    for m in merge_rows:
-        if str(m.get("state") or "") != "merged":
-            continue
-        name = str(m.get("repo_name") or "")
-        number = m.get("issue_number")
-        stamp = m.get("last_attempt")
-        if not name or number is None or stamp is None:
-            continue
-        try:
-            key = (name, int(number))
-            value = float(stamp)
-        except (TypeError, ValueError):
-            continue
-        if value > merged_at.get(key, float("-inf")):
-            merged_at[key] = value
+    merged_at = _merged_at_by_issue(merge_rows)
 
     # One pass over assignments for both timestamps, keyed the same way
     # `issue_done_at`/`issue_started_at` key theirs: coord-LOCAL repo name
@@ -3372,6 +3401,607 @@ def run_trend(
         pricing=pricing,
         extra_notes=extra_notes,
     )
+
+
+# ── issue-cost: per-issue burn, full history (#3470) ────────────────────────
+#
+# One row per issue that has EVER had a leg dispatched against it, spanning
+# `assignments` + `assignments_archive` — `coord housekeeping` MOVES (never
+# deletes) a terminal assignment older than the retention window into the
+# archive table, and this report's whole point is "what did this issue cost,
+# ever", so a read of `assignments` alone would silently under-report any
+# issue whose early legs have aged out. `since`/`until` narrow which ISSUES
+# are rows (by their end time, same rule `completed` uses), never what a
+# shown issue's own numbers cover — an issue's cost/time figures are always
+# its full lifetime, exactly like `completed`'s spend columns (#2472).
+#
+# Beyond `completed`'s legs/tokens/whole-life cost, each row adds:
+#   * wall-clock (first dispatch → merge/close) vs agent time (sum of leg
+#     `finished_at - dispatched_at`) — two different questions ("how long did
+#     a human wait" vs "how much of that was actually spent computing"),
+#     answered separately rather than conflated into one duration.
+#   * legs/cost BY STAGE (`work` / `test` / `review` / `fix-rounds`) and the
+#     model mix — where the money went, not just how much.
+#   * cost-capture COVERAGE (#3158's `cost_capture_state` tri-state) — legs
+#     captured / estimated / unmeasured, so a partial number is never shown
+#     as a whole one.
+#
+# Reuses `usage_rollup.rollup(group_by="issue")` for the per-issue leg
+# aggregation — the SAME aggregator `completed`/`usage` call, not a second
+# cost calculator (#2096's "one question, one answer") — and `_merged_at_by_
+# issue` for "is this issue merged, and when", the same function `completed`
+# uses, so the two reports can never silently disagree on what "merged"
+# means.
+
+ISSUE_COST_SINCE_CHOICES = ("24h", "7d", "30d", "90d", "all")
+ISSUE_COST_STATUS_CHOICES = ("merged", "closed", "all")
+
+ISSUE_COST_COLUMNS = [
+    "repo",
+    "issue",
+    "title",
+    "status",
+    "started_at",
+    "ended_at",
+    "wall_clock_secs",
+    "agent_time_secs",
+    "legs",
+    "cost_total",
+    "coverage_pct",
+]
+
+# One entry per ISSUE_COST_COLUMNS entry, same order (#1760).
+ISSUE_COST_COLUMN_META = [
+    ColumnMeta(id="repo", label="Repo", kind="text"),
+    ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
+    ColumnMeta(id="title", label="Title", kind="text", weight=3.0),
+    ColumnMeta(id="status", label="Status", kind="enum"),
+    ColumnMeta(id="started_at", label="Started", kind="timestamp"),
+    ColumnMeta(id="ended_at", label="Ended", kind="timestamp"),
+    ColumnMeta(id="wall_clock_secs", label="Wall Clock", kind="duration", align="right"),
+    ColumnMeta(id="agent_time_secs", label="Agent Time", kind="duration", align="right"),
+    ColumnMeta(id="legs", label="Legs", kind="int", align="right", weight=0.6),
+    ColumnMeta(id="cost_total", label="Total $", kind="money", align="right"),
+    # `kind` is an open vocabulary (see ColumnMeta's own docstring) — a
+    # client that meets "percent" before it knows the word falls back to
+    # plain stringification per the documented compatibility rule, and still
+    # shows the number.
+    ColumnMeta(id="coverage_pct", label="Coverage %", kind="percent", align="right"),
+]
+
+#: Stage vocabulary #3470 asks for, plus `other` so a `conflict-fix` /
+#: `audit` / `chat` / `plan` / etc. leg is still counted in the issue's
+#: total rather than silently dropped from every stage bucket.
+_ISSUE_COST_STAGES = ("work", "fix-rounds", "test", "review", "other")
+
+
+def _issue_cost_stage_for_leg(leg_type: str, *, is_fix_round: bool) -> str:
+    """Bucket ONE leg's raw ``type`` into the four-stage vocabulary #3470
+    asks for.
+
+    ``is_fix_round`` is the caller's own call, made with the SAME rule
+    ``issue-activity``'s ``fix_iterations`` already uses (imported
+    ``WORK_LIKE_TYPES``, never a local synonym — see ``_WORK_LIKE_TYPES``
+    above): the first work-like dispatch for the issue is ``work``, every
+    later one is a review-driven re-dispatch, i.e. ``fix-rounds``.
+    """
+    if leg_type == "smoke":
+        return "test"
+    if leg_type == "review":
+        return "review"
+    if leg_type in _WORK_LIKE_TYPES:
+        return "fix-rounds" if is_fix_round else "work"
+    return "other"
+
+
+def _issue_cost_capture_bucket(row: Mapping[str, Any], pricing: Any) -> str:
+    """Classify ONE leg's cost-capture coverage into ``captured`` /
+    ``estimated`` / ``unmeasured`` (#3158's tri-state; #3470's coverage
+    column).
+
+    ``cost_capture_state`` is authoritative when set — ``"captured"``
+    (written alongside a real ``cost_usd`` by
+    ``coord.state.update_assignment_cost``) or ``"unmeasured"`` (written by
+    ``coord.state.mark_cost_unmeasured`` when a full re-parse of the log
+    conclusively found no cost at all). A row predating that column, or one
+    nobody has (re-)examined yet, falls through to
+    :func:`~coord.usage_rollup.leg_cost`: a real captured ``cost_usd`` is
+    still ``captured``, a priced token estimate is ``estimated``, and
+    anything left — a genuinely unknown-model leg, an open leg with no
+    tokens yet, or a leg nobody has looked at — is ``unmeasured``: it
+    contributes $0 to ``cost_total`` with nothing on the wire admitting
+    that, which is exactly the #1763 trap this column exists to surface.
+    """
+    from coord.usage_rollup import leg_cost  # noqa: PLC0415
+
+    state = row.get("cost_capture_state")
+    if state == "captured":
+        return "captured"
+    if state == "unmeasured":
+        return "unmeasured"
+    captured, est, _unknown_model = leg_cost(dict(row), pricing)
+    if captured:
+        return "captured"
+    if est:
+        return "estimated"
+    return "unmeasured"
+
+
+#: What a row gets when nothing was ever dispatched against its issue — a
+#: real zero/`None`, not a missing key (same convention `_COMPLETED_NO_LEGS`
+#: uses).
+_ISSUE_COST_NO_LEGS: dict[str, Any] = {
+    "agent_time_secs": 0.0,
+    "cost_total": 0.0,
+    "cost_captured": 0.0,
+    "cost_est": 0.0,
+    "open_legs": 0,
+    "unknown_model_legs": 0,
+}
+
+
+def fold_issue_cost(
+    issues: Iterable[Mapping[str, Any]],
+    assignments: Iterable[Mapping[str, Any]],
+    merge_queue: Iterable[Mapping[str, Any]],
+    window: tuple[float, float],
+    *,
+    repo: str = "",
+    status: str = "merged",
+    generated_at: float | None = None,
+    pricing: Any = None,
+    extra_notes: Sequence[str] = (),
+) -> ReportResult:
+    """Fold full-history board rows into one row per issue's whole-life cost.
+
+    Pure — same posture as :func:`fold_completed`: every input is a plain
+    sequence of mappings, no DB, no clock beyond the explicit
+    ``generated_at``/``now`` seam.
+
+    ``status`` (default ``"merged"``) narrows which issues get a row:
+    ``"merged"`` only issues `_merged_at_by_issue` confirms landed,
+    ``"closed"`` adds issues closed by hand with no `merge_queue` row at
+    all, ``"all"`` additionally includes issues still open/in-flight — for
+    those, ``ended_at``/``wall_clock_secs`` come back ``None`` rather than a
+    guessed "now", since the issue has not finished.
+
+    ``since``/``until`` (resolved to ``window`` by :func:`run_issue_cost`)
+    filter on the same ENDED value ``completed`` filters on; an in-flight
+    row (``status="all"``, no end yet) is never excluded by the window,
+    since it has no end timestamp to compare.
+    """
+    from coord.config import PricingConfig  # noqa: PLC0415
+    from coord.usage_rollup import (  # noqa: PLC0415
+        IssueKey,
+        TimeWindow,
+        leg_cost,
+        normalize_model,
+        rollup,
+    )
+
+    if status not in ISSUE_COST_STATUS_CHOICES:
+        raise ReportError(
+            f"invalid value for 'status': {status!r} — allowed values: "
+            f"{', '.join(ISSUE_COST_STATUS_CHOICES)}"
+        )
+
+    start, end = window
+    generated_at = time.time() if generated_at is None else float(generated_at)
+    repo_filter = (repo or "").strip()
+    resolved_pricing = PricingConfig() if pricing is None else pricing
+
+    issue_rows = list(issues)
+    assignment_rows = list(assignments)
+    merge_rows = list(merge_queue)
+
+    merged_at = _merged_at_by_issue(merge_rows)
+
+    closed_by_key: dict[tuple[str, int], bool] = {}
+    title_by_key: dict[tuple[str, int], str | None] = {}
+    for issue in issue_rows:
+        name = str(issue.get("repo_name") or "")
+        number = issue.get("number")
+        if not name or number is None:
+            continue
+        try:
+            key = (name, int(number))
+        except (TypeError, ValueError):
+            continue
+        closed_by_key[key] = str(issue.get("state") or "open") == "closed"
+        title_by_key[key] = str(issue.get("title") or "") or None
+
+    # THE WINDOW IS UNBOUNDED for the rollup itself — see the module comment
+    # above: `since`/`until` choose which issues become ROWS, never what a
+    # shown issue's own cost/time figures cover (#2472's rule, reused
+    # verbatim from `_completed_spend`).
+    result = rollup(
+        [dict(a) for a in assignment_rows],
+        group_by="issue",
+        window=TimeWindow(),
+        pricing=resolved_pricing,
+    )
+
+    # Every key worth a row: has legs, OR is known to the `issues` table
+    # (closed with zero legs is a real, valid zero-cost row — same rule
+    # `fold_completed` applies), OR merged. Union, not intersection, so no
+    # source can silently hide an issue the others know about.
+    keys: set[tuple[str, int]] = {
+        (str(k.repo_name), int(k.issue_number))
+        for k in result.groups
+        if isinstance(k, IssueKey) and k.repo_name
+    }
+    keys |= set(closed_by_key)
+    keys |= set(merged_at)
+
+    rows: list[dict[str, Any]] = []
+    no_end_time = 0
+    for key in keys:
+        name, number = key
+        if repo_filter and name != repo_filter:
+            continue
+
+        is_closed = closed_by_key.get(key, False)
+        is_merged = key in merged_at
+        if status == "merged" and not is_merged:
+            continue
+        if status == "closed" and not (is_merged or is_closed):
+            continue
+        # status == "all": every key reaches here, including still-open ones.
+
+        group = result.groups.get(IssueKey(repo_name=name, issue_number=number))
+        leg_rows = list(group.leg_rows) if group is not None else []
+        leg_rows.sort(
+            key=lambda r: (r.get("dispatched_at") is None, r.get("dispatched_at") or 0.0)
+        )
+
+        started_at = next(
+            (
+                float(r["dispatched_at"])
+                for r in leg_rows
+                if r.get("dispatched_at") is not None
+            ),
+            None,
+        )
+        finish_times = [
+            float(r["finished_at"]) for r in leg_rows if r.get("finished_at") is not None
+        ]
+        ended_at = merged_at.get(key)
+        if ended_at is None and finish_times:
+            ended_at = max(finish_times)
+
+        if ended_at is None:
+            if status != "all":
+                # No END timestamp anywhere and this row is supposed to have
+                # finished — cannot be placed in any time range (same call
+                # `fold_completed` makes), so it's dropped and counted below.
+                no_end_time += 1
+                continue
+            # status == "all": a genuinely in-flight issue. Shown with
+            # ended_at=None / wall_clock_secs=None rather than a guessed
+            # "now" — never excluded by the window, since it has no end to
+            # compare against it.
+        elif ended_at < start or ended_at > end:
+            continue
+
+        wall_clock_secs = (
+            None
+            if started_at is None or ended_at is None
+            else max(0.0, ended_at - started_at)
+        )
+
+        legs_by_stage: dict[str, int] = {s: 0 for s in _ISSUE_COST_STAGES}
+        cost_by_stage: dict[str, float] = {s: 0.0 for s in _ISSUE_COST_STAGES}
+        models: dict[str, dict[str, float]] = {}
+        captured_legs = estimated_legs = unmeasured_legs = 0
+        seen_work = False
+        for leg in leg_rows:
+            leg_type = str(leg.get("type") or "work")
+            is_fix_round = False
+            if leg_type in _WORK_LIKE_TYPES:
+                is_fix_round = seen_work
+                seen_work = True
+            stage = _issue_cost_stage_for_leg(leg_type, is_fix_round=is_fix_round)
+
+            captured, est, _unknown = leg_cost(dict(leg), resolved_pricing)
+            leg_total = captured + est
+            legs_by_stage[stage] += 1
+            cost_by_stage[stage] += leg_total
+
+            model = normalize_model(leg.get("model"))
+            model_bucket = models.setdefault(model, {"legs": 0, "cost_total": 0.0})
+            model_bucket["legs"] += 1
+            model_bucket["cost_total"] += leg_total
+
+            capture_bucket = _issue_cost_capture_bucket(leg, resolved_pricing)
+            if capture_bucket == "captured":
+                captured_legs += 1
+            elif capture_bucket == "estimated":
+                estimated_legs += 1
+            else:
+                unmeasured_legs += 1
+
+        total_legs = len(leg_rows)
+        coverage_pct = (
+            None
+            if total_legs == 0
+            else round((captured_legs + estimated_legs) / total_legs * 100.0, 1)
+        )
+        row_status = "merged" if is_merged else ("closed" if is_closed else "open")
+
+        base = dict(_ISSUE_COST_NO_LEGS) if group is None else {
+            "agent_time_secs": round(float(group.duration_secs), 3),
+            "cost_total": round(float(group.cost_total), _USAGE_COST_PLACES),
+            "cost_captured": round(float(group.cost_captured), _USAGE_COST_PLACES),
+            "cost_est": round(float(group.cost_est), _USAGE_COST_PLACES),
+            "open_legs": int(group.open_legs),
+            "unknown_model_legs": int(group.unknown_model_legs),
+        }
+
+        rows.append(
+            {
+                "repo": name,
+                "issue": number,
+                "title": title_by_key.get(key),
+                "status": row_status,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "wall_clock_secs": wall_clock_secs,
+                "legs": total_legs,
+                "coverage_pct": coverage_pct,
+                "captured_legs": captured_legs,
+                "estimated_legs": estimated_legs,
+                "unmeasured_legs": unmeasured_legs,
+                "legs_by_stage": legs_by_stage,
+                "cost_by_stage": {
+                    s: round(c, _USAGE_COST_PLACES) for s, c in cost_by_stage.items()
+                },
+                "models": [
+                    {
+                        "model": m,
+                        "legs": int(v["legs"]),
+                        "cost_total": round(v["cost_total"], _USAGE_COST_PLACES),
+                    }
+                    for m, v in sorted(
+                        models.items(), key=lambda kv: -kv[1]["cost_total"]
+                    )
+                ],
+                **base,
+            }
+        )
+
+    # Newest-ended first, with in-flight rows (status="all", ended_at=None)
+    # last, and `(repo, issue)` as a total secondary key — same tie-break
+    # discipline `fold_completed` uses (#2405).
+    rows.sort(
+        key=lambda r: (
+            r["ended_at"] is None,
+            -(r["ended_at"] or 0.0),
+            r["repo"],
+            r["issue"],
+        )
+    )
+
+    notes: list[str] = list(extra_notes)
+    if no_end_time:
+        notes.append(
+            f"{no_end_time} issue(s) matching status={status!r} have no end "
+            "timestamp (no merged merge_queue row and no assignment "
+            "finished_at) and are not shown — there is no time range that "
+            "could contain them. Try status=all to see them anyway."
+        )
+    if repo_filter and not any(
+        str(i.get("repo_name") or "") == repo_filter for i in issue_rows
+    ):
+        notes.append(
+            f"No issue in this board belongs to repo {repo_filter!r} — check "
+            "the coord-local repo name (the one in coordinator.yml), not the "
+            "GitHub slug."
+        )
+    unpriced = sorted(
+        f"{r['repo']}#{r['issue']}" for r in rows if r.get("unknown_model_legs")
+    )
+    if unpriced:
+        shown = ", ".join(unpriced[:5])
+        more = f" (and {len(unpriced) - 5} more)" if len(unpriced) > 5 else ""
+        notes.append(
+            f"{len(unpriced)} issue(s) ran leg(s) on a model with no entry in "
+            f"the loaded `pricing:` config — {shown}{more}. Their tokens are "
+            "counted but that spend is NOT in `cost_total` (never silently "
+            "priced at $0), so those rows read LOW."
+        )
+    # #3158/#1763: a coverage_pct < 100% means part of `cost_total` is a
+    # confirmed-incomplete picture, not just an estimate — say so per issue
+    # (capped, like the unpriced note above) rather than let a partial number
+    # pass for a whole one.
+    partial_coverage = sorted(
+        (
+            f"{r['repo']}#{r['issue']} ({r['coverage_pct']}%, "
+            f"{r['unmeasured_legs']} unmeasured leg(s))"
+            for r in rows
+            if r.get("coverage_pct") is not None and r["coverage_pct"] < 100.0
+        )
+    )
+    if partial_coverage:
+        shown = "; ".join(partial_coverage[:5])
+        more = (
+            f" (and {len(partial_coverage) - 5} more)"
+            if len(partial_coverage) > 5
+            else ""
+        )
+        notes.append(
+            f"{len(partial_coverage)} issue(s) have cost-capture coverage "
+            f"below 100% — {shown}{more}. `cost_total` for those rows is a "
+            "lower bound, not the whole story: some leg(s) contributed "
+            "neither a captured nor an estimated cost."
+        )
+
+    totals: dict[str, Any] | None = None
+    if rows:
+        total_legs_sum = sum(r["legs"] for r in rows)
+        total_captured = sum(r["captured_legs"] for r in rows)
+        total_estimated = sum(r["estimated_legs"] for r in rows)
+        totals = {
+            "legs": total_legs_sum,
+            "cost_total": round(sum(r["cost_total"] for r in rows), _USAGE_COST_PLACES),
+            "agent_time_secs": round(sum(r["agent_time_secs"] for r in rows), 3),
+            # `wall_clock_secs` is deliberately absent from `totals`: issues
+            # run concurrently, so summing their wall-clock spans would not
+            # answer any real question (unlike `agent_time_secs`, which is
+            # additive compute regardless of overlap).
+            "coverage_pct": (
+                round((total_captured + total_estimated) / total_legs_sum * 100.0, 1)
+                if total_legs_sum
+                else None
+            ),
+        }
+
+    return ReportResult(
+        report_id="issue-cost",
+        generated_at=generated_at,
+        window=(start, end),
+        columns=list(ISSUE_COST_COLUMNS),
+        column_meta=list(ISSUE_COST_COLUMN_META),
+        rows=rows,
+        notes=notes,
+        totals=totals,
+        # "Cost vs wall-clock" (#3470) — one point per row, x=wall_clock_secs,
+        # y=cost_total. `scatter` is not yet in `CHART_KINDS` (today's known
+        # set is bar/line/sparkline); per the documented compatibility rule
+        # above `ChartSpec`, a client that doesn't know the word renders the
+        # table and ignores the chart rather than failing — never a hole
+        # where the chart would have gone. The table itself already answers
+        # "cost-per-issue distribution" (sorted rows), so the chart is spent
+        # on the question the table can't show: relationship, not ranking.
+        chart=(
+            None
+            if not rows
+            else ChartSpec(
+                kind="scatter",
+                series=(ChartSeries(label="Cost $", column="cost_total"),),
+                x="wall_clock_secs",
+                title="Cost vs wall-clock",
+                y_label="Cost $",
+            )
+        ),
+    )
+
+
+def _default_issue_cost_source() -> tuple[list[dict], list[dict], list[dict]]:
+    """``(issues, assignments, merge_queue)`` for :func:`fold_issue_cost`'s
+    FULL-HISTORY fold.
+
+    Assignments span BOTH ``assignments`` and ``assignments_archive``
+    (#3470) — ``coord housekeeping`` MOVES (never deletes) a terminal
+    assignment older than ``COORD_ARCHIVE_RETENTION_DAYS`` out of the live
+    table, so an issue whose early legs have aged into the archive would
+    otherwise silently lose part of its cost, exactly the gap #3313 already
+    closed for ``coord usage``. Mirrors :func:`coord.usage._local_usage_rows`
+    — same rollback-and-continue on a missing archive table (#2983) — and
+    reuses ``board_schema.decode_row`` under the ``"assignments"`` key so an
+    archived row gets the identical slim projection a live one does (no
+    ~8 MB ``briefing`` column on the wire, #1849).
+
+    ``issues``/``merge_queue`` mirror :func:`_default_completed_source`'s own
+    plain, single-table reads — housekeeping never archives either of those.
+    """
+    try:
+        from coord import sql  # noqa: PLC0415
+        from coord.board_schema import decode_row  # noqa: PLC0415
+        from coord.db import get_connection, rollback_after_driver_error  # noqa: PLC0415
+
+        conn = get_connection()
+        issues = [
+            dict(r)
+            for r in sql.execute(
+                conn, "SELECT repo_name, number, title, state FROM issues"
+            ).fetchall()
+        ]
+        assignments: list[dict] = []
+        for table in ("assignments", "assignments_archive"):
+            try:
+                result = sql.execute(
+                    conn, f"SELECT * FROM {table}"  # noqa: S608 — literal table name
+                ).fetchall()
+            except sql.driver_errors() as exc:
+                rollback_after_driver_error(conn, exc)
+                continue  # assignments_archive may not exist yet (housekeeping never ran)
+            assignments.extend(decode_row("assignments", r) for r in result)
+        merge_queue = [
+            dict(r)
+            for r in sql.execute(
+                conn,
+                "SELECT repo_name, issue_number, state, last_attempt FROM merge_queue",
+            ).fetchall()
+        ]
+    except Exception:  # noqa: BLE001 — an unreadable board is an empty report
+        return [], [], []
+    return issues, assignments, merge_queue
+
+
+def run_issue_cost(
+    *,
+    since: str = "30d",
+    until: str = "",
+    repo: str = "",
+    status: str = "merged",
+    now: float | None = None,
+    source: Callable[[], tuple[
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+    ]] | None = None,
+    pricing: Any = None,
+) -> ReportResult:
+    """Read the board and fold it.  ``now``/``source``/``pricing`` are test
+    seams (mirrors :func:`run_completed`); the report's own parameters are
+    ``since``/``until``/``repo``/``status``.  ``since="all"`` means no lower
+    bound at all — the whole history."""
+    generated_at = time.time() if now is None else float(now)
+    end = parse_timestamp(until) if until else generated_at
+    start = 0.0 if since == "all" else end - parse_duration(since)
+    source_fn = _default_issue_cost_source if source is None else source
+    issues, assignments, merge_queue = source_fn()
+
+    # Same seam, same reason as `run_completed`/`run_usage`: the estimated
+    # half of `cost_total` has to be priced off the fleet's OWN `pricing:`
+    # block, and a config that could not be loaded says so in a note instead
+    # of silently falling back (#1763).
+    extra_notes: list[str] = []
+    if pricing is None:
+        pricing, extra_notes = _load_pricing()
+
+    return fold_issue_cost(
+        issues,
+        assignments,
+        merge_queue,
+        (start, end),
+        repo=repo,
+        status=status,
+        generated_at=generated_at,
+        pricing=pricing,
+        extra_notes=extra_notes,
+    )
+
+
+def _validate_issue_cost_since(value: str) -> None:
+    if value in ISSUE_COST_SINCE_CHOICES:
+        return
+    try:
+        parse_duration(value)
+    except ReportError as exc:
+        raise ReportError(
+            f"invalid value for 'since': {value!r} — allowed values: "
+            f"{', '.join(ISSUE_COST_SINCE_CHOICES)}, or any duration like "
+            "'13h' (units: s, m, h, d, w)"
+        ) from exc
+
+
+def _validate_issue_cost_status(value: str) -> None:
+    if value not in ISSUE_COST_STATUS_CHOICES:
+        raise ReportError(
+            f"invalid value for 'status': {value!r} — allowed values: "
+            f"{', '.join(ISSUE_COST_STATUS_CHOICES)}"
+        )
 
 
 # ── deprecated-routes: evidence for RPC retirement (#1945) ────────────────
@@ -3868,6 +4498,71 @@ TREND = ReportDef(
 )
 
 
+ISSUE_COST = ReportDef(
+    id="issue-cost",
+    title="Issue Cost",
+    description=(
+        "Per-issue burn, full history — one row per issue, spanning "
+        "`assignments` + `assignments_archive` so an issue's early legs "
+        "never silently drop out of its cost as they age past the archive "
+        "retention window. Beyond `completed`'s legs/tokens/whole-life cost: "
+        "WALL-CLOCK (first dispatch → merge/close) vs AGENT TIME (summed leg "
+        "runtime) as two separate numbers; legs/cost BY STAGE (work / test / "
+        "review / fix-rounds) and the model mix; and cost-capture COVERAGE "
+        "(#3158) — legs captured / estimated / unmeasured — so a partial "
+        "number is never shown as a whole one. `status=merged` (default) "
+        "only, `closed` adds hand-closed issues with no merge_queue row, "
+        "`all` also includes issues still open/in-flight."
+    ),
+    params=(
+        ReportParam(
+            id="since",
+            label="Time range",
+            kind="choice",
+            choices=ISSUE_COST_SINCE_CHOICES,
+            default="30d",
+            help=(
+                "How far back the window reaches from `until`, by each "
+                "issue's END time. Presets, 'all' for the whole history, or "
+                "any duration (e.g. 13h)."
+            ),
+            free_form=True,
+            validate=_validate_issue_cost_since,
+        ),
+        ReportParam(
+            id="until",
+            label="Window end",
+            kind="text",
+            default="",
+            help="Epoch seconds or ISO-8601. Empty means now.",
+            validate=_validate_until,
+        ),
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+        ReportParam(
+            id="status",
+            label="Status",
+            kind="choice",
+            choices=ISSUE_COST_STATUS_CHOICES,
+            default="merged",
+            help=(
+                "merged: only issues confirmed merged. closed: also issues "
+                "closed by hand with no merge. all: also still-open issues "
+                "(no end time yet)."
+            ),
+            validate=_validate_issue_cost_status,
+        ),
+    ),
+    run=run_issue_cost,
+    row_identity=RowIdentity(repo_column="repo", issue_column="issue"),
+)
+
+
 DEPRECATED_ROUTES = ReportDef(
     id="deprecated-routes",
     title="Deprecated RPC Routes",
@@ -4064,6 +4759,7 @@ REPORTS: dict[str, ReportDef] = {
     USAGE.id: USAGE,
     QUEUE_OUTCOMES.id: QUEUE_OUTCOMES,
     TREND.id: TREND,
+    ISSUE_COST.id: ISSUE_COST,
     DEPRECATED_ROUTES.id: DEPRECATED_ROUTES,
 }
 
