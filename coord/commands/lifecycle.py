@@ -85,8 +85,10 @@ def _print_housekeeping_result(resp: dict) -> None:
         "recent, merge-queued, open-issue-latest, or review-linked rows. Also "
         "runs the #3469 operational-tier audit_log retention sweep (deletes "
         "stale tier='operational' rows only, per audit.operational_retention_days "
-        "— business-tier rows are never touched). Routes through the daemon "
-        "(the canonical DB lives there)."
+        "— business-tier rows are never touched). Pass --reclaim to also VACUUM "
+        "(dialect-routed) afterwards, so those DELETEs actually shrink the "
+        "on-disk DB — see 'coord housekeeping --help' for that flag's own "
+        "detail. Routes through the daemon (the canonical DB lives there)."
     ),
 )
 
