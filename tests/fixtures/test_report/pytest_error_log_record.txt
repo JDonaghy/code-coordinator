@@ -1,0 +1,12 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______________________ test_fails_after_logging_an_error _______________________
+test_error_log.py:8: in test_fails_after_logging_an_error
+    assert False, "genuine assertion failure, unrelated to the ERROR log record"
+E   AssertionError: genuine assertion failure, unrelated to the ERROR log record
+E   assert False
+------------------------------ Captured log call -------------------------------
+ERROR    coord.agent_update:test_error_log.py:7 perform_update refused: 1 live process(es) are running
+=========================== short test summary info ============================
+FAILED test_error_log.py::test_fails_after_logging_an_error - AssertionError:...
+1 failed in 0.01s

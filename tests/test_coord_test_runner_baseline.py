@@ -84,6 +84,35 @@ _emit_failed() {
     done
 }
 
+# What a REAL pytest run prints when a test exercises an error path and logs
+# it: the "Captured log call" block renders each record at column 0 with the
+# level name padded to eight characters. Verbatim shape from
+# tests/test_venv_live_install_2121.py on a red macOS baseline (#3470).
+_emit_captured_error_log() {
+    printf -- '------------------------------ Captured log call -------------------------------\n'
+    printf 'ERROR    coord.agent_update:agent_update.py:643 perform_update refused: 1 live process(es)\n'
+}
+
+# What a REAL pytest run prints when a module fails to import: a session-level
+# ERRORS section plus the "Interrupted" banner. Nothing ran.
+_emit_collection_error() {
+    printf '==================================== ERRORS ====================================\n'
+    printf -- '_______________ ERROR collecting tests/test_ambient.py ________________\n'
+    printf "ImportError: no module named nope\n"
+    printf '!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n'
+    printf 'ERROR tests/test_ambient.py - ImportError: no module named nope\n'
+}
+
+# #3470: the collection-error classifier. The runner pipes its OWN python
+# source in on stdin and passes the captured pytest output as argv[1], so
+# hand the whole invocation to a real interpreter — what is under test is
+# `coord.test_report.pytest_has_collection_error`'s verdict on real pytest
+# output, not a canned exit code. FAKE_REAL_PYTHON is the test session's
+# interpreter, which can import `coord`.
+if [[ "$1" == "-" ]]; then
+    exec "${FAKE_REAL_PYTHON:?FAKE_REAL_PYTHON must be set}" "$@"
+fi
+
 if [[ "$1" == "-c" ]]; then
     case "$2" in
         *xdist*)
@@ -121,6 +150,10 @@ if [[ "$1" == "-m" && "$2" == "pytest" ]]; then
 
     if [[ "$_here" == "$_wt" ]]; then
         # ── the BRANCH's own worktree ────────────────────────────────────────
+        if [[ "$_targeted" -eq 0 && "${FAKE_BRANCH_COLLECTION_ERROR:-0}" == "1" ]]; then
+            _emit_collection_error
+            exit 2
+        fi
         if [[ "$_targeted" -eq 1 && "${FAKE_RERUN_PASSES:-0}" == "1" ]]; then
             printf '%s passed\n' "2"
             exit 0
@@ -134,6 +167,9 @@ if [[ "$1" == "-m" && "$2" == "pytest" ]]; then
             printf '1 failed, 1 passed\n'
             exit 1
         fi
+        if [[ "${FAKE_BRANCH_LOG_NOISE:-0}" == "1" ]]; then
+            _emit_captured_error_log
+        fi
         _emit_failed "${FAKE_BRANCH_FAILED:-}"
         printf '2 failed\n'
         exit 1
@@ -141,8 +177,11 @@ if [[ "$1" == "-m" && "$2" == "pytest" ]]; then
 
     # ── the BASELINE worktree ────────────────────────────────────────────────
     if [[ "${FAKE_BASELINE_ERROR:-0}" == "1" ]]; then
-        printf 'ERROR tests/test_ambient.py - ImportError: no module named nope\n'
+        _emit_collection_error
         exit 2
+    fi
+    if [[ "${FAKE_BASELINE_LOG_NOISE:-0}" == "1" ]]; then
+        _emit_captured_error_log
     fi
     if [[ -z "${FAKE_BASELINE_FAILED:-}" ]]; then
         printf '2 passed\n'
@@ -243,6 +282,10 @@ def repo(tmp_path: Path) -> Path:
 def _run(repo: Path, **fake_env: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env.setdefault("FAKE_BRANCH_FAILED", BRANCH_FAILED)
+    # #3470: the fake interpreter delegates the runner's collection-error
+    # classifier to a real one, so the tested parser in coord/test_report.py
+    # is what decides — see `_FAKE_PYTHON`'s `"$1" == "-"` arm.
+    env.setdefault("FAKE_REAL_PYTHON", sys.executable)
     env.update(fake_env)
     return subprocess.run(
         ["bash", str(SCRIPT), str(repo), "--base-ref", "base", "--repo", "code-coordinator"],
@@ -381,6 +424,92 @@ def test_inconclusive_baseline_run_is_not_baseline_red(repo: Path) -> None:
     assert "says nothing about these tests" in result.stderr + result.stdout
 
 
+# ── #3470: an ERROR-level log record is not a collection error ──────────────
+#
+# THE BUG. The runner classified "did the suite fail to START?" with
+# `grep -qE "^(ERROR|INTERNALERROR)"`. pytest's "Captured log call" block
+# prints records at column 0 with the level name padded to eight characters
+# ("ERROR    coord.agent_update:…"), so any suite containing a test that
+# exercises an error path and logs it matched. The run was reported as
+# `FAIL(python): collection/import error` and returned BEFORE the flake filter
+# and before #2170's baseline comparison — so on #3470 a machine whose own
+# baseline was red (91 pre-existing failures in dr_verify / deploy /
+# fleet_watchdog / venv_live_install, none of them the branch's) blamed the
+# branch, exactly the outcome #2170 exists to prevent.
+#
+# Both directions are asserted: the false positive must be gone, AND a genuine
+# collection error must still be caught — a classifier whose failing verdict
+# has become unreachable is not a fix.
+
+
+def test_error_level_log_output_does_not_masquerade_as_a_collection_error(
+    repo: Path,
+) -> None:
+    """The headline regression. Same red-baseline run as
+    `test_baseline_red_when_every_failure_reproduces_on_the_merge_base`, except
+    the pytest output also carries a captured ERROR-level log record — which is
+    what every real suite that tests an error path emits. The verdict must be
+    unchanged by it.
+    """
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED=BRANCH_FAILED,
+        FAKE_BRANCH_LOG_NOISE="1",
+        FAKE_BASELINE_LOG_NOISE="1",
+    )
+
+    assert result.returncode == 4, (result.returncode, result.stdout, result.stderr)
+    assert "RESULT: BASELINE-RED (python)" in result.stdout
+    assert "collection/import error" not in result.stdout
+    assert "could not classify" not in result.stdout
+    assert "RESULT: FAIL" not in result.stdout
+
+
+def test_error_level_log_output_on_the_branch_alone_is_still_a_genuine_failure(
+    repo: Path,
+) -> None:
+    """The same noise with a GREEN baseline still reaches the ordinary verdict:
+    the fix must not have turned the log line into a free pass either."""
+    result = _run(repo, FAKE_BRANCH_LOG_NOISE="1")
+
+    assert result.returncode == 1
+    assert "FAIL(python): 2 test(s) fail on re-run — genuine" in result.stdout
+    assert "collection/import error" not in result.stdout
+
+
+def test_a_real_collection_error_is_still_classified_as_one(repo: Path) -> None:
+    """The failing verdict is still reachable. A module that will not import
+    produces pytest's own "=== ERRORS ===" / "Interrupted: 1 error during
+    collection" markers and no FAILED lines — never flake-retried, never
+    compared against the baseline."""
+    result = _run(repo, FAKE_BRANCH_COLLECTION_ERROR="1")
+
+    assert result.returncode == 1
+    assert "FAIL(python): collection/import error" in result.stdout
+    assert "BASELINE-RED" not in result.stdout
+    # It short-circuits: no isolation re-run, no baseline worktree.
+    assert "re-running them in isolation" not in result.stdout
+    assert "baseline: comparing against" not in result.stdout
+
+
+def test_an_unclassifiable_run_fails_closed_rather_than_guessing(repo: Path) -> None:
+    """`pytest_collection_error_verdict` has a third answer — `unknown`, when
+    the branch venv cannot import `coord.test_report` at all. It must not
+    collapse into whichever of yes/no is convenient: a run nobody could
+    classify is a FAIL that says so, not a silently-downgraded BASELINE-RED.
+    """
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED=BRANCH_FAILED,
+        FAKE_REAL_PYTHON="/nonexistent/python-that-cannot-import-coord",
+    )
+
+    assert result.returncode == 1
+    assert "could not classify the run" in result.stdout
+    assert "coord.test_report" in result.stdout
+    assert "BASELINE-RED" not in result.stdout
+
+
 def test_comparison_is_skipped_when_the_venv_resolves_coord_wrongly(repo: Path) -> None:
     """The baseline run reuses the BRANCH's venv (building a second one would
     double a red Test leg's cost — #2169). That is only sound if `import coord`
@@ -488,7 +617,8 @@ def test_missing_base_ref_reports_fail_uncompared(repo: Path) -> None:
         encoding="utf-8",
         timeout=120,
         env={**os.environ, "FAKE_BRANCH_FAILED": BRANCH_FAILED,
-             "FAKE_BASELINE_FAILED": BRANCH_FAILED},
+             "FAKE_BASELINE_FAILED": BRANCH_FAILED,
+             "FAKE_REAL_PYTHON": sys.executable},
     )
 
     assert result.returncode == 1
