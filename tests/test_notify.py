@@ -4755,3 +4755,147 @@ class TestConflictFixCompletionStaleRebaseMismatch:
         assert kwargs["succeeded"] is False
         assert kwargs["semantic"] is True
         assert kwargs["stale_rebase_mismatch"] is False
+
+
+# ── #3462: the conflict-fix completion arm must read the already-upstream ───
+# marker BEFORE the stale-rebase-mismatch marker, and must never frame it ────
+# as a genuine content conflict ──────────────────────────────────────────────
+
+
+class TestConflictFixCompletionAlreadyUpstream:
+    """Mirrors `TestConflictFixCompletionStaleRebaseMismatch` above, but for
+    the case where a stale-rebase worker finds the branch's content already
+    fully present on the target (#3462) — landed via another change, maybe
+    with extra tests. That is NOT a conflict of any kind, so it must be
+    reported distinctly from a plain mismatch and never escalate to the
+    ordinary conflict-fix path."""
+
+    def _transition(self, assignment_id: str = "fix-1") -> "notify_mod.Transition":
+        from coord.notify import EVENT_COMPLETION, Transition
+        return Transition(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=7,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+
+    def _record(self) -> dict:
+        return {
+            "repo_github": "acme/api",
+            "type": "conflict-fix",
+            "review_of_assignment_id": "merge-1",
+        }
+
+    def _entry(self, log_path: str) -> dict:
+        return {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": "issue-7-thing",
+            "log_path": log_path,
+        }
+
+    def test_already_upstream_marker_downgrades_succeeded_and_skips_mismatch(
+        self, tmp_path: Path,
+    ) -> None:
+        from coord.conflict_fix import ALREADY_UPSTREAM_MARKER
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {ALREADY_UPSTREAM_MARKER} — merge-tree matches target, "
+            "branch adds nothing\n"
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["parent_assignment_id"] == "merge-1"
+        assert kwargs["succeeded"] is False
+        assert kwargs["semantic"] is False
+        assert kwargs["already_upstream"] is True
+        assert kwargs["stale_rebase_mismatch"] is False
+        assert "merge-tree matches target, branch adds nothing" in (
+            kwargs["stuck_summary"] or ""
+        )
+
+    def test_semantic_marker_takes_precedence_and_skips_already_upstream_check(
+        self, tmp_path: Path,
+    ) -> None:
+        """Mirrors the semantic-precedence test for the plain mismatch
+        marker: the already-upstream check only runs `if not semantic`."""
+        from coord.conflict_fix import SEMANTIC_STUCK_MARKER
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            f"STUCK: {SEMANTIC_STUCK_MARKER} src/foo.py:1-9 — both sides "
+            "rewrote parse_args() differently\n"
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.board_service.read_board", side_effect=Exception("no board")),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["succeeded"] is False
+        assert kwargs["semantic"] is True
+        assert kwargs["already_upstream"] is False
+        assert kwargs["stale_rebase_mismatch"] is False
+
+    def test_already_upstream_takes_precedence_over_mismatch_marker(
+        self, tmp_path: Path,
+    ) -> None:
+        """A log carrying both markers (shouldn't happen per the briefing,
+        but detection order must be defensive) resolves to already-upstream,
+        not the plain mismatch — #3462 fix mandates checking
+        `ALREADY_UPSTREAM_MARKER` first."""
+        from coord.conflict_fix import (
+            ALREADY_UPSTREAM_MARKER,
+            STALE_REBASE_MISMATCH_MARKER,
+        )
+        from coord.notify import post_transition
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {ALREADY_UPSTREAM_MARKER} then also mentions "
+            f"{STALE_REBASE_MISMATCH_MARKER} defensively\n"
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.reconcile.on_conflict_fix_done") as mock_done,
+        ):
+            post_transition(self._transition(), self._record(), self._entry(str(log)))
+
+        mock_done.assert_called_once()
+        kwargs = mock_done.call_args.kwargs
+        assert kwargs["already_upstream"] is True
+        assert kwargs["stale_rebase_mismatch"] is False

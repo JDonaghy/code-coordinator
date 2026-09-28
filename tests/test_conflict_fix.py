@@ -15,7 +15,9 @@ Covers:
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +25,7 @@ import pytest
 from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.conflict_fix import (
     ALL_CANDIDATES_UNREACHABLE,
+    ALREADY_UPSTREAM_MARKER,
     ASSIGN_POST_FAILED,
     CONFLICT_FIX_SYSTEM_PROMPT,
     NO_MACHINE_CONFIGURED,
@@ -31,6 +34,7 @@ from coord.conflict_fix import (
     SEALED_SCOPE_STUCK_MARKER,
     STALE_REBASE_FIX_TITLE_PREFIX,
     STALE_REBASE_MISMATCH_MARKER,
+    already_upstream_verdict_in_text,
     build_conflict_fix_briefing,
     build_sealed_manifest_conflict_briefing,
     build_stale_rebase_briefing,
@@ -249,6 +253,27 @@ class TestBuildStaleRebaseBriefing:
         assert "DO NOT" in briefing or "do not" in briefing.lower()
         assert STALE_REBASE_MISMATCH_MARKER in briefing
 
+    def test_contains_already_upstream_check_and_marker(self) -> None:
+        """#3462: the briefing must check patch-equivalence against the
+        target BEFORE rebasing (`git merge-tree`) and AFTER rebasing (an
+        empty `git rev-list`/`git diff`), and emit a marker distinct from
+        `STALE_REBASE_MISMATCH_MARKER` when the branch turns out to already
+        be upstream — a patch-id mismatch caused by the branch being
+        superseded, not by a genuine overlapping edit."""
+        briefing = build_stale_rebase_briefing(
+            entry=_entry(error=f"{CI_STALE_PREFIX} checks predate the current base"),
+            repo_path="/work/api", test_command="pytest -x",
+        )
+        # Pre-rebase check: merge-tree against the target's tree.
+        assert "git merge-tree --write-tree origin/main HEAD" in briefing
+        assert "git rev-parse origin/main^{tree}" in briefing
+        # Post-rebase check: no commits ahead, or an empty diff.
+        assert "git rev-list origin/main..HEAD" in briefing
+        assert "git diff origin/main HEAD" in briefing
+        # The distinct marker, not the plain mismatch one, for this verdict.
+        assert ALREADY_UPSTREAM_MARKER in briefing
+        assert "already upstream" in briefing.lower()
+
     def test_includes_error_context(self) -> None:
         briefing = build_stale_rebase_briefing(
             entry=_entry(error=f"{CI_STALE_PREFIX} checks predate develop@abcd"),
@@ -277,6 +302,41 @@ class TestStaleRebaseMismatchVerdictInText:
 
     def test_false_for_ordinary_semantic_marker(self) -> None:
         assert stale_rebase_mismatch_verdict_in_text(
+            "STUCK: coord:conflict=semantic src/foo.py:1-9 — contradictory"
+        ) is False
+
+    def test_false_for_already_upstream_marker(self) -> None:
+        """#3462: the two markers are distinct verdicts about the same
+        underlying patch-id difference — `stale_rebase_mismatch_verdict_
+        in_text` must NOT also fire on `ALREADY_UPSTREAM_MARKER`."""
+        assert stale_rebase_mismatch_verdict_in_text(
+            f"STUCK: {ALREADY_UPSTREAM_MARKER} — merge-tree matches target, "
+            "branch adds nothing"
+        ) is False
+
+
+class TestAlreadyUpstreamVerdictInText:
+    def test_true_when_marker_present(self) -> None:
+        assert already_upstream_verdict_in_text(
+            f"STATUS: rebasing\nSTUCK: {ALREADY_UPSTREAM_MARKER} — merge-tree "
+            "matches target, branch adds nothing"
+        ) is True
+
+    def test_false_when_absent(self) -> None:
+        assert already_upstream_verdict_in_text("STATUS: pushed\n") is False
+        assert already_upstream_verdict_in_text(None) is False
+        assert already_upstream_verdict_in_text("") is False
+
+    def test_false_for_stale_rebase_mismatch_verdict_in_text(self) -> None:
+        """Detects the mismatch marker; already_upstream_verdict_in_text
+        must not, since it's the twin verdict for the same log shape."""
+        assert already_upstream_verdict_in_text(
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ"
+        ) is False
+
+    def test_false_for_ordinary_semantic_marker(self) -> None:
+        assert already_upstream_verdict_in_text(
             "STUCK: coord:conflict=semantic src/foo.py:1-9 — contradictory"
         ) is False
 
@@ -1919,3 +1979,106 @@ class TestSealedConflictEndToEnd:
         parked = mq.load_queue()[0]
         assert parked.state == HUMAN_REQUIRED
         assert "Manual rebase required" in (parked.error or "")
+
+
+# ── #3462: a real-git unit test for the merge-tree mechanism the ────────────
+# stale-rebase briefing prescribes ───────────────────────────────────────────
+#
+# `build_stale_rebase_briefing` tells the WORKER to run these git commands
+# itself — coord only reads the worker's resulting STUCK marker back from
+# the transcript (see `TestBuildStaleRebaseBriefing` and
+# `TestAlreadyUpstreamVerdictInText` above). This class proves the
+# prescribed mechanism itself is sound against a real git repo: a branch
+# whose commit is a strict subset of what already landed on the target
+# (the quadraui#1174 reference case — same change merged through another
+# issue, plus an extra test) is correctly identified as already-upstream,
+# while a genuinely overlapping edit against the same base is not.
+
+
+def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True,
+    )
+
+
+def _init_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(["init", "-q", "-b", "main"], path)
+    _git(["config", "user.email", "t@t.com"], path)
+    _git(["config", "user.name", "Test"], path)
+
+
+class TestAlreadyUpstreamMergeTreeMechanism:
+    def test_superseded_branch_identified_as_already_upstream(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        (repo / "README.md").write_text("hello\n")
+        _git(["add", "README.md"], repo)
+        _git(["commit", "-qm", "initial"], repo)
+
+        # The branch: one commit adding foo.py (commit C).
+        _git(["checkout", "-qb", "issue-branch"], repo)
+        (repo / "foo.py").write_text("def bar():\n    return 1\n")
+        _git(["add", "foo.py"], repo)
+        _git(["commit", "-qm", "add bar()"], repo)
+
+        # main: the SAME change lands via another issue, plus an extra test
+        # — a strict superset of the branch's own diff.
+        _git(["checkout", "-q", "main"], repo)
+        (repo / "foo.py").write_text("def bar():\n    return 1\n")
+        (repo / "test_foo.py").write_text(
+            "from foo import bar\n\n\ndef test_bar():\n    assert bar() == 1\n"
+        )
+        _git(["add", "foo.py", "test_foo.py"], repo)
+        _git(["commit", "-qm", "add bar() plus a test (landed via #other)"], repo)
+        main_tree = _git(["rev-parse", "main^{tree}"], repo).stdout.strip()
+
+        _git(["checkout", "-q", "issue-branch"], repo)
+        merge_tree = _git(
+            ["merge-tree", "--write-tree", "main", "HEAD"], repo,
+        ).stdout.strip()
+
+        assert merge_tree == main_tree, (
+            "merge-tree of a strict-subset branch against its superseding "
+            "target must equal the target's own tree — merging adds nothing"
+        )
+
+    def test_genuinely_overlapping_edit_not_identified_as_already_upstream(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        (repo / "foo.py").write_text("def bar():\n    return 1\n")
+        _git(["add", "foo.py"], repo)
+        _git(["commit", "-qm", "initial"], repo)
+
+        # The branch changes bar() one way.
+        _git(["checkout", "-qb", "issue-branch"], repo)
+        (repo / "foo.py").write_text("def bar():\n    return 2\n")
+        _git(["add", "foo.py"], repo)
+        _git(["commit", "-qm", "branch changes bar() to 2"], repo)
+
+        # main independently changes the SAME line a DIFFERENT way — a
+        # genuine overlapping edit, not a superseded branch.
+        _git(["checkout", "-q", "main"], repo)
+        (repo / "foo.py").write_text("def bar():\n    return 3\n")
+        _git(["add", "foo.py"], repo)
+        _git(["commit", "-qm", "main changes bar() to 3, unrelated to the branch"], repo)
+        main_tree = _git(["rev-parse", "main^{tree}"], repo).stdout.strip()
+
+        _git(["checkout", "-q", "issue-branch"], repo)
+        result = subprocess.run(
+            ["git", "merge-tree", "--write-tree", "main", "HEAD"],
+            cwd=str(repo), capture_output=True, text=True,
+        )
+        # A genuine overlapping edit either reports a conflict (non-zero
+        # exit, per git's own `merge-tree --write-tree` contract) or, if it
+        # somehow resolves cleanly, must produce a tree that differs from
+        # the target's own tree (the branch's change survives in the
+        # result) — either way, NOT the already-upstream conclusion.
+        if result.returncode == 0:
+            assert result.stdout.strip() != main_tree
+        else:
+            assert "CONFLICT" in result.stderr or "CONFLICT" in result.stdout

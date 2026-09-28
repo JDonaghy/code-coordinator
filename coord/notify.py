@@ -3960,9 +3960,17 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # same way, without routing it through the SEMANTIC tier-2
         # escalation path — see `coord.reconcile.on_conflict_fix_done`'s
         # `stale_rebase_mismatch` docstring for why that's a separate arm.
+        # #3462: a patch-id mismatch alone doesn't distinguish a real
+        # overlap from a branch whose content already landed on the target
+        # through another change — check `ALREADY_UPSTREAM_MARKER` first
+        # (mutually exclusive with the plain mismatch marker, so only
+        # checked when semantic is False too) and route it to its own
+        # `already_upstream` arm, which never escalates to the ordinary
+        # conflict-fix path and never says "genuine content conflict".
         parent_id = record.get("review_of_assignment_id")
         if parent_id:
             from coord.conflict_fix import (  # noqa: PLC0415
+                detect_already_upstream,
                 detect_semantic_conflict,
                 detect_stale_rebase_mismatch,
             )
@@ -3979,16 +3987,30 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             except Exception:  # noqa: BLE001 — best-effort, never break notify
                 semantic = False
 
+            # #3462: check the already-upstream marker BEFORE the plain
+            # mismatch marker — they're mutually exclusive per dispatch, but
+            # an already-upstream verdict must win the framing (superseded,
+            # not "genuine conflict") whenever both would otherwise apply.
+            already_upstream = False
             stale_rebase_mismatch = False
             if not semantic:
                 try:
-                    stale_rebase_mismatch = detect_stale_rebase_mismatch(
+                    already_upstream = detect_already_upstream(
                         log_path=log_path,
                         host=host,
                         assignment_id=transition.assignment_id,
                     )
                 except Exception:  # noqa: BLE001
-                    stale_rebase_mismatch = False
+                    already_upstream = False
+                if not already_upstream:
+                    try:
+                        stale_rebase_mismatch = detect_stale_rebase_mismatch(
+                            log_path=log_path,
+                            host=host,
+                            assignment_id=transition.assignment_id,
+                        )
+                    except Exception:  # noqa: BLE001
+                        stale_rebase_mismatch = False
 
             stuck_summary: str | None = None
             board = None
@@ -4013,6 +4035,19 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                     config = _load_config()
                 except Exception:  # noqa: BLE001
                     board, config = None, None
+            elif already_upstream:
+                # #3462: no escalation dispatch happens for this verdict
+                # (it's not a conflict), so board/config aren't strictly
+                # needed — but grab the stuck summary the same way so
+                # `on_conflict_fix_done`'s HUMAN_REQUIRED text is specific.
+                progress = entry.get("progress") or {}
+                stuck_summary = progress.get("stuck")
+                if not stuck_summary and log_path:
+                    try:
+                        from coord.progress import parse_progress  # noqa: PLC0415
+                        stuck_summary = parse_progress(log_path).stuck
+                    except Exception:  # noqa: BLE001
+                        stuck_summary = None
             elif stale_rebase_mismatch:
                 # #3444: board/config ARE needed here now — a stale-rebase
                 # mismatch escalates to the ORDINARY conflict-fix path
@@ -4042,8 +4077,11 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 parent_assignment_id=parent_id,
                 fix_assignment_id=transition.assignment_id,
                 machine_name=transition.machine_name,
-                succeeded=not semantic and not stale_rebase_mismatch,
+                succeeded=not semantic
+                and not already_upstream
+                and not stale_rebase_mismatch,
                 semantic=semantic,
+                already_upstream=already_upstream,
                 stale_rebase_mismatch=stale_rebase_mismatch,
                 board=board,
                 config=config,

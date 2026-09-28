@@ -2987,13 +2987,18 @@ def _try_ordinary_escalation_after_stale_mismatch(
     stuck_summary: str | None,
 ) -> "Assignment | None":
     """Dispatch the ordinary conflict-fix path after a stale-rebase
-    worker's ``stale-rebase-mismatch`` refusal (#3444).
+    worker's ``stale-rebase-mismatch`` refusal (#3444). Only called when
+    the verdict is ``stale-rebase-mismatch``, NOT ``already-upstream``
+    (#3462) — the caller (:func:`on_conflict_fix_done`) filters that case
+    out before reaching here, since an already-upstream branch has nothing
+    to escalate a conflict-fix attempt against.
 
     A ``stale-rebase-mismatch`` verdict means the ``checks_stale`` premise
-    that triggered the stale-rebase dispatch was wrong — the rebase hit a
-    genuine content conflict, not just a moved base. That makes this an
-    ORDINARY conflict, so it deserves the ordinary #241 conflict-fix
-    worker's mechanical/additive attempt (and its own
+    that triggered the stale-rebase dispatch was wrong — the rebase was not
+    content-preserving, which may (not necessarily) mean a genuine
+    overlapping edit against the moved base. This MAY be an ORDINARY
+    conflict, so it deserves the ordinary #241 conflict-fix worker's
+    mechanical/additive attempt (and its own
     ``SEMANTIC_STUCK_MARKER`` → escalation-or-HUMAN_REQUIRED handling on a
     second failure) before anything goes to a human — not an immediate
     HUMAN_REQUIRED, which is what happened before this fix.
@@ -3046,6 +3051,7 @@ def on_conflict_fix_done(
     machine_name: str,
     succeeded: bool,
     semantic: bool = False,
+    already_upstream: bool = False,
     stale_rebase_mismatch: bool = False,
     board: Board | None = None,
     config: Config | None = None,
@@ -3059,21 +3065,35 @@ def on_conflict_fix_done(
     can surface "manual resolution required", and a comment is posted on
     the underlying issue so the user is notified outside the TUI too.
 
+    *already_upstream* (#3462): when ``True``, a stale-rebase worker found
+    the branch's content already fully present on the target — the same
+    change landed via another issue, possibly with extra tests — and
+    correctly refused to push per its own briefing's "When the branch is
+    already upstream" section. This is checked and handled BEFORE
+    *stale_rebase_mismatch* (the two are mutually exclusive per dispatch):
+    it is NOT a conflict of any kind, so it never escalates to the ordinary
+    conflict-fix path — it goes straight to HUMAN_REQUIRED with text that
+    says there is nothing left to merge, not that a conflict exists.
+
     *stale_rebase_mismatch* (#3349 review, escalation added #3444): when
-    ``True``, a stale-rebase worker (dispatched for
-    ``merge_gate_checks_stale``, not an ordinary conflict) correctly
-    refused to push per its own briefing's "When NOT to guess" section —
-    its rebase either hit a real conflict marker or produced a different
-    patch-id than the pre-rebase branch, so it is not a pure
-    content-preserving rebase. That means the *just-stale* premise behind
-    the stale-rebase dispatch was wrong — this is an ORDINARY conflict, so
-    it gets the ordinary #241 conflict-fix worker's mechanical/additive
-    attempt (:func:`_try_ordinary_escalation_after_stale_mismatch`) before
-    anything reaches a human, exactly like any other conflict. Only when
-    THAT dispatch itself declines (no capable machine, already active,
-    retry cap consumed, …) does the entry land on HUMAN_REQUIRED — #3349's
-    safety property (the stale-rebase worker itself never resolves
-    anything) is unaffected either way.
+    ``True`` (and *already_upstream* is ``False``), a stale-rebase worker
+    (dispatched for ``merge_gate_checks_stale``, not an ordinary conflict)
+    correctly refused to push per its own briefing's "When NOT to guess"
+    section — its rebase either hit a real conflict marker or produced a
+    different patch-id than the pre-rebase branch, and the branch is NOT
+    already upstream, so this is not a pure content-preserving rebase. That
+    means the *just-stale* premise behind the stale-rebase dispatch was
+    wrong — this MAY be an ORDINARY conflict, so it gets the ordinary #241
+    conflict-fix worker's mechanical/additive attempt
+    (:func:`_try_ordinary_escalation_after_stale_mismatch`) before anything
+    reaches a human, exactly like any other conflict. Only when THAT
+    dispatch itself declines (no capable machine, already active, retry cap
+    consumed, …) does the entry land on HUMAN_REQUIRED — #3349's safety
+    property (the stale-rebase worker itself never resolves anything) is
+    unaffected either way. Note the framing here is deliberately hedged
+    ("not content-preserving", not "a genuine content conflict") — a
+    patch-id mismatch alone cannot distinguish a real overlap from a
+    superseded branch; that's exactly what *already_upstream* is for.
 
     #2566: when *semantic* is ``True`` and the tier-2 escalation didn't
     fire specifically because ``pipeline.escalate_semantic_conflicts`` is
@@ -3123,13 +3143,37 @@ def on_conflict_fix_done(
                     "merge` to retry unchanged."
                 )
                 failed_entry = entry
+            elif already_upstream:
+                # #3462: the branch's content is already fully present on
+                # the target — landed via another change, possibly with
+                # extra tests. This is NOT a conflict of any kind, so it
+                # must never escalate to the ordinary conflict-fix path
+                # (that would waste a paid leg "resolving" a conflict that
+                # doesn't exist, exactly the quadraui#1174 bug this issue
+                # is built from). Straight to HUMAN_REQUIRED with accurate
+                # "nothing to merge" text.
+                detail = stuck_summary or (
+                    "the branch's content is already present on the "
+                    "target branch"
+                )
+                entry.state = mq.HUMAN_REQUIRED
+                entry.error = (
+                    f"{existing_error}; stale-rebase worker found: {detail}. "
+                    f"Branch content is already present on "
+                    f"{entry.target_branch} (landed via another change) — "
+                    "nothing to merge; close the issue or `coord "
+                    "drive-queue remove`."
+                )
+                failed_entry = entry
             elif stale_rebase_mismatch:
                 # #3444: a stale-rebase worker's refusal means the
-                # "just-stale" premise was wrong — this is a genuine
-                # content conflict, i.e. an ORDINARY conflict, so it gets
-                # the ordinary #241 conflict-fix worker's mechanical
-                # attempt before anything reaches a human (previously this
-                # skipped straight to HUMAN_REQUIRED — #3444's bug).
+                # "just-stale" premise was wrong — the rebase was not
+                # content-preserving, so it MAY be a genuine content
+                # conflict (the already-upstream case is ruled out above),
+                # i.e. an ORDINARY conflict, so it gets the ordinary #241
+                # conflict-fix worker's mechanical attempt before anything
+                # reaches a human (previously this skipped straight to
+                # HUMAN_REQUIRED — #3444's bug).
                 detail = stuck_summary or (
                     "rebase was not content-preserving (a conflict marker "
                     "appeared, or the resulting patch-id differed from the "
@@ -3154,7 +3198,7 @@ def on_conflict_fix_done(
                     entry.error = (
                         f"{existing_error}; stale-rebase worker refused to "
                         f"push: {detail}. Not a stale-base mismatch after "
-                        "all — this is a genuine content conflict, "
+                        "all — the rebase was not content-preserving, "
                         f"escalated to an ordinary conflict-fix (assignment "
                         f"{fix.assignment_id}) on {fix.machine_name}."
                     )
@@ -3166,8 +3210,8 @@ def on_conflict_fix_done(
                     entry.state = mq.HUMAN_REQUIRED
                     entry.error = (
                         f"{existing_error}; stale-rebase worker refused to "
-                        f"push: {detail}. This is a genuine content conflict "
-                        "against the new base, not a pure rebase, and the "
+                        f"push: {detail}. The rebase was not "
+                        "content-preserving against the new base, and the "
                         "ordinary conflict-fix escalation could not be "
                         "dispatched either — manual resolution required."
                     )
@@ -3310,6 +3354,15 @@ def _on_conflict_fix_done(
     markers are mutually exclusive per dispatch, but checking both here
     means this wrapper doesn't need to know which kind of conflict-fix
     dispatch it's looking at.
+
+    #3462: a stale-rebase worker's patch-id mismatch has TWO distinct
+    causes — a genuine overlapping edit, or the branch being SUPERSEDED
+    (its content already landed on the target through another change).
+    Check :data:`coord.conflict_fix.ALREADY_UPSTREAM_MARKER` BEFORE the
+    plain mismatch marker (they're mutually exclusive per dispatch, but the
+    already-upstream verdict must win the framing when present) so an
+    already-superseded branch is never told it has "a genuine content
+    conflict" it doesn't have.
     """
     parent_id = fix_assignment.review_of_assignment_id
     if not parent_id:
@@ -3318,6 +3371,7 @@ def _on_conflict_fix_done(
     usage_limit_reason = (agent_entry or {}).get("usage_limit_reason")
 
     semantic = False
+    already_upstream = False
     stale_rebase_mismatch = False
     stuck_summary: str | None = None
     if (
@@ -3331,11 +3385,19 @@ def _on_conflict_fix_done(
         if semantic:
             succeeded = False
         else:
-            stale_rebase_mismatch, stuck_summary = _stale_rebase_mismatch_verdict(
+            already_upstream, stuck_summary = _already_upstream_verdict(
                 fix_assignment, agent_entry, config,
             )
-            if stale_rebase_mismatch:
+            if already_upstream:
                 succeeded = False
+            else:
+                stale_rebase_mismatch, stuck_summary = (
+                    _stale_rebase_mismatch_verdict(
+                        fix_assignment, agent_entry, config,
+                    )
+                )
+                if stale_rebase_mismatch:
+                    succeeded = False
 
     on_conflict_fix_done(
         parent_assignment_id=parent_id,
@@ -3343,6 +3405,7 @@ def _on_conflict_fix_done(
         machine_name=fix_assignment.machine_name or "",
         succeeded=succeeded,
         semantic=semantic,
+        already_upstream=already_upstream,
         stale_rebase_mismatch=stale_rebase_mismatch,
         board=board,
         config=config,
@@ -3430,6 +3493,50 @@ def _stale_rebase_mismatch_verdict(
             except Exception:  # noqa: BLE001
                 stuck_summary = None
     return mismatch, stuck_summary
+
+
+def _already_upstream_verdict(
+    fix_assignment: Assignment,
+    agent_entry: dict | None,
+    config: Config,
+) -> tuple[bool, str | None]:
+    """(is_already_upstream, stuck line) for a finished conflict-fix worker.
+    Mirrors :func:`_stale_rebase_mismatch_verdict` exactly, but reads for
+    :data:`coord.conflict_fix.ALREADY_UPSTREAM_MARKER` (#3462) — a
+    stale-rebase worker that found the branch's content already fully
+    present on the target (landed via another change) and correctly
+    refused to push, per its own briefing's "When the branch is already
+    upstream" section. This is NOT a conflict of any kind.
+
+    Best-effort — any failure to read the log means "not already upstream",
+    which preserves the pre-#3462 (mismatch) behaviour.
+    """
+    from coord.conflict_fix import detect_already_upstream  # noqa: PLC0415
+
+    log_path = (agent_entry or {}).get("log_path")
+    machine = next(
+        (m for m in config.machines if m.name == fix_assignment.machine_name), None,
+    )
+    try:
+        already_upstream = detect_already_upstream(
+            log_path=log_path,
+            host=machine.host if machine is not None else None,
+            assignment_id=fix_assignment.assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — never break reconcile on a log read
+        return False, None
+
+    stuck_summary: str | None = None
+    if already_upstream:
+        progress = (agent_entry or {}).get("progress") or {}
+        stuck_summary = progress.get("stuck")
+        if not stuck_summary and log_path:
+            try:
+                from coord.progress import parse_progress  # noqa: PLC0415
+                stuck_summary = parse_progress(log_path).stuck
+            except Exception:  # noqa: BLE001
+                stuck_summary = None
+    return already_upstream, stuck_summary
 
 
 def _extract_issue_number(branch: str) -> int | None:
