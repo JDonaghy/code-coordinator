@@ -6462,6 +6462,29 @@ def plan_tick(
     # carries fresh, right below.
     effective_last_reason: dict[str, str] = {e.key: e.last_reason for e in ordered}
 
+    def _refresh_only(reason: str, current: str) -> dict[str, Any]:
+        """``{}`` unless *reason* is non-empty and differs from *current*.
+
+        #3461: a `counted=False` deferral must never bump `deferrals` or feed
+        the queue-level alert (see `Deferral`'s own docstring on that flag) —
+        but the descriptive TEXT still has to keep up with reality when the
+        walk re-derives it for an entry that isn't actually competing for a
+        slot this tick (the queue is at capacity, or this entry sits behind
+        an already-chosen launch in the report-only tail). Writing ONLY on a
+        real change means `reason_at` — stamped by
+        `coord.state._update_drive_queue_entry_local` whenever `last_reason`
+        is present in the same update, #2133 — only moves when the text
+        actually does, so the `(Nm ago)` age it powers keeps meaning "how
+        long this has been true" rather than "how long since some tick
+        happened to re-walk this row". An empty *reason* (the fully-eligible,
+        nothing-to-report shape `_Verdict(True)` returns) writes nothing —
+        overwriting a real reason with blank text would be a regression, not
+        a refresh.
+        """
+        if not reason or reason == current:
+            return {}
+        return {"last_reason": reason}
+
     reconciles: list[Reconcile] = []
     blocked: list[Blocked] = []
     deferrals: list[Deferral] = []
@@ -7102,11 +7125,41 @@ def plan_tick(
         )
 
     if capacity - occupied <= 0:
+        # #3461: at capacity is the NORMAL steady state of a deep queue, so
+        # this early return can fire for many ticks in a row. Before this, it
+        # produced no deferral at all, which meant a `waiting` entry's
+        # `last_reason` — e.g. "waiting on X (queued, blocked, ...)" — never
+        # got a chance to notice X had since flipped back to `waiting`, or
+        # landed. `_resolve_prereqs` is cheap (no I/O, just the cached board
+        # + this tick's `states`), so it still runs for every `waiting` entry
+        # here; only the TEXT is refreshed (`_refresh_only` below is a no-op
+        # unless it actually changed) and only via `counted=False` — no
+        # attempt is spent, `deferrals` does not move, and the queue-level
+        # alert (computed only in the launch walk below) is untouched, same
+        # as every other early return in this function.
+        for entry in ordered:
+            if states.get(entry.key) != STATE_WAITING:
+                continue
+            verdict = _resolve_prereqs(
+                entry,
+                board,
+                states,
+                cycle_keys,
+                held_gates,
+                live_prereq_terminal,
+                effective_last_reason,
+            )
+            updates = _refresh_only(verdict.reason, entry.last_reason)
+            if not updates:
+                continue
+            deferrals.append(
+                Deferral(entry.key, verdict.reason, counted=False, updates=updates)
+            )
         return TickPlan(
             **plan_base,
             reconciles=tuple(reconciles),
             blocked=tuple(blocked),
-            deferrals=(),
+            deferrals=tuple(deferrals),
             alert=None,
             launch=None,
         )
@@ -7237,17 +7290,35 @@ def plan_tick(
     for entry in waiting:
         if launch is not None:
             # Report-only pass over the tail of the queue.  The launch above
-            # already won this tick, so nothing here is mutated (see
-            # Deferral.counted) — this exists so `--dry-run` explains the rest
-            # of the queue instead of going silent after the first line.
+            # already won this tick, so `counted` stays `False` and neither
+            # `deferrals` nor the queue-level alert moves for anything found
+            # here — that part is unchanged. #3461: the descriptive TEXT is
+            # no longer left frozen just because this entry never got to
+            # compete for a slot — `_refresh_only` (defined near the top of
+            # this function) still folds a changed reading into `updates` so
+            # `--dry-run` AND a real tick both keep `last_reason` current for
+            # every entry the walk reaches, not only the one that launched.
             cooldown = _cooldown_reason(entry)
             if cooldown:
-                deferrals.append(Deferral(entry.key, cooldown, counted=False))
+                deferrals.append(
+                    Deferral(
+                        entry.key,
+                        cooldown,
+                        counted=False,
+                        updates=_refresh_only(cooldown, entry.last_reason),
+                    )
+                )
                 continue
             backoff = _backoff_reason(entry)
             if backoff:
                 deferrals.append(
-                    Deferral(entry.key, backoff, counted=False, backing_off=True)
+                    Deferral(
+                        entry.key,
+                        backoff,
+                        counted=False,
+                        backing_off=True,
+                        updates=_refresh_only(backoff, entry.last_reason),
+                    )
                 )
                 continue
             verdict = _resolve_prereqs(
@@ -7261,20 +7332,35 @@ def plan_tick(
             )
             if not verdict.satisfied:
                 deferrals.append(
-                    Deferral(entry.key, verdict.reason, counted=False)
+                    Deferral(
+                        entry.key,
+                        verdict.reason,
+                        counted=False,
+                        updates=_refresh_only(verdict.reason, entry.last_reason),
+                    )
                 )
                 continue
             cordoned = _cordon_reason(entry)
             if cordoned:
                 deferrals.append(
-                    Deferral(entry.key, cordoned, counted=False, cordoned=True)
+                    Deferral(
+                        entry.key,
+                        cordoned,
+                        counted=False,
+                        cordoned=True,
+                        updates=_refresh_only(cordoned, entry.last_reason),
+                    )
                 )
                 continue
             repo_limit = _repo_limit_reason(entry)
             if repo_limit:
                 deferrals.append(
                     Deferral(
-                        entry.key, repo_limit, counted=False, repo_limited=True
+                        entry.key,
+                        repo_limit,
+                        counted=False,
+                        repo_limited=True,
+                        updates=_refresh_only(repo_limit, entry.last_reason),
                     )
                 )
             continue

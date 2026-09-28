@@ -1309,7 +1309,14 @@ def test_only_one_entry_launches_per_tick():
     entries = [entry(1650, position=0), entry(1654, position=1)]
     plan = plan_tick(entries, board(), capacity=5)
     assert plan.launch is not None and plan.launch.issue == 1650
-    assert len(plan.writes()) == 0  # nothing else touched
+    # #3461: the OTHER row is never launched, retried, or escalated — but its
+    # `last_reason` (previously "", never set) does refresh, so the report
+    # cell it feeds does not stay blank/stale for as long as this entry sits
+    # behind its own repo's in-flight slot.
+    assert len(plan.writes()) == 1
+    key, updates = plan.writes()[0]
+    assert key == entry_key(REPO, 1654)
+    assert updates == {"last_reason": plan.deferrals[0].reason}
 
 
 def test_entries_after_the_launch_are_reported_but_never_counted():
@@ -1321,8 +1328,14 @@ def test_entries_after_the_launch_are_reported_but_never_counted():
     assert plan.launch is not None and plan.launch.issue == 1650
     assert [d.key for d in plan.deferrals] == [entry_key(REPO, 1654)]
     assert plan.deferrals[0].counted is False
-    assert plan.deferrals[0].updates == {}
-    assert plan.writes() == []  # a launch tick mutates only the launched row
+    # #3461: `counted` staying `False` means no attempt is spent and no
+    # `deferrals` bump — but the TEXT still refreshes (from "" to the fresh
+    # "waiting on ..." reading), so `writes()` is no longer empty even though
+    # this tick launched exactly one row.
+    assert plan.deferrals[0].updates == {"last_reason": plan.deferrals[0].reason}
+    assert plan.writes() == [
+        (entry_key(REPO, 1654), {"last_reason": plan.deferrals[0].reason})
+    ]
     text = "\n".join(render_plan(plan))
     assert f"defer {entry_key(REPO, 1654)}" in text
     assert entry_key(REPO, 1650) in text
@@ -1542,9 +1555,25 @@ def test_the_launch_takes_its_own_repos_slot_in_the_report_only_tail():
     assert plan.launch is not None and plan.launch.issue == 302
     assert [d.key for d in plan.deferrals] == ["quadraui#303"]
     assert plan.deferrals[0].counted is False  # never competed for the slot
-    assert plan.deferrals[0].updates == {}
-    assert plan.writes() == []
     assert "at its limit (1/1)" in plan.deferrals[0].reason
+    # #3461: the TEXT still refreshes even though nothing here counts as a
+    # deferral — this entry's stored `last_reason` was "" (never set), so
+    # the first tick that reaches it writes the fresh reading...
+    assert plan.deferrals[0].updates == {"last_reason": plan.deferrals[0].reason}
+    assert plan.writes() == [("quadraui#303", {"last_reason": plan.deferrals[0].reason})]
+    # ...but a SECOND tick against a row that already carries that exact
+    # text writes nothing — no churn once the reading stops changing.
+    stable_entries = [
+        other(302, "quadraui", position=0),
+        other(303, "quadraui", position=1, last_reason=plan.deferrals[0].reason),
+    ]
+    plan2 = plan_tick(
+        stable_entries,
+        cross_repo_board(open_=("quadraui#302", "quadraui#303")),
+        capacity=3,
+    )
+    assert plan2.deferrals[0].updates == {}
+    assert plan2.writes() == []
 
 
 def test_an_unsatisfiable_prereq_still_blocks_inside_a_full_repo():
@@ -1587,6 +1616,128 @@ def test_a_plan_without_a_per_repo_ceiling_renders_the_original_line():
     entries = [entry(1650, position=0)]
     plan = plan_tick(entries, board(), capacity=1, max_parallel_per_repo=0)
     assert "per-repo" not in "\n".join(render_plan(plan))
+
+
+# ── plan_tick: #3461 — a waiting entry's `last_reason` must not freeze ──────
+
+
+def test_stale_last_reason_refreshes_while_the_queue_sits_at_capacity():
+    """The steady state of a deep queue is AT CAPACITY, not mid-walk — before
+    #3461 that early return produced no deferral at all, so a dependent's
+    `last_reason` could quote a pre-req's LONG-GONE `blocked` state for as
+    long as the queue stayed full."""
+    dep_key = entry_key(REPO, 1650)
+    stale_reason = (
+        f"waiting on {dep_key} (queued, blocked, but its own gate reading is "
+        "an unconfirmed probe failure, not a confirmed-still-shut gate — "
+        "retrying, not blocked permanently, #3368)"
+    )
+    entries = [
+        # Occupies the queue's only slot — recently launched, so #1794's
+        # startup grace keeps it counted even with no live session yet.
+        entry(1600, position=0, state=STATE_RUNNING, launched_at=NOW - 41.0),
+        # X: was `blocked` (the stale text above quotes it), has SINCE been
+        # removed and re-added as `waiting` — exactly the #3461 incident.
+        entry(1650, position=1, state=STATE_WAITING),
+        entry(
+            1654,
+            position=2,
+            after=(dep_key,),
+            last_reason=stale_reason,
+            deferrals=3,
+        ),
+    ]
+    plan = plan_tick(entries, board(open_=(1650, 1654)), capacity=1, now=NOW)
+    assert plan.launch is None
+    assert plan.occupied == plan.capacity == 1  # the whole point: AT capacity
+    dep_update = next(d for d in plan.deferrals if d.key == entry_key(REPO, 1654))
+    assert dep_update.counted is False  # never competed for a slot
+    assert dep_update.reason == f"waiting on {dep_key} (queued, waiting)"
+    assert dep_update.reason != stale_reason
+    assert dep_update.updates == {"last_reason": dep_update.reason}
+    # A text refresh is not a counted deferral: the persisted `deferrals`
+    # counter must not move.
+    assert "deferrals" not in dep_update.updates
+    # `writes()` also carries #1794's own "still starting" reconcile note for
+    # the running entry — unrelated to this fix — so check D's write by key
+    # rather than asserting the whole list.
+    assert dict(plan.writes())[entry_key(REPO, 1654)] == {
+        "last_reason": dep_update.reason
+    }
+
+
+def test_stale_last_reason_refreshes_in_the_report_only_tail():
+    """Same staleness, different cause: D is walked AFTER this tick's own
+    launch already won, so the pre-#3461 report-only pass discarded its
+    freshly re-derived reason instead of persisting it."""
+    dep_key = entry_key(REPO, 1650)
+    stale_reason = (
+        f"waiting on {dep_key} (queued, blocked, but its own gate reading is "
+        "an unconfirmed probe failure, not a confirmed-still-shut gate — "
+        "retrying, not blocked permanently, #3368)"
+    )
+    entries = [
+        # X: fully eligible, wins this tick's one launch.
+        entry(1650, position=0),
+        entry(
+            1654,
+            position=1,
+            after=(dep_key,),
+            last_reason=stale_reason,
+            deferrals=3,
+        ),
+    ]
+    plan = plan_tick(entries, board(open_=(1650, 1654)), capacity=1)
+    assert plan.launch is not None and plan.launch.issue == 1650
+    dep_update = next(d for d in plan.deferrals if d.key == entry_key(REPO, 1654))
+    assert dep_update.counted is False
+    assert dep_update.reason == f"waiting on {dep_key} (queued, waiting)"
+    assert dep_update.reason != stale_reason
+    assert dep_update.updates == {"last_reason": dep_update.reason}
+    assert "deferrals" not in dep_update.updates
+
+
+def test_an_unchanged_reason_writes_nothing_even_when_reported():
+    """No churn: once a `waiting` entry's stored `last_reason` already
+    matches what this tick would derive, refreshing it again is a no-op —
+    at capacity and in the report-only tail alike."""
+    dep_key = entry_key(REPO, 1650)
+    current_reason = f"waiting on {dep_key} (queued, waiting)"
+
+    at_capacity_entries = [
+        entry(1600, position=0, state=STATE_RUNNING, launched_at=NOW - 41.0),
+        entry(1650, position=1, state=STATE_WAITING),
+        entry(
+            1654,
+            position=2,
+            after=(dep_key,),
+            last_reason=current_reason,
+            deferrals=3,
+        ),
+    ]
+    at_capacity_plan = plan_tick(
+        at_capacity_entries, board(open_=(1650, 1654)), capacity=1, now=NOW
+    )
+    # #1794's own "still starting" reconcile note for the running entry is
+    # unrelated to this fix and writes every tick regardless — what matters
+    # here is that D's OWN row (whose text hasn't changed) gets no write.
+    assert entry_key(REPO, 1654) not in dict(at_capacity_plan.writes())
+
+    report_only_entries = [
+        entry(1650, position=0),
+        entry(
+            1654,
+            position=1,
+            after=(dep_key,),
+            last_reason=current_reason,
+            deferrals=3,
+        ),
+    ]
+    report_only_plan = plan_tick(
+        report_only_entries, board(open_=(1650, 1654)), capacity=1
+    )
+    assert report_only_plan.launch is not None
+    assert report_only_plan.writes() == []
 
 
 # ── plan_tick: reconciliation ────────────────────────────────────────────────
