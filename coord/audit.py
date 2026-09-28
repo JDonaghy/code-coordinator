@@ -40,6 +40,7 @@ __all__ = [
     "query_audit_log",
     "audit_lock_contention_losses",
     "flush_lock_contention_summary",
+    "sweep_operational_retention",
 ]
 
 # Valid values are documented in the issue but not enforced here — callers
@@ -276,9 +277,14 @@ def _maybe_trim(conn) -> None:
     """Opportunistic cap: when ``audit.max_rows`` is set (> 0), delete the
     oldest rows past that count after every insert.
 
-    Default (``max_rows=0``) is unlimited — this is a no-op in the common
-    case.  Config is read via :func:`_cached_config` rather than re-parsed
-    on every call — see that function's docstring for why (#2654).
+    **Tier-blind** (see :class:`coord.config.AuditConfig`'s ``max_rows``
+    docstring): this deletes the globally oldest rows by ``id`` regardless
+    of ``tier``, so a busy ``operational``-tier writer can push a
+    ``business``-tier row out ahead of it.  Default (``max_rows=0``) is
+    unlimited — this is a no-op in the common case.  Config is read via
+    :func:`_cached_config` rather than re-parsed on every call — see that
+    function's docstring for why (#2654).  Use
+    :func:`sweep_operational_retention` for a tier-scoped cap instead.
     """
     max_rows = _resolve_max_rows()
     if max_rows <= 0:
@@ -290,6 +296,70 @@ def _maybe_trim(conn) -> None:
         (max_rows,),
     )
     conn.commit()
+
+
+# ── #3469: per-tier retention for the operational tier ──────────────────────
+#
+# `_maybe_trim` above is a row-count cap, tier-blind by construction (it has
+# to be: `max_rows` predates the `tier` column's operational-vs-business
+# distinction even mattering for retention). #3469's actual problem --
+# `forge_availability`'s ~100k operational-tier rows/day dwarfing the whole
+# table -- needs a cap that can bound just that tier without ever being able
+# to touch a `business`-tier row (a real board transition: dispatch, test/
+# review/merge verdicts) no matter how old it is. This is that cap: a plain
+# time-window DELETE scoped to `tier = 'operational'`, wired into
+# `coord.housekeeping.sweep`'s low-cadence tick (and `coord housekeeping`'s
+# on-demand run) rather than firing on every insert like `_maybe_trim` does
+# — the same cadence tradeoff `coord.forge_availability._PRUNE_INTERVAL_S`
+# already documents for the exact same reason.
+
+
+def _resolve_operational_retention_days() -> float:
+    """Read ``audit.operational_retention_days`` from coordinator.yml.
+    Returns ``0`` (disabled — keep everything, today's behaviour) on any
+    failure, matching :func:`_resolve_max_rows`'s fail-safe."""
+    try:
+        cfg = _cached_config()
+        return max(0.0, float(cfg.audit.operational_retention_days))
+    except Exception:  # noqa: BLE001 — best-effort; disabled is the safe default
+        return 0.0
+
+
+def sweep_operational_retention(*, now: float | None = None, dry_run: bool = False) -> int:
+    """Delete ``tier='operational'`` ``audit_log`` rows older than
+    ``audit.operational_retention_days`` (#3469).  Returns the number of
+    rows deleted (or, with ``dry_run=True``, that *would be* deleted) —
+    ``0`` when the knob is unset/disabled (the default) or there was
+    nothing past the cutoff.
+
+    **Never touches a ``business``-tier row**, regardless of age — the
+    ``WHERE tier = 'operational'`` clause is the whole point of this
+    function existing alongside the tier-blind :func:`_maybe_trim`.
+
+    Unlike ``record_audit``'s best-effort contract (a board mutation must
+    never fail because its audit row didn't write), this is explicit,
+    on-demand maintenance (``coord housekeeping``, or the daemon's
+    low-cadence tick calling the same path) — a failure here should
+    surface to whoever ran it, not vanish into a debug log.
+    """
+    days = _resolve_operational_retention_days()
+    if days <= 0:
+        return 0
+    now = now if now is not None else time.time()
+    cutoff = now - days * 86400.0
+    conn = get_connection()
+    if dry_run:
+        row = sql.execute(
+            conn,
+            "SELECT COUNT(*) FROM audit_log WHERE tier = 'operational' AND ts < ?",
+            (cutoff,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    cur = sql.execute(
+        conn, "DELETE FROM audit_log WHERE tier = 'operational' AND ts < ?", (cutoff,),
+    )
+    conn.commit()
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
 # ── #2654: cached config reads for the two per-write resolvers below ───────

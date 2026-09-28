@@ -1987,6 +1987,9 @@ class TestGhForgeAvailabilityRecording:
         ):
             with pytest.raises(RuntimeError):
                 github_ops._gh("label", "create", "x")
+        # #3469: "app_error" observations buffer in-process too, same as
+        # "ok" (#2654) -- flush before reading the row.
+        _flush_all_ok_aggregates()
 
         row = coord_db.execute(
             "SELECT * FROM audit_log WHERE category='forge_availability'"
@@ -2000,6 +2003,9 @@ class TestGhForgeAvailabilityRecording:
         ):
             with pytest.raises(RuntimeError):
                 github_ops._gh("issue", "view", "1")
+        # #3469: "transient" observations buffer in-process too, same as
+        # "ok" (#2654) -- flush before reading the row.
+        _flush_all_ok_aggregates()
 
         row = coord_db.execute(
             "SELECT * FROM audit_log WHERE category='forge_availability'"
@@ -2403,6 +2409,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
             return_value=MagicMock(returncode=1, stdout="", stderr="GraphQL: Issue already closed"),
         ):
             github_ops.close_issue("acme/api", 42, force=True)  # must not raise
+        _flush_all_ok_aggregates()  # #3469: "app_error" buffers until flushed too
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "app_error"
 
@@ -2430,6 +2437,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         ):
             with pytest.raises(RuntimeError):
                 github_ops.reopen_issue("acme/api", 42)
+        _flush_all_ok_aggregates()  # #3469: "transient" buffers until flushed too
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "transient"
 
@@ -2450,6 +2458,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
         ):
             with pytest.raises(RuntimeError):
                 github_ops.edit_issue("acme/api", 42, title="new title")
+        _flush_all_ok_aggregates()  # #3469: "app_error" buffers until flushed too
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "app_error"
 
@@ -2487,6 +2496,7 @@ class TestDirectGhCallSitesRecordForgeAvailability:
             return_value=MagicMock(returncode=1, stdout="", stderr="run already in progress"),
         ):
             assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is False
+        _flush_all_ok_aggregates()  # #3469: "app_error" buffers until flushed too
         details = _forge_availability_rows(coord_db)
         assert details[-1]["outcome"] == "app_error"
 

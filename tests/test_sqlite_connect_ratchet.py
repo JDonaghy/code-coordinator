@@ -156,7 +156,7 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "site: it goes through tests.backends.open_named_session().",
     ),
     "test_sql_dialect.py": Classification(
-        9, (BUCKET_A,),
+        10, (BUCKET_A,),
         "The SQLite half of the dialect seam's own tests: dialect detection "
         "from a real sqlite3 connection, journal_mode=WAL, "
         "busy_timeout/query_only pragmas, a `mode=ro` URI connection. These "
@@ -168,7 +168,13 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "a writer and a reader on one file DB are the unit under test, not "
         "incidental setup — a single connection (or a `:memory:` one, which "
         "no second connection can reach) could not observe the property at "
-        "all.",
+        "all. "
+        "+1 for #3469's reclaim_space test: `VACUUM` cannot run against "
+        "coord_db's `:memory:` connection under COORD_TEST_BACKEND=postgres "
+        "(it would dispatch to the Postgres branch instead, defeating the "
+        "point of pinning the SQLite branch down), so this needs a real, "
+        "file-backed sqlite3 connection regardless of which backend the rest "
+        "of the suite is running against.",
     ),
     "test_smoke_fanout_manifest_3333.py": Classification(
         4, (BUCKET_A, BUCKET_C),

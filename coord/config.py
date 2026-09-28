@@ -1658,15 +1658,21 @@ class StoreConfig:
 
 @dataclass
 class AuditConfig:
-    """``audit:`` block (#1036/#1038) — the append-only ``audit_log``
+    """``audit:`` block (#1036/#1038/#3469) — the append-only ``audit_log``
     table's tunables.
 
-    ``max_rows`` is a future retention cap, not a pruning sweep: when set
-    above the default ``0`` (unlimited), :func:`coord.audit.record_audit`
-    opportunistically deletes the oldest rows past that count after every
-    insert.  ``0`` means keep everything forever — the default for this
-    milestone, since retention policy is explicitly out of scope (see the
-    issue's "Out of scope" section).
+    ``max_rows`` is a **tier-blind** retention cap, not a pruning sweep: when
+    set above the default ``0`` (unlimited), :func:`coord.audit._maybe_trim`
+    opportunistically deletes the oldest rows *by ``id``, across every tier*
+    past that count after every insert. Plainly: capping ``max_rows`` on a
+    busy ``operational``-tier writer (e.g. #1896's ``forge_availability``)
+    can just as easily delete ``business``-tier history (dispatch / test /
+    review / merge verdicts) to make room — it has no concept of tier at
+    all. ``0`` means keep everything forever, still the default (retention
+    policy was explicitly out of scope for the milestone that introduced
+    this field). Use ``operational_retention_days`` below when the intent is
+    "bound the operational tier without ever touching business rows" —
+    that is the tier-aware knob #3469 added for exactly this gap.
 
     ``level`` (#1038) selects how much of the audit taxonomy is captured:
     ``"business"`` records only real board transitions (dispatch, verdicts,
@@ -1676,10 +1682,39 @@ class AuditConfig:
     ``tier="operational"``, ``actor="daemon"``.  Business-tier rows are
     always recorded regardless of ``level`` — this only gates the
     operational tier.
+
+    ``operational_retention_days`` (#3469) is a time-window retention sweep
+    scoped to ``tier="operational"`` rows only — :func:`coord.audit.
+    sweep_operational_retention` deletes ``operational`` rows older than
+    this many days and never touches a ``business`` row, no matter how old.
+    Default ``0`` disables the sweep entirely (today's behaviour: keep
+    everything). Wired into :func:`coord.housekeeping.sweep`'s low-cadence
+    tick, same as every other retention sweep in this codebase.
     """
 
     max_rows: int = 0
     level: str = "operational"
+    operational_retention_days: float = 0.0
+
+
+@dataclass
+class ForgeAvailabilityConfig:
+    """``forge_availability:`` block (#3469) — retention tuning for the
+    ``category="forge_availability"`` rows :mod:`coord.forge_availability`
+    writes into ``audit_log`` (#1896/#2654/#2988).
+
+    ``retention_days`` bounds how long a ``forge_availability`` row survives
+    before :func:`coord.forge_availability._maybe_prune` deletes it. Default
+    (30) is scoped to what ``coord diagnose --forge-availability`` actually
+    reads by default (its own ``--window-days`` defaults to 30) rather than
+    the historical hardcoded 90 — #3469 measured the 90-day steady state at
+    ~9M rows / ~3GB for this one category alone. ``90`` remains the
+    documented ceiling (:data:`coord.forge_availability.RETENTION_DAYS`):
+    any configured value above it is silently clamped down to 90, never up
+    — a config typo should not accidentally uncap the sweep.
+    """
+
+    retention_days: float = 30.0
 
 
 @dataclass
@@ -2439,6 +2474,9 @@ class Config:
     milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
+    forge_availability: ForgeAvailabilityConfig = field(
+        default_factory=ForgeAvailabilityConfig
+    )
     pricing: PricingConfig = field(default_factory=PricingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
     # #1632 — absent block == disabled == today's behaviour (silence).
@@ -2706,6 +2744,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     propagation = _parse_propagation(raw.get("propagation"))
     milestone = _parse_milestone(raw.get("milestone"))
     audit = _parse_audit(raw.get("audit"))
+    forge_availability = _parse_forge_availability(raw.get("forge_availability"))
     pricing = _parse_pricing(raw.get("pricing"))
     health = _parse_health(raw.get("health"))
     notifications = _parse_notifications(raw.get("notifications"))
@@ -2731,6 +2770,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         milestone=milestone,
         providers=providers,
         audit=audit,
+        forge_availability=forge_availability,
         pricing=pricing,
         health=health,
         notifications=notifications,
@@ -4626,6 +4666,34 @@ def _parse_audit(raw: Any) -> AuditConfig:
                 f"audit.level must be one of {_VALID_AUDIT_LEVELS!r}, got {value!r}"
             )
         cfg.level = value
+    if "operational_retention_days" in raw:
+        value = raw["operational_retention_days"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ConfigError(
+                "audit.operational_retention_days must be a non-negative number"
+            )
+        cfg.operational_retention_days = float(value)
+    return cfg
+
+
+def _parse_forge_availability(raw: Any) -> ForgeAvailabilityConfig:
+    """Parse the optional ``forge_availability:`` block (#3469).
+
+    An absent block returns ``ForgeAvailabilityConfig()`` — the new 30-day
+    default, itself a deliberate change from the pre-#3469 hardcoded 90-day
+    retention (see that dataclass's docstring for the measured why).
+    """
+    if raw is None:
+        return ForgeAvailabilityConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'forge_availability' must be a mapping")
+
+    cfg = ForgeAvailabilityConfig()
+    if "retention_days" in raw:
+        value = raw["retention_days"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError("forge_availability.retention_days must be a positive number")
+        cfg.retention_days = float(value)
     return cfg
 
 
