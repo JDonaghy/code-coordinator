@@ -20,6 +20,7 @@ coordinator.yml
 .pytest.out
 .pytest.rerun.out
 .pytest.baseline.out
+.pytest.baseline-confirm.out
 .pytest-acceptance.out
 .pytest-populated-home.out
 .cargo.out
