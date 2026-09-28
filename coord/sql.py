@@ -57,10 +57,13 @@ text for the same intent.
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlsplit, urlunsplit
+
+_log = logging.getLogger(__name__)
 
 # ── dialects ──────────────────────────────────────────────────────────────
 #
@@ -1259,6 +1262,15 @@ def reclaim_space(conn: Any) -> None:
     reclaims dead-tuple space for reuse rather than shrinking the file on
     disk the way SQLite's does -- the DBA-standard tradeoff against
     ``VACUUM FULL``'s exclusive table lock, deliberately not used here.
+
+    Both branches' pre-``VACUUM`` ``commit()`` swallow a failure rather than
+    raising it: every current caller already commits before invoking this
+    function, so "nothing pending" is the overwhelmingly common case and a
+    failure here is not this function's to interpret. It is logged (not
+    silently dropped) so a real failure -- e.g. a lock conflict -- is still
+    visible; ``VACUUM`` itself is then attempted regardless and its own
+    failure, if the commit failure was in fact the underlying cause,
+    propagates normally.
     """
     dialect = detect_dialect(conn)
     if dialect == DIALECT_SQLITE:
@@ -1268,8 +1280,11 @@ def reclaim_space(conn: Any) -> None:
         # committing before invoking this function.
         try:
             conn.commit()
-        except Exception:  # noqa: BLE001 -- nothing pending is the common case
-            pass
+        except Exception:  # noqa: BLE001 -- nothing pending is the common case; logged below
+            _log.warning(
+                "reclaim_space: pre-VACUUM commit() failed (sqlite) -- "
+                "proceeding to VACUUM anyway", exc_info=True,
+            )
         execute(conn, "VACUUM")
         return
     if dialect == DIALECT_POSTGRES:
@@ -1277,8 +1292,11 @@ def reclaim_space(conn: Any) -> None:
         previous_autocommit = getattr(real_conn, "autocommit", None)
         try:
             real_conn.commit()
-        except Exception:  # noqa: BLE001 -- nothing pending is the common case
-            pass
+        except Exception:  # noqa: BLE001 -- nothing pending is the common case; logged below
+            _log.warning(
+                "reclaim_space: pre-VACUUM commit() failed (postgres) -- "
+                "proceeding to VACUUM anyway", exc_info=True,
+            )
         try:
             real_conn.autocommit = True
             execute(conn, "VACUUM")
