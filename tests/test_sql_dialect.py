@@ -614,6 +614,33 @@ def test_reclaim_space_sqlite_runs_vacuum(tmp_path):
         conn.close()
 
 
+class _FakeSqliteReclaimConnection(_FakeConnection):
+    """Spies on `commit` -- the SQLite branch must commit any pending work
+    before `VACUUM`, mirroring the Postgres branch below, rather than
+    relying on every caller having already committed (#3469 review nit:
+    every current caller does, but the asymmetry made the SQLite path
+    fragile to a future one that doesn't)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.commit_calls = 0
+
+    def commit(self):
+        self.commit_calls += 1
+
+
+_FakeSqliteReclaimConnection.__module__ = "sqlite3"
+
+
+def test_reclaim_space_sqlite_commits_pending_work_before_vacuum():
+    conn = _FakeSqliteReclaimConnection()
+
+    sql.reclaim_space(conn)
+
+    assert conn.commit_calls == 1
+    assert conn.cur.executed == [("VACUUM", ())]
+
+
 class _FakePostgresReclaimConnection(_FakeConnection):
     """Spies on `commit`/`autocommit` -- `sql.reclaim_space`'s Postgres
     branch must commit any pending work, flip `autocommit` on for the

@@ -1262,6 +1262,14 @@ def reclaim_space(conn: Any) -> None:
     """
     dialect = detect_dialect(conn)
     if dialect == DIALECT_SQLITE:
+        # Mirror the Postgres branch below: commit any pending work first so
+        # this is never the thing that turns "caller forgot to commit" into
+        # a lost write, rather than relying on every current caller already
+        # committing before invoking this function.
+        try:
+            conn.commit()
+        except Exception:  # noqa: BLE001 -- nothing pending is the common case
+            pass
         execute(conn, "VACUUM")
         return
     if dialect == DIALECT_POSTGRES:

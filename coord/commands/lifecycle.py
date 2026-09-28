@@ -30,23 +30,47 @@ def _print_housekeeping_result(resp: dict) -> None:
     # this sweep did, so a run that only reclaimed leaked worktrees must not
     # print "nothing to archive" and hide it.
     removed_wt = resp.get("removed_confirm_worktrees", 0)
-    if not archived_a and not archived_n and not removed_wt:
+    # #3469: the operational-tier audit retention sweep runs unconditionally
+    # (its own knob, its own window — see `coord.housekeeping.sweep`'s
+    # docstring), independent of everything above, and must be reported on
+    # its own terms too: once `audit.operational_retention_days` is turned
+    # on, a tick that *only* deletes stale operational audit rows will be
+    # the common case, and silently folding it into the "nothing to
+    # archive" branch would hide the one thing #3469 exists to report.
+    audit_deleted = resp.get("audit_operational_deleted", 0)
+    # #3469: `reclaim=True` can be the only thing a run did (e.g. an
+    # operator running `coord housekeeping --reclaim` against a DB with
+    # nothing currently stale) — it must not go unreported just because
+    # nothing else fired.
+    reclaimed = bool(resp.get("reclaimed"))
+    nothing_archived = not archived_a and not archived_n and not removed_wt and not audit_deleted
+    if nothing_archived:
         click.echo(
             f"housekeeping: nothing to archive (no terminal rows older than {days}d)."
         )
-        return
-    verb = "would archive" if dry else "archived"
-    suffix = "  (dry-run — nothing moved)" if dry else ""
-    click.echo(
-        f"housekeeping: {verb} {archived_a} assignment(s) + "
-        f"{archived_n} notification(s) (terminal, older than {days}d).{suffix}"
-    )
+        if not reclaimed:
+            return
+    if archived_a or archived_n:
+        verb = "would archive" if dry else "archived"
+        suffix = "  (dry-run — nothing moved)" if dry else ""
+        click.echo(
+            f"housekeeping: {verb} {archived_a} assignment(s) + "
+            f"{archived_n} notification(s) (terminal, older than {days}d).{suffix}"
+        )
     if removed_wt:
         wt_verb = "would remove" if dry else "removed"
         click.echo(
             f"housekeeping: {wt_verb} {removed_wt} stale confirm-worktree(s) "
             "(#2974)."
         )
+    if audit_deleted:
+        audit_verb = "would delete" if dry else "deleted"
+        click.echo(
+            f"housekeeping: {audit_verb} {audit_deleted} stale operational "
+            "audit_log row(s) (#3469)."
+        )
+    if reclaimed:
+        click.echo("housekeeping: reclaimed disk space (VACUUM) (#3469).")
 
 
 @click.command(
@@ -58,8 +82,11 @@ def _print_housekeeping_result(resp: dict) -> None:
         "Moves terminal assignments older than COORD_ARCHIVE_RETENTION_DAYS "
         "(default 30) + their notifications into assignments_archive / "
         "notifications_archive — it NEVER deletes, and never touches active, "
-        "recent, merge-queued, open-issue-latest, or review-linked rows. Routes "
-        "through the daemon (the canonical DB lives there)."
+        "recent, merge-queued, open-issue-latest, or review-linked rows. Also "
+        "runs the #3469 operational-tier audit_log retention sweep (deletes "
+        "stale tier='operational' rows only, per audit.operational_retention_days "
+        "— business-tier rows are never touched). Routes through the daemon "
+        "(the canonical DB lives there)."
     ),
 )
 
@@ -69,9 +96,18 @@ def _print_housekeeping_result(resp: dict) -> None:
     is_flag=True,
     help="Report what would be archived without moving anything.",
 )
-
-
-def housekeeping(dry_run: bool) -> None:
+@click.option(
+    "--reclaim",
+    is_flag=True,
+    help=(
+        "#3469: after every archive/delete above has run, also run a "
+        "dialect-routed space-reclaim pass (SQLite VACUUM; Postgres VACUUM) "
+        "so a retention sweep's DELETEs actually shrink the on-disk DB "
+        "artifact. One-off, operator-invoked — never run automatically by "
+        "the daemon's low-cadence tick. No-op when combined with --dry-run."
+    ),
+)
+def housekeeping(dry_run: bool, reclaim: bool) -> None:
     """#762: archive stale terminal board rows (active/recent/referenced kept)."""
     from coord.board_service import daemon_reroute_target  # noqa: PLC0415
 
@@ -80,7 +116,12 @@ def housekeeping(dry_run: bool) -> None:
         from coord.client import post_record  # noqa: PLC0415
 
         try:
-            resp = post_record(_svc, "/housekeeping", {"dry_run": dry_run}, timeout=180.0)
+            resp = post_record(
+                _svc,
+                "/housekeeping",
+                {"dry_run": dry_run, "reclaim": reclaim},
+                timeout=180.0,
+            )
         except Exception as exc:  # noqa: BLE001
             click.echo(f"error: housekeeping via daemon failed: {exc}", err=True)
             sys.exit(1)
@@ -89,7 +130,7 @@ def housekeeping(dry_run: bool) -> None:
 
     from coord import housekeeping as _hk  # noqa: PLC0415
 
-    _print_housekeeping_result(_hk.sweep(dry_run=dry_run))
+    _print_housekeeping_result(_hk.sweep(dry_run=dry_run, reclaim=reclaim))
 
 
 @click.command(help="Poll agents and post completion/failure comments on GitHub.")

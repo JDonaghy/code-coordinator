@@ -1712,6 +1712,13 @@ class ForgeAvailabilityConfig:
     documented ceiling (:data:`coord.forge_availability.RETENTION_DAYS`):
     any configured value above it is silently clamped down to 90, never up
     — a config typo should not accidentally uncap the sweep.
+
+    Note the ``0`` asymmetry against ``AuditConfig.operational_retention_days``
+    above: there ``0`` means "sweep disabled, keep everything forever". Here
+    ``0``/negative is rejected outright (must be a positive number) — there is
+    no "never prune forge_availability" concept, since #1896/#2654/#2988 is
+    exactly the unbounded-growth problem this knob exists to prevent, and
+    disabling it by config would silently reopen that gap.
     """
 
     retention_days: float = 30.0

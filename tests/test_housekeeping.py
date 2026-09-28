@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
+from click.testing import CliRunner
 
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
@@ -332,3 +334,115 @@ def test_reclaim_space_runs_vacuum_on_sqlite(coord_db):
     from coord import housekeeping
 
     assert housekeeping.reclaim_space(coord_db) is True
+
+
+# ── #3469 review: `--reclaim` must actually be reachable from an operator ──
+#
+# `sweep(reclaim=...)`/`reclaim_space()` above were real from the start, but
+# nothing operator-facing could ever pass `reclaim=True`: `coord housekeeping`
+# only accepted `--dry-run`, and the daemon's `POST /housekeeping` route only
+# read `dry_run` out of the request body. These tests pin the two surfaces
+# that close that gap so the wiring can't silently regress back to
+# unreachable.
+
+def test_cli_housekeeping_reclaim_flag_runs_local_sweep_with_reclaim(coord_db, monkeypatch):
+    """`coord housekeeping --reclaim`, run with no board service configured
+    (i.e. this process *is* local/host mode), must call `housekeeping.sweep`
+    with `reclaim=True` -- not just leave the flag on the ground."""
+    from coord.cli import main
+
+    monkeypatch.setattr("coord.board_service.resolve", lambda: None)
+    fake_result = {
+        "archived_assignments": 0, "archived_notifications": 0,
+        "removed_confirm_worktrees": 0, "audit_operational_deleted": 0,
+        "reclaimed": True, "dry_run": False, "retention_days": 30,
+    }
+    with patch("coord.housekeeping.sweep", return_value=fake_result) as mock_sweep:
+        runner = CliRunner()
+        result = runner.invoke(main, ["housekeeping", "--reclaim"])
+
+    assert result.exit_code == 0, result.output
+    mock_sweep.assert_called_once_with(dry_run=False, reclaim=True)
+    assert "reclaimed disk space" in result.output
+
+
+def test_cli_housekeeping_without_reclaim_flag_defaults_reclaim_false(coord_db, monkeypatch):
+    from coord.cli import main
+
+    monkeypatch.setattr("coord.board_service.resolve", lambda: None)
+    fake_result = {
+        "archived_assignments": 0, "archived_notifications": 0,
+        "removed_confirm_worktrees": 0, "audit_operational_deleted": 0,
+        "reclaimed": False, "dry_run": False, "retention_days": 30,
+    }
+    with patch("coord.housekeeping.sweep", return_value=fake_result) as mock_sweep:
+        runner = CliRunner()
+        result = runner.invoke(main, ["housekeeping"])
+
+    assert result.exit_code == 0, result.output
+    mock_sweep.assert_called_once_with(dry_run=False, reclaim=False)
+
+
+def test_cli_housekeeping_reclaim_flag_posts_to_daemon_when_board_service_configured(
+    coord_db, monkeypatch
+):
+    """Thin-client mode: `coord housekeeping --reclaim` must forward
+    `reclaim: true` in the POST /housekeeping body, not just `dry_run`."""
+    from coord.cli import main
+
+    fake_service = object()
+    monkeypatch.setattr("coord.board_service.resolve", lambda: fake_service)
+    fake_result = {
+        "archived_assignments": 0, "archived_notifications": 0,
+        "removed_confirm_worktrees": 0, "audit_operational_deleted": 0,
+        "reclaimed": True, "dry_run": False, "retention_days": 30,
+    }
+    mock_post = MagicMock(return_value=fake_result)
+    with patch("coord.client.post_record", mock_post):
+        runner = CliRunner()
+        result = runner.invoke(main, ["housekeeping", "--reclaim"])
+
+    assert result.exit_code == 0, result.output
+    args, kwargs = mock_post.call_args
+    assert args[0] is fake_service
+    assert args[1] == "/housekeeping"
+    assert args[2] == {"dry_run": False, "reclaim": True}
+
+
+def test_post_housekeeping_route_passes_reclaim_flag_through_to_sweep(
+    file_db, monkeypatch, valid_config_path
+):
+    """The daemon's `POST /housekeeping` handler must read `reclaim` out of
+    the request body and pass it to `housekeeping.sweep`, mirroring `dry_run`
+    -- this is the other half of the operator-facing surface #3469's `--reclaim`
+    needs to actually reach `sql.reclaim_space`.  Reuses the module's `file_db`
+    fixture (see above) rather than opening a fresh `sqlite3.connect` --
+    #2884's ratchet pins the connect-site count per test file."""
+    from starlette.testclient import TestClient
+
+    from coord.config import load as load_config
+    from coord.serve_app import build_app
+
+    path, _conn = file_db
+
+    captured = {}
+
+    def _fake_sweep(*, dry_run=False, reclaim=False, now=None):
+        captured["dry_run"] = dry_run
+        captured["reclaim"] = reclaim
+        return {
+            "archived_assignments": 0, "archived_notifications": 0,
+            "removed_confirm_worktrees": 0, "audit_operational_deleted": 0,
+            "reclaimed": reclaim, "dry_run": dry_run, "retention_days": 30,
+        }
+
+    monkeypatch.setattr("coord.housekeeping.sweep", _fake_sweep)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(path), cfg)
+    with TestClient(app) as cli:
+        resp = cli.post("/housekeeping", json={"dry_run": False, "reclaim": True})
+
+    assert resp.status_code == 200, resp.text
+    assert captured == {"dry_run": False, "reclaim": True}
+    assert resp.json()["reclaimed"] is True
