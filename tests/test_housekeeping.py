@@ -14,6 +14,7 @@ route), not just a pure helper — the same shape as `tests/test_board_cap_762.p
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from unittest.mock import MagicMock, patch
@@ -344,8 +345,23 @@ def test_reclaim_space_runs_vacuum_on_sqlite(coord_db):
 # read `dry_run` out of the request body. These tests pin the two surfaces
 # that close that gap so the wiring can't silently regress back to
 # unreachable.
+#
+# All three `coord housekeeping` CLI tests below delenv COORD_HOUSEKEEPING_ON_
+# DAEMON first. `coord.board_service.daemon_reroute_target` reads it straight
+# off `os.environ`, so an ambient value decides local-vs-daemon routing before
+# any monkeypatched `resolve()` is even consulted -- and a daemon host really
+# does export it. Isolating the test is the fix for that class (CLAUDE.md /
+# #2170), not trusting the ambient environment.
 
-def test_cli_housekeeping_reclaim_flag_runs_local_sweep_with_reclaim(coord_db, monkeypatch):
+@pytest.fixture
+def _no_housekeeping_on_daemon(monkeypatch):
+    """Guarantee `COORD_HOUSEKEEPING_ON_DAEMON` is unset for one test."""
+    monkeypatch.delenv("COORD_HOUSEKEEPING_ON_DAEMON", raising=False)
+
+
+def test_cli_housekeeping_reclaim_flag_runs_local_sweep_with_reclaim(
+    coord_db, monkeypatch, _no_housekeeping_on_daemon
+):
     """`coord housekeeping --reclaim`, run with no board service configured
     (i.e. this process *is* local/host mode), must call `housekeeping.sweep`
     with `reclaim=True` -- not just leave the flag on the ground."""
@@ -366,7 +382,9 @@ def test_cli_housekeeping_reclaim_flag_runs_local_sweep_with_reclaim(coord_db, m
     assert "reclaimed disk space" in result.output
 
 
-def test_cli_housekeeping_without_reclaim_flag_defaults_reclaim_false(coord_db, monkeypatch):
+def test_cli_housekeeping_without_reclaim_flag_defaults_reclaim_false(
+    coord_db, monkeypatch, _no_housekeeping_on_daemon
+):
     from coord.cli import main
 
     monkeypatch.setattr("coord.board_service.resolve", lambda: None)
@@ -384,7 +402,7 @@ def test_cli_housekeeping_without_reclaim_flag_defaults_reclaim_false(coord_db, 
 
 
 def test_cli_housekeeping_reclaim_flag_posts_to_daemon_when_board_service_configured(
-    coord_db, monkeypatch
+    coord_db, monkeypatch, _no_housekeeping_on_daemon
 ):
     """Thin-client mode: `coord housekeeping --reclaim` must forward
     `reclaim: true` in the POST /housekeeping body, not just `dry_run`."""
@@ -446,3 +464,76 @@ def test_post_housekeeping_route_passes_reclaim_flag_through_to_sweep(
     assert resp.status_code == 200, resp.text
     assert captured == {"dry_run": False, "reclaim": True}
     assert resp.json()["reclaimed"] is True
+
+
+def test_post_housekeeping_route_does_not_leak_on_daemon_env_var(
+    file_db, monkeypatch, valid_config_path, _no_housekeeping_on_daemon
+):
+    """`POST /housekeeping` must scope its `COORD_HOUSEKEEPING_ON_DAEMON`
+    re-route guard to the request and restore it afterwards, exactly like
+    every sibling route in `coord.serve_app` (`COORD_MERGE_ON_DAEMON`,
+    `COORD_RECONCILE_ON_DAEMON`, `COORD_DIAGNOSE_ON_DAEMON`, ...).
+
+    It used to set it and never unset it. `os.environ` is process-global, so
+    one POST permanently convinced everything else in that process that it
+    *was* the daemon -- which is exactly how `coord housekeeping` on a
+    thin client silently stopped routing to the daemon and swept its own
+    empty local DB instead.  Black-box: drives the real ASGI app and asserts
+    on the process environment either side of the request.
+    """
+    from starlette.testclient import TestClient
+
+    from coord.config import load as load_config
+    from coord.serve_app import build_app
+
+    path, _conn = file_db
+    seen_inside = {}
+
+    def _fake_sweep(*, dry_run=False, reclaim=False, now=None):
+        # The guard must be ACTIVE while the sweep runs -- restoring it must
+        # not weaken what it is there for.
+        seen_inside["value"] = os.environ.get("COORD_HOUSEKEEPING_ON_DAEMON")
+        return {
+            "archived_assignments": 0, "archived_notifications": 0,
+            "removed_confirm_worktrees": 0, "audit_operational_deleted": 0,
+            "reclaimed": False, "dry_run": dry_run, "retention_days": 30,
+        }
+
+    monkeypatch.setattr("coord.housekeeping.sweep", _fake_sweep)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(path), cfg)
+    with TestClient(app) as cli:
+        assert cli.post("/housekeeping", json={}).status_code == 200
+
+    assert seen_inside["value"] == "1"
+    assert "COORD_HOUSEKEEPING_ON_DAEMON" not in os.environ
+
+
+def test_post_housekeeping_route_restores_preexisting_on_daemon_env_var(
+    file_db, monkeypatch, valid_config_path
+):
+    """The restore is a restore, not a delete: a value that was already set
+    (a real daemon host exports it) survives the request unchanged."""
+    from starlette.testclient import TestClient
+
+    from coord.config import load as load_config
+    from coord.serve_app import build_app
+
+    path, _conn = file_db
+    monkeypatch.setenv("COORD_HOUSEKEEPING_ON_DAEMON", "preexisting")
+    monkeypatch.setattr(
+        "coord.housekeeping.sweep",
+        lambda **_kw: {
+            "archived_assignments": 0, "archived_notifications": 0,
+            "removed_confirm_worktrees": 0, "audit_operational_deleted": 0,
+            "reclaimed": False, "dry_run": False, "retention_days": 30,
+        },
+    )
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(path), cfg)
+    with TestClient(app) as cli:
+        assert cli.post("/housekeeping", json={}).status_code == 200
+
+    assert os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] == "preexisting"

@@ -10716,6 +10716,18 @@ def build_app(
             body = {}
         dry_run = bool(body.get("dry_run", False))
         reclaim = bool(body.get("reclaim", False))
+        # Save/restore rather than set-and-forget: every sibling re-route
+        # guard in this module (COORD_MERGE_ON_DAEMON, COORD_RECONCILE_ON_
+        # DAEMON, COORD_DIAGNOSE_ON_DAEMON, COORD_NOTIFY_ON_DAEMON, ...) is
+        # scoped to the request with a `finally`; this one alone leaked, so
+        # a single POST left `COORD_HOUSEKEEPING_ON_DAEMON=1` set for the
+        # remaining life of the process. `os.environ` is process-global, so
+        # in-process that permanently turned every later `coord
+        # housekeeping` invocation into "I AM the daemon, run locally" — it
+        # is what made `tests/test_board_cap_762.py` (which POSTs here) able
+        # to break a later file's CLI-routing test in the same pytest
+        # process.
+        prev = os.environ.get("COORD_HOUSEKEEPING_ON_DAEMON")
         os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = "1"
         try:
             result = await run_in_threadpool(
@@ -10725,6 +10737,11 @@ def build_app(
             return JSONResponse(
                 {"error": "housekeeping failed", "detail": str(e)}, status_code=503
             )
+        finally:
+            if prev is None:
+                os.environ.pop("COORD_HOUSEKEEPING_ON_DAEMON", None)
+            else:
+                os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = prev
         return JSONResponse(result)
 
     async def post_reap_merged_sessions(request: Request) -> Response:
@@ -11568,8 +11585,19 @@ def build_app(
                     try:
                         from coord import housekeeping as _hk  # noqa: PLC0415
 
+                        # Scoped to this tick, not set-and-forget — see
+                        # `post_housekeeping` above for why leaking a
+                        # process-global re-route guard is a real defect
+                        # rather than a harmless no-op.
+                        _prev_hk = os.environ.get("COORD_HOUSEKEEPING_ON_DAEMON")
                         os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = "1"
-                        swept = await run_in_threadpool(_hk.sweep)
+                        try:
+                            swept = await run_in_threadpool(_hk.sweep)
+                        finally:
+                            if _prev_hk is None:
+                                os.environ.pop("COORD_HOUSEKEEPING_ON_DAEMON", None)
+                            else:
+                                os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = _prev_hk
                         if (
                             swept.get("archived_assignments")
                             or swept.get("archived_notifications")
