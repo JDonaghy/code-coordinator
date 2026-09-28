@@ -107,13 +107,26 @@ server = [
 # than surfacing a bare `ModuleNotFoundError`; `tests/backends.py` does the
 # same for the test suite's own `COORD_TEST_BACKEND=postgres` opt-in.
 postgres = ["psycopg[binary]>=3.1"]
+# #3472: the `xlsx` report-export writer. Optional, same reasoning as
+# `postgres` above but folded into `all`/`dev` (unlike postgres) because it
+# is pure-Python, has no C-extension/version-skew cost, and both `coord
+# report run --format xlsx` and the daemon's `GET /report/{id}?format=xlsx`
+# want it available out of the box on a full node. `coord/reports.py`'s
+# `result_to_xlsx` guards the import and raises `XlsxExtraMissingError`
+# naming this extra rather than a bare `ModuleNotFoundError` when it is
+# absent (a bare client install, or `server` without `reports-xlsx`).
+reports-xlsx = ["openpyxl>=3.1"]
 # Convenience alias: "give me everything a full node runs".
-all = ["code-coordinator[server]"]
+all = ["code-coordinator[server]", "code-coordinator[reports-xlsx]"]
 dev = [
     # The test suite exercises serve_app/agent_app/dashboard end to end, so a
     # dev install is necessarily a full-fat install. Self-referential extra
     # (PEP 621) so there is exactly one list of server deps to keep current.
     "code-coordinator[server]",
+    # Needed so the xlsx round-trip tests (tests/test_reports.py) run by
+    # default rather than skipping — #3472's acceptance bar is a real
+    # read-back through openpyxl, not just "the code path didn't crash".
+    "code-coordinator[reports-xlsx]",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     # Parallel test execution. The suite is the dominant cost of the Test gate

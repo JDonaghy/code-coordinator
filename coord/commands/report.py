@@ -12,18 +12,24 @@ one report as a plain table plus its notes block; ``--format json`` emits
 the ``ReportResult`` verbatim — the same bytes the daemon's
 ``GET /report/{id}`` returns for the same window.
 
-``--format csv`` (#1765) writes the machine-readable form to stdout, so it
-pipes and redirects normally.  It calls :func:`coord.reports.result_to_csv`
-on the **raw wire result** — the same function, on the same input, that
-``GET /report/{id}?format=csv`` calls — rather than re-serialising the human
-table above.  That is deliberate and load-bearing twice over: it is why the
-CLI and the daemon emit identical bytes, and it is why ``started_at``
-exports as an epoch instead of the ``13h ago`` that ``_format_cell``
-renders.  ``--json`` survives as a hidden alias for ``--format json``.
+``--format csv|ndjson|md|xlsx`` (#1765, extended by #3472) write a
+machine/human-readable export to stdout, so it pipes and redirects normally.
+Each one dispatches through :data:`coord.reports.EXPORT_FORMATS` on the
+**raw wire result** — the same table, on the same input, that
+``GET /report/{id}?format=<fmt>`` dispatches through — rather than
+re-serialising the human table above.  That is deliberate and load-bearing
+twice over: it is why the CLI and the daemon emit identical bytes, and it is
+why ``started_at`` exports as an epoch (or a real Excel datetime cell for
+``xlsx``) instead of the ``13h ago`` that ``_format_cell`` renders.
+``--format xlsx`` needs the optional ``reports-xlsx`` extra
+(``openpyxl``); without it, this exits ``2`` with a message naming the
+extra rather than a crash.  ``--json`` survives as a hidden alias for
+``--format json``.
 
 Exit codes: ``2`` for a bad request (unknown report, unknown parameter, bad
-value — the message names what was allowed), ``1`` for a read/transport
-failure.  Never a traceback for either.
+value, or ``--format xlsx`` without the extra installed — the message names
+what was allowed/needed), ``1`` for a read/transport failure.  Never a
+traceback for either.
 """
 
 from __future__ import annotations
@@ -265,10 +271,14 @@ def report_list(
 )
 @click.option(
     "--format", "output_format",
-    type=click.Choice(["table", "json", "csv"]),
+    type=click.Choice(["table", "json", "csv", "ndjson", "md", "xlsx"]),
     default="table",
     show_default=True,
-    help="Output encoding: human table, raw ReportResult JSON, or CSV.",
+    help=(
+        "Output encoding: human table, raw ReportResult JSON, CSV, "
+        "newline-delimited JSON, a markdown table, or an .xlsx workbook "
+        "(#3472; needs the 'reports-xlsx' extra)."
+    ),
 )
 @click.option(
     "--json", "legacy_json", is_flag=True, default=False, hidden=True,
@@ -318,18 +328,29 @@ def report_run(
         click.echo(_json.dumps(result, indent=2, default=str))
         return
 
-    if output_format == "csv":
-        # #1765: the *server's* serializer, applied to the raw wire result —
-        # never a re-serialisation of the human table. That is what makes
-        # these bytes identical to `GET /report/{id}?format=csv`, and what
-        # keeps `started_at` an epoch instead of the `13h ago` this module
-        # renders two functions up.
-        from coord.reports import result_to_csv  # noqa: PLC0415
+    if output_format in ("csv", "ndjson", "md", "xlsx"):
+        # #1765 / #3472: the *server's* serializer, applied to the raw wire
+        # result — never a re-serialisation of the human table. That is what
+        # makes these bytes identical to `GET /report/{id}?format=<fmt>`, and
+        # what keeps `started_at` an epoch instead of the `13h ago` this
+        # module renders two functions up. `EXPORT_FORMATS` is the single
+        # table every surface (CLI, daemon, dashboard) dispatches through —
+        # see `coord.reports.EXPORT_FORMATS`.
+        from coord.reports import EXPORT_FORMATS, XlsxExtraMissingError  # noqa: PLC0415
 
-        # nl=False: the serializer already terminates every line, and click
-        # would otherwise append a stray blank line that the daemon's bytes
-        # do not have.
-        click.echo(result_to_csv(result), nl=False)
+        export = EXPORT_FORMATS[output_format]
+        try:
+            body = export.serialize(result)
+        except XlsxExtraMissingError as e:
+            click.echo(f"error: {e}", err=True)
+            raise SystemExit(2) from e
+        # nl=False: the serializer already terminates every line (text
+        # formats) or is a self-contained binary blob (xlsx), and click
+        # would otherwise append a stray blank line/byte that the daemon's
+        # bytes do not have. click.echo writes bytes straight to the binary
+        # stream when given bytes, so xlsx round-trips undamaged even on a
+        # platform whose stdout does newline translation.
+        click.echo(body, nl=False)
         return
 
     window = result.get("window") or [None, None]

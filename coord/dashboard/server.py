@@ -1740,12 +1740,20 @@ def openapi_spec() -> dict:
                         "name": "format",
                         "in": "query",
                         "required": False,
-                        "schema": {"type": "string", "enum": ["json", "csv"]},
+                        "schema": {
+                            "type": "string",
+                            "enum": ["json", "csv", "ndjson", "md", "xlsx"],
+                        },
                         "description": (
-                            "#1765: response encoding. Absent/`json` returns "
-                            "the ReportResult unchanged; `csv` returns "
-                            "text/csv (raw values, `#`-prefixed notes) with "
-                            "a Content-Disposition filename."
+                            "#1765/#3472: response encoding. Absent/`json` "
+                            "returns the ReportResult unchanged; `csv` "
+                            "returns text/csv (raw values, `#`-prefixed "
+                            "notes); `ndjson` one JSON object per line; "
+                            "`md` a markdown table plus notes; `xlsx` a "
+                            "typed-cell workbook (needs the `reports-xlsx` "
+                            "extra server-side — a 400 names it if "
+                            "missing). Every non-JSON format ships a "
+                            "Content-Disposition filename."
                         ),
                     },
                 ],
@@ -1763,10 +1771,40 @@ def openapi_spec() -> dict:
                                     "lines."
                                 ),
                             },
+                            "application/x-ndjson": {
+                                "schema": {"type": "string"},
+                                "description": (
+                                    "`?format=ndjson`. One JSON object per "
+                                    "line: a leading `_meta` line, one "
+                                    "`_note` line per note, one line per "
+                                    "data row, a trailing `_totals` line "
+                                    "when the report has one."
+                                ),
+                            },
+                            "text/markdown": {
+                                "schema": {"type": "string"},
+                                "description": (
+                                    "`?format=md`. A pipe table labelled "
+                                    "from `column_meta` plus a trailing "
+                                    "`## Notes` list."
+                                ),
+                            },
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                                "schema": {"type": "string", "format": "binary"},
+                                "description": (
+                                    "`?format=xlsx`. A `Report` sheet (typed "
+                                    "cells, plus a totals row) and a `Notes` "
+                                    "sheet."
+                                ),
+                            },
                         },
                     },
                     "400": {
-                        "description": "Unknown parameter / bad parameter value / unknown format"
+                        "description": (
+                            "Unknown parameter / bad parameter value / "
+                            "unknown format / format=xlsx without the "
+                            "reports-xlsx extra installed"
+                        )
                     },
                     "404": {"description": "Unknown report id"},
                 },
@@ -3611,13 +3649,16 @@ def build_app(
 
         report_id = request.path_params["report_id"]
         params = dict(request.query_params)
-        # #1765: `format` is a *rendering* choice, not a report parameter —
-        # pop it before validation or `resolve_params` rejects it as an
-        # unknown parameter.
+        # #1765 / #3472: `format` is a *rendering* choice, not a report
+        # parameter — pop it before validation or `resolve_params` rejects
+        # it as an unknown parameter. `EXPORT_FORMATS` is the single table
+        # every surface (CLI, `coord/serve_app.py`, this route) dispatches
+        # through, so "what formats exist" is answered exactly once.
         fmt = (params.pop("format", "") or "json").strip().lower()
-        if fmt not in ("json", "csv"):
+        if fmt != "json" and fmt not in _reports.EXPORT_FORMATS:
+            allowed = ", ".join(["json", *sorted(_reports.EXPORT_FORMATS)])
             return JSONResponse(
-                {"error": f"unknown format {fmt!r} — allowed values: json, csv"},
+                {"error": f"unknown format {fmt!r} — allowed values: {allowed}"},
                 status_code=400,
             )
         try:
@@ -3633,15 +3674,23 @@ def build_app(
             return JSONResponse(
                 {"error": "report run failed", "detail": str(e)}, status_code=503
             )
-        if fmt == "csv":
+        if fmt != "json":
             # Same serializer the CLI calls, so `coord report run --format
-            # csv` and this route emit identical bytes for identical params.
+            # <fmt>` and this route emit identical bytes for identical
+            # params. `format=xlsx` without the optional `reports-xlsx`
+            # extra installed raises XlsxExtraMissingError (a ReportError)
+            # rather than crashing — surfaced as a 400 naming the extra.
+            export = _reports.EXPORT_FORMATS[fmt]
+            try:
+                body = await run_in_threadpool(export.serialize, result)
+            except _reports.XlsxExtraMissingError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
             return Response(
-                _reports.result_to_csv(result),
-                media_type="text/csv; charset=utf-8",
+                body,
+                media_type=export.media_type,
                 headers={
                     "Content-Disposition": (
-                        f'attachment; filename="{_reports.csv_filename(result)}"'
+                        f'attachment; filename="{export.filename(result)}"'
                     )
                 },
             )
