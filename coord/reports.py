@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -129,6 +130,15 @@ __all__ = [
     "parse_duration",
     "result_to_csv",
     "csv_filename",
+    "XlsxExtraMissingError",
+    "result_to_ndjson",
+    "ndjson_filename",
+    "result_to_md",
+    "md_filename",
+    "result_to_xlsx",
+    "xlsx_filename",
+    "EXPORT_FORMATS",
+    "report_filename",
 ]
 
 
@@ -142,6 +152,18 @@ class ReportError(ValueError):
 
 class UnknownReportError(ReportError):
     """The requested ``report_id`` is not in :data:`REPORTS` (daemon: 404)."""
+
+
+class XlsxExtraMissingError(ReportError):
+    """``format=xlsx`` requested without the writer dependency installed.
+
+    #3472: xlsx support needs ``openpyxl``, which lives in the optional
+    ``reports-xlsx`` extra (``pip install 'code-coordinator[reports-xlsx]'``)
+    — never a base/server dependency, so a caller that never asks for xlsx
+    pays nothing for it. Both the CLI (``coord.commands.report``) and the
+    daemon/dashboard routes catch this and turn it into a clean CLI error /
+    400 that names the extra, never a raw ``ModuleNotFoundError`` traceback.
+    """
 
 
 # ── parameter / definition / result shapes ─────────────────────────────────
@@ -4731,12 +4753,15 @@ def result_to_csv(result: "ReportResult | Mapping[str, Any]") -> str:
     return header + buf.getvalue()
 
 
-def csv_filename(result: "ReportResult | Mapping[str, Any]") -> str:
-    """``issue-activity-20260804-1130.csv`` — the suggested download name.
+def report_filename(result: "ReportResult | Mapping[str, Any]", ext: str) -> str:
+    """``issue-activity-20260804-1130.<ext>`` — the suggested download name
+    for *any* export format.
 
     Derived from the *result* (its window end), not from the wall clock, so
     the daemon's ``Content-Disposition`` and the panel's save-dialog
-    suggestion agree for the same run.
+    suggestion agree for the same run — and shared by every
+    ``<fmt>_filename`` below so ``csv``/``ndjson``/``md``/``xlsx`` name the
+    same run identically apart from the extension.
     """
     data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
     window = data.get("window") or [None, None]
@@ -4748,7 +4773,353 @@ def csv_filename(result: "ReportResult | Mapping[str, Any]") -> str:
     except (TypeError, ValueError):
         stamp = "unknown"
     report_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(data.get("report_id") or "report"))
-    return f"{report_id}-{stamp}.csv"
+    return f"{report_id}-{stamp}.{ext}"
+
+
+def csv_filename(result: "ReportResult | Mapping[str, Any]") -> str:
+    """``issue-activity-20260804-1130.csv`` — the suggested download name."""
+    return report_filename(result, "csv")
+
+
+# ── ndjson serialisation (#3472) ────────────────────────────────────────────
+#
+# One JSON object per line — the shape a downstream `jq`/`grep`/log-shipper
+# pipeline wants, rather than one big array a consumer has to buffer whole.
+# Meta lines (the report identity, notes, the totals row) are tagged with a
+# leading-underscore key so a naive consumer that only wants data rows can
+# filter them out (`jq 'select(has("_note") or has("_totals") or
+# has("_meta") | not)'`) while a careful one can still recover them — the
+# same "a note must never silently vanish" rule `result_to_csv` follows,
+# applied to a format with no comment syntax of its own.
+def _ndjson_line(obj: Mapping[str, Any]) -> str:
+    return json.dumps(dict(obj), default=str, sort_keys=False)
+
+
+def result_to_ndjson(result: "ReportResult | Mapping[str, Any]") -> str:
+    """Serialise a :class:`ReportResult` as newline-delimited JSON.
+
+    One line per data row (raw values, exactly the row dict the JSON
+    encoding carries — never a display string), preceded by a ``_meta``
+    line and any ``_note`` lines, and followed by a ``_totals`` line when
+    the report has one.
+    """
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    window = data.get("window") or [None, None]
+    lines = [
+        _ndjson_line(
+            {
+                "_meta": True,
+                "report_id": data.get("report_id"),
+                "window": [window[0], window[1]],
+                "generated_at": data.get("generated_at"),
+            }
+        )
+    ]
+    for note in data.get("notes") or []:
+        lines.append(_ndjson_line({"_note": note}))
+    for row in data.get("rows") or []:
+        row = row if isinstance(row, Mapping) else {}
+        lines.append(_ndjson_line(row))
+    totals = data.get("totals")
+    if isinstance(totals, Mapping):
+        lines.append(_ndjson_line({"_totals": True, **dict(totals)}))
+    return "".join(line + "\n" for line in lines)
+
+
+def ndjson_filename(result: "ReportResult | Mapping[str, Any]") -> str:
+    return report_filename(result, "ndjson")
+
+
+# ── markdown serialisation (#3472) ──────────────────────────────────────────
+#
+# A table for pasting into a GitHub issue/PR comment or a chat post — the
+# CLI already renders a *display* table (`coord.commands.report._render_table`)
+# but that one calls `_relative_time`, which is a function of the wall clock
+# at render time and would make the daemon's and the CLI's bytes disagree
+# the moment they run a second apart. This renders the same *raw* values
+# `result_to_csv` does, timestamps as absolute UTC, so two callers asking
+# for the same result get byte-identical markdown.
+def _md_escape(text: str) -> str:
+    # Pipes and newlines would otherwise break out of the cell/table.
+    return str(text).replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+
+def _md_cell(value: Any, meta: Mapping[str, Any] | None = None) -> str:
+    if value is None:
+        return ""
+    kind = (meta or {}).get("kind")
+    if kind == "timestamp":
+        return _md_escape(_iso(value))
+    if kind == "money":
+        try:
+            return f"${float(value):.4f}"
+        except (TypeError, ValueError):
+            return _md_escape(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return ""
+        return _md_escape(
+            "; ".join(
+                format_option_cell(v) if isinstance(v, Mapping) else _csv_scalar(v)
+                for v in value
+            )
+        )
+    if isinstance(value, Mapping):
+        return _md_escape(
+            "; ".join(f"{k}={_csv_scalar(v)}" for k, v in value.items())
+        )
+    return _md_escape(_csv_scalar(value))
+
+
+def result_to_md(result: "ReportResult | Mapping[str, Any]") -> str:
+    """Serialise a :class:`ReportResult` as a markdown table plus notes.
+
+    ``# <report_id>`` heading, the window as sub-text, a pipe table with
+    ``column_meta[].label`` headers (falling back to the raw column key,
+    same as :func:`result_to_csv`), an optional bolded totals row, and a
+    trailing ``## Notes`` list — nothing here vanishes silently, same rule
+    as the CSV comment block.
+    """
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    columns = [str(c) for c in (data.get("columns") or [])]
+    meta_by_id = {
+        str(m.get("id")): m
+        for m in (data.get("column_meta") or [])
+        if isinstance(m, Mapping)
+    }
+    labels = [
+        str((meta_by_id.get(c) or {}).get("label") or c) for c in columns
+    ]
+    window = data.get("window") or [None, None]
+    rows = list(data.get("rows") or [])
+    totals = data.get("totals")
+
+    lines = [
+        f"# {data.get('report_id')}",
+        "",
+        f"Window: {_iso(window[0])} to {_iso(window[1])}  ",
+        f"Generated: {_iso(data.get('generated_at'))}  ",
+        f"Rows: {len(rows)}",
+        "",
+    ]
+    if columns:
+        lines.append("| " + " | ".join(_md_escape(h) for h in labels) + " |")
+        lines.append("| " + " | ".join("---" for _ in columns) + " |")
+        for row in rows:
+            row = row if isinstance(row, Mapping) else {}
+            lines.append(
+                "| "
+                + " | ".join(
+                    _md_cell(row.get(c), meta_by_id.get(c)) for c in columns
+                )
+                + " |"
+            )
+        if isinstance(totals, Mapping):
+            lines.append(
+                "| "
+                + " | ".join(
+                    f"**{_md_cell(totals.get(c), meta_by_id.get(c)) or '&nbsp;'}**"
+                    for c in columns
+                )
+                + " |"
+            )
+    else:
+        lines.append("(no columns)")
+
+    if data.get("notes"):
+        lines.append("")
+        lines.append("## Notes")
+        for note in data["notes"]:
+            lines.append(f"- {_md_escape(note)}")
+
+    return "\n".join(lines) + "\n"
+
+
+def md_filename(result: "ReportResult | Mapping[str, Any]") -> str:
+    return report_filename(result, "md")
+
+
+# ── xlsx serialisation (#3472) ──────────────────────────────────────────────
+#
+# The one export format with an optional dependency: `openpyxl` lives in the
+# `reports-xlsx` extra (never base/server) so a caller who never asks for
+# xlsx never pays for it. Cells are TYPED — a `money`/`int` column lands as
+# an Excel number, a `timestamp` column as an Excel datetime, so a totals
+# column can be SUM()'d and a date column sorted, rather than every cell
+# landing as the same display string CSV would produce.
+def _xlsx_cell(value: Any, meta: Mapping[str, Any] | None = None) -> Any:
+    """One raw row value -> one openpyxl-writable cell value."""
+    if value is None:
+        return None
+    kind = (meta or {}).get("kind")
+    if kind == "timestamp":
+        try:
+            # openpyxl rejects timezone-aware datetimes outright — Excel's
+            # datetime type has no timezone concept, so this is the UTC
+            # wall-clock reading, not a silent shift.
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).replace(
+                tzinfo=None
+            )
+        except (TypeError, ValueError):
+            return str(value)
+    if kind == "money":
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
+    if kind == "int":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return ""
+        return "; ".join(
+            format_option_cell(v) if isinstance(v, Mapping) else _csv_scalar(v)
+            for v in value
+        )
+    if isinstance(value, Mapping):
+        return "; ".join(f"{k}={_csv_scalar(v)}" for k, v in value.items())
+    return str(value)
+
+
+def result_to_xlsx(result: "ReportResult | Mapping[str, Any]") -> bytes:
+    """Serialise a :class:`ReportResult` as an ``.xlsx`` workbook.
+
+    One ``Report`` sheet: a header row (``column_meta[].label``, same
+    fallback rule as CSV/markdown), one typed row per result row, and — when
+    the report has one — a bolded totals row. A second ``Notes`` sheet
+    carries the report id, window, generated-at stamp and every ``notes``
+    entry, one per line, so nothing rides invisibly the way it would in a
+    CSV comment a spreadsheet app hides by default.
+
+    Raises :class:`XlsxExtraMissingError` — never a bare
+    ``ModuleNotFoundError`` — when ``openpyxl`` (the ``reports-xlsx``
+    extra) is not installed.
+    """
+    try:
+        from openpyxl import Workbook  # noqa: PLC0415
+        from openpyxl.styles import Font  # noqa: PLC0415
+    except ModuleNotFoundError as exc:
+        raise XlsxExtraMissingError(
+            "format=xlsx needs the 'reports-xlsx' extra, which is not "
+            "installed (missing 'openpyxl').\n"
+            "  Install it with:  pip install 'code-coordinator[reports-xlsx]'"
+        ) from exc
+
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    columns = [str(c) for c in (data.get("columns") or [])]
+    meta_by_id = {
+        str(m.get("id")): m
+        for m in (data.get("column_meta") or [])
+        if isinstance(m, Mapping)
+    }
+    labels = [
+        str((meta_by_id.get(c) or {}).get("label") or c) for c in columns
+    ]
+    rows = list(data.get("rows") or [])
+    totals = data.get("totals")
+
+    wb = Workbook()
+    sheet = wb.active
+    sheet.title = "Report"
+    if columns:
+        sheet.append(labels)
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        for row in rows:
+            row = row if isinstance(row, Mapping) else {}
+            sheet.append(
+                [_xlsx_cell(row.get(c), meta_by_id.get(c)) for c in columns]
+            )
+        if isinstance(totals, Mapping):
+            sheet.append(
+                [_xlsx_cell(totals.get(c), meta_by_id.get(c)) for c in columns]
+            )
+            for cell in sheet[sheet.max_row]:
+                cell.font = Font(bold=True)
+
+    notes_sheet = wb.create_sheet("Notes")
+    window = data.get("window") or [None, None]
+    notes_sheet.append(["report_id", data.get("report_id")])
+    notes_sheet.append(["window_start", _iso(window[0])])
+    notes_sheet.append(["window_end", _iso(window[1])])
+    notes_sheet.append(["generated_at", _iso(data.get("generated_at"))])
+    notes_sheet.append([])
+    notes_sheet.append(["notes"])
+    for note in data.get("notes") or []:
+        notes_sheet.append([note])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def xlsx_filename(result: "ReportResult | Mapping[str, Any]") -> str:
+    return report_filename(result, "xlsx")
+
+
+@dataclass(frozen=True)
+class ExportFormat:
+    """One non-JSON export encoding — the CLI's ``--format`` and the
+    daemon's / dashboard's ``?format=`` both dispatch through this single
+    table (:data:`EXPORT_FORMATS`) rather than each hardcoding its own
+    ``if fmt == "csv": ... elif fmt == "xlsx": ...`` chain, so a new format
+    only ever gets added in one place and the two surfaces cannot drift on
+    what formats exist or what each one is called.
+    """
+
+    id: str
+    media_type: str
+    binary: bool
+    serialize: Callable[["ReportResult | Mapping[str, Any]"], "str | bytes"]
+    filename: Callable[["ReportResult | Mapping[str, Any]"], str]
+
+
+#: Every export encoding besides the default ``json``. Shared by
+#: ``coord.commands.report`` (CLI) and every HTTP surface
+#: (``coord/serve_app.py``, ``coord/dashboard/server.py``) so "what formats
+#: exist, and what does each one need" is answered exactly once (#3472).
+EXPORT_FORMATS: dict[str, ExportFormat] = {
+    "csv": ExportFormat(
+        id="csv",
+        media_type="text/csv; charset=utf-8",
+        binary=False,
+        serialize=result_to_csv,
+        filename=csv_filename,
+    ),
+    "ndjson": ExportFormat(
+        id="ndjson",
+        media_type="application/x-ndjson; charset=utf-8",
+        binary=False,
+        serialize=result_to_ndjson,
+        filename=ndjson_filename,
+    ),
+    "md": ExportFormat(
+        id="md",
+        media_type="text/markdown; charset=utf-8",
+        binary=False,
+        serialize=result_to_md,
+        filename=md_filename,
+    ),
+    "xlsx": ExportFormat(
+        id="xlsx",
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        binary=True,
+        serialize=result_to_xlsx,
+        filename=xlsx_filename,
+    ),
+}
 
 
 REPORTS: dict[str, ReportDef] = {

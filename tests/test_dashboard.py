@@ -954,8 +954,10 @@ class TestReportAPI:
 
     def test_unknown_format_is_400(self, rw_db) -> None:
         client = _client()
+        # #3472: `xlsx` is now a valid format, so `yaml` is the "genuinely
+        # unsupported" placeholder here instead.
         r = client.get(
-            "/api/report/drive-queue-status", params={"format": "xlsx"}
+            "/api/report/drive-queue-status", params={"format": "yaml"}
         )
         assert r.status_code == 400
         assert "csv" in r.json()["error"]
