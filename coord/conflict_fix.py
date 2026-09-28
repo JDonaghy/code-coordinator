@@ -41,6 +41,18 @@ this same worker for that case, briefed narrowly (see
 rebase and refuse — rather than resolve — the instant a real conflict or a
 content change (a ``git patch-id --stable`` mismatch) shows up, since that
 would mean the "just stale" premise was wrong.
+
+#3462: a patch-id mismatch caught by the stale-rebase worker has TWO
+distinct causes, not one — a genuine overlapping edit against the moved
+base, OR the branch being SUPERSEDED (its content already landed on the
+target through another change, so ``git pull --rebase`` drops the now-
+empty commit, or the post-rebase diff is a strict subset of the original).
+:func:`build_stale_rebase_briefing` checks patch-equivalence against the
+target (``git merge-tree``, before and after the rebase) and emits a
+distinct :data:`ALREADY_UPSTREAM_MARKER` for the superseded case, so
+:func:`coord.reconcile.on_conflict_fix_done` can park the entry with
+accurate "nothing to merge" text instead of escalating a conflict that
+does not exist.
 """
 
 from __future__ import annotations
@@ -514,6 +526,16 @@ def sealed_conflict_could_touch_manifest(files: list[str]) -> bool:
 # MARKER: a fixed, machine-parseable string, not prose.
 STALE_REBASE_MISMATCH_MARKER = "coord:conflict=stale-rebase-mismatch"
 
+# Marker a stale-rebase conflict-fix worker's log carries when it finds the
+# branch's content is already fully present on the target branch — a
+# patch-id (or diff) mismatch that comes from the branch being SUPERSEDED
+# (the same change landed via another issue, maybe with extra tests) rather
+# than from a real overlapping edit (#3462). This is the twin of
+# STALE_REBASE_MISMATCH_MARKER: both fire on a patch-id difference, but only
+# one of them means there is a genuine conflict to resolve — this one means
+# there is nothing left to land at all.
+ALREADY_UPSTREAM_MARKER = "coord:conflict=already-upstream"
+
 # Title prefix for a stale-rebase conflict-fix dispatch — visible in the TUI
 # Pipeline row so an operator can tell at a glance this used the narrower,
 # no-conflict-expected briefing rather than the ordinary one.
@@ -531,23 +553,40 @@ Rules:
 Don't try to use them — the harness will reject the call.
 - Stay on the worker's branch — do NOT push to main / develop / target.
 - Use git push --force-with-lease (NOT --force).
-- Before pushing, confirm the rebase changed nothing: compare the branch's \
-content-addressed `git patch-id --stable` against the target branch BEFORE \
-and AFTER the rebase. They must match exactly.
+- BEFORE rebasing, check whether this branch's content is already fully \
+present on the target (the same change landed via another issue, maybe \
+with extra tests): compare `git merge-tree --write-tree origin/<target> \
+HEAD` against `git rev-parse origin/<target>^{tree}`. If they match, \
+merging this branch would add nothing — there is no conflict AND nothing \
+to rebase. Stop immediately (do not rebase, do not push) and end your turn \
+with a STUCK: line starting with the marker `coord:conflict=already-upstream`.
+- Otherwise, before pushing, confirm the rebase changed nothing: compare \
+the branch's content-addressed `git patch-id --stable` against the target \
+branch BEFORE and AFTER the rebase. They must match exactly.
+- AFTER rebasing, also check whether the branch ended up with zero commits \
+ahead of the target (`git rev-list origin/<target>..HEAD` empty) or an \
+empty diff (`git diff origin/<target> HEAD` empty) — `git pull --rebase` \
+silently drops a commit that turned out to already be applied. That is the \
+SAME already-upstream conclusion as the pre-rebase check, just caught \
+later: stop, do NOT push, and use the same `coord:conflict=already-upstream` \
+marker.
 - If a real conflict marker appears during the rebase, OR the before/after \
-patch-id differs, DO NOT resolve it and DO NOT push. This dispatch is only \
-authorized for a clean, content-preserving rebase — a real conflict means \
-the base's move genuinely overlaps this branch's own changes, which needs a \
-human judgment call, not a guess. Stop and end your turn with a STUCK: line \
+patch-id differs and the branch is NOT already-upstream by the checks \
+above, DO NOT resolve it and DO NOT push. This dispatch is only authorized \
+for a clean, content-preserving rebase — a real conflict means the base's \
+move genuinely overlaps this branch's own changes, which needs a human \
+judgment call, not a guess. Stop and end your turn with a STUCK: line \
 that starts with the marker `coord:conflict=stale-rebase-mismatch`, e.g.
   STUCK: coord:conflict=stale-rebase-mismatch — patch-id before <hash>, \
 after <hash> differ
-The coordinator reads that marker from your transcript, not your process \
-exit code (which you cannot control), and escalates to a human.
+The coordinator reads these markers from your transcript, not your process \
+exit code (which you cannot control), and escalates to a human either way \
+— `coord:conflict=already-upstream` gets accurate "nothing to merge" \
+text instead of being treated as a real conflict.
 
 Progress reporting:
-- After each significant step (rebase started, patch-id verified, tests \
-passed, pushed), output:
+- After each significant step (already-upstream checked, rebase started, \
+patch-id verified, tests passed, pushed), output:
   STATUS: [what you just did] → [what you're about to do] → [confidence]
 - If you stop, output the STUCK: line described above and wait for \
 guidance.\
@@ -594,35 +633,72 @@ def build_stale_rebase_briefing(
         "## Steps",
         "",
         "1. `git fetch origin`",
-        "2. Record the pre-rebase content fingerprint: "
+        "2. Check whether this branch is already fully upstream BEFORE "
+        "rebasing (#3462): `git merge-tree --write-tree "
+        f"origin/{entry.target_branch} HEAD` and compare its output tree "
+        f"hash against `git rev-parse origin/{entry.target_branch}^{{tree}}`. "
+        "If they match, merging this branch adds NOTHING — the same change "
+        "already landed on the target (e.g. via another issue). Stop here: "
+        "do not rebase, do not push — see \"When the branch is already "
+        "upstream\" below.",
+        "3. Record the pre-rebase content fingerprint: "
         f"`git diff origin/{entry.target_branch}...HEAD | git patch-id --stable`",
-        f"3. `git pull --rebase origin {entry.target_branch}`",
-        "4. If a conflict marker appears ANYWHERE, stop — see \"When NOT to "
+        f"4. `git pull --rebase origin {entry.target_branch}`",
+        "5. If a conflict marker appears ANYWHERE, stop — see \"When NOT to "
         "guess\" below. Do not resolve it.",
-        "5. Record the post-rebase fingerprint the same way: "
+        "6. Check again whether the branch is already upstream, this time "
+        "AFTER rebasing: `git rev-list "
+        f"origin/{entry.target_branch}..HEAD` is empty, or "
+        f"`git diff origin/{entry.target_branch} HEAD` is empty. "
+        "`git pull --rebase` silently drops a commit that turns out to "
+        "already be applied, so this catches the same already-upstream "
+        "case step 2 might have missed (e.g. a subset diff that only "
+        "becomes empty once the rebase itself replays it). If either is "
+        "empty, stop here too — see \"When the branch is already upstream\" "
+        "below. Do not push.",
+        "7. Record the post-rebase fingerprint the same way as step 3: "
         f"`git diff origin/{entry.target_branch}...HEAD | git patch-id --stable`. "
-        "It must EXACTLY match step 2's. If it doesn't, stop — see below.",
-        f"6. Run tests: `{test_cmd}`",
-        f"7. `git push --force-with-lease origin {entry.branch}`",
-        "8. Exit 0 if push succeeds; non-zero otherwise.",
+        "It must EXACTLY match step 3's. If it doesn't, stop — see \"When "
+        "NOT to guess\" below.",
+        f"8. Run tests: `{test_cmd}`",
+        f"9. `git push --force-with-lease origin {entry.branch}`",
+        "10. Exit 0 if push succeeds; non-zero otherwise.",
+        "",
+        "## When the branch is already upstream",
+        "",
+        "Steps 2 and 6 both exist to catch the SAME conclusion at different "
+        "points: this branch's content is already fully present on "
+        f"`{entry.target_branch}` — landed through another change, possibly "
+        "with extra tests added alongside it. There is nothing left to "
+        "merge, and this is NOT a conflict of any kind (mechanical or "
+        "genuine) — do not rebase further, do not resolve anything, and do "
+        "NOT push. Stop and end your turn with a `STUCK:` line that begins "
+        f"with the exact marker `{ALREADY_UPSTREAM_MARKER}` and names which "
+        "check caught it, e.g.",
+        "",
+        f"    STUCK: {ALREADY_UPSTREAM_MARKER} — merge-tree matches target, "
+        "branch adds nothing",
         "",
         "## When NOT to guess",
         "",
         "This dispatch is authorized for a PURE, content-preserving rebase "
         "only — not conflict resolution. If a conflict marker appears "
-        "during the rebase, or the patch-id from step 5 differs from step "
-        "2's, DO NOT resolve it and DO NOT push: that means the base "
-        "genuinely overlaps this branch's own changes, which is a human "
-        "judgment call, not this worker's. Stop and end your turn with a "
+        "during the rebase, or the patch-id from step 7 differs from step "
+        "3's, AND the branch is NOT already-upstream per steps 2/6 above, "
+        "DO NOT resolve it and DO NOT push: that means the base genuinely "
+        "overlaps this branch's own changes, which is a human judgment "
+        "call, not this worker's. Stop and end your turn with a "
         "`STUCK:` line that begins with the exact marker "
         f"`{STALE_REBASE_MISMATCH_MARKER}` and then names what happened, e.g.",
         "",
         f"    STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before <hash>, "
         "after <hash> differ",
         "",
-        "The coordinator reads that marker from your transcript, not your",
+        "The coordinator reads these markers from your transcript, not your",
         "process exit code (which you cannot control), and escalates to a",
-        f"human on issue #{entry.issue_number}.",
+        f"human on issue #{entry.issue_number} either way — the "
+        f"`{ALREADY_UPSTREAM_MARKER}` marker gets accurate \"nothing to "
+        f"merge\" text instead of being treated as a real conflict.",
         "",
         "You will NOT use `gh` or `git push --force` — both are denied by",
         "the harness. The coordinator owns PR retries and issue posting.",
@@ -640,6 +716,22 @@ def stale_rebase_mismatch_verdict_in_text(text: str | None) -> bool:
     if not text:
         return False
     return STALE_REBASE_MISMATCH_MARKER in _decode_worker_text(text)
+
+
+def already_upstream_verdict_in_text(text: str | None) -> bool:
+    """True when a stale-rebase conflict-fix worker's log carries the
+    :data:`ALREADY_UPSTREAM_MARKER` — i.e. it found the branch's content
+    already fully present on the target (#3462), not a genuine conflict.
+
+    Deliberately does NOT also match :data:`STALE_REBASE_MISMATCH_MARKER` —
+    the two markers are distinct verdicts about the SAME underlying
+    patch-id difference, and callers need to tell them apart (see
+    :func:`detect_already_upstream`'s docstring for why order matters when
+    checking both).
+    """
+    if not text:
+        return False
+    return ALREADY_UPSTREAM_MARKER in _decode_worker_text(text)
 
 
 def build_conflict_fix_briefing(
@@ -832,6 +924,57 @@ def detect_stale_rebase_mismatch(
             )
             resp.raise_for_status()
             return stale_rebase_mismatch_verdict_in_text(resp.text)
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return False
+
+    return False
+
+
+def detect_already_upstream(
+    *,
+    log_path: str | None = None,
+    host: str | None = None,
+    assignment_id: str | None = None,
+    port: int = AGENT_PORT,
+    timeout: float = 15.0,
+) -> bool:
+    """True when a finished stale-rebase conflict-fix worker found the
+    branch's content already fully present on the target (#3462) — the
+    ``git merge-tree``/empty-diff checks in :func:`build_stale_rebase_briefing`
+    steps 2/6 caught the branch being SUPERSEDED rather than in genuine
+    conflict.
+
+    Mirrors :func:`detect_stale_rebase_mismatch` exactly (same local-log-
+    then-agent-endpoint lookup, same best-effort ``False`` on any read/
+    transport failure) but reads for :data:`ALREADY_UPSTREAM_MARKER` via
+    :func:`already_upstream_verdict_in_text`.
+
+    Callers that check both this and :func:`detect_stale_rebase_mismatch`
+    against the same log MUST check this one first (#3462 fix) — an
+    already-upstream verdict must win over a bare "genuine content
+    conflict" framing, since the two questions ("is there anything left to
+    merge at all?" vs. "does the rebase conflict?") are answered by
+    distinct, mutually exclusive markers in the same transcript.
+    """
+    if log_path:
+        try:
+            from pathlib import Path  # noqa: PLC0415
+
+            p = Path(log_path)
+            if p.exists():
+                raw = p.read_text(encoding="utf-8", errors="replace")
+                if already_upstream_verdict_in_text(raw):
+                    return True
+        except OSError:
+            pass
+
+    if host and assignment_id:
+        try:
+            resp = httpx.get(
+                f"http://{host}:{port}/logs/{assignment_id}", timeout=timeout
+            )
+            resp.raise_for_status()
+            return already_upstream_verdict_in_text(resp.text)
         except (httpx.HTTPError, httpx.TimeoutException):
             return False
 
@@ -1383,9 +1526,11 @@ def dispatch_conflict_fix(
     conflict-fix path (same briefing/system-prompt/title as the plain
     ``else`` branch below — this is not a distinct dispatch kind, just a
     retry-cap carve-out) right after a stale-rebase worker's
-    ``stale-rebase-mismatch`` refusal: that verdict means the *just-stale*
-    premise was wrong — the rebase hit a genuine content conflict, so this
-    is an ordinary conflict that deserves the ordinary mechanical attempt,
+    ``stale-rebase-mismatch`` refusal (not to be confused with an
+    ``already-upstream`` verdict, #3462 — that one is NOT a conflict and
+    never reaches this function): that verdict means the *just-stale*
+    premise was wrong — the rebase was not content-preserving, so this may
+    be an ordinary conflict that deserves the ordinary mechanical attempt,
     not an immediate HUMAN_REQUIRED. Passes
     ``ignore_stale_rebase_attempts=True`` to :func:`has_prior_conflict_fix`
     so the just-failed stale-rebase attempt — which never even tried a

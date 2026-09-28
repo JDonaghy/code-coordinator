@@ -1283,3 +1283,160 @@ class TestReconcileConflictFixStaleRebaseMismatchMarker:
         entry = mq.load_queue()[0]
         assert entry.state == PENDING
         assert entry.error is None
+
+
+# ── #3462: an already-upstream verdict must not be read as a genuine ────────
+# content conflict ───────────────────────────────────────────────────────────
+
+
+class TestReconcileConflictFixAlreadyUpstreamMarker:
+    """Mirrors `TestReconcileConflictFixStaleRebaseMismatchMarker` above, but
+    for the case where a stale-rebase worker finds the branch's content
+    already fully present on the target (the same change landed via another
+    issue, maybe with extra tests, #3462) — a patch-id mismatch that comes
+    from the branch being SUPERSEDED, not from a real overlapping edit.
+
+    This must land on HUMAN_REQUIRED with accurate "nothing to merge" text
+    — never "genuine content conflict" — and must NEVER escalate to an
+    ordinary conflict-fix dispatch (there is no conflict to mechanically
+    resolve).
+    """
+
+    @patch("coord.network.fetch_status")
+    @patch("coord.conflict_fix.httpx.post")
+    @patch("coord.reconcile._query_agent")
+    def test_already_upstream_lands_on_human_required_without_escalation(
+        self,
+        mock_query: MagicMock,
+        mock_post: MagicMock,
+        mock_fetch_status: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.conflict_fix import ALREADY_UPSTREAM_MARKER
+        from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING, QueuedMerge
+        from coord.network import StatusResult
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=PENDING,
+                error="CI stale: checks predate the current base",
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {ALREADY_UPSTREAM_MARKER} — merge-tree matches target, "
+            "branch adds nothing\n"
+        )
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[stale-rebase] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        mock_fetch_status.return_value = StatusResult(data={"assignments": []})
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state != CONFLICT
+        assert entry.state == HUMAN_REQUIRED
+        assert "already present on" in (entry.error or "")
+        assert "genuine content conflict" not in (entry.error or "")
+
+        # Never dispatched an ordinary conflict-fix — nothing to resolve.
+        mock_post.assert_not_called()
+
+    @patch("coord.reconcile._query_agent")
+    def test_already_upstream_marker_takes_priority_over_mismatch_marker(
+        self, mock_query: MagicMock, tmp_path: Path, coord_db,
+    ) -> None:
+        """A log carrying BOTH markers (shouldn't happen per the briefing,
+        but the detection order must be defensive) resolves to the
+        already-upstream verdict, not the mismatch one — #3462 fix mandates
+        checking `ALREADY_UPSTREAM_MARKER` first."""
+        from coord import merge_queue as mq
+        from coord.conflict_fix import (
+            ALREADY_UPSTREAM_MARKER,
+            STALE_REBASE_MISMATCH_MARKER,
+        )
+        from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING, QueuedMerge
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=PENDING,
+                error="CI stale: checks predate the current base",
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: rebase started\n"
+            f"STUCK: {ALREADY_UPSTREAM_MARKER} then also mentions "
+            f"{STALE_REBASE_MISMATCH_MARKER} defensively\n"
+        )
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[stale-rebase] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state != CONFLICT
+        assert entry.state == HUMAN_REQUIRED
+        assert "already present on" in (entry.error or "")
+        assert "genuine content conflict" not in (entry.error or "")
