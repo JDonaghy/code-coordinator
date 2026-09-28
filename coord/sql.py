@@ -1231,6 +1231,56 @@ def sqlite_data_version(conn: Any) -> str:
     return str(row[0]) if row is not None else "0"
 
 
+def reclaim_space(conn: Any) -> None:
+    """One-off space reclaim after a retention sweep deletes rows (#3469) --
+    dialect-routed, unlike the SQLite-only ``PRAGMA`` family above: a
+    ``DELETE`` alone never shrinks a SQLite file (the freed pages go on its
+    internal freelist for reuse, not back to the filesystem) or a Postgres
+    table (a dead-tuple bitmap grows instead), so a retention sweep with no
+    reclaim step after it bloats the on-disk artifact forever regardless of
+    backend -- exactly what :func:`coord.housekeeping.reclaim_space` (this
+    function's caller) exists to fix, deliberately as an operator-invoked,
+    one-off step rather than something the low-cadence daemon tick runs
+    automatically (a full-table rewrite, unlike every bounded operation that
+    tick already does).
+
+    **SQLite**: plain ``VACUUM`` -- rebuilds the whole file, compacting it
+    to its live-data size. Requires no other connection hold an open
+    transaction on the same file; unlike :func:`coord.backup.snapshot_
+    sqlite`'s ``VACUUM INTO``, this rewrites *in place* rather than
+    producing a separate snapshot file.
+
+    **Postgres**: plain ``VACUUM`` too, but it cannot run inside a
+    transaction block (unlike SQLite's, which is a normal auto-committing
+    statement) -- ``psycopg`` connections default to an open transaction
+    per statement, so this commits any pending work and flips ``autocommit``
+    on for the duration of the call, restoring the connection's prior
+    setting again afterward. Postgres's ``VACUUM`` (without ``FULL``)
+    reclaims dead-tuple space for reuse rather than shrinking the file on
+    disk the way SQLite's does -- the DBA-standard tradeoff against
+    ``VACUUM FULL``'s exclusive table lock, deliberately not used here.
+    """
+    dialect = detect_dialect(conn)
+    if dialect == DIALECT_SQLITE:
+        execute(conn, "VACUUM")
+        return
+    if dialect == DIALECT_POSTGRES:
+        real_conn = unwrap(conn)
+        previous_autocommit = getattr(real_conn, "autocommit", None)
+        try:
+            real_conn.commit()
+        except Exception:  # noqa: BLE001 -- nothing pending is the common case
+            pass
+        try:
+            real_conn.autocommit = True
+            execute(conn, "VACUUM")
+        finally:
+            if previous_autocommit is not None:
+                real_conn.autocommit = previous_autocommit
+        return
+    raise UnsupportedDialectError(dialect)
+
+
 def driver_error(conn: Any) -> type[BaseException]:
     """The DB-API ``Error`` base class *conn*'s driver raises (#2766).
 

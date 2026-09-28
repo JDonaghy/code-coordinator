@@ -258,13 +258,124 @@ class TestOkRollup:
         now."""
         import coord.forge_availability as fa
 
-        fa._ok_aggregates[("gh_call", "stale")] = _OkAggregate(time.time(), 0.1)
+        fa._ok_aggregates[("gh_call", "ok", "stale")] = _OkAggregate(time.time(), 0.1)
         fa._ok_aggregates_conn = object()  # guaranteed not `is` the current connection
 
         _flush_all_ok_aggregates()
 
         assert _rows(coord_db) == []
         assert fa._ok_aggregates == {}
+
+
+class TestNonOkAggregation:
+    """#3469: `transient`/`app_error` observations roll up into a per-bucket
+    aggregate exactly like `ok` already did (#2654) -- only `unreachable`
+    still writes one row per observation."""
+
+    def test_burst_of_transient_calls_writes_one_row_with_count_n(
+        self, coord_db
+    ) -> None:
+        """The issue's own acceptance bar, verbatim: a burst of N `transient`
+        calls to one (caller, shape) inside one bucket writes 1 row with
+        `count=N`, not N rows."""
+        n = 25
+        for _ in range(n):
+            record_gh_call(
+                ("api", "rate_limit"), outcome="transient", duration_s=0.05,
+                caller="coord.claim",
+            )
+
+        assert _rows(coord_db, event_type="gh_call") == []  # nothing written yet
+
+        _flush_all_ok_aggregates()
+
+        rows = _rows(coord_db, event_type="gh_call")
+        assert len(rows) == 1
+        details = json.loads(rows[0]["details_json"])
+        assert details["outcome"] == "transient"
+        assert details["count"] == n
+        assert details["duration_s_total"] == pytest.approx(0.05 * n)
+
+    def test_burst_of_app_error_calls_writes_one_row_with_count_n(
+        self, coord_db
+    ) -> None:
+        n = 10
+        for _ in range(n):
+            record_gh_call(("issue", "edit"), outcome="app_error", duration_s=0.02)
+
+        _flush_all_ok_aggregates()
+
+        rows = _rows(coord_db, event_type="gh_call")
+        assert len(rows) == 1
+        details = json.loads(rows[0]["details_json"])
+        assert details["outcome"] == "app_error"
+        assert details["count"] == n
+
+    def test_first_observations_detail_is_kept_verbatim(self, coord_db) -> None:
+        record_gh_call(
+            ("issue", "edit"), outcome="app_error", duration_s=0.1, detail="first error",
+        )
+        record_gh_call(
+            ("issue", "edit"), outcome="app_error", duration_s=0.1, detail="second error",
+        )
+        _flush_all_ok_aggregates()
+
+        details = _details(coord_db, event_type="gh_call")
+        assert len(details) == 1
+        assert details[0]["detail"] == "first error"
+
+    def test_different_outcomes_of_the_same_shape_get_separate_aggregates(
+        self, coord_db
+    ) -> None:
+        record_gh_call(("pr",), outcome="ok", duration_s=0.1)
+        record_gh_call(("pr",), outcome="transient", duration_s=0.1)
+        record_gh_call(("pr",), outcome="app_error", duration_s=0.1)
+        _flush_all_ok_aggregates()
+
+        rows = _details(coord_db, event_type="gh_call")
+        assert {r["outcome"] for r in rows} == {"ok", "transient", "app_error"}
+        assert all(r["count"] == 1 for r in rows)
+
+    def test_transient_observation_does_not_flush_an_unrelated_ok_bucket(
+        self, coord_db
+    ) -> None:
+        """#3469's stated fix: recording a `transient` observation must not
+        force-flush a pending `ok` aggregate for a DIFFERENT (caller, shape)
+        -- the pre-#3469 fragmentation this issue reports."""
+        record_gh_call(("issue", "list"), outcome="ok", duration_s=0.1, caller="a")
+        record_gh_call(("pr", "view"), outcome="transient", duration_s=0.1, caller="b")
+
+        # Neither has flushed yet -- the transient call didn't force the ok
+        # bucket to land early.
+        assert _rows(coord_db, event_type="gh_call") == []
+
+        _flush_all_ok_aggregates()
+        rows = _details(coord_db, event_type="gh_call")
+        assert {r["outcome"] for r in rows} == {"ok", "transient"}
+
+    def test_unreachable_still_writes_one_row_per_observation(self, coord_db) -> None:
+        """`unreachable` stays outside `_AGGREGATED_OUTCOMES` -- the rare,
+        high-signal true-outage indicator keeps per-observation timing."""
+        record_gh_call(("pr",), outcome="unreachable", duration_s=1.0)
+        record_gh_call(("pr",), outcome="unreachable", duration_s=1.0)
+
+        rows = _rows(coord_db, event_type="gh_call")
+        assert len(rows) == 2
+
+    def test_unreachable_still_flushes_pending_transient_and_ok_aggregates(
+        self, coord_db
+    ) -> None:
+        """The ordering guarantee still holds for the one outcome that
+        remains per-row: an `unreachable` observation flushes every pending
+        aggregate (any outcome) first, so none of them can land after it."""
+        record_gh_call(("a",), outcome="ok", duration_s=0.1)
+        record_gh_call(("b",), outcome="transient", duration_s=0.1)
+        record_gh_call(("c",), outcome="unreachable", duration_s=1.0)
+
+        rows = _rows(coord_db, event_type="gh_call")
+        assert len(rows) == 3
+        outcomes = [json.loads(r["details_json"])["outcome"] for r in rows]
+        assert outcomes == ["ok", "transient", "unreachable"]
 
 
 class TestGhCallShape:
@@ -636,3 +747,66 @@ class TestRetentionSweep:
             lambda: (_ for _ in ()).throw(RuntimeError("boom")),
         )
         _maybe_prune(force=True)  # must not raise
+
+
+class TestRetentionDaysConfigKnob:
+    """#3469: `forge_availability.retention_days` (coordinator.yml) is a
+    config knob, not the pre-#3469 hardcoded 90 -- `RETENTION_DAYS` is now
+    only the documented ceiling."""
+
+    def test_default_falls_back_to_the_ceiling_when_unresolvable(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from coord.forge_availability import _resolve_retention_days
+
+        monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "nonexistent.yml"))
+        assert _resolve_retention_days() == RETENTION_DAYS
+
+    def test_configured_value_is_honoured(self, monkeypatch, tmp_path) -> None:
+        from coord.forge_availability import _resolve_retention_days
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(
+            "repos:\n  - name: coord-tui\n    github: acme/coord-tui\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n"
+            "    repos: [coord-tui]\n"
+            "forge_availability:\n  retention_days: 5\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(cfg_path))
+        assert _resolve_retention_days() == pytest.approx(5.0)
+
+    def test_configured_value_above_the_ceiling_is_clamped_down(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from coord.forge_availability import _resolve_retention_days
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(
+            "repos:\n  - name: coord-tui\n    github: acme/coord-tui\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n"
+            "    repos: [coord-tui]\n"
+            "forge_availability:\n  retention_days: 365\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(cfg_path))
+        assert _resolve_retention_days() == RETENTION_DAYS
+
+    def test_prune_uses_the_configured_window(self, coord_db, monkeypatch) -> None:
+        """A shorter configured window deletes a row `_maybe_prune`'s old
+        hardcoded 90-day constant would have kept."""
+        monkeypatch.setattr(
+            "coord.forge_availability._resolve_retention_days", lambda: 1.0
+        )
+        now = time.time()
+        record_gh_call(("old",), outcome="ok", duration_s=0.1)
+        _flush_all_ok_aggregates()
+        old_ts = now - 2 * 86400.0  # 2 days ago -- older than the 1-day window
+        coord_db.execute("UPDATE audit_log SET ts=? WHERE category=?", (old_ts, CATEGORY))
+        coord_db.commit()
+        record_gh_call(("new",), outcome="ok", duration_s=0.1)
+        _flush_all_ok_aggregates()
+
+        _maybe_prune(force=True)
+
+        rows = _rows(coord_db)
+        assert len(rows) == 1
+        assert json.loads(rows[0]["details_json"])["shape"] == "new"

@@ -257,3 +257,78 @@ def test_drive_queue_endpoint_state_param_reads_archived_history(
             "/drive-queue", params={"repo_name": "r", "issue_number": 7}
         ).json()
         assert point_no_state["entries"] == []
+
+
+# ── #3469: operational-tier audit retention + one-off reclaim ──────────────
+
+def test_sweep_wires_audit_operational_retention(coord_db, monkeypatch):
+    """`housekeeping.sweep()` calls `coord.audit.sweep_operational_retention`
+    and reports its count -- independent of `COORD_ARCHIVE_RETENTION_DAYS`
+    (0 here disables DB archiving; the audit sweep must still run, same as
+    the confirm-worktree sweep already does)."""
+    monkeypatch.setenv("COORD_ARCHIVE_RETENTION_DAYS", "0")
+    monkeypatch.setattr("coord.audit._resolve_operational_retention_days", lambda: 7.0)
+    from coord import housekeeping
+    from coord.audit import record_audit
+
+    conn = coord_db
+    old_ts = NOW - 30 * 86400.0
+    record_audit(
+        tier="operational", category="reconcile", event_type="passive_reconcile",
+        actor="daemon", summary="old operational", ts=old_ts,
+    )
+    record_audit(
+        tier="business", category="merge", event_type="merged",
+        actor="coordinator", summary="old business", ts=old_ts,
+    )
+    conn.commit()
+
+    res = housekeeping.sweep(now=NOW)
+
+    assert res["audit_operational_deleted"] == 1
+    rows = {r[0] for r in conn.execute("SELECT summary FROM audit_log")}
+    assert rows == {"old business"}
+
+
+def test_sweep_dry_run_does_not_delete_audit_rows(coord_db, monkeypatch):
+    monkeypatch.setattr("coord.audit._resolve_operational_retention_days", lambda: 7.0)
+    from coord import housekeeping
+    from coord.audit import record_audit
+
+    conn = coord_db
+    old_ts = NOW - 30 * 86400.0
+    record_audit(
+        tier="operational", category="reconcile", event_type="passive_reconcile",
+        actor="daemon", summary="old operational", ts=old_ts,
+    )
+    conn.commit()
+
+    res = housekeeping.sweep(dry_run=True, now=NOW)
+
+    assert res["audit_operational_deleted"] == 1  # would-be count, reported
+    assert conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 1
+
+
+def test_sweep_reclaim_false_by_default_leaves_reclaimed_false(coord_db):
+    from coord import housekeeping
+
+    res = housekeeping.sweep(now=NOW)
+
+    assert res["reclaimed"] is False
+
+
+def test_sweep_reclaim_true_runs_vacuum(coord_db):
+    from coord import housekeeping
+
+    res = housekeeping.sweep(now=NOW, reclaim=True)
+
+    assert res["reclaimed"] is True
+
+
+def test_reclaim_space_runs_vacuum_on_sqlite(coord_db):
+    """Dialect-routed through `coord.sql.reclaim_space` -- a plain call must
+    not raise against the suite's real (in-memory or file) SQLite
+    connection."""
+    from coord import housekeeping
+
+    assert housekeeping.reclaim_space(coord_db) is True

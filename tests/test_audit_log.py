@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 
 import pytest
 
@@ -463,6 +464,100 @@ class TestAuditLevel:
             actor="coordinator", summary="business rows always land",
         )
         assert len(_audit_rows(coord_db)) == 1
+
+
+class TestSweepOperationalRetention:
+    """#3469: `sweep_operational_retention` is a time-window retention sweep
+    scoped to `tier='operational'` -- unlike the tier-blind `_maybe_trim`
+    (`audit.max_rows`), it must never delete a `business`-tier row no matter
+    how old, and must be a no-op when the config knob is unset (0/disabled,
+    today's default)."""
+
+    def test_disabled_by_default_deletes_nothing(self, coord_db, monkeypatch) -> None:
+        from coord.audit import sweep_operational_retention
+
+        monkeypatch.setattr("coord.audit._resolve_operational_retention_days", lambda: 0.0)
+        old_ts = time.time() - 400 * 86400.0
+        record_audit(
+            tier="operational", category="reconcile", event_type="passive_reconcile",
+            actor="daemon", summary="ancient operational row", ts=old_ts,
+        )
+
+        deleted = sweep_operational_retention()
+
+        assert deleted == 0
+        assert len(_audit_rows(coord_db)) == 1
+
+    def test_deletes_old_operational_rows_but_keeps_an_equally_old_business_row(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """The issue's own acceptance bar, verbatim."""
+        from coord.audit import sweep_operational_retention
+
+        monkeypatch.setattr("coord.audit._resolve_operational_retention_days", lambda: 7.0)
+        now = time.time()
+        old_ts = now - 30 * 86400.0  # older than the 7-day window
+        recent_ts = now - 1 * 86400.0
+
+        record_audit(
+            tier="operational", category="forge_availability", event_type="gh_call",
+            actor="system", summary="old operational", ts=old_ts,
+        )
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="old business", ts=old_ts,
+        )
+        record_audit(
+            tier="operational", category="reconcile", event_type="passive_reconcile",
+            actor="daemon", summary="recent operational", ts=recent_ts,
+        )
+
+        deleted = sweep_operational_retention(now=now)
+
+        assert deleted == 1
+        remaining = {r["summary"] for r in _audit_rows(coord_db)}
+        assert remaining == {"old business", "recent operational"}
+
+    def test_dry_run_reports_the_count_without_deleting(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.audit import sweep_operational_retention
+
+        monkeypatch.setattr("coord.audit._resolve_operational_retention_days", lambda: 7.0)
+        now = time.time()
+        old_ts = now - 30 * 86400.0
+        record_audit(
+            tier="operational", category="reconcile", event_type="passive_reconcile",
+            actor="daemon", summary="old operational", ts=old_ts,
+        )
+
+        would_delete = sweep_operational_retention(now=now, dry_run=True)
+
+        assert would_delete == 1
+        assert len(_audit_rows(coord_db)) == 1  # nothing actually removed
+
+    def test_configured_via_coordinator_yml(self, coord_db, monkeypatch, tmp_path) -> None:
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(
+            "repos:\n  - name: coord-tui\n    github: acme/coord-tui\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n"
+            "    repos: [coord-tui]\n"
+            "audit:\n  operational_retention_days: 3\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(cfg_path))
+        from coord.audit import sweep_operational_retention
+
+        now = time.time()
+        old_ts = now - 10 * 86400.0
+        record_audit(
+            tier="operational", category="reconcile", event_type="passive_reconcile",
+            actor="daemon", summary="old", ts=old_ts,
+        )
+
+        deleted = sweep_operational_retention(now=now)
+
+        assert deleted == 1
+        assert _audit_rows(coord_db) == []
 
 
 class TestHookedTransitions:

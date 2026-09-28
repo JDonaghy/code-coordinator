@@ -35,27 +35,47 @@ the existing ``audit_log`` (via :func:`coord.audit.record_audit`), tagged
 ``category="forge_availability"``. :func:`availability_report` is the read
 side — ``coord diagnose --forge-availability``.
 
-**#2654: ``outcome="ok"`` observations are rolled up, not written one row
-each.** In practice ~99% of observations are "ok" — measured at 159,601 of
-162,039 rows (98.5%) on dellserver, 80% of the *entire* audit trail — and
-they are pure denominator for the uptime-% math, not signal. Every
-``app_error``/``transient``/``unreachable`` observation (the 1.5% that
-actually says something about forge/CI availability) is still written
-per-observation exactly as before; ``ok`` observations instead accumulate
+**#2654/#3469: ``"ok"``, ``"app_error"`` and ``"transient"`` observations are
+rolled up, not written one row each.** #2654 first did this for ``"ok"``
+alone — measured at 159,601 of 162,039 rows (98.5%) on dellserver, 80% of
+the *entire* audit trail — pure denominator for the uptime-% math, not
+signal. #3469 found the *next* biggest volume was the two outcomes that
+looked like "real" per-observation signal but mostly weren't: a 24h sample
+had 32k ``transient`` and 17k ``app_error`` rows, each written individually
+— and (before #3469) *every one of them* force-flushed every pending
+``"ok"`` aggregate bucket via ``_flush_all_ok_aggregates()``, fragmenting
+those right back into many small rows. So ``"ok"``/``"app_error"``/
+``"transient"`` (:data:`_AGGREGATED_OUTCOMES`) all now accumulate
 in-process (see :class:`_OkAggregate`) and flush as a single aggregate row
-per bucket (:data:`_OK_BUCKET_S`, per ``(caller, shape)`` for ``gh_call``
-(#2988; was per ``argv0`` alone pre-#2988) / per ``(repo, number)`` for
-``ci_check_fetch``) carrying ``count``/
-``duration_s_total``/``first_ts``/``last_ts`` (plus a summed check-level
-``conclusions`` distribution for ``ci_check_fetch``). Flushed on bucket
-roll, on process exit (``atexit``), and immediately before any interesting
-outcome is recorded — the last of those guarantees an aggregate never lands
-*after* an event it chronologically precedes, which is what
-:func:`availability_report`'s ordered-observation math depends on.
+per bucket (:data:`_OK_BUCKET_S`, per ``(event_type, outcome, key)`` where
+``key`` is ``(caller, shape)`` for ``gh_call`` (#2988; was per ``argv0``
+alone pre-#2988) / per ``(repo, number)`` for ``ci_check_fetch``) carrying
+``count``/``duration_s_total``/``first_ts``/``last_ts`` (plus a summed
+check-level ``conclusions`` distribution for ``ci_check_fetch``, and — for
+``app_error``/``transient`` — the *first* observation's ``detail`` string
+verbatim, never overwritten by a later one in the same bucket). Only
+``"unreachable"`` is still written per-observation: it is the rare, truly
+high-signal outage indicator (``gh`` missing / timed out / a raised OSError
+before ``gh`` could even run), low enough volume that per-row timing
+doesn't cost anything, and :data:`AvailabilityReport.longest_unavailable_
+stretch_s`'s contiguous-run math benefits most from its exact timestamps.
+Because ``"transient"`` is now aggregated too, recording one no longer needs
+to flush *any* other bucket to stay safe — the #2654-era fragmentation this
+caused for the ok-aggregate is gone. Flushed on bucket roll, on process
+exit (``atexit``), and immediately before an ``"unreachable"`` observation
+is recorded — the last of those guarantees an aggregate never lands *after*
+an event it chronologically precedes, which is what :func:`availability_
+report`'s ordered-observation math depends on.
 :func:`availability_report` reads ``details["count"]`` to weight aggregate
-rows correctly; :data:`AvailabilityReport.longest_unavailable_stretch_s` is
-unaffected because it only ever measures contiguous runs of *unavailable*
-observations, which are never aggregated.
+rows correctly, and (#3469) ``details["first_ts"]``/``details["last_ts"]``
+— when present, i.e. for an aggregate row — to size a contiguous
+*unavailable* run by the aggregate's own observed span rather than
+collapsing it to a single instant at the row's own ``ts``. This is the one
+semantics change #3469 makes to :attr:`AvailabilityReport.
+longest_unavailable_stretch_s`: a burst of aggregated ``transient`` calls
+now contributes its true first/last timestamps to a run instead of the
+(non-existent, pre-#3469) per-call ones — strictly more accurate, not less,
+than treating the whole aggregate as one instant would be.
 
 **Best-effort, unconditionally.** Every ``record_*`` function here is a thin
 wrapper that can never raise, retry, or delay its caller — ``record_audit``
@@ -100,6 +120,11 @@ EVENT_MERGE_GATE_REFUSAL = "merge_gate_refusal"
 # actually say something about forge/CI availability.
 _AVAILABLE_OUTCOMES = frozenset({"ok", "app_error"})
 
+# #3469: outcomes that accumulate into a per-bucket aggregate (module
+# docstring) instead of writing one row per observation. "unreachable" is
+# deliberately excluded -- see the docstring for why it stays per-row.
+_AGGREGATED_OUTCOMES = frozenset({"ok", "app_error", "transient"})
+
 # Refusal reasons this issue asks to be tracked (#1896 scope: "checks_failed
 # / checks_pending / checks_stale are already distinct MergeEvent kinds ...
 # persist the counts"). Deliberately narrower than every MergeEvent kind
@@ -115,10 +140,34 @@ MERGE_GATE_REFUSAL_KINDS = frozenset({"checks_failed", "checks_pending", "checks
 # without threatening the "does not grow unboundedly" acceptance bar.
 _PRUNE_INTERVAL_S = 3600.0
 
-# Retention window (days). ">= 90 days" per the issue's acceptance bar.
+# Documented CEILING (days) on `forge_availability.retention_days`
+# (coordinator.yml) -- #3469: any configured value above this is clamped
+# down to this, never up. This used to be the sole, hardcoded retention
+# value; #3469 measured its steady state at ~9M rows / ~3GB for this
+# category alone, so the *default* actually applied is
+# `coord.config.ForgeAvailabilityConfig.retention_days` (30, see its
+# docstring) -- this constant is now only the outer bound, not the knob.
 RETENTION_DAYS = 90.0
 
 _last_prune_at = 0.0
+
+
+def _resolve_retention_days() -> float:
+    """``forge_availability.retention_days`` from coordinator.yml, clamped to
+    ``(0, RETENTION_DAYS]``. Falls back to :data:`RETENTION_DAYS` itself on
+    any resolution failure (missing/invalid config) -- a bad config must
+    prune *too little*, never too much, so the safe default is the widest
+    window, not the narrowest.
+    """
+    try:
+        from coord.config import load as _load_config  # noqa: PLC0415
+
+        days = float(_load_config().forge_availability.retention_days)
+    except Exception:  # noqa: BLE001 -- best-effort; widest window is the safe default
+        return RETENTION_DAYS
+    if days <= 0:
+        return RETENTION_DAYS
+    return min(days, RETENTION_DAYS)
 
 
 # ── #2988: attributable call keys — normalised shape + caller tag ──────────
@@ -298,8 +347,9 @@ def record_gh_call(
     argv: tuple[str, ...], *, outcome: str, duration_s: float, detail: str = "", caller: str = "",
 ) -> None:
     """Best-effort: one row per :func:`coord.github_ops._gh` invocation --
-    except ``"ok"`` outcomes, which accumulate into a per-bucket aggregate
-    instead (#2654; see the module docstring).
+    except ``"ok"``/``"app_error"``/``"transient"`` outcomes
+    (:data:`_AGGREGATED_OUTCOMES`), which accumulate into a per-bucket
+    aggregate instead (#2654/#3469; see the module docstring).
 
     ``outcome`` is one of ``"ok"`` (exit 0), ``"app_error"`` (non-zero exit,
     not an auth/network/rate-limit failure -- an ordinary application-level
@@ -313,14 +363,17 @@ def record_gh_call(
     resolved via :func:`_infer_caller_tag` when not given explicitly, so
     this NEVER records an empty tag. Every row now carries both this tag
     and :func:`gh_call_shape`'s normalised ``argv[0]``/``argv[1]``/
-    ``argv[2]`` in place of the pre-#2988 ``argv0``-only key -- the
-    ``ok``-aggregate below buckets on ``(caller, shape)`` instead of
-    ``argv0`` alone.
+    ``argv[2]`` in place of the pre-#2988 ``argv0``-only key -- every
+    aggregate below buckets on ``(caller, shape)`` instead of ``argv0``
+    alone.
     """
     caller = caller or _infer_caller_tag()
     shape = gh_call_shape(argv)
-    if outcome == "ok":
-        _record_ok(EVENT_GH_CALL, (caller, shape), duration_s=duration_s)
+    if outcome in _AGGREGATED_OUTCOMES:
+        _record_aggregate(
+            EVENT_GH_CALL, (caller, shape), outcome,
+            duration_s=duration_s, detail=detail[:200] if detail else "",
+        )
         return
     _flush_all_ok_aggregates()
     _safe_record(
@@ -359,8 +412,8 @@ def record_ci_check_fetch(
     did.
     """
     if outcome == "ok":
-        _record_ok(
-            EVENT_CI_CHECK_FETCH, f"{repo}#{number}", duration_s=duration_s,
+        _record_aggregate(
+            EVENT_CI_CHECK_FETCH, f"{repo}#{number}", "ok", duration_s=duration_s,
             repo=repo, issue=number, conclusions=conclusions,
         )
         return
@@ -439,22 +492,27 @@ _OK_BUCKET_S = 60.0
 
 
 class _OkAggregate:
-    """In-memory accumulator for one bucket's worth of ``outcome="ok"``
-    observations.
+    """In-memory accumulator for one bucket's worth of observations sharing
+    one ``(event_type, outcome, key)`` (#3469 widened this from ``"ok"``
+    alone to every outcome in :data:`_AGGREGATED_OUTCOMES`; the class name
+    predates that and stays for continuity with the #2654 history).
 
     ``repo``/``issue`` are carried through for ``ci_check_fetch`` aggregates
-    (bucketed per-PR — see ``_record_ok``'s ``key`` for ``EVENT_CI_CHECK_
-    FETCH`` — so every observation folded into one aggregate shares the same
-    repo/issue, unlike ``gh_call``'s per-``(caller, shape)`` bucketing (#2988;
-    was per-``argv0`` pre-#2988) which spans whatever repo each call happened
-    to target). ``conclusions_total`` sums the check-level conclusion
-    distribution across the bucket -- for a single-observation bucket this is
-    byte-for-byte the pre-#2654 per-call distribution.
+    (bucketed per-PR — see ``_record_aggregate``'s ``key`` for
+    ``EVENT_CI_CHECK_FETCH`` — so every observation folded into one aggregate
+    shares the same repo/issue, unlike ``gh_call``'s per-``(caller, shape)``
+    bucketing (#2988; was per-``argv0`` pre-#2988) which spans whatever repo
+    each call happened to target). ``conclusions_total`` sums the check-level
+    conclusion distribution across the bucket -- for a single-observation
+    bucket this is byte-for-byte the pre-#2654 per-call distribution.
+    ``detail`` (#3469) is the *first* observation's detail string, verbatim
+    -- never overwritten by :meth:`add`, since the point is "what did the
+    first sighting in this bucket look like", not the last.
     """
 
     __slots__ = (
-        "conclusions_total", "count", "duration_s_total", "first_ts",
-        "issue", "last_ts", "repo",
+        "conclusions_total", "count", "detail", "duration_s_total",
+        "first_ts", "issue", "last_ts", "repo",
     )
 
     def __init__(
@@ -465,6 +523,7 @@ class _OkAggregate:
         repo: str | None = None,
         issue: int | None = None,
         conclusions: dict[str, int] | None = None,
+        detail: str = "",
     ) -> None:
         self.count = 1
         self.duration_s_total = duration_s
@@ -473,6 +532,7 @@ class _OkAggregate:
         self.repo = repo
         self.issue = issue
         self.conclusions_total: dict[str, int] = dict(conclusions) if conclusions else {}
+        self.detail = detail
 
     def add(
         self, ts: float, duration_s: float, *, conclusions: dict[str, int] | None = None,
@@ -483,15 +543,18 @@ class _OkAggregate:
         self.last_ts = max(self.last_ts, ts)
         for k, v in (conclusions or {}).items():
             self.conclusions_total[k] = self.conclusions_total.get(k, 0) + v
+        # `detail` intentionally NOT updated here -- see class docstring.
 
-    def to_details(self, *, event_type: str, key: Any) -> dict[str, Any]:
+    def to_details(self, *, event_type: str, key: Any, outcome: str) -> dict[str, Any]:
         details: dict[str, Any] = {
-            "outcome": "ok",
+            "outcome": outcome,
             "count": self.count,
             "duration_s_total": round(self.duration_s_total, 3),
             "first_ts": self.first_ts,
             "last_ts": self.last_ts,
         }
+        if outcome != "ok" and self.detail:
+            details["detail"] = self.detail
         if event_type == EVENT_GH_CALL:
             caller, shape = key
             details["caller"] = caller
@@ -501,7 +564,7 @@ class _OkAggregate:
         return details
 
 
-_ok_aggregates: dict[tuple[str, Any], _OkAggregate] = {}
+_ok_aggregates: dict[tuple[str, str, Any], _OkAggregate] = {}
 _ok_aggregates_lock = threading.Lock()
 # A *strong reference* to the connection pending aggregates belong to --
 # not id(conn). id() is a memory address; once the previous connection is
@@ -551,21 +614,31 @@ def _drop_ok_aggregates_if_conn_changed() -> None:
     _ok_aggregates_conn = conn
 
 
-def _record_ok(
+def _record_aggregate(
     event_type: str,
     key: Any,
+    outcome: str,
     *,
     duration_s: float,
     repo: str | None = None,
     issue: int | None = None,
     conclusions: dict[str, int] | None = None,
+    detail: str = "",
 ) -> None:
-    """Accumulate one ``outcome="ok"`` observation into its bucket.
+    """Accumulate one observation of *outcome* into its ``(event_type,
+    outcome, key)`` bucket (#2654 introduced this for ``outcome="ok"``
+    alone; #3469 widened it to every outcome in :data:`_AGGREGATED_
+    OUTCOMES`).
 
     ``key`` is ``(caller, shape)`` for ``gh_call`` (#2988) or ``"{repo}#
     {number}"`` for ``ci_check_fetch`` -- see :func:`record_gh_call`/
     :func:`record_ci_check_fetch`. Just a dict key here; this function
-    doesn't interpret it.
+    doesn't interpret it. Deliberately does **not** flush any other pending
+    bucket before accumulating -- that is the #3469 fix: a `transient`/
+    `app_error` observation used to force an immediate per-row write (which
+    *did* need to flush unrelated `ok` buckets first to preserve ordering),
+    but now it just accumulates like `ok` always has, so there is nothing to
+    flush ahead of it.
 
     Best-effort like every other entry point in this module: bucket
     bookkeeping is a handful of dict/lock operations, but a caller here must
@@ -575,35 +648,37 @@ def _record_ok(
         _register_atexit_flush()
         _drop_ok_aggregates_if_conn_changed()
         now = time.time()
-        rolled: tuple[tuple[str, Any], _OkAggregate] | None = None
-        bucket_key = (event_type, key)
+        rolled: tuple[tuple[str, str, Any], _OkAggregate] | None = None
+        bucket_key = (event_type, outcome, key)
         with _ok_aggregates_lock:
             agg = _ok_aggregates.get(bucket_key)
             if agg is None:
                 _ok_aggregates[bucket_key] = _OkAggregate(
-                    now, duration_s, repo=repo, issue=issue, conclusions=conclusions,
+                    now, duration_s, repo=repo, issue=issue,
+                    conclusions=conclusions, detail=detail,
                 )
             elif now - agg.first_ts >= _OK_BUCKET_S:
                 rolled = (bucket_key, agg)
                 _ok_aggregates[bucket_key] = _OkAggregate(
-                    now, duration_s, repo=repo, issue=issue, conclusions=conclusions,
+                    now, duration_s, repo=repo, issue=issue,
+                    conclusions=conclusions, detail=detail,
                 )
             else:
                 agg.add(now, duration_s, conclusions=conclusions)
         if rolled is not None:
             _flush_ok_aggregate(*rolled)
     except Exception as exc:  # noqa: BLE001 -- measurement must never affect the caller
-        _log.debug("forge_availability: ok-aggregate bookkeeping failed: %s", exc)
+        _log.debug("forge_availability: aggregate bookkeeping failed: %s", exc)
 
 
-def _flush_ok_aggregate(bucket_key: tuple[str, Any], agg: _OkAggregate) -> None:
-    event_type, key = bucket_key
-    details = agg.to_details(event_type=event_type, key=key)
+def _flush_ok_aggregate(bucket_key: tuple[str, str, Any], agg: _OkAggregate) -> None:
+    event_type, outcome, key = bucket_key
+    details = agg.to_details(event_type=event_type, key=key, outcome=outcome)
     if event_type == EVENT_GH_CALL:
         caller, shape = key
-        summary = f"gh {shape} ({caller}): ok x{agg.count}"
+        summary = f"gh {shape} ({caller}): {outcome} x{agg.count}"
     else:
-        summary = f"{agg.repo}#{agg.issue}: CI checks ok x{agg.count}"
+        summary = f"{agg.repo}#{agg.issue}: CI checks {outcome} x{agg.count}"
     _safe_record(
         event_type=event_type, summary=summary, details=details, ts=agg.last_ts,
         repo=agg.repo, issue=agg.issue,
@@ -611,12 +686,16 @@ def _flush_ok_aggregate(bucket_key: tuple[str, Any], agg: _OkAggregate) -> None:
 
 
 def _flush_all_ok_aggregates() -> None:
-    """Flush every pending ``ok`` aggregate right now.
+    """Flush every pending aggregate (any outcome) right now.
 
-    Called on bucket roll (per-bucket, above), at process exit, and before
-    every non-``ok`` observation is recorded -- the last of those is what
-    guarantees an aggregate row never lands, chronologically, after an event
-    it actually precedes (module docstring).
+    Called on bucket roll (per-bucket, above), at process exit, and
+    immediately before an ``"unreachable"`` observation is recorded -- the
+    last of those is what guarantees an aggregate row never lands,
+    chronologically, after an event it actually precedes (module
+    docstring). Every *other* outcome (``"ok"``/``"app_error"``/
+    ``"transient"``) is itself aggregated (#3469), so recording one no
+    longer reaches this function at all -- only the rare ``"unreachable"``
+    path still does.
     """
     try:
         _drop_ok_aggregates_if_conn_changed()
@@ -631,7 +710,10 @@ def _flush_all_ok_aggregates() -> None:
 
 
 def _maybe_prune(*, force: bool = False) -> None:
-    """Delete ``forge_availability`` rows older than :data:`RETENTION_DAYS`.
+    """Delete ``forge_availability`` rows older than the resolved retention
+    window (:func:`_resolve_retention_days` -- ``coordinator.yml``'s
+    ``forge_availability.retention_days``, default 30, clamped to the
+    documented :data:`RETENTION_DAYS` ceiling of 90).
 
     Throttled to once per :data:`_PRUNE_INTERVAL_S` per process (``force``
     bypasses the throttle, for tests) -- see the module docstring for why a
@@ -647,7 +729,7 @@ def _maybe_prune(*, force: bool = False) -> None:
         from coord import sql  # noqa: PLC0415
         from coord.db import get_connection  # noqa: PLC0415
 
-        cutoff = now - RETENTION_DAYS * 86400.0
+        cutoff = now - _resolve_retention_days() * 86400.0
         conn = get_connection()
         sql.execute(
             conn,
@@ -769,11 +851,11 @@ def availability_report(
     # chronological order so "contiguous" means "contiguous in time".
     observations.sort(key=lambda e: (e["ts"], e["id"]))
 
-    # #2654: an "ok" observation may be a rolled-up aggregate row standing in
-    # for `count` individual observations (module docstring) rather than
+    # #2654/#3469: an observation may be a rolled-up aggregate row standing
+    # in for `count` individual observations (module docstring) rather than
     # one row each -- every sum below weights by `details["count"]`, which
-    # defaults to 1 for the non-aggregated rows (every non-"ok" outcome,
-    # plus any pre-#2654 "ok" row still inside the retention window).
+    # defaults to 1 for the non-aggregated rows (the "unreachable" outcome,
+    # plus any pre-#2654/#3469 row still inside the retention window).
     gh_calls = sum(
         (e.get("details") or {}).get("count", 1)
         for e in observations if e["event_type"] == EVENT_GH_CALL
@@ -792,13 +874,18 @@ def availability_report(
         details = e.get("details") or {}
         outcome = details.get("outcome")
         weight = details.get("count", 1)
-        duration_s = details.get("duration_s") or 0.0
+        # #3469: an aggregate row (any outcome, not just "ok" pre-#3469)
+        # carries the bucket's own first_ts/last_ts -- use those to size a
+        # contiguous run by the aggregate's true observed span rather than
+        # collapsing it to a single instant at the row's own `ts`. A raw,
+        # non-aggregated row has neither key, so this falls back to exactly
+        # the pre-#3469 `e["ts"]` / `e["ts"] + duration_s` behaviour.
+        obs_start_ts = details.get("first_ts", e["ts"])
+        obs_end_ts = details.get("last_ts", e["ts"]) + (
+            0.0 if "last_ts" in details else (details.get("duration_s") or 0.0)
+        )
         is_available = outcome in _AVAILABLE_OUTCOMES
         if is_available:
-            # Aggregate rows are always "ok" (never written for an
-            # unavailable outcome), so this branch is the only one a
-            # weight > 1 ever reaches -- the contiguous-unavailable-run
-            # math below stays per-observation, unaffected by rollup.
             available += weight
             if run_start_ts is not None:
                 longest_stretch = max(longest_stretch, (run_end_ts or run_start_ts) - run_start_ts)
@@ -807,8 +894,8 @@ def availability_report(
         else:
             unavailable += weight
             if run_start_ts is None:
-                run_start_ts = e["ts"]
-            run_end_ts = e["ts"] + duration_s
+                run_start_ts = obs_start_ts
+            run_end_ts = obs_end_ts
     if run_start_ts is not None:
         longest_stretch = max(longest_stretch, (run_end_ts or run_start_ts) - run_start_ts)
 

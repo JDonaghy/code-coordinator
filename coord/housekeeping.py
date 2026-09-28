@@ -203,16 +203,55 @@ def _move_rows(
         )
 
 
-def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
+def reclaim_space(conn: sqlite3.Connection | None = None) -> bool:
+    """Run the dialect-routed space-reclaim pass (:func:`coord.sql.
+    reclaim_space` — SQLite ``VACUUM`` / Postgres ``VACUUM``) against the
+    live DB connection, or *conn* if given.  Returns ``True`` on success.
+
+    #3469's "one-off reclaim" step: a retention sweep's ``DELETE``s alone
+    never shrink the on-disk artifact on either backend (see that function's
+    docstring) — this is the explicit, operator-invoked follow-up. Never
+    called automatically by :func:`sweep`'s low-cadence tick; only when a
+    caller opts in via ``reclaim=True`` (``coord housekeeping --reclaim`` or
+    equivalent), since a full-table rewrite is not a bounded operation like
+    everything else this module does on a timer.
+    """
+    conn = conn if conn is not None else get_connection()
+    sql.reclaim_space(conn)
+    return True
+
+
+def sweep(
+    *, dry_run: bool = False, now: float | None = None, reclaim: bool = False,
+) -> dict:
     """Archive stale terminal assignments + their notifications + merged
-    merge_queue entries + terminal drive_queue rows + orphaned plans, and
-    reclaim leaked confirm-worktree directories.
+    merge_queue entries + terminal drive_queue rows + orphaned plans, delete
+    old operational-tier audit rows, and reclaim leaked confirm-worktree
+    directories.
 
     Returns ``{"archived_assignments": N, "archived_notifications": M,
     "archived_merge_queue": K, "archived_drive_queue": Q, "archived_plans": P,
-    "removed_confirm_worktrees": W, "dry_run": bool, "retention_days": D}``.
-    ``archived_*``/``removed_confirm_worktrees`` are the counts that were (or,
-    for ``dry_run``, would be) moved/deleted.  A no-op returns zeros.
+    "removed_confirm_worktrees": W, "audit_operational_deleted": A,
+    "reclaimed": bool, "dry_run": bool, "retention_days": D}``.
+    ``archived_*``/``removed_confirm_worktrees``/``audit_operational_deleted``
+    are the counts that were (or, for ``dry_run``, would be) moved/deleted.
+    A no-op returns zeros.
+
+    #3469: ``audit_operational_deleted`` comes from :func:`coord.audit.
+    sweep_operational_retention` — a time-window DELETE scoped to
+    ``tier='operational'`` rows (``audit.operational_retention_days``,
+    default disabled), independent of the ``COORD_ARCHIVE_RETENTION_DAYS``
+    ``cutoff`` below and run unconditionally (same reasoning as
+    ``removed_confirm_worktrees``: a separate knob, a separate window,
+    should not go silent just because someone disabled DB archiving).
+    ``reclaim=True`` additionally runs a dialect-routed space-reclaim pass
+    (SQLite ``VACUUM``; a Postgres equivalent -- see :func:`coord.sql.
+    reclaim_space`) *after* every delete/archive above has committed — a
+    one-off, operator-invoked step (deliberately never automatic on the
+    daemon's low-cadence tick: it is a full-table rewrite, not a bounded
+    operation like everything else this sweep does). No-op (returns
+    ``reclaimed=False``) when ``dry_run`` is set, since there is nothing to
+    reclaim space from until the deletes it's reclaiming after actually run.
 
     Conservative by construction: nothing active, recent (within the archive
     window), queued-for-merge, latest-of-an-open-issue, or review-linked to any
@@ -234,9 +273,11 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
     ``<= 0``) — a disk leak on the daemon host is not something an operator
     who merely turned off DB archiving meant to also keep.
     """
+    from coord import audit as _audit  # noqa: PLC0415
     from coord.confirm_test import sweep_stale_confirm_worktrees  # noqa: PLC0415
 
     swept_worktrees = sweep_stale_confirm_worktrees(dry_run=dry_run, now=now)
+    audit_operational_deleted = _audit.sweep_operational_retention(now=now, dry_run=dry_run)
 
     cutoff = _archive_cutoff(now)
     result = {
@@ -246,11 +287,15 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
         "archived_drive_queue": 0,
         "archived_plans": 0,
         "removed_confirm_worktrees": len(swept_worktrees["removed"]),
+        "audit_operational_deleted": audit_operational_deleted,
+        "reclaimed": False,
         "dry_run": dry_run,
         "retention_days": _archive_retention_days(),
     }
     if cutoff is None:
-        return result  # DB archiving disabled; the worktree sweep above still ran
+        if reclaim and not dry_run:
+            result["reclaimed"] = reclaim_space()
+        return result  # DB archiving disabled; the sweeps above still ran
 
     conn = get_connection()
     index = [
@@ -347,6 +392,8 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
     if dry_run or not (
         candidates or notif_ids or mq_merged_ids or dq_candidates or plan_candidates
     ):
+        if reclaim and not dry_run:
+            result["reclaimed"] = reclaim_space(conn)
         return result
 
     with conn:
@@ -366,4 +413,6 @@ def sweep(*, dry_run: bool = False, now: float | None = None) -> dict:
             _move_rows(conn, _DRIVE_QUEUE, _DRIVE_QUEUE_ARCHIVE, "id", dq_candidates)
         if plan_candidates:
             _move_rows(conn, _PLANS, _PLANS_ARCHIVE, "assignment_id", plan_candidates)
+    if reclaim:
+        result["reclaimed"] = reclaim_space(conn)
     return result
