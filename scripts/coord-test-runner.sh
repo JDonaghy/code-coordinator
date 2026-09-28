@@ -15,7 +15,10 @@
 # #1392 kept this as shell on purpose: venv creation is genuinely shell work.
 # Its four sharp-edged
 # parsers were extracted to tested Python in coord/test_report.py (#1436) —
-# that module is the reference behaviour; the grep/awk below still mirrors it.
+# that module is the reference behaviour. The collection-error classifier now
+# CALLS it (`pytest_collection_error_verdict`, #3470) instead of mirroring it,
+# because the mirror had drifted into a false positive; the remaining grep/awk
+# parsers still mirror it and are the next candidates for the same treatment.
 #
 # Six things it handles that a bare `pytest` does not:
 #
@@ -406,6 +409,56 @@ PY_FAIL_SUITE="python"
 # baseline, and every such failure would be a FALSE baseline-red, i.e. exactly
 # the laundering this guard is written to avoid. The python arm is safe because
 # it parses failures by name and can share the branch's already-built venv.
+# ── "did this pytest run fail to START?" — ONE implementation (#3470) ────────
+#
+# Both places that ask this used to ask it with their own copy of
+#
+#     grep -qE "^(ERROR|INTERNALERROR)"
+#
+# which is wrong, and wrong in the direction that blames the branch. pytest's
+# captured-log sections print log records at column 0 with the level name
+# padded to eight characters:
+#
+#     ERROR    coord.agent_update:agent_update.py:643 perform_update refused: …
+#
+# so ANY suite containing a test that exercises an error path and logs it was
+# classified as a collection/import error. On #3470 that short-circuited the
+# flake filter AND the #2170 baseline comparison and reported
+# `FAIL(python): collection/import error` for a run that had, in fact, run
+# fine and produced 91 ordinary FAILED lines on a machine whose baseline was
+# red — the exact laundering-in-reverse the baseline comparison exists to
+# prevent. "Captured stdout call" makes it worse: a test that merely PRINTS a
+# string beginning with "ERROR" tripped it too.
+#
+# The tested answer already existed — `coord.test_report.pytest_has_collection_error`
+# (#1436), which matches pytest's own structural markers ("=== ERRORS ===",
+# "INTERNALERROR>", "Interrupted: N error during collection"). This script's
+# header calls that module "the reference behaviour"; it now CALLS it rather
+# than mirroring it in grep, so the two cannot drift apart again (one
+# question, one answer).
+#
+# Echoes exactly one of `yes` / `no` / `unknown`. `unknown` means the question
+# could not be asked at all (the branch venv cannot import `coord.test_report`)
+# and callers must fail closed on it rather than pick a convenient default —
+# a classifier that silently answers "no" when it cannot answer is a gate that
+# cannot fail.
+pytest_collection_error_verdict() {
+    local venv="$1" out="$2" verdict=""
+    verdict="$("$venv/bin/python" - "$out" <<'PY' 2>/dev/null
+import sys
+
+from coord.test_report import pytest_has_collection_error
+
+with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
+    print("yes" if pytest_has_collection_error(fh.read()) else "no")
+PY
+    )" || verdict=""
+    case "$verdict" in
+        yes|no) printf '%s\n' "$verdict" ;;
+        *)      printf 'unknown\n' ;;
+    esac
+}
+
 BASELINE_WT=""
 BASELINE_SCRATCH=""
 BASELINE_DESC=""
@@ -513,10 +566,14 @@ sys.exit(0 if base in pkg.parents else 9)
         log "baseline: every failing test PASSES on the merge-base — the branch owns this failure"
         return 1
     fi
-    if grep -qE "^(ERROR|INTERNALERROR)" "$out"; then
-        warn "baseline: the merge-base run hit a collection/import error, so it says nothing about these tests — reporting the failure as the branch's, uncompared"
-        return 1
-    fi
+    case "$(pytest_collection_error_verdict "$venv" "$out")" in
+        yes)
+            warn "baseline: the merge-base run hit a collection/import error, so it says nothing about these tests — reporting the failure as the branch's, uncompared"
+            return 1 ;;
+        unknown)
+            warn "baseline: could not classify the merge-base run (the branch venv cannot import coord.test_report), so it says nothing about these tests — reporting the failure as the branch's, uncompared"
+            return 1 ;;
+    esac
 
     local base_failed
     base_failed="$(grep '^FAILED ' "$out" | awk '{print $2}' | sort -u || true)"
@@ -838,11 +895,20 @@ run_python() {
     fi
 
     # A collection/import error is never a flake — the suite could not even run.
-    if grep -qE "^(ERROR|INTERNALERROR)" "$out"; then
-        say "FAIL(python): collection/import error"
-        tail -n 30 "$out" | sed 's/^/      /'
-        return 1
-    fi
+    # Classified by `pytest_collection_error_verdict` (#3470, see its header):
+    # a bare `^ERROR` match reads pytest's captured-log blocks as a collection
+    # error and steals every ordinary failure out of the flake filter and the
+    # baseline comparison below.
+    case "$(pytest_collection_error_verdict "$venv" "$out")" in
+        yes)
+            say "FAIL(python): collection/import error"
+            tail -n 30 "$out" | sed 's/^/      /'
+            return 1 ;;
+        unknown)
+            say "FAIL(python): could not classify the run — the branch venv cannot import coord.test_report, so 'collection error vs. ordinary failures' is unanswerable and no flake/baseline judgement is safe"
+            tail -n 30 "$out" | sed 's/^/      /'
+            return 1 ;;
+    esac
 
     local failed
     failed="$(grep '^FAILED ' "$out" | awk '{print $2}' | sort -u || true)"

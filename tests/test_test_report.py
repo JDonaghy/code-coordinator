@@ -19,6 +19,12 @@ piped rather than attached to a tty). How each was produced:
 - pytest_error_string_in_body.txt: `pytest -q --tb=short -rA` against a test
   that fails a genuine assertion AND prints "ERROR: ..." to stdout — the
   printed line survives verbatim in the "Captured stdout call" section.
+- pytest_error_log_record.txt: `pytest -q --tb=short -rA` against a test that
+  fails a genuine assertion AND emits a `logging` record at ERROR level — the
+  record lands in "Captured log call" rendered at column 0 as
+  `ERROR    <logger>:<file>:<line> <msg>` (the level name is `%(levelname)-8s`),
+  which is the #3470 false positive: one ordinary failure that read as a
+  collection error.
 - pytest_no_parseable_failures.txt: `pytest -u -q --tb=short` against a test
   that calls `os._exit(1)` — the process dies before pytest's terminal
   reporter flushes anything, producing a genuinely empty file with exit 1.
@@ -115,6 +121,23 @@ def test_pytest_collection_error_not_tripped_by_error_string_in_test_body():
     # line-start (it lands verbatim in "Captured stdout call") must not be
     # mistaken for a genuine collection/import error.
     assert tr.pytest_has_collection_error(_read("pytest_error_string_in_body.txt")) is False
+
+
+def test_pytest_collection_error_not_tripped_by_captured_error_log_record():
+    # #3470: the shape that actually broke a Test leg. pytest's "Captured log
+    # call" section renders each record at COLUMN 0 with the level name padded
+    # to eight characters — "ERROR    coord.agent_update:…" — so every suite
+    # containing a test that exercises an error path and logs it looked like a
+    # collection error to `grep -qE "^(ERROR|INTERNALERROR)"`. This is the
+    # single ordinary failure underneath: the parser must see it as such.
+    output = _read("pytest_error_log_record.txt")
+    # The fixture really does contain a column-0 "ERROR" line — without this
+    # the two assertions below would pass vacuously on any output at all.
+    assert any(line.startswith("ERROR") for line in output.splitlines())
+    assert tr.pytest_has_collection_error(output) is False
+    assert tr.pytest_failed_node_ids(output) == [
+        "test_error_log.py::test_fails_after_logging_an_error"
+    ]
 
 
 def test_pytest_collection_error_not_tripped_by_empty_output():
