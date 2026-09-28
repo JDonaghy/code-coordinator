@@ -510,6 +510,15 @@ ensure_baseline_worktree() {
     return 0
 }
 
+# Set by `python_baseline_is_red` on a 0 return: the node ids it POSITIVELY
+# confirmed red on the merge-base. Normally identical to the set it was handed,
+# but smaller when it demonstrated one of them to be a flake (see the
+# confirming re-run below, #3470). Only meaningful after a 0 return — the
+# caller reports from this, never from its own pre-call set, so the count and
+# the id list in `BASELINE-RED(python): all N failing test(s) …` describe the
+# comparison that actually happened.
+BASELINE_RED_NODE_IDS=""
+
 # 0 == every node id in $1 also fails on the merge-base (baseline is red).
 # Non-zero == the branch owns the failure, or the question could not be
 # answered. Never anything in between: see the "hard to trigger" note above.
@@ -517,6 +526,8 @@ python_baseline_is_red() {
     local failed="$1"
     local venv="$WT/.venv"
     local base_wt f file
+
+    BASELINE_RED_NODE_IDS=""
 
     ensure_baseline_worktree || return 1
     base_wt="$BASELINE_WT"
@@ -575,15 +586,105 @@ sys.exit(0 if base in pkg.parents else 9)
             return 1 ;;
     esac
 
-    local base_failed
+    local base_failed passes_on_base=""
     base_failed="$(grep '^FAILED ' "$out" | awk '{print $2}' | sort -u || true)"
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
         if ! printf '%s\n' "$base_failed" | grep -qxF "$f"; then
-            log "baseline: $f PASSES on the merge-base — a genuine branch failure"
-            return 1
+            passes_on_base+="$f"$'\n'
         fi
     done <<<"$failed"
+
+    passes_on_base="$(printf '%s' "$passes_on_base" | grep . || true)"
+    if [[ -z "$passes_on_base" ]]; then
+        BASELINE_RED_NODE_IDS="$failed"
+        return 0
+    fi
+
+    # #3470: a node id that passes on the merge-base is the ONLY thing standing
+    # between a red-baseline machine and the correct BASELINE-RED verdict
+    # (#2170's downgrade is unanimous), so it must not be believed on a single
+    # observation. Confirm it against the BRANCH before blaming the branch.
+    #
+    # The failure this closes, on this repo's own #3470 Test leg: 92 tests
+    # failed on a macOS box with no `restic`/`docker` and systemd-shaped
+    # assertions. 91 were plainly pre-existing. The 92nd was
+    # `test_agent_app.py::test_worktree_clean_does_not_block_concurrent_health`
+    # — a wall-clock assertion (`/health` under 2.0s) that flaked twice in a
+    # row under `-n auto` on a loaded box, so the #2562 isolation prune above
+    # did not drop it, and then passed once on the merge-base. One flake
+    # therefore re-attributed all 91 environment failures to the branch and
+    # burned a fix round on a branch that had broken nothing.
+    #
+    # Why this is not a loosening of #2170. The downgrade still requires
+    # positive, unanimous evidence — this only adds a SECOND branch-side
+    # observation before a node id is allowed to defeat it, and a node id
+    # survives that observation by failing again. A real regression fails
+    # deterministically on the branch and is unaffected; only a test that
+    # cannot reproduce its own failure on the branch is dropped, which is by
+    # definition the flake case the arm above already exists to catch. If the
+    # confirming run cannot answer (collection error, unparseable, missing
+    # classifier) the branch keeps the blame, same direction as every other
+    # refusal in this function.
+    local confirm_n confirm_out confirm_failed still_owned="" flake_n=0
+    confirm_n="$(printf '%s\n' "$passes_on_base" | grep -c . || true)"
+    confirm_out="$WT/.pytest.baseline-confirm.out"
+    log "baseline: $confirm_n of the $(printf '%s\n' "$failed" | grep -c . || true) failing test(s) PASS on the merge-base — re-running just those on the BRANCH to confirm it really owns them"
+    # shellcheck disable=SC2086  # node ids are intentionally word-split
+    if (cd "$WT" && "$venv/bin/python" -m pytest -q --tb=short $passes_on_base) >"$confirm_out" 2>&1; then
+        # Green: none of them fails on the branch either, so the branch cannot
+        # own any of them. Every id falls through to the flake arm below.
+        confirm_failed=""
+    else
+        case "$(pytest_collection_error_verdict "$venv" "$confirm_out")" in
+            yes)
+                warn "baseline: the confirming branch re-run hit a collection/import error, so it cannot clear these tests — reporting the failure as the branch's, uncompared"
+                return 1 ;;
+            unknown)
+                warn "baseline: could not classify the confirming branch re-run (the branch venv cannot import coord.test_report) — reporting the failure as the branch's, uncompared"
+                return 1 ;;
+        esac
+        confirm_failed="$(grep '^FAILED ' "$confirm_out" | awk '{print $2}' | sort -u || true)"
+        if [[ -z "$confirm_failed" ]]; then
+            warn "baseline: the confirming branch re-run exited non-zero with no parseable FAILED lines, so it cannot clear these tests — reporting the failure as the branch's, uncompared"
+            return 1
+        fi
+    fi
+
+    # Intersect rather than trust the exit code: only a node id the confirming
+    # run actually reported as failing stays attributed to the branch.
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        if [[ -n "$confirm_failed" ]] && printf '%s\n' "$confirm_failed" | grep -qxF "$f"; then
+            still_owned+="$f"$'\n'
+        else
+            log "baseline: $f failed in the full run but PASSES on the branch when re-run — flaky, not a branch failure; excluded from the comparison"
+            flake_n=$((flake_n + 1))
+        fi
+    done <<<"$passes_on_base"
+
+    still_owned="$(printf '%s' "$still_owned" | grep . || true)"
+    if [[ -n "$still_owned" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            log "baseline: $f PASSES on the merge-base — a genuine branch failure"
+        done <<<"$still_owned"
+        return 1
+    fi
+
+    FLAKES+=("python-baseline-confirm:$flake_n")
+    # `$failed` minus the excluded flakes. Non-empty by construction: the
+    # merge-base run exited non-zero above (a fully-green one already
+    # returned), so `base_failed` is non-empty — and `$failed` minus
+    # `$passes_on_base` IS `base_failed`. Checked anyway rather than asserted,
+    # because claiming BASELINE-RED over an empty set is the one outcome here
+    # that would be worse than reporting the failure uncompared.
+    BASELINE_RED_NODE_IDS="$(printf '%s\n' "$failed" | grep . \
+        | grep -vxF -f <(printf '%s\n' "$passes_on_base") || true)"
+    if [[ -z "$BASELINE_RED_NODE_IDS" ]]; then
+        warn "baseline: every failing test turned out to be a flake, leaving nothing to compare — reporting the failure as the branch's, uncompared"
+        return 1
+    fi
     return 0
 }
 
@@ -961,6 +1062,12 @@ run_python() {
     # (#2170 — see the baseline section above for why this only ever downgrades
     # on unanimous, positively-confirmed evidence.)
     if python_baseline_is_red "$failed"; then
+        # Report from the set the comparison actually confirmed, not from the
+        # pre-call one: #3470's confirming re-run may have excluded a node id
+        # it demonstrated to be a flake, and "all N fail identically" must
+        # describe the comparison that happened or it is a false claim.
+        failed="$BASELINE_RED_NODE_IDS"
+        count="$(printf '%s\n' "$failed" | grep -c . || true)"
         say "BASELINE-RED(python): all $count failing test(s) fail identically on $BASELINE_DESC — this machine's baseline is red and this is NOT a verdict on the branch"
         printf '%s\n' "$failed" | sed 's/^/      /'
         say "      The branch made nothing worse. Fix the BASELINE (or this machine's environment) — a machine whose suite cannot go green cannot produce a Test verdict for any branch (#2170). Reproduce the environment half with scripts/run_tests_in_populated_home.sh."

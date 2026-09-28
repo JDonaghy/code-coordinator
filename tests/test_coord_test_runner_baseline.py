@@ -144,15 +144,47 @@ if [[ "$1" == "-m" && "$2" == "pytest" ]]; then
     # An invocation carrying node ids is a targeted re-run (the flake filter, or
     # the baseline comparison); one without is the full-suite run.
     _targeted=0
+    _ids=""
     for arg in "$@"; do
-        case "$arg" in *::*) _targeted=1 ;; esac
+        case "$arg" in *::*) _targeted=1; _ids+="$arg"$'\n' ;; esac
     done
+    _ids="$(printf '%s' "$_ids" | sort | tr '\n' ' ')"
 
     if [[ "$_here" == "$_wt" ]]; then
         # ── the BRANCH's own worktree ────────────────────────────────────────
+        if [[ "$_targeted" -eq 1 && -n "${FAKE_PYTEST_IDS_LOG:-}" ]]; then
+            printf 'branch-targeted %s\n' "${_ids% }" >> "$FAKE_PYTEST_IDS_LOG"
+        fi
         if [[ "$_targeted" -eq 0 && "${FAKE_BRANCH_COLLECTION_ERROR:-0}" == "1" ]]; then
             _emit_collection_error
             exit 2
+        fi
+        # #3470: the CONFIRMING branch re-run — the runner re-runs just the node
+        # ids that passed on the merge-base, against the branch, before letting
+        # them defeat a BASELINE-RED downgrade. Recognised by its exact node-id
+        # SET, not by call order, so it can never be confused with the earlier
+        # isolation re-run (which is handed the full FAKE_BRANCH_FAILED set):
+        # if the runner ever stopped narrowing the set, this arm would simply
+        # not match and the test would fail rather than pass vacuously.
+        if [[ "$_targeted" -eq 1 && -n "${FAKE_CONFIRM_IDS:-}" ]]; then
+            _want=""
+            for id in $FAKE_CONFIRM_IDS; do _want+="$id"$'\n'; done
+            _want="$(printf '%s' "$_want" | sort | tr '\n' ' ')"
+            if [[ "$_ids" == "$_want" ]]; then
+                case "${FAKE_CONFIRM_RESULT:-pass}" in
+                    pass)
+                        # Passes on the branch too ⇒ the branch does not own it.
+                        printf '1 passed\n'; exit 0 ;;
+                    error)
+                        _emit_collection_error; exit 2 ;;
+                    noparse)
+                        printf 'INTERNALERROR> boom\n'; exit 3 ;;
+                    *)
+                        # Still fails on the branch ⇒ genuinely branch-owned.
+                        _emit_failed "$FAKE_CONFIRM_RESULT"
+                        printf '1 failed\n'; exit 1 ;;
+                esac
+            fi
         fi
         if [[ "$_targeted" -eq 1 && "${FAKE_RERUN_PASSES:-0}" == "1" ]]; then
             printf '%s passed\n' "2"
@@ -384,6 +416,130 @@ def test_partial_overlap_is_a_branch_failure(repo: Path) -> None:
     assert "RESULT: FAIL (python)" in result.stdout
     assert "BASELINE-RED" not in result.stdout
     assert "test_two PASSES on the merge-base" in result.stdout
+
+
+# ── #3470: one flake must not re-attribute a red baseline to the branch ─────
+#
+# The failure these close, from this repo's own #3470 Test leg. 92 tests failed
+# on a macOS box with no `restic`/`docker` and systemd-shaped assertions; 91
+# were plainly pre-existing. The 92nd,
+# `test_agent_app.py::test_worktree_clean_does_not_block_concurrent_health`,
+# asserts a wall-clock bound (`/health` under 2.0s) and flaked TWICE under
+# `-n auto` on a loaded box — so #2562's isolation prune did not drop it — then
+# passed once on the merge-base. #2170's downgrade is unanimous, so that single
+# node id turned 91 environment failures into `FAIL (python)` and burned a fix
+# round on a branch that had broken nothing. The runner now asks the branch a
+# second time before letting a node id defeat the downgrade.
+
+
+def test_a_flake_surviving_isolation_does_not_defeat_a_red_baseline(repo: Path) -> None:
+    """The headline case: one of two failures passes on the merge-base, but it
+    also passes on the BRANCH when re-run — so the branch does not own it, and
+    the remaining failure is baseline-red.
+
+    Note what is NOT relaxed: the flake is excluded because the branch itself
+    could not reproduce it, which is positive evidence, not an assumption.
+    """
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED="tests/test_ambient.py::test_one",
+        FAKE_CONFIRM_IDS="tests/test_ambient.py::test_two",
+        FAKE_CONFIRM_RESULT="pass",
+    )
+
+    assert result.returncode == 4, (result.returncode, result.stdout, result.stderr)
+    assert "RESULT: BASELINE-RED (python)" in result.stdout
+    assert "RESULT: FAIL" not in result.stdout
+    # The count describes the comparison that actually happened — ONE confirmed
+    # id, not the two the arm started with. "all 2" here would be a false claim
+    # about test_two, which was never confirmed red on the base.
+    assert "BASELINE-RED(python): all 1 failing test(s) fail identically" in result.stdout
+    assert "test_two" in result.stdout
+    assert "PASSES on the branch when re-run" in result.stdout
+    # And it is booked as a flake, so the run is not silently laundered.
+    assert "flakes tolerated this run" in result.stdout
+
+
+def test_a_failure_that_reproduces_on_the_branch_stays_the_branch_s(repo: Path) -> None:
+    """The gate can still fail. Same shape as the test above — one failure
+    passes on the merge-base — except the confirming branch re-run FAILS it
+    again. That is a real regression and must not be downgraded.
+
+    Without this the test above would only prove the permissive branch exists.
+    """
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED="tests/test_ambient.py::test_one",
+        FAKE_CONFIRM_IDS="tests/test_ambient.py::test_two",
+        FAKE_CONFIRM_RESULT="tests/test_ambient.py::test_two",
+    )
+
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert "RESULT: FAIL (python)" in result.stdout
+    assert "BASELINE-RED" not in result.stdout
+    assert "test_two PASSES on the merge-base" in result.stdout
+
+
+@pytest.mark.parametrize("confirm_result", ["error", "noparse"])
+def test_an_inconclusive_confirming_rerun_keeps_the_branch_failure(
+    repo: Path, confirm_result: str
+) -> None:
+    """A confirming re-run that cannot answer (collection/import error, or a
+    non-zero exit with no parseable ``FAILED`` lines) must not clear anything —
+    same refusal direction as every other unanswerable question in this
+    function. Otherwise a broken confirming run would become a free pass.
+    """
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED="tests/test_ambient.py::test_one",
+        FAKE_CONFIRM_IDS="tests/test_ambient.py::test_two",
+        FAKE_CONFIRM_RESULT=confirm_result,
+    )
+
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert "RESULT: FAIL (python)" in result.stdout
+    assert "BASELINE-RED" not in result.stdout
+    # `warn` goes to stderr, same as the other refusals in this function.
+    both_streams = result.stderr + result.stdout
+    assert "confirming branch re-run" in both_streams
+    assert "uncompared" in both_streams
+
+
+def test_the_confirming_rerun_is_scoped_to_the_ids_that_passed_on_the_base(
+    repo: Path,
+) -> None:
+    """It re-runs ONLY the node ids the merge-base cleared, not the whole
+    failing set.
+
+    Load-bearing for cost (re-running the whole failing set a third time is
+    what the arms above already paid for) and for correctness: handing it every
+    id would mean a still-failing baseline-red test kept the flake's blame
+    alive, and the downgrade could never happen.
+
+    Asserted by recording every targeted node-id set the fake interpreter is
+    handed, then reading back the branch-side ones — so this observes the
+    invocation the runner actually made rather than a canned verdict.
+    """
+    log = repo / "pytest-argv.log"
+    result = _run(
+        repo,
+        FAKE_BASELINE_FAILED="tests/test_ambient.py::test_one",
+        FAKE_CONFIRM_IDS="tests/test_ambient.py::test_two",
+        FAKE_CONFIRM_RESULT="pass",
+        FAKE_PYTEST_IDS_LOG=str(log),
+    )
+    assert result.returncode == 4, (result.returncode, result.stdout, result.stderr)
+
+    lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    branch_targeted = [
+        ids.split(" ", 1)[1] for ids in lines if ids.startswith("branch-targeted ")
+    ]
+    # Two targeted branch runs: #2562's isolation re-run over the full failing
+    # set, then #3470's confirming re-run over just the merge-base-cleared id.
+    assert branch_targeted == [
+        "tests/test_ambient.py::test_one tests/test_ambient.py::test_two",
+        "tests/test_ambient.py::test_two",
+    ], lines
 
 
 def test_branch_new_test_file_can_never_be_baseline_red(repo: Path) -> None:
