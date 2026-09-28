@@ -758,7 +758,9 @@ def _audit_housekeeping_sweep(swept: dict) -> None:
             f"notification(s), {swept.get('archived_merge_queue', 0)} "
             "merge_queue entry(ies), removed "
             f"{swept.get('removed_confirm_worktrees', 0)} stale "
-            "confirm-worktree(s) (#2974)"
+            "confirm-worktree(s) (#2974), deleted "
+            f"{swept.get('audit_operational_deleted', 0)} stale operational "
+            "audit_log row(s) (#3469)"
         ),
         details=swept,
     )
@@ -10713,9 +10715,12 @@ def build_app(
         except Exception:  # noqa: BLE001
             body = {}
         dry_run = bool(body.get("dry_run", False))
+        reclaim = bool(body.get("reclaim", False))
         os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = "1"
         try:
-            result = await run_in_threadpool(housekeeping.sweep, dry_run=dry_run)
+            result = await run_in_threadpool(
+                housekeeping.sweep, dry_run=dry_run, reclaim=reclaim
+            )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "housekeeping failed", "detail": str(e)}, status_code=503
@@ -11570,15 +11575,24 @@ def build_app(
                             or swept.get("archived_notifications")
                             or swept.get("archived_merge_queue")
                             or swept.get("removed_confirm_worktrees")
+                            # #3469: the operational-tier audit retention sweep
+                            # runs unconditionally, independent of everything
+                            # above — once `audit.operational_retention_days`
+                            # is turned on, a tick that *only* deletes stale
+                            # operational rows will be the common case, and
+                            # this must not go silent / leave zero audit trail.
+                            or swept.get("audit_operational_deleted")
                         ):
                             log.info(
                                 "housekeeping: archived %d assignment(s), "
                                 "%d notification(s), %d merge_queue entry(ies), "
-                                "removed %d stale confirm-worktree(s)",
+                                "removed %d stale confirm-worktree(s), deleted "
+                                "%d stale operational audit_log row(s)",
                                 swept["archived_assignments"],
                                 swept["archived_notifications"],
                                 swept.get("archived_merge_queue", 0),
                                 swept.get("removed_confirm_worktrees", 0),
+                                swept.get("audit_operational_deleted", 0),
                             )
                             _audit_housekeeping_sweep(swept)
                     except Exception:  # noqa: BLE001
