@@ -186,6 +186,54 @@ steps:
                 "    region: {row: 0, col: 0, height: 1, width: 5}\n"
             )
 
+    def test_expect_screen_attr_with_only_row_and_col_raises(self) -> None:
+        # (#2096) `row:`/`col:` only *address* a cell — the step body skips
+        # them when comparing, so an `attr:` holding nothing else is
+        # non-empty (passes a plain truthiness check) yet leaves the
+        # comparison loop with nothing to iterate: the step would always
+        # pass regardless of what's on screen.
+        with pytest.raises(TuiPtySpecError, match="no cell attribute"):
+            parse_smoke_spec(
+                "steps:\n  - type: expect_screen\n    id: foo\n"
+                "    attr: {row: 3, col: 5}\n"
+            )
+
+    def test_expect_screen_attr_with_only_row_raises(self) -> None:
+        # Same hole reached with a single addressing key rather than both.
+        with pytest.raises(TuiPtySpecError, match="no cell attribute"):
+            parse_smoke_spec(
+                "steps:\n  - type: expect_screen\n    attr: {row: 3}\n"
+            )
+
+    def test_expect_screen_empty_attr_mapping_raises(self) -> None:
+        # `attr: {}` is falsy, so it must still be caught (by the
+        # neither-text-nor-attr arm) rather than slipping through.
+        with pytest.raises(TuiPtySpecError, match="attr"):
+            parse_smoke_spec(
+                "steps:\n  - type: expect_screen\n    attr: {}\n"
+            )
+
+    def test_expect_screen_attr_without_attribute_key_raises_even_with_text(
+        self,
+    ) -> None:
+        # The `text:` half is falsifiable, but the `attr:` half silently
+        # asserts nothing — an author who wrote it meant to check something,
+        # so reject rather than quietly dropping half the step.
+        with pytest.raises(TuiPtySpecError, match="no cell attribute"):
+            parse_smoke_spec(
+                "steps:\n  - type: expect_screen\n    text: hello\n"
+                "    attr: {row: 0, col: 0}\n"
+            )
+
+    def test_expect_screen_attr_with_a_real_attribute_key_parses(self) -> None:
+        # The positive control: addressing keys *plus* something to compare
+        # is the intended form and must keep parsing.
+        spec = parse_smoke_spec(
+            "steps:\n  - type: expect_screen\n    id: bold-check\n"
+            "    attr: {row: 3, col: 5, bold: true}\n"
+        )
+        assert spec.steps[0].attr == {"row": 3, "col": 5, "bold": True}
+
 
 # ── raw terminal-byte encoding ──────────────────────────────────────────────
 
