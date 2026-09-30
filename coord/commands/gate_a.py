@@ -141,15 +141,25 @@ def _fetch_contract(repo_cfg, config, milestone_number: int) -> str | None:
 
     Returns ``None`` only when every candidate genuinely 404'd — a
     confirmed absence. Raises :class:`coord.github_ops.GhTransientError`
-    (unchanged) when a candidate's read failed for a transient reason
-    (auth, network, a GitHub rate limit) rather than a 404: #2973's bug
-    was exactly this distinction getting lost — a rate-limited read was
-    folded into the same ``except RuntimeError: continue`` as a real
-    404, so "I could not tell" silently became "it does not exist". A
-    transient failure on ANY candidate makes the whole read inconclusive
-    (a later candidate 404'ing doesn't confirm the transiently-failed one
-    is absent too), so it takes priority over a clean ``None`` even if a
-    later candidate genuinely 404s.
+    (unchanged) when a candidate's read failed because ``gh`` classified it
+    as a GitHub rate limit (:func:`coord.github_ops._classify_rate_limit`,
+    surfaced as :class:`coord.github_ops.GhRateLimitError`) rather than a
+    404: #2973's bug was exactly this distinction getting lost — a
+    rate-limited read was folded into the same ``except RuntimeError:
+    continue`` as a real 404, so "I could not tell" silently became "it
+    does not exist". A transient failure on ANY candidate makes the whole
+    read inconclusive (a later candidate 404'ing doesn't confirm the
+    transiently-failed one is absent too), so it takes priority over a
+    clean ``None`` even if a later candidate genuinely 404s.
+
+    Narrower than it may sound: only a rate limit is currently classified
+    this way — a plain non-zero ``gh`` exit that isn't a rate limit (a bad
+    token, a genuine network failure, ``gh`` missing) still raises a plain
+    ``RuntimeError``/:class:`coord.github_ops.GhError` and is still folded
+    into ``continue`` below, same as before this fix. Tracked as a
+    follow-up rather than widened here, since ``_is_transient_error``-style
+    reclassification of those cases is a broader, separately-reviewable
+    change to ``coord.github_ops._gh`` itself.
     """
     from coord import github_ops  # noqa: PLC0415
     from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
