@@ -1357,3 +1357,92 @@ def test_compute_board_stage_projection_stage_counts_ordinary_issue_uses_own_key
     entry = out[0]
     assert entry["stage_counts"]["work"] == 2
     assert entry["stage_counts"]["review"] == 1
+
+
+# ── #3191 CI follow-up: the projection module stays a dependency-free leaf ──
+
+
+def test_stage_projection_imports_no_heavy_module():
+    """``coord.stage_projection`` must not pull the dispatch stack in.
+
+    Its own module docstring promises "Pure computation: every function here
+    takes already-loaded data and returns plain values — no I/O, no side
+    effects", and until #3191 its only production import was
+    ``coord.models``. #3191 needs the two #3182 fan-out text encodings
+    (``[smoke:<caps>]``, ``[[smoke-fanout:...]]``) to count Test *rounds*
+    instead of raw smoke rows; taking them from ``coord.smoke`` would have
+    dragged ``coord.config``, ``coord.dispatch``, ``coord.github_ops``,
+    ``coord.revalidate`` and ``httpx`` in with them — and
+    ``compute_board_stage_projection`` runs inside ``coord serve``'s
+    ``/board`` handler, so on a daemon that had not otherwise imported
+    ``coord.smoke`` the first ``/board`` request would have triggered that
+    whole import in a threadpool worker. They live in the leaf
+    ``coord.smoke_tags`` instead.
+
+    Runs in a **subprocess** for the same reason
+    ``tests/test_client_base_install.py`` does: by the time this test body
+    executes, collection has long since imported ``coord.smoke`` into *this*
+    interpreter, so an in-process ``sys.modules`` check would pass no matter
+    what the import graph looks like.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, coord.stage_projection\n"
+        "heavy = ('coord.smoke', 'coord.dispatch', 'coord.github_ops',\n"
+        "         'coord.config', 'coord.revalidate', 'httpx')\n"
+        "print(','.join(m for m in heavy if m in sys.modules))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+    leaked = proc.stdout.strip()
+    assert leaked == "", (
+        f"importing coord.stage_projection pulled in {leaked} — keep it a "
+        "leaf (import fan-out encodings from coord.smoke_tags, not coord.smoke)"
+    )
+
+
+def test_smoke_reexports_the_fanout_encodings_from_the_leaf_module():
+    """One definition, two spellings: ``coord.smoke`` re-exports the encodings
+    so every pre-existing ``from coord.smoke import ...`` caller
+    (``coord.notify``, ``coord.diagnose``, ``coord.reconcile``, the tests) is
+    unaffected — and a future edit cannot fork the encoder from the parser by
+    redefining one of them in only one of the two modules."""
+    from coord import smoke, smoke_tags
+
+    for name in (
+        "smoke_leg_issue_title",
+        "smoke_leg_capabilities",
+        "_encode_fanout_manifest",
+        "_parse_fanout_manifest",
+    ):
+        assert getattr(smoke, name) is getattr(smoke_tags, name), name
+
+
+def test_fanout_encodings_round_trip_through_the_leaf_module():
+    """The moved code still behaves: a tag and a manifest written by
+    ``coord.smoke_tags`` parse back to exactly what went in, including the
+    #3298 base64 command field and the "unknown command" (``None``) case."""
+    from coord.smoke_tags import (
+        _encode_fanout_manifest,
+        _parse_fanout_manifest,
+        smoke_leg_capabilities,
+        smoke_leg_issue_title,
+    )
+
+    title = smoke_leg_issue_title("Fix the thing", ("windows", "gtk"))
+    assert title == "[smoke:gtk+windows] Fix the thing"
+    assert smoke_leg_capabilities(title) == ("gtk", "windows")
+    assert smoke_leg_capabilities("Fix the thing") is None
+
+    manifest = _encode_fanout_manifest(
+        [("s1", ("gtk", "windows"), "pytest -q, --x"), ("s2", ("macos",), None)]
+    )
+    assert _parse_fanout_manifest(f"{manifest}\ntrailing prose") == [
+        ("s1", ("gtk", "windows"), "pytest -q, --x"),
+        ("s2", ("macos",), None),
+    ]
+    assert _parse_fanout_manifest("no manifest here") is None
