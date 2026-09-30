@@ -75,6 +75,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from coord.models import WORK_LIKE_TYPES
+from coord.release_gate import LaneResult as ReleaseGateLaneResult
 
 __all__ = [
     "ReportError",
@@ -127,6 +128,10 @@ __all__ = [
     "ISSUE_COST_STATUS_CHOICES",
     "fold_issue_cost",
     "run_issue_cost",
+    "Tier1FeatureSupport",
+    "fold_release_parity_matrix",
+    "run_release_parity_matrix",
+    "RELEASE_PARITY_MATRIX",
     "parse_duration",
     "result_to_csv",
     "csv_filename",
@@ -5122,6 +5127,193 @@ EXPORT_FORMATS: dict[str, ExportFormat] = {
 }
 
 
+# ── release parity matrix (#3488) ──────────────────────────────────────────
+#
+# vimcode shipped Win-GUI with no visible menu bar and no window controls —
+# a regression from two individually-correct fixes (quadraui#1199 plus
+# #1200) — and nothing at release time looked. This report is the "looked":
+# combine quadraui's Tier-1 conformance-runner matrix (per feature x
+# platform, independent of any one release) with THIS release's Tier-2
+# smoke-lane results (per platform, at one SHA — the same observations
+# `coord release gate` grades) into one table, so "supported on platform X"
+# reads as a generated fact rather than a belief.
+#
+# Reuses :class:`coord.release_gate.LaneResult` for the Tier-2 half rather
+# than a second, independently-drifting lane-result shape (#2085 "one
+# question, one answer") — this report and `coord release gate` can never
+# quote a different verdict for the same lane observation.
+
+
+@dataclass(frozen=True)
+class Tier1FeatureSupport:
+    """One quadraui conformance-runner verdict: does *platform* support
+    *feature* at all — independent of any particular release SHA (Tier 1).
+    Distinct from :class:`coord.release_gate.LaneResult` (Tier 2), which is
+    pass/fail for a whole lane at one commit, not per-feature."""
+
+    feature: str
+    platform: str
+    supported: bool
+    detail: str = ""
+
+
+def _tier1_cell(entry: "Tier1FeatureSupport | None") -> str:
+    if entry is None:
+        return "no Tier-1 data"
+    return "supported" if entry.supported else "unsupported"
+
+
+def _tier2_cell(entry: "ReleaseGateLaneResult | None") -> str:
+    if entry is None:
+        return "no Tier-2 data"
+    return "pass" if entry.passed else "fail"
+
+
+def fold_release_parity_matrix(
+    repo: str,
+    *,
+    tier1: Sequence[Tier1FeatureSupport],
+    lane_results: Sequence["ReleaseGateLaneResult"],
+    generated_at: float,
+) -> ReportResult:
+    """Fold Tier-1 feature support + Tier-2 lane results into the #3488
+    parity matrix for *repo*: one row per feature, one column per platform,
+    each cell naming both tiers' verdict ("supported / pass").
+
+    Pure — every input is already fetched; see :func:`run_release_parity_matrix`
+    for the seam that supplies real data (today: both default to empty,
+    since neither a quadraui Tier-1 feed nor a persisted Tier-2 lane-result
+    store exists yet outside this report's own fixtures — a tracked
+    follow-up, out of #3488's file scope. An empty feed degrades to a matrix
+    that says so in ``notes``, never a crash or a silently-omitted half.
+    """
+    platforms = sorted({e.platform for e in tier1} | {lr.lane for lr in lane_results})
+    features = sorted({e.feature for e in tier1})
+
+    tier1_by = {(e.feature, e.platform): e for e in tier1}
+    # #2096/#2085: pick the LATEST observation per lane, the exact rule
+    # `coord.release_gate._lane_step` applies when grading the gate itself —
+    # so this table can never show a different lane verdict than the gate
+    # that just ran against the same *lane_results*.
+    tier2_by_platform: dict[str, "ReleaseGateLaneResult"] = {}
+    for lr in lane_results:
+        current = tier2_by_platform.get(lr.lane)
+        if current is None or (lr.checked_at or 0.0) >= (current.checked_at or 0.0):
+            tier2_by_platform[lr.lane] = lr
+
+    columns = ["feature", *platforms]
+    column_meta = [ColumnMeta(id="feature", label="Feature", kind="text", weight=1.5)]
+    column_meta += [ColumnMeta(id=p, label=p, kind="text") for p in platforms]
+
+    rows: list[dict[str, Any]] = []
+    for feature in features:
+        row: dict[str, Any] = {"feature": feature}
+        for platform in platforms:
+            row[platform] = (
+                f"{_tier1_cell(tier1_by.get((feature, platform)))} / "
+                f"{_tier2_cell(tier2_by_platform.get(platform))}"
+            )
+        rows.append(row)
+
+    notes: list[str] = []
+    if not tier1:
+        notes.append(
+            "No Tier-1 (quadraui conformance-runner) data supplied — every "
+            "cell's Tier-1 half reads 'no Tier-1 data' until that feed is "
+            "wired (tracked follow-up, out of #3488's file scope)."
+        )
+    if not lane_results:
+        notes.append(
+            "No Tier-2 (release-gate lane) results supplied — every cell's "
+            "Tier-2 half reads 'no Tier-2 data'."
+        )
+    else:
+        missing_platforms = sorted(set(platforms) - set(tier2_by_platform))
+        if missing_platforms:
+            notes.append(
+                "No Tier-2 lane result for: " + ", ".join(missing_platforms)
+            )
+    if not rows:
+        notes.append(f"No Tier-1 feature rows for {repo!r} — matrix is empty.")
+
+    return ReportResult(
+        report_id=RELEASE_PARITY_MATRIX_ID,
+        generated_at=generated_at,
+        window=(generated_at, generated_at),
+        columns=columns,
+        rows=rows,
+        notes=notes,
+        column_meta=column_meta,
+    )
+
+
+def _default_tier1_fetch(repo: str) -> list[Tier1FeatureSupport]:  # noqa: ARG001
+    """No production quadraui Tier-1 feed exists yet — degrades to empty so
+    the report still renders its Tier-2-only half rather than failing
+    outright (tracked follow-up, out of #3488's file scope)."""
+    return []
+
+
+def _default_lane_results_fetch(repo: str) -> list["ReleaseGateLaneResult"]:  # noqa: ARG001
+    """No persisted Tier-2 lane-result store exists yet — degrades to empty,
+    same stance as :func:`_default_tier1_fetch`."""
+    return []
+
+
+def _validate_release_parity_repo_param(value: str) -> None:
+    if not value:
+        raise ReportError("release-parity-matrix requires a 'repo' parameter")
+
+
+def run_release_parity_matrix(
+    repo: str,
+    *,
+    now: float | None = None,
+    tier1_fetch: "Callable[[str], Sequence[Tier1FeatureSupport]] | None" = None,
+    lane_results_fetch: "Callable[[str], Sequence[ReleaseGateLaneResult]] | None" = None,
+) -> ReportResult:
+    """Entry point registered in :data:`REPORTS`. ``tier1_fetch``/
+    ``lane_results_fetch`` are test seams (mirrors every other ``run_*``'s
+    own ``fetch=`` seam) — a caller with a fixture of lane results (#3488
+    acceptance: "the parity matrix renders for vimcode from a fixture of
+    lane results") passes ``lane_results_fetch=lambda repo: FIXTURE``
+    directly rather than needing a real Tier-2 store wired up first.
+    """
+    _validate_release_parity_repo_param(repo)
+    generated_at = time.time() if now is None else float(now)
+    tier1 = list((tier1_fetch or _default_tier1_fetch)(repo))
+    lane_results = list((lane_results_fetch or _default_lane_results_fetch)(repo))
+    return fold_release_parity_matrix(
+        repo, tier1=tier1, lane_results=lane_results, generated_at=generated_at,
+    )
+
+
+RELEASE_PARITY_MATRIX_ID = "release-parity-matrix"
+
+RELEASE_PARITY_MATRIX = ReportDef(
+    id=RELEASE_PARITY_MATRIX_ID,
+    title="Release Parity Matrix",
+    description=(
+        "#3488: feature x platform support for a release, combining "
+        "quadraui's Tier-1 conformance-runner matrix with this release's "
+        "Tier-2 smoke-lane results (the same observations `coord release "
+        "gate` grades) — so 'supported on platform X' is a generated fact, "
+        "not a belief."
+    ),
+    params=(
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Coord-local repo name (as declared under coordinator.yml's repos:).",
+            validate=_validate_release_parity_repo_param,
+        ),
+    ),
+    run=run_release_parity_matrix,
+)
+
+
 REPORTS: dict[str, ReportDef] = {
     ISSUE_ACTIVITY.id: ISSUE_ACTIVITY,
     COMPLETED.id: COMPLETED,
@@ -5132,6 +5324,7 @@ REPORTS: dict[str, ReportDef] = {
     TREND.id: TREND,
     ISSUE_COST.id: ISSUE_COST,
     DEPRECATED_ROUTES.id: DEPRECATED_ROUTES,
+    RELEASE_PARITY_MATRIX.id: RELEASE_PARITY_MATRIX,
 }
 
 

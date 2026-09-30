@@ -1596,6 +1596,49 @@ class PropagationConfig:
 
 
 @dataclass
+class ReleaseGateRepoConfig:
+    """One entry under ``release_gate.<repo_name>`` in coordinator.yml
+    (#3488): this repo has opted into the cross-platform release gate.
+
+    ``lanes`` names the Tier-2 smoke lanes (acceptance-driver kinds, e.g.
+    ``tui-pty``/``win-native``/``mac-native``/``gtk-native`` —
+    :data:`coord.acceptance_drivers.SUPPORTED_KINDS` is the source of truth
+    for which actually exist) that must each show a PASSING result at the
+    release SHA before a release is cuttable. ``bugbash_required`` (from the
+    YAML's ``bugbash: required|off``) additionally requires the most recent
+    ``coord bugbash`` run reachable from that SHA to have ended with zero
+    new findings.
+
+    Nothing here runs the lanes or the bugbash loop itself — this is only
+    the declaration the gate evaluates against observed results (see
+    :mod:`coord.release_gate`). An empty ``lanes`` list is rejected at parse
+    time (see :func:`_parse_release_gate`): a repo that opts in but names no
+    lane has declared a gate that can never observe anything to fail on,
+    which is exactly the "gate that cannot fail" trap (#2096).
+    """
+
+    lanes: list[str] = field(default_factory=list)
+    bugbash_required: bool = False
+
+
+@dataclass
+class ReleaseGateConfig:
+    """``release_gate:`` — repo name -> :class:`ReleaseGateRepoConfig`
+    (#3488). Same per-repo-name-keyed-mapping shape as
+    :class:`AcceptanceConfig`'s ``drivers`` (#944): opt-in, one entry per
+    repo that wants the gate, nothing at all for every other repo. Absent
+    entirely -> no repo has a release gate, and ``coord release gate``
+    refuses to run for an unlisted repo rather than silently reporting a
+    vacuous pass.
+    """
+
+    repos: dict[str, ReleaseGateRepoConfig] = field(default_factory=dict)
+
+    def for_repo(self, name: str) -> ReleaseGateRepoConfig | None:
+        return self.repos.get(name)
+
+
+@dataclass
 class MilestoneConfig:
     """Milestone-driven-workflow configuration (#767 / #769 Phase 1).
 
@@ -2514,6 +2557,9 @@ class Config:
     # #2583 — absent block == min_releases_behind=1 == today's behaviour
     # (any delta at all rolls, subject to quiescence/cordon as before).
     propagation: PropagationConfig = field(default_factory=PropagationConfig)
+    # #3488 — absent block == no repo has a cross-platform release gate ==
+    # today's behaviour (nothing stops a release from cutting).
+    release_gate: ReleaseGateConfig = field(default_factory=ReleaseGateConfig)
     milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
@@ -2785,6 +2831,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     store = _parse_store(raw.get("store"))
     merge = _parse_merge(raw.get("merge"))
     propagation = _parse_propagation(raw.get("propagation"))
+    release_gate = _parse_release_gate(raw.get("release_gate"), {r.name for r in repos})
     milestone = _parse_milestone(raw.get("milestone"))
     audit = _parse_audit(raw.get("audit"))
     forge_availability = _parse_forge_availability(raw.get("forge_availability"))
@@ -2810,6 +2857,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         store=store,
         merge=merge,
         propagation=propagation,
+        release_gate=release_gate,
         milestone=milestone,
         providers=providers,
         audit=audit,
@@ -4686,6 +4734,71 @@ def _parse_propagation(raw: Any) -> PropagationConfig:
             )
         cfg.min_releases_behind = value
     return cfg
+
+
+_RELEASE_GATE_BUGBASH_VALUES = ("required", "off")
+
+
+def _parse_release_gate(raw: Any, repo_names: set[str]) -> ReleaseGateConfig:
+    """Parse the ``release_gate:`` block (#3488, opt-in cross-platform
+    release gate). Absent entirely -> no repo has one, matching
+    ``_parse_acceptance``'s own "absent means nothing is sealed/gated"
+    stance — this is opt-in per repo, never a default every app inherits.
+    """
+    if raw is None:
+        return ReleaseGateConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'release_gate' must be a mapping of repo name -> gate config")
+
+    repos: dict[str, ReleaseGateRepoConfig] = {}
+    for repo_name, entry in raw.items():
+        if repo_name not in repo_names:
+            raise ConfigError(
+                f"release_gate references unknown repo {repo_name!r} — "
+                "it must match a name under 'repos:'"
+            )
+        if not isinstance(entry, dict):
+            raise ConfigError(f"release_gate[{repo_name!r}] must be a mapping")
+
+        known = {"lanes", "bugbash"}
+        unknown = sorted(set(entry) - known)
+        if unknown:
+            raise ConfigError(
+                f"release_gate[{repo_name!r}]: unknown option(s) {', '.join(unknown)} "
+                f"(valid: {', '.join(sorted(known))})"
+            )
+
+        lanes_raw = entry.get("lanes", []) or []
+        if not isinstance(lanes_raw, list) or not all(
+            isinstance(x, str) and x for x in lanes_raw
+        ):
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].lanes must be a list of non-empty strings"
+            )
+        if not lanes_raw:
+            # #2096: a gate declared over zero lanes (and, elsewhere, no
+            # bugbash requirement either) can never observe a failure — it
+            # would always report a vacuous pass. Reject it at parse time
+            # rather than let an operator believe a repo is gated when it
+            # cannot actually fail on anything.
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].lanes must be non-empty — a repo "
+                "opted into the release gate must name at least one Tier-2 lane"
+            )
+
+        bugbash_raw = entry.get("bugbash", "off")
+        if bugbash_raw not in _RELEASE_GATE_BUGBASH_VALUES:
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].bugbash must be one of "
+                f"{_RELEASE_GATE_BUGBASH_VALUES!r}, got {bugbash_raw!r}"
+            )
+
+        repos[repo_name] = ReleaseGateRepoConfig(
+            lanes=list(lanes_raw),
+            bugbash_required=(bugbash_raw == "required"),
+        )
+
+    return ReleaseGateConfig(repos=repos)
 
 
 def _parse_milestone(raw: Any) -> MilestoneConfig:

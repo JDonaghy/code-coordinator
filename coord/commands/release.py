@@ -4434,3 +4434,249 @@ def release_window_history(limit: int, as_json: bool) -> None:
 # release verify` are one discoverable pair. The flat `coord
 # release-preflight` above keeps working unchanged.
 release_group.add_command(release_preflight, name="preflight")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `coord release gate` — the opt-in cross-platform release gate (#3488)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# vimcode shipped Win-GUI with no visible menu bar and no window controls —
+# a regression from two individually-correct fixes (quadraui#1199 plus
+# #1200) — and nothing at release time looked. This command is the "looked":
+# it refuses a release, naming the failing lane or step, unless every
+# Tier-2 smoke lane configured for *repo* (``release_gate.<repo>.lanes`` in
+# coordinator.yml) shows a PASSING result at the release SHA, and — when
+# ``bugbash: required`` — the most recent ``coord bugbash`` run reachable
+# from that SHA ended with zero new findings.
+#
+# The decision itself (:func:`coord.release_gate.evaluate_release_gate`) is
+# pure and unit-tested against fixtures in ``tests/test_release_gat.py``.
+# What lives here is the I/O shell: loading the observed lane/bugbash
+# results, resolving real SHA ancestry via git, and the Click surface.
+#
+# KNOWN GAP (mirrors ``coord/commands/bugbash.py``'s own documented gap):
+# no production store of Tier-2 lane results or bugbash runs exists yet in
+# this codebase — both are out of #3488's file scope. ``--from-json`` is the
+# seam until one is wired: a JSON file naming the observed
+# :class:`~coord.release_gate.LaneResult`/:class:`~coord.release_gate.
+# BugbashRunRecord` entries, in the same spirit as every other ``run_*``
+# report's injectable ``fetch=`` seam.
+
+
+def _sha_ancestry_comparator(repo_path_opt: str | None) -> "Any":
+    """The real ``sha_is_at_or_after`` for :func:`coord.release_gate.
+    evaluate_release_gate`: *release_sha* is an ancestor of (or equal to)
+    *candidate_sha*, via ``git merge-base --is-ancestor`` run against
+    *repo_path_opt* (default: the current directory).
+
+    #2096: any error at all (not a git checkout, unknown SHA, git missing,
+    a timeout) means "not proven" and returns ``False`` — the exact same
+    conservative default :func:`coord.release_gate._default_sha_at_or_after`
+    takes. This must never silently resolve to "assume it's fine".
+    """
+    repo_root = Path(repo_path_opt).expanduser() if repo_path_opt else Path.cwd()
+
+    def _is_at_or_after(candidate_sha: str, release_sha: str) -> bool:
+        if candidate_sha == release_sha:
+            return True
+        try:
+            result = subprocess.run(
+                [
+                    "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+                    release_sha, candidate_sha,
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+
+    return _is_at_or_after
+
+
+def _load_release_gate_observations(
+    payload: dict,
+) -> tuple[list, list]:
+    """Parse ``--from-json``'s payload into
+    (:class:`~coord.release_gate.LaneResult`, :class:`~coord.release_gate.
+    BugbashRunRecord`) lists. Raises ``KeyError``/``TypeError``/``ValueError``
+    on a malformed entry — the caller turns that into a clean CLI error."""
+    from coord import release_gate as rg  # noqa: PLC0415
+
+    lane_results = [
+        rg.LaneResult(
+            lane=entry["lane"],
+            sha=entry["sha"],
+            passed=bool(entry["passed"]),
+            detail=entry.get("detail", ""),
+            checked_at=entry.get("checked_at"),
+        )
+        for entry in payload.get("lanes", []) or []
+    ]
+    bugbash_runs = [
+        rg.BugbashRunRecord(
+            sha=entry["sha"],
+            new_findings=int(entry["new_findings"]),
+            verified=bool(entry.get("verified", True)),
+            ran_at=float(entry.get("ran_at", 0.0)),
+            detail=entry.get("detail", ""),
+        )
+        for entry in payload.get("bugbash", []) or []
+    ]
+    return lane_results, bugbash_runs
+
+
+def _gate_verdict_to_dict(verdict: "Any") -> dict[str, Any]:
+    return {
+        "repo": verdict.repo,
+        "release_sha": verdict.release_sha,
+        "gate_passed": verdict.gate_passed,
+        "effective_passed": verdict.effective_passed,
+        "steps": [
+            {"name": s.name, "passed": s.passed, "detail": s.detail}
+            for s in verdict.steps
+        ],
+        "override": None if verdict.override is None else {
+            "reason": verdict.override.reason,
+            "by": verdict.override.by,
+            "at": verdict.override.at,
+        },
+    }
+
+
+def _render_gate_verdict(verdict: "Any") -> str:
+    lines = [f"release gate: {verdict.repo} @ {verdict.release_sha}"]
+    for step in verdict.steps:
+        marker = "PASS" if step.passed else "FAIL"
+        lines.append(f"  [{marker}] {step.name}: {step.detail}")
+    if verdict.override is not None:
+        lines.append(
+            f"  OVERRIDE applied — reason: {verdict.override.reason!r} "
+            f"(by={verdict.override.by or 'unknown'})"
+        )
+    result_line = "RESULT: " + ("PASS" if verdict.effective_passed else "FAIL")
+    if verdict.override is not None and not verdict.gate_passed:
+        result_line += " (raw gate FAILED — released only via audited override)"
+    lines.append(result_line)
+    return "\n".join(lines)
+
+
+@release_group.command(
+    "gate",
+    help=(
+        "#3488: the opt-in cross-platform release gate. Refuses (naming the "
+        "failing lane/step) unless every Tier-2 smoke lane configured for "
+        "REPO passed at --sha, and (when release_gate.<repo>.bugbash: "
+        "required) the most recent `coord bugbash` run at or after --sha "
+        "found nothing new."
+    ),
+)
+@_CONFIG_OPTION
+@click.argument("repo")
+@click.option("--sha", "release_sha", required=True,
+              help="The release commit being gated.")
+@click.option(
+    "--from-json", "from_json_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help=(
+        "JSON file with this run's OBSERVED lane/bugbash results: "
+        '{"lanes": [{"lane", "sha", "passed", "detail"?, "checked_at"?}, ...], '
+        '"bugbash": [{"sha", "new_findings", "verified"?, "ran_at"?, "detail"?}, ...]}. '
+        "No production Tier-2/bugbash store is wired yet (tracked follow-up, "
+        "out of #3488's file scope) — this is the seam until one is."
+    ),
+)
+@click.option(
+    "--repo-path", "repo_path_opt", default=None,
+    help="Local git checkout used to resolve bugbash SHA ancestry "
+         "(git merge-base --is-ancestor). Defaults to the current directory. "
+         "Only consulted when release_gate.<repo>.bugbash is 'required'.",
+)
+@click.option(
+    "--override", "override_reason", default=None, metavar="REASON",
+    help=(
+        "#1251-style audited override (same pattern as `coord merge "
+        "--override-human-required`): allow the release despite a failing "
+        "gate. Requires a non-empty reason, echoed in the verdict/--json "
+        "output. Never erases the underlying failing step(s) — they still "
+        "report FAIL; only the exit code and RESULT line change."
+    ),
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the verdict as JSON.")
+def release_gate_cmd(
+    config_path: Path,
+    repo: str,
+    release_sha: str,
+    from_json_path: Path,
+    repo_path_opt: str | None,
+    override_reason: str | None,
+    as_json: bool,
+) -> None:
+    import json as _json  # noqa: PLC0415
+
+    from coord import release_gate as rg  # noqa: PLC0415
+    from coord.commands._common import _load_config  # noqa: PLC0415
+
+    # Validate the override up front, before any config/file I/O, mirroring
+    # `coord merge --override-human-required`'s own early exit (#1251) — a
+    # thin client should never partially run and THEN discover its override
+    # reason was rejected.
+    if override_reason is not None:
+        try:
+            rg.validate_override_reason(override_reason)
+        except ValueError as exc:
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(1)
+
+    config = _load_config(config_path)
+    if config.repo(repo) is None:
+        click.echo(f"error: repo {repo!r} not in coordinator.yml", err=True)
+        sys.exit(2)
+
+    gate_cfg = config.release_gate.for_repo(repo)
+    if gate_cfg is None:
+        click.echo(
+            f"error: repo {repo!r} has no 'release_gate:' entry in "
+            "coordinator.yml — it has not opted into the cross-platform "
+            "release gate (#3488), so there is nothing to evaluate",
+            err=True,
+        )
+        sys.exit(2)
+
+    try:
+        payload = _json.loads(from_json_path.read_text())
+    except (OSError, ValueError) as exc:
+        click.echo(f"error: could not read {from_json_path}: {exc}", err=True)
+        sys.exit(2)
+    if not isinstance(payload, dict):
+        click.echo(f"error: {from_json_path} must contain a JSON object", err=True)
+        sys.exit(2)
+
+    try:
+        lane_results, bugbash_runs = _load_release_gate_observations(payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        click.echo(f"error: malformed {from_json_path}: {exc}", err=True)
+        sys.exit(2)
+
+    verdict = rg.evaluate_release_gate(
+        repo=repo,
+        release_sha=release_sha,
+        required_lanes=gate_cfg.lanes,
+        lane_results=lane_results,
+        bugbash_required=gate_cfg.bugbash_required,
+        bugbash_runs=bugbash_runs,
+        sha_is_at_or_after=_sha_ancestry_comparator(repo_path_opt),
+    )
+    if override_reason:
+        verdict = rg.apply_override(verdict, reason=override_reason)
+
+    if as_json:
+        click.echo(_json.dumps(_gate_verdict_to_dict(verdict), indent=2, sort_keys=True))
+    else:
+        click.echo(_render_gate_verdict(verdict))
+
+    if not verdict.effective_passed:
+        sys.exit(1)
