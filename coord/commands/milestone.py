@@ -1325,14 +1325,25 @@ def milestone_drive_cmd(
     # #2542: pass the same `oracle_loop` the gate tick itself will use, so
     # this preview never shows more than the one entry the actual `work`
     # gate would dispatch for an oracle-loop milestone.
-    # #2785: resolved per milestone via `milestone_oracle_loop`, reusing the
-    # `gate_a_blocked` probe already computed above rather than the
+    # #2785: resolved per milestone via `milestone_oracle_loop`, not the
     # repo-level `has_driver` alone.
+    #
+    # #2785 review (non-blocking): reads the DURABLE `record.cleared` (has
+    # GATE_A already been stamped as cleared for this milestone?) rather
+    # than `probes.gate_a_blocked` — that field is a fresh live Gate-A
+    # re-probe (`probe_milestone`'s own docstring), and folding a single
+    # transient read failure there straight into `gate_a_satisfied=False`
+    # would cosmetically over-show this preview's ready frontier for one
+    # invocation. `_milestone_gate_tick`'s WORK-state dispatch (the thing
+    # this preview mirrors) already made this same durable-vs-live switch
+    # for the identical reason — matching it here keeps the preview and the
+    # actual tick reading the same signal instead of two that can flap
+    # independently.
     if ctx.work_order.nodes:
         plan = plan_dispatch(
             ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues,
             oracle_loop=milestone_oracle_loop(
-                repo_entry, cfg, gate_a_satisfied=probes.gate_a_blocked is None
+                repo_entry, cfg, gate_a_satisfied=mg.GATE_A in record.cleared
             ),
         )
         to_dispatch, skipped, waiting, deferred = (
