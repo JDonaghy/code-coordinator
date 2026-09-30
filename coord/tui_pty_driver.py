@@ -47,7 +47,10 @@ is threaded through as the driver's ``entrypoint:``). Steps:
   ``attr: {row, col, <pyte Char field>: <expected value>}`` for one cell
   (e.g. ``{row: 3, col: 5, bold: true}``). At least one of ``text``/``attr``
   is required — a step with neither has nothing to assert against and
-  could never fail, which :func:`parse_smoke_spec` rejects (#2096).
+  could never fail, which :func:`parse_smoke_spec` rejects (#2096). The
+  ``attr`` mapping must additionally name at least one attribute key
+  *besides* ``row``/``col``: those two only address the cell, so an
+  ``attr: {row: 3, col: 5}`` is just as unfalsifiable and is rejected too.
 - ``expect_silent: {seconds}`` — the byte stream must receive **zero**
   bytes over a full ``seconds``-long real-time window. This is vimcode#1634's
   regression check: an idle app that's actually idle produces no repaint
@@ -200,7 +203,9 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
     a step missing one of its type's required fields, an ``expect_within``
     with an empty ``text:``, an ``expect_screen`` with neither ``text:``
     nor ``attr:`` (it would have nothing to assert and could never fail),
-    or a ``click``/``expect_screen`` (via ``attr:``) naming an unrecognized
+    an ``expect_screen`` whose ``attr:`` holds only the cell-addressing
+    ``row:``/``col:`` keys and so is equally unfalsifiable, or a
+    ``click``/``expect_screen`` (via ``attr:``) naming an unrecognized
     ``button:``.
     """
     try:
@@ -243,18 +248,37 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
         attr = entry.get("attr")
         if attr is not None and not isinstance(attr, dict):
             raise TuiPtySpecError(f"steps[{i}].attr must be a mapping")
-        if kind == "expect_screen" and not entry.get("text") and not attr:
-            # Neither alternative supplied means the step body
-            # (`_do_expect_screen`) has nothing to check against and would
-            # silently always pass — a gate that can never fail (#2096).
+        # `row:`/`col:` inside `attr:` only *address* the cell — they are
+        # skipped by `_do_expect_screen`'s comparison loop, so they are not
+        # themselves assertions. Only the remaining keys can ever fail.
+        assertable_attr_keys = [
+            k for k in (attr or {}) if k not in ("row", "col")
+        ]
+        if kind == "expect_screen":
             # Checked after the region/attr *shape* checks above so a
             # malformed `region:`/`attr:` still reports that specific
-            # problem rather than being masked by this one.
-            raise TuiPtySpecError(
-                f"steps[{i}] (type='expect_screen') must supply 'text:' "
-                f"and/or 'attr:' — otherwise it has nothing to assert and "
-                f"can never fail"
-            )
+            # problem rather than being masked by these.
+            if attr is not None and not assertable_attr_keys:
+                # e.g. `attr: {row: 3, col: 5}` — non-empty (so it passes a
+                # plain truthiness check) yet addresses a cell without
+                # naming anything to compare, leaving the comparison loop
+                # with nothing to iterate (#2096).
+                raise TuiPtySpecError(
+                    f"steps[{i}] (type='expect_screen') has an 'attr:' "
+                    f"mapping with no cell attribute to compare — 'row:' "
+                    f"and 'col:' only address the cell; add at least one "
+                    f"attribute key (e.g. 'bold: true'), otherwise it has "
+                    f"nothing to assert and can never fail"
+                )
+            if not entry.get("text") and not assertable_attr_keys:
+                # Neither alternative supplied means the step body
+                # (`_do_expect_screen`) has nothing to check against and
+                # would silently always pass — a gate that can never fail.
+                raise TuiPtySpecError(
+                    f"steps[{i}] (type='expect_screen') must supply 'text:' "
+                    f"and/or 'attr:' — otherwise it has nothing to assert "
+                    f"and can never fail"
+                )
 
         steps.append(SmokeStep(
             kind=kind,
