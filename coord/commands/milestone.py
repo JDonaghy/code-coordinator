@@ -25,6 +25,7 @@ from coord.milestone_dispatch import (
     MilestoneDispatchError,
     dispatch_entry,
     fetch_milestone_context,
+    gate_a_probe,
     gate_a_status,
     is_milestone_complete,
     milestone_oracle_loop,
@@ -1519,16 +1520,31 @@ def milestone_write_order_cmd(
     # driver and so wrongly refused #1949's (ms-60's) work order, which
     # shares no manifest with anything since ms-60 has no
     # `tests/acceptance/ms-60/` at all. No other Gate-A probe has run yet in
-    # this command, so resolve one fresh — `gate_a_status`'s own existence
-    # check, the same one `coord milestone dispatch` would perform.
+    # this command, so resolve one fresh via `gate_a_probe` — the same
+    # existence check `coord milestone dispatch` performs.
+    #
+    # #2785 review: unlike `milestone_dispatch_cmd`/`milestone_drive_cmd`,
+    # this command must NOT abort on a *confirmed*-absent contract — ms-60
+    # has no contract at all and that is exactly the correctly-permissive
+    # case (`gate_a_satisfied=False` -> `oracle_loop=False` -> shared groups
+    # allowed), the whole point of this issue. Only a *transient* read
+    # failure (`GateAResult.transient`, #2973's tri-state) must abort:
+    # folding it into `gate_a_satisfied=False` would silently disable the
+    # shared-group refusal for a milestone that may well be oracle-loop-
+    # controlled, purely because of ordinary GitHub flakiness — the #2785
+    # review's blocking finding. `gate_a_status`'s plain `str | None` can't
+    # tell the two apart, so this uses `gate_a_probe` directly.
+    probe = gate_a_probe(repo_entry, cfg, milestone_number)
+    if probe.transient:
+        click.echo(f"error: {probe.block_reason}", err=True)
+        sys.exit(1)
+
     try:
         validate_no_shared_oracle_group(
             work_order,
             oracle_loop=milestone_oracle_loop(
                 repo_entry, cfg,
-                gate_a_satisfied=gate_a_status(
-                    repo_entry, cfg, milestone_number
-                ) is None,
+                gate_a_satisfied=probe.block_reason is None,
             ),
         )
     except WorkOrderError as e:

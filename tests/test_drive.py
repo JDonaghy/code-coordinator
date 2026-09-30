@@ -817,21 +817,32 @@ def test_gate_a_contract_path_agrees_across_python_dispatch_and_drive():
     Rust TUI side's own ``coordinator.yml`` shape isn't exercised here — it
     always resolves to exactly the same single legacy path, so the drift
     check below still holds by construction.
+
+    #2785 review: ``gate_a_status`` is now a thin ``str | None`` wrapper
+    around ``gate_a_probe`` (added so a caller can tell a confirmed-absent
+    contract apart from an inconclusive/transient read — see
+    ``GateAResult``'s docstring) — the actual existence check, and thus the
+    ``gate_a_contract_candidates`` call, now lives in ``gate_a_probe``.
+    Checking ``gate_a_status`` against the wrapper's own trivial source
+    would trivially fail; the invariant this test actually cares about
+    (single source of truth for the candidate paths) still holds, just one
+    function over.
     """
     from coord.acceptance import gate_a_contract_path
 
     path = gate_a_contract_path(42)
     assert path == "tests/acceptance/ms-42/contract.md"
 
-    # Python: coord.milestone_dispatch.gate_a_status must go through
-    # gate_a_contract_candidates (#2896) — itself built on
-    # gate_a_contract_path — not a private re-derivation.
+    # Python: coord.milestone_dispatch.gate_a_probe (gate_a_status's real
+    # implementation, #2785) must go through gate_a_contract_candidates
+    # (#2896) — itself built on gate_a_contract_path — not a private
+    # re-derivation.
     import inspect
 
     from coord import milestone_dispatch
 
     assert "gate_a_contract_candidates(" in inspect.getsource(
-        milestone_dispatch.gate_a_status
+        milestone_dispatch.gate_a_probe
     )
 
     # coord.drive: resolve_oracle_decision must do the same.

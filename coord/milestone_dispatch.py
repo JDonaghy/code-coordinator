@@ -37,7 +37,7 @@ Three call sites share this module:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, NamedTuple
 
 import httpx
 
@@ -61,6 +61,8 @@ __all__ = [
     "MilestoneContext",
     "fetch_milestone_context",
     "GateAFileExists",
+    "GateAResult",
+    "gate_a_probe",
     "gate_a_status",
     "milestone_oracle_loop",
     "ManifestFetch",
@@ -221,22 +223,51 @@ def _default_gate_a_file_exists(repo_github: str, path: str, branch: str) -> boo
         return False
 
 
-def gate_a_status(
+class GateAResult(NamedTuple):
+    """The full tri-state result of a Gate-A existence check (#2785 review).
+
+    ``gate_a_status`` (below) collapses this into a plain ``str | None`` for
+    the callers that just want to abort on ANY truthy result — dispatch/drive
+    correctly treat "confirmed absent" and "read failed" identically, since
+    neither justifies dispatching. But a caller resolving
+    :func:`milestone_oracle_loop`'s ``gate_a_satisfied`` needs to tell the two
+    apart: a *confirmed* absence legitimately means "not oracle-loop, nothing
+    to race on yet" (``gate_a_satisfied=False`` is correct), while a
+    *transient* read failure means the answer is unknown and must not be
+    silently folded into the same "not oracle-loop" branch — that would
+    disable #2542's shared-group refusal for a milestone that may well be
+    under oracle-loop control, purely because of ordinary GitHub flakiness.
+
+    ``block_reason`` is ``None`` when Gate A is satisfied (dispatch may
+    proceed); otherwise a human-readable message, exactly as
+    :func:`gate_a_status` returns. ``transient`` is ``True`` only when
+    ``block_reason`` is set because of a failed *read* (network, auth, a
+    rate limit) rather than a confirmed 404 on every candidate path.
+    """
+
+    block_reason: str | None
+    transient: bool = False
+
+
+def gate_a_probe(
     repo_cfg: Repo,
     config: "Config",
     milestone_number: int,
     *,
     file_exists: GateAFileExists | None = None,
-) -> str | None:
+) -> GateAResult:
     """Gate A (docs/ORACLE_LOOP.md, #930): a milestone's issues may not
     dispatch until its black-box contract exists.
 
-    Returns ``None`` when dispatch may proceed — either the repo has no
-    ``acceptance.drivers`` entry configured (Gate A is an oracle-loop
-    concept; repos outside that model dispatch exactly as before #930), or
-    the contract file already exists on the repo's default branch. Returns a
-    human-readable block reason otherwise, naming the missing path and the
-    command that produces it.
+    Returns a :class:`GateAResult` whose ``block_reason`` is ``None`` when
+    dispatch may proceed — either the repo has no ``acceptance.drivers``
+    entry configured (Gate A is an oracle-loop concept; repos outside that
+    model dispatch exactly as before #930), or the contract file already
+    exists on the repo's default branch. Otherwise ``block_reason`` is a
+    human-readable message naming the missing path and the command that
+    produces it, and ``transient`` says whether that's a confirmed absence
+    or an inconclusive (failed) read — see :class:`GateAResult`'s own
+    docstring for why the distinction matters.
 
     #2896: a bare *milestone_number* doesn't say which acceptance search
     root its contract lives under (the shared repo-root tree, or an
@@ -260,7 +291,7 @@ def gate_a_status(
     remedy attached.
     """
     if not config.acceptance.has_driver(repo_cfg.name):
-        return None
+        return GateAResult(None)
 
     from coord import github_ops  # noqa: PLC0415
     from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
@@ -271,24 +302,46 @@ def gate_a_status(
     for path in candidates:
         try:
             if check(repo_cfg.github, path, repo_cfg.default_branch):
-                return None
+                return GateAResult(None)
         except github_ops.GhTransientError as e:
             transient = transient or e
             continue
     if transient is not None:
-        return (
+        return GateAResult(
             f"Gate A undetermined: could not read {repo_cfg.name}'s Gate-A "
             f"contract on {repo_cfg.default_branch!r} ({transient}). This is "
             "a failed read, not a confirmed absence — the contract may well "
-            "exist. Retry once the rate limit clears."
+            "exist. Retry once the rate limit clears.",
+            transient=True,
         )
     named = " or ".join(repr(p) for p in candidates)
-    return (
+    return GateAResult(
         f"Gate A not satisfied: {named} does not exist yet on "
         f"{repo_cfg.default_branch!r}. Run `coord acceptance mock {repo_cfg.name} "
         "<tracking_issue>` (docs/ORACLE_LOOP.md) to render the mock + write "
         "the contract before dispatching this milestone's issues."
     )
+
+
+def gate_a_status(
+    repo_cfg: Repo,
+    config: "Config",
+    milestone_number: int,
+    *,
+    file_exists: GateAFileExists | None = None,
+) -> str | None:
+    """Thin ``str | None`` view over :func:`gate_a_probe`, for the callers
+    (``milestone_dispatch_cmd``, ``milestone_drive_cmd``,
+    ``_milestone_drain_tick``) that only need to know whether to abort —
+    they already treat a confirmed absence and a transient read failure
+    identically (abort either way, since neither justifies dispatching), so
+    dropping ``GateAResult.transient`` here is safe for them. A caller that
+    needs to tell the two apart (:func:`milestone_oracle_loop`'s
+    ``gate_a_satisfied``) should call :func:`gate_a_probe` directly instead.
+    """
+    return gate_a_probe(
+        repo_cfg, config, milestone_number, file_exists=file_exists
+    ).block_reason
 
 
 def milestone_oracle_loop(
