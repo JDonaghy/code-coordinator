@@ -843,6 +843,53 @@ def test_drive_dry_run_dispatches_nothing_and_writes_no_record(
     assert state.list_milestone_gates() == []
 
 
+def test_drive_dry_run_preview_dispatch_cap_survives_a_transient_gate_a_read(
+    tmp_path: Path, rw_db, monkeypatch
+) -> None:
+    """#2785 review (non-blocking finding): `milestone_drive_cmd`'s dry-run
+    preview computes the same `work`-gate frontier the actual gate tick
+    would dispatch (see the `#2542` comment above its `plan_dispatch` call),
+    so it must resolve `oracle_loop` the same durable-record way
+    `_milestone_gate_tick` does — not from `probes.gate_a_blocked`, a fresh
+    live Gate-A re-probe computed by `probe_milestone` on every invocation.
+    A milestone already resumed past Gate A (`cleared=(mg.GATE_A,)`) whose
+    THIS-invocation Gate-A read happens to fail transiently must still show
+    the one-entry-per-tick oracle-loop cap in the preview, not silently
+    widen it to both ready entries."""
+    from click.testing import CliRunner
+
+    from coord import state
+    from coord.commands.milestone import milestone_drive_cmd
+    from coord.github_ops import GhRateLimitError
+
+    _stub_github_two_ready(monkeypatch)
+    _stub_dispatch(monkeypatch, [])
+    monkeypatch.setattr(
+        "coord.github_ops.get_repo_file",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            GhRateLimitError("API rate limit exceeded", secondary=True)
+        ),
+    )
+
+    state.save_milestone_gate(
+        mg.GateRecord(
+            repo_name="api", tracking_issue=100, gate=mg.WORK, cleared=(mg.GATE_A,)
+        ).to_dict()
+    )
+
+    result = CliRunner().invoke(
+        milestone_drive_cmd,
+        ["api", "100", "--dry-run", "--config", str(_make_config_oracle_loop(tmp_path))],
+    )
+
+    assert result.exit_code == 0, result.output
+    dispatch_count = result.output.count("would dispatch #")
+    assert dispatch_count == 1, (
+        f"expected exactly one capped preview entry, got {dispatch_count} in:\n"
+        f"{result.output}"
+    )
+
+
 def test_drive_registers_and_is_resumable(tmp_path: Path, rw_db, monkeypatch) -> None:
     """A non-dry-run `drive` writes the cold-start record; running it again
     resumes from the persisted gate rather than rewinding to Gate A."""
