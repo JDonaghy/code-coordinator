@@ -1387,7 +1387,9 @@ def _decide_acceptance_author(
         # cites), so the thing being waited for could not happen even with
         # `merge.auto_drain` on.
         return replace(
-            _decide_acceptance_landing(state, oracle, opts, counters, machine),
+            _decide_acceptance_landing(
+                state, oracle, opts, counters, machine, verifier
+            ),
             warnings=(
                 f"ACCEPTANCE: JIT slice {aid} is ADVISORY with commits present "
                 "— proceeding per --accept-advisory (#1357)",
@@ -1460,7 +1462,9 @@ def _decide_acceptance_author(
         # Authoring finished and the branch carries commits: hand over to the
         # landing driver, which observes the daemon-driven Test/Review stages
         # and performs the one step the daemon will not (#2079 — the merge).
-        return _decide_acceptance_landing(state, oracle, opts, counters, machine)
+        return _decide_acceptance_landing(
+            state, oracle, opts, counters, machine, verifier
+        )
 
     # "" / running: still authoring — nothing to drive yet.
     return _wait(
@@ -1476,6 +1480,7 @@ def _decide_acceptance_landing(
     opts: DriveOptions,
     counters: DriveCounters,
     machine: str,
+    verifier: MergeVerifier,
 ) -> Action:
     """Land the authored JIT acceptance slice (#2079).
 
@@ -1673,7 +1678,7 @@ def _decide_acceptance_landing(
         merge_aid=state.acceptance_merge_aid,
         merge_pr_url=state.acceptance_merge_pr_url,
     )
-    action = _decide_merge(shadow, opts, counters.slice_budget())
+    action = _decide_merge(shadow, opts, counters.slice_budget(), verifier)
     return replace(
         action,
         label=_acceptance_label(action.label),
@@ -1778,6 +1783,8 @@ class MergeVerifier(Protocol):
     def epic_checklist_snapshot(
         self, state: IssueState
     ) -> EpicChecklistSnapshot | None: ...
+
+    def github_backoff_active(self) -> bool: ...
 
 
 def _remote_matches_repo(remote_url: str, repo_github: str) -> bool:
@@ -1990,6 +1997,26 @@ class GitMergeVerifier:
         from coord import github_ops  # noqa: PLC0415
 
         return github_ops.get_branch_sha(state.repo_github, state.work_branch)
+
+    def github_backoff_active(self) -> bool:
+        """True when GitHub's shared, fleet-wide rate-limit backoff
+        (:mod:`coord.github_throttle`, #2809/#2934) is currently in force.
+
+        #3479: the ONE thing :func:`_decide_merge`'s ``"unknown_head"`` arm
+        must check before spending a live ``coord merge --only`` re-check —
+        see that arm's own docstring for the latched-reason bug this
+        guards against. Routed through :func:`coord.github_throttle.
+        consult` (not the same-host-only :func:`~coord.github_throttle.
+        current`) so this honours a backoff another machine recorded via
+        the daemon, exactly like the shared funnel every live ``gh`` call
+        already consults before it ever reaches GitHub — re-probing INTO a
+        window another host just tripped is precisely the synchronized-
+        hammering #2809 exists to prevent.
+        """
+        from coord import github_throttle  # noqa: PLC0415
+
+        _sleep_s, backoff = github_throttle.consult()
+        return backoff is not None
 
     def epic_checklist_snapshot(
         self, state: IssueState
@@ -2913,7 +2940,7 @@ def decide(
             warnings=warnings,
         )
 
-    merge = _decide_merge(state, opts, counters)
+    merge = _decide_merge(state, opts, counters, verifier)
     return replace(merge, warnings=warnings + merge.warnings)
 
 
@@ -4275,7 +4302,10 @@ def _park_uat_fixup_dispatch_failure(
 
 
 def _decide_merge(
-    state: IssueState, opts: DriveOptions, counters: DriveCounters
+    state: IssueState,
+    opts: DriveOptions,
+    counters: DriveCounters,
+    verifier: MergeVerifier,
 ) -> Action:
     """The MERGE stage.
 
@@ -4335,13 +4365,55 @@ def _decide_merge(
     # confirmed. No retry or fix this driver can take changes GitHub's
     # answer; wait, exactly like the CI-unreadable case below, and never
     # spend a merge attempt re-observing the identical unreadable probe.
+    #
+    # #3479: this used to be a BARE `_wait()` for as long as this reason
+    # stayed on the board — nothing here ever re-probed, so a `merge_reason`
+    # from an outage that had already cleared just kept getting re-read
+    # forever (quadraui#1083: 309 consecutive polls over 2.5h reprinting the
+    # identical "branch head unknown" line while GitHub was fully healthy
+    # the whole time — `gh auth status` OK, rate limit 5000/5000 — because
+    # the REAL block, a failing required CI check, was a few lines further
+    # down in `_decide_merge` and this arm returned before ever reaching
+    # it). "Branch head unknown" means "wait until the probe recovers", so
+    # this now actually re-probes: once the shared GitHub backoff
+    # (:mod:`coord.github_throttle`, #2809/#2934 — the SAME funnel every
+    # live `gh` call already consults) is no longer active, dispatch the
+    # identical budget-exempt real `coord merge --only <aid>` re-check the
+    # CI-unreadable arm below uses, instead of re-reading a value nothing
+    # here ever refreshes. That live attempt re-evaluates every gate,
+    # including CI, so a resolved outage reaches the SAME `checks_failed` →
+    # `coord.commands.merge._dispatch_ci_fixes` path a human running the
+    # identical command by hand already does — the quadraui#1083 recovery.
+    #
+    # While the backoff IS active, this still just waits, WITHOUT touching
+    # `verifier`/GitHub at all — #2809's whole point is that hammering
+    # GitHub during a backoff window only prolongs it, so no probe (real or
+    # otherwise) is issued while one is in force.
     if _merge_gate_kind(gate_reason) == "unknown_head":
-        return _wait(
-            label=(
-                "MERGE: branch head unknown — GitHub read failed (rate "
-                "limit, auth, or network); waiting, not retrying (#2704): "
-                f"{gate_reason}"
+        if verifier.github_backoff_active():
+            return _wait(
+                label=(
+                    "MERGE: branch head unknown — GitHub backoff active "
+                    "(#2809); waiting, not probing (#2704/#3479): "
+                    f"{gate_reason}"
+                )
             )
+        aid = state.merge_aid or state.work_aid
+        return Action(
+            kind=RUN,
+            label=(
+                "MERGE: branch head unknown — GitHub backoff clear, "
+                "re-checking for real instead of re-reading the latched "
+                f"reason (#2704/#3479): {gate_reason}"
+            ),
+            command=("merge", "--only", aid, "--method", opts.merge_method),
+            on_error="warn",
+            error_message=(
+                "coord merge returned non-zero (or the merge lock timed "
+                "out) while re-checking an unknown branch head — "
+                "re-checking next poll"
+            ),
+            serialize_merge=True,
         )
     # #2947 (follow-up to #2687): the UAT gate is a human-attended block — no
     # `coord merge` retry can clear it, only an operator or a customer

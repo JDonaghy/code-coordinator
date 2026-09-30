@@ -131,15 +131,22 @@ class FakeVerifier:
         # `work_type` before ever calling this, so every pre-#3246 test
         # (which never sets `work_type="epic-decompose"`) is unaffected.
         epic_snapshot: "EpicChecklistSnapshot | None" = None,
+        # #3479: the #2704 unknown_head re-probe's own gate. `False` (the
+        # default) is "no active backoff" — every pre-#3479 test never
+        # touched this, so leaving it off preserves their assertions
+        # byte-for-byte; the #3479 tests below override it explicitly.
+        github_backoff: bool = False,
     ) -> None:
         self._has_commits = has_commits
         self._merged = merged
         self._head_sha = head_sha
         self._epic_snapshot = epic_snapshot
+        self._github_backoff = github_backoff
         self.commits_calls = 0
         self.merged_calls = 0
         self.head_sha_calls = 0
         self.epic_snapshot_calls = 0
+        self.github_backoff_calls = 0
 
     def branch_has_commits(self, s: IssueState) -> bool | None:
         self.commits_calls += 1
@@ -156,6 +163,10 @@ class FakeVerifier:
     def epic_checklist_snapshot(self, s: IssueState) -> "EpicChecklistSnapshot | None":
         self.epic_snapshot_calls += 1
         return self._epic_snapshot
+
+    def github_backoff_active(self) -> bool:
+        self.github_backoff_calls += 1
+        return self._github_backoff
 
 
 def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
@@ -4258,33 +4269,50 @@ def test_a_genuinely_failed_check_is_not_read_as_ci_unreadable():
 # UNKNOWN_BRANCH_HEAD_REASON`. Before #2704 this fabricated a "review
 # required but not approved" refusal (fails CLOSED with the WRONG reason) or
 # a silently-passing smoke gate (fails OPEN). Now it is its own gate kind:
-# the drive waits for GitHub to answer again rather than retry `coord merge`
-# (a no-op — nothing about GitHub's reachability changes by re-running it) or
-# escalate a re-review/Test re-run for a gate nothing here actually refused.
+# the drive re-probes (or waits, while GitHub's shared backoff is active)
+# rather than escalate a re-review/Test re-run for a gate nothing here
+# actually refused.
+#
+# #3479: a bare `_wait()` here used to be the WHOLE story — nothing ever
+# re-probed, so a latched reason from a cleared outage got re-read forever
+# (quadraui#1083: 309 consecutive polls over 2.5h while GitHub was fully
+# healthy, because the real block — a failing CI check — sat a few lines
+# further down in `_decide_merge` and this arm always returned first). Now
+# the arm checks the shared GitHub backoff (`verifier.github_backoff_active()`)
+# before deciding: active → still a bare wait, no probe issued; clear →
+# dispatch the SAME budget-exempt real `coord merge --only <aid>` re-check
+# the CI-unreadable arm uses, which is what actually reaches a fresh
+# CI-failed → ci-fix dispatch instead of a fabricated reading.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
-def test_unknown_branch_head_waits_regardless_of_which_status_the_board_shows(status):
+def test_unknown_branch_head_waits_regardless_of_status_when_backoff_active(status):
+    """#3479: while GitHub's shared backoff IS active, this arm must still
+    be a bare wait — hammering GitHub mid-backoff only prolongs it (#2809)."""
     from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
 
+    verifier = FakeVerifier(github_backoff=True)
     action = step(
-        approved_work(merge_status=status, merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
+        approved_work(merge_status=status, merge_reason=UNKNOWN_BRANCH_HEAD_REASON),
+        verifier=verifier,
     )
     assert action.kind == WAIT
     assert "branch head unknown" in action.label
-    assert "not retrying" in action.label
+    assert "backoff active" in action.label
+    assert verifier.github_backoff_calls == 1
 
 
-def test_unknown_branch_head_never_spends_an_attempt():
+def test_unknown_branch_head_never_spends_an_attempt_while_backoff_active():
     from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
 
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    verifier = FakeVerifier(github_backoff=True)
     s = approved_work(merge_status="", merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
 
     for _ in range(5):
-        action = step(s, opts, counters=counters)
+        action = step(s, opts, counters=counters, verifier=verifier)
         assert action.kind == WAIT
         assert counters.merge_attempts == 0
 
@@ -4297,12 +4325,14 @@ def test_unknown_branch_head_does_not_escalate_a_fabricated_review_refusal():
     would have been classified as the "review" gate kind, and — because the
     driver's view contradicts a plain "review" refusal — escalated via
     `_merge_gate_divergence` proposing `coord review-reaffirm` for a review
-    nothing actually refused. It must instead be its own kind and just
-    wait."""
+    nothing actually refused. It must instead be its own kind and never
+    escalate — regardless of whether the backoff check lands it on a wait
+    or a re-check (#3479)."""
     from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
 
     action = step(
-        approved_work(merge_status="BLOCKED", merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
+        approved_work(merge_status="BLOCKED", merge_reason=UNKNOWN_BRANCH_HEAD_REASON),
+        verifier=FakeVerifier(github_backoff=True),
     )
     assert action.kind == WAIT
     assert not action.is_exit
@@ -4316,6 +4346,73 @@ def test_merge_gate_kind_recognises_unknown_branch_head_as_its_own_kind():
     # Regression guard: must never be swallowed into "review" just because
     # `merge_gate_failures` reports it under `gate="review"`.
     assert _merge_gate_kind(UNKNOWN_BRANCH_HEAD_REASON) != "review"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3479: the re-probe itself — the #2704 wait arm must re-evaluate the gate
+# once GitHub's shared backoff is no longer active, rather than latch onto
+# the stale reason forever (quadraui#1083).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_unknown_branch_head_reprobes_for_real_once_backoff_clears():
+    """No active backoff: the drive's next decision must be a REAL
+    (non-dry-run) `coord merge --only <aid>` re-check — never a bare
+    `_wait()` — because that live attempt is what actually re-evaluates
+    every gate (including a failing CI check) and reaches the SAME
+    `checks_failed` → ci-fix dispatch path the quadraui#1083 incident's
+    manual recovery (`coord merge --only <aid>`) took by hand."""
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    verifier = FakeVerifier(github_backoff=False)
+    counters = DriveCounters()
+    s = approved_work(
+        merge_status="BLOCKED",
+        merge_reason=UNKNOWN_BRANCH_HEAD_REASON,
+        merge_aid="m1",
+    )
+    action = step(s, counters=counters, verifier=verifier)
+
+    assert action.kind == RUN
+    assert action.command[:3] == ("merge", "--only", "m1")
+    assert not action.is_exit
+    # Budget-exempt, same as the CI-unreadable sibling arm (#2347/#2704):
+    # an indefinitely-unreachable GitHub can never exhaust
+    # `--max-merge-attempts` through THIS arm.
+    assert counters.merge_attempts == 0
+    assert verifier.github_backoff_calls == 1
+
+
+def test_unknown_branch_head_reprobe_never_spends_an_attempt_across_polls():
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    verifier = FakeVerifier(github_backoff=False)
+    s = approved_work(merge_status="", merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters, verifier=verifier)
+        assert action.kind == RUN
+        assert counters.merge_attempts == 0
+
+
+def test_unknown_branch_head_reprobe_checks_backoff_before_every_dispatch():
+    """The backoff check is consulted on every poll — a backoff recorded
+    BETWEEN two polls (e.g. this same `coord merge --only` re-check itself
+    tripping a fresh 403) must be honoured on the very next one, not just
+    the first."""
+    from coord.merge_queue import UNKNOWN_BRANCH_HEAD_REASON
+
+    s = approved_work(merge_status="", merge_reason=UNKNOWN_BRANCH_HEAD_REASON)
+
+    clear_verifier = FakeVerifier(github_backoff=False)
+    action = step(s, verifier=clear_verifier)
+    assert action.kind == RUN
+
+    active_verifier = FakeVerifier(github_backoff=True)
+    action = step(s, verifier=active_verifier)
+    assert action.kind == WAIT
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5886,6 +5983,35 @@ def test_base_accepts_a_genuinely_valid_checkout(recorded_git, tmp_path):
     s = state(work_branch="b", repo_default_branch="main")
     assert verifier.branch_has_commits(s) is True
     assert warned == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GitMergeVerifier.github_backoff_active — #3479's real backoff read
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_github_backoff_active_is_false_with_no_recorded_backoff():
+    assert GitMergeVerifier().github_backoff_active() is False
+
+
+def test_github_backoff_active_is_true_once_a_hit_is_recorded():
+    from coord.github_throttle import local_record
+
+    local_record(reason="secondary_rate_limit", status=403, request_id=None, retry_after_s=None)
+    assert GitMergeVerifier().github_backoff_active() is True
+
+
+def test_github_backoff_active_clears_once_the_window_expires():
+    from coord.github_throttle import local_record
+
+    local_record(
+        reason="secondary_rate_limit", status=403, request_id=None,
+        retry_after_s=1, now=1000.0,
+    )
+    # `consult()` defaults to the real wall clock, which is long past the
+    # `now=1000.0` + 1s window this recorded — same "fails open once
+    # expired" contract `coord.github_throttle.current()` documents.
+    assert GitMergeVerifier().github_backoff_active() is False
 
 
 @pytest.mark.parametrize(
