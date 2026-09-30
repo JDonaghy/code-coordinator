@@ -45,7 +45,9 @@ is threaded through as the driver's ``entrypoint:``). Steps:
   ``region: {row, col, width, height}`` sub-rectangle) must contain ``text``
   (a plain substring check against the rendered lines) and/or match
   ``attr: {row, col, <pyte Char field>: <expected value>}`` for one cell
-  (e.g. ``{row: 3, col: 5, bold: true}``).
+  (e.g. ``{row: 3, col: 5, bold: true}``). At least one of ``text``/``attr``
+  is required — a step with neither has nothing to assert against and
+  could never fail, which :func:`parse_smoke_spec` rejects (#2096).
 - ``expect_silent: {seconds}`` — the byte stream must receive **zero**
   bytes over a full ``seconds``-long real-time window. This is vimcode#1634's
   regression check: an idle app that's actually idle produces no repaint
@@ -170,6 +172,19 @@ class SmokeSpec:
     steps: tuple[SmokeStep, ...]
 
 
+def _int_default(value, default: int) -> int:
+    """``int(value)``, falling back to *default* only when *value* is
+    absent (``None``) — unlike the ``int(value or default)`` idiom, an
+    explicit literal ``0`` in the YAML is honored rather than silently
+    treated as "absent"."""
+    return default if value is None else int(value)
+
+
+def _float_default(value, default: float) -> float:
+    """The :func:`_int_default` idiom for a ``float`` field."""
+    return default if value is None else float(value)
+
+
 def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
     """Parse a platform-neutral smoke-spec YAML document into a
     :class:`SmokeSpec`.
@@ -183,8 +198,10 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
     spec — for: invalid YAML, a non-mapping document, a missing/empty/
     non-list ``steps:``, a step that isn't a mapping, an unknown ``type:``,
     a step missing one of its type's required fields, an ``expect_within``
-    with an empty ``text:``, or a ``click``/``expect_screen`` (via
-    ``attr:``) naming an unrecognized ``button:``.
+    with an empty ``text:``, an ``expect_screen`` with neither ``text:``
+    nor ``attr:`` (it would have nothing to assert and could never fail),
+    or a ``click``/``expect_screen`` (via ``attr:``) naming an unrecognized
+    ``button:``.
     """
     try:
         raw = yaml.safe_load(yaml_text)
@@ -226,18 +243,30 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
         attr = entry.get("attr")
         if attr is not None and not isinstance(attr, dict):
             raise TuiPtySpecError(f"steps[{i}].attr must be a mapping")
+        if kind == "expect_screen" and not entry.get("text") and not attr:
+            # Neither alternative supplied means the step body
+            # (`_do_expect_screen`) has nothing to check against and would
+            # silently always pass — a gate that can never fail (#2096).
+            # Checked after the region/attr *shape* checks above so a
+            # malformed `region:`/`attr:` still reports that specific
+            # problem rather than being masked by this one.
+            raise TuiPtySpecError(
+                f"steps[{i}] (type='expect_screen') must supply 'text:' "
+                f"and/or 'attr:' — otherwise it has nothing to assert and "
+                f"can never fail"
+            )
 
         steps.append(SmokeStep(
             kind=kind,
             index=i,
             id=str(entry.get("id", "") or ""),
             key=str(entry.get("key", "") or ""),
-            row=int(entry.get("row", 0) or 0),
-            col=int(entry.get("col", 0) or 0),
+            row=_int_default(entry.get("row"), 0),
+            col=_int_default(entry.get("col"), 0),
             button=button,
-            ms=int(entry.get("ms", 200) or 200),
-            timeout_ms=int(entry.get("timeout_ms", 5000) or 5000),
-            seconds=float(entry.get("seconds", 1.0) or 1.0),
+            ms=_int_default(entry.get("ms"), 200),
+            timeout_ms=_int_default(entry.get("timeout_ms"), 5000),
+            seconds=_float_default(entry.get("seconds"), 1.0),
             text=str(entry.get("text", "") or ""),
             region=region,
             attr=attr,
@@ -551,6 +580,8 @@ class SmokeRunner:
         self._deadline = deadline  # a `time.monotonic()` value, or None for no overall cap
         self._child: PtyChild | None = None
         self._screen: VtScreen | None = None
+        self._cols = 0
+        self._rows = 0
         self._lock = threading.Lock()
         self._total_bytes = 0
         self._last_byte_time = 0.0
@@ -653,25 +684,35 @@ class SmokeRunner:
 
     def _do_expect_screen(self, step: SmokeStep) -> None:
         assert self._screen is not None
-        screen_text = self._screen.text(step.region)
+        # Guarded by the same lock protecting `_total_bytes`/
+        # `_last_byte_time`: `_reader_loop` mutates `self._screen` from a
+        # background thread via `feed()`, so an unguarded read here could
+        # race a `feed()` still applying an escape sequence.
+        with self._lock:
+            screen_text = self._screen.text(step.region)
+            attr_failure = None
+            if step.attr:
+                row = int(step.attr.get("row", 0))
+                col = int(step.attr.get("col", 0))
+                for key, expected in step.attr.items():
+                    if key in ("row", "col"):
+                        continue
+                    actual = self._screen.cell_attr(row, col, key)
+                    if actual != expected:
+                        attr_failure = (row, col, key, expected, actual)
+                        break
         if step.text and step.text not in screen_text:
             region_note = f" in region {step.region}" if step.region else ""
             raise AssertionError(
                 f"expected screen text {step.text!r} not found{region_note}; "
                 f"screen was:\n{screen_text}"
             )
-        if step.attr:
-            row = int(step.attr.get("row", 0))
-            col = int(step.attr.get("col", 0))
-            for key, expected in step.attr.items():
-                if key in ("row", "col"):
-                    continue
-                actual = self._screen.cell_attr(row, col, key)
-                if actual != expected:
-                    raise AssertionError(
-                        f"expected cell ({row},{col}).{key} == {expected!r}, "
-                        f"got {actual!r}"
-                    )
+        if attr_failure is not None:
+            row, col, key, expected, actual = attr_failure
+            raise AssertionError(
+                f"expected cell ({row},{col}).{key} == {expected!r}, "
+                f"got {actual!r}"
+            )
 
     def _do_expect_silent(self, step: SmokeStep) -> None:
         """#2096: this can only be answered by actually observing the
@@ -695,7 +736,8 @@ class SmokeRunner:
         assert self._screen is not None
         deadline = time.monotonic() + step.ms / 1000
         while True:
-            screen_text = self._screen.text(step.region)
+            with self._lock:
+                screen_text = self._screen.text(step.region)
             if step.text in screen_text:
                 return
             if time.monotonic() >= deadline:
@@ -720,13 +762,18 @@ class SmokeRunner:
             with self._lock:
                 self._total_bytes += len(data)
                 self._last_byte_time = time.monotonic()
-            screen.feed(data)
+                # `feed()` mutates the screen and `cursor()` reads it back —
+                # both under the same lock the assertion steps take before
+                # their own `text()`/`cell_attr()` reads, so neither can
+                # observe a `VtScreen` mid-mutation.
+                screen.feed(data)
+                if _CPR_QUERY in data:
+                    row, col = screen.cursor()
             if _CPR_QUERY in data:
                 # Reply enqueued here, WRITTEN from `_responder_loop` — never
                 # write the child's stdin synchronously from this thread.
                 # See this module's docstring: doing so deadlocks a real
                 # Windows ConPTY session.
-                row, col = screen.cursor()
                 self._cpr_queue.put(f"\x1b[{row + 1};{col + 1}R".encode("ascii"))
 
     def _responder_loop(self) -> None:
