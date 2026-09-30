@@ -186,6 +186,9 @@ def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
         machine=kw.pop("machine", "precision"),
         oracle=kw.pop("oracle", None),
         gate_checker=gate_checker,
+        # #2304: absent by default, matching every pre-#2304 `decide()` call
+        # site byte-for-byte — the dead-end reread tests below pass their own.
+        reread_state=kw.pop("reread_state", None),
     )
 
 
@@ -3250,6 +3253,73 @@ def test_a_dead_end_exit_code_reaches_the_drive_exited_audit_row(
     # ...and the board-visible escalation went out as a `coord` argv, once.
     escalations = [c for c in driver.recorded if c[1:3] == ["escalate", "record"]]
     assert len(escalations) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2304: the dead-end predicate's confirmation re-read
+#
+# `detect_dead_end` judges a single snapshot and cannot tell "no verdict
+# yet" from "no verdict, ever" — shape 1's predicate rests on an ABSENT
+# field, so a snapshot taken a moment before the verdict write lands and
+# evaluated a moment after it presents the identical forbidden combination.
+# On quadraui#486 the verdict was durably on the board THREE SECONDS before
+# the drive declared it permanently absent. `decide()`'s `reread_state` hook
+# closes the race with one confirmation read before trusting the shape.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_a_stale_no_verdict_snapshot_is_not_trusted_and_the_drive_continues():
+    """quadraui#486, verbatim: the reread returns a row carrying a verdict —
+    the dead end must not fire, and the drive must actually continue onto
+    the fix arm the verdict unblocks, in this SAME `decide()` call (not
+    merely suppress the escalation and wait out another poll)."""
+    stale = work_tested(
+        review_aid="c9b489b2333e", review_status="done", review_verdict=""
+    )
+    fresh = work_tested(
+        review_aid="c9b489b2333e", review_status="done",
+        review_verdict="request-changes",
+    )
+    action = step(stale, reread_state=lambda: fresh)
+    assert action.kind == RUN
+    assert action.command == ("fix", "c9b489b2333e")
+
+
+def test_a_genuinely_verdict_less_review_still_dead_ends_after_the_reread():
+    """#1956's real signature — the reread ALSO comes back with no verdict —
+    must keep escalating. The confirmation read closes a race; it must never
+    become a way to suppress a genuine dead end."""
+    stale = work_tested(
+        review_aid="c9b489b2333e", review_status="done", review_verdict=""
+    )
+    action = step(stale, reread_state=lambda: stale)
+    assert action.is_exit
+    assert action.exit_code == EXIT_DEAD_END
+    assert "review_terminal_no_verdict" in action.message
+
+
+def test_a_failed_reread_falls_back_to_the_stale_reading_rather_than_blocking():
+    """A transport blip on the confirmation read (`None`, matching
+    `Driver.read_state`'s own contract for exactly this failure) must not
+    turn a genuine dead end into an indefinite wait — fall back to the one
+    reading actually in hand."""
+    stale = work_tested(
+        review_aid="c9b489b2333e", review_status="done", review_verdict=""
+    )
+    action = step(stale, reread_state=lambda: None)
+    assert action.is_exit
+    assert action.exit_code == EXIT_DEAD_END
+
+
+def test_the_default_call_site_shape_still_escalates_on_the_first_read():
+    """Every pre-#2304 `decide()` call passed no `reread_state` at all —
+    `step()`'s own default omits it — so the original #2019 behaviour (no
+    confirmation, escalate immediately) must be exactly preserved."""
+    action = step(
+        work_tested(review_aid="c9b489b2333e", review_status="done", review_verdict="")
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_DEAD_END
 
 
 def test_a_review_worker_that_died_retries_through_the_cli_then_stops_at_the_cap():
