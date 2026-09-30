@@ -836,6 +836,11 @@ def check_disabled_timers(ctx: WatchdogContext) -> list[Finding]:
     stabilises, see ``docs/AGENT_OPERATIONS.md``). Suppress the specific
     unit in ``watchdog-suppress.json`` to keep this from paging on an
     intentional operator decision.
+
+    A ``transient`` unit (created via ``systemd-run``, living only in
+    ``/run/user/<uid>/systemd/transient/``) is excluded from this check
+    entirely — it has no on-disk enablement symlink to be "disabled", so
+    the state is normal, not a finding (#2815).
     """
     if SYSTEMCTL is None:
         return []
@@ -862,7 +867,7 @@ def check_disabled_timers(ctx: WatchdogContext) -> list[Finding]:
         if len(parts) < 2:
             continue
         unit, state = parts[0], parts[1]
-        if state in ("enabled", "static", "generated", "alias"):
+        if state in ("enabled", "static", "generated", "alias", "transient"):
             continue
         findings.append(
             Finding(
