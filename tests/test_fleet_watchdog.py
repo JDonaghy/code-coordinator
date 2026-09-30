@@ -400,6 +400,62 @@ class TestSuppressionSentinel:
         assert (tmp_path / ".local" / "bin" / "coord").is_symlink()
 
 
+class TestDisabledTimerCheck:
+    """#2815: a transient ``coord-*.timer`` (created via ``systemd-run``,
+    e.g. #2587's overnight guard) must not be misread as disabled — it has
+    no on-disk enablement state to be "disabled" from. A genuinely
+    disabled/masked timer must still be reported."""
+
+    def test_transient_timer_produces_no_finding(self, tmp_path, monkeypatch):
+        fake_systemctl = tmp_path / "fake-systemctl"
+        fake_systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$*\" == *list-unit-files* ]]; then\n"
+            "  echo 'coord-rollpending-guard.timer transient'\n"
+            "fi\n"
+        )
+        fake_systemctl.chmod(0o755)
+        monkeypatch.setattr(fleet_watchdog, "SYSTEMCTL", str(fake_systemctl))
+
+        ctx = _ctx(tmp_path)
+        findings = fleet_watchdog.check_disabled_timers(ctx)
+        assert findings == []
+
+    def test_disabled_timer_still_reported(self, tmp_path, monkeypatch):
+        fake_systemctl = tmp_path / "fake-systemctl"
+        fake_systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$*\" == *list-unit-files* ]]; then\n"
+            "  echo 'coord-some-timer.timer disabled'\n"
+            "fi\n"
+        )
+        fake_systemctl.chmod(0o755)
+        monkeypatch.setattr(fleet_watchdog, "SYSTEMCTL", str(fake_systemctl))
+
+        ctx = _ctx(tmp_path)
+        findings = fleet_watchdog.check_disabled_timers(ctx)
+        [finding] = findings
+        assert finding.condition == "timer-disabled"
+        assert finding.signature == "coord-some-timer.timer"
+
+    def test_masked_timer_still_reported(self, tmp_path, monkeypatch):
+        fake_systemctl = tmp_path / "fake-systemctl"
+        fake_systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$*\" == *list-unit-files* ]]; then\n"
+            "  echo 'coord-some-other.timer masked'\n"
+            "fi\n"
+        )
+        fake_systemctl.chmod(0o755)
+        monkeypatch.setattr(fleet_watchdog, "SYSTEMCTL", str(fake_systemctl))
+
+        ctx = _ctx(tmp_path)
+        findings = fleet_watchdog.check_disabled_timers(ctx)
+        [finding] = findings
+        assert finding.condition == "timer-disabled"
+        assert finding.signature == "coord-some-other.timer"
+
+
 # ---------------------------------------------------------------------------
 # Acceptance test 4: the Nth consecutive identical repair escalates instead
 # of repairing.
