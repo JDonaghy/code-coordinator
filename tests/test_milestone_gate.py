@@ -571,6 +571,12 @@ def test_gate_tick_work_state_serializes_oracle_loop_milestones(
     _stub_github_two_ready(monkeypatch)
     dispatched: list = []
     _stub_dispatch(monkeypatch, dispatched)
+    # #2785: oracle_loop is resolved from `probe_milestone`'s live Gate-A
+    # probe now, not bare `has_driver` — `probe_milestone` always re-checks
+    # Gate A regardless of `record.gate` (see its own docstring), so give it
+    # a contract to confirm this milestone genuinely is past Gate A, matching
+    # `cleared=(mg.GATE_A,)` below.
+    monkeypatch.setattr("coord.github_ops.get_repo_file", lambda *a, **kw: "# Contract\n")
 
     state.save_milestone_gate(
         mg.GateRecord(

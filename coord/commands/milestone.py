@@ -27,6 +27,7 @@ from coord.milestone_dispatch import (
     fetch_milestone_context,
     gate_a_status,
     is_milestone_complete,
+    milestone_oracle_loop,
     pick_machine,
     plan_dispatch,
     plan_queue,
@@ -1106,11 +1107,16 @@ def milestone_dispatch_cmd(
     # #2542: under oracle-loop control (Gate A already checked above), chain
     # the whole milestone's drive-queue entries so the tick can never launch
     # two of them at once — see plan_queue's own docstring for why.
+    # #2785: resolved per milestone via `milestone_oracle_loop`, not the
+    # repo-level `has_driver` alone. `block_reason` above already confirms
+    # this milestone's Gate-A contract exists (we'd have exited otherwise).
     queue_plan = plan_queue(
         ctx.work_order,
         ctx.terminal_issues,
         repo_entry.name,
-        oracle_loop=cfg.acceptance.has_driver(repo_entry.name),
+        oracle_loop=milestone_oracle_loop(
+            repo_entry, cfg, gate_a_satisfied=block_reason is None
+        ),
     )
 
     if not queue_plan:
@@ -1318,10 +1324,15 @@ def milestone_drive_cmd(
     # #2542: pass the same `oracle_loop` the gate tick itself will use, so
     # this preview never shows more than the one entry the actual `work`
     # gate would dispatch for an oracle-loop milestone.
+    # #2785: resolved per milestone via `milestone_oracle_loop`, reusing the
+    # `gate_a_blocked` probe already computed above rather than the
+    # repo-level `has_driver` alone.
     if ctx.work_order.nodes:
         plan = plan_dispatch(
             ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues,
-            oracle_loop=cfg.acceptance.has_driver(repo_entry.name),
+            oracle_loop=milestone_oracle_loop(
+                repo_entry, cfg, gate_a_satisfied=probes.gate_a_blocked is None
+            ),
         )
         to_dispatch, skipped, waiting, deferred = (
             plan.to_dispatch, plan.skipped, plan.waiting, plan.deferred,
@@ -1501,9 +1512,24 @@ def milestone_write_order_cmd(
     # (coord-portal#122). Cheap/early check for the explicit-group case only
     # — see validate_no_shared_oracle_group's docstring for what it can't
     # catch.
+    #
+    # #2785: resolved PER MILESTONE via `milestone_oracle_loop` — NOT
+    # `cfg.acceptance.has_driver(repo_entry.name)` alone, which is true for
+    # every milestone in a repo that has ever declared ANY acceptance
+    # driver and so wrongly refused #1949's (ms-60's) work order, which
+    # shares no manifest with anything since ms-60 has no
+    # `tests/acceptance/ms-60/` at all. No other Gate-A probe has run yet in
+    # this command, so resolve one fresh — `gate_a_status`'s own existence
+    # check, the same one `coord milestone dispatch` would perform.
     try:
         validate_no_shared_oracle_group(
-            work_order, oracle_loop=cfg.acceptance.has_driver(repo_entry.name)
+            work_order,
+            oracle_loop=milestone_oracle_loop(
+                repo_entry, cfg,
+                gate_a_satisfied=gate_a_status(
+                    repo_entry, cfg, milestone_number
+                ) is None,
+            ),
         )
     except WorkOrderError as e:
         click.echo(f"error: {e}", err=True)
