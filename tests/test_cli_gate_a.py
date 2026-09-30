@@ -209,6 +209,40 @@ class TestGateACommand:
         assert result.exit_code == 1
         assert "coord acceptance mock" in result.output
 
+    def test_a_rate_limited_read_is_not_reported_as_a_missing_contract(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#2973: a failed contents-API read (GitHub secondary rate limit)
+        must not be folded into the same "does not exist" outcome as a
+        genuine 404 — the file was on `main` the whole time; only the read
+        failed. Reporting it as absent recommends `coord acceptance mock`,
+        which against an already-approved milestone dispatches a duplicate
+        mock-author."""
+        from coord.github_ops import GhRateLimitError
+
+        def _repo_file(repo: str, path: str, branch: str | None = None) -> str:
+            raise GhRateLimitError(
+                "gh api repos/acme/api/contents/tests/acceptance/ms-37/"
+                "contract.md?ref=main failed: API rate limit exceeded for "
+                "user ID 12345",
+                secondary=True,
+            )
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "ms-37 epic", "milestone": {"number": 37}, "labels": []},
+        ), patch("coord.github_ops.get_repo_file", side_effect=_repo_file):
+            result = CliRunner().invoke(
+                main,
+                ["gate-a", "--approved", "api", "900", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 1
+        assert "does not exist" not in result.output
+        assert "coord acceptance mock" not in result.output
+        assert "rate limit" in result.output.lower()
+        assert "retry" in result.output.lower()
+
     def test_unknown_repo_exits_two(self, config_file: Path, coord_db) -> None:
         result = _run(config_file, ["--approved", "nope", "900"])
         assert result.exit_code == 2

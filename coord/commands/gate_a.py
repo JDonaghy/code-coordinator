@@ -137,17 +137,36 @@ def _fetch_contract(repo_cfg, config, milestone_number: int) -> str | None:
     number doesn't say whether it's a directory-discovered driver's slice
     (shared repo-root tree) or an entrypoint-linked driver's relocated one,
     so this checks each candidate :func:`coord.acceptance.
-    gate_a_contract_candidates` returns until one exists."""
+    gate_a_contract_candidates` returns until one exists.
+
+    Returns ``None`` only when every candidate genuinely 404'd — a
+    confirmed absence. Raises :class:`coord.github_ops.GhTransientError`
+    (unchanged) when a candidate's read failed for a transient reason
+    (auth, network, a GitHub rate limit) rather than a 404: #2973's bug
+    was exactly this distinction getting lost — a rate-limited read was
+    folded into the same ``except RuntimeError: continue`` as a real
+    404, so "I could not tell" silently became "it does not exist". A
+    transient failure on ANY candidate makes the whole read inconclusive
+    (a later candidate 404'ing doesn't confirm the transiently-failed one
+    is absent too), so it takes priority over a clean ``None`` even if a
+    later candidate genuinely 404s.
+    """
     from coord import github_ops  # noqa: PLC0415
     from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
+    transient: github_ops.GhTransientError | None = None
     for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
         try:
             return github_ops.get_repo_file(
                 repo_cfg.github, path, branch=repo_cfg.default_branch,
             )
+        except github_ops.GhTransientError as e:
+            transient = transient or e
+            continue
         except RuntimeError:
             continue
+    if transient is not None:
+        raise transient
     return None
 
 
@@ -216,7 +235,27 @@ def gate_a(
         sys.exit(2)
     milestone_number = int(milestone_number)
 
-    contract_text = _fetch_contract(repo_cfg, cfg, milestone_number)
+    try:
+        contract_text = _fetch_contract(repo_cfg, cfg, milestone_number)
+    except github_ops.GhTransientError as e:
+        # #2973: a failed READ is a different claim than a confirmed
+        # ABSENCE — only the latter justifies telling the caller to
+        # dispatch `coord acceptance mock` (which, against a milestone
+        # that already has an approved contract, produces a duplicate/
+        # conflicting one). Mirror the issue-fetch path just above, which
+        # already reports this correctly: name the real cause and ask for
+        # a retry, print no remedy.
+        click.echo(
+            f"error: could not read the Gate-A contract for ms-{milestone_number} "
+            f"({repo}#{tracking_issue}): {e}",
+            err=True,
+        )
+        click.echo(
+            "  This is a failed read, not a confirmed absence — the contract "
+            "may well exist. Retry once the rate limit clears.",
+            err=True,
+        )
+        sys.exit(1)
     if contract_text is None:
         from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
