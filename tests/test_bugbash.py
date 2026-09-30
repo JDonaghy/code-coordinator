@@ -1,8 +1,14 @@
 """Tests for coord/bugbash.py — the per-platform find -> dedupe -> file ->
 queue loop engine (#3487). Exercises dedupe (open match, closed-issue
 regression, no match), filing/queueing with the `coord` seam faked,
-loop-termination (zero-findings, round cap, cost cap), and `--dry-run`
-filing nothing."""
+loop-termination (zero-findings, round cap, cost cap, lane failure), and
+`--dry-run` filing nothing. Also covers the production explorer
+(`coord/commands/bugbash.py::_dispatch_and_await_lane`) against faked
+`dispatch_with_retry`/`poll_until_terminal`/log-fetch seams (review fix
+iteration 1, #3487: a lane's dispatch/poll/log failure must be
+distinguishable from a genuine zero-findings pass, and the production
+explorer must reuse the shared `poll_until_terminal` poller rather than a
+third hand-rolled one)."""
 
 from __future__ import annotations
 
@@ -420,6 +426,74 @@ class TestRunBugbashTermination:
         assert len(win_calls) == 1
         assert report.rounds[1].skipped_lanes == ["win-native"]
 
+    def test_all_lanes_failing_reports_lane_failure_not_zero_findings(self):
+        # #2096 fix: every lane's ExploreOutcome comes back ok=False (e.g.
+        # the whole fleet is unreachable) — this must NOT be reported as
+        # "zero_findings" (a genuine clean pass), since nothing was actually
+        # verified to have run.
+        config = _config(max_rounds=5)
+
+        def failing_explorer(lane, round_num):
+            return ExploreOutcome(ok=False, notes="dispatch failed: connection refused")
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=failing_explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.termination_reason == "lane_failure"
+        assert report.rounds[0].lane_failures == {"win-native": "dispatch failed: connection refused"}
+        assert report.rounds[0].all_explored_lanes_failed is True
+        assert report.any_lane_failures is True
+        assert runner.calls == []
+
+    def test_one_of_two_lanes_failing_is_not_all_failed(self):
+        # A partial failure (one lane down, the other verified) must still
+        # report a real "zero_findings" clean pass if the surviving lane
+        # genuinely found nothing — but the failure is still recorded for
+        # visibility.
+        ok_lane = _lane(platform="mac-native", machine="mac1")
+        bad_lane = _lane(platform="win-native", machine="pc1")
+        config = _config(lanes=[bad_lane, ok_lane], max_rounds=5)
+
+        def explorer(lane, round_num):
+            if lane.platform == "win-native":
+                return ExploreOutcome(ok=False, notes="timed out after 1800s waiting on asg-1")
+            return ExploreOutcome(ok=True, findings=(), cost=1.0, notes="status=completed")
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.termination_reason == "zero_findings"
+        assert report.rounds[0].all_explored_lanes_failed is False
+        assert report.rounds[0].lane_failures == {"win-native": "timed out after 1800s waiting on asg-1"}
+        assert report.any_lane_failures is True
+
+    def test_skipped_lane_is_not_counted_as_a_failure(self):
+        # A lane skipped for blowing its per-lane cost cap never got asked
+        # anything this round — it must not show up in lane_failures, and a
+        # round where every remaining (non-skipped) lane succeeded is a
+        # genuine clean pass.
+        expensive_lane = _lane(platform="win-native", machine="pc1")
+        cheap_lane = _lane(platform="mac-native", machine="mac1")
+        config = _config(lanes=[expensive_lane, cheap_lane], max_rounds=3, cost_cap_per_lane=2.0)
+
+        def explorer(lane, round_num):
+            cost = 5.0 if lane.platform == "win-native" else 0.5
+            return ExploreOutcome(findings=(), cost=cost, ok=True)
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        # Round 1: both lanes explored, zero findings -> terminates cleanly.
+        assert report.termination_reason == "zero_findings"
+        assert report.rounds[0].lane_failures == {}
+        assert report.rounds[0].skipped_lanes == []
+
     def test_duplicate_only_round_still_terminates_zero_findings(self):
         # A round whose only finding is a DUPLICATE of an already-open
         # issue must count as zero NEW findings, terminating the loop —
@@ -520,3 +594,187 @@ class TestRunBugbashConfirmGate:
         # Round 1 declined (confirm gate), round 2 files freely.
         assert report.rounds[0].filings[0].filed is False
         assert report.rounds[1].filings[0].filed is True
+
+
+# ── production explorer (coord/commands/bugbash.py) ─────────────────────
+#
+# _dispatch_and_await_lane is the PRODUCTION Explorer seam: dispatch a
+# headless worker, wait for it via the shared `poll_until_terminal` poller
+# (#2743), then fetch+parse its log. Every branch below faked at the seam
+# boundary (`dispatch_with_retry`, `poll_until_terminal`, `httpx.get` for
+# the log fetch) — no real network/fleet access.
+
+
+@dataclass
+class _FakeRealMachine:
+    name: str
+    host: str
+    capabilities: list = field(default_factory=list)
+    repos: list = field(default_factory=list)
+
+
+@dataclass
+class _FakeConcurrency:
+    max_retries: int = 3
+    backoff_base: float = 1.0
+
+
+@dataclass
+class _FakeModels:
+    default: str = "sonnet"
+
+
+@dataclass
+class _FakeRealConfig:
+    machines: list
+    concurrency: _FakeConcurrency = field(default_factory=_FakeConcurrency)
+    models: _FakeModels = field(default_factory=_FakeModels)
+
+
+def _prod_lane(machine="pc1", platform="win-native"):
+    from coord.bugbash import BugbashLane
+    return BugbashLane(platform=platform, driver_kind=platform, machine=machine, capability="windows")
+
+
+class _FakePollOutcome:
+    def __init__(self, status, exit_code=None, error=None):
+        self.status = status
+        self.exit_code = exit_code
+        self.error = error
+
+
+class TestDispatchAndAwaitLane:
+    def test_unknown_machine_is_ok_false(self):
+        from coord.commands.bugbash import _dispatch_and_await_lane
+
+        cfg = _FakeRealConfig(machines=[])
+        outcome = _dispatch_and_await_lane(
+            _prod_lane(machine="ghost"), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is False
+        assert "ghost" in outcome.notes
+        assert outcome.findings == ()
+
+    def test_dispatch_failure_is_ok_false(self, monkeypatch):
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+
+        def boom(*a, **k):
+            raise RuntimeError("no agent reachable")
+
+        monkeypatch.setattr("coord.dispatch.dispatch_with_retry", boom)
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is False
+        assert "dispatch failed" in outcome.notes
+
+    def _dispatch_ok(self, monkeypatch):
+        monkeypatch.setattr(
+            "coord.dispatch.dispatch_with_retry", lambda *a, **k: {"id": "asg-1"},
+        )
+
+    def test_poll_not_found_is_ok_false(self, monkeypatch):
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("not_found"),
+        )
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is False
+        assert "not found" in outcome.notes
+
+    def test_poll_timeout_is_ok_false(self, monkeypatch):
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("timeout"),
+        )
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is False
+        assert "timed out" in outcome.notes
+
+    def test_nonzero_exit_code_is_ok_false(self, monkeypatch):
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=1, error="crashed"),
+        )
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is False
+        assert "FAILED (exit 1)" in outcome.notes
+        assert "crashed" in outcome.notes
+
+    def test_log_fetch_failure_is_ok_false(self, monkeypatch):
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        import httpx as httpx_mod
+
+        def boom_get(*a, **k):
+            raise httpx_mod.ConnectError("refused")
+
+        monkeypatch.setattr(httpx_mod, "get", boom_get)
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is False
+        assert "log fetch failed" in outcome.notes
+
+    def test_successful_round_trip_parses_findings_and_is_ok_true(self, monkeypatch):
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "done.\\n```bugbash-findings\\n'
+            '[{\\"title\\": \\"Crash on install\\", \\"expected\\": \\"e\\", '
+            '\\"actual\\": \\"a\\", \\"repro\\": \\"r\\", \\"evidence\\": \\"ev\\"}]\\n'
+            '```"}]}}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is True
+        assert outcome.cost == 1.0
+        assert len(outcome.findings) == 1
+        assert outcome.findings[0].title == "Crash on install"
