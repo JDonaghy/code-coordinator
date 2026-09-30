@@ -477,6 +477,91 @@ def test_compute_issue_projection_stage_counts_test_counts_smoke_legs():
     assert out["stage_counts"]["test"] == 2
 
 
+def test_compute_issue_projection_stage_counts_test_fanout_legs_count_as_one_round():
+    """#3191: a #3182 capability-partition fan-out dispatches one
+    `type="smoke"` row PER partition for a SINGLE Test attempt — a flat row
+    count reports 2 for a clean, fully-successful first attempt, which every
+    board reader renders as "this needed a retry". Legs sharing the same
+    parent and `[[smoke-fanout:...]]` manifest must collapse to one round."""
+    from coord.smoke import _encode_fanout_manifest, smoke_leg_issue_title
+
+    manifest = _encode_fanout_manifest(
+        [("s1", ("gtk", "windows"), "pytest"), ("s2", ("macos",), "pytest")]
+    )
+    a = [
+        _work(
+            assignment_id="w1", status="done", dispatched_at=1.0,
+            test_state="passed", test_reason=f"{manifest}\nboth legs passed.",
+        ),
+        _work(
+            assignment_id="s1", type="smoke", status="done", test_state="passed",
+            dispatched_at=2.0, review_of_assignment_id="w1",
+            issue_title=smoke_leg_issue_title("t", ("gtk", "windows")),
+        ),
+        _work(
+            assignment_id="s2", type="smoke", status="done", test_state="passed",
+            dispatched_at=2.0, review_of_assignment_id="w1",
+            issue_title=smoke_leg_issue_title("t", ("macos",)),
+        ),
+    ]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stage_counts"]["test"] == 1
+
+
+def test_compute_issue_projection_stage_counts_test_fanout_two_rounds_count_as_two():
+    """A genuine retry (a fresh fan-out round after the first one failed and
+    was reset) must still surface as 2, not collapse into the same round as
+    the first — the fix must not hide real retries, only fold same-round
+    partitions together."""
+    from coord.smoke import _encode_fanout_manifest, smoke_leg_issue_title
+
+    round1_manifest = _encode_fanout_manifest(
+        [("s1", ("gtk", "windows"), "pytest"), ("s2", ("macos",), "pytest")]
+    )
+    round2_manifest = _encode_fanout_manifest(
+        [("s3", ("gtk", "windows"), "pytest"), ("s4", ("macos",), "pytest")]
+    )
+    a = [
+        # Round 1's manifest has since been overwritten by round 2's — its
+        # legs are now "orphaned" and counted individually (documented
+        # limitation), which still correctly signals "more than one round".
+        _work(
+            assignment_id="w1", status="done", dispatched_at=3.0,
+            test_state="passed", test_reason=f"{round2_manifest}\nboth legs passed.",
+        ),
+        _work(
+            assignment_id="s1", type="smoke", status="failed", test_state="failed",
+            dispatched_at=1.0, review_of_assignment_id="w1",
+            issue_title=smoke_leg_issue_title("t", ("gtk", "windows")),
+        ),
+        _work(
+            assignment_id="s2", type="smoke", status="done", test_state="passed",
+            dispatched_at=1.0, review_of_assignment_id="w1",
+            issue_title=smoke_leg_issue_title("t", ("macos",)),
+        ),
+        _work(
+            assignment_id="s3", type="smoke", status="done", test_state="passed",
+            dispatched_at=3.0, review_of_assignment_id="w1",
+            issue_title=smoke_leg_issue_title("t", ("gtk", "windows")),
+        ),
+        _work(
+            assignment_id="s4", type="smoke", status="done", test_state="passed",
+            dispatched_at=3.0, review_of_assignment_id="w1",
+            issue_title=smoke_leg_issue_title("t", ("macos",)),
+        ),
+    ]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    # Round 2's two partitions collapse to 1 (live manifest); round 1's two
+    # orphaned legs count individually (2) — 3 total, still > 1, still
+    # visibly "more than a single clean attempt" even though it isn't an
+    # exact historical reconstruction (see the documented limitation).
+    assert out["stage_counts"]["test"] == 3
+
+
 def test_compute_issue_projection_stage_counts_merge_counts_conflict_fix_legs():
     """Repeated landing attempts show up as `type="conflict-fix"` legs
     (#241) — there is no `type="merge"` assignment to count directly."""

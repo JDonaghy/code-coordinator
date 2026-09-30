@@ -75,6 +75,7 @@ class _AssignmentLike(Protocol):
     review_verdict: str | None
     review_of_assignment_id: str | None
     test_state: str | None
+    test_reason: str | None
     repo_name: str
     issue_number: int
     acceptance_state: str | None
@@ -82,6 +83,7 @@ class _AssignmentLike(Protocol):
     acceptance_passed: int | None
     uat_state: str | None
     uat_reason: str | None
+    issue_title: str | None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -195,7 +197,11 @@ def _leg_count_for_stage(
       field exists to surface, and a strict ``type == "work"`` match would
       never see them.
     * ``"test"`` has no ``type="test"`` assignment — the Test-stage's
-      dispatched worker is ``type="smoke"`` (``coord.smoke``).
+      dispatched worker is ``type="smoke"`` (``coord.smoke``). Since #3182,
+      one Test *attempt* can dispatch more than one ``type="smoke"`` row (a
+      fan-out leg per capability partition), so a flat row count over-reports
+      — see :func:`_test_stage_leg_count` for how rows are folded back into
+      rounds.
     * ``"merge"`` has no ``type="merge"`` assignment either — repeated
       landing attempts show up as ``type="conflict-fix"`` legs (#241). Note
       the counting convention this implies differs from every other stage:
@@ -230,7 +236,7 @@ def _leg_count_for_stage(
         ]
         return len(matching) + len(extra)
     if stage == "test":
-        return sum(1 for a in assignments_for_issue if (a.type or "work") == "smoke")
+        return _test_stage_leg_count(assignments_for_issue)
     if stage == "merge":
         return sum(1 for a in assignments_for_issue if (a.type or "work") == "conflict-fix")
     if stage == "acceptance":
@@ -240,6 +246,78 @@ def _leg_count_for_stage(
             if (a.type or "work") == "work" and (a.acceptance_state or "") != ""
         )
     return len(assignments_for_stage(assignments_for_issue, stage, require_plan=require_plan))
+
+
+def _test_stage_leg_count(assignments_for_issue: list) -> int:
+    """How many separate Test-stage *attempts* — not raw ``type="smoke"``
+    rows — this issue has had (#3191).
+
+    Before #3182, one Test attempt was always exactly one ``type="smoke"``
+    row, so :func:`_leg_count_for_stage`'s flat row count was already
+    correct. #3182's fan-out (``coord.smoke._dispatch_smoke_fanout``) breaks
+    that: a diff whose ``capability_rules`` matches span more than one
+    machine-satisfiable partition (e.g. ``gtk+windows`` and ``macos``)
+    dispatches one smoke row PER partition for a single Test round, so a
+    clean, fully-successful first attempt reported ``stage_counts["test"] ==
+    2`` — read by every board client as "this needed a retry" (#3013), which
+    is exactly backwards.
+
+    A fan-out leg's own ``issue_title`` carries a ``[smoke:<caps>]`` tag
+    (``coord.smoke.smoke_leg_issue_title``/``smoke_leg_capabilities``); an
+    ordinary single-leg dispatch (the pre-#3182 path, and every row that
+    predates it) carries none. Untagged rows keep counting 1:1 — no
+    behaviour change for the common case.
+
+    A tagged leg's round is identified via the ``[[smoke-fanout:...]]``
+    manifest (``coord.smoke._encode_fanout_manifest``/``_parse_fanout_manifest``)
+    stamped on the leg's own parent row (``review_of_assignment_id``) —
+    every leg the manifest names is one round, and rounds collapse to a
+    single count regardless of how many partitions they fanned out to.
+
+    Known limitation, not fixed here: a Test retry clears the parent's
+    ``test_reason`` (``coord.state.reset_work_test_state``) before the next
+    round dispatches and writes a fresh manifest, so a SUPERSEDED round's
+    manifest no longer exists to fold its legs back together by the time
+    this runs — those orphaned tagged legs fall back to counting 1 each,
+    same as before this fix. That only ever *over*-counts a past, already-
+    resolved round; it never reproduces the bug this closes, which was
+    about the live/most-recent round (the one every reader actually looks
+    at) reporting a false retry on a clean first attempt.
+    """
+    from coord.smoke import _parse_fanout_manifest, smoke_leg_capabilities  # noqa: PLC0415
+
+    smoke_legs = [a for a in assignments_for_issue if (a.type or "work") == "smoke"]
+    if not smoke_legs:
+        return 0
+
+    # Every row's own manifest, keyed by that row's `assignment_id` — a
+    # fan-out leg's PARENT (the work-like row `review_of_assignment_id`
+    # points back to) is the one that carries it, not the leg itself.
+    manifest_leg_ids_by_parent: dict[str, frozenset[str]] = {}
+    for a in assignments_for_issue:
+        parsed = _parse_fanout_manifest(getattr(a, "test_reason", None))
+        if parsed and a.assignment_id:
+            manifest_leg_ids_by_parent[a.assignment_id] = frozenset(
+                leg_id for leg_id, _caps, _cmd in parsed if leg_id
+            )
+
+    count = 0
+    counted_rounds: set[tuple[str, frozenset[str]]] = set()
+    for leg in smoke_legs:
+        if smoke_leg_capabilities(getattr(leg, "issue_title", None)) is None:
+            count += 1
+            continue
+        manifest_ids = manifest_leg_ids_by_parent.get(leg.review_of_assignment_id or "")
+        if not manifest_ids or leg.assignment_id not in manifest_ids:
+            # Orphaned tagged leg — see the "Known limitation" note above.
+            count += 1
+            continue
+        round_key = (leg.review_of_assignment_id or "", manifest_ids)
+        if round_key in counted_rounds:
+            continue
+        counted_rounds.add(round_key)
+        count += 1
+    return count
 
 
 def _widen_work_like_types(assignments: list) -> list:
