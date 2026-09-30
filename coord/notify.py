@@ -1175,6 +1175,44 @@ def _fix_round_ceiling_blocked_for_work(work: "Assignment") -> bool:
     return is_fix_round_ceiling_blocked(dq_entry.state, dq_entry.last_reason)
 
 
+def _drive_terminally_exited_for_work(work: "Assignment") -> bool:
+    """#3308: true when *work*'s (repo, issue) has a drive-queue row that has
+    already exited for good — :data:`coord.drive_queue.STUCK_QUEUE_STATES`
+    (``blocked``/``failed``), the same "is this row stuck" question
+    :func:`coord.drive_queue.add_preflight_notice` and :mod:`coord.reports`
+    already ask rather than re-deriving it (#2096's "one question, one
+    answer").
+
+    ``blocked`` covers every terminal cause ``_reconcile_running`` can write
+    for a drive-queue row: the permanent give-ups already marked with a
+    :data:`coord.drive_queue._PERMANENT_BLOCK_MARKERS` token
+    (``refused``/``dead_end``/the #2972 fix-round ceiling) AND the plain
+    ``N/N attempts — giving up`` ``exhausted`` outcome that carries no
+    marker at all — vimcode#883, this issue's own reference case, exhausted
+    a ``checks_stale`` merge block that way. All of them share the same
+    consequence for THIS caller: nothing is going to relaunch the row on
+    its own. #2230's blocked-resume sweep only resumes a `blocked` entry on
+    POSITIVE evidence its own merge gate now reads clear, and a
+    ``merge_conflict_unresolved`` CONFLICT can never supply that evidence —
+    so distinguishing which specific `blocked` reason this is would add
+    complexity with no different answer for this call site.
+
+    Same "no row for this (repo, issue) reads as nothing to act on" default
+    as :func:`_fix_round_ceiling_blocked_for_work` above — an issue can be
+    driven with no ``coord drive-queue add`` at all, and a live/waiting row
+    (still owned by a real or soon-to-relaunch drive) correctly reads
+    ``False`` here too.
+    """
+    from coord.drive_queue import QueueEntry, STUCK_QUEUE_STATES  # noqa: PLC0415
+    from coord.state import get_drive_queue_entry  # noqa: PLC0415
+
+    row = get_drive_queue_entry(work.repo_name, work.issue_number)
+    if row is None:
+        return False
+    dq_entry = QueueEntry.from_row(row)
+    return dq_entry.state in STUCK_QUEUE_STATES
+
+
 def _conflict_confined_to_sealed_paths(
     entry: "QueuedMerge", config: Config,
 ) -> list[str] | None:
@@ -1238,7 +1276,17 @@ def dispatch_stalled_pipeline_action(
     ``mock-author``), which dispatches regardless of the flag: no loop owns
     that row (#2302), so the flag would only leave it stalled forever with
     no alternative dispatcher to race. ``work`` rows under the same reasons
-    keep the opt-in gate — ``coord drive`` owns those.
+    keep the opt-in gate — ``coord drive`` owns those — UNLESS (#3308) the
+    reason is ``merge_conflict_unresolved`` AND the owning drive-queue row
+    has already exited for good (:func:`_drive_terminally_exited_for_work`
+    — budget-exhausted or dead-end): the "``coord drive`` owns those"
+    premise is false the instant the drive itself has terminally stopped,
+    and #2230's own blocked-resume sweep cannot recover a genuine conflict
+    either, so this is the identical "no loop owns this row, no alternative
+    dispatcher to race" shape #2302/#2537 already carved out — just for a
+    ``work`` row whose drive has exited rather than a row type ``coord
+    drive`` never ran at all.
+
     Mutates *board* in place exactly like
     the auto-loop / review-dispatch helpers it delegates to — the caller is
     responsible for persisting it.
@@ -1331,13 +1379,32 @@ def dispatch_stalled_pipeline_action(
     # (observed live: coord-portal#132). So this reason joins the bypass for
     # these row types too — every other reason, and `work` rows under either
     # reason, keep the opt-in gate unchanged.
+    #
+    # #3308: a `merge_conflict_unresolved` stall whose OWNING drive-queue row
+    # has already exited for good (vimcode#883: `checks_stale` exhausted its
+    # attempt budget, then a #2246 sibling sweep reclassified the parked
+    # merge-queue entry as a rebaseable CONFLICT) is the SAME "no loop owns
+    # this row" shape as the #2302/#2537 carve-outs above — just reached from
+    # a `work` row whose drive genuinely ran, rather than a row type `coord
+    # drive` never touches. The "`coord drive` owns those" premise the `work`
+    # opt-in gate otherwise relies on is false once that drive has terminally
+    # exited: there is no live session left to race, and #2230's own
+    # blocked-resume sweep only resumes on evidence the merge gate reads
+    # clear, which a genuine conflict can never supply. See
+    # `_drive_terminally_exited_for_work`'s docstring for the full case list.
     from coord.models import SEALED_PATH_AUTHOR_TYPES  # noqa: PLC0415
 
     sealed_author_stall = (
         detection.reason in ("review_request_changes_no_fix", "merge_conflict_unresolved")
         and work.type in SEALED_PATH_AUTHOR_TYPES
     )
-    if not config.pipeline.auto_dispatch_stalled and not sealed_author_stall:
+    drive_exhausted_conflict = (
+        detection.reason == "merge_conflict_unresolved"
+        and _drive_terminally_exited_for_work(work)
+    )
+    if not config.pipeline.auto_dispatch_stalled and not (
+        sealed_author_stall or drive_exhausted_conflict
+    ):
         return StalledDispatchAction(
             kind="disabled", detail="pipeline.auto_dispatch_stalled is False",
         )

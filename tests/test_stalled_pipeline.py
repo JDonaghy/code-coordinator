@@ -2383,6 +2383,148 @@ class TestDispatchSealedAuthorBypassesFlagCoversMergeConflict:
         stub.assert_not_called()
 
 
+class TestDispatchDriveExhaustedConflictBypassesFlag:
+    """#3308: a `merge_conflict_unresolved` stall on a plain `work` row whose
+    OWNING drive-queue row has already exited for good (blocked/failed) must
+    dispatch regardless of `auto_dispatch_stalled` — the "`coord drive` owns
+    that row" premise the flag otherwise relies on is false once the drive
+    itself has terminally stopped, and #2230's own blocked-resume sweep can
+    never clear a genuine conflict either. Reference case: vimcode#883
+    exhausted its attempt budget on a `checks_stale` merge block (a PLAIN
+    `exhausted` give-up, no `_PERMANENT_BLOCK_MARKERS` token at all), then a
+    #2246 sibling sweep reclassified its parked merge-queue entry as a
+    rebaseable CONFLICT."""
+
+    def test_work_conflict_stall_dispatches_when_drive_exhausted_with_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _work("work-1", test_state="passed", issue_number=883),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-883-fix", target_branch="develop", issue_number=883,
+            issue_title="t", state=CONFLICT,
+            # #2246's own wording for a sibling-triggered park —
+            # `classify_conflict` reads "could not be rebased" as
+            # rebaseable, exactly the shape that sweep relies on.
+            error=(
+                "could not be rebased onto develop — became CONFLICTING "
+                "when a sibling merged into develop (#2246)"
+            ),
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+        assert work.type == "work"
+
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            state_mod,
+            "get_drive_queue_entry",
+            lambda repo_name, issue_number: {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "state": "blocked",
+                "last_reason": (
+                    "merge : BLOCKED (checks_stale) (2/2 attempts) — "
+                    "giving up"
+                ),
+            },
+        )
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=883,
+            issue_title="[conflict-fix] t", assignment_id="cf-883", status="pending",
+            type="conflict-fix",
+        )
+        stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        stub.assert_called_once()
+
+    def test_work_conflict_stall_stays_disabled_when_drive_still_waiting(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """A drive-queue row that is merely `waiting` (still scheduled to
+        relaunch) has NOT terminally exited — the flag must still gate the
+        dispatch, unlike the `blocked` case above."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-883-fix", target_branch="develop", issue_number=883,
+            issue_title="t", state=CONFLICT,
+            error="could not be rebased onto develop",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        monkeypatch.setattr(
+            state_mod,
+            "get_drive_queue_entry",
+            lambda repo_name, issue_number: {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "state": "waiting",
+                "last_reason": "requeued at position 1",
+            },
+        )
+        stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "disabled"
+        stub.assert_not_called()
+
+    def test_drive_exhausted_bypass_scoped_to_merge_conflict_unresolved_only(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """The #3308 bypass must not widen to OTHER stalled-pipeline
+        reasons on a `work` row just because its drive-queue row happens to
+        be `blocked` — only `merge_conflict_unresolved` is in scope."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_request_changes_no_fix"
+        assert work.type == "work"
+
+        monkeypatch.setattr(
+            state_mod,
+            "get_drive_queue_entry",
+            lambda repo_name, issue_number: {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "state": "blocked",
+                "last_reason": "2/2 attempts — giving up",
+            },
+        )
+        stub = MagicMock()
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "disabled"
+        stub.assert_not_called()
+
+
 class TestLiveSessionGuard:
     def test_dispatch_skipped_when_live_session_active(
         self, config: Config, monkeypatch
