@@ -35,6 +35,15 @@ import dataclasses
 from typing import Any, Protocol, runtime_checkable
 
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, effective_issue_number
+# #3191: the two #3182 fan-out encodings this module has to PARSE to count
+# Test *rounds* rather than raw smoke rows — see `_test_stage_leg_count`.
+# Imported from the leaf `coord.smoke_tags`, never from `coord.smoke`, so
+# this module keeps the property its docstring above claims: the only thing
+# it pulls in is pure computation. `coord.smoke` would bring `coord.config`,
+# `coord.dispatch`, `coord.github_ops`, `coord.revalidate` and `httpx` with
+# it, and `compute_board_stage_projection` runs inside `coord serve`'s
+# `/board` handler.
+from coord.smoke_tags import _parse_fanout_manifest, smoke_leg_capabilities
 
 # ── Stage-status vocabulary — mirrors tui/src/app/pipeline.rs::StageStatus ──
 PENDING = "pending"
@@ -263,16 +272,17 @@ def _test_stage_leg_count(assignments_for_issue: list) -> int:
     is exactly backwards.
 
     A fan-out leg's own ``issue_title`` carries a ``[smoke:<caps>]`` tag
-    (``coord.smoke.smoke_leg_issue_title``/``smoke_leg_capabilities``); an
-    ordinary single-leg dispatch (the pre-#3182 path, and every row that
+    (``coord.smoke_tags.smoke_leg_issue_title``/``smoke_leg_capabilities``);
+    an ordinary single-leg dispatch (the pre-#3182 path, and every row that
     predates it) carries none. Untagged rows keep counting 1:1 — no
     behaviour change for the common case.
 
     A tagged leg's round is identified via the ``[[smoke-fanout:...]]``
-    manifest (``coord.smoke._encode_fanout_manifest``/``_parse_fanout_manifest``)
-    stamped on the leg's own parent row (``review_of_assignment_id``) —
-    every leg the manifest names is one round, and rounds collapse to a
-    single count regardless of how many partitions they fanned out to.
+    manifest (``coord.smoke_tags._encode_fanout_manifest``/
+    ``_parse_fanout_manifest``) stamped on the leg's own parent row
+    (``review_of_assignment_id``) — every leg the manifest names is one
+    round, and rounds collapse to a single count regardless of how many
+    partitions they fanned out to.
 
     Known limitation, not fixed here: a Test retry clears the parent's
     ``test_reason`` (``coord.state.reset_work_test_state``) before the next
@@ -284,8 +294,6 @@ def _test_stage_leg_count(assignments_for_issue: list) -> int:
     about the live/most-recent round (the one every reader actually looks
     at) reporting a false retry on a clean first attempt.
     """
-    from coord.smoke import _parse_fanout_manifest, smoke_leg_capabilities  # noqa: PLC0415
-
     smoke_legs = [a for a in assignments_for_issue if (a.type or "work") == "smoke"]
     if not smoke_legs:
         return 0

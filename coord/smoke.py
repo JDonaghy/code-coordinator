@@ -82,7 +82,6 @@ independence; for smoke we want a *capable* machine for hardware, and
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import re
@@ -123,6 +122,24 @@ from coord.models import (
 # runner actually emits, or from what `coord.notify` parses back out of the
 # agent's own transcript (see `_smoke_baseline_red_reason` there).
 from coord.revalidate import BASELINE_RED_OUTPUT_MARKER, RUNNER_BASELINE_RED_EXIT
+# The #3182 fan-out's on-the-board text encodings, DEFINED in a leaf module
+# and re-exported here under their original spellings so every existing
+# importer (`coord.notify`, `coord.diagnose`, `coord.reconcile`, the tests)
+# still reads them off `coord.smoke`, with exactly one definition of each.
+# See `coord/smoke_tags.py`'s docstring for why they were split out: they are
+# pure `re`/`base64` string handling, and `coord.stage_projection` — a
+# deliberately dependency-free leaf module — has to parse both to count Test
+# rounds (#3191). Reaching them through THIS module would drag the whole
+# dispatch stack (`coord.config`, `coord.dispatch`, `coord.github_ops`,
+# `coord.revalidate`, `httpx`) into `coord serve`'s `/board` request path.
+from coord.smoke_tags import (  # noqa: F401  (re-export; see note above)
+    _FANOUT_MANIFEST_RE,
+    _LEG_TAG_RE,
+    _encode_fanout_manifest,
+    _parse_fanout_manifest,
+    smoke_leg_capabilities,
+    smoke_leg_issue_title,
+)
 
 logger = logging.getLogger("coord.smoke")
 
@@ -638,114 +655,13 @@ def partition_capability_requirements(
 # sweep if a partition never got a machine at all — the existing, generic
 # mechanism, not a fan-out-specific reinvention of it.
 
-# Restricted to `[a-z0-9+_-]` — every capability name in this codebase
-# (gtk, windows, macos, browser, provider:opencode via `+`-joining, etc.)
-# fits that class. If `coordinator.yml` ever declares a capability with an
-# uppercase letter, a dot, or another character outside it,
-# `smoke_leg_capabilities()` silently returns None for that leg (misread as
-# an ordinary untagged row) rather than raising — nothing today validates
-# capability naming at config-load time, so keep new capability names
-# lowercase/`[a-z0-9+_-]` until that validation exists.
-_LEG_TAG_RE = re.compile(r"^\[smoke:([a-z0-9+_-]+)\] ")
-
-
-def smoke_leg_issue_title(base_title: str, capabilities: tuple[str, ...]) -> str:
-    """The ``issue_title`` for one capability-partition leg of a #3182 fan-out.
-
-    Encodes *capabilities* (sorted, ``+``-joined) as a parseable prefix —
-    ``"[smoke:gtk+windows] <base_title>"`` — so :func:`smoke_leg_capabilities`
-    can read it back off the board. Used both for the per-partition in-flight
-    dedupe (:func:`_find_leg_for_partition`) and for telling a fan-out leg's
-    own verdict apart from an ordinary single-leg smoke row's when processing
-    it (``coord.notify``).
-    """
-    tag = "+".join(sorted(capabilities))
-    return f"[smoke:{tag}] {base_title}"
-
-
-def smoke_leg_capabilities(issue_title: str | None) -> tuple[str, ...] | None:
-    """The capability set :func:`smoke_leg_issue_title` encoded, or ``None``.
-
-    ``None`` for an ordinary (untagged) smoke row — every pre-#3182 ``[smoke]
-    ...`` single-partition dispatch, which never carries this prefix — or for
-    any non-smoke row. Never raises on a malformed or missing title.
-    """
-    if not issue_title:
-        return None
-    m = _LEG_TAG_RE.match(issue_title)
-    if not m:
-        return None
-    return tuple(m.group(1).split("+"))
-
-
-_FANOUT_MANIFEST_RE = re.compile(r"^\[\[smoke-fanout:([^\]]*)\]\]\n?")
-
-
-def _encode_fanout_manifest(
-    legs: list[tuple[str, tuple[str, ...], str | None]],
-) -> str:
-    """The manifest line stamped at the FRONT of the parent's ``test_reason``
-    for a #3182 fan-out: ``[[smoke-fanout:<id>=<caps>=<command_b64>,...]]``,
-    one entry per leg dispatched (or already active/completed) this round.
-    Preserved byte-for-byte across every later rewrite of the parent's
-    ``test_reason`` (the running-progress stamp, and the final aggregate) so
-    :func:`finalize_smoke_fanout` can always find its siblings again from
-    just the parent's own row — see the module note above for why this, and
-    not a new query endpoint.
-
-    ``command_b64`` (#3298) is the partition's own resolved Test-stage
-    command, URL-safe base64-encoded so an arbitrary shell command — commas,
-    brackets, newlines, anything a real ``test_command``/rule ``command`` can
-    contain — can never corrupt this manifest's own ``,``/``=``/``]``
-    delimiters. Encodes as an empty third field when the command is unknown
-    (``None``), which round-trips through :func:`_parse_fanout_manifest` as
-    ``command=None`` rather than raising or misparsing.
-    """
-    def _entry(leg_id: str, caps: tuple[str, ...], command: str | None) -> str:
-        cap_str = "+".join(sorted(caps))
-        cmd_b64 = (
-            base64.urlsafe_b64encode(command.encode()).decode() if command else ""
-        )
-        return f"{leg_id}={cap_str}={cmd_b64}"
-
-    body = ",".join(_entry(leg_id, caps, command) for leg_id, caps, command in legs)
-    return f"[[smoke-fanout:{body}]]"
-
-
-def _parse_fanout_manifest(
-    test_reason: str | None,
-) -> list[tuple[str, tuple[str, ...], str | None]] | None:
-    """The ``(leg_id, capabilities, command)`` triples
-    :func:`_encode_fanout_manifest` wrote, or ``None`` when *test_reason*
-    carries no manifest (not a fan-out row). Tolerates a malformed entry by
-    skipping just that entry, never raising.
-
-    ``command`` is ``None`` for a pre-#3298 two-field entry
-    (``<id>=<caps>``, no trailing ``=<command_b64>``) — an already-in-flight
-    row from before this field existed — as well as for a malformed base64
-    payload; either way the caller gets "unknown command", never a crash.
-    """
-    if not test_reason:
-        return None
-    m = _FANOUT_MANIFEST_RE.match(test_reason)
-    if not m:
-        return None
-    legs: list[tuple[str, tuple[str, ...], str | None]] = []
-    for entry in m.group(1).split(","):
-        if not entry:
-            continue
-        leg_id, _, rest = entry.partition("=")
-        caps, _, cmd_b64 = rest.partition("=")
-        if not leg_id or not caps:
-            continue
-        command: str | None = None
-        if cmd_b64:
-            try:
-                command = base64.urlsafe_b64decode(cmd_b64.encode()).decode()
-            except (ValueError, UnicodeDecodeError):
-                command = None
-        legs.append((leg_id, tuple(caps.split("+")), command))
-    return legs
+# `smoke_leg_issue_title` / `smoke_leg_capabilities` (the `[smoke:<caps>]`
+# tag on each leg's `issue_title`) and `_encode_fanout_manifest` /
+# `_parse_fanout_manifest` (the `[[smoke-fanout:...]]` manifest on the
+# parent's `test_reason`) used to be DEFINED here. They now live in
+# `coord/smoke_tags.py` and are re-exported by the import at the top of this
+# module, so `from coord.smoke import ...` is unchanged for every caller —
+# see that module's docstring for why the split exists.
 
 
 def _build_fanout_running_reason(
