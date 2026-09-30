@@ -1582,13 +1582,15 @@ class TestCatalogue:
         assert set(REPORTS) == {
             "issue-activity", "completed", "drive-queue-status", "decisions",
             "usage", "queue-outcomes", "trend", "deprecated-routes", "issue-cost",
+            "release-parity-matrix",
         }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
-            "issue-activity", "issue-cost", "queue-outcomes", "trend", "usage",
+            "issue-activity", "issue-cost", "queue-outcomes", "release-parity-matrix",
+            "trend", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -1759,7 +1761,8 @@ class TestCli:
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
-            "issue-activity", "issue-cost", "queue-outcomes", "trend", "usage",
+            "issue-activity", "issue-cost", "queue-outcomes", "release-parity-matrix",
+            "trend", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -2218,7 +2221,8 @@ class TestDaemonEndpoints:
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
             "completed", "decisions", "deprecated-routes", "drive-queue-status",
-            "issue-activity", "issue-cost", "queue-outcomes", "trend", "usage",
+            "issue-activity", "issue-cost", "queue-outcomes", "release-parity-matrix",
+            "trend", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
