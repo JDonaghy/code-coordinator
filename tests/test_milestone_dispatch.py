@@ -478,6 +478,87 @@ class TestGateAStatus:
         assert "retry" in reason.lower()
 
 
+class TestGateAProbe:
+    """#2785 review (blocking finding): `gate_a_status` collapses a
+    confirmed-absent contract and a transient read failure into the same
+    plain ``str``, which is exactly right for callers that abort on either
+    (dispatch/drive), but wrong for a caller resolving `milestone_oracle_
+    loop`'s ``gate_a_satisfied`` — that needs to treat "confirmed absent" as
+    legitimately not-oracle-loop while refusing to fold a transient failure
+    into the same bucket. `gate_a_probe` exposes the distinction its
+    `GateAResult.transient` field was added for.
+    """
+
+    def _cfg(self, *, with_driver: bool) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        drivers = {}
+        if with_driver:
+            drivers["api"] = AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test")
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[_machine("laptop", ["api"])],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_satisfied_is_not_transient(self) -> None:
+        from coord.milestone_dispatch import gate_a_probe
+
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        result = gate_a_probe(repo, cfg, 9, file_exists=lambda *a: True)
+        assert result.block_reason is None
+        assert result.transient is False
+
+    def test_confirmed_absent_is_not_transient(self) -> None:
+        """The milestone-scoped case this whole issue is about: no contract
+        exists for THIS milestone. `transient` must be False so a caller can
+        tell this apart from an inconclusive read and safely resolve
+        `gate_a_satisfied=False` (not oracle-loop) rather than aborting."""
+        from coord.milestone_dispatch import gate_a_probe
+
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        result = gate_a_probe(repo, cfg, 9, file_exists=lambda *a: False)
+        assert result.block_reason is not None
+        assert result.transient is False
+
+    def test_transient_read_failure_is_flagged_transient(self) -> None:
+        """A rate-limited (or otherwise transient) read must be flagged
+        distinctly — folding it into `transient=False` would make a caller
+        treat "GitHub could not be read" identically to "confirmed absent",
+        silently disabling a race-prevention gate that should stay closed
+        while the answer is unknown (#2785 review's blocking finding)."""
+        from coord.github_ops import GhRateLimitError
+        from coord.milestone_dispatch import gate_a_probe
+
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        with patch(
+            "coord.github_ops.get_repo_file",
+            side_effect=GhRateLimitError(
+                "gh api repos/acme/api/contents/tests/acceptance/ms-9/"
+                "contract.md?ref=main failed: API rate limit exceeded for "
+                "user ID 12345",
+                secondary=True,
+            ),
+        ):
+            result = gate_a_probe(repo, cfg, 9)
+        assert result.block_reason is not None
+        assert result.transient is True
+
+    def test_gate_a_status_agrees_with_gate_a_probe_block_reason(self) -> None:
+        """`gate_a_status` is a thin view over `gate_a_probe` — the two must
+        never report a different block reason for the same inputs (#2096,
+        "one question, one answer")."""
+        from coord.milestone_dispatch import gate_a_probe
+
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        probe = gate_a_probe(repo, cfg, 9, file_exists=lambda *a: False)
+        status = gate_a_status(repo, cfg, 9, file_exists=lambda *a: False)
+        assert probe.block_reason == status
+
 
 class TestMilestoneOracleLoop:
     """#2785: `oracle_loop` must be resolved PER MILESTONE, not from
