@@ -2405,6 +2405,7 @@ def decide(
     machine: str = "",
     oracle: OracleDecision | None = None,
     gate_checker: AcceptanceGateChecker | None = None,
+    reread_state: Callable[[], IssueState | None] | None = None,
 ) -> Action:
     """One step of the state machine: given the board, what next?
 
@@ -2420,6 +2421,20 @@ def decide(
     to ``coord assign``. *gate_checker* is only consulted when *oracle* is
     active (to resolve a routed repo's ``--for-path``, #1453 review finding
     1) — unused, like *oracle*, on every pre-#1453 call site.
+
+    *reread_state* (#2304) is the dead-end predicate's confirmation read.
+    ``detect_dead_end`` judges a single snapshot, and shape 1
+    (``review_terminal_no_verdict``) rests on the ABSENCE of a field — a
+    snapshot taken a moment before the verdict was written and evaluated a
+    moment after presents exactly the forbidden combination, and no amount of
+    staring at that one snapshot can tell "not written yet" apart from "never
+    coming". ``None`` (the default, every pre-#2304 caller) preserves the old
+    behaviour byte-for-byte: escalate on the first read. When supplied, a
+    dead-end verdict gets ONE fresh re-read before it is trusted; if the
+    re-read no longer reproduces the shape, *state* itself is swapped for the
+    fresh copy and the rest of this function runs on it — so a verdict that
+    landed in the interim is not just un-escalated, the drive actually
+    continues onto the fix/merge arm it unblocks, in this same call.
     """
     machine = machine or opts.machine or state.picked_machine
 
@@ -2902,6 +2917,22 @@ def decide(
     # #2024: `--skip-test` is a live Test-stage move (`_decide_test` records
     # `skipped`), so the human-attended-Test shape must not escalate past it.
     dead_end = detect_dead_end(state, can_waive_test_gate=opts.skip_test)
+    if dead_end is not None and reread_state is not None:
+        # #2304: a dead end whose predicate rests on an ABSENT field (shape
+        # 1's `not state.review_verdict`, above all) cannot be trusted off a
+        # single snapshot — presence is observable, absence-so-far is not.
+        # One confirmation re-read closes the whole class: if the fresh row
+        # still reproduces the shape, escalate on IT (so the recorded gates
+        # match what was actually seen last); if it does not, the verdict
+        # landed in the gap between the stale read and this check, and
+        # `state` is swapped for the fresh copy so every gate below sees it
+        # too — the drive falls through to the fix/merge arm the verdict
+        # unblocks in this same call, rather than merely suppressing a false
+        # escalation and waiting out another full poll for the same result.
+        fresh = reread_state()
+        if fresh is not None:
+            state = fresh
+            dead_end = detect_dead_end(state, can_waive_test_gate=opts.skip_test)
     if dead_end is not None:
         return replace(
             _escalate_dead_end(state, dead_end), warnings=warnings
@@ -5910,6 +5941,11 @@ class Driver:
             action = decide(
                 state, self.opts, counters, self.verifier,
                 machine=machine, oracle=oracle, gate_checker=self.oracle_gate,
+                # #2304: the dead-end predicate's confirmation re-read — the
+                # same board fetch this loop already does every poll, just
+                # available to `decide()` for an extra, immediate look before
+                # a `review_terminal_no_verdict`-shaped snapshot is trusted.
+                reread_state=self.read_state,
             )
             for warning in action.warnings:
                 self.warn(warning)
