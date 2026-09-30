@@ -7160,3 +7160,217 @@ def test_merge_gate_remedy_command_is_the_safe_inspect_fallback_for_none_and_non
     ordinary = "no candidate machine available for claude-coordinator#1650"
     assert is_merge_gate_block_reason(ordinary) is False
     assert merge_gate_remedy_command(ordinary, REPO, 1650) == merge_plan_inspect_command(REPO)
+
+
+class TestDriveQueueListReadDistinguishesFailureFromEmpty:
+    """#2992: `coord drive-queue list` must not report a daemon it could
+    not read as "the queue is empty" — those are two different facts and
+    the CLI collapsed them to the same rendering.
+
+    Unlike the rest of this file, these exercise `coord/commands/
+    drive_queue.py` (the CLI shell, imported directly rather than through
+    `CliRunner` for most cases — plus one end-to-end pair at the bottom for
+    the exact rendered text) — scoped here per the #2992 briefing's own
+    file list rather than `tests/test_cli_drive_queue.py`, which is the
+    CLI black-box suite for everything else in this command group.
+    """
+
+    @staticmethod
+    def _svc():
+        import coord.client as cc
+
+        return cc.ServiceConfig(url="http://daemon:7435")
+
+    def test_host_mode_has_no_daemon_to_fail_against(self, monkeypatch):
+        """No `board_service` configured (the suite-wide default, #584/#590)
+        — #2992 is scoped to the thin-client path, so host mode must keep
+        reading the local DB exactly as before and never report a
+        `failure`."""
+        import coord.state as state
+        from coord.commands import drive_queue as dq
+
+        monkeypatch.setattr(state, "list_drive_queue", lambda repo=None: [{"issue_number": 1}])
+
+        rows, failure, service_url = dq._drive_queue_list_read(None)
+
+        assert rows == [{"issue_number": 1}]
+        assert failure is None
+        assert service_url is None
+
+    def test_thin_client_daemon_failure_is_reported_not_collapsed_to_empty(self, monkeypatch):
+        import coord.client as cc
+        from coord.commands import drive_queue as dq
+
+        svc = self._svc()
+        monkeypatch.setattr(cc, "resolve_board_service", lambda: svc)
+        monkeypatch.setattr(
+            cc,
+            "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(ok=False, entries=[], error="boom"),
+        )
+
+        rows, failure, service_url = dq._drive_queue_list_read(None)
+
+        assert rows == []
+        assert failure is not None
+        assert failure.ok is False
+        assert failure.error == "boom"
+        assert service_url == svc.url
+
+    def test_thin_client_genuinely_empty_queue_reads_as_success(self, monkeypatch):
+        import coord.client as cc
+        from coord.commands import drive_queue as dq
+
+        svc = self._svc()
+        monkeypatch.setattr(cc, "resolve_board_service", lambda: svc)
+        monkeypatch.setattr(
+            cc,
+            "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(ok=True, entries=[]),
+        )
+
+        rows, failure, service_url = dq._drive_queue_list_read(None)
+
+        assert rows == []
+        assert failure is None
+        assert service_url == svc.url
+
+    def test_thin_client_populated_queue_passes_the_real_rows_through(self, monkeypatch):
+        import coord.client as cc
+        from coord.commands import drive_queue as dq
+
+        svc = self._svc()
+        real_rows = [{"issue_number": 1}, {"issue_number": 2}]
+        monkeypatch.setattr(cc, "resolve_board_service", lambda: svc)
+        monkeypatch.setattr(
+            cc,
+            "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(ok=True, entries=real_rows),
+        )
+
+        rows, failure, service_url = dq._drive_queue_list_read(None)
+
+        assert rows == real_rows
+        assert failure is None
+        assert service_url == svc.url
+
+    def test_the_three_read_outcomes_are_mutually_distinguishable(self, monkeypatch):
+        """Empty / transport-failure / populated must never produce the
+        same `(rows, failure, service_url)` shape — the issue's own
+        acceptance bar, at the routing layer."""
+        import coord.client as cc
+        from coord.commands import drive_queue as dq
+
+        svc = self._svc()
+        monkeypatch.setattr(cc, "resolve_board_service", lambda: svc)
+
+        monkeypatch.setattr(
+            cc,
+            "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(ok=True, entries=[{"issue_number": 1}]),
+        )
+        populated = dq._drive_queue_list_read(None)
+
+        monkeypatch.setattr(
+            cc, "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(ok=True, entries=[]),
+        )
+        empty = dq._drive_queue_list_read(None)
+
+        monkeypatch.setattr(
+            cc, "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(ok=False, entries=[], error="503"),
+        )
+        errored = dq._drive_queue_list_read(None)
+
+        assert populated != empty
+        assert empty != errored
+        assert populated != errored
+        assert empty[1] is None and errored[1] is not None
+
+    def test_failure_text_never_says_queue_is_empty_and_names_the_daemon(self):
+        from coord.commands import drive_queue as dq
+
+        text = dq._drive_queue_list_failure_text(
+            "http://daemon:7435", "HTTP 503 from http://daemon:7435/drive-queue"
+        )
+
+        assert "queue is empty" not in text
+        assert "http://daemon:7435" in text
+        assert "503" in text
+
+    def test_failure_json_is_never_a_bare_empty_list(self):
+        import json
+
+        from coord.commands import drive_queue as dq
+
+        payload = dq._drive_queue_list_failure_json("http://daemon:7435", "boom")
+
+        assert payload != "[]"
+        decoded = json.loads(payload)
+        assert decoded["ok"] is False
+        assert decoded["service_url"] == "http://daemon:7435"
+        assert decoded["error"] == "boom"
+
+    def test_cli_end_to_end_reports_daemon_failure_not_empty_queue(self, monkeypatch, tmp_path):
+        """The actual `coord drive-queue list` invocation: a failed read
+        must render neither `(drive queue is empty)` nor a bare `[]`, and
+        must exit non-zero so scripts branching on it notice."""
+        import coord.client as cc
+        from click.testing import CliRunner
+
+        from coord.cli import main
+
+        svc = self._svc()
+        monkeypatch.setattr(cc, "resolve_board_service", lambda: svc)
+        monkeypatch.setattr(
+            cc,
+            "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(
+                ok=False, entries=[], error="HTTP 503 from http://daemon:7435/drive-queue"
+            ),
+        )
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text("repos: []\nmachines: []\n")
+
+        result = CliRunner().invoke(
+            main, ["drive-queue", "list", "--config", str(config_path)]
+        )
+
+        assert result.exit_code != 0
+        assert "queue is empty" not in result.output
+        assert "http://daemon:7435" in result.output
+
+        json_result = CliRunner().invoke(
+            main, ["drive-queue", "list", "--json", "--config", str(config_path)]
+        )
+        assert json_result.exit_code != 0
+        assert json_result.output.strip() != "[]"
+
+    def test_cli_end_to_end_reports_a_genuinely_empty_queue_unchanged(
+        self, monkeypatch, tmp_path
+    ):
+        """The other half of the pair above: a real empty queue must keep
+        printing exactly today's message, on the exact same thin-client
+        code path a failed read now diverges from."""
+        import coord.client as cc
+        from click.testing import CliRunner
+
+        from coord.cli import main
+
+        svc = self._svc()
+        monkeypatch.setattr(cc, "resolve_board_service", lambda: svc)
+        monkeypatch.setattr(
+            cc,
+            "fetch_drive_queue_result",
+            lambda svc, repo=None, **kw: cc.DriveQueueRead(ok=True, entries=[]),
+        )
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text("repos: []\nmachines: []\n")
+
+        result = CliRunner().invoke(
+            main, ["drive-queue", "list", "--config", str(config_path)]
+        )
+
+        assert result.exit_code == 0
+        assert result.output.strip() == "(drive queue is empty)"

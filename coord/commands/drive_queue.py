@@ -132,6 +132,7 @@ from coord.overlap_predict import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
+    from coord.client import DriveQueueRead
     from coord.config import Config
     from coord.merge_queue import QueuedMerge
 
@@ -1460,15 +1461,64 @@ def _board_for_list_diagnosis() -> BoardView | None:
         return None
 
 
+def _drive_queue_list_read(
+    repo: str | None,
+) -> tuple[list[dict], DriveQueueRead | None, str | None]:
+    """Fetch the rows `list` renders, distinguishing "daemon unreachable"
+    from "genuinely empty" on a thin client (#2992).
+
+    Returns ``(rows, failure, service_url)`` — ``failure`` is ``None`` on a
+    successful read (rows may still be ``[]``, a genuinely drained queue)
+    and a :class:`coord.client.DriveQueueRead` with ``ok=False`` when the
+    daemon could not be read at all; ``service_url`` names the daemon the
+    failed read targeted (``None`` in host mode). Host mode (no
+    ``board_service`` configured) has no daemon to fail against, so it
+    always reads the local DB and never returns a failure here — out of
+    scope per #2992's own issue body (``coord/state.py``'s local-DB
+    fallback is a separate seam).
+    """
+    from coord.client import fetch_drive_queue_result, resolve_board_service  # noqa: PLC0415
+    from coord.state import list_drive_queue  # noqa: PLC0415
+
+    svc = resolve_board_service()
+    if svc is None:
+        return list_drive_queue(repo), None, None
+    result = fetch_drive_queue_result(svc, repo)
+    if not result.ok:
+        return [], result, svc.url
+    return result.entries, None, svc.url
+
+
+def _drive_queue_list_failure_text(service_url: str, error: str | None) -> str:
+    """The `list` failure line — must read as unmistakably NOT "empty"
+    (#2992's acceptance bar: never contains the words "queue is empty")."""
+    return (
+        f"(drive queue UNREADABLE — could not reach board daemon at "
+        f"{service_url}: {error})"
+    )
+
+
+def _drive_queue_list_failure_json(service_url: str, error: str | None) -> str:
+    """The `--json` failure payload — never a bare `[]` a caller could
+    mistake for zero entries (#2992)."""
+    return _json.dumps({"error": error, "service_url": service_url, "ok": False})
+
+
 @drive_queue_group.command("list")
 @click.option("--repo", "repo", default=None, help="Restrict to one repo (default: every repo).")
 @click.option("--json", "output_json", is_flag=True, default=False, help="Emit the raw rows as JSON.")
 @_CONFIG_OPTION
 def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> None:
     """Show the queue in run order."""
-    from coord.state import list_drive_queue  # noqa: PLC0415
+    rows, failure, service_url = _drive_queue_list_read(repo)
+    if failure is not None:
+        import sys as _sys  # noqa: PLC0415
 
-    rows = list_drive_queue(repo)
+        if output_json:
+            click.echo(_drive_queue_list_failure_json(service_url, failure.error))
+        else:
+            click.echo(_drive_queue_list_failure_text(service_url, failure.error))
+        _sys.exit(1)
     if output_json:
         click.echo(_json.dumps(rows))
         return

@@ -204,3 +204,125 @@ class TestFetchBoardPayloadConditionalGet:
         cc.reset_board_payload_cache()
 
         assert cc._board_payload_cache == {}
+
+
+class TestFetchDriveQueueResult:
+    """#2992: a daemon read failure must be distinguishable from a
+    genuinely empty queue — ``fetch_drive_queue_result`` is the function
+    that carries that distinction; ``fetch_drive_queue`` stays a fail-soft
+    wrapper around it for callers that don't want it (unchanged contract).
+    """
+
+    def test_populated_queue_is_ok_with_the_real_rows(self, monkeypatch) -> None:
+        rows = [{"repo_name": "cc", "issue_number": 1}, {"repo_name": "cc", "issue_number": 2}]
+
+        def fake_get(url, *, headers=None, params=None, **kw):
+            return _FakeResponse(json_body={"entries": rows})
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        result = cc.fetch_drive_queue_result(_svc())
+
+        assert result.ok is True
+        assert result.entries == rows
+        assert result.error is None
+
+    def test_genuinely_empty_queue_is_ok_with_zero_rows(self, monkeypatch) -> None:
+        def fake_get(url, *, headers=None, params=None, **kw):
+            return _FakeResponse(json_body={"entries": []})
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        result = cc.fetch_drive_queue_result(_svc())
+
+        assert result.ok is True
+        assert result.entries == []
+        assert result.error is None
+
+    def test_transport_error_is_not_ok_and_names_the_reason(self, monkeypatch) -> None:
+        def fake_get(url, *, headers=None, params=None, **kw):
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        result = cc.fetch_drive_queue_result(_svc())
+
+        assert result.ok is False
+        assert result.entries == []
+        assert result.error is not None
+        assert "refused" in result.error or "ConnectError" in result.error
+
+    def test_5xx_is_not_ok_and_names_the_status(self, monkeypatch) -> None:
+        def fake_get(url, *, headers=None, params=None, **kw):
+            return _FakeResponse(status_code=503)
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        result = cc.fetch_drive_queue_result(_svc())
+
+        assert result.ok is False
+        assert result.entries == []
+        assert "503" in result.error
+
+    def test_malformed_json_is_not_ok(self, monkeypatch) -> None:
+        def fake_get(url, *, headers=None, params=None, **kw):
+            return _FakeResponse(json_body={"not_entries_at_all": True})
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        result = cc.fetch_drive_queue_result(_svc())
+
+        assert result.ok is False
+        assert result.entries == []
+        assert result.error
+
+    def test_the_three_shapes_are_mutually_distinguishable(self, monkeypatch) -> None:
+        """Empty / transport-error / populated must never collapse to the
+        same result — the whole point of #2992."""
+
+        def get_for(shape: str):
+            def fake_get(url, *, headers=None, params=None, **kw):
+                if shape == "populated":
+                    return _FakeResponse(json_body={"entries": [{"issue_number": 1}]})
+                if shape == "empty":
+                    return _FakeResponse(json_body={"entries": []})
+                raise httpx.ConnectError("refused")
+
+            return fake_get
+
+        monkeypatch.setattr(cc.httpx, "get", get_for("populated"))
+        populated = cc.fetch_drive_queue_result(_svc())
+        monkeypatch.setattr(cc.httpx, "get", get_for("empty"))
+        empty = cc.fetch_drive_queue_result(_svc())
+        monkeypatch.setattr(cc.httpx, "get", get_for("error"))
+        errored = cc.fetch_drive_queue_result(_svc())
+
+        assert (populated.ok, empty.ok, errored.ok) == (True, True, False)
+        assert populated.entries != empty.entries
+        assert errored.error is not None
+        assert populated.error is None
+        assert empty.error is None
+
+    def test_fetch_drive_queue_stays_fail_soft_to_empty_list_on_failure(
+        self, monkeypatch
+    ) -> None:
+        """The pre-existing, unchanged contract: `fetch_drive_queue` itself
+        never raises and never exposes the failure — only
+        `fetch_drive_queue_result` does."""
+
+        def fake_get(url, *, headers=None, params=None, **kw):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        assert cc.fetch_drive_queue(_svc()) == []
+
+    def test_fetch_drive_queue_returns_the_real_rows_on_success(self, monkeypatch) -> None:
+        rows = [{"repo_name": "cc", "issue_number": 7}]
+
+        def fake_get(url, *, headers=None, params=None, **kw):
+            return _FakeResponse(json_body={"entries": rows})
+
+        monkeypatch.setattr(cc.httpx, "get", fake_get)
+
+        assert cc.fetch_drive_queue(_svc()) == rows
