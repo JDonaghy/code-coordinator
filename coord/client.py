@@ -763,6 +763,70 @@ def fetch_drive_escalations(
     return entries if isinstance(entries, list) else []
 
 
+@dataclass(frozen=True)
+class DriveQueueRead:
+    """Result of one drive-queue read attempt (#2992).
+
+    Distinguishes "the daemon could not be read" from "the daemon answered
+    and the queue is genuinely empty" — a distinction :func:`fetch_drive_queue`
+    itself collapses on purpose (see its docstring), because most callers only
+    want best-effort rows. ``coord drive-queue list`` is the one caller that
+    must NOT collapse it: reporting "queue is empty" for a daemon that never
+    actually answered is exactly the false "nothing to see here" #2992 was
+    filed over.
+
+    ``ok=True`` — the daemon answered; ``entries`` is the real list, ``[]``
+    included for a genuinely drained queue.
+    ``ok=False`` — the read failed (network error, non-2xx, malformed JSON);
+    ``entries`` is always ``[]`` here too (never meaningful) and ``error``
+    carries a short human-readable reason.
+    """
+
+    ok: bool
+    entries: list[dict]
+    error: str | None = None
+
+
+def fetch_drive_queue_result(
+    svc: ServiceConfig,
+    repo_name: str | None = None,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> DriveQueueRead:
+    """GET the drive queue — same request as :func:`fetch_drive_queue` — but
+    returning a :class:`DriveQueueRead` that keeps "could not read" and
+    "read fine, zero rows" apart (#2992).
+
+    This is the one place that decides what counts as a successful
+    drive-queue read; :func:`fetch_drive_queue` is now a thin fail-soft
+    wrapper around it, so there is exactly one answer to "did this read
+    succeed" rather than two implementations that could drift apart.
+    """
+    try:
+        params = {"repo_name": repo_name} if repo_name else {}
+        resp = httpx.get(
+            f"{svc.url}/drive-queue",
+            params=params,
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        return DriveQueueRead(
+            ok=False, entries=[], error=f"HTTP {status} from {svc.url}/drive-queue"
+        )
+    except Exception as exc:  # noqa: BLE001 — transport/JSON failure; reported, not swallowed
+        return DriveQueueRead(ok=False, entries=[], error=f"{type(exc).__name__}: {exc}")
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return DriveQueueRead(
+            ok=False, entries=[], error="malformed response (no 'entries' list)"
+        )
+    return DriveQueueRead(ok=True, entries=entries)
+
+
 def fetch_drive_queue(
     svc: ServiceConfig,
     repo_name: str | None = None,
@@ -775,21 +839,15 @@ def fetch_drive_queue(
     error, bad JSON, or a genuinely empty queue) — fail-soft, mirrors
     :func:`fetch_drive_escalations`. ``after_json`` arrives already decoded to
     a list; this helper does not re-parse it.
+
+    Deliberately still collapses "failed" and "genuinely empty" to the same
+    ``[]`` — most callers (``coord.state.list_drive_queue``'s daemon route,
+    the auto-loop tick) only want best-effort rows and must keep degrading
+    quietly. A caller that needs to tell the two apart — ``coord
+    drive-queue list`` (#2992) — should call :func:`fetch_drive_queue_result`
+    instead, of which this is now a thin wrapper.
     """
-    try:
-        params = {"repo_name": repo_name} if repo_name else {}
-        resp = httpx.get(
-            f"{svc.url}/drive-queue",
-            params=params,
-            headers=_headers(svc),
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:  # noqa: BLE001
-        return []
-    entries = data.get("entries") if isinstance(data, dict) else None
-    return entries if isinstance(entries, list) else []
+    return fetch_drive_queue_result(svc, repo_name, timeout=timeout).entries
 
 
 def fetch_leg_counts(
