@@ -1901,6 +1901,24 @@ def _run_drain(
     :func:`_drain_remaining_hosts` reports nothing left behind, *
     deadline_seconds* elapses, or an attempt comes back with a real failure.
 
+    #3081: a ``STATUS_HOLDING`` attempt is NOT one of those "nothing left
+    behind" outcomes, even though it is a reported exit-0 no-op for a
+    single-shot ``coord release propagate`` — see :data:`rp.STATUS_HOLDING`'s
+    own docstring. The `--min-behind` gate it fires is evaluated **fleet-wide**
+    against whatever version most of the fleet is already on, which can go
+    quiet the moment the TARGET drifts (a new release publishes mid-drain)
+    even though a host this SAME `--drain` session cordoned earlier is still
+    nowhere near current. A holding attempt also returns before
+    :func:`_apply_cordons` ever runs, so its own `record.cordons` is empty —
+    reading that as "every previously-cordoned host converged" is exactly how
+    a host still on the old version got reported "reached the target" and
+    left cordoned with exit 0. So: `remaining` carries the previous attempt's
+    set forward unchanged through a holding attempt (nothing this attempt
+    says can prove a host current), and the loop only exits 0 on
+    ``STATUS_HOLDING`` when nothing is left outstanding — otherwise it names
+    the stragglers and exits 1, the same "unconfirmed success is a defect"
+    rule every other status in this loop already follows.
+
     Never lets a single attempt actually terminate the process: each call is
     ``release_propagate.callback(...)`` — the plain function Click wraps,
     invoked directly rather than through Click's own dispatch — with its
@@ -1989,8 +2007,25 @@ def _run_drain(
             )
             sys.exit(exit_code)
 
-        remaining = _drain_remaining_hosts(record)
         status = record.status
+        if status == rp.STATUS_HOLDING:
+            # #3081: a holding attempt returns from `release_propagate`
+            # BEFORE `_apply_cordons` ever runs (see the #2583 gate's own
+            # comment: "a held run genuinely cordons nothing and touches no
+            # host") — so `record.cordons` is empty on THIS attempt by
+            # construction, not because every host this drain session had
+            # cordoned actually rolled. Diffing that empty dict against
+            # `last_remaining` the same way a real attempt's cordon plan is
+            # diffed reads every previously-cordoned host as having "reached
+            # the target" on the very next holding attempt — the exact false
+            # report #3081 reproduced (dell64, still on 0.5.351 and still
+            # cordoned, printed as "reached the target"). No per-host
+            # comparison happened this attempt, so nothing this attempt says
+            # can move a host out of `remaining` — carry the previous
+            # attempt's set forward unchanged instead.
+            remaining = last_remaining if last_remaining is not None else set()
+        else:
+            remaining = _drain_remaining_hosts(record)
         if last_remaining is None:
             suffix = f" — still behind: {', '.join(sorted(remaining))}" if remaining else ""
             _echo(f"[drain] attempt {attempt}: {status}{suffix}")
@@ -2013,6 +2048,25 @@ def _run_drain(
             )
             sys.exit(exit_code)
         if status == rp.STATUS_HOLDING:
+            if remaining:
+                # #3081: holding must never be reported the same as "nothing
+                # is outstanding" — this run (an earlier attempt in the SAME
+                # `--drain` invocation) cordoned these hosts and they were
+                # never confirmed rolled. Exiting 0 here is exactly the
+                # defect this closes: a cordoned, behind host left invisible
+                # to any wrapper reading the exit code. Name it and fail.
+                stragglers = ", ".join(sorted(remaining))
+                _echo(
+                    "[drain] holding — not enough drift to roll yet "
+                    f"(--min-behind) — still behind and left cordoned: "
+                    f"{stragglers}",
+                    force_stderr=True,
+                )
+                _emit_summary(
+                    drain_status="holding_with_stragglers", attempt=attempt,
+                    remaining=remaining, record=record,
+                )
+                sys.exit(1)
             _echo("[drain] holding — not enough drift to roll yet (--min-behind)")
             _emit_summary(
                 drain_status="holding", attempt=attempt, remaining=remaining, record=record

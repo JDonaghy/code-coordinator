@@ -3262,6 +3262,102 @@ def test_run_drain_does_not_report_convergence_when_the_breaker_abandons_hosts(
     assert slept, "must have kept polling instead of declaring convergence on attempt 1"
 
 
+# ── #3081: a holding attempt must never read as "every cordoned host
+# converged" ──────────────────────────────────────────────────────────────
+#
+# `release_propagate` finishes a holding attempt BEFORE `_apply_cordons` ever
+# runs (see `STATUS_HOLDING`'s own docstring: "a holding run cordons nothing
+# and touches no host") — so `record.cordons` on a holding attempt is empty
+# by construction, not because every host a PRIOR attempt in the same
+# `--drain` session cordoned actually rolled. The live report: dell64 was
+# named `still behind` on attempt 1 (verified, cordoned), the target then
+# drifted mid-drain (a new release published between polls) so attempt 2's
+# fleet-aggregate `--min-behind` delta fell below threshold and came back
+# `holding` — and `_run_drain` printed the false `[drain] dell64: reached
+# the target` and exited 0 with dell64 still on the old version and still
+# cordoned.
+
+
+def test_run_drain_holding_after_cordoning_reports_stragglers_not_convergence(
+    monkeypatch, capsys,
+):
+    """Reproduces the exact #3081 report: attempt 1 cordons dell64 and rolls
+    three other hosts; attempt 2 comes back `holding` (the target moved from
+    0.5.359 to 0.5.360 between polls, so the fleet-aggregate delta read as
+    "only 1 behind"). dell64 must still be reported as outstanding — never
+    "reached the target" — and the run must exit non-zero naming it rather
+    than exiting 0 with it left cordoned."""
+    attempts = {"n": 0}
+
+    def _fake_attempt(**kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            record = rp.PropagationRecord(
+                started_at=0.0, target_version="0.5.359", status=rp.STATUS_VERIFIED,
+                cordons={
+                    "cordoned": ["dell64"],
+                    "uncordoned": ["dellserver", "precision", "elitebook"],
+                    "stuck_in_cooldown": [], "collateral_spared": [], "unknown": [],
+                },
+            )
+        else:
+            # The target drifted to 0.5.360 between polls and the
+            # fleet-aggregate delta fell below threshold — a holding
+            # attempt, which never reaches `_apply_cordons` at all.
+            record = rp.PropagationRecord(
+                started_at=1.0, target_version="0.5.360", status=rp.STATUS_HOLDING,
+                releases_behind=1, min_releases_behind=5,
+            )
+        exc = SystemExit(0)
+        exc.record = record
+        raise exc
+
+    monkeypatch.setattr(release_cmd.release_propagate, "callback", _fake_attempt)
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        release_cmd._run_drain(
+            deadline_seconds=60.0, poll_seconds=1.0, do_cordon=True, as_json=False,
+        )
+    out = capsys.readouterr()
+    assert exc_info.value.code == 1, (out.out, out.err)
+    assert "dell64: reached the target" not in out.out, (
+        "dell64 never rolled — a holding attempt must not report it converged"
+    )
+    assert "dell64" in out.err
+    assert "left cordoned" in out.err
+
+
+def test_run_drain_holding_on_the_very_first_attempt_still_exits_clean(
+    monkeypatch, capsys,
+):
+    """The other half of the fix: a `--drain` session whose FIRST attempt
+    already comes back `holding` — nothing has been cordoned yet this
+    session — must still exit 0. Carrying `last_remaining` forward through a
+    holding attempt must not manufacture stragglers out of nothing."""
+
+    def _fake_attempt(**kwargs):
+        record = rp.PropagationRecord(
+            started_at=0.0, target_version="0.5.360", status=rp.STATUS_HOLDING,
+            releases_behind=1, min_releases_behind=5,
+        )
+        exc = SystemExit(0)
+        exc.record = record
+        raise exc
+
+    monkeypatch.setattr(release_cmd.release_propagate, "callback", _fake_attempt)
+    slept: list[float] = []
+    monkeypatch.setattr(release_cmd, "_sleep", lambda s: slept.append(s))
+
+    with pytest.raises(SystemExit) as exc_info:
+        release_cmd._run_drain(
+            deadline_seconds=60.0, poll_seconds=1.0, do_cordon=True, as_json=False,
+        )
+    out = capsys.readouterr()
+    assert exc_info.value.code == 0, (out.out, out.err)
+    assert not slept
+
+
 # ── #3047 review: `--drain --json` must be one parseable document ────────
 
 
