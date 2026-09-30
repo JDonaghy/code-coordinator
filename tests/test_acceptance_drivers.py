@@ -1608,3 +1608,111 @@ class TestRunDriverWinNative:
             "win-native", "./vimcode.exe", cwd=str(tmp_path), entrypoint="native/smoke.yaml",
         )
         assert seen_cwd["cwd"] == str(tmp_path)
+
+
+class TestRunDriverMacNative:
+    """#3485: the ``mac-native`` driver — the actual Quartz/AX calls, the
+    native-spec parser, and the step executor live in
+    :mod:`coord.mac_native_driver` (unit-tested against a scripted fake
+    ``MacCalls`` in ``tests/test_mac_native_driver.py``); this class covers
+    only this module's own seam: resolving ``entrypoint:`` to a spec file
+    and folding its normalized ``tests`` list into a :class:`DriverResult`
+    — the same split :class:`TestRunDriverWinNative` above covers for
+    ``win-native``."""
+
+    def test_supported_kinds_tuple_has_mac_native(self) -> None:
+        assert "mac-native" in SUPPORTED_KINDS
+
+    def test_missing_entrypoint_raises_driver_error(self, tmp_path) -> None:
+        with pytest.raises(DriverError, match="entrypoint"):
+            run_driver("mac-native", "./vimcode.app", cwd=str(tmp_path))
+
+    def test_spec_file_not_found_raises_driver_error(self, tmp_path) -> None:
+        with pytest.raises(DriverError, match="not found"):
+            run_driver(
+                "mac-native", "./vimcode.app", cwd=str(tmp_path),
+                entrypoint="tests/native.yaml",
+            )
+
+    def test_malformed_spec_raises_driver_error(self, tmp_path) -> None:
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps: []\n")
+        with pytest.raises(DriverError, match="invalid"):
+            run_driver("mac-native", "./vimcode.app", cwd=str(tmp_path), entrypoint="native.yaml")
+
+    def test_run_native_spec_result_is_folded_into_driver_result(self, tmp_path, monkeypatch) -> None:
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        fake_tests = [
+            {"id": "000 launch", "status": "pass", "message": ""},
+            {"id": "a11y-1199", "status": "fail", "message": "no AX node", "capture_b64": "aGk="},
+        ]
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            assert "steps:" in spec_text
+            assert launch_command == "./vimcode.app --smoke"
+            assert cwd == str(tmp_path)
+            return fake_tests
+
+        import coord.mac_native_driver as mac_native_driver
+        monkeypatch.setattr(mac_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver(
+            "mac-native", "./vimcode.app --smoke", cwd=str(tmp_path), entrypoint="native.yaml",
+        )
+        assert result.tests == fake_tests
+        # A gate must be able to fail: one failing entry must flip the
+        # overall exit code, not just be listed and ignored (#2096).
+        assert result.exit_code == 1
+        assert result.ok is False
+
+    def test_all_passing_tests_report_a_clean_exit(self, tmp_path, monkeypatch) -> None:
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return [{"id": "000 launch", "status": "pass", "message": ""}]
+
+        import coord.mac_native_driver as mac_native_driver
+        monkeypatch.setattr(mac_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver("mac-native", "./vimcode.app", cwd=str(tmp_path), entrypoint="native.yaml")
+        assert result.exit_code == 0
+        assert result.ok is True
+
+    def test_zero_tests_is_not_a_clean_exit(self, tmp_path, monkeypatch) -> None:
+        # Mirrors this module's other drivers' "an empty tests list must
+        # never read as a silent pass" rule.
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return []
+
+        import coord.mac_native_driver as mac_native_driver
+        monkeypatch.setattr(mac_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver("mac-native", "./vimcode.app", cwd=str(tmp_path), entrypoint="native.yaml")
+        assert result.exit_code != 0
+        assert result.ok is False
+
+    def test_entrypoint_is_resolved_relative_to_cwd(self, tmp_path, monkeypatch) -> None:
+        nested = tmp_path / "native"
+        nested.mkdir()
+        spec = nested / "smoke.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        seen_cwd = {}
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            seen_cwd["cwd"] = cwd
+            return [{"id": "000 launch", "status": "pass", "message": ""}]
+
+        import coord.mac_native_driver as mac_native_driver
+        monkeypatch.setattr(mac_native_driver, "run_native_spec", fake_run_native_spec)
+
+        run_driver(
+            "mac-native", "./vimcode.app", cwd=str(tmp_path), entrypoint="native/smoke.yaml",
+        )
+        assert seen_cwd["cwd"] == str(tmp_path)
