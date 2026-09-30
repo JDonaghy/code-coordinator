@@ -1,0 +1,793 @@
+"""``mac-native`` acceptance driver — Tier 2's macOS-native tier (#3485).
+
+``tui-pty`` (#3483) and ``win-native`` (#3484) both proved the same point on
+two different platforms: an in-process harness can't see real
+window-manager/OS behaviour. macOS has the identical blind spot — vimcode's
+macOS suite is thin (~22 driver tests against ~277 for GTK) and, like the
+Windows build before #3484 landed, has never once asked the real OS "is
+there actually an accessible element here?" or "does a real click at this
+pixel actually land?". Those are Accessibility/Quartz questions, answerable
+only by asking macOS.
+
+This driver launches the driven repo's real compiled ``.app``/binary, finds
+its real window, and probes it with real OS calls:
+
+- ``CGEvent`` — real mouse/keyboard input injected at the HID event tap
+  (``CGEventPost``), not an in-process event queue.
+- the Accessibility (AX) tree (``AXUIElementCreateApplication`` +
+  ``AXUIElementCopyAttributeValue``) — the same tree VoiceOver (or a real
+  user) sees, covering the ``expect_a11y``/``expect_a11y_within`` steps.
+- ``screencapture -l <windowid>`` — a window-specific capture (works even
+  when the window is covered by another one), attached as evidence to every
+  *failing* step (see :meth:`NativeRunner._attach_capture_if_possible`).
+- ``CGWindowListCopyWindowInfo`` — finding the launched process's real
+  window and polling whether it still exists (``expect_closed``).
+
+**Injectable OS-call seam.** Every actual Quartz/AX/``screencapture`` call is
+one method on the :class:`MacCalls` protocol, implemented for real by
+:class:`MacOSCalls` (macOS-only, ``pyobjc`` — the ``mac-native`` extra).
+:class:`NativeRunner` — the spec-step executor — never calls a Quartz/AX API
+directly; it only calls through ``MacCalls``. This is the same seam
+:mod:`coord.win_native_driver` uses for ``WinCalls``: it makes the
+spec-to-OS *translation* logic (parsing, step sequencing, pass/fail,
+capture-on-failure) unit-testable on any platform, with a scripted fake
+standing in for the OS (see ``tests/test_mac_native_driver.py``) — a real run
+against a real ``.app`` on real macOS hardware (macmini) is out of reach for
+this repo's own test suite and is exercised at the operator level, the same
+split :mod:`coord.win_native_driver`'s own docstring calls out for real
+Win32/UIA.
+
+**Spec format matches ``win-native``'s core vocabulary on purpose** (#3485's
+acceptance bar: "the same spec file as ``tui-pty`` and ``win-native``, with
+no macOS-specific spec forks"). ``launch``/``key``/``click``/``wait``/
+``capture``/``expect_a11y``/``expect_a11y_within``/``expect_closed`` are the
+exact step names and fields :mod:`coord.win_native_driver` already defines
+for its ``mode: window`` case (everything except the Win32-only
+``expect_menu``/``expect_hit``, which have no macOS analogue — there is no
+native ``HMENU``/``WM_NCHITTEST`` on this platform — and the Windows-
+Terminal-hosted-mode steps, which are a ConPTY-console concept). A spec
+author writing one of these shared steps gets identical behaviour under
+either driver, so one spec file can be routed to whichever platform's
+``mac-native``/``win-native`` driver is configured for that repo without a
+per-OS fork.
+
+**Spec steps** (:func:`parse_native_spec`, YAML):
+
+- ``launch`` — start the command (or ``open -W`` a ``.app`` bundle), find its
+  real window, and size/position it deterministically.
+- ``key: <name>`` / ``click: {x, y, button}`` — real input at *screen* pixel
+  coordinates relative to the window's origin, via
+  :meth:`MacCalls.send_key`/:meth:`MacCalls.send_click`.
+- ``wait: {ms}`` — a plain deterministic pause.
+- ``capture`` — an explicit ``screencapture -l <windowid>`` evidence
+  snapshot, attached to this step's own result (pass or fail) as
+  ``capture_b64``.
+- ``expect_a11y: {role, name}`` — the AX tree must contain a visible element
+  matching *role* (exact, case-insensitive against ``AXRole``) and *name*
+  (substring, case-insensitive against ``AXTitle``/``AXDescription``/
+  ``AXValue``) right now.
+- ``expect_a11y_within: {role, name, timeout_ms}`` — the same match, but
+  polled repeatedly until it appears or *timeout_ms* elapses.
+- ``expect_closed: {timeout_ms}`` — the window must actually stop existing
+  (re-polled via ``CGWindowListCopyWindowInfo`` until gone) within
+  *timeout_ms*. Per #2096, a click is confirmed closed by *observing the
+  window gone afterward*, never by the mere absence of an exception from an
+  earlier click step.
+
+**Safety: kill only the PID this driver itself launched.** :meth:`MacCalls.kill`
+takes a ``pid: int`` — the exact process id :meth:`MacCalls.launch` returned
+— and nothing in this module ever looks a process up by bundle identifier or
+executable name to terminate it. An operator's own macmini session is very
+likely running other apps concurrently; a teardown that matched by name would
+be one bad assumption away from killing something that isn't this driver's
+own child. See ``tests/test_mac_native_driver.py``'s
+``test_no_name_based_kill_path_exists_in_the_module`` — a source-level
+regression guard, mirroring :mod:`coord.win_native_driver`'s own
+``test_no_image_name_kill_path_exists_in_the_module``.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+import subprocess
+import time
+from dataclasses import dataclass
+from typing import Protocol
+
+import yaml
+
+
+class MacNativeSpecError(Exception):
+    """Raised for a malformed native spec: invalid YAML, a missing/empty
+    ``steps:`` list, an unknown step ``type``, a missing required field, or
+    an unrecognized ``button``."""
+
+
+class MacNativeRuntimeError(Exception):
+    """Raised when the native driver itself can't run: not on macOS, a
+    missing optional dependency (the ``mac-native`` extra), the launched
+    process/window never appearing, or a step referencing a window before
+    any ``launch`` step ran."""
+
+
+# ── native spec model ───────────────────────────────────────────────────────
+
+# Deliberately the win-native subset shared across both platforms — see the
+# module docstring's "no macOS-specific spec forks" section. `expect_menu`/
+# `expect_hit`/the terminal-hosted-mode steps have no macOS analogue and are
+# intentionally absent here rather than stubbed out.
+_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "launch": (),
+    "key": ("key",),
+    "click": ("x", "y"),
+    "wait": ("ms",),
+    "capture": (),
+    "expect_a11y": ("role", "name"),
+    "expect_a11y_within": ("role", "name"),
+    "expect_closed": (),
+}
+
+_VALID_BUTTONS = ("left", "right", "middle")
+
+
+@dataclass(frozen=True)
+class NativeStep:
+    """One parsed step of a mac-native spec. Mirrors
+    :class:`coord.win_native_driver.NativeStep`'s "every unused field keeps
+    its default" shape — callers never have to branch on ``kind`` before
+    reading one."""
+
+    kind: str
+    index: int
+    id: str = ""
+    key: str = ""
+    x: int = 0
+    y: int = 0
+    button: str = ""
+    ms: int = 0
+    timeout_ms: int = 5000
+    role: str = ""
+    name: str = ""
+
+    @property
+    def step_id(self) -> str:
+        return self.id or f"{self.index:03d} {self.kind}"
+
+
+@dataclass(frozen=True)
+class NativeSpec:
+    name: str
+    width: int
+    height: int
+    steps: tuple[NativeStep, ...]
+
+
+def _int_default(value, default: int) -> int:
+    """``int(value)``, falling back to *default* only when *value* is
+    absent (``None``) — an explicit literal ``0`` in the YAML is honored
+    rather than silently treated as "absent" (mirrors
+    :func:`coord.win_native_driver._int_default`)."""
+    return default if value is None else int(value)
+
+
+def parse_native_spec(yaml_text: str) -> NativeSpec:
+    """Parse a mac-native spec YAML document into a :class:`NativeSpec`.
+
+    Top level: ``name:`` (optional), ``width:``/``height:`` (optional,
+    default 1024x768 — the window-resize target), ``steps:`` — a non-empty
+    list of mappings each carrying a ``type:`` from :data:`_REQUIRED_FIELDS`.
+
+    Raises :class:`MacNativeSpecError` — never returns a partially-parsed
+    spec — for: invalid YAML, a non-mapping document, a missing/empty/
+    non-list ``steps:``, a step that isn't a mapping, an unknown ``type:``, a
+    step missing one of its type's required fields, or an unrecognized
+    ``button:``.
+    """
+    try:
+        raw = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        raise MacNativeSpecError(f"native spec is not valid YAML: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise MacNativeSpecError("native spec must be a YAML mapping at the top level")
+
+    steps_raw = raw.get("steps")
+    if not isinstance(steps_raw, list) or not steps_raw:
+        raise MacNativeSpecError("native spec must have a non-empty 'steps:' list")
+
+    steps: list[NativeStep] = []
+    for i, entry in enumerate(steps_raw):
+        if not isinstance(entry, dict):
+            raise MacNativeSpecError(f"steps[{i}] must be a mapping")
+        kind = entry.get("type")
+        if kind not in _REQUIRED_FIELDS:
+            raise MacNativeSpecError(
+                f"steps[{i}]: unknown step type {kind!r} — expected one of "
+                f"{', '.join(sorted(_REQUIRED_FIELDS))}"
+            )
+        missing = [f for f in _REQUIRED_FIELDS[kind] if entry.get(f) in (None, "")]
+        if missing:
+            raise MacNativeSpecError(
+                f"steps[{i}] (type={kind!r}) is missing required field(s): "
+                f"{', '.join(missing)}"
+            )
+
+        button = str(entry.get("button", "") or "")
+        if button and button not in _VALID_BUTTONS:
+            raise MacNativeSpecError(
+                f"steps[{i}]: unrecognized button {button!r} — expected one "
+                f"of {', '.join(_VALID_BUTTONS)}"
+            )
+
+        steps.append(NativeStep(
+            kind=kind,
+            index=i,
+            id=str(entry.get("id", "") or ""),
+            key=str(entry.get("key", "") or ""),
+            x=_int_default(entry.get("x"), 0),
+            y=_int_default(entry.get("y"), 0),
+            button=button,
+            ms=_int_default(entry.get("ms"), 0),
+            timeout_ms=_int_default(entry.get("timeout_ms"), 5000),
+            role=str(entry.get("role", "") or ""),
+            name=str(entry.get("name", "") or ""),
+        ))
+
+    return NativeSpec(
+        name=str(raw.get("name", "") or ""),
+        width=int(raw.get("width", 1024) or 1024),
+        height=int(raw.get("height", 768) or 768),
+        steps=tuple(steps),
+    )
+
+
+# ── the injectable OS-call seam ─────────────────────────────────────────────
+
+class MacCalls(Protocol):
+    """The minimal set of real-OS operations :class:`NativeRunner` drives a
+    native app through — implemented for real by :class:`MacOSCalls`
+    (macOS-only), and by a scripted fake in
+    ``tests/test_mac_native_driver.py`` so the spec-to-OS *translation*
+    logic is testable on any platform.
+
+    ``launch`` returns the PID of the process THIS call started;
+    :meth:`kill` must accept only that same PID back — never a bundle
+    identifier or executable name — so teardown can never take down a
+    process it didn't itself launch (see the module docstring's safety
+    note).
+    """
+
+    def launch(self, command: str, cwd: str) -> int: ...
+
+    def find_top_window(self, pid: int, timeout_s: float) -> int:
+        """Poll for the launched process's real window, returning its
+        ``CGWindowID`` once found. Raises :class:`MacNativeRuntimeError` if
+        none appears within *timeout_s* — this is the "launch" step's own
+        confirmation that the process didn't just start, but actually
+        produced a window (#2096)."""
+        ...
+
+    def move_window(
+        self, pid: int, window_id: int, x: int, y: int, width: int, height: int,
+    ) -> None: ...
+
+    def is_window_alive(self, window_id: int) -> bool: ...
+
+    def send_click(self, window_id: int, x: int, y: int, button: str) -> None: ...
+
+    def send_key(self, pid: int, key: str) -> None: ...
+
+    def ax_elements(self, pid: int) -> list[dict]:
+        """Every element in the app's Accessibility tree right now, each as
+        ``{"role": str, "name": str, "visible": bool}``."""
+        ...
+
+    def capture(self, window_id: int) -> bytes:
+        """A ``screencapture -l <window_id>`` capture of *window_id* right
+        now (works even when covered by another window) — raises
+        :class:`MacNativeRuntimeError` on failure rather than returning
+        empty bytes, since a capture step exists specifically to produce
+        evidence and has nothing to report if it can't."""
+        ...
+
+    def kill(self, pid: int) -> None: ...
+
+
+def _find_a11y_match(elements: list[dict], role: str, name: str) -> dict | None:
+    """The first *elements* entry whose ``role`` matches exactly
+    (case-insensitive) and ``name`` matches as a substring
+    (case-insensitive), and which is not explicitly marked invisible — or
+    ``None`` if nothing matches. An empty *name* matches any name. Identical
+    to :func:`coord.win_native_driver._find_a11y_match` — same contract,
+    different tree source (AX vs UIA)."""
+    role_l = role.lower()
+    name_l = name.lower()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        if el.get("visible") is False:
+            continue
+        if str(el.get("role", "")).lower() != role_l:
+            continue
+        if name_l and name_l not in str(el.get("name", "")).lower():
+            continue
+        return el
+    return None
+
+
+def _summarize_elements(elements: list[dict]) -> str:
+    return ", ".join(
+        f"{el.get('role', '?')}:{el.get('name', '')!r}"
+        for el in elements if isinstance(el, dict)
+    ) or "(empty tree)"
+
+
+# ── the spec-step executor ──────────────────────────────────────────────────
+
+class NativeRunner:
+    """Drives one :class:`NativeSpec` against an injected :class:`MacCalls`,
+    producing coord's normalized ``{"id", "status", "message"}`` verdict
+    list (plus ``capture_b64`` on failing steps when a capture could be
+    taken) — the same shape :func:`coord.win_native_driver.run_native_spec`/
+    :func:`coord.tui_pty_driver.run_smoke_spec` already produce.
+    """
+
+    def __init__(
+        self, calls: MacCalls, command: str, cwd: str, *, deadline: float | None = None,
+    ) -> None:
+        self._calls = calls
+        self._command = command
+        self._cwd = cwd
+        self._deadline = deadline
+        self._spec: NativeSpec | None = None
+        self._pid: int | None = None
+        self._window_id: int | None = None
+
+    def run(self, spec: NativeSpec) -> list[dict]:
+        self._spec = spec
+        results: list[dict] = []
+        try:
+            for step in spec.steps:
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    results.append({
+                        "id": step.step_id, "status": "fail",
+                        "message": "aborted: mac-native driver-level timeout exceeded",
+                    })
+                    continue
+                results.append(self._run_step(step))
+        finally:
+            self._teardown()
+        return results
+
+    def _run_step(self, step: NativeStep) -> dict:
+        handlers = {
+            "launch": self._do_launch,
+            "key": self._do_key,
+            "click": self._do_click,
+            "wait": self._do_wait,
+            "capture": self._do_capture,
+            "expect_a11y": self._do_expect_a11y,
+            "expect_a11y_within": self._do_expect_a11y_within,
+            "expect_closed": self._do_expect_closed,
+        }
+        entry: dict = {"id": step.step_id, "status": "pass", "message": ""}
+        try:
+            extra = handlers[step.kind](step)
+            if extra:
+                entry.update(extra)
+        except (MacNativeSpecError, MacNativeRuntimeError, AssertionError) as e:
+            entry["status"] = "fail"
+            entry["message"] = str(e)
+            self._attach_capture_if_possible(entry)
+        return entry
+
+    def _attach_capture_if_possible(self, entry: dict) -> None:
+        """Best-effort ``screencapture`` evidence attached to *entry* — never
+        raises, and never masks the real failure reason in ``message`` if
+        the capture itself can't be taken."""
+        if self._window_id is None:
+            return
+        try:
+            image = self._calls.capture(self._window_id)
+        except Exception as e:  # noqa: BLE001 — evidence is best-effort
+            entry["capture_error"] = str(e)
+            return
+        if image:
+            entry["capture_b64"] = base64.b64encode(image).decode("ascii")
+
+    def _require_window(self) -> tuple[int, int]:
+        if self._pid is None or self._window_id is None:
+            raise MacNativeRuntimeError(
+                "no window — spec has no 'launch' step before this one"
+            )
+        return self._pid, self._window_id
+
+    # -- action steps --
+
+    def _do_launch(self, step: NativeStep) -> dict | None:
+        spec = self._spec
+        assert spec is not None
+        pid = self._calls.launch(self._command, self._cwd)
+        self._pid = pid
+        timeout_s = (step.timeout_ms or 10000) / 1000
+        window_id = self._calls.find_top_window(pid, timeout_s)
+        self._window_id = window_id
+        self._calls.move_window(pid, window_id, 0, 0, spec.width, spec.height)
+        return None
+
+    def _do_key(self, step: NativeStep) -> None:
+        pid, _ = self._require_window()
+        self._calls.send_key(pid, step.key)
+
+    def _do_click(self, step: NativeStep) -> None:
+        _, window_id = self._require_window()
+        self._calls.send_click(window_id, step.x, step.y, step.button or "left")
+
+    def _do_wait(self, step: NativeStep) -> None:
+        time.sleep(step.ms / 1000)
+
+    def _do_capture(self, step: NativeStep) -> dict:
+        _, window_id = self._require_window()
+        image = self._calls.capture(window_id)
+        return {"capture_b64": base64.b64encode(image).decode("ascii")}
+
+    # -- assertion steps --
+
+    def _do_expect_a11y(self, step: NativeStep) -> None:
+        pid, _ = self._require_window()
+        elements = self._calls.ax_elements(pid)
+        if _find_a11y_match(elements, step.role, step.name) is None:
+            raise AssertionError(
+                f"no Accessibility element found with role={step.role!r} "
+                f"name={step.name!r}; tree had: {_summarize_elements(elements)}"
+            )
+
+    def _do_expect_a11y_within(self, step: NativeStep) -> dict:
+        pid, _ = self._require_window()
+        start = time.monotonic()
+        deadline = start + step.timeout_ms / 1000
+        while True:
+            elements = self._calls.ax_elements(pid)
+            if _find_a11y_match(elements, step.role, step.name) is not None:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                return {"message": f"appeared after {elapsed_ms}ms"}
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"expected role={step.role!r} name={step.name!r} within "
+                    f"{step.timeout_ms}ms; never appeared. tree had: "
+                    f"{_summarize_elements(elements)}"
+                )
+            time.sleep(0.02)
+
+    def _do_expect_closed(self, step: NativeStep) -> None:
+        """#2096: confirmed by re-polling the window list until it actually
+        reports gone — never by the mere absence of an exception from an
+        earlier click step."""
+        _, window_id = self._require_window()
+        deadline = time.monotonic() + (step.timeout_ms or 5000) / 1000
+        while True:
+            if not self._calls.is_window_alive(window_id):
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"window still alive {step.timeout_ms}ms after "
+                    f"expect_closed — it did not actually close"
+                )
+            time.sleep(0.02)
+
+    # -- teardown --
+
+    def _teardown(self) -> None:
+        """Kills only the PID this run itself launched (see the module
+        docstring's safety note) — never by bundle id/name, and never if
+        `launch` never ran (`self._pid` stays `None`)."""
+        if self._pid is not None:
+            try:
+                self._calls.kill(self._pid)
+            except Exception:  # noqa: BLE001 — teardown must not mask the real result
+                pass
+
+
+# ── real macOS implementation (macOS-only) ──────────────────────────────────
+
+_NAMED_VKEYS: dict[str, int] = {
+    # macOS virtual keycodes (US ANSI layout) — not ASCII-ordered, hence the
+    # explicit table rather than a formula (mirrors
+    # :data:`coord.win_native_driver._NAMED_VKEYS`'s own "named keys a spec
+    # author can reference" convention, just with macOS's own numbering).
+    "enter": 0x24, "return": 0x24, "esc": 0x35, "escape": 0x35, "tab": 0x30,
+    "backspace": 0x33, "delete": 0x33, "space": 0x31,
+    "up": 0x7E, "down": 0x7D, "left": 0x7B, "right": 0x7C,
+    "home": 0x73, "end": 0x77, "pageup": 0x74, "pagedown": 0x79,
+    "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60, "f6": 0x61,
+    "f7": 0x62, "f8": 0x64, "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F,
+}
+
+_VKEY_LETTERS: dict[str, int] = {
+    "a": 0x00, "b": 0x0B, "c": 0x08, "d": 0x02, "e": 0x0E, "f": 0x03,
+    "g": 0x05, "h": 0x04, "i": 0x22, "j": 0x26, "k": 0x28, "l": 0x25,
+    "m": 0x2E, "n": 0x2D, "o": 0x1F, "p": 0x23, "q": 0x0C, "r": 0x0F,
+    "s": 0x01, "t": 0x11, "u": 0x20, "v": 0x09, "w": 0x0D, "x": 0x07,
+    "y": 0x10, "z": 0x06,
+}
+
+_VKEY_DIGITS: dict[str, int] = {
+    "0": 0x1D, "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15,
+    "5": 0x17, "6": 0x16, "7": 0x1A, "8": 0x1C, "9": 0x19,
+}
+
+
+def _vkey_for(key: str) -> tuple[int, bool]:
+    """``(virtual_keycode, needs_shift)`` for one spec ``key:`` name.
+    Raises :class:`MacNativeSpecError` for anything unrecognized. Mirrors
+    :func:`coord.win_native_driver._vkey_for`'s contract, just against
+    macOS's own (non-ASCII-ordered) virtual-keycode table."""
+    lowered = key.lower()
+    if lowered in _NAMED_VKEYS:
+        return _NAMED_VKEYS[lowered], False
+    if lowered.startswith("ctrl+") and len(lowered) == 6:
+        ch = lowered[5]
+        code = _VKEY_LETTERS.get(ch, _VKEY_DIGITS.get(ch))
+        if code is None:
+            raise MacNativeSpecError(f"unrecognized key {key!r}")
+        return code, False
+    if len(key) == 1:
+        ch = key.lower()
+        code = _VKEY_LETTERS.get(ch, _VKEY_DIGITS.get(ch))
+        if code is None:
+            raise MacNativeSpecError(f"unrecognized key {key!r}")
+        needs_shift = key.isalpha() and key.isupper()
+        return code, needs_shift
+    raise MacNativeSpecError(f"unrecognized key {key!r}")
+
+
+class MacOSCalls:
+    """The real :class:`MacCalls` implementation — ``Quartz`` (``pyobjc``)
+    for ``CGEvent`` input injection and window discovery, ``ApplicationServices``
+    for the Accessibility tree, and the ``screencapture`` CLI (ships with
+    every macOS install, no extra dependency) for window captures.
+
+    macOS-only: raises :class:`MacNativeRuntimeError` at construction on any
+    other platform, mirroring
+    :class:`coord.win_native_driver.Win32Calls`'s own platform guard.
+    """
+
+    def __init__(self) -> None:
+        if not _is_macos():
+            raise MacNativeRuntimeError(
+                "MacOSCalls requires macOS — the mac-native driver only "
+                "runs on a real macOS host (e.g. macmini)"
+            )
+        self._quartz = _import_quartz()
+        self._ax = _import_ax()
+
+    # -- process lifecycle --
+
+    def launch(self, command: str, cwd: str) -> int:
+        proc = subprocess.Popen(command, shell=True, cwd=cwd or None)
+        return proc.pid
+
+    def kill(self, pid: int) -> None:
+        # By PID only — see the module docstring's safety note. No
+        # bundle-identifier/name-based lookup exists anywhere in this class.
+        import signal  # noqa: PLC0415
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def find_top_window(self, pid: int, timeout_s: float) -> int:
+        quartz = self._quartz
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            info_list = quartz.CGWindowListCopyWindowInfo(
+                quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGNullWindowID,
+            )
+            for info in info_list or []:
+                if info.get("kCGWindowOwnerPID") == pid:
+                    return int(info["kCGWindowNumber"])
+            time.sleep(0.1)
+        raise MacNativeRuntimeError(
+            f"no on-screen window appeared for pid={pid} within {timeout_s}s"
+        )
+
+    def is_window_alive(self, window_id: int) -> bool:
+        quartz = self._quartz
+        info_list = quartz.CGWindowListCopyWindowInfo(
+            quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGNullWindowID,
+        )
+        return any(info.get("kCGWindowNumber") == window_id for info in info_list or [])
+
+    def move_window(
+        self, pid: int, window_id: int, x: int, y: int, width: int, height: int,
+    ) -> None:
+        ax = self._ax
+        app = ax.AXUIElementCreateApplication(pid)
+        window = _first_ax_window(ax, app)
+        if window is None:
+            return
+        ax.AXUIElementSetAttributeValue(
+            window, ax.kAXPositionAttribute, ax.AXValueCreate(ax.kAXValueCGPointType, (x, y)),
+        )
+        ax.AXUIElementSetAttributeValue(
+            window, ax.kAXSizeAttribute,
+            ax.AXValueCreate(ax.kAXValueCGSizeType, (width, height)),
+        )
+
+    # -- input injection --
+
+    def send_click(self, window_id: int, x: int, y: int, button: str) -> None:
+        quartz = self._quartz
+        info_list = quartz.CGWindowListCopyWindowInfo(
+            quartz.kCGWindowListOptionIncludingWindow, window_id,
+        )
+        bounds = (info_list[0]["kCGWindowBounds"] if info_list else {}) or {}
+        screen_x = bounds.get("X", 0) + x
+        screen_y = bounds.get("Y", 0) + y
+
+        down_type, up_type, cg_button = {
+            "left": (quartz.kCGEventLeftMouseDown, quartz.kCGEventLeftMouseUp,
+                     quartz.kCGMouseButtonLeft),
+            "right": (quartz.kCGEventRightMouseDown, quartz.kCGEventRightMouseUp,
+                      quartz.kCGMouseButtonRight),
+            "middle": (quartz.kCGEventOtherMouseDown, quartz.kCGEventOtherMouseUp,
+                       quartz.kCGMouseButtonCenter),
+        }[button]
+        point = quartz.CGPointMake(screen_x, screen_y)
+        for event_type in (down_type, up_type):
+            event = quartz.CGEventCreateMouseEvent(None, event_type, point, cg_button)
+            quartz.CGEventPost(quartz.kCGHIDEventTap, event)
+
+    def send_key(self, pid: int, key: str) -> None:
+        quartz = self._quartz
+        vkey, needs_shift = _vkey_for(key)
+        needs_ctrl = key.lower().startswith("ctrl+")
+        down = quartz.CGEventCreateKeyboardEvent(None, vkey, True)
+        up = quartz.CGEventCreateKeyboardEvent(None, vkey, False)
+        flags = 0
+        if needs_shift:
+            flags |= quartz.kCGEventFlagMaskShift
+        if needs_ctrl:
+            flags |= quartz.kCGEventFlagMaskControl
+        if flags:
+            quartz.CGEventSetFlags(down, flags)
+            quartz.CGEventSetFlags(up, flags)
+        quartz.CGEventPost(quartz.kCGHIDEventTap, down)
+        quartz.CGEventPost(quartz.kCGHIDEventTap, up)
+
+    # -- Accessibility --
+
+    def ax_elements(self, pid: int) -> list[dict]:
+        ax = self._ax
+        app = ax.AXUIElementCreateApplication(pid)
+        elements: list[dict] = []
+
+        def _walk(element) -> None:
+            try:
+                role = _ax_attr(ax, element, ax.kAXRoleAttribute) or ""
+                name = (
+                    _ax_attr(ax, element, ax.kAXTitleAttribute)
+                    or _ax_attr(ax, element, ax.kAXDescriptionAttribute)
+                    or _ax_attr(ax, element, ax.kAXValueAttribute)
+                    or ""
+                )
+                hidden = bool(_ax_attr(ax, element, "AXHidden") or False)
+                elements.append({"role": str(role), "name": str(name), "visible": not hidden})
+            except Exception:  # noqa: BLE001 — a dead/stale element node
+                return
+            children = _ax_attr(ax, element, ax.kAXChildrenAttribute) or []
+            for child in children:
+                _walk(child)
+
+        _walk(app)
+        return elements
+
+    # -- capture --
+
+    def capture(self, window_id: int) -> bytes:
+        import tempfile  # noqa: PLC0415
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            proc = subprocess.run(
+                ["screencapture", "-x", "-l", str(window_id), tmp_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode != 0 or not os.path.exists(tmp_path):
+                raise MacNativeRuntimeError(
+                    f"screencapture failed for window_id={window_id}: "
+                    f"{proc.stderr.strip() if proc.stderr else '(no stderr)'}"
+                )
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+            if not data:
+                raise MacNativeRuntimeError(
+                    f"screencapture produced an empty file for window_id={window_id}"
+                )
+            return data
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _first_ax_window(ax, app):
+    windows = _ax_attr(ax, app, ax.kAXWindowsAttribute) or []
+    return windows[0] if windows else None
+
+
+def _ax_attr(ax, element, attribute: str):
+    error, value = ax.AXUIElementCopyAttributeValue(element, attribute, None)
+    if error != 0:  # kAXErrorSuccess == 0
+        return None
+    return value
+
+
+def _is_macos() -> bool:
+    return os.uname().sysname == "Darwin" if hasattr(os, "uname") else False
+
+
+def _import_quartz():
+    """The optional ``pyobjc-framework-Quartz`` dependency (the
+    ``mac-native`` extra) — guarded the same way
+    :func:`coord.tui_pty_driver._import_pyte`/
+    :func:`coord.win_native_driver._import_uia` guard their own optional
+    dependencies, so a missing package names the extra to install rather
+    than surfacing a bare ``ModuleNotFoundError``."""
+    try:
+        import Quartz  # noqa: PLC0415
+    except ModuleNotFoundError as exc:
+        raise MacNativeRuntimeError(
+            "mac-native needs the 'mac-native' extra, which is not "
+            "installed (missing 'pyobjc-framework-Quartz').\n"
+            "  Install it with:  pip install 'code-coordinator[mac-native]'"
+        ) from exc
+    return Quartz
+
+
+def _import_ax():
+    """The optional ``pyobjc-framework-ApplicationServices`` dependency (the
+    Accessibility half of the ``mac-native`` extra) — same guard convention
+    as :func:`_import_quartz`."""
+    try:
+        import ApplicationServices  # noqa: PLC0415
+    except ModuleNotFoundError as exc:
+        raise MacNativeRuntimeError(
+            "mac-native needs the 'mac-native' extra, which is not "
+            "installed (missing 'pyobjc-framework-ApplicationServices').\n"
+            "  Install it with:  pip install 'code-coordinator[mac-native]'"
+        ) from exc
+    return ApplicationServices
+
+
+# ── top-level entry point ───────────────────────────────────────────────────
+
+def run_native_spec(
+    spec_text: str, *, launch_command: str, cwd: str,
+    calls: MacCalls | None = None, timeout: float | None = None,
+) -> list[dict]:
+    """Parse *spec_text* and run it against *calls* (a real
+    :class:`MacOSCalls` by default) launching *launch_command* in *cwd* —
+    the top-level entry point
+    :func:`coord.acceptance_drivers._run_mac_native` calls.
+
+    *timeout*, when given, is an overall wall-clock budget in seconds for
+    the whole spec — mirrors :func:`coord.win_native_driver.run_native_spec`'s
+    own ``timeout``: each step already carries its own bounded per-step
+    budget, but their sum can still exceed it, in which case every
+    remaining step fails explicitly rather than the run truncating or
+    blocking past it.
+
+    Raises :class:`MacNativeSpecError` for a malformed spec. Runtime
+    failures (the process never launches, a window never appears, an
+    assertion fails) do NOT raise — they're folded into the returned list
+    as a ``status="fail"`` entry, the same "partial results, not a crash"
+    contract :func:`coord.win_native_driver.run_native_spec` already gives.
+    """
+    spec = parse_native_spec(spec_text)
+    resolved_calls = calls if calls is not None else MacOSCalls()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    runner = NativeRunner(resolved_calls, launch_command, cwd, deadline=deadline)
+    return runner.run(spec)

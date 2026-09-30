@@ -80,6 +80,23 @@ format. This adapter (:func:`_run_win_native`) is the same thin seam
 ``entrypoint:`` and hands off to
 :func:`coord.win_native_driver.run_native_spec`.
 
+``mac-native`` (#3485, the macOS-native tier alongside ``win-native``)
+launches the driven repo's real compiled ``.app``/binary and drives it with
+real ``CGEvent`` input while probing real OS state: the Accessibility (AX)
+tree (covering the ``expect_a11y``/``expect_a11y_within`` steps) and a
+per-window ``screencapture -l <windowid>`` capture attached to every failing
+step as evidence. It deliberately speaks the *same* step vocabulary
+``win-native`` already defines for its ``mode: window`` case (``launch``,
+``key``, ``click``, ``wait``, ``capture``, ``expect_a11y``,
+``expect_a11y_within``, ``expect_closed``) — no macOS-specific spec fork —
+so one spec file can drive either platform's native tier. All of the spec
+parsing, the Quartz/AX call seam, and the step executor live in
+:mod:`coord.mac_native_driver` — see that module's docstring for the spec
+format and the platform-parity rationale. This adapter
+(:func:`_run_mac_native`) is the same thin seam :func:`_run_win_native` is:
+it resolves the native spec from the driver's ``entrypoint:`` and hands off
+to :func:`coord.mac_native_driver.run_native_spec`.
+
 ``terraform`` additionally runs a deterministic policy gate (#3234, epic
 #3230 child 3) whenever the driven repo has opted in by carrying the
 convention files: ``tflint`` (rule-based HCL/provider checks — pinned
@@ -112,7 +129,7 @@ from pathlib import Path
 # adapter landing, but running it must fail loudly rather than silently no-op.
 SUPPORTED_KINDS = (
     "tui-tuidriver", "cli-pytest", "web-playwright", "terraform", "tui-pty",
-    "win-native",
+    "win-native", "mac-native",
 )
 
 # #2748 (IL-2): driver kinds whose `run` produces a real pass/fail verdict
@@ -290,12 +307,13 @@ def run_driver(
     into a driver's own "wrote no report" crash message.
 
     *entrypoint* (``AcceptanceDriverConfig.entrypoint``) is only consulted
-    by ``tui-pty`` (#3483) and ``win-native`` (#3484) — it names the
-    repo-root-relative smoke/native-spec YAML file (see
-    :mod:`coord.tui_pty_driver`/:mod:`coord.win_native_driver`), the same
-    way ``entrypoint`` already names ``tui-tuidriver``'s sealed Rust
-    acceptance file for :func:`coord.acceptance.acceptance_root_for_driver`.
-    Every other kind ignores it.
+    by ``tui-pty`` (#3483), ``win-native`` (#3484) and ``mac-native``
+    (#3485) — it names the repo-root-relative smoke/native-spec YAML file
+    (see :mod:`coord.tui_pty_driver`/:mod:`coord.win_native_driver`/
+    :mod:`coord.mac_native_driver`), the same way ``entrypoint`` already
+    names ``tui-tuidriver``'s sealed Rust acceptance file for
+    :func:`coord.acceptance.acceptance_root_for_driver`. Every other kind
+    ignores it.
     """
     if kind not in SUPPORTED_KINDS:
         raise DriverError(
@@ -319,6 +337,8 @@ def run_driver(
         return _run_tui_pty(run_command, cwd, entrypoint, timeout=timeout)
     if kind == "win-native":
         return _run_win_native(run_command, cwd, entrypoint, timeout=timeout)
+    if kind == "mac-native":
+        return _run_mac_native(run_command, cwd, entrypoint, timeout=timeout)
     return _run_generic(run_command, cwd, timeout=timeout)
 
 
@@ -736,6 +756,67 @@ def _run_win_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int
         raise DriverError(f"win-native spec is invalid: {e}") from e
     except WinNativeRuntimeError as e:
         raise DriverError(f"win-native driver could not run: {e}") from e
+
+    exit_code = 0 if tests and all(t.get("status") != "fail" for t in tests) else 1
+    raw_output = "\n".join(
+        f"{t.get('status')}: {t.get('id')} {t.get('message', '')}".rstrip()
+        for t in tests
+    )
+    return DriverResult(exit_code=exit_code, tests=tests, raw_output=raw_output)
+
+
+def _run_mac_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int) -> DriverResult:
+    """The ``mac-native`` shape (#3485): *run_command* is the shell command
+    that launches the driven repo's real compiled ``.app``/binary — the
+    platform-neutral native spec YAML that drives it lives at *entrypoint*
+    (repo-root-relative), the ``mac-native`` analogue of ``win-native``'s own
+    ``entrypoint:`` convention (see :func:`_run_win_native` and the module
+    docstring).
+
+    All of the real Quartz/AX calls and the step executor live in
+    :mod:`coord.mac_native_driver` — this function is the thin seam that
+    resolves *entrypoint* to a spec file and calls
+    :func:`coord.mac_native_driver.run_native_spec`, then folds its
+    normalized ``tests`` list (each failing entry optionally carrying a
+    ``capture_b64`` ``screencapture`` snapshot) into a :class:`DriverResult`
+    the same way :func:`_run_win_native` does.
+
+    Raises :class:`DriverError` — never a bare exception — for a missing
+    ``entrypoint:``, a spec file that doesn't exist, or a malformed spec
+    (an invalid-YAML/unknown-step-type
+    :class:`coord.mac_native_driver.MacNativeSpecError`). A process that
+    never launches, a window that never appears, or a failed probe do NOT
+    raise here — :func:`coord.mac_native_driver.run_native_spec` folds those
+    into individual failing entries in ``tests`` instead.
+    """
+    from coord.mac_native_driver import (  # noqa: PLC0415 — see module docstring on the deferred import
+        MacNativeRuntimeError,
+        MacNativeSpecError,
+        run_native_spec,
+    )
+
+    if not entrypoint:
+        raise DriverError(
+            "mac-native driver requires an `entrypoint:` naming the native "
+            "spec YAML file (repo-root-relative) — none configured"
+        )
+    spec_path = Path(cwd) / entrypoint
+    if not spec_path.is_file():
+        raise DriverError(f"mac-native spec not found: {spec_path}")
+
+    try:
+        spec_text = spec_path.read_text()
+    except OSError as e:
+        raise DriverError(f"mac-native spec could not be read: {spec_path}: {e}") from e
+
+    try:
+        tests = run_native_spec(
+            spec_text, launch_command=run_command, cwd=cwd, timeout=timeout,
+        )
+    except MacNativeSpecError as e:
+        raise DriverError(f"mac-native spec is invalid: {e}") from e
+    except MacNativeRuntimeError as e:
+        raise DriverError(f"mac-native driver could not run: {e}") from e
 
     exit_code = 0 if tests and all(t.get("status") != "fail" for t in tests) else 1
     raw_output = "\n".join(

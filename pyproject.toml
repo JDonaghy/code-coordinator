@@ -142,6 +142,20 @@ tui-pty = [
 win-native = [
     "comtypes>=1.2; sys_platform == 'win32'",
 ]
+# #3485: the `mac-native` acceptance driver — probes a real macOS app's
+# window with real CGEvent input, the Accessibility (AX) tree, and
+# `screencapture -l <windowid>`. `pyobjc-framework-Quartz`/
+# `pyobjc-framework-ApplicationServices` are only ever imported by
+# `coord/mac_native_driver.py`'s `MacOSCalls` (macOS-only at construction,
+# same guard as `win-native`'s `Win32Calls`), so the `sys_platform` marker
+# means installing this extra on Linux/Windows pulls in nothing.
+# `coord/mac_native_driver.py`'s `_import_quartz`/`_import_ax` guard the
+# imports and name this extra rather than a bare `ModuleNotFoundError`,
+# mirroring `win_native_driver.py`'s `_import_uia` convention.
+mac-native = [
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+]
 # Convenience alias: "give me everything a full node runs".
 all = ["code-coordinator[server]", "code-coordinator[reports-xlsx]", "code-coordinator[tui-pty]"]
 dev = [
