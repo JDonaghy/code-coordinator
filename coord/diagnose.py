@@ -1234,7 +1234,57 @@ def _recover_test(
     — exactly the #1598 incident's "nothing to reconcile" symptom, and
     exactly why the daemon restart mentioned in that report didn't clear it
     either: nothing was ever looking at the CHILD row.
+
+    #3332: the same catch-all mis-files ``test_state="blocked"`` too — the
+    dead-end marker ``coord.dead_end`` (shape 2) and ``coord.smoke`` both
+    already know is terminal-and-unactionable (``dispatch_smoke`` gives up
+    and never re-probes it; ``dispatch_pending_smoke`` skips the row on
+    every tick). ``latest.status`` is ``"done"`` for that row too, so
+    without an explicit check it falls through exactly like the ``running``
+    case did before #1605. Checked here, not just left to ``coord.dead_end``,
+    because that module only runs from the ``drive``/auto-loop path —
+    ``coord diagnose --stage test`` is a separate entry point an operator
+    runs by hand, and it must not disagree with the driver about whether the
+    same row is wedged.
     """
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+
+    if latest.test_state == TEST_STATE_BLOCKED:
+        from coord.smoke import mute_smoke_legs  # noqa: PLC0415
+
+        # Same predicate `coord.dead_end`'s shape 2 uses to tell #1672
+        # (unroutable fleet) apart from #2272 (mute Test-stage legs) — #2235
+        # exists to keep those two REASONS from blurring together, so this
+        # reuses the identical function rather than re-deriving the split
+        # (#2096 "one question, one answer").
+        mute_legs = mute_smoke_legs(latest.test_reason)
+        if mute_legs:
+            cause = (
+                f"{mute_legs} Test-stage leg(s) in a row finished without "
+                "printing a `SMOKE:` verdict marker, exhausting the retry "
+                "budget (#2272) — nothing is known to be wrong with the "
+                "branch; the commonest cause is the smoke command exceeding "
+                "the worker's 600s Bash ceiling. Check the last Test-stage "
+                "transcript for a backgrounded command before blaming the diff."
+            )
+        else:
+            cause = (
+                "coord.smoke.dispatch_smoke found no capability-matched "
+                "machine and recorded 'blocked' rather than re-probing a "
+                "broken fleet on every tick (#1672) — it will not try again "
+                "on its own. Fix the fleet (or the capability rules), then "
+                "clear the marker."
+            )
+        res.findings.append(
+            f"⚠ test_state='blocked': "
+            f"{latest.test_reason or 'no reason recorded'} — {cause} This "
+            "is a permanent dead end (coord.dead_end shape 2) — no amount "
+            "of waiting produces a verdict. `--reset` clears the marker so "
+            "the row re-enters the Test-stage scan."
+        )
+        res.recovered = False
+        res.needs_reset = True
+        return
     if latest.test_state == "running":
         smoke = next(
             (
@@ -1901,17 +1951,61 @@ def _reset_test_stage(
     to touch a ``test-author``/``mock-author`` row, since those share
     ``issue_number`` across sibling JIT-slice assignments for the same
     milestone tracking issue.
+
+    #3332: itemizes which rows were actually cleared, using
+    ``state.test_reset_candidates`` — the same predicate
+    ``reset_work_test_state`` writes against (#2096 "one question, one
+    answer") — read BEFORE the write to see what carries a ``test_state``,
+    then again AFTER to verify the clear persisted rather than trusting the
+    UPDATE's bare ``rowcount``. A report of "cleared 3 work row(s)" with no
+    way to tell which 3 (of however many share the issue) is exactly the gap
+    #3332 flagged.
     """
     from coord import state  # noqa: PLC0415
 
+    before = state.test_reset_candidates(
+        repo_name, issue_number, assignment_id=assignment_id
+    )
+    had_state = [(aid, typ) for aid, typ, ts in before if ts]
+
     if dry_run:
-        res.findings.append("(dry-run) would clear test_state → re-testable")
+        if had_state:
+            listed = ", ".join(f"{aid} ({typ})" for aid, typ in had_state)
+            res.findings.append(
+                f"(dry-run) would clear test_state → re-testable on "
+                f"{len(had_state)} row(s): {listed}"
+            )
+        else:
+            res.findings.append(
+                "(dry-run) would clear test_state → re-testable (no matching "
+                "row currently carries one — this would be a no-op)"
+            )
         res.needs_reset = True
         return
+
     updated = state.reset_work_test_state(
         repo_name, issue_number, assignment_id=assignment_id
     )
-    res.actions_taken.append(f"cleared Test verdict on {updated} work row(s) (re-testable)")
+    after = state.test_reset_candidates(
+        repo_name, issue_number, assignment_id=assignment_id
+    )
+    still_set = [(aid, typ) for aid, typ, ts in after if ts]
+    cleared = [pair for pair in had_state if pair not in still_set]
+    if still_set:
+        listed = ", ".join(f"{aid} ({typ})" for aid, typ in still_set)
+        res.actions_taken.append(
+            f"reset requested for {updated} row(s), but test_state is still "
+            f"set on re-read for: {listed} — the clear did NOT persist for "
+            "these (#2096)"
+        )
+    if cleared:
+        listed = ", ".join(f"{aid} ({typ})" for aid, typ in cleared)
+        res.actions_taken.append(
+            f"cleared Test verdict on {len(cleared)} work row(s) "
+            f"(re-testable): {listed}"
+        )
+    elif not still_set:
+        res.actions_taken.append(f"cleared Test verdict on {updated} work row(s) (re-testable)")
     res.reset_performed = True
     res.recovered = True
     res.branch_preserved = True

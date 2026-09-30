@@ -3650,6 +3650,64 @@ def reset_work_review_state(
     return cur.rowcount
 
 
+def _test_reset_where(
+    repo_name: str, issue_number: int, assignment_id: str | None
+) -> tuple[str, tuple]:
+    """The WHERE clause + params identifying the rows a Test-gate reset
+    touches for ``(repo_name, issue_number, assignment_id)`` — shared by
+    :func:`reset_work_test_state` and :func:`test_reset_candidates` (#3332)
+    so the two can never answer "which rows would this touch" differently
+    (#2096 "one question, one answer"). See :func:`reset_work_test_state`'s
+    docstring for why ``test-author``/``mock-author`` additionally require
+    *assignment_id* to match.
+    """
+    if assignment_id is not None:
+        where = (
+            "repo_name=? AND issue_number=? AND ("
+            "type IN ('work','plan','epic-decompose') OR "
+            "(type IN ('test-author','mock-author') AND assignment_id=?)"
+            ")"
+        )
+        params: tuple = (repo_name, issue_number, assignment_id)
+    else:
+        where = "repo_name=? AND issue_number=? AND type IN ('work','plan','epic-decompose')"
+        params = (repo_name, issue_number)
+    return where, params
+
+
+def test_reset_candidates(
+    repo_name: str, issue_number: int, *, assignment_id: str | None = None
+) -> list[tuple[str, str, str | None]]:
+    """The rows :func:`reset_work_test_state` would touch for the same
+    arguments, as ``(assignment_id, type, test_state)`` triples.
+
+    #3332: lets a caller report WHICH rows a reset cleared instead of a bare
+    count — ``coord diagnose --stage test --reset`` used to report e.g.
+    "cleared Test verdict on 3 work row(s)" for a branch with 4 work-like
+    rows with no way to tell which 3, or whether the 4th was a deliberate
+    skip or a miss. Calling this again *after* the write (comparing which
+    rows still carry a ``test_state``) is also the re-read #2096 asks for —
+    the same pattern :func:`coord.diagnose._reset_review_stage` already uses
+    (#3206's ``still_present`` check) rather than trusting the UPDATE's
+    ``rowcount`` alone.
+    """
+    conn = get_connection()
+    where, params = _test_reset_where(repo_name, issue_number, assignment_id)
+    rows = sql.execute(
+        conn,
+        f"SELECT assignment_id, type, test_state FROM assignments WHERE {where} "
+        "ORDER BY assignment_id",
+        params,
+    ).fetchall()
+    result: list[tuple[str, str, str | None]] = []
+    for row in rows:
+        if hasattr(row, "keys"):
+            result.append((row["assignment_id"], row["type"], row["test_state"]))
+        else:
+            result.append((row[0], row[1], row[2]))
+    return result
+
+
 def reset_work_test_state(
     repo_name: str, issue_number: int, *, assignment_id: str | None = None
 ) -> int:
@@ -3689,17 +3747,7 @@ def reset_work_test_state(
     reset itself.
     """
     conn = get_connection()
-    if assignment_id is not None:
-        where = (
-            "repo_name=? AND issue_number=? AND ("
-            "type IN ('work','plan','epic-decompose') OR "
-            "(type IN ('test-author','mock-author') AND assignment_id=?)"
-            ")"
-        )
-        params: tuple = (repo_name, issue_number, assignment_id)
-    else:
-        where = "repo_name=? AND issue_number=? AND type IN ('work','plan','epic-decompose')"
-        params = (repo_name, issue_number)
+    where, params = _test_reset_where(repo_name, issue_number, assignment_id)
 
     try:
         from coord.smoke import _parse_fanout_manifest  # noqa: PLC0415
