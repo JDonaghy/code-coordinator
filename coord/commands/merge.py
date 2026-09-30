@@ -137,7 +137,6 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool, skip_rev
 
 def _apply_ci_revalidation(
     items, board, config, ci_store, gh_ops, *, dry_run: bool,
-    poll_sleep=None, poll_clock=None,
 ) -> set[str]:
     """#1851: the ``--revalidate`` arm for CI staleness — the CI analogue of
     :func:`_apply_revalidation`'s stale-local-verdict arm, resolving a
@@ -147,64 +146,35 @@ def _apply_ci_revalidation(
     outlive the base it actually validated even when the local Test verdict
     is perfectly fresh).
 
-    Unlike :func:`_apply_revalidation` there is nothing to compose and no
-    local suite to run — the remedy is :meth:`coord.ci_store.CiStore.
-    rerun_for_pr`, a ``gh run rerun`` that costs CI minutes on GitHub's own
-    runners, not a routed Test-stage agent. Strictly cheaper than what
-    :func:`_apply_revalidation` does for the same reason CI should always be
-    preferred when both would establish the same fact (#1851's "Cost
-    framing").
+    #3276: every candidate :func:`coord.merge_queue.ci_revalidation_candidates`
+    returns is, by that function's own contract, blocked *solely* on CI
+    staleness — and the remedy that would have been here,
+    :meth:`coord.ci_store.CiStore.rerun_for_pr`, is a same-base ``gh run
+    rerun`` that a staleness reading (the base moved; the check didn't) can
+    never satisfy. #3266 already established exactly that and fixed the two
+    unattended call sites (``merge_queue.process()``'s own #2197 auto-rerun
+    and ``coord.commands.drive_queue._run_auto_revalidate_checks_stale``) to
+    stop spending a CI cycle on it — see ``MAX_CI_STALE_RERUNS``'s comment in
+    ``coord/merge_queue.py``. This CLI arm was left as a disclosed scope cut
+    (opt-in, human-invoked, no budget counter) with a docstring promising a
+    "tracked follow-up" that was never filed as an issue — #3276 is that
+    follow-up. So: no candidate here is ever handed to ``rerun_for_pr``
+    anymore. Each one gets the rebase remedy on stdout instead, both under
+    ``--dry-run`` and for real — the two cases are identical now because
+    nothing is actually triggered either way (#3276's acceptance: ``--dry-
+    run`` must say the same thing it would do).
 
     Opt-in behind ``--revalidate`` exactly like :func:`_apply_revalidation`
-    — never called from auto-drain (see ``docs/DRIVE_QUEUE.md``). Under
-    ``--dry-run`` this only *names* what it would trigger; no ``gh`` mutation
-    runs.
+    — never called from auto-drain (see ``docs/DRIVE_QUEUE.md``).
 
-    #1925: triggering a rerun and then handing the entry straight to
-    ``merge_queue.process()`` used to fail-close on the rerun's OWN
-    registration gap — ``gh pr checks`` errors for the few seconds before
-    GitHub has created any check-run record, which reads as the #1525
-    synthetic ``unknown`` conclusion and blocks exactly like a genuinely
-    broken CI would. :func:`coord.ci_store.wait_for_ci_settle` closes that
-    gap with a bounded poll right here, so the caller's subsequent
-    ``process()`` call sees a real, resolved result — pass or fail — for the
-    common case.
-
-    Returns the ``assignment_id``s whose wait ran out the budget while STILL
-    only seeing the registration-gap symptom (never a real check) —
-    :func:`wait_for_ci_settle`'s ``registering=True`` case. The caller must
-    exclude these from the ``process()`` call that follows: evaluating the
-    gate against that exact symptom is the bug this fixes, so it must not
-    reappear at the timeout edge just because the wait gave up. The entry
-    stays ``PENDING`` with an explanatory ``entry.error`` instead — legible
-    as "come back shortly", never as "checks failed" (#1925's acceptance:
-    an ``unknown`` this command caused must not be presented identically to
-    an ``unknown`` from genuinely broken CI).
-
-    #3266 — KNOWN FOLLOW-UP, not fixed here: every candidate this selects
-    (via :func:`coord.merge_queue.ci_revalidation_candidates`) is blocked
-    *solely* on CI staleness, and the ``rerun_for_pr`` call below is a
-    same-base ``gh run rerun`` that a staleness reading, by definition,
-    can never satisfy — see ``MAX_CI_STALE_RERUNS``'s comment in
-    ``coord/merge_queue.py``, which #3266 fixed identically at
-    ``merge_queue.process()`` and at ``coord.commands.drive_queue.
-    _run_auto_revalidate_checks_stale`` (the unattended periodic call
-    site). This CLI arm is the one remaining caller still spending a real
-    CI cycle on that guaranteed no-op. Left unfixed here on purpose for
-    this round — it is opt-in and human-invoked, unlike the unattended
-    drive-queue path, and the misleading ``ci_stale_reason`` remedy text
-    that used to point an operator at ``--revalidate`` *for this specific
-    condition* was already removed by #3266 — but an operator who runs
-    ``--revalidate`` for an unrelated reason (a genuine infra-failure
-    retry) on a PR that also happens to be ``checks_stale`` still silently
-    burns a no-op CI cycle for that PR. Tracked as a follow-up: the fix
-    would be to drop this entry from *candidates* (or from what gets
-    rerun) whenever the ONLY reason it is here is staleness, so
-    ``--revalidate`` never fires `rerun_for_pr` for a condition it cannot
-    clear.
+    Returns an empty set always now — kept as a ``set[str]`` return (rather
+    than ``None``) so the two call sites' "entries this arm deferred, exclude
+    them from this pass's ``process()`` call" plumbing (#1925's ``registering``
+    case, from when this arm still triggered a rerun and had to wait out its
+    own registration gap) needs no change; there is simply never anything to
+    defer any more, since nothing is triggered.
     """
     from coord import merge_queue as _mq  # noqa: PLC0415
-    from coord.ci_store import wait_for_ci_settle  # noqa: PLC0415
 
     deferred: set[str] = set()
     if ci_store is None or not ci_store.is_available:
@@ -218,61 +188,31 @@ def _apply_ci_revalidation(
         return deferred
     for entry in candidates:
         label = f"{entry.repo_name} #{entry.issue_number} ({entry.branch})"
-        if dry_run:
-            click.echo(
-                f"  --revalidate: would re-run CI for {label} "
-                f"(PR #{entry.pr_number}) — checks predate the current base"
-            )
-            continue
-        ok = ci_store.rerun_for_pr(entry.repo_github, entry.pr_number)
-        if not ok:
-            click.echo(
-                f"  --revalidate: could not trigger a CI re-run for {label} "
-                f"(PR #{entry.pr_number}) — see gh output above",
-                err=True,
-            )
-            continue
         click.echo(
-            f"  --revalidate: triggered a CI re-run for {label} "
-            f"(PR #{entry.pr_number})"
+            f"  --revalidate: skipping {label} (PR #{entry.pr_number}) — "
+            "blocked solely on stale CI checks; a re-run replays the same "
+            "run against the same base it already ran against and can "
+            "never clear this (#3276). Rebase (or push a new commit) to "
+            "get a check against the current base."
         )
-        result = wait_for_ci_settle(
-            ci_store, entry.repo_github, entry.pr_number,
-            echo=click.echo, sleep=poll_sleep, clock=poll_clock,
-        )
-        if result.settled:
-            click.echo(
-                f"  --revalidate: CI re-run for {label} settled after "
-                f"{result.waited_seconds:.0f}s — the merge gate will "
-                "evaluate the fresh result"
-            )
-        elif result.registering:
-            entry.error = (
-                f"{label}: the CI re-run --revalidate just triggered "
-                f"(PR #{entry.pr_number}) has not registered on GitHub yet "
-                f"after {result.waited_seconds:.0f}s — this is the re-run "
-                "THIS command started, not a CI failure; re-run `coord "
-                "merge --revalidate` (or plain `coord merge`) shortly (#1925)"
-            )
-            deferred.add(entry.assignment_id)
-            click.echo(f"  --revalidate: {entry.error}")
-        else:
-            click.echo(
-                f"  --revalidate: CI re-run for {label} is still running "
-                f"after {result.waited_seconds:.0f}s — leaving it to the "
-                "merge gate this pass (will report as CI still running)"
-            )
     return deferred
 
 
 def _reload_board_after_wait(board, *, dry_run: bool):
-    """#2143: force a fresh board read after ``_apply_ci_revalidation``'s
-    ``wait_for_ci_settle`` poll — which, like ``_apply_revalidation``'s
-    composite/solo suite runs, can hold the caller for minutes.
+    """#2143: force a fresh board read after ``--revalidate``'s CI-staleness
+    arm (:func:`_apply_ci_revalidation`) — which, like
+    :func:`_apply_revalidation`'s composite/solo suite runs, used to be able
+    to hold the caller for minutes via a post-rerun settle poll.
+
+    #3276: that poll is gone — :func:`_apply_ci_revalidation` no longer
+    triggers a rerun at all (see its own docstring), so it returns quickly.
+    This reload stays anyway: :func:`_apply_revalidation`'s local-suite arm,
+    called just before this in both callers, can still run for minutes, and
+    the same staleness argument below applies to it too.
 
     ``_apply_revalidation`` already refreshes the board it hands back, but
-    only when *it* recorded a new verdict; it has no way to know a CI-settle
-    wait ran afterwards. Real state can change on GitHub during that wait —
+    only when *it* recorded a new verdict; it has no way to know what ran
+    after it. Real state can change on GitHub while either arm is running —
     most dangerously a review approval landing, or a concurrent merge driver
     (the drive-queue timer, another operator) merging the exact branch this
     run is about to act on — and `merge_queue.process()` must not evaluate
@@ -283,9 +223,9 @@ def _reload_board_after_wait(board, *, dry_run: bool):
     Unconditional (not "only when something looks stale"): the risk here is
     a stale *read*, and there's no cheap way to tell "nothing changed" from
     "something changed but we didn't notice" without just re-reading. One
-    extra ``load_board()`` is a rounding error next to the suite run(s) or
-    the CI-settle poll that just happened. Under ``--dry-run`` nothing was
-    triggered (no wait actually ran), so the board is left untouched.
+    extra ``load_board()`` is a rounding error next to the suite run(s) that
+    just happened. Under ``--dry-run`` nothing was triggered (no suite run
+    actually ran), so the board is left untouched.
     """
     if dry_run:
         return board
@@ -2392,15 +2332,16 @@ def merge(
                 only_items, board_only, cfg_only, ci_store_only, gh_ops,
                 dry_run=dry_run,
             )
-            # #2143: the CI-settle wait just above can run for minutes —
-            # re-read the board so the gates `process()` runs below see
-            # whatever landed on GitHub during it, not the pre-wait snapshot.
+            # #2143: `_apply_revalidation`'s local-suite run just above can
+            # run for minutes — re-read the board so the gates `process()`
+            # runs below see whatever landed on GitHub during it, not a
+            # pre-run snapshot. (#3276: `_apply_ci_revalidation` itself no
+            # longer triggers a rerun, so this is no longer also covering a
+            # CI-settle wait — see its own docstring.)
             board_only = _reload_board_after_wait(board_only, dry_run=dry_run)
-        # #1925: an entry deferred by the CI-settle wait above must not go
-        # through process() this pass — that would immediately re-derive the
-        # exact self-triggered "unknown" reading the wait was just trying to
-        # avoid handing to the gate. It stays PENDING with the explanatory
-        # `entry.error` _apply_ci_revalidation already set.
+        # #1925/#3276: `deferred_ci` is always empty now that
+        # `_apply_ci_revalidation` never triggers a rerun — kept so this
+        # exclusion needs no change if that ever stops being true.
         if only_entry.assignment_id in deferred_ci:
             events_only = []
         else:
@@ -2841,15 +2782,17 @@ def merge(
         deferred_ci = _apply_ci_revalidation(
             pending, board, cfg, ci_store, gh_ops, dry_run=dry_run,
         )
-        # #2143: the CI-settle wait just above can run for minutes —
-        # re-read the board so the gates `process()` runs below see
-        # whatever landed on GitHub during it, not the pre-wait snapshot.
+        # #2143: `_apply_revalidation`'s local-suite run just above can run
+        # for minutes — re-read the board so the gates `process()` runs
+        # below see whatever landed on GitHub during it, not a pre-run
+        # snapshot. (#3276: `_apply_ci_revalidation` itself no longer
+        # triggers a rerun, so this is no longer also covering a CI-settle
+        # wait — see its own docstring.)
         board = _reload_board_after_wait(board, dry_run=dry_run)
-    # #1925: entries the CI-settle wait above gave up on while still only
-    # seeing the registration-gap symptom must not go through process() this
-    # pass — see `_apply_ci_revalidation`'s docstring. They keep their
-    # PENDING state and the explanatory `entry.error` it already set; `items`
-    # (unfiltered) still carries them through to the save step below.
+    # #1925/#3276: `deferred_ci` is always empty now that
+    # `_apply_ci_revalidation` never triggers a rerun — kept so this
+    # exclusion needs no change if that ever stops being true. `items`
+    # (unfiltered) still carries every entry through to the save step below.
     process_items = (
         [x for x in items if x.assignment_id not in deferred_ci]
         if deferred_ci else items
