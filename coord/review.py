@@ -13,6 +13,12 @@ Public entry points:
   for a repo's `reviews.repo_overrides`. Shared with `coord.dispatch.dispatch`
   so the worker's briefing and the reviewer's briefing are graded/shown the
   exact same rule text, and can never drift apart.
+- `diff_missing_shared_scenario(...)`, `shared_scenario_focus_lines(...)` —
+  #3489: opt-in per-repo rule (`reviews.require_shared_scenario`) — a
+  behaviour-changing diff in an opted-in repo must add/extend a shared,
+  backend-neutral scenario (or Tier-2 smoke-spec step), not only a
+  single-backend test. Same free/non-blocking-nudge shape as
+  `diff_missing_test_coverage` below; inert for a repo that hasn't opted in.
 - `build_review_briefing(...)`  — assemble the reviewer's prompt from the
   repo's CLAUDE.md, the generic checklist, any repo-specific overrides
   (`repo_focus_lines`), and the worker's own claims (completion summary +
@@ -1719,6 +1725,153 @@ def diff_missing_test_coverage(diff_text: str | None) -> bool:
     return not any(_is_test_path(p) for p in paths)
 
 
+# ── #3489: opt-in "shared (backend-neutral) scenario" review rule ──────────
+#
+# "If it works in one backend it works in all" only holds when behaviour is
+# tested ONCE, through the shared scenario suite every backend runs
+# (quadraui's `tests/conformance/scenarios/*.scn.json` through
+# `ConformanceDriver`). Without this, reviewers happily accept a
+# single-backend test and the suites go lopsided (vimcode: ~277 GTK / ~159
+# TUI / ~22 macOS / ~9 Windows `#[test]`s; quadraui: only 19 shared
+# scenarios).
+#
+# Same shape as `diff_missing_test_coverage` (#2192) immediately above: a
+# free, path-only, non-blocking static check. It never gates dispatch by
+# itself — enforcement is the reviewer's own judgment, driven by the prompt
+# text `shared_scenario_focus_lines` appends to `build_review_briefing`,
+# naming the rule and instructing a `request-changes` verdict when it fires.
+# Inert (returns False unconditionally) for a repo absent from
+# `reviews.require_shared_scenario` — the per-repo opt-in guard.
+
+_REFACTOR_EXEMPTION_MARKERS = (
+    "pure refactor",
+    "internal-only",
+    "internal only",
+    "no user-visible",
+    "no behavior change",
+    "no behaviour change",
+)
+
+
+def _states_refactor_exemption(completion_summary: str | None) -> bool:
+    """Does the worker's own *completion_summary* state the CLAUDE.md "pure
+    refactor / internal-only" exemption (#3489)?
+
+    A path-only heuristic cannot tell a genuine behavior-preserving refactor
+    of shipped source from a real behavior change — the same limitation
+    `diff_missing_test_coverage`'s docstring notes. The worker's own stated
+    claim (#3112's `completion_summary` — the one surface a worker can
+    actually make this claim on) is the only signal available to a pure
+    function here; the reviewer still verifies the claim against the diff,
+    the same way it verifies any other claim in the "Worker's own claims"
+    section.
+    """
+    text = (completion_summary or "").lower()
+    return any(marker in text for marker in _REFACTOR_EXEMPTION_MARKERS)
+
+
+def _is_shared_scenario_path(path: str, scenario_dir: str) -> bool:
+    """Does *path* look like a shared/backend-neutral scenario (or Tier-2
+    smoke-spec step) for *scenario_dir* (#3489)?
+
+    Matches anything under *scenario_dir* itself, plus any path with a
+    `smoke-spec/` segment — the issue's explicit "or a Tier-2 smoke-spec
+    step" carve-out, which need not live under the same directory.
+    """
+    normalized_dir = scenario_dir.strip("/").lower()
+    lower = path.lower()
+    if normalized_dir and (lower == normalized_dir or lower.startswith(normalized_dir + "/")):
+        return True
+    return "/smoke-spec/" in f"/{lower}"
+
+
+def diff_missing_shared_scenario(
+    diff_text: str | None,
+    *,
+    repo_name: str,
+    reviews_cfg: ReviewsConfig,
+    completion_summary: str | None = None,
+) -> bool:
+    """#3489: True when *diff_text* changes user-visible behavior in a repo
+    that has opted into `reviews.require_shared_scenario` but adds/extends
+    no shared, backend-neutral scenario (or Tier-2 smoke-spec step) — e.g.
+    only a single-backend test, or no test at all.
+
+    Inert (always False) when *repo_name* hasn't opted in
+    (`reviews_cfg.require_shared_scenario`), when *diff_text* is empty, when
+    the diff touches no user-visible source (CLAUDE.md's internal-only
+    exemption, same granularity as `diff_missing_test_coverage`), or when
+    *completion_summary* states the pure-refactor/internal-only exemption
+    (`_states_refactor_exemption`).
+    """
+    scenario_dir = reviews_cfg.require_shared_scenario.get(repo_name)
+    if not scenario_dir:
+        return False
+    if not diff_text or not diff_text.strip():
+        return False
+    if _states_refactor_exemption(completion_summary):
+        return False
+    paths = github_ops.diff_file_paths(diff_text)
+    if not any(_is_user_visible_path(p) for p in paths):
+        return False
+    return not any(_is_shared_scenario_path(p, scenario_dir) for p in paths)
+
+
+def shared_scenario_focus_lines(
+    reviews_cfg: ReviewsConfig,
+    repo_name: str,
+    *,
+    diff_text: str | None = None,
+    completion_summary: str | None = None,
+) -> list[str]:
+    """Return the ``## Shared scenario coverage`` briefing section for
+    *repo_name*'s `reviews.require_shared_scenario` opt-in (#3489), or
+    ``[]`` when the repo hasn't opted in.
+
+    Mirrors `repo_focus_lines`'s "inert unless configured" shape (#3112) so
+    this rule changes nothing — not even prompt text — for a repo that
+    hasn't declared a conformance scenario suite. When configured, always
+    names the rule and the repo's scenario directory; when the free
+    `diff_missing_shared_scenario` check also fires for *diff_text*/
+    *completion_summary*, a mandatory ``request-changes`` instruction is
+    appended, naming the rule the same way the sealed-path tamper banner
+    names itself.
+    """
+    scenario_dir = reviews_cfg.require_shared_scenario.get(repo_name)
+    if not scenario_dir:
+        return []
+    lines = [
+        "",
+        "## Shared scenario coverage (`reviews.require_shared_scenario`, #3489)",
+        "",
+        "This repo opts into the shared-scenario review rule: a "
+        "behaviour-changing diff must add or extend a backend-neutral "
+        f"scenario under `{scenario_dir}/` (or a Tier-2 smoke-spec step) — "
+        "not only a single-backend test. \"If it works in one backend it "
+        "works in all\" only holds when behaviour is tested once, through "
+        "the shared scenario suite every backend runs. Pure refactors / "
+        "internal-only changes stay exempt — say so in the PR if that "
+        "applies, the same way CLAUDE.md's black-box rule is honored.",
+    ]
+    if diff_missing_shared_scenario(
+        diff_text,
+        repo_name=repo_name,
+        reviews_cfg=reviews_cfg,
+        completion_summary=completion_summary,
+    ):
+        lines.append("")
+        lines.append(
+            f"**This diff changes user-visible behavior but touches no file "
+            f"under `{scenario_dir}/` (and no Tier-2 smoke-spec step), and "
+            "claims no pure-refactor/internal-only exemption. Per the "
+            "`require_shared_scenario` rule, you MUST `request-changes`, "
+            "naming this rule — unless you independently determine this "
+            "diff really is a pure refactor / internal-only change the "
+            "static check couldn't see.**"
+        )
+    return lines
+
+
 def repo_focus_lines(reviews_cfg: ReviewsConfig, repo_name: str) -> list[str]:
     """Return the ``### Repo-specific focus`` block for *repo_name*, or ``[]``
     if the repo has no ``reviews.repo_overrides`` configured (#3112).
@@ -2002,6 +2155,14 @@ def build_review_briefing(
         lines.append("- Any security issues (injection, auth bypass, credential exposure)?")
 
     lines.extend(repo_focus_lines(reviews_cfg, repo_name))
+    lines.extend(
+        shared_scenario_focus_lines(
+            reviews_cfg,
+            repo_name,
+            diff_text=diff_text,
+            completion_summary=completion_summary,
+        )
+    )
 
     if reviews_cfg.reviewer_prompt.strip():
         lines.append("")
@@ -3396,6 +3557,25 @@ def dispatch_review(
                 "files changed — matches #2132's 'missing test only' pattern "
                 "(free static check, non-blocking; dispatching review as normal)",
                 completed.assignment_id,
+            )
+
+        # #3489: same free/non-blocking shape as the #2192 nudge above, for
+        # the opt-in "shared (backend-neutral) scenario" rule — inert (never
+        # logs) for a repo absent from `reviews.require_shared_scenario`.
+        if diff_missing_shared_scenario(
+            full_diff_text,
+            repo_name=repo.name,
+            reviews_cfg=config.reviews,
+            completion_summary=completed.completion_summary,
+        ):
+            log.warning(
+                "[review] %s: repo %r opted into reviews.require_shared_scenario "
+                "and this diff changes user-visible behavior but adds/extends no "
+                "shared scenario under %r (free static check, non-blocking; "
+                "dispatching review as normal — the reviewer's briefing names "
+                "the rule)",
+                completed.assignment_id, repo.name,
+                config.reviews.require_shared_scenario.get(repo.name),
             )
 
         # #1811: does the resolved review provider share the worker's model

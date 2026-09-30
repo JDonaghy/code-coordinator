@@ -181,6 +181,106 @@ reviews:
         load(p)
 
 
+# ── #3489: reviews.require_shared_scenario config parsing ──────────────────
+
+
+def test_reviews_config_require_shared_scenario_defaults_empty(tmp_path: Path) -> None:
+    """No ``reviews.require_shared_scenario`` in coordinator.yml must leave
+    the mapping empty — no existing deployment sees any behavior change."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.require_shared_scenario == {}
+
+
+def test_reviews_config_require_shared_scenario_parses_explicit_dir(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        """\
+repos:
+  - name: quadraui
+    github: acme/quadraui
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [quadraui]
+reviews:
+  require_shared_scenario:
+    quadraui: tests/conformance/scenarios
+"""
+    )
+    cfg = load(p)
+    assert cfg.reviews.require_shared_scenario == {
+        "quadraui": "tests/conformance/scenarios"
+    }
+
+
+def test_reviews_config_require_shared_scenario_true_uses_default_dir(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        """\
+repos:
+  - name: quadraui
+    github: acme/quadraui
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [quadraui]
+reviews:
+  require_shared_scenario:
+    quadraui: true
+"""
+    )
+    cfg = load(p)
+    from coord.config import DEFAULT_SHARED_SCENARIO_DIR
+    assert cfg.reviews.require_shared_scenario == {"quadraui": DEFAULT_SHARED_SCENARIO_DIR}
+
+
+def test_reviews_config_require_shared_scenario_rejects_unknown_repo(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        """\
+repos:
+  - name: api
+    github: acme/api
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [api]
+reviews:
+  require_shared_scenario:
+    ghost: tests/conformance/scenarios
+"""
+    )
+    from coord.config import ConfigError
+    with pytest.raises(ConfigError, match="unknown repo: 'ghost'"):
+        load(p)
+
+
+def test_reviews_config_require_shared_scenario_rejects_empty_string(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        """\
+repos:
+  - name: api
+    github: acme/api
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [api]
+reviews:
+  require_shared_scenario:
+    api: ""
+"""
+    )
+    from coord.config import ConfigError
+    with pytest.raises(ConfigError, match="require_shared_scenario\\[api\\]"):
+        load(p)
+
+
 def test_reviews_config_provider_defaults_to_none(tmp_path: Path) -> None:
     """#1811 regression: no ``reviews.provider`` in coordinator.yml must leave
     ``cfg.reviews.provider`` as ``None`` — the review dispatch path then
@@ -1004,6 +1104,223 @@ def test_diff_missing_test_coverage_recognizes_in_crate_rust_test_dir() -> None:
         "+mod new_thing_test;\n"
     )
     assert diff_missing_test_coverage(diff) is False
+
+
+# ── #3489: opt-in "shared (backend-neutral) scenario" review rule ──────────
+
+_VIMCODE_BEHAVIOR_DIFF = (
+    "diff --git a/src/gtk/window.rs b/src/gtk/window.rs\n"
+    "--- a/src/gtk/window.rs\n"
+    "+++ b/src/gtk/window.rs\n"
+    "@@ -1,2 +1,3 @@\n"
+    "+pub fn new_split() {}\n"
+)
+
+_VIMCODE_SINGLE_BACKEND_TEST_DIFF = _VIMCODE_BEHAVIOR_DIFF + (
+    "diff --git a/src/gtk/tests/window_test.rs b/src/gtk/tests/window_test.rs\n"
+    "--- a/src/gtk/tests/window_test.rs\n"
+    "+++ b/src/gtk/tests/window_test.rs\n"
+    "@@ -1,2 +1,3 @@\n"
+    "+fn test_new_split() {}\n"
+)
+
+_VIMCODE_SHARED_SCENARIO_DIFF = _VIMCODE_SINGLE_BACKEND_TEST_DIFF + (
+    "diff --git a/tests/conformance/scenarios/split.scn.json "
+    "b/tests/conformance/scenarios/split.scn.json\n"
+    "--- a/tests/conformance/scenarios/split.scn.json\n"
+    "+++ b/tests/conformance/scenarios/split.scn.json\n"
+    "@@ -1,2 +1,3 @@\n"
+    '+{"name": "split"}\n'
+)
+
+
+def test_diff_missing_shared_scenario_rejects_single_backend_test_only() -> None:
+    """A behaviour-changing diff with only a single-backend test, in a repo
+    that opted in, must flag as missing shared-scenario coverage."""
+    from coord.review import diff_missing_shared_scenario
+
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    assert (
+        diff_missing_shared_scenario(
+            _VIMCODE_SINGLE_BACKEND_TEST_DIFF, repo_name="vimcode", reviews_cfg=cfg,
+        )
+        is True
+    )
+
+
+def test_diff_missing_shared_scenario_accepts_diff_with_scenario_file() -> None:
+    """The same diff, plus a shared scenario file under the configured
+    directory, must be accepted (not flagged)."""
+    from coord.review import diff_missing_shared_scenario
+
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    assert (
+        diff_missing_shared_scenario(
+            _VIMCODE_SHARED_SCENARIO_DIFF, repo_name="vimcode", reviews_cfg=cfg,
+        )
+        is False
+    )
+
+
+def test_diff_missing_shared_scenario_accepts_tier2_smoke_spec_step() -> None:
+    """A Tier-2 smoke-spec step (issue's explicit carve-out) also satisfies
+    the rule, even outside the configured scenario_dir."""
+    from coord.review import diff_missing_shared_scenario
+
+    diff = _VIMCODE_SINGLE_BACKEND_TEST_DIFF + (
+        "diff --git a/docs/smoke-spec/split.md b/docs/smoke-spec/split.md\n"
+        "--- a/docs/smoke-spec/split.md\n"
+        "+++ b/docs/smoke-spec/split.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+- split: do X, expect Y\n"
+    )
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    assert (
+        diff_missing_shared_scenario(diff, repo_name="vimcode", reviews_cfg=cfg) is False
+    )
+
+
+def test_diff_missing_shared_scenario_inert_for_repo_not_opted_in() -> None:
+    """The rule is completely inert for a repo absent from
+    ``reviews.require_shared_scenario`` — same diff as the "rejects" case."""
+    from coord.review import diff_missing_shared_scenario
+
+    cfg = ReviewsConfig(require_shared_scenario={})
+    assert (
+        diff_missing_shared_scenario(
+            _VIMCODE_SINGLE_BACKEND_TEST_DIFF, repo_name="vimcode", reviews_cfg=cfg,
+        )
+        is False
+    )
+    cfg_other_repo = ReviewsConfig(require_shared_scenario={"quadraui": "tests/conformance/scenarios"})
+    assert (
+        diff_missing_shared_scenario(
+            _VIMCODE_SINGLE_BACKEND_TEST_DIFF, repo_name="vimcode", reviews_cfg=cfg_other_repo,
+        )
+        is False
+    )
+
+
+def test_diff_missing_shared_scenario_honors_stated_refactor_exemption() -> None:
+    """A stated pure-refactor/internal-only claim in completion_summary must
+    be honoured, the same way CLAUDE.md's black-box rule exempts it."""
+    from coord.review import diff_missing_shared_scenario
+
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    assert (
+        diff_missing_shared_scenario(
+            _VIMCODE_SINGLE_BACKEND_TEST_DIFF,
+            repo_name="vimcode",
+            reviews_cfg=cfg,
+            completion_summary="This is a pure refactor; no behavior change.",
+        )
+        is False
+    )
+
+
+def test_diff_missing_shared_scenario_no_flag_for_empty_or_internal_diff() -> None:
+    from coord.review import diff_missing_shared_scenario
+
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    assert diff_missing_shared_scenario(None, repo_name="vimcode", reviews_cfg=cfg) is False
+    assert diff_missing_shared_scenario("", repo_name="vimcode", reviews_cfg=cfg) is False
+    internal_diff = (
+        "diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md\n"
+        "--- a/docs/ARCHITECTURE.md\n"
+        "+++ b/docs/ARCHITECTURE.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+Some clarifying prose.\n"
+    )
+    assert (
+        diff_missing_shared_scenario(internal_diff, repo_name="vimcode", reviews_cfg=cfg)
+        is False
+    )
+
+
+def test_shared_scenario_focus_lines_empty_for_repo_not_opted_in() -> None:
+    from coord.review import shared_scenario_focus_lines
+
+    cfg = ReviewsConfig(require_shared_scenario={})
+    assert shared_scenario_focus_lines(cfg, "vimcode") == []
+
+
+def test_shared_scenario_focus_lines_names_rule_and_scenario_dir() -> None:
+    from coord.review import shared_scenario_focus_lines
+
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    lines = shared_scenario_focus_lines(cfg, "vimcode")
+    text = "\n".join(lines)
+    assert "require_shared_scenario" in text
+    assert "tests/conformance/scenarios" in text
+
+
+def test_shared_scenario_focus_lines_mandatory_banner_when_missing() -> None:
+    from coord.review import shared_scenario_focus_lines
+
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    lines = shared_scenario_focus_lines(
+        cfg, "vimcode", diff_text=_VIMCODE_SINGLE_BACKEND_TEST_DIFF,
+    )
+    text = "\n".join(lines)
+    assert "MUST" in text
+    assert "request-changes" in text
+
+
+def test_shared_scenario_focus_lines_no_banner_when_scenario_present() -> None:
+    from coord.review import shared_scenario_focus_lines
+
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    lines = shared_scenario_focus_lines(
+        cfg, "vimcode", diff_text=_VIMCODE_SHARED_SCENARIO_DIFF,
+    )
+    text = "\n".join(lines)
+    assert "MUST" not in text
+
+
+def test_build_review_briefing_includes_shared_scenario_section() -> None:
+    """End-to-end: an opted-in repo's briefing names the rule and the
+    scenario directory, and the mandatory banner fires for a diff that
+    changes behaviour without adding one."""
+    cfg = ReviewsConfig(require_shared_scenario={"vimcode": "tests/conformance/scenarios"})
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/vimcode/pull/42",
+        repo_github="acme/vimcode",
+        repo_name="vimcode",
+        issue_number=7,
+        issue_title="Add window split",
+        issue_body="Add a GTK window split command.",
+        branch="issue-7-split",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=cfg,
+        repo_claude_md=None,
+        diff_text=_VIMCODE_SINGLE_BACKEND_TEST_DIFF,
+    )
+    assert "require_shared_scenario" in briefing
+    assert "tests/conformance/scenarios" in briefing
+    assert "MUST" in briefing
+    assert "request-changes" in briefing
+
+
+def test_build_review_briefing_omits_shared_scenario_section_when_not_opted_in() -> None:
+    cfg = ReviewsConfig(require_shared_scenario={})
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/vimcode/pull/42",
+        repo_github="acme/vimcode",
+        repo_name="vimcode",
+        issue_number=7,
+        issue_title="Add window split",
+        issue_body="Add a GTK window split command.",
+        branch="issue-7-split",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=cfg,
+        repo_claude_md=None,
+        diff_text=_VIMCODE_SINGLE_BACKEND_TEST_DIFF,
+    )
+    assert "require_shared_scenario" not in briefing
 
 
 def test_briefing_test_author_touching_only_sealed_path_no_tamper() -> None:

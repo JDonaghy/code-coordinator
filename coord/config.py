@@ -169,6 +169,13 @@ class ConfigError(Exception):
     """Raised when coordinator.yml is missing, malformed, or fails validation."""
 
 
+# #3489: default repo-relative directory a repo's shared, backend-neutral
+# conformance scenarios live in when `reviews.require_shared_scenario`
+# opts a repo in with `true` rather than an explicit path string. Matches
+# quadraui's actual `tests/conformance/scenarios/*.scn.json` layout.
+DEFAULT_SHARED_SCENARIO_DIR = "tests/conformance/scenarios"
+
+
 @dataclass
 class HooksConfig:
     on_round_complete: list[str] = field(default_factory=list)
@@ -210,6 +217,35 @@ class ReviewsConfig:
         "Check for platform-specific code in shared/cross-platform paths",
     ])
     repo_overrides: dict[str, list[str]] = field(default_factory=dict)
+    # #3489: opt-in review rule — "if it works in one backend it works in
+    # all" only holds when behaviour is tested ONCE, through a shared,
+    # backend-neutral scenario suite every backend runs (quadraui's
+    # `tests/conformance/scenarios/*.scn.json` through `ConformanceDriver`).
+    # Without this, reviewers happily accept a single-backend test and the
+    # suites go lopsided — vimcode's driver suites are ~277 GTK / ~159 TUI /
+    # ~22 macOS / ~9 Windows `#[test]`s, and quadraui has only 19 shared
+    # scenarios to date.
+    #
+    # Keyed by repo name -> the repo-relative directory its shared scenarios
+    # live in (e.g. `tests/conformance/scenarios`). A repo absent from this
+    # mapping has NOT opted in and the rule is completely inert for it —
+    # `coord.review.diff_missing_shared_scenario` returns False before
+    # looking at the diff at all, so repos that don't declare a conformance
+    # suite see no behavior change from this feature existing. `true` (bool)
+    # is shorthand for `_DEFAULT_SHARED_SCENARIO_DIR` (parsed in
+    # `_parse_reviews`); an explicit string names a repo-specific location.
+    #
+    # Enforcement mirrors CLAUDE.md's existing black-box-coverage rule
+    # (`coord.review.diff_missing_test_coverage`, #2192): a free, path-only,
+    # non-blocking static nudge feeds the reviewer's own judgment via
+    # `build_review_briefing`'s prompt text, which names the rule and the
+    # repo's scenario directory and instructs the reviewer to request-changes
+    # when a behaviour-changing diff adds only a single-backend test. Pure
+    # refactors / internal-only changes stay exempt, the same way CLAUDE.md's
+    # black-box rule exempts them — honored the same way, by the diff simply
+    # touching no user-visible source, or by the worker's own stated
+    # refactor/internal-only claim in `completion_summary`.
+    require_shared_scenario: dict[str, str] = field(default_factory=dict)
     # Flood guard (incident 2026-06-08): bound *bulk* review dispatch so a
     # backlog "unmasking" (e.g. removing a gate that had been suppressing
     # reviews) can't fire hundreds of metered `claude -p` reviews in one pass.
@@ -3523,6 +3559,35 @@ def _parse_reviews(
                 f"reviews.repo_overrides[{repo_name}] must be a list of strings"
             )
     cfg.repo_overrides = overrides
+
+    # #3489: require_shared_scenario — opt-in per repo, keyed by repo name.
+    # Value is either `true` (shorthand for DEFAULT_SHARED_SCENARIO_DIR) or
+    # an explicit non-empty string naming the repo-relative scenario
+    # directory. A repo absent from this mapping is NOT opted in.
+    shared_scenario_raw = raw.get("require_shared_scenario", {}) or {}
+    if not isinstance(shared_scenario_raw, dict):
+        raise ConfigError(
+            "reviews.require_shared_scenario must be a mapping of repo → "
+            "scenario dir (string) or true"
+        )
+    shared_scenario: dict[str, str] = {}
+    for repo_name, value in shared_scenario_raw.items():
+        if not isinstance(repo_name, str):
+            raise ConfigError("reviews.require_shared_scenario keys must be repo names")
+        if repo_name not in repo_names:
+            raise ConfigError(
+                f"reviews.require_shared_scenario references unknown repo: {repo_name!r}"
+            )
+        if value is True:
+            shared_scenario[repo_name] = DEFAULT_SHARED_SCENARIO_DIR
+        elif isinstance(value, str) and value.strip():
+            shared_scenario[repo_name] = value.strip()
+        else:
+            raise ConfigError(
+                f"reviews.require_shared_scenario[{repo_name}] must be `true` "
+                "or a non-empty string (the repo-relative scenario directory)"
+            )
+    cfg.require_shared_scenario = shared_scenario
     return cfg
 
 
