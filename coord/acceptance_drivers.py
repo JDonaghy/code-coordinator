@@ -7,12 +7,14 @@ is the one seam that varies per medium — TUI (quadraui ``TuiDriver``), CLI
 *run* a repo's declared acceptance suite and *parse* its raw output into a
 normalized list of ``{"id": str, "status": "pass"|"fail"|"skip", "message":
 str}`` dicts (``cli-pytest`` additionally carries ``"expected"``/``"got"``
-on a failing test — see :func:`parse_pytest_junit_xml`). ``tui-tuidriver``,
-``cli-pytest`` (#1125), ``web-playwright`` (#1539), ``terraform``
-(#3232), and ``tui-pty`` (#3483) are implemented; other ``kind`` values are
-declared in ``coordinator.yml`` (see :class:`coord.config.AcceptanceConfig`)
-but rejected here with a clear "not yet implemented" error until their
-issues land (native).
+on a failing test — see :func:`parse_pytest_junit_xml`; ``win-native``
+additionally carries ``"capture_b64"`` on a failing step — see
+:func:`_run_win_native`). ``tui-tuidriver``, ``cli-pytest`` (#1125),
+``web-playwright`` (#1539), ``terraform`` (#3232), ``tui-pty`` (#3483), and
+``win-native`` (#3484) are implemented; other ``kind`` values are declared
+in ``coordinator.yml`` (see :class:`coord.config.AcceptanceConfig`) but
+rejected here with a clear "not yet implemented" error until their issues
+land.
 
 ``cli-pytest`` parses pytest's built-in ``--junit-xml`` report (a core
 pytest flag, not a plugin — no extra dependency required in the driven
@@ -61,6 +63,23 @@ seam: it resolves the smoke spec from the driver's ``entrypoint:`` (the
 ``tui-pty`` analogue of ``tui-tuidriver``'s own entrypoint-as-sealed-file
 convention) and hands off to :func:`coord.tui_pty_driver.run_smoke_spec`.
 
+``win-native`` (#3484, the Win32-native tier below ``tui-pty``) launches the
+driven repo's real compiled Windows exe — a GUI app in its own window, or a
+TUI binary hosted inside a real Windows Terminal/conhost window — and drives
+it with real ``SendInput``/``PostMessage`` input while probing real OS
+state: ``GetMenu``, ``WM_NCHITTEST``, and the UI Automation tree, with a
+``PrintWindow`` capture attached to every failing step as evidence. On
+2026-09-29 vimcode's window had a real native menu (``GetMenu`` -> 7 items)
+that was completely invisible because a custom caption left 0 px of
+non-client area, and no min/max/close — both passed every ``tui-tuidriver``/
+``tui-pty`` test, because neither ever asks the real OS those questions.
+All of the spec parsing, the Win32/UIA call seam, and the step executor live
+in :mod:`coord.win_native_driver` — see that module's docstring for the spec
+format. This adapter (:func:`_run_win_native`) is the same thin seam
+:func:`_run_tui_pty` is: it resolves the native spec from the driver's
+``entrypoint:`` and hands off to
+:func:`coord.win_native_driver.run_native_spec`.
+
 ``terraform`` additionally runs a deterministic policy gate (#3234, epic
 #3230 child 3) whenever the driven repo has opted in by carrying the
 convention files: ``tflint`` (rule-based HCL/provider checks — pinned
@@ -91,7 +110,10 @@ from pathlib import Path
 # Driver kinds this module knows how to run. Keep in sync with the adapters
 # implemented below — a kind can be *declared* in coordinator.yml ahead of its
 # adapter landing, but running it must fail loudly rather than silently no-op.
-SUPPORTED_KINDS = ("tui-tuidriver", "cli-pytest", "web-playwright", "terraform", "tui-pty")
+SUPPORTED_KINDS = (
+    "tui-tuidriver", "cli-pytest", "web-playwright", "terraform", "tui-pty",
+    "win-native",
+)
 
 # #2748 (IL-2): driver kinds whose `run` produces a real pass/fail verdict
 # but NOT yet a deterministic one, because an input they depend on hasn't
@@ -268,11 +290,12 @@ def run_driver(
     into a driver's own "wrote no report" crash message.
 
     *entrypoint* (``AcceptanceDriverConfig.entrypoint``) is only consulted
-    by ``tui-pty`` (#3483) — it names the repo-root-relative smoke-spec YAML
-    file (see :mod:`coord.tui_pty_driver`), the same way ``entrypoint``
-    already names ``tui-tuidriver``'s sealed Rust acceptance file for
-    :func:`coord.acceptance.acceptance_root_for_driver`. Every other kind
-    ignores it.
+    by ``tui-pty`` (#3483) and ``win-native`` (#3484) — it names the
+    repo-root-relative smoke/native-spec YAML file (see
+    :mod:`coord.tui_pty_driver`/:mod:`coord.win_native_driver`), the same
+    way ``entrypoint`` already names ``tui-tuidriver``'s sealed Rust
+    acceptance file for :func:`coord.acceptance.acceptance_root_for_driver`.
+    Every other kind ignores it.
     """
     if kind not in SUPPORTED_KINDS:
         raise DriverError(
@@ -294,6 +317,8 @@ def run_driver(
         return _run_terraform(run_command, cwd, timeout=timeout)
     if kind == "tui-pty":
         return _run_tui_pty(run_command, cwd, entrypoint, timeout=timeout)
+    if kind == "win-native":
+        return _run_win_native(run_command, cwd, entrypoint, timeout=timeout)
     return _run_generic(run_command, cwd, timeout=timeout)
 
 
@@ -650,6 +675,67 @@ def _run_tui_pty(run_command: str, cwd: str, entrypoint: str, *, timeout: int) -
         raise DriverError(f"tui-pty smoke spec is invalid: {e}") from e
     except TuiPtyRuntimeError as e:
         raise DriverError(f"tui-pty driver could not run: {e}") from e
+
+    exit_code = 0 if tests and all(t.get("status") != "fail" for t in tests) else 1
+    raw_output = "\n".join(
+        f"{t.get('status')}: {t.get('id')} {t.get('message', '')}".rstrip()
+        for t in tests
+    )
+    return DriverResult(exit_code=exit_code, tests=tests, raw_output=raw_output)
+
+
+def _run_win_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int) -> DriverResult:
+    """The ``win-native`` shape (#3484): *run_command* is the shell command
+    that launches the driven repo's real compiled Windows exe — the
+    platform-neutral native spec YAML that drives it lives at *entrypoint*
+    (repo-root-relative), the ``win-native`` analogue of ``tui-pty``'s own
+    ``entrypoint:`` convention (see :func:`_run_tui_pty` and the module
+    docstring).
+
+    All of the real Win32/UIA calls and the step executor live in
+    :mod:`coord.win_native_driver` — this function is the thin seam that
+    resolves *entrypoint* to a spec file and calls
+    :func:`coord.win_native_driver.run_native_spec`, then folds its
+    normalized ``tests`` list (each failing entry optionally carrying a
+    ``capture_b64`` ``PrintWindow`` snapshot) into a :class:`DriverResult`
+    the same way :func:`_run_tui_pty` does.
+
+    Raises :class:`DriverError` — never a bare exception — for a missing
+    ``entrypoint:``, a spec file that doesn't exist, or a malformed spec
+    (an invalid-YAML/unknown-step-type
+    :class:`coord.win_native_driver.WinNativeSpecError`). A process that
+    never launches, a window that never appears, or a failed probe do NOT
+    raise here — :func:`coord.win_native_driver.run_native_spec` folds those
+    into individual failing entries in ``tests`` instead.
+    """
+    from coord.win_native_driver import (  # noqa: PLC0415 — see module docstring on the deferred import
+        WinNativeRuntimeError,
+        WinNativeSpecError,
+        run_native_spec,
+    )
+
+    if not entrypoint:
+        raise DriverError(
+            "win-native driver requires an `entrypoint:` naming the native "
+            "spec YAML file (repo-root-relative) — none configured"
+        )
+    spec_path = Path(cwd) / entrypoint
+    if not spec_path.is_file():
+        raise DriverError(f"win-native spec not found: {spec_path}")
+
+    try:
+        spec_text = spec_path.read_text()
+    except OSError as e:
+        raise DriverError(f"win-native spec could not be read: {spec_path}: {e}") from e
+
+    try:
+        tests = run_native_spec(
+            spec_text, launch_command=run_command, cwd=cwd, timeout=timeout,
+        )
+    except WinNativeSpecError as e:
+        raise DriverError(f"win-native spec is invalid: {e}") from e
+    except WinNativeRuntimeError as e:
+        raise DriverError(f"win-native driver could not run: {e}") from e
 
     exit_code = 0 if tests and all(t.get("status") != "fail" for t in tests) else 1
     raw_output = "\n".join(

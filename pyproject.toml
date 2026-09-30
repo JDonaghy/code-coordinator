@@ -130,6 +130,18 @@ tui-pty = [
     "pyte>=0.8",
     "pywinpty>=2.0; sys_platform == 'win32'",
 ]
+# #3484: the `win-native` acceptance driver — probes a real Windows exe's
+# window with real Win32/UIA calls (GetMenu, WM_NCHITTEST, PrintWindow) and
+# the UI Automation tree. `comtypes` is the UI Automation client and is only
+# ever imported by `coord/win_native_driver.py`'s `Win32Calls` (Windows-only
+# at construction, same guard as `tui-pty`'s `WindowsConPtyChild`), so the
+# `sys_platform` marker means installing this extra on Linux/macOS pulls in
+# nothing. `coord/win_native_driver.py`'s `_import_uia` guards the import
+# and names this extra rather than a bare `ModuleNotFoundError`, mirroring
+# `tui_pty_driver.py`'s `_import_pyte` convention.
+win-native = [
+    "comtypes>=1.2; sys_platform == 'win32'",
+]
 # Convenience alias: "give me everything a full node runs".
 all = ["code-coordinator[server]", "code-coordinator[reports-xlsx]", "code-coordinator[tui-pty]"]
 dev = [
