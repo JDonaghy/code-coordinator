@@ -98,6 +98,23 @@ steps:
         assert spec.cols == 80
         assert spec.rows == 24
 
+    def test_explicit_zero_ms_is_honored_not_treated_as_absent(self) -> None:
+        # `int(entry.get("ms", 200) or 200)` would silently turn an
+        # explicit `ms: 0` into the 200 default — it must be honored as
+        # the literal value the spec author wrote.
+        spec = parse_smoke_spec(
+            "steps:\n  - type: wait_idle\n    ms: 0\n    timeout_ms: 0\n"
+        )
+        step = spec.steps[0]
+        assert step.ms == 0
+        assert step.timeout_ms == 0
+
+    def test_explicit_zero_seconds_is_honored_not_treated_as_absent(self) -> None:
+        spec = parse_smoke_spec(
+            "steps:\n  - type: expect_silent\n    seconds: 0\n"
+        )
+        assert spec.steps[0].seconds == 0.0
+
     def test_invalid_yaml_raises_spec_error(self) -> None:
         with pytest.raises(TuiPtySpecError, match="not valid YAML"):
             parse_smoke_spec("steps: [")
@@ -150,6 +167,23 @@ steps:
         with pytest.raises(TuiPtySpecError, match="attr"):
             parse_smoke_spec(
                 "steps:\n  - type: expect_screen\n    attr: not-a-mapping\n"
+            )
+
+    def test_expect_screen_with_neither_text_nor_attr_raises(self) -> None:
+        # (#2096) A step with nothing to assert against would always pass
+        # regardless of what's on screen — its failing verdict must be
+        # unreachable at parse time, not just at runtime.
+        with pytest.raises(TuiPtySpecError, match="text.*and/or.*attr"):
+            parse_smoke_spec("steps:\n  - type: expect_screen\n    id: foo\n")
+
+    def test_expect_screen_with_only_region_and_no_text_or_attr_raises(self) -> None:
+        # A `region:` alone narrows *where* a comparison would look but
+        # still supplies nothing to compare against — same always-passes
+        # trap as omitting region entirely.
+        with pytest.raises(TuiPtySpecError, match="text.*and/or.*attr"):
+            parse_smoke_spec(
+                "steps:\n  - type: expect_screen\n"
+                "    region: {row: 0, col: 0, height: 1, width: 5}\n"
             )
 
 
