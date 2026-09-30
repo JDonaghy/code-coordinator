@@ -450,6 +450,33 @@ class TestGateAStatus:
             reason = gate_a_status(repo, cfg, 9)
         assert reason is None
 
+    def test_rate_limited_read_is_not_reported_as_a_missing_contract(self) -> None:
+        """#2973: `coord milestone dispatch`/`coord milestone gate-b` echo
+        this reason verbatim to a human. A rate-limited read must not be
+        folded into "does not exist" — that outcome recommends `coord
+        acceptance mock`, which against a milestone that already has an
+        approved contract dispatches a duplicate mock-author."""
+        from coord.github_ops import GhRateLimitError
+
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        with patch(
+            "coord.github_ops.get_repo_file",
+            side_effect=GhRateLimitError(
+                "gh api repos/acme/api/contents/tests/acceptance/ms-9/"
+                "contract.md?ref=main failed: API rate limit exceeded for "
+                "user ID 12345",
+                secondary=True,
+            ),
+        ):
+            reason = gate_a_status(repo, cfg, 9)
+        assert reason is not None
+        assert "does not exist" not in reason
+        assert "coord acceptance mock" not in reason
+        assert "rate limit" in reason.lower()
+        assert "retry" in reason.lower()
+
+
 
 class TestGateAStatusRelocatedSlices:
     """#2896: a repo with an entrypoint-linked route (the relocated
@@ -509,6 +536,53 @@ class TestGateAStatusRelocatedSlices:
         assert reason is not None
         assert "tests/acceptance/ms-65/contract.md" in reason
         assert "tui/tests/acceptance/ms-65/contract.md" in reason
+
+    def test_a_later_candidate_confirming_existence_wins_over_an_earlier_rate_limit(
+        self,
+    ) -> None:
+        """#2973: mirrors `coord.commands.gate_a._fetch_contract`'s
+        precedence rule — a confirmed existence on ANY candidate wins
+        outright, even after an earlier candidate's transient failure. Only
+        when NOTHING confirms existence does the earlier transient failure
+        make the whole read inconclusive (see the next test)."""
+        from coord.github_ops import GhTransientError
+
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+        calls: list[str] = []
+
+        def _check(repo_github: str, path: str, branch: str) -> bool:
+            calls.append(path)
+            if len(calls) == 1:
+                raise GhTransientError("secondary_rate_limit backoff active")
+            return True
+
+        assert gate_a_status(repo, cfg, 65, file_exists=_check) is None
+        assert len(calls) == 2
+
+    def test_an_unresolved_transient_failure_is_reported_distinctly_from_a_404(
+        self,
+    ) -> None:
+        """#2973: the first candidate's read fails transiently, the second
+        genuinely 404s — the transient failure must still win (it's
+        inconclusive, not a confirmed absence), and the block reason must
+        say so rather than recommending `coord acceptance mock`."""
+        from coord.github_ops import GhTransientError
+
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+
+        def _check(repo_github: str, path: str, branch: str) -> bool:
+            if path == "tests/acceptance/ms-65/contract.md":
+                raise GhTransientError("secondary_rate_limit backoff active")
+            return False
+
+        reason = gate_a_status(repo, cfg, 65, file_exists=_check)
+        assert reason is not None
+        assert "does not exist" not in reason
+        assert "coord acceptance mock" not in reason
+        assert "rate limit" in reason.lower() or "secondary_rate_limit" in reason
+        assert "retry" in reason.lower()
 
 
 # ── issue_oracle_ready (#1138, docs/ORACLE_LOOP.md issue-level gate) ─────────
@@ -928,6 +1002,55 @@ class TestIssueOracleReady:
             "acme/api", "tests/acceptance/ms-37/manifest.yml", branch="main",
         )
 
+    def test_rate_limited_default_file_exists_fails_open_without_crashing(self) -> None:
+        """#2973: `issue_oracle_ready`'s own docstring says a Gate-A-not-yet-
+        satisfied outcome (confirmed 404 OR now, inconclusive) is a no-op —
+        dispatch proceeds as if this gate doesn't apply, rather than firing
+        a confusing refusal before the contract even exists. A rate-limited
+        existence read must reach that same no-op WITHOUT raising through
+        `issue_oracle_ready` — this is `coord.dispatch.
+        enforce_oracle_readiness`'s hard gate on every Work dispatch, so an
+        uncaught exception here would turn one rate-limited read into a
+        fleet-wide dispatch outage, exactly the failure mode this module's
+        fail-soft design exists to avoid."""
+        from coord.github_ops import GhRateLimitError
+
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        with patch(
+            "coord.github_ops.get_repo_file",
+            side_effect=GhRateLimitError("secondary_rate_limit backoff active"),
+        ):
+            readiness = issue_oracle_ready(repo, cfg, 37, 1118)
+        assert readiness.applies is False
+        assert readiness.reason is None
+
+    def test_manifest_read_transient_error_degrades_to_no_slice_without_crashing(
+        self,
+    ) -> None:
+        """#2973: once Gate A's existence check has passed, a *separate*
+        transient failure reading the (advisory) manifest/exempt data must
+        still degrade to "no slice authored yet" — the pre-existing
+        fail-soft behaviour for a genuine 404 — rather than propagating as
+        an uncaught exception."""
+        from coord.github_ops import GhTransientError
+
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+
+        def _fetch(repo_github: str, path: str, branch: str) -> str | None:
+            if path.endswith("contract.md"):
+                return CONTRACT
+            raise GhTransientError("secondary_rate_limit backoff active")
+
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=_fetch,
+            fetch_gate_a_approval=_approval(),
+        )
+        assert readiness.applies is True
+        assert readiness.has_slice is False
+
 
 class TestIssueOracleReadyRelocatedSlices:
     """#2896: ms-65's contract/manifest live under
@@ -991,6 +1114,39 @@ class TestIssueOracleReadyRelocatedSlices:
         assert readiness.applies is True
         assert readiness.has_slice is False
         assert readiness.reason is not None
+
+    def test_transient_failure_on_one_candidate_does_not_crash_the_signoff_read(
+        self,
+    ) -> None:
+        """#2973: the legacy repo-root candidate rate-limits, the relocated
+        candidate is the real one and has content — `gate_a_status` already
+        passes on the relocated candidate (see
+        `TestGateAStatusRelocatedSlices`); `gate_a_signoff`'s own content
+        read must likewise keep walking past the transient failure rather
+        than raising through `issue_oracle_ready`."""
+        from coord.github_ops import GhTransientError
+
+        cfg = self._cfg()
+        repo = cfg.repo("claude-coordinator")
+        mapping = {
+            "tui/tests/acceptance/ms-65/contract.md": CONTRACT,
+            "tui/tests/acceptance/ms-65/manifest.yml": "tests:\n  ms65::a: 2282\n",
+        }
+
+        def fetch(repo_github: str, path: str, branch: str) -> str | None:
+            if path == "tests/acceptance/ms-65/contract.md":
+                raise GhTransientError("secondary_rate_limit backoff active")
+            return mapping.get(path)
+
+        readiness = issue_oracle_ready(
+            repo, cfg, 65, 2282,
+            fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(repo_name="claude-coordinator", milestone=65),
+        )
+        assert readiness.applies is True
+        assert readiness.has_slice is True
+        assert readiness.reason is None
+        assert readiness.gate_a_state == "approved"
 
 
 # ── fetch_milestone_context ──────────────────────────────────────────────────

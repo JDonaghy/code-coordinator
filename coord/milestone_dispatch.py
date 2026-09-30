@@ -197,6 +197,11 @@ def is_milestone_complete(ctx: MilestoneContext) -> bool:
 
 # (repo_github, path, branch) -> True if the file exists at that ref.
 # Injected so tests never hit `gh` — mirrors ``coord.claim``'s BranchLookup.
+#
+# #2973: may also raise ``coord.github_ops.GhTransientError`` — a failed
+# read (auth, network, a GitHub rate limit) is a different claim than a
+# confirmed 404, and callers (``gate_a_status``) must not fold the two
+# together the way the pre-#2973 default implementation did.
 GateAFileExists = Callable[[str, str, str], bool]
 
 
@@ -206,6 +211,11 @@ def _default_gate_a_file_exists(repo_github: str, path: str, branch: str) -> boo
     try:
         github_ops.get_repo_file(repo_github, path, branch=branch)
         return True
+    except github_ops.GhTransientError:
+        # #2973: a rate-limited (or otherwise transient) read is NOT a
+        # confirmed absence — let it propagate so `gate_a_status` can tell
+        # the two apart, instead of silently becoming `False` here.
+        raise
     except RuntimeError:
         return False
 
@@ -235,17 +245,42 @@ def gate_a_status(
     checking only the legacy repo-root path and reporting a false "Gate A
     not satisfied" for a milestone whose contract already exists, just
     somewhere else.
+
+    #2973: a candidate whose read *fails* (auth, network, a GitHub rate
+    limit — :class:`coord.github_ops.GhTransientError`) is a different claim
+    than a candidate that genuinely 404s, and only the latter justifies the
+    "run `coord acceptance mock`" remedy below — that remedy dispatches a
+    duplicate mock-author against a milestone that may already have an
+    approved contract. Mirrors :func:`coord.commands.gate_a._fetch_contract`:
+    a confirmed existence on ANY candidate wins outright (even after an
+    earlier candidate's transient failure), but a transient failure on any
+    checked candidate makes the whole read inconclusive when nothing else
+    confirms existence — reported distinctly, with no dispatch-a-mock-author
+    remedy attached.
     """
     if not config.acceptance.has_driver(repo_cfg.name):
         return None
 
+    from coord import github_ops  # noqa: PLC0415
     from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
     candidates = gate_a_contract_candidates(config, repo_cfg.name, milestone_number)
     check = file_exists or _default_gate_a_file_exists
+    transient: github_ops.GhTransientError | None = None
     for path in candidates:
-        if check(repo_cfg.github, path, repo_cfg.default_branch):
-            return None
+        try:
+            if check(repo_cfg.github, path, repo_cfg.default_branch):
+                return None
+        except github_ops.GhTransientError as e:
+            transient = transient or e
+            continue
+    if transient is not None:
+        return (
+            f"Gate A undetermined: could not read {repo_cfg.name}'s Gate-A "
+            f"contract on {repo_cfg.default_branch!r} ({transient}). This is "
+            "a failed read, not a confirmed absence — the contract may well "
+            "exist. Retry once the rate limit clears."
+        )
     named = " or ".join(repr(p) for p in candidates)
     return (
         f"Gate A not satisfied: {named} does not exist yet on "
@@ -257,6 +292,17 @@ def gate_a_status(
 
 # (repo_github, path, branch) -> file content, or None if it doesn't exist.
 # Injected so tests never hit `gh` — mirrors GateAFileExists above.
+#
+# #2973: may also raise ``coord.github_ops.GhTransientError`` — same reason
+# as ``GateAFileExists`` above. ``gate_a_signoff_status`` and
+# ``issue_oracle_ready`` both build a ``GateAFileExists`` closure on top of
+# this fetch (memoised, so the existence probe and the content read share
+# one call), so this must propagate the same distinction they'd otherwise
+# lose. Callers that only want *content*, never existence — the manifest/
+# exempt reads in ``_fetch_manifest_data`` and the contract-hashing loop in
+# ``gate_a_signoff`` — catch it locally and keep degrading to ``None``,
+# their pre-#2973 behaviour: those reads are advisory/best-effort, not the
+# gate whose misreporting #2973 is about.
 ManifestFetch = Callable[[str, str, str], "str | None"]
 
 
@@ -265,6 +311,8 @@ def _default_fetch_repo_file(repo_github: str, path: str, branch: str) -> str | 
 
     try:
         return github_ops.get_repo_file(repo_github, path, branch=branch)
+    except github_ops.GhTransientError:
+        raise
     except RuntimeError:
         return None
 
@@ -313,6 +361,7 @@ def _fetch_manifest_data(
     legacy manifest and/or fragment file; a milestone's data lives under
     exactly one, so the first root that produces anything wins.
     """
+    from coord import github_ops  # noqa: PLC0415
     from coord.acceptance import (  # noqa: PLC0415
         ACCEPTANCE_DIRNAME,
         MANIFEST_FRAGMENTS_DIRNAME,
@@ -326,7 +375,14 @@ def _fetch_manifest_data(
     def _fetch_one(dir_path: str, filename_stem: str) -> "tuple[ManifestData, bool]":
         for ext in (".yml", ".yaml", ".json"):
             path = f"{dir_path}/{filename_stem}{ext}"
-            content = fetch(repo_github, path, branch)
+            try:
+                content = fetch(repo_github, path, branch)
+            except github_ops.GhTransientError:
+                # #2973: this is an advisory manifest/exempt read, not the
+                # contract-existence gate — a transient GitHub error here
+                # degrades to "no manifest data yet" exactly like a genuine
+                # 404 always has, rather than crashing dispatch.
+                content = None
             if content is None:
                 continue
             try:
@@ -433,11 +489,23 @@ def gate_a_signoff(
     for the common single-candidate case).
     """
     from coord import gate_a as gate_a_mod  # noqa: PLC0415
+    from coord import github_ops  # noqa: PLC0415
     from coord.acceptance import gate_a_contract_candidates  # noqa: PLC0415
 
     contract_text: str | None = None
     for path in gate_a_contract_candidates(config, repo_cfg.name, milestone_number):
-        contract_text = fetch(repo_cfg.github, path, repo_cfg.default_branch)
+        try:
+            contract_text = fetch(repo_cfg.github, path, repo_cfg.default_branch)
+        except github_ops.GhTransientError:
+            # #2973: by the time this runs, `gate_a_status` has already
+            # confirmed SOME candidate exists (that's the precondition every
+            # caller of this checks first) — a transient failure re-reading
+            # a candidate here (this loop re-walks the same list, and a
+            # not-yet-memoised path can still hit a fresh rate limit) just
+            # means this particular candidate isn't the hashable one; keep
+            # walking rather than letting the read crash the signoff check.
+            contract_text = None
+            continue
         if contract_text is not None:
             break
     return gate_a_mod.evaluate(
