@@ -980,7 +980,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 pass
 
         all_assignments = list(board.active) + list(board.completed)
-        session_usage = build_session_usage(all_assignments, started_at=started_at)
+        session_usage = build_session_usage(all_assignments, started_at=started_at, cfg=cfg)
         burn_line = format_burn_rate_line(session_usage)
         if burn_line:
             click.echo("")
@@ -1103,7 +1103,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         machine_by_aid = {
             a.assignment_id: a.machine_name for a in rows if a.assignment_id
         }
-        usage = build_session_usage(rows, remote_by_id=agent_completed or None)
+        usage = build_session_usage(rows, remote_by_id=agent_completed or None, cfg=cfg)
         for au in usage.assignments:
             # #3376 review round 2: `cost_unknown` means no local log AND no
             # remote entry. That is the ghost-dispatch signal ONLY if this
@@ -2992,6 +2992,14 @@ def usage(
             pass
 
     # Optionally fetch remote cost data for assignments without local logs.
+    # #2305: cfg is only loaded here (not unconditionally) — the bare
+    # `coord usage` view has always worked with no coordinator.yml present
+    # at all (see TestUsageCommandBareViewHonorsWindowFlags), and that must
+    # stay true. When it IS loaded (here, or by --remote below), it's
+    # threaded into build_session_usage() so a tier-named provider (e.g.
+    # "oc-mid") resolves correctly instead of degrading to ClaudeProvider
+    # log parsing.
+    cfg: "Config | None" = None
     remote_by_id: dict[str, dict] = {}
     if remote and all_assignments:
         cfg = _load_config(config_path)
@@ -3027,6 +3035,7 @@ def usage(
         all_assignments,
         remote_by_id=remote_by_id if remote_by_id else None,
         started_at=started_at,
+        cfg=cfg,
     )
     click.echo(format_usage_report(session, window_label=window_label))
 

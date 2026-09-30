@@ -79,6 +79,7 @@ from coord.worker_events import (
 )
 
 if TYPE_CHECKING:
+    from coord.config import Config
     from coord.providers.base import Provider
 
 # ── the two classes ─────────────────────────────────────────────────────────
@@ -461,6 +462,7 @@ def classify_log(
     tail_bytes: int = 65536,
     provider_name: str | None = None,
     provider: "Provider | None" = None,
+    cfg: "Config | None" = None,
 ) -> FailureClassification:
     """Classify a worker's terminal state from its log.
 
@@ -483,6 +485,14 @@ def classify_log(
     behaviour for every existing caller that doesn't pass it. *provider* is
     an escape hatch for tests to pass an already-constructed provider
     directly, bypassing name resolution.
+
+    *cfg* (#2305): the coordinator's :class:`~coord.config.Config`, passed
+    straight through to :func:`coord.providers.get_provider` so a
+    tier-named ``providers.definitions`` entry (e.g. ``oc-mid``) resolves to
+    its real backend instead of silently degrading to
+    :class:`~coord.providers.claude.ClaudeProvider` — *provider_name* alone
+    only ever matches the built-in type names. ``None`` (the default)
+    preserves pre-#2305 behaviour.
 
     #1710 NOTE — a documented, narrow behaviour difference from the
     pre-#1710 implementation: that version additionally scanned the raw
@@ -509,7 +519,7 @@ def classify_log(
 
     if provider is None:
         from coord.providers import get_provider  # noqa: PLC0415
-        provider = get_provider(provider_name)
+        provider = get_provider(provider_name, cfg=cfg)
     summary = provider.parse_log(log_path, tail_bytes=tail_bytes)
 
     classification = classify_failure(

@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 import coord.state as state_mod
 from coord.cli import main
+from coord.config import Config, ProviderDef, ProvidersConfig
 from coord.models import Assignment
 from coord.usage import (
     HIGH_BURN_RATE_USD_PER_HOUR,
@@ -60,6 +61,7 @@ def _assignment(
     model: str | None = None,
     dispatched_at: float | None = None,
     finished_at: float | None = None,
+    provider_name: str | None = None,
 ) -> Assignment:
     return Assignment(
         machine_name="m1",
@@ -71,6 +73,7 @@ def _assignment(
         model=model,
         dispatched_at=dispatched_at,
         finished_at=finished_at,
+        provider_name=provider_name,
     )
 
 
@@ -373,6 +376,41 @@ class TestCollectUsage:
         )
         a = _assignment(assignment_id="abc123")
         result = collect_usage([a], logs_dir=logs_dir)
+        assert result[0].cost_unknown is False
+
+    def test_tier_named_provider_cost_unknown_wrong_without_cfg(
+        self, tmp_path: Path
+    ) -> None:
+        """#2305 regression: the `get_provider()` call at
+        `coord/usage.py:~286` (the "neither local log nor remote data"
+        fallback) has no `cfg` to consult here — a tier name that maps to a
+        non-cost-reporting backend (`claude-pty`) degrades to the built-in
+        `ClaudeProvider`, which *does* report cost, so this ghost-dispatch
+        row wrongly flags `cost_unknown=True` for a provider that was never
+        expected to report cost in the first place."""
+        logs_dir = tmp_path / "logs"  # empty — no local log
+        a = _assignment(assignment_id="ghost002", provider_name="interactive-tier")
+        result = collect_usage([a], logs_dir=logs_dir)  # no cfg
+        assert result[0].cost_unknown is True
+
+    def test_tier_named_provider_cost_unknown_correct_with_cfg(
+        self, tmp_path: Path
+    ) -> None:
+        """#2305 fix: `cfg` threaded through `collect_usage` ->
+        `_assignment_to_usage` -> `get_provider()` resolves
+        `interactive-tier` to `claude-pty` (`cost_reporting=False`), so the
+        ghost-dispatch row correctly stays `cost_unknown=False` — there was
+        never any cost to have captured."""
+        logs_dir = tmp_path / "logs"  # empty — no local log
+        a = _assignment(assignment_id="ghost002", provider_name="interactive-tier")
+        cfg = Config(
+            repos=[],
+            machines=[],
+            providers=ProvidersConfig(
+                definitions={"interactive-tier": ProviderDef(type="claude-pty")}
+            ),
+        )
+        result = collect_usage([a], logs_dir=logs_dir, cfg=cfg)
         assert result[0].cost_unknown is False
 
 

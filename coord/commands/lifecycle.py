@@ -428,7 +428,7 @@ def done(config_path: Path) -> None:
             pass
 
     all_assignments = list(board.active) + list(board.completed)
-    session_usage = build_session_usage(all_assignments, started_at=started_at)
+    session_usage = build_session_usage(all_assignments, started_at=started_at, cfg=cfg)
     total_cost = session_usage.total_cost_usd
 
     click.echo("")
