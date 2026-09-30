@@ -1,0 +1,996 @@
+"""``win-native`` acceptance driver — Tier 2's Windows-native tier (#3484).
+
+``tui-pty`` (#3483) proved that an in-process harness can't see real terminal
+byte behaviour. This module is the next rung down: on 2026-09-29 vimcode's
+Windows window had a real native menu attached (``GetMenu`` -> 7 items) that
+was invisible because quadraui#1199's custom caption left 0 px of
+non-client area, and the window had no min/max/close — both passed *every*
+test at the ``tui-tuidriver``/``tui-pty`` tiers, because neither ever asks
+the real OS "is there a menu bar here?" or "what does a mouse click at this
+pixel actually hit?". Those are Win32 questions, answerable only by asking
+Win32.
+
+This driver launches the driven repo's real compiled GUI/TUI exe, finds its
+real top-level window, and probes it with real OS calls:
+
+- ``GetMenu``/``GetMenuItemCount``/``GetMenuString`` — does a native menu
+  bar exist, and what's on it.
+- ``WM_NCHITTEST`` — what does the OS think is at a given screen point
+  (``HTCLOSE``, ``HTCAPTION``, ``HTCLIENT``, ...).
+- the UI Automation tree — focusable/named elements by role+name, the same
+  way a screen reader (or a real user tabbing through the app) would see
+  it.
+- ``SendInput``/``PostMessage`` — real input, not an in-process event queue.
+- ``PrintWindow`` — captures the window even when it's covered by another
+  one, attached as evidence to every *failing* step (see
+  :meth:`NativeRunner._attach_capture_if_possible`).
+
+**Injectable OS-call seam.** Every actual Win32/UIA call is one method on
+the :class:`WinCalls` protocol, implemented for real by :class:`Win32Calls`
+(Windows-only, ``ctypes`` + the optional ``comtypes`` UI Automation client —
+the ``win-native`` extra). :class:`NativeRunner` — the spec-step executor —
+never calls a Win32 API directly; it only calls through ``WinCalls``. This
+is the same seam :mod:`coord.tui_pty_driver` uses for ``PtyChild``: it is
+what makes the spec-to-Win32 *translation* logic (parsing, step sequencing,
+pass/fail, capture-on-failure) unit-testable on any platform, with a scripted
+fake standing in for the OS (see ``tests/test_win_native_driver.py``) — a
+real run against a real exe on real Windows hardware (dell64) is out of
+reach for this repo's own test suite and is exercised at the operator level,
+the same split :mod:`coord.tui_pty_driver`'s own docstring calls out for
+ConPTY.
+
+**Safety: kill only the PID this driver itself launched.** :meth:`WinCalls.kill`
+takes a ``pid: int`` — the exact process id :meth:`WinCalls.launch`/
+:meth:`WinCalls.launch_in_terminal` returned — and nothing in this module
+ever looks a process up by its executable's own filename to terminate it.
+Windows Terminal and conhost are both things an operator is very likely
+also running their *own* session in; a teardown that matched on a shared
+host process's filename would be one bad assumption away from killing the
+operator's own work, not just this driver's child. See
+``tests/test_win_native_driver.py``'s
+``test_no_image_name_kill_path_exists_in_the_module`` — a source-level
+regression guard, not just a behavioral one.
+
+**Spec steps** (:func:`parse_native_spec`, YAML — the ``win-native``
+sibling of ``tui-pty``'s smoke spec):
+
+- ``launch`` — start the exe (or, in terminal-hosted mode, the exe inside a
+  real terminal host — see below), find its real top-level window, and size
+  it deterministically via ``MoveWindow``.
+- ``key: <name>`` / ``click: {x, y, button}`` — real input at *screen*
+  pixel coordinates relative to the window's client origin, via
+  :meth:`WinCalls.send_key`/:meth:`WinCalls.send_click`.
+- ``wait: {ms}`` — a plain deterministic pause.
+- ``capture`` — an explicit ``PrintWindow`` evidence snapshot, attached to
+  this step's own result (pass or fail) as ``capture_b64``.
+- ``expect_menu: {items, exact}`` — ``GetMenu`` must return a real native
+  menu (not ``NULL``) whose item labels contain (or, with ``exact: true``,
+  exactly equal) *items* — the vimcode#1199/#1228 regression check.
+- ``expect_hit: {x, y, ht}`` — ``WM_NCHITTEST`` at ``(x, y)`` must equal
+  *ht* (one of the named ``HT*`` hit-test codes, e.g. ``HTCLOSE``).
+- ``expect_a11y: {role, name}`` — the UI Automation tree must contain a
+  visible element matching *role* (exact, case-insensitive) and *name*
+  (substring, case-insensitive) right now.
+- ``expect_a11y_within: {role, name, timeout_ms}`` — the same match, but
+  polled repeatedly until it appears or *timeout_ms* elapses.
+- ``expect_closed: {timeout_ms}`` — the window must actually stop existing
+  (``IsWindow`` re-polled until false) within *timeout_ms*. This is the
+  "Close actually closes the window" check (quadraui#1228) — per #2096, a
+  click is confirmed closed by *observing the window gone afterward*, never
+  by the mere fact that the click was sent without an exception.
+
+**Terminal-hosted mode** (added 2026-09-30, vimcode#1634-#1636: three bugs
+that all pass under a raw ConPTY — ``tui-pty``'s own tier — yet reproduce
+for an operator in a real terminal *window*, because the remaining cause
+lives in the terminal emulator layer, which only a window-level driver can
+see). ``mode: terminal`` plus ``terminal_app: windows-terminal|conhost``
+launches the TUI binary inside a real Windows Terminal or legacy conhost
+window rather than probing the exe's own top-level window directly, and adds
+three more steps:
+
+- ``expect_idle_stable: {ms, interval_ms}`` — ``PrintWindow`` the terminal
+  window repeatedly every *interval_ms* (default 100) across a full *ms*
+  window (default 5000) and fail if any two consecutive captures differ —
+  the vimcode#1634 idle-flicker oracle: a genuinely idle terminal produces
+  byte-identical repaints; a ~1 Hz flicker does not.
+- ``expect_menu_latency: {x, y, button, role, name, max_ms}`` — real-click
+  (default ``button: right``) at ``(x, y)``, then time until a matching UI
+  Automation element (default ``role: MenuItem``) appears, failing if it
+  never does within *max_ms* — the vimcode#1635 right-click-menu-latency
+  oracle.
+- ``expect_panel_switch: {x, y, role, name, timeout_ms}`` — real-click at
+  ``(x, y)`` (an activity-bar icon), then assert a matching UI Automation
+  element (the switched-to panel) appears within *timeout_ms* — the
+  vimcode#1636 dead-activity-bar-click oracle.
+
+Both of the latter two perform their own triggering click as part of the
+step — the latency/switch being measured starts at that exact ``SendInput``
+call, not at some earlier unrelated step, since a separately-timed
+``click`` step would leave an unbounded, unmeasured gap between the input
+and the start of the timing window.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+import subprocess
+import time
+from dataclasses import dataclass
+from typing import Protocol
+
+import yaml
+
+
+class WinNativeSpecError(Exception):
+    """Raised for a malformed native spec: invalid YAML, a missing/empty
+    ``steps:`` list, an unknown step ``type``, a missing required field, an
+    unrecognized button/hit-test-code/mode/terminal_app, or a ``mode:
+    terminal`` spec missing ``terminal_app:``."""
+
+
+class WinNativeRuntimeError(Exception):
+    """Raised when the native driver itself can't run: not on Windows, a
+    missing optional dependency (the ``win-native`` extra), the launched
+    process/window never appearing, or a step referencing a window before
+    any ``launch`` step ran."""
+
+
+# ── native spec model ───────────────────────────────────────────────────────
+
+_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "launch": (),
+    "key": ("key",),
+    "click": ("x", "y"),
+    "wait": ("ms",),
+    "capture": (),
+    "expect_menu": ("items",),
+    "expect_hit": ("x", "y", "ht"),
+    "expect_a11y": ("role", "name"),
+    "expect_a11y_within": ("role", "name"),
+    "expect_closed": (),
+    "expect_idle_stable": (),
+    "expect_menu_latency": ("x", "y"),
+    "expect_panel_switch": ("x", "y", "role", "name"),
+}
+
+_VALID_BUTTONS = ("left", "right", "middle")
+_VALID_MODES = ("window", "terminal")
+_VALID_TERMINAL_APPS = ("windows-terminal", "conhost")
+
+# Named `WM_NCHITTEST` return codes a spec author can reference by name
+# rather than a raw integer — the actual Win32 `HT*` constants, both
+# directions of this mapping live in :data:`_HT_CODES` below (shared with
+# :class:`Win32Calls`'s real translation).
+_HT_CODES: dict[str, int] = {
+    "HTERROR": -2, "HTTRANSPARENT": -1, "HTNOWHERE": 0, "HTCLIENT": 1,
+    "HTCAPTION": 2, "HTSYSMENU": 3, "HTGROWBOX": 4, "HTSIZE": 4, "HTMENU": 5,
+    "HTHSCROLL": 6, "HTVSCROLL": 7, "HTMINBUTTON": 8, "HTMAXBUTTON": 9,
+    "HTLEFT": 10, "HTRIGHT": 11, "HTTOP": 12, "HTTOPLEFT": 13,
+    "HTTOPRIGHT": 14, "HTBOTTOM": 15, "HTBOTTOMLEFT": 16, "HTBOTTOMRIGHT": 17,
+    "HTBORDER": 18, "HTREDUCE": 8, "HTZOOM": 9, "HTSIZEFIRST": 10,
+    "HTSIZELAST": 17, "HTOBJECT": 19, "HTCLOSE": 20, "HTHELP": 21,
+}
+_HT_CODES_BY_VALUE: dict[int, str] = {v: k for k, v in reversed(list(_HT_CODES.items()))}
+
+
+@dataclass(frozen=True)
+class NativeStep:
+    """One parsed step of a win-native spec. Mirrors
+    :class:`coord.tui_pty_driver.SmokeStep`'s "every unused field keeps its
+    default" shape — callers never have to branch on ``kind`` before reading
+    one."""
+
+    kind: str
+    index: int
+    id: str = ""
+    key: str = ""
+    x: int = 0
+    y: int = 0
+    button: str = ""
+    ms: int = 0
+    interval_ms: int = 100
+    timeout_ms: int = 5000
+    max_ms: int = 2000
+    ht: str = ""
+    role: str = ""
+    name: str = ""
+    items: tuple[str, ...] = ()
+    exact: bool = False
+
+    @property
+    def step_id(self) -> str:
+        return self.id or f"{self.index:03d} {self.kind}"
+
+
+@dataclass(frozen=True)
+class NativeSpec:
+    name: str
+    width: int
+    height: int
+    mode: str
+    terminal_app: str
+    steps: tuple[NativeStep, ...]
+
+
+def _int_default(value, default: int) -> int:
+    """``int(value)``, falling back to *default* only when *value* is
+    absent (``None``) — an explicit literal ``0`` in the YAML is honored
+    rather than silently treated as "absent" (mirrors
+    :func:`coord.tui_pty_driver._int_default`)."""
+    return default if value is None else int(value)
+
+
+def parse_native_spec(yaml_text: str) -> NativeSpec:
+    """Parse a win-native spec YAML document into a :class:`NativeSpec`.
+
+    Top level: ``name:`` (optional), ``width:``/``height:`` (optional,
+    default 1024x768 — the ``MoveWindow`` target size), ``mode:``
+    (``window`` (default) or ``terminal``), ``terminal_app:`` (required
+    when ``mode: terminal`` — ``windows-terminal`` or ``conhost``),
+    ``steps:`` — a non-empty list of mappings each carrying a ``type:``
+    from :data:`_REQUIRED_FIELDS`.
+
+    Raises :class:`WinNativeSpecError` — never returns a partially-parsed
+    spec — for: invalid YAML, a non-mapping document, a missing/empty/
+    non-list ``steps:``, a step that isn't a mapping, an unknown ``type:``,
+    a step missing one of its type's required fields, an unrecognized
+    ``button:``/``ht:``/``mode:``/``terminal_app:``, an ``expect_menu``
+    with an empty ``items:`` list, or ``mode: terminal`` with no
+    ``terminal_app:`` given.
+    """
+    try:
+        raw = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        raise WinNativeSpecError(f"native spec is not valid YAML: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise WinNativeSpecError("native spec must be a YAML mapping at the top level")
+
+    mode = str(raw.get("mode", "window") or "window")
+    if mode not in _VALID_MODES:
+        raise WinNativeSpecError(
+            f"unrecognized mode {mode!r} — expected one of {', '.join(_VALID_MODES)}"
+        )
+    terminal_app = str(raw.get("terminal_app", "") or "")
+    if mode == "terminal":
+        if not terminal_app:
+            raise WinNativeSpecError(
+                "mode: terminal requires 'terminal_app:' (windows-terminal or conhost)"
+            )
+        if terminal_app not in _VALID_TERMINAL_APPS:
+            raise WinNativeSpecError(
+                f"unrecognized terminal_app {terminal_app!r} — expected one "
+                f"of {', '.join(_VALID_TERMINAL_APPS)}"
+            )
+
+    steps_raw = raw.get("steps")
+    if not isinstance(steps_raw, list) or not steps_raw:
+        raise WinNativeSpecError("native spec must have a non-empty 'steps:' list")
+
+    steps: list[NativeStep] = []
+    for i, entry in enumerate(steps_raw):
+        if not isinstance(entry, dict):
+            raise WinNativeSpecError(f"steps[{i}] must be a mapping")
+        kind = entry.get("type")
+        if kind not in _REQUIRED_FIELDS:
+            raise WinNativeSpecError(
+                f"steps[{i}]: unknown step type {kind!r} — expected one of "
+                f"{', '.join(sorted(_REQUIRED_FIELDS))}"
+            )
+        missing = [f for f in _REQUIRED_FIELDS[kind] if entry.get(f) in (None, "")]
+        if missing:
+            raise WinNativeSpecError(
+                f"steps[{i}] (type={kind!r}) is missing required field(s): "
+                f"{', '.join(missing)}"
+            )
+
+        button = str(entry.get("button", "") or "")
+        if button and button not in _VALID_BUTTONS:
+            raise WinNativeSpecError(
+                f"steps[{i}]: unrecognized button {button!r} — expected one "
+                f"of {', '.join(_VALID_BUTTONS)}"
+            )
+
+        ht = str(entry.get("ht", "") or "")
+        if kind == "expect_hit" and ht not in _HT_CODES:
+            raise WinNativeSpecError(
+                f"steps[{i}]: unrecognized hit-test code {ht!r} — expected "
+                f"one of {', '.join(sorted(_HT_CODES))}"
+            )
+
+        items_raw = entry.get("items")
+        if kind == "expect_menu":
+            if not isinstance(items_raw, list) or not items_raw:
+                raise WinNativeSpecError(
+                    f"steps[{i}] (type='expect_menu') must have a non-empty "
+                    f"'items:' list"
+                )
+
+        steps.append(NativeStep(
+            kind=kind,
+            index=i,
+            id=str(entry.get("id", "") or ""),
+            key=str(entry.get("key", "") or ""),
+            x=_int_default(entry.get("x"), 0),
+            y=_int_default(entry.get("y"), 0),
+            button=button,
+            ms=_int_default(entry.get("ms"), 0),
+            interval_ms=_int_default(entry.get("interval_ms"), 100),
+            timeout_ms=_int_default(entry.get("timeout_ms"), 5000),
+            max_ms=_int_default(entry.get("max_ms"), 2000),
+            ht=ht,
+            role=str(entry.get("role", "") or ""),
+            name=str(entry.get("name", "") or ""),
+            items=tuple(str(i) for i in items_raw) if isinstance(items_raw, list) else (),
+            exact=bool(entry.get("exact", False)),
+        ))
+
+    return NativeSpec(
+        name=str(raw.get("name", "") or ""),
+        width=int(raw.get("width", 1024) or 1024),
+        height=int(raw.get("height", 768) or 768),
+        mode=mode,
+        terminal_app=terminal_app,
+        steps=tuple(steps),
+    )
+
+
+# ── the injectable OS-call seam ─────────────────────────────────────────────
+
+class WinCalls(Protocol):
+    """The minimal set of real-OS operations :class:`NativeRunner` drives a
+    native app through — implemented for real by :class:`Win32Calls`
+    (Windows-only), and by a scripted fake in
+    ``tests/test_win_native_driver.py`` so the spec-to-Win32 *translation*
+    logic is testable on any platform.
+
+    ``launch``/``launch_in_terminal`` return the PID of the process THIS
+    call started; :meth:`kill` must accept only that same PID back — never
+    an image name — so teardown can never take down a process it didn't
+    itself launch (see the module docstring's safety note).
+    """
+
+    def launch(self, command: str, cwd: str) -> int: ...
+
+    def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int: ...
+
+    def find_top_window(self, pid: int, timeout_s: float) -> int:
+        """Poll for the launched process's real top-level window, returning
+        its handle once found. Raises :class:`WinNativeRuntimeError` if none
+        appears within *timeout_s* — this is the "launch" step's own
+        confirmation that the process didn't just start, but actually
+        produced a window (#2096)."""
+        ...
+
+    def move_window(self, hwnd: int, x: int, y: int, width: int, height: int) -> None: ...
+
+    def is_window_alive(self, hwnd: int) -> bool: ...
+
+    def get_menu_items(self, hwnd: int) -> list[str] | None:
+        """``GetMenu``'s item labels, or ``None`` when the window has no
+        native menu attached at all (a ``NULL`` HMENU)."""
+        ...
+
+    def hit_test(self, hwnd: int, x: int, y: int) -> str:
+        """The named ``HT*`` result of ``WM_NCHITTEST`` at screen point
+        ``(x, y)``."""
+        ...
+
+    def send_click(self, hwnd: int, x: int, y: int, button: str) -> None: ...
+
+    def send_key(self, hwnd: int, key: str) -> None: ...
+
+    def uia_elements(self, hwnd: int) -> list[dict]:
+        """Every element in the window's UI Automation tree right now, each
+        as ``{"role": str, "name": str, "visible": bool}``."""
+        ...
+
+    def capture(self, hwnd: int) -> bytes:
+        """A ``PrintWindow`` capture of *hwnd* right now (works even when
+        covered by another window) — raises :class:`WinNativeRuntimeError`
+        on failure rather than returning empty bytes, since a capture step
+        exists specifically to produce evidence and has nothing to report
+        if it can't."""
+        ...
+
+    def kill(self, pid: int) -> None: ...
+
+
+def _find_a11y_match(elements: list[dict], role: str, name: str) -> dict | None:
+    """The first *elements* entry whose ``role`` matches exactly
+    (case-insensitive) and ``name`` matches as a substring
+    (case-insensitive), and which is not explicitly marked invisible — or
+    ``None`` if nothing matches. An empty *name* matches any name."""
+    role_l = role.lower()
+    name_l = name.lower()
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        if el.get("visible") is False:
+            continue
+        if str(el.get("role", "")).lower() != role_l:
+            continue
+        if name_l and name_l not in str(el.get("name", "")).lower():
+            continue
+        return el
+    return None
+
+
+def _summarize_elements(elements: list[dict]) -> str:
+    return ", ".join(
+        f"{el.get('role', '?')}:{el.get('name', '')!r}"
+        for el in elements if isinstance(el, dict)
+    ) or "(empty tree)"
+
+
+# ── the spec-step executor ──────────────────────────────────────────────────
+
+class NativeRunner:
+    """Drives one :class:`NativeSpec` against an injected :class:`WinCalls`,
+    producing coord's normalized ``{"id", "status", "message"}`` verdict
+    list (plus ``capture_b64`` on failing steps when a capture could be
+    taken) — the same shape :func:`coord.tui_pty_driver.run_smoke_spec`
+    already produces.
+    """
+
+    def __init__(
+        self, calls: WinCalls, command: str, cwd: str, *, deadline: float | None = None,
+    ) -> None:
+        self._calls = calls
+        self._command = command
+        self._cwd = cwd
+        self._deadline = deadline
+        self._spec: NativeSpec | None = None
+        self._pid: int | None = None
+        self._hwnd: int | None = None
+        # Set by a handler that already has the exact failing capture in
+        # hand (e.g. `expect_idle_stable`'s differing frame) so
+        # `_attach_capture_if_possible` doesn't take a second, less
+        # representative capture after the fact.
+        self._pending_failure_capture: bytes | None = None
+
+    def run(self, spec: NativeSpec) -> list[dict]:
+        self._spec = spec
+        results: list[dict] = []
+        try:
+            for step in spec.steps:
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    results.append({
+                        "id": step.step_id, "status": "fail",
+                        "message": "aborted: win-native driver-level timeout exceeded",
+                    })
+                    continue
+                results.append(self._run_step(step))
+        finally:
+            self._teardown()
+        return results
+
+    def _run_step(self, step: NativeStep) -> dict:
+        handlers = {
+            "launch": self._do_launch,
+            "key": self._do_key,
+            "click": self._do_click,
+            "wait": self._do_wait,
+            "capture": self._do_capture,
+            "expect_menu": self._do_expect_menu,
+            "expect_hit": self._do_expect_hit,
+            "expect_a11y": self._do_expect_a11y,
+            "expect_a11y_within": self._do_expect_a11y_within,
+            "expect_closed": self._do_expect_closed,
+            "expect_idle_stable": self._do_expect_idle_stable,
+            "expect_menu_latency": self._do_expect_menu_latency,
+            "expect_panel_switch": self._do_expect_panel_switch,
+        }
+        entry: dict = {"id": step.step_id, "status": "pass", "message": ""}
+        try:
+            extra = handlers[step.kind](step)
+            if extra:
+                entry.update(extra)
+        except (WinNativeSpecError, WinNativeRuntimeError, AssertionError) as e:
+            entry["status"] = "fail"
+            entry["message"] = str(e)
+            self._attach_capture_if_possible(entry)
+        return entry
+
+    def _attach_capture_if_possible(self, entry: dict) -> None:
+        """Best-effort ``PrintWindow`` evidence attached to *entry* — never
+        raises, and never masks the real failure reason in ``message`` if
+        the capture itself can't be taken."""
+        image = self._pending_failure_capture
+        self._pending_failure_capture = None
+        if image is None and self._hwnd is not None:
+            try:
+                image = self._calls.capture(self._hwnd)
+            except Exception as e:  # noqa: BLE001 — evidence is best-effort
+                entry["capture_error"] = str(e)
+                return
+        if image:
+            entry["capture_b64"] = base64.b64encode(image).decode("ascii")
+
+    def _require_hwnd(self) -> int:
+        if self._hwnd is None:
+            raise WinNativeRuntimeError(
+                "no window — spec has no 'launch' step before this one"
+            )
+        return self._hwnd
+
+    # -- action steps --
+
+    def _do_launch(self, step: NativeStep) -> dict | None:
+        spec = self._spec
+        assert spec is not None
+        if spec.mode == "terminal":
+            pid = self._calls.launch_in_terminal(self._command, self._cwd, spec.terminal_app)
+        else:
+            pid = self._calls.launch(self._command, self._cwd)
+        self._pid = pid
+        timeout_s = (step.timeout_ms or 10000) / 1000
+        hwnd = self._calls.find_top_window(pid, timeout_s)
+        self._hwnd = hwnd
+        self._calls.move_window(hwnd, 0, 0, spec.width, spec.height)
+        return None
+
+    def _do_key(self, step: NativeStep) -> None:
+        self._calls.send_key(self._require_hwnd(), step.key)
+
+    def _do_click(self, step: NativeStep) -> None:
+        self._calls.send_click(self._require_hwnd(), step.x, step.y, step.button or "left")
+
+    def _do_wait(self, step: NativeStep) -> None:
+        time.sleep(step.ms / 1000)
+
+    def _do_capture(self, step: NativeStep) -> dict:
+        image = self._calls.capture(self._require_hwnd())
+        return {"capture_b64": base64.b64encode(image).decode("ascii")}
+
+    # -- assertion steps --
+
+    def _do_expect_menu(self, step: NativeStep) -> None:
+        items = self._calls.get_menu_items(self._require_hwnd())
+        if items is None:
+            raise AssertionError(
+                "GetMenu returned no native menu (NULL) — window has no "
+                "menu bar attached"
+            )
+        if step.exact:
+            if list(items) != list(step.items):
+                raise AssertionError(
+                    f"expected menu items {list(step.items)!r} exactly, got {items!r}"
+                )
+        else:
+            missing = [i for i in step.items if i not in items]
+            if missing:
+                raise AssertionError(
+                    f"expected menu to contain {missing!r}; actual menu "
+                    f"items: {items!r}"
+                )
+
+    def _do_expect_hit(self, step: NativeStep) -> None:
+        actual = self._calls.hit_test(self._require_hwnd(), step.x, step.y)
+        if actual != step.ht:
+            raise AssertionError(
+                f"WM_NCHITTEST at ({step.x},{step.y}) expected {step.ht}, got {actual}"
+            )
+
+    def _do_expect_a11y(self, step: NativeStep) -> None:
+        elements = self._calls.uia_elements(self._require_hwnd())
+        if _find_a11y_match(elements, step.role, step.name) is None:
+            raise AssertionError(
+                f"no UI Automation element found with role={step.role!r} "
+                f"name={step.name!r}; tree had: {_summarize_elements(elements)}"
+            )
+
+    def _do_expect_a11y_within(self, step: NativeStep) -> dict:
+        hwnd = self._require_hwnd()
+        start = time.monotonic()
+        deadline = start + step.timeout_ms / 1000
+        while True:
+            elements = self._calls.uia_elements(hwnd)
+            if _find_a11y_match(elements, step.role, step.name) is not None:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                return {"message": f"appeared after {elapsed_ms}ms"}
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"expected role={step.role!r} name={step.name!r} within "
+                    f"{step.timeout_ms}ms; never appeared. tree had: "
+                    f"{_summarize_elements(elements)}"
+                )
+            time.sleep(0.02)
+
+    def _do_expect_closed(self, step: NativeStep) -> None:
+        """#2096: confirmed by re-polling `IsWindow` until it actually
+        reports gone — never by the mere absence of an exception from an
+        earlier click step."""
+        hwnd = self._require_hwnd()
+        deadline = time.monotonic() + (step.timeout_ms or 5000) / 1000
+        while True:
+            if not self._calls.is_window_alive(hwnd):
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"window still alive {step.timeout_ms}ms after "
+                    f"expect_closed — it did not actually close"
+                )
+            time.sleep(0.02)
+
+    def _do_expect_idle_stable(self, step: NativeStep) -> None:
+        """vimcode#1634's idle-flicker oracle: repeated ``PrintWindow``
+        captures across a real-time window must be byte-identical. Only
+        answerable by actually taking the captures and comparing them
+        afterward (#2096) — nothing here can raise mid-wait, so the mere
+        absence of an exception during the loop proves nothing on its own;
+        the comparison after each new capture is the actual check."""
+        hwnd = self._require_hwnd()
+        interval_s = (step.interval_ms or 100) / 1000
+        deadline = time.monotonic() + (step.ms or 5000) / 1000
+        prev = self._calls.capture(hwnd)
+        elapsed_captures = 1
+        while time.monotonic() < deadline:
+            time.sleep(interval_s)
+            current = self._calls.capture(hwnd)
+            elapsed_captures += 1
+            if current != prev:
+                self._pending_failure_capture = current
+                raise AssertionError(
+                    f"capture #{elapsed_captures} differs from the previous "
+                    f"one taken {step.interval_ms}ms earlier while the app "
+                    f"should have been idle (flicker)"
+                )
+            prev = current
+
+    def _do_expect_menu_latency(self, step: NativeStep) -> dict:
+        """vimcode#1635's right-click-menu-latency oracle: the timing
+        window starts at THIS step's own click, not an earlier one, so
+        there's no unmeasured gap between the real input and the start of
+        the clock."""
+        hwnd = self._require_hwnd()
+        role = step.role or "MenuItem"
+        start = time.monotonic()
+        self._calls.send_click(hwnd, step.x, step.y, step.button or "right")
+        deadline = start + (step.max_ms or 2000) / 1000
+        while True:
+            elements = self._calls.uia_elements(hwnd)
+            if _find_a11y_match(elements, role, step.name) is not None:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                return {"message": f"menu appeared {elapsed_ms}ms after right-click"}
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"no menu (role={role!r}) appeared within {step.max_ms}ms "
+                    f"of clicking ({step.x},{step.y})"
+                )
+            time.sleep(0.01)
+
+    def _do_expect_panel_switch(self, step: NativeStep) -> dict:
+        """vimcode#1636's dead-activity-bar-click oracle — same
+        click-starts-the-clock reasoning as :meth:`_do_expect_menu_latency`."""
+        hwnd = self._require_hwnd()
+        start = time.monotonic()
+        self._calls.send_click(hwnd, step.x, step.y, step.button or "left")
+        deadline = start + (step.timeout_ms or 5000) / 1000
+        while True:
+            elements = self._calls.uia_elements(hwnd)
+            if _find_a11y_match(elements, step.role, step.name) is not None:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                return {"message": f"panel appeared {elapsed_ms}ms after activity-bar click"}
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"activity-bar click at ({step.x},{step.y}) never "
+                    f"switched to role={step.role!r} name={step.name!r} "
+                    f"within {step.timeout_ms}ms"
+                )
+            time.sleep(0.02)
+
+    # -- teardown --
+
+    def _teardown(self) -> None:
+        """Kills only the PID this run itself launched (see the module
+        docstring's safety note) — never by image name, and never if
+        `launch` never ran (`self._pid` stays `None`)."""
+        if self._pid is not None:
+            try:
+                self._calls.kill(self._pid)
+            except Exception:  # noqa: BLE001 — teardown must not mask the real result
+                pass
+
+
+# ── real Win32 implementation (Windows-only) ────────────────────────────────
+
+_NAMED_VKEYS: dict[str, int] = {
+    "enter": 0x0D, "return": 0x0D, "esc": 0x1B, "escape": 0x1B, "tab": 0x09,
+    "backspace": 0x08, "space": 0x20, "up": 0x26, "down": 0x28, "left": 0x25,
+    "right": 0x27, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "delete": 0x2E, "insert": 0x2D,
+    **{f"f{n}": 0x6F + n for n in range(1, 13)},
+}
+
+
+def _vkey_for(key: str) -> tuple[int, bool]:
+    """``(virtual_key_code, needs_shift)`` for one spec ``key:`` name.
+    Raises :class:`WinNativeSpecError` for anything unrecognized."""
+    lowered = key.lower()
+    if lowered in _NAMED_VKEYS:
+        return _NAMED_VKEYS[lowered], False
+    if lowered.startswith("ctrl+") and len(lowered) == 6:
+        return ord(lowered[5].upper()), False
+    if len(key) == 1:
+        needs_shift = key.isalpha() and key.isupper()
+        return ord(key.upper()), needs_shift
+    raise WinNativeSpecError(f"unrecognized key {key!r}")
+
+
+class Win32Calls:
+    """The real :class:`WinCalls` implementation — ``ctypes`` for window
+    management, input injection, menu/hit-test probing and ``PrintWindow``;
+    the optional ``comtypes``-based UI Automation client (the ``win-native``
+    extra) for the accessibility tree.
+
+    Windows-only: raises :class:`WinNativeRuntimeError` at construction on
+    any other platform, mirroring
+    :class:`coord.tui_pty_driver.WindowsConPtyChild`'s own platform guard.
+    """
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise WinNativeRuntimeError(
+                "Win32Calls requires Windows — the win-native driver only "
+                "runs on a real Windows host (e.g. dell64)"
+            )
+        import ctypes  # noqa: PLC0415
+        import ctypes.wintypes  # noqa: PLC0415
+
+        self._ctypes = ctypes
+        self._user32 = ctypes.windll.user32
+        self._kernel32 = ctypes.windll.kernel32
+
+    # -- process lifecycle --
+
+    def launch(self, command: str, cwd: str) -> int:
+        proc = subprocess.Popen(command, shell=True, cwd=cwd or None)
+        return proc.pid
+
+    def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int:
+        create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        if terminal_app == "windows-terminal":
+            full_command = f"wt.exe {command}"
+        else:
+            full_command = command
+        proc = subprocess.Popen(
+            full_command, shell=True, cwd=cwd or None, creationflags=create_new_console,
+        )
+        return proc.pid
+
+    def kill(self, pid: int) -> None:
+        # By PID only — see the module docstring's safety note. No
+        # image-name-based lookup exists anywhere in this class.
+        PROCESS_TERMINATE = 0x0001
+        handle = self._kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if handle:
+            try:
+                self._kernel32.TerminateProcess(handle, 0)
+            finally:
+                self._kernel32.CloseHandle(handle)
+
+    def find_top_window(self, pid: int, timeout_s: float) -> int:
+        ctypes = self._ctypes
+        deadline = time.monotonic() + timeout_s
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum_proc(hwnd, _lparam):
+            owner_pid = ctypes.wintypes.DWORD()
+            self._user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+            if owner_pid.value == pid and self._user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+                return False
+            return True
+
+        while time.monotonic() < deadline:
+            found.clear()
+            self._user32.EnumWindows(_enum_proc, 0)
+            if found:
+                return found[0]
+            time.sleep(0.1)
+        raise WinNativeRuntimeError(
+            f"no visible top-level window appeared for pid={pid} within {timeout_s}s"
+        )
+
+    def is_window_alive(self, hwnd: int) -> bool:
+        return bool(self._user32.IsWindow(hwnd))
+
+    def move_window(self, hwnd: int, x: int, y: int, width: int, height: int) -> None:
+        self._user32.MoveWindow(hwnd, x, y, width, height, True)
+
+    # -- menu / hit-test probes --
+
+    def get_menu_items(self, hwnd: int) -> list[str] | None:
+        hmenu = self._user32.GetMenu(hwnd)
+        if not hmenu:
+            return None
+        count = self._user32.GetMenuItemCount(hmenu)
+        MF_BYPOSITION = 0x00000400
+        items = []
+        buf = self._ctypes.create_unicode_buffer(256)
+        for i in range(max(count, 0)):
+            self._user32.GetMenuStringW(hmenu, i, buf, 256, MF_BYPOSITION)
+            items.append(buf.value)
+        return items
+
+    def hit_test(self, hwnd: int, x: int, y: int) -> str:
+        WM_NCHITTEST = 0x0084
+        lparam = (y << 16) | (x & 0xFFFF)
+        result = self._user32.SendMessageW(hwnd, WM_NCHITTEST, 0, lparam)
+        # ctypes returns an unsigned value for negative hit-test codes
+        # (HTERROR=-2, HTTRANSPARENT=-1) — re-interpret as signed 32-bit.
+        if result > 0x7FFFFFFF:
+            result -= 0x100000000
+        return _HT_CODES_BY_VALUE.get(result, f"HT_UNKNOWN({result})")
+
+    # -- input injection --
+
+    def send_click(self, hwnd: int, x: int, y: int, button: str) -> None:
+        rect = self._ctypes.wintypes.RECT()
+        self._user32.GetWindowRect(hwnd, self._ctypes.byref(rect))
+        screen_x, screen_y = rect.left + x, rect.top + y
+        self._user32.SetCursorPos(screen_x, screen_y)
+        down, up = {
+            "left": (0x0002, 0x0004),
+            "right": (0x0008, 0x0010),
+            "middle": (0x0020, 0x0040),
+        }[button]
+        self._user32.mouse_event(down, 0, 0, 0, 0)
+        self._user32.mouse_event(up, 0, 0, 0, 0)
+
+    def send_key(self, hwnd: int, key: str) -> None:
+        self._user32.SetForegroundWindow(hwnd)
+        vk, needs_shift = _vkey_for(key)
+        KEYEVENTF_KEYUP = 0x0002
+        if key.lower().startswith("ctrl+"):
+            self._user32.keybd_event(0x11, 0, 0, 0)  # VK_CONTROL down
+        if needs_shift:
+            self._user32.keybd_event(0x10, 0, 0, 0)  # VK_SHIFT down
+        self._user32.keybd_event(vk, 0, 0, 0)
+        self._user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        if needs_shift:
+            self._user32.keybd_event(0x10, 0, KEYEVENTF_KEYUP, 0)
+        if key.lower().startswith("ctrl+"):
+            self._user32.keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0)
+
+    # -- UI Automation --
+
+    def uia_elements(self, hwnd: int) -> list[dict]:
+        client = _import_uia()
+        automation = client.CreateObject(
+            "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+            clsctx=1,  # CLSCTX_INPROC_SERVER
+        )
+        root = automation.ElementFromHandle(hwnd)
+        walker = automation.ControlViewWalker
+        elements: list[dict] = []
+
+        def _walk(element) -> None:
+            try:
+                elements.append({
+                    "role": element.LocalizedControlType or "",
+                    "name": element.CurrentName or "",
+                    "visible": not bool(element.CurrentIsOffscreen),
+                })
+            except Exception:  # noqa: BLE001 — a dead/stale element node
+                return
+            child = walker.GetFirstChildElement(element)
+            while child is not None:
+                _walk(child)
+                child = walker.GetNextSiblingElement(child)
+
+        _walk(root)
+        return elements
+
+    # -- capture --
+
+    def capture(self, hwnd: int) -> bytes:
+        ctypes = self._ctypes
+        gdi32 = ctypes.windll.gdi32
+        rect = ctypes.wintypes.RECT()
+        self._user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            raise WinNativeRuntimeError(
+                f"cannot capture hwnd={hwnd} — window rect is {width}x{height}"
+            )
+
+        hdc_window = self._user32.GetWindowDC(hwnd)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_window)
+        hbitmap = gdi32.CreateCompatibleBitmap(hdc_window, width, height)
+        gdi32.SelectObject(hdc_mem, hbitmap)
+        PW_RENDERFULLCONTENT = 0x00000002
+        ok = self._user32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT)
+        try:
+            if not ok:
+                raise WinNativeRuntimeError(f"PrintWindow failed for hwnd={hwnd}")
+            return _bitmap_to_bmp_bytes(ctypes, gdi32, hdc_mem, hbitmap, width, height)
+        finally:
+            gdi32.DeleteObject(hbitmap)
+            gdi32.DeleteDC(hdc_mem)
+            self._user32.ReleaseDC(hwnd, hdc_window)
+
+
+def _bitmap_to_bmp_bytes(ctypes, gdi32, hdc_mem, hbitmap, width: int, height: int) -> bytes:
+    """``GetDIBits`` the captured bitmap into raw 24-bit BGR pixel data,
+    wrapped in a minimal, self-contained ``.bmp`` file (no extra imaging
+    library needed) — sufficient as a failing-step evidence attachment."""
+    import struct
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+            ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+            ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+            ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+            ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+            ("biClrImportant", ctypes.c_uint32),
+        ]
+
+    row_bytes = ((width * 3 + 3) // 4) * 4
+    image_size = row_bytes * height
+    header = BITMAPINFOHEADER()
+    header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    header.biWidth = width
+    header.biHeight = height
+    header.biPlanes = 1
+    header.biBitCount = 24
+    header.biCompression = 0  # BI_RGB
+    header.biSizeImage = image_size
+
+    buf = (ctypes.c_ubyte * image_size)()
+    gdi32.GetDIBits(hdc_mem, hbitmap, 0, height, buf, ctypes.byref(header), 0)
+
+    bmp_header = struct.pack("<2sIHHI", b"BM", 14 + ctypes.sizeof(header) + image_size, 0, 0, 14 + ctypes.sizeof(header))
+    return bmp_header + bytes(header) + bytes(buf)
+
+
+def _import_uia():
+    """The optional ``comtypes`` UI Automation client (the ``win-native``
+    extra) — guarded the same way
+    :func:`coord.tui_pty_driver._import_pyte`/``WindowsConPtyChild`` guard
+    their own optional dependencies, so a missing package names the extra
+    to install rather than surfacing a bare ``ModuleNotFoundError``."""
+    try:
+        import comtypes.client as client  # noqa: PLC0415
+    except ModuleNotFoundError as exc:
+        raise WinNativeRuntimeError(
+            "win-native needs the 'win-native' extra, which is not "
+            "installed (missing 'comtypes').\n"
+            "  Install it with:  pip install 'code-coordinator[win-native]'"
+        ) from exc
+    return client
+
+
+# ── top-level entry point ───────────────────────────────────────────────────
+
+def run_native_spec(
+    spec_text: str, *, launch_command: str, cwd: str,
+    calls: WinCalls | None = None, timeout: float | None = None,
+) -> list[dict]:
+    """Parse *spec_text* and run it against *calls* (a real
+    :class:`Win32Calls` by default) launching *launch_command* in *cwd* —
+    the top-level entry point
+    :func:`coord.acceptance_drivers._run_win_native` calls.
+
+    *timeout*, when given, is an overall wall-clock budget in seconds for
+    the whole spec — mirrors :func:`coord.tui_pty_driver.run_smoke_spec`'s
+    own ``timeout``: each step already carries its own bounded per-step
+    budget, but their sum can still exceed it, in which case every
+    remaining step fails explicitly rather than the run truncating or
+    blocking past it.
+
+    Raises :class:`WinNativeSpecError` for a malformed spec. Runtime
+    failures (the process never launches, a window never appears, an
+    assertion fails) do NOT raise — they're folded into the returned list
+    as a ``status="fail"`` entry, the same "partial results, not a crash"
+    contract :func:`coord.tui_pty_driver.run_smoke_spec` already gives.
+    """
+    spec = parse_native_spec(spec_text)
+    resolved_calls = calls if calls is not None else Win32Calls()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    runner = NativeRunner(resolved_calls, launch_command, cwd, deadline=deadline)
+    return runner.run(spec)
