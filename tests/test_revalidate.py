@@ -994,7 +994,8 @@ class TestIsInfrastructureFailure:
 
 class _CiRerunFake:
     """Green checks whose `started_at` predates the base commit time — the
-    #1851 staleness signal — with a spy on `rerun_for_pr`."""
+    #1851 staleness signal — with a spy on `rerun_for_pr` that #3276 asserts
+    is NEVER called for this exact shape (a staleness-only block)."""
 
     def __init__(self, *, checks_started_at: float | None = 500.0, rerun_ok: bool = True):
         self.is_available = True
@@ -1029,7 +1030,11 @@ class TestApplyCiRevalidation:
         e.pr_number = pr
         return e
 
-    def test_triggers_rerun_for_a_ci_stale_entry(self, capsys) -> None:
+    def test_stale_only_candidate_is_skipped_not_rerun(self, capsys) -> None:
+        """#3276: every candidate `ci_revalidation_candidates` returns is
+        blocked *solely* on CI staleness — a same-base `rerun_for_pr` can
+        never clear that (#3266). `--revalidate`'s CI arm must report the
+        rebase remedy instead of spending a guaranteed no-op CI cycle."""
         from coord.commands.merge import _apply_ci_revalidation
 
         items = [self._entry_with_pr(501)]
@@ -1041,27 +1046,41 @@ class TestApplyCiRevalidation:
             dry_run=False,
         )
 
-        assert ci.rerun_calls == [("acme/api", 501)]
+        assert ci.rerun_calls == [], "a staleness-only block can never be cleared by a rerun"
         out = capsys.readouterr().out
-        assert "triggered a CI re-run" in out
+        assert "blocked solely on stale CI checks" in out
         assert "PR #501" in out
+        assert "triggered a CI re-run" not in out
 
-    def test_dry_run_names_it_without_triggering(self, capsys) -> None:
+    def test_dry_run_says_the_same_thing_as_a_real_run(self, capsys) -> None:
+        """#3276: nothing is ever actually triggered any more, so `--dry-run`
+        and a real `--revalidate` run must report identically — neither
+        promises a re-run it would not (or does not) make."""
         from coord.commands.merge import _apply_ci_revalidation
 
-        items = [self._entry_with_pr(501)]
-        ci = _CiRerunFake()
+        items_dry = [self._entry_with_pr(501)]
+        ci_dry = _CiRerunFake()
         cfg = _config(gates=["merge"], reviews=False)
 
         _apply_ci_revalidation(
-            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
-            dry_run=True,
+            items_dry, Board(active=[], completed=[]), cfg, ci_dry,
+            _GhBranchTimestamp(), dry_run=True,
         )
+        dry_out = capsys.readouterr().out
 
-        assert ci.rerun_calls == [], "dry-run must not trigger a real rerun"
-        out = capsys.readouterr().out
-        assert "would re-run CI" in out
-        assert "PR #501" in out
+        items_real = [self._entry_with_pr(501)]
+        ci_real = _CiRerunFake()
+        _apply_ci_revalidation(
+            items_real, Board(active=[], completed=[]), cfg, ci_real,
+            _GhBranchTimestamp(), dry_run=False,
+        )
+        real_out = capsys.readouterr().out
+
+        assert ci_dry.rerun_calls == []
+        assert ci_real.rerun_calls == []
+        assert dry_out == real_out
+        assert "blocked solely on stale CI checks" in dry_out
+        assert "would re-run CI" not in dry_out
 
     def test_nothing_stale_says_so_and_triggers_nothing(self, capsys) -> None:
         from coord.commands.merge import _apply_ci_revalidation
@@ -1094,177 +1113,18 @@ class TestApplyCiRevalidation:
         out = capsys.readouterr().out
         assert "triggered" not in out
 
-    def test_partial_rerun_failure_is_reported(self, capsys) -> None:
-        from coord.commands.merge import _apply_ci_revalidation
 
-        items = [self._entry_with_pr(501)]
-        ci = _CiRerunFake(rerun_ok=False)
-        cfg = _config(gates=["merge"], reviews=False)
-
-        _apply_ci_revalidation(
-            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
-            dry_run=False,
-        )
-
-        assert ci.rerun_calls == [("acme/api", 501)]
-        captured = capsys.readouterr()
-        # `click.echo(..., err=True)` for the failure line — checked on stderr.
-        assert "could not trigger a CI re-run" in captured.err
-
-
-class _CiRerunSettleFake:
-    """#1925: like `_CiRerunFake` (green-but-stale pre-rerun, spied
-    `rerun_for_pr`), except `list_checks_for_pr` switches to *post_rerun*
-    (a scripted sequence, last entry repeats) once `rerun_for_pr` has been
-    called — so tests can drive `_apply_ci_revalidation`'s post-trigger
-    settle-wait deterministically."""
-
-    def __init__(self, post_rerun: list[list]):
-        self.is_available = True
-        self.post_rerun = post_rerun
-        self.rerun_calls: list[tuple[str, int]] = []
-        self._reads_since_rerun = 0
-
-    def list_checks_for_pr(self, repo, number):
-        from types import SimpleNamespace
-
-        if not self.rerun_calls:
-            # Pre-rerun: green, but started well before the mocked base
-            # commit time (1000.0) — the #1851 staleness signal that makes
-            # this entry a candidate in the first place.
-            return [SimpleNamespace(
-                name="build", status="completed", conclusion="success",
-                started_at=500.0, completed_at=None,
-            )]
-        i = min(self._reads_since_rerun, len(self.post_rerun) - 1)
-        self._reads_since_rerun += 1
-        return self.post_rerun[i]
-
-    def rerun_for_pr(self, repo, number):
-        self.rerun_calls.append((repo, number))
-        return True
-
-    def invalidate(self, repo, number):
-        pass
-
-
-def _unreadable_ns(repo="acme/api", number=501):
-    from types import SimpleNamespace
-    return SimpleNamespace(
-        name=f"coord: could not read CI status for {repo}#{number} (gh pr "
-        "checks failed: no checks reported)",
-        status="completed", conclusion="unknown",
-        started_at=None, completed_at=None,
-    )
-
-
-def _green_ns():
-    from types import SimpleNamespace
-    return SimpleNamespace(
-        name="build", status="completed", conclusion="success",
-        started_at=1500.0, completed_at=None,
-    )
-
-
-def _failed_ns():
-    from types import SimpleNamespace
-    return SimpleNamespace(
-        name="build", status="completed", conclusion="failure",
-        started_at=1500.0, completed_at=None,
-    )
-
-
-class _FakeClock:
-    def __init__(self):
-        self.now = 0.0
-
-    def clock(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.now += seconds
-
-
-class TestApplyCiRevalidationSettleWait:
-    """#1925: the registration-gap regression itself — triggering a CI
-    re-run and immediately reading `gh pr checks` used to see the #1525
-    synthetic `unknown` conclusion and block exactly like genuinely broken
-    CI. These drive `_apply_ci_revalidation` end to end (past the trigger,
-    through the settle wait) with a fake clock so no test sleeps for real.
-    """
-
-    @staticmethod
-    def _entry_with_pr(pr: int):
-        e = _entry("w1", issue=101)
-        e.pr_number = pr
-        return e
-
-    def test_settles_quickly_is_not_deferred(self, capsys) -> None:
-        from coord.commands.merge import _apply_ci_revalidation
-
-        items = [self._entry_with_pr(501)]
-        ci = _CiRerunSettleFake(post_rerun=[[_unreadable_ns()], [_green_ns()]])
-        cfg = _config(gates=["merge"], reviews=False)
-        clk = _FakeClock()
-
-        deferred = _apply_ci_revalidation(
-            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
-            dry_run=False, poll_sleep=clk.sleep, poll_clock=clk.clock,
-        )
-
-        assert deferred == set()
-        assert items[0].error is None
-        out = capsys.readouterr().out
-        assert "settled after" in out
-        assert "checks_failed" not in out
-
-    def test_never_registers_defers_instead_of_blocking(self, capsys) -> None:
-        """The reproduced #1925 shape: the re-run never registers within the
-        wait budget. Must come back as `deferred`, not as a `checks_failed`-
-        shaped block, and the message must say plainly that THIS command
-        caused the transient reading."""
-        from coord.commands.merge import _apply_ci_revalidation
-
-        items = [self._entry_with_pr(501)]
-        ci = _CiRerunSettleFake(post_rerun=[[_unreadable_ns()]])
-        cfg = _config(gates=["merge"], reviews=False)
-        clk = _FakeClock()
-
-        deferred = _apply_ci_revalidation(
-            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
-            dry_run=False, poll_sleep=clk.sleep, poll_clock=clk.clock,
-        )
-
-        assert deferred == {"w1"}
-        entry = items[0]
-        assert entry.state == mq.PENDING, "must stay pending, never blocked terminally"
-        assert entry.error is not None
-        assert "not a CI failure" in entry.error
-        assert "--revalidate" in entry.error
-        out = capsys.readouterr().out
-        assert "checks_failed" not in out
-
-    def test_genuinely_red_after_rerun_is_not_deferred(self, capsys) -> None:
-        """A real failure discovered by the re-run must settle and be left
-        for the merge gate to block on for its own (real) reason — #1925
-        only defers the self-caused registration gap, never a genuine
-        result, good or bad."""
-        from coord.commands.merge import _apply_ci_revalidation
-
-        items = [self._entry_with_pr(501)]
-        ci = _CiRerunSettleFake(post_rerun=[[_failed_ns()]])
-        cfg = _config(gates=["merge"], reviews=False)
-        clk = _FakeClock()
-
-        deferred = _apply_ci_revalidation(
-            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
-            dry_run=False, poll_sleep=clk.sleep, poll_clock=clk.clock,
-        )
-
-        assert deferred == set()
-        assert items[0].error is None
-        out = capsys.readouterr().out
-        assert "settled after" in out
+# #3276: the #1925 registration-gap settle-wait fixtures/tests that used to
+# live here (`_CiRerunSettleFake`, `TestApplyCiRevalidationSettleWait`, and
+# the black-box `TestMergeRevalidateCiSettleBlackBox` further down) drove
+# `_apply_ci_revalidation`'s post-`rerun_for_pr` `wait_for_ci_settle` poll —
+# the very rerun this fix removes, since every entry that poll ran for is
+# blocked *solely* on CI staleness and a same-base rerun can never clear
+# that (#3266). With no rerun triggered there is nothing to settle-wait for,
+# so that machinery (and its tests) is gone; see
+# `TestApplyCiRevalidation.test_stale_only_candidate_is_skipped_not_rerun`
+# and the replacement black-box coverage in
+# `TestMergeRevalidateCiStaleBlackBox` below for what replaced it.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1799,31 +1659,14 @@ class TestSkipReviewComposesWithRevalidate:
         assert _states() == {"w1": mq.MERGED}, result.output
 
 
-class _FakeTimeModule:
-    """Drop-in replacement for the stdlib `time` module as seen by
-    `coord.ci_store.wait_for_ci_settle` — `sleep` advances the same counter
-    `monotonic` reads, so a bounded poll loop runs to completion with no
-    real wall-clock wait, however many polls the default budget allows."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def sleep(self, seconds: float) -> None:
-        self.now += seconds
-
-    def monotonic(self) -> float:
-        return self.now
-
-
-class TestMergeRevalidateCiSettleBlackBox:
-    """#1925 acceptance, end to end through the real CLI: a branch whose
-    local Test verdict AND CI checks are both stale (the exact #1551/#532
-    reproduction — a base move stales both signals at once) must merge in
-    ONE `coord merge --revalidate` invocation when the re-run it triggers is
-    genuinely healthy, must still block — with the real reason, never the
-    self-inflicted "unknown" — when it's genuinely red, and must come back
-    as a legible "come back shortly" (never `checks_failed`) when the re-run
-    just hasn't registered within the wait budget yet.
+class TestMergeRevalidateCiStaleBlackBox:
+    """#3276 acceptance, end to end through the real CLI: a branch whose
+    local Test verdict AND CI checks are both stale (the #1551/#532 shape —
+    a base move stales both signals at once). `--revalidate` clears the
+    local-verdict staleness with a real re-test (`_apply_revalidation`), but
+    must NOT spend a CI cycle on the CI-staleness half — a same-base rerun
+    can never satisfy it (#3266) — and must say so plainly rather than
+    silently doing nothing. The entry stays PENDING; only a rebase clears it.
     """
 
     @staticmethod
@@ -1843,74 +1686,32 @@ class TestMergeRevalidateCiSettleBlackBox:
         mq.save_queue(entries)
         return entries[0]
 
-    def test_stale_verdict_plus_settling_green_ci_merges_in_one_shot(
+    def test_stale_verdict_plus_stale_ci_retests_locally_but_never_reruns_ci(
         self, git_fleet: Path, tmp_path: Path, coord_db,
     ) -> None:
         self._seed_with_pr(501)
         cfg = self._cfg(tmp_path, git_fleet)
-        ci = _CiRerunSettleFake(post_rerun=[[_unreadable_ns()], [_green_ns()]])
+        ci = _CiRerunFake(checks_started_at=500.0)
 
         with patch("coord.ci_store.build_ci_store", return_value=ci), \
-             patch("coord.github_ops.get_branch_commit_timestamp", return_value=1000.0), \
-             patch("coord.ci_store.time", _FakeTimeModule()):
+             patch("coord.github_ops.get_branch_commit_timestamp", return_value=1000.0):
             result = _invoke(
                 ["merge", "--config", str(cfg), "--only", "w1", "--revalidate"],
                 git_fleet,
             )
 
         assert result.exit_code == 0, result.output
-        assert ci.rerun_calls == [("acme/api", 501)]
-        assert "triggered a CI re-run" in result.output
-        assert "settled after" in result.output
-        assert _states()["w1"] == mq.MERGED, result.output
-
-    def test_stale_verdict_plus_genuinely_red_ci_stays_blocked_with_real_reason(
-        self, git_fleet: Path, tmp_path: Path, coord_db,
-    ) -> None:
-        self._seed_with_pr(501)
-        cfg = self._cfg(tmp_path, git_fleet)
-        ci = _CiRerunSettleFake(post_rerun=[[_failed_ns()]])
-
-        with patch("coord.ci_store.build_ci_store", return_value=ci), \
-             patch("coord.github_ops.get_branch_commit_timestamp", return_value=1000.0), \
-             patch("coord.ci_store.time", _FakeTimeModule()):
-            result = _invoke(
-                ["merge", "--config", str(cfg), "--only", "w1", "--revalidate"],
-                git_fleet,
-            )
-
-        assert result.exit_code == 0, result.output
+        # The local-verdict staleness (a separate gate) still gets a real
+        # re-test — #3276 only changes the CI-staleness arm.
+        assert "--revalidate: PASSED" in result.output
+        # The CI-staleness arm never fires `rerun_for_pr` — it cannot clear
+        # this — and says so plainly instead of silently doing nothing.
+        assert ci.rerun_calls == []
+        assert "blocked solely on stale CI checks" in result.output
+        assert "triggered a CI re-run" not in result.output
+        # Still genuinely blocked — only a rebase clears CI staleness.
         assert _states()["w1"] == mq.PENDING, result.output
-        assert "checks failed" in result.output
-        # The block must be the REAL failure this re-run found, not the
-        # self-triggered #1925 registration-gap message.
-        assert "not a CI failure" not in result.output
-
-    def test_stale_verdict_plus_rerun_that_never_registers_defers_cleanly(
-        self, git_fleet: Path, tmp_path: Path, coord_db,
-    ) -> None:
-        """The exact #1551/#532 reproduction: the re-run never settles
-        within the wait budget. Must be reported as pending/deferred, never
-        as `checks_failed`, and the entry must stay PENDING (mergeable on a
-        later invocation once CI catches up) rather than parked as broken.
-        """
-        self._seed_with_pr(501)
-        cfg = self._cfg(tmp_path, git_fleet)
-        ci = _CiRerunSettleFake(post_rerun=[[_unreadable_ns()]])
-
-        with patch("coord.ci_store.build_ci_store", return_value=ci), \
-             patch("coord.github_ops.get_branch_commit_timestamp", return_value=1000.0), \
-             patch("coord.ci_store.time", _FakeTimeModule()):
-            result = _invoke(
-                ["merge", "--config", str(cfg), "--only", "w1", "--revalidate"],
-                git_fleet,
-            )
-
-        assert result.exit_code == 0, result.output
-        assert _states()["w1"] == mq.PENDING, result.output
-        assert "checks_failed" not in result.output
-        assert "not a CI failure" in result.output
-        assert "THIS command started" in result.output
+        assert "CI stale" in result.output
 
 
 class TestDaemonRoute:

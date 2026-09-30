@@ -3203,10 +3203,12 @@ class TestResolveBoardWorkKey:
 
 
 class TestMergeRevalidateCiRerunCli:
-    """#1851 black-box: `coord merge --revalidate` re-runs CI (not a local
-    suite) for an entry blocked solely on stale CI checks. `--dry-run` names
-    it without triggering anything; plain `--dry-run` (no --revalidate)
-    still names the PR as CI-stale in the gate reading."""
+    """#1851 black-box, updated by #3276: `coord merge --revalidate` used to
+    re-run CI (not a local suite) for an entry blocked solely on stale CI
+    checks, but #3266 established a same-base rerun can never clear that —
+    so it now reports the rebase remedy instead, identically under
+    `--dry-run` and for real. Plain `--dry-run` (no `--revalidate`) still
+    names the PR as CI-stale in the gate reading."""
 
     @staticmethod
     def _config(tmp_path: Path) -> Path:
@@ -3291,9 +3293,12 @@ class TestMergeRevalidateCiRerunCli:
         assert ci.rerun_calls == []
         assert "checks_stale" in result.output or "CI stale" in result.output
 
-    def test_revalidate_dry_run_names_the_rerun_without_triggering(
+    def test_revalidate_dry_run_names_the_skip_without_triggering(
         self, tmp_path: Path, coord_db,
     ) -> None:
+        """#3276: every candidate here is blocked *solely* on CI staleness —
+        a same-base rerun can never clear that (#3266) — so `--dry-run`
+        must not promise a rerun it would not (and could not) make."""
         cfg = self._config(tmp_path)
         self._seed()
         ci = self._fake_ci()
@@ -3305,10 +3310,16 @@ class TestMergeRevalidateCiRerunCli:
 
         assert result.exit_code == 0, result.output
         assert ci.rerun_calls == []
-        assert "would re-run CI" in result.output
+        assert "would re-run CI" not in result.output
+        assert "blocked solely on stale CI checks" in result.output
         assert "PR #501" in result.output
 
-    def test_revalidate_triggers_the_ci_rerun(self, tmp_path: Path, coord_db) -> None:
+    def test_revalidate_never_triggers_the_ci_rerun_for_a_stale_only_entry(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#3276: `--revalidate` (no `--dry-run`) must behave identically to
+        the dry-run case above — nothing was ever actually triggerable for a
+        staleness-only block."""
         cfg = self._config(tmp_path)
         self._seed()
         ci = self._fake_ci()
@@ -3317,24 +3328,28 @@ class TestMergeRevalidateCiRerunCli:
             result = CliRunner().invoke(main, ["merge", "--config", str(cfg), "--revalidate"])
 
         assert result.exit_code == 0, result.output
-        assert ci.rerun_calls == [("acme/api", 501)]
-        assert "triggered a CI re-run" in result.output
+        assert ci.rerun_calls == []
+        assert "triggered a CI re-run" not in result.output
+        assert "blocked solely on stale CI checks" in result.output
 
 
 class TestMergeRevalidateRereadsBoardAfterWait:
-    """#2143 black-box: a review approval that lands *during* the
-    ``--revalidate`` CI-settle wait must be seen by the gate that runs right
-    after — not the board snapshot loaded before the wait started.
+    """#2143 black-box: a review approval that lands while ``--revalidate``'s
+    CI-staleness arm runs must be seen by the gate that runs right after —
+    not the board snapshot loaded before that arm ran.
 
     Reproduces the 2026-08-12 incident's shape with two sibling queue
     entries sharing one repo-wide `coord merge --revalidate` run: entry
-    ``ci1`` is blocked solely on stale CI (the thing `--revalidate` actually
-    re-runs and waits on) and entry ``rv1`` is a completely unrelated
-    PENDING entry whose review approval only exists on the board that gets
-    saved *while* the ``ci1`` wait is in flight. Before #2143 the board was
-    loaded once at the top of `coord merge` and never re-read, so `rv1`
-    would be reported `review_required` for an approval that, by the time
-    `process()` ran, had already landed.
+    ``ci1`` is blocked solely on stale CI (the arm this reload runs after —
+    #3276: it reports the rebase remedy rather than re-running CI, since a
+    same-base rerun can never clear that) and entry ``rv1`` is a completely
+    unrelated PENDING entry whose review approval only exists on the board
+    that gets saved *while* ``ci1`` is being processed. Before #2143 the
+    board was loaded once at the top of `coord merge` and never re-read, so
+    `rv1` would be reported `review_required` for an approval that, by the
+    time `process()` ran, had already landed. The reload is unconditional
+    (see `_reload_board_after_wait`'s docstring), so it still runs even
+    though #3276 means nothing was actually triggered for `ci1`.
     """
 
     @staticmethod
@@ -3371,11 +3386,10 @@ class TestMergeRevalidateRereadsBoardAfterWait:
             def list_checks_for_pr(self, repo, number):
                 if number == 501:
                     # Green, but started well before the (mocked) base
-                    # commit time below — the #1851 CI-staleness signal
-                    # `--revalidate` re-runs for. Returned unchanged on
-                    # every read (including the post-rerun settle read),
-                    # so ``wait_for_ci_settle`` sees an immediately-resolved
-                    # (not in-flight) result and never actually sleeps.
+                    # commit time below — the #1851 CI-staleness signal that
+                    # makes ci1 a candidate. #3276: `--revalidate` never
+                    # reruns for this, so this stays unchanged across every
+                    # read in the test.
                     return [SimpleNamespace(
                         name="build", status="completed", conclusion="success",
                         started_at=500.0, completed_at=None,
@@ -3437,7 +3451,7 @@ class TestMergeRevalidateRereadsBoardAfterWait:
             ))
         return Board(active=[], completed=reviews)
 
-    def test_review_approved_during_the_wait_is_not_reported_stale(
+    def test_review_approved_while_ci_stale_arm_runs_is_not_reported_stale(
         self, tmp_path: Path, coord_db,
     ) -> None:
         cfg = self._config(tmp_path)
@@ -3470,14 +3484,14 @@ class TestMergeRevalidateRereadsBoardAfterWait:
             )
 
         assert result.exit_code == 0, result.output
-        # The CI-settle wait for ci1 actually ran (proves the repro shape —
-        # rv1's fresh approval is only visible because *something* re-read
-        # the board after this). `--revalidate`'s own trigger is the first
-        # call; `process()`'s independent #2197 auto-rerun (still-stale
-        # after the settle read) may add a second — irrelevant to this test.
-        assert ("acme/api", 501) in ci.rerun_calls
+        # #3276: ci1 is blocked solely on stale CI — the arm this reload
+        # runs after must report the remedy, never fire a same-base rerun.
+        assert ci.rerun_calls == []
+        assert "blocked solely on stale CI checks" in result.output
         # The core #2143 assertion: rv1 must never be reported blocked on a
-        # stale review read, and must actually merge on the fresh one.
+        # stale review read, and must actually merge on the fresh one —
+        # proving the reload after the CI-stale arm still ran even though
+        # #3276 means that arm no longer triggers anything for ci1.
         assert "review required but not approved" not in result.output
         assert 502 in merge_calls
         persisted = {x.assignment_id: x.state for x in mq.load_queue()}

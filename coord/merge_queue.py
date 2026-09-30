@@ -2539,9 +2539,12 @@ MAX_CI_INFRA_RERUNS = 2
 # all. Kept defined — rather than deleted — because `QueuedMerge.
 # ci_stale_reruns` still exists for rows written before this fix (see its
 # own comment) and because `coord.commands.merge._apply_ci_revalidation`
-# (the opt-in ``--revalidate`` CLI arm) still references it; that caller is
-# lower severity (opt-in, human-invoked) and is a tracked follow-up, not
-# something this fix's file scope covers.
+# (the opt-in ``--revalidate`` CLI arm) still references it in its own
+# docstring. #3276 closed the gap #3266 left open there: that caller now
+# reports the rebase remedy for a staleness-only candidate instead of
+# calling `rerun_for_pr` for it either — the third and last of this
+# primitive's call sites, so nothing left in this module calls `rerun_for_pr`
+# for a condition it can never clear.
 MAX_CI_STALE_RERUNS = 2
 
 # #2252: at most one auto-rerun per failure streak before a genuinely-
@@ -3804,12 +3807,12 @@ def ci_revalidation_candidates(
     `rerun_for_pr` replays the same run against the same base it already
     used, so it can never see the new one. `process()`'s OWN #2197
     auto-rerun for this trigger was dropped for that reason (see
-    `MAX_CI_STALE_RERUNS`'s comment). The one remaining caller that still
-    calls `rerun_for_pr` on what this returns is `coord.commands.merge
-    ._apply_ci_revalidation` (the opt-in ``--revalidate`` CI arm) — equally
-    unable to clear the block, but lower severity since a human has to
-    explicitly ask for it. Left as-is here: fixing it is a change to that
-    module, out of this function's/file's scope, and a tracked follow-up.
+    `MAX_CI_STALE_RERUNS`'s comment). `coord.commands.merge
+    ._apply_ci_revalidation` (the opt-in ``--revalidate`` CI arm) was the one
+    remaining caller that still called `rerun_for_pr` on what this returns —
+    #3276 fixed it too: it now reports the rebase remedy for every entry this
+    function returns (all of them are staleness-only, by this function's own
+    contract above) instead of spending a guaranteed no-op CI cycle.
 
     #3396: `coord.commands.drive_queue._run_auto_revalidate_checks_stale`
     (the unattended periodic call site) still calls this function to find
@@ -4099,12 +4102,13 @@ class QueuedMerge:
     # this column.
     #
     # `coord.commands.merge._apply_ci_revalidation` (the opt-in
-    # ``--revalidate`` CLI arm) is the one remaining caller of
-    # `ci_revalidation_candidates` that still calls `rerun_for_pr` for this
-    # exact condition — it does not touch this counter (no budget, no cap;
-    # a human invoked it once, on purpose), but it is equally unable to
-    # clear a staleness block for the reason above, and is a tracked,
-    # lower-severity follow-up (see its own docstring).
+    # ``--revalidate`` CLI arm) never touched this counter (no budget, no
+    # cap; a human invoked it once, on purpose) but, until #3276, was the
+    # one remaining caller of `ci_revalidation_candidates` that still called
+    # `rerun_for_pr` for this exact unclearable condition. #3276 fixed it:
+    # that arm now reports the rebase remedy for a staleness-only candidate
+    # instead of re-running, so nothing in the codebase calls `rerun_for_pr`
+    # for a block only a rebase can clear.
     ci_stale_reruns: int = 0
     # #2252: count of automatic `CiStore.rerun_failed_for_pr` calls
     # `process()` has issued for this entry's CURRENT streak of genuinely-
