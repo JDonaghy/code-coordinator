@@ -116,8 +116,22 @@ postgres = ["psycopg[binary]>=3.1"]
 # naming this extra rather than a bare `ModuleNotFoundError` when it is
 # absent (a bare client install, or `server` without `reports-xlsx`).
 reports-xlsx = ["openpyxl>=3.1"]
+# #3483: the `tui-pty` acceptance driver — drives a real binary under a real
+# pty/ConPTY and reads its output through a VT emulator. `pyte` is pure
+# Python (no C-extension/version-skew cost, same reasoning as `reports-xlsx`
+# above), so it's folded into `dev`/`all` unconditionally. `pywinpty` is the
+# ConPTY backing on Windows only — the `sys_platform` marker means installing
+# this extra on Linux/macOS (every dev machine and CI runner today) pulls in
+# nothing platform-specific to resolve or build. `coord/tui_pty_driver.py`
+# guards both imports and raises a clear error naming this extra rather than
+# a bare `ModuleNotFoundError`, mirroring `reports.py`'s
+# `XlsxExtraMissingError` convention.
+tui-pty = [
+    "pyte>=0.8",
+    "pywinpty>=2.0; sys_platform == 'win32'",
+]
 # Convenience alias: "give me everything a full node runs".
-all = ["code-coordinator[server]", "code-coordinator[reports-xlsx]"]
+all = ["code-coordinator[server]", "code-coordinator[reports-xlsx]", "code-coordinator[tui-pty]"]
 dev = [
     # The test suite exercises serve_app/agent_app/dashboard end to end, so a
     # dev install is necessarily a full-fat install. Self-referential extra
@@ -127,6 +141,10 @@ dev = [
     # default rather than skipping — #3472's acceptance bar is a real
     # read-back through openpyxl, not just "the code path didn't crash".
     "code-coordinator[reports-xlsx]",
+    # Needed so tests/test_tui_pty_driver.py's VT-screen assertions run by
+    # default rather than skipping (#3483) — same "read-back through the
+    # real library, not just a code-path-didn't-crash check" reasoning.
+    "code-coordinator[tui-pty]",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     # Parallel test execution. The suite is the dominant cost of the Test gate

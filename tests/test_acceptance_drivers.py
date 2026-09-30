@@ -1363,3 +1363,140 @@ class TestAssertEphemeralRg:
     def test_pattern_is_anchored_at_both_ends(self) -> None:
         assert EPHEMERAL_RG_PATTERN.pattern.startswith("^")
         assert EPHEMERAL_RG_PATTERN.pattern.endswith("$")
+
+
+class TestRunDriverTuiPty:
+    """#3483: the ``tui-pty`` driver — the actual pty/ConPTY spawning, raw
+    terminal input, and VT screen assertions live in
+    :mod:`coord.tui_pty_driver` (unit-tested against a scripted fake child
+    in ``tests/test_tui_pty_driver.py``); this class covers only this
+    module's own seam: resolving ``entrypoint:`` to a spec file and folding
+    its normalized ``tests`` list into a :class:`DriverResult`."""
+
+    def test_supported_kinds_tuple_has_tui_pty(self) -> None:
+        assert "tui-pty" in SUPPORTED_KINDS
+
+    def test_missing_entrypoint_raises_driver_error(self, tmp_path) -> None:
+        with pytest.raises(DriverError, match="entrypoint"):
+            run_driver("tui-pty", "./vcd", cwd=str(tmp_path))
+
+    def test_spec_file_not_found_raises_driver_error(self, tmp_path) -> None:
+        with pytest.raises(DriverError, match="not found"):
+            run_driver(
+                "tui-pty", "./vcd", cwd=str(tmp_path),
+                entrypoint="tests/smoke.yaml",
+            )
+
+    def test_malformed_spec_raises_driver_error(self, tmp_path) -> None:
+        spec = tmp_path / "smoke.yaml"
+        spec.write_text("steps: []\n")
+        with pytest.raises(DriverError, match="invalid"):
+            run_driver("tui-pty", "./vcd", cwd=str(tmp_path), entrypoint="smoke.yaml")
+
+    def test_run_smoke_spec_result_is_folded_into_driver_result(self, tmp_path, monkeypatch) -> None:
+        spec = tmp_path / "smoke.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        fake_tests = [
+            {"id": "000 launch", "status": "pass", "message": ""},
+            {"id": "idle-flicker-1634", "status": "fail", "message": "flickered"},
+        ]
+
+        def fake_run_smoke_spec(spec_text, *, launch_command, cwd, timeout=None):
+            assert "steps:" in spec_text
+            assert launch_command == "./vcd --smoke"
+            assert cwd == str(tmp_path)
+            return fake_tests
+
+        import coord.tui_pty_driver as tui_pty_driver
+        monkeypatch.setattr(tui_pty_driver, "run_smoke_spec", fake_run_smoke_spec)
+
+        result = run_driver(
+            "tui-pty", "./vcd --smoke", cwd=str(tmp_path), entrypoint="smoke.yaml",
+        )
+        assert result.tests == fake_tests
+        # A gate must be able to fail: one failing entry must flip the
+        # overall exit code, not just be listed and ignored (#2096).
+        assert result.exit_code == 1
+        assert result.ok is False
+
+    def test_all_passing_tests_report_a_clean_exit(self, tmp_path, monkeypatch) -> None:
+        spec = tmp_path / "smoke.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        def fake_run_smoke_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return [{"id": "000 launch", "status": "pass", "message": ""}]
+
+        import coord.tui_pty_driver as tui_pty_driver
+        monkeypatch.setattr(tui_pty_driver, "run_smoke_spec", fake_run_smoke_spec)
+
+        result = run_driver("tui-pty", "./vcd", cwd=str(tmp_path), entrypoint="smoke.yaml")
+        assert result.exit_code == 0
+        assert result.ok is True
+
+    def test_zero_tests_is_not_a_clean_exit(self, tmp_path, monkeypatch) -> None:
+        # Mirrors this module's other drivers' "an empty tests list must
+        # never read as a silent pass" rule (see TestZeroTestPlaywrightRunIsAFailureNotAPass).
+        spec = tmp_path / "smoke.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        def fake_run_smoke_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return []
+
+        import coord.tui_pty_driver as tui_pty_driver
+        monkeypatch.setattr(tui_pty_driver, "run_smoke_spec", fake_run_smoke_spec)
+
+        result = run_driver("tui-pty", "./vcd", cwd=str(tmp_path), entrypoint="smoke.yaml")
+        assert result.exit_code != 0
+        assert result.ok is False
+
+    def test_entrypoint_is_resolved_relative_to_cwd(self, tmp_path, monkeypatch) -> None:
+        nested = tmp_path / "tui"
+        nested.mkdir()
+        spec = nested / "smoke.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        seen_cwd = {}
+
+        def fake_run_smoke_spec(spec_text, *, launch_command, cwd, timeout=None):
+            seen_cwd["cwd"] = cwd
+            return [{"id": "000 launch", "status": "pass", "message": ""}]
+
+        import coord.tui_pty_driver as tui_pty_driver
+        monkeypatch.setattr(tui_pty_driver, "run_smoke_spec", fake_run_smoke_spec)
+
+        run_driver(
+            "tui-pty", "./vcd", cwd=str(tmp_path), entrypoint="tui/smoke.yaml",
+        )
+        assert seen_cwd["cwd"] == str(tmp_path)
+
+    def test_real_end_to_end_against_a_real_pty(self, tmp_path) -> None:
+        """No mocking of coord.tui_pty_driver at all here — a real Unix pty
+        (skipped implicitly on non-POSIX since UnixPtyChild itself guards
+        that) launching a real Python process, driven end to end through
+        `run_driver`. Proves the whole seam — entrypoint resolution, YAML
+        parsing, pty spawn, VT screen assertion — works together, not just
+        each piece in isolation."""
+        if os.name != "posix":
+            pytest.skip("real UnixPtyChild path requires POSIX")
+
+        spec = tmp_path / "smoke.yaml"
+        spec.write_text(
+            "steps:\n"
+            "  - type: launch\n"
+            "  - type: wait_idle\n"
+            "    ms: 100\n"
+            "    timeout_ms: 3000\n"
+            "  - type: expect_screen\n"
+            "    id: greeting\n"
+            "    text: HELLO REAL PTY\n"
+        )
+        command = (
+            f"{shlex.quote(sys.executable)} -c "
+            "\"import sys,time; sys.stdout.write('HELLO REAL PTY\\r\\n'); "
+            "sys.stdout.flush(); time.sleep(2)\""
+        )
+        result = run_driver("tui-pty", command, cwd=str(tmp_path), entrypoint="smoke.yaml")
+        by_id = {t["id"]: t for t in result.tests}
+        assert by_id["greeting"]["status"] == "pass"
+        assert result.exit_code == 0
