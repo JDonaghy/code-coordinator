@@ -614,11 +614,19 @@ def validate_no_shared_oracle_group(
     ms-N's manifest at once.
 
     ``oracle_loop`` is the caller's already-resolved
-    ``config.acceptance.has_driver(repo_name)`` — this stays a pure
-    function, no config/GitHub reach-out of its own. A no-op when
-    ``oracle_loop`` is False (repos outside the oracle loop keep declaring
-    parallel groups exactly as before this check existed) or when no group
-    holds more than one node.
+    :func:`coord.milestone_dispatch.milestone_oracle_loop` for *this
+    milestone* (#2785) — NOT the repo-level ``config.acceptance.
+    has_driver(repo_name)`` alone, which is true for every milestone in a
+    repo that has ever declared ANY acceptance driver and so over-fires for
+    a milestone that has no ``tests/acceptance/ms-N/`` of its own to race
+    on (#2785's ms-60/#1949: ordinary refactors sharing a repo with real
+    oracle-loop milestones, whose `## Work order` became permanently
+    un-editable under the old, repo-level resolution). This function stays
+    pure either way — no config/GitHub reach-out of its own; resolving
+    ``oracle_loop`` correctly is the caller's job. A no-op when
+    ``oracle_loop`` is False (a milestone outside the oracle loop keeps
+    declaring parallel groups exactly as before this check existed) or when
+    no group holds more than one node.
 
     This is deliberately only the cheap, early check for the EXPLICIT-group
     case — ``coord milestone write-order`` validates it before a word order

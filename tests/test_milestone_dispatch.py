@@ -25,6 +25,7 @@ from coord.milestone_dispatch import (
     gate_a_status,
     is_milestone_complete,
     issue_oracle_ready,
+    milestone_oracle_loop,
     pick_machine,
     plan_dispatch,
     plan_queue,
@@ -476,6 +477,49 @@ class TestGateAStatus:
         assert "rate limit" in reason.lower()
         assert "retry" in reason.lower()
 
+
+
+class TestMilestoneOracleLoop:
+    """#2785: `oracle_loop` must be resolved PER MILESTONE, not from
+    `config.acceptance.has_driver(repo_name)` alone — that repo-level fact
+    is true for every milestone in a repo that has ever declared ANY
+    acceptance driver, even one (like ms-60/#1949) with no
+    `tests/acceptance/ms-60/` of its own to race on."""
+
+    def _cfg(self, *, with_driver: bool) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        drivers = {}
+        if with_driver:
+            drivers["api"] = AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test")
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[_machine("laptop", ["api"])],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_false_when_repo_has_no_driver_at_all(self) -> None:
+        cfg = self._cfg(with_driver=False)
+        repo = cfg.repo("api")
+        assert milestone_oracle_loop(repo, cfg, gate_a_satisfied=True) is False
+
+    def test_false_when_driver_configured_but_this_milestones_contract_missing(
+        self,
+    ) -> None:
+        """The #2785 regression: a repo-level driver alone must NOT be
+        enough — a milestone with no contract of its own (nothing satisfied
+        `gate_a_satisfied`) is not oracle-loop, even though the repo has a
+        driver configured for OTHER milestones."""
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        assert milestone_oracle_loop(repo, cfg, gate_a_satisfied=False) is False
+
+    def test_true_when_driver_configured_and_this_milestones_contract_exists(
+        self,
+    ) -> None:
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        assert milestone_oracle_loop(repo, cfg, gate_a_satisfied=True) is True
 
 
 class TestGateAStatusRelocatedSlices:
