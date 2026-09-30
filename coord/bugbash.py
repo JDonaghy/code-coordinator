@@ -410,11 +410,28 @@ class ExploreOutcome:
     """What one lane's exploration round produced: its findings, plus the
     cost spent producing them (whatever unit :class:`BugbashConfig`'s cost
     caps are denominated in — turns, dollars, minutes; this module is
-    agnostic, it just accumulates and compares)."""
+    agnostic, it just accumulates and compares).
+
+    ``ok`` is the explicit, machine-checkable signal for "this outcome is a
+    verified observation of the lane," separate from ``notes`` (#2096: an
+    unconfirmed success is a defect). A production explorer sets
+    ``ok=False`` on every path that did NOT actually observe the lane run to
+    completion — dispatch failed, the poll never reached a terminal state,
+    the assignment vanished, it finished with a non-zero exit code, or its
+    log couldn't be fetched — with ``notes`` explaining why. It defaults to
+    ``True`` because a fake explorer in a test, and a real explorer that
+    genuinely completed, both hand back a trustworthy ``findings`` tuple
+    without having to opt in. ``findings=(), ok=False`` and ``findings=(),
+    ok=True`` are NOT the same thing: the first means "we don't know if
+    there were findings," the second means "we looked, and there weren't
+    any" — :func:`run_bugbash` keeps them distinguishable in
+    :attr:`RoundReport.lane_failures` and its termination reason, rather
+    than collapsing both into "zero findings"."""
 
     findings: tuple[Finding, ...] = ()
     cost: float = 0.0
     notes: str = ""
+    ok: bool = True
 
 
 #: ``(lane, round_num) -> ExploreOutcome`` — "go run this lane's
@@ -507,6 +524,14 @@ def file_finding(
     this is the sole mechanism backing "a dry run files nothing": there is
     no code path from ``dry_run=True`` to the runner being invoked.
     """
+    if dedupe.verdict is DedupeVerdict.DUPLICATE:
+        # Nothing to preview or file — the title/body below are discarded
+        # on this path, so don't bother building them.
+        return FilingResult(
+            finding=finding, verdict=dedupe.verdict,
+            filed=False, queued=False, issue_number=dedupe.matched_number,
+        )
+
     title = compose_finding_issue_title(finding)
     body = format_bug_report(
         expected=finding.expected,
@@ -514,12 +539,6 @@ def file_finding(
         repro=finding.repro,
         evidence=_evidence_with_acceptance(finding, dedupe),
     )
-
-    if dedupe.verdict is DedupeVerdict.DUPLICATE:
-        return FilingResult(
-            finding=finding, verdict=dedupe.verdict,
-            filed=False, queued=False, issue_number=dedupe.matched_number,
-        )
 
     if dry_run:
         return FilingResult(
@@ -600,6 +619,33 @@ class RoundReport:
     #: since it genuinely was new/regression, just not filed this round.
     new_count: int = 0
     declined: bool = False
+    #: ``{platform: notes}`` for every lane explored this round whose
+    #: :attr:`ExploreOutcome.ok` was ``False`` — a dispatch failure, a poll
+    #: that never reached a terminal state, a vanished assignment, a
+    #: non-zero exit code, or a log-fetch failure (#2096: an unverified
+    #: round must never render identically to a clean one). Never populated
+    #: from a *skipped* lane (:attr:`skipped_lanes` already covers those —
+    #: a lane skipped for having blown its per-lane cost cap was never
+    #: asked a question this round, so it can't have failed to answer one).
+    lane_failures: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def explored_lanes(self) -> set[str]:
+        """Platforms actually explored this round (i.e. not skipped) —
+        every explored lane adds an entry to ``lane_cost`` even when its
+        outcome cost ``0.0``, so this is exactly ``lane_cost``'s key set."""
+        return set(self.lane_cost)
+
+    @property
+    def all_explored_lanes_failed(self) -> bool:
+        """``True`` when every lane explored this round (there must be at
+        least one) came back ``ok=False`` — the "the whole fleet is down,
+        not a clean pass" signal (#2096). A round with nothing explored at
+        all (e.g. every lane skipped on its cost cap) is NOT reported as
+        "all failed" — there is nothing to distrust, just nothing that
+        ran."""
+        explored = self.explored_lanes
+        return bool(explored) and explored <= set(self.lane_failures)
 
 
 @dataclass
@@ -622,6 +668,14 @@ class BugbashReport:
             f for r in self.rounds for f in r.filings
             if f.preview_title is not None
         ]
+
+    @property
+    def any_lane_failures(self) -> bool:
+        """``True`` if ANY round recorded a lane failure — surfaced
+        regardless of whether it happened to be the terminating round, so
+        an operator glancing at a "round_cap"/"cost_cap" run still sees that
+        part of what it observed along the way was unverified (#2096)."""
+        return any(r.lane_failures for r in self.rounds)
 
 
 def run_bugbash(
@@ -646,7 +700,15 @@ def run_bugbash(
     run. Termination is checked AFTER filing, from the round's own observed
     ``new_count``/cost, never inferred from "no exception was raised":
 
-    - ``"zero_findings"`` — this round's non-duplicate finding count is 0.
+    - ``"zero_findings"`` — this round's non-duplicate finding count is 0,
+      AND at least one explored lane actually completed
+      (``RoundReport.all_explored_lanes_failed`` is ``False``) — a genuine
+      observed clean pass.
+    - ``"lane_failure"`` — this round's non-duplicate finding count is ALSO
+      0, but every lane explored this round came back ``ok=False``
+      (dispatch/poll/log failure) — #2096: a fleet-wide dispatch outage
+      must never be reported identically to a clean bugbash pass. Check
+      ``BugbashReport.rounds[-1].lane_failures`` for what actually broke.
     - ``"cost_cap"`` — cumulative cost has reached ``cost_cap_total``.
     - ``"round_cap"`` — ``config.max_rounds`` rounds ran without either of
       the above firing.
@@ -669,6 +731,12 @@ def run_bugbash(
             report.lane_cost[lane.platform] = lane_cost[lane.platform]
             total_cost += outcome.cost
             report.findings.extend(outcome.findings)
+            if not outcome.ok:
+                # #2096: this lane's "findings" (almost certainly empty) are
+                # NOT a verified observation — record why, so a round whose
+                # every lane failed this way can never render identically to
+                # a round that actually looked and found nothing.
+                report.lane_failures[lane.platform] = outcome.notes or "explorer reported failure"
 
         open_issues = open_issues_fetcher(config.repo)
         closed_issues = closed_issues_fetcher(config.repo)
@@ -719,7 +787,12 @@ def run_bugbash(
         rounds.append(report)
 
         if report.new_count == 0:
-            reason = "zero_findings"
+            # #2096: "zero findings" is only a genuine clean-pass verdict
+            # when at least one lane was actually verified to have run this
+            # round. A round where every explored lane failed to dispatch,
+            # poll, or fetch its log gets its own distinct reason instead —
+            # see RoundReport.lane_failures for what broke.
+            reason = "lane_failure" if report.all_explored_lanes_failed else "zero_findings"
             break
         if total_cost >= config.cost_cap_total:
             reason = "cost_cap"
