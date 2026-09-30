@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from coord.config import Config
     from coord.providers.base import Provider
 
 
@@ -118,6 +119,7 @@ def parse_progress(
     *,
     provider_name: str | None = None,
     provider: "Provider | None" = None,
+    cfg: "Config | None" = None,
 ) -> WorkerProgress:
     """Parse progress from a worker log.
 
@@ -137,6 +139,15 @@ def parse_progress(
             precedence over *provider_name*. Mainly for tests that want to
             exercise a specific (e.g. fake, non-claude) provider without
             wiring up a full :class:`~coord.config.Config`.
+        cfg: The coordinator's :class:`~coord.config.Config`, when the caller
+            has one in scope. #2305: without this, ``provider_name`` only
+            ever resolves against the built-in provider *types*
+            (``claude``/``claude-pty``/``opencode``) — a **tier-named**
+            ``providers.definitions`` entry (e.g. ``oc-mid``) silently
+            degrades to :class:`~coord.providers.claude.ClaudeProvider`.
+            Passed straight through to :func:`coord.providers.get_provider`;
+            ``None`` (the default) preserves the pre-#2305 built-ins-only
+            resolution, so existing callers are unaffected.
     """
     from coord.worker_events import detect_anomalies, is_stream_json
 
@@ -147,7 +158,7 @@ def parse_progress(
     if is_stream_json(p):
         if provider is None:
             from coord.providers import get_provider  # noqa: PLC0415
-            provider = get_provider(provider_name)
+            provider = get_provider(provider_name, cfg=cfg)
         summary = provider.parse_log(p, tail_bytes=tail_bytes)
         progress = WorkerProgress()
         # Synthesise a single rolling "update" line so coord status keeps

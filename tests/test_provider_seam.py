@@ -36,13 +36,40 @@ from pathlib import Path
 
 import pytest
 
+from coord.config import Config, ProviderDef, ProvidersConfig
 from coord.failure_class import ENVIRONMENTAL, WORK, classify_log
 from coord.progress import parse_progress
 from coord.providers import get_provider
 from coord.providers.base import Capabilities, Provider, WorkerSummary
 from coord.providers.claude import ClaudeProvider
+from coord.providers.opencode import OpenCodeProvider
 from coord.review import parse_review_from_log
 from coord.usage import parse_usage_from_log
+
+
+#: A real, verbatim opencode capture (#1703/#1704) — same fixture
+#: ``tests/test_providers.py`` pins ``OpenCodeProvider.parse_log()``'s exact
+#: field values against. Reused here (#2305) as the "vehicle" log for
+#: proving ``cfg``-based resolution of a **tier-named** provider definition
+#: (e.g. ``oc-mid``) actually reaches ``OpenCodeProvider.parse_log()`` at
+#: each of the four #2305 call sites, without depending on a real opencode
+#: binary — the fixture is a static capture, not a live run.
+_OPENCODE_FIXTURE = Path(__file__).parent / "fixtures" / "opencode_run_sample.jsonl"
+
+
+def _cfg_with_tier_provider(name: str, ptype: str) -> Config:
+    """A minimal :class:`~coord.config.Config` whose ``providers.definitions``
+    carries one entry keyed by a **tier name** (e.g. ``"oc-mid"``) rather
+    than a built-in provider *type* name — the #2305 shape: the name alone
+    doesn't match ``_BUILTIN_PROVIDER_TYPES``, so resolution only succeeds
+    when the caller actually threads ``cfg`` through to
+    :func:`coord.providers.get_provider`.
+    """
+    return Config(
+        repos=[],
+        machines=[],
+        providers=ProvidersConfig(definitions={name: ProviderDef(type=ptype)}),
+    )
 
 
 # ── The fake provider ───────────────────────────────────────────────────────
@@ -185,6 +212,30 @@ class TestGetProvider:
             "totally-unknown-provider" in r.message for r in caplog.records
         ), "unknown provider_name must produce a LOUD warning, not a silent fallback (#1710)"
 
+    def test_tier_named_definition_degrades_to_claude_without_cfg(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#2305: this is the bug itself, pinned directly at the seam —
+        ``oc-mid`` is a real fleet tier name (see the issue), not a typo.
+        Without ``cfg`` there is no ``providers.definitions`` to consult, so
+        it degrades to :class:`ClaudeProvider`, loudly."""
+        with caplog.at_level(logging.WARNING, logger="coord.providers"):
+            provider = get_provider("oc-mid")
+        assert isinstance(provider, ClaudeProvider)
+        assert any("oc-mid" in r.message for r in caplog.records)
+
+    def test_tier_named_definition_resolves_via_cfg(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#2305 fix: with ``cfg`` threaded through, the same tier name
+        resolves against ``cfg.providers.definitions`` — the *type* backing
+        it (``opencode``), not :class:`ClaudeProvider`, and with no warning."""
+        cfg = _cfg_with_tier_provider("oc-mid", "opencode")
+        with caplog.at_level(logging.WARNING, logger="coord.providers"):
+            provider = get_provider("oc-mid", cfg=cfg)
+        assert isinstance(provider, OpenCodeProvider)
+        assert not caplog.records
+
 
 # ── progress.py ──────────────────────────────────────────────────────────────
 
@@ -250,6 +301,23 @@ class TestProgressSeam:
         progress = parse_progress(log)
         assert progress.updates == ["Turn 1: Bash"]
 
+    def test_tier_named_definition_misparses_without_cfg(self) -> None:
+        """#2305 regression: `parse_progress`'s own `get_provider()` call
+        (the site at `coord/progress.py:150`) is never handed `cfg` here —
+        `oc-mid` degrades to ClaudeProvider, which has no idea how to read
+        opencode's `step_finish` events, so the real 4-turn run reads as 0."""
+        assert _OPENCODE_FIXTURE.exists(), "opencode_run_sample.jsonl fixture is missing"
+        progress = parse_progress(_OPENCODE_FIXTURE, provider_name="oc-mid")
+        assert progress.updates == ["Turn 0: edit"]
+
+    def test_tier_named_definition_parses_correctly_with_cfg(self) -> None:
+        """#2305 fix: threading `cfg` through resolves `oc-mid` to
+        `OpenCodeProvider` at the `coord/progress.py:150` site, and the real
+        4-turn count from the verbatim capture comes through."""
+        cfg = _cfg_with_tier_provider("oc-mid", "opencode")
+        progress = parse_progress(_OPENCODE_FIXTURE, provider_name="oc-mid", cfg=cfg)
+        assert progress.updates == ["Turn 4: edit"]
+
 
 # ── usage.py ─────────────────────────────────────────────────────────────────
 
@@ -314,6 +382,27 @@ class TestUsageSeam:
         assert usage is None
         assert not caplog.records
 
+    def test_tier_named_definition_misparses_without_cfg(self) -> None:
+        """#2305 regression: the `get_provider()` call at `coord/usage.py:182`
+        with no `cfg` degrades `oc-mid` to ClaudeProvider — the real 8392
+        input tokens in the verbatim opencode capture read as 0."""
+        u = parse_usage_from_log(_OPENCODE_FIXTURE, provider_name="oc-mid")
+        assert u is not None
+        assert u.input_tokens == 0
+        assert u.num_turns == 0
+
+    def test_tier_named_definition_parses_correctly_with_cfg(self) -> None:
+        """#2305 fix: `cfg` threaded through resolves `oc-mid` to
+        `OpenCodeProvider` at `coord/usage.py:182`, so the real numbers from
+        the verbatim capture come through (see
+        `test_opencode_parse_log_real_success_fixture` in
+        `tests/test_providers.py` for where these values are pinned)."""
+        cfg = _cfg_with_tier_provider("oc-mid", "opencode")
+        u = parse_usage_from_log(_OPENCODE_FIXTURE, provider_name="oc-mid", cfg=cfg)
+        assert u is not None
+        assert u.input_tokens == 8392
+        assert u.num_turns == 4
+
 
 # ── failure_class.py ─────────────────────────────────────────────────────────
 
@@ -353,6 +442,56 @@ class TestFailureClassificationSeam:
             c = classify_log(log, provider_name="nonexistent-provider")
         assert c.failure_class == WORK
         assert any("nonexistent-provider" in r.message for r in caplog.records)
+
+    def test_tier_named_definition_misclassifies_without_cfg(
+        self, tmp_path: Path
+    ) -> None:
+        """#2305 regression: the `get_provider()` call at
+        `coord/failure_class.py:~511` with no `cfg` degrades `oc-mid` to
+        ClaudeProvider — ClaudeProvider's parser has no idea how to read
+        opencode's `type: "error"` event, so a genuine environmental 503
+        classifies as an unknown WORK failure instead."""
+        log = _write_fake_log(
+            tmp_path / "opencode-error.log",
+            [
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "name": "UnknownError",
+                            "data": {"message": "API Error: 503 overloaded_error"},
+                        },
+                    }
+                ),
+            ],
+        )
+        c = classify_log(log, provider_name="oc-mid")
+        assert c.failure_class == WORK
+
+    def test_tier_named_definition_classifies_correctly_with_cfg(
+        self, tmp_path: Path
+    ) -> None:
+        """#2305 fix: `cfg` threaded through resolves `oc-mid` to
+        `OpenCodeProvider` at the `coord/failure_class.py` site, so the same
+        log correctly classifies as ENVIRONMENTAL."""
+        log = _write_fake_log(
+            tmp_path / "opencode-error.log",
+            [
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "name": "UnknownError",
+                            "data": {"message": "API Error: 503 overloaded_error"},
+                        },
+                    }
+                ),
+            ],
+        )
+        cfg = _cfg_with_tier_provider("oc-mid", "opencode")
+        c = classify_log(log, provider_name="oc-mid", cfg=cfg)
+        assert c.failure_class == ENVIRONMENTAL
+        assert c.api_status == 503
 
 
 # ── review.py (unchanged code path — asserted for #1710's acceptance bar) ───

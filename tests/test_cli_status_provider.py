@@ -17,13 +17,18 @@ stays uncluttered — only a non-default backend earns the tag.
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import coord.network as network_mod
+import pytest
 from click.testing import CliRunner
 
 from coord.commands.status import status as status_cmd
 from coord.models import Assignment, Board
 from coord.network import MachineStatus, StatusResult
 from coord.state import save_board
+from tests.conftest import VALID_CONFIG
 
 
 def _work(
@@ -188,3 +193,46 @@ def test_busy_line_omits_provider_when_absent(valid_config_path, monkeypatch) ->
     )
     assert result.exit_code == 0, result.output
     assert "provider=" not in result.output, result.output
+
+
+# ── #2305: tier-named providers.definitions must resolve, not degrade ──────
+
+
+@pytest.fixture
+def tier_provider_config_path(tmp_path: Path) -> Path:
+    """`valid_config_path` plus a tier-named `providers.definitions` entry —
+    the real fleet shape #2305 is about (`oc-mid` etc.), not a builtin
+    provider *type* name."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        VALID_CONFIG
+        + "\nproviders:\n"
+        "  definitions:\n"
+        "    oc-mid:\n"
+        "      type: opencode\n"
+    )
+    return p
+
+
+def test_status_resolves_tier_named_provider_without_warning(
+    tier_provider_config_path, monkeypatch, coord_db, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#2305 acceptance criterion: `coord status` against a board holding a
+    tier-named assignment (`oc-mid`, not a built-in `claude`/`claude-pty`/
+    `opencode` type name) must resolve the assignment's own provider
+    definition — no `get_provider: unknown provider_name` warning — because
+    `build_session_usage()` (feeding the burn-rate line) is now handed
+    `cfg`, which carries `providers.definitions`."""
+    save_board(Board(completed=[_work("w1", provider_name="oc-mid")]))
+    monkeypatch.setattr(network_mod, "check_all", lambda *a, **k: [])
+    runner = CliRunner()
+    with caplog.at_level(logging.WARNING, logger="coord.providers"):
+        result = runner.invoke(
+            status_cmd,
+            ["--config", str(tier_provider_config_path)],
+            catch_exceptions=False,
+        )
+    assert result.exit_code == 0, result.output
+    assert not any(
+        "unknown provider_name" in r.message for r in caplog.records
+    ), [r.message for r in caplog.records]

@@ -27,6 +27,7 @@ from coord.models import Assignment
 from coord.state import COORD_DIR
 
 if TYPE_CHECKING:
+    from coord.config import Config
     from coord.providers.base import Provider
 
 _log = logging.getLogger(__name__)
@@ -155,6 +156,7 @@ def parse_usage_from_log(
     *,
     provider_name: str | None = None,
     provider: "Provider | None" = None,
+    cfg: "Config | None" = None,
 ) -> AssignmentUsage | None:
     """Parse an :class:`AssignmentUsage` from a worker log file.
 
@@ -172,6 +174,14 @@ def parse_usage_from_log(
     behaviour byte-for-byte for every caller that doesn't pass it. *provider*
     is an escape hatch to pass an already-constructed provider directly
     (tests; bypasses name resolution).
+
+    *cfg* (#2305): the coordinator's :class:`~coord.config.Config`, passed
+    straight through to :func:`coord.providers.get_provider` so a
+    **tier-named** ``providers.definitions`` entry (e.g. ``oc-mid``) resolves
+    to its real backend instead of silently degrading to
+    :class:`~coord.providers.claude.ClaudeProvider` — *provider_name* alone
+    only ever matches the built-in type names. ``None`` (the default)
+    preserves pre-#2305 behaviour.
     """
     from coord.worker_events import is_stream_json
 
@@ -179,7 +189,7 @@ def parse_usage_from_log(
         return None
     if provider is None:
         from coord.providers import get_provider  # noqa: PLC0415
-        provider = get_provider(provider_name)
+        provider = get_provider(provider_name, cfg=cfg)
     if not is_stream_json(log_path):
         # #1710: a provider that claims it reports cost but whose log isn't
         # stream-json shaped gets NO cost/token data here — that mismatch is
@@ -221,6 +231,7 @@ def _assignment_to_usage(
     *,
     logs_dir: Path | None = None,
     remote_data: dict | None = None,
+    cfg: "Config | None" = None,
 ) -> AssignmentUsage:
     """Build an :class:`AssignmentUsage` for *a*.
 
@@ -229,6 +240,12 @@ def _assignment_to_usage(
 
     *remote_data* is a dict from the agent's ``list_assignments()`` response
     (e.g. ``{"cost_so_far": 0.12, "model_used": "claude-sonnet-4-6", ...}``).
+
+    *cfg* (#2305): threaded through to both the local-log parse and the
+    "neither local nor remote" ``get_provider`` fallback below, so a
+    tier-named provider (e.g. ``oc-mid``) resolves to its real backend
+    rather than :class:`~coord.providers.claude.ClaudeProvider`. ``None``
+    (the default) preserves pre-#2305 behaviour.
     """
     _logs_dir = logs_dir if logs_dir is not None else LOGS_DIR
     from coord.models import effective_issue_number  # noqa: PLC0415
@@ -252,7 +269,7 @@ def _assignment_to_usage(
         # #1710: thread the assignment's resolved provider name through so
         # the parse uses the right provider's parse_log() rather than always
         # assuming claude.
-        parsed = parse_usage_from_log(log_path, provider_name=a.provider_name)
+        parsed = parse_usage_from_log(log_path, provider_name=a.provider_name, cfg=cfg)
         if parsed is not None:
             usage.model = parsed.model or a.model
             usage.total_cost_usd = parsed.total_cost_usd
@@ -283,7 +300,7 @@ def _assignment_to_usage(
     if a.assignment_id:
         from coord.providers import get_provider  # noqa: PLC0415
 
-        provider = get_provider(a.provider_name)
+        provider = get_provider(a.provider_name, cfg=cfg)
         if provider.capabilities().cost_reporting:
             usage.cost_unknown = True
 
@@ -298,6 +315,7 @@ def collect_usage(
     *,
     logs_dir: Path | None = None,
     remote_by_id: dict[str, dict] | None = None,
+    cfg: "Config | None" = None,
 ) -> list[AssignmentUsage]:
     """Collect :class:`AssignmentUsage` for every assignment on the board.
 
@@ -305,13 +323,21 @@ def collect_usage(
     whose logs live on a remote machine.  Pass ``None`` (the default) to skip
     remote lookups entirely — the result will still be correct for any
     assignment whose log is available locally.
+
+    *cfg* (#2305): the coordinator's :class:`~coord.config.Config`, when the
+    caller has one — threaded to :func:`_assignment_to_usage` so a
+    tier-named ``providers.definitions`` entry resolves correctly rather
+    than degrading to :class:`~coord.providers.claude.ClaudeProvider`.
+    ``None`` (the default) preserves pre-#2305 behaviour.
     """
     result: list[AssignmentUsage] = []
     for a in board_assignments:
         if not a.assignment_id:
             continue
         remote = (remote_by_id or {}).get(a.assignment_id)
-        result.append(_assignment_to_usage(a, logs_dir=logs_dir, remote_data=remote))
+        result.append(
+            _assignment_to_usage(a, logs_dir=logs_dir, remote_data=remote, cfg=cfg)
+        )
     return result
 
 
@@ -321,12 +347,16 @@ def build_session_usage(
     logs_dir: Path | None = None,
     remote_by_id: dict[str, dict] | None = None,
     started_at: float | None = None,
+    cfg: "Config | None" = None,
 ) -> SessionUsage:
     """Build a :class:`SessionUsage` from the current board.
 
     *started_at* should come from ``session.json["started_at"]`` (parsed to
     a Unix timestamp).  If not provided we fall back to the oldest
     ``dispatched_at`` among the assignments.
+
+    *cfg* (#2305): passed straight through to :func:`collect_usage` — see
+    its docstring.
     """
     if started_at is None:
         # Derive from oldest dispatch time on the board.
@@ -341,6 +371,7 @@ def build_session_usage(
         board_assignments,
         logs_dir=logs_dir,
         remote_by_id=remote_by_id,
+        cfg=cfg,
     )
     return SessionUsage(started_at=started_at, assignments=assignments)
 
