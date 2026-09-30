@@ -1780,6 +1780,95 @@ def test_stuck_test_state_with_a_live_smoke_child_is_not_a_contradiction(monkeyp
     assert res.recovered is True
 
 
+# ── #3332: test_state='blocked' is a dead end, not "stage looks healthy" ────
+
+
+def test_blocked_test_state_reported_as_wedged_with_needs_reset(monkeypatch, config) -> None:
+    """#3332: a `done` work row wedged at `test_state='blocked'` — the marker
+    `dispatch_smoke` stamps when it gives up on a Test-stage dispatch and
+    never re-probes (#1672) — must be reported as wedged, not "stage looks
+    healthy". `--reset` is the documented remedy; the diagnostic must point
+    at it, and `needs_reset` (the field automation branches on) must say so
+    too."""
+    _stub(monkeypatch, session="dead")
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "blocked"
+    work.test_reason = "no capability-matched machine available"
+    board = Board(completed=[work])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test", dry_run=True)
+
+    assert res.recovered is False
+    assert res.needs_reset is True
+    assert not any("stage looks healthy" in f for f in res.findings)
+    assert any("blocked" in f and "--reset" in f for f in res.findings)
+
+
+def test_blocked_test_state_names_unroutable_fleet_cause(monkeypatch, config) -> None:
+    """#1672 shape: no capability-matched machine — `mute_smoke_legs` finds
+    no tally marker in the reason, so this must name the fleet cause, not
+    the #2272 mute-legs one (#2235: the two need different remedies)."""
+    _stub(monkeypatch, session="dead")
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "blocked"
+    work.test_reason = "no capability-matched machine available"
+    board = Board(completed=[work])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test", dry_run=True)
+
+    assert any("#1672" in f and "capability-matched" in f for f in res.findings)
+    assert not any("#2272" in f for f in res.findings)
+
+
+def test_blocked_test_state_names_mute_legs_cause(monkeypatch, config) -> None:
+    """#2272 shape: N Test-stage legs finished mute in a row and the retry
+    budget ran out — `mute_smoke_legs` (the exact function `coord.dead_end`
+    shape 2 uses, #2096 "one question, one answer") finds the tally marker,
+    so this must name THAT cause instead."""
+    _stub(monkeypatch, session="dead")
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "blocked"
+    work.test_reason = "no-verdict (#2244) x3"
+    board = Board(completed=[work])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test", dry_run=True)
+
+    assert any("#2272" in f for f in res.findings)
+    assert not any("#1672" in f for f in res.findings)
+
+
+def test_reset_test_reports_which_rows_were_cleared(monkeypatch, config, coord_db) -> None:
+    """#3332: the reset report must name which rows it cleared, not just a
+    bare count — an operator reading "cleared Test verdict on 3 work
+    row(s)" for a branch with 4 work-like rows can't tell a deliberate skip
+    from a miss."""
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    state.record_dispatched_assignment(
+        assignment=Assignment(
+            machine_name="precision", repo_name="api", issue_number=42,
+            issue_title="t", assignment_id="w1", type="work", status="done",
+        ),
+        repo_github="acme/api",
+    )
+    state.record_test_verdict(
+        assignment_id="w1", test_state="blocked", test_reason="no machine"
+    )
+
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "blocked"
+    board = Board(completed=[work])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test", reset=True)
+
+    assert res.reset_performed is True
+    assert any(
+        "cleared Test verdict" in a and "w1" in a for a in res.actions_taken
+    )
+    assert state.load_assignment_test_state("w1") is None
+
+
 def test_reset_dry_run_does_nothing(monkeypatch, config) -> None:
     calls = _stub(monkeypatch, session="live")
     a = _assign(aid="w1", typ="work", status="running")
