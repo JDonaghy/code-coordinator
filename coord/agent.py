@@ -3795,7 +3795,13 @@ internal-only change (CLAUDE.md's existing exemption), say so explicitly \
 in your final message instead — that already satisfies the reviewer, no \
 test required.
 
-#3502: your PR merging does NOT automatically mean issue it's for is \
+#3502: this ONLY applies to `type="work"` assignments — the ones whose \
+merge auto-closes the linked issue (`CLOSES_ISSUE_TYPES` in \
+`coord/models.py`). If you were dispatched as `mock-author`, \
+`test-author`, or `epic-decompose`, the `issue_number` you were given is \
+a milestone's TRACKING issue, not one your merge closes — this marker is \
+meaningless on those legs and you should omit it. For `type="work"`: your \
+PR merging does NOT automatically mean issue it's for is \
 actually resolved. If merging this PR would make the coordinator \
 auto-close the issue, but you know the issue's own problem is NOT fully \
 fixed — root cause lives in another repo and only a dependent half of \

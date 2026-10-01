@@ -8409,16 +8409,37 @@ def process(
                         _epic_cache[n] = False
                 return _epic_cache[n]
 
-            # #1196 hole 2 / #1318: GitHub's own closing-keyword magic reads
-            # the PR body directly at merge time and never calls
+            # #3502: resolve the EFFECTIVE worker+reviewer `ISSUE_RESOLUTION:`
+            # verdict for this entry ONCE, up front — before the PR-body lint
+            # below (which must downgrade an already-existing `Closes #N` to
+            # `Refs #N` whenever the verdict is not "resolved", the headline
+            # bug this issue fixes: a PR opened early with the worker's
+            # `resolved` claim baked into its body, later overridden by a
+            # more-cautious reviewer verdict, never gets its body rewritten
+            # today) and the post-merge close/comment decision further below
+            # (which reuses this exact same value rather than recomputing it
+            # — avoiding a second `gh`/GitHub review-findings round trip for
+            # every `CLOSES_ISSUE_TYPES` merge).
+            issue_resolution = (
+                _issue_resolution_for_entry(entry, board, gh_ops)
+                if entry.assignment_type in CLOSES_ISSUE_TYPES
+                else IssueResolution()
+            )
+
+            # #1196 hole 2 / #1318 / #3502: GitHub's own closing-keyword magic
+            # reads the PR body directly at merge time and never calls
             # `github_ops.close_issue` — that chokepoint's open-children
-            # guard can't stop it. Scan the body for `Closes #N`/`Fixes
-            # #N`/`Resolves #N` and downgrade to `Refs #N` for any N that
-            # either currently has open children (#1196) or carries the
-            # epic/tracking label (#1318 — an epic can have zero open
-            # children today and still be the wrong thing to auto-close),
-            # before the merge lands. Best effort throughout: a lint
-            # failure must never block a merge.
+            # guard (and the `ISSUE_RESOLUTION:` veto above) can't stop it.
+            # Scan the body for `Closes #N`/`Fixes #N`/`Resolves #N` and
+            # downgrade to `Refs #N` for any N that either currently has open
+            # children (#1196), carries the epic/tracking label (#1318 — an
+            # epic can have zero open children today and still be the wrong
+            # thing to auto-close), or whose EFFECTIVE `ISSUE_RESOLUTION:` is
+            # not "resolved" (#3502 — a reviewer's `partial`/`investigation`
+            # verdict, posted after the PR already existed with the worker's
+            # `resolved` claim baked into `Closes #N`, must still win), before
+            # the merge lands. Best effort throughout: a lint failure must
+            # never block a merge.
             try:
                 pr_body = gh_ops.get_pr_body(entry.repo_github, entry.pr_number)
             except Exception:  # noqa: BLE001
@@ -8434,16 +8455,33 @@ def process(
                         pass
                     if _is_epic(n):
                         blocking.add(n)
+                    if (
+                        n == entry.issue_number
+                        and entry.assignment_type in CLOSES_ISSUE_TYPES
+                        and issue_resolution.value != "resolved"
+                    ):
+                        blocking.add(n)
                 if blocking:
                     new_body, downgraded = downgrade_closing_keywords(pr_body, blocking)
                     if downgraded:
+                        issue_resolution_hit = (
+                            entry.issue_number in downgraded
+                            and entry.assignment_type in CLOSES_ISSUE_TYPES
+                            and issue_resolution.value != "resolved"
+                        )
+                        reason = (
+                            f"open children / epic / ISSUE_RESOLUTION:"
+                            f" {issue_resolution.value} — #1196/#1318/#3502"
+                            if issue_resolution_hit
+                            else "open children / epic — #1196/#1318"
+                        )
                         try:
                             gh_ops.edit_pr_body(entry.repo_github, entry.pr_number, new_body)
                             events.append(MergeEvent(
                                 entry, "pr_body_downgraded",
                                 "downgraded closing keyword to Refs for "
                                 + ", ".join(f"#{n}" for n in downgraded)
-                                + " (open children / epic — #1196/#1318)",
+                                + f" ({reason})",
                             ))
                         except Exception as e:  # noqa: BLE001
                             events.append(MergeEvent(
@@ -8495,6 +8533,45 @@ def process(
                     ))
                     continue  # #1318: refuse — never merge a branch that will
                     # auto-close an epic via a commit message we can't rewrite.
+
+            # #3502: the identical gap, for THIS entry's own issue. The
+            # PR-body lint above can rewrite `Closes #N` -> `Refs #N` in the
+            # PR *body* when the effective `ISSUE_RESOLUTION:` verdict is
+            # not "resolved" — but a worker's own commit SUBJECT using a
+            # closing keyword (this repo's own convention, e.g. `Fix #N: ...`
+            # — confirmed to match `_CLOSING_RE` regardless of the trailing
+            # colon) auto-closes the issue via GitHub's commit-message scan
+            # once it lands on the base branch, independent of the PR body
+            # entirely. Same unrewritable-history constraint as the epic
+            # case above: block rather than let a `partial`/`investigation`
+            # verdict be silently defeated, with the same `--force-merge`
+            # escape hatch.
+            if (
+                entry.assignment_type in CLOSES_ISSUE_TYPES
+                and issue_resolution.value != "resolved"
+                and entry.issue_number in commit_referenced
+            ):
+                msg = (
+                    f"a commit message on this branch contains a closing keyword "
+                    f"(Closes/Fixes/Resolves) for #{entry.issue_number}, but this "
+                    f"PR is marked `ISSUE_RESOLUTION: {issue_resolution.value}` — "
+                    f"GitHub would auto-close the issue on merge regardless of the "
+                    f"PR body (#3502). Reword the commit message(s) to 'refs #N' "
+                    f"and push, or pass --force-merge to merge anyway (the issue "
+                    f"WILL still auto-close)."
+                )
+                if force_merge:
+                    events.append(MergeEvent(
+                        entry, "issue_resolution_closing_keyword_in_commit_forced", msg,
+                    ))
+                else:
+                    entry.error = msg
+                    events.append(MergeEvent(
+                        entry, "issue_resolution_closing_keyword_in_commit", msg,
+                    ))
+                    continue  # #3502: refuse — never merge a branch that will
+                    # auto-close an issue marked not-yet-resolved via a commit
+                    # message we can't rewrite.
 
             # #1467: pre-flight linearity check. GitHub refuses to
             # rebase-merge any branch containing a merge commit ("This
@@ -8569,14 +8646,14 @@ def process(
                 #
                 # #3502: NOT ENOUGH, though — even for a CLOSES_ISSUE_TYPES
                 # entry, the worker's/reviewer's own `ISSUE_RESOLUTION:`
-                # judgment can veto the close. Resolved once per merge, up
-                # front, so both the close-or-not decision and the comment
-                # posted below read the identical verdict.
-                issue_resolution = (
-                    _issue_resolution_for_entry(entry, board, gh_ops)
-                    if entry.assignment_type in CLOSES_ISSUE_TYPES
-                    else IssueResolution()
-                )
+                # judgment can veto the close. Already resolved once per
+                # merge, up near the PR-body lint above (which needs the
+                # same verdict to decide whether to downgrade an
+                # already-existing `Closes #N` to `Refs #N` BEFORE
+                # `gh_ops.merge_pr` runs) — reused here as-is so the
+                # close-or-not decision, the PR-body lint, and the comment
+                # posted below all read the identical verdict, and so this
+                # doesn't cost a second `gh`/review-findings round trip.
                 if (
                     entry.assignment_type in CLOSES_ISSUE_TYPES
                     and issue_resolution.value == "resolved"

@@ -109,6 +109,7 @@ from coord.merge_queue import (
 )
 from coord.milestone_order import TRACKING_ISSUE_LABEL
 from coord.models import (
+    CLOSES_ISSUE_TYPES,
     EPIC_DECOMPOSE_TYPE,
     DEFAULT_ISSUE_RESOLUTION,
     is_merge_landed_reason,
@@ -2082,10 +2083,11 @@ def _merge_landed_state(facts: "IssueFacts") -> tuple[str, str]:
     a `coord drive-queue list`/TUI read never shows a row that still needs
     real work as indistinguishable from a clean `done`.
 
-    Centralised so the three `_reconcile_running` call sites below that
-    fold `facts.landed` (or an equivalent live-confirmed-merge reading)
-    into a terminal write can't drift from each other (#2096: one
-    question, one answer).
+    Centralised so every call site below that folds `facts.landed` (or an
+    equivalent live-confirmed-merge reading) into a terminal write can't
+    drift from each other (#2096: one question, one answer) — three in
+    `_reconcile_running`, plus the `_capacity_for` STATE_PARKED/BLOCKED/
+    FAILED sweep and `_cordon_reason`, five in total.
     """
     if facts.merged_partial:
         return (
@@ -2183,9 +2185,21 @@ def build_board_view(
             # aware derivation is `coord.merge_queue._issue_resolution_for_
             # entry`, used at the actual merge decision; this is a
             # best-effort display-only echo of it).
-            entry["merge_resolution"] = parse_issue_resolution(
-                row.get("completion_summary")
-            ).value
+            #
+            # Scoped to `CLOSES_ISSUE_TYPES` (today, exactly `{"work"}`),
+            # NOT the broader `WORK_LIKE` this loop otherwise reads rows
+            # for. A `mock-author`/`test-author`/`epic-decompose` row's
+            # `issue_number` was never going to be closed on merge in the
+            # first place (#1077) — plausible as it is for one of those
+            # dispatch types' final message to ALSO carry an
+            # `ISSUE_RESOLUTION:` marker (the instruction text doesn't
+            # exclude them), echoing it here would read as `merged-partial`
+            # for a row `merge_queue.py`'s actual close/comment decision
+            # never treats as partial, a meaningless, confusing state.
+            if (row.get("type") or "") in CLOSES_ISSUE_TYPES:
+                entry["merge_resolution"] = parse_issue_resolution(
+                    row.get("completion_summary")
+                ).value
         if status == "done":
             # #3239: at least one dispatch for this issue definitely reached
             # `coord assign` and ran the work to completion — see
