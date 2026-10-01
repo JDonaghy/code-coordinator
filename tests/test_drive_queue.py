@@ -415,6 +415,33 @@ def test_build_board_view_defaults_merge_resolution_to_resolved():
     assert not facts.merged_partial
 
 
+def test_build_board_view_ignores_issue_resolution_marker_for_mock_author():
+    # #3502 review (non-blocking concern): `mock-author`/`test-author`/
+    # `epic-decompose` rows are WORK_LIKE but never in CLOSES_ISSUE_TYPES —
+    # their `issue_number` is the milestone's tracking issue, never closed
+    # on merge (#1077). Even if such a leg's final message happens to carry
+    # an `ISSUE_RESOLUTION:` marker (the worker instructions don't exclude
+    # those types), echoing it here would read `merged-partial` for a row
+    # `merge_queue.py`'s actual close/comment decision never treats as
+    # partial — a meaningless, confusing display state.
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 1864, "type": "mock-author",
+                    "status": "merged",
+                    "completion_summary": "ISSUE_RESOLUTION: partial — n/a",
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 1864))
+    assert facts.merged
+    assert facts.merge_resolution == "resolved"
+    assert not facts.merged_partial
+
+
 def test_build_board_view_reads_merge_ci_pending_from_the_live_plan_reason():
     """#1891: the live `merge_plan` section (board-render time) is the
     primary source — mirrors `drive_state._merge_entry`'s own resolution."""

@@ -1008,6 +1008,116 @@ class TestProcess:
         partial_events = [e for e in events if e.kind == "merged_partial"]
         assert partial_events and "reviewer caught it" in partial_events[0].message
 
+    def test_existing_pr_body_downgraded_when_reviewer_overrides_worker(self) -> None:
+        # #3502 review (blocking finding): the headline scenario. A PR
+        # already exists (`pr_number` set, body baked in with "Closes #N"
+        # from the WORKER's own "resolved" claim, written before any
+        # review ran) and the REVIEWER later overrides with `partial`.
+        # `process()` never re-enters `_briefing_body` once `pr_number` is
+        # set, so the only thing that can still stop GitHub's own
+        # closing-keyword auto-close is the existing #1196/#1318 PR-body
+        # lint — it must now also catch a non-"resolved" `ISSUE_RESOLUTION`
+        # verdict and rewrite the body to "Refs #N" BEFORE `gh_ops.merge_pr`
+        # runs.
+        from coord.models import Assignment, Board, IssueResolution
+        from coord.review import ReviewFindings
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            completion_summary="Fixed it outright.",
+        )
+        review = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-a", type="review", status="done",
+            review_of_assignment_id="a", review_verdict="approve",
+        )
+        board = Board(active=[], completed=[work, review])
+        items = [_q("a", assignment_type="work", pr=100)]
+        gh = FakeGh(pr_bodies={100: "Closes #1\n\nAutomated merge from the coordinator."})
+
+        findings = ReviewFindings(
+            verdict="approve",
+            body="ISSUE_RESOLUTION: partial — reviewer caught it",
+            issue_resolution=IssueResolution("partial", "reviewer caught it"),
+        )
+        with patch(
+            "coord.review.fetch_review_findings_from_github", return_value=findings,
+        ):
+            events = process(items, gh, board=board)
+
+        assert items[0].state == MERGED
+        # The coordinator's own deterministic close must be skipped...
+        assert gh.close_calls == []
+        # ...AND the PR body itself must have been rewritten BEFORE
+        # merge_pr ran, so GitHub's own native closing-keyword scan (which
+        # never goes through close_issue()) doesn't auto-close it either.
+        assert gh.edit_body_calls, "PR-body lint must downgrade the existing Closes keyword"
+        assert gh.pr_bodies[100] == "Refs #1\n\nAutomated merge from the coordinator."
+        downgraded_events = [e for e in events if e.kind == "pr_body_downgraded"]
+        assert downgraded_events, [e.kind for e in events]
+        assert "ISSUE_RESOLUTION" in downgraded_events[0].message
+        partial_events = [e for e in events if e.kind == "merged_partial"]
+        assert partial_events and "reviewer caught it" in partial_events[0].message
+        # merge_pr must have been called AFTER the body was already rewritten.
+        assert gh.merge_calls == [("acme/api", 100, "rebase")]
+
+    def test_existing_pr_body_with_closing_keyword_not_touched_when_resolved(
+        self,
+    ) -> None:
+        # Control for the test above: when the effective verdict IS
+        # "resolved" (today's behaviour), an existing "Closes #N" body must
+        # be left alone and the issue must still close.
+        board = self._board_with_work("ISSUE_RESOLUTION: resolved")
+        items = [_q("a", assignment_type="work", pr=100)]
+        gh = FakeGh(pr_bodies={100: "Closes #1\n\nAutomated merge."})
+
+        events = process(items, gh, board=board)
+
+        assert items[0].state == MERGED
+        assert gh.close_calls == [("acme/api", 1)]
+        assert gh.edit_body_calls == []
+        assert gh.pr_bodies[100] == "Closes #1\n\nAutomated merge."
+        assert not [e for e in events if e.kind == "pr_body_downgraded"]
+
+    def test_commit_message_closing_keyword_blocks_merge_when_partial(self) -> None:
+        # #3502 review (non-blocking concern): a commit SUBJECT using a
+        # closing keyword (this repo's own `Fix #N: ...` convention) also
+        # auto-closes the issue via GitHub's commit-message scan once it
+        # lands on the base branch — independent of the PR body entirely,
+        # and unrewritable by this `gh`-only wire layer. Must block rather
+        # than silently let a `partial` verdict be defeated.
+        board = self._board_with_work(
+            "ISSUE_RESOLUTION: partial — root cause elsewhere"
+        )
+        items = [_q("a", assignment_type="work", pr=100)]
+        gh = FakeGh(pr_commit_messages={100: ["Fix #1: patch the symptom"]})
+
+        events = process(items, gh, board=board)
+
+        assert items[0].state == CONFLICT or items[0].state != MERGED
+        assert gh.merge_calls == []
+        blocked = [
+            e for e in events if e.kind == "issue_resolution_closing_keyword_in_commit"
+        ]
+        assert blocked, [e.kind for e in events]
+
+    def test_commit_message_closing_keyword_force_merge_overrides(self) -> None:
+        board = self._board_with_work(
+            "ISSUE_RESOLUTION: partial — root cause elsewhere"
+        )
+        items = [_q("a", assignment_type="work", pr=100)]
+        gh = FakeGh(pr_commit_messages={100: ["Fix #1: patch the symptom"]})
+
+        events = process(items, gh, board=board, force_merge=True)
+
+        assert items[0].state == MERGED
+        forced = [
+            e for e in events
+            if e.kind == "issue_resolution_closing_keyword_in_commit_forced"
+        ]
+        assert forced, [e.kind for e in events]
+
     def test_conflict_does_not_halt_other_repo_groups(self) -> None:
         """A conflict in one (repo, target) group must not touch other groups."""
         items = [
