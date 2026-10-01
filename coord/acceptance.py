@@ -957,13 +957,22 @@ def build_verdict(
     passed = sum(1 for t in tests if t.get("status") == "pass")
     failed = sum(1 for t in tests if t.get("status") == "fail")
     skipped = sum(1 for t in tests if t.get("status") == "skip")
+    # #3510: a session precheck (win-native/mac-native/gtk-native) that
+    # finds a locked/absent GUI reports a distinct "unavailable" status,
+    # not "fail" — it's an environment condition, not an app bug. It must
+    # still block `green`/`ci_green`: an unconfirmed result is not a pass
+    # (epic #2096's "a gate must be able to fail" / "unconfirmed success
+    # is a defect"). Counted and reported separately so callers can tell
+    # "the app is broken" apart from "go unlock the host".
+    unavailable = sum(1 for t in tests if t.get("status") == "unavailable")
     payload: dict[str, Any] = {
         "scope": scope,
         "total": len(tests),
         "passed": passed,
         "failed": failed,
         "skipped": skipped,
-        "green": failed == 0 and len(tests) > 0,
+        "unavailable": unavailable,
+        "green": failed == 0 and unavailable == 0 and len(tests) > 0,
         "tests": tests,
     }
     if issue_number is not None:
@@ -1038,12 +1047,18 @@ def apply_expected_red(verdict: dict[str, Any], expected_red_ids: "set[str]") ->
     real_failures = sum(
         1 for t in tests if t.get("status") == "fail" and t["id"] not in expected_red_ids
     )
+    # #3510: an `unavailable` entry (locked/absent GUI session) is never
+    # expected-red-eligible — it isn't a test failure to excuse, it's a
+    # precheck that never ran anything — so it always counts against
+    # `ci_green` just like it does against `green` in build_verdict.
+    unavailable = verdict.get("unavailable", 0)
     verdict["unexpected_green"] = unexpected_green
     verdict["expected_red_still_red"] = expected_red_still_red
     verdict["missing_expected_red_ids"] = missing_expected_red_ids
     verdict["ci_green"] = (
         len(tests) > 0
         and real_failures == 0
+        and unavailable == 0
         and not unexpected_green
         and not missing_expected_red_ids
     )

@@ -213,6 +213,29 @@ class TestBuildVerdict:
         assert verdict["green"] is False
         assert verdict["total"] == 0
 
+    def test_unavailable_entry_is_not_green(self) -> None:
+        # #3510 review: a win-native/mac-native/gtk-native locked/absent
+        # session precheck reports `status="unavailable"`, not "fail" — but
+        # it must still block `green`. Before this fix a single
+        # `unavailable` entry with zero `fail` entries produced
+        # `green=True`, a silent false pass.
+        tests = [{"id": "session", "status": "unavailable", "message": "no $DISPLAY"}]
+        verdict = build_verdict(tests, scope="all")
+        assert verdict["failed"] == 0
+        assert verdict["unavailable"] == 1
+        assert verdict["green"] is False
+
+    def test_unavailable_counted_separately_from_failed(self) -> None:
+        tests = [
+            {"id": "a", "status": "pass"},
+            {"id": "session", "status": "unavailable", "message": "session locked"},
+        ]
+        verdict = build_verdict(tests, scope="all")
+        assert verdict["passed"] == 1
+        assert verdict["failed"] == 0
+        assert verdict["unavailable"] == 1
+        assert verdict["green"] is False
+
 
 class TestFailureSummary:
     def test_no_failures_is_empty_string(self) -> None:
@@ -603,6 +626,23 @@ class TestApplyExpectedRed:
         )
         result = apply_expected_red(verdict, {"still_here", "vanished_test"})
         assert result["missing_expected_red_ids"] == ["vanished_test"]
+        assert result["ci_green"] is False
+
+    def test_unavailable_entry_blocks_ci_green_even_with_expected_red(self) -> None:
+        """#3510 review: an `unavailable` entry (locked/absent GUI session)
+        is never an expected-red excuse — it must block `ci_green` exactly
+        like it blocks `green`, even when some unrelated id is registered
+        expected_red."""
+        verdict = build_verdict(
+            [
+                {"id": "wide_label_paints_every_glyph", "status": "fail"},
+                {"id": "session", "status": "unavailable", "message": "no $DISPLAY"},
+            ],
+            scope="all",
+        )
+        result = apply_expected_red(verdict, {"wide_label_paints_every_glyph"})
+        assert result["expected_red_still_red"] == ["wide_label_paints_every_glyph"]
+        assert result["unexpected_green"] == []
         assert result["ci_green"] is False
 
     def test_no_missing_ids_when_all_expected_red_ids_ran(self) -> None:

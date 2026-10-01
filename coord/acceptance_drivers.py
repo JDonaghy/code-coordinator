@@ -782,7 +782,15 @@ def _run_win_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int
     except WinNativeRuntimeError as e:
         raise DriverError(f"win-native driver could not run: {e}") from e
 
-    exit_code = 0 if tests and all(t.get("status") != "fail" for t in tests) else 1
+    # #3510: a locked/absent interactive session reports a distinct
+    # "unavailable" status (coord.win_native_driver's session precheck),
+    # not "fail" — it must still fail this exit code rather than read as a
+    # silent pass. An unconfirmed result is not a pass.
+    exit_code = (
+        0
+        if tests and all(t.get("status") not in ("fail", "unavailable") for t in tests)
+        else 1
+    )
     raw_output = "\n".join(
         f"{t.get('status')}: {t.get('id')} {t.get('message', '')}".rstrip()
         for t in tests
@@ -843,7 +851,14 @@ def _run_mac_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int
     except MacNativeRuntimeError as e:
         raise DriverError(f"mac-native driver could not run: {e}") from e
 
-    exit_code = 0 if tests and all(t.get("status") != "fail" for t in tests) else 1
+    # #3510: a locked/absent GUI session reports a distinct "unavailable"
+    # status (coord.mac_native_driver's session precheck), not "fail" —
+    # it must still fail this exit code rather than read as a silent pass.
+    exit_code = (
+        0
+        if tests and all(t.get("status") not in ("fail", "unavailable") for t in tests)
+        else 1
+    )
     raw_output = "\n".join(
         f"{t.get('status')}: {t.get('id')} {t.get('message', '')}".rstrip()
         for t in tests
@@ -904,7 +919,15 @@ def _run_gtk_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int
     except GtkNativeRuntimeError as e:
         raise DriverError(f"gtk-native driver could not run: {e}") from e
 
-    exit_code = 0 if tests and all(t.get("status") != "fail" for t in tests) else 1
+    # #3510: a missing $DISPLAY/$WAYLAND_DISPLAY reports a distinct
+    # "unavailable" status (coord.gtk_native_driver's session precheck),
+    # not "fail" — it must still fail this exit code rather than read as a
+    # silent pass.
+    exit_code = (
+        0
+        if tests and all(t.get("status") not in ("fail", "unavailable") for t in tests)
+        else 1
+    )
     raw_output = "\n".join(
         f"{t.get('status')}: {t.get('id')} {t.get('message', '')}".rstrip()
         for t in tests
