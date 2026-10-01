@@ -155,3 +155,21 @@ def test_non_native_capability_installs_server_extra_only(tmp_path: Path) -> Non
     log = _pip_argv_log(tmp_path)
     assert "code-coordinator[server]" in log
     assert "tui-pty" not in log
+
+
+def test_from_github_source_still_carries_the_lane_extras(tmp_path: Path) -> None:
+    """The PyPI-less fallback path (`--from-github`, used before a release is
+    published) composes the extras onto the SAME package name, so a host
+    provisioned that way is not silently left without its lane drivers — the
+    exact failure mode #3515 is about. The `[server]` extra composition and
+    the `@ git+` suffix are built in two separate steps, so this is the one
+    assertion that proves they compose rather than one clobbering the other.
+    """
+    fake_bin = _make_fake_bin(tmp_path)
+    result = _run_installer(tmp_path, fake_bin, "--capabilities", "gtk", "--from-github")
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = _pip_argv_log(tmp_path)
+    assert (
+        "code-coordinator[server,gtk-native,tui-pty] @ "
+        "git+https://github.com/JDonaghy/claude-coordinator.git" in log
+    )
