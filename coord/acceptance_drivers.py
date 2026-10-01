@@ -143,6 +143,7 @@ import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,6 +154,92 @@ SUPPORTED_KINDS = (
     "tui-tuidriver", "cli-pytest", "web-playwright", "terraform", "tui-pty",
     "win-native", "mac-native", "gtk-native",
 )
+
+# #3515: the one place a machine's `capabilities` (coordinator.yml) map to
+# the `pyproject.toml` optional-dependency extra its Tier-2 lane driver
+# actually needs installed. No fleet roll or agent update ever pulled these
+# in before this — a lane only worked if someone hand-installed into
+# `~/.coord-venv`, and the next `coord agent update`/`coord release
+# propagate` rebuilt that venv from scratch and silently wiped it (observed
+# live 2026-10-01: `gi` hand-installed on precision, `pyte` missing
+# everywhere a Tier-2 lane runs). Kept here, next to :data:`SUPPORTED_KINDS`
+# — the same "one question, one answer" reasoning (epic #2096): `coord.
+# agent_app`'s self-update, `coord.release_propagate`'s fleet roll and
+# `install-agent.sh`'s bootstrap must all resolve a machine's required
+# extras through this ONE mapping, never three independently-drifting
+# copies.
+LANE_CAPABILITY_EXTRAS: dict[str, str] = {
+    "windows": "win-native",
+    "macos": "mac-native",
+    "gtk": "gtk-native",
+}
+
+
+def repos_requiring_tui_pty(drivers: Mapping[str, object]) -> frozenset[str]:
+    """Repo names (keys of `coordinator.yml`'s `acceptance.drivers`) that
+    declare a ``tui-pty``-kind acceptance driver somewhere — the flat form,
+    or one of its ``routes`` (#1125 in-repo path routing).
+
+    Duck-typed (``getattr``, not an import of
+    ``coord.config.AcceptanceDriverConfig``) for the same reason
+    :mod:`coord.bugbash` duck-types its own config parameter rather than
+    importing :mod:`coord.config`: this module is foundational and widely
+    imported, so taking a dependency on the config module risks a cycle the
+    other direction never needs — the same posture :data:`TIER2_LANE_KINDS`'s
+    docstring (``coord.config``) describes from the other side.
+    """
+    out: set[str] = set()
+    for repo_name, entry in drivers.items():
+        kind = getattr(entry, "kind", "")
+        routes = getattr(entry, "routes", None) or ()
+        if kind == "tui-pty" or any(
+            getattr(route, "kind", "") == "tui-pty" for route in routes
+        ):
+            out.add(repo_name)
+    return frozenset(out)
+
+
+def lane_extras_for_machine(
+    capabilities: Iterable[str],
+    *,
+    repos: Iterable[str] = (),
+    tui_pty_repos: frozenset[str] | None = None,
+) -> list[str]:
+    """The `pyproject.toml` lane extras a machine with *capabilities* needs
+    installed alongside `server` (#3515).
+
+    ``windows``/``macos``/``gtk`` each map straight through
+    :data:`LANE_CAPABILITY_EXTRAS`. ``tui-pty`` is different: it isn't a
+    machine capability at all, it's a property of *which repos* a host
+    serves — "is this host in a repo's `tui-pty` route" — so it's derived
+    from *repos* (a machine's own `coordinator.yml` `repos:` list)
+    intersected against *tui_pty_repos* (every repo name
+    :func:`repos_requiring_tui_pty` found to declare one).
+
+    *tui_pty_repos* is ``None`` when the caller only has the machine's own
+    capabilities/repos in hand, never the fleet-wide, repo-keyed
+    `acceptance.drivers` map needed to compute it properly — the agent's own
+    in-process self-update fallback (`coord.agent_app._agent_pkg_spec`) is
+    exactly that caller. In that case this falls back to the conservative
+    default: any host that already needs a native lane extra needs
+    `tui-pty` too, because every native lane observed in #3515's own
+    incident table also needed `pyte`, and `tui-pty` is pure-Python (no
+    C-extension/version-skew cost — the same reasoning `pyproject.toml`'s
+    own comment on the extra gives), so installing it somewhere that turns
+    out not to need it costs nothing. A caller that DOES have the full
+    config (`coord.release_propagate`, which has `cfg.acceptance.drivers`)
+    passes the exact computed set instead, which may be empty even when
+    *extras* is non-empty (a win-native host that serves no `tui-pty`-kind
+    repo) — passing ``frozenset()`` explicitly opts OUT of the fallback.
+    """
+    caps = set(capabilities)
+    extras = [extra for cap, extra in LANE_CAPABILITY_EXTRAS.items() if cap in caps]
+    if tui_pty_repos is None:
+        if extras:
+            extras.append("tui-pty")
+    elif set(repos) & tui_pty_repos:
+        extras.append("tui-pty")
+    return extras
 
 # #2748 (IL-2): driver kinds whose `run` produces a real pass/fail verdict
 # but NOT yet a deterministic one, because an input they depend on hasn't

@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Callable
 
 from starlette.applications import Starlette
@@ -32,7 +33,12 @@ from coord.platform_paths import venv_python as platform_venv_python
 _log = logging.getLogger(__name__)
 
 
-def _agent_pkg_spec() -> str:
+def _agent_pkg_spec(
+    *,
+    capabilities: Iterable[str] = (),
+    repos: Iterable[str] = (),
+    tui_pty_repos: frozenset[str] | None = None,
+) -> str:
     """What `POST /update` asks pip to install (#1237). An agent *is* the
     server half of the package, so it must reinstall itself WITH the
     `[server]` extra — a bare upgrade would, on a fresh venv, leave the
@@ -45,8 +51,54 @@ def _agent_pkg_spec() -> str:
     (`_do_update`'s existing try/except) turns that into an explicit
     `last_update.json` failure naming what was expected, instead of
     guessing.
+
+    #3515: ALSO folds in whichever Tier-2 lane extras *capabilities*/*repos*
+    need — `win-native`/`mac-native`/`gtk-native`/`tui-pty`
+    (`coord.acceptance_drivers.lane_extras_for_machine`, the one mapping
+    every install surface resolves through). Before this, no fleet roll or
+    agent update ever installed a lane driver's Python deps at all: a lane
+    only worked if someone hand-installed into `~/.coord-venv`, and the next
+    blue/green swap silently wiped it. Callers default to `()`/`None` (no
+    lane extras) rather than re-deriving them here, so a caller with no
+    capabilities/repos in hand — there is none left in this codebase, but a
+    future direct call — degrades to the pre-#3515 `[server]`-only spec
+    instead of raising.
     """
-    return _dist_pkg_spec(extra="server")
+    from coord.acceptance_drivers import lane_extras_for_machine  # noqa: PLC0415 — avoid an import cycle
+
+    extras = ["server", *lane_extras_for_machine(
+        capabilities, repos=repos, tui_pty_repos=tui_pty_repos,
+    )]
+    return _dist_pkg_spec(extra=",".join(extras))
+
+
+def _tui_pty_repos_for_server(server: AgentServer) -> frozenset[str] | None:
+    """The repo-keyed `tui-pty` set `_agent_pkg_spec` needs (#3515), read
+    straight off whatever `coordinator.yml` this agent itself last loaded.
+
+    `AgentServer` keeps that full, freshly-reloaded `Config` (`acceptance`
+    included) on `_health_config` purely so `/health`'s own local checkout
+    probe can resolve repos the same way `coord health` does — see that
+    attribute's docstring in `coord.agent.AgentServer.__init__`. There is no
+    public accessor for it (nothing outside that one `/health` probe has
+    needed one before), so this reaches the private attribute directly
+    rather than widening `AgentServer`'s public surface for a single read.
+    `None` — the honest "don't know" the agent-only fallback in
+    `coord.acceptance_drivers.lane_extras_for_machine` expects — whenever
+    this agent is config-free, predates the `acceptance:` block, or hasn't
+    loaded a config at all (every case `getattr` degrades gracefully
+    through rather than raising).
+    """
+    from coord.acceptance_drivers import repos_requiring_tui_pty  # noqa: PLC0415 — avoid an import cycle
+
+    cfg = getattr(server, "_health_config", None)
+    if cfg is None:
+        return None
+    acceptance = getattr(cfg, "acceptance", None)
+    drivers = getattr(acceptance, "drivers", None)
+    if drivers is None:
+        return None
+    return repos_requiring_tui_pty(drivers)
 
 
 #: The sibling systemd *user* units `POST /restart-services` (#2069) is
@@ -1408,7 +1460,7 @@ def build_app(
 
         Request body (JSON, optional)::
 
-            {"target_version": "0.4.85", "force": false}
+            {"target_version": "0.4.85", "force": false, "extras": ["gtk-native"]}
 
         #1568: when the caller (``coord agent update``) knows exactly which
         release it's asking for, it passes ``target_version``, pinning the
@@ -1417,6 +1469,19 @@ def build_app(
         matching distribution") instead of a silent no-op. ``target_version``
         is echoed back in ``last_update`` so ``/health`` lets the caller
         verify the upgrade actually landed.
+
+        #3515: ``extras`` lets a caller that already has the fleet-wide
+        picture in hand (``coord release propagate``, which resolves
+        :func:`coord.release_propagate.lane_extras_for_host` against the
+        full `coordinator.yml` — repos AND `acceptance.drivers`, not just
+        this one agent's own capabilities) OVERRIDE this agent's own
+        self-derived lane extras (:func:`_agent_pkg_spec`'s default, driven
+        off ``self.capabilities``/``self.repos`` and whatever `acceptance:`
+        this agent's own last-reloaded config happened to carry). Absent —
+        the default, and every pre-#3515 caller — this agent derives its own
+        extras, exactly as described there. `server` is **always** included
+        regardless of what's passed; a caller only ever needs to name the
+        LANE extras.
         """
         is_editable, project_path = _detect_install_mode()
         if is_editable:
@@ -1445,6 +1510,12 @@ def build_app(
             body = {}
         target_version = body.get("target_version") or None
         force = bool(body.get("force"))
+        raw_extras = body.get("extras")
+        explicit_extras: list[str] | None = (
+            [str(e) for e in raw_extras]
+            if isinstance(raw_extras, list) and raw_extras
+            else None
+        )
 
         # #2121 item 2: every install must name who asked for it. A caller
         # that knows (`coord release propagate`, `coord agent update`) says
@@ -1480,9 +1551,17 @@ def build_app(
             }
             try:
                 venv_dir = _venv_dir()
+                if explicit_extras is not None:
+                    pkg_spec = _dist_pkg_spec(extra=",".join(["server", *explicit_extras]))
+                else:
+                    pkg_spec = _agent_pkg_spec(
+                        capabilities=server.capabilities,
+                        repos=server.repos,
+                        tui_pty_repos=_tui_pty_repos_for_server(server),
+                    )
                 result = agent_update.perform_update(
                     venv_dir,
-                    _agent_pkg_spec(),
+                    pkg_spec,
                     target_version=target_version,
                     initiator=initiator,
                 )

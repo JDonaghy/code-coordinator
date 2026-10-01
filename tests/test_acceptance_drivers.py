@@ -74,9 +74,11 @@ from coord.acceptance_drivers import (
     DriverError,
     EPHEMERAL_RG_PATTERN,
     FIXTURE_SERVER_DEPENDENT_KINDS,
+    LANE_CAPABILITY_EXTRAS,
     SUPPORTED_KINDS,
     VALIDATE_ONLY_KINDS,
     assert_ephemeral_rg,
+    lane_extras_for_machine,
     parse_conftest_json,
     parse_playwright_json_report,
     parse_pytest_junit_xml,
@@ -84,6 +86,7 @@ from coord.acceptance_drivers import (
     parse_test_output,
     parse_tflint_json,
     render_run_command,
+    repos_requiring_tui_pty,
     run_driver,
 )
 
@@ -1874,3 +1877,97 @@ class TestRunDriverGtkNative:
             "gtk-native", "./vimcode --gtk", cwd=str(tmp_path), entrypoint="native/smoke.yaml",
         )
         assert seen_cwd["cwd"] == str(tmp_path)
+
+
+# ── #3515: capability -> lane-extra mapping ─────────────────────────────────
+
+
+class _FakeDriver:
+    """Duck-typed stand-in for `coord.config.AcceptanceDriverConfig` — only
+    the two attributes `repos_requiring_tui_pty` actually reads."""
+
+    def __init__(self, kind: str = "", routes: list["_FakeDriver"] | None = None) -> None:
+        self.kind = kind
+        self.routes = routes or []
+
+
+class TestLaneExtrasForMachine:
+    """#3515: the one place a machine's `coordinator.yml` `capabilities`
+    resolve to the `pyproject.toml` extras its Tier-2 lane driver needs."""
+
+    def test_mapping_covers_every_native_lane(self) -> None:
+        assert LANE_CAPABILITY_EXTRAS == {
+            "windows": "win-native",
+            "macos": "mac-native",
+            "gtk": "gtk-native",
+        }
+
+    def test_no_capabilities_yields_no_extras(self) -> None:
+        assert lane_extras_for_machine([]) == []
+
+    def test_gtk_capability_yields_gtk_native(self) -> None:
+        # No `tui_pty_repos` given -> the conservative "a native lane also
+        # needs tui-pty" fallback fires (nothing else in hand to resolve
+        # the exact set from).
+        assert lane_extras_for_machine(["gtk"]) == ["gtk-native", "tui-pty"]
+
+    def test_windows_capability_yields_win_native(self) -> None:
+        assert lane_extras_for_machine(["windows"]) == ["win-native", "tui-pty"]
+
+    def test_macos_capability_yields_mac_native(self) -> None:
+        assert lane_extras_for_machine(["macos"]) == ["mac-native", "tui-pty"]
+
+    def test_multiple_native_capabilities_yield_multiple_extras(self) -> None:
+        extras = lane_extras_for_machine(["gtk", "windows"])
+        assert set(extras) == {"gtk-native", "win-native", "tui-pty"}
+        assert extras.count("tui-pty") == 1
+
+    def test_non_native_capability_ignored(self) -> None:
+        assert lane_extras_for_machine(["rust", "python"]) == []
+
+    def test_explicit_empty_tui_pty_repos_opts_out_of_native_fallback(self) -> None:
+        """A caller (`coord.release_propagate`) that HAS the fleet-wide
+        picture and found no `tui-pty`-kind repo at all passes `frozenset()`
+        explicitly — that must NOT trip the "unknown, assume yes" fallback
+        `None` is reserved for."""
+        extras = lane_extras_for_machine(
+            ["gtk"], repos=["coord-tui"], tui_pty_repos=frozenset(),
+        )
+        assert extras == ["gtk-native"]
+
+    def test_explicit_tui_pty_repos_matching_a_served_repo_adds_tui_pty(self) -> None:
+        extras = lane_extras_for_machine(
+            [], repos=["vimcode", "other-repo"], tui_pty_repos=frozenset({"vimcode"}),
+        )
+        assert extras == ["tui-pty"]
+
+    def test_explicit_tui_pty_repos_not_served_by_this_host_adds_nothing(self) -> None:
+        extras = lane_extras_for_machine(
+            [], repos=["other-repo"], tui_pty_repos=frozenset({"vimcode"}),
+        )
+        assert extras == []
+
+
+class TestReposRequiringTuiPty:
+    def test_flat_driver_with_tui_pty_kind_is_included(self) -> None:
+        drivers = {"vimcode": _FakeDriver(kind="tui-pty")}
+        assert repos_requiring_tui_pty(drivers) == frozenset({"vimcode"})
+
+    def test_flat_driver_with_other_kind_is_excluded(self) -> None:
+        drivers = {"coord-tui": _FakeDriver(kind="tui-tuidriver")}
+        assert repos_requiring_tui_pty(drivers) == frozenset()
+
+    def test_routed_driver_with_a_tui_pty_route_is_included(self) -> None:
+        drivers = {
+            "claude-coordinator": _FakeDriver(
+                kind="",
+                routes=[
+                    _FakeDriver(kind="cli-pytest"),
+                    _FakeDriver(kind="tui-pty"),
+                ],
+            ),
+        }
+        assert repos_requiring_tui_pty(drivers) == frozenset({"claude-coordinator"})
+
+    def test_empty_drivers_map_yields_empty_set(self) -> None:
+        assert repos_requiring_tui_pty({}) == frozenset()

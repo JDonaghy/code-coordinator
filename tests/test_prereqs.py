@@ -548,8 +548,11 @@ class TestWindowsCapabilityManifest:
         return [p for p in prereqs.CAPABILITY_PREREQS if p.capability == "windows"]
 
     def test_backed_by_cargo_xwin_and_the_msvc_target(self) -> None:
+        # #3515: `comtypes` (win-native's own Python dep) and `pyte`
+        # (tui-pty's) joined this set — see TestLaneDriverDependencyPrereqs
+        # below for their own coverage.
         assert {p.tool for p in self._windows_prereqs()} == {
-            "cargo-xwin", "windows-msvc-target",
+            "cargo-xwin", "windows-msvc-target", "comtypes", "pyte",
         }
 
     def test_probe_all_covers_it_only_when_declared(self) -> None:
@@ -702,6 +705,119 @@ class TestWindowsCapabilityManifest:
         `windows` up automatically — no separate registration needed for a
         config-free agent to probe it too (see TestAllCapabilityNames)."""
         assert "windows" in prereqs.ALL_CAPABILITY_NAMES
+
+
+class TestLaneDriverDependencyPrereqs:
+    """#3515: the Tier-2 lane drivers' own Python/system dependencies —
+    before this, a missing `gi`/`pyte`/`comtypes`/pyobjc import (or a
+    missing `xdotool`/`xwd`) was invisible to `coord doctor` and only ever
+    surfaced as a stack trace the first time the driver actually ran."""
+
+    @staticmethod
+    def _prereqs_for(capability: str):
+        return [p for p in prereqs.CAPABILITY_PREREQS if p.capability == capability]
+
+    def test_gtk_capability_is_backed_by_gi_xdotool_xwd_and_pyte(self) -> None:
+        tools = {p.tool for p in self._prereqs_for("gtk")}
+        assert {"gi", "xdotool", "xwd", "pyte"} <= tools
+
+    def test_windows_capability_is_backed_by_comtypes_and_pyte(self) -> None:
+        tools = {p.tool for p in self._prereqs_for("windows")}
+        assert {"comtypes", "pyte"} <= tools
+
+    def test_macos_capability_is_backed_by_pyobjc_and_pyte(self) -> None:
+        tools = {p.tool for p in self._prereqs_for("macos")}
+        assert {"pyobjc-quartz", "pyobjc-application-services", "pyte"} <= tools
+
+    def test_macos_joined_all_capability_names(self) -> None:
+        """A config-free agent (`AgentServer._cached_tool_versions`) probes
+        `ALL_CAPABILITY_NAMES`, not just `self.capabilities` — `macos` must
+        be derivable from `CAPABILITY_PREREQS` the same way `windows`/`gtk`
+        already are, with no separate registration."""
+        assert "macos" in prereqs.ALL_CAPABILITY_NAMES
+
+    def test_python_module_probes_use_find_spec_not_a_real_import(self) -> None:
+        """`gi`/`pyobjc`'s GObject-introspection and Quartz/AX bindings can
+        have real side effects at import time — this module must never
+        trigger them just to answer "is it even installed"."""
+        for tool in ("gi", "comtypes", "pyobjc-quartz", "pyobjc-application-services", "pyte"):
+            prereq = next(p for p in prereqs.CAPABILITY_PREREQS if p.tool == tool)
+            assert prereq.custom_probe is not None
+
+    def test_gi_found_when_find_spec_resolves(self) -> None:
+        with patch("coord.prereqs.importlib.util.find_spec", return_value=object()):
+            probes = prereqs.probe_all(["gtk"])
+        assert probes["gi"].found is True
+        assert probes["gi"].ok is True
+
+    def test_gi_not_found_when_find_spec_returns_none(self) -> None:
+        with patch("coord.prereqs.importlib.util.find_spec", return_value=None):
+            probes = prereqs.probe_all(["gtk"])
+        assert probes["gi"].found is False
+        assert probes["gi"].ok is False
+        assert "gtk-native" in probes["gi"].what_breaks
+
+    def test_gi_not_found_when_find_spec_raises(self) -> None:
+        """A parent package genuinely missing raises `ModuleNotFoundError`
+        from `find_spec` itself (not just returning `None`) — must degrade
+        to `found=False`, never bubble up and break the whole sweep."""
+        with patch(
+            "coord.prereqs.importlib.util.find_spec",
+            side_effect=ModuleNotFoundError("no module named gi"),
+        ):
+            probes = prereqs.probe_all(["gtk"])
+        assert probes["gi"].found is False
+
+    def test_comtypes_what_breaks_names_the_wsl_caveat(self) -> None:
+        """dell64's `windows` capability is backed by a WSL (Linux) agent
+        venv — `comtypes` structurally cannot import there regardless of
+        what gets pip-installed, so the remedy must say so rather than
+        implying a bare install fixes it."""
+        with patch("coord.prereqs.importlib.util.find_spec", return_value=None):
+            probes = prereqs.probe_all(["windows"])
+        assert "WSL" in probes["comtypes"].what_breaks
+
+    def test_xdotool_and_xwd_use_presence_only_probe(self) -> None:
+        """Neither tool has a floor-checkable version in this manifest —
+        a nonzero exit from a GUESSED version flag must not read as "not
+        found" (`xwd` has no clean `--version` at all)."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/xdotool"):
+            probes = prereqs.probe_all(["gtk"])
+        assert probes["xdotool"].found is True
+        assert probes["xdotool"].ok is True
+
+    def test_xdotool_missing_from_path_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["gtk"])
+        assert probes["xdotool"].found is False
+        assert probes["xwd"].found is False
+
+    def test_pyte_probed_once_regardless_of_which_native_capability_declared_it(
+        self,
+    ) -> None:
+        """A host with more than one native capability must not probe
+        `pyte` more than once in a way that could disagree with itself —
+        `probe_all` dedupes by tool name, and the underlying check is
+        identical regardless of which capability triggered it."""
+        with patch("coord.prereqs.importlib.util.find_spec", return_value=object()):
+            probes = prereqs.probe_all(["gtk", "windows", "macos"])
+        assert probes["pyte"].found is True
+
+    def test_doctor_names_a_missing_lane_dependency_not_a_stack_trace(self) -> None:
+        """#3515 acceptance: a missing lane dependency reads as a named
+        remedy via the existing `unmet_capabilities` cross-check — the same
+        mechanism `coord doctor` already renders every other capability
+        through, with zero new rendering code needed."""
+        with patch("coord.prereqs.importlib.util.find_spec", return_value=None), \
+             patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["gtk"])
+        unmet = prereqs.unmet_capabilities(["gtk"], probes)
+        assert "gtk" in unmet
+        reasons = " ".join(unmet["gtk"])
+        assert "gi not found" in reasons
+        assert "xdotool not found" in reasons
+        assert "xwd not found" in reasons
+        assert "pyte not found" in reasons
 
 
 class TestAzureCapabilityManifest:

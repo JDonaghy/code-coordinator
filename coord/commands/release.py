@@ -1602,6 +1602,21 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     updated_hosts: list[str] = []
     local_name = _local_machine_name(config)
 
+    # #3515: resolved ONCE, up front — propagate has the full,
+    # just-loaded `config` (every machine's `repos:` AND the repo-keyed
+    # `acceptance.drivers` map) in hand, which is exactly the fleet-wide
+    # picture `coord.agent_app`'s own in-agent self-update fallback does
+    # NOT have. Passed explicitly to `_roll_python` below (even when
+    # empty) via `rp.lane_extras_for_host`, so this run's `/update` asks
+    # for the precise extras this host's capabilities/repos need rather
+    # than leaving each agent to guess from its own, possibly stale,
+    # last-reloaded config.
+    from coord.acceptance_drivers import repos_requiring_tui_pty  # noqa: PLC0415
+
+    tui_pty_repos = repos_requiring_tui_pty(
+        getattr(getattr(config, "acceptance", None), "drivers", None) or {}
+    )
+
     # #1835 review: plan_lanes() puts the daemon host's python lane first
     # specifically so "a caller must never reach an endpoint its daemon
     # predates" holds — but that is only true if a failure there actually
@@ -1664,6 +1679,10 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             ok, detail, serve_unit_ok = _roll_python(
                 machine, target_version=record.target_version,
                 agent_port=AGENT_PORT, timeout=timeout, force=force,
+                extras=rp.lane_extras_for_host(
+                    machine.capabilities, repos=machine.repos,
+                    tui_pty_repos=tui_pty_repos,
+                ),
             )
             if ok:
                 updated_hosts.append(roll.host)
@@ -2530,7 +2549,7 @@ def _local_machine_name(config) -> str | None:
 
 
 def _roll_python(machine, *, target_version: str, agent_port: int, timeout: float,
-                 force: bool) -> tuple[bool, str, bool]:
+                 force: bool, extras: "list[str] | None" = None) -> tuple[bool, str, bool]:
     """POST /update and wait for the agent to actually report the version.
 
     Success is judged by the version the agent reports, never by "the POST
@@ -2559,6 +2578,14 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
       2026-08-10 incident's shape (dellserver's coord-serve was fine;
       coord-web was what failed). Callers deciding whether it's safe to
       let OTHER hosts proceed must key off ``serve_unit_ok``, not ``ok``.
+
+    #3515: *extras* — the python lane's pip extras BEYOND ``server``
+    (``coord.release_propagate.lane_extras_for_host``'s result, resolved by
+    the caller against the fleet-wide ``repos``/``acceptance.drivers``
+    picture) — are forwarded verbatim as ``/update``'s own ``extras`` field,
+    overriding that agent's in-process self-derivation. ``None``/``[]`` omits
+    the field entirely, so a pre-#3515 agent (one that predates the
+    ``extras`` body key) still gets exactly the request it always has.
     """
     from coord.agent_update import cli_initiator  # noqa: PLC0415
     from coord.commands.agent_ops import (  # noqa: PLC0415
@@ -2568,16 +2595,19 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     from coord.release_verify import DAEMON_UNIT  # noqa: PLC0415
 
     pre = _fetch_pre_started_at([machine])
+    update_body: dict = {
+        "target_version": target_version,
+        "force": force,
+        # #2121: the roll names itself on the target host's audit trail.
+        "initiator": cli_initiator(
+            f"coord release propagate -> {machine.name} python lane"
+        ),
+    }
+    if extras:
+        update_body["extras"] = extras
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/update",
-        {
-            "target_version": target_version,
-            "force": force,
-            # #2121: the roll names itself on the target host's audit trail.
-            "initiator": cli_initiator(
-                f"coord release propagate -> {machine.name} python lane"
-            ),
-        },
+        update_body,
         timeout=15.0,
     )
     if error:

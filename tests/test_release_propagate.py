@@ -595,6 +595,59 @@ def test_an_unknown_daemon_host_degrades_to_config_order():
     assert [r.host for r in rolls] == ["a", "b"]
 
 
+# ── #3515: lane_extras_for_host ─────────────────────────────────────────────
+#
+# `_roll_python` (coord/commands/release.py) passes this function's result as
+# `/update`'s `extras` field — the python lane's install command must ask for
+# the Tier-2 lane extras a machine's own `capabilities`/`repos` need, derived
+# through the SAME mapping `coord.agent_app`'s in-agent self-update fallback
+# uses (`coord.acceptance_drivers.lane_extras_for_machine`), never a second
+# copy of the capability -> extra table.
+
+
+def test_lane_extras_for_host_with_no_capabilities_is_empty():
+    assert rp.lane_extras_for_host([]) == []
+
+
+def test_lane_extras_for_host_maps_gtk_capability():
+    assert rp.lane_extras_for_host(["gtk"], tui_pty_repos=frozenset()) == ["gtk-native"]
+
+
+def test_lane_extras_for_host_maps_windows_capability():
+    assert rp.lane_extras_for_host(["windows"], tui_pty_repos=frozenset()) == ["win-native"]
+
+
+def test_lane_extras_for_host_maps_macos_capability():
+    assert rp.lane_extras_for_host(["macos"], tui_pty_repos=frozenset()) == ["mac-native"]
+
+
+def test_lane_extras_for_host_adds_tui_pty_for_a_served_tui_pty_repo():
+    """Propagate always has the fleet-wide picture, so it passes the exact
+    `tui_pty_repos` set it resolved (`coord.acceptance_drivers
+    .repos_requiring_tui_pty`) rather than relying on the native-lane
+    fallback `coord.agent_app`'s own in-agent call uses when it has no such
+    picture in hand — this is the one shape that fallback alone could never
+    reach: `tui-pty` with zero native capabilities at all."""
+    extras = rp.lane_extras_for_host(
+        [], repos=["vimcode"], tui_pty_repos=frozenset({"vimcode"}),
+    )
+    assert extras == ["tui-pty"]
+
+
+def test_lane_extras_for_host_omits_tui_pty_for_an_unserved_repo():
+    extras = rp.lane_extras_for_host(
+        ["gtk"], repos=["other-repo"], tui_pty_repos=frozenset({"vimcode"}),
+    )
+    assert extras == ["gtk-native"]
+
+
+def test_lane_extras_for_host_combines_native_and_tui_pty():
+    extras = rp.lane_extras_for_host(
+        ["windows"], repos=["vimcode"], tui_pty_repos=frozenset({"vimcode"}),
+    )
+    assert set(extras) == {"win-native", "tui-pty"}
+
+
 # ── #2898: two channels, named distinctly ────────────────────────────────
 #
 # Phase 3 of #2894 gave coord-tui its own repo, its own `v*` tag namespace and

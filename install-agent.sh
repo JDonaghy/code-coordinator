@@ -5,15 +5,13 @@ set -euo pipefail
 VENV_DIR="$HOME/.coord-venv"
 MACHINE_NAME=""
 PORT=7433
-# #1237: the `[server]` extra is MANDATORY on an agent. The base package is a
-# client-only CLI (no starlette/uvicorn), so `coord agent` on a bare install
-# refuses to boot with an "install the [server] extra" message.
+CAPABILITIES=""
+FROM_GITHUB=0
 # #2104: the distribution renamed `claude-coordinator` -> `code-coordinator`.
 # The venv, the `coord` entrypoint and the unit name below are all unchanged —
 # only the name pip resolves against moved. A host that already has the old
 # distribution in $VENV_DIR keeps it (pip installs the new name alongside);
 # `coord/dist_name.py` resolves whichever is present, preferring the new one.
-INSTALL_SOURCE="code-coordinator[server]"  # PyPI package name + server extra
 # Fall back to GitHub install if PyPI isn't published yet. Still the OLD repo
 # path on purpose: GitHub redirects a renamed repo's old URL indefinitely, so
 # this keeps working both before and after the repo rename (#2104), whereas
@@ -25,10 +23,58 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --machine) MACHINE_NAME="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
-        --from-github) INSTALL_SOURCE="code-coordinator[server] @ git+${GITHUB_REPO}"; shift ;;
+        --capabilities) CAPABILITIES="$2"; shift 2 ;;
+        --from-github) FROM_GITHUB=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# #1237: the `[server]` extra is MANDATORY on an agent. The base package is a
+# client-only CLI (no starlette/uvicorn), so `coord agent` on a bare install
+# refuses to boot with an "install the [server] extra" message.
+#
+# #3515: `--capabilities a,b,c` (comma-separated, same strings as this
+# machine's `coordinator.yml` `capabilities:` entry) folds in whichever
+# Tier-2 lane extras this host needs ALONGSIDE `server` -- before this, no
+# fleet roll or agent update ever installed a lane driver's Python deps at
+# all (`gi`/`pyte`/`comtypes`/pyobjc), so a lane only worked if someone
+# hand-installed into $VENV_DIR, wiped clean on the next update. This is a
+# literal, HAND-SYNCED copy of
+# `coord.acceptance_drivers.LANE_CAPABILITY_EXTRAS` -- not generated or
+# imported from it, because this script runs BEFORE coord itself is on the
+# box, so there is no python import to resolve the mapping from yet. Keep
+# the two in sync by hand on any future lane addition, the same discipline
+# `coord/config.py`'s own `TIER2_LANE_KINDS` docstring already documents for
+# `coord.acceptance_drivers.SUPPORTED_KINDS`.
+EXTRAS="server"
+if [ -n "$CAPABILITIES" ]; then
+    SAW_NATIVE=0
+    IFS=',' read -r -a CAP_ARRAY <<< "$CAPABILITIES"
+    for cap in "${CAP_ARRAY[@]}"; do
+        case "$cap" in
+            windows) EXTRAS="$EXTRAS,win-native"; SAW_NATIVE=1 ;;
+            macos) EXTRAS="$EXTRAS,mac-native"; SAW_NATIVE=1 ;;
+            gtk) EXTRAS="$EXTRAS,gtk-native"; SAW_NATIVE=1 ;;
+            tui-pty) EXTRAS="$EXTRAS,tui-pty" ;;
+        esac
+    done
+    # Same conservative fallback as `coord.acceptance_drivers
+    # .lane_extras_for_machine`'s own `tui_pty_repos=None` branch: every
+    # native lane in #3515's own incident table also needed `pyte`, and
+    # `tui-pty` is pure-Python, so installing it on a host that turns out
+    # not to need it costs nothing -- unlike this script, `coord release
+    # propagate` HAS the fleet-wide `acceptance.drivers` picture and passes
+    # the exact set instead (see `coord.release_propagate
+    # .lane_extras_for_host`).
+    if [ "$SAW_NATIVE" -eq 1 ] && [[ ",$EXTRAS," != *",tui-pty,"* ]]; then
+        EXTRAS="$EXTRAS,tui-pty"
+    fi
+fi
+if [ "$FROM_GITHUB" -eq 1 ]; then
+    INSTALL_SOURCE="code-coordinator[$EXTRAS] @ git+${GITHUB_REPO}"
+else
+    INSTALL_SOURCE="code-coordinator[$EXTRAS]"
+fi
 
 echo "=== code-coordinator agent installer ==="
 

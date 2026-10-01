@@ -268,6 +268,43 @@ LANE_TUI = "tui"
 #: *order* is :func:`plan_lanes`'s output, not this tuple.
 ALL_LANES: tuple[str, ...] = (LANE_PYTHON, LANE_UNITS, LANE_TUI)
 
+
+def lane_extras_for_host(
+    capabilities: Iterable[str],
+    *,
+    repos: Iterable[str] = (),
+    tui_pty_repos: "frozenset[str] | None" = None,
+) -> list[str]:
+    """#3515: the `pyproject.toml` lane extras (beyond `server`) the python
+    lane's `POST /update` must ask for on a host with *capabilities* serving
+    *repos* — ``coord.commands.release``'s `_roll_python` passes the result
+    as `/update`'s `extras` field.
+
+    Deliberately NOT a reimplementation: it's a straight pass-through to
+    :func:`coord.acceptance_drivers.lane_extras_for_machine`, the ONE mapping
+    `coord.agent_app`'s own in-agent self-update fallback uses too (#2096
+    "one question, one answer" — a propagate-side copy of the capability ->
+    extra table would be a second implementation of the exact same question
+    that could silently drift from the agent's). Re-exported here (rather
+    than leaving ``coord/commands/release.py`` to import
+    :mod:`coord.acceptance_drivers` directly) purely so that module's own
+    imports stay inside this package's existing "decision half" seam — the
+    same reason this module re-exports :data:`~coord.drive_queue.HOLD_FIRED`/
+    :data:`~coord.drive_queue.STATE_RUNNING` rather than leaving callers to
+    import ``coord.drive_queue`` as well as this module.
+
+    Unlike that in-agent fallback, propagate always has the fleet-wide
+    picture — every machine's `repos:` AND the repo-keyed
+    `acceptance.drivers` map — so a caller here should always resolve
+    *tui_pty_repos* explicitly via
+    :func:`coord.acceptance_drivers.repos_requiring_tui_pty` and pass it
+    (even when empty) rather than leave it ``None`` and fall into the
+    native-lane fallback meant for a context that doesn't have that picture.
+    """
+    from coord.acceptance_drivers import lane_extras_for_machine  # noqa: PLC0415 — avoid an import cycle
+
+    return lane_extras_for_machine(capabilities, repos=repos, tui_pty_repos=tui_pty_repos)
+
 # ── release channels (#2898) ─────────────────────────────────────────────────
 #
 # Until #2898 there was only ONE channel and it did not need a name: `publish.
