@@ -1589,6 +1589,24 @@ class TestRunDriverWinNative:
         assert result.exit_code != 0
         assert result.ok is False
 
+    def test_unavailable_session_is_not_a_clean_exit(self, tmp_path, monkeypatch) -> None:
+        # #3510 review: an `unavailable` entry (locked/absent session) must
+        # flip the exit code just like `fail` does — it is a THIRD status,
+        # not a synonym for `pass`, and a gate must be able to fail on it
+        # rather than read a locked desktop as a silent green run.
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return [{"id": "session", "status": "unavailable", "message": "session locked"}]
+
+        import coord.win_native_driver as win_native_driver
+        monkeypatch.setattr(win_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver("win-native", "./vimcode.exe", cwd=str(tmp_path), entrypoint="native.yaml")
+        assert result.exit_code != 0
+        assert result.ok is False
+
     def test_entrypoint_is_resolved_relative_to_cwd(self, tmp_path, monkeypatch) -> None:
         nested = tmp_path / "native"
         nested.mkdir()
@@ -1697,6 +1715,22 @@ class TestRunDriverMacNative:
         assert result.exit_code != 0
         assert result.ok is False
 
+    def test_unavailable_session_is_not_a_clean_exit(self, tmp_path, monkeypatch) -> None:
+        # #3510 review: an `unavailable` entry (locked/absent session) must
+        # flip the exit code just like `fail` does.
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return [{"id": "session", "status": "unavailable", "message": "screen locked"}]
+
+        import coord.mac_native_driver as mac_native_driver
+        monkeypatch.setattr(mac_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver("mac-native", "./vimcode.app", cwd=str(tmp_path), entrypoint="native.yaml")
+        assert result.exit_code != 0
+        assert result.ok is False
+
     def test_entrypoint_is_resolved_relative_to_cwd(self, tmp_path, monkeypatch) -> None:
         nested = tmp_path / "native"
         nested.mkdir()
@@ -1797,6 +1831,22 @@ class TestRunDriverGtkNative:
 
         def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
             return []
+
+        import coord.gtk_native_driver as gtk_native_driver
+        monkeypatch.setattr(gtk_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver("gtk-native", "./vimcode --gtk", cwd=str(tmp_path), entrypoint="native.yaml")
+        assert result.exit_code != 0
+        assert result.ok is False
+
+    def test_unavailable_session_is_not_a_clean_exit(self, tmp_path, monkeypatch) -> None:
+        # #3510 review: an `unavailable` entry (missing $DISPLAY) must
+        # flip the exit code just like `fail` does.
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return [{"id": "session", "status": "unavailable", "message": "no $DISPLAY"}]
 
         import coord.gtk_native_driver as gtk_native_driver
         monkeypatch.setattr(gtk_native_driver, "run_native_spec", fake_run_native_spec)

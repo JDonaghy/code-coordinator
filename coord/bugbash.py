@@ -48,12 +48,17 @@ never run.
 
 **#3510: an unavailable lane is not a bug finding.** When a win-native/
 mac-native/gtk-native lane's own driver reports a locked or absent GUI
-session (or no usable display), the explorer hands back
-:attr:`ExploreOutcome.unavailable`, and :func:`run_bugbash` skips that lane
-for the round (:attr:`RoundReport.unavailable_lanes`) rather than running
-the exploration checklist against it or filing any finding from it — a
-locked desktop is an environment condition for the operator to fix, not
-evidence of an app bug.
+session (or no usable display), an explorer that sets
+:attr:`ExploreOutcome.unavailable` causes :func:`run_bugbash` to skip that
+lane for the round (:attr:`RoundReport.unavailable_lanes`) rather than
+running the exploration checklist against it or filing any finding from it
+— a locked desktop is an environment condition for the operator to fix,
+not evidence of an app bug. This engine-level behavior is unit-tested
+against a fake explorer in ``tests/test_bugbash.py``; the production
+explorer (:func:`coord.commands.bugbash._dispatch_and_await_lane`) does
+not itself set ``unavailable`` yet — see its own module docstring's
+"KNOWN GAP" note — so a live ``coord bugbash`` run does not currently
+benefit from this skip until that wiring lands.
 """
 
 from __future__ import annotations
@@ -441,14 +446,19 @@ class ExploreOutcome:
     native driver observed a locked/absent GUI session (win-native/
     mac-native) or no usable display (gtk-native) and ran no exploration at
     all — a host/environment condition, never a bug finding and never a
-    dispatch/poll failure. A production explorer sets ``unavailable=True``
-    when the dispatched worker's Tier-2 lane result came back
-    ``status="unavailable"`` (see ``coord.win_native_driver``'s/
+    dispatch/poll failure. An explorer that sets ``unavailable=True`` (as
+    the fake explorers in ``tests/test_bugbash.py`` do, modeling a
+    dispatched worker whose Tier-2 lane result came back
+    ``status="unavailable"`` — see ``coord.win_native_driver``'s/
     ``coord.mac_native_driver``'s/``coord.gtk_native_driver``'s own
-    precheck). :func:`run_bugbash` skips such a lane for the round —
+    precheck) causes :func:`run_bugbash` to skip that lane for the round —
     recording it in :attr:`RoundReport.unavailable_lanes` instead of
-    :attr:`RoundReport.lane_failures` — and never files findings from it
-    this round, even defensively, regardless of what ``findings`` carries."""
+    :attr:`RoundReport.lane_failures` — and never file findings from it
+    this round, even defensively, regardless of what ``findings`` carries.
+    The production explorer,
+    :func:`coord.commands.bugbash._dispatch_and_await_lane`, does not yet
+    set this flag (tracked as a KNOWN GAP in that module's docstring) —
+    today this is exercised only at the engine/unit-test level."""
 
     findings: tuple[Finding, ...] = ()
     cost: float = 0.0
