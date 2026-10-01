@@ -4551,6 +4551,12 @@ def _load_release_gate_observations(
             passed=_require_bool(entry["passed"], field_name="lanes[].passed"),
             detail=entry.get("detail", ""),
             checked_at=entry.get("checked_at"),
+            # #3510: a locked/absent GUI session or missing display, as
+            # reported by the native driver's own session precheck — never
+            # coerced from a truthy non-bool, same discipline as `passed`.
+            unavailable=_require_bool(
+                entry.get("unavailable", False), field_name="lanes[].unavailable",
+            ),
         )
         for entry in payload.get("lanes", []) or []
     ]
@@ -4576,7 +4582,10 @@ def _gate_verdict_to_dict(verdict: "Any") -> dict[str, Any]:
         "gate_passed": verdict.gate_passed,
         "effective_passed": verdict.effective_passed,
         "steps": [
-            {"name": s.name, "passed": s.passed, "detail": s.detail}
+            {
+                "name": s.name, "passed": s.passed, "detail": s.detail,
+                "unavailable": s.unavailable,
+            }
             for s in verdict.steps
         ],
         "override": None if verdict.override is None else {
@@ -4590,7 +4599,15 @@ def _gate_verdict_to_dict(verdict: "Any") -> dict[str, Any]:
 def _render_gate_verdict(verdict: "Any") -> str:
     lines = [f"release gate: {verdict.repo} @ {verdict.release_sha}"]
     for step in verdict.steps:
-        marker = "PASS" if step.passed else "FAIL"
+        # #3510: a locked/absent GUI session is blocking but is NOT the app
+        # failing — labeled distinctly so an operator knows to unlock the
+        # host rather than go debug the app.
+        if step.unavailable:
+            marker = "UNAVAILABLE"
+        elif step.passed:
+            marker = "PASS"
+        else:
+            marker = "FAIL"
         lines.append(f"  [{marker}] {step.name}: {step.detail}")
     if verdict.override is not None:
         lines.append(

@@ -84,6 +84,16 @@ own child. See ``tests/test_mac_native_driver.py``'s
 ``test_no_name_based_kill_path_exists_in_the_module`` — a source-level
 regression guard, mirroring :mod:`coord.win_native_driver`'s own
 ``test_no_image_name_kill_path_exists_in_the_module``.
+
+**Locked/absent session precheck (#3510).** The same vimcode#1629 class of
+problem applies here: a locked screen or no GUI session (headless/SSH-only)
+is an environment condition, not an app bug. Before :meth:`NativeRunner.run`
+launches anything it calls :meth:`MacCalls.session_available` — real check:
+``CGSessionCopyCurrentDictionary`` must return a session, with
+``CGSSessionScreenIsLocked`` false and ``kCGSessionOnConsoleKey`` true. When
+unavailable, the run returns a single ``status="unavailable"`` result —
+never a ``"fail"`` — and no step (not even ``launch``) runs. See
+:mod:`coord.win_native_driver`'s own module docstring for the same shape.
 """
 
 from __future__ import annotations
@@ -293,6 +303,17 @@ class MacCalls(Protocol):
 
     def kill(self, pid: int) -> None: ...
 
+    def session_available(self) -> tuple[bool, str]:
+        """``(True, "")`` when an unlocked GUI session is present for this
+        driver to launch into; ``(False, reason)`` when the screen is
+        locked or no GUI session exists (#3510) — checked by
+        :meth:`NativeRunner.run` BEFORE any step (including ``launch``)
+        runs, so a locked/absent session is reported as
+        ``status="unavailable"`` rather than a failed step. Never raises —
+        a probe failure here is itself an "unavailable" verdict, not a
+        crash."""
+        ...
+
 
 def _find_a11y_match(elements: list[dict], role: str, name: str) -> dict | None:
     """The first *elements* entry whose ``role`` matches exactly
@@ -345,7 +366,19 @@ class NativeRunner:
         self._window_id: int | None = None
 
     def run(self, spec: NativeSpec) -> list[dict]:
+        """Run *spec*, first checking :meth:`MacCalls.session_available`
+        (#3510). A locked screen or absent GUI session is an environment
+        condition, not an app bug: when unavailable, this returns a single
+        ``status="unavailable"`` entry and runs NO step at all (not even
+        ``launch``) — never folding it into an ordinary ``"fail"``."""
         self._spec = spec
+        available, reason = self._calls.session_available()
+        if not available:
+            return [{
+                "id": "session",
+                "status": "unavailable",
+                "message": reason or "no unlocked GUI session is available",
+            }]
         results: list[dict] = []
         try:
             for step in spec.steps:
@@ -577,6 +610,31 @@ class MacOSCalls:
         except ProcessLookupError:
             pass
 
+    # -- session precheck (#3510) --
+
+    def session_available(self) -> tuple[bool, str]:
+        """Real check: ``CGSessionCopyCurrentDictionary`` must return an
+        actual session dictionary (``None``/empty means no GUI session is
+        logged in at all — headless or SSH-only), its
+        ``CGSSessionScreenIsLocked`` key must be false, and its
+        ``kCGSessionOnConsoleKey`` must be true (fast-user-switched-away
+        sessions are not on the console)."""
+        quartz = self._quartz
+        session_info = quartz.CGSessionCopyCurrentDictionary()
+        if not session_info:
+            return False, (
+                "CGSessionCopyCurrentDictionary returned no session — no "
+                "GUI session is active on this host (headless, SSH-only, "
+                "or nobody logged in)"
+            )
+        if bool(session_info.get("CGSSessionScreenIsLocked", False)):
+            return False, "the screen is locked (CGSSessionScreenIsLocked)"
+        if not bool(session_info.get("kCGSessionOnConsoleKey", True)):
+            return False, (
+                "the session is not on the console (fast user switched away)"
+            )
+        return True, ""
+
     def find_top_window(self, pid: int, timeout_s: float) -> int:
         quartz = self._quartz
         deadline = time.monotonic() + timeout_s
@@ -785,6 +843,12 @@ def run_native_spec(
     assertion fails) do NOT raise — they're folded into the returned list
     as a ``status="fail"`` entry, the same "partial results, not a crash"
     contract :func:`coord.win_native_driver.run_native_spec` already gives.
+
+    When *calls* reports a locked screen or no GUI session
+    (:meth:`MacCalls.session_available`, #3510), the returned list is a
+    single ``status="unavailable"`` entry and no step runs — a distinct
+    verdict from ``"fail"``, since a locked screen is an environment
+    condition, not an app bug.
     """
     spec = parse_native_spec(spec_text)
     resolved_calls = calls if calls is not None else MacOSCalls()

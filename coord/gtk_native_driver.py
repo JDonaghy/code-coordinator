@@ -106,6 +106,18 @@ child. See ``tests/test_gtk_native_driver.py``'s
 regression guard, mirroring :mod:`coord.win_native_driver`'s
 ``test_no_image_name_kill_path_exists_in_the_module`` and
 :mod:`coord.mac_native_driver`'s own equivalent.
+
+**Missing-display precheck (#3510).** Unlike ``win-native``/``mac-native``,
+a missing display here means no ``$DISPLAY``/``$WAYLAND_DISPLAY`` at all —
+no Xvfb/compositor session is up on this host. That's a host-provisioning
+condition, not an app bug, so before :meth:`NativeRunner.run` launches
+anything it calls :meth:`GtkCalls.session_available`. When unavailable, the
+run returns a single ``status="unavailable"`` result — never a ``"fail"``
+— and no step (not even ``launch``) runs. ``LinuxGtkCalls`` itself no
+longer raises at construction time for a missing display (that check moved
+into :meth:`LinuxGtkCalls.session_available` so it's always reachable
+through the seam, including from a fake in tests) — only a non-Linux host
+is still a construction-time :class:`GtkNativeRuntimeError`.
 """
 
 from __future__ import annotations
@@ -129,10 +141,12 @@ class GtkNativeSpecError(Exception):
 
 
 class GtkNativeRuntimeError(Exception):
-    """Raised when the native driver itself can't run: not on Linux, no
-    ``$DISPLAY`` available, a missing ``xdotool``/``xwd`` binary or AT-SPI
-    binding, the launched process/window never appearing, or a step
-    referencing a window before any ``launch`` step ran."""
+    """Raised when the native driver itself can't run: not on Linux, a
+    missing ``xdotool``/``xwd`` binary or AT-SPI binding, the launched
+    process/window never appearing, or a step referencing a window before
+    any ``launch`` step ran. A missing ``$DISPLAY``/``$WAYLAND_DISPLAY`` is
+    NOT one of these (#3510) — that is an "unavailable" lane verdict via
+    :meth:`GtkCalls.session_available`, never a raised exception."""
 
 
 # ── native spec model ───────────────────────────────────────────────────────
@@ -314,6 +328,16 @@ class GtkCalls(Protocol):
 
     def kill(self, pid: int) -> None: ...
 
+    def session_available(self) -> tuple[bool, str]:
+        """``(True, "")`` when a usable display is present for this driver
+        to launch into; ``(False, reason)`` when neither ``$DISPLAY`` nor
+        ``$WAYLAND_DISPLAY`` is set (#3510) — checked by
+        :meth:`NativeRunner.run` BEFORE any step (including ``launch``)
+        runs, so a missing display is reported as ``status="unavailable"``
+        rather than a failed step. Never raises — a probe failure here is
+        itself an "unavailable" verdict, not a crash."""
+        ...
+
 
 def _find_a11y_match(elements: list[dict], role: str, name: str) -> dict | None:
     """The first *elements* entry whose ``role`` matches exactly
@@ -368,7 +392,19 @@ class NativeRunner:
         self._window_id: int | None = None
 
     def run(self, spec: NativeSpec) -> list[dict]:
+        """Run *spec*, first checking :meth:`GtkCalls.session_available`
+        (#3510). A missing display is a host-provisioning condition, not an
+        app bug: when unavailable, this returns a single
+        ``status="unavailable"`` entry and runs NO step at all (not even
+        ``launch``) — never folding it into an ordinary ``"fail"``."""
         self._spec = spec
+        available, reason = self._calls.session_available()
+        if not available:
+            return [{
+                "id": "session",
+                "status": "unavailable",
+                "message": reason or "no usable display is available",
+            }]
         results: list[dict] = []
         try:
             for step in spec.steps:
@@ -557,12 +593,14 @@ class LinuxGtkCalls:
     ``python3-gi``) for the accessibility tree, and ``xwd`` (ships with every
     X11 install) for window captures.
 
-    Linux-only, and requires a live ``$DISPLAY``: raises
-    :class:`GtkNativeRuntimeError` at construction otherwise, mirroring
-    :class:`coord.mac_native_driver.MacOSCalls`'s/
-    :class:`coord.win_native_driver.Win32Calls`'s own platform guards. This
-    driver never starts its own ``Xvfb`` — see the module docstring's
-    "headless by construction" note.
+    Linux-only: raises :class:`GtkNativeRuntimeError` at construction on any
+    other platform, mirroring :class:`coord.mac_native_driver.MacOSCalls`'s/
+    :class:`coord.win_native_driver.Win32Calls`'s own platform guards. A
+    missing ``$DISPLAY``/``$WAYLAND_DISPLAY`` is NOT a construction-time
+    raise (#3510) — see :meth:`session_available`, checked by
+    :class:`NativeRunner` before any step runs. This driver never starts its
+    own ``Xvfb`` — see the module docstring's "headless by construction"
+    note.
     """
 
     def __init__(self) -> None:
@@ -572,11 +610,25 @@ class LinuxGtkCalls:
                 "runs on a real Linux host with a display (e.g. a fleet "
                 "host running a persistent Xvfb session)"
             )
-        if not os.environ.get("DISPLAY"):
-            raise GtkNativeRuntimeError(
-                "gtk-native needs $DISPLAY set — no headless compositor or "
-                "Xvfb session appears to be running on this host"
-            )
+        # Deliberately NOT a construction-time raise for a missing display
+        # (#3510) — that is an "unavailable" lane verdict, not a driver
+        # construction failure, and is checked (and reachable through the
+        # same `GtkCalls` seam a test's fake implements) via
+        # :meth:`session_available`, called by `NativeRunner.run` before any
+        # step — see the module docstring's "missing-display precheck".
+
+    # -- session precheck (#3510) --
+
+    def session_available(self) -> tuple[bool, str]:
+        """Real check: either ``$DISPLAY`` (X11) or ``$WAYLAND_DISPLAY``
+        (Wayland) must be set — no headless compositor or Xvfb session
+        appears to be running on this host otherwise."""
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return True, ""
+        return False, (
+            "neither $DISPLAY nor $WAYLAND_DISPLAY is set — no headless "
+            "compositor or Xvfb session appears to be running on this host"
+        )
 
     # -- process lifecycle --
 
@@ -772,6 +824,12 @@ def run_native_spec(
     assertion fails) do NOT raise — they're folded into the returned list
     as a ``status="fail"`` entry, the same "partial results, not a crash"
     contract :func:`coord.mac_native_driver.run_native_spec` already gives.
+
+    When *calls* reports no usable display
+    (:meth:`GtkCalls.session_available`, #3510), the returned list is a
+    single ``status="unavailable"`` entry and no step runs — a distinct
+    verdict from ``"fail"``, since a missing display is a host-provisioning
+    condition, not an app bug.
     """
     spec = parse_native_spec(spec_text)
     resolved_calls = calls if calls is not None else LinuxGtkCalls()

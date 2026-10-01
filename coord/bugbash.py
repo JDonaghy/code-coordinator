@@ -45,6 +45,15 @@ routing does — a lane only exists when some configured machine actually
 carries the driver's declared ``capability``, so a repo with no capable
 machine for a platform silently gets no lane rather than a lane that can
 never run.
+
+**#3510: an unavailable lane is not a bug finding.** When a win-native/
+mac-native/gtk-native lane's own driver reports a locked or absent GUI
+session (or no usable display), the explorer hands back
+:attr:`ExploreOutcome.unavailable`, and :func:`run_bugbash` skips that lane
+for the round (:attr:`RoundReport.unavailable_lanes`) rather than running
+the exploration checklist against it or filing any finding from it — a
+locked desktop is an environment condition for the operator to fix, not
+evidence of an app bug.
 """
 
 from __future__ import annotations
@@ -426,12 +435,26 @@ class ExploreOutcome:
     there were findings," the second means "we looked, and there weren't
     any" — :func:`run_bugbash` keeps them distinguishable in
     :attr:`RoundReport.lane_failures` and its termination reason, rather
-    than collapsing both into "zero findings"."""
+    than collapsing both into "zero findings".
+
+    ``unavailable`` is a THIRD, separate outcome (#3510): the lane's own
+    native driver observed a locked/absent GUI session (win-native/
+    mac-native) or no usable display (gtk-native) and ran no exploration at
+    all — a host/environment condition, never a bug finding and never a
+    dispatch/poll failure. A production explorer sets ``unavailable=True``
+    when the dispatched worker's Tier-2 lane result came back
+    ``status="unavailable"`` (see ``coord.win_native_driver``'s/
+    ``coord.mac_native_driver``'s/``coord.gtk_native_driver``'s own
+    precheck). :func:`run_bugbash` skips such a lane for the round —
+    recording it in :attr:`RoundReport.unavailable_lanes` instead of
+    :attr:`RoundReport.lane_failures` — and never files findings from it
+    this round, even defensively, regardless of what ``findings`` carries."""
 
     findings: tuple[Finding, ...] = ()
     cost: float = 0.0
     notes: str = ""
     ok: bool = True
+    unavailable: bool = False
 
 
 #: ``(lane, round_num) -> ExploreOutcome`` — "go run this lane's
@@ -628,6 +651,16 @@ class RoundReport:
     #: a lane skipped for having blown its per-lane cost cap was never
     #: asked a question this round, so it can't have failed to answer one).
     lane_failures: dict[str, str] = field(default_factory=dict)
+    #: ``{platform: notes}`` for every lane explored this round whose
+    #: :attr:`ExploreOutcome.unavailable` was ``True`` (#3510) — a locked or
+    #: absent GUI session (win-native/mac-native) or no usable display
+    #: (gtk-native). Distinct from :attr:`lane_failures`: this is a verified
+    #: observation (the native driver's own session precheck ran and
+    #: reported it), not a dispatch/poll/log failure — but it is ALSO not a
+    #: verified "ran the checklist and found nothing" either, so it is
+    #: tracked separately rather than folded into either bucket. No
+    #: findings are ever filed from a lane recorded here this round.
+    unavailable_lanes: dict[str, str] = field(default_factory=dict)
 
     @property
     def explored_lanes(self) -> set[str]:
@@ -643,9 +676,26 @@ class RoundReport:
         not a clean pass" signal (#2096). A round with nothing explored at
         all (e.g. every lane skipped on its cost cap) is NOT reported as
         "all failed" — there is nothing to distrust, just nothing that
-        ran."""
+        ran. Does NOT count an ``unavailable`` lane as failed — see
+        :attr:`all_explored_lanes_unavailable_or_failed` for the combined
+        check."""
         explored = self.explored_lanes
         return bool(explored) and explored <= set(self.lane_failures)
+
+    @property
+    def all_explored_lanes_unavailable_or_failed(self) -> bool:
+        """``True`` when every lane explored this round either failed to
+        dispatch/poll/log OR reported its GUI session/display unavailable
+        (#3510) — i.e. NONE of them actually ran the exploration checklist.
+        Used by :func:`run_bugbash` to pick the ``"lanes_unavailable"``
+        termination reason over a false ``"zero_findings"`` clean-pass read
+        when every lane this round was simply locked/absent rather than
+        genuinely explored (#2096: zero findings is only a clean pass when
+        something was actually observed to run)."""
+        explored = self.explored_lanes
+        return bool(explored) and explored <= (
+            set(self.lane_failures) | set(self.unavailable_lanes)
+        )
 
 
 @dataclass
@@ -677,6 +727,15 @@ class BugbashReport:
         part of what it observed along the way was unverified (#2096)."""
         return any(r.lane_failures for r in self.rounds)
 
+    @property
+    def any_lane_unavailable(self) -> bool:
+        """``True`` if ANY round recorded a lane as unavailable (#3510) —
+        surfaced regardless of whether it happened to be the terminating
+        round, so an operator glancing at a run that otherwise filed/found
+        plenty still sees that one platform was locked/absent the whole
+        time and needs attention, not a bug report."""
+        return any(r.unavailable_lanes for r in self.rounds)
+
 
 def run_bugbash(
     config: BugbashConfig,
@@ -701,14 +760,24 @@ def run_bugbash(
     ``new_count``/cost, never inferred from "no exception was raised":
 
     - ``"zero_findings"`` — this round's non-duplicate finding count is 0,
-      AND at least one explored lane actually completed
-      (``RoundReport.all_explored_lanes_failed`` is ``False``) — a genuine
-      observed clean pass.
+      AND at least one explored lane actually completed its checklist
+      (neither ``RoundReport.all_explored_lanes_failed`` nor
+      ``RoundReport.all_explored_lanes_unavailable_or_failed`` is ``True``)
+      — a genuine observed clean pass.
     - ``"lane_failure"`` — this round's non-duplicate finding count is ALSO
       0, but every lane explored this round came back ``ok=False``
       (dispatch/poll/log failure) — #2096: a fleet-wide dispatch outage
       must never be reported identically to a clean bugbash pass. Check
       ``BugbashReport.rounds[-1].lane_failures`` for what actually broke.
+    - ``"lanes_unavailable"`` — this round's non-duplicate finding count is
+      ALSO 0, no lane came back a dispatch/poll/log failure, but every lane
+      explored this round reported its GUI session/display unavailable
+      (#3510: locked or absent, e.g. a locked dell64) — a different reason
+      from ``"lane_failure"`` (the explorer DID run and DID get a verified
+      answer, it's just "the host is locked", not "I don't know"), and
+      still not a clean pass either, since nothing was actually exercised
+      against the app. Check ``BugbashReport.rounds[-1].unavailable_lanes``
+      for which host needs unlocking.
     - ``"cost_cap"`` — cumulative cost has reached ``cost_cap_total``.
     - ``"round_cap"`` — ``config.max_rounds`` rounds ran without either of
       the above firing.
@@ -730,6 +799,16 @@ def run_bugbash(
             lane_cost[lane.platform] += outcome.cost
             report.lane_cost[lane.platform] = lane_cost[lane.platform]
             total_cost += outcome.cost
+            if outcome.unavailable:
+                # #3510: a locked/absent GUI session (or missing display)
+                # is a host condition, not a finding — recorded separately
+                # from both a clean pass and a dispatch/poll failure, and
+                # NEVER contributes findings this round, even defensively
+                # if the explorer happened to also hand some back.
+                report.unavailable_lanes[lane.platform] = (
+                    outcome.notes or "lane unavailable — no usable GUI session/display"
+                )
+                continue
             report.findings.extend(outcome.findings)
             if not outcome.ok:
                 # #2096: this lane's "findings" (almost certainly empty) are
@@ -788,11 +867,20 @@ def run_bugbash(
 
         if report.new_count == 0:
             # #2096: "zero findings" is only a genuine clean-pass verdict
-            # when at least one lane was actually verified to have run this
-            # round. A round where every explored lane failed to dispatch,
-            # poll, or fetch its log gets its own distinct reason instead —
-            # see RoundReport.lane_failures for what broke.
-            reason = "lane_failure" if report.all_explored_lanes_failed else "zero_findings"
+            # when at least one lane was actually verified to have RUN THE
+            # CHECKLIST this round. A round where every explored lane failed
+            # to dispatch/poll/fetch its log gets "lane_failure"; a round
+            # where every explored lane instead reported its session/display
+            # unavailable (#3510 — locked or absent, never a dispatch
+            # failure) gets its own distinct "lanes_unavailable" reason, in
+            # that priority order since a round can't be "all failed" AND
+            # "all unavailable" (each lane only sets one of the two).
+            if report.all_explored_lanes_failed:
+                reason = "lane_failure"
+            elif report.all_explored_lanes_unavailable_or_failed:
+                reason = "lanes_unavailable"
+            else:
+                reason = "zero_findings"
             break
         if total_cost >= config.cost_cap_total:
             reason = "cost_cap"

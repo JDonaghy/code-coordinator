@@ -5206,6 +5206,11 @@ def _tier1_cell(entry: "Tier1FeatureSupport | None") -> str:
 def _tier2_cell(entry: "ReleaseGateLaneResult | None") -> str:
     if entry is None:
         return "no Tier-2 data"
+    if entry.unavailable:
+        # #3510: a locked/absent GUI session or missing display — distinct
+        # from an app-bug "fail", same label `coord release gate` itself
+        # uses (one question, one answer, #2085).
+        return "unavailable"
     return "pass" if entry.passed else "fail"
 
 

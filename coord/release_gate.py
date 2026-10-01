@@ -30,6 +30,17 @@ resolving SHA ancestry via git) lives in ``coord.commands.release``.
   :meth:`ReleaseGateVerdict.failing_steps` vs. :meth:`ReleaseGateVerdict.
   effective_passed`. The override is audited evidence layered ON TOP of the
   failure, not a rewrite of what was actually observed.
+
+**#3510: a locked/absent GUI session is BLOCKING, but not "failed".** A
+Tier-2 lane observation can itself be ``unavailable`` (the driver's own
+session precheck — a locked desktop, no GUI session, or no display —
+reported by :mod:`coord.win_native_driver`/:mod:`coord.mac_native_driver`/
+:mod:`coord.gtk_native_driver`, never an ordinary ``"fail"``). This still
+blocks the gate (:attr:`LaneResult.unavailable` makes :attr:`GateStepResult.
+passed` ``False`` the same as any other failing step — #2096, a gate must
+be able to fail), but :attr:`GateStepResult.unavailable` keeps that
+distinct from an app bug, so an operator reads "unlock the host" instead of
+"go debug the app."
 """
 
 from __future__ import annotations
@@ -64,6 +75,14 @@ class LaneResult:
     #: missing/zero value sorts first, never last, so an un-timestamped
     #: fixture never silently wins over a real one.
     checked_at: float | None = None
+    #: ``True`` when this observation is the driver's own ``unavailable``
+    #: verdict (#3510) — a locked/absent GUI session or missing display,
+    #: never an app bug. ``passed`` must be ``False`` whenever this is
+    #: ``True`` (nothing ran, so nothing can have passed); callers
+    #: constructing a `LaneResult` by hand should never set both
+    #: ``passed=True`` and ``unavailable=True`` — :func:`_lane_step` treats
+    #: ``unavailable`` as authoritative over ``passed`` regardless.
+    unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,6 +139,14 @@ class GateStepResult:
     name: str
     passed: bool
     detail: str = ""
+    #: ``True`` when this step is blocking NOT because the app failed, but
+    #: because the lane's own session precheck reported the host's GUI
+    #: session/display locked or absent (#3510 — see
+    #: :attr:`LaneResult.unavailable`). Always implies ``passed=False``: a
+    #: step can never be both passing and unavailable. Lets a caller render
+    #: "UNAVAILABLE — unlock the host" rather than "FAILED — debug the app"
+    #: without losing the fact that the gate is still blocked either way.
+    unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,6 +192,14 @@ class ReleaseGateVerdict:
     @property
     def failing_steps(self) -> tuple[GateStepResult, ...]:
         return tuple(s for s in self.steps if not s.passed)
+
+    @property
+    def unavailable_steps(self) -> tuple[GateStepResult, ...]:
+        """The subset of :attr:`failing_steps` blocking because a lane's GUI
+        session/display was unavailable (#3510), not because the app
+        actually failed — so a caller can label those distinctly from a
+        genuine app-bug failure in its rendered output."""
+        return tuple(s for s in self.steps if s.unavailable)
 
 
 def validate_override_reason(reason: str | None) -> str:
@@ -239,6 +274,22 @@ def _lane_step(
         )
 
     chosen = max(at_release_sha, key=lambda lr: lr.checked_at or 0.0)
+    if chosen.unavailable:
+        # #3510: blocking, but distinctly labeled — a locked/absent GUI
+        # session or missing display is an environment condition, not an
+        # app bug, so this is reported `unavailable=True` rather than an
+        # ordinary failed step, even though it still fails the gate
+        # (#2096: a gate must be able to fail).
+        return GateStepResult(
+            name=f"lane:{lane}",
+            passed=False,
+            unavailable=True,
+            detail=chosen.detail or (
+                f"lane {lane!r} was unavailable at {release_sha!r} — no "
+                "usable interactive/GUI session (locked or absent); unlock "
+                "the host and re-run rather than debugging the app"
+            ),
+        )
     if chosen.passed:
         return GateStepResult(
             name=f"lane:{lane}", passed=True, detail=chosen.detail or "passed",

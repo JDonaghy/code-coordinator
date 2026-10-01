@@ -229,6 +229,8 @@ class FakeMacCalls:
         ax_script: list[list[dict]] | None = None,
         capture_script: list[bytes] | None = None,
         closes_after_n_polls: int | None = None,
+        session_ok: bool = True,
+        session_reason: str = "",
     ) -> None:
         self.launch_fails = launch_fails
         self.window_never_appears = window_never_appears
@@ -236,6 +238,8 @@ class FakeMacCalls:
         self._capture_script = list(capture_script or [b"frame-0"])
         self._closes_after_n_polls = closes_after_n_polls
         self._alive_poll_count = 0
+        self._session_ok = session_ok
+        self._session_reason = session_reason
 
         self.launched: list[tuple[str, str]] = []
         self.moved: list[tuple[int, int, int, int, int, int]] = []
@@ -244,6 +248,9 @@ class FakeMacCalls:
         self.killed: list[int] = []
         self._next_pid = 1000
         self._window_id = 5555
+
+    def session_available(self) -> tuple[bool, str]:
+        return self._session_ok, self._session_reason
 
     def launch(self, command: str, cwd: str) -> int:
         if self.launch_fails:
@@ -331,6 +338,34 @@ class TestNativeRunnerLaunch:
         results = runner.run(_spec([_step("key", key="a")]))
         assert results[0]["status"] == "fail"
         assert "no window" in results[0]["message"]
+
+
+class TestNativeRunnerSessionPrecheck:
+    """#3510: a locked screen or absent GUI session is reported as a
+    distinct ``unavailable`` lane verdict, never an ordinary failed step —
+    and no step (not even ``launch``) runs when it's locked."""
+
+    def test_locked_screen_reports_unavailable_and_runs_no_step(self) -> None:
+        calls = FakeMacCalls(session_ok=False, session_reason="the screen is locked")
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch")]))
+        assert results == [
+            {"id": "session", "status": "unavailable", "message": "the screen is locked"}
+        ]
+        assert calls.launched == []
+
+    def test_locked_screen_never_a_failed_step(self) -> None:
+        calls = FakeMacCalls(session_ok=False, session_reason="locked")
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch")]))
+        assert all(r["status"] != "fail" for r in results)
+
+    def test_unlocked_session_runs_normally(self) -> None:
+        calls = FakeMacCalls(session_ok=True)
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch")]))
+        assert results == [{"id": "000 launch", "status": "pass", "message": ""}]
+        assert calls.launched
 
 
 class TestNativeRunnerActions:
