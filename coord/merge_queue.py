@@ -50,6 +50,9 @@ from coord.models import (
     CLOSES_ISSUE_TYPES,
     WORK_LIKE_TYPES,
     Assignment,
+    IssueResolution,
+    effective_issue_resolution,
+    parse_issue_resolution,
     trust_issue_closed_for,
 )
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
@@ -57,6 +60,7 @@ from coord.state import (
     COORD_DIR,
     baseline_red_merge_blocked,
     baseline_red_streak,
+    comment_on_issue,
     dismiss_drive_escalation,
     record_uat_verdict,
 )
@@ -554,10 +558,19 @@ class ApprovalScan(NamedTuple):
       — that verdict needs no head SHA to be true, so ``unknown_head`` is
       False and every surface reads the genuine refusal. See
       :func:`_latest_review_verdict`.
+
+    - ``review_assignment`` — (#3502) the approving review's own
+      :class:`~coord.models.Assignment`, when ``approved`` is ``True`` and
+      ``None`` otherwise. Added so a caller that needs to read something
+      ELSE off the SAME approving review (e.g. its own `ISSUE_RESOLUTION:`
+      judgment, via :func:`coord.review.fetch_review_findings_from_github`)
+      reuses this one walk instead of re-implementing "which review
+      approved this" a second time (#2096: one question, one answer).
     """
 
     approved: bool
     unknown_head: bool
+    review_assignment: Assignment | None = None
 
 
 def _latest_review_verdict(pool, branch_work_ids: set | frozenset) -> str | None:
@@ -703,14 +716,14 @@ def scan_approved_reviews(
                     patch_id_attempted = True
                 if current_patch_id is not None and review_patch_id == current_patch_id:
                     # content-identical rebase — approval still covers it
-                    return ApprovalScan(approved=True, unknown_head=False)
+                    return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
             if current_sha is None:
                 # Refused because we don't KNOW the head, not because we
                 # checked and it moved. Same (closed) gate verdict, but a
                 # display surface must not call this "not approved".
                 unknown_head = True
             continue  # stale/unconfirmed: cannot prove this approval covers the current head
-        return ApprovalScan(approved=True, unknown_head=False)
+        return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
     if unknown_head and _latest_review_verdict(pool, branch_work_ids) != "approve":
         # #2704 follow-up: an unreadable branch head only explains the
         # refusal while the approval is the chain's last word. The #1966
@@ -6485,11 +6498,11 @@ def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingI
 @dataclass
 class MergeEvent:
     entry: QueuedMerge
-    kind: str  # "opened" | "sized" | "merged" | "conflict" | "skipped" | "error" | "reopened"
+    kind: str  # "opened" | "sized" | "merged" | "merged_partial" | "conflict" | "skipped" | "error" | "reopened"
     message: str = ""
 
 
-def _briefing_body(entry: QueuedMerge) -> str:
+def _briefing_body(entry: QueuedMerge, board=None, gh_ops: "GhOps | None" = None) -> str:
     # `Closes #N` makes GitHub auto-close the linked issue when the PR
     # merges — without it the issue stays stranded open and the TUI's
     # lifecycle ledger shows the row as In-flight forever (the brain
@@ -6501,7 +6514,21 @@ def _briefing_body(entry: QueuedMerge) -> str:
     # entry's issue_number is the milestone's tracking issue — closing it on
     # merge is wrong (the epic reads "done" while its sub-issues are still
     # open), so it gets the non-closing `Refs #N` instead.
-    keyword = "Closes" if entry.assignment_type in CLOSES_ISSUE_TYPES else "Refs"
+    #
+    # #3502: even for a `CLOSES_ISSUE_TYPES` entry, the worker's/reviewer's
+    # own `ISSUE_RESOLUTION:` judgment (:func:`_issue_resolution_for_entry`)
+    # can veto the closing keyword — this call site is reached when
+    # `process()` finds no `pr_number` yet, i.e. right before merging, by
+    # which point a review has almost always already run, so both halves of
+    # the judgment are usually available. *board*/*gh_ops* default to
+    # ``None`` (every pre-#3502 test/call site) which reads as "resolved" —
+    # unchanged behaviour.
+    resolution = _issue_resolution_for_entry(entry, board, gh_ops)
+    keyword = (
+        "Closes"
+        if entry.assignment_type in CLOSES_ISSUE_TYPES and resolution.value == "resolved"
+        else "Refs"
+    )
     return (
         f"{keyword} #{entry.issue_number}\n\n"
         f"Automated merge from the coordinator for assignment "
@@ -6528,6 +6555,58 @@ def _work_assignment_for_entry(entry: QueuedMerge, board) -> Assignment | None:
         if getattr(a, "assignment_id", None) == entry.assignment_id and getattr(a, "type", None) == "work":
             return a
     return None
+
+
+def _issue_resolution_for_entry(
+    entry: QueuedMerge, board, gh_ops: "GhOps | None" = None,
+) -> IssueResolution:
+    """(#3502) The EFFECTIVE `ISSUE_RESOLUTION:` verdict for *entry* — the
+    worker's own judgment (its `completion_summary`), folded with the
+    approving reviewer's judgment (when one exists), reviewer winning any
+    disagreement that makes it MORE cautious, never less
+    (:func:`coord.models.effective_issue_resolution`).
+
+    Both halves degrade gracefully to "resolved" (today's unconditional
+    behaviour) when unavailable:
+
+    * *board* is ``None``, or the originating `work` assignment can't be
+      found on it (:func:`_work_assignment_for_entry`) — no worker claim to
+      read.
+    * No approving review is found (:func:`scan_approved_reviews`), or its
+      findings can't be recovered from the GitHub message bus
+      (:func:`coord.review.fetch_review_findings_from_github` — the one
+      review-findings source this module can reach without a notify.py/
+      state.py DB round trip) — no reviewer claim to read.
+
+    Deferred-imports `coord.review` to avoid a circular import (`review.py`
+    does not import `merge_queue.py` at module level, but keeping the
+    import local here mirrors every other cross-module deferred import in
+    this file).
+    """
+    work = _work_assignment_for_entry(entry, board)
+    worker_resolution = parse_issue_resolution(
+        getattr(work, "completion_summary", None) if work is not None else None
+    )
+
+    reviewer_resolution: IssueResolution | None = None
+    if board is not None:
+        scan = scan_approved_reviews(entry, board, gh_ops)
+        review_assignment = scan.review_assignment
+        if scan.approved and review_assignment is not None:
+            from coord.review import fetch_review_findings_from_github  # noqa: PLC0415
+
+            try:
+                findings = fetch_review_findings_from_github(
+                    entry.repo_github,
+                    entry.issue_number,
+                    review_assignment.assignment_id,
+                )
+            except Exception:  # noqa: BLE001 — best-effort; falls back to the worker's claim
+                findings = None
+            if findings is not None:
+                reviewer_resolution = findings.issue_resolution
+
+    return effective_issue_resolution(worker_resolution, reviewer_resolution)
 
 
 def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None:
@@ -7702,7 +7781,7 @@ def process(
                         base=entry.target_branch,
                         head=entry.branch,
                         title=f"#{entry.issue_number}: {entry.issue_title}",
-                        body=_briefing_body(entry),
+                        body=_briefing_body(entry, board, gh_ops),
                     )
                 except Exception as e:  # noqa: BLE001 — surface gh failure as event
                     events.append(MergeEvent(entry, "error", f"create_pr failed: {e}"))
@@ -8487,7 +8566,21 @@ def process(
                 # entry's issue_number is the milestone's tracking issue —
                 # closing it here would be the exact #1077 bug regardless of
                 # what the PR body says.
-                if entry.assignment_type in CLOSES_ISSUE_TYPES:
+                #
+                # #3502: NOT ENOUGH, though — even for a CLOSES_ISSUE_TYPES
+                # entry, the worker's/reviewer's own `ISSUE_RESOLUTION:`
+                # judgment can veto the close. Resolved once per merge, up
+                # front, so both the close-or-not decision and the comment
+                # posted below read the identical verdict.
+                issue_resolution = (
+                    _issue_resolution_for_entry(entry, board, gh_ops)
+                    if entry.assignment_type in CLOSES_ISSUE_TYPES
+                    else IssueResolution()
+                )
+                if (
+                    entry.assignment_type in CLOSES_ISSUE_TYPES
+                    and issue_resolution.value == "resolved"
+                ):
                     try:
                         gh_ops.close_issue(entry.repo_github, entry.issue_number)
                         events.append(MergeEvent(
@@ -8501,6 +8594,40 @@ def process(
                             f"merged PR #{entry.pr_number} (warning: could not "
                             f"close issue #{entry.issue_number}: {e}){bypass_note}",
                         ))
+                elif (
+                    entry.assignment_type in CLOSES_ISSUE_TYPES
+                    and issue_resolution.value != "resolved"
+                ):
+                    # #3502: the worker/reviewer said this PR does NOT
+                    # resolve the issue — never close it, and tell anyone
+                    # watching the issue (not just the queue DB) what
+                    # remains, quoting whichever side's judgment won
+                    # (`_issue_resolution_for_entry`/`effective_issue_resolution`).
+                    remainder = (
+                        issue_resolution.reason
+                        or "the worker/reviewer marked this PR as not fully "
+                        "resolving the issue — see the PR for details."
+                    )
+                    comment_body = (
+                        f"Merged PR #{entry.pr_number}, but this is marked "
+                        f"`ISSUE_RESOLUTION: {issue_resolution.value}` — this "
+                        f"issue is intentionally left OPEN.\n\nWhat remains: "
+                        f"{remainder}"
+                    )
+                    try:
+                        comment_on_issue(
+                            entry.repo_name, entry.issue_number, comment_body,
+                            repo_github=entry.repo_github,
+                        )
+                        comment_note = ""
+                    except Exception as e:  # noqa: BLE001 — never fail a merge on a comment
+                        comment_note = f" (warning: could not post remainder comment: {e})"
+                    events.append(MergeEvent(
+                        entry, "merged_partial",
+                        f"merged PR #{entry.pr_number}; issue #{entry.issue_number} "
+                        f"left open ({issue_resolution.value}: {remainder})"
+                        f"{bypass_note}{comment_note}",
+                    ))
                 else:
                     events.append(MergeEvent(
                         entry, "merged",

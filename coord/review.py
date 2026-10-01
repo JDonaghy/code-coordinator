@@ -45,7 +45,7 @@ import re
 import time
 import uuid
 from typing import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -59,9 +59,11 @@ from coord.models import (
     WORK_LIKE_TYPES,
     Assignment,
     Board,
+    IssueResolution,
     Machine,
     Repo,
     coordinator_owned_docs,
+    parse_issue_resolution,
     trust_issue_closed_for,
 )
 from coord.refine_chat import MAX_CLAUDE_MD_CHARS
@@ -87,6 +89,13 @@ class ReviewFindings:
     """Structured review output extracted from a reviewer worker log."""
     verdict: str  # "approve" or "request-changes"
     body: str
+    # #3502: the reviewer's own `ISSUE_RESOLUTION:` judgment, parsed out of
+    # `body` with the exact same marker `coord.models.parse_issue_resolution`
+    # also reads off a worker's `completion_summary` — one parser, two
+    # callers, so the two can never disagree about what the marker means.
+    # Defaults to "resolved" (unset) when the reviewer didn't emit one,
+    # mirroring every other verdict marker's absent-means-default posture.
+    issue_resolution: IssueResolution = field(default_factory=IssueResolution)
 
 
 # Matches the structured block the reviewer is instructed to emit at end of session.
@@ -744,7 +753,9 @@ def _parse_review_text(text: str) -> ReviewFindings | None:
     body = m.group(2).strip()
     if verdict not in ("approve", "request-changes"):
         return None
-    return ReviewFindings(verdict=verdict, body=body)
+    return ReviewFindings(
+        verdict=verdict, body=body, issue_resolution=parse_issue_resolution(body)
+    )
 
 
 def _parse_review_from_lines(
@@ -891,7 +902,11 @@ def fetch_review_findings_from_github(
         hit = extract_findings_block(c.get("body", ""), assignment_id)
         if hit is not None:
             verdict, body = hit
-            return ReviewFindings(verdict=verdict or "request-changes", body=body)
+            return ReviewFindings(
+                verdict=verdict or "request-changes",
+                body=body,
+                issue_resolution=parse_issue_resolution(body),
+            )
     return None
 
 
@@ -2320,6 +2335,24 @@ def build_review_briefing(
             lines.append("### Completion summary")
             lines.append("")
             lines.append(_summary)
+            _worker_resolution = parse_issue_resolution(_summary)
+            if _worker_resolution.value != "resolved":
+                # #3502: the worker itself said this PR does NOT resolve
+                # issue #{issue_number} — surface it explicitly rather than
+                # leaving it buried in prose, and ask the reviewer to
+                # confirm or correct it in their own ISSUE_RESOLUTION line
+                # below (see the FORMAT CONTRACT section).
+                lines.append("")
+                lines.append(
+                    f"⚠️ The worker marked this `ISSUE_RESOLUTION: "
+                    f"{_worker_resolution.value}` — it does NOT believe this "
+                    f"PR fully resolves issue #{issue_number}"
+                    + (f" ({_worker_resolution.reason})" if _worker_resolution.reason else "")
+                    + ". Confirm or correct this with your own "
+                    "`ISSUE_RESOLUTION:` line (see below) — your judgment "
+                    "can only make it MORE cautious, never silently reopen "
+                    "it as fully resolved without saying why."
+                )
         if _commits:
             lines.append("")
             lines.append("### Commit messages")
@@ -2638,11 +2671,51 @@ def build_review_briefing(
     lines.append("```")
     lines.append("REVIEW_VERDICT: approve")
     lines.append("REVIEW_BODY:")
+    lines.append("ISSUE_RESOLUTION: resolved")
     lines.append("<your full review text in markdown>")
     lines.append("END_REVIEW")
     lines.append("```")
     lines.append("")
     lines.append("Use `REVIEW_VERDICT: request-changes` if changes are needed.")
+    # #3502: ISSUE_RESOLUTION is a SEPARATE judgment from REVIEW_VERDICT —
+    # code quality and "does this actually fix the reported bug" are
+    # different questions. A PR can be well-written, pass review, AND still
+    # not resolve the issue (root cause lives elsewhere, this is
+    # investigation-only, only one hypothesis was ruled out). Merging it
+    # auto-closes the issue unless you say otherwise HERE.
+    lines.append("")
+    lines.append(
+        "ALSO include an `ISSUE_RESOLUTION:` line inside `REVIEW_BODY:` "
+        "(shown above, defaulting to `resolved`) — one of `resolved` | "
+        "`partial` | `investigation`:"
+    )
+    lines.append(
+        "- `resolved` — merging this PR fully fixes issue "
+        f"#{issue_number}. The default; say nothing extra if this is true."
+    )
+    lines.append(
+        "- `partial` — this PR makes real progress but issue "
+        f"#{issue_number}'s own problem is NOT fixed yet (e.g. the root "
+        "cause is in another repo and only a dependent half of the fix "
+        "landed here). Add `— <what remains>` after the value, e.g. "
+        "`ISSUE_RESOLUTION: partial — root cause is a quadraui gap, "
+        "quadraui#NNN now FILED (not just drafted in a docs file — an "
+        "actual GitHub issue) and must land before this can close`."
+    )
+    lines.append(
+        "- `investigation` — this PR is investigation-only (no production "
+        "change, or only one hypothesis ruled out) — the bug is exactly "
+        "as unresolved as before. Say what remains after the dash, same "
+        "as `partial`."
+    )
+    lines.append(
+        "A drafted-but-unfiled upstream issue (e.g. a bullet in a design "
+        "doc, a TODO comment) is NOT \"filed\" — only a real GitHub issue "
+        "number counts. If the worker's own completion summary above "
+        "already flagged `partial`/`investigation`, your own line can "
+        "only confirm it or make it MORE cautious, never silently revert "
+        "it to `resolved` without saying why that worker claim was wrong."
+    )
     # #1456: the coordinator's #476 gate (an advisory-only request-changes must
     # not burn another fix round) counts bullets under the body's section
     # headings, and since #1456 it fails CLOSED — an unparseable body keeps the
@@ -2699,6 +2772,7 @@ def _find_or_open_pr(
     issue_number: int,
     issue_title: str,
     assignment_type: str = "work",
+    completion_summary: str | None = None,
 ) -> dict | None:
     """Return {number, url, existed} for a PR on `branch`, opening one if needed.
 
@@ -2714,6 +2788,18 @@ def _find_or_open_pr(
     PR resolves — the body uses the non-closing ``Refs #N`` so the tracking
     issue still gets a discoverable backlink but does not flip to closed
     when the contract PR merges.
+
+    #3502: *completion_summary* — the worker's own final message, already
+    captured on ``Assignment.completion_summary`` by the time a PR opens —
+    is scanned for an ``ISSUE_RESOLUTION:`` marker via
+    :func:`coord.models.parse_issue_resolution`. Even for an otherwise
+    ``CLOSES_ISSUE_TYPES`` type, a worker who marked the issue
+    "partial"/"investigation" gets ``Refs #N`` here too, so the PR body
+    GitHub reads at merge time never carries a closing keyword this
+    worker's own final message said was wrong. This is the EARLY half of
+    the decision (only the worker's claim exists yet — review hasn't run);
+    `coord.merge_queue.process` re-derives the FINAL keyword at actual
+    merge time with the reviewer's judgment folded in too (#3502).
     """
     try:
         existing = github_ops.find_pr_for_branch(repo_github, branch)
@@ -2725,7 +2811,12 @@ def _find_or_open_pr(
             "url": existing.get("url"),
             "existed": True,
         }
-    keyword = "Closes" if assignment_type in CLOSES_ISSUE_TYPES else "Refs"
+    resolution = parse_issue_resolution(completion_summary)
+    keyword = (
+        "Closes"
+        if assignment_type in CLOSES_ISSUE_TYPES and resolution.value == "resolved"
+        else "Refs"
+    )
     try:
         return github_ops.create_pr(
             repo_github,
@@ -2897,6 +2988,7 @@ def open_pr_for_completed_work(
             issue_number=completed.issue_number,
             issue_title=completed.issue_title,
             assignment_type=completed.type,
+            completion_summary=completed.completion_summary,
         )
     except Exception:  # noqa: BLE001 — best-effort; dispatch_review retries later
         log.warning(
@@ -3545,6 +3637,7 @@ def dispatch_review(
             issue_number=completed.issue_number,
             issue_title=completed.issue_title,
             assignment_type=completed.type,
+            completion_summary=completed.completion_summary,
         )
 
         # #904 (fix #1): build a ranked list of ALL eligible reviewer machines so

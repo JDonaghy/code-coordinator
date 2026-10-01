@@ -489,6 +489,47 @@ def test_briefing_includes_worker_completion_summary() -> None:
     assert "Added a regression test observed RED before the fix." in briefing
 
 
+# ── #3502: ISSUE_RESOLUTION marker instructions + worker-claim callout ─────
+
+
+def test_briefing_always_instructs_reviewer_on_issue_resolution_marker() -> None:
+    """Every briefing — not just ones with a worker claim — must ask the
+    reviewer for their own `ISSUE_RESOLUTION:` judgment, since it's a
+    SEPARATE question from `REVIEW_VERDICT:` (code quality vs. "does this
+    actually fix the reported bug")."""
+    briefing = build_review_briefing(**_briefing_kwargs())
+    assert "ISSUE_RESOLUTION:" in briefing
+    assert "partial" in briefing
+    assert "investigation" in briefing
+
+
+def test_briefing_flags_workers_own_partial_claim() -> None:
+    """#3502: when the worker's own completion summary already carries
+    `ISSUE_RESOLUTION: partial`, the reviewer must see it called out
+    explicitly, not buried in prose."""
+    briefing = build_review_briefing(
+        **_briefing_kwargs(
+            completion_summary=(
+                "Fixed the symptom.\n\n"
+                "ISSUE_RESOLUTION: partial — root cause lives upstream, "
+                "quadraui#999 filed."
+            ),
+        )
+    )
+    assert "worker marked this" in briefing
+    assert "partial" in briefing
+    assert "quadraui#999" in briefing
+
+
+def test_briefing_does_not_flag_a_resolved_worker_claim() -> None:
+    """No callout noise when the worker's own claim is the default
+    'resolved' (no marker at all)."""
+    briefing = build_review_briefing(
+        **_briefing_kwargs(completion_summary="Fixed the bug outright.")
+    )
+    assert "worker marked this" not in briefing
+
+
 def test_briefing_includes_worker_commit_messages() -> None:
     briefing = build_review_briefing(
         **_briefing_kwargs(
@@ -5514,6 +5555,81 @@ def test_find_or_open_pr_uses_refs_for_mock_author() -> None:
     assert "Closes #1041" not in captured["body"]
 
 
+def test_find_or_open_pr_uses_refs_when_worker_marks_issue_partial() -> None:
+    """#3502: a `type="work"` PR (normally CLOSES_ISSUE_TYPES) must still
+    get the non-closing `Refs #N` keyword when the worker's own
+    `completion_summary` carries `ISSUE_RESOLUTION: partial` — merging it
+    must not auto-close an issue the worker itself says is not resolved.
+    """
+    from coord.review import _find_or_open_pr
+    import coord.github_ops as github_ops_mod
+
+    captured: dict = {}
+
+    def _fake_find_pr(repo_github, branch):
+        return None
+
+    def _fake_create_pr(repo_github, *, base, head, title, body):
+        captured["body"] = body
+        return {"number": 57, "url": "https://github.com/acme/api/pull/57", "existed": False}
+
+    import unittest.mock as mock
+    with (
+        mock.patch.object(github_ops_mod, "find_pr_for_branch", _fake_find_pr),
+        mock.patch.object(github_ops_mod, "create_pr", _fake_create_pr),
+    ):
+        result = _find_or_open_pr(
+            "acme/api",
+            branch="issue-42-fix",
+            default_branch="main",
+            issue_number=42,
+            issue_title="Fix the login bug",
+            assignment_type="work",
+            completion_summary=(
+                "### Summary\nFixed the symptom here.\n\n"
+                "ISSUE_RESOLUTION: partial — root cause is in another repo, "
+                "quadraui#999 now filed."
+            ),
+        )
+
+    assert result is not None
+    assert captured["body"].startswith("Refs #42\n\n")
+    assert "Closes #42" not in captured["body"]
+
+
+def test_find_or_open_pr_uses_closes_when_completion_summary_absent() -> None:
+    """Unchanged pre-#3502 behaviour: no `completion_summary` at all still
+    reads as `resolved`."""
+    from coord.review import _find_or_open_pr
+    import coord.github_ops as github_ops_mod
+
+    captured: dict = {}
+
+    def _fake_find_pr(repo_github, branch):
+        return None
+
+    def _fake_create_pr(repo_github, *, base, head, title, body):
+        captured["body"] = body
+        return {"number": 58, "url": "https://github.com/acme/api/pull/58", "existed": False}
+
+    import unittest.mock as mock
+    with (
+        mock.patch.object(github_ops_mod, "find_pr_for_branch", _fake_find_pr),
+        mock.patch.object(github_ops_mod, "create_pr", _fake_create_pr),
+    ):
+        result = _find_or_open_pr(
+            "acme/api",
+            branch="issue-43-fix",
+            default_branch="main",
+            issue_number=43,
+            issue_title="Fix another bug",
+            assignment_type="work",
+        )
+
+    assert result is not None
+    assert captured["body"].startswith("Closes #43\n\n")
+
+
 def test_dispatch_review_passes_assignment_type_to_pr_lookup(
     two_machine_config: Config,
 ) -> None:
@@ -6343,6 +6459,70 @@ END_REVIEW
         result = parse_review_from_log(log)
         assert result is not None
         assert result.verdict == "request-changes"
+
+
+class TestReviewFindingsIssueResolution:
+    """#3502: `ReviewFindings.issue_resolution`, parsed via
+    `coord.models.parse_issue_resolution` from the SAME `body` capture
+    every other review consumer reads — one parser, used by both the
+    worker-side (`completion_summary`) and reviewer-side (`body`) callers,
+    so the two can never disagree about what the marker means."""
+
+    def test_reviewer_marks_partial_inside_body(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+ISSUE_RESOLUTION: partial — root cause is a quadraui gap, quadraui#999 \
+now filed, must land before this closes.
+
+## Blocking findings
+None.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"
+        assert result.issue_resolution.value == "partial"
+        assert "quadraui#999" in result.issue_resolution.reason
+
+    def test_reviewer_marks_investigation(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+ISSUE_RESOLUTION: investigation — only ruled out one hypothesis, bug \
+still reproducible.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.issue_resolution.value == "investigation"
+
+    def test_absent_marker_defaults_to_resolved(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+Looks great, ships the fix.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.issue_resolution.value == "resolved"
+        assert result.issue_resolution.reason == ""
+
+    def test_malformed_marker_defaults_to_resolved(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+ISSUE_RESOLUTION: not-a-real-value — nonsense.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.issue_resolution.value == "resolved"
 
 
 class TestParseReviewFromAgent:
