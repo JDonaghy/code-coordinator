@@ -69,6 +69,7 @@ import io
 import json
 import re
 import time
+import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -4995,6 +4996,39 @@ def _xlsx_cell(value: Any, meta: Mapping[str, Any] | None = None) -> Any:
     return str(value)
 
 
+#: Fixed stamp used in place of "now" everywhere `result_to_xlsx` would
+#: otherwise embed a save-time timestamp: `openpyxl` stamps
+#: `docProps/core.xml` (`created`/`modified`) and every zip entry's
+#: `date_time` with the wall-clock time *at save*, at one-second
+#: resolution — so two saves of the identical report that straddle a
+#: second boundary produce different bytes (#3500). Pinning both to this
+#: constant (the oldest timestamp the zip format can represent) makes
+#: `result_to_xlsx` a pure function of its input: identical reports produce
+#: byte-identical files, so they can be diffed.
+_XLSX_FIXED_STAMP = datetime(1980, 1, 1, 0, 0, 0)
+
+
+def _zero_xlsx_zip_timestamps(data: bytes) -> bytes:
+    """Rewrite every zip entry's `date_time` in a saved `.xlsx` to the fixed
+    stamp, leaving contents untouched. `openpyxl` has no option to pin this
+    itself, so it has to be done as a post-processing pass over the bytes
+    it produced (#3500)."""
+    stamp = _XLSX_FIXED_STAMP.timetuple()[:6]
+    src = io.BytesIO(data)
+    dst = io.BytesIO()
+    with (
+        zipfile.ZipFile(src, "r") as zin,
+        zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout,
+    ):
+        for item in zin.infolist():
+            payload = zin.read(item.filename)
+            info = zipfile.ZipInfo(item.filename, date_time=stamp)
+            info.compress_type = item.compress_type
+            info.external_attr = item.external_attr
+            zout.writestr(info, payload)
+    return dst.getvalue()
+
+
 def result_to_xlsx(result: "ReportResult | Mapping[str, Any]") -> bytes:
     """Serialise a :class:`ReportResult` as an ``.xlsx`` workbook.
 
@@ -5033,6 +5067,12 @@ def result_to_xlsx(result: "ReportResult | Mapping[str, Any]") -> bytes:
     totals = data.get("totals")
 
     wb = Workbook()
+    # openpyxl otherwise stamps docProps/core.xml with wall-clock "now" at
+    # save, which makes two saves of the same report byte-unequal whenever
+    # they straddle a second boundary (#3500). Pin both to a fixed stamp so
+    # `result_to_xlsx` is a pure function of `result`.
+    wb.properties.created = _XLSX_FIXED_STAMP
+    wb.properties.modified = _XLSX_FIXED_STAMP
     sheet = wb.active
     sheet.title = "Report"
     if columns:
@@ -5064,7 +5104,7 @@ def result_to_xlsx(result: "ReportResult | Mapping[str, Any]") -> bytes:
 
     buf = io.BytesIO()
     wb.save(buf)
-    return buf.getvalue()
+    return _zero_xlsx_zip_timestamps(buf.getvalue())
 
 
 def xlsx_filename(result: "ReportResult | Mapping[str, Any]") -> str:

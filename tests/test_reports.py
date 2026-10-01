@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -3710,6 +3711,32 @@ class TestXlsxSerializer:
         pytest.importorskip("openpyxl")
         result = _export_fixture_result()
         assert result_to_xlsx(result) == result_to_xlsx(result.to_dict())
+
+    def test_output_is_byte_identical_even_as_the_save_clock_advances(
+        self, monkeypatch
+    ) -> None:
+        """#3500: `zipfile.ZipFile.writestr` stamps every entry's
+        `date_time` with `time.localtime(time.time())` *at save*, at
+        one-second resolution — so two saves of the identical report
+        straddling a second boundary used to produce different bytes,
+        exactly the flake observed on PR #2785's CI run. Advance the clock
+        `zipfile` reads from by several seconds between the two calls and
+        assert the output doesn't move."""
+        pytest.importorskip("openpyxl")
+        result = _export_fixture_result()
+
+        base_wall = time.time()
+        clock = {"offset": 0.0}
+        monkeypatch.setattr(
+            "zipfile.time.time", lambda: base_wall + clock["offset"]
+        )
+
+        first = result_to_xlsx(result)
+        clock["offset"] += 5.0  # advance the save clock by 5s, well past
+        # the 1s resolution that caused the flake.
+        second = result_to_xlsx(result)
+
+        assert first == second
 
     def test_filename_ends_in_xlsx_and_is_deterministic(self) -> None:
         name = xlsx_filename(_export_fixture_result())
