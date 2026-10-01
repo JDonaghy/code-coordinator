@@ -872,3 +872,127 @@ acceptance:
     )
     with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
         load(p)
+
+
+# ── #3509: Tier-2 lane-kind entrypoints are additive-only, not sealed ───────
+#
+# `coord bugbash` (#3487) files every finding with the acceptance line "the
+# fix must add a Tier-1 shared conformance scenario or a Tier-2 smoke-spec
+# step that fails first" — but before this, `sealed_paths()` folded EVERY
+# driver's `entrypoint:` into the hard-sealed set regardless of `kind`, so a
+# `type="work"` worker adding the very step its own fix requires tripped the
+# same mandatory tamper banner as rewriting the oracle it's graded against.
+# These four `kind`s (`tui-pty`/`win-native`/`mac-native`/`gtk-native`) are
+# excluded from `sealed_paths()` entirely; the mandatory additive-only
+# enforcement itself lives in `coord.review._lane_entrypoint_violation_lines`
+# (tested in tests/test_review.py), fed by `additive_only_entrypoints()`.
+
+
+def test_tui_pty_entrypoint_excluded_from_sealed_paths(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-pty
+      run: "coord-acceptance-tui-pty {ms}"
+      entrypoint: "smoke/tui-pty.yaml"
+"""
+    )
+    cfg = load(p)
+    # Still every repo's *declared* entrypoint (kind-independent)...
+    assert cfg.acceptance.entrypoints("coord-tui") == ["smoke/tui-pty.yaml"]
+    # ...but NOT part of the hard-sealed set, nor its sibling dir.
+    assert cfg.acceptance.sealed_paths("coord-tui") == ["tests/acceptance/"]
+    assert "smoke/tui-pty.yaml" not in cfg.acceptance.sealed_paths("coord-tui")
+    assert "smoke/acceptance/" not in cfg.acceptance.sealed_paths("coord-tui")
+
+
+@pytest.mark.parametrize("kind", ["win-native", "mac-native", "gtk-native"])
+def test_other_lane_kinds_also_excluded_from_sealed_paths(
+    tmp_path: Path, kind: str,
+) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + f"""\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: {kind}
+      run: "coord-acceptance-{kind} {{ms}}"
+      entrypoint: "smoke/native.yaml"
+"""
+    )
+    cfg = load(p)
+    assert cfg.acceptance.sealed_paths("coord-tui") == ["tests/acceptance/"]
+    assert cfg.acceptance.additive_only_entrypoints("coord-tui") == ["smoke/native.yaml"]
+
+
+def test_additive_only_entrypoints_empty_when_no_lane_kind_driver(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test --test acceptance"
+      entrypoint: "tests/acceptance.rs"
+"""
+    )
+    cfg = load(p)
+    assert cfg.acceptance.additive_only_entrypoints("coord-tui") == []
+
+
+def test_tui_tuidriver_and_cli_pytest_entrypoints_stay_sealed_exactly_as_today(
+    tmp_path: Path,
+) -> None:
+    """#3509 acceptance: the existing `tui-tuidriver`/`cli-pytest` routes must
+    be byte-for-byte unaffected by the #3509 change."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE.replace("coord-tui", "claude-coordinator") + ROUTED_WITH_ENTRYPOINT)
+    cfg = load(p)
+    assert cfg.acceptance.sealed_paths("claude-coordinator") == [
+        "tests/acceptance/", "tui/tests/acceptance.rs", "tui/tests/acceptance/",
+    ]
+    assert cfg.acceptance.additive_only_entrypoints("claude-coordinator") == []
+
+
+def test_mixed_routes_seal_only_the_non_lane_entrypoint(tmp_path: Path) -> None:
+    """A repo routing both a sealed (tui-tuidriver) suite and a Tier-2 lane
+    (tui-pty) smoke spec keeps exactly one of its two entrypoints sealed."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "tui/**"
+          kind: tui-tuidriver
+          run: "cd tui && cargo test --test acceptance"
+          entrypoint: "tui/tests/acceptance.rs"
+        - match: "vimcode/**"
+          kind: tui-pty
+          run: "coord-acceptance-tui-pty {ms}"
+          entrypoint: "vimcode/smoke/tui-pty.yaml"
+"""
+    )
+    cfg = load(p)
+    assert cfg.acceptance.sealed_paths("claude-coordinator") == [
+        "tests/acceptance/", "tui/tests/acceptance.rs", "tui/tests/acceptance/",
+    ]
+    assert cfg.acceptance.additive_only_entrypoints("claude-coordinator") == [
+        "vimcode/smoke/tui-pty.yaml",
+    ]
+    # entrypoints() stays kind-independent — both still show up there.
+    assert cfg.acceptance.entrypoints("claude-coordinator") == [
+        "tui/tests/acceptance.rs", "vimcode/smoke/tui-pty.yaml",
+    ]

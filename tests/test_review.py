@@ -2689,6 +2689,275 @@ def test_dispatch_review_unaffected_when_no_mechanical_violation(
     assert completed.review_state != "done"
 
 
+# ── #3509: Tier-2 lane-kind smoke-spec entrypoints — additive-only, not
+# sealed ───────────────────────────────────────────────────────────────────
+
+
+def test_dispatch_review_mechanical_short_circuit_for_lane_entrypoint_weakened(
+    two_machine_config: Config,
+) -> None:
+    """#3509 acceptance: a work diff that REMOVES an existing line from a
+    Tier-2 lane-kind (tui-pty) smoke-spec entry point must short-circuit to
+    a mandatory request-changes, WITHOUT a review leg ever being
+    dispatched — mirrors the sealed-path mechanical tests above."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    cfg = replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(
+                kind="tui-pty", run="coord-acceptance-tui-pty {ms}",
+                entrypoint="smoke/tui-pty.yaml",
+            ),
+        }),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "should-never-be-used"})
+    diff = (
+        "diff --git a/smoke/tui-pty.yaml b/smoke/tui-pty.yaml\n"
+        "--- a/smoke/tui-pty.yaml\n"
+        "+++ b/smoke/tui-pty.yaml\n"
+        "@@ -5,3 +5,1 @@\n"
+        "-  - expect_within: {ms: 500, text: \"menu opened\"}\n"
+        "-  - expect_silent: {seconds: 2}\n"
+        "+  - key: esc\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 50, "url": "https://github.com/acme/api/pull/50", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert client.calls == []
+    assert result is not None
+    assert result.review_verdict == "request-changes"
+    assert result.verdict_source == "mechanical"
+    assert "smoke/tui-pty.yaml" in (result.verdict_source_reason or "")
+    assert "SMOKE-SPEC ENTRY POINT WEAKENED" in result.briefing
+    assert completed.review_state == "done"
+    assert completed.review_verdict == "request-changes"
+
+
+def test_dispatch_review_lane_entrypoint_pure_addition_gets_normal_review(
+    two_machine_config: Config,
+) -> None:
+    """#3509 acceptance: a work diff that only ADDS a new step to a Tier-2
+    lane-kind entry point is NOT a violation — growing the smoke spec is the
+    whole point of `coord bugbash`'s ratchet — so a normal review IS
+    dispatched, exactly like any other unremarkable diff."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    cfg = replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(
+                kind="tui-pty", run="coord-acceptance-tui-pty {ms}",
+                entrypoint="smoke/tui-pty.yaml",
+            ),
+        }),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "review-id-lane-add"})
+    diff = (
+        "diff --git a/smoke/tui-pty.yaml b/smoke/tui-pty.yaml\n"
+        "--- a/smoke/tui-pty.yaml\n"
+        "+++ b/smoke/tui-pty.yaml\n"
+        "@@ -5,1 +5,2 @@\n"
+        "+  - expect_within: {ms: 500, text: \"menu opened\"}\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 51, "url": "https://github.com/acme/api/pull/51", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert len(client.calls) == 1
+    assert result is not None
+    assert result.status == "running"
+    assert result.verdict_source is None
+
+
+def test_dispatch_review_lane_entrypoint_brand_new_file_gets_normal_review(
+    two_machine_config: Config,
+) -> None:
+    """A wholly new smoke-spec entry point file (nothing to weaken yet) must
+    never mechanically short-circuit."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    cfg = replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(
+                kind="gtk-native", run="coord-acceptance-gtk-native {ms}",
+                entrypoint="smoke/gtk.yaml",
+            ),
+        }),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "review-id-lane-new"})
+    diff = (
+        "diff --git a/smoke/gtk.yaml b/smoke/gtk.yaml\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/smoke/gtk.yaml\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+steps:\n"
+        "+  - launch: {}\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 52, "url": "https://github.com/acme/api/pull/52", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert len(client.calls) == 1
+    assert result is not None
+    assert result.status == "running"
+    assert result.verdict_source is None
+
+
+def test_lane_entrypoint_violation_lines_pure_addition_is_not_a_violation() -> None:
+    from coord.review import _lane_entrypoint_violation_lines
+
+    diff = (
+        "diff --git a/smoke/tui-pty.yaml b/smoke/tui-pty.yaml\n"
+        "--- a/smoke/tui-pty.yaml\n"
+        "+++ b/smoke/tui-pty.yaml\n"
+        "@@ -5,1 +5,2 @@\n"
+        "+  - key: enter\n"
+    )
+    touched, lines = _lane_entrypoint_violation_lines(diff, ["smoke/tui-pty.yaml"])
+    assert touched is None
+    assert lines == []
+
+
+def test_lane_entrypoint_violation_lines_flags_a_removed_step() -> None:
+    from coord.review import _lane_entrypoint_violation_lines
+
+    diff = (
+        "diff --git a/smoke/tui-pty.yaml b/smoke/tui-pty.yaml\n"
+        "--- a/smoke/tui-pty.yaml\n"
+        "+++ b/smoke/tui-pty.yaml\n"
+        "@@ -5,2 +5,1 @@\n"
+        "-  - expect_silent: {seconds: 2}\n"
+        "+  - key: enter\n"
+    )
+    touched, lines = _lane_entrypoint_violation_lines(diff, ["smoke/tui-pty.yaml"])
+    assert touched == ["smoke/tui-pty.yaml"]
+    assert "SMOKE-SPEC ENTRY POINT WEAKENED" in lines[0]
+
+
+def test_lane_entrypoint_violation_lines_flags_a_loosened_latency_budget() -> None:
+    """A "raised latency budget" weakening reads, textually, as a removed
+    line followed by a looser replacement — exactly like a removed step."""
+    from coord.review import _lane_entrypoint_violation_lines
+
+    diff = (
+        "diff --git a/smoke/win-native.yaml b/smoke/win-native.yaml\n"
+        "--- a/smoke/win-native.yaml\n"
+        "+++ b/smoke/win-native.yaml\n"
+        "@@ -3,1 +3,1 @@\n"
+        "-  - expect_within: {ms: 200, text: \"ready\"}\n"
+        "+  - expect_within: {ms: 20000, text: \"ready\"}\n"
+    )
+    touched, lines = _lane_entrypoint_violation_lines(diff, ["smoke/win-native.yaml"])
+    assert touched == ["smoke/win-native.yaml"]
+
+
+def test_lane_entrypoint_violation_lines_ignores_unrelated_files() -> None:
+    """A removal in some OTHER file must never flag the lane entrypoint."""
+    from coord.review import _lane_entrypoint_violation_lines
+
+    diff = (
+        "diff --git a/coord/agent.py b/coord/agent.py\n"
+        "--- a/coord/agent.py\n"
+        "+++ b/coord/agent.py\n"
+        "@@ -1,2 +1,1 @@\n"
+        "-removed_line = True\n"
+    )
+    touched, lines = _lane_entrypoint_violation_lines(diff, ["smoke/tui-pty.yaml"])
+    assert touched is None
+    assert lines == []
+
+
+def test_lane_entrypoint_violation_lines_empty_when_no_additive_entrypoints() -> None:
+    from coord.review import _lane_entrypoint_violation_lines
+
+    diff = (
+        "diff --git a/smoke/tui-pty.yaml b/smoke/tui-pty.yaml\n"
+        "--- a/smoke/tui-pty.yaml\n"
+        "+++ b/smoke/tui-pty.yaml\n"
+        "@@ -5,2 +5,1 @@\n"
+        "-  - expect_silent: {seconds: 2}\n"
+    )
+    assert _lane_entrypoint_violation_lines(diff, None) == (None, [])
+    assert _lane_entrypoint_violation_lines(diff, []) == (None, [])
+    assert _lane_entrypoint_violation_lines(None, ["smoke/tui-pty.yaml"]) == (None, [])
+
+
+def test_briefing_additive_only_entrypoint_advisory_text_when_unviolated() -> None:
+    """A non-violating diff gets the advisory "additive only" guidance, not
+    the mandatory banner."""
+    briefing = build_review_briefing(
+        **_briefing_kwargs(additive_only_entrypoints=["smoke/tui-pty.yaml"])
+    )
+    assert "Smoke-spec entry point — additive only, not sealed" in briefing
+    assert "SMOKE-SPEC ENTRY POINT WEAKENED" not in briefing
+
+
+def test_briefing_additive_only_entrypoint_mandatory_banner_when_violated() -> None:
+    diff = (
+        "diff --git a/smoke/tui-pty.yaml b/smoke/tui-pty.yaml\n"
+        "--- a/smoke/tui-pty.yaml\n"
+        "+++ b/smoke/tui-pty.yaml\n"
+        "@@ -5,2 +5,1 @@\n"
+        "-  - expect_silent: {seconds: 2}\n"
+    )
+    briefing = build_review_briefing(
+        **_briefing_kwargs(
+            diff_text=diff, additive_only_entrypoints=["smoke/tui-pty.yaml"],
+        )
+    )
+    assert "SMOKE-SPEC ENTRY POINT WEAKENED" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
+def test_briefing_no_additive_only_entrypoint_section_by_default() -> None:
+    briefing = build_review_briefing(**_briefing_kwargs())
+    assert "Smoke-spec entry point" not in briefing
+    assert "SMOKE-SPEC ENTRY POINT WEAKENED" not in briefing
+
+
 def test_dispatch_review_threads_assignment_type_for_test_author_exemption(
     two_machine_config: Config,
 ) -> None:
