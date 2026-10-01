@@ -709,6 +709,105 @@ class TestUpdateLaneExtras:
         assert args[1] == "code-coordinator[server,win-native]"
         server.shutdown()
 
+    def test_win_native_extra_on_wsl_bootstraps_the_bridge_venv(
+        self, tmp_path: Path
+    ) -> None:
+        """#3515 review iteration 1 (Change item #4): a successful update
+        that asked for `win-native` on a WSL-hosted agent must ALSO
+        bootstrap the real Windows-side bridge venv — this is the install
+        half of "make win-native on dell64 install ... without hand
+        steps", wired into the one place every self-update AND fleet-roll
+        `/update` call already goes through."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ),
+            patch("coord.win_native_bridge.is_wsl_host", return_value=True),
+            patch(
+                "coord.win_native_bridge.ensure_windows_win_native_venv",
+                return_value="C:\\coord-win-native-venv\\Scripts\\python.exe",
+            ) as mock_ensure,
+        ):
+            client, server = _make_client(tmp_path, capabilities=["python"])
+            client.post("/update", json={"extras": ["win-native"]})
+            assert _wait_until(lambda: mock_ensure.called)
+        payload = _wait_for_last_update(server)
+        assert payload["result"] == "upgraded"
+        server.shutdown()
+
+    def test_non_wsl_host_never_touches_the_bridge(self, tmp_path: Path) -> None:
+        """The ordinary case (native Windows, or every other host in the
+        fleet): `is_wsl_host()` false means the bridge bootstrap must never
+        even be attempted, `win-native` extra or not."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ),
+            patch("coord.win_native_bridge.is_wsl_host", return_value=False),
+            patch(
+                "coord.win_native_bridge.ensure_windows_win_native_venv",
+            ) as mock_ensure,
+        ):
+            client, server = _make_client(tmp_path, capabilities=["python"])
+            client.post("/update", json={"extras": ["win-native"]})
+            payload = _wait_for_last_update(server)
+        assert payload["result"] == "upgraded"
+        mock_ensure.assert_not_called()
+        server.shutdown()
+
+    def test_no_win_native_extra_never_touches_the_bridge(self, tmp_path: Path) -> None:
+        """A plain `[server]`-only (or other-lane) update must not even ask
+        whether this is a WSL host — the bridge bootstrap is scoped
+        strictly to a `win-native` extra actually being requested."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ),
+            patch("coord.win_native_bridge.is_wsl_host") as mock_is_wsl,
+        ):
+            client, server = _make_client(tmp_path, capabilities=["python"])
+            client.post("/update")
+            payload = _wait_for_last_update(server)
+        assert payload["result"] == "upgraded"
+        mock_is_wsl.assert_not_called()
+        server.shutdown()
+
+    def test_bridge_bootstrap_failure_does_not_fail_the_update(
+        self, tmp_path: Path
+    ) -> None:
+        """A Windows-side provisioning failure (no interop reachable yet,
+        `powershell.exe` missing) must never turn an otherwise-successful
+        swap into a reported update failure — `coord doctor`'s `comtypes`
+        prereq is the durable signal for this gap, not `last_update.json`
+        (mirrors `install-agent.sh`'s own non-fatal posture for the same
+        bootstrap step)."""
+        from coord.win_native_bridge import WinNativeBridgeError
+
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ),
+            patch("coord.win_native_bridge.is_wsl_host", return_value=True),
+            patch(
+                "coord.win_native_bridge.ensure_windows_win_native_venv",
+                side_effect=WinNativeBridgeError("no Windows-side Python found"),
+            ),
+        ):
+            client, server = _make_client(tmp_path, capabilities=["python"])
+            client.post("/update", json={"extras": ["win-native"]})
+            payload = _wait_for_last_update(server)
+        assert payload["result"] == "upgraded"
+        assert payload["error"] is None
+        server.shutdown()
+
     def test_empty_explicit_extras_list_falls_back_to_self_derivation(
         self, tmp_path: Path
     ) -> None:

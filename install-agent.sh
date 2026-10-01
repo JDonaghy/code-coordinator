@@ -175,6 +175,33 @@ echo "Installed: $("$VENV_DIR/bin/coord" version)"
 trap - EXIT
 CREATED_VENV=0
 
+# --- `win-native` WSL bridge bootstrap (#3515) -------------------------------
+# A `windows`-capability agent on a WSL host (dell64, docs/WSL_WINDOWS_WORKER.md)
+# is a Linux venv — the `$INSTALL_SOURCE` pip install above correctly resolves
+# `comtypes`'s `sys_platform == 'win32'` marker to "skip it" there, same as
+# always. `coord.win_native_bridge` is the actual mechanism for that gap: a
+# SEPARATE, real Windows-side Python found through WSL's own interop (the same
+# trick docs/WSL_WINDOWS_WORKER.md already uses for `cargo.exe`), with
+# `code-coordinator[win-native]` installed into a dedicated venv there. This is
+# deliberately NON-FATAL — `warning`, not `exit 1` — on either leg (no `windows`
+# interop reachable yet, or the bootstrap itself failing): the mandatory
+# `[server]` install above already succeeded, and a Windows-side provisioning
+# gap must never take the regular agent down with it. `coord doctor`'s
+# `comtypes` prereq (coord/prereqs.py's `_probe_comtypes`) reports the gap by
+# name afterwards if this doesn't resolve it.
+if [[ ",$CAPABILITIES," == *",windows,"* ]]; then
+    if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+        echo "windows capability + WSL host detected — bootstrapping the win-native bridge venv (#3515)..."
+        if "$VENV_DIR/bin/python3" -m coord.win_native_bridge --ensure; then
+            : # bootstrapped or already current
+        else
+            echo "warning: could not bootstrap the win-native Windows-side venv automatically." >&2
+            echo "  'coord doctor' will report comtypes as unmet until this is resolved — see" >&2
+            echo "  coord/win_native_bridge.py's docstring for the remedy." >&2
+        fi
+    fi
+fi
+
 # --- coord CLI shim (#2936) --------------------------------------------------
 # Workers are spawned with THIS agent's own venv stripped from PATH (#402,
 # hardened by #2569's PIP_REQUIRE_VIRTUALENV after an 11h fleet outage — see

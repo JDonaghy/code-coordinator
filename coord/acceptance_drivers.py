@@ -78,7 +78,12 @@ in :mod:`coord.win_native_driver` — see that module's docstring for the spec
 format. This adapter (:func:`_run_win_native`) is the same thin seam
 :func:`_run_tui_pty` is: it resolves the native spec from the driver's
 ``entrypoint:`` and hands off to
-:func:`coord.win_native_driver.run_native_spec`.
+:func:`coord.win_native_driver.run_native_spec` — or, on a WSL-hosted agent
+(dell64, ``docs/WSL_WINDOWS_WORKER.md``), to
+:func:`coord.win_native_bridge.run_native_spec_via_bridge`, which runs the
+spec on a real Windows-side Python found through WSL's own interop instead
+(#3515 — see that module's docstring for why `comtypes` can never resolve
+in-process on a WSL-hosted agent no matter what gets pip-installed there).
 
 ``mac-native`` (#3485, the macOS-native tier alongside ``win-native``)
 launches the driven repo's real compiled ``.app``/binary and drives it with
@@ -832,20 +837,30 @@ def _run_win_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int
     ``capture_b64`` ``PrintWindow`` snapshot) into a :class:`DriverResult`
     the same way :func:`_run_tui_pty` does.
 
-    Raises :class:`DriverError` — never a bare exception — for a missing
-    ``entrypoint:``, a spec file that doesn't exist, or a malformed spec
-    (an invalid-YAML/unknown-step-type
-    :class:`coord.win_native_driver.WinNativeSpecError`). A process that
-    never launches, a window that never appears, or a failed probe do NOT
-    raise here — :func:`coord.win_native_driver.run_native_spec` folds those
-    into individual failing entries in ``tests`` instead.
-    """
-    from coord.win_native_driver import (  # noqa: PLC0415 — see module docstring on the deferred import
-        WinNativeRuntimeError,
-        WinNativeSpecError,
-        run_native_spec,
-    )
+    **The WSL case (#3515).** `ctypes.windll`/`comtypes` have no meaning
+    outside a genuine Win32 process, so a WSL-hosted ``windows``-capability
+    agent (dell64, ``docs/WSL_WINDOWS_WORKER.md``) can never run
+    :func:`coord.win_native_driver.run_native_spec` in-process no matter
+    what gets pip-installed into its own (Linux) venv. :func:`coord.
+    win_native_bridge.is_wsl_host` detects that case and routes through
+    :func:`coord.win_native_bridge.run_native_spec_via_bridge` instead,
+    which bootstraps a real Windows-side Python reachable through WSL's own
+    interop and runs the spec on THAT interpreter — see that module's
+    docstring for the full mechanism. A native-Windows agent (or any
+    non-WSL host, including every test in this suite) takes the in-process
+    path unchanged.
 
+    Raises :class:`DriverError` — never a bare exception — for a missing
+    ``entrypoint:``, a spec file that doesn't exist, a malformed spec (an
+    invalid-YAML/unknown-step-type
+    :class:`coord.win_native_driver.WinNativeSpecError`), or — WSL only — a
+    :class:`coord.win_native_bridge.WinNativeBridgeError` (the Windows-side
+    Python couldn't be found/bootstrapped, or the bridge subprocess itself
+    failed to run). A process that never launches, a window that never
+    appears, or a failed probe do NOT raise either way — both
+    :func:`coord.win_native_driver.run_native_spec` and the bridge fold
+    those into individual failing entries in ``tests`` instead.
+    """
     if not entrypoint:
         raise DriverError(
             "win-native driver requires an `entrypoint:` naming the native "
@@ -860,14 +875,33 @@ def _run_win_native(run_command: str, cwd: str, entrypoint: str, *, timeout: int
     except OSError as e:
         raise DriverError(f"win-native spec could not be read: {spec_path}: {e}") from e
 
-    try:
-        tests = run_native_spec(
-            spec_text, launch_command=run_command, cwd=cwd, timeout=timeout,
+    from coord.win_native_bridge import (  # noqa: PLC0415 — see module docstring on the deferred import
+        WinNativeBridgeError,
+        is_wsl_host,
+        run_native_spec_via_bridge,
+    )
+
+    if is_wsl_host():
+        try:
+            tests = run_native_spec_via_bridge(
+                spec_text, run_command=run_command, cwd=cwd, timeout=timeout,
+            )
+        except WinNativeBridgeError as e:
+            raise DriverError(f"win-native WSL bridge could not run: {e}") from e
+    else:
+        from coord.win_native_driver import (  # noqa: PLC0415 — see module docstring on the deferred import
+            WinNativeRuntimeError,
+            WinNativeSpecError,
+            run_native_spec,
         )
-    except WinNativeSpecError as e:
-        raise DriverError(f"win-native spec is invalid: {e}") from e
-    except WinNativeRuntimeError as e:
-        raise DriverError(f"win-native driver could not run: {e}") from e
+        try:
+            tests = run_native_spec(
+                spec_text, launch_command=run_command, cwd=cwd, timeout=timeout,
+            )
+        except WinNativeSpecError as e:
+            raise DriverError(f"win-native spec is invalid: {e}") from e
+        except WinNativeRuntimeError as e:
+            raise DriverError(f"win-native driver could not run: {e}") from e
 
     # #3510: a locked/absent interactive session reports a distinct
     # "unavailable" status (coord.win_native_driver's session precheck),
