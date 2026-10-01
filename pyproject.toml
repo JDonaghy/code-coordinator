@@ -139,6 +139,16 @@ tui-pty = [
 # nothing. `coord/win_native_driver.py`'s `_import_uia` guards the import
 # and names this extra rather than a bare `ModuleNotFoundError`, mirroring
 # `tui_pty_driver.py`'s `_import_pyte` convention.
+#
+# #3515: a WSL-hosted `windows`-capability agent (dell64,
+# docs/WSL_WINDOWS_WORKER.md) is a Linux venv, so `pip install
+# 'code-coordinator[win-native]'` *there* correctly resolves this marker to
+# "skip it" — `comtypes` needs a real win32 interpreter, which that venv
+# structurally can't provide, no matter which extras it's given.
+# `coord/win_native_bridge.py` is the actual mechanism for that case: it
+# installs THIS SAME extra into a separate, real Windows-side Python found
+# through WSL's own interop instead, and `coord/acceptance_drivers.py`'s
+# `_run_win_native` runs the spec there. See that module's docstring.
 win-native = [
     "comtypes>=1.2; sys_platform == 'win32'",
 ]

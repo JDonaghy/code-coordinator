@@ -1631,6 +1631,75 @@ class TestRunDriverWinNative:
         assert seen_cwd["cwd"] == str(tmp_path)
 
 
+class TestRunDriverWinNativeWslBridge:
+    """#3515 (review iteration 1, Change item #4): a WSL-hosted agent must
+    route through :mod:`coord.win_native_bridge` instead of the in-process
+    :func:`coord.win_native_driver.run_native_spec` — `ctypes.windll`/
+    `comtypes` have no meaning in that (Linux) process no matter what's
+    pip-installed into it. :class:`TestRunDriverWinNative` above already
+    covers the non-WSL (native Windows / every other test in this suite)
+    path; these tests force :func:`coord.win_native_bridge.is_wsl_host` True
+    to cover the other branch."""
+
+    def test_wsl_host_routes_through_the_bridge(self, tmp_path, monkeypatch) -> None:
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        import coord.win_native_bridge as win_native_bridge
+
+        monkeypatch.setattr(win_native_bridge, "is_wsl_host", lambda: True)
+
+        seen = {}
+
+        def fake_bridge(spec_text, *, run_command, cwd, timeout):
+            seen["run_command"] = run_command
+            seen["cwd"] = cwd
+            return [{"id": "000 launch", "status": "pass", "message": ""}]
+
+        monkeypatch.setattr(win_native_bridge, "run_native_spec_via_bridge", fake_bridge)
+
+        result = run_driver(
+            "win-native", "./vimcode.exe --smoke", cwd=str(tmp_path), entrypoint="native.yaml",
+        )
+        assert seen["run_command"] == "./vimcode.exe --smoke"
+        assert seen["cwd"] == str(tmp_path)
+        assert result.tests == [{"id": "000 launch", "status": "pass", "message": ""}]
+        assert result.exit_code == 0
+
+    def test_bridge_error_is_wrapped_in_driver_error(self, tmp_path, monkeypatch) -> None:
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        import coord.win_native_bridge as win_native_bridge
+
+        monkeypatch.setattr(win_native_bridge, "is_wsl_host", lambda: True)
+
+        def fake_bridge(spec_text, *, run_command, cwd, timeout):
+            raise win_native_bridge.WinNativeBridgeError("no Windows-side Python found")
+
+        monkeypatch.setattr(win_native_bridge, "run_native_spec_via_bridge", fake_bridge)
+
+        with pytest.raises(DriverError, match="WSL bridge"):
+            run_driver("win-native", "./vimcode.exe", cwd=str(tmp_path), entrypoint="native.yaml")
+
+    def test_non_wsl_host_never_touches_the_bridge(self, tmp_path, monkeypatch) -> None:
+        """The default (every other test in this class): `is_wsl_host()`
+        false means the in-process `run_native_spec` path runs, and the
+        bridge module's `run_native_spec_via_bridge` is never even called."""
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        import coord.win_native_driver as win_native_driver
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return [{"id": "000 launch", "status": "pass", "message": ""}]
+
+        monkeypatch.setattr(win_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver("win-native", "./vimcode.exe", cwd=str(tmp_path), entrypoint="native.yaml")
+        assert result.exit_code == 0
+
+
 class TestRunDriverMacNative:
     """#3485: the ``mac-native`` driver — the actual Quartz/AX calls, the
     native-spec parser, and the step executor live in

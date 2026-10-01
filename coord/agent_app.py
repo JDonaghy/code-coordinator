@@ -13,8 +13,8 @@ import sys
 import threading
 import time
 import urllib.request
-from pathlib import Path
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Callable
 
 from starlette.applications import Starlette
@@ -1552,13 +1552,16 @@ def build_app(
             try:
                 venv_dir = _venv_dir()
                 if explicit_extras is not None:
-                    pkg_spec = _dist_pkg_spec(extra=",".join(["server", *explicit_extras]))
+                    lane_extras = explicit_extras
                 else:
-                    pkg_spec = _agent_pkg_spec(
-                        capabilities=server.capabilities,
+                    from coord.acceptance_drivers import lane_extras_for_machine  # noqa: PLC0415 — avoid an import cycle
+
+                    lane_extras = lane_extras_for_machine(
+                        server.capabilities,
                         repos=server.repos,
                         tui_pty_repos=_tui_pty_repos_for_server(server),
                     )
+                pkg_spec = _dist_pkg_spec(extra=",".join(["server", *lane_extras]))
                 result = agent_update.perform_update(
                     venv_dir,
                     pkg_spec,
@@ -1591,6 +1594,33 @@ def build_app(
                     )
                     _write_last_update(state_dir, payload)
                     return
+
+                # #3515: a WSL-hosted `windows`-capability agent (dell64,
+                # docs/WSL_WINDOWS_WORKER.md) just reinstalled `win-native`
+                # into its OWN (Linux) venv above, where `comtypes` correctly
+                # resolves to "skip it" — this ALSO bootstraps/refreshes the
+                # separate, real Windows-side venv `coord.win_native_bridge`
+                # needs, the same non-fatal "warn, never fail the update"
+                # posture `install-agent.sh`'s own bootstrap hook follows. A
+                # failure here must never turn an otherwise-successful swap
+                # into a reported update failure — `coord doctor`'s
+                # `comtypes` prereq (`coord.prereqs._probe_comtypes`) is the
+                # durable signal for this gap, not `last_update.json`.
+                if "win-native" in lane_extras:
+                    from coord.win_native_bridge import (  # noqa: PLC0415 — avoid an import cycle
+                        WinNativeBridgeError,
+                        ensure_windows_win_native_venv,
+                        is_wsl_host,
+                    )
+
+                    if is_wsl_host():
+                        try:
+                            ensure_windows_win_native_venv()
+                        except WinNativeBridgeError as e:
+                            _log.warning(
+                                "win-native WSL bridge bootstrap failed after "
+                                "agent update: %s", e,
+                            )
 
                 # #1241: prefer the version the smoke check already read
                 # straight from the new slot (deterministic, no reliance on

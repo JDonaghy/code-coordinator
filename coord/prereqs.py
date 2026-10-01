@@ -307,6 +307,17 @@ def _probe_playwright_browsers(prereq: Prereq, _timeout: float) -> ToolProbe:
 # named, actionable `coord doctor` line instead of a stack trace the first
 # time that lane's driver actually runs).
 
+#: Shared `what_breaks` text for `pyte`'s three structurally-identical
+#: `Prereq` entries below (`gtk`/`windows`/`macos`) — there is no standalone
+#: `tui-pty` capability to key a single entry off of (see the comment above
+#: the `gtk` one), so the entry itself has to be duplicated per capability;
+#: this constant is the one place the actual remedy text lives, so a future
+#: edit to it can't drift across the three copies.
+_TUI_PTY_WHAT_BREAKS = (
+    "the tui-pty acceptance driver cannot drive a real pty/ConPTY "
+    "session — `pip install 'code-coordinator[tui-pty]'`"
+)
+
 
 def _probe_binary_presence_only(prereq: Prereq, _timeout: float) -> ToolProbe:
     """`custom_probe` for a binary with no reliable `--version` flag (#3515)
@@ -356,6 +367,51 @@ def _probe_python_module(module_name: str) -> Callable[["Prereq", float], "ToolP
         )
 
     return _probe
+
+
+def _probe_comtypes(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `windows` capability's `comtypes` check
+    (#3515) — the WSL-aware sibling of :func:`_probe_python_module`.
+
+    A WSL-hosted agent (`coord.win_native_bridge.is_wsl_host`) can never see
+    `comtypes` importable in ITS OWN (Linux) interpreter — `ctypes.windll`
+    has no meaning there, full stop. So on a WSL host this checks the real
+    Windows-side venv `coord.win_native_bridge.ensure_windows_win_native_venv`
+    bootstraps instead (`import comtypes` run on THAT interpreter via a
+    direct subprocess call, never the bootstrap itself — a probe must not
+    have the side effect of installing something on every `/health` poll).
+    A missing Windows-side venv (never bootstrapped, or `python.exe`
+    unreachable through interop) degrades to `found=False`, the same honest
+    "not met yet" every other prereq in this module reports, never a crash.
+
+    Everywhere else (native Windows, or a test harness with no `windows`
+    capability in play at all) this is exactly
+    `_probe_python_module("comtypes")`.
+    """
+    from coord.win_native_bridge import (  # noqa: PLC0415 — avoid an import cycle
+        DEFAULT_WINDOWS_VENV_DIR,
+        is_wsl_host,
+        windows_venv_python,
+    )
+
+    if not is_wsl_host():
+        return _probe_python_module("comtypes")(prereq, timeout)
+
+    venv_python = windows_venv_python(DEFAULT_WINDOWS_VENV_DIR)
+    try:
+        result = subprocess.run(
+            [venv_python, "-c", "import comtypes"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        found = result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        found = False
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=found,
+        version="importable (Windows-side win-native bridge venv)" if found else None,
+        min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
 
 
 # --- `windows` capability: the msvc cross-target lives per-toolchain (#2952) --
@@ -948,10 +1004,7 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
     Prereq(
         tool="pyte", binary="", version_args=(), version_re="",
         min_version=None, capability="gtk",
-        what_breaks=(
-            "the tui-pty acceptance driver cannot drive a real pty/ConPTY "
-            "session — `pip install 'code-coordinator[tui-pty]'`"
-        ),
+        what_breaks=_TUI_PTY_WHAT_BREAKS,
         custom_probe=_probe_python_module("pyte"),
     ),
     # `browser` gates Playwright acceptance suites in the repos this fleet
@@ -1038,16 +1091,18 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
     ),
     # #3515: the `win-native` acceptance driver's own Python dependency.
     # `comtypes` carries a `sys_platform == 'win32'` marker in `pyproject.
-    # toml` for a real reason this probe cannot paper over: dell64's
-    # `windows` capability is backed by a WSL-hosted (Linux) agent venv, and
-    # `pip install` on Linux resolves the marker to "skip this dependency"
-    # — there is structurally no way for THIS probe, run in that venv, to
-    # ever see `comtypes` importable. #3515 flags this as an open question
-    # (how `win-native` reaches real Win32 from a WSL-hosted agent — a
-    # Windows-side Python, PowerShell, or a helper exe) rather than a probe
-    # bug: reporting `found=False` here is the CORRECT, honest answer for a
-    # WSL host today, not a false negative to suppress — `what_breaks` says
-    # so explicitly rather than implying a bare `pip install` would fix it.
+    # toml` for a real reason a plain in-process probe cannot paper over:
+    # dell64's `windows` capability is backed by a WSL-hosted (Linux) agent
+    # venv, and `pip install` on Linux resolves the marker to "skip this
+    # dependency" — there is structurally no way for an import check run in
+    # THAT venv to ever see `comtypes` importable, no matter what gets
+    # pip-installed into it. `_probe_comtypes` below is WSL-aware: on a WSL
+    # host it checks the real Windows-side venv `coord.win_native_bridge`
+    # bootstraps instead of this process's own interpreter (see that
+    # module's docstring for the full WSL->Windows mechanism and
+    # `coord.acceptance_drivers._run_win_native`, its one caller at run
+    # time). Everywhere else (native Windows, or no `windows` capability at
+    # all) this is exactly `_probe_python_module("comtypes")`.
     Prereq(
         tool="comtypes", binary="", version_args=(), version_re="",
         min_version=None, capability="windows",
@@ -1055,21 +1110,18 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
             "the win-native acceptance driver cannot import comtypes (the "
             "UI Automation client) — on native Windows, `pip install "
             "'code-coordinator[win-native]'`; on a WSL-hosted agent (e.g. "
-            "dell64) this is EXPECTED to read unmet until #3515's open WSL "
-            "question is resolved (`comtypes` needs a real win32 "
-            "interpreter, which a WSL agent's Linux venv structurally "
-            "cannot provide) — see the issue for the Windows-side-Python/"
-            "PowerShell/helper-exe options under consideration"
+            "dell64), `python -m coord.win_native_bridge --ensure` "
+            "bootstraps the Windows-side venv this needs (also run "
+            "automatically by `install-agent.sh`/a fleet roll when the "
+            "`windows` capability is declared) — see that module's "
+            "docstring if it still reads unmet after that"
         ),
-        custom_probe=_probe_python_module("comtypes"),
+        custom_probe=_probe_comtypes,
     ),
     Prereq(
         tool="pyte", binary="", version_args=(), version_re="",
         min_version=None, capability="windows",
-        what_breaks=(
-            "the tui-pty acceptance driver cannot drive a real pty/ConPTY "
-            "session — `pip install 'code-coordinator[tui-pty]'`"
-        ),
+        what_breaks=_TUI_PTY_WHAT_BREAKS,
         custom_probe=_probe_python_module("pyte"),
     ),
     # #3515: backs a future `macos` capability the same way `gtk`/`windows`
@@ -1102,10 +1154,7 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
     Prereq(
         tool="pyte", binary="", version_args=(), version_re="",
         min_version=None, capability="macos",
-        what_breaks=(
-            "the tui-pty acceptance driver cannot drive a real pty/ConPTY "
-            "session — `pip install 'code-coordinator[tui-pty]'`"
-        ),
+        what_breaks=_TUI_PTY_WHAT_BREAKS,
         custom_probe=_probe_python_module("pyte"),
     ),
     # #3233: backs the `azure` capability routing `**/*.tf` (terraform

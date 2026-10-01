@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from coord import prereqs
 from coord.github_ops import GH_PR_CHECKS_JSON_MIN_VERSION
@@ -776,6 +776,66 @@ class TestLaneDriverDependencyPrereqs:
         with patch("coord.prereqs.importlib.util.find_spec", return_value=None):
             probes = prereqs.probe_all(["windows"])
         assert "WSL" in probes["comtypes"].what_breaks
+
+    def test_comtypes_probe_is_wsl_aware_and_checks_the_bridge_venv(self) -> None:
+        """#3515 review iteration 1: on a WSL host, `comtypes` can never
+        import in THIS process no matter what's installed — the probe must
+        check the real Windows-side bridge venv
+        (`coord.win_native_bridge.ensure_windows_win_native_venv` bootstraps)
+        instead of this interpreter's own `find_spec`."""
+        import coord.win_native_bridge as win_native_bridge
+
+        comtypes_prereq = next(
+            p for p in prereqs.CAPABILITY_PREREQS if p.tool == "comtypes"
+        )
+        with (
+            patch.object(win_native_bridge, "is_wsl_host", return_value=True),
+            patch(
+                "coord.prereqs.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ) as mock_run,
+        ):
+            probe = comtypes_prereq.custom_probe(comtypes_prereq, 5.0)
+        assert probe.found is True
+        assert probe.ok is True
+        # Checks the BRIDGE venv's python, never this process's own.
+        argv = mock_run.call_args[0][0]
+        assert argv[0] == win_native_bridge.windows_venv_python(
+            win_native_bridge.DEFAULT_WINDOWS_VENV_DIR
+        )
+
+    def test_comtypes_probe_on_wsl_is_unmet_when_bridge_venv_missing(self) -> None:
+        import coord.win_native_bridge as win_native_bridge
+
+        comtypes_prereq = next(
+            p for p in prereqs.CAPABILITY_PREREQS if p.tool == "comtypes"
+        )
+        with (
+            patch.object(win_native_bridge, "is_wsl_host", return_value=True),
+            patch(
+                "coord.prereqs.subprocess.run",
+                side_effect=FileNotFoundError("no such venv"),
+            ),
+        ):
+            probe = comtypes_prereq.custom_probe(comtypes_prereq, 5.0)
+        assert probe.found is False
+        assert probe.ok is False
+
+    def test_comtypes_probe_on_non_wsl_falls_back_to_find_spec(self) -> None:
+        """Native Windows (or any non-WSL host, including every other test
+        in this file) must behave exactly like
+        `_probe_python_module("comtypes")` — no behavior change there."""
+        import coord.win_native_bridge as win_native_bridge
+
+        comtypes_prereq = next(
+            p for p in prereqs.CAPABILITY_PREREQS if p.tool == "comtypes"
+        )
+        with (
+            patch.object(win_native_bridge, "is_wsl_host", return_value=False),
+            patch("coord.prereqs.importlib.util.find_spec", return_value=object()),
+        ):
+            probe = comtypes_prereq.custom_probe(comtypes_prereq, 5.0)
+        assert probe.found is True
 
     def test_xdotool_and_xwd_use_presence_only_probe(self) -> None:
         """Neither tool has a floor-checkable version in this manifest —
