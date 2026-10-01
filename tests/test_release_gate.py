@@ -79,6 +79,60 @@ class TestEvaluateReleaseGateLanes:
         assert failing.name == "lane:win-native"
         assert "menu bar" in failing.detail
 
+    def test_unavailable_lane_blocks_the_gate_but_is_labeled_unavailable_not_failed(self) -> None:
+        """#3510: a locked/absent GUI session must still block the release
+        (#2096: a gate must be able to fail) but must be distinguishable
+        from an ordinary app-bug failure."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=["tui-pty", "win-native"],
+            lane_results=[
+                LaneResult(lane="tui-pty", sha="deadbeef", passed=True),
+                LaneResult(
+                    lane="win-native", sha="deadbeef", passed=False, unavailable=True,
+                    detail="LogonUI.exe running — desktop is locked",
+                ),
+            ],
+        )
+        assert verdict.gate_passed is False
+        assert verdict.effective_passed is False
+        [failing] = verdict.failing_steps
+        assert failing.name == "lane:win-native"
+        assert failing.unavailable is True
+        assert "desktop is locked" in failing.detail
+        [unavailable_step] = verdict.unavailable_steps
+        assert unavailable_step.name == "lane:win-native"
+
+    def test_unavailable_lane_default_detail_tells_the_operator_to_unlock_not_debug(self) -> None:
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=["win-native"],
+            lane_results=[
+                LaneResult(lane="win-native", sha="deadbeef", passed=False, unavailable=True),
+            ],
+        )
+        [step] = verdict.steps
+        assert step.unavailable is True
+        assert step.passed is False
+        assert "unlock" in step.detail
+
+    def test_failed_lane_is_not_unavailable(self) -> None:
+        """A genuine app failure must never be mislabeled `unavailable` —
+        only a lane result that actually set it is."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=["win-native"],
+            lane_results=[
+                LaneResult(lane="win-native", sha="deadbeef", passed=False, detail="crashed"),
+            ],
+        )
+        [step] = verdict.steps
+        assert step.unavailable is False
+        assert verdict.unavailable_steps == ()
+
     def test_missing_lane_result_fails_never_defaults_to_pass(self) -> None:
         """#2096: a lane the caller never observed at all must not silently
         count as green."""
@@ -435,6 +489,64 @@ class TestReleaseGateCli:
         assert "lane:win-native" in result.output
         assert "no menu bar" in result.output
         assert "RESULT: FAIL" in result.output
+
+    def test_unavailable_lane_blocks_and_renders_distinctly_from_fail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """#3510: the CLI's human-readable output must label an unavailable
+        lane distinctly from an app-bug failure, while still refusing the
+        release (exit nonzero, RESULT: FAIL)."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["tui-pty", "win-native"], bugbash_required=False),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [
+                {"lane": "tui-pty", "sha": "deadbeef", "passed": True},
+                {"lane": "win-native", "sha": "deadbeef", "passed": False,
+                 "unavailable": True,
+                 "detail": "LogonUI.exe running — desktop is locked"},
+            ],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 1, result.output
+        assert "[UNAVAILABLE] lane:win-native" in result.output
+        assert "desktop is locked" in result.output
+        assert "RESULT: FAIL" in result.output
+        # Never mislabeled as an ordinary failure.
+        assert "[FAIL] lane:win-native" not in result.output
+
+    def test_truthy_non_bool_unavailable_is_rejected_not_coerced(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """#2096-review precedent extended to the new field: a hand-authored
+        payload spelling `"unavailable": "true"` must be rejected, not
+        silently coerced to a real boolean."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["win-native"], bugbash_required=False),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [
+                {"lane": "win-native", "sha": "deadbeef", "passed": False,
+                 "unavailable": "true"},
+            ],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 2, result.output
+        assert "unavailable" in result.output
 
     def test_passes_when_everything_is_green(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,

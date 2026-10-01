@@ -494,6 +494,77 @@ class TestRunBugbashTermination:
         assert report.rounds[0].lane_failures == {}
         assert report.rounds[0].skipped_lanes == []
 
+    def test_all_lanes_unavailable_reports_lanes_unavailable_not_zero_findings(self):
+        # #3510: every lane's ExploreOutcome comes back unavailable=True
+        # (e.g. dell64's session is locked) — this must NOT be reported as
+        # "zero_findings" (a genuine clean pass, since nothing was actually
+        # exercised against the app) nor as "lane_failure" (the explorer DID
+        # get a verified answer, just "the host is locked").
+        config = _config(max_rounds=5)
+
+        def unavailable_explorer(lane, round_num):
+            return ExploreOutcome(unavailable=True, notes="LogonUI.exe running — desktop is locked")
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=unavailable_explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.termination_reason == "lanes_unavailable"
+        assert report.rounds[0].unavailable_lanes == {
+            "win-native": "LogonUI.exe running — desktop is locked"
+        }
+        assert report.rounds[0].lane_failures == {}
+        assert report.rounds[0].all_explored_lanes_unavailable_or_failed is True
+        assert report.any_lane_unavailable is True
+        assert runner.calls == []
+
+    def test_unavailable_lane_files_no_findings_even_if_explorer_hands_some_back(self):
+        # Defensive: an unavailable lane's findings must never be filed this
+        # round, even if the (production) explorer defensively hands back a
+        # non-empty findings tuple alongside unavailable=True.
+        config = _config(max_rounds=1)
+        bogus_finding = _finding(title="should never be filed")
+
+        def unavailable_explorer(lane, round_num):
+            return ExploreOutcome(
+                unavailable=True, notes="no $DISPLAY", findings=(bogus_finding,),
+            )
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=unavailable_explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.rounds[0].findings == []
+        assert report.rounds[0].filings == []
+        assert report.total_filed == 0
+        assert runner.calls == []
+
+    def test_one_unavailable_one_ok_lane_is_not_all_unavailable(self):
+        # A partial unavailability (one lane locked, the other verified)
+        # must still report a real "zero_findings" clean pass if the
+        # surviving lane genuinely found nothing — but the unavailable lane
+        # is still recorded for visibility.
+        locked_lane = _lane(platform="win-native", machine="pc1")
+        ok_lane = _lane(platform="mac-native", machine="mac1")
+        config = _config(lanes=[locked_lane, ok_lane], max_rounds=5)
+
+        def explorer(lane, round_num):
+            if lane.platform == "win-native":
+                return ExploreOutcome(unavailable=True, notes="locked")
+            return ExploreOutcome(ok=True, findings=(), cost=1.0, notes="status=completed")
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.termination_reason == "zero_findings"
+        assert report.rounds[0].all_explored_lanes_unavailable_or_failed is False
+        assert report.rounds[0].unavailable_lanes == {"win-native": "locked"}
+        assert report.any_lane_unavailable is True
+
     def test_duplicate_only_round_still_terminates_zero_findings(self):
         # A round whose only finding is a DUPLICATE of an already-open
         # issue must count as zero NEW findings, terminating the loop —

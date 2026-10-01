@@ -108,6 +108,20 @@ step — the latency/switch being measured starts at that exact ``SendInput``
 call, not at some earlier unrelated step, since a separately-timed
 ``click`` step would leave an unbounded, unmeasured gap between the input
 and the start of the timing window.
+
+**Locked/absent session precheck (#3510).** On dell64, vimcode#1629's real-
+Windows check could not verify its visual criteria because the session was
+locked (``GetForegroundWindow() == NULL``, ``LogonUI`` running in session 1);
+vimcode#1558/#1561/#1622 record the same. A locked desktop is an
+environment condition, not an app bug, so before :meth:`NativeRunner.run`
+launches anything it calls :meth:`WinCalls.session_available` — real
+checks: ``OpenInputDesktop`` succeeds, ``WTSGetActiveConsoleSessionId``
+reports an active console session, and no ``LogonUI.exe`` is running in
+that session. When unavailable, the run returns a single
+``status="unavailable"`` result — never a ``"fail"`` — and no step (not
+even ``launch``) runs. :func:`coord.bugbash.run_bugbash` skips such a lane
+rather than exploring it, and :mod:`coord.release_gate` reports it as
+blocking-but-unavailable rather than failed.
 """
 
 from __future__ import annotations
@@ -396,6 +410,16 @@ class WinCalls(Protocol):
 
     def kill(self, pid: int) -> None: ...
 
+    def session_available(self) -> tuple[bool, str]:
+        """``(True, "")`` when an unlocked interactive Windows session is
+        present for this driver to launch into; ``(False, reason)`` when it
+        is locked or absent (#3510) — checked by :meth:`NativeRunner.run`
+        BEFORE any step (including ``launch``) runs, so a locked/absent
+        session is reported as ``status="unavailable"`` rather than a failed
+        step. Never raises — a probe failure here is itself an
+        "unavailable" verdict, not a crash."""
+        ...
+
 
 def _find_a11y_match(elements: list[dict], role: str, name: str) -> dict | None:
     """The first *elements* entry whose ``role`` matches exactly
@@ -451,7 +475,19 @@ class NativeRunner:
         self._pending_failure_capture: bytes | None = None
 
     def run(self, spec: NativeSpec) -> list[dict]:
+        """Run *spec*, first checking :meth:`WinCalls.session_available`
+        (#3510). A locked or absent interactive session is an environment
+        condition, not an app bug: when unavailable, this returns a single
+        ``status="unavailable"`` entry and runs NO step at all (not even
+        ``launch``) — never folding it into an ordinary ``"fail"``."""
         self._spec = spec
+        available, reason = self._calls.session_available()
+        if not available:
+            return [{
+                "id": "session",
+                "status": "unavailable",
+                "message": reason or "no interactive Windows session is available",
+            }]
         results: list[dict] = []
         try:
             for step in spec.steps:
@@ -771,6 +807,85 @@ class Win32Calls:
             finally:
                 self._kernel32.CloseHandle(handle)
 
+    # -- session precheck (#3510) --
+
+    def session_available(self) -> tuple[bool, str]:
+        """Real check: ``OpenInputDesktop`` succeeds (an interactive
+        desktop exists to open at all), ``WTSGetActiveConsoleSessionId``
+        reports a real console session, and no ``LogonUI.exe`` is running
+        in that session (the lock-screen host process). Any one of these
+        failing means the host's desktop is locked or absent."""
+        ctypes = self._ctypes
+        DESKTOP_READOBJECTS = 0x0001
+        hdesk = self._user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+        if not hdesk:
+            return False, (
+                "OpenInputDesktop failed — no interactive input desktop is "
+                "available on this session (locked or non-interactive)"
+            )
+        self._user32.CloseDesktop(hdesk)
+
+        wtsapi32 = ctypes.windll.wtsapi32
+        INVALID_SESSION_ID = 0xFFFFFFFF
+        session_id = wtsapi32.WTSGetActiveConsoleSessionId()
+        if session_id == INVALID_SESSION_ID:
+            return False, (
+                "WTSGetActiveConsoleSessionId reports no active console "
+                "session on this host"
+            )
+
+        if self._logonui_running_in_session(session_id):
+            return False, (
+                f"LogonUI.exe is running in session {session_id} — the "
+                "desktop is locked"
+            )
+        return True, ""
+
+    def _logonui_running_in_session(self, session_id: int) -> bool:
+        """``True`` iff ``LogonUI.exe`` (the Windows lock-screen host
+        process) is running in *session_id* — walked via a
+        ``CreateToolhelp32Snapshot`` process snapshot, the same mechanism
+        Task Manager itself uses, rather than anything that could be
+        confused by a differently-named process (the module docstring's
+        "kill only the PID this driver itself launched" safety note applies
+        equally here: this is read-only enumeration, never a kill)."""
+        ctypes = self._ctypes
+        kernel32 = self._kernel32
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32),
+                ("th32ProcessID", ctypes.c_uint32),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", ctypes.c_uint32), ("cntThreads", ctypes.c_uint32),
+                ("th32ParentProcessID", ctypes.c_uint32),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_uint32),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == -1:
+            return False
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
+                return False
+            while True:
+                name = entry.szExeFile.decode("mbcs", errors="ignore")
+                if name.lower() == "logonui.exe":
+                    proc_session = ctypes.wintypes.DWORD()
+                    kernel32.ProcessIdToSessionId(
+                        entry.th32ProcessID, ctypes.byref(proc_session),
+                    )
+                    if proc_session.value == session_id:
+                        return True
+                if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                    return False
+        finally:
+            kernel32.CloseHandle(snapshot)
+
     def find_top_window(self, pid: int, timeout_s: float) -> int:
         ctypes = self._ctypes
         deadline = time.monotonic() + timeout_s
@@ -988,6 +1103,12 @@ def run_native_spec(
     assertion fails) do NOT raise — they're folded into the returned list
     as a ``status="fail"`` entry, the same "partial results, not a crash"
     contract :func:`coord.tui_pty_driver.run_smoke_spec` already gives.
+
+    When *calls* reports a locked or absent interactive session
+    (:meth:`WinCalls.session_available`, #3510), the returned list is a
+    single ``status="unavailable"`` entry and no step runs — a distinct
+    verdict from ``"fail"``, since a locked desktop is an environment
+    condition, not an app bug.
     """
     spec = parse_native_spec(spec_text)
     resolved_calls = calls if calls is not None else Win32Calls()
