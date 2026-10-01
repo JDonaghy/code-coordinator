@@ -32,6 +32,7 @@ from coord.drive_queue import (
     STATE_BLOCKED,
     STATE_DONE,
     STATE_FAILED,
+    STATE_MERGED_PARTIAL,
     STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
@@ -118,11 +119,18 @@ def board(
     ci_pending: tuple[int, ...] = (),
     ci_pending_live: tuple[int, ...] = (),
     ci_absent: tuple[int, ...] = (),
+    # #3502: issues whose merged work-like assignment carried a non-default
+    # `ISSUE_RESOLUTION:` marker — `merge_resolution` maps the issue number
+    # to the exact value ("partial"/"investigation"); `partial` is a
+    # shorthand tuple for the common "partial" case.
+    partial: tuple[int, ...] = (),
+    merge_resolution: dict[int, str] | None = None,
 ) -> BoardView:
     facts: dict[str, IssueFacts] = {}
+    merge_resolution = merge_resolution or {}
     for issue in {
         *merged, *closed, *open_, *reopened, *active,
-        *ci_pending, *ci_pending_live, *ci_absent,
+        *ci_pending, *ci_pending_live, *ci_absent, *partial, *merge_resolution,
     }:
         facts[entry_key(REPO, issue)] = IssueFacts(
             known=True,
@@ -130,6 +138,10 @@ def board(
                 "closed" if issue in closed else ("open" if issue in open_ or issue in reopened else "")
             ),
             merged=issue in merged,
+            merge_resolution=(
+                merge_resolution.get(issue)
+                or ("partial" if issue in partial else "resolved")
+            ),
             # #3384: GitHub's own witness that a human explicitly reopened
             # this issue — see `IssueFacts.reopened`.
             reopened=issue in reopened,
@@ -194,6 +206,59 @@ def test_landed_prefers_closed_over_a_stale_reopened_flag():
 def test_reopened_alone_with_no_merge_record_is_still_not_landed():
     facts = IssueFacts(known=True, issue_state="open", reopened=True)
     assert not facts.landed
+
+
+# ── #3502: IssueFacts.merged_partial / _merge_landed_state ──────────────────
+
+
+def test_merged_partial_true_for_a_merged_issue_with_a_non_resolved_marker():
+    facts = IssueFacts(
+        known=True, issue_state="open", merged=True, merge_resolution="partial",
+    )
+    assert facts.merged_partial
+    assert facts.landed  # still landed — nothing left to dispatch
+
+
+def test_merged_partial_false_for_the_default_resolved_marker():
+    facts = IssueFacts(
+        known=True, issue_state="open", merged=True, merge_resolution="resolved",
+    )
+    assert not facts.merged_partial
+
+
+def test_merged_partial_false_when_the_issue_is_closed():
+    # A closed issue is its own, stronger "done" signal — closing wins even
+    # if an earlier merge carried a non-default marker.
+    facts = IssueFacts(
+        known=True, issue_state="closed", merged=True, merge_resolution="partial",
+    )
+    assert not facts.merged_partial
+    assert facts.landed
+
+
+def test_merged_partial_false_when_not_merged_at_all():
+    facts = IssueFacts(known=True, issue_state="closed", merge_resolution="partial")
+    assert not facts.merged_partial
+
+
+def test_merge_landed_state_is_state_done_for_a_clean_merge():
+    from coord.drive_queue import STATE_DONE, _merge_landed_state
+
+    facts = IssueFacts(known=True, issue_state="open", merged=True)
+    state, witness = _merge_landed_state(facts)
+    assert state == STATE_DONE
+    assert witness == "merged"
+
+
+def test_merge_landed_state_is_state_merged_partial_for_a_partial_marker():
+    from coord.drive_queue import _merge_landed_state
+
+    facts = IssueFacts(
+        known=True, issue_state="open", merged=True, merge_resolution="partial",
+    )
+    state, witness = _merge_landed_state(facts)
+    assert state == STATE_MERGED_PARTIAL
+    assert "partial" in witness
 
 
 # ── keys and --after parsing ─────────────────────────────────────────────────
@@ -308,6 +373,46 @@ def test_build_board_view_reads_merge_and_activity_from_work_like_rows():
     # here) stays `None`, the safe "not stale" default.
     assert view.facts(entry_key(REPO, 1654)).issue_synced_at == 1_700_000_000.0
     assert view.facts(entry_key(REPO, 1650)).issue_synced_at is None
+
+
+def test_build_board_view_reads_a_partial_issue_resolution_marker():
+    # #3502: a merged work-like row's own `completion_summary` carries the
+    # `ISSUE_RESOLUTION:` marker this reads off, with no extra `gh` call.
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 1864, "type": "work",
+                    "status": "merged",
+                    "completion_summary": (
+                        "Fixed the symptom.\n\nISSUE_RESOLUTION: partial — "
+                        "root cause elsewhere."
+                    ),
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 1864))
+    assert facts.merged
+    assert facts.merge_resolution == "partial"
+    assert facts.merged_partial
+
+
+def test_build_board_view_defaults_merge_resolution_to_resolved():
+    # No `completion_summary` at all (every pre-#3502 row) must not flag
+    # as partial.
+    view = build_board_view(
+        {
+            "assignments": [
+                {"repo_name": REPO, "issue_number": 1650, "type": "work", "status": "merged"},
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 1650))
+    assert facts.merge_resolution == "resolved"
+    assert not facts.merged_partial
 
 
 def test_build_board_view_reads_merge_ci_pending_from_the_live_plan_reason():
@@ -1781,6 +1886,71 @@ def test_a_waiting_entry_whose_work_merged_but_issue_still_open_also_reconciles(
     reconcile = plan.reconciles[0]
     assert reconcile.updates["state"] == STATE_DONE
     assert "merged" in reconcile.reason
+
+
+# ── plan_tick: a merged-but-not-resolved issue (#3502) ──────────────────────
+#
+# claude-coordinator#3502: merging the PR behind a work-like assignment
+# must not read as plain "done" when the worker/reviewer marked the issue
+# as not fully resolved — the queue (and anything watching it) must show
+# this distinctly so the issue's remaining work doesn't silently vanish.
+
+
+def test_a_waiting_entry_with_a_partial_marker_reconciles_to_merged_partial():
+    entries = [entry(1864)]
+    plan = plan_tick(
+        entries, board(merged=(1864,), open_=(1864,), partial=(1864,)), capacity=1,
+    )
+    assert plan.launch is None
+    assert [r.outcome for r in plan.reconciles] == ["done"]
+    reconcile = plan.reconciles[0]
+    assert reconcile.updates["state"] == STATE_MERGED_PARTIAL
+    assert reconcile.updates["state"] != STATE_DONE
+
+
+def test_a_waiting_entry_with_a_resolved_marker_still_reconciles_to_done():
+    # Explicit "resolved" (today's default) behaves exactly like the
+    # pre-#3502 unmarked case.
+    entries = [entry(1864)]
+    plan = plan_tick(
+        entries,
+        board(merged=(1864,), open_=(1864,), merge_resolution={1864: "resolved"}),
+        capacity=1,
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_a_closed_issue_with_a_stale_partial_marker_still_reads_as_done():
+    # A human closing the issue is its own, stronger "done" signal — an
+    # earlier merge's partial marker must not override it.
+    entries = [entry(1864)]
+    plan = plan_tick(
+        entries, board(merged=(1864,), closed=(1864,), partial=(1864,)), capacity=1,
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_merged_partial_is_a_terminal_queue_state():
+    from coord.drive_queue import TERMINAL_QUEUE_STATES
+
+    assert STATE_MERGED_PARTIAL in TERMINAL_QUEUE_STATES
+
+
+def test_merged_partial_satisfies_a_dependents_after_clause():
+    # #3502: the CODE landed — a dependent chained `--after` this entry
+    # must still be released. Only the issue's OWN resolution is distinct,
+    # not whether downstream work can proceed.
+    entries = [
+        entry(1864, position=0, after=()),
+        entry(1865, position=1, after=(entry_key(REPO, 1864),)),
+    ]
+    plan = plan_tick(
+        entries, board(merged=(1864,), open_=(1864,), partial=(1864,)), capacity=1,
+    )
+    assert plan.launch is not None
+    assert plan.launch.issue == 1865
 
 
 # ── plan_tick: a reopened issue's stale `merged` witness (#3384) ────────────

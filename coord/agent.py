@@ -3795,6 +3795,33 @@ internal-only change (CLAUDE.md's existing exemption), say so explicitly \
 in your final message instead — that already satisfies the reviewer, no \
 test required.
 
+#3502: your PR merging does NOT automatically mean issue it's for is \
+actually resolved. If merging this PR would make the coordinator \
+auto-close the issue, but you know the issue's own problem is NOT fully \
+fixed — root cause lives in another repo and only a dependent half of \
+the fix landed here, this PR is investigation-only (no production change, \
+or only one hypothesis ruled out), or you only confirmed a symptom \
+without fixing the cause — say so explicitly, right before your \
+SMOKE_TESTS block:
+
+  ISSUE_RESOLUTION: partial — <what remains, in one sentence>
+
+or
+
+  ISSUE_RESOLUTION: investigation — <what you ruled out / what's still \
+unknown>
+
+Omit the line entirely (it defaults to `resolved`, today's behaviour) \
+when this PR genuinely fixes the issue. A drafted-but-unfiled upstream \
+issue — a bullet in a design doc, a TODO comment, a line in a tracking \
+markdown file — is NOT "filed"; only a real GitHub issue number counts, \
+so don't write `partial — see quadraui issue` unless that issue actually \
+exists and you name its number. This is read by the coordinator's merge \
+gate (not posted to GitHub by you — never run `gh` commands): a `partial`/ \
+`investigation` here keeps the issue OPEN after your PR merges, with a \
+comment on the issue quoting what remains, instead of auto-closing work \
+that still has a reported bug live.
+
 #252: before exiting, emit a SMOKE_TESTS block telling the human what to \
 manually verify.  You changed the code; you know what's worth poking.
 

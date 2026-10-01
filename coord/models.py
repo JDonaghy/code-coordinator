@@ -598,6 +598,103 @@ SEALED_MANIFEST_FILENAME = "manifest.yml"
 # of this guarantee.
 CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
 
+# #3502: the three values a worker (or reviewer) may self-report via the
+# `ISSUE_RESOLUTION:` marker, parsed like `SMOKE_TESTS:`/`REVIEW_VERDICT:`
+# from the final message:
+#
+#   * "resolved"      — this PR fully resolves the issue (the default, and
+#                        today's unconditional behaviour, when the marker
+#                        is absent/malformed).
+#   * "partial"       — this PR makes progress but the issue's own problem
+#                        is NOT fixed yet (e.g. the root cause lives in a
+#                        dependency and only HALF the fix landed here).
+#   * "investigation" — this PR is investigation-only (no production
+#                        change, or only one hypothesis ruled out) — the
+#                        issue is exactly as unresolved as before it merged.
+#
+# Ranked so :func:`effective_issue_resolution` can pick "the more cautious
+# of two opinions" with a plain `max()` — higher rank means LESS resolved.
+ISSUE_RESOLUTION_VALUES: frozenset[str] = frozenset(
+    {"resolved", "partial", "investigation"}
+)
+_ISSUE_RESOLUTION_RANK: dict[str, int] = {
+    "resolved": 0,
+    "partial": 1,
+    "investigation": 2,
+}
+DEFAULT_ISSUE_RESOLUTION = "resolved"
+
+
+@dataclass(frozen=True)
+class IssueResolution:
+    """One self-reported `ISSUE_RESOLUTION:` judgment (#3502).
+
+    ``value`` is always one of :data:`ISSUE_RESOLUTION_VALUES` — never the
+    raw, possibly-malformed marker text. ``reason`` is the free-text
+    remainder after the value (e.g. "the quadraui issue was only drafted,
+    not filed"), empty when the marker carried none or wasn't present at
+    all.
+    """
+
+    value: str = DEFAULT_ISSUE_RESOLUTION
+    reason: str = ""
+
+
+# Mirrors `SMOKE_TESTS:`/`REVIEW_VERDICT:`'s tolerance for trailing
+# Markdown decoration and picks the LAST occurrence in the text (a worker
+# that redoes its final summary after further edits should win). The
+# reason is everything after the value on the same line, with a leading
+# separator (em/en-dash, hyphen, or colon) stripped so both
+# "ISSUE_RESOLUTION: partial — foo" and "ISSUE_RESOLUTION: partial: foo"
+# read the same remainder.
+_ISSUE_RESOLUTION_RE = re.compile(
+    r"ISSUE_RESOLUTION:[ \t]*(resolved|partial|investigation)\b[ \t]*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ISSUE_RESOLUTION_REASON_SEP_RE = re.compile(r"^[\s*_`:—–-]+")
+
+
+def parse_issue_resolution(text: str | None) -> IssueResolution:
+    """Extract the last `ISSUE_RESOLUTION:` marker from *text*, or the
+    "resolved" default when absent — or malformed, e.g. an unrecognized
+    value, which this regex simply never matches (#3502 acceptance:
+    absent/malformed both read as "resolved", today's unconditional
+    behaviour, never a crash and never a silently-invented new value).
+    """
+    if not text:
+        return IssueResolution()
+    matches = list(_ISSUE_RESOLUTION_RE.finditer(text))
+    if not matches:
+        return IssueResolution()
+    value = matches[-1].group(1).lower()
+    reason = _ISSUE_RESOLUTION_REASON_SEP_RE.sub("", matches[-1].group(2).strip()).strip()
+    return IssueResolution(value=value, reason=reason)
+
+
+def effective_issue_resolution(
+    worker: IssueResolution, reviewer: IssueResolution | None
+) -> IssueResolution:
+    """Combine a worker's and (optionally) a reviewer's `IssueResolution`
+    into the single verdict the merge gate acts on (#3502).
+
+    The more cautious of the two wins — a reviewer's "partial" overrides a
+    worker's "resolved", but a reviewer can never downgrade a worker's
+    "partial"/"investigation" back down to "resolved" ("never the
+    reverse", per the issue). Ties prefer the reviewer's own wording (the
+    independent, later-arriving opinion) when both flagged the same
+    non-default rank; the worker's is used otherwise.
+    """
+    if reviewer is None:
+        return worker
+    worker_rank = _ISSUE_RESOLUTION_RANK.get(worker.value, 0)
+    reviewer_rank = _ISSUE_RESOLUTION_RANK.get(reviewer.value, 0)
+    if reviewer_rank >= worker_rank and reviewer_rank > 0:
+        return reviewer
+    if worker_rank > reviewer_rank:
+        return worker
+    return worker
+
+
 # #1142: the assignment `type` `coord pr` gives its PR-opening helper session
 # when the *original* assignment it's opening a PR for is NOT itself in
 # ``CLOSES_ISSUE_TYPES`` (e.g. "test-author"/"mock-author", whose
