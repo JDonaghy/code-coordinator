@@ -46,16 +46,23 @@ done
 # the two in sync by hand on any future lane addition, the same discipline
 # `coord/config.py`'s own `TIER2_LANE_KINDS` docstring already documents for
 # `coord.acceptance_drivers.SUPPORTED_KINDS`.
-EXTRAS="server"
+#
+# The no-lane default below is deliberately the LITERAL `code-coordinator
+# [server]` rather than an interpolated `code-coordinator[$EXTRAS]`:
+# `tests/test_provision_machine.py` greps this script for that exact string
+# as its proof that the #1237 extra is still mandatory and the venv is still
+# a non-editable PyPI install. Lane extras append onto it below.
+INSTALL_PACKAGE="code-coordinator[server]"  # PyPI package name + server extra
+LANE_EXTRAS=""
 if [ -n "$CAPABILITIES" ]; then
     SAW_NATIVE=0
     IFS=',' read -r -a CAP_ARRAY <<< "$CAPABILITIES"
     for cap in "${CAP_ARRAY[@]}"; do
         case "$cap" in
-            windows) EXTRAS="$EXTRAS,win-native"; SAW_NATIVE=1 ;;
-            macos) EXTRAS="$EXTRAS,mac-native"; SAW_NATIVE=1 ;;
-            gtk) EXTRAS="$EXTRAS,gtk-native"; SAW_NATIVE=1 ;;
-            tui-pty) EXTRAS="$EXTRAS,tui-pty" ;;
+            windows) LANE_EXTRAS="$LANE_EXTRAS,win-native"; SAW_NATIVE=1 ;;
+            macos) LANE_EXTRAS="$LANE_EXTRAS,mac-native"; SAW_NATIVE=1 ;;
+            gtk) LANE_EXTRAS="$LANE_EXTRAS,gtk-native"; SAW_NATIVE=1 ;;
+            tui-pty) LANE_EXTRAS="$LANE_EXTRAS,tui-pty" ;;
         esac
     done
     # Same conservative fallback as `coord.acceptance_drivers
@@ -66,14 +73,19 @@ if [ -n "$CAPABILITIES" ]; then
     # propagate` HAS the fleet-wide `acceptance.drivers` picture and passes
     # the exact set instead (see `coord.release_propagate
     # .lane_extras_for_host`).
-    if [ "$SAW_NATIVE" -eq 1 ] && [[ ",$EXTRAS," != *",tui-pty,"* ]]; then
-        EXTRAS="$EXTRAS,tui-pty"
+    if [ "$SAW_NATIVE" -eq 1 ] && [[ "$LANE_EXTRAS," != *",tui-pty,"* ]]; then
+        LANE_EXTRAS="$LANE_EXTRAS,tui-pty"
     fi
 fi
+# $LANE_EXTRAS already carries its own leading comma per entry, so this
+# composes `code-coordinator[server,gtk-native,tui-pty]`.
+if [ -n "$LANE_EXTRAS" ]; then
+    INSTALL_PACKAGE="code-coordinator[server$LANE_EXTRAS]"
+fi
 if [ "$FROM_GITHUB" -eq 1 ]; then
-    INSTALL_SOURCE="code-coordinator[$EXTRAS] @ git+${GITHUB_REPO}"
+    INSTALL_SOURCE="$INSTALL_PACKAGE @ git+${GITHUB_REPO}"
 else
-    INSTALL_SOURCE="code-coordinator[$EXTRAS]"
+    INSTALL_SOURCE="$INSTALL_PACKAGE"
 fi
 
 echo "=== code-coordinator agent installer ==="
