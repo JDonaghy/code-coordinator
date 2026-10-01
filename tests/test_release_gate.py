@@ -335,6 +335,23 @@ class TestParseReleaseGateConfig:
         with pytest.raises(ConfigError, match="lanes must be non-empty"):
             parse_mapping(_mapping({"vimcode": {"lanes": []}}))
 
+    def test_empty_lanes_allowed_when_bugbash_required(self) -> None:
+        """A lanes-less, bugbash-only gate can still fail (see
+        ``evaluate_release_gate``'s own ``test_no_eligible_bugbash_run_fails``)
+        — a repo that only wants to gate on bugbash findings must not be
+        forced to also name a Tier-2 lane it doesn't care about."""
+        cfg = parse_mapping(
+            _mapping({"vimcode": {"lanes": [], "bugbash": "required"}})
+        )
+        entry = cfg.release_gate.for_repo("vimcode")
+        assert entry == ReleaseGateRepoConfig(lanes=[], bugbash_required=True)
+
+    def test_omitted_lanes_allowed_when_bugbash_required(self) -> None:
+        cfg = parse_mapping(_mapping({"vimcode": {"bugbash": "required"}}))
+        entry = cfg.release_gate.for_repo("vimcode")
+        assert entry.lanes == []
+        assert entry.bugbash_required is True
+
     def test_invalid_bugbash_value_rejected(self) -> None:
         with pytest.raises(ConfigError, match="bugbash"):
             parse_mapping(_mapping({"vimcode": {"lanes": ["tui-pty"], "bugbash": "sometimes"}}))
@@ -509,6 +526,152 @@ class TestReleaseGateCli:
         )
         assert result.exit_code == 2, result.output
         assert "malformed" in result.output or "could not read" in result.output
+
+    @pytest.mark.parametrize("bad_value", ["false", "0", "no", "", 0, 1, None])
+    def test_truthy_non_bool_passed_is_rejected_not_coerced(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_value: object,
+    ) -> None:
+        """#2096-review: a hand-authored ``--from-json`` payload with
+        ``"passed": "false"`` (or ``"0"``, ``0``, ...) must be rejected, not
+        silently coerced to ``True`` by Python's own truthiness — that would
+        let a genuinely-red lane read as a clean PASS with no error at all."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["tui-pty"], bugbash_required=False),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [{"lane": "tui-pty", "sha": "deadbeef", "passed": bad_value}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 2, result.output
+        assert "malformed" in result.output
+
+    @pytest.mark.parametrize("bad_value", ["false", "0", 0])
+    def test_truthy_non_bool_verified_is_rejected_not_coerced(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_value: object,
+    ) -> None:
+        """Same trap, on ``bugbash[].verified`` — a lane-failure round that
+        never actually observed zero findings must not read as verified."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["tui-pty"], bugbash_required=True),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [{"lane": "tui-pty", "sha": "deadbeef", "passed": True}],
+            "bugbash": [{"sha": "deadbeef", "new_findings": 0, "verified": bad_value}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 2, result.output
+        assert "malformed" in result.output
+
+    def test_real_bool_values_still_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Defense-in-depth for the bool check above: real ``true``/``false``
+        JSON booleans must keep working exactly as before."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["tui-pty"], bugbash_required=True),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [{"lane": "tui-pty", "sha": "deadbeef", "passed": True}],
+            "bugbash": [{"sha": "deadbeef", "new_findings": 0, "verified": False}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        # verified=False -> the bugbash run never actually observed zero
+        # findings -> the bugbash step must fail, not be silently coerced
+        # away.
+        assert result.exit_code == 1, result.output
+        assert "RESULT: FAIL" in result.output
+
+    def test_override_is_recorded_to_the_durable_audit_log(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, coord_db,
+    ) -> None:
+        """The issue's own acceptance criterion: an override "needs an
+        audited reason string, following the `--override-human-required`
+        pattern" — and that pattern (coord/commands/merge.py) writes to the
+        durable, queryable audit_log via `coord.audit.record_audit`, not
+        just stdout/--json. #3488-review: this must mirror it exactly."""
+        import getpass
+
+        from coord.audit import query_audit_log
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["win-native"], bugbash_required=False),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [{"lane": "win-native", "sha": "deadbeef", "passed": False,
+                       "detail": "no menu bar"}],
+        })
+        reason = "known win-native regression, hotfix tracked in #9999"
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--override", reason,
+             "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 0, result.output
+
+        log = query_audit_log(category="release_gate")
+        entries = log["entries"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["event_type"] == "release_gate_override"
+        assert entry["tier"] == "business"
+        assert entry["repo"] == "vimcode"
+        assert reason in entry["summary"]
+        assert entry["details"]["reason"] == reason
+        assert entry["details"]["release_sha"] == "deadbeef"
+        assert entry["details"]["gate_passed"] is False
+        assert entry["details"]["failing_steps"] == ["lane:win-native"]
+        assert entry["actor"] == getpass.getuser()
+
+    def test_override_by_is_populated_not_unknown(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, coord_db,
+    ) -> None:
+        """Nit from review: `GateOverride.by` used to never be populated by
+        the CLI, so the rendered 'by=unknown' branch was the only one ever
+        reachable."""
+        import getpass
+
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["win-native"], bugbash_required=False),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [{"lane": "win-native", "sha": "deadbeef", "passed": False,
+                       "detail": "no menu bar"}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--override", "known issue",
+             "--config", str(tmp_path / "coordinator.yml"), "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        assert f'"by": "{getpass.getuser()}"' in result.output
 
 
 class TestReleaseGateShaAncestry:

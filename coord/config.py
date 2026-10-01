@@ -1612,9 +1612,12 @@ class ReleaseGateRepoConfig:
     Nothing here runs the lanes or the bugbash loop itself — this is only
     the declaration the gate evaluates against observed results (see
     :mod:`coord.release_gate`). An empty ``lanes`` list is rejected at parse
-    time (see :func:`_parse_release_gate`): a repo that opts in but names no
-    lane has declared a gate that can never observe anything to fail on,
-    which is exactly the "gate that cannot fail" trap (#2096).
+    time (see :func:`_parse_release_gate`) UNLESS ``bugbash_required`` is
+    set — a repo that opts in with no lanes and no bugbash requirement has
+    declared a gate that can never observe anything to fail on, which is
+    exactly the "gate that cannot fail" trap (#2096); a lanes-less,
+    bugbash-only gate can still fail on a red/unverified bugbash run, so
+    that combination is allowed.
     """
 
     lanes: list[str] = field(default_factory=list)
@@ -4775,22 +4778,27 @@ def _parse_release_gate(raw: Any, repo_names: set[str]) -> ReleaseGateConfig:
             raise ConfigError(
                 f"release_gate[{repo_name!r}].lanes must be a list of non-empty strings"
             )
-        if not lanes_raw:
-            # #2096: a gate declared over zero lanes (and, elsewhere, no
-            # bugbash requirement either) can never observe a failure — it
-            # would always report a vacuous pass. Reject it at parse time
-            # rather than let an operator believe a repo is gated when it
-            # cannot actually fail on anything.
-            raise ConfigError(
-                f"release_gate[{repo_name!r}].lanes must be non-empty — a repo "
-                "opted into the release gate must name at least one Tier-2 lane"
-            )
 
         bugbash_raw = entry.get("bugbash", "off")
         if bugbash_raw not in _RELEASE_GATE_BUGBASH_VALUES:
             raise ConfigError(
                 f"release_gate[{repo_name!r}].bugbash must be one of "
                 f"{_RELEASE_GATE_BUGBASH_VALUES!r}, got {bugbash_raw!r}"
+            )
+
+        if not lanes_raw and bugbash_raw != "required":
+            # #2096: a gate declared over zero lanes AND no bugbash
+            # requirement can never observe a failure — it would always
+            # report a vacuous pass. Reject it at parse time rather than
+            # let an operator believe a repo is gated when it cannot
+            # actually fail on anything. A lanes-less, bugbash-only gate
+            # (`bugbash: required`) is fine — `evaluate_release_gate` can
+            # still fail it on a red/unverified bugbash run — so that
+            # combination is allowed through.
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].lanes must be non-empty unless "
+                "bugbash: required is set — a repo opted into the release "
+                "gate must be able to observe at least one failure"
             )
 
         repos[repo_name] = ReleaseGateRepoConfig(
