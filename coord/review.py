@@ -1475,6 +1475,108 @@ def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[
     )
 
 
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+
+def _diff_removed_content_lines(diff_text: str, path: str) -> list[str]:
+    """Removed (``-``) content lines touching *path* in *diff_text* (#3509).
+
+    Scoped to the ``diff --git`` block(s) whose ``a/``/``b/`` side names
+    *path* exactly, so an unrelated file's deletions elsewhere in a
+    multi-file diff never leak in — mirrors
+    :func:`_sealed_to_sealed_rename_exemptions`'s per-block scoping, just
+    walking line-by-line instead of regex-splitting the whole diff, since
+    callers here want ordered content, not just a yes/no per sealed prefix.
+    Excludes diff/hunk header noise (``--- a/X``, ``+++ b/X``, ``@@ ... @@``)
+    — only a line starting with a single ``-`` is a real removed line.
+
+    A wholly new file has no removed lines by construction: a ``+++
+    b/path`` hunk against ``/dev/null`` is 100% ``+`` lines. A pure rename
+    with no content change has none either (nothing in the renamed block is
+    a ``-``/``+`` content line at all). So this returns ``[]`` for both —
+    exactly the cases #3509 calls "unrestricted growth", never flagged.
+    """
+    removed: list[str] = []
+    in_block = False
+    for line in diff_text.splitlines():
+        header = _DIFF_GIT_HEADER_RE.match(line)
+        if header is not None:
+            in_block = path in (header.group(1), header.group(2))
+            continue
+        if not in_block:
+            continue
+        if line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:])
+    return removed
+
+
+def _lane_entrypoint_violation_lines(
+    diff_text: str | None,
+    additive_only_entrypoints: list[str] | None,
+) -> tuple[list[str] | None, list[str]]:
+    """(#3509) Detect a MANDATORY violation of a Tier-2 lane-kind
+    (``tui-pty``/``win-native``/``mac-native``/``gtk-native``) smoke-spec
+    entry point's additive-only rule.
+
+    Unlike ``tests/acceptance/`` and the ``tui-tuidriver``/``cli-pytest``
+    entry points, *additive_only_entrypoints*
+    (:meth:`coord.config.AcceptanceConfig.additive_only_entrypoints` —
+    deliberately excluded from :meth:`coord.config.AcceptanceConfig.
+    sealed_paths` by #3509) is not sealed: a diff may add new steps, or
+    whole new spec files beside it, freely. What it must never do is remove
+    or rewrite a line that already existed — ``coord bugbash``'s whole
+    ratchet (#3487) depends on every fix GROWING the smoke spec, never
+    shrinking it, so a fix that "passes" by deleting the step it should
+    have made pass instead (or loosening an ``expect_*`` field, raising a
+    latency budget, shortening an idle window — all of which read,
+    textually, as a removed line) must be rejected exactly as hard as an
+    outright deletion.
+
+    Detection is deliberately conservative and line-based, not
+    YAML-semantic: ANY removed content line inside one of these files
+    (:func:`_diff_removed_content_lines`) is treated as a violation — the
+    same "anything beyond pure addition is suspect" shape the existing
+    test-author entry-point "additive registration only" guidance already
+    uses (see ``build_review_briefing``'s ``sealed_entrypoints`` branch).
+    The difference here is this one is MANDATORY and applies to every
+    assignment type, not just advisory text for a browsing reviewer: there
+    is no independent author ever expected to revisit this file, so a
+    false negative here is permanent, not caught at a later authoring step.
+
+    Returns ``(touched_paths, banner_lines)`` the moment a removal is found
+    in any entry, else ``(None, [])`` — including when
+    *additive_only_entrypoints* is empty, *diff_text* is empty, or every
+    touch is purely additive (a brand-new file, or only ``+`` lines
+    appended to an existing one).
+    """
+    if not additive_only_entrypoints or not diff_text:
+        return None, []
+    touched = [
+        p for p in additive_only_entrypoints
+        if _diff_removed_content_lines(diff_text, p)
+    ]
+    if not touched:
+        return None, []
+    lines = [
+        "## \U0001f6a8 SMOKE-SPEC ENTRY POINT WEAKENED",
+        "",
+        (
+            "The diff removes or rewrites existing line(s) in this repo's "
+            "Tier-2 lane smoke-spec entry point: "
+            + ", ".join(f"`{p}`" for p in touched)
+            + " (#3509). This file is additive-only: new steps and new spec "
+            "files beside it are expected and welcome, but deleting or "
+            "weakening an existing step — a removed step, a removed or "
+            "loosened `expect_*` field, a raised latency budget, a "
+            "shortened idle window — defeats the whole point of `coord "
+            "bugbash`'s regression ratchet (#3487): every fix is expected "
+            "to grow this spec, never shrink it. **request-changes is "
+            "mandatory here**, regardless of anything else in this diff."
+        ),
+    ]
+    return touched, lines
+
+
 # ── #3180: mandatory-verdict detection, shared by the briefing text AND the
 # dispatch-time mechanical short-circuit ────────────────────────────────────
 #
@@ -1597,17 +1699,24 @@ def _mechanical_mandatory_verdict(
     sealed_paths: list[str] | None,
     sealed_entrypoints: list[str] | None,
     coordinator_doc_paths: list[str] | None,
+    additive_only_entrypoints: list[str] | None = None,
 ) -> tuple[str, list[str], list[str]] | None:
     """(#3180) The single check `dispatch_review` runs BEFORE spending a
     review leg: does this diff already, mechanically, trip a MANDATORY
     request-changes rule?
 
     Checks the coordinator-doc rule first (it never inverts by assignment
-    type, per `build_review_briefing`'s docstring) and only then the sealed-
-    path rule (which does invert for `SEALED_PATH_AUTHOR_TYPES`). Returns
-    ``(kind, touched_paths, banner_lines)`` — *kind* is ``"coordinator_doc"``
-    or ``"sealed_path"``, used only to label the mechanical verdict's own
-    ``verdict_source_reason`` — the instant either fires, else ``None``.
+    type, per `build_review_briefing`'s docstring), then the sealed-path
+    rule (which does invert for `SEALED_PATH_AUTHOR_TYPES`), then (#3509)
+    the Tier-2 lane-kind additive-only rule — a `*additive_only_entrypoints*`
+    path is never in `sealed_paths`, so a diff confined to one never trips
+    the sealed-path check above; this is the only check standing between it
+    and a worker silently deleting the smoke-spec step its own fix should
+    have made pass. Returns ``(kind, touched_paths, banner_lines)`` — *kind*
+    is ``"coordinator_doc"``, ``"sealed_path"``, or
+    ``"lane_entrypoint_weakened"``, used only to label the mechanical
+    verdict's own ``verdict_source_reason`` — the instant any of the three
+    fires, else ``None``.
     """
     touched_docs, doc_lines = _coordinator_doc_violation_lines(
         diff_text, coordinator_doc_paths
@@ -1619,6 +1728,11 @@ def _mechanical_mandatory_verdict(
     )
     if touched_sealed:
         return "sealed_path", touched_sealed, sealed_lines
+    touched_lane, lane_lines = _lane_entrypoint_violation_lines(
+        diff_text, additive_only_entrypoints
+    )
+    if touched_lane:
+        return "lane_entrypoint_weakened", touched_lane, lane_lines
     return None
 
 
@@ -1920,6 +2034,7 @@ def build_review_briefing(
     diff_text: str | None = None,
     sealed_paths: list[str] | None = None,
     sealed_entrypoints: list[str] | None = None,
+    additive_only_entrypoints: list[str] | None = None,
     coordinator_doc_paths: list[str] | None = None,
     assignment_type: str = "work",
     provider_same_as_worker: bool = False,
@@ -2000,6 +2115,19 @@ def build_review_briefing(
     is expected and non-blocking. Every other type (default ``"work"``) keeps
     the original rule unchanged: any touch to *sealed_paths* is mandatory
     ``request-changes``.
+
+    *additive_only_entrypoints* (#3509) is the Tier-2 lane-kind subset
+    (``tui-pty``/``win-native``/``mac-native``/``gtk-native``,
+    :meth:`coord.config.AcceptanceConfig.additive_only_entrypoints`) that is
+    deliberately NOT part of *sealed_paths* at all — a work diff may add new
+    steps, or whole new spec files beside one, freely. Unlike
+    *sealed_entrypoints*'s advisory-only guidance above, this one IS
+    mechanically enforced (:func:`_lane_entrypoint_violation_lines`, applied
+    for every assignment type, not just non-authors): a diff that removes or
+    rewrites a pre-existing line in one of these files gets the same
+    mandatory ``request-changes`` banner a sealed-path tamper would,
+    regardless of *assignment_type* — see that function's docstring for why
+    there is no "the author's job is to write here" inversion for this one.
 
     *coordinator_doc_paths* (#2966) is the repo's coordinator-owned doc set —
     :func:`coord.models.coordinator_owned_docs`, the repo's own CLAUDE.md plus
@@ -2318,6 +2446,43 @@ def build_review_briefing(
                     + ". If the diff modifies any of them, **request-changes** — "
                     "this is a hard rule, not a suggestion (docs/ORACLE_LOOP.md)."
                 )
+
+    if additive_only_entrypoints:
+        # #3509: unlike sealed_paths above, this one applies to EVERY
+        # assignment type the same way — there is no "the author's job is
+        # to write here" inversion, since no assignment type's job is ever
+        # editing an existing step. Computed via the same helper
+        # `dispatch_review`'s mechanical short-circuit uses — see
+        # `_lane_entrypoint_violation_lines`'s docstring.
+        lines.append("")
+        _weakened_paths, _weakened_lines = _lane_entrypoint_violation_lines(
+            diff_text, additive_only_entrypoints
+        )
+        if _weakened_paths:
+            lines.extend(_weakened_lines)
+        else:
+            lines.append("## Smoke-spec entry point — additive only, not sealed")
+            lines.append("")
+            lines.append(
+                ", ".join(f"`{p}`" for p in additive_only_entrypoints)
+                + " is this repo's Tier-2 lane-kind acceptance driver entry "
+                "point (#3509) — a `coord bugbash` (#3487) smoke spec every "
+                "fix is expected to grow, not a sealed oracle. Do **not** "
+                "request-changes solely because this diff adds new steps or "
+                "new spec files beside it — that is expected and welcome."
+            )
+            lines.append("")
+            lines.append(
+                "- **Expected, do NOT flag:** new steps, or new spec files "
+                "beside this entry point."
+            )
+            lines.append(
+                "- **request-changes:** the diff removes or rewrites an "
+                "existing step, loosens an `expect_*` field, raises a "
+                "latency budget, or shortens an idle window — any of which "
+                "weakens a regression check `coord bugbash` already "
+                "depends on."
+            )
 
     if coordinator_doc_paths:
         # #2966: "only the coordinator writes docs" was prose-only — nothing
@@ -2949,6 +3114,7 @@ def _record_mechanical_review_verdict(
     kind_label = {
         "coordinator_doc": "coordinator-owned doc(s) edited",
         "sealed_path": "sealed path(s) violated",
+        "lane_entrypoint_weakened": "Tier-2 lane smoke-spec entry point weakened",
     }.get(kind, kind)
     touched_str = ", ".join(touched_paths)
     reason = f"{kind_label}: {touched_str}"
@@ -3642,7 +3808,16 @@ def dispatch_review(
         # bounced, or leave it unwired and ship dead code. Each route now
         # declares its own `entrypoint:`.
         sealed_paths = config.acceptance.sealed_paths(completed.repo_name)
-        sealed_entrypoints = config.acceptance.entrypoints(completed.repo_name)
+        sealed_entrypoints = [
+            ep for ep in config.acceptance.entrypoints(completed.repo_name)
+            if ep in sealed_paths
+        ]
+        # #3509: the Tier-2 lane-kind entrypoints EXCLUDED from sealed_paths
+        # above — additive-only, mechanically enforced by
+        # `_lane_entrypoint_violation_lines` instead of the sealed-path rule.
+        additive_only_entrypoints = config.acceptance.additive_only_entrypoints(
+            completed.repo_name
+        )
 
         # #2966: coordinator-owned docs (repo's own CLAUDE.md plus anything it
         # additionally lists under coordinator_only_files) — see
@@ -3713,6 +3888,7 @@ def dispatch_review(
             sealed_paths=sealed_paths,
             sealed_entrypoints=sealed_entrypoints,
             coordinator_doc_paths=coordinator_doc_paths,
+            additive_only_entrypoints=additive_only_entrypoints,
         )
         if _mechanical is not None:
             mech_kind, mech_touched, mech_lines = _mechanical
@@ -3814,6 +3990,7 @@ def dispatch_review(
                 diff_text=diff_text,
                 sealed_paths=sealed_paths,
                 sealed_entrypoints=sealed_entrypoints,
+                additive_only_entrypoints=additive_only_entrypoints,
                 coordinator_doc_paths=coordinator_doc_paths,
                 assignment_type=completed.type,
                 completion_summary=completed.completion_summary,

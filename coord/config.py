@@ -427,6 +427,20 @@ class AcceptanceDriverConfig:
     ``pytest tests/acceptance/{ms}`` legitimately has no entry point, which
     is exactly why #1175's blanket refusal only ever broke the Rust route.
 
+    #3509: the four Tier-2 lane kinds (:data:`TIER2_LANE_KINDS` —
+    ``tui-pty``/``win-native``/``mac-native``/``gtk-native``) are the one
+    exception to "folded into the sealed set" above. Their ``entrypoint:``
+    is a smoke spec that ``coord bugbash`` (#3487) expects every fix to
+    GROW, with no independent ``test-author`` the way ``tests/acceptance/``
+    has one — full sealing made it impossible for a ``type="work"`` worker
+    to add the smoke-spec step its own fix is required to ship. See
+    :meth:`AcceptanceConfig.sealed_paths` and
+    :meth:`AcceptanceConfig.additive_only_entrypoints` for the derived sets,
+    and :func:`coord.review._lane_entrypoint_violation_lines` for the
+    mandatory (but narrower) rule that still applies: additions are
+    unrestricted, but removing or rewriting a pre-existing line is still a
+    mandatory ``request-changes``.
+
     ``match`` and ``routes`` implement #1125's in-repo path routing: a repo
     entry with a non-empty ``routes`` list is a *router* — its own
     ``kind``/``run``/``mock``/``capability``/``setup``/``entrypoint`` are
@@ -469,6 +483,20 @@ class AcceptanceDriverConfig:
 # directory without the trailing slash.
 SEALED_ACCEPTANCE_DIR = "tests/acceptance/"
 
+# #3509: the four Tier-2 (epic #3482) platform-lane acceptance driver kinds
+# whose `entrypoint:` is a smoke spec `coord bugbash` (#3487) grows one step
+# at a time, not an oracle a `test-author` writes once and a worker is
+# graded against — see `AcceptanceConfig.sealed_paths`'s docstring for why
+# that makes full sealing wrong for exactly these four kinds. Kept in sync
+# with `coord.bugbash.LANE_DRIVER_KINDS` by hand rather than imported — the
+# same hand-sync discipline `coord.acceptance_drivers.SUPPORTED_KINDS` and
+# `coord.bugbash.LANE_DRIVER_KINDS` already use for each other, for the same
+# reason: `coord.bugbash` deliberately takes a duck-typed `config: Any`
+# rather than importing this (foundational, widely-imported) module, so
+# this module returns the favor instead of introducing a config->feature
+# dependency from the other side.
+TIER2_LANE_KINDS = frozenset({"tui-pty", "win-native", "mac-native", "gtk-native"})
+
 
 def entrypoint_sibling_acceptance_dir(entrypoint: str) -> str:
     """The ``acceptance/`` directory an entrypoint-linked driver ``include!``s
@@ -496,6 +524,27 @@ class AcceptanceConfig:
 
     drivers: dict[str, AcceptanceDriverConfig] = field(default_factory=dict)
 
+    def _entrypoint_kind_pairs(self, repo_name: str) -> list[tuple[str, str]]:
+        """``(entrypoint, kind)`` for every declared entrypoint of
+        *repo_name*, deduped on the entrypoint, declaration order preserved
+        — the one traversal :meth:`entrypoints`, :meth:`sealed_paths` and
+        (#3509) :meth:`additive_only_entrypoints` all build on, so "which
+        driver kind owns this entrypoint" is answered in exactly one place
+        rather than three copies of the same ``for cfg in [entry,
+        *entry.routes]`` walk silently drifting apart.
+        """
+        entry = self.drivers.get(repo_name)
+        if entry is None:
+            return []
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for cfg in [entry, *entry.routes]:
+            ep = cfg.entrypoint.strip()
+            if ep and ep not in seen:
+                seen.add(ep)
+                out.append((ep, cfg.kind))
+        return out
+
     def entrypoints(self, repo_name: str) -> list[str]:
         """Every ``entrypoint:`` declared by *repo_name*'s acceptance driver
         (#1552), deduped, declaration order preserved.
@@ -508,16 +557,31 @@ class AcceptanceConfig:
         flat repo contributes at most its own. Repos with no driver — and
         drivers whose suite is directory-discovered (``cli-pytest``) —
         return ``[]``.
+
+        Includes Tier-2 lane-kind entrypoints (:data:`TIER2_LANE_KINDS`) —
+        this is "every entrypoint the repo declares", not "every SEALED
+        entrypoint"; use :meth:`sealed_paths` for the sealed subset and
+        :meth:`additive_only_entrypoints` for the lane-kind one (#3509).
         """
-        entry = self.drivers.get(repo_name)
-        if entry is None:
-            return []
-        out: list[str] = []
-        for cfg in [entry, *entry.routes]:
-            ep = cfg.entrypoint.strip()
-            if ep and ep not in out:
-                out.append(ep)
-        return out
+        return [ep for ep, _kind in self._entrypoint_kind_pairs(repo_name)]
+
+    def additive_only_entrypoints(self, repo_name: str) -> list[str]:
+        """(#3509) The subset of :meth:`entrypoints` declared by a Tier-2
+        lane-kind driver (``tui-pty``/``win-native``/``mac-native``/
+        ``gtk-native``, :data:`TIER2_LANE_KINDS`) — deliberately excluded
+        from :meth:`sealed_paths`, see that method's docstring for why.
+
+        These paths are not a free-for-all: :func:`coord.review
+        ._lane_entrypoint_violation_lines` still mandatorily rejects a
+        ``type="work"`` diff that removes or rewrites a pre-existing line in
+        one of them (a deleted step, a loosened ``expect_*`` field, a raised
+        latency budget, a shortened idle window) — only ADDING to them (a
+        new step, or a wholly new spec file beside them) is unrestricted.
+        """
+        return [
+            ep for ep, kind in self._entrypoint_kind_pairs(repo_name)
+            if kind in TIER2_LANE_KINDS
+        ]
 
     def sealed_paths(self, repo_name: str) -> list[str]:
         """The full sealed-oracle path set for *repo_name* (#944 sealing v1,
@@ -554,11 +618,33 @@ class AcceptanceConfig:
         standalone ``coord-tui`` repo's flat ``tests/acceptance.rs``) has
         that sibling collapse onto ``SEALED_ACCEPTANCE_DIR`` itself — see the
         dedup below.
+
+        #3509: a Tier-2 lane-kind entrypoint (:data:`TIER2_LANE_KINDS` —
+        ``tui-pty``/``win-native``/``mac-native``/``gtk-native``) is
+        deliberately excluded from this set, entrypoint AND sibling dir
+        both. Those four kinds' ``entrypoint:`` is a smoke spec
+        ``coord bugbash`` (#3487) files findings against on the acceptance
+        line "the fix must add a Tier-1 shared conformance scenario or a
+        Tier-2 smoke-spec step that fails first" — a regression ratchet
+        every fix is expected to GROW, with no independent author the way
+        ``tests/acceptance/`` has one. Full sealing made that structurally
+        impossible: a ``type="work"`` diff adding the very step its own fix
+        requires tripped the same mandatory tamper banner as rewriting the
+        oracle it's graded against. Excluded here does not mean
+        unrestricted — :func:`coord.review._lane_entrypoint_violation_lines`
+        (fed by :meth:`additive_only_entrypoints`) still mandatorily rejects
+        a diff that removes or weakens a pre-existing line in one of these
+        files; only growing them is unconstrained. ``tui-tuidriver`` and
+        ``cli-pytest`` are unaffected — neither kind is in
+        :data:`TIER2_LANE_KINDS`, so their entrypoints stay fully sealed
+        exactly as before.
         """
         if not self.has_driver(repo_name):
             return []
         out = [SEALED_ACCEPTANCE_DIR]
-        for ep in self.entrypoints(repo_name):
+        for ep, kind in self._entrypoint_kind_pairs(repo_name):
+            if kind in TIER2_LANE_KINDS:
+                continue
             if ep not in out:
                 out.append(ep)
             sibling = entrypoint_sibling_acceptance_dir(ep)
@@ -3908,10 +3994,15 @@ def _parse_acceptance_routes(
 def _acceptance_entrypoint(entry: dict, label: str) -> str:
     """Validate an acceptance driver's optional ``entrypoint:`` (#1552).
 
-    Must be a repo-root-relative *file* path — it is folded into the sealed
-    set as an exact-match entry (:meth:`AcceptanceConfig.sealed_paths`), so
-    an absolute path or a trailing-slash directory would silently seal
-    nothing at all. Reject both here rather than at review time, where the
+    Must be a repo-root-relative *file* path — for most ``kind`` values it
+    is folded into the sealed set as an exact-match entry
+    (:meth:`AcceptanceConfig.sealed_paths`), so an absolute path or a
+    trailing-slash directory would silently seal nothing at all. (#3509:
+    the four Tier-2 lane kinds in :data:`TIER2_LANE_KINDS` are the one
+    exception — their entrypoint is additive-only, not sealed — but the
+    same validation still applies: a malformed path there would just as
+    silently defeat :meth:`AcceptanceConfig.additive_only_entrypoints`.)
+    Reject both malformations here rather than at review time, where the
     only symptom would be a `test-author` bounced for a scope violation it
     cannot fix.
     """

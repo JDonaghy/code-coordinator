@@ -2952,3 +2952,23 @@ class TestTailscaleSelfDnsCache:
         resolved = resolve_local_machine(cfg)
         assert resolved is not None
         assert resolved.name == "macmini"
+
+
+# ── #3509: Tier-2 lane-kind entrypoints are additive-only, not sealed ───────
+#
+# Full behavioral coverage (sealed_paths/additive_only_entrypoints across
+# flat and routed drivers) lives in tests/test_config_acceptance.py, which is
+# where every existing sealed_paths/entrypoint test for AcceptanceConfig
+# already lives (that file's own docstring: "Tests for the `acceptance:`
+# block in coordinator.yml") — this is just the constant-level smoke test
+# for the file this issue names explicitly.
+
+
+def test_tier2_lane_kinds_constant_matches_bugbash_lane_driver_kinds() -> None:
+    """coord.config.TIER2_LANE_KINDS is hand-synced with
+    coord.bugbash.LANE_DRIVER_KINDS by design (coord.bugbash deliberately
+    avoids importing coord.config — see TIER2_LANE_KINDS's own comment) —
+    this test is the thing that notices if the two ever drift apart."""
+    from coord.bugbash import LANE_DRIVER_KINDS
+
+    assert coord_config.TIER2_LANE_KINDS == frozenset(LANE_DRIVER_KINDS)
