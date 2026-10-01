@@ -1075,6 +1075,113 @@ def test_a_green_roll_is_verified_and_journalled(valid_config_path, state_dir,
     assert record["verification"]["severity"] == "ok"
 
 
+def test_release_propagate_passes_capability_derived_extras_to_roll_python(
+    tmp_path, state_dir, no_network, monkeypatch,
+):
+    """#3515 end to end: a `gtk`-capable machine's python-lane roll must ask
+    `_roll_python` for `gtk-native` — the whole point of this issue, verified
+    at the one seam (`coord release propagate`'s own roll loop) that ties
+    `coordinator.yml`'s `capabilities:` to the actual `/update` request a
+    real fleet roll sends. No `tui-pty` here: this config declares no
+    `acceptance.drivers` at all, so propagate's own `repos_requiring_tui_pty`
+    resolves an empty (but KNOWN, not unknown) set — the exact case where
+    passing an explicit `tui_pty_repos` must NOT trip the native-lane
+    fallback `coord.agent_app`'s in-agent-only call relies on instead (see
+    `test_lane_extras_for_host_maps_gtk_capability` in
+    `tests/test_release_propagate.py`)."""
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(
+        """\
+repos:
+  - name: api
+    github: acme/api
+
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    capabilities: [python, gtk]
+    repos: [api]
+"""
+    )
+
+    captured_extras: list = []
+
+    def _python(machine, **kwargs):
+        captured_extras.append(kwargs.get("extras"))
+        return True, "now v0.4.111", True
+
+    def _units(machine, **kwargs):
+        return True, "1 unit(s) refreshed; daemon-reload ok"
+
+    def _tui(machine, **kwargs):
+        return True, "coord-tui now v0.4.111"
+
+    monkeypatch.setattr(release_cmd, "_roll_python", _python)
+    monkeypatch.setattr(release_cmd, "_roll_units", _units)
+    monkeypatch.setattr(release_cmd, "_roll_tui", _tui)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"]}, daemon="laptop")
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(config_path),
+         "--target", "0.4.111", "--daemon-host", "laptop"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_extras == [["gtk-native"]]
+
+
+def test_release_propagate_adds_tui_pty_for_a_served_tui_pty_repo(
+    tmp_path, state_dir, no_network, monkeypatch,
+):
+    """Same seam as the test above, but with `acceptance.drivers` declaring
+    a `tui-pty`-kind driver for the one repo this machine serves — propagate
+    must resolve `tui-pty` from that, with NO native capability involved at
+    all (the one shape the in-agent fallback could never produce on its
+    own)."""
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(
+        """\
+repos:
+  - name: vimcode
+    github: acme/vimcode
+
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    capabilities: [python]
+    repos: [vimcode]
+
+acceptance:
+  drivers:
+    vimcode:
+      kind: tui-pty
+      run: "coord-acceptance-tui-pty {ms}"
+      entrypoint: "smoke/tui-pty.yaml"
+"""
+    )
+
+    captured_extras: list = []
+
+    def _python(machine, **kwargs):
+        captured_extras.append(kwargs.get("extras"))
+        return True, "now v0.4.111", True
+
+    monkeypatch.setattr(release_cmd, "_roll_python", _python)
+    monkeypatch.setattr(release_cmd, "_roll_units", lambda m, **k: (True, "ok"))
+    monkeypatch.setattr(release_cmd, "_roll_tui", lambda m, **k: (True, "ok"))
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"]}, daemon="laptop")
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(config_path),
+         "--target", "0.4.111", "--daemon-host", "laptop"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_extras == [["tui-pty"]]
+
+
 def test_a_waiting_between_legs_entry_rolls_its_host_normally(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
@@ -2230,6 +2337,69 @@ def test_roll_python_posts_a_meaningful_initiator(monkeypatch):
     initiator = update_payload.get("initiator")
     assert isinstance(initiator, str)
     assert initiator.startswith("coord release propagate -> server python lane (")
+
+
+def test_roll_python_forwards_extras_to_the_update_payload(monkeypatch):
+    """#3515: `_roll_python`'s `extras` kwarg must land verbatim in the
+    `/update` POST body — this is the wire `coord release propagate`'s own
+    `rp.lane_extras_for_host` result reaches the target agent through."""
+    posts: list[tuple[str, dict]] = []
+
+    def _fake_post(url, payload, *, timeout):
+        posts.append((url, payload))
+        if url.endswith("/update"):
+            return 202, {}, ""
+        if url.endswith("/restart-services"):
+            return 200, {"units": {}}, ""
+        raise AssertionError(f"unexpected POST {url}")
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._fetch_pre_started_at", lambda machines: {}
+    )
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._wait_agents_updated",
+        lambda machines, *, target_version, timeout, pre_started_at: {
+            m.name: {"matched": True} for m in machines
+        },
+    )
+
+    release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0,
+        force=False, extras=["gtk-native", "tui-pty"],
+    )
+
+    update_payload = next(p for u, p in posts if u.endswith("/update"))
+    assert update_payload.get("extras") == ["gtk-native", "tui-pty"]
+
+
+def test_roll_python_omits_extras_field_when_none_given(monkeypatch):
+    """No regression for every pre-#3515 caller: an omitted/empty `extras`
+    must not add the key at all, so an agent that predates it sees exactly
+    the request it always has."""
+    posts: list[tuple[str, dict]] = []
+
+    def _capturing_post(url, payload, *, timeout):
+        posts.append((url, payload))
+        return 202, {}, ""
+
+    monkeypatch.setattr(release_cmd, "_post", _capturing_post)
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._fetch_pre_started_at", lambda machines: {}
+    )
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._wait_agents_updated",
+        lambda machines, *, target_version, timeout, pre_started_at: {
+            m.name: {"matched": True} for m in machines
+        },
+    )
+
+    release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False,
+    )
+
+    update_payload = next(p for u, p in posts if u.endswith("/update"))
+    assert "extras" not in update_payload
 
 
 # ──────────────────────────────────────────────────────────────────────────

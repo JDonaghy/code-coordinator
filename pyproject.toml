@@ -156,6 +156,33 @@ mac-native = [
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
 ]
+# #3486/#3515: the `gtk-native` acceptance driver — probes a real Linux/GTK
+# binary's window with real `xdotool` input and the AT-SPI accessibility
+# tree, same tier as `win-native`/`mac-native` above. `PyGObject` is the
+# GObject-introspection binding `coord/gtk_native_driver.py`'s `_import_atspi`
+# imports (`gi.repository.Atspi`) — `sys_platform == 'linux'` means installing
+# this extra on Windows/macOS pulls in nothing, mirroring `win-native`'s/
+# `mac-native`'s own platform markers.
+#
+# NOT pip-installable on their own, and NOT expressed as a marker here
+# because there is no PEP 508 syntax for "a system package" — a host that
+# needs this extra ALSO needs, from its OS package manager:
+#   * `xdotool` — the input-driving CLI `coord/gtk_native_driver.py` shells
+#     out to for `key`/`click` steps;
+#   * `x11-apps` (for `xwd`) — the per-window capture attached to every
+#     failing step as evidence, the `gtk-native` analogue of `win-native`'s
+#     `PrintWindow`/`mac-native`'s `screencapture -l`;
+#   * `gir1.2-atspi-2.0` and `at-spi2-core` — the AT-SPI accessibility
+#     service and its introspection typelib, without which `PyGObject`
+#     imports fine but `Atspi.get_desktop(0)` finds no tree at all;
+#   * `libgirepository-2.0-dev libcairo2-dev pkg-config python3-dev` — the
+#     build headers `pip install PyGObject` itself needs when no prebuilt
+#     wheel matches the host (common on Debian/Ubuntu).
+# #3515's `coord doctor` lane check reports a missing one of these as a named
+# remedy rather than a stack trace — see `coord/commands/status.py`.
+gtk-native = [
+    "PyGObject>=3.46; sys_platform == 'linux'",
+]
 # Convenience alias: "give me everything a full node runs".
 all = ["code-coordinator[server]", "code-coordinator[reports-xlsx]", "code-coordinator[tui-pty]"]
 dev = [
