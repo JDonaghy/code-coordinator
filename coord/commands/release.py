@@ -20,12 +20,15 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
 from coord import restart_cmd
 from coord.commands._common import _CONFIG_OPTION
+
+if TYPE_CHECKING:
+    from coord.release_gate import ShaComparator
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -4463,7 +4466,22 @@ release_group.add_command(release_preflight, name="preflight")
 # report's injectable ``fetch=`` seam.
 
 
-def _sha_ancestry_comparator(repo_path_opt: str | None) -> "Any":
+def _release_gate_actor() -> str:
+    """Who is running ``coord release gate --override`` — same pattern as
+    ``coord.commands.gate_a._actor``: the local OS username, best-effort.
+
+    Populates :attr:`~coord.release_gate.GateOverride.by` (previously always
+    ``None``, so the verdict's rendered ``by=unknown`` branch was the only
+    one ever reachable) and the audit row's ``actor`` field."""
+    import getpass  # noqa: PLC0415
+
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 — no passwd entry in some containers
+        return "unknown"
+
+
+def _sha_ancestry_comparator(repo_path_opt: str | None) -> "ShaComparator":
     """The real ``sha_is_at_or_after`` for :func:`coord.release_gate.
     evaluate_release_gate`: *release_sha* is an ancestor of (or equal to)
     *candidate_sha*, via ``git merge-base --is-ancestor`` run against
@@ -4496,6 +4514,27 @@ def _sha_ancestry_comparator(repo_path_opt: str | None) -> "Any":
     return _is_at_or_after
 
 
+def _require_bool(value: Any, *, field_name: str) -> bool:
+    """Reject anything that isn't literally ``True``/``False``.
+
+    #2096-review: a hand-authored ``--from-json`` payload is the realistic
+    failure mode here — ``"passed": "false"``, ``"0"``, ``"no"`` are all
+    non-empty strings, so Python's own ``bool(...)`` coercion turns every
+    one of them into ``True`` with no error at all. That would let a
+    genuinely-red lane (or an unverified/lane-failed bugbash run) read as a
+    clean PASS, silently, which is exactly the failure mode this whole gate
+    exists to prevent. ``isinstance`` (not ``bool(x) == x`` or similar) is
+    deliberate: ``1``/``0`` are also not acceptable spellings of a boolean
+    here, only the real thing.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{field_name!r} must be a JSON boolean (true/false), "
+            f"got {value!r} ({type(value).__name__})"
+        )
+    return value
+
+
 def _load_release_gate_observations(
     payload: dict,
 ) -> tuple[list, list]:
@@ -4509,7 +4548,7 @@ def _load_release_gate_observations(
         rg.LaneResult(
             lane=entry["lane"],
             sha=entry["sha"],
-            passed=bool(entry["passed"]),
+            passed=_require_bool(entry["passed"], field_name="lanes[].passed"),
             detail=entry.get("detail", ""),
             checked_at=entry.get("checked_at"),
         )
@@ -4519,7 +4558,9 @@ def _load_release_gate_observations(
         rg.BugbashRunRecord(
             sha=entry["sha"],
             new_findings=int(entry["new_findings"]),
-            verified=bool(entry.get("verified", True)),
+            verified=_require_bool(
+                entry.get("verified", True), field_name="bugbash[].verified",
+            ),
             ran_at=float(entry.get("ran_at", 0.0)),
             detail=entry.get("detail", ""),
         )
@@ -4671,7 +4712,36 @@ def release_gate_cmd(
         sha_is_at_or_after=_sha_ancestry_comparator(repo_path_opt),
     )
     if override_reason:
-        verdict = rg.apply_override(verdict, reason=override_reason)
+        actor = _release_gate_actor()
+        verdict = rg.apply_override(verdict, reason=override_reason, by=actor)
+        # #1251-style audit trail — mirrors `coord merge
+        # --override-human-required`'s own `record_audit(...)` call
+        # (coord/commands/merge.py) and `coord acceptance expected-red
+        # --clear`'s: an audited override must land somewhere durable and
+        # queryable (the audit log), not just stdout/--json, which nobody
+        # but the invoking operator's own terminal ever sees. Without this,
+        # an operator could override a release gate repeatedly with zero
+        # durable record of who did it, when, or why — the opposite of
+        # "audited".
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category="release_gate",
+            event_type="release_gate_override",
+            actor=actor,
+            summary=(
+                f"release gate override: {repo} @ {release_sha} — "
+                f"{override_reason}"
+            ),
+            repo=repo,
+            details={
+                "release_sha": release_sha,
+                "reason": override_reason,
+                "gate_passed": verdict.gate_passed,
+                "failing_steps": [s.name for s in verdict.failing_steps],
+            },
+        )
 
     if as_json:
         click.echo(_json.dumps(_gate_verdict_to_dict(verdict), indent=2, sort_keys=True))
