@@ -12,6 +12,8 @@ import httpx
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from coord.milestone_dispatch import OracleReadiness
+
 from coord import github_ops
 from coord.comments import (
     format_advisory,
@@ -112,7 +114,7 @@ class DispatchRefused(ValueError):
 
 def enforce_oracle_readiness(
     *, proposal_type: str, repo: Repo | None, config: Config, issue_number: int,
-) -> None:
+) -> "OracleReadiness | None":
     """#1138: hard-gate a ``type="work"`` dispatch on the issue-level oracle
     gate (:func:`coord.milestone_dispatch.issue_oracle_ready`) — refuses an
     issue that belongs to an oracle-opted-in milestone (Gate A already
@@ -147,11 +149,23 @@ def enforce_oracle_readiness(
     hard stop would turn a GitHub hiccup into a fleet-wide outage for every
     oracle-configured repo, which is a worse failure mode than the gap
     #1138 closes.
+
+    Returns the :class:`coord.milestone_dispatch.OracleReadiness` verdict
+    it computed (``None`` for every cheap-no-op / fail-open case above) —
+    (#2166) so ``dispatch()`` can build the worker-briefing oracle-loop
+    contract block from THIS SAME verdict instead of re-deriving "does a
+    slice exist" via a second, independent read. Before this, the gate
+    read the default branch over ``gh`` while the briefing separately
+    scanned the dispatching host's local base checkout for a manifest —
+    two sources that silently disagreed whenever that checkout lagged
+    (#2166's split-brain). One call, reused for both the pass/fail
+    decision and the text the worker sees, makes that disagreement
+    structurally impossible rather than merely rare.
     """
     if proposal_type != "work" or repo is None:
-        return
+        return None
     if not config.acceptance.has_driver(repo.name):
-        return
+        return None
 
     from coord import github_ops  # noqa: PLC0415
     from coord.milestone_dispatch import issue_oracle_ready  # noqa: PLC0415
@@ -159,7 +173,7 @@ def enforce_oracle_readiness(
     try:
         issue_data = github_ops.get_issue(repo.github, issue_number)
     except RuntimeError:
-        return
+        return None
 
     milestone_number = (issue_data.get("milestone") or {}).get("number")
     issue_labels = [lbl.get("name", "") for lbl in (issue_data.get("labels") or [])]
@@ -169,6 +183,7 @@ def enforce_oracle_readiness(
     )
     if readiness.reason is not None:
         raise DispatchRefused(readiness.reason)
+    return readiness
 
 
 def enforce_epic_dispatch_guard(
@@ -784,7 +799,11 @@ def dispatch(
     # a driver kind this install doesn't implement. Placed early / before
     # the TOS gate below so a refusal never depends on provider resolution
     # succeeding first.
-    enforce_oracle_readiness(
+    #
+    # #2166: the returned verdict is reused below to build the worker-
+    # briefing oracle-loop contract block — the SAME read this gate just
+    # used, not a second independent one — so the two can never disagree.
+    oracle_readiness = enforce_oracle_readiness(
         proposal_type=proposal.type, repo=repo, config=config,
         issue_number=proposal.issue_number,
     )
@@ -994,44 +1013,64 @@ def dispatch(
     # a milestone-level flag, so "driver configured for this repo" is the
     # signal, mirroring the tests/acceptance/ auto-seal above) AND this issue
     # already has an authored slice, OR (#3212) is exempted from one —
-    # oracle_loop_contract_block covers both and returns "" only when neither
-    # applies (e.g. before Gate A/#931 has run for it at all). An exemption
-    # waives the automated gate, not the design contract the milestone's
-    # mocks define, so the worker still needs the pointer — see
-    # oracle_loop_contract_block's docstring for the exempted-issue variant.
+    # oracle_loop_contract_block_for_slice covers both and returns "" only
+    # when neither applies (e.g. before Gate A/#931 has run for it at all).
+    # An exemption waives the automated gate, not the design contract the
+    # milestone's mocks define, so the worker still needs the pointer — see
+    # oracle_loop_contract_block_for_slice's docstring for the exempted-issue
+    # variant.
+    #
+    # #2166: this used to re-derive "does a slice exist" by scanning the
+    # dispatching HOST's local base checkout (`repo_root / search_root`) —
+    # a second, independent read from the #1138 gate above, which reads the
+    # default branch over `gh`. A stale base checkout (nothing refreshes it
+    # automatically — see docs/ORACLE_LOOP.md) made the two disagree: the
+    # gate let a dispatch through because the slice existed on the default
+    # branch, while this scan came back `""` because the local clone hadn't
+    # pulled it yet, silently sending the worker with no oracle contract at
+    # all. Now this builds the block from `oracle_readiness` — the EXACT
+    # verdict the gate above already computed — so there is only one read
+    # and the two can never diverge again.
     briefing_text = proposal.briefing
     if proposal.type == "work" and proposal.issue_number:
-        from pathlib import Path  # noqa: PLC0415
-
         from coord.state import issue_context_block  # noqa: PLC0415
 
         oracle_contract = ""
         if config.acceptance.has_driver(proposal.repo_name):
-            from coord.acceptance import oracle_loop_contract_block  # noqa: PLC0415
+            from coord.acceptance import (  # noqa: PLC0415
+                oracle_loop_contract_block_for_slice,
+            )
 
-            # #2896: the issue's slice may live under the shared repo-root
-            # tree (a directory-discovered driver, e.g. ms-37's cli-pytest
-            # suite) OR under an entrypoint-linked driver's own sibling
-            # `acceptance/` dir (e.g. ms-65's tui-tuidriver suite, relocated
-            # out of the repo root) — this dispatch call has no single path
-            # in hand to pick a route ahead of time (proposal.issue_number
-            # alone doesn't say which), so it tries every search root this
-            # repo declares and uses whichever one actually has the slice.
-            # A local checkout scan (no `gh`), so trying more than one root
-            # costs nothing but a stat/read against a directory that
-            # usually doesn't exist.
-            repo_root = Path(repo_path).expanduser()
-            for search_root in config.acceptance.acceptance_search_roots(
-                proposal.repo_name
-            ):
-                oracle_contract = oracle_loop_contract_block(
-                    repo_root / search_root,
+            if oracle_readiness is not None and oracle_readiness.applies:
+                oracle_contract = oracle_loop_contract_block_for_slice(
                     proposal.repo_name,
                     proposal.issue_number,
-                    acceptance_dirname=search_root,
+                    has_slice=oracle_readiness.has_slice,
+                    exempt=oracle_readiness.exempt,
+                    ms_dir=oracle_readiness.ms_dir,
+                    acceptance_dirname=oracle_readiness.acceptance_dirname,
                 )
-                if oracle_contract:
-                    break
+                # #2166 acceptance criterion: a gate must be able to fail,
+                # and unconfirmed success is a defect — if the gate's own
+                # verdict says there's a slice (or an exemption) to point
+                # at, rendering the block must not silently come back
+                # empty. That combination can only mean a bug in the
+                # renderer above, not "no slice yet" (which `applies`/
+                # `has_slice`/`exempt` already ruled out) — refuse loudly
+                # rather than dispatch a worker with a hollow briefing.
+                if (
+                    oracle_readiness.has_slice or oracle_readiness.exempt
+                ) and not oracle_contract:
+                    raise DispatchRefused(
+                        f"#2166: internal inconsistency building the "
+                        f"oracle-loop briefing for {proposal.repo_name}#"
+                        f"{proposal.issue_number} — the gate found a "
+                        "slice/exemption (ms_dir="
+                        f"{oracle_readiness.ms_dir!r}) but rendering the "
+                        "contract block came back empty. Refusing rather "
+                        "than dispatching a worker with no oracle "
+                        "contract."
+                    )
 
         # #1720: dispatch-time file-overlap fence — the union of file
         # footprints of every OTHER currently-running work-like assignment

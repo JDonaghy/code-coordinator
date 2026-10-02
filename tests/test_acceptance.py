@@ -48,6 +48,7 @@ from coord.acceptance import (
     ms_dir_for_exempt_issue,
     ms_dir_for_issue,
     oracle_loop_contract_block,
+    oracle_loop_contract_block_for_slice,
     oracle_loop_contract_reviewer_note,
     parse_manifest_text,
     resolve_for_path,
@@ -1464,6 +1465,63 @@ class TestOracleLoopContractBlock:
         assert "tui/tests/acceptance/ms65/mocks/" in block
         assert "edit `tui/tests/acceptance/**`" in block
         # Never names the (wrong, unrelated) repo-root default.
+        assert "`tests/acceptance/" not in block
+
+
+class TestOracleLoopContractBlockForSlice:
+    """(#2166) :func:`oracle_loop_contract_block_for_slice` renders the
+    exact same text :func:`oracle_loop_contract_block` does, but from an
+    already-resolved verdict (no local checkout) — the version
+    `coord.dispatch.dispatch` now uses so the worker-briefing block can
+    never drift from the #1138 gate's own read."""
+
+    def test_empty_when_ms_dir_missing(self) -> None:
+        # OracleReadiness.applies == False (e.g. no milestone) -> ms_dir
+        # is "" -> nothing to render, same as oracle_loop_contract_block's
+        # "no manifest found" case.
+        assert oracle_loop_contract_block_for_slice(
+            "api", 945, has_slice=False, exempt=False, ms_dir="",
+        ) == ""
+
+    def test_empty_when_neither_slice_nor_exempt(self) -> None:
+        # A milestone resolved (ms_dir set) but this issue has no slice and
+        # isn't exempted — the #1138 gate's own "no acceptance slice yet"
+        # refusal covers this case; nothing to point the worker at.
+        assert oracle_loop_contract_block_for_slice(
+            "api", 945, has_slice=False, exempt=False, ms_dir="ms-25",
+        ) == ""
+
+    def test_renders_same_text_as_the_local_checkout_scan(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms25").mkdir(parents=True)
+        (root / "ms25" / "manifest.yml").write_text("tests:\n  ms25::a: 945\n")
+        from_disk = oracle_loop_contract_block(root, "api", 945)
+        from_verdict = oracle_loop_contract_block_for_slice(
+            "api", 945, has_slice=True, exempt=False, ms_dir="ms25",
+            acceptance_dirname=ACCEPTANCE_DIRNAME,
+        )
+        assert from_disk == from_verdict
+        assert "coord acceptance run --repo api --issue 945" in from_verdict
+
+    def test_renders_the_exempt_variant(self) -> None:
+        block = oracle_loop_contract_block_for_slice(
+            "api", 1125, has_slice=False, exempt=True, ms_dir="ms-37",
+            acceptance_dirname="tests/acceptance",
+        )
+        assert "(exempted issue, #3212)" in block
+        assert "tests/acceptance/ms-37/contract.md" in block
+        # The exempted variant deliberately drops the "run coord
+        # acceptance run" instruction (there is no slice of its own).
+        assert "coord acceptance run" not in block
+
+    def test_acceptance_dirname_names_a_relocated_slice(self) -> None:
+        block = oracle_loop_contract_block_for_slice(
+            "coord-tui", 2282, has_slice=True, exempt=False, ms_dir="ms-65",
+            acceptance_dirname="tui/tests/acceptance/",
+        )
+        assert "tui/tests/acceptance/ms-65/contract.md" in block
         assert "`tests/acceptance/" not in block
 
 

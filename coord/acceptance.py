@@ -877,6 +877,66 @@ def oracle_loop_contract_block(
     if ms_dir is None:
         return ""
 
+    return _render_oracle_contract_block(
+        repo_name, issue_number, ms_dir, acceptance_dirname, exempt=exempt,
+    )
+
+
+def oracle_loop_contract_block_for_slice(
+    repo_name: str,
+    issue_number: int,
+    *,
+    has_slice: bool,
+    exempt: bool,
+    ms_dir: str,
+    acceptance_dirname: str = ACCEPTANCE_DIRNAME,
+) -> str:
+    """(#2166) The exact same worker-briefing contract text
+    :func:`oracle_loop_contract_block` renders, but driven by an already-
+    resolved verdict (*has_slice*/*exempt*/*ms_dir*/*acceptance_dirname*)
+    instead of scanning a local checkout for one.
+
+    Exists so :func:`coord.dispatch.dispatch` can build the briefing block
+    from the EXACT SAME read :func:`coord.milestone_dispatch.
+    issue_oracle_ready` already did for the #1138 hard gate (default
+    branch, over ``gh``, one memoised fetch seam) rather than a second,
+    independent local-checkout scan that can silently disagree with it —
+    the #2166 split-brain: a dispatching host whose base checkout lagged
+    the default branch by a few commits had this (the old
+    ``oracle_loop_contract_block(Path, ...)`` call) come back ``""`` while
+    the gate, reading the default branch directly, had already let the
+    issue through — so the worker got dispatched with no oracle contract
+    at all, silently.
+
+    Returns ``""`` when *ms_dir* is empty (the gate never resolved a
+    milestone for this issue — ``OracleReadiness.applies`` was ``False``)
+    or neither *has_slice* nor *exempt* is set (no contract to point at
+    yet). Callers that have a full ``OracleReadiness`` in hand should pass
+    its ``has_slice``/``exempt``/``ms_dir``/``acceptance_dirname`` fields
+    straight through.
+    """
+    if not ms_dir or not (has_slice or exempt):
+        return ""
+    return _render_oracle_contract_block(
+        repo_name, issue_number, ms_dir, acceptance_dirname, exempt=exempt,
+    )
+
+
+def _render_oracle_contract_block(
+    repo_name: str,
+    issue_number: int,
+    ms_dir: str,
+    acceptance_dirname: str,
+    *,
+    exempt: bool,
+) -> str:
+    """Shared template for :func:`oracle_loop_contract_block` (local-
+    checkout scan) and :func:`oracle_loop_contract_block_for_slice`
+    (gate-verdict-driven, #2166) — ONE rendering so the text a worker sees
+    can never drift between the two slice-presence sources, even though
+    which SOURCE decided "there is a slice" differs between the two
+    callers.
+    """
     dirname = acceptance_dirname.rstrip("/") if acceptance_dirname else ACCEPTANCE_DIRNAME
     contract_path = f"{dirname}/{ms_dir}/contract.md"
     mocks_dir = f"{dirname}/{ms_dir}/mocks"
