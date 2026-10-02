@@ -5316,6 +5316,103 @@ class TestMarkNotifiedReleasesLeakedReviewClaim:
         assert state.claim_review_dispatch("w1") is False
 
 
+# ── #2468: atomic review-POSTING claim ───────────────────────────────────────
+
+
+class TestReviewPostClaim:
+    """`claim_review_post` / `release_review_post_claim`: closes the #2468
+    incident — the identical "Review Complete" comment posted twice, 4
+    seconds apart, on #2288's round-4 review. `coord.notify.
+    _try_parse_and_post_review` (the live completion path) and
+    `coord.notify.post_orphaned_review_findings` (the orphan sweep) both
+    query "done review, `review_posted_at IS NULL`" and only set
+    `review_posted_at` AFTER posting — this is the DB-level conditional
+    insert, mirroring #3113's `claim_review_dispatch`, that makes exactly one
+    of two racing callers win the right to post."""
+
+    def test_second_claim_for_the_same_assignment_loses(self, coord_db) -> None:
+        assert state.claim_review_post("rv1") is True
+        # Same DB, same key — simulates the live completion path and the
+        # orphan sweep racing each other for the SAME review assignment: the
+        # second caller must lose deterministically, never also post.
+        assert state.claim_review_post("rv1") is False
+
+    def test_claims_for_different_assignments_both_win(self, coord_db) -> None:
+        assert state.claim_review_post("rv1") is True
+        assert state.claim_review_post("rv2") is True
+
+    def test_release_then_reclaim_succeeds(self, coord_db) -> None:
+        """A failed post (both `gh pr review` and the issue-comment fallback
+        raised) must not permanently strand the row unposted — releasing the
+        claim lets a later retry win it again."""
+        assert state.claim_review_post("rv1") is True
+        state.release_review_post_claim("rv1")
+        assert state.claim_review_post("rv1") is True
+
+    def test_release_is_idempotent(self, coord_db) -> None:
+        state.release_review_post_claim("never-claimed")  # must not raise
+        assert state.claim_review_post("never-claimed") is True
+
+    def test_empty_assignment_id_always_wins(self, coord_db) -> None:
+        # Mirrors claim_review_dispatch's own empty-id short-circuit —
+        # nothing to key a claim on, so never block.
+        assert state.claim_review_post("") is True
+        assert state.claim_review_post("") is True
+
+    def test_successful_post_never_releases_the_claim(self, coord_db) -> None:
+        """Deliberately asymmetric with the dispatch-claim's release-on-
+        terminal-status behaviour: a successful post leaves the claim in
+        place forever. That's harmless (`review_posted_at` being set already
+        excludes the row from both callers' candidate queries), and NOT
+        releasing it means a slow concurrent second caller that only checks
+        the claim table — never GitHub itself — can't somehow still post a
+        duplicate after the winner's `mark_review_posted` call lands."""
+        assert state.claim_review_post("rv1") is True
+        state.mark_review_posted("rv1")
+        # No explicit release call for the success path — the claim is
+        # still held, so a second attempt still loses.
+        assert state.claim_review_post("rv1") is False
+
+
+class TestReviewPostClaimRacesLiveAndOrphanPaths:
+    """Issue #2468's own scope note: "Add a test that races the two paths."
+    Simulates `_try_parse_and_post_review` (the live completion path) and
+    `post_orphaned_review_findings` (the orphan sweep) both reaching the
+    claim for the SAME assignment — exactly the #2288 round-4 incident."""
+
+    def test_only_one_of_two_racing_posters_wins(self, coord_db) -> None:
+        aid = "rv-2288-round4"
+
+        live_path_won = state.claim_review_post(aid)
+        orphan_sweep_won = state.claim_review_post(aid)
+
+        # Exactly one of the two callers gets to post; the other must skip
+        # rather than writing the byte-identical GitHub comment a second
+        # time.
+        assert live_path_won is True
+        assert orphan_sweep_won is False
+        assert (live_path_won, orphan_sweep_won).count(True) == 1
+
+    def test_loser_retries_successfully_after_winner_fails_to_post(
+        self, coord_db
+    ) -> None:
+        """If the winner's actual GitHub post then fails (e.g. a transient
+        `gh` error) and releases its claim, a subsequent attempt — standing
+        in for the next drain pass — must be able to win and post instead of
+        the findings being silently lost forever."""
+        aid = "rv-2288-round4"
+
+        assert state.claim_review_post(aid) is True
+        assert state.claim_review_post(aid) is False
+
+        # Winner's post failed; it releases per `claim_review_post`'s own
+        # contract (release ONLY on a failed post attempt).
+        state.release_review_post_claim(aid)
+
+        # A later pass can now win and post.
+        assert state.claim_review_post(aid) is True
+
+
 # ── #3333: atomic smoke fan-out dispatch claim ───────────────────────────────
 
 

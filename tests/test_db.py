@@ -2472,7 +2472,14 @@ class TestUatStateAndReasonColumns:
 # #3470 bumped this to (21, 98): two new `assignments` indexes appended to
 # `_SCHEMA_SQL` (not a column — `_MIGRATE_ADD_COLUMNS`'s length is
 # unchanged), for the `issue-cost` report's full-history scan.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (21, 98)
+# #2468 bumped this to (22, 98): a new `review_post_claims` TABLE (not a
+# column — `_MIGRATE_ADD_COLUMNS`'s length is unchanged at 98, so only the
+# version moved, to force `_ensure_schema`'s `CREATE TABLE IF NOT EXISTS` to
+# run once more on an existing database) — same shape as #3113's
+# `review_claims` / #3333's `smoke_claims` bumps above. Closes the race where
+# the live review-completion path and the orphan sweep both see
+# `review_posted_at IS NULL` and both post the identical GitHub comment.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (22, 98)
 
 
 class TestMigrateAddColumnsVersionGuard:

@@ -2871,6 +2871,161 @@ def release_review_claim_if_row_is_review(assignment_id: str) -> None:
         pass
 
 
+# ── Atomic review-POSTING claim (#2468) ──────────────────────────────────────
+
+
+def claim_review_post(assignment_id: str) -> bool:
+    """Atomically claim the right to POST a review's findings for
+    *assignment_id* (#2468).
+
+    Returns ``True`` when THIS call wins the claim (no other in-flight claim
+    exists for the same review assignment), ``False`` when another caller
+    already holds it — the caller should skip posting entirely rather than
+    also writing a duplicate comment.
+
+    ``coord.notify._try_parse_and_post_review`` (the live completion path)
+    and ``coord.notify.post_orphaned_review_findings`` (the orphan sweep)
+    both query "done review assignments with ``review_posted_at IS NULL``"
+    as their candidate set and only set ``review_posted_at`` AFTER the
+    GitHub post succeeds — a classic check-then-act gap. Two coordinator
+    passes racing each other (the #2468 incident: the identical "Review
+    Complete" comment posted twice, 4 seconds apart, on #2288's round-4
+    review) each saw ``review_posted_at IS NULL`` and both posted. This is
+    the DB-level conditional insert that closes the gap — a single
+    ``INSERT ... OR IGNORE`` is atomic even across two separate
+    processes/machines, mirroring :func:`claim_review_dispatch` exactly,
+    but for *posting* a review rather than *dispatching* one.
+
+    Routes to the daemon when ``board_service`` is configured (the claim
+    table lives on the shared canonical DB, same as ``assignments``), else
+    writes the local DB directly.
+
+    Released by :func:`release_review_post_claim` — call sites are both
+    posting functions above, ONLY on a failed post attempt, so a legitimate
+    retry of a transient GitHub/``gh`` failure is never permanently
+    stranded. A successful post never releases the claim: once
+    ``review_posted_at`` is set, the row is excluded from both callers'
+    candidate queries forever, so a lingering claim row is harmless.
+    """
+    if not assignment_id:
+        return True
+    svc = _board_service()
+    resp = _route_write(svc, "/review-post-claim", {"assignment_id": assignment_id})
+    if resp is not None:
+        return bool(resp.get("claimed", False))
+    return _claim_review_post_local(assignment_id)
+
+
+def _claim_review_post_local(assignment_id: str) -> bool:
+    """Local-DB write for :func:`claim_review_post`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP — mirrors :func:`_claim_review_dispatch_local` exactly, including
+    its ``retry_on_locked`` + row-scoped :func:`coord.db.undo_pending_write`
+    treatment: a `database is locked` collision is absorbed rather than
+    raised straight out, and if the `INSERT OR IGNORE` applied but the
+    following `conn.commit()` raised, the closure undoes its own
+    just-inserted row before re-raising so a commit failure never leaves a
+    claim nobody actually won sitting on the shared connection for an
+    unrelated handler's next commit to durably persist (the vimcode#1086
+    incident :func:`_claim_review_dispatch_local`'s own docstring
+    describes, for the sibling table).
+    """
+
+    def _write() -> int:
+        conn = get_connection()
+        claimed_at = time.time()
+        inserted = 0
+        try:
+            cur = sql.insert_ignore(
+                conn, "review_post_claims", ["assignment_id", "claimed_at"],
+                (assignment_id, claimed_at),
+            )
+            inserted = cur.rowcount or 0
+            conn.commit()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            if inserted:
+                undo_pending_write(
+                    conn, exc,
+                    undo=lambda: sql.execute(
+                        conn,
+                        "DELETE FROM review_post_claims "
+                        "WHERE assignment_id=? AND claimed_at=?",
+                        (assignment_id, claimed_at),
+                    ),
+                )
+            raise
+        return inserted
+
+    return retry_on_locked(_write) > 0
+
+
+def release_review_post_claim(assignment_id: str) -> None:
+    """Release a claim taken by :func:`claim_review_post`, when posting the
+    review's findings failed (#2468).
+
+    Idempotent — deleting an absent row is a no-op. Routes to the daemon
+    exactly like :func:`claim_review_post` does: a thin client that claimed
+    via the ``/review-post-claim`` POST above must release through the same
+    seam, or the claim it took on the daemon's canonical DB would never
+    actually clear.
+
+    Deliberately NOT called on a successful post — see
+    :func:`claim_review_post`'s docstring for why a lingering claim after
+    success is harmless.
+    """
+    if not assignment_id:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/review-post-claim-release", {"assignment_id": assignment_id}
+    )
+    if resp is not None:
+        return
+    _release_review_post_claim_local(assignment_id)
+
+
+def _release_review_post_claim_local(assignment_id: str) -> None:
+    """Local-DB write for :func:`release_review_post_claim`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP. Same ``retry_on_locked`` + undo-this-row-on-commit-failure
+    treatment as :func:`_release_review_dispatch_claim_local` — see that
+    function's docstring for why the undo is a compensating statement
+    rather than any transaction-level rollback.
+    """
+
+    def _write() -> None:
+        conn = get_connection()
+        row = sql.execute(
+            conn,
+            "SELECT claimed_at FROM review_post_claims WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        claimed_at = row[0] if row is not None else None
+        deleted = 0
+        try:
+            cur = sql.execute(
+                conn,
+                "DELETE FROM review_post_claims WHERE assignment_id=?",
+                (assignment_id,),
+            )
+            deleted = cur.rowcount or 0
+            conn.commit()
+        except sql.driver_errors() as exc:  # #2784: was sqlite3.OperationalError only
+            if deleted and claimed_at is not None:
+                undo_pending_write(
+                    conn, exc,
+                    undo=lambda: sql.insert_ignore(
+                        conn, "review_post_claims", ["assignment_id", "claimed_at"],
+                        (assignment_id, claimed_at),
+                    ),
+                )
+            raise
+
+    retry_on_locked(_write)
+
+
 # ── Atomic smoke fan-out dispatch claim (#3333) ──────────────────────────────
 
 
