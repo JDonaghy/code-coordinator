@@ -38,18 +38,21 @@ from coord.drive_queue import (
     STATE_WAITING,
     UNREACHABLE_WAIT_MIN_DEFERRALS,
     BoardView,
+    ExistingPrMatch,
     IssueFacts,
     ProbeResult,
     QueueEntry,
     QueueError,
     add_preflight_notice,
     build_board_view,
+    conventional_branch_patterns,
     detect_unreachable_waits,
     compute_leg_counts,
     dispatch_type_for_labels,
     effective_max_fix_rounds,
     entries_from_rows,
     entry_key,
+    existing_pr_relaunch_remedy,
     find_cycle,
     is_empty_branch_death_reason,
     is_merge_gate_block_reason,
@@ -7435,6 +7438,77 @@ def test_merge_gate_remedy_command_is_the_safe_inspect_fallback_for_none_and_non
     ordinary = "no candidate machine available for claude-coordinator#1650"
     assert is_merge_gate_block_reason(ordinary) is False
     assert merge_gate_remedy_command(ordinary, REPO, 1650) == merge_plan_inspect_command(REPO)
+
+
+# ── #2377: don't relaunch over an already-fixed PR ──────────────────────────
+#
+# The live incident: claude-coordinator#2283's entry was `blocked` on the
+# #2363 empty-branch-death signature, and the recommended remedy was a blind
+# `coord drive-queue remove 2283 && coord drive-queue add 2283` — blind to PR
+# #2353 already carrying the correctly re-authored, all-green work. These
+# cover the two PURE functions the fix is built from; `tests/
+# test_cli_drive_queue.py` covers the `add`-time refusal and the tick's
+# escalation-command override end to end.
+
+
+def test_conventional_branch_patterns_match_both_named_shapes():
+    patterns = conventional_branch_patterns(2283)
+    assert "issue-2283-*" in patterns
+    assert "test-author-ms-*-slice-2283" in patterns
+    import fnmatch
+
+    # The real #2283 incident's own branch name (a work dispatch would use
+    # this shape with a different, descriptive slug).
+    assert any(
+        fnmatch.fnmatch("issue-2283-drive-queue-reliability", p) for p in patterns
+    )
+    # The oracle-loop JIT acceptance-author shape, wildcarded on milestone.
+    assert any(fnmatch.fnmatch("test-author-ms-65-slice-2283", p) for p in patterns)
+    # Never a false positive on an unrelated, merely-similar issue number.
+    assert not any(fnmatch.fnmatch("issue-22830-foo", p) for p in patterns)
+    assert not any(
+        fnmatch.fnmatch("test-author-ms-65-slice-22830", p) for p in patterns
+    )
+
+
+def test_existing_pr_relaunch_remedy_is_none_without_a_match():
+    """#2377's unconditional default: no PR found on the conventional branch
+    name(s) — start fresh, today's only behaviour, unchanged."""
+    assert existing_pr_relaunch_remedy(REPO, 2283, None) is None
+
+
+def test_existing_pr_relaunch_remedy_recommends_merging_a_green_pr():
+    match = ExistingPrMatch(
+        number=2353, branch="test-author-ms-65-slice-2283",
+        url="https://github.com/example/claude-coordinator/pull/2353",
+        all_green=True,
+    )
+    remedy = existing_pr_relaunch_remedy(REPO, 2283, match)
+    assert remedy is not None
+    assert remedy["command_or_action"] == f"coord merge --only {REPO}#2283"
+    assert "2353" in remedy["what_happens"]
+    assert "drive-queue remove" not in remedy["command_or_action"]
+    assert "drive-queue add" not in remedy["command_or_action"]
+
+
+def test_existing_pr_relaunch_remedy_refuses_the_relaunch_even_when_red():
+    """A red/stale-checks PR is NOT a green light to requeue either — #2377's
+    design note: something else may already be mid-fixing that branch, and a
+    fresh drive on top of it risks clobbering it mid-flight. The gate must
+    be able to say "not ready" too: this match is deliberately `all_green=
+    False`, so the assertion below only holds if the function can actually
+    produce the non-merge branch."""
+    match = ExistingPrMatch(
+        number=2353, branch="test-author-ms-65-slice-2283",
+        url="https://github.com/example/claude-coordinator/pull/2353",
+        all_green=False,
+    )
+    remedy = existing_pr_relaunch_remedy(REPO, 2283, match)
+    assert remedy is not None
+    assert remedy["command_or_action"] != f"coord merge --only {REPO}#2283"
+    assert "coord merge --only" not in remedy["command_or_action"]
+    assert "drive-queue remove" not in remedy["command_or_action"]
+    assert "2353" in remedy["what_happens"]
 
 
 class TestDriveQueueListReadDistinguishesFailureFromEmpty:

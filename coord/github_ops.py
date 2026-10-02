@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import json
 import re
 import socket
@@ -2343,6 +2344,46 @@ def find_pr_for_branch(repo: str, branch: str) -> dict | None:
         "--limit", "1",
         default=[], caller="github_ops.find_pr_for_branch")
     return items[0] if items else None
+
+
+def find_open_pr_for_branch_patterns(repo: str, patterns: Sequence[str]) -> dict | None:
+    """Return the first OPEN PR on *repo* whose head branch matches one of
+    *patterns* (``fnmatch`` globs), or ``None`` when none match or ``gh``
+    fails (#2377).
+
+    Unlike :func:`find_pr_for_branch` (an exact ``gh pr list --head
+    <branch>`` match), the caller here does not know the exact branch name
+    ahead of time — only its conventional SHAPE (see
+    `coord.drive_queue.conventional_branch_patterns`), since a worker's real
+    branch carries a free-text descriptive suffix a caller cannot predict.
+    This lists every OPEN PR once and matches client-side instead.
+
+    Fail-open like every other read in this module: a transient ``gh``
+    error returns ``None`` — "no match found" — the same answer a caller
+    gets when no PR actually exists. Both degrade to the caller's existing
+    "nothing found, proceed" default, which is the deliberately safe
+    posture here: a false negative (missed an existing PR) costs an
+    operator a wasted relaunch; a false block on a healthy queue would be
+    strictly worse.
+    """
+    try:
+        raw = _gh(
+            "pr", "list", "--repo", repo, "--state", "open",
+            "--json", "number,headRefName,url", "--limit", "200",
+            caller="github_ops.find_open_pr_for_branch_patterns",
+        )
+    except RuntimeError:
+        return None
+    prs = _json_loads_or(raw, default=[])
+    if not isinstance(prs, list):
+        return None
+    for pr in prs:
+        if not isinstance(pr, dict):
+            continue
+        branch = str(pr.get("headRefName") or "")
+        if branch and any(fnmatch.fnmatch(branch, pattern) for pattern in patterns):
+            return pr
+    return None
 
 
 def get_pr_state_for_branch(repo: str, branch: str) -> str | None:

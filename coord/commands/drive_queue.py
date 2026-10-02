@@ -69,6 +69,7 @@ from coord.drive_queue import (
     STATE_WAITING,
     TERMINAL_QUEUE_STATES,
     BoardView,
+    ExistingPrMatch,
     IssueFacts,
     ProbeResult,
     QueueEntry,
@@ -79,11 +80,13 @@ from coord.drive_queue import (
     add_preflight_notice,
     apply_gate_status,
     build_board_view,
+    conventional_branch_patterns,
     detect_unreachable_waits,
     diagnose_blocked_after,
     effective_max_fix_rounds,
     entries_from_rows,
     entry_key,
+    existing_pr_relaunch_remedy,
     find_cycle,
     fired_holds,
     flag_shadows_config_warning,
@@ -462,6 +465,26 @@ def drive_queue_add(
             f"\nwarning: {entry_key(repo, issue)} was scope=fleet — this add did not "
             f"repeat --scope {HOLD_SCOPE_FLEET}, so its gate is now scope={hold_scope} "
             "(entries-only). Pass --scope fleet again if the fleet-wide stop was still needed."
+        )
+
+    # #2377: refuse OUTRIGHT — never just advise — when an OPEN PR already
+    # exists on this entry's conventional branch name(s). The live incident
+    # this closes (claude-coordinator#2283): the one remedy a `blocked`/
+    # `failed` entry's own recommended fix actually runs is `coord
+    # drive-queue remove <k> && coord drive-queue add <k>` — `remove` drops
+    # the row entirely, so by the time THIS `add` runs there is no
+    # `previous` state left to condition the check on, only GitHub's own
+    # live truth. Checked on every `add` call, not only an upsert over a
+    # stuck row, for exactly that reason. Merging (or fixing forward) a
+    # discovered PR is deliberately left to the operator — see
+    # `existing_pr_relaunch_remedy`'s own docstring.
+    existing_match = _existing_pr_match(config_path, repo, issue)
+    existing_remedy = existing_pr_relaunch_remedy(repo, issue, existing_match)
+    if existing_remedy is not None:
+        raise click.ClickException(
+            f"refusing to queue {entry_key(repo, issue)} — "
+            f"{existing_remedy['what_happens']} Run instead: "
+            f"{existing_remedy['command_or_action']}"
         )
 
     # #2247: predicted file overlap ORDERS, never refuses. Anything that goes
@@ -898,6 +921,59 @@ def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
     if repo_cfg is None:
         return None
     return str(repo_cfg.github or ""), str(getattr(repo_cfg, "default_branch", "") or "main")
+
+
+def _existing_pr_match(
+    config_path: Path, repo: str, issue: int,
+) -> "ExistingPrMatch | None":
+    """#2377: resolve *repo*#*issue*'s conventional-branch PR, if any, to a
+    go/no-go CI verdict — the one place that owns the `gh pr list` + checks
+    read `coord.drive_queue.ExistingPrMatch` stays pure of.
+
+    Fail-open at every layer (unreadable config, no GitHub slug, `gh`
+    error, unreadable checks) — the same posture #2247's overlap prediction
+    takes: a false "nothing found" costs an operator a wasted relaunch, but
+    a false block on a healthy queue would be strictly worse (it IS the
+    queue). `coord.github_ops.find_open_pr_for_branch_patterns` and
+    `coord.ci_github.GitHubCi.list_checks_for_pr` already fail open on a
+    transient `gh` error on their own; this only adds the same posture
+    around the config/slug lookup wrapping them.
+    """
+    coordinates = _repo_coordinates(config_path, repo)
+    if coordinates is None:
+        return None
+    repo_github, _base_branch = coordinates
+    if not repo_github:
+        return None
+    try:
+        from coord import github_ops  # noqa: PLC0415
+
+        pr = github_ops.find_open_pr_for_branch_patterns(
+            repo_github, conventional_branch_patterns(issue)
+        )
+    except Exception:  # noqa: BLE001 — fail-open, see docstring
+        pr = None
+    if not pr:
+        return None
+    number = pr.get("number")
+    if not isinstance(number, int):
+        return None
+    try:
+        from coord.ci_github import GitHubCi  # noqa: PLC0415
+        from coord.ci_store import failed_checks, in_flight_checks  # noqa: PLC0415
+
+        checks = GitHubCi().list_checks_for_pr(repo_github, number)
+    except Exception:  # noqa: BLE001 — fail-open: an unreadable check list
+        # is not evidence of green OR red — treat it the same as "no checks
+        # reported", which `all_green` below already reads as not-green.
+        checks = []
+    all_green = bool(checks) and not failed_checks(checks) and not in_flight_checks(checks)
+    return ExistingPrMatch(
+        number=number,
+        branch=str(pr.get("headRefName") or ""),
+        url=str(pr.get("url") or ""),
+        all_green=all_green,
+    )
 
 
 def _predict_overlap(
@@ -6299,7 +6375,13 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     )
 
 
-def _blocked_escalation_command(entry: QueueEntry | None, key: str, reason: str) -> str:
+def _blocked_escalation_command(
+    entry: QueueEntry | None,
+    key: str,
+    reason: str,
+    *,
+    config_path: Path | None = None,
+) -> str:
     """The command a `blocked`/`oscillating` escalation should propose
     (#3016) — `_requeue_command` ONLY for a genuinely never-dispatched entry;
     a gate-specific remedy (or the safe read-only inspect fallback) whenever
@@ -6315,11 +6397,33 @@ def _blocked_escalation_command(entry: QueueEntry | None, key: str, reason: str)
     one place that maps a merge-gate reason to its safe one-line fix (or, if
     none is known blind, the inspect command); this only decides WHICH of
     the two families applies.
+
+    #2377: even when nothing names a merge-gate block, "nothing left to
+    lose" from a blind requeue is only true when nothing ELSE has since
+    fixed this entry by hand — the claude-coordinator#2283 incident: a
+    manual `coord acceptance author` run outside the drive loop had already
+    produced a green, ready-to-merge PR for this exact entry while it sat
+    `blocked` on the empty-branch-death signature. So before falling back to
+    `_requeue_command`, check GitHub for an OPEN PR on this entry's
+    conventional branch name(s) and propose THAT remedy instead — merge it
+    when every check is green, inspect it otherwise — never the requeue.
+    *config_path* is optional (defaults to no check, i.e. today's unchanged
+    behaviour) purely so every OTHER existing caller/test of this function
+    that has no config to hand keeps working unchanged; the real `tick`
+    call sites below always pass their own.
     """
     if is_merge_gate_block_reason(reason):
         parsed = parse_key(key)
         if parsed is not None:
             return merge_gate_remedy_command(reason, parsed[0], parsed[1])
+    if config_path is not None:
+        parsed = parse_key(key)
+        if parsed is not None:
+            repo, issue = parsed
+            match = _existing_pr_match(config_path, repo, issue)
+            remedy = existing_pr_relaunch_remedy(repo, issue, match)
+            if remedy is not None:
+                return remedy["command_or_action"]
     return _requeue_command(entry, key)
 
 
@@ -7121,7 +7225,9 @@ def drive_queue_tick(
                     f"{entry.position if entry else '?'} | after="
                     f"{','.join(entry.after) if entry and entry.after else '(none)'}"
                 ),
-                command=_blocked_escalation_command(entry, item.key, item.reason),
+                command=_blocked_escalation_command(
+                    entry, item.key, item.reason, config_path=config_path,
+                ),
             )
 
         # #2230: an entry #2230's sweep would have resumed, but has already
@@ -7148,7 +7254,9 @@ def drive_queue_tick(
                     f"/{MAX_BLOCKED_RESUMES} | position="
                     f"{entry.position if entry else '?'}"
                 ),
-                command=_blocked_escalation_command(entry, item.key, item.reason),
+                command=_blocked_escalation_command(
+                    entry, item.key, item.reason, config_path=config_path,
+                ),
             )
 
         # #2806: a `blocked` entry #2230's sweep targeted this tick, but whose
@@ -7310,7 +7418,14 @@ def drive_queue_tick(
                 target.issue,
                 reason=reason,
                 gates=f"queue_state=blocked | attempts={attempts}",
-                command=_requeue_command(target, target.key),
+                # #2377: route through the same existing-PR check as the
+                # `plan.blocked`/`oscillating` escalations above — a launch
+                # subprocess failing to even start says nothing about
+                # whether a PR from an earlier attempt (or a manual
+                # recovery) already landed the fix.
+                command=_blocked_escalation_command(
+                    target, target.key, reason, config_path=config_path,
+                ),
             )
             # #2235 Phase 0: a launch that never reached tmux is #2235's own
             # `stick-demo#1` row. It blocks OUTSIDE the plan (the subprocess

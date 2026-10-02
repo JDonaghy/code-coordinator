@@ -4274,6 +4274,96 @@ def is_dispatch_failure_reason(reason: str | None) -> bool:
     return _is_dispatch_failure_reason(reason)
 
 
+# ── don't relaunch over an already-fixed PR (#2377) ─────────────────────────
+#
+# The live incident: claude-coordinator#2283's drive-queue entry was `blocked`
+# on exactly the #2363 empty-branch-death signature, and the decisions
+# report's recommended remedy was a blind `coord drive-queue remove 2283 &&
+# coord drive-queue add 2283` — blind to the fact that PR #2353 already
+# carried the correctly re-authored work, merged into no branch yet but every
+# CI check green. Relaunching would have, at best, wasted work re-authoring
+# what already existed, at worst clobbered it mid-flight. See the two
+# chokepoints both `coord drive-queue add` and the tick's escalation writer
+# (`coord.commands.drive_queue._blocked_escalation_command`) funnel through.
+
+
+def conventional_branch_patterns(issue: int) -> list[str]:
+    """The ``fnmatch`` glob(s) for *issue*'s conventional branch name(s)
+    (#2377) — the two shapes this repo's own dispatch convention and
+    `docs/ORACLE_LOOP.md` name, and deliberately ONLY these two (#2377 scopes
+    a third naming scheme to "add one when one is actually observed to need
+    it", not guessed ahead of time):
+
+    * ``issue-<n>-*`` — a plain ``type=work`` dispatch's branch. Globbed
+      because the suffix is a free-text, worker/dispatch-chosen slug (e.g.
+      this very issue's own branch, ``issue-2377-drive-queue-reliability-
+      a-blocked-entry``) that a caller checking a drive-queue row has no way
+      to predict ahead of time.
+    * ``test-author-ms-*-slice-<n>`` — an oracle-loop JIT acceptance-author
+      slice (`coord/test_author.py`'s ``target_branch``). Globbed on the
+      milestone number for the same reason: a blocked/failed QUEUE entry
+      does not reliably carry which epic/milestone its issue belongs to
+      without a live GitHub read of its own.
+    """
+    return [f"issue-{issue}-*", f"test-author-ms-*-slice-{issue}"]
+
+
+@dataclass(frozen=True)
+class ExistingPrMatch:
+    """An OPEN PR found on one of *issue*'s conventional branch names
+    (#2377), already resolved to a go/no-go CI verdict by the caller that
+    built it — :func:`coord.commands.drive_queue._existing_pr_match`, the
+    one place that owns the `gh pr list` + checks read this module stays
+    pure of.
+    """
+
+    number: int
+    branch: str
+    url: str
+    all_green: bool
+
+
+def existing_pr_relaunch_remedy(
+    repo: str, issue: int, match: "ExistingPrMatch | None"
+) -> dict[str, str] | None:
+    """#2377: the option (and `drive-queue add` refusal message) *match*
+    recommends INSTEAD OF a blind ``remove && add`` relaunch — or ``None``
+    when *match* is ``None`` (today's only behaviour unchanged: no PR on the
+    conventional branch name(s), start fresh).
+
+    Two shapes, both refusing the relaunch — a red/stale-checks PR is NOT a
+    green light to requeue either: something else may already be mid-fixing
+    that branch, and a fresh drive launched on top of it is exactly the "at
+    best wasted work, at worst clobbering it mid-flight" risk #2377 opens
+    with. Merging a discovered PR is deliberately NOT done here — surfacing
+    it (or refusing the relaunch) is enough; merging stays a `coord merge`
+    decision.
+    """
+    if match is None:
+        return None
+    key = entry_key(repo, issue)
+    if match.all_green:
+        return {
+            "label": "Merge existing PR",
+            "command_or_action": f"coord merge --only {key}",
+            "what_happens": (
+                f"PR #{match.number} ({match.branch}) already carries this "
+                "work with every check green — merge it instead of "
+                "relaunching a fresh drive over it."
+            ),
+        }
+    return {
+        "label": "Inspect existing PR",
+        "command_or_action": f"coord merge --plan --repo {repo}",
+        "what_happens": (
+            f"PR #{match.number} ({match.branch}) already exists for this "
+            "entry, but its checks are not all green — fix it forward (or "
+            "confirm by hand it is truly dead) before relaunching a fresh "
+            "drive over it."
+        ),
+    }
+
+
 # ── `add`-time preflight (#2339) ─────────────────────────────────────────────
 
 #: Board statuses a queue attempt can never move on its own — every launch

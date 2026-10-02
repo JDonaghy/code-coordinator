@@ -2564,6 +2564,49 @@ class TestGhJsonHelper:
         with patch("coord.github_ops._gh", return_value=""):
             assert github_ops.find_pr_for_branch("acme/api", "some-branch") is None
 
+    def test_find_open_pr_for_branch_patterns_matches_a_glob(self) -> None:
+        """#2377: the caller does not know the exact branch name ahead of
+        time, only its conventional SHAPE — `issue-<n>-*`/`test-author-ms-
+        *-slice-<n>` — so this matches client-side against every OPEN PR,
+        unlike `find_pr_for_branch`'s exact `--head` match."""
+        raw = json.dumps(
+            [
+                {"number": 10, "headRefName": "unrelated-branch", "url": "u1"},
+                {
+                    "number": 2353,
+                    "headRefName": "test-author-ms-65-slice-2283",
+                    "url": "u2",
+                },
+            ]
+        )
+        with patch("coord.github_ops._gh", return_value=raw):
+            found = github_ops.find_open_pr_for_branch_patterns(
+                "acme/api", ["issue-2283-*", "test-author-ms-*-slice-2283"]
+            )
+        assert found is not None
+        assert found["number"] == 2353
+
+    def test_find_open_pr_for_branch_patterns_returns_none_without_a_match(self) -> None:
+        raw = json.dumps([{"number": 10, "headRefName": "unrelated-branch", "url": "u1"}])
+        with patch("coord.github_ops._gh", return_value=raw):
+            found = github_ops.find_open_pr_for_branch_patterns(
+                "acme/api", ["issue-2283-*"]
+            )
+        assert found is None
+
+    def test_find_open_pr_for_branch_patterns_fails_open_on_a_gh_error(self) -> None:
+        """A transient `gh` failure must read as "no match found" — the
+        same answer as no PR existing — never raise and never block the
+        caller's own "proceed" default."""
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=github_ops.GhError("boom"),
+        ):
+            found = github_ops.find_open_pr_for_branch_patterns(
+                "acme/api", ["issue-2283-*"]
+            )
+        assert found is None
+
 
 class TestCreateLabel:
     """#1483: the seam behind `coord set-test-mode`'s label pre-creation."""
