@@ -1053,15 +1053,26 @@ def _missing_required_gates(config_path: Path, repo: str, issue: int) -> tuple[s
     gates are read live again a moment later; a false "satisfied" would
     reproduce the exact #3539 incident — advising ``coord merge --only``
     over a PR a live merge attempt still refuses.
+
+    The board comes from ``coord.board_service.read_board()``, NOT
+    ``coord.state.build_board()`` (#615/#906): `coord drive-queue add` has
+    no whole-command daemon reroute, so a thin client reading the local DB
+    here would see an empty board, resolve no decisions, and fail open to
+    "both gates missing" on every add — technically safe, uselessly noisy.
+    `read_board()` is the one place the local-vs-daemon decision is made
+    (GET /board on a thin client, the local DB otherwise), which is also
+    why no entry is needed in `tests/test_thin_client_board_audit.py`'s
+    ``COMMANDS_ALLOWLIST``: there is no direct local-board call site to
+    allowlist.
     """
     try:
         from coord import github_ops  # noqa: PLC0415
+        from coord.board_service import read_board  # noqa: PLC0415
         from coord.commands._common import _load_config  # noqa: PLC0415
         from coord.gates import build_gate_report  # noqa: PLC0415
-        from coord.state import build_board  # noqa: PLC0415
 
         cfg = _load_config(config_path)
-        board = build_board()
+        board = read_board()
         report = build_gate_report(board, cfg, repo, issue, gh_ops=github_ops)
     except (Exception, SystemExit):  # noqa: BLE001 — fail-open to "missing"
         return ("review", "test")

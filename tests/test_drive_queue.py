@@ -7602,7 +7602,7 @@ def test_missing_required_gates_reports_only_the_unsatisfied_gate(monkeypatch):
     ]
     monkeypatch.setattr("coord.gates.build_gate_report", lambda *a, **k: report)
     monkeypatch.setattr("coord.commands._common._load_config", lambda *a, **k: object())
-    monkeypatch.setattr("coord.state.build_board", lambda *a, **k: object())
+    monkeypatch.setattr("coord.board_service.read_board", lambda *a, **k: object())
 
     assert _missing_required_gates(Path("/dev/null"), "quadraui", 1109) == ("review",)
 
@@ -7618,7 +7618,7 @@ def test_missing_required_gates_empty_when_both_satisfied(monkeypatch):
     ]
     monkeypatch.setattr("coord.gates.build_gate_report", lambda *a, **k: report)
     monkeypatch.setattr("coord.commands._common._load_config", lambda *a, **k: object())
-    monkeypatch.setattr("coord.state.build_board", lambda *a, **k: object())
+    monkeypatch.setattr("coord.board_service.read_board", lambda *a, **k: object())
 
     assert _missing_required_gates(Path("/dev/null"), "quadraui", 1109) == ()
 
@@ -7635,7 +7635,7 @@ def test_missing_required_gates_fails_open_to_missing_on_a_read_error(monkeypatc
 
     monkeypatch.setattr("coord.gates.build_gate_report", _boom)
     monkeypatch.setattr("coord.commands._common._load_config", lambda *a, **k: object())
-    monkeypatch.setattr("coord.state.build_board", lambda *a, **k: object())
+    monkeypatch.setattr("coord.board_service.read_board", lambda *a, **k: object())
 
     assert _missing_required_gates(Path("/dev/null"), "quadraui", 1109) == ("review", "test")
 
@@ -7651,9 +7651,48 @@ def test_missing_required_gates_fails_open_when_no_decision_could_be_resolved(mo
     report.notes = ["no assignments found on the board for quadraui#1109"]
     monkeypatch.setattr("coord.gates.build_gate_report", lambda *a, **k: report)
     monkeypatch.setattr("coord.commands._common._load_config", lambda *a, **k: object())
-    monkeypatch.setattr("coord.state.build_board", lambda *a, **k: object())
+    monkeypatch.setattr("coord.board_service.read_board", lambda *a, **k: object())
 
     assert _missing_required_gates(Path("/dev/null"), "quadraui", 1109) == ("review", "test")
+
+
+def test_missing_required_gates_reads_the_board_through_the_daemon_aware_seam(monkeypatch):
+    """#615/#906: `coord drive-queue add` has no whole-command daemon
+    reroute, so this gate read must go through
+    `coord.board_service.read_board()` (GET /board on a thin client) and
+    never `coord.state.build_board()` directly — a thin client reading the
+    local DB would see an empty board and fail open to "both gates missing"
+    on every add. Pinned by making the local read EXPLODE: a regression back
+    to `build_board()` is swallowed by the fail-open `except` and shows up
+    here as ("review", "test") instead of the real ().
+    """
+    from coord.commands.drive_queue import _missing_required_gates
+    from coord.gates import GateDecision, GateReport
+
+    sentinel_board = object()
+    seen: list[object] = []
+
+    report = GateReport(repo_name="quadraui", issue_number=1109)
+    report.decisions = [
+        GateDecision(gate="review", required=True, ok=True),
+        GateDecision(gate="test", required=True, ok=True),
+    ]
+
+    def _build_gate_report(board, *a, **k):
+        seen.append(board)
+        return report
+
+    def _local_board_is_forbidden(*a, **k):
+        raise AssertionError("read the local board instead of board_service.read_board()")
+
+    monkeypatch.setattr("coord.gates.build_gate_report", _build_gate_report)
+    monkeypatch.setattr("coord.commands._common._load_config", lambda *a, **k: object())
+    monkeypatch.setattr("coord.board_service.read_board", lambda *a, **k: sentinel_board)
+    monkeypatch.setattr("coord.state.build_board", _local_board_is_forbidden)
+    monkeypatch.setattr("coord.state.load_board", _local_board_is_forbidden)
+
+    assert _missing_required_gates(Path("/dev/null"), "quadraui", 1109) == ()
+    assert seen == [sentinel_board]
 
 
 class TestDriveQueueListReadDistinguishesFailureFromEmpty:
