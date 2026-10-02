@@ -733,7 +733,7 @@ def is_verdictless_job(check: CheckRun, job: JobRun | None) -> bool:
 
 
 def checks_are_stale(checks: list[CheckRun], base_commit_time: float | None) -> bool:
-    """True when a **green** *checks* result predates *base_commit_time* (#1851).
+    """True when *checks* predate *base_commit_time* (#1851).
 
     GitHub attaches ``pull_request`` check runs to the PR's *head* SHA and
     re-runs them on head ``synchronize`` — never on base movement — so a
@@ -742,10 +742,17 @@ def checks_are_stale(checks: list[CheckRun], base_commit_time: float | None) -> 
     what matters is what the base looked like when the run *began*, not when
     it finished.
 
-    Callers should apply :func:`failed_checks`/:func:`in_flight_checks`
-    first — this function assumes *checks* is the all-passing remainder and
-    doesn't re-derive that itself, so it never contradicts "CI failed"/"CI
-    running" with a third, competing reading of the same checks. An empty
+    Originally written for the caller's all-**passing** remainder — apply
+    :func:`failed_checks`/:func:`in_flight_checks` first and pass what's
+    left, so this never contradicts "CI failed"/"CI running" with a third,
+    competing reading of the same checks. #1986 also calls this with the
+    FAILED remainder instead (``coord.merge_queue``'s ``checks_failed``
+    path): the comparison itself never inspects ``conclusion``, only
+    ``started_at``, so "did this run predate the base?" is the identical
+    question either way — there is no second notion of CI staleness for the
+    red case, only a second caller asking the same one (#2096: one question,
+    one answer). Which verdict a stale run carries decides what the caller's
+    message says; it never decides whether the merge blocks. An empty
     *checks* list (nothing to compare) reads as not-stale; the caller's own
     "no checks" handling covers that case — see :meth:`CiStore.expects_checks`
     and ``coord.merge_queue``'s ``checks_absent`` gate (#1904), which now

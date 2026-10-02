@@ -44,14 +44,20 @@ def _check(
     status: str = "completed",
     conclusion: str | None = "failure",
     run_id: str = "1",
+    started_at: float | None = None,
 ) -> CheckRun:
     """#1892 test helper: a `CheckRun` with a settable `run_id`, needed to
     exercise `_ci_infra_reason`'s per-run job lookup — mirrors
-    `tests/test_ci_store.py`'s `_check`, which has no `run_id` parameter."""
+    `tests/test_ci_store.py`'s `_check`, which has no `run_id` parameter.
+
+    `started_at` (#1986) lets a caller position the run before/after a
+    fake base timestamp, to exercise the `checks_failed` staleness wording
+    — defaults to `None` (unreadable anchor) exactly like every pre-#1986
+    caller of this helper, so none of them need updating."""
     return CheckRun(
         name=name, status=status, conclusion=conclusion,
         url=f"https://gh/runs/{run_id}", run_id=run_id,
-        started_at=None, completed_at=None,
+        started_at=started_at, completed_at=None,
     )
 
 
@@ -9588,6 +9594,126 @@ class TestTwoGreenBranchesOneBaseMove:
         process(items, gh, ci_store=self._ci(started_at=1500.0))
         assert items[0].state == MERGED
         assert gh.ts_calls == 1  # the gate's own read, and nothing more
+
+
+class TestChecksFailedStaleness:
+    """#1986: a FAILING check can be exactly as stale as a #1851 PASSING
+    one — this issue's live incident (#1895) was a `windows` check red for
+    `fcntl` import failure that #1156 had already fixed on `main`, 33
+    commits before this branch's base. Unlike a stale pass (reported with
+    full provenance since #1851), a stale failure used to be reported as a
+    bare, current-looking defect, inviting either pointless debugging of a
+    bug that no longer exists, or a wrong `--force-merge`.
+
+    Acceptance: the refusal still BLOCKS either way — only the message
+    changes, never the decision — and a CURRENT failing check must be
+    reported exactly as before (no staleness wording), so the signal stays
+    meaningful."""
+
+    class _Gh(FakeGh):
+        ts: float = 1000.0
+        def get_branch_commit_timestamp(self, repo, branch):
+            return self.ts
+
+    @staticmethod
+    def _ci(failed_started_at: float | None):
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [_check("windows", started_at=failed_started_at)]
+        return _Ci()
+
+    def test_stale_failure_names_both_anchors_and_still_blocks(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        events = process(items, gh, ci_store=self._ci(failed_started_at=500.0))
+
+        assert items[0].state == PENDING  # still blocks
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        failed = [e for e in events if e.kind == "checks_failed"][0]
+        assert failed.message.startswith("checks failed:")  # #2212: drive_queue matches on this
+        assert "predates the current base" in failed.message
+        assert "rebase" in failed.message
+        assert items[0].error == failed.message
+
+    def test_current_failure_has_no_staleness_wording(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        events = process(items, gh, ci_store=self._ci(failed_started_at=1500.0))
+
+        assert items[0].state == PENDING  # still blocks
+        failed = [e for e in events if e.kind == "checks_failed"][0]
+        assert failed.message == "checks failed: windows (failure)"
+        assert "predates the current base" not in failed.message
+        assert "stale" not in failed.message.lower()
+
+    def test_stale_and_current_failure_reasons_differ(self) -> None:
+        """Acceptance criterion: the two reason strings must differ."""
+        stale_items = [_q("w1", pr=99)]
+        stale_events = process(
+            stale_items, self._Gh(), ci_store=self._ci(failed_started_at=500.0),
+        )
+        current_items = [_q("w2", pr=100)]
+        current_events = process(
+            current_items, self._Gh(), ci_store=self._ci(failed_started_at=1500.0),
+        )
+        stale_msg = [e for e in stale_events if e.kind == "checks_failed"][0].message
+        current_msg = [e for e in current_events if e.kind == "checks_failed"][0].message
+        assert stale_msg != current_msg
+        # Both share the same prefix — only the provenance differs.
+        assert stale_msg.startswith("checks failed: windows (failure)")
+        assert current_msg == "checks failed: windows (failure)"
+
+    def test_dry_run_previews_the_same_staleness_wording(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        events = process(
+            items, gh, ci_store=self._ci(failed_started_at=500.0), dry_run=True,
+        )
+        assert items[0].state == PENDING
+        failed = [e for e in events if e.kind == "checks_failed"][0]
+        assert "would be blocked: checks failed:" in failed.message
+        assert "predates the current base" in failed.message
+
+    def test_dry_run_current_failure_has_no_staleness_wording(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        events = process(
+            items, gh, ci_store=self._ci(failed_started_at=1500.0), dry_run=True,
+        )
+        failed = [e for e in events if e.kind == "checks_failed"][0]
+        assert failed.message == "(dry run) would be blocked: checks failed: windows (failure)"
+
+    def test_unreadable_base_anchor_omits_the_claim_rather_than_guessing(self) -> None:
+        """When the base timestamp can't be read at all, the stale-looking
+        default inside `_ci_checks_are_stale` must NOT make this function
+        assert staleness it has no evidence for — `ci_staleness_note`'s own
+        anchor read fails the same way and the suffix comes back empty."""
+        class _NoTimestampGh(FakeGh):
+            pass
+
+        items = [_q("w1", pr=99)]
+        events = process(
+            items, _NoTimestampGh(), ci_store=self._ci(failed_started_at=500.0),
+        )
+        failed = [e for e in events if e.kind == "checks_failed"][0]
+        assert failed.message == "checks failed: windows (failure)"
+
+    def test_checks_failed_stale_suffix_direct(self) -> None:
+        """Direct unit coverage of the suffix renderer, independent of the
+        `process()` plumbing around it."""
+        failed = [_check("windows", started_at=500.0)]
+        suffix = mq.checks_failed_stale_suffix(
+            failed, self._Gh(), "acme/api", "main",
+        )
+        assert "predates the current base" in suffix
+        assert "rebase" in suffix
+
+    def test_checks_failed_stale_suffix_empty_when_anchor_unreadable(self) -> None:
+        failed = [_check("windows", started_at=500.0)]
+        suffix = mq.checks_failed_stale_suffix(failed, None, "acme/api", "main")
+        assert suffix == ""
 
 
 class TestProcessConflictedEmptyChecks:

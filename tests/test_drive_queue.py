@@ -7364,6 +7364,27 @@ def test_merge_gate_remedy_command_falls_back_to_inspect_for_red_ci():
     assert "drive-queue remove" not in command
 
 
+def test_merge_gate_remedy_command_recognizes_a_stale_checks_failed_reason():
+    """#1986: a RED check that predates the current base still carries the
+    plain `checks failed` prefix (`coord/merge_queue.py`'s
+    `checks_failed_stale_suffix` only ever APPENDS to it) — so this must
+    keep matching here exactly as the bare #2983-less red-CI shape does
+    above, not fall through to "not a merge-gate block" just because the
+    message now also names the stale base."""
+    reason = (
+        "checks failed: windows (failure) — but that run predates the "
+        "current base (ran against main as of 2026-08-07T03:33:48Z, main "
+        "now 2026-08-08T01:02:03Z) — rebase onto main and push (`git push "
+        "--force-with-lease`) and let CI re-run before trusting this "
+        "result; a CI re-run against the same base cannot see a moved base"
+    )
+    assert is_merge_gate_block_reason(reason) is True
+    command = merge_gate_remedy_command(reason, REPO, 1986)
+    assert command == merge_plan_inspect_command(REPO)
+    assert "revalidate" not in command
+    assert "drive-queue remove" not in command
+
+
 def test_merge_gate_remedy_command_falls_back_to_inspect_for_review_required():
     reason = (
         "review_required — coord merge's own gate reports 'review missing', "

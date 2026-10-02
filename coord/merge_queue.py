@@ -2770,9 +2770,19 @@ def _ci_checks_are_stale(
     *,
     fail_closed: bool = True,
 ) -> bool:
-    """True when *checks* — already confirmed by the caller to have no
-    failed/in-flight entries — are stale relative to *target_branch*'s
-    current base (#1851).
+    """True when *checks* are stale relative to *target_branch*'s current
+    base (#1851).
+
+    Originally written for the caller's all-PASSING remainder (no
+    failed/in-flight entries) — the ``checks_stale`` path below. #1986 reuses
+    it unchanged for the FAILED remainder too: the underlying comparison
+    (``started_at`` vs. the base's current commit time, via
+    :func:`coord.ci_store.checks_are_stale`) never reads ``conclusion``, so
+    "did this run see the base's current tip?" has exactly one answer
+    regardless of which way the run concluded (#2096: one question, one
+    answer). A stale FAILING check still blocks the merge either way — this
+    only changes whether the refusal names the staleness, never the
+    pass/fail verdict itself.
 
     GitHub does not re-run ``pull_request`` workflows on a base-only move
     (only on head ``synchronize``), so a green check can silently outlive the
@@ -2903,6 +2913,50 @@ def ci_stale_reason(
         f"{CI_STALE_PREFIX} checks predate the current base{note} — rebase "
         f"onto {branch} and push (`git push --force-with-lease`); a CI "
         "re-run against the same base cannot see a moved base"
+    )
+
+
+def checks_failed_stale_suffix(
+    failed: "list[CheckRun]",
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    target_branch: str | None,
+) -> str:
+    """Clause appended to a ``checks failed: ...`` refusal when the failing
+    run(s) predate *target_branch*'s current base (#1986).
+
+    Hit while merging #1895: a `windows` check was red for `ModuleNotFoundError:
+    No module named 'fcntl'` — a bug #1156 had already fixed on `main` 33
+    commits before this branch's base. The gate reported it as a bare,
+    current-looking failure, inviting either pointless debugging of a defect
+    that no longer exists, or a `--force-merge` reasoned on "it's probably
+    just flaky" — neither of which an operator should have to guess at when
+    the gate already has the evidence.
+
+    #1851/:func:`ci_stale_reason` already answers "did this run see the
+    base's current tip?" for a stale PASSING check; this is the exact same
+    question for a FAILING one, so it reuses :func:`ci_staleness_note` for
+    the anchor wording rather than inventing a second rendering of "predates
+    the base" (#2096: one question, one answer). Callers decide staleness
+    first via :func:`_ci_checks_are_stale` — this never makes that call
+    itself, only renders the clause once asked to.
+
+    Returns ``""`` when the anchors can't be read — the same unreadable case
+    :func:`ci_staleness_note` itself falls back on — so the caller's plain
+    ``checks failed: ...`` message prints unchanged rather than asserting
+    staleness evidence this can't actually produce. Either way the refusal
+    still BLOCKS: this only ever adds provenance to an existing block, never
+    removes or downgrades it.
+    """
+    note = ci_staleness_note(failed, gh_ops, repo_github, target_branch)
+    if not note:
+        return ""
+    branch = target_branch or "the target branch"
+    return (
+        " — but that run predates the current base" + note + " — rebase "
+        f"onto {branch} and push (`git push --force-with-lease`) and let CI "
+        "re-run before trusting this result; a CI re-run against the same "
+        "base cannot see a moved base"
     )
 
 
@@ -7649,11 +7703,26 @@ def process(
                             summary = ", ".join(
                                 f"{c.name} ({c.conclusion})" for c in failed
                             )
-                            msg = (
-                                unreadable_reason
-                                or infra_reason
-                                or f"checks failed: {summary}"
-                            )
+                            if unreadable_reason:
+                                msg = unreadable_reason
+                            elif infra_reason:
+                                msg = infra_reason
+                            else:
+                                # #1986: preview the same staleness
+                                # provenance the live path now adds to a
+                                # bare `checks failed: ...` — see
+                                # `checks_failed_stale_suffix`'s docstring.
+                                # Preview-only: never mutates, just shows
+                                # what a real attempt would compute.
+                                msg = f"checks failed: {summary}"
+                                if _ci_checks_are_stale(
+                                    failed, gh_ops, entry.repo_github,
+                                    entry.target_branch, _smoke,
+                                ):
+                                    msg += checks_failed_stale_suffix(
+                                        failed, gh_ops, entry.repo_github,
+                                        entry.target_branch,
+                                    )
                             events.append(MergeEvent(
                                 entry, "checks_failed",
                                 f"(dry run) would be blocked: {msg}",
@@ -8283,6 +8352,20 @@ def process(
                         # this already-confirmed streak as a flake.
                         entry.ci_flaky_pending = ""
                     msg = f"checks failed: {summary}"
+                    # #1986: a RED check can be exactly as stale as a GREEN
+                    # one (#1851) — it just looks like a current defect
+                    # instead of an obvious re-test candidate, which is what
+                    # invites either pointless debugging of a bug already
+                    # fixed on the current base, or a wrong `--force-merge`.
+                    # Reports provenance only; the entry still blocks either
+                    # way (see `checks_failed_stale_suffix`'s docstring).
+                    if _ci_checks_are_stale(
+                        failed, gh_ops, entry.repo_github, entry.target_branch,
+                        smoke,
+                    ):
+                        msg += checks_failed_stale_suffix(
+                            failed, gh_ops, entry.repo_github, entry.target_branch,
+                        )
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_failed", msg))
                     continue  # #292: skip, don't halt the group
