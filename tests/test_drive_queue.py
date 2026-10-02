@@ -4942,6 +4942,56 @@ def test_a_fix_round_ceiling_blocked_entry_is_never_resumed():
     assert plan.launch is None
 
 
+def test_an_issue_resolution_reword_blocked_entry_is_never_resumed():
+    """#3522: same posture as the #1844/#2019/#2972 permanent blocks above —
+    a drive that exhausted its merge attempts against the
+    `issue_resolution_closing_keyword_in_commit` gate must not auto-resume
+    just because the merge gate reads clear again. The gate's own text gets
+    embedded verbatim into `_die`'s "merge attempted N times without
+    landing" diagnostic, carrying the `(#3522)` marker — this is the EXACT
+    claude-coordinator#3519 deadlock: `coord merge` refused three times,
+    the drive died into `blocked`, and this sweep's resume (`resumes=1/3`,
+    `2/3`, `3/3`) kept relaunching into the identical, unfixable-by-
+    relaunch refusal because nothing told it the refusal could not change
+    on retry. The real remedy (a reword-commit worker, dispatched straight
+    from the merge gate — see `coord.merge_queue.process`) runs entirely
+    outside this sweep; a relaunch here could only duplicate that spend."""
+    entries = [
+        _blocked_entry(
+            3519,
+            position=1,
+            last_reason=(
+                "merge attempted 3 times without landing.\n"
+                "   Last board state: status='PENDING' reason='none'\n"
+                "   Last `coord merge --only` diagnostic:\n"
+                "     a commit message on this branch contains a closing "
+                "keyword (Closes/Fixes/Resolves) for #3519, but this PR is "
+                "marked `ISSUE_RESOLUTION: partial` — GitHub would "
+                "auto-close the issue on merge regardless of the PR body "
+                "(#3502). Reword the commit message(s) to 'refs #N' and "
+                "push, or pass --force-merge to merge anyway (the issue "
+                "WILL still auto-close). The coordinator dispatches an "
+                "automatic reword-commit worker for this (#3522); resuming "
+                "a drive session cannot fix it on its own.\n"
+                "   Inspect the gates: coord merge --plan --repo "
+                "claude-coordinator"
+            ),
+        )
+    ]
+    key = entry_key(REPO, 3519)
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={key: False},  # gate reads clear
+        merge_only_ready={key: True},  # even Merge-only-ready must not fire
+    )
+    assert plan.reconciles == ()
+    assert plan.blocked == ()
+    assert plan.merge_only == ()
+    assert plan.launch is None
+
+
 def test_fix_round_ceiling_blocked_keys_finds_only_2972_blocked_rows():
     """#3454: `coord.commands.drive_queue._fix_round_ceiling_blocked_keys` —
     the filter `_run_auto_revalidate_checks_stale` uses so it never
@@ -5809,7 +5859,7 @@ def test_a_parked_entry_with_review_still_pending_falls_through_to_the_ordinary_
     assert plan.launch is not None and plan.launch.issue == 2350
 
 
-def test_is_permanent_block_reason_recognises_all_three_markers_and_nothing_else():
+def test_is_permanent_block_reason_recognises_all_known_markers_and_nothing_else():
     from coord.drive_queue import is_permanent_block_reason
 
     assert is_permanent_block_reason("... (#1844); blocking without spending an attempt")
@@ -5819,6 +5869,13 @@ def test_is_permanent_block_reason_recognises_all_three_markers_and_nothing_else
     assert is_permanent_block_reason(
         "fix-round ceiling reached across relaunches (#2972): 3 work leg(s) "
         "already run against a budget of 3 — giving up"
+    )
+    # #3522: the issue_resolution_closing_keyword_in_commit refusal — see
+    # test_an_issue_resolution_reword_blocked_entry_is_never_resumed below.
+    assert is_permanent_block_reason(
+        "merge attempted 3 times without landing.\n   Last board state: "
+        "status='PENDING' reason='a commit message on this branch "
+        "contains a closing keyword ... (#3522)'"
     )
     assert not is_permanent_block_reason(
         "drive session died without landing the work 2/2 times — giving up"

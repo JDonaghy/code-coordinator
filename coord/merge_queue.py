@@ -7307,6 +7307,18 @@ def process(
     an ``epic_closing_keyword_in_commit_forced`` warning event is still
     emitted — the override is never silent.
 
+    #3522: the identical commit-message shape for THIS entry's own issue
+    (``issue_resolution_closing_keyword_in_commit`` — a `partial`/
+    `investigation` ``ISSUE_RESOLUTION:`` verdict contradicted by its own
+    commit message) is, unlike the epic case above, actually remedied: the
+    moment the refusal fires, *board* and *config* permitting, this
+    dispatches a message-only reword-commit worker
+    (:func:`coord.conflict_fix.dispatch_conflict_fix` with
+    ``reword_commit=True``) so a future `coord merge` attempt can clear the
+    refusal without an operator force-push. The merge itself still refuses
+    THIS attempt either way — the dispatch is fire-and-forget, never
+    awaited inline.
+
     Mutates `items` in place; the caller saves the queue after.
     """
     events: list[MergeEvent] = []
@@ -8558,7 +8570,9 @@ def process(
                     f"GitHub would auto-close the issue on merge regardless of the "
                     f"PR body (#3502). Reword the commit message(s) to 'refs #N' "
                     f"and push, or pass --force-merge to merge anyway (the issue "
-                    f"WILL still auto-close)."
+                    f"WILL still auto-close). The coordinator dispatches an "
+                    f"automatic reword-commit worker for this (#3522); resuming "
+                    f"a drive session cannot fix it on its own."
                 )
                 if force_merge:
                     events.append(MergeEvent(
@@ -8569,6 +8583,41 @@ def process(
                     events.append(MergeEvent(
                         entry, "issue_resolution_closing_keyword_in_commit", msg,
                     ))
+                    # #3522: nothing ever remedied this refusal before — a
+                    # worker's own commit convention (e.g. `Fix #N: ...`)
+                    # deadlocked every retry, and the drive-queue's own
+                    # resume sweep (`coord.drive_queue._reconcile_blocked`)
+                    # burned its resume budget relaunching into the
+                    # identical, unfixable-by-relaunch block
+                    # (claude-coordinator#3519). Dispatch the narrow,
+                    # message-only remedy the instant the gate fires, right
+                    # here — the SAME dispatcher #241/#3349 already use for
+                    # the mechanical/stale-CI shapes, so this is one more
+                    # caller of an existing worker, not a new mechanism.
+                    # Best-effort: *board*/*config* are only ``None`` for a
+                    # caller that never wired merge-gate state through in
+                    # the first place (dry runs, some unit tests), and a
+                    # dispatch failure (no machine, agent unreachable, …)
+                    # must never take down the merge refusal it's trying to
+                    # remedy.
+                    if board is not None and config is not None:
+                        try:
+                            from coord.conflict_fix import (  # noqa: PLC0415
+                                dispatch_conflict_fix,
+                            )
+
+                            fix = dispatch_conflict_fix(
+                                entry, board, config, reword_commit=True,
+                            )
+                        except Exception:  # noqa: BLE001
+                            fix = None
+                        if fix is not None:
+                            events.append(MergeEvent(
+                                entry, "issue_resolution_reword_dispatched",
+                                f"dispatched a reword-commit worker to "
+                                f"{fix.machine_name} for #{entry.issue_number} "
+                                f"(#3522)",
+                            ))
                     continue  # #3502: refuse — never merge a branch that will
                     # auto-close an issue marked not-yet-resolved via a commit
                     # message we can't rewrite.

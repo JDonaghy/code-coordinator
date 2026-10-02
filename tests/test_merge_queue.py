@@ -1118,6 +1118,84 @@ class TestProcess:
         ]
         assert forced, [e.kind for e in events]
 
+    def test_commit_message_closing_keyword_dispatches_reword_commit_worker(
+        self,
+    ) -> None:
+        # #3522: the gate refusal above used to be a dead end — nothing
+        # ever remedied it, so every retry hit the identical refusal
+        # forever (claude-coordinator#3519). `process()` must now dispatch
+        # the message-only reword-commit worker itself, the moment the
+        # gate fires, rather than leaving it to a separate sweep.
+        board = self._board_with_work(
+            "ISSUE_RESOLUTION: partial — root cause elsewhere"
+        )
+        items = [_q("a", assignment_type="work", pr=100)]
+        gh = FakeGh(pr_commit_messages={100: ["Fix #1: patch the symptom"]})
+
+        fake_fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="[reword-commit-fix] t", assignment_id="fix-1",
+            type="conflict-fix", status="running",
+        )
+        with patch(
+            "coord.conflict_fix.dispatch_conflict_fix", return_value=fake_fix,
+        ) as mock_dispatch:
+            events = process(items, gh, board=board, config=object())
+
+        assert items[0].state != MERGED
+        assert mock_dispatch.call_count == 1
+        _, kwargs = mock_dispatch.call_args
+        assert kwargs.get("reword_commit") is True
+        dispatched = [
+            e for e in events if e.kind == "issue_resolution_reword_dispatched"
+        ]
+        assert dispatched, [e.kind for e in events]
+        assert "laptop" in dispatched[0].message
+
+    def test_commit_message_closing_keyword_no_dispatch_without_config(
+        self,
+    ) -> None:
+        """Without *config* wired through (today's default for most
+        callers), the refusal still fires but no dispatch is attempted —
+        existing behaviour for every caller that predates #3522."""
+        board = self._board_with_work(
+            "ISSUE_RESOLUTION: partial — root cause elsewhere"
+        )
+        items = [_q("a", assignment_type="work", pr=100)]
+        gh = FakeGh(pr_commit_messages={100: ["Fix #1: patch the symptom"]})
+
+        with patch("coord.conflict_fix.dispatch_conflict_fix") as mock_dispatch:
+            process(items, gh, board=board)
+
+        assert mock_dispatch.call_count == 0
+
+    def test_commit_message_closing_keyword_dispatch_failure_is_best_effort(
+        self,
+    ) -> None:
+        """A dispatch failure (no machine, agent unreachable, …) must never
+        take down the merge refusal it's trying to remedy — the refusal
+        event still fires, just without the remedy event alongside it."""
+        board = self._board_with_work(
+            "ISSUE_RESOLUTION: partial — root cause elsewhere"
+        )
+        items = [_q("a", assignment_type="work", pr=100)]
+        gh = FakeGh(pr_commit_messages={100: ["Fix #1: patch the symptom"]})
+
+        with patch(
+            "coord.conflict_fix.dispatch_conflict_fix",
+            side_effect=RuntimeError("no machine"),
+        ):
+            events = process(items, gh, board=board, config=object())
+
+        assert items[0].state != MERGED
+        blocked = [
+            e for e in events if e.kind == "issue_resolution_closing_keyword_in_commit"
+        ]
+        assert blocked, [e.kind for e in events]
+        assert not [
+            e for e in events if e.kind == "issue_resolution_reword_dispatched"
+        ]
+
     def test_conflict_does_not_halt_other_repo_groups(self) -> None:
         """A conflict in one (repo, target) group must not touch other groups."""
         items = [

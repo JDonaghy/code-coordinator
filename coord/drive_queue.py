@@ -329,7 +329,32 @@ PARK_STALE_SECONDS = 45 * 60.0
 # the narrower predicate `coord.commands.drive_queue` uses to also stop its
 # OWN independent auto-dispatch (the stale-rebase conflict-fix revalidation)
 # from re-firing against a row that has already given up this way.
-_PERMANENT_BLOCK_MARKERS: tuple[str, ...] = ("(#1844)", "(#2019)", "(#2972)")
+#
+# #3522: `(#3522)` joined this tuple for a FOURTH shape, distinct from the
+# three above in one way — it IS actively remedied, just never by relaunching
+# a whole drive session. `coord.merge_queue.process()`'s own
+# `issue_resolution_closing_keyword_in_commit` gate refuses to merge a branch
+# whose PR is marked `ISSUE_RESOLUTION: partial`/`investigation` but whose
+# commit message(s) still carry a GitHub closing keyword for that same issue
+# — and, since #3522, dispatches a message-only reword-commit worker
+# (`coord.conflict_fix.dispatch_conflict_fix(..., reword_commit=True)`) the
+# moment it fires. Before that worker existed, a drive that exhausted its
+# merge-attempt budget against this refusal (`_die`'s "merge attempted N
+# times without landing", embedding this module's own diagnostic text
+# verbatim) died into `blocked`, and this sweep's live-gate re-check — which
+# has no way to observe "a commit got reworded on another machine", only
+# whether the merge gate currently reads clear — kept reading the SAME
+# refusal as "unlucky, re-check later" and burned its resume budget
+# relaunching into it (claude-coordinator#3519's exact deadlock: three
+# identical refusals, `resumes=1/3`, `2/3`, `3/3`, then stuck). The actual
+# remedy runs entirely OUTSIDE this relaunch loop — a dedicated worker,
+# dispatched from the merge gate itself, that force-pushes once it has
+# verified the reword changed nothing but wording — so there is nothing for
+# a drive-session relaunch to contribute here either; it can only duplicate
+# spend while the real remedy is already in flight. See
+# `coord.merge_queue.process`'s `issue_resolution_closing_keyword_in_commit`
+# handling for where the marker's text originates.
+_PERMANENT_BLOCK_MARKERS: tuple[str, ...] = ("(#1844)", "(#2019)", "(#2972)", "(#3522)")
 
 
 def is_fix_round_ceiling_reason(reason: str | None) -> bool:
@@ -380,8 +405,13 @@ def is_fix_round_ceiling_blocked(state: str | None, last_reason: str | None) -> 
 
 
 def is_permanent_block_reason(text: str | None) -> bool:
-    """Whether *text* names a PERMANENT cause of `blocked` — #2230's sweep
-    must never re-check these; relaunching cannot change either outcome.
+    """Whether *text* names a cause of `blocked` that #2230's sweep must
+    never re-check — **relaunching the drive session cannot change the
+    outcome**, whether that is because the block is truly permanent
+    (#1844/#2019/#2972) or because, #3522, the real remedy already runs
+    entirely outside this sweep's relaunch loop (a dedicated reword-commit
+    worker dispatched straight from the merge gate) and a resume here could
+    only duplicate that spend, never substitute for it.
 
     Marker-based, the same convention `coord.gate_a.is_gate_a_refusal_reason`
     uses for the analogous Gate-A classification: cheap, and correct even
