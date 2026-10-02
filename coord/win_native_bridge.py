@@ -43,12 +43,32 @@ standing in for the Windows side — the exact seam
 `coord/win_native_driver.py`'s own `WinCalls` protocol uses for the OS layer
 one level down, and the only way to exercise this module's logic at all on a
 CI box with no real WSL/Windows pairing.
+
+**#3519 — never worked on a real WSL host.** Two defects found provisioning
+dell64: (1) every Windows-side `python.exe` this module builds is
+Windows-path-shaped (`C:\\...`, see :data:`DEFAULT_WINDOWS_VENV_DIR`), but
+Linux's own `exec`/`open` can't resolve that string as `argv[0]` — only
+`/mnt/c/...` means anything to it. Every executable this module hands to
+`run` now goes through :func:`_windows_exec_argv`
+(`wslpath -u` via :func:`windows_path_to_wsl_path`) first; the *arguments*
+given to that Windows process (a `cwd`, a venv directory) stay Windows-form,
+since that's what the Windows side needs to resolve them. (2)
+:func:`find_windows_python` called `powershell.exe` by bare name (not
+reachable without an `appendWindowsPath` PATH extension that doesn't hold
+fleet-wide — see :data:`POWERSHELL_EXE`) and trusted whatever `Get-Command
+python` returned, which is the Microsoft Store App Execution Alias stub
+when no real Python is on `PATH` — now rejected by
+:func:`_looks_like_real_python`'s version probe, with the standard
+python.org/`py`-launcher install locations checked as a fallback and
+:data:`WINDOWS_PYTHON_OVERRIDE_ENV` as an explicit escape hatch.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -64,6 +84,52 @@ DEFAULT_WINDOWS_VENV_DIR = r"C:\ProgramData\coord-win-native-venv"
 #: not imported from it to avoid a cycle (`acceptance_drivers` imports THIS
 #: module, not the other way around).
 DEFAULT_PACKAGE_SPEC = "code-coordinator[win-native]"
+
+#: #3519: the WSL/agent shell's own `$PATH` has no Windows directories (no
+#: `appendWindowsPath` assumption holds fleet-wide — dell64 doesn't have
+#: it), so `powershell.exe` can't be found by bare name. WSL interop still
+#: execs a PE binary given its WSL-visible path, so this is the one thing
+#: this module calls by a hardcoded absolute path rather than discovering —
+#: it's the one stable, version-independent location every Windows install
+#: ships PowerShell at.
+POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+#: #3519: explicit escape hatch for `find_windows_python` — set this to a
+#: known-good Windows-side `python.exe`/`py.exe` path (Windows-form or
+#: WSL-form, either is accepted — see :func:`windows_path_to_wsl_path`) to
+#: skip discovery entirely. Read directly by :func:`find_windows_python`,
+#: never cached, so it takes effect on the very next call.
+WINDOWS_PYTHON_OVERRIDE_ENV = "COORD_WIN_NATIVE_PYTHON"
+
+#: #3519: the standard per-user and machine-wide install locations a real
+#: python.org installer (or the `py` launcher installer) puts files at,
+#: expressed as WSL-visible glob patterns rather than asking Windows for
+#: `%LOCALAPPDATA%`/`%ProgramFiles%` — the WSL/agent shell's own env has no
+#: reliable Windows-side env vars, but the C: drive is always visible at
+#: `/mnt/c` regardless. Covers every Windows user profile, not just one
+#: guessed username.
+_STANDARD_WINDOWS_PYTHON_GLOBS = (
+    "/mnt/c/Users/*/AppData/Local/Programs/Python/Python3*/python.exe",
+    "/mnt/c/Program Files/Python3*/python.exe",
+)
+_STANDARD_WINDOWS_PY_LAUNCHER_GLOBS = (
+    "/mnt/c/Users/*/AppData/Local/Programs/Python/Launcher/py.exe",
+)
+
+#: A real `python.exe`/`py.exe --version` prints e.g. `Python 3.12.10`. The
+#: Microsoft Store App Execution Alias stub (what `Get-Command python`
+#: resolves to when no real Python is on `PATH` — `…\WindowsApps\python.exe`)
+#: prints "Python was not found; run without arguments to install from the
+#: Microsoft Store…" instead: no version number, so this regex rejects it
+#: without needing to special-case the WindowsApps path string itself (the
+#: directory name isn't guaranteed stable across Windows releases, the
+#: absence of a real version number is).
+_REAL_PYTHON_VERSION_RE = re.compile(r"^python\s+\d+\.\d+", re.IGNORECASE)
+
+#: Windows-form absolute path, e.g. `C:\Users\me\...` or `C:/Users/me/...`
+#: — what WSL interop hands back from `Get-Command`/explicit overrides, and
+#: the one shape Linux's own `exec` can never open directly.
+_WINDOWS_STYLE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 RunFn = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -96,29 +162,85 @@ def is_wsl_host(
     return "microsoft" in text.lower()
 
 
-def find_windows_python(*, run: RunFn = subprocess.run, timeout: float = 15.0) -> str | None:
-    """Locate a real Windows-side Python reachable through WSL interop.
+def _is_windows_style_path(path: str) -> bool:
+    """True for a Windows-form absolute path (`C:\\...`/`C:/...`) — the one
+    shape Linux's own `exec`/`open` can never resolve directly, vs. an
+    already-WSL-visible one (`/mnt/c/...`) that needs no translation."""
+    return bool(_WINDOWS_STYLE_PATH_RE.match(path))
 
-    Tries, in order: `python.exe`/`py.exe` already resolving on THIS
-    process's own `$PATH` (true when the Windows PATH is appended to WSL's,
-    a common `/etc/wsl.conf` `[interop] appendWindowsPath=true` default),
-    then falls back to asking PowerShell to resolve it — `powershell.exe`
-    itself is reachable via WSL interop even on a shell whose `$PATH` was
-    never extended with Windows directories at all (interop execs an
-    absolute/`$PATH`-relative `.exe` name directly, the same mechanism
-    `docs/WSL_WINDOWS_WORKER.md` already uses for `cargo.exe`).
 
-    Returns `None` — never raises — when nothing resolves; the caller turns
-    that into a :class:`WinNativeBridgeError` naming the remedy.
+def windows_path_to_wsl_path(
+    path: str, *, run: RunFn = subprocess.run, timeout: float = 15.0,
+) -> str:
+    """Translate a Windows-form absolute path to the WSL path Linux can
+    actually `exec`/`open` (`wslpath -u`) — the other direction from
+    :func:`translate_to_windows_path` (#3519).
+
+    Every Windows *executable* this module hands to `run` as `argv[0]`
+    needs this: WSL interop lets Linux exec a Windows PE binary, but only
+    given a path Linux's own `open()` can resolve — a literal `C:\\...`
+    string means nothing to it. Arguments passed TO that Windows process
+    (a `cwd`, a venv directory) stay Windows-form unchanged; this function
+    is never applied to those.
+
+    Idempotent on an already-WSL-form input (returned unchanged, no `run`
+    call at all) — safe to call speculatively on a path whose origin
+    (`shutil.which`, a glob match, an operator override) isn't known to be
+    Windows- or WSL-form ahead of time.
     """
-    for candidate in ("python.exe", "py.exe"):
-        path = shutil.which(candidate)
-        if path:
-            return path
+    if not _is_windows_style_path(path):
+        return path
+    try:
+        proc = run(["wslpath", "-u", path], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise WinNativeBridgeError(f"`wslpath -u {path}` failed to run: {e}") from e
+    if proc.returncode != 0:
+        raise WinNativeBridgeError(
+            f"`wslpath -u {path}` failed: {(proc.stderr or '').strip()}"
+        )
+    translated = (proc.stdout or "").strip()
+    if not translated:
+        raise WinNativeBridgeError(f"`wslpath -u {path}` produced no output")
+    return translated
+
+
+def _windows_exec_argv(argv: list[str], *, run: RunFn) -> list[str]:
+    """*argv* with its executable (`argv[0]`) translated WSL-ward — every
+    call site that execs a Windows-side binary routes through this rather
+    than translating inline, so the "only argv[0], never the arguments"
+    rule (#3519) can't accidentally be applied to the wrong element."""
+    return [windows_path_to_wsl_path(argv[0], run=run), *argv[1:]]
+
+
+def _looks_like_real_python(candidate: str, *, run: RunFn, timeout: float) -> bool:
+    """Probe *candidate* with `--version` and require an actual version
+    number in the output — rejects the Microsoft Store App Execution Alias
+    stub (#3519), which exits without one. Also rejects anything that
+    fails to start/times out/exits non-zero (a stale/broken install, or a
+    path that doesn't even exist)."""
+    try:
+        exec_argv = _windows_exec_argv([candidate, "--version"], run=run)
+    except WinNativeBridgeError:
+        return False
+    try:
+        proc = run(exec_argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+    return bool(_REAL_PYTHON_VERSION_RE.match(output))
+
+
+def _resolve_via_powershell(*, run: RunFn, timeout: float) -> str | None:
+    """Ask PowerShell (called by its full WSL-visible path — see
+    :data:`POWERSHELL_EXE`, never a bare `powershell.exe` that depends on
+    an `appendWindowsPath` PATH extension that doesn't hold fleet-wide) to
+    resolve `python` the same way an interactive Windows shell would."""
     try:
         proc = run(
             [
-                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Command",
                 "(Get-Command python -ErrorAction SilentlyContinue).Source",
             ],
             capture_output=True, text=True, timeout=timeout,
@@ -129,14 +251,81 @@ def find_windows_python(*, run: RunFn = subprocess.run, timeout: float = 15.0) -
     return resolved or None
 
 
+def find_windows_python(
+    *,
+    run: RunFn = subprocess.run,
+    timeout: float = 15.0,
+    environ: Mapping[str, str] | None = None,
+    glob_fn: Callable[[str], list[str]] | None = None,
+) -> str | None:
+    """Locate a real Windows-side Python reachable through WSL interop.
+
+    Checked, in order, returning as soon as one checks out — later tiers
+    are never even consulted once an earlier one yields a real Python:
+
+    1. :data:`WINDOWS_PYTHON_OVERRIDE_ENV` — an explicit operator-set
+       escape hatch. Trusted as-is, no `--version` probe, so it still
+       works for a Python that doesn't understand `--version` or isn't
+       reachable from this process for the probe itself.
+    2. `python.exe`/`py.exe` already resolving on THIS process's own
+       `$PATH` (true when the Windows PATH is appended to WSL's, a common
+       `/etc/wsl.conf` `[interop] appendWindowsPath=true` default).
+    3. PowerShell's own `Get-Command python` resolution
+       (:func:`_resolve_via_powershell`) — reachable via WSL interop even
+       when `$PATH` was never extended with Windows directories at all.
+    4. The standard python.org/`py`-launcher install locations
+       (:data:`_STANDARD_WINDOWS_PYTHON_GLOBS` /
+       `_STANDARD_WINDOWS_PY_LAUNCHER_GLOBS`) — catches a real per-user
+       install that was never put on `PATH` at all.
+
+    Every candidate from (2)-(4) is probed with
+    :func:`_looks_like_real_python` and skipped if it fails — this is what
+    rejects the Microsoft Store App Execution Alias stub `Get-Command`
+    resolves to when no real Python is on `PATH`.
+
+    *glob_fn* defaults to the stdlib `glob.glob`, looked up lazily (not
+    bound at this function's definition time) so a test can monkeypatch
+    `coord.win_native_bridge.glob.glob` and have it actually take effect.
+
+    Returns `None` — never raises — when nothing resolves; the caller turns
+    that into a :class:`WinNativeBridgeError` naming the remedy.
+    """
+    env = os.environ if environ is None else environ
+    override = env.get(WINDOWS_PYTHON_OVERRIDE_ENV)
+    if override:
+        return override
+    glob_impl = glob_fn if glob_fn is not None else glob.glob
+
+    for name in ("python.exe", "py.exe"):
+        path = shutil.which(name)
+        if path and _looks_like_real_python(path, run=run, timeout=timeout):
+            return path
+
+    ps_resolved = _resolve_via_powershell(run=run, timeout=timeout)
+    if ps_resolved and _looks_like_real_python(ps_resolved, run=run, timeout=timeout):
+        return ps_resolved
+
+    for pattern in (*_STANDARD_WINDOWS_PYTHON_GLOBS, *_STANDARD_WINDOWS_PY_LAUNCHER_GLOBS):
+        for candidate in sorted(glob_impl(pattern)):
+            if _looks_like_real_python(candidate, run=run, timeout=timeout):
+                return candidate
+    return None
+
+
 def windows_venv_python(venv_dir: str) -> str:
     """The `Scripts\\python.exe` path for a Windows venv rooted at *venv_dir*."""
     return f"{venv_dir.rstrip(chr(92))}\\Scripts\\python.exe"
 
 
 def _run_checked(run: RunFn, argv: list[str], *, timeout: float, step: str) -> "subprocess.CompletedProcess[str]":
+    """Run a Windows-side command, translating *argv*'s executable
+    WSL-ward first (:func:`_windows_exec_argv` — #3519: `argv[0]` must be a
+    path Linux can actually `exec`, every other element stays Windows-form
+    for the Windows process on the other end).
+    """
+    exec_argv = _windows_exec_argv(argv, run=run)
     try:
-        proc = run(argv, capture_output=True, text=True, timeout=timeout)
+        proc = run(exec_argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise WinNativeBridgeError(f"{step} timed out after {timeout}s: {argv!r}") from e
     except OSError as e:
@@ -175,10 +364,10 @@ def ensure_windows_win_native_venv(
 
     try:
         probe = run(
-            [venv_python, "-c", "import comtypes"],
+            _windows_exec_argv([venv_python, "-c", "import comtypes"], run=run),
             capture_output=True, text=True, timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, WinNativeBridgeError):
         probe = None
     if probe is not None and probe.returncode == 0:
         return venv_python
@@ -187,11 +376,13 @@ def ensure_windows_win_native_venv(
     if not resolved_python:
         raise WinNativeBridgeError(
             "no Windows-side Python found via WSL interop (checked "
-            "python.exe/py.exe on PATH, then `powershell.exe Get-Command "
-            "python`) — install Python for Windows "
+            "python.exe/py.exe on PATH, PowerShell's `Get-Command python`, "
+            "and the standard python.org/`py`-launcher install locations) "
+            "— install Python for Windows "
             "(https://www.python.org/downloads/windows/), confirm "
-            "'powershell.exe -Command \"(Get-Command python).Source\"' "
-            "resolves it from inside this WSL shell, then retry"
+            f"'{POWERSHELL_EXE} -Command \"(Get-Command python).Source\"' "
+            "resolves it from inside this WSL shell, or set "
+            f"${WINDOWS_PYTHON_OVERRIDE_ENV} explicitly, then retry"
         )
 
     _run_checked(
@@ -280,9 +471,10 @@ def run_native_spec_via_bridge(
         "timeout": timeout,
     })
     bridge_timeout = timeout + 30
+    exec_argv = _windows_exec_argv([resolved, "-c", _BRIDGE_RUNNER_SRC], run=run)
     try:
         proc = run(
-            [resolved, "-c", _BRIDGE_RUNNER_SRC],
+            exec_argv,
             input=request, capture_output=True, text=True, timeout=bridge_timeout,
         )
     except subprocess.TimeoutExpired as e:
