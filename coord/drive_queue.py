@@ -4315,51 +4315,84 @@ class ExistingPrMatch:
     built it — :func:`coord.commands.drive_queue._existing_pr_match`, the
     one place that owns the `gh pr list` + checks read this module stays
     pure of.
+
+    *missing_gates* (#3539) is the subset of ``("review", "test")`` that
+    `coord.gates.build_gate_report` — the SAME read `coord gates`/`coord
+    merge` themselves use, never a second guess (#2096: one question, one
+    answer) — reports as still required-but-not-ok for this PR's work
+    chain. Empty by default so every pre-#3539 construction of this
+    dataclass (every existing test that only ever set *all_green*) keeps
+    reading as "fully gated" — i.e. byte-identical old behaviour — without
+    being touched.
     """
 
     number: int
     branch: str
     url: str
     all_green: bool
+    missing_gates: tuple[str, ...] = ()
 
 
 def existing_pr_relaunch_remedy(
     repo: str, issue: int, match: "ExistingPrMatch | None"
 ) -> dict[str, str] | None:
-    """#2377: the option (and `drive-queue add` refusal message) *match*
-    recommends INSTEAD OF a blind ``remove && add`` relaunch — or ``None``
-    when *match* is ``None`` (today's only behaviour unchanged: no PR on the
-    conventional branch name(s), start fresh).
+    """#2377/#3539: the option (and `drive-queue add` refusal message)
+    *match* recommends INSTEAD OF a blind ``remove && add`` relaunch — or
+    ``None`` when *match* is ``None`` (no PR on the conventional branch
+    name(s), start fresh) OR when *match* is green but still carries
+    unrecorded gates (#3539 — see below): both ``None`` shapes mean "let
+    this `add` proceed", not "nothing was found".
 
-    Two shapes, both refusing the relaunch — a red/stale-checks PR is NOT a
-    green light to requeue either: something else may already be mid-fixing
-    that branch, and a fresh drive launched on top of it is exactly the "at
-    best wasted work, at worst clobbering it mid-flight" risk #2377 opens
-    with. Merging a discovered PR is deliberately NOT done here — surfacing
-    it (or refusing the relaunch) is enough; merging stays a `coord merge`
-    decision.
+    Three shapes:
+
+    * **red / stale checks** — refuse; something else may already be
+      mid-fixing that branch, and a fresh drive launched on top of it is
+      exactly the "at best wasted work, at worst clobbering it mid-flight"
+      risk #2377 opens with.
+    * **green, but Test and/or Review never recorded** (#3539 — the
+      quadraui#1109/PR#1253 incident: CI all green, yet `coord gates`
+      showed both `review` and `test` BLOCKED, and the ``merge it instead``
+      advice below was impossible — `coord merge --only` itself refused
+      with ``enqueue blocked by review gate``). Refusing here would strand
+      the entry with no way to ever collect the missing verdicts. Returning
+      ``None`` lets the `add` proceed and the queue's own drive resume on
+      the EXISTING branch — `decide()` only ever dispatches a fresh Work
+      leg when ``state.work_aid`` is unset (see `coord/drive.py`), which it
+      is not here, so this can only ever run the missing stage(s) (Test
+      dispatch, Review dispatch) forward to merge, never restart Work.
+    * **green and every gate already satisfied** — truly done: refuse and
+      point at ``coord merge --only`` instead of relaunching a fresh drive
+      over it. Merging is deliberately NOT done here — surfacing it (or
+      refusing the relaunch) is enough; merging stays a `coord merge`
+      decision.
     """
     if match is None:
         return None
     key = entry_key(repo, issue)
-    if match.all_green:
+    if not match.all_green:
         return {
-            "label": "Merge existing PR",
-            "command_or_action": f"coord merge --only {key}",
+            "label": "Inspect existing PR",
+            "command_or_action": merge_plan_inspect_command(repo),
             "what_happens": (
-                f"PR #{match.number} ({match.branch}) already carries this "
-                "work with every check green — merge it instead of "
+                f"PR #{match.number} ({match.branch}) already exists for "
+                "this entry, but its checks are not all green — fix it "
+                "forward (or confirm by hand it is truly dead) before "
                 "relaunching a fresh drive over it."
             ),
         }
+    if match.missing_gates:
+        # #3539: deliberately no refusal dict — see the docstring's second
+        # shape. Returning `None` here is the whole fix: it lets `add`
+        # proceed instead of stranding the entry on an impossible "merge
+        # it" when `coord merge --only` would itself refuse.
+        return None
     return {
-        "label": "Inspect existing PR",
-        "command_or_action": merge_plan_inspect_command(repo),
+        "label": "Merge existing PR",
+        "command_or_action": f"coord merge --only {key}",
         "what_happens": (
-            f"PR #{match.number} ({match.branch}) already exists for this "
-            "entry, but its checks are not all green — fix it forward (or "
-            "confirm by hand it is truly dead) before relaunching a fresh "
-            "drive over it."
+            f"PR #{match.number} ({match.branch}) already carries this "
+            "work with every check green — merge it instead of "
+            "relaunching a fresh drive over it."
         ),
     }
 
