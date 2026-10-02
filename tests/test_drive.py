@@ -654,9 +654,14 @@ def test_resolve_oracle_decision_is_active_when_everything_lines_up():
     assert "ms-38" in decision.reason
 
 
-def test_resolve_oracle_decision_resolves_issue_exempt_when_active():
-    """#2199: `issue_exempt` is resolved alongside `active` — one GitHub
-    fetch budget, not a second one paid later by the trust gate."""
+def test_resolve_oracle_decision_is_inactive_for_an_exempt_issue():
+    """#2171: an issue in `manifest.exempt` (or labelled `oracle:exempt`)
+    has no sealed slice for a `type="test-author"` session to write — the
+    same #1138 hard gate (`issue_oracle_ready`) would never block its Work
+    dispatch on one either. `resolve_oracle_decision` must say so with
+    `active=False` (not merely flag `issue_exempt=True` on an otherwise
+    active decision) so `_dispatch_work_stage` dispatches Work directly
+    instead of dead-ending on a test-author with nothing to author."""
     checker = FakeGateChecker(exists=True, exempt=True)
     decision = resolve_oracle_decision(
         oracle_state(issue_labels=("bug",)),
@@ -664,8 +669,10 @@ def test_resolve_oracle_decision_resolves_issue_exempt_when_active():
         make_config_with_acceptance_driver(),
         checker,
     )
-    assert decision.active is True
+    assert decision.active is False
     assert decision.issue_exempt is True
+    assert "exempt" in decision.reason
+    assert "ms-38" in decision.reason
     assert checker.exempt_calls == [(REPO, 38, ISSUE, ("bug",))]
 
 
@@ -865,6 +872,41 @@ def test_gate_a_contract_path_agrees_across_python_dispatch_and_drive():
 def test_oracle_inactive_dispatches_work_directly_as_before():
     """oracle=None (the default) is byte-for-byte the pre-#1453 behaviour."""
     action = step(state())
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
+
+
+def test_oracle_exempt_issue_dispatches_work_directly_no_test_author():
+    """#2171: `resolve_oracle_decision` returns `active=False` for an exempt
+    issue (see the regression test above), so `_dispatch_work_stage` must
+    skip the JIT-authoring branch entirely and dispatch Work straight away
+    — never a `coord acceptance author ...` for an issue with nothing to
+    author."""
+    oracle = OracleDecision(
+        False,
+        "#1392 is exempt in ms-38's manifest — normal drive",
+        issue_exempt=True,
+    )
+    action = step(state(), oracle=oracle)
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
+
+
+def test_dispatch_work_stage_also_guards_on_issue_exempt_defensively():
+    """Belt-and-suspenders (mirrors `_decide_acceptance_gate`'s own guard):
+    even if something ever constructed an `active=True, issue_exempt=True`
+    decision, the work-stage dispatch must still skip authoring rather than
+    trust `active` alone."""
+    oracle = OracleDecision(
+        True, "ORACLE DRIVE", tracking_issue=1120, issue_exempt=True,
+    )
+    action = step(state(), oracle=oracle)
+    assert action.kind == RUN
     assert action.command == (
         "assign", "precision", REPO, "1392",
         "--driven-by", f"drive:{REPO}#1392",

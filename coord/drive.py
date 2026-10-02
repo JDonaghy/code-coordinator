@@ -1006,16 +1006,19 @@ class OracleDecision:
     — the argument :func:`_decide_acceptance_author` needs to build ``coord
     acceptance author <repo> <tracking_issue> --issue <N>``.
 
-    #2199: ``issue_exempt`` — resolved alongside ``active`` (same one-shot
-    GitHub fetch budget: ``AcceptanceGateChecker.is_issue_exempt`` reuses the
-    #1138 hard gate's own manifest read) — is *this issue*'s
-    ``manifest.exempt``/``oracle:exempt`` opt-out from the sealed suite.
-    :func:`_decide_acceptance_gate` (the trust gate) skips entirely when
-    this is ``True``: an exempt issue has no authored slice for `coord
-    acceptance record` to re-run, so treating its absence as a red verdict
-    would be exactly the "acquire a new blocking gate it never opted into"
-    regression #2199's acceptance criteria rule out. Always ``False`` when
-    ``active`` is ``False`` — meaningless outside the oracle loop.
+    #2199/#2171: ``issue_exempt`` — resolved alongside ``active`` (same
+    one-shot GitHub fetch budget: ``AcceptanceGateChecker.is_issue_exempt``
+    reuses the #1138 hard gate's own manifest read) — is *this issue*'s
+    ``manifest.exempt``/``oracle:exempt`` opt-out from the sealed suite. An
+    exempt issue makes :func:`resolve_oracle_decision` return ``active=False``
+    (#2171 — it has no slice for a `test-author` session to write, so
+    JIT-authoring must not run either), with ``issue_exempt=True`` and
+    ``reason`` naming the exemption for the preflight banner. ``True`` only
+    ever coincides with ``active=False`` by construction; kept as its own
+    field (rather than inferred from ``reason``) so
+    :func:`_decide_acceptance_gate` and :func:`_dispatch_work_stage` can
+    check it directly and defensively, without parsing prose. ``False``
+    when the issue is not exempt, whatever ``active`` is.
     """
 
     active: bool
@@ -1094,6 +1097,24 @@ def resolve_oracle_decision(
     issue_exempt = gate_checker.is_issue_exempt(
         state.repo, state.milestone_number, state.issue, state.issue_labels,
     )
+    if issue_exempt:
+        # #2171: an issue in `manifest.exempt`/labelled `oracle:exempt` has
+        # no sealed slice for a `type="test-author"` session to write — the
+        # #1138 hard gate (`issue_oracle_ready`) would never block its Work
+        # dispatch on one either. Returning INACTIVE here (not just setting
+        # `issue_exempt=True` on an active decision) means BOTH downstream
+        # gates fall through to a normal drive: `_dispatch_work_stage`
+        # dispatches Work directly instead of authoring first, and
+        # `_decide_acceptance_gate`'s trust gate never fires. Before this,
+        # `active` stayed True for an exempt issue, so the JIT-authoring
+        # step ran anyway — burning a metered dispatch for guaranteed-zero
+        # output and then dead-ending with nothing left to dispatch Work.
+        return OracleDecision(
+            False,
+            f"#{state.issue} is exempt in ms-{state.milestone_number}'s "
+            "manifest — normal drive",
+            issue_exempt=True,
+        )
     return OracleDecision(
         True,
         f"ORACLE DRIVE — ms-{state.milestone_number}'s Gate-A contract is "
@@ -1102,7 +1123,6 @@ def resolve_oracle_decision(
         f"{state.milestone_tracking_issue} --issue {state.issue}`) before "
         "dispatching work",
         tracking_issue=state.milestone_tracking_issue,
-        issue_exempt=issue_exempt,
     )
 
 
@@ -2997,7 +3017,13 @@ def _dispatch_work_stage(
     *counters* is threaded in for the slice's own merge budget (#2079 —
     ``DriveCounters.acceptance``); every other decision here is stateless.
     """
-    if oracle is not None and oracle.active:
+    if oracle is not None and oracle.active and not oracle.issue_exempt:
+        # #2171: `oracle.active` alone already excludes an exempt issue
+        # (`resolve_oracle_decision` returns `active=False` for one) — the
+        # explicit `not oracle.issue_exempt` here is belt-and-suspenders,
+        # mirroring `_decide_acceptance_gate`'s own guard below, so this
+        # call site asks the SAME direct question rather than relying on
+        # `active`'s meaning to carry it transitively.
         assert gate_checker is not None and verifier is not None, (
             "oracle.active implies resolve_oracle_decision ran with a real "
             "gate_checker; decide()/Driver always thread one through"
