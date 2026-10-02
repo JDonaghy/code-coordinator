@@ -433,6 +433,7 @@ def _fetch_manifest_data(
     *,
     issue_number: int | None = None,
     roots: Iterable[str] | None = None,
+    root_out: "list[str] | None" = None,
 ):
     """*milestone_number*'s manifest data via *fetch* (a raw-content GitHub
     fetch, no local checkout, no directory listing) — the legacy single-file
@@ -468,6 +469,16 @@ def _fetch_manifest_data(
     unchanged from before #2896. Tries each root until one actually has a
     legacy manifest and/or fragment file; a milestone's data lives under
     exactly one, so the first root that produces anything wins.
+
+    *root_out* (#2166), when given, has the matched root dir appended —
+    the SAME root this data actually came from — so a caller rendering the
+    worker-briefing contract block (which needs to name a repo-relative
+    dirname in the text, e.g. ``tests/acceptance/ms-37/contract.md``) can
+    do so without a second, independent search. Appends the first
+    candidate root (or the legacy single-root default) when nothing
+    matched, mirroring the fall-through return below — there is no "right"
+    root to name for a slice that doesn't exist, so the caller must check
+    ``has_slice``/``exempt`` before trusting this for message text.
     """
     from coord import github_ops  # noqa: PLC0415
     from coord.acceptance import (  # noqa: PLC0415
@@ -511,6 +522,8 @@ def _fetch_manifest_data(
         legacy, legacy_found = _fetch_one(f"{root_dir}/{ms_dir}", "manifest")
         if issue_number is None:
             if legacy_found:
+                if root_out is not None:
+                    root_out.append(root_dir)
                 return legacy
             continue
         fragment, fragment_found = _fetch_one(
@@ -518,10 +531,14 @@ def _fetch_manifest_data(
             str(issue_number),
         )
         if legacy_found or fragment_found:
+            if root_out is not None:
+                root_out.append(root_dir)
             return merge_manifest_data(legacy, fragment)
 
     # No root produced anything — degrade to empty data, same as the old
     # single-root "not found" behaviour.
+    if root_out is not None:
+        root_out.append(search_roots[0])
     return legacy if issue_number is None else merge_manifest_data(legacy, fragment)
 
 
@@ -714,6 +731,19 @@ class OracleReadiness:
     #: gate doesn't apply. ``"approved"``/``"exempt"`` are the only values
     #: that let ``reason`` be ``None``.
     gate_a_state: str = ""
+    #: (#2166) The milestone this readiness verdict was computed against,
+    #: and the ``ms-NN`` directory name / repo-relative acceptance-root
+    #: dirname the slice (or exemption) it found actually lives under —
+    #: set whenever ``applies`` is ``True``. Exists so a caller that needs
+    #: to RENDER the worker-briefing contract block
+    #: (:func:`coord.acceptance.oracle_loop_contract_block_for_slice`) can
+    #: do so from THIS SAME verdict instead of re-deriving "does a slice
+    #: exist" from a second, independent read (previously a scan of the
+    #: dispatching host's local checkout, #2166's split-brain) — one
+    #: fetch, one source of truth, per #2096 "one question, one answer".
+    milestone_number: int | None = None
+    ms_dir: str = ""
+    acceptance_dirname: str = ""
 
 
 def _gate_a_exempt_trade_off_note(
@@ -857,13 +887,26 @@ def issue_oracle_ready(
     from coord.acceptance import test_ids_for_issue  # noqa: PLC0415
     from coord.acceptance_drivers import SUPPORTED_KINDS  # noqa: PLC0415
 
+    # #2166: capture WHICH search root this issue's manifest data actually
+    # came from, so the verdict below can carry enough to let a caller
+    # render the worker-briefing contract block from THIS read — the same
+    # `gh`-fetched-from-the-default-branch source the gate itself just
+    # used — instead of a second, independent local-checkout scan that can
+    # silently disagree with it (the #2166 split-brain).
+    matched_roots: list[str] = []
     manifest = _fetch_manifest_data(
         repo_cfg.github, milestone_number, repo_cfg.default_branch, fetch,
         issue_number=issue_number,
         roots=config.acceptance.acceptance_search_roots(repo_cfg.name),
+        root_out=matched_roots,
     )
     has_slice = bool(test_ids_for_issue(manifest.tests, issue_number))
     exempt = issue_number in manifest.exempt or "oracle:exempt" in set(issue_labels)
+
+    from coord.acceptance import ACCEPTANCE_DIRNAME, ms_dirname  # noqa: PLC0415
+
+    ms_dir = ms_dirname(milestone_number)
+    acceptance_dirname = matched_roots[0] if matched_roots else ACCEPTANCE_DIRNAME
 
     entry = config.acceptance.drivers.get(repo_cfg.name)
     unsupported = _unsupported_driver_kinds(entry) if entry is not None else ()
@@ -887,13 +930,16 @@ def issue_oracle_ready(
         return OracleReadiness(
             applies=True, exempt=exempt, has_slice=has_slice,
             unsupported_kinds=unsupported, reason=signoff.reason,
-            gate_a_state=signoff.state,
+            gate_a_state=signoff.state, milestone_number=milestone_number,
+            ms_dir=ms_dir, acceptance_dirname=acceptance_dirname,
         )
 
     if exempt:
         return OracleReadiness(
             applies=True, exempt=True, has_slice=has_slice,
             unsupported_kinds=unsupported, gate_a_state=signoff.state,
+            milestone_number=milestone_number, ms_dir=ms_dir,
+            acceptance_dirname=acceptance_dirname,
         )
 
     reason: str | None = None
@@ -920,7 +966,8 @@ def issue_oracle_ready(
     return OracleReadiness(
         applies=True, exempt=False, has_slice=has_slice,
         unsupported_kinds=unsupported, reason=reason,
-        gate_a_state=signoff.state,
+        gate_a_state=signoff.state, milestone_number=milestone_number,
+        ms_dir=ms_dir, acceptance_dirname=acceptance_dirname,
     )
 
 

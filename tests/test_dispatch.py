@@ -569,21 +569,37 @@ class TestDispatch:
         assert "tui/tests/acceptance.rs" in payload["files_forbidden"]
 
     @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
     def test_payload_prepends_oracle_loop_contract_when_slice_authored(
-        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+        self, mock_get_issue, mock_get_repo_file, mock_post: MagicMock,
+        proposal: Proposal, tmp_path, coord_db,
     ) -> None:
         """#945: a repo with an acceptance driver configured AND an authored
         manifest slice for this issue gets the oracle-loop contract block
-        prepended (after the #603 digest, before the original briefing)."""
+        prepended (after the #603 digest, before the original briefing).
+
+        #2166: the briefing's contract block is now built from the SAME
+        `github_ops` read (default branch) the #1138 gate uses, not a scan
+        of the dispatching host's local checkout — so this mocks
+        `get_issue`/`get_repo_file` rather than writing files under
+        `tmp_path` (which is no longer read for this at all)."""
         from coord.config import AcceptanceConfig, AcceptanceDriverConfig
 
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
 
-        acceptance_dir = tmp_path / "tests" / "acceptance" / "ms01"
-        acceptance_dir.mkdir(parents=True)
-        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+        mock_get_issue.return_value = {"milestone": {"number": 1}, "labels": []}
+
+        def _repo_file(repo, path, branch=None):
+            if path.endswith("contract.md"):
+                return "contract body"
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms1::a: 10\n"
+            raise RuntimeError("404")
+
+        mock_get_repo_file.side_effect = _repo_file
 
         cfg = Config(
             repos=[Repo(name="api", github="acme/api")],
@@ -598,30 +614,42 @@ class TestDispatch:
         dispatch(proposal, cfg)
         briefing = mock_post.call_args.kwargs["json"]["briefing"]
         assert "## 🔒 Oracle-loop acceptance contract" in briefing
-        assert "tests/acceptance/ms01/contract.md" in briefing
+        assert "tests/acceptance/ms-1/contract.md" in briefing
         assert "coord acceptance run --repo api --issue 10" in briefing
         assert briefing.rstrip().endswith("Fix the auth module")  # original briefing last
 
     @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
     def test_payload_prepends_oracle_loop_contract_for_a_relocated_slice(
-        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+        self, mock_get_issue, mock_get_repo_file, mock_post: MagicMock,
+        proposal: Proposal, tmp_path, coord_db,
     ) -> None:
         """#2896: an entrypoint-linked driver's slice now lives under that
         entrypoint's own sibling `acceptance/` dir, not the shared
         repo-root tree — this dispatch call has no single path in hand to
         pick a route ahead of time, so it must search every root the repo
-        declares and find the slice wherever it actually landed."""
+        declares (#2166: via `github_ops`, same as the gate) and find the
+        slice wherever it actually landed."""
         from coord.config import AcceptanceConfig, AcceptanceDriverConfig
 
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
 
+        mock_get_issue.return_value = {"milestone": {"number": 1}, "labels": []}
+
         # Nothing at the shared repo-root tree — only the entrypoint's own
         # sibling dir has the slice.
-        acceptance_dir = tmp_path / "tui" / "tests" / "acceptance" / "ms01"
-        acceptance_dir.mkdir(parents=True)
-        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+        def _repo_file(repo, path, branch=None):
+            if path.startswith("tui/tests/acceptance/"):
+                if path.endswith("contract.md"):
+                    return "contract body"
+                if path.endswith("manifest.yml"):
+                    return "tests:\n  ms1::a: 10\n"
+            raise RuntimeError("404")
+
+        mock_get_repo_file.side_effect = _repo_file
 
         cfg = Config(
             repos=[Repo(name="api", github="acme/api")],
@@ -639,22 +667,28 @@ class TestDispatch:
         dispatch(proposal, cfg)
         briefing = mock_post.call_args.kwargs["json"]["briefing"]
         assert "## 🔒 Oracle-loop acceptance contract" in briefing
-        assert "tui/tests/acceptance/ms01/contract.md" in briefing
+        assert "tui/tests/acceptance/ms-1/contract.md" in briefing
         # Never names the (empty, wrong) shared repo-root default.
-        assert "`tests/acceptance/ms01" not in briefing
+        assert "`tests/acceptance/ms-1" not in briefing
 
     @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
     def test_payload_oracle_loop_contract_with_tilde_repo_path(
-        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+        self, mock_get_issue, mock_get_repo_file, mock_post: MagicMock,
+        proposal: Proposal, tmp_path, coord_db,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """#945 review follow-up: repo_paths entries configured with a
-        literal ``~`` (the README's canonical ``repo_paths: { my-project:
-        ~/src/my-project }`` example) must resolve the same way the sibling
-        ``.expanduser()`` call three lines above does. Before the fix,
-        ``Path(repo_path) / ACCEPTANCE_DIRNAME`` left the ``~`` unexpanded,
-        ``.exists()`` was always False, and the contract block silently
-        never appeared for any repo configured the documented way."""
+        """#945 review follow-up / #2166: the oracle-loop contract block is
+        now rendered entirely from the #1138 gate's `github_ops` read
+        (default branch, no local checkout involved at all) — a
+        `repo_paths` entry configured with a literal ``~`` (the README's
+        canonical ``repo_paths: { my-project: ~/src/my-project }``
+        example) must not matter, since nothing under that path is ever
+        read to build this block any more. Before #2166 this exercised
+        ``Path(repo_path) / ACCEPTANCE_DIRNAME`` tilde-expansion directly;
+        now it proves the block still renders correctly even though NO
+        local directory for the repo exists anywhere on disk."""
         from coord.config import AcceptanceConfig, AcceptanceDriverConfig
 
         mock_resp = MagicMock()
@@ -664,11 +698,19 @@ class TestDispatch:
         fake_home = tmp_path / "home"
         fake_home.mkdir()
         monkeypatch.setenv("HOME", str(fake_home))
+        # Deliberately no `~/src/api` directory anywhere on disk — nothing
+        # should ever try to read it.
 
-        repo_dir = fake_home / "src" / "api"
-        acceptance_dir = repo_dir / "tests" / "acceptance" / "ms01"
-        acceptance_dir.mkdir(parents=True)
-        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+        mock_get_issue.return_value = {"milestone": {"number": 1}, "labels": []}
+
+        def _repo_file(repo, path, branch=None):
+            if path.endswith("contract.md"):
+                return "contract body"
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms1::a: 10\n"
+            raise RuntimeError("404")
+
+        mock_get_repo_file.side_effect = _repo_file
 
         cfg = Config(
             repos=[Repo(name="api", github="acme/api")],
@@ -683,11 +725,14 @@ class TestDispatch:
         dispatch(proposal, cfg)
         briefing = mock_post.call_args.kwargs["json"]["briefing"]
         assert "## 🔒 Oracle-loop acceptance contract" in briefing
-        assert "tests/acceptance/ms01/contract.md" in briefing
+        assert "tests/acceptance/ms-1/contract.md" in briefing
 
     @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
     def test_payload_prepends_oracle_loop_contract_when_driver_is_routed(
-        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+        self, mock_get_issue, mock_get_repo_file, mock_post: MagicMock,
+        proposal: Proposal, tmp_path, coord_db,
     ) -> None:
         """#1125 review finding 1: the same as
         test_payload_prepends_oracle_loop_contract_when_slice_authored, but
@@ -701,9 +746,16 @@ class TestDispatch:
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
 
-        acceptance_dir = tmp_path / "tests" / "acceptance" / "ms01"
-        acceptance_dir.mkdir(parents=True)
-        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+        mock_get_issue.return_value = {"milestone": {"number": 1}, "labels": []}
+
+        def _repo_file(repo, path, branch=None):
+            if path.endswith("contract.md"):
+                return "contract body"
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms1::a: 10\n"
+            raise RuntimeError("404")
+
+        mock_get_repo_file.side_effect = _repo_file
 
         cfg = Config(
             repos=[Repo(name="api", github="acme/api")],
@@ -722,7 +774,7 @@ class TestDispatch:
         dispatch(proposal, cfg)
         briefing = mock_post.call_args.kwargs["json"]["briefing"]
         assert "## 🔒 Oracle-loop acceptance contract" in briefing
-        assert "tests/acceptance/ms01/contract.md" in briefing
+        assert "tests/acceptance/ms-1/contract.md" in briefing
 
     @patch("coord.dispatch.httpx.post")
     def test_payload_no_oracle_loop_contract_without_driver(
@@ -1157,6 +1209,59 @@ class TestOracleReadinessGate:
         result = dispatch(p, cfg)
         assert result["ok"] is True
         mock_post.assert_called_once()
+
+        # #2166: the briefing itself must carry the oracle contract — this
+        # is the exact bug the issue reports: the gate approving the
+        # dispatch is not proof the WORKER got the contract. The briefing
+        # block is built from `enforce_oracle_readiness`'s own
+        # `issue_oracle_ready` verdict (the gate's read) rather than a
+        # second, independent manifest/contract fetch — #2096's "one
+        # question, one answer".
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "## 🔒 Oracle-loop acceptance contract" in briefing
+        assert "tests/acceptance/ms-37/contract.md" in briefing
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
+    def test_refuses_rather_than_dispatch_with_hollow_briefing_on_render_mismatch(
+        self, mock_get_issue, mock_get_repo_file, mock_post,
+    ) -> None:
+        """#2166 regression: if the gate's own verdict says a slice (or an
+        exemption) exists for this issue, but rendering the briefing block
+        from that SAME verdict somehow comes back empty — a renderer bug,
+        never "no slice yet" (the gate already ruled that out) — dispatch
+        must refuse loudly rather than silently send the worker a briefing
+        with no oracle contract at all. This is the #2096 "a gate must be
+        able to fail" / "unconfirmed success is a defect" backstop: even
+        though the fix makes the two reads share one fetch seam (so this
+        can't happen via a stale checkout any more), the render step is
+        still a second computation off that one verdict and must not be
+        trusted blindly."""
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1118, issue_title="Usage Core",
+            rationale="", type="work",
+        )
+        mock_get_issue.return_value = {"milestone": {"number": 37}, "labels": []}
+
+        def _repo_file(repo, path, branch=None):
+            if path.endswith("contract.md"):
+                return "contract body"
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms37::a: 1118\n"
+            raise RuntimeError("404")
+
+        mock_get_repo_file.side_effect = _repo_file
+
+        with patch(
+            "coord.acceptance.oracle_loop_contract_block_for_slice",
+            return_value="",
+        ):
+            with pytest.raises(DispatchRefused, match="internal inconsistency"):
+                dispatch(p, cfg)
+        mock_post.assert_not_called()
 
     @patch("coord.dispatch.httpx.post")
     @patch("coord.github_ops.get_repo_file")
