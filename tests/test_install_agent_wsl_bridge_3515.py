@@ -73,7 +73,31 @@ exit 1
     _write_exe(fake_bin / "systemctl", "#!/usr/bin/env bash\nexit 0\n")
     for noop in ("loginctl", "claude"):
         _write_exe(fake_bin / noop, "#!/usr/bin/env bash\nexit 0\n")
+    _write_exe(fake_bin / "grep", _GREP_STUB)
     return fake_bin
+
+
+#: #3532: `install-agent.sh`'s WSL-detection fallback is literally
+#: `grep -qi microsoft /proc/version` (consulted only when `WSL_DISTRO_NAME`
+#: is unset) — run for real, that reads the actual host's `/proc/version`,
+#: which says "microsoft" on a genuine WSL2 host (dell64) regardless of
+#: which branch THIS test means to exercise. Intercepting exactly that one
+#: invocation and answering from `$COORD_TEST_PROC_VERSION_IS_WSL` (set by
+#: `_run_installer` below, from the same `wsl=` flag the test author
+#: already passed) makes the installer's WSL detection hermetic the same
+#: way `tests/conftest.py`'s `_non_wsl_host_by_default` does for the Python
+#: driver path — every OTHER `grep` call (e.g. the `python3 --version`
+#: compatibility check) is forwarded to the real binary unchanged.
+_GREP_STUB = """#!/usr/bin/env bash
+if [ "$1" = "-qi" ] && [ "$2" = "microsoft" ] && [ "$3" = "/proc/version" ]; then
+    if [ "${COORD_TEST_PROC_VERSION_IS_WSL:-0}" = "1" ]; then
+        exit 0
+    else
+        exit 1
+    fi
+fi
+exec /usr/bin/grep "$@"
+"""
 
 
 def _bridge_log(tmp_path: Path) -> Path:
@@ -111,6 +135,12 @@ def _run_installer(
         env["WSL_DISTRO_NAME"] = "Ubuntu"
     else:
         env.pop("WSL_DISTRO_NAME", None)
+    # #3532: back the installer's `/proc/version` fallback check with the
+    # same `wsl=` flag, via the `grep` stub in `_make_fake_bin`, instead of
+    # leaving it to read the REAL host's `/proc/version` — a genuine WSL2
+    # host (dell64) would otherwise always win that check regardless of
+    # what `WSL_DISTRO_NAME` above says.
+    env["COORD_TEST_PROC_VERSION_IS_WSL"] = "1" if wsl else "0"
     return subprocess.run(
         [POSIX_BASH, str(INSTALLER), "--machine", "testhost", *extra_args],
         cwd=tmp_path,

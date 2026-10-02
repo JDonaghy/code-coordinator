@@ -1304,3 +1304,33 @@ def _no_frozen_coord_dir_constants():
     _scrub_lazy_coord_dir_constants()
     yield
     _scrub_lazy_coord_dir_constants()
+
+
+@pytest.fixture(autouse=True)
+def _non_wsl_host_by_default(monkeypatch):
+    """#3532: ``coord.win_native_bridge.is_wsl_host`` detects the REAL host
+    it's running on (``WSL_DISTRO_NAME``/``/proc/version``) — fine for
+    production, but it means every ``win-native`` acceptance-driver test
+    that doesn't scripts its own ``run_native_spec``/bridge fake implicitly
+    assumed "whatever machine runs this test suite is not WSL". That held
+    for every machine except dell64 (a genuine WSL2 host with a working
+    Windows-side Python, #3519): there, ``is_wsl_host()`` legitimately
+    returns ``True`` and ``coord.acceptance_drivers._run_win_native`` takes
+    the real WSL->Windows bridge path instead of the scripted fake these
+    tests set up on ``coord.win_native_driver.run_native_spec`` — a
+    baseline-red latch (#3386), not a test bug in the assertions themselves.
+
+    Forcing the DEFAULT to non-WSL here, once, is the same "one question,
+    one answer" posture as this file's other ``_no_real_*``/``_no_live_*``
+    fixtures: every test in the suite gets a hermetic answer to "is this
+    host WSL" regardless of which machine actually runs it. A test that
+    means to exercise the WSL/bridge branch (``TestRunDriverWinNativeWslBridge``
+    in ``tests/test_acceptance_drivers.py``) monkeypatches
+    ``win_native_bridge.is_wsl_host`` back to ``True`` itself, inside the
+    test body — that call reuses this same function-scoped ``monkeypatch``
+    fixture and so simply wins (last ``setattr`` on the same attribute),
+    no ordering trick needed.
+    """
+    import coord.win_native_bridge as win_native_bridge
+
+    monkeypatch.setattr(win_native_bridge, "is_wsl_host", lambda: False)
