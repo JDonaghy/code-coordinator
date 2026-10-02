@@ -145,6 +145,17 @@ __all__ = [
     "xlsx_filename",
     "EXPORT_FORMATS",
     "report_filename",
+    "PublicExportError",
+    "PUBLIC_PRIVATE_REPO_LABEL",
+    "redact_report_for_public",
+    "load_public_allowlist",
+    "has_cost_columns",
+    "has_basis_note",
+    "assert_public_export_allowed",
+    "run_public_export",
+    "result_to_public_html",
+    "public_html_filename",
+    "public_csv_filename",
 ]
 
 
@@ -5418,6 +5429,471 @@ EXPORT_FORMATS: dict[str, ExportFormat] = {
         filename=xlsx_filename,
     ),
 }
+
+
+# ── public export (#3474) ──────────────────────────────────────────────────
+#
+# "Public" means OUTSIDE the fleet: someone evaluating the tool, or marketing
+# material quoting "cost per merged issue". That audience must never see a
+# private repo's name, an issue title, or an issue number — only the repos an
+# operator has explicitly named in `reporting.public.allowlist_repos`
+# (:class:`coord.config.PublicReportingConfig`) may appear verbatim; every
+# other repo's rows are redacted into one aggregate "private repo" row.
+#
+# Three pieces, same separation of concerns as the rest of this module:
+# `redact_report_for_public` is the **pure** fold (a `ReportResult` + an
+# allowlist in, a redacted `ReportResult` out — no config load, no I/O, unit
+# tests against a fixture result); `run_public_export` is the runner (loads
+# the allowlist off `coordinator.yml`, runs the report, redacts, and refuses
+# to produce a cost-bearing number with no stated basis); `result_to_public_
+# html` is the one new serialisation — a self-contained static HTML page,
+# sibling to `result_to_csv`/`result_to_xlsx` but never fed an
+# un-redacted result.
+
+#: The one row every non-allowlisted repo's rows collapse into.
+PUBLIC_PRIVATE_REPO_LABEL = "private repo"
+
+
+class PublicExportError(ReportError):
+    """A public export was refused — not a bad request against the report
+    engine itself (the report ran fine), but a redaction-policy refusal:
+    today, only "this report carries a cost figure but no basis/coverage
+    note survived redaction" (#3474: "a public number with no stated basis
+    is not produced"). The CLI and the daemon both turn this into a clean
+    error, never a traceback — same convention as :class:`ReportError`,
+    which this subclasses."""
+
+
+def _public_row_identity_columns(
+    report: ReportDef | None, columns: Sequence[str]
+) -> tuple[str | None, str | None, str | None]:
+    """Which of *columns* hold a row's repo / issue / title, for redaction.
+
+    Prefers the report's own declared :class:`RowIdentity` (#2454) — the
+    SAME per-row identity the coord-tui panel's "View on Board" navigation
+    reads, per #2096's "one question, one answer": this must not grow a
+    second, independently-drifting idea of which column is "the repo".
+    Falls back to the ``repo``/``issue``/``title`` names every report in
+    this module uses by convention, for a report that declares no
+    ``row_identity`` at all (``drive-queue-status``, ``decisions``, ...) or
+    when called with ``report=None`` (a bare ``ReportResult`` fixture).
+    """
+    if report is not None and report.row_identity is not None:
+        repo_col: str | None = report.row_identity.repo_column
+        issue_col: str | None = report.row_identity.issue_column
+    else:
+        repo_col = "repo" if "repo" in columns else None
+        issue_col = "issue" if "issue" in columns else None
+    title_col = "title" if "title" in columns else None
+    return repo_col, issue_col, title_col
+
+
+def _accumulate_private_row(
+    bucket: dict[str, Any],
+    row: Mapping[str, Any],
+    columns: Sequence[str],
+    column_meta: Mapping[str, Mapping[str, Any]],
+    skip: frozenset[str],
+) -> None:
+    """Fold one redacted row into the running "private repo" aggregate.
+
+    ``int``/``money`` columns sum (a count or a dollar figure is still
+    honest once aggregated); ``list`` columns union (so e.g. a redacted
+    ``machines`` column still names real machines, which are fleet
+    infrastructure, not private repo data); every other kind — ``title`` by
+    construction, plus any ``text``/``enum``/``timestamp`` column this
+    report happens to carry — blanks to ``None`` rather than guessing at a
+    sane aggregate, since "first value wins" would silently pick one
+    private repo's value to represent all of them.
+
+    *column_meta* is the wire ``to_dict()`` shape (plain ``dict`` per
+    column, keyed by ``id``), not :class:`ColumnMeta` instances — this fold
+    runs identically whether the result came from an in-process
+    :func:`run_report` or an already-JSON-decoded daemon response.
+    """
+    for c in columns:
+        if c in skip:
+            continue
+        meta = column_meta.get(c) or {}
+        kind = meta.get("kind")
+        value = row.get(c)
+        if kind in ("int", "money"):
+            try:
+                total = float(bucket.get(c) or 0.0) + float(value or 0.0)
+            except (TypeError, ValueError):
+                bucket.setdefault(c, None)
+                continue
+            bucket[c] = int(total) if kind == "int" else total
+        elif kind == "list":
+            existing = list(bucket.get(c) or [])
+            for v in value or ():
+                if v not in existing:
+                    existing.append(v)
+            bucket[c] = existing
+        else:
+            bucket.setdefault(c, None)
+
+
+def _redact_notes(notes: Sequence[str], private_names: frozenset[str]) -> list[str]:
+    """Drop any note that names one of *private_names* verbatim.
+
+    Free-text notes (:func:`_derive_notes`'s anomalies are keyed
+    ``f"{repo}#{issue}: ..."``) are the one place a redacted repo's name
+    could otherwise leak straight back into a "redacted" export. The #3471
+    cost-basis/coverage note names no repo at all, so it always survives
+    this filter untouched — which is exactly the "carries the cost basis +
+    coverage... verbatim" requirement.
+
+    Over-redacting (dropping a note whose text merely CONTAINS a private
+    repo's name, e.g. as a substring of an unrelated word) is the safe
+    failure mode for a PUBLIC export — unlike every other report note,
+    there is no second chance to catch a leak here.
+    """
+    if not private_names:
+        return list(notes)
+    return [
+        note
+        for note in notes
+        if not any(name and name in note for name in private_names)
+    ]
+
+
+def redact_report_for_public(
+    result: "ReportResult | Mapping[str, Any]",
+    *,
+    allowed_repos: Iterable[str],
+    report: ReportDef | None = None,
+) -> dict[str, Any]:
+    """Redact *result* for sharing outside the fleet (#3474).
+
+    **Pure** — no config load, no I/O; *allowed_repos* is the caller's
+    already-resolved allowlist (:func:`run_public_export` loads it off
+    ``coordinator.yml``). Accepts a :class:`ReportResult` OR its
+    ``to_dict()`` shape (same convention as ``result_to_csv`` et al) and
+    always returns the wire dict — this is what lets the SAME redaction run
+    in-process (:func:`run_public_export`) or client-side over an
+    already-fetched daemon response (``coord report export --public`` on a
+    thin client never needs a second, DB-backed redaction path).
+
+    Every row whose repo (per :func:`_public_row_identity_columns`) is not
+    in *allowed_repos* is dropped from the output and folded into a single
+    aggregate :data:`PUBLIC_PRIVATE_REPO_LABEL` row (see
+    :func:`_accumulate_private_row`); its issue/title columns, when the
+    report has them, are blanked to ``None``. Rows about an allowlisted
+    repo pass through **restricted to the result's own declared
+    ``columns``** — any extra per-row key (``first_event_at``, the raw
+    ``session_name``, ...) is dropped unconditionally, allowlisted or not,
+    so a field nobody has audited against this policy can never leak
+    through it even for a named repo.
+
+    A report with no per-row repo identity at all (no declared
+    ``row_identity`` and no conventional ``repo`` column — the release
+    parity matrix, keyed by a single ``repo`` *parameter* rather than a
+    per-row repo) has nothing structural to redact; its rows still get the
+    same "``columns``-only" trim, and its notes are left untouched since
+    nothing here can tell whether they name a private repo.
+    """
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    allowed = frozenset(allowed_repos)
+    columns = [str(c) for c in (data.get("columns") or [])]
+    column_meta = {
+        str(m.get("id")): m
+        for m in (data.get("column_meta") or [])
+        if isinstance(m, Mapping)
+    }
+    repo_col, issue_col, title_col = _public_row_identity_columns(report, columns)
+
+    if repo_col is None or repo_col not in columns:
+        rows = [
+            {c: (row or {}).get(c) for c in columns} for row in (data.get("rows") or [])
+        ]
+        data["rows"] = rows
+        return data
+
+    skip = frozenset(c for c in (repo_col, issue_col, title_col) if c)
+    kept_rows: list[dict[str, Any]] = []
+    private_bucket: dict[str, Any] = {}
+    private_names: set[str] = set()
+    had_private = False
+    for row in data.get("rows") or []:
+        raw_row = {c: (row or {}).get(c) for c in columns}
+        repo_value = raw_row.get(repo_col)
+        if repo_value in allowed:
+            kept_rows.append(raw_row)
+            continue
+        had_private = True
+        if repo_value:
+            private_names.add(str(repo_value))
+        _accumulate_private_row(private_bucket, raw_row, columns, column_meta, skip)
+
+    if had_private:
+        private_bucket[repo_col] = PUBLIC_PRIVATE_REPO_LABEL
+        if issue_col:
+            private_bucket[issue_col] = None
+        if title_col:
+            private_bucket[title_col] = None
+        kept_rows.append(private_bucket)
+
+    data["rows"] = kept_rows
+    data["notes"] = _redact_notes(data.get("notes") or [], frozenset(private_names))
+    return data
+
+
+def load_public_allowlist() -> frozenset[str]:
+    """The fleet's ``reporting.public.allowlist_repos``, best-effort.
+
+    Inverse stance from :func:`_load_pricing`: THAT seam falls back to
+    built-in pricing defaults when ``coordinator.yml`` cannot be loaded,
+    because a wrong price estimate is recoverable. A public export has no
+    such safe non-empty fallback — a config that fails to load returns the
+    EMPTY allowlist, i.e. "redact everything", the only default a PUBLIC
+    export can fail closed on.
+    """
+    try:
+        from coord.config import load, resolve_config_path  # noqa: PLC0415
+
+        cfg = load(resolve_config_path())
+        return frozenset(cfg.reporting.public.allowlist_repos)
+    except Exception:  # noqa: BLE001 — fail CLOSED: unreadable config => redact everything
+        return frozenset()
+
+
+def has_cost_columns(column_meta: Iterable[Mapping[str, Any]]) -> bool:
+    """Does any entry of a wire ``column_meta`` list carry a non-empty
+    ``basis`` (#3471) — i.e. is this result's dollar figure a cost column
+    at all? Shared by :func:`run_public_export` and the CLI's client-side
+    redaction path so both apply the exact same "refuse an unstated public
+    cost number" rule (#2096: one question, one answer)."""
+    return any((m.get("basis") or "") for m in column_meta)
+
+
+def has_basis_note(notes: Iterable[str]) -> bool:
+    """Did the #3471 standard cost-basis/coverage note survive redaction?
+    Shared the same way as :func:`has_cost_columns`."""
+    return any(str(n).startswith("Cost basis:") for n in notes)
+
+
+def assert_public_export_allowed(redacted: Mapping[str, Any], report_id: str) -> None:
+    """Raise :class:`PublicExportError` when *redacted* carries a cost
+    column but no basis/coverage note survived redaction (#3474: "a public
+    number with no stated basis is not produced"). The ONE place this rule
+    is enforced — :func:`run_public_export` and ``coord report export
+    --public``'s client-side path both call this, rather than each
+    re-deriving the same check.
+    """
+    column_meta = redacted.get("column_meta") or []
+    notes = redacted.get("notes") or []
+    if has_cost_columns(column_meta) and not has_basis_note(notes):
+        raise PublicExportError(
+            f"report {report_id!r} carries a cost figure but no cost-basis/"
+            "coverage note survived redaction — refusing to produce a public "
+            "number with no stated basis (#3474)."
+        )
+
+
+def run_public_export(
+    report_id: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    allowed_repos: Iterable[str] | None = None,
+    **injected: Any,
+) -> dict[str, Any]:
+    """Run *report_id*, then redact it for public sharing (#3474).
+
+    ``allowed_repos`` is a test/caller seam; ``None`` (the normal case)
+    resolves it off the loaded ``coordinator.yml`` via
+    :func:`load_public_allowlist`. ``**injected`` passes straight through
+    to :func:`run_report` (mirrors every ``run_*``'s own test seams, e.g.
+    an injected ``fetch=``).
+
+    Raises :class:`PublicExportError` via :func:`assert_public_export_allowed`
+    when the report carries a cost column (``column_meta[].basis`` set,
+    #3471) but no basis/coverage note survived redaction.
+    """
+    report = REPORTS.get(report_id)
+    if report is None:
+        raise UnknownReportError(
+            f"unknown report {report_id!r} — known reports: "
+            f"{', '.join(sorted(REPORTS))}"
+        )
+    result = run_report(report_id, params, **injected)
+    allowed = load_public_allowlist() if allowed_repos is None else frozenset(allowed_repos)
+    redacted = redact_report_for_public(result, allowed_repos=allowed, report=report)
+    assert_public_export_allowed(redacted, report_id)
+    return redacted
+
+
+def _public_html_escape(value: Any) -> str:
+    import html as _html  # noqa: PLC0415 — only this function needs it
+
+    return _html.escape("" if value is None else str(value), quote=True)
+
+
+#: Minimal, dependency-free port of ``reports.html``'s own
+#: ``buildSeriesData``/``buildChartOption`` (#2271/#3473) — same two chart
+#: shapes (`group_by is None`: one point per row; `group_by` set: a pivot,
+#: cells summed, an empty cell is 0), kept in lockstep deliberately so a
+#: screenshot of this page and of the live dashboard for the same
+#: `ReportResult` never disagree. Reads the inlined `REPORT` blob this
+#: module writes below — no fetch, no build step, so the page still renders
+#: its chart offline once the (pinned, CDN) echarts script has loaded once.
+_PUBLIC_CHART_JS = """
+function buildSeriesData(chart, rows) {
+  if (!chart.group_by) {
+    const categories = rows.map((r) => r[chart.x]);
+    const series = chart.series.map((s) => ({
+      name: s.label,
+      type: chart.kind === 'sparkline' ? 'line' : chart.kind,
+      data: rows.map((r) => Number(r[s.column]) || 0),
+      showSymbol: chart.kind !== 'sparkline',
+    }));
+    return { categories, series };
+  }
+  const categories = [];
+  const seenX = new Set();
+  for (const r of rows) {
+    const x = r[chart.x];
+    if (!seenX.has(x)) { seenX.add(x); categories.push(x); }
+  }
+  const groups = [];
+  const seenG = new Set();
+  for (const r of rows) {
+    const g = r[chart.group_by];
+    if (!seenG.has(g)) { seenG.add(g); groups.push(g); }
+  }
+  const template = chart.series[0];
+  const series = groups.map((g) => {
+    const data = categories.map((x) => {
+      let sum = 0;
+      for (const r of rows) {
+        if (r[chart.group_by] === g && r[chart.x] === x) sum += Number(r[template.column]) || 0;
+      }
+      return sum;
+    });
+    return { name: String(g), type: chart.kind === 'sparkline' ? 'line' : chart.kind, data, showSymbol: chart.kind !== 'sparkline' };
+  });
+  return { categories, series };
+}
+(function () {
+  const chart = REPORT.chart;
+  const rows = REPORT.result.rows;
+  const { categories, series } = buildSeriesData(chart, rows);
+  const el = echarts.init(document.getElementById('chart'), null, { renderer: 'canvas' });
+  el.setOption({
+    backgroundColor: 'transparent',
+    textStyle: { color: '#c9d1d9' },
+    title: chart.title ? { text: chart.title, textStyle: { color: '#e6edf3', fontSize: 13 } } : undefined,
+    legend: series.length > 1 ? { textStyle: { color: '#8b949e' } } : undefined,
+    grid: { top: 36, bottom: 32, left: 48, right: 16 },
+    xAxis: { type: 'category', data: categories, axisLabel: { color: '#8b949e' }, axisLine: { lineStyle: { color: '#30363d' } } },
+    yAxis: { type: 'value', name: chart.y_label || undefined, axisLabel: { color: '#8b949e' }, axisLine: { lineStyle: { color: '#30363d' } }, splitLine: { lineStyle: { color: '#21262d' } } },
+    series,
+  });
+})();
+"""
+
+
+def result_to_public_html(result: "ReportResult | Mapping[str, Any]") -> str:
+    """Self-contained static HTML for a #3474 public export.
+
+    Takes an ALREADY-REDACTED result (:func:`run_public_export`'s return,
+    or a caller's own :func:`redact_report_for_public` call) — this
+    function does no redaction itself; it only renders. The report id,
+    window, table (``columns``/``column_meta``/``rows``/``totals``) and
+    EVERY ``notes`` entry — the basis/coverage note included, verbatim —
+    are inlined as plain HTML text, so the page is readable with no
+    JavaScript at all. A declared ``chart`` (#2271) adds one further,
+    OPTIONAL piece: a pinned-CDN ECharts ``<script>`` plus the minimal
+    renderer in :data:`_PUBLIC_CHART_JS`, reading the SAME inlined data —
+    never a second copy, and never required for the table/notes to render.
+    """
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    columns = [str(c) for c in (data.get("columns") or [])]
+    meta_by_id = {
+        str(m.get("id")): m
+        for m in (data.get("column_meta") or [])
+        if isinstance(m, Mapping)
+    }
+    labels = [str((meta_by_id.get(c) or {}).get("label") or c) for c in columns]
+    rows = list(data.get("rows") or [])
+    window = data.get("window") or [None, None]
+
+    header_html = "".join(f"<th>{_public_html_escape(l)}</th>" for l in labels)
+    body_rows_html = []
+    for row in rows:
+        row = row if isinstance(row, Mapping) else {}
+        cells = "".join(
+            f"<td>{_public_html_escape(_csv_cell(row.get(c)))}</td>" for c in columns
+        )
+        body_rows_html.append(f"<tr>{cells}</tr>")
+
+    totals = data.get("totals")
+    totals_html = ""
+    if isinstance(totals, Mapping):
+        cells = "".join(
+            f"<td>{_public_html_escape(_csv_cell(totals.get(c)))}</td>" for c in columns
+        )
+        totals_html = f"<tfoot><tr>{cells}</tr></tfoot>"
+
+    notes_html = "".join(
+        f"<li>{_public_html_escape(n)}</li>" for n in (data.get("notes") or [])
+    )
+
+    chart = data.get("chart")
+    chart_html = ""
+    if isinstance(chart, Mapping) and chart.get("kind") in CHART_KINDS:
+        payload = json.dumps(
+            {"result": {"rows": rows}, "chart": dict(chart)},
+            default=str,
+            sort_keys=False,
+        )
+        chart_html = (
+            '<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/'
+            'dist/echarts.min.js"></script>\n'
+            '<div id="chart" style="width:100%;height:360px"></div>\n'
+            f"<script>\nconst REPORT = {payload};\n{_PUBLIC_CHART_JS}\n</script>\n"
+        )
+
+    report_id = _public_html_escape(data.get("report_id"))
+    generated = _public_html_escape(_iso(data.get("generated_at")))
+    window_html = _public_html_escape(f"{_iso(window[0])} to {_iso(window[1])}")
+
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en"><head><meta charset="utf-8">'
+        f"<title>coord public report — {report_id}</title>"
+        "<style>"
+        "body{font-family:-apple-system,system-ui,sans-serif;background:#0d1117;"
+        "color:#c9d1d9;padding:16px;line-height:1.5}"
+        "table{border-collapse:collapse;width:100%;font-size:0.9em}"
+        "th,td{border-bottom:1px solid #30363d;padding:6px 8px;text-align:left}"
+        "tfoot td{font-weight:600;border-top:2px solid #30363d}"
+        "li{color:#d29922}"
+        "</style></head><body>"
+        f"<h1>coord public report — {report_id}</h1>"
+        f"<p>window: {window_html} &middot; generated: {generated}</p>"
+        + chart_html
+        + "<table><thead><tr>" + header_html + "</tr></thead><tbody>"
+        + "".join(body_rows_html) + "</tbody>" + totals_html + "</table>"
+        + "<h2>Notes</h2><ul>" + notes_html + "</ul>"
+        + "</body></html>\n"
+    )
+
+
+def public_html_filename(result: "ReportResult | Mapping[str, Any]") -> str:
+    """``issue-cost-20260804-1130.public.html`` — the suggested download
+    name, sharing :func:`report_filename`'s stamp logic with a ``.public``
+    marker so it can never be confused with an un-redacted export of the
+    same run."""
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    return report_filename(data, "public.html")
+
+
+def public_csv_filename(result: "ReportResult | Mapping[str, Any]") -> str:
+    """Same ``.public`` marker as :func:`public_html_filename`, for the CSV
+    half of the same export."""
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    return report_filename(data, "public.csv")
 
 
 # ── release parity matrix (#3488) ──────────────────────────────────────────

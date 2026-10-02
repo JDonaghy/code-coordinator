@@ -26,10 +26,28 @@ why ``started_at`` exports as an epoch (or a real Excel datetime cell for
 extra rather than a crash.  ``--json`` survives as a hidden alias for
 ``--format json``.
 
+``coord report export <id> --public`` (#3474) runs a report the same way
+``report run`` does (``coord.state.run_report`` — daemon when
+``board_service`` is set, local registry otherwise) and then redacts it for
+an audience OUTSIDE the fleet, via :func:`coord.reports.redact_report_for_public`:
+every repo not named in ``coordinator.yml``'s ``reporting.public.allowlist_
+repos`` is dropped and folded into one aggregate ``"private repo"`` row —
+no name, no issue number, no title. The result is written as a
+self-contained ``.public.html`` (data inlined, chart on a pinned ECharts
+CDN) plus the same redacted ``.public.csv`` into ``--out`` (default: the
+current directory). A report whose dollar figure has no stated cost basis
+left standing after redaction is refused outright (``PublicExportError``) —
+"a public number with no stated basis is not produced" (#3474). The
+redaction itself runs **client-side**, over the already-fetched result —
+same precedent as every ``--format`` above, which also serialises
+client-side over ``run_report``'s own return value — so a thin client never
+needs a second, DB-backed export path.
+
 Exit codes: ``2`` for a bad request (unknown report, unknown parameter, bad
-value, or ``--format xlsx`` without the extra installed — the message names
-what was allowed/needed), ``1`` for a read/transport failure.  Never a
-traceback for either.
+value, ``--format xlsx`` without the extra installed, or a public export
+refused over an unstated cost basis — the message names what was
+allowed/needed), ``1`` for a read/transport failure.  Never a traceback for
+either.
 """
 
 from __future__ import annotations
@@ -372,3 +390,116 @@ def report_run(
         click.echo(f"notes ({len(notes)}):")
         for note in notes:
             click.echo(f"  • {note}")
+
+
+@report_group.command(
+    "export",
+    help="Export a report for sharing outside the fleet (#3474; --public is required today).",
+)
+@click.argument("report_id")
+@click.option(
+    "--param", "raw_params", multiple=True, metavar="KEY=VALUE",
+    help="Report parameter, repeatable (e.g. --param since=13h).",
+)
+@click.option(
+    "--public", is_flag=True, default=False,
+    help=(
+        "Redact every repo not in coordinator.yml's "
+        "reporting.public.allowlist_repos before exporting — everything "
+        "else is aggregated into one 'private repo' row with no name, "
+        "issue number or title. The only export mode supported today; "
+        "omitting this flag is a usage error rather than silently "
+        "producing an un-redacted export."
+    ),
+)
+@click.option(
+    "--out", "out_dir", type=click.Path(path_type=Path), default=Path("."),
+    show_default=True,
+    help="Directory to write the exported <report>.public.html/.csv pair into.",
+)
+@_CONFIG_OPTION
+def report_export(
+    report_id: str,
+    raw_params: tuple[str, ...],
+    public: bool,
+    out_dir: Path,
+    config_path: Path,
+) -> None:
+    if not public:
+        click.echo(
+            "error: `coord report export` needs --public today — a "
+            "self-contained, redacted HTML+CSV pair for sharing outside the "
+            "fleet (#3474). There is no un-redacted export mode.",
+            err=True,
+        )
+        raise SystemExit(2)
+
+    from coord.config import load as load_config  # noqa: PLC0415
+    from coord.reports import (  # noqa: PLC0415
+        REPORTS,
+        PublicExportError,
+        assert_public_export_allowed,
+        public_csv_filename,
+        public_html_filename,
+        redact_report_for_public,
+        result_to_csv,
+        result_to_public_html,
+    )
+    from coord.state import run_report  # noqa: PLC0415
+
+    params: dict[str, str] = {}
+    for raw in raw_params:
+        if "=" not in raw:
+            click.echo(
+                f"error: --param expects KEY=VALUE, got {raw!r} "
+                "(e.g. --param since=13h)",
+                err=True,
+            )
+            raise SystemExit(2)
+        key, _, value = raw.partition("=")
+        params[key.strip()] = value
+
+    try:
+        result = run_report(report_id, params)
+    except ValueError as e:
+        # ReportError (local) or the daemon's 400/404 body, re-raised as a
+        # ValueError by coord.client.fetch_report — mirrors `report run`.
+        click.echo(f"error: {e}", err=True)
+        raise SystemExit(2) from e
+    except Exception as e:  # noqa: BLE001 — transport/DB failure
+        click.echo(f"error: report run failed: {e}", err=True)
+        raise SystemExit(1) from e
+
+    # #3474: redaction runs HERE, client-side, over the already-fetched
+    # `result` — same precedent `--format csv|xlsx|...` above already sets
+    # (those also serialise client-side over `run_report`'s own return
+    # value), so a thin client never needs a second, DB-backed export path.
+    # A `coordinator.yml` that fails to load (absent — reports need none for
+    # `list`/`run` — or malformed) is NOT a usage error here: it falls back
+    # to the empty allowlist, i.e. redact everything, the only safe default
+    # for an export leaving the fleet.
+    try:
+        allowed = frozenset(load_config(config_path).reporting.public.allowlist_repos)
+    except Exception as e:  # noqa: BLE001 — fail CLOSED: unreadable config => redact everything
+        click.echo(
+            f"warning: could not load {config_path} ({e}) — redacting every "
+            "repo (reporting.public.allowlist_repos defaults to empty).",
+            err=True,
+        )
+        allowed = frozenset()
+
+    report_def = REPORTS.get(report_id)
+    redacted = redact_report_for_public(result, allowed_repos=allowed, report=report_def)
+    try:
+        assert_public_export_allowed(redacted, report_id)
+    except PublicExportError as e:
+        click.echo(f"error: {e}", err=True)
+        raise SystemExit(2) from e
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    html_path = out_dir / public_html_filename(redacted)
+    csv_path = out_dir / public_csv_filename(redacted)
+    html_path.write_text(result_to_public_html(redacted), encoding="utf-8")
+    csv_path.write_text(result_to_csv(redacted), encoding="utf-8")
+    click.echo(f"wrote {html_path}")
+    click.echo(f"wrote {csv_path}")

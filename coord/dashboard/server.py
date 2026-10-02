@@ -1820,6 +1820,59 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/api/report/{report_id}/public": {
+            "get": {
+                "summary": (
+                    "#3474: a redacted, self-contained export of a report "
+                    "for sharing OUTSIDE the fleet. Every repo not in "
+                    "coordinator.yml's reporting.public.allowlist_repos is "
+                    "aggregated into one 'private repo' row — no name, "
+                    "issue number or title. Refused with 400 when the "
+                    "report carries a cost figure but no cost-basis/"
+                    "coverage note survives redaction."
+                ),
+                "parameters": [
+                    _dashboard_path_param("report_id", "report id from the catalogue"),
+                    {
+                        "name": "format",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string", "enum": ["html", "csv"]},
+                        "description": (
+                            "Absent/`html` returns a self-contained static "
+                            "page (data inlined; a declared chart renders "
+                            "via a pinned ECharts CDN script). `csv` "
+                            "returns the identical redacted rows as "
+                            "text/csv. Both ship a Content-Disposition "
+                            "filename."
+                        ),
+                    },
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "text/html": {
+                                "schema": {"type": "string"},
+                                "description": "`?format=html` (default).",
+                            },
+                            "text/csv": {
+                                "schema": {"type": "string"},
+                                "description": "`?format=csv`.",
+                            },
+                        },
+                    },
+                    "400": {
+                        "description": (
+                            "Unknown parameter / bad parameter value / "
+                            "unknown format / an unstated cost basis "
+                            "refused the export"
+                        )
+                    },
+                    "404": {"description": "Unknown report id"},
+                },
+            }
+        },
         "/api/approve": {
             "post": {
                 "summary": "Dispatch one or more proposals by id",
@@ -3719,6 +3772,82 @@ def build_app(
             )
         return JSONResponse(
             result.to_dict() if isinstance(result, _reports.ReportResult) else result
+        )
+
+    async def api_report_export_public(request: Request) -> Response:
+        """GET /api/report/{report_id}/public?format=html|csv&... — a
+        redacted, self-contained export for sharing OUTSIDE the fleet
+        (#3474): the dashboard's ``/reports`` "Share" affordance and
+        ``coord report export --public`` both end up describing the exact
+        same redaction, since both go through
+        ``coord.reports.redact_report_for_public`` — never a second,
+        independently-drifting idea of what "public" means (#2096).
+
+        ``format`` defaults to ``html`` (the self-contained page: data
+        inlined, chart — if any — on a pinned ECharts CDN); ``csv`` returns
+        the identical redacted rows as a download. Every repo not in the
+        loaded ``coordinator.yml``'s ``reporting.public.allowlist_repos``
+        is aggregated into one ``"private repo"`` row with no name, issue
+        number or title. A cost-bearing report whose basis/coverage note
+        did not survive redaction is refused with 400 — "a public number
+        with no stated basis is not produced" (#3474).
+        """
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from coord import reports as _reports  # noqa: PLC0415
+
+        report_id = request.path_params["report_id"]
+        params = dict(request.query_params)
+        fmt = (params.pop("format", "") or "html").strip().lower()
+        if fmt not in ("html", "csv"):
+            return JSONResponse(
+                {"error": f"unknown public export format {fmt!r} — allowed values: html, csv"},
+                status_code=400,
+            )
+        try:
+            if _fixture is not None:
+                raw_result = _fixture.report_result(report_id, params)
+            else:
+                raw_result = await run_in_threadpool(_reports.run_report, report_id, params)
+        except _reports.UnknownReportError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except _reports.ReportError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
+            return JSONResponse(
+                {"error": "report run failed", "detail": str(e)}, status_code=503
+            )
+
+        report_def = _reports.REPORTS.get(report_id)
+        # The app's own bound `config` (fixture or live — see `build_app`'s
+        # own docstring), never a second, independent `coordinator.yml`
+        # read off disk: fixture mode's "every read is answered from the
+        # fixture" promise has to hold for the redaction policy too, not
+        # just the report data being redacted.
+        allowed = frozenset(config.reporting.public.allowlist_repos)
+        redacted = await run_in_threadpool(
+            _reports.redact_report_for_public,
+            raw_result,
+            allowed_repos=allowed,
+            report=report_def,
+        )
+        try:
+            _reports.assert_public_export_allowed(redacted, report_id)
+        except _reports.PublicExportError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        if fmt == "csv":
+            body = await run_in_threadpool(_reports.result_to_csv, redacted)
+            filename = _reports.public_csv_filename(redacted)
+            media_type = "text/csv; charset=utf-8"
+        else:
+            body = await run_in_threadpool(_reports.result_to_public_html, redacted)
+            filename = _reports.public_html_filename(redacted)
+            media_type = "text/html; charset=utf-8"
+        return Response(
+            body,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     async def api_approve(request: Request) -> JSONResponse:
@@ -5666,6 +5795,11 @@ def build_app(
         Route("/api/drive-queue/action", api_drive_queue_action, methods=["POST"]),
         Route("/api/report", api_report_catalogue, methods=["GET"]),
         Route("/api/report/{report_id}", api_report_run, methods=["GET"]),
+        Route(
+            "/api/report/{report_id}/public",
+            api_report_export_public,
+            methods=["GET"],
+        ),
         Route("/api/approve", api_approve, methods=["POST"]),
         Route("/api/reject", api_reject, methods=["POST"]),
         Route("/api/diff/{id}", api_diff, methods=["GET"]),
