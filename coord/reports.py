@@ -71,7 +71,7 @@ import re
 import time
 import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -289,6 +289,19 @@ class ColumnMeta:
     reasonable cell: ``kind`` says how to format it, ``align``/``weight``
     say how to lay out the column.  ``id`` matches the corresponding
     ``columns[]`` entry (and order matches too), so a client can zip them.
+
+    ``basis`` (#3471) is additive and empty (``""``) on every non-cost
+    column.  On a cost column (a ``kind="money"`` figure that sums
+    ``cost_usd`` — ``cost_captured``/``cost_est``/``cost_total`` in
+    ``usage``, ``cost_total`` in ``completed``/``issue-cost``,
+    ``cost_per_issue`` in ``trend``) it carries the fleet's configured
+    ``reporting.cost_basis`` (:class:`coord.config.ReportingConfig`) —
+    ``"api_equivalent"`` by default, or ``"billed"`` when the operator
+    asserts the fleet actually pays per-call API rates.  The point: a chart
+    screenshotted out of context for external use still states what its
+    dollar figure actually represents instead of silently implying real
+    billed spend.  A client that predates the field ignores the key and
+    renders the number exactly as before.
     """
 
     id: str
@@ -299,6 +312,7 @@ class ColumnMeta:
     kind: str
     align: str = "left"  # "left" | "right"
     weight: float = 1.0  # relative column width hint
+    basis: str = ""  # "" (not a cost column) | "api_equivalent" | "billed"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -307,7 +321,38 @@ class ColumnMeta:
             "kind": self.kind,
             "align": self.align,
             "weight": self.weight,
+            "basis": self.basis,
         }
+
+
+def _stamp_cost_basis(
+    column_meta: Sequence[ColumnMeta], cost_basis: str, cost_columns: frozenset[str]
+) -> list[ColumnMeta]:
+    """Return *column_meta* with ``basis`` set to ``cost_basis`` on every
+    entry whose ``id`` is in *cost_columns*, unchanged otherwise (#3471).
+
+    The module-level ``*_COLUMN_META`` constants (``COMPLETED_COLUMN_META``,
+    ``TREND_COLUMN_META``, ``ISSUE_COST_COLUMN_META``, the ``usage`` columns
+    built from ``_USAGE_COLUMN_META``) stay basis-free templates: the actual
+    value is config-driven (``reporting.cost_basis``) and not known until a
+    report actually runs, so stamping it here — once, at fold time — is the
+    ONE place that does it, rather than every fold duplicating the same
+    ``replace()`` call inline.
+    """
+    return [
+        replace(m, basis=cost_basis) if m.id in cost_columns else m
+        for m in column_meta
+    ]
+
+
+#: Default ``reporting.cost_basis`` (#3471) — mirrors
+#: :class:`coord.config.ReportingConfig`'s own default verbatim, kept here
+#: too so a bare ``fold_*`` call (this module's own unit tests, the common
+#: case) gets the same honest default the daemon's loaded config would,
+#: without importing :mod:`coord.config` at module scope (every other
+#: config read in this module is a deferred import for the same reason —
+#: see :func:`_load_pricing`).
+DEFAULT_COST_BASIS = "api_equivalent"
 
 
 # ── chart declaration (#2271) ──────────────────────────────────────────────
@@ -1953,6 +1998,11 @@ def _usage_stage_breakdown(
     return stages
 
 
+#: #3471 — the ``usage`` columns a ``basis`` belongs on: every dollar figure,
+#: none of the counts/tokens/durations around them.
+_USAGE_COST_COLUMNS = frozenset({"cost_captured", "cost_est", "cost_total"})
+
+
 def fold_usage(
     rows: Iterable[Mapping[str, Any]],
     window: Any,
@@ -1961,6 +2011,7 @@ def fold_usage(
     pricing: Any = None,
     generated_at: float | None = None,
     extra_notes: Sequence[str] = (),
+    cost_basis: str = DEFAULT_COST_BASIS,
 ) -> ReportResult:
     """Fold board assignment rows into a per-issue / per-repo cost rollup.
 
@@ -1974,6 +2025,10 @@ def fold_usage(
     *pricing* left at ``None`` falls through to ``usage_rollup``'s own
     built-in defaults, which is correct for a unit test and **not** what the
     runner does (see :func:`run_usage`, which loads ``coordinator.yml``).
+
+    *cost_basis* (#3471) is stamped onto every cost column's ``ColumnMeta``
+    and named in the standard coverage note appended to ``notes`` — see
+    :func:`_stamp_cost_basis` / :func:`_capture_coverage_note`.
     """
     from coord.usage_rollup import IssueKey, rollup  # noqa: PLC0415
 
@@ -2030,13 +2085,22 @@ def fold_usage(
             f"{totals['open_legs']} leg(s) in this window are still running — "
             "their duration counts as 0 and their cost is not final."
         )
+    # #3471: the standard coverage line, over every leg that fed `totals`
+    # (i.e. `result.total.leg_rows` — the window/group_by/repo-filtered set
+    # this report's own `rollup` call just aggregated), so the dollar share
+    # it quotes matches the dollars this report actually shows.
+    coverage_note = _capture_coverage_note(result.total.leg_rows, pricing, cost_basis)
+    if coverage_note:
+        notes.append(coverage_note)
 
     return ReportResult(
         report_id="usage",
         generated_at=end if generated_at is None else float(generated_at),
         window=(start, end),
         columns=columns,
-        column_meta=[_USAGE_COLUMN_META[c] for c in columns],
+        column_meta=_stamp_cost_basis(
+            [_USAGE_COLUMN_META[c] for c in columns], cost_basis, _USAGE_COST_COLUMNS
+        ),
         rows=out_rows,
         notes=notes,
         totals=totals,
@@ -2060,27 +2124,36 @@ def _default_usage_rows(repo: str | None) -> list[dict]:  # noqa: ARG001
     return SqliteStore().list_assignments()
 
 
-def _load_pricing() -> tuple[Any, list[str]]:
-    """The ``pricing:`` block from the loaded ``coordinator.yml``.
+def _load_pricing() -> tuple[Any, str, list[str]]:
+    """The ``pricing:`` and ``reporting.cost_basis`` settings from the loaded
+    ``coordinator.yml``.
 
-    Returns ``(PricingConfig, notes)``.  A config that cannot be loaded falls
-    back to the built-in defaults **and says so in ``notes``** — silently
-    falling back is exactly the failure mode #1763 exists to remove.
+    Returns ``(PricingConfig, cost_basis, notes)`` — both off the SAME loaded
+    :class:`~coord.config.Config` in one read (#3471), so a config that
+    cannot be loaded only reports ONE "could not be loaded" warning, not two
+    disagreeing ones, and the two values can never be evaluated against two
+    different configs. A config that cannot be loaded falls back to the
+    built-in pricing defaults and ``"api_equivalent"`` (:data:`DEFAULT_COST_
+    BASIS`) and **says so in ``notes``** — silently falling back is exactly
+    the failure mode #1763 exists to remove, and #3471 extends that rule to
+    the cost basis.
     """
     from coord.config import PricingConfig  # noqa: PLC0415
 
     try:
         from coord.config import load, resolve_config_path  # noqa: PLC0415
 
-        return load(resolve_config_path()).pricing, []
+        cfg = load(resolve_config_path())
+        return cfg.pricing, cfg.reporting.cost_basis, []
     except Exception as exc:  # noqa: BLE001 — surfaced as a note, not a crash
         return (
             PricingConfig(),
+            DEFAULT_COST_BASIS,
             [
                 "WARNING: coordinator.yml could not be loaded "
                 f"({type(exc).__name__}: {exc}) — `cost_est` uses the built-in "
                 "default rates, which may differ from this fleet's `pricing:` "
-                "block."
+                f"block, and the cost basis defaults to `{DEFAULT_COST_BASIS}`."
             ],
         )
 
@@ -2093,9 +2166,11 @@ def run_usage(
     now: float | None = None,
     fetch: Callable[[str | None], Sequence[Mapping[str, Any]]] | None = None,
     pricing: Any = None,
+    cost_basis: str | None = None,
 ) -> ReportResult:
-    """Fetch board rows and fold them.  ``now``/``fetch``/``pricing`` are test
-    seams; the report's own parameters are ``window``/``group_by``/``repo``."""
+    """Fetch board rows and fold them.  ``now``/``fetch``/``pricing``/
+    ``cost_basis`` are test seams; the report's own parameters are
+    ``window``/``group_by``/``repo``."""
     generated_at = time.time() if now is None else float(now)
     resolved = resolve_usage_window(window, generated_at)
 
@@ -2104,9 +2179,16 @@ def run_usage(
     if repo:
         rows = [r for r in rows if str(r.get("repo_name") or "") == repo]
 
+    # Same seam, same reason as `pricing` (#1763) — #3471 extends it to the
+    # cost basis stamped on every cost column. One `_load_pricing()` call
+    # covers whichever of the two the caller left unset.
     extra_notes: list[str] = []
-    if pricing is None:
-        pricing, extra_notes = _load_pricing()
+    if pricing is None or cost_basis is None:
+        loaded_pricing, loaded_basis, extra_notes = _load_pricing()
+        if pricing is None:
+            pricing = loaded_pricing
+        if cost_basis is None:
+            cost_basis = loaded_basis
 
     return fold_usage(
         rows,
@@ -2115,6 +2197,7 @@ def run_usage(
         pricing=pricing,
         generated_at=generated_at,
         extra_notes=extra_notes,
+        cost_basis=cost_basis,
     )
 
 
@@ -2793,8 +2876,9 @@ COMPLETED_COLUMN_META = [
 
 def _completed_spend(
     assignment_rows: Sequence[Mapping[str, Any]], pricing: Any
-) -> dict[tuple[str, int], dict[str, Any]]:
-    """Per-issue ``legs``/tokens/cost, keyed ``(repo_name, issue_number)``.
+) -> tuple[dict[tuple[str, int], dict[str, Any]], dict[tuple[str, int], list[dict]]]:
+    """``(spend, leg_rows)`` — per-issue ``legs``/tokens/cost, plus the raw
+    leg rows that produced them, both keyed ``(repo_name, issue_number)``.
 
     A thin adapter over :func:`coord.usage_rollup.rollup`, **not** a second
     cost calculator: the pricing rules, the captured-vs-estimated split and
@@ -2813,6 +2897,12 @@ def _completed_spend(
     ``usage`` reports for the same issue, so the cost columns must use
     ``usage``'s attribution rule.  The timestamps keep #2454's, which is a
     port of ``completed_rows``.
+
+    ``leg_rows`` (#3471) is the raw leg rows behind each issue's numbers —
+    not shipped on the wire itself, but what :func:`fold_completed` feeds
+    :func:`_capture_coverage_note` for its own standard coverage line, over
+    exactly the legs that fed the `cost_total` it shows, no more and no
+    less.
     """
     from coord.usage_rollup import IssueKey, TimeWindow, rollup  # noqa: PLC0415
 
@@ -2841,11 +2931,14 @@ def _completed_spend(
         pricing=pricing,
     )
     spend: dict[tuple[str, int], dict[str, Any]] = {}
+    leg_rows: dict[tuple[str, int], list[dict]] = {}
     for key, group in result.groups.items():
         if not isinstance(key, IssueKey) or not key.repo_name:
             continue
-        spend[(str(key.repo_name), int(key.issue_number))] = _usage_metrics(group)
-    return spend
+        ikey = (str(key.repo_name), int(key.issue_number))
+        spend[ikey] = _usage_metrics(group)
+        leg_rows[ikey] = group.leg_rows
+    return spend, leg_rows
 
 
 def _merged_at_by_issue(
@@ -2913,6 +3006,7 @@ def fold_completed(
     generated_at: float | None = None,
     pricing: Any = None,
     extra_notes: Sequence[str] = (),
+    cost_basis: str = DEFAULT_COST_BASIS,
 ) -> ReportResult:
     """Fold the board's own tables into one row per issue that *finished*
     inside ``window``.
@@ -2927,6 +3021,12 @@ def fold_completed(
     runner does — :func:`run_completed` loads ``coordinator.yml`` and passes
     the real ``pricing:`` block, the same seam :func:`fold_usage` uses and for
     the same #1763 reason.
+
+    *cost_basis* (#3471) is stamped onto ``cost_total``'s ``ColumnMeta`` and
+    named in the standard coverage note — see :func:`_stamp_cost_basis` /
+    :func:`_capture_coverage_note`. :func:`fold_trend` (#2826) folds THIS
+    function's own rows rather than re-deriving cost, so passing it through
+    here is also what gives ``trend`` the identical note, for free.
     """
     start, end = window
     generated_at = time.time() if generated_at is None else float(generated_at)
@@ -2970,7 +3070,7 @@ def fold_completed(
             if value is not None and value > last_finish.get(key, float("-inf")):
                 last_finish[key] = value
 
-    spend = _completed_spend(assignment_rows, pricing)
+    spend, spend_leg_rows = _completed_spend(assignment_rows, pricing)
 
     rows: list[dict] = []
     no_end_time = 0
@@ -3052,13 +3152,27 @@ def fold_completed(
             "coordinator.yml, or run the `usage` report for the per-issue "
             "breakdown."
         )
+    # #3471: the standard coverage line, over exactly the legs behind the
+    # shown rows' `cost_total` (every leg of every issue that made it into
+    # `rows` — not every assignment ever fetched, which would include
+    # issues this window dropped).
+    shown_legs = [
+        leg
+        for r in rows
+        for leg in spend_leg_rows.get((r["repo"], r["issue"]), ())
+    ]
+    coverage_note = _capture_coverage_note(shown_legs, pricing, cost_basis)
+    if coverage_note:
+        notes.append(coverage_note)
 
     return ReportResult(
         report_id="completed",
         generated_at=generated_at,
         window=(start, end),
         columns=list(COMPLETED_COLUMNS),
-        column_meta=list(COMPLETED_COLUMN_META),
+        column_meta=_stamp_cost_basis(
+            COMPLETED_COLUMN_META, cost_basis, frozenset({"cost_total"})
+        ),
         rows=rows,
         notes=notes,
     )
@@ -3092,15 +3206,18 @@ def _default_completed_source() -> tuple[list[dict], list[dict], list[dict]]:
         # counts, the captured `cost_usd`, the `model` its estimate is keyed
         # by, and `for_issue_number` for #1553's attribution. `type` is NOT
         # selected: it only feeds `usage`'s per-stage drill-down, which this
-        # report does not emit.
+        # report does not emit. `cost_capture_state` (#3471) IS selected —
+        # `_capture_coverage_note`'s classifier (`_leg_capture_bucket`) reads
+        # it as the authoritative #3158 tri-state before falling back to
+        # `leg_cost`, the same rule `issue-cost` already applies.
         assignments = [
             dict(r)
             for r in sql.execute(
                 conn,
                 "SELECT repo_name, issue_number, for_issue_number, "
                 "dispatched_at, finished_at, input_tokens, output_tokens, "
-                "cache_read_tokens, cache_creation_tokens, cost_usd, model "
-                "FROM assignments",
+                "cache_read_tokens, cache_creation_tokens, cost_usd, model, "
+                "cost_capture_state FROM assignments",
             ).fetchall()
         ]
         merge_queue = [
@@ -3126,11 +3243,13 @@ def run_completed(
         Sequence[Mapping[str, Any]],
     ]] | None = None,
     pricing: Any = None,
+    cost_basis: str | None = None,
 ) -> ReportResult:
-    """Read the board and fold it.  ``now``/``source``/``pricing`` are test
-    seams (mirrors :func:`run_issue_activity`); the report's own parameters are
-    ``since``/``until``/``repo`` — the same three, with the same vocabulary
-    and the same validators, that ``issue-activity`` uses."""
+    """Read the board and fold it.  ``now``/``source``/``pricing``/
+    ``cost_basis`` are test seams (mirrors :func:`run_issue_activity`); the
+    report's own parameters are ``since``/``until``/``repo`` — the same
+    three, with the same vocabulary and the same validators, that
+    ``issue-activity`` uses."""
     generated_at = time.time() if now is None else float(now)
     end = parse_timestamp(until) if until else generated_at
     start = end - parse_duration(since)
@@ -3140,10 +3259,14 @@ def run_completed(
     # Same seam, same reason as `run_usage`: the estimated half of `cost_total`
     # has to be priced off the fleet's OWN `pricing:` block, and a config that
     # could not be loaded says so in a note instead of silently falling back
-    # (#1763).
+    # (#1763). #3471 extends this to the cost basis stamped on `cost_total`.
     extra_notes: list[str] = []
-    if pricing is None:
-        pricing, extra_notes = _load_pricing()
+    if pricing is None or cost_basis is None:
+        loaded_pricing, loaded_basis, extra_notes = _load_pricing()
+        if pricing is None:
+            pricing = loaded_pricing
+        if cost_basis is None:
+            cost_basis = loaded_basis
 
     return fold_completed(
         issues,
@@ -3154,6 +3277,7 @@ def run_completed(
         generated_at=generated_at,
         pricing=pricing,
         extra_notes=extra_notes,
+        cost_basis=cost_basis,
     )
 
 
@@ -3270,6 +3394,7 @@ def fold_trend(
     generated_at: float | None = None,
     pricing: Any = None,
     extra_notes: Sequence[str] = (),
+    cost_basis: str = DEFAULT_COST_BASIS,
 ) -> ReportResult:
     """Bucket MERGED issues (see the #2826 section comment above for the
     exact definition) into fixed-width buckets ending at ``window_end``, one
@@ -3287,6 +3412,14 @@ def fold_trend(
     ``range``, but shadowing the builtin in a function that needs to call
     ``range()`` in the bucket loop below is a trap, not a style nit; see
     :func:`run_trend`, which owns the ``range`` name at the wire boundary.
+
+    *cost_basis* (#3471) is passed straight through to the ``fold_completed``
+    call below, so the SAME standard coverage note (over the exact
+    merged-issue legs this fold buckets, across the widened trailing window)
+    rides along in ``completed.notes`` and ends up in ``trend``'s own
+    ``notes`` with no separate computation — one question ("what did these
+    legs cost, and how completely do we know it"), one function answering
+    it, reused rather than re-derived (#2096).
     """
     bucket_seconds, point_count = resolve_trend_range(range_)
     window_end = float(window_end)
@@ -3306,6 +3439,7 @@ def fold_trend(
         repo=repo,
         generated_at=generated_at,
         pricing=pricing,
+        cost_basis=cost_basis,
     )
 
     bucket_starts = _period_bounds(window_start, window_end, bucket_seconds)
@@ -3381,7 +3515,9 @@ def fold_trend(
         generated_at=generated_at,
         window=(window_start, window_end),
         columns=list(TREND_COLUMNS),
-        column_meta=list(TREND_COLUMN_META),
+        column_meta=_stamp_cost_basis(
+            TREND_COLUMN_META, cost_basis, frozenset({"cost_per_issue"})
+        ),
         rows=rows,
         notes=notes,
     )
@@ -3399,10 +3535,11 @@ def run_trend(
         Sequence[Mapping[str, Any]],
     ]] | None = None,
     pricing: Any = None,
+    cost_basis: str | None = None,
 ) -> ReportResult:
-    """Read the board and fold it.  ``now``/``source``/``pricing`` are test
-    seams (mirrors :func:`run_completed`); the report's own parameters are
-    ``range``/``until``/``repo``."""
+    """Read the board and fold it.  ``now``/``source``/``pricing``/
+    ``cost_basis`` are test seams (mirrors :func:`run_completed`); the
+    report's own parameters are ``range``/``until``/``repo``."""
     generated_at = time.time() if now is None else float(now)
     window_end = parse_timestamp(until) if until else generated_at
     # Same source as `completed` — the merged-issue fold this report buckets
@@ -3413,10 +3550,15 @@ def run_trend(
     # Same seam, same reason as `run_completed`/`run_usage`: the estimated
     # half of `cost_per_issue` has to be priced off the fleet's OWN
     # `pricing:` block, and a config that could not be loaded says so in a
-    # note instead of silently falling back (#1763).
+    # note instead of silently falling back (#1763). #3471 extends this to
+    # the cost basis stamped on `cost_per_issue`.
     extra_notes: list[str] = []
-    if pricing is None:
-        pricing, extra_notes = _load_pricing()
+    if pricing is None or cost_basis is None:
+        loaded_pricing, loaded_basis, extra_notes = _load_pricing()
+        if pricing is None:
+            pricing = loaded_pricing
+        if cost_basis is None:
+            cost_basis = loaded_basis
 
     return fold_trend(
         issues,
@@ -3428,6 +3570,7 @@ def run_trend(
         generated_at=generated_at,
         pricing=pricing,
         extra_notes=extra_notes,
+        cost_basis=cost_basis,
     )
 
 
@@ -3522,10 +3665,16 @@ def _issue_cost_stage_for_leg(leg_type: str, *, is_fix_round: bool) -> str:
     return "other"
 
 
-def _issue_cost_capture_bucket(row: Mapping[str, Any], pricing: Any) -> str:
+def _leg_capture_bucket(row: Mapping[str, Any], pricing: Any) -> str:
     """Classify ONE leg's cost-capture coverage into ``captured`` /
-    ``estimated`` / ``unmeasured`` (#3158's tri-state; #3470's coverage
-    column).
+    ``estimated`` / ``unmeasured`` (#3158's tri-state; #3470's ``issue-cost``
+    coverage column; #3471's standard coverage note shared by all four
+    cost-bearing reports — ``usage``, ``completed``, ``trend``,
+    ``issue-cost``).  One classifier, called from everywhere a leg's
+    coverage is asked about, per this repo's own #2096 "one question, one
+    answer" rule — `issue-cost`'s per-row ``coverage_pct`` and every
+    report's #3471 note both resolve a leg's bucket here, never a second
+    reimplementation that could silently disagree with this one.
 
     ``cost_capture_state`` is authoritative when set — ``"captured"``
     (written alongside a real ``cost_usd`` by
@@ -3555,6 +3704,67 @@ def _issue_cost_capture_bucket(row: Mapping[str, Any], pricing: Any) -> str:
     return "unmeasured"
 
 
+def _capture_coverage_note(
+    leg_rows: Sequence[Mapping[str, Any]], pricing: Any, cost_basis: str
+) -> str | None:
+    """The standard #3471 coverage line every cost-bearing report appends to
+    its own ``notes``: how many of the legs behind its dollar figure are
+    ``captured`` / ``estimated`` / ``unmeasured`` (:func:`_leg_capture_bucket`
+    — the SAME classifier ``issue-cost``'s own ``coverage_pct`` column uses,
+    per #2096's "one question, one answer"), and the SHARE of the shown
+    dollar total each bucket represents — not just a leg count, since 3.8k
+    of 14.1k all-time legs having no captured cost (the number this issue
+    opens with) says little about whether that 27% is 27% of the MONEY too.
+
+    Returns ``None`` when *leg_rows* is empty — nothing to report coverage
+    over; callers already have their own "no usage/no issues" note for that
+    case and this would just be a second, redundant way of saying it.
+
+    *pricing* left at ``None`` resolves to the built-in
+    :class:`~coord.config.PricingConfig` defaults — same fallback
+    :func:`~coord.usage_rollup.rollup` itself applies, so a caller that
+    passes ``None`` through (a unit test that never loaded a config) gets
+    the identical rates its own `cost_total` was already priced with,
+    rather than a crash on ``None.rates_for``.
+    """
+    from coord.config import PricingConfig  # noqa: PLC0415
+    from coord.usage_rollup import leg_cost  # noqa: PLC0415
+
+    resolved_pricing = PricingConfig() if pricing is None else pricing
+
+    captured_legs = estimated_legs = unmeasured_legs = 0
+    captured_cost = 0.0
+    estimated_cost = 0.0
+    for row in leg_rows:
+        bucket = _leg_capture_bucket(row, resolved_pricing)
+        captured, est, _unknown = leg_cost(dict(row), resolved_pricing)
+        if bucket == "captured":
+            captured_legs += 1
+        elif bucket == "estimated":
+            estimated_legs += 1
+        else:
+            unmeasured_legs += 1
+        captured_cost += captured
+        estimated_cost += est
+
+    total_legs = captured_legs + estimated_legs + unmeasured_legs
+    if total_legs == 0:
+        return None
+
+    total_cost = captured_cost + estimated_cost
+    captured_share = (captured_cost / total_cost * 100.0) if total_cost else 0.0
+    estimated_share = (estimated_cost / total_cost * 100.0) if total_cost else 0.0
+    return (
+        f"Cost basis: `{cost_basis}` (see column_meta `basis`) — "
+        "`cost_usd` is what `claude -p` reports, an API-list-price "
+        "equivalent, not necessarily money billed. Coverage: "
+        f"{captured_legs} leg(s) captured ({captured_share:.1f}% of the $ "
+        f"shown), {estimated_legs} estimated ({estimated_share:.1f}%), "
+        f"{unmeasured_legs} unmeasured (contributes $0, 0% of the $ shown) "
+        f"of {total_legs} leg(s) total."
+    )
+
+
 #: What a row gets when nothing was ever dispatched against its issue — a
 #: real zero/`None`, not a missing key (same convention `_COMPLETED_NO_LEGS`
 #: uses).
@@ -3579,12 +3789,19 @@ def fold_issue_cost(
     generated_at: float | None = None,
     pricing: Any = None,
     extra_notes: Sequence[str] = (),
+    cost_basis: str = DEFAULT_COST_BASIS,
 ) -> ReportResult:
     """Fold full-history board rows into one row per issue's whole-life cost.
 
     Pure — same posture as :func:`fold_completed`: every input is a plain
     sequence of mappings, no DB, no clock beyond the explicit
     ``generated_at``/``now`` seam.
+
+    *cost_basis* (#3471) is stamped onto ``cost_total``'s ``ColumnMeta`` and
+    named in the standard coverage note, computed here from the SAME
+    per-leg ``captured_legs``/``estimated_legs``/``unmeasured_legs`` tally
+    this fold already accumulates for ``coverage_pct`` — see
+    :func:`_leg_capture_bucket` / :func:`_capture_coverage_note`.
 
     ``status`` (default ``"merged"``) narrows which issues get a row:
     ``"merged"`` only issues `_merged_at_by_issue` confirms landed,
@@ -3662,6 +3879,10 @@ def fold_issue_cost(
     keys |= set(merged_at)
 
     rows: list[dict[str, Any]] = []
+    # #3471: every leg behind a SHOWN row, flattened — fed to
+    # `_capture_coverage_note` below for the standard coverage line, over
+    # exactly the legs whose cost this report's rows actually display.
+    shown_legs: list[dict] = []
     no_end_time = 0
     for key in keys:
         name, number = key
@@ -3716,6 +3937,7 @@ def fold_issue_cost(
             if started_at is None or ended_at is None
             else max(0.0, ended_at - started_at)
         )
+        shown_legs.extend(leg_rows)
 
         legs_by_stage: dict[str, int] = {s: 0 for s in _ISSUE_COST_STAGES}
         cost_by_stage: dict[str, float] = {s: 0.0 for s in _ISSUE_COST_STAGES}
@@ -3740,7 +3962,7 @@ def fold_issue_cost(
             model_bucket["legs"] += 1
             model_bucket["cost_total"] += leg_total
 
-            capture_bucket = _issue_cost_capture_bucket(leg, resolved_pricing)
+            capture_bucket = _leg_capture_bucket(leg, resolved_pricing)
             if capture_bucket == "captured":
                 captured_legs += 1
             elif capture_bucket == "estimated":
@@ -3862,6 +4084,14 @@ def fold_issue_cost(
             "lower bound, not the whole story: some leg(s) contributed "
             "neither a captured nor an estimated cost."
         )
+    # #3471: the standard coverage line, shared verbatim with
+    # `usage`/`completed`/`trend` — over `shown_legs`, the exact legs behind
+    # the `cost_total` these rows display, so its dollar-share arithmetic is
+    # never asked to agree with `partial_coverage`'s per-issue leg counts
+    # above by coincidence; both read `_leg_capture_bucket`.
+    coverage_note = _capture_coverage_note(shown_legs, resolved_pricing, cost_basis)
+    if coverage_note:
+        notes.append(coverage_note)
 
     totals: dict[str, Any] | None = None
     if rows:
@@ -3888,7 +4118,9 @@ def fold_issue_cost(
         generated_at=generated_at,
         window=(start, end),
         columns=list(ISSUE_COST_COLUMNS),
-        column_meta=list(ISSUE_COST_COLUMN_META),
+        column_meta=_stamp_cost_basis(
+            ISSUE_COST_COLUMN_META, cost_basis, frozenset({"cost_total"})
+        ),
         rows=rows,
         notes=notes,
         totals=totals,
@@ -3979,11 +4211,12 @@ def run_issue_cost(
         Sequence[Mapping[str, Any]],
     ]] | None = None,
     pricing: Any = None,
+    cost_basis: str | None = None,
 ) -> ReportResult:
-    """Read the board and fold it.  ``now``/``source``/``pricing`` are test
-    seams (mirrors :func:`run_completed`); the report's own parameters are
-    ``since``/``until``/``repo``/``status``.  ``since="all"`` means no lower
-    bound at all — the whole history."""
+    """Read the board and fold it.  ``now``/``source``/``pricing``/
+    ``cost_basis`` are test seams (mirrors :func:`run_completed`); the
+    report's own parameters are ``since``/``until``/``repo``/``status``.
+    ``since="all"`` means no lower bound at all — the whole history."""
     generated_at = time.time() if now is None else float(now)
     end = parse_timestamp(until) if until else generated_at
     start = 0.0 if since == "all" else end - parse_duration(since)
@@ -3993,10 +4226,15 @@ def run_issue_cost(
     # Same seam, same reason as `run_completed`/`run_usage`: the estimated
     # half of `cost_total` has to be priced off the fleet's OWN `pricing:`
     # block, and a config that could not be loaded says so in a note instead
-    # of silently falling back (#1763).
+    # of silently falling back (#1763). #3471 extends this to the cost basis
+    # stamped on `cost_total`.
     extra_notes: list[str] = []
-    if pricing is None:
-        pricing, extra_notes = _load_pricing()
+    if pricing is None or cost_basis is None:
+        loaded_pricing, loaded_basis, extra_notes = _load_pricing()
+        if pricing is None:
+            pricing = loaded_pricing
+        if cost_basis is None:
+            cost_basis = loaded_basis
 
     return fold_issue_cost(
         issues,
@@ -4008,6 +4246,7 @@ def run_issue_cost(
         generated_at=generated_at,
         pricing=pricing,
         extra_notes=extra_notes,
+        cost_basis=cost_basis,
     )
 
 
