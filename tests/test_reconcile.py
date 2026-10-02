@@ -1456,3 +1456,113 @@ class TestReconcileConflictFixAlreadyUpstreamMarker:
         assert entry.state == HUMAN_REQUIRED
         assert "already present on" in (entry.error or "")
         assert "genuine content conflict" not in (entry.error or "")
+
+
+# ── #3522 review: a reword-commit worker's content-mismatch refusal must ───
+# escalate to HUMAN_REQUIRED, not be read as a resolved reword ──────────────
+
+
+class TestReconcileConflictFixRewordMismatchMarker:
+    """Mirrors `TestReconcileConflictFixAlreadyUpstreamMarker` above, but for
+    a reword-commit dispatch (`dispatch_conflict_fix(..., reword_commit=
+    True)`, used for the `issue_resolution_closing_keyword_in_commit` merge
+    gate, #3522). That worker's briefing tells it to stop and NOT push when
+    its message-only rewrite turns out not to be content-preserving — a
+    conflict marker during the rebase, or a patch-id/tree mismatch — and
+    ends its turn with a `STUCK:` line carrying `REWORD_MISMATCH_MARKER`
+    instead of pushing. Before this fix, nothing anywhere read that marker,
+    so `reconcile()`'s "done" branch treated the clean exit as a resolved
+    reword and reset the entry to PENDING, which just reproduced the
+    identical `issue_resolution_closing_keyword_in_commit` refusal on the
+    next `coord merge` attempt forever (the exact deadlock #3522 exists to
+    close).
+
+    Unlike `stale_rebase_mismatch`, this must NOT escalate to the ordinary
+    conflict-fix path — that worker is authorized to touch content, which is
+    exactly what this narrow, message-only dispatch was scoped to avoid.
+    """
+
+    @patch("coord.github_ops.post_issue_comment")
+    @patch("coord.network.fetch_status")
+    @patch("coord.conflict_fix.httpx.post")
+    @patch("coord.reconcile._query_agent")
+    def test_reword_mismatch_lands_on_human_required_without_escalation(
+        self,
+        mock_query: MagicMock,
+        mock_post: MagicMock,
+        mock_fetch_status: MagicMock,
+        mock_post_comment: MagicMock,
+        tmp_path: Path,
+        coord_db,
+    ) -> None:
+        from coord import merge_queue as mq
+        from coord.conflict_fix import REWORD_MISMATCH_MARKER
+        from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING, QueuedMerge
+        from coord.network import StatusResult
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="merge-1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-7-thing",
+                target_branch="main",
+                issue_number=7,
+                issue_title="Do the thing",
+                state=PENDING,
+                error=(
+                    "a commit message on this branch contains a closing "
+                    "keyword (Closes/Fixes/Resolves) for #7, but this PR is "
+                    "marked `ISSUE_RESOLUTION: partial`"
+                ),
+            ),
+        ])
+
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: reword started\n"
+            f"STUCK: {REWORD_MISMATCH_MARKER} — patch-id before abc123, "
+            "after def456 differ\n"
+        )
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=7,
+                issue_title="[reword-commit-fix] Do the thing",
+                assignment_id="fix-1", status="running",
+                type="conflict-fix", review_of_assignment_id="merge-1",
+            ),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "fix-1", "status": "done", "finished_at": 100.0,
+                "log_path": str(log),
+            }],
+        }
+        mock_fetch_status.return_value = StatusResult(data={"assignments": []})
+
+        reconcile(board, cfg)
+
+        entry = mq.load_queue()[0]
+        assert entry.state != PENDING
+        assert entry.state != CONFLICT
+        assert entry.state == HUMAN_REQUIRED
+        assert "reword-commit worker refused to push" in (entry.error or "")
+        assert "patch-id before abc123, after def456 differ" in (entry.error or "")
+
+        # Never dispatched an ordinary conflict-fix — this dispatch's narrow
+        # message-only authorization doesn't cover a content mismatch.
+        mock_post.assert_not_called()
+
+        mock_post_comment.assert_called_once()
+        posted_body = mock_post_comment.call_args.args[2]
+        assert "reword-commit worker refused to push" in posted_body
+        assert "Manual reword required" in posted_body
+        assert f"Refs #{entry.issue_number}" in posted_body

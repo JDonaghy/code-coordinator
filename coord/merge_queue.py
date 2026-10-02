@@ -8601,13 +8601,36 @@ def process(
                     # must never take down the merge refusal it's trying to
                     # remedy.
                     if board is not None and config is not None:
+                        # #3522 review (non-blocking): align with every other
+                        # `dispatch_conflict_fix` call site
+                        # (`commands/merge.py`'s `_machine_for_assignment`,
+                        # `notify.py`'s `prefer_machine=work.machine_name`) —
+                        # prefer the original worker's machine (it already
+                        # has the repo/branch checked out), opt into the
+                        # #3353 live-liveness check via `status_fetcher` (so
+                        # a machine that merely LOOKS idle because it's
+                        # offline isn't picked), and capture a rich decline
+                        # reason via `machine_pick_out` instead of the bare
+                        # `fix is None` the original code silently swallowed.
+                        from coord.conflict_fix import (  # noqa: PLC0415
+                            describe_conflict_fix_decline,
+                            dispatch_conflict_fix,
+                        )
+                        from coord.network import fetch_status  # noqa: PLC0415
+
+                        pick_out: list = []
+                        fix = None
                         try:
-                            from coord.conflict_fix import (  # noqa: PLC0415
-                                dispatch_conflict_fix,
-                            )
+                            prefer = None
+                            target = board.find_by_id(entry.assignment_id)
+                            if target is not None:
+                                prefer = target.machine_name
 
                             fix = dispatch_conflict_fix(
                                 entry, board, config, reword_commit=True,
+                                prefer_machine=prefer,
+                                status_fetcher=fetch_status,
+                                machine_pick_out=pick_out,
                             )
                         except Exception:  # noqa: BLE001
                             fix = None
@@ -8617,6 +8640,12 @@ def process(
                                 f"dispatched a reword-commit worker to "
                                 f"{fix.machine_name} for #{entry.issue_number} "
                                 f"(#3522)",
+                            ))
+                        else:
+                            events.append(MergeEvent(
+                                entry, "conflict_fix_dispatch_declined",
+                                "reword-commit dispatch declined: "
+                                + describe_conflict_fix_decline(pick_out),
                             ))
                     continue  # #3502: refuse — never merge a branch that will
                     # auto-close an issue marked not-yet-resolved via a commit

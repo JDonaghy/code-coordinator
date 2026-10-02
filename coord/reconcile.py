@@ -3064,6 +3064,7 @@ def on_conflict_fix_done(
     semantic: bool = False,
     already_upstream: bool = False,
     stale_rebase_mismatch: bool = False,
+    reword_mismatch: bool = False,
     board: Board | None = None,
     config: Config | None = None,
     stuck_summary: str | None = None,
@@ -3124,6 +3125,20 @@ def on_conflict_fix_done(
     (rather than auto-retrying, which would just burn more of the same
     exhausted budget — the #1461 "do not auto-retry immediately" rule
     applies here too), just with an accurate message.
+
+    *reword_mismatch* (#3522): when ``True``, a ``reword_commit=True``
+    conflict-fix worker (dispatched for
+    ``issue_resolution_closing_keyword_in_commit``) correctly refused to
+    push a message-only rewrite because it was not content-preserving —
+    either a conflict marker appeared mid-rebase, or the patch-id/tree
+    fingerprint differed afterward, per its own briefing's "When NOT to
+    guess" section. Unlike *stale_rebase_mismatch*, this does NOT get the
+    ordinary #241 conflict-fix escalation first: that worker is authorized
+    for a general mechanical rebase, which is a strictly broader (and
+    riskier) action than this dispatch's narrow "reword only" mandate ever
+    asked for, and a genuine content mismatch here means the branch needs
+    human eyes on what changed, not another automated rewrite attempt. Goes
+    straight to HUMAN_REQUIRED, same as *already_upstream*.
 
     Called from both ``reconcile()`` (via mark_done/failed) and
     ``coord notify`` (via post_transition) — both paths must trigger this
@@ -3186,6 +3201,38 @@ def on_conflict_fix_done(
                     "`coord drive-queue remove` — there is nothing to "
                     "rebase or merge. The coordinator will not re-dispatch "
                     "a conflict-fix for this entry in the current session."
+                )
+            elif reword_mismatch:
+                # #3522: the reword-commit worker found that rewording the
+                # offending commit's wording would NOT be content-preserving
+                # (a rebase conflict, or a patch-id/tree mismatch) and
+                # correctly refused to push rather than silently widening
+                # its narrow "message-only" mandate. Straight to
+                # HUMAN_REQUIRED — no ordinary-conflict-fix escalation; that
+                # worker's authorization to touch content is exactly the
+                # thing this dispatch was deliberately scoped to avoid, so
+                # handing it the problem would defeat the point.
+                detail = stuck_summary or (
+                    "the commit-message rewrite was not content-preserving "
+                    "(a conflict marker appeared, or the resulting patch-id "
+                    "or tree differed from before the reword)"
+                )
+                entry.state = mq.HUMAN_REQUIRED
+                entry.error = (
+                    f"{existing_error}; reword-commit worker refused to "
+                    f"push: {detail}. Manual reword required."
+                )
+                failed_entry = entry
+                failed_entry_closing_note = (
+                    "Manual reword required: edit the offending commit "
+                    "message(s) locally (e.g. `git rebase -i "
+                    f"{entry.target_branch}` with `reword`, or `git commit "
+                    "--amend` on the tip commit) so they use `Refs "
+                    f"#{entry.issue_number}` instead of a closing keyword, "
+                    "verify the diff is unchanged, then `git push "
+                    "--force-with-lease` and re-run `coord merge`. The "
+                    "coordinator will not re-dispatch a conflict-fix for "
+                    "this entry in the current session."
                 )
             elif stale_rebase_mismatch:
                 # #3444: a stale-rebase worker's refusal means the
@@ -3386,6 +3433,17 @@ def _on_conflict_fix_done(
     already-upstream verdict must win the framing when present) so an
     already-superseded branch is never told it has "a genuine content
     conflict" it doesn't have.
+
+    #3522: the same "clean exit is not proof of success" problem applies to
+    a reword-commit dispatch (``dispatch_conflict_fix(..., reword_commit=
+    True)``, used for ``issue_resolution_closing_keyword_in_commit``) — its
+    briefing's own "When NOT to guess" section tells the worker to stop and
+    NOT push when the reword turns out not to be content-preserving. Check
+    for :data:`coord.conflict_fix.REWORD_MISMATCH_MARKER` alongside the
+    other markers and downgrade *succeeded* the same way — all four markers
+    are mutually exclusive per dispatch, but checking all of them here means
+    this wrapper doesn't need to know which kind of conflict-fix dispatch it
+    is looking at.
     """
     parent_id = fix_assignment.review_of_assignment_id
     if not parent_id:
@@ -3396,6 +3454,7 @@ def _on_conflict_fix_done(
     semantic = False
     already_upstream = False
     stale_rebase_mismatch = False
+    reword_mismatch = False
     stuck_summary: str | None = None
     if (
         not usage_limit_reason
@@ -3421,6 +3480,14 @@ def _on_conflict_fix_done(
                 )
                 if stale_rebase_mismatch:
                     succeeded = False
+                else:
+                    reword_mismatch, stuck_summary = (
+                        _reword_mismatch_verdict(
+                            fix_assignment, agent_entry, config,
+                        )
+                    )
+                    if reword_mismatch:
+                        succeeded = False
 
     on_conflict_fix_done(
         parent_assignment_id=parent_id,
@@ -3430,6 +3497,7 @@ def _on_conflict_fix_done(
         semantic=semantic,
         already_upstream=already_upstream,
         stale_rebase_mismatch=stale_rebase_mismatch,
+        reword_mismatch=reword_mismatch,
         board=board,
         config=config,
         stuck_summary=stuck_summary,
@@ -3498,6 +3566,50 @@ def _stale_rebase_mismatch_verdict(
     )
     try:
         mismatch = detect_stale_rebase_mismatch(
+            log_path=log_path,
+            host=machine.host if machine is not None else None,
+            assignment_id=fix_assignment.assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — never break reconcile on a log read
+        return False, None
+
+    stuck_summary: str | None = None
+    if mismatch:
+        progress = (agent_entry or {}).get("progress") or {}
+        stuck_summary = progress.get("stuck")
+        if not stuck_summary and log_path:
+            try:
+                from coord.progress import parse_progress  # noqa: PLC0415
+                stuck_summary = parse_progress(log_path).stuck
+            except Exception:  # noqa: BLE001
+                stuck_summary = None
+    return mismatch, stuck_summary
+
+
+def _reword_mismatch_verdict(
+    fix_assignment: Assignment,
+    agent_entry: dict | None,
+    config: Config,
+) -> tuple[bool, str | None]:
+    """(is_reword_mismatch, stuck line) for a finished conflict-fix worker.
+    Mirrors :func:`_stale_rebase_mismatch_verdict` exactly, but reads for
+    :data:`coord.conflict_fix.REWORD_MISMATCH_MARKER` (#3522) — a
+    reword-commit worker that found its message-only rewrite would NOT be
+    content-preserving and correctly refused to push, per its own
+    briefing's "When NOT to guess" section.
+
+    Best-effort — any failure to read the log means "not a mismatch", which
+    means a clean exit resets the parent entry to PENDING (same fallback as
+    the sibling verdict functions).
+    """
+    from coord.conflict_fix import detect_reword_mismatch  # noqa: PLC0415
+
+    log_path = (agent_entry or {}).get("log_path")
+    machine = next(
+        (m for m in config.machines if m.name == fix_assignment.machine_name), None,
+    )
+    try:
+        mismatch = detect_reword_mismatch(
             log_path=log_path,
             host=machine.host if machine is not None else None,
             assignment_id=fix_assignment.assignment_id,

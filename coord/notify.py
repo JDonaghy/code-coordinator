@@ -4034,10 +4034,21 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # checked when semantic is False too) and route it to its own
         # `already_upstream` arm, which never escalates to the ordinary
         # conflict-fix path and never says "genuine content conflict".
+        # #3522: the same clean-exit ambiguity applies to a reword-commit
+        # dispatch (`dispatch_conflict_fix(..., reword_commit=True)`, used
+        # for `issue_resolution_closing_keyword_in_commit`) — its briefing
+        # tells the worker to stop and NOT push when the rewrite isn't
+        # content-preserving. Check `REWORD_MISMATCH_MARKER` last (mutually
+        # exclusive with the other three, so only checked when none of them
+        # fired) and route it to its own `reword_mismatch` arm, which — like
+        # `already_upstream` — never escalates to the ordinary conflict-fix
+        # path (that worker's broader content-touching authorization is
+        # exactly what this narrow dispatch was scoped to avoid).
         parent_id = record.get("review_of_assignment_id")
         if parent_id:
             from coord.conflict_fix import (  # noqa: PLC0415
                 detect_already_upstream,
+                detect_reword_mismatch,
                 detect_semantic_conflict,
                 detect_stale_rebase_mismatch,
             )
@@ -4060,6 +4071,7 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             # not "genuine conflict") whenever both would otherwise apply.
             already_upstream = False
             stale_rebase_mismatch = False
+            reword_mismatch = False
             if not semantic:
                 try:
                     already_upstream = detect_already_upstream(
@@ -4078,6 +4090,15 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                         )
                     except Exception:  # noqa: BLE001
                         stale_rebase_mismatch = False
+                    if not stale_rebase_mismatch:
+                        try:
+                            reword_mismatch = detect_reword_mismatch(
+                                log_path=log_path,
+                                host=host,
+                                assignment_id=transition.assignment_id,
+                            )
+                        except Exception:  # noqa: BLE001
+                            reword_mismatch = False
 
             stuck_summary: str | None = None
             board = None
@@ -4139,6 +4160,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                     config = _load_config()
                 except Exception:  # noqa: BLE001
                     board, config = None, None
+            elif reword_mismatch:
+                # #3522: no escalation dispatch happens for this verdict
+                # either (see the module-level comment above), so board/
+                # config aren't strictly needed — but grab the stuck summary
+                # the same way so `on_conflict_fix_done`'s HUMAN_REQUIRED
+                # text is specific.
+                progress = entry.get("progress") or {}
+                stuck_summary = progress.get("stuck")
+                if not stuck_summary and log_path:
+                    try:
+                        from coord.progress import parse_progress  # noqa: PLC0415
+                        stuck_summary = parse_progress(log_path).stuck
+                    except Exception:  # noqa: BLE001
+                        stuck_summary = None
 
             on_conflict_fix_done(
                 parent_assignment_id=parent_id,
@@ -4146,10 +4181,12 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 machine_name=transition.machine_name,
                 succeeded=not semantic
                 and not already_upstream
-                and not stale_rebase_mismatch,
+                and not stale_rebase_mismatch
+                and not reword_mismatch,
                 semantic=semantic,
                 already_upstream=already_upstream,
                 stale_rebase_mismatch=stale_rebase_mismatch,
+                reword_mismatch=reword_mismatch,
                 board=board,
                 config=config,
                 stuck_summary=stuck_summary,
