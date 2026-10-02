@@ -1495,6 +1495,16 @@ def openapi_spec() -> dict:
                 "responses": {"200": {"description": "text/html"}},
             }
         },
+        "/reports": {
+            "get": {
+                "summary": (
+                    "Generic report renderer (#3473): catalogue-driven params "
+                    "form, table, and ECharts chart over GET /api/report + "
+                    "GET /api/report/{id} — no per-report markup."
+                ),
+                "responses": {"200": {"description": "text/html"}},
+            }
+        },
         "/api/board": {
             "get": {
                 "summary": "Recent board state: active assignments + last 20 completed",
@@ -2930,6 +2940,19 @@ def build_app(
             legacy_index_html(webapp_dist),
             headers={WEBAPP_BUNDLE_HEADER: WEBAPP_BUNDLE_MISSING},
         )
+
+    async def reports_page(request: Request) -> HTMLResponse:  # noqa: ARG001 — Starlette handler signature
+        """GET /reports — the generic report renderer (#3473).
+
+        A static, build-free page (``coord/dashboard/reports.html``) that
+        draws the catalogue + charts/tables entirely from ``GET /api/report``
+        and ``GET /api/report/{id}`` — never a per-report branch here, and
+        never part of the ``webapp_dist`` bundle (#2009 removed that build
+        step; this page must not bring one back). Read fresh on every
+        request, same stance as ``legacy_index_html`` above, so an edit to
+        the file is visible without restarting a long-lived ``coord web``.
+        """
+        return HTMLResponse((DASHBOARD_DIR / "reports.html").read_text())
 
     async def api_board(request: Request) -> JSONResponse:
         board = _read_board()
@@ -5631,6 +5654,7 @@ def build_app(
 
     routes = [
         Route("/", index, methods=["GET"]),
+        Route("/reports", reports_page, methods=["GET"]),
         Route("/api/board", api_board, methods=["GET"]),
         Route("/api/machines", api_machines, methods=["GET"]),
         Route("/api/machines/health", api_machines_health, methods=["GET"]),
