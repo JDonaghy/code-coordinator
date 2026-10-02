@@ -3754,10 +3754,24 @@ def _capture_coverage_note(
     total_cost = captured_cost + estimated_cost
     captured_share = (captured_cost / total_cost * 100.0) if total_cost else 0.0
     estimated_share = (estimated_cost / total_cost * 100.0) if total_cost else 0.0
+    if cost_basis == "billed":
+        # #3471 review: the "billed" basis asserts `cost_usd` IS real money
+        # charged (ReportingConfig's own docstring) — the note must not then
+        # turn around and deny that in the same breath. Only the
+        # "api_equivalent" (default) basis gets the list-price-not-billed
+        # caveat; "billed" gets its own, non-contradictory sentence.
+        basis_sentence = (
+            f"Cost basis: `{cost_basis}` (see column_meta `basis`) — "
+            "`cost_usd` is asserted to be real money billed to the fleet."
+        )
+    else:
+        basis_sentence = (
+            f"Cost basis: `{cost_basis}` (see column_meta `basis`) — "
+            "`cost_usd` is what `claude -p` reports, an API-list-price "
+            "equivalent, not necessarily money billed."
+        )
     return (
-        f"Cost basis: `{cost_basis}` (see column_meta `basis`) — "
-        "`cost_usd` is what `claude -p` reports, an API-list-price "
-        "equivalent, not necessarily money billed. Coverage: "
+        f"{basis_sentence} Coverage: "
         f"{captured_legs} leg(s) captured ({captured_share:.1f}% of the $ "
         f"shown), {estimated_legs} estimated ({estimated_share:.1f}%), "
         f"{unmeasured_legs} unmeasured (contributes $0, 0% of the $ shown) "
