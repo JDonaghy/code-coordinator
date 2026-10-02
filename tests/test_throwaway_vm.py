@@ -347,7 +347,14 @@ def test_teardown_fires_on_interrupt(stubs: dict) -> None:
         # before the script installed its teardown trap, leaving no `az group
         # delete` and a 50-attempt wait loop still running, which surfaced as
         # the communicate() timeout rather than an honest failure.
-        deadline = time.monotonic() + 30.0
+        #
+        # #3534: this is poll-and-observe already, not a fixed sleep, but a
+        # 30s ceiling was not generous enough once a Test leg runs the whole
+        # suite in parallel on a busy host -- scheduling delays alone can eat
+        # that budget before the first `ssh ... true` probe even lands in the
+        # log. Widen the ceiling; the loop still exits the instant the
+        # evidence shows up, so this costs nothing on an idle box.
+        deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline:
             if any(c.endswith(" true") for c in _ssh_calls(stubs)):
                 break
@@ -356,13 +363,31 @@ def test_teardown_fires_on_interrupt(stubs: dict) -> None:
             time.sleep(0.05)
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.communicate(timeout=5)
+            proc.communicate(timeout=15)
             pytest.fail("script never reached its SSH-reachability wait loop")
         os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-        stdout, _ = proc.communicate(timeout=30)
+
+        # #3534: assert teardown on its OWN observed evidence -- the `az
+        # group delete` call actually landing in the log -- with its own
+        # generous, bounded poll, rather than gating that assertion behind
+        # the *process* having fully exited and its stdout pipe having fully
+        # drained. Those are two different conditions: under heavy parallel
+        # load the pipe can take a while to drain even after teardown has
+        # already run, and `communicate()`'s one combined timeout couples
+        # "did teardown fire" to "did the pipe finish draining" -- the wrong
+        # observation for what this test is actually asserting.
+        teardown_deadline = time.monotonic() + 60.0
+        while time.monotonic() < teardown_deadline:
+            if any(c.startswith("group delete") for c in _az_calls(stubs)):
+                break
+            if proc.poll() is not None:  # process already gone either way
+                break
+            time.sleep(0.05)
+
+        stdout, _ = proc.communicate(timeout=60)
     except subprocess.TimeoutExpired:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        proc.communicate(timeout=5)
+        proc.communicate(timeout=15)
         pytest.fail("script did not exit after SIGINT")
 
     assert proc.returncode != 0, stdout
