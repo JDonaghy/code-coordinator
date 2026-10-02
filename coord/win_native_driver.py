@@ -814,7 +814,18 @@ class Win32Calls:
         desktop exists to open at all), ``WTSGetActiveConsoleSessionId``
         reports a real console session, and no ``LogonUI.exe`` is running
         in that session (the lock-screen host process). Any one of these
-        failing means the host's desktop is locked or absent."""
+        failing means the host's desktop is locked or absent.
+
+        Defensive by design: this gates every ``win-native`` run (#3510), so
+        a probe that raises (e.g. a lookup error on a function that doesn't
+        live where expected — #3521) must report "unavailable, here's why"
+        rather than take the whole lane down with an uncaught exception."""
+        try:
+            return self._session_available_unchecked()
+        except Exception as exc:  # noqa: BLE001 - must never crash the lane
+            return False, f"session_available probe failed: {exc}"
+
+    def _session_available_unchecked(self) -> tuple[bool, str]:
         ctypes = self._ctypes
         DESKTOP_READOBJECTS = 0x0001
         hdesk = self._user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
@@ -825,9 +836,12 @@ class Win32Calls:
             )
         self._user32.CloseDesktop(hdesk)
 
-        wtsapi32 = ctypes.windll.wtsapi32
+        # WTSGetActiveConsoleSessionId is exported by kernel32, not
+        # wtsapi32 (#3521) — it's the one WTS* function that lives there;
+        # the rest of the WTS family (WTSQuerySessionInformation etc.) is
+        # genuinely in wtsapi32, which is the likely source of the mix-up.
         INVALID_SESSION_ID = 0xFFFFFFFF
-        session_id = wtsapi32.WTSGetActiveConsoleSessionId()
+        session_id = self._kernel32.WTSGetActiveConsoleSessionId()
         if session_id == INVALID_SESSION_ID:
             return False, (
                 "WTSGetActiveConsoleSessionId reports no active console "
