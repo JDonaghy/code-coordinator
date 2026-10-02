@@ -14,6 +14,7 @@ here) and is exercised at the operator level instead — the same split
 from __future__ import annotations
 
 import base64
+import ctypes
 import os
 import time
 
@@ -795,6 +796,153 @@ class TestWin32CallsPlatformGuard:
             pytest.skip("this guard only fires off Windows")
         with pytest.raises(WinNativeRuntimeError, match="Windows"):
             Win32Calls()
+
+
+class _FakeUser32:
+    """``OpenInputDesktop``/``CloseDesktop`` stand-in — desktop unlocked."""
+
+    def OpenInputDesktop(self, *_args, **_kwargs):
+        return 0x1234  # truthy handle
+
+    def CloseDesktop(self, _hdesk) -> None:
+        pass
+
+
+class _ProcessEntry32Mirror(ctypes.Structure):
+    """Field-for-field mirror of the ``PROCESSENTRY32`` defined inline in
+    :meth:`Win32Calls._logonui_running_in_session` — not the same Python
+    class, but same layout, so ``ctypes.cast`` on the ``byref`` pointer the
+    real method passes in reads/writes the same memory the fakes below
+    populate."""
+
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32),
+        ("th32ProcessID", ctypes.c_uint32),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_uint32), ("cntThreads", ctypes.c_uint32),
+        ("th32ParentProcessID", ctypes.c_uint32),
+        ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_uint32),
+        ("szExeFile", ctypes.c_char * 260),
+    ]
+
+
+class _FakeKernel32NoSession:
+    """Mimics the *real* kernel32 (#3521): ``WTSGetActiveConsoleSessionId``
+    is present and callable here — unlike the old, wrong ``wtsapi32``
+    lookup, which would raise ``AttributeError`` on real Windows."""
+
+    exe_name = b"explorer.exe"
+
+    def __init__(self, session_id: int = 1) -> None:
+        self._session_id = session_id
+
+    def WTSGetActiveConsoleSessionId(self) -> int:
+        return self._session_id
+
+    def CreateToolhelp32Snapshot(self, *_args, **_kwargs):
+        return 1  # non-zero, non -1 "handle"
+
+    def Process32First(self, _snapshot, entry_ref) -> bool:
+        entry = ctypes.cast(entry_ref, ctypes.POINTER(_ProcessEntry32Mirror)).contents
+        entry.szExeFile = self.exe_name
+        return True
+
+    def Process32Next(self, _snapshot, _entry_ref) -> bool:
+        return False  # only the one process — no LogonUI.exe
+
+    def ProcessIdToSessionId(self, _pid, session_ref) -> bool:
+        session_ref._obj.value = self._session_id
+        return True
+
+    def CloseHandle(self, _handle) -> None:
+        pass
+
+
+def _ensure_mbcs_codec_available() -> None:
+    """``_logonui_running_in_session`` decodes ``szExeFile`` with Windows'
+    ``mbcs`` codec, which only exists on real Windows. Register an
+    ascii-compatible alias off-Windows so these tests can exercise that
+    real decode path (all the fake exe names here are ASCII) instead of
+    mocking around it — a no-op if ``mbcs`` is already natively available."""
+    import codecs
+
+    try:
+        codecs.lookup("mbcs")
+    except LookupError:
+        codecs.register(lambda name: codecs.lookup("ascii") if name == "mbcs" else None)
+
+
+def _make_win32_calls(user32, kernel32) -> Win32Calls:
+    """Build a :class:`Win32Calls` bypassing ``__init__``'s platform guard
+    (construction requires real Windows) with real ``ctypes``/``ctypes.
+    wintypes`` — both work fine off-Windows — but faked ``user32``/
+    ``kernel32`` handles, exactly mirroring what ``__init__`` would have
+    set on a real Windows host."""
+    import ctypes.wintypes  # noqa: F401 - imported for side effect, used by the class
+
+    _ensure_mbcs_codec_available()
+    calls = object.__new__(Win32Calls)
+    calls._ctypes = ctypes
+    calls._user32 = user32
+    calls._kernel32 = kernel32
+    return calls
+
+
+class TestSessionAvailable:
+    """#3521: ``WTSGetActiveConsoleSessionId`` lives on kernel32, not
+    wtsapi32 — the old code crashed every win-native run with an
+    uncaught ``AttributeError`` before this fix. These tests fake
+    ``Win32Calls`` so the wtsapi32-shaped mistake would raise if
+    reintroduced, and confirm the probe is defensive end to end."""
+
+    def test_uses_kernel32_and_reports_available_when_unlocked(self) -> None:
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        available, reason = calls.session_available()
+        assert available is True
+        assert reason == ""
+
+    def test_a_raising_probe_yields_unavailable_with_reason_not_an_exception(
+        self,
+    ) -> None:
+        class _ExplodingUser32:
+            def OpenInputDesktop(self, *_args, **_kwargs):
+                raise AttributeError(
+                    "function 'WTSGetActiveConsoleSessionId' not found"
+                )
+
+        calls = _make_win32_calls(_ExplodingUser32(), _FakeKernel32NoSession())
+        available, reason = calls.session_available()
+        assert available is False
+        assert "failed" in reason.lower()
+        assert "WTSGetActiveConsoleSessionId" in reason
+
+    def test_invalid_session_id_reports_unavailable(self) -> None:
+        INVALID_SESSION_ID = 0xFFFFFFFF
+        calls = _make_win32_calls(
+            _FakeUser32(), _FakeKernel32NoSession(session_id=INVALID_SESSION_ID),
+        )
+        available, reason = calls.session_available()
+        assert available is False
+        assert "no active console session" in reason
+
+    def test_logonui_running_reports_locked(self) -> None:
+        class _FakeKernel32Locked(_FakeKernel32NoSession):
+            exe_name = b"LogonUI.exe"
+
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32Locked())
+        available, reason = calls.session_available()
+        assert available is False
+        assert "LogonUI.exe" in reason
+
+    def test_open_input_desktop_failure_reports_unavailable(self) -> None:
+        class _FakeUser32Locked:
+            def OpenInputDesktop(self, *_args, **_kwargs):
+                return 0  # falsy handle — no interactive desktop
+
+        calls = _make_win32_calls(_FakeUser32Locked(), _FakeKernel32NoSession())
+        available, reason = calls.session_available()
+        assert available is False
+        assert "OpenInputDesktop" in reason
 
 
 class TestImportUia:
