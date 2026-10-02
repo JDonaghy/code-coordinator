@@ -1699,6 +1699,32 @@ class TestRunDriverWinNativeWslBridge:
         result = run_driver("win-native", "./vimcode.exe", cwd=str(tmp_path), entrypoint="native.yaml")
         assert result.exit_code == 0
 
+    def test_hermetic_default_beats_a_real_looking_wsl_environ(self, tmp_path, monkeypatch) -> None:
+        """#3532: dell64 is a genuine WSL host, so ``conftest.py``'s
+        ``_non_wsl_host_by_default`` autouse fixture must win over
+        ``is_wsl_host``'s OWN detection inputs outright — not merely happen
+        to agree with them because the box running this particular test
+        suite isn't WSL. Forcing ``WSL_DISTRO_NAME`` (the stronger of
+        ``is_wsl_host``'s two signals, and the one WSL sets for every
+        interactive/non-interactive shell alike) to look exactly like
+        dell64, and confirming the in-process (non-bridge) path still runs,
+        proves the fixture actually overrides the real signal rather than
+        coincidentally matching a non-WSL test runner."""
+        monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+
+        spec = tmp_path / "native.yaml"
+        spec.write_text("steps:\n  - type: launch\n")
+
+        import coord.win_native_driver as win_native_driver
+
+        def fake_run_native_spec(spec_text, *, launch_command, cwd, timeout=None):
+            return [{"id": "000 launch", "status": "pass", "message": ""}]
+
+        monkeypatch.setattr(win_native_driver, "run_native_spec", fake_run_native_spec)
+
+        result = run_driver("win-native", "./vimcode.exe", cwd=str(tmp_path), entrypoint="native.yaml")
+        assert result.exit_code == 0
+
 
 class TestRunDriverMacNative:
     """#3485: the ``mac-native`` driver — the actual Quartz/AX calls, the
