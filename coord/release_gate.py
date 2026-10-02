@@ -25,7 +25,11 @@ resolving SHA ancestry via git) lives in ``coord.commands.release``.
 - A ``coord bugbash`` run that terminated via its own ``"lane_failure"``
   reason (:mod:`coord.bugbash`'s own #2096 guard: every explored lane failed
   to dispatch/poll/log) is NOT treated as a clean pass here either — see
-  :attr:`BugbashRunRecord.verified`.
+  :attr:`BugbashRunRecord.verified`. Neither is one that terminated
+  ``"protocol_error"`` (#3517: a lane completed, but its final report was a
+  malformed or missing findings block — never a parseable, trustworthy
+  "zero findings" answer) — see :func:`bugbash_run_record_from_report`, the
+  one place that maps both termination reasons onto ``verified=False``.
 - An operator override never erases the underlying failing steps — see
   :meth:`ReleaseGateVerdict.failing_steps` vs. :meth:`ReleaseGateVerdict.
   effective_passed`. The override is audited evidence layered ON TOP of the
@@ -47,7 +51,7 @@ from __future__ import annotations
 
 import time as _time
 from dataclasses import dataclass, replace
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 # ── observed inputs ─────────────────────────────────────────────────────────
 
@@ -91,11 +95,22 @@ class BugbashRunRecord:
     reduced to what the release gate needs to grade it.
 
     ``verified`` mirrors :meth:`coord.bugbash.BugbashReport.rounds`'s own
-    #2096 distinction: ``False`` means the terminating round's
-    ``termination_reason`` was ``"lane_failure"`` — every lane explored that
-    round failed to dispatch/poll/fetch its log, so "zero new findings" was
-    never actually OBSERVED, it is just the absence of a dispatch that could
-    have found one. A run like that must never read as a clean pass.
+    #2096/#3517 distinction: ``False`` means the terminating round's
+    ``termination_reason`` was EITHER ``"lane_failure"`` (every lane explored
+    that round failed to dispatch/poll/fetch its log) OR ``"protocol_error"``
+    (#3517: a lane completed, but its final report was a malformed or
+    missing ```` ```bugbash-findings ```` block — never a parseable, trustworthy
+    "zero findings" answer). In both cases "zero new findings" was never
+    actually OBSERVED — in the first case nothing answered at all, in the
+    second something answered but the answer can't be trusted — so a run
+    terminated either way must never read as a clean pass here. ``detail``
+    is expected to say which of the two happened (surfaced verbatim in the
+    gate step's own ``detail``, see :func:`_bugbash_step`), but this type
+    intentionally does NOT split them into two booleans: the release gate
+    only ever needs the single yes/no "was this genuinely observed clean"
+    answer, and a caller building this from a real
+    :class:`coord.bugbash.BugbashReport` sets ``verified=False`` for either
+    ``termination_reason`` the exact same way (one question, one answer).
     """
 
     sha: str
@@ -109,6 +124,53 @@ class BugbashRunRecord:
         """A genuinely verified, zero-new-findings run — the only shape
         that may satisfy the gate's bugbash step."""
         return self.verified and self.new_findings == 0
+
+
+#: `coord.bugbash.BugbashReport` termination reasons that mean "this round's
+#: zero-new-findings count was never actually OBSERVED" (#2096/#3517) — see
+#: :func:`bugbash_run_record_from_report`, the ONE place that maps a real
+#: bugbash run onto :attr:`BugbashRunRecord.verified`.
+_UNVERIFIED_TERMINATION_REASONS = frozenset({"lane_failure", "protocol_error"})
+
+
+def bugbash_run_record_from_report(report: Any, *, sha: str, ran_at: float = 0.0) -> BugbashRunRecord:
+    """The ONE place that turns a real ``coord bugbash`` run
+    (:class:`coord.bugbash.BugbashReport`) into this module's own
+    :class:`BugbashRunRecord` (#2096/#3517 "one question, one answer") — so
+    a caller wiring the production bugbash-journal store (the
+    ``--from-json`` KNOWN GAP noted in ``coord.commands.release``) reads the
+    SAME verdict this module's own tests exercise here, rather than
+    reimplementing — and risking silently disagreeing with — what counts as
+    a verified clean pass.
+
+    Duck-typed on *report* (``termination_reason`` plus each round's
+    ``new_count``) rather than importing :class:`coord.bugbash.BugbashReport`
+    directly — this module stays dependency-free per its own module
+    docstring, and ``coord.bugbash`` has no reason to import
+    ``coord.release_gate`` back.
+
+    ``new_findings`` is the sum of every round's ``new_count`` — the
+    non-duplicate (new/regression) findings actually OBSERVED, independent
+    of whether each one went on to be filed. Using *filed* count instead
+    would let a run where the operator declined the confirm-gate prompt
+    (#3487) read as "zero new findings" even though something genuinely new
+    was found — a gate that can be satisfied just by declining to file is a
+    gate that can't fail (#2096).
+
+    ``verified`` is ``False`` exactly when ``report.termination_reason`` is
+    in :data:`_UNVERIFIED_TERMINATION_REASONS` (``"lane_failure"`` or
+    ``"protocol_error"``, #3517) — every other termination reason
+    (``"zero_findings"``, ``"cost_cap"``, ``"round_cap"``) reflects a round
+    that was genuinely observed, even one that hit a cost/round cap while
+    still finding new things.
+    """
+    new_findings = sum(getattr(r, "new_count", 0) for r in getattr(report, "rounds", ()))
+    reason = getattr(report, "termination_reason", "")
+    verified = reason not in _UNVERIFIED_TERMINATION_REASONS
+    detail = "" if verified else f"terminated {reason!r} — not a verified clean pass"
+    return BugbashRunRecord(
+        sha=sha, new_findings=new_findings, verified=verified, ran_at=ran_at, detail=detail,
+    )
 
 
 # ── the comparator a caller supplies for "at or after" ─────────────────────

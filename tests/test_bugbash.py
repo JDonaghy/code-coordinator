@@ -122,30 +122,92 @@ class TestParseFindingsBlock:
             '"repro": "r", "evidence": "ev"}]\n'
             "```\n"
         )
-        findings = parse_findings_block(text, platform="win-native", repo="vimcode")
-        assert len(findings) == 1
-        assert findings[0].title == "Crash on install"
-        assert findings[0].platform == "win-native"
-        assert findings[0].repo == "vimcode"
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        assert result.protocol_error == ""
+        assert len(result.findings) == 1
+        assert result.findings[0].title == "Crash on install"
+        assert result.findings[0].platform == "win-native"
+        assert result.findings[0].repo == "vimcode"
+        assert result.findings[0].incomplete is False
 
-    def test_no_block_returns_empty(self):
-        assert parse_findings_block("nothing to see here", platform="win-native", repo="vimcode") == []
+    def test_no_block_with_no_clean_statement_is_a_protocol_error(self):
+        # #3517: a dropped/forgotten fence must NOT silently read as a clean
+        # (zero-findings) pass — it's indistinguishable from a real finding
+        # that got lost, so it must come back as a protocol error instead.
+        result = parse_findings_block("nothing to see here", platform="win-native", repo="vimcode")
+        assert result.findings == ()
+        assert result.protocol_error != ""
 
-    def test_malformed_json_returns_empty(self):
+    def test_no_block_with_explicit_clean_statement_is_a_clean_pass(self):
+        text = "I walked the full checklist and found zero findings this round."
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        assert result.findings == ()
+        assert result.protocol_error == ""
+
+    def test_malformed_json_is_a_protocol_error_not_empty(self):
+        # #3517: this used to silently return `[]`, indistinguishable from a
+        # genuine clean pass. A lane protocol slip must be reported, not
+        # dropped.
         text = "```bugbash-findings\nnot json\n```"
-        assert parse_findings_block(text, platform="win-native", repo="vimcode") == []
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        assert result.findings == ()
+        assert result.protocol_error != ""
+        assert "JSON" in result.protocol_error
 
-    def test_entry_missing_required_field_is_dropped(self):
+    def test_non_list_json_is_a_protocol_error(self):
+        text = '```bugbash-findings\n{"title": "not a list"}\n```'
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        assert result.findings == ()
+        assert result.protocol_error != ""
+
+    def test_entry_missing_evidence_is_kept_with_derived_evidence_and_incomplete_flag(self):
+        # #3517: the live finding this bug was filed from — a valid block,
+        # one entry with every field EXCEPT `evidence`. It must survive as a
+        # real finding, not get silently dropped to "zero findings".
+        text = (
+            "```bugbash-findings\n"
+            '[{"title": "idle vcd emits a cursor-hide burst", "expected": "silent", '
+            '"actual": "25-byte burst every ~2s", "repro": "idle for 10s", '
+            '"captures": ["probe-dump-1.txt"]}]\n'
+            "```"
+        )
+        result = parse_findings_block(text, platform="tui-pty", repo="vimcode")
+        assert result.protocol_error == ""
+        assert len(result.findings) == 1
+        finding = result.findings[0]
+        assert finding.incomplete is True
+        assert finding.missing_fields == ("evidence",)
+        assert "probe-dump-1.txt" in finding.evidence
+
+    def test_entry_missing_evidence_and_captures_derives_from_actual(self):
+        text = (
+            "```bugbash-findings\n"
+            '[{"title": "x", "expected": "e", "actual": "a", "repro": "r"}]\n'
+            "```"
+        )
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        [finding] = result.findings
+        assert finding.incomplete is True
+        assert "a" in finding.evidence
+
+    def test_entry_missing_repro_is_kept_with_placeholder_and_incomplete_flag(self):
         text = (
             "```bugbash-findings\n"
             '[{"title": "x", "expected": "e", "actual": "a", "repro": "", "evidence": "ev"}]\n'
             "```"
         )
-        assert parse_findings_block(text, platform="win-native", repo="vimcode") == []
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        assert result.protocol_error == ""
+        [finding] = result.findings
+        assert finding.incomplete is True
+        assert "repro" in finding.missing_fields
+        assert finding.repro != ""
 
     def test_empty_array_is_a_clean_round(self):
         text = "```bugbash-findings\n[]\n```"
-        assert parse_findings_block(text, platform="win-native", repo="vimcode") == []
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        assert result.findings == ()
+        assert result.protocol_error == ""
 
 
 # ── discover_lanes ────────────────────────────────────────────────────────
@@ -565,6 +627,55 @@ class TestRunBugbashTermination:
         assert report.rounds[0].unavailable_lanes == {"win-native": "locked"}
         assert report.any_lane_unavailable is True
 
+    def test_protocol_error_reports_protocol_error_not_zero_findings(self):
+        # #3517: a lane that completed (ok=True) but whose report could not
+        # be trusted (a malformed/missing findings block) must NOT let the
+        # round read as a genuine "zero_findings" clean pass — that silent
+        # collapse is exactly how a real finding got dropped and let a bug
+        # pass the #3488 release gate.
+        config = _config(max_rounds=5)
+
+        def bad_protocol_explorer(lane, round_num):
+            return ExploreOutcome(
+                ok=True, findings=(), cost=1.84,
+                protocol_error="no fence found and no explicit clean statement",
+            )
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=bad_protocol_explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.termination_reason == "protocol_error"
+        assert report.rounds[0].protocol_error_lanes == {
+            "win-native": "no fence found and no explicit clean statement"
+        }
+        assert report.rounds[0].lane_failures == {}
+        assert report.any_protocol_errors is True
+        assert runner.calls == []
+
+    def test_one_protocol_error_one_ok_lane_still_blocks_zero_findings(self):
+        # Unlike lane_failure/unavailable (which require ALL explored lanes
+        # to agree), a protocol error on even ONE lane must block the
+        # "zero_findings" read for the whole round (#3517) — a lane's bad
+        # report can't be outvoted by a sibling lane's clean one.
+        bad_lane = _lane(platform="win-native", machine="pc1")
+        ok_lane = _lane(platform="mac-native", machine="mac1")
+        config = _config(lanes=[bad_lane, ok_lane], max_rounds=5)
+
+        def explorer(lane, round_num):
+            if lane.platform == "win-native":
+                return ExploreOutcome(ok=True, findings=(), cost=1.0, protocol_error="bad block")
+            return ExploreOutcome(ok=True, findings=(), cost=1.0, notes="status=completed")
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.termination_reason == "protocol_error"
+        assert report.rounds[0].protocol_error_lanes == {"win-native": "bad block"}
+
     def test_duplicate_only_round_still_terminates_zero_findings(self):
         # A round whose only finding is a DUPLICATE of an already-open
         # issue must count as zero NEW findings, terminating the loop —
@@ -829,7 +940,8 @@ class TestDispatchAndAwaitLane:
             '"text": "done.\\n```bugbash-findings\\n'
             '[{\\"title\\": \\"Crash on install\\", \\"expected\\": \\"e\\", '
             '\\"actual\\": \\"a\\", \\"repro\\": \\"r\\", \\"evidence\\": \\"ev\\"}]\\n'
-            '```"}]}}'
+            '```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 1.84, "num_turns": 75}'
         )
 
         class _Resp:
@@ -846,6 +958,83 @@ class TestDispatchAndAwaitLane:
             _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
         )
         assert outcome.ok is True
-        assert outcome.cost == 1.0
+        # #3517: cost must be the worker's REAL `total_cost_usd` from its
+        # log, not a flat per-round placeholder — the bug report's exact
+        # mismatch was a $1.84 lane recorded as `total_cost=1.00`.
+        assert outcome.cost == 1.84
         assert len(outcome.findings) == 1
         assert outcome.findings[0].title == "Crash on install"
+        assert outcome.protocol_error == ""
+
+    def test_cost_with_no_result_event_defaults_to_zero_not_a_flat_placeholder(self, monkeypatch):
+        """A log with no terminal `result` event (e.g. truncated) must never
+        fall back to a made-up flat cost — `0.0` is the honest "we don't
+        know" default, same discipline `WorkerSummary` already applies
+        everywhere else cost is read (#3517)."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "zero findings this round."}]}}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.cost == 0.0
+
+    def test_no_fence_and_no_clean_statement_is_a_protocol_error_not_zero_findings(self, monkeypatch):
+        """#3517's actual regression scenario end to end: a lane worker's
+        final message carries no ```` ```bugbash-findings ```` fence and no
+        explicit clean statement — `_dispatch_and_await_lane` must hand back
+        a non-empty `protocol_error`, never `findings=(), ok=True` (which
+        `run_bugbash` would read as a genuine clean pass)."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "I ran out of budget partway through."}]}}\n'
+            '{"type": "result", "total_cost_usd": 1.0}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is True
+        assert outcome.findings == ()
+        assert outcome.protocol_error != ""
+        assert outcome.cost == 1.0

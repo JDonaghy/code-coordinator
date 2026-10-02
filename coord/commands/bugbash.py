@@ -166,18 +166,41 @@ def _dispatch_and_await_lane(
     # (`coord.worker_events._assistant_text`), rather than re-deriving the
     # stream-json content-block shape here — `coord log --raw` and this
     # poller must never disagree about what a session's transcript said.
-    from coord.worker_events import _assistant_text, iter_events_from_text
+    # Likewise for cost: `update_summary`/`WorkerSummary` is the SAME
+    # accumulator `coord log`/`parse_log` use to total a session's real
+    # `total_cost_usd` off its `result` event (#3517) — not a second,
+    # independently-drifting cost readout, and never the flat per-round
+    # placeholder this explorer used to hand back regardless of what the
+    # worker actually spent.
+    from coord.worker_events import (
+        WorkerSummary,
+        _assistant_text,
+        iter_events_from_text,
+        update_summary,
+    )
 
     last_assistant_text = ""
+    summary = WorkerSummary()
     for event in iter_events_from_text(log_resp.text):
+        update_summary(summary, event)
         if event.type != "assistant":
             continue
         text = _assistant_text(event)
         if text.strip():
             last_assistant_text = text
 
-    findings = parse_findings_block(last_assistant_text, platform=lane.platform, repo=repo_name)
-    return ExploreOutcome(findings=tuple(findings), cost=1.0, notes="status=completed")
+    parsed = parse_findings_block(last_assistant_text, platform=lane.platform, repo=repo_name)
+    if parsed.protocol_error:
+        # #3517: the worker completed, but its report can't be trusted as a
+        # findings block at all — this must come back DISTINCT from
+        # "findings=(), ok=True" (a genuine clean pass), never silently as
+        # zero findings.
+        return ExploreOutcome(
+            cost=summary.total_cost_usd,
+            notes=f"protocol error: {parsed.protocol_error}",
+            protocol_error=parsed.protocol_error,
+        )
+    return ExploreOutcome(findings=parsed.findings, cost=summary.total_cost_usd, notes="status=completed")
 
 
 def _fetch_recently_closed_issues(slug: str, *, limit: int = 200) -> list[dict]:
@@ -210,13 +233,20 @@ def _print_round(report: BugbashReport) -> None:
         # line that reads identically to a genuinely clean round.
         for platform, note in r.lane_failures.items():
             click.secho(f"  lane FAILED ({platform}): {note}", fg="red")
+        # #3517: a lane's protocol slip (malformed/missing findings block)
+        # must be just as visible — never let it hide behind a quiet
+        # "0 finding(s)" line that reads identically to a genuinely clean
+        # round.
+        for platform, note in r.protocol_error_lanes.items():
+            click.secho(f"  lane PROTOCOL ERROR ({platform}): {note}", fg="red")
         for f in r.filings:
+            incomplete = " [INCOMPLETE REPORT]" if f.finding.incomplete else ""
             if f.filed:
-                click.echo(f"  filed+queued: #{f.issue_number} — {f.finding.title}")
+                click.echo(f"  filed+queued: #{f.issue_number} — {f.finding.title}{incomplete}")
             elif f.verdict.value == "duplicate":
-                click.echo(f"  duplicate of #{f.issue_number}: {f.finding.title}")
+                click.echo(f"  duplicate of #{f.issue_number}: {f.finding.title}{incomplete}")
             elif f.preview_title is not None:
-                click.echo(f"  would file ({f.verdict.value}): {f.preview_title}")
+                click.echo(f"  would file ({f.verdict.value}): {f.preview_title}{incomplete}")
 
 
 @click.command(
@@ -331,14 +361,30 @@ def bugbash_cmd(
             fg="red", err=True,
         )
         sys.exit(1)
-    elif report.any_lane_failures:
+    elif report.termination_reason == "protocol_error":
+        # #3517: a lane completed but its report could not be trusted as a
+        # findings block at all — this must exit nonzero exactly like
+        # "lane_failure" does, or a script doing
+        # `coord bugbash REPO --yes && next_step` would proceed on a round
+        # it never actually got a trustworthy answer from.
+        click.secho(
+            "error: a lane in the terminating round reported a protocol "
+            "error (malformed or missing findings block) — this is NOT a "
+            "verified zero-findings pass; see the lane PROTOCOL ERROR "
+            "lines above.",
+            fg="red", err=True,
+        )
+        sys.exit(1)
+    elif report.any_lane_failures or report.any_protocol_errors:
         # A partial failure along the way: some lane(s) never got a
-        # verified answer even though the run as a whole terminated
-        # normally — worth a nonzero-severity note, but not fatal, since
-        # other lanes DID produce a real observation this run.
+        # verified answer, or answered with an untrustworthy report, even
+        # though the run as a whole terminated normally — worth a
+        # nonzero-severity note, but not fatal, since other lanes DID
+        # produce a real observation this run.
         click.secho(
             "warning: one or more rounds had a lane that failed to "
-            "dispatch/poll/fetch — see the lane FAILED lines above; "
-            "treat this run's coverage as partial.",
+            "dispatch/poll/fetch, or reported a protocol error — see the "
+            "lane FAILED / lane PROTOCOL ERROR lines above; treat this "
+            "run's coverage as partial.",
             fg="yellow", err=True,
         )
