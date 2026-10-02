@@ -964,6 +964,18 @@ run_python() {
     # 5m49s → 1m36s on a 4642-test suite, identical results). Detected rather
     # than assumed, because the venv is built from the branch under test and
     # any branch predating the dev-dep would die on an unknown -n flag.
+    #
+    # #3537: `.github/workflows/test.yml`'s `test` job runs the exact same
+    # `pytest -n auto --ignore=tests/acceptance` shape (no explicit --dist,
+    # so both land on pytest-xdist's default `--dist=load`) — one question
+    # ("does the suite pass under xdist"), one answer, rather than CI and
+    # the fleet's Test stage silently drifting into two invocations that
+    # could disagree. There is no serial-only test subset in this repo
+    # (checked at authoring time: no xdist-unsafe markers, no `-p no:xdist`
+    # anywhere, and `tests/backends.py` already shards schema names by
+    # `PYTEST_XDIST_WORKER` so the whole suite is xdist-safe) — if one is
+    # ever introduced, exclude it from BOTH this invocation and
+    # `test.yml`'s together, not just one of them.
     local par=()
     if "$venv/bin/python" -c "import xdist" 2>/dev/null; then
         par=(-n auto)

@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
       # #2180: `--ignore=tests/acceptance` — the sealed oracle-loop suite
       # (tests/acceptance/ms-NN/) is split out of the ordinary suite and
@@ -32,7 +34,24 @@ jobs:
       # never swept in here; ms-37 (plain .py files under
       # testpaths=["tests"]) was the one accidental gap. (ms-51 — Playwright,
       # never .py either — left this repo entirely with the webapp, #2009.)
-      - run: pytest --ignore=tests/acceptance
+      #
+      # #3537: `-n auto`, no explicit `--dist`, matches
+      # `scripts/coord-test-runner.sh`'s `run_python()` exactly (same
+      # `import xdist` gate, same bare `-n auto` — pytest-xdist's default
+      # `--dist=load`) so CI and the fleet's own Test stage answer "does this
+      # suite pass" through the same invocation shape rather than two
+      # independently-maintained ones that could silently disagree (one
+      # question, one answer). pytest-xdist is already a `[dev]` extra
+      # (pyproject.toml), installed by the `pip install` above — no new
+      # dependency. There is no predetermined "must run serial" test set in
+      # this repo today (checked: no xdist-unsafe markers, no `-p no:xdist`
+      # anywhere) — `tests/backends.py` already shards its schema names by
+      # `PYTEST_XDIST_WORKER` precisely so the whole suite is safe under
+      # `-n auto`, so there is nothing to split into a separate serial step.
+      # If a future test needs to be serial-only, give it the same
+      # `@pytest.mark.posix_only`-style registered marker and exclude it
+      # here AND in `coord-test-runner.sh` together, not just one of them.
+      - run: pytest -n auto --ignore=tests/acceptance
       # #2899: the `COORD_TUI_SRC=. python scripts/codegen.py --rust --check`
       # step that used to live here is GONE. It was #2897's explicit stand-in
       # for the byte-comparison, held here only for as long as the crate did
