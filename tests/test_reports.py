@@ -4882,8 +4882,14 @@ class TestCompletedFold:
         assert result.rows == []
         assert any("coord-local repo name" in n for n in result.notes)
 
-    def test_a_clean_window_produces_no_notes(self) -> None:
-        assert _fold_completed().notes == []
+    def test_a_clean_window_produces_only_the_standard_coverage_note(self) -> None:
+        """#3471: a clean window (nothing unpriced, no dropped rows) still
+        carries exactly ONE note — the standard captured/estimated/
+        unmeasured coverage line every cost-bearing report appends, never a
+        totally silent `notes: []` for a cost-bearing report."""
+        notes = _fold_completed().notes
+        assert len(notes) == 1, notes
+        assert notes[0].startswith("Cost basis: `api_equivalent`")
 
     def test_the_result_is_json_serialisable(self) -> None:
         json.dumps(_fold_completed().to_dict())
@@ -5114,8 +5120,12 @@ class TestCompletedSpend:
         assert "and 3 more" in pricing_notes[0], "the list is capped, and says so"
 
     def test_a_priced_fixture_still_produces_no_notes(self) -> None:
-        """The spend columns must not make every clean report noisy."""
-        assert _fold_completed().notes == []
+        """The spend columns must not make every clean report noisy — beyond
+        #3471's own standard coverage note, which every cost-bearing report
+        carries regardless."""
+        notes = _fold_completed().notes
+        assert len(notes) == 1, notes
+        assert notes[0].startswith("Cost basis: `api_equivalent`")
 
     def test_pricing_overrides_move_the_estimate(self) -> None:
         """Same #1116/#1763 seam `usage` has: the fleet's own `pricing:` block
@@ -6099,3 +6109,210 @@ class TestIssueCostCatalogue:
     def test_row_identity_names_repo_and_issue(self) -> None:
         rep = next(r for r in catalogue()["reports"] if r["id"] == "issue-cost")
         assert rep["row_identity"] == {"repo_column": "repo", "issue_column": "issue"}
+
+
+# ── #3471: cost basis + coverage, across all four cost-bearing reports ─────
+#
+# `usage`, `completed`, `trend`, `issue-cost` each sum `cost_usd` the SAME
+# way (`coord.usage_rollup.leg_cost`), so a chart screenshotted out of
+# context for any one of them must state (a) what its dollar figure actually
+# represents — `ColumnMeta.basis`, config-driven via `reporting.cost_basis`
+# — and (b) how completely it's known — the standard captured/estimated/
+# unmeasured coverage line every one of them appends to `notes`.
+
+
+class TestCostBasisColumnMeta:
+    """`basis` lands on the cost column(s) of every one of the four reports,
+    and ONLY on them — a non-cost column (`legs`, `started_at`, ...) stays
+    `basis=""`, same as a client that predates the field would see."""
+
+    def test_usage_stamps_basis_on_the_three_dollar_columns_only(self) -> None:
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        by_id = {m.id: m for m in result.column_meta}
+        for cost_col in ("cost_captured", "cost_est", "cost_total"):
+            assert by_id[cost_col].basis == "api_equivalent", cost_col
+        for other_col in ("issue", "repo", "title", "legs", "tokens_in"):
+            assert by_id[other_col].basis == "", other_col
+
+    def test_completed_stamps_basis_on_cost_total_only(self) -> None:
+        result = _fold_completed()
+        by_id = {m.id: m for m in result.column_meta}
+        assert by_id["cost_total"].basis == "api_equivalent"
+        for other_col in ("repo", "issue", "title", "started_at", "ended_at", "legs"):
+            assert by_id[other_col].basis == "", other_col
+
+    def test_trend_stamps_basis_on_cost_per_issue_only(self) -> None:
+        result = _trend_fold([], [], [])
+        by_id = {m.id: m for m in result.column_meta}
+        assert by_id["cost_per_issue"].basis == "api_equivalent"
+        for other_col in ("bucket_start", "merged", "legs_per_issue"):
+            assert by_id[other_col].basis == "", other_col
+
+    def test_issue_cost_stamps_basis_on_cost_total_only(self) -> None:
+        result = _fold_issue_cost(status="all")
+        by_id = {m.id: m for m in result.column_meta}
+        assert by_id["cost_total"].basis == "api_equivalent"
+        for other_col in ("repo", "issue", "title", "status", "coverage_pct"):
+            assert by_id[other_col].basis == "", other_col
+
+    def test_billed_basis_propagates_from_the_cost_basis_param(self) -> None:
+        """A report doesn't hardcode `api_equivalent` — it stamps whatever
+        `cost_basis` it's handed, which `run_*` resolves off
+        `reporting.cost_basis`."""
+        from coord.reports import fold_usage
+
+        result = fold_usage(
+            _usage_fixture_rows(), _unbounded_window(), cost_basis="billed"
+        )
+        by_id = {m.id: m for m in result.column_meta}
+        assert by_id["cost_total"].basis == "billed"
+
+    def test_the_module_level_column_meta_constants_stay_basis_free_templates(
+        self,
+    ) -> None:
+        """#3471: the shared `*_COLUMN_META` module constants are templates —
+        stamping happens once per fold call, not by mutating the shared
+        list, so two reports run back to back (possibly with two different
+        configured bases, or just two different test runs) can never leak
+        one call's `basis` into the next."""
+        from coord.reports import COMPLETED_COLUMN_META as completed_meta
+
+        assert all(m.basis == "" for m in completed_meta)
+        assert all(m.basis == "" for m in TREND_COLUMN_META)
+        assert all(m.basis == "" for m in ISSUE_COST_COLUMN_META)
+
+
+class TestCostBasisDefault:
+    def test_default_config_reporting_cost_basis_is_api_equivalent(self) -> None:
+        from coord.config import Config, ReportingConfig
+
+        cfg = Config(repos=[], machines=[])
+        assert cfg.reporting == ReportingConfig()
+        assert cfg.reporting.cost_basis == "api_equivalent"
+
+    def test_an_invalid_cost_basis_is_rejected_at_parse_time(self) -> None:
+        from coord.config import ConfigError, _parse_reporting
+
+        with pytest.raises(ConfigError, match="cost_basis"):
+            _parse_reporting({"cost_basis": "not-a-real-basis"})
+
+    def test_billed_is_accepted(self) -> None:
+        from coord.config import _parse_reporting
+
+        assert _parse_reporting({"cost_basis": "billed"}).cost_basis == "billed"
+
+    def test_reporting_block_in_coordinator_yml_reaches_every_cost_report(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end, mirroring `TestUsagePricingFollowsConfig`'s own
+        `pricing:` test: the basis an operator writes in coordinator.yml is
+        the basis every one of the four reports stamps — no separate
+        plumbing per report to get wrong."""
+        from coord.reports import run_completed, run_issue_cost, run_trend, run_usage
+
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(
+            "repos:\n"
+            "  - name: api\n"
+            "    github: acme/api\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tail\n"
+            "    repos: [api]\n"
+            "reporting:\n"
+            "  cost_basis: billed\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(cfg))
+
+        def empty_source():
+            return [], [], []
+
+        usage_result = run_usage(
+            window="30d", now=_U_NOW, fetch=lambda repo: [_leg("api", 1)]
+        )
+        completed_result = run_completed(now=_U_NOW, source=empty_source)
+        trend_result = run_trend(now=_U_NOW, source=empty_source)
+        issue_cost_result = run_issue_cost(now=_U_NOW, source=empty_source)
+
+        assert {m.id: m.basis for m in usage_result.column_meta}["cost_total"] == "billed"
+        assert (
+            {m.id: m.basis for m in completed_result.column_meta}["cost_total"]
+            == "billed"
+        )
+        assert (
+            {m.id: m.basis for m in trend_result.column_meta}["cost_per_issue"]
+            == "billed"
+        )
+        assert (
+            {m.id: m.basis for m in issue_cost_result.column_meta}["cost_total"]
+            == "billed"
+        )
+
+
+class TestCaptureCoverageNote:
+    """The standard #3471 line: how many legs behind a report's dollar
+    figure are captured / estimated / unmeasured, and the SHARE of the
+    shown total each bucket represents — not just a leg count."""
+
+    def test_usage_reports_the_standard_coverage_note(self) -> None:
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        coverage = [n for n in result.notes if n.startswith("Cost basis:")]
+        assert len(coverage) == 1, result.notes
+        note = coverage[0]
+        assert "api_equivalent" in note
+        assert "captured" in note and "estimated" in note and "unmeasured" in note
+        assert "% of the $ shown" in note
+
+    def test_completed_reports_the_standard_coverage_note(self) -> None:
+        result = _fold_completed()
+        coverage = [n for n in result.notes if n.startswith("Cost basis:")]
+        assert len(coverage) == 1, result.notes
+
+    def test_trend_inherits_completeds_own_coverage_note(self) -> None:
+        """#2096: `trend` never recomputes coverage — it reuses exactly the
+        note `fold_completed` already derived over the same widened window,
+        which is why this assertion is about INHERITANCE, not a second
+        independent computation landing on the same numbers by luck."""
+        issues = [_trend_issue(1), _trend_issue(2)]
+        assignments = [
+            _trend_assignment(1, 0.0, 100.0, 3.0),
+            _trend_assignment(2, 200.0, 300.0, 4.0),
+        ]
+        merge_queue = [
+            {"repo_name": "myrepo", "issue_number": 1, "state": "merged", "last_attempt": 100.0},
+            {"repo_name": "myrepo", "issue_number": 2, "state": "merged", "last_attempt": 300.0},
+        ]
+        result = _trend_fold(issues, assignments, merge_queue)
+        coverage = [n for n in result.notes if n.startswith("Cost basis:")]
+        assert len(coverage) == 1, result.notes
+        assert "2 leg(s) total" in coverage[0]
+
+    def test_issue_cost_reports_the_standard_coverage_note(self) -> None:
+        result = _fold_issue_cost(status="all")
+        coverage = [n for n in result.notes if n.startswith("Cost basis:")]
+        assert len(coverage) == 1, result.notes
+        # 7 total legs across the fixture's issues (5 on myrepo#7, 1 on
+        # myrepo#20, 1 on other#13) feed the coverage tally.
+        assert "7 leg(s) total" in coverage[0]
+
+    def test_no_legs_at_all_produces_no_coverage_note(self) -> None:
+        """Nothing to report coverage over — a redundant line saying so
+        would just restate `fold_usage`'s own "no usage recorded" note."""
+        from coord.reports import fold_usage
+
+        result = fold_usage([], _unbounded_window())
+        assert not any(n.startswith("Cost basis:") for n in result.notes)
+        assert any("No usage recorded" in n for n in result.notes)
+
+    def test_fully_captured_legs_show_100_percent_and_zero_unmeasured(self) -> None:
+        from coord.reports import fold_usage
+
+        rows = [_leg("api", 1, cost_usd=1.0), _leg("api", 1, cost_usd=2.0)]
+        result = fold_usage(rows, _unbounded_window())
+        coverage = next(n for n in result.notes if n.startswith("Cost basis:"))
+        assert "2 leg(s) captured (100.0% of the $ shown)" in coverage
+        assert "0 unmeasured" in coverage
