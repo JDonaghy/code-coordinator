@@ -485,6 +485,7 @@ def drive_queue_add(
     # kind is happening on that path. Merging (or fixing forward) a
     # discovered PR is deliberately left to the operator — see
     # `existing_pr_relaunch_remedy`'s own docstring.
+    existing_pr_resume_note = ""
     if previous is None or previous.state in STUCK_QUEUE_STATES:
         existing_match = _existing_pr_match(config_path, repo, issue)
         existing_remedy = existing_pr_relaunch_remedy(repo, issue, existing_match)
@@ -493,6 +494,24 @@ def drive_queue_add(
                 f"refusing to queue {entry_key(repo, issue)} — "
                 f"{existing_remedy['what_happens']} Run instead: "
                 f"{existing_remedy['command_or_action']}"
+            )
+        # #3539: `existing_remedy is None` with a real *existing_match* is
+        # ambiguous on its own — "no PR found, start fresh" and "PR found,
+        # green, but still missing a gate — resume on it" both return
+        # `None` from `existing_pr_relaunch_remedy` (see its docstring).
+        # Say which one happened: silently queuing a resume with no echo
+        # at all would read identically to a fresh `add` and hide the exact
+        # trap #3539 reports (an operator with no way to tell this add is
+        # about to drive the SAME branch, not a new one).
+        if existing_match is not None and existing_match.missing_gates:
+            gates_list = " and ".join(existing_match.missing_gates)
+            existing_pr_resume_note = (
+                f"\nresuming on existing PR #{existing_match.number} "
+                f"({existing_match.branch}) — CI is green but {gates_list} "
+                f"{'gate is' if len(existing_match.missing_gates) == 1 else 'gates are'} "
+                "not yet recorded; this add will dispatch only the missing "
+                f"stage(s) on that branch, never a new Work leg (coord "
+                f"gates {repo} {issue} shows the live detail)."
             )
 
     # #2247: predicted file overlap ORDERS, never refuses. Anything that goes
@@ -645,6 +664,7 @@ def drive_queue_add(
     click.echo(
         f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}{fix_rounds_note}"
         f"{no_acceptance_note}{scope_downgrade_warning}{overlap_note}"
+        f"{existing_pr_resume_note}"
     )
 
     # #2339: say out loud when this add cannot possibly accomplish anything —
@@ -951,15 +971,32 @@ def _existing_pr_match(
     answer than `coord.merge_queue.plan()`'s own `PLAN_READY` verdict — it
     reads raw `failed_checks`/`in_flight_checks` only and does not account
     for `merge_queue._ci_checks_are_stale` (a green check that silently
-    outlived a base move), review state, or any other merge gate. The
-    issue's own design accepted either condition ("all green OR `coord merge
-    --plan` reads READY"), and `coord merge --only` re-runs its own full gate
-    check before actually merging either way, so the worst case from the gap
-    is a confusing round trip (recommended here, still BLOCKED there), never
-    an incorrect merge. Wiring the fuller verdict in would need this call
-    site to assemble `plan()`'s board/GhOps/smoke-verdict inputs for a
-    single PR lookup — a bigger, riskier change than this fix-round's scope;
-    left as a known gap rather than attempted half-wired.
+    outlived a base move). The issue's own design accepted either condition
+    ("all green OR `coord merge --plan` reads READY"), and `coord merge
+    --only` re-runs its own full gate check before actually merging either
+    way, so the worst case from the gap is a confusing round trip
+    (recommended here, still BLOCKED there), never an incorrect merge.
+    Wiring the fuller verdict in would need this call site to assemble
+    `plan()`'s board/GhOps/smoke-verdict inputs for a single PR lookup — a
+    bigger, riskier change than this fix-round's scope; left as a known gap
+    rather than attempted half-wired.
+
+    `missing_gates` (#3539), unlike `all_green`, DOES reuse the real gate
+    decision — `coord.gates.build_gate_report`, the exact function `coord
+    gates` prints and that wraps `coord.merge_queue`'s own
+    `requires_review`/`scan_approved_reviews`/`requires_smoke`/
+    `evaluate_smoke_verdict` — rather than a second guess, closing the
+    quadraui#1109 gap: a PR can be all-green on CI while `coord gates`
+    still reports `review`/`test` BLOCKED, and the #2377 guard's old
+    "merge it" advice for an all-green PR was then impossible (`coord merge
+    --only` itself refused with `enqueue blocked by review gate`). Only
+    computed when `all_green` — a red PR's gate state is moot, the caller
+    refuses on CI alone either way. Fails open toward "missing" (NEVER
+    toward "satisfied"): an unreadable board/config, or a PR whose work
+    chain `build_gate_report` can't resolve a decision for, reports every
+    gate as still missing rather than claiming a merge is ready when a live
+    `coord merge --only` might still refuse it (#2096: unconfirmed success
+    is a defect).
     """
     coordinates = _repo_coordinates(config_path, repo)
     if coordinates is None:
@@ -990,12 +1027,51 @@ def _existing_pr_match(
         # reported", which `all_green` below already reads as not-green.
         checks = []
     all_green = bool(checks) and not failed_checks(checks) and not in_flight_checks(checks)
+    missing_gates = _missing_required_gates(config_path, repo, issue) if all_green else ()
     return ExistingPrMatch(
         number=number,
         branch=str(pr.get("headRefName") or ""),
         url=str(pr.get("url") or ""),
         all_green=all_green,
+        missing_gates=missing_gates,
     )
+
+
+def _missing_required_gates(config_path: Path, repo: str, issue: int) -> tuple[str, ...]:
+    """#3539: which of ``("review", "test")`` are still required-but-not-ok
+    for *repo*#*issue*, per `coord.gates.build_gate_report` — the SAME
+    review/test decision `coord gates` prints and `coord merge` itself
+    gates on (#2096: one question, one answer; never a second, driftable
+    guess at "is this PR actually ready").
+
+    Fails open toward "missing", never toward "satisfied": any read failure
+    (unreadable config, no board, an exception inside `build_gate_report`
+    itself) or a report with no resolved decisions at all (no work-like
+    assignment `build_gate_report` could select a winner from) reports
+    BOTH gates missing. A false "missing" here costs one operator-visible
+    resume note on an add that may turn out to be a no-op once the real
+    gates are read live again a moment later; a false "satisfied" would
+    reproduce the exact #3539 incident — advising ``coord merge --only``
+    over a PR a live merge attempt still refuses.
+    """
+    try:
+        from coord import github_ops  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.gates import build_gate_report  # noqa: PLC0415
+        from coord.state import build_board  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        board = build_board()
+        report = build_gate_report(board, cfg, repo, issue, gh_ops=github_ops)
+    except (Exception, SystemExit):  # noqa: BLE001 — fail-open to "missing"
+        return ("review", "test")
+    by_gate = {d.gate: d for d in report.decisions}
+    missing = []
+    for gate in ("review", "test"):
+        decision = by_gate.get(gate)
+        if decision is None or (decision.required and not decision.ok):
+            missing.append(gate)
+    return tuple(missing)
 
 
 def _predict_overlap(

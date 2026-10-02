@@ -2977,6 +2977,22 @@ def test_no_test_verdict_yet_waits_for_coord_to_dispatch_the_stage():
     assert action.command == ()
 
 
+def test_resuming_on_an_existing_pr_with_no_test_or_review_recorded_never_redispatches_work():
+    """#3539: the exact quadraui#1109/PR#1253 shape, pinned at `decide()`
+    itself — a `coord drive-queue add` the #2377/#3539 guard now ACCEPTS
+    (CI green, but neither Test nor Review ever recorded) resumes by
+    launching `coord drive` on this same (repo, issue) again. The guard's
+    whole premise that this can only ever run the missing stage(s) forward,
+    never restart Work, rests on `decide()` branching on `state.work_aid`
+    alone (see its own `if not state.work_aid:` dispatch-work arm) — this
+    pins that: a `work_aid`-bearing, branch-bearing, `done` state with BOTH
+    gates unrecorded must wait for the Test stage, never re-dispatch Work."""
+    action = step(done_work(work_test_state=""))
+    assert action.kind == WAIT
+    assert action.command == ()
+    assert not action.label.startswith("WORK:")
+
+
 def test_skip_test_records_the_verdict_through_the_test_cli():
     """The CLI, never record_test_verdict() — see #1384."""
     action = step(done_work(), DriveOptions(machine="precision", skip_test=True))
