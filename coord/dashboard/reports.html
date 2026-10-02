@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coord — reports</title>
+<!--
+  #3473: a GENERIC renderer over the report catalogue — there is no
+  per-report branch anywhere in this file. Everything shown here comes
+  from GET /api/report (the catalogue) and GET /api/report/{id} (a run) —
+  a new entry in coord.reports.REPORTS appears here with ZERO front-end
+  change. This page's data calls MUST stay confined to those two routes
+  (see tests/test_dashboard_reports.py, which greps the shipped <script>
+  for every fetch() target and asserts each one starts with "/api/report").
+
+  No build step, no framework, pinned CDN for the one piece this page
+  cannot draw itself: the chart. The React webapp was removed in #2009
+  and must not come back here (see CLAUDE.md).
+-->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, system-ui, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.5; }
+.container { max-width: 1000px; margin: 0 auto; padding: 12px; }
+h1 { font-size: 1.2em; color: #58a6ff; margin-bottom: 12px; }
+h1 a { color: #8b949e; font-size: 0.6em; margin-left: 10px; text-decoration: none; }
+h2 { font-size: 1em; color: #8b949e; margin: 16px 0 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+.meta { color: #8b949e; font-size: 0.85em; }
+a { color: #58a6ff; }
+
+label { display: block; font-size: 0.82em; color: #8b949e; margin-bottom: 3px; }
+.field { margin-bottom: 10px; }
+select, input[type="text"] {
+  width: 100%; padding: 8px; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 6px; color: #c9d1d9; font-size: 14px; min-height: 36px;
+}
+.form-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+.form-grid .field { flex: 1 1 200px; }
+
+.btn { padding: 8px 16px; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 14px; min-height: 36px; margin-right: 6px; margin-top: 6px; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-run { background: #1f6feb; }
+.btn-export { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; }
+.btn-export:hover { border-color: #58a6ff; }
+
+#error-banner { display: none; background: #2d0e0e; color: #ff7b72; border: 1px solid #da3633; border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; font-size: 0.9em; }
+
+#report-chart { width: 100%; height: 320px; display: none; }
+#report-chart.has-chart { display: block; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+th, td { padding: 6px 8px; border-bottom: 1px solid #30363d; text-align: left; white-space: nowrap; }
+th { color: #8b949e; font-weight: 600; position: sticky; top: 0; background: #161b22; }
+td.align-right, th.align-right { text-align: right; }
+tfoot td { font-weight: 600; color: #e6edf3; border-top: 2px solid #30363d; }
+#table-scroll { overflow-x: auto; }
+
+#report-notes { margin-top: 10px; }
+#report-notes li { color: #d29922; font-size: 0.85em; margin-bottom: 4px; }
+
+#report-description { color: #8b949e; font-size: 0.9em; margin-bottom: 10px; }
+#empty-state { color: #8b949e; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>coord reports <a href="/">&larr; dashboard</a></h1>
+
+  <div id="error-banner"></div>
+
+  <div class="card">
+    <div class="field">
+      <label for="report-select">Report</label>
+      <select id="report-select"></select>
+    </div>
+    <div id="report-description"></div>
+    <form id="report-form">
+      <div id="report-params" class="form-grid"></div>
+      <button type="submit" class="btn btn-run" id="run-btn">Run report</button>
+    </form>
+  </div>
+
+  <div id="results" style="display:none">
+    <div class="card">
+      <h2>Chart</h2>
+      <div id="report-chart"></div>
+      <div id="chart-note" class="meta"></div>
+      <div id="chart-export" style="display:none">
+        <button type="button" class="btn btn-export" id="export-png">Export PNG</button>
+        <button type="button" class="btn btn-export" id="export-svg">Export SVG</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Table</h2>
+      <div id="export-buttons">
+        <a class="btn btn-export" id="export-csv" download>CSV</a>
+        <a class="btn btn-export" id="export-xlsx" download>XLSX</a>
+        <a class="btn btn-export" id="export-ndjson" download>NDJSON</a>
+        <a class="btn btn-export" id="export-md" download>MD</a>
+      </div>
+      <div id="table-scroll">
+        <table id="report-table">
+          <thead><tr id="table-head"></tr></thead>
+          <tbody id="table-body"></tbody>
+          <tfoot><tr id="table-totals" style="display:none"></tr></tfoot>
+        </table>
+      </div>
+      <ul id="report-notes"></ul>
+    </div>
+  </div>
+
+  <div id="empty-state" class="meta">Pick a report and press "Run report".</div>
+</div>
+
+<script>
+'use strict';
+
+// ── tiny fetch helpers — every data call this page makes goes through one
+// of these two, and both hit /api/report*. tests/test_dashboard_reports.py
+// greps this <script> block for every fetch call's target and asserts that
+// each one starts with "/api/report" — keep it that way.
+async function fetchCatalogue() {
+  const r = await fetch('/api/report');
+  if (!r.ok) throw new Error('catalogue fetch failed: HTTP ' + r.status);
+  return await r.json();
+}
+
+async function fetchReport(reportId, params) {
+  const qs = new URLSearchParams(params).toString();
+  const url = '/api/report/' + encodeURIComponent(reportId) + (qs ? '?' + qs : '');
+  const r = await fetch(url);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || ('report fetch failed: HTTP ' + r.status));
+  return body;
+}
+
+// ── state ───────────────────────────────────────────────────────────────
+let catalogue = [];
+let currentReport = null;      // the selected ReportDef (catalogue entry)
+let chartInstance = null;
+let currentChartOption = null;
+let currentReportId = null;
+let currentParams = {};
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  if (!msg) { el.style.display = 'none'; el.textContent = ''; return; }
+  el.style.display = 'block';
+  el.textContent = msg;
+}
+
+// ── params form, generated purely from ReportParam (#3473) ───────────────
+function buildParamsForm(report, initial) {
+  const wrap = document.getElementById('report-params');
+  wrap.innerHTML = '';
+  for (const p of report.params) {
+    const field = document.createElement('div');
+    field.className = 'field';
+    const label = document.createElement('label');
+    label.setAttribute('for', 'param-' + p.id);
+    label.textContent = p.label + (p.help ? '' : '');
+    label.title = p.help || '';
+    field.appendChild(label);
+
+    const value = (initial && initial[p.id] !== undefined) ? initial[p.id] : p.default;
+
+    if (p.kind === 'choice' && !p.free_form) {
+      const select = document.createElement('select');
+      select.id = 'param-' + p.id;
+      select.dataset.paramId = p.id;
+      for (const choice of p.choices) {
+        const opt = document.createElement('option');
+        opt.value = choice;
+        opt.textContent = choice;
+        if (choice === value) opt.selected = true;
+        select.appendChild(opt);
+      }
+      field.appendChild(select);
+    } else {
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = 'param-' + p.id;
+      input.dataset.paramId = p.id;
+      input.value = value || '';
+      input.placeholder = p.help || '';
+      if (p.kind === 'choice' && p.free_form && p.choices.length) {
+        const listId = 'param-' + p.id + '-presets';
+        const datalist = document.createElement('datalist');
+        datalist.id = listId;
+        for (const choice of p.choices) {
+          const opt = document.createElement('option');
+          opt.value = choice;
+          datalist.appendChild(opt);
+        }
+        input.setAttribute('list', listId);
+        field.appendChild(datalist);
+      }
+      field.appendChild(input);
+    }
+    wrap.appendChild(field);
+  }
+}
+
+function readParamsForm(report) {
+  const params = {};
+  for (const p of report.params) {
+    const el = document.getElementById('param-' + p.id);
+    if (el) params[p.id] = el.value;
+  }
+  return params;
+}
+
+// ── deep link (#3473: report id + params in the URL) ──────────────────────
+function paramsFromLocation() {
+  const qs = new URLSearchParams(window.location.search);
+  const out = {};
+  for (const [k, v] of qs.entries()) out[k] = v;
+  return out;
+}
+
+function updateLocation(reportId, params) {
+  const qs = new URLSearchParams({report: reportId, ...params});
+  const url = window.location.pathname + '?' + qs.toString();
+  window.history.replaceState(null, '', url);
+}
+
+// ── column formatting (#1760 ColumnMeta.kind — open vocabulary; an unknown
+// kind falls back to plain stringification, never a crash) ───────────────
+function formatCell(value, kind) {
+  if (value === null || value === undefined) return '';
+  switch (kind) {
+    case 'timestamp': {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return String(value);
+      return new Date(n * 1000).toISOString().replace('.000Z', 'Z');
+    }
+    case 'duration': {
+      let secs = Number(value);
+      if (!Number.isFinite(secs)) return String(value);
+      const units = [['d', 86400], ['h', 3600], ['m', 60], ['s', 1]];
+      const parts = [];
+      for (const [label, size] of units) {
+        if (secs >= size || (label === 's' && parts.length === 0)) {
+          const n = Math.floor(secs / size);
+          secs -= n * size;
+          if (n > 0 || (label === 's' && parts.length === 0)) parts.push(n + label);
+        }
+      }
+      return parts.slice(0, 2).join(' ') || '0s';
+    }
+    case 'money': {
+      const n = Number(value);
+      return Number.isFinite(n) ? '$' + n.toFixed(2) : String(value);
+    }
+    case 'int': {
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toLocaleString() : String(value);
+    }
+    case 'list':
+      return Array.isArray(value) ? value.join(', ') : String(value);
+    case 'enum':
+    case 'text':
+    default:
+      return Array.isArray(value) ? value.join(', ') : String(value);
+  }
+}
+
+function metaFor(result) {
+  const byId = {};
+  for (const m of result.column_meta || []) byId[m.id] = m;
+  return result.columns.map((id) => byId[id] || { id, label: id, kind: 'text', align: 'left', weight: 1 });
+}
+
+function renderTable(result) {
+  const metas = metaFor(result);
+  const head = document.getElementById('table-head');
+  head.innerHTML = '';
+  for (const m of metas) {
+    const th = document.createElement('th');
+    th.textContent = m.label;
+    if (m.align === 'right') th.classList.add('align-right');
+    head.appendChild(th);
+  }
+
+  const body = document.getElementById('table-body');
+  body.innerHTML = '';
+  for (const row of result.rows) {
+    const tr = document.createElement('tr');
+    for (const m of metas) {
+      const td = document.createElement('td');
+      td.textContent = formatCell(row[m.id], m.kind);
+      if (m.align === 'right') td.classList.add('align-right');
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+
+  const totalsRow = document.getElementById('table-totals');
+  totalsRow.innerHTML = '';
+  if (result.totals) {
+    totalsRow.style.display = '';
+    for (const m of metas) {
+      const td = document.createElement('td');
+      const has = Object.prototype.hasOwnProperty.call(result.totals, m.id);
+      td.textContent = has ? formatCell(result.totals[m.id], m.kind) : '';
+      if (m.align === 'right') td.classList.add('align-right');
+      totalsRow.appendChild(td);
+    }
+  } else {
+    totalsRow.style.display = 'none';
+  }
+
+  const notes = document.getElementById('report-notes');
+  notes.innerHTML = '';
+  for (const note of result.notes || []) {
+    const li = document.createElement('li');
+    li.textContent = note;
+    notes.appendChild(li);
+  }
+}
+
+// ── chart (#2271 ChartSpec → Apache ECharts) ───────────────────────────────
+// Open vocabulary, same compatibility rule as ColumnMeta.kind: a `kind` this
+// page doesn't know about degrades to "table only", never a blank hole.
+const KNOWN_CHART_KINDS = ['bar', 'line', 'sparkline'];
+
+function buildSeriesData(chart, rows) {
+  if (!chart.group_by) {
+    const categories = rows.map((r) => r[chart.x]);
+    const series = chart.series.map((s) => ({
+      name: s.label,
+      type: chart.kind === 'sparkline' ? 'line' : chart.kind,
+      data: rows.map((r) => Number(r[s.column]) || 0),
+      color: s.color || undefined,
+      stack: chart.stacked ? 'total' : undefined,
+      showSymbol: chart.kind !== 'sparkline',
+    }));
+    return { categories, series };
+  }
+  // Pivot: x-axis is the distinct `x` values in first-appearance order, one
+  // output series per distinct `group_by` value. Cells are SUMMED; an empty
+  // cell is 0 — magnitudes, not rates (see ChartSpec's docstring).
+  const categories = [];
+  const seenX = new Set();
+  for (const r of rows) {
+    const x = r[chart.x];
+    if (!seenX.has(x)) { seenX.add(x); categories.push(x); }
+  }
+  const groups = [];
+  const seenG = new Set();
+  for (const r of rows) {
+    const g = r[chart.group_by];
+    if (!seenG.has(g)) { seenG.add(g); groups.push(g); }
+  }
+  const template = chart.series[0];
+  const series = groups.map((g) => {
+    const data = categories.map((x) => {
+      let sum = 0;
+      for (const r of rows) {
+        if (r[chart.group_by] === g && r[chart.x] === x) sum += Number(r[template.column]) || 0;
+      }
+      return sum;
+    });
+    return {
+      name: String(g),
+      type: chart.kind === 'sparkline' ? 'line' : chart.kind,
+      data,
+      stack: chart.stacked ? 'total' : undefined,
+      showSymbol: chart.kind !== 'sparkline',
+    };
+  });
+  return { categories, series };
+}
+
+function buildChartOption(chart, rows) {
+  const { categories, series } = buildSeriesData(chart, rows);
+  const sparkline = chart.kind === 'sparkline';
+  return {
+    backgroundColor: 'transparent',
+    textStyle: { color: '#c9d1d9' },
+    title: chart.title && !sparkline ? { text: chart.title, textStyle: { color: '#e6edf3', fontSize: 13 } } : undefined,
+    grid: sparkline ? { top: 4, bottom: 4, left: 4, right: 4 } : { top: 36, bottom: 32, left: 48, right: 16 },
+    legend: !sparkline && series.length > 1 ? { textStyle: { color: '#8b949e' } } : undefined,
+    xAxis: {
+      type: 'category',
+      data: categories,
+      show: !sparkline,
+      axisLine: { lineStyle: { color: '#30363d' } },
+      axisLabel: { color: '#8b949e' },
+    },
+    yAxis: {
+      type: 'value',
+      name: sparkline ? undefined : chart.y_label || undefined,
+      show: !sparkline,
+      axisLine: { lineStyle: { color: '#30363d' } },
+      axisLabel: { color: '#8b949e' },
+      splitLine: { lineStyle: { color: '#21262d' } },
+    },
+    series,
+  };
+}
+
+function renderChart(result) {
+  const container = document.getElementById('report-chart');
+  const note = document.getElementById('chart-note');
+  const exportWrap = document.getElementById('chart-export');
+  const chart = result.chart;
+
+  if (!chart || !KNOWN_CHART_KINDS.includes(chart.kind)) {
+    container.classList.remove('has-chart');
+    exportWrap.style.display = 'none';
+    note.textContent = chart ? ('chart kind ' + JSON.stringify(chart.kind) + ' not supported by this page — showing table only') : '';
+    if (chartInstance) { chartInstance.dispose(); chartInstance = null; }
+    currentChartOption = null;
+    return;
+  }
+
+  container.classList.add('has-chart');
+  note.textContent = '';
+  exportWrap.style.display = '';
+  currentChartOption = buildChartOption(chart, result.rows);
+  if (!chartInstance || chartInstance.isDisposed()) {
+    chartInstance = echarts.init(container, null, { renderer: 'canvas' });
+  }
+  chartInstance.setOption(currentChartOption, true);
+}
+
+function downloadDataUrl(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+document.getElementById('export-png').addEventListener('click', () => {
+  if (!chartInstance) return;
+  const url = chartInstance.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: '#0d1117' });
+  downloadDataUrl(url, (currentReportId || 'chart') + '.png');
+});
+
+document.getElementById('export-svg').addEventListener('click', () => {
+  if (!currentChartOption) return;
+  const tmp = document.createElement('div');
+  tmp.style.position = 'fixed';
+  tmp.style.left = '-99999px';
+  tmp.style.width = '800px';
+  tmp.style.height = '320px';
+  document.body.appendChild(tmp);
+  const svgChart = echarts.init(tmp, null, { renderer: 'svg' });
+  svgChart.setOption(currentChartOption);
+  const url = svgChart.getDataURL();
+  downloadDataUrl(url, (currentReportId || 'chart') + '.svg');
+  svgChart.dispose();
+  tmp.remove();
+});
+
+// ── export buttons (server-side CSV/XLSX/NDJSON/MD — #3472) ───────────────
+function wireExportLinks(reportId, params) {
+  const qs = new URLSearchParams(params);
+  for (const fmt of ['csv', 'xlsx', 'ndjson', 'md']) {
+    const el = document.getElementById('export-' + fmt);
+    const fqs = new URLSearchParams(qs);
+    fqs.set('format', fmt);
+    el.href = '/api/report/' + encodeURIComponent(reportId) + '?' + fqs.toString();
+  }
+}
+
+// ── run ─────────────────────────────────────────────────────────────────
+async function runReport(reportId, params) {
+  showError('');
+  try {
+    const result = await fetchReport(reportId, params);
+    currentReportId = reportId;
+    currentParams = params;
+    document.getElementById('empty-state').style.display = 'none';
+    document.getElementById('results').style.display = '';
+    renderTable(result);
+    renderChart(result);
+    wireExportLinks(reportId, params);
+    updateLocation(reportId, params);
+  } catch (e) {
+    showError(String(e.message || e));
+  }
+}
+
+async function onReportSelected(reportId, initialParams) {
+  currentReport = catalogue.find((r) => r.id === reportId) || null;
+  if (!currentReport) return;
+  document.getElementById('report-description').textContent = currentReport.description;
+  buildParamsForm(currentReport, initialParams);
+}
+
+document.getElementById('report-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (!currentReport) return;
+  runReport(currentReport.id, readParamsForm(currentReport));
+});
+
+document.getElementById('report-select').addEventListener('change', (e) => {
+  onReportSelected(e.target.value, null);
+});
+
+async function init() {
+  try {
+    const cat = await fetchCatalogue();
+    catalogue = cat.reports || [];
+  } catch (e) {
+    showError('failed to load report catalogue: ' + (e.message || e));
+    return;
+  }
+
+  const select = document.getElementById('report-select');
+  select.innerHTML = '';
+  for (const r of catalogue) {
+    const opt = document.createElement('option');
+    opt.value = r.id;
+    opt.textContent = r.title;
+    select.appendChild(opt);
+  }
+
+  const deepLink = paramsFromLocation();
+  const initialReportId = deepLink.report && catalogue.some((r) => r.id === deepLink.report)
+    ? deepLink.report
+    : (catalogue[0] && catalogue[0].id);
+  if (!initialReportId) return;
+
+  select.value = initialReportId;
+  const initialParams = { ...deepLink };
+  delete initialParams.report;
+  await onReportSelected(initialReportId, initialParams);
+
+  if (deepLink.report) {
+    // Deep link carried a report id — run it immediately so the URL is
+    // shareable end-to-end, not just as a pre-filled form.
+    runReport(initialReportId, readParamsForm(currentReport));
+  }
+}
+
+init();
+</script>
+</body>
+</html>
