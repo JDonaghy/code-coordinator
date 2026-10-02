@@ -2347,9 +2347,9 @@ def find_pr_for_branch(repo: str, branch: str) -> dict | None:
 
 
 def find_open_pr_for_branch_patterns(repo: str, patterns: Sequence[str]) -> dict | None:
-    """Return the first OPEN PR on *repo* whose head branch matches one of
-    *patterns* (``fnmatch`` globs), or ``None`` when none match or ``gh``
-    fails (#2377).
+    """Return the first OPEN, non-draft PR on *repo* whose head branch
+    matches one of *patterns* (``fnmatch`` globs), or ``None`` when none
+    match or ``gh`` fails (#2377).
 
     Unlike :func:`find_pr_for_branch` (an exact ``gh pr list --head
     <branch>`` match), the caller here does not know the exact branch name
@@ -2357,6 +2357,16 @@ def find_open_pr_for_branch_patterns(repo: str, patterns: Sequence[str]) -> dict
     `coord.drive_queue.conventional_branch_patterns`), since a worker's real
     branch carries a free-text descriptive suffix a caller cannot predict.
     This lists every OPEN PR once and matches client-side instead.
+
+    Draft PRs are skipped: a draft matching the conventional branch pattern
+    with green checks is not a valid "don't relaunch, merge this instead"
+    answer, since `coord merge --only <n>` cannot merge a draft — surfacing
+    one here would just trade a safe relaunch refusal for a dead-end one.
+
+    Capped at 200 open PRs with no further paging — a repo with more than
+    200 concurrently open PRs would silently read a true match past the
+    limit as "not found" (the same fail-open posture as everything else
+    here: a missed match costs a wasted relaunch, not a wrong block).
 
     Fail-open like every other read in this module: a transient ``gh``
     error returns ``None`` — "no match found" — the same answer a caller
@@ -2369,7 +2379,7 @@ def find_open_pr_for_branch_patterns(repo: str, patterns: Sequence[str]) -> dict
     try:
         raw = _gh(
             "pr", "list", "--repo", repo, "--state", "open",
-            "--json", "number,headRefName,url", "--limit", "200",
+            "--json", "number,headRefName,url,isDraft", "--limit", "200",
             caller="github_ops.find_open_pr_for_branch_patterns",
         )
     except RuntimeError:
@@ -2379,6 +2389,8 @@ def find_open_pr_for_branch_patterns(repo: str, patterns: Sequence[str]) -> dict
         return None
     for pr in prs:
         if not isinstance(pr, dict):
+            continue
+        if pr.get("isDraft"):
             continue
         branch = str(pr.get("headRefName") or "")
         if branch and any(fnmatch.fnmatch(branch, pattern) for pattern in patterns):

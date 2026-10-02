@@ -4354,7 +4354,7 @@ def existing_pr_relaunch_remedy(
         }
     return {
         "label": "Inspect existing PR",
-        "command_or_action": f"coord merge --plan --repo {repo}",
+        "command_or_action": merge_plan_inspect_command(repo),
         "what_happens": (
             f"PR #{match.number} ({match.branch}) already exists for this "
             "entry, but its checks are not all green — fix it forward (or "

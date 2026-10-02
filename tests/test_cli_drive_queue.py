@@ -828,6 +828,99 @@ def test_add_proceeds_normally_when_no_existing_pr_matches(cli, seed, monkeypatc
     assert queued(3) is not None
 
 
+def test_add_metadata_update_on_a_waiting_entry_with_a_matching_pr_is_not_refused(
+    cli, seed, monkeypatch
+):
+    """Review finding on #2377: the existing-PR refusal must only gate the
+    two shapes that can actually relaunch a drive (a fresh insert, or a
+    requeue over an already-stuck `blocked`/`failed` row) — not an ordinary
+    metadata upsert over a live `waiting` entry. #1753's own queue row
+    already pushed a healthy, not-yet-green PR on the expected Work -> Test
+    -> Review -> Merge path by the time an operator tweaks `--hold-after`;
+    that must keep working."""
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={1753: "open"})
+    cli("add", REPO, "1753")
+    assert queued(1753)["state"] == "waiting"
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=4242,
+            branch="issue-1753-some-fix",
+            url="https://github.com/example/claude-coordinator/pull/4242",
+            all_green=True,
+        ),
+    )
+
+    result = cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["hold_after"] == 1
+    assert queued(1753)["hold_reason"] == "deploy"
+
+
+def test_add_metadata_update_on_a_running_entry_with_a_matching_pr_is_not_refused(
+    cli, seed, monkeypatch
+):
+    """Same as above, but for a `running` entry — the common, healthy case
+    the review finding calls out explicitly: a worker is still mid-flight on
+    its own branch/PR and an operator changes `--machine` or similar without
+    requesting any relaunch."""
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={1753: "open"})
+    cli("add", REPO, "1753")
+    state._update_drive_queue_entry_local(REPO, 1753, state=STATE_RUNNING)
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=4242,
+            branch="issue-1753-some-fix",
+            url="https://github.com/example/claude-coordinator/pull/4242",
+            all_green=True,
+        ),
+    )
+
+    result = cli("add", REPO, "1753", "--machine", "dellserver")
+
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["state"] == STATE_RUNNING
+    assert queued(1753)["machine"] == "dellserver"
+
+
+def test_add_still_refuses_a_requeue_over_an_already_blocked_entry_with_a_green_pr(
+    cli, seed, monkeypatch
+):
+    """The one case an in-place `add` IS used for a relaunch-adjacent
+    purpose — bumping `--max-fix-rounds` on an already-stuck row (#2972) —
+    must still hit the #2377 refusal; only the healthy waiting/running
+    metadata-upsert case (above) is exempted."""
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={1753: "open"})
+    cli("add", REPO, "1753")
+    state._update_drive_queue_entry_local(REPO, 1753, state=STATE_BLOCKED)
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=4242,
+            branch="issue-1753-some-fix",
+            url="https://github.com/example/claude-coordinator/pull/4242",
+            all_green=True,
+        ),
+    )
+
+    result = cli("add", REPO, "1753", "--max-fix-rounds", "3")
+
+    assert result.exit_code != 0
+    assert "4242" in result.output
+    assert f"coord merge --only {REPO}#1753" in result.output
+
+
 def test_blocked_escalation_command_proposes_merge_over_requeue_when_pr_is_green(
     monkeypatch, config_file,
 ):

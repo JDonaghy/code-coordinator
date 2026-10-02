@@ -7509,6 +7509,9 @@ def test_existing_pr_relaunch_remedy_refuses_the_relaunch_even_when_red():
     assert "coord merge --only" not in remedy["command_or_action"]
     assert "drive-queue remove" not in remedy["command_or_action"]
     assert "2353" in remedy["what_happens"]
+    # Review nit on #2377: reuses `merge_plan_inspect_command` rather than a
+    # second hardcoded copy of the same string.
+    assert remedy["command_or_action"] == merge_plan_inspect_command(REPO)
 
 
 class TestDriveQueueListReadDistinguishesFailureFromEmpty:

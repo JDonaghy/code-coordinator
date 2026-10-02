@@ -2586,6 +2586,28 @@ class TestGhJsonHelper:
         assert found is not None
         assert found["number"] == 2353
 
+    def test_find_open_pr_for_branch_patterns_skips_a_draft(self) -> None:
+        """Review non-blocking finding on #2377: a draft PR matching the
+        conventional branch pattern must not be surfaced as a "merge this
+        instead of relaunching" answer — `coord merge --only` cannot merge
+        a draft, so returning one here would just trade a safe refusal for
+        a dead-end one."""
+        raw = json.dumps(
+            [
+                {
+                    "number": 2353,
+                    "headRefName": "test-author-ms-65-slice-2283",
+                    "url": "u2",
+                    "isDraft": True,
+                },
+            ]
+        )
+        with patch("coord.github_ops._gh", return_value=raw):
+            found = github_ops.find_open_pr_for_branch_patterns(
+                "acme/api", ["issue-2283-*", "test-author-ms-*-slice-2283"]
+            )
+        assert found is None
+
     def test_find_open_pr_for_branch_patterns_returns_none_without_a_match(self) -> None:
         raw = json.dumps([{"number": 10, "headRefName": "unrelated-branch", "url": "u1"}])
         with patch("coord.github_ops._gh", return_value=raw):
