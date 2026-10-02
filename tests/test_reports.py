@@ -6316,3 +6316,31 @@ class TestCaptureCoverageNote:
         coverage = next(n for n in result.notes if n.startswith("Cost basis:"))
         assert "2 leg(s) captured (100.0% of the $ shown)" in coverage
         assert "0 unmeasured" in coverage
+
+    def test_billed_basis_note_does_not_contradict_itself(self) -> None:
+        """Review fix: under `cost_basis="billed"` the note must not both
+        claim `Cost basis: \\`billed\\`` AND, in the same sentence, say the
+        figure is "not necessarily money billed" — that denies the very
+        basis it just named. Only the default `api_equivalent` basis gets
+        the list-price-not-billed caveat."""
+        from coord.reports import fold_usage
+
+        result = fold_usage(
+            _usage_fixture_rows(), _unbounded_window(), cost_basis="billed"
+        )
+        coverage = next(n for n in result.notes if n.startswith("Cost basis:"))
+        assert "`billed`" in coverage
+        assert "not necessarily money billed" not in coverage
+        assert "real money billed" in coverage
+
+    def test_api_equivalent_basis_note_keeps_the_not_necessarily_billed_caveat(
+        self,
+    ) -> None:
+        """The default basis is unaffected by the review fix: it still
+        carries the explicit "not necessarily money billed" caveat."""
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        coverage = next(n for n in result.notes if n.startswith("Cost basis:"))
+        assert "`api_equivalent`" in coverage
+        assert "not necessarily money billed" in coverage
