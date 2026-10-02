@@ -25,11 +25,13 @@ from click.testing import CliRunner
 
 from coord.config import Config, ConfigError, ReleaseGateConfig, ReleaseGateRepoConfig, parse_mapping
 from coord.models import Machine, Repo
+from coord.bugbash import BugbashReport, RoundReport
 from coord.release_gate import (
     BugbashRunRecord,
     GateOverride,
     LaneResult,
     apply_override,
+    bugbash_run_record_from_report,
     evaluate_release_gate,
     validate_override_reason,
 )
@@ -290,6 +292,84 @@ class TestEvaluateReleaseGateBugbash:
         )
         [step] = verdict.steps
         assert step.passed is True
+
+
+class TestBugbashRunRecordFromReport:
+    """#3517: `bugbash_run_record_from_report` is the ONE place that maps a
+    real `coord.bugbash.BugbashReport` onto this module's own
+    `BugbashRunRecord` — so a round that terminated via `"protocol_error"`
+    (a lane's malformed/missing findings block) is rejected by the release
+    gate exactly like `"lane_failure"` already was, never silently read as a
+    clean pass."""
+
+    def test_zero_findings_termination_is_verified_and_clean(self) -> None:
+        report = BugbashReport(
+            repo="vimcode",
+            rounds=[RoundReport(round_num=1, new_count=0)],
+            termination_reason="zero_findings",
+        )
+        record = bugbash_run_record_from_report(report, sha="deadbeef", ran_at=10.0)
+        assert record.verified is True
+        assert record.new_findings == 0
+        assert record.clean is True
+
+    def test_protocol_error_termination_is_unverified_and_rejected_by_gate(self) -> None:
+        # The exact #3517 shape: a round whose lane completed but reported a
+        # malformed/missing findings block, so `new_count` is 0 — this must
+        # NOT be read as a clean pass.
+        report = BugbashReport(
+            repo="vimcode",
+            rounds=[RoundReport(round_num=1, new_count=0, protocol_error_lanes={"tui-pty": "no fence"})],
+            termination_reason="protocol_error",
+        )
+        record = bugbash_run_record_from_report(report, sha="deadbeef", ran_at=10.0)
+        assert record.verified is False
+        assert record.clean is False
+        assert "protocol_error" in record.detail
+
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            bugbash_required=True,
+            bugbash_runs=[record],
+        )
+        [step] = verdict.steps
+        assert step.passed is False
+        assert "not a verified clean pass" in step.detail
+
+    def test_lane_failure_termination_is_unverified(self) -> None:
+        report = BugbashReport(
+            repo="vimcode",
+            rounds=[RoundReport(round_num=1, new_count=0, lane_failures={"win-native": "dispatch failed"})],
+            termination_reason="lane_failure",
+        )
+        record = bugbash_run_record_from_report(report, sha="deadbeef")
+        assert record.verified is False
+
+    def test_new_findings_counts_new_count_not_just_filed(self) -> None:
+        # A finding declined at the confirm gate is genuinely "new" even
+        # though it was never filed (#3487's confirm-gate pattern) — using
+        # `total_filed` instead of `new_count` would let a declined round
+        # read as "zero new findings", which is a gate that can't fail.
+        report = BugbashReport(
+            repo="vimcode",
+            rounds=[RoundReport(round_num=1, new_count=2, declined=True)],
+            termination_reason="round_cap",
+        )
+        record = bugbash_run_record_from_report(report, sha="deadbeef")
+        assert record.new_findings == 2
+        assert record.verified is True
+        assert record.clean is False
+
+    def test_cost_cap_and_round_cap_terminations_are_still_verified(self) -> None:
+        for reason in ("cost_cap", "round_cap"):
+            report = BugbashReport(
+                repo="vimcode", rounds=[RoundReport(round_num=1, new_count=0)],
+                termination_reason=reason,
+            )
+            record = bugbash_run_record_from_report(report, sha="deadbeef")
+            assert record.verified is True, reason
 
 
 class TestOverride:

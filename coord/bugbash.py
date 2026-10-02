@@ -147,57 +147,196 @@ class Finding:
     #: this finding — folded into the issue's Evidence section, not a
     #: separate upload step (#3487 doesn't specify an artifact store).
     captures: tuple[str, ...] = ()
+    #: #3517: ``True`` when the lane worker's JSON entry for this finding was
+    #: missing one or more required fields and a value below had to be
+    #: defaulted/derived rather than actually reported. A protocol slip
+    #: (the worker naming a field differently, or skipping it) must NEVER
+    #: silently collapse a real finding into "no finding" — see
+    #: :data:`_REQUIRED_FINDING_FIELDS` and :func:`_finding_from_entry`. Kept
+    #: ``False`` for a well-formed entry.
+    incomplete: bool = False
+    #: Which required field names (see :data:`_REQUIRED_FINDING_FIELDS`) were
+    #: missing/blank in the raw JSON entry this finding was built from —
+    #: empty whenever :attr:`incomplete` is ``False``.
+    missing_fields: tuple[str, ...] = ()
 
 
-def parse_findings_block(text: str, *, platform: str, repo: str) -> list[Finding]:
+@dataclass(frozen=True)
+class FindingsParseResult:
+    """What :func:`parse_findings_block` extracted from one lane worker's
+    final message (#3517).
+
+    ``findings`` is never silently emptied by a per-entry defect — a JSON
+    entry missing a required field is still turned into a :class:`Finding`
+    (see :attr:`Finding.incomplete`). ``protocol_error`` is the DISTINCT
+    failure mode this type exists to make unmistakable: a non-empty string
+    means the lane's report itself could not be trusted at all — the
+    ```` ```bugbash-findings ```` fence held invalid JSON or something other
+    than a list, or there was no fence AND no explicit statement that the
+    round found nothing. ``findings`` is always ``()`` when
+    ``protocol_error`` is set. Callers (:func:`coord.bugbash.run_bugbash` via
+    :data:`ExploreOutcome.protocol_error`) must never read an empty
+    ``findings`` tuple alone as "zero findings" without also checking this
+    field — that conflation is exactly bug #3517.
+    """
+
+    findings: tuple[Finding, ...] = ()
+    protocol_error: str = ""
+
+
+#: The findings-entry fields a lane worker's briefing (see
+#: :func:`build_exploration_briefing`) asks for by name. ``evidence`` is
+#: handled specially by :func:`_finding_from_entry` (derived from ``captures``
+#: / ``actual`` rather than merely defaulted to a placeholder) since it is
+#: the one field #3517's real-world miss actually dropped.
+_REQUIRED_FINDING_FIELDS: tuple[str, ...] = ("title", "expected", "actual", "repro", "evidence")
+
+#: Placeholder text used for a missing field with no better derivation —
+#: visibly a placeholder (never mistaken for a real report) rather than an
+#: empty string, which would render as a blank issue-body section.
+_MISSING_FIELD_PLACEHOLDER = "(not reported by lane worker)"
+
+#: Phrases that count as an explicit "this round found nothing" statement
+#: when a lane worker's final message carries no ```` ```bugbash-findings ````
+#: fence at all (#3517). Deliberately narrow and literal (no fuzzy/NLP
+#: matching) — a missing fence defaults to a PROTOCOL ERROR, never silently
+#: to a clean pass, so the bar for accepting "no fence" as clean is an
+#: unambiguous statement, not a guess.
+_CLEAN_PASS_PHRASES: tuple[str, ...] = (
+    "no findings", "zero findings", "0 findings", "found nothing",
+    "nothing to report", "no bugs found", "no issues found",
+    "found no issues", "found no bugs", "clean round", "clean pass",
+)
+
+
+def _is_explicit_clean_statement(text: str) -> bool:
+    """``True`` when *text* contains one of :data:`_CLEAN_PASS_PHRASES`,
+    case-insensitively — the ONLY thing that lets a fence-less message in
+    :func:`parse_findings_block` read as a genuine clean pass rather than a
+    protocol error (#3517)."""
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _CLEAN_PASS_PHRASES)
+
+
+def _finding_from_entry(entry: dict, *, platform: str, repo: str) -> Finding:
+    """Turn one raw JSON object from a ```` ```bugbash-findings ```` block
+    into a :class:`Finding` — NEVER dropping it for a missing required field
+    (#3517). Each missing/blank field in :data:`_REQUIRED_FINDING_FIELDS` is
+    replaced with the best available value and recorded in
+    :attr:`Finding.missing_fields`:
+
+    - ``evidence`` is derived from ``captures`` (what the worker DID attach)
+      when present, else from ``actual`` (the behaviour it already
+      described), else a visible placeholder — this is exactly the field the
+      live #3517 finding omitted, so it gets the most effort to recover.
+    - every other field falls back to :data:`_MISSING_FIELD_PLACEHOLDER`,
+      which is distinguishable from a real report at a glance.
+    """
+    missing: list[str] = []
+
+    def _field(key: str) -> str:
+        value = str(entry.get(key, "")).strip()
+        if not value:
+            missing.append(key)
+            return _MISSING_FIELD_PLACEHOLDER
+        return value
+
+    title = _field("title")
+    expected = _field("expected")
+    actual_raw = str(entry.get("actual", "")).strip()
+    actual = actual_raw or _MISSING_FIELD_PLACEHOLDER
+    if not actual_raw:
+        missing.append("actual")
+    repro = _field("repro")
+
+    captures_raw = entry.get("captures") or []
+    captures = tuple(str(c) for c in captures_raw) if isinstance(captures_raw, list) else ()
+
+    evidence = str(entry.get("evidence", "")).strip()
+    if not evidence:
+        missing.append("evidence")
+        if captures:
+            evidence = "Derived from captures (evidence field was missing): " + ", ".join(captures)
+        elif actual_raw:
+            evidence = "Derived from `actual` (evidence field was missing): " + actual_raw
+        else:
+            evidence = _MISSING_FIELD_PLACEHOLDER
+
+    return Finding(
+        title=title,
+        platform=platform,
+        repo=repo,
+        suspected_repo=str(entry.get("suspected_repo", repo)).strip() or repo,
+        expected=expected,
+        actual=actual,
+        repro=repro,
+        evidence=evidence,
+        captures=captures,
+        incomplete=bool(missing),
+        missing_fields=tuple(missing),
+    )
+
+
+def parse_findings_block(text: str, *, platform: str, repo: str) -> FindingsParseResult:
     """Extract the ```` ```bugbash-findings ```` fenced JSON block from a lane
-    worker's final message and turn it into :class:`Finding` objects.
+    worker's final message and turn it into :class:`FindingsParseResult`
+    (#3517).
 
-    Tolerant of no block at all (a clean round — returns ``[]``) and of a
-    block that fails to parse as a JSON list of objects (also ``[]``: a
-    malformed report is not a reportable finding, mirroring
-    :func:`coord.bug_intake.parse_bug_report`'s "partial isn't actionable"
-    stance). Each object must carry ``title``/``expected``/``actual``/
-    ``repro``/``evidence``; ``suspected_repo`` defaults to *repo* and
-    ``captures`` defaults to ``[]`` when omitted.
+    Three distinct outcomes, none of which collapse into each other:
+
+    - **No fence, and an explicit clean statement** (one of
+      :data:`_CLEAN_PASS_PHRASES`) — a genuine clean round: returns
+      ``FindingsParseResult()`` (empty findings, no protocol error).
+    - **No fence, and no explicit clean statement** — the worker's protocol
+      slip, not a clean pass: returns a non-empty ``protocol_error``. A
+      lane worker that simply forgot to fence its findings must never read
+      identically to one that affirmatively found nothing.
+    - **A fence present, but its contents fail to parse as a JSON list**
+      (invalid JSON, or valid JSON that isn't a list) — also a
+      ``protocol_error``, never silently ``[]`` (that was bug #3517: a
+      malformed block and a clean pass rendered identically).
+
+    Otherwise, every object in the parsed list becomes a :class:`Finding`
+    via :func:`_finding_from_entry` — missing required fields are defaulted/
+    derived and flagged :attr:`Finding.incomplete`, never dropped. An item in
+    the list that isn't a JSON object at all is skipped (the fence itself
+    still parsed as a valid JSON list, so this is not elevated to a protocol
+    error).
     """
     pattern = re.compile(
         rf"```{re.escape(FINDINGS_FENCE)}\s*\n(.*?)```", re.DOTALL,
     )
     match = pattern.search(text)
     if match is None:
-        return []
+        if _is_explicit_clean_statement(text):
+            return FindingsParseResult()
+        return FindingsParseResult(
+            protocol_error=(
+                f"no ```{FINDINGS_FENCE}``` fence found in the lane worker's "
+                "final message, and it did not explicitly state a clean "
+                "(zero-findings) pass"
+            ),
+        )
     try:
         raw = json.loads(match.group(1))
-    except (ValueError, TypeError):
-        return []
-    if not isinstance(raw, list):
-        return []
-
-    findings: list[Finding] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        required = ("title", "expected", "actual", "repro", "evidence")
-        if any(not str(entry.get(k, "")).strip() for k in required):
-            continue
-        captures = entry.get("captures") or []
-        if not isinstance(captures, list):
-            captures = []
-        findings.append(
-            Finding(
-                title=str(entry["title"]).strip(),
-                platform=platform,
-                repo=repo,
-                suspected_repo=str(entry.get("suspected_repo", repo)).strip() or repo,
-                expected=str(entry["expected"]).strip(),
-                actual=str(entry["actual"]).strip(),
-                repro=str(entry["repro"]).strip(),
-                evidence=str(entry["evidence"]).strip(),
-                captures=tuple(str(c) for c in captures),
-            )
+    except (ValueError, TypeError) as e:
+        return FindingsParseResult(
+            protocol_error=f"```{FINDINGS_FENCE}``` fence did not contain valid JSON: {e}",
         )
-    return findings
+    if not isinstance(raw, list):
+        return FindingsParseResult(
+            protocol_error=(
+                f"```{FINDINGS_FENCE}``` fence must contain a JSON list, "
+                f"got {type(raw).__name__}"
+            ),
+        )
+
+    findings = tuple(
+        _finding_from_entry(entry, platform=platform, repo=repo)
+        for entry in raw
+        if isinstance(entry, dict)
+    )
+    return FindingsParseResult(findings=findings)
 
 
 # ── dedupe ───────────────────────────────────────────────────────────────
@@ -458,13 +597,31 @@ class ExploreOutcome:
     The production explorer,
     :func:`coord.commands.bugbash._dispatch_and_await_lane`, does not yet
     set this flag (tracked as a KNOWN GAP in that module's docstring) —
-    today this is exercised only at the engine/unit-test level."""
+    today this is exercised only at the engine/unit-test level.
+
+    ``protocol_error`` is a FOURTH, separate outcome (#3517): the lane
+    worker DID run to completion (``ok=True``, unlike a dispatch/poll/log
+    failure) and its own driver observed no locked/absent session (unlike
+    ``unavailable``) — but its final message, run through
+    :func:`parse_findings_block`, came back as a :class:`FindingsParseResult`
+    with a non-empty ``protocol_error``: no parseable
+    ```` ```bugbash-findings ```` block, and
+    no explicit statement that the round found nothing. This must never be
+    mistaken for ``findings=(), ok=True`` ("ran the checklist, found
+    nothing") — that conflation is exactly how bug #3517's real finding (a
+    valid block, but one entry missing ``evidence``) got dropped to "zero
+    findings" and let a real bug pass the #3488 release gate.
+    :func:`run_bugbash` records a non-empty ``protocol_error`` in
+    :attr:`RoundReport.protocol_error_lanes` and that round can never
+    terminate ``"zero_findings"`` while any lane set it (see
+    :attr:`BugbashReport.any_protocol_errors`)."""
 
     findings: tuple[Finding, ...] = ()
     cost: float = 0.0
     notes: str = ""
     ok: bool = True
     unavailable: bool = False
+    protocol_error: str = ""
 
 
 #: ``(lane, round_num) -> ExploreOutcome`` — "go run this lane's
@@ -509,6 +666,16 @@ def _evidence_with_acceptance(finding: Finding, dedupe: DedupeResult) -> str:
     parts = [finding.evidence.strip()] if finding.evidence.strip() else []
     if finding.captures:
         parts.append("Captures: " + ", ".join(finding.captures))
+    if finding.incomplete:
+        # #3517: a finding filed from a lane report missing one or more
+        # required fields must say so on the issue itself, not just in the
+        # CLI's round output — a human triaging it needs to know some of
+        # what's below was defaulted/derived, not actually reported.
+        parts.append(
+            "INCOMPLETE REPORT: the lane worker's findings entry was missing "
+            f"required field(s): {', '.join(finding.missing_fields)}. Values "
+            "above were defaulted/derived rather than reported."
+        )
     if dedupe.verdict is DedupeVerdict.REGRESSION and dedupe.matched_number is not None:
         parts.append(
             f"Regression: reopens the symptom from closed issue "
@@ -671,6 +838,18 @@ class RoundReport:
     #: tracked separately rather than folded into either bucket. No
     #: findings are ever filed from a lane recorded here this round.
     unavailable_lanes: dict[str, str] = field(default_factory=dict)
+    #: ``{platform: detail}`` for every lane explored this round whose
+    #: :attr:`ExploreOutcome.protocol_error` was non-empty (#3517) — the lane
+    #: worker completed (``ok=True``), its driver reported no locked/absent
+    #: session, but its final message could not be trusted as a findings
+    #: report at all: no parseable ```` ```bugbash-findings ```` block, and no
+    #: explicit "found nothing" statement either. Distinct from BOTH
+    #: ``lane_failures`` (we never even got an answer) and
+    #: ``unavailable_lanes`` (the driver's own precheck blocked the run) —
+    #: here the worker ran and answered, but the answer violates the
+    #: reporting contract, so it must never be read as "zero findings
+    #: observed" (that silent collapse is exactly bug #3517).
+    protocol_error_lanes: dict[str, str] = field(default_factory=dict)
 
     @property
     def explored_lanes(self) -> set[str]:
@@ -746,6 +925,15 @@ class BugbashReport:
         time and needs attention, not a bug report."""
         return any(r.unavailable_lanes for r in self.rounds)
 
+    @property
+    def any_protocol_errors(self) -> bool:
+        """``True`` if ANY round recorded a lane protocol error (#3517) —
+        surfaced regardless of whether it happened to be the terminating
+        round, so an operator glancing at an otherwise-clean run still sees
+        that one lane's report could not be trusted and needs a human to
+        look at its transcript, not a silent "zero findings" credit."""
+        return any(r.protocol_error_lanes for r in self.rounds)
+
 
 def run_bugbash(
     config: BugbashConfig,
@@ -772,22 +960,32 @@ def run_bugbash(
     - ``"zero_findings"`` — this round's non-duplicate finding count is 0,
       AND at least one explored lane actually completed its checklist
       (neither ``RoundReport.all_explored_lanes_failed`` nor
-      ``RoundReport.all_explored_lanes_unavailable_or_failed`` is ``True``)
-      — a genuine observed clean pass.
+      ``RoundReport.all_explored_lanes_unavailable_or_failed`` is ``True``),
+      AND no lane reported a protocol error (``RoundReport
+      .protocol_error_lanes`` is empty) — a genuine observed clean pass.
     - ``"lane_failure"`` — this round's non-duplicate finding count is ALSO
       0, but every lane explored this round came back ``ok=False``
       (dispatch/poll/log failure) — #2096: a fleet-wide dispatch outage
       must never be reported identically to a clean bugbash pass. Check
       ``BugbashReport.rounds[-1].lane_failures`` for what actually broke.
+    - ``"protocol_error"`` — this round's non-duplicate finding count is ALSO
+      0, not every lane failed to dispatch/poll/log, but at least one lane
+      that DID complete reported a :attr:`ExploreOutcome.protocol_error`
+      (#3517: a malformed or missing ```` ```bugbash-findings ```` block, or a
+      fence-less message with no explicit "found nothing" statement). This
+      takes priority over ``"lanes_unavailable"`` below — a lane that
+      answered badly is a stronger "do not trust this round" signal than one
+      that was simply locked out. Check ``BugbashReport.rounds[-1]
+      .protocol_error_lanes`` for which lane and why.
     - ``"lanes_unavailable"`` — this round's non-duplicate finding count is
-      ALSO 0, no lane came back a dispatch/poll/log failure, but every lane
-      explored this round reported its GUI session/display unavailable
-      (#3510: locked or absent, e.g. a locked dell64) — a different reason
-      from ``"lane_failure"`` (the explorer DID run and DID get a verified
-      answer, it's just "the host is locked", not "I don't know"), and
-      still not a clean pass either, since nothing was actually exercised
-      against the app. Check ``BugbashReport.rounds[-1].unavailable_lanes``
-      for which host needs unlocking.
+      ALSO 0, no lane came back a dispatch/poll/log failure or a protocol
+      error, but every lane explored this round reported its GUI session/
+      display unavailable (#3510: locked or absent, e.g. a locked dell64) —
+      a different reason from ``"lane_failure"`` (the explorer DID run and
+      DID get a verified answer, it's just "the host is locked", not "I
+      don't know"), and still not a clean pass either, since nothing was
+      actually exercised against the app. Check ``BugbashReport
+      .rounds[-1].unavailable_lanes`` for which host needs unlocking.
     - ``"cost_cap"`` — cumulative cost has reached ``cost_cap_total``.
     - ``"round_cap"`` — ``config.max_rounds`` rounds ran without either of
       the above firing.
@@ -826,6 +1024,13 @@ def run_bugbash(
                 # every lane failed this way can never render identically to
                 # a round that actually looked and found nothing.
                 report.lane_failures[lane.platform] = outcome.notes or "explorer reported failure"
+            elif outcome.protocol_error:
+                # #3517: the lane DID complete, but its final message could
+                # not be trusted as a findings report at all — a malformed/
+                # missing block, never silently read as "zero findings
+                # observed" (that conflation is exactly what let a real
+                # finding disappear and pass the #3488 release gate).
+                report.protocol_error_lanes[lane.platform] = outcome.protocol_error
 
         open_issues = open_issues_fetcher(config.repo)
         closed_issues = closed_issues_fetcher(config.repo)
@@ -876,17 +1081,23 @@ def run_bugbash(
         rounds.append(report)
 
         if report.new_count == 0:
-            # #2096: "zero findings" is only a genuine clean-pass verdict
-            # when at least one lane was actually verified to have RUN THE
-            # CHECKLIST this round. A round where every explored lane failed
-            # to dispatch/poll/fetch its log gets "lane_failure"; a round
-            # where every explored lane instead reported its session/display
-            # unavailable (#3510 — locked or absent, never a dispatch
-            # failure) gets its own distinct "lanes_unavailable" reason, in
-            # that priority order since a round can't be "all failed" AND
-            # "all unavailable" (each lane only sets one of the two).
+            # #2096/#3517: "zero findings" is only a genuine clean-pass
+            # verdict when at least one lane was actually verified to have
+            # RUN THE CHECKLIST this round AND every lane that did complete
+            # produced a trustworthy report. A round where every explored
+            # lane failed to dispatch/poll/fetch its log gets "lane_failure";
+            # a round where some lane completed but its report couldn't be
+            # trusted at all (a malformed/missing findings block — #3517)
+            # gets "protocol_error" instead, ahead of "lanes_unavailable"
+            # below since a bad answer is a stronger "don't trust this round"
+            # signal than a lane simply being locked out; a round where every
+            # explored lane instead reported its session/display unavailable
+            # (#3510 — locked or absent, never a dispatch failure) gets its
+            # own distinct "lanes_unavailable" reason last.
             if report.all_explored_lanes_failed:
                 reason = "lane_failure"
+            elif report.protocol_error_lanes:
+                reason = "protocol_error"
             elif report.all_explored_lanes_unavailable_or_failed:
                 reason = "lanes_unavailable"
             else:
