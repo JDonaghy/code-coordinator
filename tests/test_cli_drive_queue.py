@@ -747,6 +747,152 @@ def test_add_preflight_survives_an_unreadable_board(cli, seed, monkeypatch):
     assert "queued claude-coordinator#3" in result.output
 
 
+# ── #2377: don't relaunch over an already-fixed PR ──────────────────────────
+#
+# The live incident this closes: claude-coordinator#2283's drive-queue entry
+# was `blocked` on the #2363 empty-branch-death signature, and the
+# recommended remedy was a blind `coord drive-queue remove 2283 && coord
+# drive-queue add 2283` — blind to PR #2353 already carrying the correctly
+# re-authored, all-green work. `_existing_pr_match` owns the real `gh pr
+# list` + checks read (covered separately via `coord.github_ops`); these
+# mock it directly at the one chokepoint `add` calls through, same posture
+# `test_add_preflight_survives_an_unreadable_board` above takes for the board
+# fetch.
+
+
+def test_add_refuses_to_relaunch_over_an_already_green_pr(cli, seed, monkeypatch):
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={2283: "open"})
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=2353,
+            branch="test-author-ms-65-slice-2283",
+            url="https://github.com/example/claude-coordinator/pull/2353",
+            all_green=True,
+        ),
+    )
+
+    result = cli("add", REPO, "2283")
+
+    assert result.exit_code != 0
+    assert "2353" in result.output
+    assert f"coord merge --only {REPO}#2283" in result.output
+    assert "drive-queue remove" not in result.output
+    # Refused BEFORE the write — never queued.
+    assert queued(2283) is None
+
+
+def test_add_refuses_to_relaunch_over_a_pr_with_red_checks_too(cli, seed, monkeypatch):
+    """#2377's design note: a red/stale-checks PR is not a green light to
+    requeue either — something else may already be mid-fixing it. `add`
+    still refuses (never silently proceeds with the blind relaunch), just
+    with a different pointer than the green case."""
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={2283: "open"})
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=2353,
+            branch="test-author-ms-65-slice-2283",
+            url="https://github.com/example/claude-coordinator/pull/2353",
+            all_green=False,
+        ),
+    )
+
+    result = cli("add", REPO, "2283")
+
+    assert result.exit_code != 0
+    assert "2353" in result.output
+    assert "coord merge --only" not in result.output
+    assert queued(2283) is None
+
+
+def test_add_proceeds_normally_when_no_existing_pr_matches(cli, seed, monkeypatch):
+    """Today's only behaviour, unchanged, when the #2377 check finds
+    nothing — explicit here (rather than relying only on the fail-open
+    `gh`-less default) so a future change to `_existing_pr_match` can't
+    silently start refusing every `add`."""
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: None,
+    )
+    seed(issues={3: "open"})
+
+    result = cli("add", REPO, "3")
+
+    assert result.exit_code == 0, result.output
+    assert "queued claude-coordinator#3" in result.output
+    assert queued(3) is not None
+
+
+def test_blocked_escalation_command_proposes_merge_over_requeue_when_pr_is_green(
+    monkeypatch, config_file,
+):
+    """The exact #2283 incident, pinned at the function the tick's escalation
+    writer actually calls — the one field (`drive_escalations.
+    proposed_command`) `coord decide`'s one-key execution and the
+    `decisions` report's "Recommended" option both read verbatim."""
+    from coord.commands.drive_queue import _blocked_escalation_command
+    from coord.drive_queue import ExistingPrMatch, entry_key
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=2353,
+            branch="test-author-ms-65-slice-2283",
+            url="https://github.com/example/claude-coordinator/pull/2353",
+            all_green=True,
+        ),
+    )
+    reason = (
+        "acceptance author aid-1 exited DONE, but its branch "
+        "'test-author-ms-65-slice-2283' carries no commits, 3 time(s) in a "
+        "row (budget 3, #2334) — nothing was authored, so there is no slice "
+        "to land, and retrying has not produced a different outcome.\n"
+        "   inspect: coord log aid-1 --machine dellserver\n"
+        "   this needs an operator decision: re-author by hand (coord "
+        "acceptance author claude-coordinator 65 --issue 2283), or re-run "
+        "coord drive with --no-acceptance to skip JIT authoring."
+    )
+    key = entry_key(REPO, 2283)
+
+    command = _blocked_escalation_command(None, key, reason, config_path=config_file)
+
+    assert command == f"coord merge --only {REPO}#2283"
+    assert "drive-queue remove" not in command
+    assert "drive-queue add" not in command
+
+
+def test_blocked_escalation_command_still_requeues_when_no_pr_matches(
+    monkeypatch, config_file,
+):
+    """#2377's unconditional default, pinned at the same function: no PR on
+    the conventional branch name(s) — today's `remove && add` requeue,
+    unchanged."""
+    from coord.commands.drive_queue import _blocked_escalation_command
+    from coord.drive_queue import entry_key
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: None,
+    )
+    reason = (
+        "work adv-1 exited ADVISORY with no commits on its branch "
+        "(3/3 attempts) — nothing was pushed, so there is nothing to test, "
+        "review, or merge, and retrying has not produced a different outcome."
+    )
+    key = entry_key(REPO, 1762)
+
+    command = _blocked_escalation_command(None, key, reason, config_path=config_file)
+
+    assert command == (
+        f"coord drive-queue remove {REPO} 1762 && coord drive-queue add {REPO} 1762"
+    )
+
+
 def test_a_declared_file_is_checked_against_a_live_branchs_real_diff(
     cli, declare, seed, branch_diff,
 ):

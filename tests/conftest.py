@@ -516,6 +516,36 @@ def _no_live_tmux_driver_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_existing_pr_match(monkeypatch):
+    """#2377: default ``coord.commands.drive_queue._existing_pr_match`` to
+    "no PR found" instead of shelling out to a real ``gh pr list``.
+
+    ``coord drive-queue add`` (and the tick's blocked/oscillating escalation
+    writer) now checks GitHub for an OPEN PR on the entry's conventional
+    branch name before proposing a relaunch. Left unmocked, a test whose
+    fixture ALSO replaces ``coord.commands.drive_queue.subprocess.run`` (the
+    ``launches`` fixture in ``tests/test_cli_drive_queue.py`` and its
+    siblings — one process-wide symbol, so it sees every subprocess call the
+    module makes, not just a drive launch) would route this new `gh pr list`
+    call through the real ``coord.github_ops._gh`` (per ``_no_live_gh``
+    above: once a test mocks the subprocess boundary, the real `_gh` body
+    runs against THAT mock) and the resulting ``["gh", "pr", "list", ...]``
+    argv would land in the SAME captured-launches list those tests assert is
+    `coord drive --tmux` argv only — the exact #2839 hazard
+    ``_default_pipeline_labels`` (see ``tests/test_cli_drive_queue.py``)
+    already guards for `apply_issue_labels`'s own `gh issue` calls.
+
+    A test that wants to exercise the real check monkeypatches this back
+    explicitly — its own ``monkeypatch.setattr`` call runs after this
+    fixture's, so it wins — exactly as the #2377 tests in
+    ``tests/test_cli_drive_queue.py`` do.
+    """
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match", lambda *a, **k: None
+    )
+
+
+@pytest.fixture(autouse=True)
 def _interactive_stdin_is_tty(monkeypatch):
     """#2086: ``coord assign --interactive`` now refuses up front when
     stdin is not a TTY (``coord.commands.dispatch._stdin_is_tty()``) — a
