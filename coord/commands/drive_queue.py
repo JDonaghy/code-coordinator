@@ -67,6 +67,7 @@ from coord.drive_queue import (
     STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
+    STUCK_QUEUE_STATES,
     TERMINAL_QUEUE_STATES,
     BoardView,
     ExistingPrMatch,
@@ -468,24 +469,31 @@ def drive_queue_add(
         )
 
     # #2377: refuse OUTRIGHT — never just advise — when an OPEN PR already
-    # exists on this entry's conventional branch name(s). The live incident
-    # this closes (claude-coordinator#2283): the one remedy a `blocked`/
-    # `failed` entry's own recommended fix actually runs is `coord
-    # drive-queue remove <k> && coord drive-queue add <k>` — `remove` drops
-    # the row entirely, so by the time THIS `add` runs there is no
-    # `previous` state left to condition the check on, only GitHub's own
-    # live truth. Checked on every `add` call, not only an upsert over a
-    # stuck row, for exactly that reason. Merging (or fixing forward) a
+    # exists on this entry's conventional branch name(s), but ONLY for the
+    # two shapes that can actually relaunch a drive over it: a true fresh
+    # insert (`previous is None` — including the `coord drive-queue remove
+    # <k> && coord drive-queue add <k>` remedy, which drops the row entirely
+    # before this `add` runs, so by then there is no `previous` left either)
+    # and a requeue-style `add` over an already-stuck row (`previous.state`
+    # in `STUCK_QUEUE_STATES` — the #2972 "bump --max-fix-rounds and re-add"
+    # pattern `_requeue_command` documents). `_enqueue_drive_queue_local`
+    # is a pure metadata upsert for every OTHER case — `waiting`/`running`
+    # entries that pushed their own (healthy, simply not-yet-green) PR on the
+    # expected path through Work -> Test -> Review -> Merge — and routine
+    # `--hold-after`/`--machine`/`--after` edits to those must keep working
+    # even though a matching PR already exists, since no relaunch of any
+    # kind is happening on that path. Merging (or fixing forward) a
     # discovered PR is deliberately left to the operator — see
     # `existing_pr_relaunch_remedy`'s own docstring.
-    existing_match = _existing_pr_match(config_path, repo, issue)
-    existing_remedy = existing_pr_relaunch_remedy(repo, issue, existing_match)
-    if existing_remedy is not None:
-        raise click.ClickException(
-            f"refusing to queue {entry_key(repo, issue)} — "
-            f"{existing_remedy['what_happens']} Run instead: "
-            f"{existing_remedy['command_or_action']}"
-        )
+    if previous is None or previous.state in STUCK_QUEUE_STATES:
+        existing_match = _existing_pr_match(config_path, repo, issue)
+        existing_remedy = existing_pr_relaunch_remedy(repo, issue, existing_match)
+        if existing_remedy is not None:
+            raise click.ClickException(
+                f"refusing to queue {entry_key(repo, issue)} — "
+                f"{existing_remedy['what_happens']} Run instead: "
+                f"{existing_remedy['command_or_action']}"
+            )
 
     # #2247: predicted file overlap ORDERS, never refuses. Anything that goes
     # wrong in here (unreadable body, unreachable board, a failed compare)
@@ -938,6 +946,20 @@ def _existing_pr_match(
     `coord.ci_github.GitHubCi.list_checks_for_pr` already fail open on a
     transient `gh` error on their own; this only adds the same posture
     around the config/slug lookup wrapping them.
+
+    `all_green` here is a narrower "safe to merge instead of relaunching"
+    answer than `coord.merge_queue.plan()`'s own `PLAN_READY` verdict — it
+    reads raw `failed_checks`/`in_flight_checks` only and does not account
+    for `merge_queue._ci_checks_are_stale` (a green check that silently
+    outlived a base move), review state, or any other merge gate. The
+    issue's own design accepted either condition ("all green OR `coord merge
+    --plan` reads READY"), and `coord merge --only` re-runs its own full gate
+    check before actually merging either way, so the worst case from the gap
+    is a confusing round trip (recommended here, still BLOCKED there), never
+    an incorrect merge. Wiring the fuller verdict in would need this call
+    site to assemble `plan()`'s board/GhOps/smoke-verdict inputs for a
+    single PR lookup — a bigger, riskier change than this fix-round's scope;
+    left as a known gap rather than attempted half-wired.
     """
     coordinates = _repo_coordinates(config_path, repo)
     if coordinates is None:
