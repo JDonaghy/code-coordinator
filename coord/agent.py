@@ -3828,6 +3828,20 @@ gate (not posted to GitHub by you — never run `gh` commands): a `partial`/ \
 comment on the issue quoting what remains, instead of auto-closing work \
 that still has a reported bug live.
 
+#3522: if you are going to declare `partial` or `investigation`, your \
+commit messages must reference this issue with `Refs #N` — never `Fix \
+#N`/`Fixes #N`/`Closes #N`/`Resolves #N`, even when that is this repo's \
+own commit convention for a fully-resolving change. GitHub scans commit \
+messages for closing keywords independently of the PR body and auto-closes \
+the issue the moment the commit lands on the base branch, regardless of \
+what your `ISSUE_RESOLUTION:` line says — the coordinator's merge gate can \
+rewrite the PR body but cannot rewrite history in a `gh`-only wire layer, \
+so it refuses to merge a `partial`/`investigation` PR whose commits still \
+carry a closing keyword. If you already wrote a commit this way before \
+deciding on `partial`/`investigation`, reword it (`git commit --amend` for \
+the most recent commit, `git rebase -i` for an earlier one) to say `Refs \
+#N` before you push.
+
 #252: before exiting, emit a SMOKE_TESTS block telling the human what to \
 manually verify.  You changed the code; you know what's worth poking.
 

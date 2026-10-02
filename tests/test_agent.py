@@ -1771,6 +1771,20 @@ def test_worker_system_prompt_forbids_the_base_checkout():
     assert "~/src/<repo>" in WORKER_SYSTEM_PROMPT
 
 
+def test_worker_system_prompt_tells_partial_investigation_workers_to_use_refs():
+    """#3522: a worker declaring `ISSUE_RESOLUTION: partial`/`investigation`
+    must be told to reference the issue with `Refs #N`, never a closing
+    keyword — otherwise its own commit (e.g. this repo's `Fix #N: ...`
+    convention) auto-closes the issue regardless of the PR body, deadlocking
+    the merge gate `issue_resolution_closing_keyword_in_commit` added by
+    #3502."""
+    assert "Refs #N" in WORKER_SYSTEM_PROMPT
+    assert "#3522" in WORKER_SYSTEM_PROMPT
+    # The prompt must also tell a worker who already wrote the commit the
+    # wrong way how to fix it before pushing, not just what not to do.
+    assert "git commit --amend" in WORKER_SYSTEM_PROMPT
+
+
 def test_mock_author_system_prompt_forbids_the_base_checkout():
     assert "current working directory" in MOCK_AUTHOR_SYSTEM_PROMPT
     assert "~/src/<repo>" in MOCK_AUTHOR_SYSTEM_PROMPT

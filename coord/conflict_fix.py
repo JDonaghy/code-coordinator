@@ -53,6 +53,20 @@ distinct :data:`ALREADY_UPSTREAM_MARKER` for the superseded case, so
 :func:`coord.reconcile.on_conflict_fix_done` can park the entry with
 accurate "nothing to merge" text instead of escalating a conflict that
 does not exist.
+
+#3522: a fourth no-conflict-expected shape, dispatched directly by
+``coord.merge_queue.process()`` the moment its own
+``issue_resolution_closing_keyword_in_commit`` gate fires (#3502) — a
+commit message on the branch carries a GitHub closing keyword for this
+entry's own issue even though the PR is marked ``ISSUE_RESOLUTION:
+partial``/``investigation``. ``dispatch_conflict_fix(..., reword_commit=
+True)`` sends a worker authorized ONLY to reword that commit's wording
+(never its content), verified content-preserving the same way the
+stale-rebase worker verifies its own premise — see
+:func:`build_reword_commit_briefing`. Before this, nothing ever remedied
+that refusal: the merge gate correctly kept refusing forever, and the
+drive-queue's own resume sweep kept burning its budget relaunching into
+the identical, unfixable-by-relaunch block (claude-coordinator#3519).
 """
 
 from __future__ import annotations
@@ -732,6 +746,240 @@ def already_upstream_verdict_in_text(text: str | None) -> bool:
     if not text:
         return False
     return ALREADY_UPSTREAM_MARKER in _decode_worker_text(text)
+
+
+# ── #3522: reword-commit (issue_resolution_closing_keyword_in_commit) ──────
+#
+# `coord.merge_queue.process()`'s `issue_resolution_closing_keyword_in_commit`
+# gate refuses to merge a branch whose PR is marked `ISSUE_RESOLUTION:
+# partial`/`investigation` but whose commit message(s) still carry a
+# GitHub closing keyword (`Fix`/`Fixes`/`Closes`/`Resolves #N`) for that
+# SAME issue — GitHub auto-closes the issue from the commit message on
+# merge regardless of what the PR body or the coordinator's own
+# `close_issue()` chokepoint say. Unlike the PR-body half of the same gate
+# (#1196/#1318), there is no `gh`-only rewrite for a commit message already
+# on the branch — only a local rebase that REWORDS it can fix this, and
+# nothing ever dispatched that rebase, so every such PR deadlocked:
+# `coord merge` refuses every attempt, the drive-queue's own resume sweep
+# (`coord.drive_queue._reconcile_blocked`) saw the same unfixable refusal
+# and burned its resume budget relaunching into it, and only an operator
+# force-push ever cleared it (claude-coordinator#3519).
+#
+# This section gives that gate a remedy worker, dispatched by
+# `coord.merge_queue.process()` itself the moment the gate fires (see that
+# module): a message-only rewrite, narrower even than the stale-rebase
+# briefing above — it is authorized to change ONLY the wording of a commit
+# SUBJECT that references this entry's own issue with a closing keyword,
+# never the tree. Verified the same way the stale-rebase worker verifies a
+# "just stale" premise: a content-addressed `git patch-id --stable` (and
+# the working tree itself) must be byte-identical before and after the
+# reword — if it isn't, something touched content, not just the message,
+# and the worker refuses rather than force-push a silently-changed diff out
+# from under a review that already approved a different tree.
+
+# Marker a reword-commit worker's STUCK: line starts with when the rewrite
+# was not content-preserving — a patch-id or tree mismatch, or a rebase
+# conflict encountered while rewording. Same convention as
+# STALE_REBASE_MISMATCH_MARKER/SEALED_SCOPE_STUCK_MARKER: a fixed,
+# machine-parseable string, not prose.
+REWORD_MISMATCH_MARKER = "coord:conflict=reword-mismatch"
+
+# Title prefix for a reword-commit conflict-fix dispatch — visible in the
+# TUI Pipeline row so an operator can tell at a glance this used the
+# narrow, message-only briefing rather than the ordinary conflict-fix one.
+REWORD_COMMIT_FIX_TITLE_PREFIX = "[reword-commit-fix]"
+
+REWORD_COMMIT_FIX_SYSTEM_PROMPT = """\
+You are a Claude Code conflict-fix worker. This branch's PR is marked \
+`ISSUE_RESOLUTION: partial` or `ISSUE_RESOLUTION: investigation` — it does \
+NOT fully resolve its issue — but one of its own commit messages still \
+uses a GitHub closing keyword (`Fix`/`Fixes`/`Closes`/`Resolves #N`) for \
+that same issue. GitHub auto-closes the issue from the commit message on \
+merge, independent of the PR body, so this blocks the merge until the \
+wording is fixed. Your job is a MESSAGE-ONLY rewrite: change the wording, \
+never the content.
+
+Rules:
+- The coordinator denies `gh` and `git push --force` for this worker. \
+Don't try to use them — the harness will reject the call.
+- Stay on the worker's branch — do NOT push to main / develop / target.
+- Use git push --force-with-lease (NOT --force).
+- Rewrite ONLY the commit subject/body wording that uses a closing keyword \
+for this entry's own issue number — e.g. `Fix #N: ...` / `Fixes #N ...` / \
+`Closes #N` / `Resolves #N` becomes `Refs #N: ...` (same text otherwise). \
+Leave every other commit, and every other word of the ones you touch, \
+untouched.
+- Before rewriting, record the branch's content fingerprint: `git diff \
+<target-branch>...HEAD | git patch-id --stable`, and its tree: `git \
+diff <target-branch> HEAD` (expect no output — nothing ahead of the merge \
+base besides this branch's own already-landed changes).
+- Use `git rebase -i <target-branch>` with `reword` on the affected \
+commit(s) (or, for a simple one-commit rewrite, `git commit --amend`), \
+editing ONLY the wording described above.
+- After rewriting, confirm BOTH fingerprints are UNCHANGED: the patch-id \
+must match exactly, and `git diff <target-branch> HEAD` must produce the \
+IDENTICAL output as before. A rewording that changes either means \
+something touched content, not just the message — DO NOT push.
+- If a conflict marker appears during the rebase, or either fingerprint \
+differs after the reword, DO NOT push. Stop and end your turn with a \
+STUCK: line that starts with the exact marker \
+`coord:conflict=reword-mismatch`, e.g.
+  STUCK: coord:conflict=reword-mismatch — patch-id before <hash>, after \
+<hash> differ
+The coordinator reads that marker from your transcript, not your process \
+exit code (which you cannot control), and escalates to a human rather than \
+force-pushing a diff review never saw.
+
+Progress reporting:
+- After each significant step (fingerprint recorded, reword done, \
+fingerprint verified, pushed), output:
+  STATUS: [what you just did] → [what you're about to do] → [confidence]
+- If you stop, output the STUCK: line described above and wait for \
+guidance.\
+"""
+
+
+def build_reword_commit_briefing(
+    *,
+    entry: QueuedMerge,
+    repo_path: str,
+    test_command: str | None,
+) -> str:
+    """Briefing for a conflict-fix dispatched against the #3522
+    `issue_resolution_closing_keyword_in_commit` merge-gate refusal — a
+    message-only rewrite of whichever commit(s) use a GitHub closing
+    keyword for *entry.issue_number*, verified content-preserving (patch-id
+    and tree both unchanged) the same way :func:`build_stale_rebase_briefing`
+    verifies its "just stale" premise.
+
+    *test_command* is accepted for signature symmetry with the other
+    ``build_*_briefing`` functions, but a pure message rewrite changes no
+    code, so this briefing does not ask the worker to re-run it — unlike
+    :func:`build_conflict_fix_briefing`/:func:`build_stale_rebase_briefing`,
+    both of which DO change (or might change) tracked files.
+    """
+    lines: list[str] = [
+        f"# Reword commit for ISSUE_RESOLUTION: ambiguous closing keyword — "
+        f"{entry.repo_github} branch `{entry.branch}`",
+        "",
+        f"`{entry.branch}`'s PR is marked `ISSUE_RESOLUTION: partial` or "
+        "`ISSUE_RESOLUTION: investigation` — it does NOT fully resolve "
+        f"#{entry.issue_number} — but a commit message on this branch still "
+        f"uses a GitHub closing keyword for #{entry.issue_number}.",
+        f"Reason: {entry.error or 'issue_resolution_closing_keyword_in_commit'}",
+        "",
+        f"Issue: #{entry.issue_number} — {entry.issue_title}",
+        "",
+        "## Where you are",
+        "",
+        f"You are already in a dedicated git worktree checked out on "
+        f"`{entry.branch}` — the coordinator created it for you. Work HERE.",
+        "",
+        f"Do **NOT** `cd {repo_path}` (that is the machine's shared base "
+        "checkout) and do NOT `git checkout` / `git switch` anywhere. Leaving "
+        f"the base checkout parked on `{entry.branch}` breaks every later "
+        "dispatch against that branch on this machine (#1694).",
+        "",
+        "## Steps",
+        "",
+        "1. `git fetch origin`",
+        f"2. Record the pre-rewrite fingerprint: `git diff "
+        f"origin/{entry.target_branch}...HEAD | git patch-id --stable` and "
+        f"confirm `git diff origin/{entry.target_branch} HEAD` is what you "
+        "expect it to be (whatever it is now, it must be IDENTICAL after "
+        "the reword).",
+        f"3. Find the commit(s) whose subject or body references "
+        f"`#{entry.issue_number}` with a closing keyword — `Fix`/`Fixes`/"
+        f"`Fixed`/`Close`/`Closes`/`Closed`/`Resolve`/`Resolves`/`Resolved` "
+        f"immediately followed by `#{entry.issue_number}` — and reword ONLY "
+        "that wording to `Refs`, via `git rebase -i "
+        f"origin/{entry.target_branch}` (`reword` on each such commit) or "
+        "`git commit --amend` if it is the tip commit. Change nothing else "
+        "in the message and nothing in the diff.",
+        f"4. Re-check the fingerprint from step 2: `git diff "
+        f"origin/{entry.target_branch}...HEAD | git patch-id --stable` must "
+        f"match EXACTLY, and `git diff origin/{entry.target_branch} HEAD` "
+        "must be byte-identical to step 2's. If either differs, see "
+        '"When NOT to guess" below.',
+        f"5. `git push --force-with-lease origin {entry.branch}`",
+        "6. Exit 0 if push succeeds; non-zero otherwise.",
+        "",
+        "## When NOT to guess",
+        "",
+        "This dispatch is authorized for a MESSAGE-ONLY rewrite — never a "
+        "content change. If a conflict marker appears during the rebase, "
+        "or either fingerprint from step 4 differs from step 2's, DO NOT "
+        "push: something touched content, not just wording, and this "
+        "worker's narrow authorization does not cover resolving that. Stop "
+        "and end your turn with a `STUCK:` line that begins with the exact "
+        f"marker `{REWORD_MISMATCH_MARKER}` and then names what happened, "
+        "e.g.",
+        "",
+        f"    STUCK: {REWORD_MISMATCH_MARKER} — patch-id before <hash>, "
+        "after <hash> differ",
+        "",
+        "The coordinator reads that marker from your transcript, not your "
+        "process exit code (which you cannot control), and escalates to a "
+        f"human on issue #{entry.issue_number} rather than force-pushing a "
+        "diff the review that already approved this branch never saw.",
+        "",
+        "You will NOT use `gh` or `git push --force` — both are denied by "
+        "the harness. The coordinator owns PR retries and issue posting.",
+    ]
+    return "\n".join(lines)
+
+
+def reword_mismatch_verdict_in_text(text: str | None) -> bool:
+    """True when a reword-commit conflict-fix worker's log carries the
+    :data:`REWORD_MISMATCH_MARKER` — i.e. it refused to push because the
+    rewrite was not content-preserving (a real conflict, or a patch-id/tree
+    mismatch). Mirrors :func:`stale_rebase_mismatch_verdict_in_text`.
+    """
+    if not text:
+        return False
+    return REWORD_MISMATCH_MARKER in _decode_worker_text(text)
+
+
+def detect_reword_mismatch(
+    *,
+    log_path: str | None = None,
+    host: str | None = None,
+    assignment_id: str | None = None,
+    port: int = AGENT_PORT,
+    timeout: float = 15.0,
+) -> bool:
+    """True when a finished reword-commit conflict-fix worker refused to
+    push because its rewrite was not content-preserving (caught in step 4
+    of :func:`build_reword_commit_briefing`).
+
+    Mirrors :func:`detect_stale_rebase_mismatch` exactly (same
+    local-log-then-agent-endpoint lookup, same best-effort ``False`` on any
+    read/transport failure) but reads for :data:`REWORD_MISMATCH_MARKER` via
+    :func:`reword_mismatch_verdict_in_text`.
+    """
+    if log_path:
+        try:
+            from pathlib import Path  # noqa: PLC0415
+
+            p = Path(log_path)
+            if p.exists():
+                raw = p.read_text(encoding="utf-8", errors="replace")
+                if reword_mismatch_verdict_in_text(raw):
+                    return True
+        except OSError:
+            pass
+
+    if host and assignment_id:
+        try:
+            resp = httpx.get(
+                f"http://{host}:{port}/logs/{assignment_id}", timeout=timeout
+            )
+            resp.raise_for_status()
+            return reword_mismatch_verdict_in_text(resp.text)
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return False
+
+    return False
 
 
 def build_conflict_fix_briefing(
@@ -1418,6 +1666,7 @@ def dispatch_conflict_fix(
     stuck_summary: str | None = None,
     stale_rebase: bool = False,
     after_stale_rebase_mismatch: bool = False,
+    reword_commit: bool = False,
     status_fetcher: Callable[..., StatusResult] | None = None,
     machine_pick_out: "list[ConflictFixMachinePick] | None" = None,
 ) -> Assignment | None:
@@ -1540,6 +1789,26 @@ def dispatch_conflict_fix(
     unaffected: the stale-rebase worker itself still never resolves
     anything — only this ordinary worker (or its own semantic-escalation
     tier) may.
+
+    ``reword_commit=True`` (#3522) dispatches the remedy for a merge-gate
+    refusal recorded as ``issue_resolution_closing_keyword_in_commit``
+    (``coord.merge_queue.process()``'s own gate, fired the moment it sees
+    that refusal — no separate sweep call site needed) — a commit message
+    on the branch carries a GitHub closing keyword for this entry's own
+    issue even though the PR is marked ``ISSUE_RESOLUTION: partial``/
+    ``investigation``. Uses :func:`build_reword_commit_briefing` instead of
+    the ordinary briefing: narrower even than the stale-rebase one, it is
+    authorized ONLY to reword the offending commit message(s) — never to
+    change content — and verifies that with the same patch-id/tree
+    fingerprint technique :func:`build_stale_rebase_briefing` uses to prove
+    its own "just stale" premise. A mismatch (real content change, or a
+    rebase conflict) refuses — STUCK, retry cap consumed exactly like any
+    other conflict-fix failure — rather than force-pushing a diff the
+    review that already approved this branch never saw. Goes through the
+    SAME retry-cap check as the ordinary (non-``semantic``) path above — a
+    reword that recurs against the same error after a prior attempt
+    escalates to a human exactly like a recurring mechanical conflict
+    would.
     """
     if semantic:
         if has_prior_semantic_escalation(board, entry.assignment_id):
@@ -1555,6 +1824,7 @@ def dispatch_conflict_fix(
     sealed_author = (
         not semantic
         and not stale_rebase
+        and not reword_commit
         and entry.assignment_type in SEALED_PATH_AUTHOR_TYPES
     )
 
@@ -1610,6 +1880,14 @@ def dispatch_conflict_fix(
         )
         system_prompt = STALE_REBASE_FIX_SYSTEM_PROMPT
         title = f"{STALE_REBASE_FIX_TITLE_PREFIX} {entry.issue_title}"
+    elif reword_commit:
+        briefing = build_reword_commit_briefing(
+            entry=entry,
+            repo_path=repo_path,
+            test_command=repo.test_command,
+        )
+        system_prompt = REWORD_COMMIT_FIX_SYSTEM_PROMPT
+        title = f"{REWORD_COMMIT_FIX_TITLE_PREFIX} {entry.issue_title}"
     elif sealed_author:
         briefing = build_sealed_manifest_conflict_briefing(
             entry=entry,
@@ -1765,6 +2043,10 @@ def dispatch_conflict_fix(
             # worker's mismatch refusal — same title/briefing either way,
             # so this is the only durable trace of which path led here.
             "after_stale_rebase_mismatch": after_stale_rebase_mismatch,
+            # #3522: same reasoning — distinguishes the message-only reword
+            # remedy from every other conflict-fix flavour without
+            # re-deriving it from the title prefix.
+            "reword_commit": reword_commit,
         },
     )
 

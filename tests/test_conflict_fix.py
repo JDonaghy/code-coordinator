@@ -29,6 +29,8 @@ from coord.conflict_fix import (
     ASSIGN_POST_FAILED,
     CONFLICT_FIX_SYSTEM_PROMPT,
     NO_MACHINE_CONFIGURED,
+    REWORD_COMMIT_FIX_TITLE_PREFIX,
+    REWORD_MISMATCH_MARKER,
     SEALED_CONFLICT_FIX_TITLE_PREFIX,
     SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT,
     SEALED_SCOPE_STUCK_MARKER,
@@ -36,11 +38,13 @@ from coord.conflict_fix import (
     STALE_REBASE_MISMATCH_MARKER,
     already_upstream_verdict_in_text,
     build_conflict_fix_briefing,
+    build_reword_commit_briefing,
     build_sealed_manifest_conflict_briefing,
     build_stale_rebase_briefing,
     describe_conflict_fix_decline,
     dispatch_conflict_fix,
     pick_conflict_fix_machine,
+    reword_mismatch_verdict_in_text,
     select_conflict_fix_machine,
     sealed_conflict_could_touch_manifest,
     sealed_conflict_is_manifest_only,
@@ -339,6 +343,157 @@ class TestAlreadyUpstreamVerdictInText:
         assert already_upstream_verdict_in_text(
             "STUCK: coord:conflict=semantic src/foo.py:1-9 — contradictory"
         ) is False
+
+
+# ── #3522: reword-commit (issue_resolution_closing_keyword_in_commit) ──────
+
+
+class TestBuildRewordCommitBriefing:
+    def test_contains_message_only_steps_and_fingerprint_checks(self) -> None:
+        briefing = build_reword_commit_briefing(
+            entry=_entry(
+                error=(
+                    "a commit message on this branch contains a closing "
+                    "keyword for #1, but this PR is marked "
+                    "`ISSUE_RESOLUTION: partial`"
+                ),
+            ),
+            repo_path="/work/api",
+            test_command="pytest -x",
+        )
+        assert "git fetch origin" in briefing
+        assert "git push --force-with-lease origin issue-1-fix" in briefing
+        assert "patch-id" in briefing.lower()
+        assert "Refs" in briefing
+        assert "#1" in briefing
+        # Message-only: never a `git pull --rebase` (that's the content
+        # rebase briefings' job) — this one uses `git rebase -i`/`reword`.
+        assert "git rebase -i" in briefing or "git commit --amend" in briefing
+
+    def test_refuses_to_guess_on_conflict_or_mismatch(self) -> None:
+        briefing = build_reword_commit_briefing(
+            entry=_entry(), repo_path="/work/api", test_command="pytest",
+        )
+        assert "DO NOT" in briefing or "do not" in briefing.lower()
+        assert REWORD_MISMATCH_MARKER in briefing
+
+    def test_includes_error_context(self) -> None:
+        briefing = build_reword_commit_briefing(
+            entry=_entry(error="Reason: ISSUE_RESOLUTION reword needed for #1"),
+            repo_path="/work/api",
+            test_command=None,
+        )
+        assert "ISSUE_RESOLUTION reword needed for #1" in briefing
+
+
+class TestRewordMismatchVerdictInText:
+    def test_true_when_marker_present(self) -> None:
+        assert reword_mismatch_verdict_in_text(
+            f"STATUS: rewording\nSTUCK: {REWORD_MISMATCH_MARKER} "
+            "patch-id before abc123, after def456 differ"
+        ) is True
+
+    def test_false_when_absent(self) -> None:
+        assert reword_mismatch_verdict_in_text("STATUS: pushed\n") is False
+        assert reword_mismatch_verdict_in_text(None) is False
+        assert reword_mismatch_verdict_in_text("") is False
+
+    def test_false_for_ordinary_semantic_marker(self) -> None:
+        assert reword_mismatch_verdict_in_text(
+            "STUCK: coord:conflict=semantic src/foo.py:1-9 — contradictory"
+        ) is False
+
+    def test_false_for_stale_rebase_mismatch_marker(self) -> None:
+        """Distinct verdicts for distinct dispatch kinds — must not
+        cross-match."""
+        assert reword_mismatch_verdict_in_text(
+            f"STUCK: {STALE_REBASE_MISMATCH_MARKER} patch-id before abc123, "
+            "after def456 differ"
+        ) is False
+
+
+class TestDispatchRewordCommit:
+    def test_uses_the_narrower_briefing_and_title(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#3522: `reword_commit=True` sends the reword-commit system
+        prompt/title, not the ordinary conflict-fix one — the worker gets
+        narrower authorization (message-only, no content change)."""
+        client = _FakeHTTPClient({"id": "fix-id-reword"})
+        entry = _entry(
+            error=(
+                "a commit message on this branch contains a closing "
+                "keyword for #1, but this PR is marked "
+                "`ISSUE_RESOLUTION: partial`"
+            ),
+        )
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop", reword_commit=True,
+        )
+        assert result is not None
+        assert result.issue_title.startswith(REWORD_COMMIT_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] != CONFLICT_FIX_SYSTEM_PROMPT
+        assert "patch-id" in payload["briefing"].lower()
+
+    def test_skips_the_sealed_author_branch(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """The #3502 `ISSUE_RESOLUTION:` gate only ever fires for
+        `CLOSES_ISSUE_TYPES` (today: `work`) entries, mutually exclusive
+        with the sealed-path author types — but even if asked for one, the
+        reword briefing (not the sealed-manifest one) must win."""
+        client = _FakeHTTPClient({"id": "fix-id-reword-sealed"})
+        entry = _entry(assignment_type="test-author")
+        result = dispatch_conflict_fix(
+            entry, Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop", reword_commit=True,
+        )
+        assert result is not None
+        assert result.issue_title.startswith(REWORD_COMMIT_FIX_TITLE_PREFIX)
+        _, payload = client.calls[0]
+        assert payload["system_prompt"] != SEALED_MANIFEST_CONFLICT_SYSTEM_PROMPT
+
+    def test_retry_cap_blocks_second_dispatch_on_recurrence(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """Same retry-cap machinery as every other flavour: a second
+        reword block recurring with the identical error after a prior
+        conflict-fix attempt does not dispatch again — escalates instead."""
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="prev-fix", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        entry = _entry()
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            entry, board, two_machine_config,
+            http_client=client, reword_commit=True,
+        )
+        assert result is None
+        assert client.calls == []
+
+    def test_no_double_dispatch_while_one_is_already_active(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title=f"{REWORD_COMMIT_FIX_TITLE_PREFIX} Fix the thing",
+            assignment_id="running-fix-1", status="running",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        entry = _entry()
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            entry, board, two_machine_config,
+            http_client=client, prefer_machine="laptop", reword_commit=True,
+        )
+        assert result is None
+        assert client.calls == []
 
 
 # ── #2555: sealed-author (test-author/mock-author) conflict resolution ─────
