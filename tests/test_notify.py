@@ -1360,6 +1360,119 @@ class TestPostOrphanedReviewFindings:
         assert body_arg.startswith("<!-- coord:review verdict=approve")
         assert "All clear." in body_arg
 
+
+class TestReviewPostClaimRace:
+    """#2468: the identical "Review Complete" comment posted twice, 4 seconds
+    apart, on #2288's round-4 review. `_try_parse_and_post_review` (the live
+    completion path) and `post_orphaned_review_findings` (the orphan sweep)
+    both query "done review, `review_posted_at IS NULL`" and only set
+    `review_posted_at` AFTER posting — a classic check-then-act gap when two
+    coordinator passes race each other. These tests simulate the race by
+    having one caller win `claim_review_post` out-of-band (standing in for a
+    concurrent process) immediately before the other caller runs, and assert
+    the loser never posts."""
+
+    def test_orphan_sweep_skips_when_live_path_already_claimed(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """Live-path's claim wins first (simulating `_try_parse_and_post_
+        review` mid-flight on another process, `review_posted_at` not yet
+        set) — the orphan sweep must see the row as a candidate
+        (`review_posted_at IS NULL`) but skip posting rather than writing a
+        second, byte-identical comment."""
+        _record_review_assignment("orphan-race1", review_target="50")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=1234.0 "
+            "WHERE assignment_id='orphan-race1'"
+        )
+        conn.commit()
+
+        # Simulates the live completion path having already won the claim
+        # on a concurrent process, before this sweep runs.
+        assert state_mod.claim_review_post("orphan-race1") is True
+
+        log_path = _make_log_with_review(tmp_path, "request-changes", "Blocking finding.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan-race1", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.notify.github_ops.post_issue_comment") as mock_comment:
+            posted = notify_mod.post_orphaned_review_findings(config)
+
+        assert posted == []
+        mock_review.assert_not_called()
+        mock_comment.assert_not_called()
+
+    def test_live_path_treats_lost_claim_as_handled_not_a_parse_failure(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """Orphan sweep's claim wins first (simulating a concurrent
+        `post_orphaned_review_findings` pass) — `_try_parse_and_post_review`
+        must return True (handled elsewhere) rather than False, which the
+        caller in `post_transition` would read as a parse failure and post
+        yet another, differently-worded fallback comment."""
+        _record_review_assignment("rev-race2", review_target="99")
+        log_path = _make_log_with_review(tmp_path, "request-changes", "Blocking finding.")
+
+        # Simulates a concurrent orphan-sweep pass having already won the
+        # claim for this same assignment.
+        assert state_mod.claim_review_post("rev-race2") is True
+
+        transition = notify_mod.Transition(
+            assignment_id="rev-race2",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event="completion",
+            exit_code=0,
+        )
+        record = {"review_target": "99", "repo_github": "acme/api"}
+        entry = {"log_path": log_path}
+        with patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.notify.github_ops.post_issue_comment") as mock_comment:
+            result = notify_mod._try_parse_and_post_review(
+                transition, record, entry, 1.0,
+            )
+
+        assert result is True
+        mock_review.assert_not_called()
+        mock_comment.assert_not_called()
+
+    def test_duplicate_direct_calls_post_exactly_once(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """Two back-to-back calls to `_try_parse_and_post_review` for the
+        SAME assignment — standing in for two coordinator passes racing each
+        other on the live completion path itself — must post exactly once."""
+        _record_review_assignment("rev-race3", review_target="101")
+        log_path = _make_log_with_review(tmp_path, "approve", "LGTM.")
+
+        transition = notify_mod.Transition(
+            assignment_id="rev-race3",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event="completion",
+            exit_code=0,
+        )
+        record = {"review_target": "101", "repo_github": "acme/api"}
+        entry = {"log_path": log_path}
+        with patch("coord.notify.github_ops.post_pr_review") as mock_review:
+            first = notify_mod._try_parse_and_post_review(
+                transition, record, entry, 1.0,
+            )
+            second = notify_mod._try_parse_and_post_review(
+                transition, record, entry, 1.0,
+            )
+
+        assert first is True
+        assert second is True  # loser: treated as handled, not re-posted
+        mock_review.assert_called_once()
+
     # ── #2476: cost/token capture on the orphaned-findings path ────────────
     #
     # Root cause: `post_orphaned_review_findings` (run_drain's step 4, which

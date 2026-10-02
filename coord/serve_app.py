@@ -4175,6 +4175,67 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/review-post-claim": {
+            "post": {
+                "summary": (
+                    "Atomically claim the right to POST a review's findings "
+                    "to GitHub (#2468) — a conditional insert so the live "
+                    "completion path and the orphan sweep can never both "
+                    "post the identical comment"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — `claimed` is true iff this call won",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
+        "/review-post-claim-release": {
+            "post": {
+                "summary": (
+                    "Release a claim taken via /review-post-claim (#2468), "
+                    "ONLY when the post attempt itself failed, so a "
+                    "legitimate retry isn't permanently stranded"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — idempotent, absent claim is a no-op",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
         "/smoke-claim": {
             "post": {
                 "summary": (
@@ -8408,6 +8469,44 @@ def build_app(
             )
         return JSONResponse({"ok": True})
 
+    async def post_review_post_claim(request: Request) -> Response:
+        # #2468: atomic review-POSTING claim on the daemon's canonical DB —
+        # see coord.state.claim_review_post's docstring for the duplicate-
+        # comment race this closes.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            claimed = state._claim_review_post_local(body["assignment_id"])
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "review-post-claim write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True, "claimed": claimed})
+
+    async def post_review_post_claim_release(request: Request) -> Response:
+        # #2468: release a claim taken via post_review_post_claim above.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._release_review_post_claim_local(body["assignment_id"])
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "review-post-claim-release write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_smoke_claim(request: Request) -> Response:
         # #3333: atomic smoke fan-out dispatch claim on the daemon's
         # canonical DB — see coord.state.claim_smoke_dispatch's docstring
@@ -12003,6 +12102,11 @@ def build_app(
         Route("/review-findings", post_review_findings, methods=["POST"]),
         Route("/review-claim", post_review_claim, methods=["POST"]),
         Route("/review-claim-release", post_review_claim_release, methods=["POST"]),
+        Route("/review-post-claim", post_review_post_claim, methods=["POST"]),
+        Route(
+            "/review-post-claim-release", post_review_post_claim_release,
+            methods=["POST"],
+        ),
         Route("/smoke-claim", post_smoke_claim, methods=["POST"]),
         Route("/smoke-claim-release", post_smoke_claim_release, methods=["POST"]),
         Route("/smoke-fanout-merge", post_smoke_fanout_merge, methods=["POST"]),

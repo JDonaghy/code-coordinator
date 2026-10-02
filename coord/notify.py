@@ -72,12 +72,14 @@ from coord.smoke import (
     smoke_leg_capabilities,
 )
 from coord.state import (
+    claim_review_post,
     load_dispatched,
     load_done_reviews_needing_post,
     load_liveness_audit_state,
     load_notified,
     mark_notified,
     mark_review_posted,
+    release_review_post_claim,
     save_liveness_audit_state,
     save_plan,
 )
@@ -3585,6 +3587,25 @@ def _try_parse_and_post_review(
         transition.assignment_id, findings.verdict, findings.body
     )
 
+    # #2468: claim the right to POST this review's findings before actually
+    # posting them. `post_orphaned_review_findings` (the orphan sweep) reads
+    # the identical "done review, review_posted_at IS NULL" candidate set
+    # this function is reacting to, and used to race it: both callers could
+    # see NULL and both post the byte-identical comment (the #2288 round-4
+    # incident this closes). Losing the claim means another caller is
+    # posting — or has already posted — these exact findings, so this call
+    # must NOT fall through to the "could not post" fallback comment below;
+    # return True (handled) rather than False (which the caller would read
+    # as a parse failure and post yet another, differently-worded, comment).
+    if not claim_review_post(transition.assignment_id):
+        log.info(
+            "#2468: lost the review-post claim for %s — another caller is "
+            "posting (or already posted) these findings; skipping to avoid "
+            "a duplicate GitHub comment",
+            transition.assignment_id,
+        )
+        return True
+
     review_target = record.get("review_target")
     repo_github = record["repo_github"]
 
@@ -3648,6 +3669,11 @@ def _try_parse_and_post_review(
         log.warning(
             "Failed to post review comment for %s: %s", transition.assignment_id, exc
         )
+        # #2468: both post attempts (gh pr review, then this issue-comment
+        # fallback) failed — release the claim so a later retry (another
+        # `coord notify` pass, or `post_orphaned_review_findings`) isn't
+        # permanently blocked from posting these findings at all.
+        release_review_post_claim(transition.assignment_id)
         return False
 
 
@@ -4546,6 +4572,24 @@ def post_orphaned_review_findings(
             # per-stage display can skip the HTTP fetch on later runs.
             _persist_review_findings(aid, findings.verdict, findings.body)
 
+            # #2468: claim the right to POST before actually posting —
+            # `_try_parse_and_post_review` (the live completion path, run
+            # from `detect_transitions` earlier in the same drain, or from a
+            # concurrent `coord notify` process) reads the identical
+            # "review_posted_at IS NULL" candidate set this sweep queried via
+            # `load_done_reviews_needing_post`. Losing the claim means that
+            # other caller is posting — or has already posted — these exact
+            # findings; skip entirely rather than writing a second,
+            # byte-identical GitHub comment (the #2288 round-4 incident).
+            if not claim_review_post(aid):
+                log.info(
+                    "post_orphaned: lost the review-post claim for %s — "
+                    "another caller is posting (or already posted) these "
+                    "findings; skipping",
+                    aid,
+                )
+                continue
+
             review_target = row.get("review_target")
             repo_github = row.get("repo_github") or ""
             issue_number = row.get("issue_number", 0)
@@ -4617,6 +4661,12 @@ def post_orphaned_review_findings(
                     mark_notified(aid, EVENT_COMPLETION)
                 posted_ids.append(aid)
                 log.info("post_orphaned: posted findings for review %s", aid)
+            else:
+                # #2468: both post attempts failed — release the claim so a
+                # later retry (the next drain's orphan sweep, or the live
+                # path) isn't permanently blocked from posting these
+                # findings at all.
+                release_review_post_claim(aid)
 
     return posted_ids
 

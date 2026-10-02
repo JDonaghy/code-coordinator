@@ -1087,7 +1087,27 @@ def retry_on_locked(
 # knows the table exists: `_ensure_archive_mirror` itself, unconditionally
 # and idempotently (`CREATE INDEX IF NOT EXISTS`) on every housekeeping
 # sweep — see that function's own comment in coord/housekeeping.py.
-_DB_SCHEMA_VERSION = 21
+#
+# #2468: bumped 21 -> 22 for the new `review_post_claims` TABLE above (not a
+# column — same shape as #3113/#3333's table-only bumps: `_migrate_add_
+# columns` below is unchanged, `CREATE TABLE IF NOT EXISTS` in `_SCHEMA_SQL`
+# is what actually creates it on an existing database). `_try_parse_and_
+# post_review` (the live completion path) and `post_orphaned_review_findings`
+# (the orphan sweep) both query "done reviews with `review_posted_at IS
+# NULL`" and only set `review_posted_at` AFTER successfully posting to
+# GitHub — two coordinator passes racing each other (one on the live path,
+# one on the orphan sweep, or two concurrent `coord notify` invocations) can
+# both see NULL and both post, producing the byte-identical duplicate-comment
+# incident on #2288 round 4 this closes. `coord.state.claim_review_post`
+# does the same conditional `INSERT ... OR IGNORE` + `rowcount` check
+# `claim_review_dispatch` already does for *dispatching* a review; the loser
+# of THIS claim skips *posting* it instead. Released
+# (`coord.state.release_review_post_claim`) only when the post attempt
+# itself fails, so a legitimate retry of a transient `gh`/GitHub failure
+# isn't permanently stranded — a successful post leaves the claim in place
+# forever, which is harmless since `review_posted_at` being set already
+# excludes the row from both callers' candidate queries.
+_DB_SCHEMA_VERSION = 22
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1979,6 +1999,32 @@ _SCHEMA_SQL = """
             capability_partition TEXT    NOT NULL,
             claimed_at           REAL    NOT NULL,
             PRIMARY KEY (work_assignment_id, capability_partition)
+        );
+
+        -- #2468: atomic review-POSTING claim — a sibling to `review_claims`
+        -- above, but for the act of posting a review's findings to GitHub
+        -- rather than dispatching the review worker. `_try_parse_and_post_
+        -- review` (the live completion path, in `coord.notify`) and
+        -- `post_orphaned_review_findings` (the orphan sweep, same module)
+        -- both query "done review assignments with `review_posted_at IS
+        -- NULL`" as their candidate set and only set `review_posted_at`
+        -- AFTER the GitHub post succeeds — a classic check-then-act gap.
+        -- Two coordinator passes racing each other (the #2468 incident: the
+        -- identical "Review Complete" comment posted twice, 4 seconds apart,
+        -- on #2288's round-4 review) each saw `review_posted_at IS NULL`
+        -- and both posted. `coord.state.claim_review_post` does a
+        -- conditional `INSERT ... OR IGNORE` keyed on `assignment_id` and
+        -- checks `rowcount` to learn atomically whether THIS call gets to
+        -- post; the loser skips instead of also posting a duplicate
+        -- comment. Released (`coord.state.release_review_post_claim`) only
+        -- when the post attempt itself fails, so a transient GitHub/`gh`
+        -- failure doesn't permanently strand the row unposted — a
+        -- successful post never releases the claim, which is harmless
+        -- because `review_posted_at` being set already excludes the row
+        -- from both callers' candidate queries from then on.
+        CREATE TABLE IF NOT EXISTS review_post_claims (
+            assignment_id TEXT    PRIMARY KEY,
+            claimed_at    REAL    NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);

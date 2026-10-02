@@ -595,6 +595,119 @@ def test_post_review_claim_release_endpoint_missing_field_returns_400(
     assert resp.status_code == 400
 
 
+# ── #2468: atomic review-POSTING claim — daemon routing + endpoints ─────────
+
+
+def test_claim_review_post_routes_to_daemon(monkeypatch, coord_db) -> None:
+    """When board_service is set, the claim POSTs to /review-post-claim NOT
+    the local DB (mirrors test_claim_review_dispatch_routes_to_daemon)."""
+    from coord.state import claim_review_post
+
+    captured: dict = {}
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc,
+        "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True, "claimed": True},
+    )
+
+    won = claim_review_post("rev-905")
+
+    assert won is True
+    assert captured["path"] == "/review-post-claim"
+    assert captured["payload"]["assignment_id"] == "rev-905"
+    # Local DB must NOT have been written (empty local DB, thin-client).
+    row = get_connection().execute(
+        "SELECT 1 FROM review_post_claims WHERE assignment_id='rev-905'"
+    ).fetchone()
+    assert row is None
+
+
+def test_release_review_post_claim_routes_to_daemon(monkeypatch, coord_db) -> None:
+    """Release must route through the SAME daemon seam as claim — a
+    purely-local release on a thin client would touch the wrong (empty) DB
+    and silently no-op, leaving the daemon-held claim stuck forever."""
+    from coord.state import release_review_post_claim
+
+    captured: dict = {}
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc,
+        "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True},
+    )
+
+    release_review_post_claim("rev-905")
+
+    assert captured["path"] == "/review-post-claim-release"
+    assert captured["payload"]["assignment_id"] == "rev-905"
+
+
+def test_claim_review_post_writes_local_when_no_service(coord_db) -> None:
+    """Daemon host (no board_service): the claim writes to the local SQLite."""
+    from coord.state import claim_review_post
+
+    assert claim_review_post("rev-local") is True
+    row = get_connection().execute(
+        "SELECT 1 FROM review_post_claims WHERE assignment_id='rev-local'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_post_review_post_claim_endpoint_second_call_loses(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    """POST /review-post-claim: first call wins (claimed=True), a second
+    call for the same assignment_id loses (claimed=False) — the daemon-side
+    half of the #2468 duplicate-comment race fix."""
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r1 = cli.post("/review-post-claim", json={"assignment_id": "rev-abc"})
+        r2 = cli.post("/review-post-claim", json={"assignment_id": "rev-abc"})
+
+    assert r1.status_code == 200 and r1.json()["claimed"] is True
+    assert r2.status_code == 200 and r2.json()["claimed"] is False
+
+
+def test_post_review_post_claim_endpoint_missing_field_returns_400(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/review-post-claim", json={})
+    assert resp.status_code == 400
+
+
+def test_post_review_post_claim_release_endpoint_allows_reclaim(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    """POST /review-post-claim-release frees a claim so a later
+    /review-post-claim for the same assignment_id wins again."""
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        first = cli.post("/review-post-claim", json={"assignment_id": "rev-def"})
+        assert first.json()["claimed"] is True
+
+        released = cli.post(
+            "/review-post-claim-release", json={"assignment_id": "rev-def"}
+        )
+        assert released.status_code == 200
+
+        reclaimed = cli.post("/review-post-claim", json={"assignment_id": "rev-def"})
+    assert reclaimed.json()["claimed"] is True
+
+
+def test_post_review_post_claim_release_endpoint_missing_field_returns_400(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/review-post-claim-release", json={})
+    assert resp.status_code == 400
+
+
 # ── request-changes persists correctly ───────────────────────────────────────
 
 
@@ -682,6 +795,13 @@ def test_post_orphaned_finds_and_posts_from_daemon_board(
 
     def fake_post_record(svc, path, payload, **kw):
         daemon_calls.append((path, payload))
+        # #2468: /review-post-claim must report `claimed: True` for the
+        # single candidate this test's board payload exposes, or
+        # `post_orphaned_review_findings` reads the no-"claimed"-key default
+        # as "lost the race" and skips posting entirely — there is no other
+        # caller racing it here.
+        if path == "/review-post-claim":
+            return {"ok": True, "claimed": True}
         return {"ok": True}
 
     monkeypatch.setattr(cc, "post_record", fake_post_record)
