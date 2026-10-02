@@ -1,13 +1,13 @@
 """Tests for coord/win_native_bridge.py — the WSL -> real-Windows bridge for
-the `win-native` acceptance driver (#3515, review iteration 1: Change item
-#4 — "make win-native on dell64 install and run without hand steps").
+the `win-native` acceptance driver (#3515, #3519: making it actually run on
+a real WSL host).
 
 Every real Windows-side interaction (`python.exe`/`py.exe`/`powershell.exe`/
 `wslpath` subprocess calls) is driven through an injected `run` fake rather
 than a real WSL+Windows pairing — the same seam
 `tests/test_win_native_driver.py` uses a scripted `WinCalls` fake for, and
 the only way to exercise this module's logic at all on a Linux CI box with
-no real Windows interop available.
+no real WSL/Windows interop available.
 """
 
 from __future__ import annotations
@@ -19,12 +19,15 @@ import pytest
 
 from coord.win_native_bridge import (
     DEFAULT_PACKAGE_SPEC,
+    POWERSHELL_EXE,
+    WINDOWS_PYTHON_OVERRIDE_ENV,
     WinNativeBridgeError,
     ensure_windows_win_native_venv,
     find_windows_python,
     is_wsl_host,
     run_native_spec_via_bridge,
     translate_to_windows_path,
+    windows_path_to_wsl_path,
     windows_venv_python,
     _main,
 )
@@ -34,9 +37,23 @@ def _proc(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _to_wsl(windows_path: str) -> str:
+    """Mirrors `wslpath -u`'s own translation closely enough for a fake:
+    `C:\\foo\\bar` -> `/mnt/c/foo/bar`."""
+    drive, rest = windows_path.split(":", 1)
+    return f"/mnt/{drive.lower()}" + rest.replace("\\", "/")
+
+
+def _wslpath_u_handler(argv, **kw):
+    """A `("wslpath", "-u")` handler every fake below can reuse — computes
+    the translation from whatever path it's actually asked to translate,
+    rather than hardcoding one expected call."""
+    return _proc(stdout=_to_wsl(argv[2]) + "\n")
+
+
 class _FakeRun:
     """Records every call and dispatches to a per-call-shape handler keyed
-    off the invoked argv's first element — close enough to a real shell
+    off the invoked argv's first elements — close enough to a real shell
     without actually spawning anything, mirroring
     `tests/test_win_native_driver.py`'s scripted-fake convention."""
 
@@ -77,32 +94,124 @@ class TestIsWslHost:
         assert not is_wsl_host(environ={}, version_path=tmp_path / "does-not-exist")
 
 
+# ── windows_path_to_wsl_path ─────────────────────────────────────────────────
+
+
+class TestWindowsPathToWslPath:
+    def test_translates_windows_style_path_via_wslpath(self) -> None:
+        run = _FakeRun({("wslpath", "-u"): _wslpath_u_handler})
+        assert windows_path_to_wsl_path("C:\\ProgramData\\foo\\python.exe", run=run) == (
+            "/mnt/c/ProgramData/foo/python.exe"
+        )
+
+    def test_already_wsl_form_path_returned_unchanged_no_run_call(self) -> None:
+        def _boom(argv, **kw):
+            raise AssertionError("should not call wslpath for an already-WSL path")
+
+        assert windows_path_to_wsl_path("/mnt/c/Python312/python.exe", run=_boom) == (
+            "/mnt/c/Python312/python.exe"
+        )
+
+    def test_raises_on_nonzero_exit(self) -> None:
+        run = _FakeRun({
+            ("wslpath", "-u"): lambda argv, **kw: _proc(returncode=1, stderr="bad path"),
+        })
+        with pytest.raises(WinNativeBridgeError, match="wslpath"):
+            windows_path_to_wsl_path("C:\\no\\such\\path", run=run)
+
+    def test_raises_when_wslpath_missing(self) -> None:
+        def _run(argv, **kw):
+            raise FileNotFoundError("no wslpath")
+
+        with pytest.raises(WinNativeBridgeError, match="failed to run"):
+            windows_path_to_wsl_path("C:\\foo\\python.exe", run=_run)
+
+
 # ── find_windows_python ──────────────────────────────────────────────────────
 
 
 class TestFindWindowsPython:
-    def test_falls_back_to_powershell_when_which_finds_nothing(self, monkeypatch) -> None:
-        monkeypatch.setattr("coord.win_native_bridge.shutil.which", lambda _c: None)
-        run = _FakeRun({
-            ("powershell.exe",): lambda argv, **kw: _proc(stdout="C:\\Python312\\python.exe\n"),
-        })
-        assert find_windows_python(run=run) == "C:\\Python312\\python.exe"
-
     def test_prefers_which_over_powershell(self, monkeypatch) -> None:
         monkeypatch.setattr(
             "coord.win_native_bridge.shutil.which",
             lambda c: "/mnt/c/Python312/python.exe" if c == "python.exe" else None,
         )
 
-        def _boom(argv, **kw):
+        def _ps_boom(argv, **kw):
             raise AssertionError("should not fall back to powershell")
 
-        assert find_windows_python(run=_boom) == "/mnt/c/Python312/python.exe"
+        run = _FakeRun({
+            ("/mnt/c/Python312/python.exe", "--version"): lambda argv, **kw: _proc(
+                stdout="Python 3.12.1\n"
+            ),
+            (POWERSHELL_EXE,): _ps_boom,
+        })
+        assert find_windows_python(run=run, glob_fn=lambda _p: []) == (
+            "/mnt/c/Python312/python.exe"
+        )
+
+    def test_falls_back_to_powershell_called_by_full_path(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.win_native_bridge.shutil.which", lambda _c: None)
+        run = _FakeRun({
+            (POWERSHELL_EXE,): lambda argv, **kw: _proc(stdout="C:\\Python312\\python.exe\n"),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            ("/mnt/c/Python312/python.exe", "--version"): lambda argv, **kw: _proc(
+                stdout="Python 3.12.1\n"
+            ),
+        })
+        assert find_windows_python(run=run, glob_fn=lambda _p: []) == (
+            "C:\\Python312\\python.exe"
+        )
+
+    def test_rejects_microsoft_store_stub(self, monkeypatch) -> None:
+        """`Get-Command python` resolving to the WindowsApps App Execution
+        Alias stub must not be trusted — it only prints an install nag and
+        never a real version (#3519)."""
+        monkeypatch.setattr("coord.win_native_bridge.shutil.which", lambda _c: None)
+        stub = "C:\\Users\\johnf\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe"
+        real = "/mnt/c/Users/johnf/AppData/Local/Programs/Python/Python312/python.exe"
+        run = _FakeRun({
+            (POWERSHELL_EXE,): lambda argv, **kw: _proc(stdout=f"{stub}\n"),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (_to_wsl(stub), "--version"): lambda argv, **kw: _proc(
+                returncode=0,
+                stdout=(
+                    "Python was not found; run without arguments to install "
+                    "from the Microsoft Store, or disable this shortcut from "
+                    "Settings > Manage App Execution Aliases.\n"
+                ),
+            ),
+            (real, "--version"): lambda argv, **kw: _proc(stdout="Python 3.12.10\n"),
+        })
+        assert find_windows_python(run=run, glob_fn=lambda pattern: [real]) == real
+
+    def test_discovers_standard_per_user_install_not_on_path(self, monkeypatch) -> None:
+        """A real per-user python.org install that was never put on `PATH`
+        (dell64's actual #3519 case) must still be found via the standard
+        install-location globs."""
+        monkeypatch.setattr("coord.win_native_bridge.shutil.which", lambda _c: None)
+        per_user_install = (
+            "/mnt/c/Users/johnf/AppData/Local/Programs/Python/Python312/python.exe"
+        )
+        seen_patterns: list[str] = []
+
+        def _glob_fn(pattern: str) -> list[str]:
+            seen_patterns.append(pattern)
+            return [per_user_install] if "Python3*" in pattern and "Users" in pattern else []
+
+        run = _FakeRun({
+            (POWERSHELL_EXE,): lambda argv, **kw: _proc(stdout=""),
+            (per_user_install, "--version"): lambda argv, **kw: _proc(
+                stdout="Python 3.12.10\n"
+            ),
+        })
+        assert find_windows_python(run=run, glob_fn=_glob_fn) == per_user_install
+        assert seen_patterns  # the standard-location globs were actually consulted
 
     def test_none_when_nothing_resolves(self, monkeypatch) -> None:
         monkeypatch.setattr("coord.win_native_bridge.shutil.which", lambda _c: None)
-        run = _FakeRun({("powershell.exe",): lambda argv, **kw: _proc(stdout="")})
-        assert find_windows_python(run=run) is None
+        run = _FakeRun({(POWERSHELL_EXE,): lambda argv, **kw: _proc(stdout="")})
+        assert find_windows_python(run=run, glob_fn=lambda _p: []) is None
 
     def test_none_when_powershell_itself_is_unreachable(self, monkeypatch) -> None:
         monkeypatch.setattr("coord.win_native_bridge.shutil.which", lambda _c: None)
@@ -110,7 +219,21 @@ class TestFindWindowsPython:
         def _run(argv, **kw):
             raise FileNotFoundError("no powershell.exe")
 
-        assert find_windows_python(run=_run) is None
+        assert find_windows_python(run=_run, glob_fn=lambda _p: []) is None
+
+    def test_explicit_override_short_circuits_discovery(self) -> None:
+        def _boom(argv, **kw):
+            raise AssertionError("override must skip discovery entirely")
+
+        def _glob_boom(_pattern):
+            raise AssertionError("override must skip discovery entirely")
+
+        result = find_windows_python(
+            run=_boom,
+            glob_fn=_glob_boom,
+            environ={WINDOWS_PYTHON_OVERRIDE_ENV: "/mnt/c/custom/python.exe"},
+        )
+        assert result == "/mnt/c/custom/python.exe"
 
 
 # ── windows_venv_python ──────────────────────────────────────────────────────
@@ -131,15 +254,22 @@ class TestEnsureWindowsWinNativeVenv:
         pip install — re-running this on every agent update/fleet roll must
         be cheap, not a repeated multi-minute provisioning step."""
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
         run = _FakeRun({
-            (venv_python, "-c"): lambda argv, **kw: _proc(returncode=0),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(returncode=0),
         })
         result = ensure_windows_win_native_venv(run=run, venv_dir="C:\\coord-win-native-venv")
         assert result == venv_python
-        assert len(run.calls) == 1  # only the probe, no venv/pip calls
+        # argv[0] handed to `run` for the actual exec is WSL-form...
+        assert run.calls[-1][0][0] == wsl_venv_python
+        assert len(run.calls) == 2  # the wslpath translate + the probe itself, no venv/pip calls
 
     def test_bootstraps_from_scratch_when_missing(self) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
+        python_exe = "C:\\Python312\\python.exe"
+        wsl_python_exe = _to_wsl(python_exe)
         calls_seen = []
 
         def _probe(argv, **kw):
@@ -155,56 +285,69 @@ class TestEnsureWindowsWinNativeVenv:
             return _proc(returncode=0)
 
         run = _FakeRun({
-            (venv_python, "-c"): _probe,
-            ("C:\\Python312\\python.exe", "-m", "venv"): _venv_create,
-            (venv_python, "-m", "pip"): _pip_install,
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): _probe,
+            (wsl_python_exe, "-m", "venv"): _venv_create,
+            (wsl_venv_python, "-m", "pip"): _pip_install,
         })
         result = ensure_windows_win_native_venv(
-            python_exe="C:\\Python312\\python.exe",
-            run=run, venv_dir="C:\\coord-win-native-venv",
+            python_exe=python_exe, run=run, venv_dir="C:\\coord-win-native-venv",
         )
         assert result == venv_python
-        assert calls_seen[1][:3] == ["C:\\Python312\\python.exe", "-m", "venv"]
-        assert calls_seen[2][:3] == [venv_python, "-m", "pip"]
+        # executables are WSL-form...
+        assert calls_seen[1][:3] == [wsl_python_exe, "-m", "venv"]
+        assert calls_seen[2][:3] == [wsl_venv_python, "-m", "pip"]
+        # ...but the venv_dir *argument* handed to that Windows process stays
+        # Windows-form, since that's what the Windows-side python needs (#3519).
+        assert calls_seen[1][3] == "C:\\coord-win-native-venv"
         assert DEFAULT_PACKAGE_SPEC in calls_seen[2]
 
     def test_raises_when_no_windows_python_found(self, monkeypatch) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
         monkeypatch.setattr("coord.win_native_bridge.shutil.which", lambda _c: None)
+        monkeypatch.setattr("coord.win_native_bridge.glob.glob", lambda _p: [])
         run = _FakeRun({
-            (venv_python, "-c"): lambda argv, **kw: _proc(returncode=1),
-            ("powershell.exe",): lambda argv, **kw: _proc(stdout=""),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(returncode=1),
+            (POWERSHELL_EXE,): lambda argv, **kw: _proc(stdout=""),
         })
         with pytest.raises(WinNativeBridgeError, match="no Windows-side Python found"):
             ensure_windows_win_native_venv(run=run, venv_dir="C:\\coord-win-native-venv")
 
     def test_raises_when_venv_creation_fails(self) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
+        python_exe = "C:\\Python312\\python.exe"
+        wsl_python_exe = _to_wsl(python_exe)
         run = _FakeRun({
-            (venv_python, "-c"): lambda argv, **kw: _proc(returncode=1),
-            ("C:\\Python312\\python.exe", "-m", "venv"): lambda argv, **kw: _proc(
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(returncode=1),
+            (wsl_python_exe, "-m", "venv"): lambda argv, **kw: _proc(
                 returncode=1, stderr="access denied"
             ),
         })
         with pytest.raises(WinNativeBridgeError, match="venv"):
             ensure_windows_win_native_venv(
-                python_exe="C:\\Python312\\python.exe",
-                run=run, venv_dir="C:\\coord-win-native-venv",
+                python_exe=python_exe, run=run, venv_dir="C:\\coord-win-native-venv",
             )
 
     def test_raises_when_pip_install_fails(self) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
+        python_exe = "C:\\Python312\\python.exe"
+        wsl_python_exe = _to_wsl(python_exe)
         run = _FakeRun({
-            (venv_python, "-c"): lambda argv, **kw: _proc(returncode=1),
-            ("C:\\Python312\\python.exe", "-m", "venv"): lambda argv, **kw: _proc(returncode=0),
-            (venv_python, "-m", "pip"): lambda argv, **kw: _proc(
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(returncode=1),
+            (wsl_python_exe, "-m", "venv"): lambda argv, **kw: _proc(returncode=0),
+            (wsl_venv_python, "-m", "pip"): lambda argv, **kw: _proc(
                 returncode=1, stderr="no matching distribution"
             ),
         })
         with pytest.raises(WinNativeBridgeError, match="pip install"):
             ensure_windows_win_native_venv(
-                python_exe="C:\\Python312\\python.exe",
-                run=run, venv_dir="C:\\coord-win-native-venv",
+                python_exe=python_exe, run=run, venv_dir="C:\\coord-win-native-venv",
             )
 
 
@@ -243,6 +386,7 @@ class TestTranslateToWindowsPath:
 class TestRunNativeSpecViaBridge:
     def test_runs_bridge_and_parses_tests(self) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
 
         def _bridge(argv, **kw):
             request = json.loads(kw["input"])
@@ -253,7 +397,8 @@ class TestRunNativeSpecViaBridge:
             }))
 
         run = _FakeRun({
-            (venv_python, "-c"): _bridge,
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): _bridge,
             ("wslpath", "-w"): lambda argv, **kw: _proc(
                 stdout="\\\\wsl.localhost\\Ubuntu\\repo\n"
             ),
@@ -263,12 +408,17 @@ class TestRunNativeSpecViaBridge:
             venv_python=venv_python, run=run,
         )
         assert tests == [{"id": "launch", "status": "pass", "message": ""}]
+        # the executable actually exec'd is the WSL-form path, never the
+        # Windows-form one the caller holds (#3519).
+        assert run.calls[-1][0][0] == wsl_venv_python
 
     def test_bootstraps_when_no_venv_python_given(self) -> None:
         venv_python = windows_venv_python("C:\\ProgramData\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
         run = _FakeRun({
-            (venv_python, "-c", "import comtypes"): lambda argv, **kw: _proc(returncode=0),
-            (venv_python, "-c"): lambda argv, **kw: _proc(stdout=json.dumps({"tests": []})),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c", "import comtypes"): lambda argv, **kw: _proc(returncode=0),
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(stdout=json.dumps({"tests": []})),
             ("wslpath", "-w"): lambda argv, **kw: _proc(stdout="C:\\repo\n"),
         })
         tests = run_native_spec_via_bridge(
@@ -278,8 +428,10 @@ class TestRunNativeSpecViaBridge:
 
     def test_raises_on_nonzero_bridge_exit(self) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
         run = _FakeRun({
-            (venv_python, "-c"): lambda argv, **kw: _proc(returncode=1, stderr="traceback"),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(returncode=1, stderr="traceback"),
             ("wslpath", "-w"): lambda argv, **kw: _proc(stdout="C:\\repo\n"),
         })
         with pytest.raises(WinNativeBridgeError, match="exited 1"):
@@ -290,8 +442,10 @@ class TestRunNativeSpecViaBridge:
 
     def test_raises_on_unparsable_output(self) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
         run = _FakeRun({
-            (venv_python, "-c"): lambda argv, **kw: _proc(stdout="not json"),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(stdout="not json"),
             ("wslpath", "-w"): lambda argv, **kw: _proc(stdout="C:\\repo\n"),
         })
         with pytest.raises(WinNativeBridgeError, match="unparsable"):
@@ -302,8 +456,10 @@ class TestRunNativeSpecViaBridge:
 
     def test_raises_when_response_missing_tests_list(self) -> None:
         venv_python = windows_venv_python("C:\\coord-win-native-venv")
+        wsl_venv_python = _to_wsl(venv_python)
         run = _FakeRun({
-            (venv_python, "-c"): lambda argv, **kw: _proc(stdout=json.dumps({"ok": True})),
+            ("wslpath", "-u"): _wslpath_u_handler,
+            (wsl_venv_python, "-c"): lambda argv, **kw: _proc(stdout=json.dumps({"ok": True})),
             ("wslpath", "-w"): lambda argv, **kw: _proc(stdout="C:\\repo\n"),
         })
         with pytest.raises(WinNativeBridgeError, match="tests"):
