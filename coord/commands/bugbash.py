@@ -45,10 +45,30 @@ machines from an unattended worker session. A real two-lane
 ``coord bugbash vimcode --dry-run`` transcript against the live fleet is
 still outstanding and must be captured by an operator (or a session with
 real fleet access) before this lands; it is NOT attached to this PR.
+
+**#3569 closed the gap this module used to carry here too:** a fixed
+1800s lane timeout gave up on a still-productive explorer, never
+cancelled it (it kept running and spending money unattended), and
+discarded its eventual findings outright — the concrete 2026-10-03
+instance lost (and had to be manually recovered from the raw log into)
+three real vimcode findings this way. ``coord bugbash`` is now a
+:class:`_BugbashGroup` with two subcommands: ``run`` (the original
+behaviour, still reachable as a bare ``coord bugbash REPO ...``
+invocation via this group's ``parse_args`` splice) and ``harvest`` (new).
+``run``'s ``--lane-timeout`` (raised default, still overridable) is now a
+STALL window, not a hard cap — :func:`_dispatch_and_await_lane` keeps
+polling past it as long as the explorer's transcript keeps growing and
+its cost stays under ``--cost-cap-per-lane`` (the real budget control),
+only cancelling (:func:`coord.network.cancel_assignment`) once it
+genuinely stalls or crosses that cap — and if the cancel itself races a
+just-finished explorer or fails outright, ``coord bugbash harvest``
+recovers the result afterwards through the identical dedupe/file/queue
+path (:func:`coord.bugbash.harvest_outcome`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import uuid
 from pathlib import Path
@@ -65,6 +85,7 @@ from coord.bugbash import (
     build_exploration_briefing,
     discover_lanes,
     finding_target_repo,
+    harvest_outcome,
     parse_findings_block,
     parse_unavailable_report,
     run_bugbash,
@@ -78,97 +99,61 @@ DEFAULT_COST_CAP_PER_LANE = 20.0
 DEFAULT_COST_CAP_TOTAL = 60.0
 DEFAULT_CONFIRM_ROUNDS = 1
 DEFAULT_POLL_INTERVAL = 15.0
-DEFAULT_LANE_TIMEOUT = 1800.0
+#: #3569: a thorough exploration routinely runs past 30 minutes (the real
+#: vimcode tui-pty lane that motivated this fix ran 168 turns / $6.08 well
+#: past its old 1800s cap) -- raised to 2.5h. This is no longer a hard
+#: wall-clock cap on the whole exploration: `_dispatch_and_await_lane` below
+#: treats it as a STALL window ("no new transcript output for this long") and
+#: keeps waiting past it as long as the explorer is still producing output
+#: and hasn't exceeded its lane's own `--cost-cap-per-lane`, which is the
+#: real budget control the issue asked for.
+DEFAULT_LANE_TIMEOUT = 9000.0
 
 
-def _dispatch_and_await_lane(
-    lane: BugbashLane,
-    round_num: int,
-    *,
-    repo_name: str,
-    config,
-    reference_backend: str,
-    checklist=EXPLORATION_CHECKLIST,
-    poll_interval: float = DEFAULT_POLL_INTERVAL,
-    timeout: float = DEFAULT_LANE_TIMEOUT,
-) -> ExploreOutcome:
-    """Production :data:`coord.bugbash.Explorer`: dispatch a headless
-    exploration worker to *lane*'s machine, wait (bounded by *timeout*) for
-    it to finish, and parse its findings out of the transcript.
-
-    Never raises on a dispatch/poll/log failure — every such path returns
-    ``ok=False`` with the reason folded into ``notes`` (#2096: this must
-    never be mistaken for "zero findings observed"; :func:`coord.bugbash
-    .run_bugbash` treats an all-``ok=False`` round as its own
-    ``"lane_failure"`` termination reason, never as a clean pass). Only a
-    lane that was actually verified to finish — dispatched, polled to a
-    ``"completed"`` status with exit code 0, and had its log fetched —
-    returns ``ok=True``.
-
-    "Has this assignment reached a terminal state" is answered by the ONE
-    shared poller this codebase already settled on
-    (:func:`coord.commands._common.poll_until_terminal`, #2743) rather than
-    a second, independently-drifting implementation — it is what tells
-    apart a genuinely vanished assignment (``"not_found"``) from one still
-    running past *timeout* (``"timeout"``), which a bespoke ``/status``
-    loop here would otherwise have to re-derive (and could re-derive
-    wrong)."""
-    from coord.commands._common import poll_until_terminal
-    from coord.dispatch import dispatch_with_retry
-    from coord.models import Proposal
-    from coord.network import claude_credential_reachable
-
-    machine = next((m for m in config.machines if m.name == lane.machine), None)
-    if machine is None:
-        return ExploreOutcome(ok=False, notes=f"machine {lane.machine!r} not in coordinator.yml")
-
-    briefing = build_exploration_briefing(
-        lane, reference_backend=reference_backend, checklist=checklist,
-    )
-    proposal = Proposal(
-        id=0,
-        machine_name=machine.name,
-        repo_name=repo_name,
-        issue_number=0,
-        issue_title=f"(bugbash {lane.platform} round {round_num})",
-        rationale="bugbash-explore",
-        briefing=briefing,
-        model=config.models.default,
-        type="bugbash-explore",
-        required_gates=[],
-    )
+def _peek_log_text(machine, assignment_id: str) -> str | None:
+    """Best-effort fetch of *assignment_id*'s current transcript from
+    *machine*, for #3569's stall check — ``None`` on any HTTP failure (a
+    transient fetch error must read as "couldn't tell if it progressed",
+    never as "it definitely didn't"). Deliberately separate from the
+    FINAL log fetch below (:func:`_fetch_and_parse_outcome`): this is a
+    cheap mid-flight peek, not a parse."""
     try:
-        response = dispatch_with_retry(
-            proposal, config,
-            max_retries=config.concurrency.max_retries,
-            backoff_base=config.concurrency.backoff_base,
-            credential_fetcher=claude_credential_reachable,
+        resp = httpx.get(
+            f"http://{machine.host}:{AGENT_PORT}/logs/{assignment_id}", timeout=30.0,
         )
-    except Exception as e:  # noqa: BLE001 — a lane failing to dispatch is an unverified round, not a crash of the whole bugbash run
-        return ExploreOutcome(ok=False, notes=f"dispatch failed: {e}")
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    return resp.text
 
-    assignment_id = response.get("id") or uuid.uuid4().hex[:12]
 
-    outcome = poll_until_terminal(
-        assignment_id, machine, timeout=int(timeout), interval=int(poll_interval),
-    )
-    if outcome.status == "not_found":
-        return ExploreOutcome(
-            ok=False,
-            notes=f"assignment {assignment_id} not found on {machine.name} "
-            "(not active or completed)",
-        )
-    if outcome.status == "timeout":
-        return ExploreOutcome(ok=False, notes=f"timed out after {timeout:.0f}s waiting on {assignment_id}")
+def _cost_so_far(log_text: str) -> float:
+    """The real cumulative ``total_cost_usd`` parseable out of *log_text* so
+    far (#3569's stall loop uses this to respect ``--cost-cap-per-lane``
+    even while an explorer is still running) — the SAME accumulator
+    (:func:`coord.worker_events.update_summary`) :func:`_fetch_and_parse_outcome`
+    and ``coord log``/``parse_log`` all use, never a second, independently
+    -drifting cost readout. ``0.0`` (not a flat placeholder) when no
+    ``result`` event has landed yet."""
+    from coord.worker_events import WorkerSummary, iter_events_from_text, update_summary
 
-    exit_code = outcome.exit_code if outcome.exit_code is not None else -1
-    if exit_code != 0:
-        return ExploreOutcome(
-            ok=False,
-            notes=f"assignment {assignment_id} FAILED (exit {exit_code})"
-            + (f": {outcome.error}" if outcome.error else ""),
-        )
+    summary = WorkerSummary()
+    for event in iter_events_from_text(log_text):
+        update_summary(summary, event)
+    return summary.total_cost_usd
 
+
+def _fetch_and_parse_outcome(machine, assignment_id: str, *, platform: str, repo: str) -> ExploreOutcome:
+    """Fetch *assignment_id*'s FINAL transcript from *machine* and turn it
+    into an :class:`ExploreOutcome` — the shared "parse a finished
+    assignment's log" step both :func:`_dispatch_and_await_lane` (the
+    inline poll-to-completion path) and ``coord bugbash harvest`` (#3569,
+    :func:`_harvest_assignment` below) use, so a late-arriving explorer
+    picked up after the fact is parsed by EXACTLY the same rules as one
+    observed inline (#2096 "one question, one answer"). Assumes the caller
+    has already verified the assignment reached a terminal state with exit
+    code 0 — this function only fetches and parses, it does not poll.
+    """
     try:
         log_resp = httpx.get(
             f"http://{machine.host}:{AGENT_PORT}/logs/{assignment_id}", timeout=30.0,
@@ -221,7 +206,7 @@ def _dispatch_and_await_lane(
             unavailable=True, cost=summary.total_cost_usd, notes=unavailable_reason,
         )
 
-    parsed = parse_findings_block(last_assistant_text, platform=lane.platform, repo=repo_name)
+    parsed = parse_findings_block(last_assistant_text, platform=platform, repo=repo)
     if parsed.protocol_error:
         # #3517: the worker completed, but its report can't be trusted as a
         # findings block at all — this must come back DISTINCT from
@@ -233,6 +218,216 @@ def _dispatch_and_await_lane(
             protocol_error=parsed.protocol_error,
         )
     return ExploreOutcome(findings=parsed.findings, cost=summary.total_cost_usd, notes="status=completed")
+
+
+def _dispatch_and_await_lane(
+    lane: BugbashLane,
+    round_num: int,
+    *,
+    repo_name: str,
+    config,
+    reference_backend: str,
+    checklist=EXPLORATION_CHECKLIST,
+    poll_interval: float = DEFAULT_POLL_INTERVAL,
+    timeout: float = DEFAULT_LANE_TIMEOUT,
+    cost_cap: float = float("inf"),
+) -> ExploreOutcome:
+    """Production :data:`coord.bugbash.Explorer`: dispatch a headless
+    exploration worker to *lane*'s machine and wait for it to finish, then
+    parse its findings out of the transcript.
+
+    Never raises on a dispatch/poll/log failure — every such path returns
+    ``ok=False`` with the reason folded into ``notes`` (#2096: this must
+    never be mistaken for "zero findings observed"; :func:`coord.bugbash
+    .run_bugbash` treats an all-``ok=False`` round as its own
+    ``"lane_failure"`` termination reason, never as a clean pass). Only a
+    lane that was actually verified to finish — dispatched, polled to a
+    ``"completed"`` status with exit code 0, and had its log fetched —
+    returns ``ok=True``.
+
+    "Has this assignment reached a terminal state" is answered by the ONE
+    shared poller this codebase already settled on
+    (:func:`coord.commands._common.poll_until_terminal`, #2743) rather than
+    a second, independently-drifting implementation.
+
+    **#3569: *timeout* is a STALL window, not a hard wall-clock cap.** A
+    thorough exploration (the real tui-pty run that motivated this fix ran
+    168 turns / $6.08, well past the old fixed 30-minute cap) legitimately
+    takes longer than any one fixed deadline. So instead of giving up the
+    instant *timeout* elapses, this polls in *timeout*-sized windows and, on
+    each window that doesn't reach a terminal state, peeks the explorer's
+    own transcript (:func:`_peek_log_text`): if it grew since the last
+    check AND its cumulative cost (:func:`_cost_so_far`) is still under
+    *cost_cap* (the lane's own ``--cost-cap-per-lane``, the real budget
+    control), that's real progress, not a stall — wait another window.
+    Only when a FULL window produces no new output, or the cost cap is
+    actually hit, does this give up — and even then it never just walks
+    away: it tries to cancel the explorer (:func:`coord.network
+    .cancel_assignment`, the same seam ``coord stop`` uses) so a stalled
+    lane is never left running unattended. Three distinct outcomes from
+    there, each reported in ``notes`` so the CLI's "lane FAILED" line says
+    exactly which happened (#3569 ask #4):
+
+    - the cancel succeeds — the explorer is confirmed stopped;
+    - the cancel reports the assignment had ALREADY reached a terminal
+      state (a race between the last poll and the cancel call) — its result
+      is fetched and parsed right here, in place, rather than thrown away;
+    - the cancel itself fails (agent unreachable, etc.) — the explorer may
+      still be running, and the notes point at ``coord bugbash harvest`` to
+      recover it later once it does finish.
+    """
+    from coord.commands._common import poll_until_terminal
+    from coord.dispatch import dispatch_with_retry
+    from coord.models import Proposal
+    from coord.network import cancel_assignment, claude_credential_reachable
+
+    machine = next((m for m in config.machines if m.name == lane.machine), None)
+    if machine is None:
+        return ExploreOutcome(ok=False, notes=f"machine {lane.machine!r} not in coordinator.yml")
+
+    briefing = build_exploration_briefing(
+        lane, reference_backend=reference_backend, checklist=checklist,
+    )
+    proposal = Proposal(
+        id=0,
+        machine_name=machine.name,
+        repo_name=repo_name,
+        issue_number=0,
+        issue_title=f"(bugbash {lane.platform} round {round_num})",
+        rationale="bugbash-explore",
+        briefing=briefing,
+        model=config.models.default,
+        type="bugbash-explore",
+        required_gates=[],
+    )
+    try:
+        response = dispatch_with_retry(
+            proposal, config,
+            max_retries=config.concurrency.max_retries,
+            backoff_base=config.concurrency.backoff_base,
+            credential_fetcher=claude_credential_reachable,
+        )
+    except Exception as e:  # noqa: BLE001 — a lane failing to dispatch is an unverified round, not a crash of the whole bugbash run
+        return ExploreOutcome(ok=False, notes=f"dispatch failed: {e}")
+
+    assignment_id = response.get("id") or uuid.uuid4().hex[:12]
+
+    # #3569: baseline the transcript length BEFORE the first stall window so
+    # the first timeout is judged against real growth, not a sentinel that
+    # would trivially always read as "progressed".
+    last_log_len = len(_peek_log_text(machine, assignment_id) or "")
+    stall_reason = ""
+    while True:
+        outcome = poll_until_terminal(
+            assignment_id, machine, timeout=int(timeout), interval=int(poll_interval),
+        )
+        if outcome.status != "timeout":
+            break
+        log_text = _peek_log_text(machine, assignment_id)
+        progressed = log_text is not None and len(log_text) != last_log_len
+        current_cost = _cost_so_far(log_text) if log_text is not None else 0.0
+        if progressed:
+            last_log_len = len(log_text)
+        if progressed and current_cost < cost_cap:
+            continue  # real progress, still under budget — keep waiting
+        stall_reason = (
+            "no new output" if not progressed
+            else f"cumulative cost {current_cost:.2f} reached per-lane cap {cost_cap:.2f}"
+        )
+        break
+
+    if outcome.status == "not_found":
+        return ExploreOutcome(
+            ok=False,
+            notes=f"assignment {assignment_id} not found on {machine.name} "
+            "(not active or completed)",
+        )
+    if outcome.status == "timeout":
+        # #3569: never leave the explorer running unattended — try to
+        # cancel it, and report what ACTUALLY happened post-cancel (#2096:
+        # this verdict comes from the cancel's own observed result, never
+        # from the mere act of sending the request).
+        cancel = cancel_assignment(machine, assignment_id)
+        base_notes = f"timed out after {timeout:.0f}s waiting on {assignment_id} ({stall_reason})"
+        if cancel.ok:
+            return ExploreOutcome(
+                ok=False, notes=f"{base_notes} — cancelled the explorer",
+            )
+        if cancel.status == "completed":
+            # Race: it actually finished between our last poll and the
+            # cancel call — harvest it right now instead of discarding a
+            # real result.
+            result = _fetch_and_parse_outcome(
+                machine, assignment_id, platform=lane.platform, repo=repo_name,
+            )
+            return dataclasses.replace(
+                result,
+                notes=f"{base_notes} but the explorer finished before cancel took "
+                f"effect — harvested inline. {result.notes}",
+            )
+        return ExploreOutcome(
+            ok=False,
+            notes=(
+                f"{base_notes} — could not cancel ({cancel.error}); the explorer may "
+                f"still be running on {machine.name}. Recover with `coord bugbash "
+                f"harvest {assignment_id} --repo {repo_name} --machine {machine.name} "
+                f"--lane {lane.platform}` once it finishes."
+            ),
+        )
+
+    exit_code = outcome.exit_code if outcome.exit_code is not None else -1
+    if exit_code != 0:
+        return ExploreOutcome(
+            ok=False,
+            notes=f"assignment {assignment_id} FAILED (exit {exit_code})"
+            + (f": {outcome.error}" if outcome.error else ""),
+        )
+
+    return _fetch_and_parse_outcome(machine, assignment_id, platform=lane.platform, repo=repo_name)
+
+
+def _harvest_assignment(
+    assignment_id: str, machine, *, platform: str, repo: str, poll_timeout: float = 5.0,
+) -> ExploreOutcome:
+    """Verify *assignment_id* has actually reached a terminal state on
+    *machine* right now, then parse its transcript — the #3569 recovery
+    path (``coord bugbash harvest``) for a lane explorer that
+    :func:`_dispatch_and_await_lane`'s dispatch loop stopped waiting on
+    (either because its cancel attempt failed, or because an operator
+    deliberately let it keep running past the lane's own stall window).
+
+    A short, single-shot :func:`coord.commands._common.poll_until_terminal`
+    check (*poll_timeout*, default 5s) — this answers "what IS its current
+    state right now", not a live wait, so an assignment that's genuinely
+    still running comes back ``ok=False`` with a clear "still running" note
+    rather than a misleading timeout (#2096: this verdict is a real,
+    just-taken observation, never inferred from the absence of an error).
+    """
+    from coord.commands._common import poll_until_terminal
+
+    outcome = poll_until_terminal(
+        assignment_id, machine, timeout=int(poll_timeout), interval=max(1, int(poll_timeout)),
+    )
+    if outcome.status == "not_found":
+        return ExploreOutcome(
+            ok=False,
+            notes=f"assignment {assignment_id} not found on {machine.name} "
+            "(not active or completed)",
+        )
+    if outcome.status == "timeout":
+        return ExploreOutcome(
+            ok=False,
+            notes=f"assignment {assignment_id} is still running on {machine.name} — "
+            "nothing to harvest yet; try again once it finishes",
+        )
+    exit_code = outcome.exit_code if outcome.exit_code is not None else -1
+    if exit_code != 0:
+        return ExploreOutcome(
+            ok=False,
+            notes=f"assignment {assignment_id} FAILED (exit {exit_code})"
+            + (f": {outcome.error}" if outcome.error else ""),
+        )
+    return _fetch_and_parse_outcome(machine, assignment_id, platform=platform, repo=repo)
 
 
 def _fetch_recently_closed_issues(slug: str, *, limit: int = 200) -> list[dict]:
@@ -254,6 +449,12 @@ def _fetch_recently_closed_issues(slug: str, *, limit: int = 200) -> list[dict]:
 
 
 def _print_round(report: BugbashReport) -> None:
+    """Render every round's findings/filings/failures — shared by
+    ``coord bugbash run``'s multi-round report and ``coord bugbash
+    harvest``'s single-round recovery (#3569), which wraps its one
+    :class:`RoundReport` in a one-round :class:`BugbashReport` so both
+    paths render through this exact same function rather than two
+    independently-drifting printers."""
     for r in report.rounds:
         click.echo(
             f"round {r.round_num}: {len(r.findings)} finding(s), "
@@ -292,8 +493,39 @@ def _print_round(report: BugbashReport) -> None:
                 click.echo(f"  would file ({f.verdict.value}){routed}: {f.preview_title}{incomplete}")
 
 
-@click.command(
+class _BugbashGroup(click.Group):
+    """``coord bugbash REPO ...`` keeps working exactly as a single command
+    (#3569 adds ``harvest`` as a real second subcommand alongside it, but
+    must not break the existing invocation). Click can't have a group
+    declare its own positional REPO argument AND dispatch named
+    subcommands from the same token — so instead this splices in the
+    implicit ``run`` subcommand name whenever the first token isn't a
+    flag or an already-registered subcommand name (i.e. it's a repo name,
+    not ``harvest``), before handing off to Click's normal group dispatch.
+    """
+
+    def parse_args(self, ctx, args):  # type: ignore[override]
+        if args and not args[0].startswith("-") and args[0] not in self.commands:
+            args = ["run", *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group(
     "bugbash",
+    cls=_BugbashGroup,
+    help=(
+        "#3487/#3569: `coord bugbash REPO ...` runs the per-platform find "
+        "-> dedupe -> file -> queue loop (see `coord bugbash run --help`). "
+        "`coord bugbash harvest ASSIGNMENT_ID ...` recovers a lane "
+        "explorer's findings after the run stopped waiting on it."
+    ),
+)
+def bugbash_cmd() -> None:
+    pass
+
+
+@bugbash_cmd.command(
+    "run",
     help=(
         "#3487: run the per-platform find -> dedupe -> file -> queue loop "
         "for REPO until a round finds nothing new, or a round/cost cap "
@@ -303,7 +535,13 @@ def _print_round(report: BugbashReport) -> None:
         "--dry-run lists what would be filed without calling `coord issue "
         "create` / `coord drive-queue add` at all. The first "
         "--confirm-rounds rounds of a REAL (non-dry-run) run still prompt "
-        "for confirmation before filing anything."
+        "for confirmation before filing anything.\n\n"
+        "#3569: --lane-timeout is a STALL window, not a hard wall-clock cap "
+        "-- a lane still producing new output and under --cost-cap-per-lane "
+        "keeps running past it. If a lane genuinely stalls, its explorer is "
+        "cancelled (never left running unattended); if cancelling races a "
+        "just-finished explorer, or fails outright, see `coord bugbash "
+        "harvest` to recover its result."
     ),
 )
 @click.argument("repo")
@@ -316,10 +554,16 @@ def _print_round(report: BugbashReport) -> None:
 @click.option("--cost-cap-per-lane", type=float, default=DEFAULT_COST_CAP_PER_LANE, show_default=True)
 @click.option("--cost-cap-total", type=float, default=DEFAULT_COST_CAP_TOTAL, show_default=True)
 @click.option("--confirm-rounds", type=int, default=DEFAULT_CONFIRM_ROUNDS, show_default=True)
+@click.option(
+    "--lane-timeout", type=float, default=DEFAULT_LANE_TIMEOUT, show_default=True,
+    help="Seconds with no new transcript output from a lane's explorer before treating it as "
+    "stalled and cancelling it (#3569) -- NOT a hard cap on the whole exploration; genuine "
+    "progress under --cost-cap-per-lane keeps extending the wait.",
+)
 @click.option("--dry-run", is_flag=True, help="List what would be filed; never calls `coord issue create` / `coord drive-queue add`.")
 @click.option("--yes", "-y", is_flag=True, help="Skip the interactive confirmation prompt on the first --confirm-rounds rounds.")
 @_CONFIG_OPTION
-def bugbash_cmd(
+def bugbash_run_cmd(
     repo: str,
     reference: str,
     lane_filter: tuple[str, ...],
@@ -327,6 +571,7 @@ def bugbash_cmd(
     cost_cap_per_lane: float,
     cost_cap_total: float,
     confirm_rounds: int,
+    lane_timeout: float,
     dry_run: bool,
     yes: bool,
     config_path: Path,
@@ -364,6 +609,7 @@ def bugbash_cmd(
     def explorer(lane: BugbashLane, round_num: int) -> ExploreOutcome:
         return _dispatch_and_await_lane(
             lane, round_num, repo_name=repo, config=cfg, reference_backend=reference,
+            timeout=lane_timeout, cost_cap=cost_cap_per_lane,
         )
 
     def confirm(round_num: int, candidates: list) -> bool:
@@ -431,3 +677,88 @@ def bugbash_cmd(
             "run's coverage as partial.",
             fg="yellow", err=True,
         )
+
+
+@bugbash_cmd.command(
+    "harvest",
+    help=(
+        "#3569: recover a lane explorer's findings after `coord bugbash "
+        "run` stopped waiting on it -- either its own --lane-timeout "
+        "stalled and the cancel attempt failed (so the explorer may still "
+        "be running), or an operator deliberately left it running. Fetches "
+        "ASSIGNMENT_ID's transcript from --machine, parses it exactly like "
+        "a live round would, and runs the SAME dedupe -> file -> queue "
+        "path (never a second, looser copy) -- never gated behind an "
+        "extra confirmation prompt, since running this command IS the "
+        "operator's deliberate confirmation.\n\n"
+        "If ASSIGNMENT_ID is still running, this reports that and files "
+        "nothing -- run it again once the explorer finishes."
+    ),
+)
+@click.argument("assignment_id")
+@click.option("--repo", required=True, help="App repo the explorer ran against.")
+@click.option("--machine", required=True, help="Machine name (coordinator.yml) the explorer ran on.")
+@click.option(
+    "--lane", "platform", required=True,
+    help="Lane platform tag (e.g. win-native) the explorer was dispatched for.",
+)
+@click.option("--dry-run", is_flag=True, help="Preview what would be filed; never calls `coord issue create` / `coord drive-queue add`.")
+@_CONFIG_OPTION
+def bugbash_harvest_cmd(
+    assignment_id: str,
+    repo: str,
+    machine: str,
+    platform: str,
+    dry_run: bool,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.echo(f"error: repo {repo!r} not in coordinator.yml", err=True)
+        sys.exit(2)
+    machine_cfg = next((m for m in cfg.machines if m.name == machine), None)
+    if machine_cfg is None:
+        click.echo(f"error: machine {machine!r} not in coordinator.yml", err=True)
+        sys.exit(2)
+
+    # Reuse the SAME lane discovery `coord bugbash run` uses (#2096 "one
+    # question, one answer") when it already names a capable lane for this
+    # platform; fall back to a lane built straight from --machine/--lane
+    # when discovery doesn't currently find one (e.g. a transient /health
+    # probe denial) rather than refusing to harvest a result that already
+    # exists on disk.
+    lanes = discover_lanes(cfg, repo, reference_backend=platform)
+    lane = next((l for l in lanes if l.platform == platform and l.machine == machine), None)
+    if lane is None:
+        lane = BugbashLane(platform=platform, driver_kind=platform, machine=machine, capability="")
+
+    outcome = _harvest_assignment(assignment_id, machine_cfg, platform=platform, repo=repo)
+    # A dispatch/poll/log failure (ok=False, NOT unavailable) means there is
+    # nothing trustworthy to harvest at all -- `harvest_outcome` would just
+    # bucket it as a lane failure with zero findings, which would read as
+    # "harvested, found nothing" rather than "could not even check" (#2096).
+    if not outcome.ok and not outcome.unavailable:
+        click.secho(f"error: {outcome.notes}", fg="red", err=True)
+        sys.exit(1)
+
+    round_report = harvest_outcome(
+        outcome, lane, repo=repo, runner=subprocess_coord_runner,
+        open_issues_fetcher=lambda r: github_ops.get_open_issues(cfg.repo(r).github),
+        closed_issues_fetcher=lambda r: _fetch_recently_closed_issues(cfg.repo(r).github),
+        dry_run=dry_run,
+    )
+    wrapped = BugbashReport(
+        repo=repo, rounds=[round_report], termination_reason="harvested",
+        total_cost=outcome.cost,
+    )
+    _print_round(wrapped)
+    click.echo(
+        f"done: harvested assignment {assignment_id!r}, filed={wrapped.total_filed}, "
+        f"total_cost={wrapped.total_cost:.2f}"
+    )
+    if dry_run:
+        click.echo(f"would file {len(wrapped.would_file)} issue(s) — nothing was created.")
+
+    if round_report.protocol_error_lanes or round_report.lane_failures:
+        sys.exit(1)
