@@ -100,6 +100,20 @@ class TestDedupeFinding:
         result = dedupe_finding(finding, open_issues=open_issues, closed_issues=[])
         assert result.verdict is DedupeVerdict.NEW
 
+    def test_short_title_matches_tagged_issue_despite_tag_word_dilution(self):
+        # #3546: a short real-world title ("Caption buttons unclickable", 3
+        # words) scored only 0.5 Jaccard similarity against the tagged issue
+        # title BEFORE the tag's own 3 extra tokens ("bugbash", "win",
+        # "native") were stripped for comparison — below the 0.6 threshold,
+        # so the exact same bug reported twice was never recognised as a
+        # duplicate. This is the "titles differing enough to defeat
+        # matching" root cause behind vimcode#1656/#1660 being filed twice.
+        finding = _finding(title="Caption buttons unclickable", platform="win-native")
+        open_issues = [{"number": 1656, "title": "[bugbash:win-native] Caption buttons unclickable"}]
+        result = dedupe_finding(finding, open_issues=open_issues, closed_issues=[])
+        assert result.verdict is DedupeVerdict.DUPLICATE
+        assert result.matched_number == 1656
+
     def test_untagged_open_issue_matches_regardless_of_platform(self):
         # A hand-filed issue carries no [bugbash:<platform>] tag — still
         # eligible to match on title alone.
@@ -362,6 +376,36 @@ class TestFileFinding:
         assert result.queued is False
         assert result.preview_title is not None
         assert runner.calls == []
+
+    def test_suspected_repo_routes_filing_to_a_different_repo(self):
+        # #3546: three findings whose fault was in coord's own win-native
+        # driver / WSL bridge were filed into vimcode anyway, where no
+        # worker could fix them. `suspected_repo` must route BOTH
+        # `coord issue create` and `coord drive-queue add` to the repo at
+        # fault, not unconditionally to the app repo the lane ran against.
+        finding = _finding(
+            title="win-native launch() leaks the shell's PID",
+            repo="vimcode", suspected_repo="claude-coordinator",
+        )
+        dedupe = dedupe_finding(finding, [], [])
+        runner = FakeRunner(next_issue_number=3542)
+        result = file_finding(finding, dedupe, _lane(), runner, dry_run=False)
+
+        assert result.filed is True
+        assert result.issue_number == 3542
+        assert runner.calls[0][:3] == ["issue", "create", "claude-coordinator"]
+        assert runner.calls[1] == [
+            "drive-queue", "add", "claude-coordinator", "3542", "--machine", "pc1",
+        ]
+
+    def test_suspected_repo_defaults_to_the_app_repo(self):
+        # No suspected_repo override (the common case) still files into the
+        # app repo the lane actually ran against.
+        finding = _finding(repo="vimcode", suspected_repo="vimcode")
+        dedupe = dedupe_finding(finding, [], [])
+        runner = FakeRunner(next_issue_number=1)
+        file_finding(finding, dedupe, _lane(), runner, dry_run=False)
+        assert runner.calls[0][:3] == ["issue", "create", "vimcode"]
 
     def test_filed_issue_title_carries_platform_tag(self):
         finding = _finding(platform="mac-native")
@@ -693,6 +737,113 @@ class TestRunBugbashTermination:
         assert report.termination_reason == "zero_findings"
         assert report.total_filed == 0
         assert report.rounds[0].filings[0].verdict is DedupeVerdict.DUPLICATE
+
+    def test_cross_round_dedupe_recognizes_own_earlier_filing_even_with_stale_fetch(self):
+        # #3546: the real vimcode run filed "caption buttons unclickable" as
+        # vimcode#1656 in round 1, then AGAIN as #1660 in the SAME round and
+        # #1669/#1675 in later rounds — dedupe never saw its own earlier
+        # filings. Simulate the worst case: the open-issues fetch is
+        # permanently stale (never reflects anything this run itself just
+        # filed, as a lagging `gh issue list` would) — the SAME finding
+        # reported again in round 2 must still be recognised as a duplicate
+        # of round 1's real issue number, not filed a second time.
+        config = _config(max_rounds=3)
+        finding = _finding(title="Caption buttons unclickable")
+        explorer = _make_explorer([[finding], [finding]])
+        runner = FakeRunner(next_issue_number=1656)
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [],  # stale: never updates
+            closed_issues_fetcher=lambda r: [],
+        )
+        assert report.total_filed == 1
+        assert report.rounds[0].filings[0].filed is True
+        assert report.rounds[0].filings[0].issue_number == 1656
+        assert report.rounds[1].filings[0].verdict is DedupeVerdict.DUPLICATE
+        assert report.rounds[1].filings[0].filed is False
+        assert report.rounds[1].filings[0].issue_number == 1656
+        create_calls = [c for c in runner.calls if c[:2] == ["issue", "create"]]
+        assert len(create_calls) == 1
+
+    def test_two_lanes_reporting_same_bug_one_round_files_once(self):
+        # #3546: two lane instances sharing the SAME platform (the real run
+        # had two "win-native" lanes from a coordinator.yml route + top-level
+        # driver both naming that kind) each independently reported the
+        # identical bug in round 1 — dedupe must collapse them to one filing,
+        # not two, even though neither finding existed as an open issue
+        # before the round started.
+        lane_a = _lane(platform="win-native", machine="pc1")
+        lane_b = _lane(platform="win-native", machine="pc2")
+        config = _config(lanes=[lane_a, lane_b], max_rounds=1)
+
+        def explorer(lane, round_num):
+            return ExploreOutcome(
+                findings=(_finding(title="Caption buttons unclickable", platform="win-native"),)
+            )
+
+        runner = FakeRunner(next_issue_number=1656)
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        create_calls = [c for c in runner.calls if c[:2] == ["issue", "create"]]
+        assert len(create_calls) == 1
+        filings = report.rounds[0].filings
+        assert sum(1 for f in filings if f.filed) == 1
+        duplicate_filing = next(f for f in filings if not f.filed)
+        assert duplicate_filing.verdict is DedupeVerdict.DUPLICATE
+        # The duplicate resolves to the sibling's REAL issue number — not a
+        # permanent "duplicate of #None" placeholder.
+        assert duplicate_filing.issue_number == 1656
+
+    def test_all_lanes_skipped_reports_lanes_unavailable_not_zero_findings(self):
+        # #3546: round 4 of the real run skipped every configured lane (both
+        # had already blown their per-lane cost cap) and the CLI still
+        # printed `terminated='zero_findings'` — a release gate reading that
+        # would conclude "last bugbash clean" about a round that tested
+        # nothing at all.
+        lane = _lane(platform="win-native", machine="pc1")
+        config = _config(lanes=[lane], max_rounds=3, cost_cap_per_lane=1.0)
+
+        def explorer(lane, round_num):
+            # Round 1 finds something (so the loop doesn't already stop
+            # there) and spends enough to blow the per-lane cap for round 2.
+            if round_num == 1:
+                return ExploreOutcome(findings=(_finding(title="Bug A"),), cost=5.0)
+            return ExploreOutcome(findings=(), cost=5.0)
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.rounds[0].skipped_lanes == []
+        assert report.rounds[1].skipped_lanes == ["win-native"]
+        assert report.rounds[1].all_lanes_skipped is True
+        assert "cumulative cost" in report.rounds[1].skip_reasons["win-native"]
+        assert report.termination_reason == "lanes_unavailable"
+        assert report.termination_reason != "zero_findings"
+
+    def test_some_lanes_skipped_some_explored_is_not_all_skipped(self):
+        # A partial skip (one lane over its cap, the other still running)
+        # must still report a genuine "zero_findings" clean pass if the
+        # surviving lane found nothing — distinct from the all-skipped case
+        # above.
+        expensive_lane = _lane(platform="win-native", machine="pc1")
+        cheap_lane = _lane(platform="mac-native", machine="mac1")
+        config = _config(lanes=[expensive_lane, cheap_lane], max_rounds=3, cost_cap_per_lane=2.0)
+
+        def explorer(lane, round_num):
+            cost = 5.0 if lane.platform == "win-native" else 0.5
+            return ExploreOutcome(findings=(), cost=cost, ok=True)
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.termination_reason == "zero_findings"
+        assert report.rounds[0].all_lanes_skipped is False
 
 
 class TestRunBugbashDryRun:

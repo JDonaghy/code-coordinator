@@ -405,7 +405,17 @@ def _best_match(
         issue_platform = _platform_from_title(title)
         if issue_platform is not None and issue_platform != finding.platform:
             continue
-        score = _title_similarity(finding.title, title)
+        # #3546: score against the TAG-STRIPPED title, not the raw one — the
+        # platform gate above already accounts for the ``[bugbash:<platform>]``
+        # prefix, so scoring the untouched title made its own extra tokens
+        # ("bugbash", the platform name) dilute the Jaccard score against a
+        # short real-world title. "Caption buttons unclickable" (3 words) vs.
+        # "[bugbash:win-native] Caption buttons unclickable" scored only 0.5
+        # — BELOW :data:`DEFAULT_DEDUPE_THRESHOLD` — purely because of the
+        # tag's own 3 extra words, which is exactly the "titles differing
+        # enough to defeat matching" root cause behind vimcode#1656/#1660
+        # being filed as two separate issues for one bug.
+        score = _title_similarity(finding.title, _strip_platform_tag(title))
         if score >= threshold and (best is None or score > best[1]):
             best = (issue, score)
     return best
@@ -414,6 +424,54 @@ def _best_match(
 def _platform_from_title(title: str) -> str | None:
     m = re.match(r"^\[bugbash:([^\]]+)\]", title)
     return m.group(1) if m else None
+
+
+def _strip_platform_tag(title: str) -> str:
+    """Remove a leading ``[bugbash:<platform>]`` tag (if present) before
+    scoring title similarity — see :func:`_best_match`'s comment for why
+    leaving it in place made the score sensitive to the platform name
+    itself rather than just the bug description."""
+    return re.sub(r"^\[bugbash:[^\]]+\]\s*", "", title)
+
+
+def _dedupe_round_findings(
+    findings: Sequence[Finding],
+    open_issues: list[dict],
+    closed_issues: list[dict],
+    *,
+    threshold: float = DEFAULT_DEDUPE_THRESHOLD,
+) -> list[DedupeResult]:
+    """Dedupe every finding from ONE round, in order, against *open_issues*/
+    *closed_issues* — AND against every finding already decided NEW or
+    REGRESSION earlier in this SAME call (#3546).
+
+    The bugbash run that filed vimcode#1656/#1660/#1669/#1675 as four
+    separate issues for one bug did so partly because two lanes reporting
+    the identical symptom in the SAME round were each deduped only against
+    issues that existed BEFORE the round started — neither lane's finding
+    could see the other's. This function fixes that: a finding is matched
+    not just against *open_issues* but against a running list seeded with
+    every PRIOR finding in *findings* that this same walk already decided
+    was new/a regression, so the second lane's identical report comes back
+    :attr:`DedupeVerdict.DUPLICATE` instead of also being judged new.
+
+    A within-round match's :attr:`DedupeResult.matched_number` is ``None``
+    here — the sibling finding it matches has not actually been filed
+    through ``coord issue create`` yet at dedupe time, so there is no real
+    issue number to report. :func:`run_bugbash`'s filing loop resolves this
+    to the sibling's real number once that sibling is actually filed,
+    rather than leaving every within-round duplicate permanently numberless.
+    """
+    results: list[DedupeResult] = []
+    running_open = list(open_issues)
+    for finding in findings:
+        result = dedupe_finding(finding, running_open, closed_issues, threshold=threshold)
+        results.append(result)
+        if result.verdict is not DedupeVerdict.DUPLICATE:
+            running_open.append(
+                {"number": None, "title": compose_finding_issue_title(finding)}
+            )
+    return results
 
 
 def dedupe_finding(
@@ -548,7 +606,11 @@ def build_exploration_briefing(
         "When done, end your final message with a fenced "
         f"```{FINDINGS_FENCE}``` block containing a JSON array of finding "
         "objects, each with: title, expected, actual, repro, evidence, "
-        "suspected_repo (the app or its UI framework), captures (list of "
+        "suspected_repo (the repo the FIX belongs in — the app, its UI "
+        "framework, e.g. quadraui, OR the coordinator tooling itself, e.g. "
+        "claude-coordinator, if the bug is actually in this bugbash driver "
+        "or its WSL/native bridge rather than in the app under test), "
+        "captures (list of "
         "capture paths/descriptions, may be empty). An empty array means "
         "zero findings this round.",
     ]
@@ -700,6 +762,24 @@ class FilingResult:
     preview_body: str | None = None
 
 
+def finding_target_repo(finding: Finding) -> str:
+    """Which repo a finding's issue should be filed into (#3546 requirement
+    2): :attr:`Finding.suspected_repo` when the worker reported one, else
+    *finding.repo* (the app the lane actually ran against) as the fallback.
+
+    Three coord/win-native-driver/WSL-bridge bugs from the first real
+    vimcode bugbash run were filed (and queued) in vimcode anyway, where no
+    worker could ever fix them, because filing unconditionally targeted
+    *finding.repo*. ``suspected_repo`` already carries the worker's best
+    guess at the actually-at-fault repo (the app itself, its UI framework,
+    or coord's own driver/bridge — see :func:`build_exploration_briefing`)
+    and defaults to *repo* in :func:`_finding_from_entry` when a lane
+    worker doesn't name one explicitly, so this is a one-line fallback, not
+    a guess of its own.
+    """
+    return finding.suspected_repo or finding.repo
+
+
 def file_finding(
     finding: Finding,
     dedupe: DedupeResult,
@@ -720,6 +800,11 @@ def file_finding(
     success, queued through ``coord drive-queue add --machine
     <lane.machine>``.
 
+    Both calls target :func:`finding_target_repo` (#3546) — NOT always
+    *finding.repo* — so a finding whose ``suspected_repo`` names coord's
+    own driver/bridge or the app's UI framework lands where a worker can
+    actually fix it, rather than in the app repo where nobody can.
+
     ``dry_run=True`` skips BOTH calls entirely and returns a preview —
     this is the sole mechanism backing "a dry run files nothing": there is
     no code path from ``dry_run=True`` to the runner being invoked.
@@ -732,6 +817,7 @@ def file_finding(
             filed=False, queued=False, issue_number=dedupe.matched_number,
         )
 
+    target_repo = finding_target_repo(finding)
     title = compose_finding_issue_title(finding)
     body = format_bug_report(
         expected=finding.expected,
@@ -755,7 +841,7 @@ def file_finding(
 
     create_out = runner(
         [
-            "issue", "create", finding.repo,
+            "issue", "create", target_repo,
             "--title", title,
             "--expected", finding.expected,
             "--actual", finding.actual,
@@ -771,7 +857,7 @@ def file_finding(
     issue_number = int(match.group(1))
 
     runner(
-        ["drive-queue", "add", finding.repo, str(issue_number), "--machine", lane.machine]
+        ["drive-queue", "add", target_repo, str(issue_number), "--machine", lane.machine]
     )
 
     return FilingResult(
@@ -811,6 +897,14 @@ class RoundReport:
     filings: list[FilingResult] = field(default_factory=list)
     lane_cost: dict[str, float] = field(default_factory=dict)
     skipped_lanes: list[str] = field(default_factory=list)
+    #: ``{platform: reason}`` for every entry in :attr:`skipped_lanes`
+    #: (#3546) — a skip must be as explainable as a failure or an
+    #: unavailability, never a bare platform name with no reason attached.
+    #: Currently populated with the per-lane cost-cap detail (the only
+    #: engine-level skip reason today); kept as its own dict (rather than
+    #: folded into ``skipped_lanes`` itself) so ``skipped_lanes``'s existing
+    #: ``list[str]`` shape — already read by callers — never has to change.
+    skip_reasons: dict[str, str] = field(default_factory=dict)
     #: Findings this round that were NOT duplicates of an already-tracked
     #: open issue — i.e. what actually moved the round-cap/zero-findings
     #: termination decision. Computed from the SAME dedupe verdicts stored
@@ -886,6 +980,25 @@ class RoundReport:
             set(self.lane_failures) | set(self.unavailable_lanes)
         )
 
+    @property
+    def all_lanes_skipped(self) -> bool:
+        """``True`` when at least one lane was skipped this round (its
+        per-lane cost cap was already blown) AND NOT A SINGLE lane was
+        actually explored (#3546) — i.e. the round asked nothing, got no
+        answer from anyone, yet :attr:`new_count` still reads ``0`` the same
+        way a genuine clean pass does.
+
+        The first real vimcode bugbash run's round 4 skipped every
+        configured lane this way and the CLI still printed
+        ``terminated='zero_findings'`` — a release gate reading that output
+        would conclude "last bugbash clean" about a round that tested
+        nothing at all. Distinct from :attr:`all_explored_lanes_failed` /
+        :attr:`all_explored_lanes_unavailable_or_failed`, both of which
+        require ``explored_lanes`` to be non-empty (a lane that was asked
+        and answered badly) — this property is specifically the "nobody was
+        even asked" case."""
+        return bool(self.skipped_lanes) and not self.explored_lanes
+
 
 @dataclass
 class BugbashReport:
@@ -949,17 +1062,24 @@ def run_bugbash(
 
     Each round: every lane is explored (unless it has already exceeded
     ``cost_cap_per_lane``, in which case it is skipped and recorded in
-    ``skipped_lanes`` — never silently dropped), findings are deduped
-    against a FRESH fetch of open/closed issues (so a finding filed earlier
-    in the SAME run is already visible and won't be re-filed next round),
-    and non-duplicates are filed via :func:`file_finding` — gated by
-    *confirm* for the first ``config.confirm_rounds`` rounds when not a dry
-    run. Termination is checked AFTER filing, from the round's own observed
-    ``new_count``/cost, never inferred from "no exception was raised":
+    ``skipped_lanes``/``skip_reasons`` — never silently dropped), findings
+    are deduped via :func:`_dedupe_round_findings` against a FRESH fetch of
+    open/closed issues MERGED with every issue THIS RUN has already filed
+    (#3546: a finding filed earlier in the same run — this round or an
+    earlier one — must be recognised by its real issue number, not just by
+    whatever a fresh ``gh issue list`` happens to already reflect, and two
+    lanes reporting the same bug in the SAME round must collapse to one
+    filing too), and non-duplicates are filed via :func:`file_finding` —
+    gated by *confirm* for the first ``config.confirm_rounds`` rounds when
+    not a dry run. Termination is checked AFTER filing, from the round's own
+    observed ``new_count``/cost, never inferred from "no exception was
+    raised":
 
     - ``"zero_findings"`` — this round's non-duplicate finding count is 0,
-      AND at least one explored lane actually completed its checklist
-      (neither ``RoundReport.all_explored_lanes_failed`` nor
+      AND at least one lane was actually explored this round (not every
+      lane was skipped on its cost cap — ``RoundReport.all_lanes_skipped``
+      is ``False``), AND that explored lane actually completed its
+      checklist (neither ``RoundReport.all_explored_lanes_failed`` nor
       ``RoundReport.all_explored_lanes_unavailable_or_failed`` is ``True``),
       AND no lane reported a protocol error (``RoundReport
       .protocol_error_lanes`` is empty) — a genuine observed clean pass.
@@ -979,13 +1099,16 @@ def run_bugbash(
       .protocol_error_lanes`` for which lane and why.
     - ``"lanes_unavailable"`` — this round's non-duplicate finding count is
       ALSO 0, no lane came back a dispatch/poll/log failure or a protocol
-      error, but every lane explored this round reported its GUI session/
-      display unavailable (#3510: locked or absent, e.g. a locked dell64) —
-      a different reason from ``"lane_failure"`` (the explorer DID run and
-      DID get a verified answer, it's just "the host is locked", not "I
-      don't know"), and still not a clean pass either, since nothing was
-      actually exercised against the app. Check ``BugbashReport
-      .rounds[-1].unavailable_lanes`` for which host needs unlocking.
+      error, and either (a) every lane explored this round reported its GUI
+      session/display unavailable (#3510: locked or absent, e.g. a locked
+      dell64), or (b) EVERY configured lane was skipped on its cost cap and
+      none was explored at all this round (#3546: a round that asked
+      nothing must never read as a clean pass either) — a different reason
+      from ``"lane_failure"`` (the explorer DID run and DID get a verified
+      answer, or nothing was even asked), and still not a clean pass either,
+      since nothing was actually exercised against the app. Check
+      ``BugbashReport.rounds[-1].unavailable_lanes``/``skip_reasons`` for
+      which host needs unlocking or budget needs raising.
     - ``"cost_cap"`` — cumulative cost has reached ``cost_cap_total``.
     - ``"round_cap"`` — ``config.max_rounds`` rounds ran without either of
       the above firing.
@@ -995,6 +1118,17 @@ def run_bugbash(
     total_cost = 0.0
     rounds: list[RoundReport] = []
     reason = "round_cap"
+    # #3546: every issue THIS RUN has actually filed into config.repo,
+    # across every round so far — consulted alongside each round's FRESH
+    # open-issues fetch so a finding matching an issue this run itself
+    # already created reads as a duplicate by NUMBER, never depending on a
+    # `gh issue list` snapshot having caught up with this process's own
+    # recent write. `run_filed_by_title` is the same data keyed for O(1)
+    # resolution when a within-round duplicate (see
+    # `_dedupe_round_findings`) needs its placeholder `matched_number=None`
+    # upgraded to the sibling's real number once that sibling is filed.
+    run_filed_issues: list[dict] = []
+    run_filed_by_title: dict[str, int] = {}
 
     for round_num in range(1, config.max_rounds + 1):
         report = RoundReport(round_num=round_num)
@@ -1002,6 +1136,10 @@ def run_bugbash(
         for lane in config.lanes:
             if lane_cost[lane.platform] >= config.cost_cap_per_lane:
                 report.skipped_lanes.append(lane.platform)
+                report.skip_reasons[lane.platform] = (
+                    f"cumulative cost {lane_cost[lane.platform]:.2f} already "
+                    f">= per-lane cap {config.cost_cap_per_lane:.2f}"
+                )
                 continue
             outcome = explorer(lane, round_num)
             lane_cost[lane.platform] += outcome.cost
@@ -1032,15 +1170,21 @@ def run_bugbash(
                 # finding disappear and pass the #3488 release gate).
                 report.protocol_error_lanes[lane.platform] = outcome.protocol_error
 
-        open_issues = open_issues_fetcher(config.repo)
+        # #3546: merge the fresh fetch with every issue THIS RUN has already
+        # filed — a finding matching one of this run's own earlier filings
+        # must be recognised by number even if the fresh fetch hasn't (yet)
+        # caught up with this process's own recent write.
+        open_issues = list(open_issues_fetcher(config.repo)) + run_filed_issues
         closed_issues = closed_issues_fetcher(config.repo)
 
         # Dedupe every finding exactly once (one question, one answer) —
         # everything below (the confirm gate's candidate list, new_count,
         # and the actual filing decision) reads off this SAME verdict per
-        # finding rather than re-asking dedupe_finding with a chance to
-        # disagree with itself.
-        dedupes = [dedupe_finding(f, open_issues, closed_issues) for f in report.findings]
+        # finding rather than re-asking dedupe with a chance to disagree
+        # with itself. `_dedupe_round_findings` also catches two lanes
+        # reporting the same bug in THIS round against each other, not just
+        # against issues that existed before the round started.
+        dedupes = _dedupe_round_findings(report.findings, open_issues, closed_issues)
 
         require_confirm = (not config.dry_run) and round_num <= config.confirm_rounds
         candidates = [
@@ -1071,17 +1215,39 @@ def run_bugbash(
                     )
                 )
                 continue
+            if dedupe.verdict is DedupeVerdict.DUPLICATE and dedupe.matched_number is None:
+                # #3546: a within-round duplicate from `_dedupe_round_findings`
+                # — its sibling finding may have already been filed earlier
+                # in THIS loop (in which case its real issue number is now in
+                # `run_filed_by_title`). Resolve it so the report/CLI shows
+                # the real number instead of a permanent "duplicate of
+                # #None".
+                resolved = run_filed_by_title.get(dedupe.matched_title or "")
+                if resolved is not None:
+                    dedupe = DedupeResult(
+                        verdict=dedupe.verdict, matched_number=resolved,
+                        matched_title=dedupe.matched_title, score=dedupe.score,
+                    )
             # An unresolvable lane (finding.platform not in this run's
             # config.lanes) is only a problem when it would actually be
             # queued — file_finding raises in that case, never silently
             # drops the machine target (#2096: a gate must be able to fail).
             result = file_finding(finding, dedupe, lane, runner, dry_run=config.dry_run)
             report.filings.append(result)
+            if result.filed and result.issue_number is not None:
+                # Only track filings that landed in config.repo's own
+                # namespace — a finding routed elsewhere via
+                # `finding_target_repo` (#3546 requirement 2) dedupes
+                # against THAT repo's issues, not this one's.
+                if finding_target_repo(finding) == config.repo:
+                    filed_title = compose_finding_issue_title(finding)
+                    run_filed_issues.append({"number": result.issue_number, "title": filed_title})
+                    run_filed_by_title[filed_title] = result.issue_number
 
         rounds.append(report)
 
         if report.new_count == 0:
-            # #2096/#3517: "zero findings" is only a genuine clean-pass
+            # #2096/#3517/#3546: "zero findings" is only a genuine clean-pass
             # verdict when at least one lane was actually verified to have
             # RUN THE CHECKLIST this round AND every lane that did complete
             # produced a trustworthy report. A round where every explored
@@ -1092,13 +1258,15 @@ def run_bugbash(
             # below since a bad answer is a stronger "don't trust this round"
             # signal than a lane simply being locked out; a round where every
             # explored lane instead reported its session/display unavailable
-            # (#3510 — locked or absent, never a dispatch failure) gets its
-            # own distinct "lanes_unavailable" reason last.
+            # (#3510 — locked or absent, never a dispatch failure), OR every
+            # configured lane was skipped on its cost cap with NONE explored
+            # at all (#3546), gets the same "lanes_unavailable" reason —
+            # neither is a verified clean pass.
             if report.all_explored_lanes_failed:
                 reason = "lane_failure"
             elif report.protocol_error_lanes:
                 reason = "protocol_error"
-            elif report.all_explored_lanes_unavailable_or_failed:
+            elif report.all_explored_lanes_unavailable_or_failed or report.all_lanes_skipped:
                 reason = "lanes_unavailable"
             else:
                 reason = "zero_findings"

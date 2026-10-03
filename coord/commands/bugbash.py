@@ -50,6 +50,7 @@ from coord.bugbash import (
     ExploreOutcome,
     build_exploration_briefing,
     discover_lanes,
+    finding_target_repo,
     parse_findings_block,
     run_bugbash,
     subprocess_coord_runner,
@@ -228,6 +229,11 @@ def _print_round(report: BugbashReport) -> None:
             f"{r.new_count} new/regression, {sum(1 for f in r.filings if f.filed)} filed"
             + (f" (lanes skipped: {', '.join(r.skipped_lanes)})" if r.skipped_lanes else "")
         )
+        # #3546: a skip must be as explainable as a lane failure/
+        # unavailability — never a bare platform name with no reason.
+        for platform in r.skipped_lanes:
+            reason = r.skip_reasons.get(platform, "no reason recorded")
+            click.secho(f"  lane SKIPPED ({platform}): {reason}", fg="yellow")
         # #2096: a lane failure must be as visible as a filed finding — never
         # let a fleet-wide dispatch outage hide behind a quiet "0 finding(s)"
         # line that reads identically to a genuinely clean round.
@@ -241,12 +247,18 @@ def _print_round(report: BugbashReport) -> None:
             click.secho(f"  lane PROTOCOL ERROR ({platform}): {note}", fg="red")
         for f in r.filings:
             incomplete = " [INCOMPLETE REPORT]" if f.finding.incomplete else ""
+            # #3546: a finding routed by `suspected_repo` away from the app
+            # repo this round explored must say so here — an operator
+            # scanning "filed+queued: #42" has no way to tell it landed in
+            # coord's own repo rather than the app's without this.
+            target_repo = finding_target_repo(f.finding)
+            routed = f" [{target_repo}]" if target_repo != f.finding.repo else ""
             if f.filed:
-                click.echo(f"  filed+queued: #{f.issue_number} — {f.finding.title}{incomplete}")
+                click.echo(f"  filed+queued: #{f.issue_number}{routed} — {f.finding.title}{incomplete}")
             elif f.verdict.value == "duplicate":
-                click.echo(f"  duplicate of #{f.issue_number}: {f.finding.title}{incomplete}")
+                click.echo(f"  duplicate of #{f.issue_number}{routed}: {f.finding.title}{incomplete}")
             elif f.preview_title is not None:
-                click.echo(f"  would file ({f.verdict.value}): {f.preview_title}{incomplete}")
+                click.echo(f"  would file ({f.verdict.value}){routed}: {f.preview_title}{incomplete}")
 
 
 @click.command(
