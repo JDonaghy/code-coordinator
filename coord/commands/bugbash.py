@@ -23,6 +23,20 @@ to the generic catch-all worker (full Read/Edit/Write/Bash/Monitor,
 ``WORKER_SYSTEM_PROMPT``) — a tracked follow-up, since that module is
 outside this issue's file scope (see the PR description).
 
+#3566 closed the gap this module used to carry here: the first live
+``mac-native`` bugbash attempt found ``AXIsProcessTrusted() == False`` and
+improvised an unsafe workaround instead of stopping, and the two later
+attempts that DID stop correctly still reported ``terminated='zero_findings'``
+— a lane that never ran read identically to a clean pass.
+:func:`coord.bugbash.build_exploration_briefing` now carries a hard rule
+("drive the app only through this lane's own driver... if a permission is
+missing, stop and report unavailable") plus the exact reporting contract,
+and :func:`_dispatch_and_await_lane` below detects it
+(:func:`coord.bugbash.parse_unavailable_report`) and sets
+:attr:`coord.bugbash.ExploreOutcome.unavailable` — so
+:func:`coord.bugbash.run_bugbash` reports ``lanes_unavailable``, not
+``zero_findings``, for a lane that never actually ran.
+
 KNOWN GAP (#3487 acceptance, "one real dry run against vimcode on at least
 two lanes"): this module was written and unit-tested from THIS worktree,
 which has no reachable Tailscale fleet and — deliberately — no business
@@ -52,6 +66,7 @@ from coord.bugbash import (
     discover_lanes,
     finding_target_repo,
     parse_findings_block,
+    parse_unavailable_report,
     run_bugbash,
     subprocess_coord_runner,
 )
@@ -189,6 +204,22 @@ def _dispatch_and_await_lane(
         text = _assistant_text(event)
         if text.strip():
             last_assistant_text = text
+
+    # #3566 ask #5: a worker's own "lane unavailable" report (the
+    # briefing's hard rule — a missing permission/session, never an
+    # improvised workaround) OR a driver session/permission failure
+    # surfacing directly in the transcript is a THIRD outcome, distinct
+    # from both a clean pass and a protocol error — checked against the
+    # FULL raw log text (not just the last assistant message) so it's
+    # caught even if the worker reported it mid-session before crashing.
+    # Must be checked BEFORE `parse_findings_block`: an unavailable report
+    # deliberately carries no findings fence (the briefing tells the
+    # worker to skip it), which would otherwise read as a protocol error.
+    unavailable_reason = parse_unavailable_report(log_resp.text)
+    if unavailable_reason:
+        return ExploreOutcome(
+            unavailable=True, cost=summary.total_cost_usd, notes=unavailable_reason,
+        )
 
     parsed = parse_findings_block(last_assistant_text, platform=lane.platform, repo=repo_name)
     if parsed.protocol_error:

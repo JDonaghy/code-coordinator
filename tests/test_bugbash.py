@@ -22,6 +22,7 @@ from coord.bugbash import (
     DedupeVerdict,
     ExploreOutcome,
     Finding,
+    UNAVAILABLE_FENCE,
     _pick_lane_machine,
     build_exploration_briefing,
     compose_finding_issue_title,
@@ -29,6 +30,7 @@ from coord.bugbash import (
     discover_lanes,
     file_finding,
     parse_findings_block,
+    parse_unavailable_report,
     run_bugbash,
 )
 
@@ -224,6 +226,53 @@ class TestParseFindingsBlock:
         assert result.protocol_error == ""
 
 
+class TestParseUnavailableReport:
+    """#3566: the lane-unavailable reporting contract — a worker that hit a
+    missing permission/session and stopped (per the briefing's hard rule)
+    rather than improvising a workaround."""
+
+    def test_fenced_report_is_extracted(self):
+        text = (
+            "I checked and Accessibility is not granted for this identity.\n\n"
+            f"```{UNAVAILABLE_FENCE}\n"
+            "AXIsProcessTrusted() is False for this worker's identity\n"
+            "```\n"
+        )
+        reason = parse_unavailable_report(text)
+        assert reason == "AXIsProcessTrusted() is False for this worker's identity"
+
+    def test_no_fence_and_no_signature_is_empty(self):
+        assert parse_unavailable_report("zero findings this round.") == ""
+
+    def test_findings_fence_alone_does_not_trigger_unavailable(self):
+        text = (
+            "```bugbash-findings\n"
+            '[{"title": "x", "expected": "e", "actual": "a", "repro": "r", '
+            '"evidence": "ev"}]\n'
+            "```"
+        )
+        assert parse_unavailable_report(text) == ""
+
+    def test_driver_session_unavailable_json_signature_is_detected_without_a_fence(self):
+        """#3566 ask #5's "or a driver session/permission failure" —
+        caught even if the worker forgot to write the fence, because the
+        native driver's own JSON verdict is right there in a tool result."""
+        text = (
+            'tool_result: [{"id": "session", "status": "unavailable", '
+            '"message": "the screen is locked"}]'
+        )
+        reason = parse_unavailable_report(text)
+        assert "unavailable" in reason or "locked" in reason
+
+    def test_ax_trust_denial_signature_is_detected(self):
+        text = "driver precheck failed: AXIsProcessTrusted() is False"
+        assert parse_unavailable_report(text) != ""
+
+    def test_empty_fence_falls_back_to_signature_scan(self):
+        text = f"```{UNAVAILABLE_FENCE}\n```\nthe screen is locked for this session"
+        assert parse_unavailable_report(text) != ""
+
+
 # ── discover_lanes ────────────────────────────────────────────────────────
 
 
@@ -299,6 +348,22 @@ class TestBuildExplorationBriefing:
         assert "panels" in out
         assert "menus" in out
         assert "bugbash-findings" in out
+
+    def test_includes_the_drive_only_through_the_driver_hard_rule(self):
+        """#3566 ask #4: the briefing must tell a `bugbash-explore` worker
+        to drive the app ONLY through the lane's own driver and name the
+        specific unsafe workarounds the first live incident used."""
+        lane = BugbashLane(platform="mac-native", driver_kind="mac-native", machine="macmini", capability="macos")
+        out = build_exploration_briefing(lane, reference_backend="win-native")
+        assert "HARD RULE" in out
+        for forbidden in ("osascript", "System Events", "do script", "System Settings"):
+            assert forbidden in out
+
+    def test_includes_the_unavailable_reporting_contract(self):
+        lane = BugbashLane(platform="mac-native", driver_kind="mac-native", machine="macmini", capability="macos")
+        out = build_exploration_briefing(lane, reference_backend="win-native")
+        assert UNAVAILABLE_FENCE in out
+        assert "stop" in out.lower()
 
 
 # ── filing (coord seam faked) ────────────────────────────────────────────
@@ -1189,3 +1254,98 @@ class TestDispatchAndAwaitLane:
         assert outcome.findings == ()
         assert outcome.protocol_error != ""
         assert outcome.cost == 1.0
+
+    def test_worker_unavailable_report_sets_unavailable_not_zero_findings(self, monkeypatch):
+        """#3566 acceptance: an explorer reporting a permission failure
+        yields `ExploreOutcome.unavailable=True`, and — end to end through
+        `run_bugbash` — `unavailable_lanes=['mac-native']`, never
+        `zero_findings`."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "Accessibility is not granted for this identity — '
+            "stopping per the hard rule rather than improvising a "
+            'workaround.\\n```bugbash-unavailable\\n'
+            'AXIsProcessTrusted() is False\\n```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 0.42}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(machine="pc1", platform="mac-native"), 1,
+            repo_name="vimcode", config=cfg, reference_backend="win-native",
+        )
+        assert outcome.unavailable is True
+        assert outcome.ok is True  # default — unavailable is the real signal
+        assert "AXIsProcessTrusted" in outcome.notes
+        assert outcome.findings == ()
+        assert outcome.cost == 0.42
+
+    def test_unavailable_propagates_through_run_bugbash_as_unavailable_lane(self, monkeypatch):
+        """End-to-end through the engine: a lane whose explorer reports
+        unavailable must show up in `RoundReport.unavailable_lanes`, and
+        the round must terminate `lanes_unavailable`, not `zero_findings`
+        (#3510's own engine-level contract, now reachable from the
+        production explorer)."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "stopping.\\n```bugbash-unavailable\\n'
+            'the screen is locked\\n```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 0.1}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        lane = _prod_lane(machine="pc1", platform="mac-native")
+
+        def explorer(explore_lane, round_num):
+            return cmd_bugbash._dispatch_and_await_lane(
+                explore_lane, round_num, repo_name="vimcode", config=cfg,
+                reference_backend="win-native",
+            )
+
+        config = BugbashConfig(
+            repo="vimcode", lanes=[lane], reference_backend="win-native",
+            max_rounds=1, confirm_rounds=0,
+        )
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.rounds[-1].unavailable_lanes.get("mac-native") is not None
+        assert report.termination_reason == "lanes_unavailable"

@@ -85,6 +85,23 @@ own child. See ``tests/test_mac_native_driver.py``'s
 regression guard, mirroring :mod:`coord.win_native_driver`'s own
 ``test_no_image_name_kill_path_exists_in_the_module``.
 
+**Frontmost refusal, never a blind retry (#3566).** The first live
+`mac-native` bugbash attempt found `AXIsProcessTrusted() == False`, then
+improvised: Terminal.app `do script`, a hand-rolled key-injection helper,
+clicks sent while its own log read `frontmost confirmed: False` with the
+actual frontmost pid belonging to the operator's iTerm2. Those landed in the
+operator's live session — a context menu, a "terminate running process?"
+dialog. :meth:`NativeRunner._do_key`/:meth:`_do_click` now call
+:meth:`MacCalls.is_frontmost` immediately before every single key/click and
+refuse (:class:`MacNativeRuntimeError`, folded into an ordinary failing step
+— never retried into whatever window happens to be in front) unless the
+launched pid is frontmost *right now*. :meth:`MacOSCalls.send_click`/
+:meth:`send_key` additionally post through `CGEventPostToPid` rather than
+the global `CGEventPost(kCGHIDEventTap, ...)` HID tap — input is addressed
+to the launched process directly rather than broadcast to whichever window
+the real pointer/keyboard focus happens to be on, so even a frontmost-check
+race lands on the intended process rather than an arbitrary other one.
+
 **Locked/absent session precheck (#3510).** The same vimcode#1629 class of
 problem applies here: a locked screen or no GUI session (headless/SSH-only)
 is an environment condition, not an app bug. Before :meth:`NativeRunner.run`
@@ -284,7 +301,15 @@ class MacCalls(Protocol):
 
     def is_window_alive(self, window_id: int) -> bool: ...
 
-    def send_click(self, window_id: int, x: int, y: int, button: str) -> None: ...
+    def is_frontmost(self, pid: int) -> tuple[bool, int]:
+        """``(True, pid)`` when *pid*'s window is frontmost right now;
+        ``(False, actual_frontmost_pid)`` otherwise — checked by
+        :class:`NativeRunner` immediately before every ``key``/``click``
+        step (#3566). Never raises: a probe failure here must read as "not
+        confirmed frontmost" (refuse), never crash the step."""
+        ...
+
+    def send_click(self, pid: int, window_id: int, x: int, y: int, button: str) -> None: ...
 
     def send_key(self, pid: int, key: str) -> None: ...
 
@@ -449,13 +474,31 @@ class NativeRunner:
         self._calls.move_window(pid, window_id, 0, 0, spec.width, spec.height)
         return None
 
+    def _require_frontmost(self, pid: int) -> None:
+        """#3566: refuse any key/click unless *pid* is frontmost RIGHT NOW.
+        Raises :class:`MacNativeRuntimeError` (folded by :meth:`_run_step`
+        into an ordinary failing step — no retry path exists anywhere in
+        this runner, so a focus failure can never blindly retry into
+        whatever window happens to be in front) rather than letting
+        :meth:`MacCalls.send_click`/:meth:`send_key` fire blind."""
+        is_front, front_pid = self._calls.is_frontmost(pid)
+        if not is_front:
+            raise MacNativeRuntimeError(
+                f"refusing to send input — pid={pid} is not frontmost right "
+                f"now (actual frontmost pid={front_pid}); a focus failure "
+                f"is a step failure, never a blind retry into whatever "
+                f"window is in front (#3566)"
+            )
+
     def _do_key(self, step: NativeStep) -> None:
         pid, _ = self._require_window()
+        self._require_frontmost(pid)
         self._calls.send_key(pid, step.key)
 
     def _do_click(self, step: NativeStep) -> None:
-        _, window_id = self._require_window()
-        self._calls.send_click(window_id, step.x, step.y, step.button or "left")
+        pid, window_id = self._require_window()
+        self._require_frontmost(pid)
+        self._calls.send_click(pid, window_id, step.x, step.y, step.button or "left")
 
     def _do_wait(self, step: NativeStep) -> None:
         time.sleep(step.ms / 1000)
@@ -657,6 +700,23 @@ class MacOSCalls:
         )
         return any(info.get("kCGWindowNumber") == window_id for info in info_list or [])
 
+    def is_frontmost(self, pid: int) -> tuple[bool, int]:
+        """#3566: `CGWindowListCopyWindowInfo`'s on-screen-only list is
+        already ordered front-to-back — the first entry at the normal
+        window layer (``kCGWindowLayer == 0``; menu bar items/status icons
+        sit at other layers and would otherwise masquerade as "frontmost")
+        is the actual frontmost app window right now."""
+        quartz = self._quartz
+        info_list = quartz.CGWindowListCopyWindowInfo(
+            quartz.kCGWindowListOptionOnScreenOnly, quartz.kCGNullWindowID,
+        )
+        for info in info_list or []:
+            if info.get("kCGWindowLayer", 0) != 0:
+                continue
+            front_pid = int(info.get("kCGWindowOwnerPID", -1))
+            return front_pid == pid, front_pid
+        return False, -1
+
     def move_window(
         self, pid: int, window_id: int, x: int, y: int, width: int, height: int,
     ) -> None:
@@ -675,7 +735,10 @@ class MacOSCalls:
 
     # -- input injection --
 
-    def send_click(self, window_id: int, x: int, y: int, button: str) -> None:
+    def send_click(self, pid: int, window_id: int, x: int, y: int, button: str) -> None:
+        """#3566: posts via ``CGEventPostToPid`` — addressed directly to
+        *pid* — rather than the global ``CGEventPost(kCGHIDEventTap, ...)``
+        HID tap every other window on the desktop would also receive."""
         quartz = self._quartz
         info_list = quartz.CGWindowListCopyWindowInfo(
             quartz.kCGWindowListOptionIncludingWindow, window_id,
@@ -695,9 +758,11 @@ class MacOSCalls:
         point = quartz.CGPointMake(screen_x, screen_y)
         for event_type in (down_type, up_type):
             event = quartz.CGEventCreateMouseEvent(None, event_type, point, cg_button)
-            quartz.CGEventPost(quartz.kCGHIDEventTap, event)
+            quartz.CGEventPostToPid(pid, event)
 
     def send_key(self, pid: int, key: str) -> None:
+        """#3566: posts via ``CGEventPostToPid`` — see :meth:`send_click`'s
+        own docstring for why, same rationale."""
         quartz = self._quartz
         vkey, needs_shift = _vkey_for(key)
         needs_ctrl = key.lower().startswith("ctrl+")
@@ -711,8 +776,8 @@ class MacOSCalls:
         if flags:
             quartz.CGEventSetFlags(down, flags)
             quartz.CGEventSetFlags(up, flags)
-        quartz.CGEventPost(quartz.kCGHIDEventTap, down)
-        quartz.CGEventPost(quartz.kCGHIDEventTap, up)
+        quartz.CGEventPostToPid(pid, down)
+        quartz.CGEventPostToPid(pid, up)
 
     # -- Accessibility --
 
