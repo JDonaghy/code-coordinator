@@ -41,6 +41,7 @@ __all__ = [
     "audit_lock_contention_losses",
     "flush_lock_contention_summary",
     "sweep_operational_retention",
+    "resolve_operational_retention_days",
 ]
 
 # Valid values are documented in the issue but not enforced here — callers
@@ -323,6 +324,21 @@ def _resolve_operational_retention_days() -> float:
         return max(0.0, float(cfg.audit.operational_retention_days))
     except Exception:  # noqa: BLE001 — best-effort; disabled is the safe default
         return 0.0
+
+
+def resolve_operational_retention_days() -> float:
+    """Public wrapper around :func:`_resolve_operational_retention_days`.
+
+    ``coord.reports``' ``deprecated-routes`` report (#1947) needs the exact
+    same number this module's own sweep caps itself to: a ``zero_calls``
+    route cannot be trusted for longer than data has actually been kept
+    around, so the gate's "observed window" must be capped at this value,
+    not re-derived from ``coordinator.yml`` a second way. One source of
+    truth for "how far back is audit data trustworthy" — see #2085 (one
+    question, one answer) for why a second config read here would be a bug
+    waiting to happen rather than a convenience.
+    """
+    return _resolve_operational_retention_days()
 
 
 def sweep_operational_retention(*, now: float | None = None, dry_run: bool = False) -> int:

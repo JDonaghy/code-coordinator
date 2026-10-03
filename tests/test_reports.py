@@ -47,6 +47,9 @@ from coord.reports import (
     TREND_COLUMN_META,
     TREND_COLUMNS,
     TREND_RANGE_CHOICES,
+    DEPRECATED_ROUTE_ELIGIBLE,
+    DEPRECATED_ROUTE_NOT_ELIGIBLE,
+    DEPRECATION_RETIREMENT_WINDOW_DAYS,
     TREND_TRAILING_BUCKETS,
     ColumnMeta,
     ReportError,
@@ -1164,6 +1167,121 @@ class TestFoldDeprecatedRoutes:
 
         result = fold_deprecated_routes([], 1000.0)
         assert {r["route"] for r in result.rows} == set(RPC_SUPERSEDED_BY_RESOURCE)
+
+
+class TestDeprecatedRoutesRetirementGate:
+    """#1947: `observed_secs`/`eligible` — "zero calls for 30+ days", not
+    just "zero calls ever recorded"."""
+
+    _DAY = 86400.0
+
+    def test_in_use_route_is_never_eligible_regardless_of_age(self) -> None:
+        now = 1000.0 + 60 * self._DAY
+        entries = [_dep_entry(1000.0, "/old-a")]
+        result = fold_deprecated_routes(
+            entries, now, routes=_DEP_ROUTES, retention_days=0
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["status"] == "in_use"
+        assert row["eligible"] == DEPRECATED_ROUTE_NOT_ELIGIBLE
+        assert row["observed_secs"] is None
+
+    def test_no_data_route_is_never_eligible(self) -> None:
+        result = fold_deprecated_routes([], 1000.0, routes=_DEP_ROUTES, retention_days=0)
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["status"] == "no_data"
+        assert row["eligible"] == DEPRECATED_ROUTE_NOT_ELIGIBLE
+        assert row["observed_secs"] is None
+
+    def test_zero_calls_route_not_yet_eligible_under_the_window(self) -> None:
+        """Telemetry only proven live 10 days ago (another route's call) —
+        nowhere near the 30-day bar, even though this route itself has
+        zero calls."""
+        now = 10 * self._DAY
+        entries = [_dep_entry(0.0, "/old-b")]  # proves telemetry is live
+        result = fold_deprecated_routes(
+            entries, now, routes=_DEP_ROUTES, retention_days=0
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["status"] == "zero_calls"
+        assert row["eligible"] == DEPRECATED_ROUTE_NOT_ELIGIBLE
+        assert row["observed_secs"] == pytest.approx(10 * self._DAY)
+
+    def test_zero_calls_route_eligible_once_window_clears_30_days(self) -> None:
+        now = 31 * self._DAY
+        entries = [_dep_entry(0.0, "/old-b")]
+        result = fold_deprecated_routes(
+            entries, now, routes=_DEP_ROUTES, retention_days=0
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["status"] == "zero_calls"
+        assert row["eligible"] == DEPRECATED_ROUTE_ELIGIBLE
+        assert row["observed_secs"] == pytest.approx(31 * self._DAY)
+
+    def test_window_exactly_at_the_boundary_is_eligible(self) -> None:
+        now = DEPRECATION_RETIREMENT_WINDOW_DAYS * self._DAY
+        entries = [_dep_entry(0.0, "/old-b")]
+        result = fold_deprecated_routes(
+            entries, now, routes=_DEP_ROUTES, retention_days=0
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["eligible"] == DEPRECATED_ROUTE_ELIGIBLE
+
+    def test_retention_days_caps_the_observed_window_never_overstates_it(self) -> None:
+        """A 90-day-old first call cannot prove a 90-day window when only 10
+        days of audit history is actually retained — the route must read
+        `not_yet`, not falsely `eligible` on data that could have been
+        swept without a trace."""
+        now = 90 * self._DAY
+        entries = [_dep_entry(0.0, "/old-b")]
+        result = fold_deprecated_routes(
+            entries, now, routes=_DEP_ROUTES, retention_days=10,
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["observed_secs"] == pytest.approx(10 * self._DAY)
+        assert row["eligible"] == DEPRECATED_ROUTE_NOT_ELIGIBLE
+
+    def test_retention_below_window_adds_a_note(self) -> None:
+        entries = [_dep_entry(0.0, "/old-b")]
+        result = fold_deprecated_routes(
+            entries, 90 * self._DAY, routes=_DEP_ROUTES, retention_days=10,
+        )
+        assert any("operational_retention_days" in n for n in result.notes)
+
+    def test_retention_at_or_above_window_adds_no_such_note(self) -> None:
+        entries = [_dep_entry(0.0, "/old-b")]
+        result = fold_deprecated_routes(
+            entries, 90 * self._DAY, routes=_DEP_ROUTES,
+            retention_days=DEPRECATION_RETIREMENT_WINDOW_DAYS,
+        )
+        assert not any("operational_retention_days" in n for n in result.notes)
+
+    def test_retention_disabled_zero_means_uncapped(self) -> None:
+        now = 400 * self._DAY
+        entries = [_dep_entry(0.0, "/old-b")]
+        result = fold_deprecated_routes(
+            entries, now, routes=_DEP_ROUTES, retention_days=0,
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["observed_secs"] == pytest.approx(now)
+        assert row["eligible"] == DEPRECATED_ROUTE_ELIGIBLE
+
+    def test_retention_days_none_resolves_from_audit_config(self, monkeypatch) -> None:
+        """Omitting ``retention_days`` reads the SAME knob
+        ``coord.audit.sweep_operational_retention`` enforces — one source
+        of truth (#2085), not a second config read that could drift."""
+        monkeypatch.setattr(
+            "coord.audit.resolve_operational_retention_days", lambda: 5.0
+        )
+        entries = [_dep_entry(0.0, "/old-b")]
+        result = fold_deprecated_routes(entries, 90 * self._DAY, routes=_DEP_ROUTES)
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["observed_secs"] == pytest.approx(5 * self._DAY)
+
+    def test_eligible_column_present_in_column_meta(self) -> None:
+        result = fold_deprecated_routes([], 1000.0, routes=_DEP_ROUTES)
+        assert "eligible" in result.columns
+        assert "observed_secs" in result.columns
 
 
 class TestRunDeprecatedRoutes:
