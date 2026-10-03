@@ -384,6 +384,33 @@ def _current_self_head() -> str | None:
     return self_freshness(fetch=False).head_sha
 
 
+def _load_config_for_drive(config_path: str) -> Any:
+    """Real default for `Driver.config_loader` (#1654): re-read
+    coordinator.yml fresh — ``config_path`` empty resolves the usual
+    ``$COORD_CONFIG`` → ``~/.coord/coordinator.yml`` → ``./coordinator.yml``
+    chain, AND the thin-client (board_service) redirect, exactly like the
+    construction-time load in ``coord.commands._common._load_config`` —
+    calls the SAME ``resolve_and_load_config`` helper that function now
+    wraps, so a mid-run reload can never resolve a *different* file (or
+    skip the thin-client branch an ordinary client is expected to take)
+    than the one this drive started with (#2096, "one question, one
+    answer"). Deliberately NOT ``_load_config`` itself: that one also
+    ``sys.exit``s on a parse failure (a bad mid-run edit must warn, never
+    kill the drive — see ``Driver._reload_config``) and re-writes the
+    shared ``machines`` DB snapshot (meant for a one-time boot, not every
+    poll).
+
+    Imported lazily: ``coord.commands._common`` pulls in ``click``/
+    ``httpx``, and every pure decision function in this module already
+    takes an already-loaded config rather than touching disk itself — this
+    keeps that true for every caller except the one that's explicitly an
+    I/O shell.
+    """
+    from coord.commands._common import resolve_and_load_config  # noqa: PLC0415
+
+    return resolve_and_load_config(Path(config_path) if config_path else None)
+
+
 def _bounded_tail(text: str, limit: int = _CAPTURED_OUTPUT_LIMIT) -> str:
     """*text*, or its last *limit* characters if longer — the tail, because
     the actionable line (a traceback's final "raise ...", a guard's remedy)
@@ -2111,6 +2138,39 @@ class Preflight:
     warnings: tuple[str, ...] = ()
 
 
+def check_usage_gate(
+    config: Any, usage_limits: PlanLimits | None,
+) -> str | None:
+    """Evaluate the usage gate — raise on ``block``, return a warn message
+    on ``warn``, ``None`` otherwise.
+
+    #1654: the SOLE place this question is asked, so :func:`preflight`'s
+    one-time call at the top of a run and :meth:`Driver._loop`'s per-poll
+    re-check (added for #1654, since the gate's own ``mode``/thresholds can
+    change mid-run) can never drift into two different answers for the
+    same inputs (#2096, "one question, one answer").
+
+    *config* of ``None`` skips the gate entirely (no ``usage_gate`` section
+    to consult) — mirrors every pre-#1466 caller.
+    """
+    if config is None:
+        return None
+    gate_cfg = config.usage_gate
+    limits = usage_limits if usage_limits is not None else PlanLimits(status="unknown")
+    gate_result = evaluate_usage_gate(limits, gate_cfg)
+    if gate_result.action == "block":
+        raise DriveError(
+            f"{gate_result.message} (usage_gate.mode: block) — refusing to "
+            "dispatch. Wait for the window to reset, or lower urgency by "
+            "raising the threshold / setting usage_gate.mode: warn in "
+            "coordinator.yml.",
+            EXIT_USAGE,
+        )
+    if gate_result.action == "warn":
+        return f"{gate_result.message} (usage_gate.mode: warn — proceeding anyway)"
+    return None
+
+
 def preflight(
     state: IssueState,
     opts: DriveOptions,
@@ -2165,20 +2225,9 @@ def preflight(
 
     warnings: list[str] = []
 
-    if config is not None:
-        gate_cfg = config.usage_gate
-        limits = usage_limits if usage_limits is not None else PlanLimits(status="unknown")
-        gate_result = evaluate_usage_gate(limits, gate_cfg)
-        if gate_result.action == "block":
-            raise DriveError(
-                f"{gate_result.message} (usage_gate.mode: block) — refusing to "
-                "dispatch. Wait for the window to reset, or lower urgency by "
-                "raising the threshold / setting usage_gate.mode: warn in "
-                "coordinator.yml.",
-                EXIT_USAGE,
-            )
-        if gate_result.action == "warn":
-            warnings.append(f"{gate_result.message} (usage_gate.mode: warn — proceeding anyway)")
+    gate_warning = check_usage_gate(config, usage_limits)
+    if gate_warning:
+        warnings.append(gate_warning)
 
     if not state.auto_loop:
         warnings.append(
@@ -5399,6 +5448,13 @@ class Driver:
     # without a real git checkout — same shape as *usage_prober* above.
     # Defaults to the real, local-only (`fetch=False`) probe.
     self_head_probe: Callable[[], str | None] = _current_self_head
+    # #1654: injected so tests can script a fake coordinator.yml reload
+    # sequence without real YAML I/O — same injection shape as
+    # *usage_prober*/*self_head_probe* above. Defaults to the real loader,
+    # re-reading ``self.opts.config_path`` (empty string resolves the usual
+    # ``$COORD_CONFIG`` → ``~/.coord/coordinator.yml`` → ``./coordinator.yml``
+    # chain) fresh every call — see ``_reload_config``.
+    config_loader: Callable[[str], Any] = _load_config_for_drive
 
     _run_log: Path | None = field(default=None, init=False, repr=False)
     # #2443: this session's own on-disk `coord` HEAD, captured once by
@@ -5426,6 +5482,17 @@ class Driver:
     # call, so it is only ever trustworthy read immediately after one, which
     # is exactly how `_loop` uses it.
     _last_run_output: str = field(default="", init=False, repr=False)
+    # #1654: latches so a coordinator.yml that fails to parse mid-run (an
+    # operator mid-edit, a truncated write) warns ONCE for the whole broken
+    # window, not once per poll — `_reload_config` sets this on a failed
+    # reload and clears it (with a short recovery log line) the first time a
+    # reload succeeds again.
+    _config_reload_broken: bool = field(default=False, init=False, repr=False)
+    # #1654: the last usage-gate WARN message this run already printed, so a
+    # `mode: warn` config that stays warn-worthy across many polls (the
+    # common case — the usage window doesn't reset every poll) logs once per
+    # DISTINCT message rather than spamming the identical line every tick.
+    _last_usage_gate_warning: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.out = self.out or sys.stdout
@@ -5472,6 +5539,68 @@ class Driver:
             return project(payload, self.repo, self.issue, self.config)
         except DriveStateError as exc:
             raise DriveError(str(exc), EXIT_USAGE) from exc
+
+    def _reload_config(self) -> None:
+        """Re-read coordinator.yml at the top of every poll (#1654).
+
+        `self.config` used to be a pure construction-time snapshot the poll
+        loop never revisited — a ladder/usage-gate edit made while a drive
+        was already running had no effect until the NEXT invocation, which
+        is exactly backwards for a lever (#1649's reroute mode, a tightened
+        threshold) most likely to be flipped reactively, mid-window, because
+        a drive is already running and burning credits. Cheap: one YAML
+        parse against a loop that already shells out to a `coord`
+        subprocess (`run_coord`) every tick.
+
+        A config that fails to parse (an operator mid-edit, a truncated
+        write) must never kill an otherwise-healthy run: this keeps the
+        last-good `self.config` and only warns — exactly ONCE for the whole
+        broken window (`_config_reload_broken` latches it), not once per
+        poll. `self.opts` (this invocation's own identity — the CLI flags)
+        is never touched here; only `self.config` is replaced.
+        """
+        try:
+            new_config = self.config_loader(self.opts.config_path)
+        except Exception as exc:  # noqa: BLE001 — a bad edit must never kill the drive
+            if not self._config_reload_broken:
+                self.warn(
+                    "coordinator.yml reload failed, keeping the last-known-"
+                    f"good config: {exc}"
+                )
+                self._config_reload_broken = True
+            return
+        if self._config_reload_broken:
+            self.log(
+                "coordinator.yml reload recovered — back to a fresh config"
+            )
+            self._config_reload_broken = False
+        self._log_config_change(self.config, new_config)
+        self.config = new_config
+
+    def _log_config_change(self, old: Any, new: Any) -> None:
+        """Narrate a reload that changes a decision this loop actually makes
+        (#1654), so a mid-run behaviour change is explicable from this run's
+        own log afterwards rather than looking like nondeterminism.
+
+        Deliberately narrow — only the usage gate, the one knob this loop
+        re-consults every poll (see `check_usage_gate` below) — rather than
+        a full recursive diff of the whole `Config` object, which would be
+        noisy (most fields are per-repo/machine topology this driver never
+        reads for THIS issue) and risks echoing a secret accidentally pasted
+        into coordinator.yml into this run's log.
+        """
+        old_gate, new_gate = old.usage_gate, new.usage_gate
+        old_shape = (old_gate.mode, old_gate.session_threshold_pct, old_gate.week_threshold_pct)
+        new_shape = (new_gate.mode, new_gate.session_threshold_pct, new_gate.week_threshold_pct)
+        if old_shape != new_shape:
+            self.log(
+                "coordinator.yml reload: usage_gate changed "
+                f"mode {old_gate.mode!r} -> {new_gate.mode!r}, "
+                f"session_threshold_pct {old_gate.session_threshold_pct!r} -> "
+                f"{new_gate.session_threshold_pct!r}, week_threshold_pct "
+                f"{old_gate.week_threshold_pct!r} -> {new_gate.week_threshold_pct!r} "
+                "— this run's next dispatch decision reflects the new config."
+            )
 
     # ── execution ───────────────────────────────────────────────────────
     def run_coord(self, args: tuple[str, ...], *, serialize_merge: bool = False) -> int:
@@ -5751,12 +5880,15 @@ class Driver:
         if state is None:
             raise DriveError("could not read board state", EXIT_USAGE)
 
-        # #1466: probe ONCE here (not per-poll) — the underlying `claude -p
-        # "/usage"` call is itself cached ~60s (coord.usage_limits), but
-        # there's no reason to re-shell-out every loop iteration for a
-        # decision only made at the top of the run. Skipped entirely when
-        # the gate is off, so a `disabled` config never pays the subprocess
-        # cost.
+        # #1466: this is the ONE-TIME preflight check — raises/warns before
+        # the loop below ever starts, using whatever config this run was
+        # launched with. #1654 added a SECOND, per-poll re-check
+        # (`check_usage_gate`, called again right before every RUN action
+        # below) against `self.config` AS RELOADED THAT TICK, so a mid-run
+        # `usage_gate.mode`/threshold edit reaches the very next dispatch —
+        # this first call only ever decides whether the run gets to start at
+        # all. Skipped entirely when the gate is off, so a `disabled`
+        # config never pays the subprocess cost.
         usage_limits = (
             self.usage_prober() if self.config.usage_gate.mode != "disabled" else None
         )
@@ -5875,6 +6007,12 @@ class Driver:
                         flush=True,
                     )
                 return EXIT_DEADLINE
+
+            # #1654: re-read coordinator.yml before every decision this tick
+            # makes — see `_reload_config`'s own docstring for why (a
+            # construction-time snapshot made a mid-run ladder/usage-gate
+            # edit invisible for the drive's entire remaining life).
+            self._reload_config()
 
             state = self.read_state()
             if state is None:
@@ -6076,6 +6214,22 @@ class Driver:
                 self.log(action.label)
 
             if action.kind == RUN:
+                # #1654: re-check the usage gate against THIS poll's
+                # (possibly just-reloaded) config, not the snapshot
+                # `preflight()` consulted once before the loop started —
+                # `check_usage_gate` is the SAME question preflight asks, so
+                # a mid-run `usage_gate.mode` edit (warn -> block, or a
+                # tightened threshold) reaches the very next dispatch
+                # instead of only the next `coord drive` invocation.
+                usage_limits = (
+                    self.usage_prober()
+                    if self.config.usage_gate.mode != "disabled"
+                    else None
+                )
+                gate_warning = check_usage_gate(self.config, usage_limits)
+                if gate_warning and gate_warning != self._last_usage_gate_warning:
+                    self.warn(gate_warning)
+                    self._last_usage_gate_warning = gate_warning
                 rc = self.run_coord(
                     action.command, serialize_merge=action.serialize_merge
                 )

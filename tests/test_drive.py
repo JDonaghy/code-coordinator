@@ -428,6 +428,102 @@ def test_driver_loop_disabled_gate_never_calls_the_prober(driver_factory):
     assert calls == []
 
 
+# ── #1654: the poll loop re-reads coordinator.yml every tick ───────────────
+
+
+def test_driver_loop_picks_up_a_mid_run_usage_gate_change_on_the_next_poll(
+    driver_factory, capsys,
+):
+    """A `usage_gate.mode` edit made WHILE a drive is already polling must
+    reach the very next dispatch decision, not just the next `coord drive`
+    invocation (#1654's motivating #1653 scenario). Scripts a config_loader
+    that hands back the construction-time (`warn`) config on the first
+    reload and a `block`-mode config on every reload after — exactly like
+    an operator editing coordinator.yml between two polls."""
+    cfg_warn = _config_with_gate(mode="warn", session_threshold_pct=50.0)
+    cfg_block = _config_with_gate(mode="block", session_threshold_pct=50.0)
+    reloads = [cfg_warn, cfg_block]
+    calls = {"n": 0}
+
+    def loader(_path):
+        idx = min(calls["n"], len(reloads) - 1)
+        calls["n"] += 1
+        return reloads[idx]
+
+    driver = driver_factory(
+        [{"assignments": []}],
+        opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=10.0),
+        config=cfg_warn,
+        usage_prober=lambda: PlanLimits(status="ok", session_pct=95.0),
+        config_loader=loader,
+    )
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    assert exc.value.exit_code == EXIT_USAGE
+    assert "block" in str(exc.value)
+    # Exactly one `coord assign` reached the subprocess boundary — the FIRST
+    # poll's reload still saw `warn` (construction-time config, unchanged),
+    # so it dispatched; the SECOND poll's reload already saw `block`, so the
+    # usage gate refused before a second `coord assign` was ever spawned.
+    assert len(driver.recorded) == 1
+    captured = capsys.readouterr()
+    # The reload's own narration is informational (`self.log`, not
+    # `self.warn`) — it goes to stdout, distinct from the usage gate's own
+    # warn-level lines on stderr asserted above via `exc.value`.
+    assert "usage_gate changed" in captured.out
+    assert "'warn' -> 'block'" in captured.out
+
+
+def test_driver_loop_survives_a_mid_run_config_parse_failure(driver_factory, capsys):
+    """A coordinator.yml an operator is mid-editing (truncated write, a
+    YAML typo) must never kill an otherwise-healthy drive: the last-good
+    config stays in force, the drive keeps running to its deadline, and the
+    warning is printed exactly once for the whole broken window — not once
+    per poll."""
+    cfg = make_config()
+
+    def broken_loader(_path):
+        raise ValueError("while parsing a block mapping")
+
+    driver = driver_factory(
+        [board(status="running")],
+        opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=2.5 / 60.0),
+        config=cfg,
+        config_loader=broken_loader,
+    )
+    assert driver.run() == EXIT_DEADLINE
+    assert driver.config is cfg  # last-good snapshot, never replaced
+    err = capsys.readouterr().err
+    assert err.count("coordinator.yml reload failed") == 1
+
+
+def test_driver_loop_config_reload_never_mutates_opts(driver_factory):
+    """`self.opts` is this invocation's own identity (the CLI flags) — a
+    config reload must never touch it, even across several successful
+    reloads that DO change `self.config`."""
+    cfg_a = _config_with_gate(mode="warn", session_threshold_pct=50.0)
+    cfg_b = _config_with_gate(mode="disabled")
+    reloads = [cfg_a, cfg_b, cfg_a, cfg_b]
+    calls = {"n": 0}
+
+    def loader(_path):
+        idx = min(calls["n"], len(reloads) - 1)
+        calls["n"] += 1
+        return reloads[idx]
+
+    opts = DriveOptions(machine="precision", poll=1.0, deadline_mins=3.5 / 60.0)
+    driver = driver_factory(
+        [board(status="running")], opts=opts, config=cfg_a, config_loader=loader,
+    )
+    assert driver.run() == EXIT_DEADLINE
+    assert driver.opts is opts
+    assert driver.opts.machine == "precision"
+    assert driver.opts.poll == 1.0
+    # The reload really did run (and really did change self.config) —
+    # otherwise this test would trivially pass by never exercising reload.
+    assert calls["n"] >= 2
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # no work yet: plan / dispatch
 # ═══════════════════════════════════════════════════════════════════════════
@@ -6294,7 +6390,7 @@ def driver_factory(tmp_path, monkeypatch, capsys):
 
     def make(
         payloads, *, opts=None, verifier=None, config=None, oracle_gate=None,
-        usage_prober=None, self_head_probe=None, ticks=200,
+        usage_prober=None, self_head_probe=None, config_loader=None, ticks=200,
     ):
         clock = {"t": 0.0}
         recorded: list[list[str]] = []
@@ -6305,14 +6401,24 @@ def driver_factory(tmp_path, monkeypatch, capsys):
 
         monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
 
+        resolved_config = config or make_config()
         driver = Driver(
             repo=REPO,
             issue=ISSUE,
             opts=opts or DriveOptions(machine="precision", poll=1.0),
-            config=config or make_config(),
+            config=resolved_config,
             fetcher=FakeFetcher(payloads),
             verifier=verifier or FakeVerifier(),
             oracle_gate=oracle_gate,
+            # #1654: default to a no-op reload (hands back the SAME config
+            # object every poll) — a real driver re-reads coordinator.yml
+            # from disk every tick, but defaulting to that here would make
+            # every existing test in this module implicitly depend on
+            # `$COORD_CONFIG`/`~/.coord/coordinator.yml` resolving
+            # successfully (or silently latching the one-warn-only path),
+            # neither of which is what those tests are about. Tests
+            # exercising the reload itself pass their own.
+            config_loader=config_loader or (lambda _path: resolved_config),
             # #1466: never let a Driver test shell out to a real `claude -p
             # "/usage"` — default to a stub reporting "unknown" (same as no
             # probe at all), which the gate always treats as "proceed,

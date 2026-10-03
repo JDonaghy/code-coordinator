@@ -330,7 +330,23 @@ def _save_config_snapshot(
                 pass
 
 
-def _load_config(path: Path | None, *, allow_thin_client: bool = True) -> Config:
+def resolve_and_load_config(path: Path | None, *, allow_thin_client: bool = True) -> Config:
+    """Resolve *path* (thin-client aware) and parse it — the one place this
+    question is asked, so every caller that needs a *freshly loaded* config
+    (not just the one-time CLI boot in :func:`_load_config`, which also
+    writes the DB snapshot and exits the process on a parse failure) gets
+    the SAME resolution rule rather than a second, drifting copy (#2096,
+    "one question, one answer"). :func:`coord.drive.Driver`'s per-poll
+    config reload (#1654) is the other caller: unlike `_load_config`, it
+    must never call ``sys.exit`` (a bad mid-run edit must warn, not kill the
+    drive) and must never re-run ``_save_config_snapshot`` every poll (a
+    DELETE+INSERT into the shared ``machines`` table, meant for "this
+    process just booted", not "it's still running 50 polls later").
+
+    Raises :class:`ConfigError` on any resolution/parse failure — never
+    exits, never echoes. Callers that want the CLI's print-and-exit-2
+    behavior still go through :func:`_load_config`.
+    """
     # Resolve the default location ($COORD_CONFIG → ~/.coord/coordinator.yml →
     # ./coordinator.yml) when no explicit --config was given, so `coord` works on
     # a machine without a repo checkout and isn't sensitive to the CWD.
@@ -366,24 +382,28 @@ def _load_config(path: Path | None, *, allow_thin_client: bool = True) -> Config
     # caller of ``_load_config`` legitimately wants thin-client resolution
     # (they ARE clients of the daemon's board) — this flag exists so ONLY
     # `coord serve`'s own bootstrap can opt out.
+    if allow_thin_client:
+        from coord.client import resolve_board_service  # noqa: PLC0415
+
+        svc = resolve_board_service()
+        if svc is not None:
+            from coord.client import fetch_remote_config  # noqa: PLC0415
+
+            try:
+                path = fetch_remote_config(svc)
+            except Exception as exc:  # noqa: BLE001 — do NOT fall through to
+                # load(path): path may point at a local file that happens to
+                # exist (the exact bypass this issue closes). Fail loudly
+                # instead of silently trusting whatever is on disk.
+                raise ConfigError(
+                    f"could not fetch config from {svc.url}: {exc}"
+                ) from exc
+    return load(path)
+
+
+def _load_config(path: Path | None, *, allow_thin_client: bool = True) -> Config:
     try:
-        if allow_thin_client:
-            from coord.client import resolve_board_service  # noqa: PLC0415
-
-            svc = resolve_board_service()
-            if svc is not None:
-                from coord.client import fetch_remote_config  # noqa: PLC0415
-
-                try:
-                    path = fetch_remote_config(svc)
-                except Exception as exc:  # noqa: BLE001 — do NOT fall through to
-                    # load(path): path may point at a local file that happens to
-                    # exist (the exact bypass this issue closes). Fail loudly
-                    # instead of silently trusting whatever is on disk.
-                    raise ConfigError(
-                        f"could not fetch config from {svc.url}: {exc}"
-                    ) from exc
-        cfg = load(path)
+        cfg = resolve_and_load_config(path, allow_thin_client=allow_thin_client)
     except ConfigError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(2)
