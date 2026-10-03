@@ -41,7 +41,13 @@ left standing after redaction is refused outright (``PublicExportError``) —
 redaction itself runs **client-side**, over the already-fetched result —
 same precedent as every ``--format`` above, which also serialises
 client-side over ``run_report``'s own return value — so a thin client never
-needs a second, DB-backed export path.
+needs a second, DB-backed export path. The allowlist that drives it,
+though, is resolved via :func:`_resolve_public_allowlist` — the same
+thin-client-first ``board_service``/``fetch_remote_config`` seam
+``coord.commands._common._load_config`` uses for every other config read
+(#1080/#947/#2824), never a raw local ``coordinator.yml`` load: the
+allowlist is the one input here that is explicitly security-sensitive, so
+a thin client with a stale local copy must never under-redact against it.
 
 Exit codes: ``2`` for a bad request (unknown report, unknown parameter, bad
 value, ``--format xlsx`` without the extra installed, or a public export
@@ -60,6 +66,36 @@ from pathlib import Path
 import click
 
 from coord.commands._common import _CONFIG_OPTION
+
+
+def _resolve_public_allowlist(config_path) -> frozenset[str]:  # noqa: ANN001
+    """The thin-client-safe ``reporting.public.allowlist_repos`` for
+    ``coord report export --public`` (#3474 review).
+
+    Mirrors :func:`coord.commands._common._load_config`'s "thin client
+    first" resolution — a machine with ``board_service``/``client.toml``
+    configured fetches the DAEMON's live config (``fetch_remote_config``)
+    rather than trusting whatever ``coordinator.yml`` happens to sit on
+    local disk, the exact bug class #1080/#947/#2824 already paid for
+    (a stale/stray local file silently diverging from the daemon's real
+    config with no signal anything is wrong). ``_load_config`` itself
+    ``sys.exit(2)``s on a bad config, which is right for every OTHER
+    command but wrong here: the allowlist is the one input this feature
+    treats as security-sensitive, so a failure to resolve it (daemon
+    unreachable, local file malformed/absent) must fail SOFT — the caller
+    catches whatever this raises and falls back to the empty allowlist,
+    i.e. "redact everything" (same posture as the daemon-side sibling,
+    :func:`coord.reports.load_public_allowlist`).
+    """
+    from coord.client import fetch_remote_config, resolve_board_service  # noqa: PLC0415
+    from coord.config import load as load_config  # noqa: PLC0415
+
+    path = config_path
+    svc = resolve_board_service()
+    if svc is not None:
+        path = fetch_remote_config(svc)
+    return frozenset(load_config(path).reporting.public.allowlist_repos)
+
 
 # Row keys whose values are epoch timestamps — rendered as a relative age in
 # the human table (absolute in --json, which is the machine contract).
@@ -434,7 +470,6 @@ def report_export(
         )
         raise SystemExit(2)
 
-    from coord.config import load as load_config  # noqa: PLC0415
     from coord.reports import (  # noqa: PLC0415
         REPORTS,
         PublicExportError,
@@ -474,16 +509,21 @@ def report_export(
     # `result` — same precedent `--format csv|xlsx|...` above already sets
     # (those also serialise client-side over `run_report`'s own return
     # value), so a thin client never needs a second, DB-backed export path.
-    # A `coordinator.yml` that fails to load (absent — reports need none for
-    # `list`/`run` — or malformed) is NOT a usage error here: it falls back
-    # to the empty allowlist, i.e. redact everything, the only safe default
-    # for an export leaving the fleet.
+    # The allowlist itself goes through `_resolve_public_allowlist` — the
+    # SAME thin-client-first resolution every other config read uses
+    # (#1080/#947/#2824), not a raw local-file load — so a thin client whose
+    # daemon has since tightened `reporting.public.allowlist_repos` can
+    # never under-redact from a stale local copy. Any failure to resolve it
+    # (daemon unreachable, local file malformed/absent — reports need no
+    # config at all for `list`/`run`) is NOT a usage error here: it falls
+    # back to the empty allowlist, i.e. redact everything, the only safe
+    # default for an export leaving the fleet.
     try:
-        allowed = frozenset(load_config(config_path).reporting.public.allowlist_repos)
-    except Exception as e:  # noqa: BLE001 — fail CLOSED: unreadable config => redact everything
+        allowed = _resolve_public_allowlist(config_path)
+    except Exception as e:  # noqa: BLE001 — fail CLOSED: unreadable/unreachable config => redact everything
         click.echo(
-            f"warning: could not load {config_path} ({e}) — redacting every "
-            "repo (reporting.public.allowlist_repos defaults to empty).",
+            f"warning: could not resolve reporting.public.allowlist_repos "
+            f"({e}) — redacting every repo.",
             err=True,
         )
         allowed = frozenset()

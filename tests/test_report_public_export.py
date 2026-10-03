@@ -18,6 +18,12 @@ Three layers, same split this repo's report tests already use:
   resolving the allowlist off its own config source (``--config`` / the
   app's bound ``Config``) and writing/serving the identical redacted
   bytes.
+* ``TestRealReportCatalogueRedaction``/``TestPublicHtmlScriptInjection``
+  cover the PR #3541 review findings: a report with no per-row ``repo``
+  identity at all (``queue-outcomes``) and two reports whose KEPT rows
+  embed a different repo's ``"repo#issue"`` ref in a list column
+  (``decisions``' ``downstream``, ``drive-queue-status``'s ``after``), plus
+  the inline chart ``<script>`` JSON-breakout.
 """
 
 from __future__ import annotations
@@ -32,13 +38,20 @@ from coord.cli import main
 from coord.config import Config, ConfigError, PublicReportingConfig, _parse_reporting
 from coord.dashboard.fixture import FixtureServer
 from coord.dashboard.server import build_app
+from coord.drive_queue import entry_key
 from coord.models import Machine, Repo
 from coord.reports import (
     PUBLIC_PRIVATE_REPO_LABEL,
+    REPORTS,
+    ChartSeries,
+    ChartSpec,
     ColumnMeta,
     PublicExportError,
     ReportResult,
     assert_public_export_allowed,
+    fold_decisions,
+    fold_drive_queue_status,
+    fold_queue_outcomes,
     has_basis_note,
     has_cost_columns,
     public_csv_filename,
@@ -446,3 +459,199 @@ class TestDashboardPublicExportRoute:
         client = self._client((PUBLIC_REPO,))
         r = client.get("/api/report/no-such-report/public")
         assert r.status_code == 404
+
+
+class TestRealReportCatalogueRedaction:
+    """PR #3541 review: run the ACTUAL report folds (not just the synthetic
+    repo/issue/title/cost_total/machines fixture every other test in this
+    file uses) through :func:`redact_report_for_public`, for every report
+    the review named as leaking."""
+
+    def test_queue_outcomes_has_no_row_identity_and_no_conventional_repo_column(self) -> None:
+        # The bug was reachable BECAUSE this report declares none of the
+        # three conventional identity columns `_public_row_identity_columns`
+        # falls back to (no `repo`, no `issue`, no `title` column) — assert
+        # that premise still holds so the next test keeps meaning what it says.
+        report = REPORTS["queue-outcomes"]
+        assert report.row_identity is None
+        from coord.reports import QUEUE_OUTCOMES_COLUMNS
+
+        assert "repo" not in QUEUE_OUTCOMES_COLUMNS
+        assert "issue" not in QUEUE_OUTCOMES_COLUMNS
+        assert "title" not in QUEUE_OUTCOMES_COLUMNS
+
+    def test_queue_outcomes_issues_list_is_scrubbed_with_no_row_identity(self) -> None:
+        public_key = entry_key(PUBLIC_REPO, PUBLIC_ISSUE)
+        private_key = entry_key(PRIVATE_REPO, PRIVATE_ISSUE)
+        start, end = 1_799_000_000.0, 1_800_000_000.0
+        episodes = [
+            {
+                "key": public_key,
+                "resolved": True,
+                "resolved_at": start + 10,
+                "human_acted": True,
+                "source": "operator",
+                "true_cause": "needs_decision",
+                "stated_reason": "",
+            },
+            {
+                "key": private_key,
+                "resolved": True,
+                "resolved_at": start + 20,
+                "human_acted": True,
+                "source": "operator",
+                "true_cause": "needs_decision",
+                "stated_reason": "",
+            },
+        ]
+        result = fold_queue_outcomes(episodes, (start, end))
+        assert result.report_id == "queue-outcomes"
+        # Sanity: before redaction both keys are really there, unscrubbed.
+        pre_issues = [set(r["issues"]) for r in result.rows]
+        assert any(public_key in s and private_key in s for s in pre_issues)
+
+        redacted = redact_report_for_public(
+            result, allowed_repos={PUBLIC_REPO}, report=REPORTS["queue-outcomes"]
+        )
+        blob = json.dumps(redacted)
+        assert PRIVATE_REPO not in blob
+        assert str(PRIVATE_ISSUE) not in blob
+        assert public_key in blob
+        issues = next(r["issues"] for r in redacted["rows"] if public_key in r["issues"])
+        assert private_key not in issues
+        assert PUBLIC_PRIVATE_REPO_LABEL in issues
+
+    def test_decisions_downstream_list_is_scrubbed_for_a_kept_root_row(self) -> None:
+        from coord.drive_queue import STATE_BLOCKED
+
+        public_key = entry_key(PUBLIC_REPO, PUBLIC_ISSUE)
+        private_key = entry_key(PRIVATE_REPO, PRIVATE_ISSUE)
+        generated_at = 1_800_000_000.0
+        escalations = [
+            {
+                "repo_name": PUBLIC_REPO,
+                "issue_number": PUBLIC_ISSUE,
+                "reason": "a gate diverged",
+                "proposed_command": "coord merge --revalidate",
+                "created_at": generated_at,
+                "stage": "merge",
+            }
+        ]
+        queue_entries = [
+            {
+                "repo_name": PRIVATE_REPO,
+                "issue_number": PRIVATE_ISSUE,
+                "state": STATE_BLOCKED,
+                "last_reason": f"queued but blocked — {public_key} it will never satisfy",
+                "after_json": [public_key],
+                "reason_at": generated_at,
+                "enqueued_at": generated_at,
+            }
+        ]
+        result = fold_decisions(escalations, queue_entries, generated_at)
+        assert result.report_id == "decisions"
+        root = next(r for r in result.rows if r["repo"] == PUBLIC_REPO)
+        assert private_key in root["downstream"]  # unredacted: the leak, pre-fix
+
+        redacted = redact_report_for_public(
+            result, allowed_repos={PUBLIC_REPO}, report=REPORTS["decisions"]
+        )
+        blob = json.dumps(redacted)
+        assert PRIVATE_REPO not in blob
+        assert str(PRIVATE_ISSUE) not in blob
+        kept = [r for r in redacted["rows"] if r["repo"] == PUBLIC_REPO]
+        assert len(kept) == 1
+        assert private_key not in kept[0]["downstream"]
+        assert PUBLIC_PRIVATE_REPO_LABEL in kept[0]["downstream"]
+
+    def test_drive_queue_status_after_list_is_scrubbed_for_a_kept_row(self) -> None:
+        private_key = entry_key(PRIVATE_REPO, PRIVATE_ISSUE)
+        entries = [
+            {
+                "position": 1,
+                "repo_name": PUBLIC_REPO,
+                "issue_number": PUBLIC_ISSUE,
+                "state": "waiting",
+                "machine": "laptop",
+                "attempts": 0,
+                "deferrals": 0,
+                "last_reason": "",
+                "after_json": [private_key],
+            }
+        ]
+        result = fold_drive_queue_status(entries, 1_800_000_000.0)
+        assert result.report_id == "drive-queue-status"
+        row = next(r for r in result.rows if r["repo"] == PUBLIC_REPO)
+        assert private_key in row["after"]  # unredacted: the leak, pre-fix
+
+        redacted = redact_report_for_public(
+            result, allowed_repos={PUBLIC_REPO}, report=REPORTS["drive-queue-status"]
+        )
+        blob = json.dumps(redacted)
+        assert PRIVATE_REPO not in blob
+        assert str(PRIVATE_ISSUE) not in blob
+        kept = [r for r in redacted["rows"] if r["repo"] == PUBLIC_REPO]
+        assert len(kept) == 1
+        assert private_key not in kept[0]["after"]
+        assert PUBLIC_PRIVATE_REPO_LABEL in kept[0]["after"]
+
+    def test_list_columns_that_are_not_repo_issue_shaped_are_left_alone(self) -> None:
+        # `machines`/`options` are also `kind: list` columns — the scrub must
+        # only touch elements that actually PARSE as `repo#issue`, never a
+        # plain machine name or an options dict (#3474 review: "never
+        # disturbs a column that merely happens to also be kind: list").
+        redacted = redact_report_for_public(
+            _fixture_result(), allowed_repos={PUBLIC_REPO}
+        )
+        public_row = next(r for r in redacted["rows"] if r["repo"] == PUBLIC_REPO)
+        assert public_row["machines"] == ["laptop"]
+
+
+class TestPublicHtmlScriptInjection:
+    """PR #3541 review: an unescaped `</script>` inside the inlined chart
+    JSON must not be able to break out of the `<script>` block."""
+
+    def _chart_result(self, title: str) -> ReportResult:
+        return ReportResult(
+            report_id="completed",
+            generated_at=1_800_000_000.0,
+            window=(1_799_000_000.0, 1_800_000_000.0),
+            columns=["repo", "issue", "title", "cost_total"],
+            column_meta=[
+                ColumnMeta(id="repo", label="Repo", kind="text"),
+                ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
+                ColumnMeta(id="title", label="Title", kind="text"),
+                ColumnMeta(id="cost_total", label="Cost $", kind="money", align="right"),
+            ],
+            rows=[{"repo": PUBLIC_REPO, "issue": PUBLIC_ISSUE, "title": title, "cost_total": 1.0}],
+            notes=[],
+            chart=ChartSpec(
+                kind="bar",
+                series=(ChartSeries(label="Cost", column="cost_total"),),
+                x="title",
+            ),
+        )
+
+    def test_a_title_containing_a_script_breakout_cannot_inject_a_new_script_tag(
+        self,
+    ) -> None:
+        malicious = "</script><script>window.__pwned = true;</script>"
+        html = result_to_public_html(self._chart_result(malicious))
+        # Exactly the two `<script` openers THIS function itself emits (the
+        # pinned ECharts CDN tag, and the inline chart-data block) — a third
+        # would mean the malicious title broke out of the JSON payload and
+        # opened a script tag of its own.
+        assert html.count("<script") == 2
+        assert "</script><script>" not in html
+
+    def test_the_escaped_payload_still_round_trips_as_the_original_title(self) -> None:
+        # The escape must be reversible by the browser's JSON.parse/eval —
+        # not a lossy sanitiser that mangles a legitimate title.
+        import re
+
+        malicious = "a </script> title"
+        html = result_to_public_html(self._chart_result(malicious))
+        match = re.search(r"const REPORT = (\{.*\});\n", html)
+        assert match is not None
+        payload = json.loads(match.group(1))
+        assert payload["result"]["rows"][0]["title"] == malicious
