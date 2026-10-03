@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -45,10 +46,6 @@ def repo_local_only(tmp_path: Path) -> Path:
     _git(repo, "add", "README")
     _git(repo, "commit", "-m", "initial")
     return repo
-
-
-def _shell_quote(s: str) -> str:
-    return "'" + s.replace("'", "'\\''") + "'"
 
 
 # The #1563 evidence, verbatim shape.
@@ -81,11 +78,18 @@ _OK_RESULT_EVENT = {
 }
 
 
-def _printf_lines(*events: dict) -> str:
-    """Shell snippet that prints each event as one NDJSON line."""
-    return "; ".join(
-        f"printf '%s\\n' {_shell_quote(json.dumps(e))}" for e in events
-    )
+# Portable replacement for the POSIX-only `["/bin/sh", "-c", "printf ..."]`
+# fake worker shape (#2725/#2843): `_print_lines_argv` runs the equivalent via
+# `sys.executable -c` instead of a shell — no `/bin/sh` dependency, which is
+# absent on Windows and was failing every test in this file at spawn time
+# regardless of the `_maybe_bash_wrap` default (#2843's OTHER root cause,
+# independent of the bash-wrap-default fix in `coord/agent.py`).
+def _print_lines_argv(*events: dict, exit_code: int = 0) -> list[str]:
+    """One NDJSON line per *event*, printed via a real python child process."""
+    script = "".join(f"print({json.dumps(e)!r})\n" for e in events)
+    if exit_code:
+        script += f"import sys; sys.exit({exit_code})\n"
+    return [sys.executable, "-c", script]
 
 
 def test_terminal_api_error_recorded_failed(
@@ -100,10 +104,7 @@ def test_terminal_api_error_recorded_failed(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            _printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT),
-        ],
+        worker_command=lambda spec: _print_lines_argv(_INIT_EVENT, _ERROR_RESULT_EVENT),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -134,10 +135,7 @@ def test_terminal_api_error_appears_in_log(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            _printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT),
-        ],
+        worker_command=lambda spec: _print_lines_argv(_INIT_EVENT, _ERROR_RESULT_EVENT),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -168,10 +166,7 @@ def test_normal_successful_result_still_done(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            _printf_lines(_INIT_EVENT, _OK_RESULT_EVENT),
-        ],
+        worker_command=lambda spec: _print_lines_argv(_INIT_EVENT, _OK_RESULT_EVENT),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -203,10 +198,7 @@ def test_transient_error_then_internal_retry_success_still_done(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            _printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT, _OK_RESULT_EVENT),
-        ],
+        worker_command=lambda spec: _print_lines_argv(_INIT_EVENT, _ERROR_RESULT_EVENT, _OK_RESULT_EVENT),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -239,10 +231,7 @@ def test_terminal_api_error_with_nonzero_exit(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            f"{_printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT)}; exit 1",
-        ],
+        worker_command=lambda spec: _print_lines_argv(_INIT_EVENT, _ERROR_RESULT_EVENT, exit_code=1),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -275,10 +264,7 @@ def test_terminal_api_error_still_captures_claude_session_id(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            _printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT),
-        ],
+        worker_command=lambda spec: _print_lines_argv(_INIT_EVENT, _ERROR_RESULT_EVENT),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -325,10 +311,7 @@ def test_reap_parses_the_terminal_log_only_once(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            _printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT),
-        ],
+        worker_command=lambda spec: _print_lines_argv(_INIT_EVENT, _ERROR_RESULT_EVENT),
     )
     spec = AssignmentSpec(
         repo_name="api",

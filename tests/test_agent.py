@@ -576,6 +576,27 @@ def test_assign_unknown_binary_marks_failed(tmp_path: Path) -> None:
     assert final.error is not None
 
 
+# #2843: `_maybe_bash_wrap`'s whole `enabled=True` branch spawns a real
+# `bash -c 'exec ...'` parent — a POSIX shell with POSIX `exec()` semantics
+# (process-image replacement, same PID). On win32 this is now a deliberate
+# no-op (see `_maybe_bash_wrap`'s own docstring): bash isn't guaranteed
+# present, and Git for Windows' bundled MSYS bash doesn't give the
+# same-PID/process-group invariant this mitigation depends on even when it
+# is. The tests marked with this skip exist specifically to exercise that
+# POSIX-only wrapping, so they skip on win32 rather than assert a behavior
+# the fix deliberately disables there — root cause and measurement in
+# #2843 (W11, child of #2680).
+_bash_wrap_posix_only = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="exercises _maybe_bash_wrap's real bash -c 'exec ...' wrapping, "
+    "which coord/agent.py now no-ops on win32 (#2843) — bash isn't "
+    "guaranteed present, and where it is (Git for Windows' MSYS bash) its "
+    "exec builtin doesn't preserve the PID/process-group invariant this "
+    "mitigation depends on",
+)
+
+
+@_bash_wrap_posix_only
 def test_assign_unknown_binary_bash_wrapped_marks_failed(tmp_path: Path) -> None:
     """With the bash-wrap on, an unknown binary fails via bash exec's non-zero
     exit (#299) — the assignment still ends up FAILED."""
@@ -626,6 +647,7 @@ def test_inject_message_writes_to_worker_stdin(tmp_path: Path) -> None:
     assert "# inject: second message" in log, "inject marker missing from log"
 
 
+@_bash_wrap_posix_only
 def test_maybe_bash_wrap_helper() -> None:
     """The pure wrap helper produces bash -c 'exec ...' when enabled (#299)."""
     from coord.agent import _maybe_bash_wrap
@@ -636,6 +658,7 @@ def test_maybe_bash_wrap_helper() -> None:
     assert wrapped == ["bash", "-c", "exec claude -p --allowedTools Read,Bash"]
 
 
+@_bash_wrap_posix_only
 def test_spawn_bash_wrap_enabled_routes_through_bash(tmp_path: Path) -> None:
     """With bash_wrap_spawn=True, _spawn launches via bash -c 'exec ...'."""
     import coord.agent as agent_mod
@@ -4367,7 +4390,33 @@ def test_stash_artifacts_for_branch_partial_miss_logs_named_glob(
 
 # ── #1323: build_command runs before stash (fix #3) ──────────────────────────
 
+# #2843 investigation note (NOT the W11 reap-lifecycle cluster this issue is
+# otherwise about, and NOT #1163 either): `_run_pre_stash_build`
+# (coord/agent.py) unconditionally runs the operator-authored
+# `build_commands` string from coordinator.yml via `["/bin/sh", "-c", ...]`.
+# That's a real win32 gap — there is no `/bin/sh` on Windows — but it is a
+# DIFFERENT, pre-existing limitation from the reap-status-stuck-on-FAILED
+# signature #2843 targets (this fails a log-content assertion about the
+# build command's own output, never the assignment's status), and the two
+# tests below each hand it a POSIX-only shell snippet (`printf
+# "\\x7fELF%0200d" ...`, `exit 42`) as their `build_commands` value, so even
+# swapping the interpreter for `cmd /c` would not make them portable — the
+# fixture content itself is shell-specific, not just the dispatch mechanism.
+# Porting `build_commands` cross-platform (cmd.exe/PowerShell translation of
+# an arbitrary operator-authored shell string) is real, separate scope this
+# slice does not take on; skip rather than half-port.
+_build_command_posix_only = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="build_commands (coordinator.yml) runs via `/bin/sh -c` "
+    "(coord.agent._run_pre_stash_build) and these two tests' own "
+    "build_commands values are POSIX shell snippets — no `/bin/sh` on "
+    "Windows, and no portable stand-in without a cross-platform "
+    "build_commands port (separate from #2843's W11 reap-lifecycle cluster "
+    "and from #1163's Job Objects/ConPTY/junctions scope)",
+)
 
+
+@_build_command_posix_only
 def test_stash_artifacts_build_command_runs_before_glob(tmp_path: Path) -> None:
     """build_command is run in the worktree before the artifact glob (#1323 fix #3).
 
@@ -4432,6 +4481,7 @@ def test_stash_artifacts_build_command_runs_before_glob(tmp_path: Path) -> None:
     assert "pre-stash build" in log_text
 
 
+@_build_command_posix_only
 def test_stash_artifacts_build_command_logged_on_failure(tmp_path: Path) -> None:
     """A failing build_command is logged but does not abort the stash (#1323 fix #3).
 

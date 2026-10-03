@@ -14,6 +14,7 @@ detection wired in `AgentServer._reap` (coord/agent.py).
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,30 @@ def repo_local_only(tmp_path: Path) -> Path:
 _KILL_MESSAGE = "You’ve hit your session limit · resets 8:30pm (America/Chicago)"
 
 
+# Portable replacements for the POSIX-only `["/bin/sh", "-c", script]` fake
+# worker shape (#2725/#2843): `script` below is inline PYTHON, run via
+# `sys.executable -c`, never a shell — no `/bin/sh` dependency, which is
+# absent on Windows and was failing every test in this file at spawn time
+# regardless of the `_maybe_bash_wrap` default (#2843's OTHER root cause,
+# independent of the bash-wrap-default fix in `coord/agent.py`).
+def _kill_message_argv(*, exit_code: int = 0) -> list[str]:
+    """`printf '%s\\n' <msg>[; exit N]`, as a portable argv."""
+    script = f"print({_KILL_MESSAGE!r})\n"
+    if exit_code:
+        script += f"import sys; sys.exit({exit_code})\n"
+    return [sys.executable, "-c", script]
+
+
+_PARTIAL_COMMIT_THEN_KILL_SCRIPT = (
+    "import subprocess\n"
+    "open('partial.txt', 'w').write('partial\\n')\n"
+    "subprocess.run(['git', 'add', 'partial.txt'], check=True)\n"
+    "subprocess.run(['git', '-c', 'user.email=t@t.com', '-c', 'user.name=T', "
+    "'commit', '-q', '-m', 'partial'], check=True)\n"
+    f"print({_KILL_MESSAGE!r})\n"
+)
+
+
 def test_usage_limit_kill_detected_on_nonzero_exit(
     tmp_path: Path, repo_local_only: Path
 ) -> None:
@@ -59,10 +84,7 @@ def test_usage_limit_kill_detected_on_nonzero_exit(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            f"printf '%s\\n' {_shell_quote(_KILL_MESSAGE)}; exit 1",
-        ],
+        worker_command=lambda spec: _kill_message_argv(exit_code=1),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -101,10 +123,7 @@ def test_usage_limit_kill_detected_on_clean_exit_zero_commits(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            f"printf '%s\\n' {_shell_quote(_KILL_MESSAGE)}",
-        ],
+        worker_command=lambda spec: _kill_message_argv(),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -149,10 +168,7 @@ def test_usage_limit_kill_never_recorded_done_even_with_commits(
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            "printf 'partial\\n' > partial.txt && git add partial.txt && "
-            "git -c user.email=t@t.com -c user.name=T commit -q -m 'partial' && "
-            f"printf '%s\\n' {_shell_quote(_KILL_MESSAGE)}",
+            sys.executable, "-c", _PARTIAL_COMMIT_THEN_KILL_SCRIPT,
         ],
     )
     spec = AssignmentSpec(
@@ -199,7 +215,9 @@ def test_zero_commit_clean_exit_is_advisory_for_all_work_like_types(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo 'already implemented'"],
+        worker_command=lambda spec: [
+            sys.executable, "-c", "print('already implemented')",
+        ],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -232,7 +250,7 @@ def test_review_type_zero_commits_still_done(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo 'LGTM'"],
+        worker_command=lambda spec: [sys.executable, "-c", "print('LGTM')"],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -262,7 +280,10 @@ def test_normal_failure_has_no_usage_limit_reason(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo boom >&2; exit 1"],
+        worker_command=lambda spec: [
+            sys.executable, "-c",
+            "import sys; print('boom', file=sys.stderr); sys.exit(1)",
+        ],
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -290,10 +311,7 @@ def test_usage_limit_reason_appears_in_log(
         repos=["api"],
         repo_paths={"api": str(repo_local_only)},
         state_dir=tmp_path / "state",
-        worker_command=lambda spec: [
-            "/bin/sh", "-c",
-            f"printf '%s\\n' {_shell_quote(_KILL_MESSAGE)}; exit 1",
-        ],
+        worker_command=lambda spec: _kill_message_argv(exit_code=1),
     )
     spec = AssignmentSpec(
         repo_name="api",
@@ -310,7 +328,3 @@ def test_usage_limit_reason_appears_in_log(
     log_text = Path(final.log_path).read_text()
     assert "usage-limit kill detected" in log_text
     server.shutdown()
-
-
-def _shell_quote(s: str) -> str:
-    return "'" + s.replace("'", "'\\''") + "'"
