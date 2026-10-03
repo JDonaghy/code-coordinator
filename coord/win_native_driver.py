@@ -370,11 +370,18 @@ class WinCalls(Protocol):
     def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int: ...
 
     def find_top_window(self, pid: int, timeout_s: float) -> int:
-        """Poll for the launched process's real top-level window, returning
-        its handle once found. Raises :class:`WinNativeRuntimeError` if none
-        appears within *timeout_s* — this is the "launch" step's own
-        confirmation that the process didn't just start, but actually
-        produced a window (#2096)."""
+        """Poll for *pid*'s (or one of its descendant processes') real
+        top-level window, returning its handle once found. Raises
+        :class:`WinNativeRuntimeError` if none appears within *timeout_s* —
+        this is the "launch" step's own confirmation that the process
+        didn't just start, but actually produced a window (#2096).
+
+        *pid* is not always the real app's own pid: ``subprocess.Popen(...,
+        shell=True)`` on Windows spawns ``cmd.exe`` as the immediate child
+        and returns *its* pid, while the real app (e.g. ``vimcode.exe``) is
+        a grandchild with a different pid that ``cmd.exe`` itself never
+        owns a window for (#3542). Implementations must search *pid*'s
+        whole descendant-process tree, not just *pid* itself."""
         ...
 
     def move_window(self, hwnd: int, x: int, y: int, width: int, height: int) -> None: ...
@@ -857,12 +864,28 @@ class Win32Calls:
 
     def _logonui_running_in_session(self, session_id: int) -> bool:
         """``True`` iff ``LogonUI.exe`` (the Windows lock-screen host
-        process) is running in *session_id* — walked via a
-        ``CreateToolhelp32Snapshot`` process snapshot, the same mechanism
-        Task Manager itself uses, rather than anything that could be
-        confused by a differently-named process (the module docstring's
-        "kill only the PID this driver itself launched" safety note applies
-        equally here: this is read-only enumeration, never a kill)."""
+        process) is running in *session_id* — walked via
+        :meth:`_snapshot_processes`, the same mechanism Task Manager itself
+        uses, rather than anything that could be confused by a differently-
+        named process (the module docstring's "kill only the PID this
+        driver itself launched" safety note applies equally here: this is
+        read-only enumeration, never a kill)."""
+        ctypes = self._ctypes
+        for pid, _ppid, name in self._snapshot_processes():
+            if name.lower() == "logonui.exe":
+                proc_session = ctypes.wintypes.DWORD()
+                self._kernel32.ProcessIdToSessionId(pid, ctypes.byref(proc_session))
+                if proc_session.value == session_id:
+                    return True
+        return False
+
+    def _snapshot_processes(self) -> list[tuple[int, int, str]]:
+        """Every currently running process as ``(pid, parent_pid,
+        exe_name)``, via a single ``CreateToolhelp32Snapshot`` walk — the
+        same mechanism Task Manager itself uses. Read-only enumeration,
+        shared by :meth:`_logonui_running_in_session` (#3510) and
+        :meth:`_descendant_pids` (#3542); never used to kill (see the
+        module docstring's safety note)."""
         ctypes = self._ctypes
         kernel32 = self._kernel32
         TH32CS_SNAPPROCESS = 0x00000002
@@ -880,48 +903,81 @@ class Win32Calls:
 
         snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if not snapshot or snapshot == -1:
-            return False
+            return []
+        out: list[tuple[int, int, str]] = []
         try:
             entry = PROCESSENTRY32()
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
             if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
-                return False
+                return []
             while True:
                 name = entry.szExeFile.decode("mbcs", errors="ignore")
-                if name.lower() == "logonui.exe":
-                    proc_session = ctypes.wintypes.DWORD()
-                    kernel32.ProcessIdToSessionId(
-                        entry.th32ProcessID, ctypes.byref(proc_session),
-                    )
-                    if proc_session.value == session_id:
-                        return True
+                out.append((entry.th32ProcessID, entry.th32ParentProcessID, name))
                 if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
-                    return False
+                    break
         finally:
             kernel32.CloseHandle(snapshot)
+        return out
+
+    def _descendant_pids(self, root_pid: int) -> set[int]:
+        """*root_pid* plus every process it transitively spawned (child,
+        grandchild, ...) — a fresh :meth:`_snapshot_processes` walk each
+        call, since the real app may not have started yet the first time
+        this is polled.
+
+        #3542: ``launch``/``launch_in_terminal`` don't always return the
+        real app's own pid — ``subprocess.Popen(..., shell=True)`` returns
+        ``cmd.exe``'s pid, with the real app (``vimcode.exe``) a grandchild
+        that ``cmd.exe`` itself never owns a window for. Searching the
+        whole descendant tree finds the real app's window regardless of
+        how many shell/console hosts sit between the returned pid and it.
+        """
+        children: dict[int, list[int]] = {}
+        for pid, ppid, _name in self._snapshot_processes():
+            children.setdefault(ppid, []).append(pid)
+        result = {root_pid}
+        frontier = [root_pid]
+        while frontier:
+            current = frontier.pop()
+            for child in children.get(current, ()):
+                if child not in result:
+                    result.add(child)
+                    frontier.append(child)
+        return result
 
     def find_top_window(self, pid: int, timeout_s: float) -> int:
         ctypes = self._ctypes
         deadline = time.monotonic() + timeout_s
         found: list[int] = []
+        candidate_pids: set[int] = {pid}
+        # `WINFUNCTYPE` (stdcall) only exists in ctypes on real Windows —
+        # real runs always go through it (Win32Calls.__init__ guards
+        # off-Windows construction), but falling back to `CFUNCTYPE` off-
+        # Windows is what lets this method's descendant-walk logic be
+        # exercised by a scripted fake on Linux/macOS too (#3542), the same
+        # "unit-testable on any platform" seam the module docstring
+        # describes for the rest of this class.
+        win_functype = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 
-        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        @win_functype(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
         def _enum_proc(hwnd, _lparam):
             owner_pid = ctypes.wintypes.DWORD()
             self._user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
-            if owner_pid.value == pid and self._user32.IsWindowVisible(hwnd):
+            if owner_pid.value in candidate_pids and self._user32.IsWindowVisible(hwnd):
                 found.append(hwnd)
                 return False
             return True
 
         while time.monotonic() < deadline:
+            candidate_pids = self._descendant_pids(pid)
             found.clear()
             self._user32.EnumWindows(_enum_proc, 0)
             if found:
                 return found[0]
             time.sleep(0.1)
         raise WinNativeRuntimeError(
-            f"no visible top-level window appeared for pid={pid} within {timeout_s}s"
+            f"no visible top-level window appeared for pid={pid} or any of "
+            f"its child processes within {timeout_s}s"
         )
 
     def is_window_alive(self, hwnd: int) -> bool:
