@@ -1108,8 +1108,14 @@ def run_issue_activity(
 # `(generated_at, generated_at)`.  `drive_queue` has no `completed_at` and
 # `coord/drive_queue.py` emits no audit events, so there is no data source
 # for a queue *history* report — see this issue's "Out of scope".
+#
+# #1909: the rows are ordered by LIFECYCLE BAND, not by raw `position` — see
+# `_drive_queue_lifecycle_sort_key` below. `band` is a derived display column
+# (not a `drive_queue` row field) naming which of the three bands a row fell
+# into, so a client never has to infer it from `state` alone.
 
 DRIVE_QUEUE_STATUS_COLUMNS = [
+    "band",
     "position",
     "repo",
     "issue",
@@ -1128,6 +1134,12 @@ DRIVE_QUEUE_STATUS_COLUMNS = [
 
 # One entry per DRIVE_QUEUE_STATUS_COLUMNS entry, same order (#1760).
 DRIVE_QUEUE_STATUS_COLUMN_META = [
+    # #1909: the band an entry's row was sorted into — "terminal" (done and
+    # the other states in `TERMINAL_QUEUE_STATES`), "running", or "pending"
+    # (everything still waiting to launch). Named distinctly from `state`
+    # because several raw states fold into one band (`done`/`merged-partial`/
+    # `blocked`/`failed` all read `terminal`).
+    ColumnMeta(id="band", label="Band", kind="enum"),
     ColumnMeta(id="position", label="Pos", kind="int", align="right"),
     ColumnMeta(id="repo", label="Repo", kind="text"),
     ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
@@ -1151,6 +1163,70 @@ DRIVE_QUEUE_STATUS_COLUMN_META = [
 # attempt is the thing an operator most wants shouted at them.
 _RETRIED_ATTEMPTS_THRESHOLD = 1
 
+# #1909: the three lifecycle bands, in display order. "terminal" (done and
+# the rest of `TERMINAL_QUEUE_STATES`) sorts first, then "running", then
+# "pending" — literally the order the issue names them in, not "what the
+# operator probably cares about most" (that question belongs to #1866's
+# live Queue panel, not this report).
+_LIFECYCLE_BAND_RANK = {"terminal": 0, "running": 1, "pending": 2}
+
+
+def _drive_queue_lifecycle_band(
+    state: str, terminal_states: frozenset[str], running_state: str
+) -> str:
+    """The #1909 band label for one row's raw ``state``.
+
+    Always one of ``"terminal"``/``"running"``/``"pending"`` — never
+    anything else — so a client can switch on it exhaustively without a
+    fallback case. ``hold_state`` (a fired deploy gate) is deliberately NOT
+    consulted here: it is orthogonal to ``state`` (see `coord/drive_queue.py`
+    around `HOLD_FIRED`) — a held entry's `state` stays `waiting`, so it
+    already lands in `pending` without any extra check, which is exactly
+    the issue's "waiting (and any held)" wording.
+    """
+    if state == running_state:
+        return "running"
+    if state in terminal_states:
+        return "terminal"
+    return "pending"
+
+
+def _drive_queue_lifecycle_sort_key(row: Mapping[str, Any]) -> tuple[int, float, int]:
+    """#1909's row ordering: ``(band rank, recency/0, position)``.
+
+    * **terminal** — most-recently-finished first. The recency proxy is
+      whichever of ``reason_at`` / ``launched_at`` / ``enqueued_at`` is
+      present, in that priority. ``reason_at`` is stamped by
+      ``_update_drive_queue_entry_local`` on every ``last_reason`` write, and
+      every call site in ``coord/drive_queue.py`` that flips a row terminal
+      writes ``last_reason`` in the SAME update (e.g. every
+      ``_merge_landed_state`` caller) — so ``reason_at`` reads as "when this
+      row last changed", which for a terminal row IS when it finished.
+      Negated so the largest (most recent) timestamp sorts first; a row
+      with none of the three (predates the columns) falls back to ``0.0``,
+      the oldest possible reading, and ties within that are broken by
+      ``position`` descending (the more recently enqueued of two
+      equally-undated rows is still the newer one).
+    * **running** — no ordering requirement from the issue; broken by
+      ``position`` ascending for determinism (typically a single row).
+    * **pending** — ``position`` ascending, exactly the order
+      ``plan_tick``'s launch walk (`_resolve_prereqs` in
+      `coord/drive_queue.py`) will reach them. This is the band the issue
+      calls "the important one".
+    """
+    band = row["band"]
+    position = int(row["position"])
+    if band == "terminal":
+        recency = row.get("reason_at")
+        if recency is None:
+            recency = row.get("launched_at")
+        if recency is None:
+            recency = row.get("enqueued_at")
+        if recency is None:
+            recency = 0.0
+        return (_LIFECYCLE_BAND_RANK[band], -float(recency), -position)
+    return (_LIFECYCLE_BAND_RANK[band], 0.0, position)
+
 
 def fold_drive_queue_status(
     entries: Iterable[Mapping[str, Any]],
@@ -1167,21 +1243,42 @@ def fold_drive_queue_status(
     caller's clock reading, reused verbatim for both ends of ``window`` since
     a live snapshot has no meaningful range.
 
-    ``entries`` arrives pre-ordered (``list_drive_queue`` is
-    ``ORDER BY position, id``) — this fold does not re-sort.
+    ``entries`` arrives pre-ordered (``list_drive_queue`` is ``ORDER BY
+    position, id``), but **this fold DOES re-sort** (#1909) — deliberately
+    relaxing the "never re-sorts" contract this docstring used to state.
+    Raw `position` order interleaves finished work with what hasn't run
+    yet, which reads as noise (see the issue's own reproduction). Output
+    rows are grouped into three lifecycle bands instead — terminal (done
+    and the rest of `TERMINAL_QUEUE_STATES`, most-recently-finished first),
+    running, then pending (everything else, ascending `position` — the
+    exact order `plan_tick`'s launch walk, `_resolve_prereqs` in
+    `coord/drive_queue.py`, will reach them). See
+    :func:`_drive_queue_lifecycle_sort_key` for the exact key. Each row
+    also carries a derived ``band`` column naming which band it landed in.
     """
+    from coord.drive_queue import (  # noqa: PLC0415
+        STATE_BLOCKED,
+        STATE_DONE,
+        STATE_FAILED,
+        STATE_RUNNING,
+        STATE_WAITING,
+        TERMINAL_QUEUE_STATES,
+    )
+
     title_map = dict(titles or {})
     rows: list[dict[str, Any]] = []
     for entry in entries:
         repo = str(entry.get("repo_name") or "")
         issue = int(entry.get("issue_number") or 0)
+        state = entry.get("state") or ""
         rows.append(
             {
+                "band": _drive_queue_lifecycle_band(state, TERMINAL_QUEUE_STATES, STATE_RUNNING),
                 "position": int(entry.get("position") or 0),
                 "repo": repo,
                 "issue": issue,
                 "title": title_map.get((repo, issue)),
-                "state": entry.get("state") or "",
+                "state": state,
                 "machine": entry.get("machine") or "",
                 "attempts": int(entry.get("attempts") or 0),
                 "deferrals": int(entry.get("deferrals") or 0),
@@ -1207,19 +1304,16 @@ def fold_drive_queue_status(
             }
         )
 
+    # #1909: lifecycle-band order, not the raw `position`/`id` order
+    # `entries` arrived in — see `_drive_queue_lifecycle_sort_key`. `position`
+    # is unique per entry, so the key never actually ties; `sort`'s stability
+    # only matters if a future band grows a coarser key.
+    rows.sort(key=_drive_queue_lifecycle_sort_key)
+
     notes: list[str] = []
     if not rows:
         notes.append("The drive queue is empty.")
     else:
-        from coord.drive_queue import (  # noqa: PLC0415
-            STATE_BLOCKED,
-            STATE_DONE,
-            STATE_FAILED,
-            STATE_RUNNING,
-            STATE_WAITING,
-            TERMINAL_QUEUE_STATES,
-        )
-
         counts: dict[str, int] = {}
         for r in rows:
             counts[r["state"]] = counts.get(r["state"], 0) + 1
@@ -4604,11 +4698,12 @@ DRIVE_QUEUE_STATUS = ReportDef(
     id="drive-queue-status",
     title="Drive Queue Status",
     description=(
-        "A live snapshot of the drive queue — one row per queued entry in "
-        "run order, with its state, machine pin, attempts/deferrals and the "
-        "tick's own last_reason. A snapshot, not a history: `drive_queue` "
-        "has no `completed_at`, so this shows what is queued now, not what "
-        "the queue has processed."
+        "A live snapshot of the drive queue — one row per queued entry, "
+        "grouped by lifecycle band (terminal, then running, then pending in "
+        "the order it will actually run), with its state, machine pin, "
+        "attempts/deferrals and the tick's own last_reason. A snapshot, not "
+        "a history: `drive_queue` has no `completed_at`, so this shows what "
+        "is queued now, not what the queue has processed."
     ),
     params=(
         ReportParam(
