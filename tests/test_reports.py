@@ -38,6 +38,9 @@ from coord.gate_a import park_marker
 from coord.models import POLICY_REFUSAL_MARKER
 from coord.reports import (
     COMPLETED_COLUMNS,
+    DEPRECATED_ROUTE_ELIGIBLE,
+    DEPRECATED_ROUTE_NOT_ELIGIBLE,
+    DEPRECATION_RETIREMENT_WINDOW_DAYS,
     EXPORT_FORMATS,
     ISSUE_COST_COLUMN_META,
     ISSUE_COST_COLUMNS,
@@ -47,9 +50,6 @@ from coord.reports import (
     TREND_COLUMN_META,
     TREND_COLUMNS,
     TREND_RANGE_CHOICES,
-    DEPRECATED_ROUTE_ELIGIBLE,
-    DEPRECATED_ROUTE_NOT_ELIGIBLE,
-    DEPRECATION_RETIREMENT_WINDOW_DAYS,
     TREND_TRAILING_BUCKETS,
     ColumnMeta,
     ReportError,
@@ -1266,17 +1266,29 @@ class TestDeprecatedRoutesRetirementGate:
         assert row["observed_secs"] == pytest.approx(now)
         assert row["eligible"] == DEPRECATED_ROUTE_ELIGIBLE
 
-    def test_retention_days_none_resolves_from_audit_config(self, monkeypatch) -> None:
-        """Omitting ``retention_days`` reads the SAME knob
-        ``coord.audit.sweep_operational_retention`` enforces — one source
-        of truth (#2085), not a second config read that could drift."""
-        monkeypatch.setattr(
-            "coord.audit.resolve_operational_retention_days", lambda: 5.0
+    def test_the_fold_never_reads_the_ambient_config(self, monkeypatch) -> None:
+        """Omitting ``retention_days`` must NOT reach ``coordinator.yml``.
+
+        The fold is documented pure, and a config read here would make it
+        answer differently on a machine that happens to have a
+        ``coordinator.yml`` with a small ``audit.operational_retention_days``
+        than on one with none — the host-dependent-result class #2170 exists
+        to keep out of this suite.  The runner resolves the knob instead
+        (see ``TestRunDeprecatedRoutes``), so blowing the resolver up here
+        must not be observable."""
+
+        def _boom() -> float:
+            raise AssertionError("the pure fold must not resolve the retention knob")
+
+        monkeypatch.setattr("coord.audit.resolve_operational_retention_days", _boom)
+        now = 90 * self._DAY
+        result = fold_deprecated_routes(
+            [_dep_entry(0.0, "/old-b")], now, routes=_DEP_ROUTES
         )
-        entries = [_dep_entry(0.0, "/old-b")]
-        result = fold_deprecated_routes(entries, 90 * self._DAY, routes=_DEP_ROUTES)
         row = next(r for r in result.rows if r["route"] == "/old-a")
-        assert row["observed_secs"] == pytest.approx(5 * self._DAY)
+        # Default is uncapped (`0`), so the full window is observed.
+        assert row["observed_secs"] == pytest.approx(now)
+        assert row["eligible"] == DEPRECATED_ROUTE_ELIGIBLE
 
     def test_eligible_column_present_in_column_meta(self) -> None:
         result = fold_deprecated_routes([], 1000.0, routes=_DEP_ROUTES)
@@ -1324,6 +1336,37 @@ class TestRunDeprecatedRoutes:
             now=1000.0, fetch=lambda now: ([], False), routes=_DEP_ROUTES
         )
         assert not any("page cap" in n for n in result.notes)
+
+    def test_retention_days_resolves_from_the_audit_knob(self, monkeypatch) -> None:
+        """#1947: omitting ``retention_days`` reads the SAME knob
+        ``coord.audit.sweep_operational_retention`` enforces — one source of
+        truth (#2085), not a second config read that could drift.  The
+        resolution lives HERE, in the impure runner, not in the pure fold."""
+        monkeypatch.setattr(
+            "coord.audit.resolve_operational_retention_days", lambda: 5.0
+        )
+        result = run_deprecated_routes(
+            now=90 * 86400.0,
+            fetch=lambda now: ([_dep_entry(0.0, "/old-b")], False),
+            routes=_DEP_ROUTES,
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["observed_secs"] == pytest.approx(5 * 86400.0)
+        assert row["eligible"] == DEPRECATED_ROUTE_NOT_ELIGIBLE
+
+    def test_explicit_retention_days_overrides_the_audit_knob(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.audit.resolve_operational_retention_days", lambda: 5.0
+        )
+        result = run_deprecated_routes(
+            now=90 * 86400.0,
+            fetch=lambda now: ([_dep_entry(0.0, "/old-b")], False),
+            routes=_DEP_ROUTES,
+            retention_days=0,
+        )
+        row = next(r for r in result.rows if r["route"] == "/old-a")
+        assert row["observed_secs"] == pytest.approx(90 * 86400.0)
+        assert row["eligible"] == DEPRECATED_ROUTE_ELIGIBLE
 
 
 # ── decisions (#2369): escalations + blocked queue roots as cards ─────────

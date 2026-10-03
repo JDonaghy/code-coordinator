@@ -4419,9 +4419,10 @@ def _validate_issue_cost_status(value: str) -> None:
 # the whole corpus (a lower bound on how long telemetry has been live — it
 # can only ever UNDERSTATE the true window, never overstate it, which is the
 # safe direction for a retirement gate) and then capped at
-# `audit.operational_retention_days` via `coord.audit.
-# resolve_operational_retention_days` — the same cap that module's own sweep
-# enforces — because a row older than retention could have been swept
+# `audit.operational_retention_days` — resolved by `run_deprecated_routes`
+# through `coord.audit.resolve_operational_retention_days`, the same cap that
+# module's own sweep enforces, and passed DOWN into the pure fold rather than
+# read inside it — because a row older than retention could have been swept
 # without a trace, so claiming a window longer than retention allows would
 # be exactly the "belief" #1945/#1947 exist to rule out.
 
@@ -4474,7 +4475,7 @@ def fold_deprecated_routes(
     generated_at: float,
     *,
     routes: Mapping[str, str] | None = None,
-    retention_days: float | None = None,
+    retention_days: float = 0.0,
 ) -> ReportResult:
     """Fold already-fetched deprecation-telemetry audit rows into a
     per-route snapshot.  **Pure** — no DB, no daemon, no clock.
@@ -4490,20 +4491,22 @@ def fold_deprecated_routes(
     exists purely so this stays a pure function a test can call without
     importing the daemon module).
 
-    ``retention_days`` defaults to :func:`coord.audit.
-    resolve_operational_retention_days` (``0`` disables the cap) — overridable
-    for the same reason ``routes=`` is: so this stays callable without a
-    daemon/config/DB in the loop.
+    ``retention_days`` is a PLAIN NUMBER here, defaulting to ``0``
+    (uncapped), and is deliberately NOT resolved from ``coordinator.yml`` by
+    this function: reading the ambient config would make a function
+    documented as pure answer differently on a machine that happens to have
+    a ``coordinator.yml`` with a small ``audit.operational_retention_days``
+    than on one that has none — the host-dependent-result class #2170 exists
+    to keep out of this suite. :func:`run_deprecated_routes` (the impure
+    runner, which already owns the clock and the DB walk) resolves it from
+    :func:`coord.audit.resolve_operational_retention_days` and passes it
+    down, exactly as ``run_drive_queue_status`` resolves ``queue_escalation``
+    for ``fold_drive_queue_status``.
     """
     if routes is None:
         from coord.serve_app import RPC_SUPERSEDED_BY_RESOURCE  # noqa: PLC0415
 
         routes = RPC_SUPERSEDED_BY_RESOURCE
-
-    if retention_days is None:
-        from coord.audit import resolve_operational_retention_days  # noqa: PLC0415
-
-        retention_days = resolve_operational_retention_days()
 
     entries = list(entries)
     any_data = bool(entries)
@@ -4549,10 +4552,11 @@ def fold_deprecated_routes(
 
         observed_secs: float | None = None
         eligible = DEPRECATED_ROUTE_NOT_ELIGIBLE
-        if status == DEPRECATED_ROUTE_ZERO_CALLS:
-            # `any_data` is True here, so `earliest_ts` is always set.
-            observed_secs = max(0.0, generated_at - earliest_ts)  # type: ignore[operator]
-            if retention_days and retention_days > 0:
+        if status == DEPRECATED_ROUTE_ZERO_CALLS and earliest_ts is not None:
+            # `any_data` is True here, so `earliest_ts` is always set — the
+            # `is not None` above is what lets a type checker see that too.
+            observed_secs = max(0.0, generated_at - earliest_ts)
+            if retention_days > 0:
                 observed_secs = min(observed_secs, retention_days * 86400.0)
             if observed_secs >= DEPRECATION_RETIREMENT_WINDOW_DAYS * 86400.0:
                 eligible = DEPRECATED_ROUTE_ELIGIBLE
@@ -4581,7 +4585,7 @@ def fold_deprecated_routes(
             "`no_data`, not `zero_calls` — treat it as UNKNOWN, never as "
             "evidence it is safe to retire."
         )
-    if any_data and retention_days and 0 < retention_days < DEPRECATION_RETIREMENT_WINDOW_DAYS:
+    if any_data and 0 < retention_days < DEPRECATION_RETIREMENT_WINDOW_DAYS:
         notes.append(
             f"audit.operational_retention_days is {retention_days:g}, below "
             f"the {DEPRECATION_RETIREMENT_WINDOW_DAYS:g}-day window #1947's "
@@ -4630,8 +4634,19 @@ def run_deprecated_routes(
     fold in this module. Understating is the safe direction for a
     retirement gate: it can only make `eligible` harder to earn, never
     easier.
+
+    ``retention_days`` defaults to :func:`coord.audit.
+    resolve_operational_retention_days` — the SAME number
+    ``coord.audit.sweep_operational_retention`` caps itself to, read here
+    (the impure runner that already owns the clock and the DB walk) rather
+    than inside the pure fold, so a direct fold caller never gets a
+    host-dependent answer. Passing it explicitly is the test seam.
     """
     generated_at = time.time() if now is None else float(now)
+    if retention_days is None:
+        from coord.audit import resolve_operational_retention_days  # noqa: PLC0415
+
+        retention_days = resolve_operational_retention_days()
     fetch_fn = _default_fetch_deprecation_entries if fetch is None else fetch
     entries, truncated = fetch_fn(generated_at)
     result = fold_deprecated_routes(
