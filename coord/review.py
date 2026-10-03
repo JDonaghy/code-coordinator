@@ -3712,8 +3712,29 @@ def dispatch_review(
         # never match the merge-time `branch_patch_id`, which is computed from an
         # uncapped compare-API diff). The display copy shown to the reviewer is
         # then truncated locally from the same fetch — no second `gh` call.
+        #
+        # #2364: `pr` can legitimately be `None` here — the drive-queue path
+        # opens PRs lazily, so "review ran before the PR existed" is a normal
+        # timing, not an edge case. Previously that made `full_diff_text`
+        # (and therefore `review_patch_id` below) permanently `None` for such
+        # a review, which in turn made every later `review-reaffirm` against
+        # it fail forever with "missing patch-id data" even though the stored
+        # verdict was a real `approve`. Fall back to a direct branch-vs-base
+        # compare diff — the exact same API `github_ops.get_branch_patch_id`
+        # uses at merge time to fingerprint `branch_patch_id` — so the two
+        # sides of the "did the content change" question are always computed
+        # the same way, whether or not a PR happens to exist yet.
         _diff = diff_fetcher or github_ops.pr_diff
-        full_diff_text = _diff(repo.github, pr["number"], max_chars=None) if pr else None
+        if pr:
+            full_diff_text = _diff(repo.github, pr["number"], max_chars=None)
+        else:
+            _compare_diff_pre_pr = compare_diff_fetcher or github_ops.get_compare_diff
+            try:
+                full_diff_text = _compare_diff_pre_pr(
+                    repo.github, base_branch, completed.branch
+                )
+            except Exception:  # noqa: BLE001 — fail-safe: missing diff is not blocking
+                full_diff_text = None
 
         # #3196: cross-check `pr_diff`'s file list against a fresh, explicit
         # compare of the branch's own current refs before trusting it. A
@@ -3730,7 +3751,13 @@ def dispatch_review(
         # untrustworthy (not just that one file — a diff computed against
         # the wrong base is wrong throughout), so it's replaced outright by
         # the compare's own diff rather than patched.
-        if full_diff_text:
+        #
+        # #2364: skip entirely when `pr` is `None` — `full_diff_text` above
+        # already came straight from `get_compare_diff`/*compare_diff_fetcher*,
+        # the exact source this cross-check would otherwise fetch again to
+        # corroborate it against. Re-running it would just spend two more
+        # `gh` calls to confirm a diff agrees with itself.
+        if full_diff_text and pr:
             _compare_files = compare_files_fetcher or github_ops.get_compare_files
             try:
                 known_files = _compare_files(repo.github, base_branch, completed.branch)
