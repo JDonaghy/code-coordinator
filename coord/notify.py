@@ -1071,6 +1071,13 @@ class StalledDispatchAction:
       (#602).
     - ``"skipped_human_required"``  — the conflict-fix retry cap was already
       hit; surfacing to a human, not auto-retrying.
+    - ``"skipped_debounced"`` (#3536) — ``merge_gate_checks_stale`` on an
+      entry whose PRIOR stale-rebase dispatch (any outcome, including a
+      successful one — see :func:`stale_rebase_debounced`) finished less
+      than :data:`STALE_REBASE_DEBOUNCE_SECONDS` ago. The base is moving
+      fast enough that rebasing again immediately would likely just restart
+      CI a second time before this one even reports; waiting for the next
+      tick lets it settle instead.
     - ``"skipped_fix_round_ceiling_blocked"`` (#3454) — ``merge_conflict_
       unresolved`` or ``merge_gate_checks_stale`` on a (repo, issue) whose
       drive-queue row already gave up on the #2972 fix-round ceiling (see
@@ -1259,6 +1266,92 @@ def _conflict_confined_to_sealed_paths(
     return None
 
 
+# #3536: minimum quiet window after a stale-rebase conflict-fix for a given
+# merge-queue entry before another one is dispatched for the SAME entry. See
+# `stale_rebase_debounced` for why this exists on top of `has_prior_conflict_
+# fix`'s own retry cap.
+STALE_REBASE_DEBOUNCE_SECONDS = 300.0
+
+
+def _recent_stale_rebase_dispatch_at(
+    board: "Board", merge_entry_id: str | None,
+) -> float | None:
+    """The most recent ``dispatched_at`` of a stale-rebase conflict-fix
+    (title-prefixed :data:`coord.conflict_fix.STALE_REBASE_FIX_TITLE_PREFIX`)
+    already attempted against *merge_entry_id*, across EVERY outcome —
+    including the ones :func:`coord.conflict_fix.has_prior_conflict_fix`
+    itself already lets a fresh dispatch through for (a successful rebase;
+    a cancelled no-op). This is not a retry-cap check: it only answers "how
+    recently did this entry's base last move enough to trigger one", so it
+    has to see every PRIOR attempt `has_prior_conflict_fix` would let a new
+    one past, not only the ones that would block it outright.
+
+    ``None`` when *merge_entry_id* is ``None`` or no such attempt exists.
+    """
+    from coord.conflict_fix import STALE_REBASE_FIX_TITLE_PREFIX  # noqa: PLC0415
+
+    if merge_entry_id is None:
+        return None
+    latest: float | None = None
+    for a in list(board.active) + list(board.completed):
+        if a.type != "conflict-fix":
+            continue
+        if a.review_of_assignment_id != merge_entry_id:
+            continue
+        if not (a.issue_title or "").startswith(STALE_REBASE_FIX_TITLE_PREFIX):
+            continue
+        if a.dispatched_at is None:
+            continue
+        if latest is None or a.dispatched_at > latest:
+            latest = a.dispatched_at
+    return latest
+
+
+def stale_rebase_debounced(
+    board: "Board",
+    merge_entry_id: str | None,
+    *,
+    now: float,
+    debounce_seconds: float = STALE_REBASE_DEBOUNCE_SECONDS,
+) -> str | None:
+    """Reason text when a fresh stale-rebase dispatch for *merge_entry_id*
+    should be held back (#3536) — ``None`` means go ahead.
+
+    #784/#2475's ``has_prior_conflict_fix`` deliberately lets a FRESH
+    stale-rebase dispatch through the instant the previous one finishes
+    successfully — a new base move is a genuinely new situation, not a
+    retry of the old one. Under RAPID base movement (several approved
+    siblings merging into the same target branch in quick succession — the
+    2026-10-02 #3532/#3386 incident this issue describes) that carve-out
+    becomes exactly the thrash the issue warns about: a worker that was
+    about to merge gets rebased again, restarting its CI and spending a
+    fresh batch of `gh` calls, every time ANOTHER sibling lands underneath
+    it — sometimes several times in the same hour.
+
+    This adds one more gate, checked AFTER ``has_prior_conflict_fix`` has
+    already cleared: if a stale-rebase conflict-fix for this SAME entry was
+    dispatched within *debounce_seconds*, hold off instead of dispatching a
+    second one immediately. The entry's own stale-CI reason stays on the
+    board — nothing here resolves it — so a human or the very next tick
+    still sees it; this only buys the base time to settle before spending
+    another rebase-and-restart-CI cycle on it, which is also kinder to
+    whichever sibling is mid-merge: it gets a chance to land before this
+    entry's rebase target moves out from under it yet again.
+    """
+    last = _recent_stale_rebase_dispatch_at(board, merge_entry_id)
+    if last is None:
+        return None
+    elapsed = now - last
+    if elapsed >= debounce_seconds:
+        return None
+    return (
+        f"stale-rebase conflict-fix debounced (#3536): the last one for "
+        f"this entry was dispatched {elapsed:.0f}s ago, inside the "
+        f"{debounce_seconds:.0f}s settle window — the base is moving fast; "
+        "waiting for it to settle instead of rebasing again immediately"
+    )
+
+
 def dispatch_stalled_pipeline_action(
     detection: StalledDetection,
     work: "Assignment",
@@ -1266,6 +1359,7 @@ def dispatch_stalled_pipeline_action(
     config: Config,
     *,
     terminal_cache: dict | None = None,
+    now: float | None = None,
 ) -> StalledDispatchAction:
     """#1478: act on a #1441 stalled-pipeline detection instead of only
     narrating it.
@@ -1360,7 +1454,15 @@ def dispatch_stalled_pipeline_action(
     — so a given assignment_id gets exactly one dispatch attempt per stall,
     mirroring the one-shot comment (#1441's own guardrail, reused rather
     than re-derived per #1478's own request).
+
+    *now* (#3536): the shell's ``time.time()``, threaded straight into
+    :func:`stale_rebase_debounced` for the ``merge_gate_checks_stale`` arm
+    below. ``None`` resolves to a fresh ``time.time()`` read here — the
+    production caller never passes it explicitly, same as every other
+    ``now``-accepting function in this module; tests pass a fixed value for
+    determinism.
     """
+    now = now if now is not None else time.time()
     # #2302: `pipeline.auto_dispatch_stalled` exists to bound blast radius on
     # rows another loop already owns (`coord drive`'s request-changes → fix
     # arm for `work` rows, #1692) — a second dispatcher racing that loop
@@ -1839,6 +1941,19 @@ def dispatch_stalled_pipeline_action(
             return StalledDispatchAction(
                 kind="skipped_human_required",
                 detail="conflict-fix already active or its retry cap was already hit",
+            )
+        # #3536: a successful rebase does NOT consume `has_prior_conflict_
+        # fix`'s cap (#784/#2475 — a fresh base move is a fresh situation),
+        # so under rapid base movement that check above clears every single
+        # time. Debounce separately: hold off on a SECOND stale-rebase
+        # dispatch for this entry while the base is still settling, instead
+        # of restarting CI on every move.
+        debounce_reason = stale_rebase_debounced(
+            board, entry.assignment_id, now=now,
+        )
+        if debounce_reason is not None:
+            return StalledDispatchAction(
+                kind="skipped_debounced", detail=debounce_reason,
             )
         # #3349: `stale_rebase=True` — no content conflict is expected here
         # (unlike `merge_conflict_unresolved`), so the worker gets the

@@ -5043,6 +5043,113 @@ def test_a_blocked_entry_that_has_hit_the_resume_ceiling_stays_blocked_and_says_
     assert plan.launch is None
 
 
+# ── #3536: stagger a mass gate-clear resume ─────────────────────────────────
+#
+# The 2026-10-02 incident: #3386's baseline-red latch cleared for a whole
+# repo's worth of `blocked` rows at once (about a dozen). Pre-#3536,
+# `_reconcile_blocked` hands back `resumed` for EVERY one of them on the
+# SAME tick — each then driving its own live `gh` re-checks on the very next
+# poll, which is exactly the synchronized-poll pattern that trips GitHub's
+# secondary rate limit fleet-wide. These pin the fix: only
+# `max_resumes_per_tick_per_repo` confirmed-clear resumes release per repo
+# per tick; the rest stay `blocked`, untouched, and get first refusal next
+# tick.
+
+
+def test_a_mass_gate_clear_releases_only_the_stagger_cap_this_tick():
+    entries = [
+        _blocked_entry(301, position=1, resumes=0),
+        _blocked_entry(302, position=2, resumes=0),
+        _blocked_entry(303, position=3, resumes=0),
+    ]
+    live_gate = {entry_key(REPO, i): False for i in (301, 302, 303)}
+    plan = plan_tick(entries, board(), capacity=3, live_blocked_gate=live_gate)
+
+    by_key = {r.key: r for r in plan.reconciles}
+    resumed = [k for k, r in by_key.items() if r.outcome == "resumed"]
+    staggered = [k for k, r in by_key.items() if r.outcome == "resume_staggered"]
+    # Default cap is 2 — the two earliest-positioned rows win this tick's
+    # slots; the third is staggered.
+    assert sorted(resumed) == sorted([entry_key(REPO, 301), entry_key(REPO, 302)])
+    assert staggered == [entry_key(REPO, 303)]
+
+    staggered_reconcile = by_key[entry_key(REPO, 303)]
+    assert "state" not in staggered_reconcile.updates  # stays blocked
+    assert "resumes" not in staggered_reconcile.updates  # budget not spent
+    assert "#3536" in staggered_reconcile.reason
+
+
+def test_a_staggered_entry_resumes_once_its_turn_comes_on_a_later_tick():
+    """The row staggered above gets first refusal on the very next tick,
+    once the two ahead of it have already moved off `blocked` (persisted by
+    the caller as `waiting`, mirroring `plan.reconciles[*].updates["state"]`
+    from the prior tick)."""
+    entries = [
+        entry(301, position=1, state=STATE_WAITING),
+        entry(302, position=2, state=STATE_WAITING),
+        _blocked_entry(303, position=3, resumes=0),
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=3,
+        live_blocked_gate={entry_key(REPO, 303): False},
+    )
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 303))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+
+
+def test_max_resumes_per_tick_per_repo_none_disables_the_stagger():
+    """``None`` is an explicit opt-out back to pre-#3536, unstaggered
+    behaviour — every pre-#3536 test fixture (a single blocked entry) never
+    exercised this cap at all, so disabling it must reproduce the old
+    "everything confirmed clear resumes immediately" outcome exactly."""
+    entries = [
+        _blocked_entry(301, position=1, resumes=0),
+        _blocked_entry(302, position=2, resumes=0),
+        _blocked_entry(303, position=3, resumes=0),
+    ]
+    live_gate = {entry_key(REPO, i): False for i in (301, 302, 303)}
+    plan = plan_tick(
+        entries, board(), capacity=3, live_blocked_gate=live_gate,
+        max_resumes_per_tick_per_repo=None,
+    )
+    outcomes = {r.key: r.outcome for r in plan.reconciles}
+    assert all(o == "resumed" for o in outcomes.values())
+
+
+def test_the_stagger_cap_is_scoped_per_repo():
+    """Two repos each clearing their own two-row backlog in the same tick
+    both release in full — the cap bounds one repo's burst, not the whole
+    fleet's aggregate (that's `github_throttle`'s token bucket's job, not
+    this queue's)."""
+    entries = [
+        _blocked_entry(301, position=1, resumes=0),
+        _blocked_entry(302, position=2, resumes=0),
+        entry(
+            401, position=3, repo="otherrepo", state=STATE_BLOCKED,
+            attempts=DEFAULT_MAX_ATTEMPTS, resumes=0,
+            last_reason="drive session died without landing the work — giving up",
+        ),
+        entry(
+            402, position=4, repo="otherrepo", state=STATE_BLOCKED,
+            attempts=DEFAULT_MAX_ATTEMPTS, resumes=0,
+            last_reason="drive session died without landing the work — giving up",
+        ),
+    ]
+    live_gate = {
+        entry_key(REPO, 301): False,
+        entry_key(REPO, 302): False,
+        entry_key("otherrepo", 401): False,
+        entry_key("otherrepo", 402): False,
+    }
+    plan = plan_tick(entries, board(), capacity=4, live_blocked_gate=live_gate)
+    outcomes = {r.key: r.outcome for r in plan.reconciles}
+    assert outcomes[entry_key(REPO, 301)] == "resumed"
+    assert outcomes[entry_key(REPO, 302)] == "resumed"
+    assert outcomes[entry_key("otherrepo", 401)] == "resumed"
+    assert outcomes[entry_key("otherrepo", 402)] == "resumed"
+
+
 # ── #2935: a never-dispatched after=-blocked entry must never reach the ────
 # merge-gate sweep at all
 #

@@ -969,6 +969,33 @@ def _no_real_github_backoff_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_github_pace_store(monkeypatch, tmp_path):
+    """#3536: never let a test write the OPERATOR'S real
+    ``~/.coord/github_pace.json``.
+
+    Same hazard as ``_no_real_github_backoff_store`` immediately above, one
+    file over: this one is ``coord.github_throttle``'s proactive pacing
+    token bucket, also consulted by every `gh` call via
+    ``coord.github_ops._gh``. A leaked test write could plant a stale,
+    empty bucket that stalls a real fleet's `gh` calls for a few seconds, or
+    coincidentally hand a real caller extra burst it hadn't earned. Also
+    gives every test a FRESH, full bucket (a new ``tmp_path`` each time)
+    rather than sharing one bucket across however many tests in a session
+    happen to call through the real ``_gh()`` — without this, a handful of
+    unmocked ``subprocess.run``-patched tests running back-to-back could
+    exhaust the shared burst and start sleeping mid-suite for no reason
+    connected to what any single test is checking.
+
+    ``coord.github_throttle._pace_state_path`` reads
+    ``$COORD_GITHUB_PACE_STATE`` first for exactly this redirect, the same
+    env-var seam ``_no_real_github_backoff_store`` uses.
+    """
+    monkeypatch.setenv(
+        "COORD_GITHUB_PACE_STATE", str(tmp_path / "github-pace-state.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_real_machine_fault_store(monkeypatch, tmp_path):
     """#3367: never let a test write the OPERATOR'S real
     ``~/.coord/machine_faults.json``.
