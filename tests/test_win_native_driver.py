@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import os
+import subprocess
 import time
 
 import pytest
@@ -1225,6 +1226,64 @@ class TestWin32CallsLaunchAvoidsUncCwd:
         calls.launch("app.exe", r"C:\Users\me\repo")
         assert captured["command"] == "app.exe"
         assert captured["cwd"] == r"C:\Users\me\repo"
+
+
+class TestWin32CallsLaunchDoesNotInheritStdHandles:
+    """#3544: `Win32Calls.launch`/`launch_in_terminal` must never hand
+    `subprocess.Popen(..., shell=True)` its own inherited stdin/stdout/
+    stderr — reproduces the exact bridge shape (the Windows-side bridge
+    runner's own stdout is a pipe the WSL-side `subprocess.run(
+    capture_output=True)` is reading; without an explicit redirect here,
+    `cmd.exe` and the GUI exe it execs duplicate that same pipe handle and
+    never let it see EOF, so the bridge call hangs for the full
+    `bridge_timeout` and the launched exe is left orphaned — see
+    `coord.win_native_driver._NO_HANDLE_INHERITANCE` and
+    `coord.win_native_bridge.run_native_spec_via_bridge`). These assert
+    against a scripted fake `subprocess.Popen`, since the real handle-
+    inheritance hang can only be observed on a real WSL<->Windows pairing
+    (confirmed on dell64 per #3544's repro)."""
+
+    def test_launch_redirects_all_three_std_handles_to_devnull(
+        self, monkeypatch,
+    ) -> None:
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 4242
+
+        def fake_popen(command, *, shell, cwd=None, **kwargs):
+            captured.update(kwargs)
+            return _FakeProc()
+
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", fake_popen,
+        )
+        calls.launch("vimcode.exe sample.txt", r"C:\Users\me\repo")
+        assert captured.get("stdin") is subprocess.DEVNULL
+        assert captured.get("stdout") is subprocess.DEVNULL
+        assert captured.get("stderr") is subprocess.DEVNULL
+
+    def test_launch_in_terminal_redirects_all_three_std_handles_to_devnull(
+        self, monkeypatch,
+    ) -> None:
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 9999
+
+        def fake_popen(command, *, shell, cwd=None, **kwargs):
+            captured.update(kwargs)
+            return _FakeProc()
+
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", fake_popen,
+        )
+        calls.launch_in_terminal("vimcode.exe", r"C:\Users\me\repo", "windows-terminal")
+        assert captured.get("stdin") is subprocess.DEVNULL
+        assert captured.get("stdout") is subprocess.DEVNULL
+        assert captured.get("stderr") is subprocess.DEVNULL
 
 
 class TestImportUia:
