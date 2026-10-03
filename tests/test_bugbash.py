@@ -281,6 +281,7 @@ class _FakeMachine:
     name: str
     repos: list
     capabilities: list = field(default_factory=list)
+    host: str = "example.local"
 
 
 @dataclass
@@ -301,16 +302,47 @@ class _FakeConfig:
     acceptance: _FakeAcceptanceConfig
 
 
+class _FakeHealthResp:
+    def __init__(self, payload: dict) -> None:
+        self._p = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._p
+
+
+class _FakeHealthClient:
+    """A scripted `/health` responder (#3566) — mirrors
+    `tests/test_smoke.py`'s own `_FakeClient`, kept local so
+    `coord.bugbash`'s probe cross-check can be exercised here without a real
+    network call. Default (`health={}`) fails OPEN — no `tool_versions` key,
+    same as an agent that predates the probe — so every pre-existing
+    `discover_lanes`/`_pick_lane_machine` test that doesn't care about this
+    behaves exactly as it did before this fix."""
+
+    def __init__(self, health: dict | None = None) -> None:
+        self._health = health if health is not None else {}
+        self.get_calls: list[str] = []
+
+    def get(self, url, *, timeout) -> _FakeHealthResp:
+        self.get_calls.append(url)
+        return _FakeHealthResp(self._health)
+
+
 class TestDiscoverLanes:
     def test_no_driver_returns_no_lanes(self):
         cfg = _FakeConfig(machines=[], acceptance=_FakeAcceptanceConfig(drivers={}))
-        assert discover_lanes(cfg, "vimcode") == []
+        assert discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient()) == []
 
     def test_route_with_capable_machine_becomes_a_lane(self):
         machine = _FakeMachine(name="pc1", repos=["vimcode"], capabilities=["windows"])
         entry = _FakeDriverCfg(routes=[_FakeDriverCfg(kind="win-native", capability="windows")])
         cfg = _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
-        lanes = discover_lanes(cfg, "vimcode", reference_backend="win-native")
+        lanes = discover_lanes(
+            cfg, "vimcode", reference_backend="win-native", http_client=_FakeHealthClient(),
+        )
         assert len(lanes) == 1
         assert lanes[0].platform == "win-native"
         assert lanes[0].machine == "pc1"
@@ -320,24 +352,90 @@ class TestDiscoverLanes:
         machine = _FakeMachine(name="pc1", repos=["vimcode"], capabilities=[])
         entry = _FakeDriverCfg(routes=[_FakeDriverCfg(kind="win-native", capability="windows")])
         cfg = _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
-        assert discover_lanes(cfg, "vimcode") == []
+        assert discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient()) == []
 
     def test_non_lane_kind_is_ignored(self):
         machine = _FakeMachine(name="pc1", repos=["vimcode"], capabilities=[])
         entry = _FakeDriverCfg(routes=[_FakeDriverCfg(kind="cli-pytest", capability="")])
         cfg = _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
-        assert discover_lanes(cfg, "vimcode") == []
+        assert discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient()) == []
 
     def test_top_level_driver_without_routes(self):
         machine = _FakeMachine(name="mac1", repos=["vimcode"], capabilities=["macos"])
         entry = _FakeDriverCfg(kind="mac-native", capability="macos", routes=[])
         cfg = _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
-        lanes = discover_lanes(cfg, "vimcode")
+        lanes = discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient())
         assert [l.platform for l in lanes] == ["mac-native"]
 
     def test_pick_lane_machine_requires_repo_membership(self):
         machine = _FakeMachine(name="pc1", repos=["other"], capabilities=["windows"])
-        assert _pick_lane_machine(_FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig({})), "vimcode", "windows") is None
+        assert _pick_lane_machine(
+            _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig({})),
+            "vimcode", "windows", http_client=_FakeHealthClient(),
+        ) is None
+
+    def test_declared_capability_contradicted_by_health_probe_is_skipped(self):
+        """#3566: a `macos` machine whose Accessibility-trust grant is
+        revoked must not be picked just because `coordinator.yml` still
+        claims the capability — `/health`'s own probe wins."""
+        machine = _FakeMachine(name="macmini", repos=["vimcode"], capabilities=["macos"])
+        health = {
+            "tool_versions": {
+                "macos-accessibility-trust": {
+                    "tool": "macos-accessibility-trust", "capability": "macos",
+                    "found": False, "version": None, "min_version": None,
+                    "meets_floor": None,
+                    "what_breaks": "AXIsProcessTrusted() is False — grant it",
+                },
+            },
+        }
+        assert _pick_lane_machine(
+            _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig({})),
+            "vimcode", "macos", http_client=_FakeHealthClient(health),
+        ) is None
+
+    def test_declared_capability_contradicted_by_health_probe_falls_through_to_next_machine(self):
+        """A second, genuinely-healthy machine is still picked rather than
+        the whole lane being dropped — this skips ONE bad candidate, it
+        doesn't refuse routing outright when another capable machine exists."""
+        denied = _FakeMachine(
+            name="macmini", repos=["vimcode"], capabilities=["macos"], host="macmini.local",
+        )
+        healthy = _FakeMachine(
+            name="mac2", repos=["vimcode"], capabilities=["macos"], host="mac2.local",
+        )
+        health = {
+            "tool_versions": {
+                "macos-accessibility-trust": {
+                    "tool": "macos-accessibility-trust", "capability": "macos",
+                    "found": False, "version": None, "min_version": None,
+                    "meets_floor": None, "what_breaks": "denied",
+                },
+            },
+        }
+
+        class _PerMachineClient:
+            def get(self, url, *, timeout):
+                if "macmini" in url:
+                    return _FakeHealthResp(health)
+                return _FakeHealthResp({})
+
+        assert _pick_lane_machine(
+            _FakeConfig(machines=[denied, healthy], acceptance=_FakeAcceptanceConfig({})),
+            "vimcode", "macos", http_client=_PerMachineClient(),
+        ) == "mac2"
+
+    def test_health_probe_failing_open_still_picks_the_machine(self):
+        """No `tool_versions` in `/health` (predates the probe, or a
+        connectivity hiccup) must fail OPEN — the same contract
+        `coord.smoke._capability_probe_reasons` already documents — so this
+        fix doesn't regress routing for the common case of a machine that
+        simply hasn't reported a probe for this capability yet."""
+        machine = _FakeMachine(name="macmini", repos=["vimcode"], capabilities=["macos"])
+        assert _pick_lane_machine(
+            _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig({})),
+            "vimcode", "macos", http_client=_FakeHealthClient({}),
+        ) == "macmini"
 
 
 class TestBuildExplorationBriefing:
