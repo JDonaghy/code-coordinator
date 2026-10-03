@@ -41,6 +41,7 @@ from coord.agent_update import (
     rollback,
 )
 from coord.audit import query_audit_log
+from coord.platform_paths import venv_bin, venv_exe, venv_pip, venv_python
 
 @pytest.fixture
 def proc_root(tmp_path: Path) -> Path:
@@ -87,19 +88,18 @@ def _run_stub(*, version: str = "9.9.9", calls: list | None = None):
             calls.append(cmd)
         if "-m" in cmd and "venv" in cmd:
             slot = Path(cmd[-1])
-            (slot / "bin").mkdir(parents=True, exist_ok=True)
-            for name in ("python", "pip", "coord"):
-                f = slot / "bin" / name
-                f.write_text("#!/bin/sh\n")
-                f.chmod(0o755)
+            venv_bin(slot).mkdir(parents=True, exist_ok=True)
+            for target in (venv_python(slot), venv_pip(slot), venv_exe(slot, "coord")):
+                target.write_text("#!/bin/sh\n")
+                target.chmod(0o755)
             (slot / "VERSION").write_text(version)
             return subprocess.CompletedProcess(cmd, 0, "created\n", "")
-        if cmd[0].endswith("/bin/pip") and "install" in cmd:
+        if Path(cmd[0]) == venv_pip(Path(cmd[0]).parent.parent) and "install" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "Successfully installed\n", "")
-        if cmd[0].endswith("/bin/python") and "-c" in cmd:
+        if Path(cmd[0]) == venv_python(Path(cmd[0]).parent.parent) and "-c" in cmd:
             slot = Path(cmd[0]).parent.parent
             return subprocess.CompletedProcess(cmd, 0, f"{_slot_version(slot)}\n", "")
-        if cmd[0].endswith("/bin/coord") and "--version" in cmd:
+        if Path(cmd[0]) == venv_exe(Path(cmd[0]).parent.parent, "coord") and "--version" in cmd:
             slot = Path(cmd[0]).parent.parent
             return subprocess.CompletedProcess(
                 cmd, 0, f"coord, version {_slot_version(slot)}\n", ""

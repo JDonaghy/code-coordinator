@@ -13,11 +13,16 @@ An update must be all-or-nothing.
 The fix: never write into the venv that's live. Install the target version
 into a **fresh** venv — one of two fixed "slots" next to the live one
 (``~/.coord-venv.blue`` / ``~/.coord-venv.green``) — smoke-check it, and
-only then flip a symlink so ``~/.coord-venv`` always resolves to one
-*complete* slot, old or new, never a mix. Rename of a symlink onto an
-existing path is atomic on POSIX (same filesystem), so any `coord`
-invocation racing the flip sees either the fully-old or the fully-new
-install — there is no observable in-between state.
+only then flip a directory link (see :mod:`coord.dirlink`) so
+``~/.coord-venv`` always resolves to one *complete* slot, old or new, never
+a mix. Rename of a symlink onto an existing path is atomic on POSIX (same
+filesystem), so any `coord` invocation racing the flip sees either the
+fully-old or the fully-new install — there is no observable in-between
+state. #2842: POSIX uses a symlink for exactly that atomicity guarantee;
+win32 has no directory-reparse-point equivalent of an atomic rename-over,
+so there the flip is best-effort (old link removed, new one renamed in
+immediately after) rather than a silent single-platform fiction — see
+:mod:`coord.dirlink` for the full reasoning.
 
 Using exactly two named slots (rather than a fresh directory per release)
 also gives rollback for free: the slot that was live before the swap is
@@ -86,6 +91,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from coord import restart_cmd
+from coord.dirlink import is_dir_link, make_dir_link, read_dir_link, replace_dir_link
 from coord.platform_paths import venv_exe, venv_pip, venv_python
 
 _log = logging.getLogger(__name__)
@@ -391,23 +397,24 @@ def current_slot(venv_dir: Path) -> Path | None:
     way, since ``install-agent.sh`` creates ``~/.coord-venv`` as a real
     directory.
     """
-    if not venv_dir.is_symlink():
+    if not is_dir_link(venv_dir):
         return None
-    target = venv_dir.readlink()
+    target = read_dir_link(venv_dir)
     if not target.is_absolute():
         target = (venv_dir.parent / target).resolve()
     return target
 
 
 def ensure_symlink_layout(venv_dir: Path) -> Path:
-    """Migrate *venv_dir* to the blue/green symlink layout if it isn't already.
+    """Migrate *venv_dir* to the blue/green link layout if it isn't already.
 
-    Idempotent: if *venv_dir* is already a symlink, just returns its current
-    target. Otherwise renames the existing plain directory into the
-    ``.blue`` slot and replaces *venv_dir* with a symlink pointing at it.
-    This is the one-time, one-machine migration every pre-#1241 install
-    needs; every update after that stays in the symlink layout, so this
-    becomes a no-op for the rest of that machine's life.
+    Idempotent: if *venv_dir* is already a directory link (a symlink on
+    POSIX, a junction on win32 — see :mod:`coord.dirlink`), just returns
+    its current target. Otherwise renames the existing plain directory
+    into the ``.blue`` slot and replaces *venv_dir* with a link pointing at
+    it. This is the one-time, one-machine migration every pre-#1241
+    install needs; every update after that stays in the link layout, so
+    this becomes a no-op for the rest of that machine's life.
     """
     existing = current_slot(venv_dir)
     if existing is not None:
@@ -418,13 +425,13 @@ def ensure_symlink_layout(venv_dir: Path) -> Path:
     if blue.exists():
         # Should be unreachable — `blue`/`green` only ever come into being
         # via this function or `perform_update`, both gated on `venv_dir`
-        # not already being a symlink. Refuse rather than clobber whatever
-        # is there.
+        # not already being a directory link. Refuse rather than clobber
+        # whatever is there.
         raise FileExistsError(
             f"{blue} already exists — refusing to migrate {venv_dir} over it"
         )
     venv_dir.rename(blue)
-    venv_dir.symlink_to(blue, target_is_directory=True)
+    make_dir_link(venv_dir, blue)
     return blue
 
 
@@ -517,20 +524,18 @@ def running_slot(venv_dir: Path) -> Path | None:
 
 
 def _atomic_swap(venv_dir: Path, new_slot: Path) -> None:
-    """Flip *venv_dir* to point at *new_slot* in one filesystem operation.
+    """Flip *venv_dir* to point at *new_slot*.
 
-    Builds the new symlink at a temp path next to *venv_dir* and renames it
-    directly onto *venv_dir* — ``rename()`` replacing an existing path is
-    atomic on POSIX when both are on the same filesystem (true here: both
-    are siblings under the same parent directory), so any `coord`
-    invocation racing this always sees either the old, complete slot or the
-    new, complete slot — never a half-updated ``venv_dir``.
+    Delegates to :func:`coord.dirlink.replace_dir_link`: atomic on POSIX
+    (a symlink `rename()` onto an existing path is a single filesystem
+    operation there, so any `coord` invocation racing this always sees
+    either the old, complete slot or the new, complete slot — never a
+    half-updated ``venv_dir``) and best-effort on win32, where a directory
+    junction has no equivalent single-syscall replace (#2842) — see that
+    module's docstring for the platform difference this does *not* paper
+    over.
     """
-    tmp_link = venv_dir.parent / f".{venv_dir.name}.next-link"
-    if tmp_link.is_symlink() or tmp_link.exists():
-        tmp_link.unlink()
-    tmp_link.symlink_to(new_slot, target_is_directory=True)
-    tmp_link.replace(venv_dir)
+    replace_dir_link(venv_dir, new_slot)
 
 
 def _smoke_check(slot: Path, *, target_version: str | None) -> tuple[bool, str | None, str]:
