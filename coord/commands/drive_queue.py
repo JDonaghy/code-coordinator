@@ -6520,6 +6520,17 @@ def _blocked_escalation_command(
     behaviour) purely so every OTHER existing caller/test of this function
     that has no config to hand keeps working unchanged; the real `tick`
     call sites below always pass their own.
+
+    #3539: `existing_pr_relaunch_remedy` returning ``None`` is no longer
+    proof that *match* itself is ``None`` — a green PR with Test and/or
+    Review never recorded ALSO returns ``None`` (see that function's own
+    docstring), on purpose, so a plain `add` can resume on it. That case
+    still HAS a PR and HAS been dispatched, so it must not fall through to
+    `_requeue_command`'s blind ``remove && add`` either — remove would
+    discard a completed, green work cycle for no reason. Propose the plain
+    `add` (no `remove` first) instead; `_requeue_command` stays reserved for
+    the one case its own docstring names: *match* itself is ``None``,
+    i.e. nothing was ever dispatched for this row at all.
     """
     if is_merge_gate_block_reason(reason):
         parsed = parse_key(key)
@@ -6533,6 +6544,10 @@ def _blocked_escalation_command(
             remedy = existing_pr_relaunch_remedy(repo, issue, match)
             if remedy is not None:
                 return remedy["command_or_action"]
+            if match is not None:
+                # #3539: green PR, gate(s) not yet recorded — resume via a
+                # plain `add`, never the blind `remove && add` requeue below.
+                return f"coord drive-queue add {repo} {issue}"
     return _requeue_command(entry, key)
 
 
