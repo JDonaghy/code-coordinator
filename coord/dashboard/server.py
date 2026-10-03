@@ -634,6 +634,29 @@ _SESSIONS_SLOW_THRESHOLD = 3.0  # seconds; a healthy sweep is normally <1s
 # on every ~4s dashboard poll.
 _SESSIONS_COOLDOWN = 20.0  # seconds before a down machine is re-probed
 
+# #1228: belt-and-suspenders hard cap on each per-machine sweep *future*,
+# applied by api_sessions itself via `asyncio.wait_for` rather than trusted
+# to `list_coord_tmux_sessions`'s internal `subprocess.run(timeout=5.0)`.
+# #1217 iteration 2 assumed that internal timeout bounded every sweep to
+# ~5-6s worst case, but a live smoke test measured a >60s (12x) overrun
+# against a real offline machine and the root cause was never confirmed —
+# a same-night diagnostic session could only reproduce fast (<1s) ssh
+# rejections, not a genuine hang, against that machine. A deterministic
+# repro against a TEST-NET-1 (192.0.2.0/24, RFC 5737) address — guaranteed
+# non-routable, no DNS/auth involved — shows `ssh -o BatchMode=yes -o
+# ConnectTimeout=4` (with or without this codebase's `_SSH_MUX_OPTS`
+# ControlMaster options) and Python's own `subprocess.run(timeout=5.0)`
+# wrapping it BOTH bound correctly to ~4s against a genuinely packet-dropped
+# host (see TestSessionsHardTimeout / the ssh timing note in
+# tests/test_dashboard.py) — so neither hypothesis in the issue reproduces
+# here. Since the real overrun's cause is still unconfirmed, this endpoint
+# no longer trusts any upstream timeout at all: whatever the per-machine
+# sweep future does, `api_sessions` itself gives up on it after this many
+# seconds and reports that machine as empty for this poll (and starts its
+# offline cooldown), so one bad host can never stall the response past this
+# bound regardless of what's actually slow underneath.
+_SESSIONS_HARD_TIMEOUT = 6.0  # seconds; event-loop-side cap per machine
+
 # #2066: PipelineView.current_stage values that represent genuinely finished
 # work with no pending action — safe for api_pipeline's recency cutoff to age
 # out. Every other current_stage ("coding", "review_running", "review_done",
@@ -3343,6 +3366,17 @@ def build_app(
         (see the comment above ``_sessions_executor``'s definition for why:
         #1217 iteration 1 fixed a dashboard-wide hang caused by exactly this
         fan-out saturating the process's shared default executor).
+
+        #1228: ``list_coord_tmux_sessions``'s internal 5s ``subprocess.run``
+        timeout is treated as unverified, not trusted — a live smoke test
+        of iteration 2 measured a >60s overrun against a real offline
+        machine with the root cause never confirmed. Each per-machine sweep
+        future is additionally wrapped in ``asyncio.wait_for(...,
+        timeout=_SESSIONS_HARD_TIMEOUT)`` so this endpoint itself gives up
+        on a stalled sweep regardless of what's slow underneath (the
+        in-flight thread keeps running to completion in the background —
+        ``asyncio.wait_for`` cannot cancel a blocking OS thread — but the
+        request no longer waits on it).
         """
         if _fixture is not None:
             # Seeded roster — no tmux, no ssh fan-out in fixture mode.
@@ -3386,6 +3420,21 @@ def build_app(
         async def _cached_empty(machine, is_local):
             return machine, [], is_local
 
+        async def _bounded_sweep(machine, is_local):
+            # #1228: `asyncio.wait_for` bounds how long THIS request waits
+            # on the sweep — it cannot cancel the underlying OS thread, so
+            # on timeout the thread keeps running in `_sessions_executor` to
+            # completion (and its result, when it eventually lands, is just
+            # discarded). That's an acceptable trade for never letting one
+            # stalled host block the response past `_SESSIONS_HARD_TIMEOUT`.
+            future = loop.run_in_executor(_sessions_executor, _sweep_one, machine)
+            try:
+                return await asyncio.wait_for(future, timeout=_SESSIONS_HARD_TIMEOUT)
+            except asyncio.TimeoutError:
+                if not is_local:
+                    _sessions_offline_since[machine.name] = time.monotonic()
+                return machine, [], is_local
+
         tasks = []
         for m in config.machines:
             is_local = _is_local_machine(m)
@@ -3397,7 +3446,7 @@ def build_app(
             ):
                 tasks.append(_cached_empty(m, is_local))
             else:
-                tasks.append(loop.run_in_executor(_sessions_executor, _sweep_one, m))
+                tasks.append(_bounded_sweep(m, is_local))
 
         sweeps = await asyncio.gather(*tasks)
         # Local host(s) first so they win any session-name collision, matching

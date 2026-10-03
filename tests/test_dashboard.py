@@ -412,6 +412,162 @@ class TestSessionsFanOutResilience:
         assert calls.count("flaky.tailnet") == 2
 
 
+class TestSessionsHardTimeout:
+    """#1228 (follow-up to #1217): `list_coord_tmux_sessions`'s internal 5s
+    `subprocess.run` timeout was *assumed*, never verified, to bound every
+    per-machine sweep to ~5-6s worst case. A live smoke test of the #1217
+    iteration-2 fix measured a >60s (12x) overrun against a real offline
+    machine and the root cause was never confirmed. These tests prove
+    `api_sessions` no longer trusts that internal bound at all: it wraps
+    each sweep future in its own `asyncio.wait_for(..., timeout=
+    _SESSIONS_HARD_TIMEOUT)`, so a sweep that stalls for *any* reason —
+    not just the ConnectTimeout/BatchMode path the internal timeout
+    covers — cannot hold the response hostage."""
+
+    def test_endpoint_returns_within_hard_timeout_even_if_sweep_never_returns_in_time(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Simulates exactly the unverified assumption in #1228: a
+        per-machine sweep that blocks far longer than the internal 5s cap
+        is ever supposed to allow. Without the endpoint-level
+        `asyncio.wait_for`, this request would block for the full sleep;
+        with it, the request returns at `_SESSIONS_HARD_TIMEOUT` instead."""
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_HARD_TIMEOUT", 0.1)
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_SLOW_THRESHOLD", 0.05)
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_COOLDOWN", 60.0)
+
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="stuck", host="stuck.tailnet", repos=["api"])],
+        )
+
+        def _fake_list(*, host=None):
+            # Far longer than _SESSIONS_HARD_TIMEOUT and longer than this
+            # endpoint's old assumed ~5-6s worst case too — stands in for
+            # whatever made the real fan-out take >60s in the #1217
+            # iteration-2 smoke test.
+            time.sleep(1.0)
+            return []
+
+        client = TestClient(build_app(config))
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", side_effect=_fake_list),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            start = time.monotonic()
+            r = client.get("/api/sessions")
+            elapsed = time.monotonic() - start
+
+        assert r.status_code == 200
+        assert r.json() == []
+        # Bounded by the hard timeout (0.1s) plus generous scheduling slack
+        # — nowhere near the mocked sweep's full 1.0s sleep.
+        assert elapsed < 0.6, f"endpoint waited {elapsed}s past its hard timeout"
+
+    def test_sweep_that_hits_hard_timeout_still_triggers_offline_cooldown(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A machine whose sweep gets abandoned via the hard timeout (not
+        the in-thread slow-threshold check, which never gets a chance to
+        run since the thread is still mid-sleep) must still enter the
+        offline cooldown — otherwise every ~4s poll re-pays the full stall
+        for a chronically wedged machine."""
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_HARD_TIMEOUT", 0.1)
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_COOLDOWN", 60.0)
+
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="stuck", host="stuck.tailnet", repos=["api"])],
+        )
+
+        calls: list[str | None] = []
+
+        def _fake_list(*, host=None):
+            calls.append(host.ssh_target if host is not None else None)
+            time.sleep(1.0)
+            return []
+
+        client = TestClient(build_app(config))
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", side_effect=_fake_list),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            client.get("/api/sessions")
+            client.get("/api/sessions")
+
+        # The second poll must skip spawning a new sweep entirely — it's
+        # within the cooldown window started by the first poll's hard
+        # timeout, even though that first sweep's thread is still asleep.
+        assert calls.count("stuck.tailnet") == 1
+
+
+class TestSshConnectTimeoutAgainstUnreachableHost:
+    """#1228: settle (rather than assume) whether `ssh -o BatchMode=yes -o
+    ConnectTimeout=4` — with this codebase's exact `TmuxHost(batch=True)`
+    argv, including the `_SSH_MUX_OPTS` ControlMaster options — actually
+    bounds a genuinely unreachable (packet-dropped, no route) host, as
+    opposed to only the fast auth/host-key rejections the #1217 chat
+    diagnostic session reproduced.
+
+    Uses a TEST-NET-1 address (``192.0.2.0/24``, RFC 5737) instead of a
+    real fleet machine's uptime: it is guaranteed non-routable on the
+    public internet, involves no DNS lookup and no auth, so any machine
+    running this suite reproduces the same "no response at all" condition
+    a chronically offline fleet machine would present at the network
+    level — deterministically, without needing one to stay offline.
+
+    This is a real subprocess test (no mocking) and is skipped outright
+    when the local network stack rejects the destination instantly (e.g.
+    a sandbox with no outbound routing at all) — that's a different,
+    already-bounded failure signature and doesn't exercise the packet-drop
+    path this test is for.
+    """
+
+    _TEST_NET_1_HOST = "192.0.2.1"  # RFC 5737: reserved, never routed
+
+    def test_connect_timeout_bounds_a_packet_dropped_host(self) -> None:
+        import subprocess
+
+        from coord.interactive import TmuxHost
+
+        host = TmuxHost(ssh_target=self._TEST_NET_1_HOST, batch=True)
+        cmd = host.cmd(["list-panes", "-a"])
+
+        start = time.monotonic()
+        try:
+            # Mirrors list_coord_tmux_sessions' own subprocess.run(timeout=5.0)
+            # exactly — if ssh's ConnectTimeout=4 didn't bound the call, this
+            # outer timeout would be the one to fire instead.
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - start
+            pytest.fail(
+                f"ssh did not return within the outer 5s timeout at all "
+                f"(elapsed={elapsed:.2f}s) — ConnectTimeout=4 failed to "
+                f"bound a packet-dropped host; this IS the #1228 bug."
+            )
+        elapsed = time.monotonic() - start
+
+        if elapsed < 1.0:
+            pytest.skip(
+                f"this environment rejected {self._TEST_NET_1_HOST} "
+                f"instantly (elapsed={elapsed:.2f}s, rc={result.returncode}, "
+                f"stderr={result.stderr.strip()!r}) instead of black-holing "
+                "it — can't exercise the packet-drop path here."
+            )
+
+        # ssh failed to connect (never reaches auth) ...
+        assert result.returncode != 0
+        # ... and ConnectTimeout=4 genuinely bounded it: comfortably under
+        # the outer 5s subprocess timeout, and in the right ballpark for a
+        # ~4s connect timeout rather than some other unrelated fast/slow
+        # path.
+        assert 3.0 <= elapsed <= 4.8, (
+            f"elapsed={elapsed:.2f}s outside the expected ConnectTimeout=4 "
+            f"window (rc={result.returncode}, stderr={result.stderr.strip()!r})"
+        )
+
+
 class TestProposalsAPI:
     def test_returns_proposals(self, tmp_path: Path) -> None:
         proposals = [
