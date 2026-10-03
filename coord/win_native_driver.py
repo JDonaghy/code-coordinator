@@ -810,6 +810,41 @@ def _popen_command_and_cwd(command: str, cwd: str) -> tuple[str, str | None]:
     return command, (cwd or None)
 
 
+#: #3544: every kwarg :meth:`Win32Calls.launch`/:meth:`~Win32Calls.launch_in_terminal`
+#: must pass to ``subprocess.Popen`` so the launched ``cmd.exe`` (and whatever
+#: GUI-subsystem grandchild it execs) never inherits this *process's own*
+#: stdin/stdout/stderr handles.
+#:
+#: Without this, a plain ``subprocess.Popen(command, shell=True, cwd=...)``
+#: (no ``stdin=``/``stdout=``/``stderr=``) hands the child Python's own
+#: standard handles unchanged — on Windows that's an inheritance, not a
+#: dup/close-on-exec situation. When this `Win32Calls` lives inside the
+#: `win-native` bridge runner (:data:`coord.win_native_bridge._BRIDGE_RUNNER_SRC`,
+#: a Windows-side ``python -c ...`` whose own stdout is a pipe the WSL-side
+#: ``subprocess.run(capture_output=True)`` is reading), that pipe write-end
+#: handle gets duplicated into the launched GUI exe. A GUI-subsystem process
+#: (``vimcode.exe``) never exits on its own — a human closes the window, or a
+#: spec step does — so it holds that handle open indefinitely. A pipe's
+#: read end only sees EOF once *every* write-end handle is closed; with the
+#: orphaned GUI exe still holding one, the WSL-side read blocks past the
+#: whole bridge script's own completion, for the full
+#: ``bridge_timeout``, even though the bridge runner itself finished and
+#: exited normally. ``Get-Process`` then shows the launched exe still
+#: running, orphaned, after the bridge has already timed out and raised.
+#:
+#: Redirecting all three standard streams to ``DEVNULL`` severs that
+#: inheritance: the child gets its own private, already-closed-on-the-
+#: parent-side handles, never a dup of this process's own pipe. This is the
+#: fix, not a workaround — nothing in this driver ever reads a launched
+#: app's stdout/stderr (the whole point of `win-native` is observing the
+#: real OS/window state, not console text), so there is no output to lose.
+_NO_HANDLE_INHERITANCE: dict = {
+    "stdin": subprocess.DEVNULL,
+    "stdout": subprocess.DEVNULL,
+    "stderr": subprocess.DEVNULL,
+}
+
+
 class Win32Calls:
     """The real :class:`WinCalls` implementation — ``ctypes`` for window
     management, input injection, menu/hit-test probing and ``PrintWindow``;
@@ -838,7 +873,9 @@ class Win32Calls:
 
     def launch(self, command: str, cwd: str) -> int:
         full_command, popen_cwd = _popen_command_and_cwd(command, cwd)
-        proc = subprocess.Popen(full_command, shell=True, cwd=popen_cwd)
+        proc = subprocess.Popen(
+            full_command, shell=True, cwd=popen_cwd, **_NO_HANDLE_INHERITANCE,
+        )
         return proc.pid
 
     def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int:
@@ -850,6 +887,7 @@ class Win32Calls:
         full_command, popen_cwd = _popen_command_and_cwd(full_command, cwd)
         proc = subprocess.Popen(
             full_command, shell=True, cwd=popen_cwd, creationflags=create_new_console,
+            **_NO_HANDLE_INHERITANCE,
         )
         return proc.pid
 
