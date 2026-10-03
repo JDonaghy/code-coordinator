@@ -1239,6 +1239,19 @@ class Assignment:
     # case.  Always the *resolved* name (after the spec > repo > default
     # precedence chain), not just the raw proposal.provider field.
     provider_name: str | None = None
+    # #1649 review: WHY `provider_name`/`model` were overridden from what
+    # plan/label/pin resolution would otherwise have chosen — today only
+    # the usage-gate reroute writes this (`coord approve`'s per-proposal
+    # loop, carrying the same prose `describe_model_choice`'s "warning:"/
+    # "model:" echo already printed live). None for every row predating
+    # this column and for every normal dispatch that was never rerouted —
+    # read as "no override reason recorded", never as "no override
+    # happened" (a reroute that landed before this field existed has no
+    # way to retroactively populate it). This is what makes a degraded
+    # dispatch discoverable after the fact, once `coord approve`'s
+    # terminal output has scrolled away — see `coord/usage_limits.py`'s
+    # module docstring for the reroute feature itself.
+    model_reason: str | None = None
     # #546: token counts for automated (claude -p) assignments.  Parsed from
     # the final stream-json result event at the same time as cost_usd.  All
     # default to 0; interactive (Max/OAuth) sessions stay at 0 and the TUI

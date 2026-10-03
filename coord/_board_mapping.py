@@ -147,6 +147,10 @@ def row_to_assignment(row: object) -> Assignment:
         smoke_tests=decode_smoke_tests(d.get("smoke_tests")),
         # #324: resolved provider name; None for rows predating this feature.
         provider_name=d.get("provider_name"),
+        # #1649 review: why provider_name/model were overridden (today only
+        # the usage-gate reroute); None for rows predating this column or
+        # any dispatch that was never rerouted.
+        model_reason=d.get("model_reason"),
         # #546: token counts; absent column (pre-migration) or NULL → 0.
         input_tokens=int(d.get("input_tokens") or 0),
         output_tokens=int(d.get("output_tokens") or 0),

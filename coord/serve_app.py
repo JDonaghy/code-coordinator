@@ -3269,6 +3269,7 @@ def openapi_spec() -> dict:
                                     "proposal": {"type": "object"},
                                     "repo_github": {"type": "string"},
                                     "provider_name": {"type": "string", "nullable": True},
+                                    "model_reason": {"type": "string", "nullable": True},
                                 },
                                 "required": ["assignment_id", "repo_github"],
                             }
@@ -7474,6 +7475,9 @@ def build_app(
                 proposal=proposal,
                 repo_github=body["repo_github"],
                 provider_name=body.get("provider_name"),
+                # #1649 review: thin-client parity for the usage-gate
+                # reroute reason — see state.record_dispatched's docstring.
+                model_reason=body.get("model_reason"),
                 # #2087 review, non-blocking finding 1: validate against the
                 # daemon's own already-loaded config, not an independent
                 # reload — see state._validate_dispatch_target's docstring.

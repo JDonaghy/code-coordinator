@@ -129,6 +129,71 @@ machines:
             load(self._write(tmp_path, extra))
 
 
+class TestEscalationProviderValidation:
+    """#1649 review (non-blocking finding 1): a `"provider/model"` rung in
+    `models.escalation` is now load-bearing for usage-gate reroute
+    (`select_reroute_route`) — previously irrelevant for disabled/warn/
+    block modes, where `models.escalation` only ever resolved Claude model
+    aliases. A typo'd provider name must fail loudly at config load, the
+    same way `_validate_pinned_route` already does for `models.pinned`."""
+
+    BASE = """\
+repos:
+  - name: api
+    github: acme/api
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+"""
+
+    def _write(self, tmp_path: Path, extra: str) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(self.BASE + extra)
+        return p
+
+    def test_unknown_provider_in_escalation_raises_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        extra = "models:\n  escalation: [haiku, ghost-provider/glm-5.2]\n"
+        with pytest.raises(ConfigError, match="unknown provider"):
+            load(self._write(tmp_path, extra))
+
+    def test_known_provider_prefixed_rung_is_accepted(self, tmp_path: Path) -> None:
+        extra = (
+            "models:\n"
+            "  escalation: [haiku, sonnet, opencode/glm-5.2]\n"
+            "providers:\n"
+            "  definitions:\n"
+            "    opencode:\n"
+            "      type: opencode\n"
+        )
+        cfg = load(self._write(tmp_path, extra))
+        assert cfg.models.escalation == ["haiku", "sonnet", "opencode/glm-5.2"]
+
+    def test_bare_rung_needs_no_provider_definitions(self, tmp_path: Path) -> None:
+        """A deployment with no `providers:` block at all (every
+        pre-#1649/#55 config) must stay unaffected — bare aliases are
+        implicitly "claude", which is always known."""
+        extra = "models:\n  escalation: [haiku, sonnet, opus]\n"
+        cfg = load(self._write(tmp_path, extra))
+        assert cfg.models.escalation == ["haiku", "sonnet", "opus"]
+
+    def test_escalation_rung_missing_model_after_provider_raises(
+        self, tmp_path: Path
+    ) -> None:
+        extra = (
+            "models:\n"
+            "  escalation: [haiku, \"opencode/\"]\n"
+            "providers:\n"
+            "  definitions:\n"
+            "    opencode:\n"
+            "      type: opencode\n"
+        )
+        with pytest.raises(ConfigError, match="missing a model"):
+            load(self._write(tmp_path, extra))
+
+
 class TestResolveDispatchModelAliasPinPrecedence:
     """#1650 acceptance: a pinned type is unaffected by label-derived
     routing or by however far the escalation ladder has climbed; only an

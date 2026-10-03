@@ -173,6 +173,8 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         # #1956: verdict provenance; None → NULL (treated as "agent").
         a.verdict_source,
         a.verdict_source_reason,
+        # #1649 review: why provider_name/model were overridden; None → NULL.
+        a.model_reason,
     )
 
 
@@ -187,7 +189,8 @@ _UPSERT_SQL = """
         uat_actor, uat_prior, review_verdict,
         review_verdict_original, review_verdict_override_reason, review_head_sha,
         review_patch_id, review_scoped, review_scope_base_sha,
-        cost_usd, smoke_tests, provider_name, verdict_source, verdict_source_reason
+        cost_usd, smoke_tests, provider_name, verdict_source, verdict_source_reason,
+        model_reason
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
@@ -198,7 +201,8 @@ _UPSERT_SQL = """
         ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?,
-        ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?,
+        ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         -- #1451: `status`/`finished_at` are guarded by a finished_at-CAS, not
@@ -372,7 +376,13 @@ _UPSERT_SQL = """
         verdict_source        = COALESCE(
             excluded.verdict_source, assignments.verdict_source),
         verdict_source_reason = COALESCE(
-            excluded.verdict_source_reason, assignments.verdict_source_reason)
+            excluded.verdict_source_reason, assignments.verdict_source_reason),
+        -- #1649 review: same COALESCE-preserve pattern as provider_name
+        -- above — a later whole-board upsert from a path that doesn't know
+        -- about the reroute reason (agent reload, thin-client round-trip)
+        -- must not erase a value `record_dispatched`/`record_dispatched_
+        -- assignment` already recorded for this row.
+        model_reason          = COALESCE(excluded.model_reason, assignments.model_reason)
 """
 
 
@@ -389,7 +399,7 @@ _DISPATCHED_UPSERT_SQL = """INSERT INTO assignments (
             files_allowed, model, dispatched_at, review_of_assignment_id,
             review_target, required_gates, review_iteration,
             provider_name, branch, for_issue_number, driven_by,
-            dispatched_by_assignment_id
+            dispatched_by_assignment_id, model_reason
         ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             -- #1553: a follow-up dispatched off another assignment (review,
             -- smoke, [fix-N], retry, pr-helper) inherits that parent's
@@ -407,7 +417,7 @@ _DISPATCHED_UPSERT_SQL = """INSERT INTO assignments (
                 SELECT p.for_issue_number FROM assignments p
                 WHERE p.assignment_id = ?
             )),
-            ?, ?)
+            ?, ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -445,7 +455,11 @@ _DISPATCHED_UPSERT_SQL = """INSERT INTO assignments (
             dispatched_by_assignment_id = COALESCE(
                 excluded.dispatched_by_assignment_id,
                 assignments.dispatched_by_assignment_id
-            )"""
+            ),
+            -- #1649 review: COALESCE so a retry/re-dispatch doesn't clear a
+            -- previously-recorded reroute reason from the original dispatch
+            -- — same pattern as provider_name above.
+            model_reason = COALESCE(excluded.model_reason, assignments.model_reason)"""
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -974,6 +988,7 @@ def record_dispatched(
     proposal: Proposal,
     repo_github: str,
     provider_name: str | None = None,
+    model_reason: str | None = None,
 ) -> None:
     """Record a newly dispatched assignment — routes to the daemon when set."""
     # #2417: stamp the calling worker's own assignment id (if any) BEFORE
@@ -994,6 +1009,7 @@ def record_dispatched(
             "proposal": asdict(proposal),
             "repo_github": repo_github,
             "provider_name": provider_name,
+            "model_reason": model_reason,
         },
     )
     if resp is not None:
@@ -1003,6 +1019,7 @@ def record_dispatched(
         proposal=proposal,
         repo_github=repo_github,
         provider_name=provider_name,
+        model_reason=model_reason,
     )
 
 
@@ -1012,6 +1029,7 @@ def _record_dispatched_local(
     proposal: Proposal,
     repo_github: str,
     provider_name: str | None = None,
+    model_reason: str | None = None,
     config=None,
 ) -> None:
     """Record a newly dispatched assignment in the assignments table.
@@ -1023,6 +1041,11 @@ def _record_dispatched_local(
         provider_name: The *resolved* provider name (after the spec > repo >
             default precedence chain).  ``None`` for callers that predate
             #324 — the TUI shows the implicit default ("claude") when NULL.
+        model_reason: #1649 review — WHY `provider_name`/`model` were
+            overridden from what plan/label/pin resolution would otherwise
+            have chosen (today only `coord approve`'s usage-gate reroute
+            sets this). ``None`` for every other dispatch — see
+            :attr:`coord.models.Assignment.model_reason`.
         config: optional already-loaded :class:`~coord.config.Config` to
             validate against — see :func:`_validate_dispatch_target`'s
             docstring. The daemon's ``/dispatched-work`` handler passes its
@@ -1052,8 +1075,9 @@ def _record_dispatched_local(
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, required_gates,
-            provider_name, branch, driven_by, dispatched_by_assignment_id
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider_name, branch, driven_by, dispatched_by_assignment_id,
+            model_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO NOTHING""",
         (
             assignment_id,
@@ -1072,6 +1096,7 @@ def _record_dispatched_local(
             branch,
             proposal.driven_by,
             proposal.dispatched_by_assignment_id,
+            model_reason,
         ),
     )
     conn.commit()
@@ -1202,6 +1227,7 @@ def _record_dispatched_assignment_local(
                 assignment.review_of_assignment_id,
                 assignment.driven_by,
                 assignment.dispatched_by_assignment_id,
+                assignment.model_reason,
             ),
         )
         conn.commit()

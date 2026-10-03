@@ -661,6 +661,15 @@ def approve(
         # branch, so there's no precedence conflict with that call's own
         # pin check.
         reroute_explicit_model: str | None = None
+        # #1649 review: the reroute reason, carried all the way to
+        # `record_dispatched` below so it is recoverable from the
+        # assignment row after this terminal output has scrolled away —
+        # not just echoed live. `gate_result.message` already names the
+        # trigger, the reset time, and (for "reroute") what it rerouted
+        # from and to — the same text the "warning:" echo above prints,
+        # reused verbatim rather than re-derived so the persisted reason
+        # can never drift from what the operator actually saw.
+        model_reason: str | None = None
         if cfg.usage_gate.mode == "reroute":
             from coord.usage_limits import evaluate_usage_gate, get_plan_limits  # noqa: PLC0415
 
@@ -690,13 +699,22 @@ def approve(
                 # attribution misses a corner case.
                 click.echo(f"[{p.id}] warning: {gate_result.message}", err=True)
             if gate_result.action == "reroute":
-                assert gate_result.route is not None  # action=="reroute" always sets it
+                if gate_result.route is None:
+                    # Defensive: action=="reroute" always sets `route` (see
+                    # `evaluate_usage_gate`'s own invariant) — a plain
+                    # `raise` rather than `assert` so this stays load-bearing
+                    # under `python -O`, which strips bare asserts.
+                    raise RuntimeError(
+                        "usage-gate reroute: action=='reroute' but route is "
+                        "None — evaluate_usage_gate invariant violated"
+                    )
                 from coord.config import parse_model_route  # noqa: PLC0415
 
                 new_provider, new_model = parse_model_route(gate_result.route)
                 p.provider = new_provider
                 effective_provider_name = new_provider
                 reroute_explicit_model = new_model or None
+                model_reason = gate_result.message
 
         # #1706 review fix: don't force `models.default` (a Claude model
         # alias) onto a non-claude/claude-pty provider that pins its own
@@ -896,6 +914,11 @@ def approve(
                 proposal=p,
                 repo_github=repo.github,
                 provider_name=response.get("_provider_name"),
+                # #1649 review: the usage-gate reroute reason (``None`` for
+                # every dispatch that wasn't rerouted) — see
+                # `Assignment.model_reason`'s docstring for why this needs
+                # to survive past the live `coord approve` terminal output.
+                model_reason=model_reason,
             )
 
         try:
