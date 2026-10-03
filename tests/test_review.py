@@ -3202,6 +3202,45 @@ def test_dispatch_review_captures_patch_id(
     assert result.review_patch_id == "patchid-xyz"
 
 
+def test_dispatch_review_captures_patch_id_without_pr(
+    two_machine_config: Config,
+) -> None:
+    """#2364: a review can legitimately run before a PR exists yet (the
+    drive-queue path opens PRs lazily) — `review_patch_id` must still get
+    populated in that case, via a direct branch-vs-base compare diff rather
+    than `gh pr diff` (which needs a PR number). Without this,
+    `review-reaffirm` permanently refuses every such approval with "missing
+    patch-id data" no matter how trivial a later delta is."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "patchid-no-pr-1"})
+    compare_calls: list[tuple[str, str, str]] = []
+
+    def _compare_diff(repo_github: str, base: str, head: str) -> str | None:
+        compare_calls.append((repo_github, base, head))
+        return "diff --git a/f.py b/f.py\n+x\n"
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: None,  # no PR open yet
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=lambda repo, branch: "deadbeef1234",
+        patch_id_computer=lambda diff_text: "patchid-no-pr",
+        compare_diff_fetcher=_compare_diff,
+    )
+
+    assert result is not None
+    assert result.pr_url is None
+    assert result.review_patch_id == "patchid-no-pr"
+    # The compare diff must be fetched against the branch's own base/head —
+    # the same shape `github_ops.get_branch_patch_id` uses at merge time —
+    # not `gh pr diff` (which has no PR number to call with).
+    assert compare_calls and compare_calls[0][2] == completed.branch
+
+
 def test_dispatch_review_tolerates_patch_id_fetch_failure(
     two_machine_config: Config,
 ) -> None:
