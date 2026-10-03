@@ -328,3 +328,147 @@ class TestDaemonRouting:
         sleep_s, backoff = github_throttle.consult(now=1000.0)
         assert sleep_s == 0.0
         assert backoff is None
+
+
+# ── #3536: proactive pacing (a token bucket, ahead of any 403) ──────────────
+
+
+class TestPaceStep:
+    """`_pace_step` is the pure bucket arithmetic -- no file I/O, no clock
+    read -- so it is tested directly, independent of `local_pace_acquire`'s
+    read/write wrapper (covered by `TestLocalPaceAcquire` below)."""
+
+    def test_fresh_bucket_grants_immediately(self) -> None:
+        sleep_s, state = github_throttle._pace_step(
+            None, now=1000.0, rate_per_s=1.0, burst=5.0,
+        )
+        assert sleep_s == 0.0
+        assert state["tokens"] == pytest.approx(4.0)
+        assert state["last"] == 1000.0
+
+    def test_burst_bounds_how_many_immediate_grants_in_a_row(self) -> None:
+        """Simulated concurrent callers: repeated acquisitions at the SAME
+        instant (no time to refill between them) are bounded by *burst* --
+        the whole point of a token bucket over a bare "one call every N
+        seconds" rate limiter, which would reject every one of a legitimate
+        short clump."""
+        state = None
+        now = 1000.0
+        granted = 0
+        for _ in range(12):
+            sleep_s, state = github_throttle._pace_step(
+                state, now=now, rate_per_s=0.5, burst=5.0,
+            )
+            if sleep_s == 0.0:
+                granted += 1
+        assert granted == 5
+
+    def test_once_the_burst_is_spent_a_caller_is_charged_a_wait(self) -> None:
+        state = None
+        now = 1000.0
+        for _ in range(5):
+            _, state = github_throttle._pace_step(
+                state, now=now, rate_per_s=0.5, burst=5.0,
+            )
+        sleep_s, state = github_throttle._pace_step(
+            state, now=now, rate_per_s=0.5, burst=5.0,
+        )
+        # Empty bucket, rate 0.5 tok/s -> one token takes 2s to accrue.
+        assert sleep_s == pytest.approx(2.0)
+        assert state["tokens"] == 0.0
+
+    def test_tokens_refill_over_elapsed_time(self) -> None:
+        _, state = github_throttle._pace_step(
+            None, now=1000.0, rate_per_s=1.0, burst=5.0,
+        )
+        # Drain the rest of the burst at the same instant.
+        for _ in range(3):
+            _, state = github_throttle._pace_step(
+                state, now=1000.0, rate_per_s=1.0, burst=5.0,
+            )
+        assert state["tokens"] == pytest.approx(1.0)
+        # 10s later at 1 tok/s the bucket is back to full (capped at burst),
+        # so a fresh caller is granted immediately again.
+        sleep_s, state = github_throttle._pace_step(
+            state, now=1010.0, rate_per_s=1.0, burst=5.0,
+        )
+        assert sleep_s == 0.0
+        assert state["tokens"] == pytest.approx(4.0)
+
+    def test_malformed_state_is_treated_as_a_fresh_full_bucket(self) -> None:
+        sleep_s, state = github_throttle._pace_step(
+            {"tokens": "not a number"}, now=1000.0, rate_per_s=1.0, burst=5.0,
+        )
+        assert sleep_s == 0.0
+        assert state["tokens"] == pytest.approx(4.0)
+
+
+class TestLocalPaceAcquire:
+    def test_first_call_is_never_delayed(self) -> None:
+        assert github_throttle.local_pace_acquire(now=1000.0) == 0.0
+
+    def test_state_file_persists_across_calls(self, tmp_path, monkeypatch) -> None:
+        path = tmp_path / "pace.json"
+        monkeypatch.setenv("COORD_GITHUB_PACE_STATE", str(path))
+        for _ in range(int(github_throttle.PACE_DEFAULT_BURST)):
+            github_throttle.local_pace_acquire(
+                now=1000.0, rate_per_s=0.1, burst=github_throttle.PACE_DEFAULT_BURST,
+            )
+        assert path.exists()
+        sleep_s = github_throttle.local_pace_acquire(
+            now=1000.0, rate_per_s=0.1, burst=github_throttle.PACE_DEFAULT_BURST,
+        )
+        # Burst exhausted at the same instant -- a jittered wait for the
+        # next token at a slow 0.1 tok/s rate (~10s +/- 20%).
+        assert sleep_s > 0.0
+
+    def test_bounds_calls_per_window_across_simulated_concurrent_callers(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """#3536 acceptance: a token bucket shared via the same on-disk file
+        every process on this host reads/writes bounds how many of a batch
+        of "concurrent" callers (here: back-to-back calls at the same
+        instant, standing in for separate processes racing the same file)
+        get waved through immediately."""
+        path = tmp_path / "pace.json"
+        monkeypatch.setenv("COORD_GITHUB_PACE_STATE", str(path))
+        granted = 0
+        for _ in range(20):
+            sleep_s = github_throttle.local_pace_acquire(
+                now=2000.0, rate_per_s=0.5, burst=6.0,
+            )
+            if sleep_s == 0.0:
+                granted += 1
+        assert granted == 6
+
+    def test_best_effort_on_unwritable_path(self, tmp_path, monkeypatch) -> None:
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setenv(
+            "COORD_GITHUB_PACE_STATE", str(blocker / "nested" / "github_pace.json")
+        )
+        # Must not raise -- best-effort, same posture as `local_record`.
+        assert github_throttle.local_pace_acquire(now=1000.0) == 0.0
+
+    def test_corrupt_state_file_is_treated_as_a_fresh_bucket(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        bad = tmp_path / "corrupt.json"
+        bad.write_text("not json at all", encoding="utf-8")
+        monkeypatch.setenv("COORD_GITHUB_PACE_STATE", str(bad))
+        assert github_throttle.local_pace_acquire(now=1000.0) == 0.0
+
+
+class TestPace:
+    def test_pace_is_local_pace_acquire_today(self, monkeypatch) -> None:
+        """#3536: no daemon route exists yet (see the module docstring) --
+        `pace()` is a thin, stable name in front of the same single-host
+        bucket `local_pace_acquire` implements."""
+        calls = []
+        monkeypatch.setattr(
+            github_throttle, "local_pace_acquire",
+            lambda **kw: calls.append(kw) or 0.0,
+        )
+        result = github_throttle.pace(now=1000.0, rate_per_s=2.0, burst=9.0)
+        assert result == 0.0
+        assert calls == [{"now": 1000.0, "rate_per_s": 2.0, "burst": 9.0}]

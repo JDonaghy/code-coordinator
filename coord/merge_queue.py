@@ -2218,6 +2218,57 @@ def is_ci_pending_reason(reason: str | None) -> bool:
     return (reason or "").startswith(CI_PENDING_PREFIX)
 
 
+# #3536: floor/cap for `ci_pending_poll_interval_s`'s exponential growth.
+# `CI_PENDING_POLL_BASE_S` matches the fastest fixed poll cadence #2809's own
+# incident narrative already named (15s); `CI_PENDING_POLL_CAP_S` keeps a
+# long-pending entry from ever waiting so long that a genuinely-resolved
+# check goes unnoticed for minutes at a stretch.
+CI_PENDING_POLL_BASE_S = 15.0
+CI_PENDING_POLL_CAP_S = 300.0
+
+
+def ci_pending_poll_interval_s(
+    consecutive_pending_polls: int,
+    *,
+    base: float = CI_PENDING_POLL_BASE_S,
+    cap: float = CI_PENDING_POLL_CAP_S,
+) -> float:
+    """How long a caller should wait before re-checking CI again, given how
+    many CONSECUTIVE times in a row it has already observed this entry as
+    ``checks_pending`` (#3536).
+
+    Doubles *base* once per consecutive pending observation, capped at
+    *cap*: ``ci_pending_poll_interval_s(0)`` is *base* itself (the very
+    first pending read — no reason yet to slow down),
+    ``ci_pending_poll_interval_s(1)`` is ``2 * base``, and so on, never
+    exceeding *cap* once the doubling would.
+
+    #2814's fix made every poll re-issue a real, attempt-exempt ``coord
+    merge --only`` re-check for as long as an entry sits CI-pending — the
+    only thing that refreshes a standalone drive's cached ``error`` (see
+    :func:`coord.drive._decide_merge`'s module comment on the four
+    CI-outcome siblings `is_ci_pending_reason` is one of). That is correct
+    for a single entry in isolation, but #3536's incident shows it does not
+    scale: several sibling entries on the same host parked on CI-pending at
+    once all re-check on the SAME fixed interval, serializing through the
+    host-wide merge lock and adding `gh` calls that only grow GitHub's
+    secondary-limit exposure the longer CI genuinely stays pending — exactly
+    when the fleet can least afford more traffic.
+
+    This is the pure interval policy a caller tracking a per-entry pending
+    streak (a persisted counter alongside the existing
+    ``ci_infra_reruns``/``ci_flaky_reruns``/``ci_unreadable_reruns``) can use
+    to space those re-checks out the longer CI stays pending, instead of
+    polling on the same fixed cadence indefinitely. Deliberately pure (no
+    clock read, no persistence, no `gh` call) so the growth policy itself is
+    cheaply unit-testable independent of wherever a caller decides to track
+    the streak and the wall-clock moment it last actually checked.
+    """
+    consecutive_pending_polls = max(0, int(consecutive_pending_polls))
+    interval = base * (2.0 ** consecutive_pending_polls)
+    return min(interval, cap)
+
+
 # #2347: the reason string prefix for a `checks_failed` block whose failing
 # check(s) are ALL the #1525 synthetic "could not read CI status"/"gh too
 # old" stand-ins (`coord.ci_store.is_unreadable_check`) — the check-list

@@ -14060,3 +14060,34 @@ class TestArchivedMergedIssueKeysOnRealPostgres:
         finally:
             monkeypatch.undo()
             session.close()
+
+
+# ── #3536: exponential merge-wait polling interval ──────────────────────────
+
+
+class TestCiPendingPollIntervalS:
+    """`ci_pending_poll_interval_s` is the pure growth policy a caller
+    tracking a per-entry CI-pending streak can use to space live `gh`
+    re-checks out the longer CI stays pending, instead of polling on the
+    same fixed cadence indefinitely (#3536)."""
+
+    def test_first_pending_read_uses_the_base_interval(self) -> None:
+        assert mq.ci_pending_poll_interval_s(0) == mq.CI_PENDING_POLL_BASE_S
+
+    def test_interval_doubles_each_consecutive_pending_read(self) -> None:
+        base = mq.CI_PENDING_POLL_BASE_S
+        assert mq.ci_pending_poll_interval_s(1) == base * 2
+        assert mq.ci_pending_poll_interval_s(2) == base * 4
+        assert mq.ci_pending_poll_interval_s(3) == base * 8
+
+    def test_interval_never_exceeds_the_cap(self) -> None:
+        assert mq.ci_pending_poll_interval_s(20) == mq.CI_PENDING_POLL_CAP_S
+        # Comfortably past where the doubling alone would overflow the cap.
+        assert mq.ci_pending_poll_interval_s(1000) == mq.CI_PENDING_POLL_CAP_S
+
+    def test_a_negative_streak_is_treated_as_zero(self) -> None:
+        assert mq.ci_pending_poll_interval_s(-5) == mq.CI_PENDING_POLL_BASE_S
+
+    def test_custom_base_and_cap_are_honoured(self) -> None:
+        assert mq.ci_pending_poll_interval_s(1, base=10.0, cap=15.0) == 15.0
+        assert mq.ci_pending_poll_interval_s(0, base=10.0, cap=15.0) == 10.0

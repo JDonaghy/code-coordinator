@@ -1595,6 +1595,100 @@ class TestDispatchPerReason:
         _, call_kwargs = stub.call_args
         assert call_kwargs["stale_rebase"] is True
 
+    def test_merge_gate_checks_stale_debounced_after_a_recent_stale_rebase(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#3536: a successful stale-rebase conflict-fix does NOT consume
+        `has_prior_conflict_fix`'s retry cap (#784/#2475 — a fresh base move
+        is a fresh situation), so under rapid base movement that check alone
+        lets a SECOND dispatch through the instant the first one finishes.
+        This debounces it: a prior stale-rebase dispatch for the SAME entry,
+        inside the settle window, holds off a new one regardless of its own
+        outcome."""
+        config.pipeline.auto_dispatch_stalled = True
+        prior_fix = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=951,
+            issue_title="[stale-rebase-fix] t", assignment_id="cf-1",
+            status="done", type="conflict-fix", review_of_assignment_id="work-1",
+            dispatched_at=1000.0, finished_at=1050.0,
+        )
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+            prior_fix,
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_gate_checks_stale"
+
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+        stub = MagicMock()
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+        # 60s after `prior_fix.dispatched_at` -- well inside the default
+        # 300s settle window.
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work, board, config, now=1060.0,
+        )
+
+        assert action.kind == "skipped_debounced"
+        assert "#3536" in action.detail
+        stub.assert_not_called()
+
+    def test_merge_gate_checks_stale_dispatches_again_once_the_debounce_window_passes(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Same board as the debounce test above, but *now* is past the
+        settle window -- the rebase goes ahead exactly like pre-#3536
+        behaviour."""
+        config.pipeline.auto_dispatch_stalled = True
+        prior_fix = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=951,
+            issue_title="[stale-rebase-fix] t", assignment_id="cf-1",
+            status="done", type="conflict-fix", review_of_assignment_id="work-1",
+            dispatched_at=1000.0, finished_at=1050.0,
+        )
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+            prior_fix,
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-951-fix", target_branch="develop", issue_number=951,
+            issue_title="t", state=PENDING,
+            error=f"{CI_STALE_PREFIX} checks predate the current base",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_gate_checks_stale"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=951,
+            issue_title="[stale-rebase-fix] t", assignment_id="cf-2",
+            status="pending", type="conflict-fix",
+        )
+        stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        # `prior_fix.dispatched_at` (1000.0) + the 300s settle window + a
+        # 1s margin.
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work, board, config, now=1301.0,
+        )
+
+        assert action.kind == "conflict_fix_dispatched"
+        stub.assert_called_once()
+
     def test_merge_conflict_unresolved_skips_a_fix_round_ceiling_blocked_row(
         self, config: Config, monkeypatch
     ) -> None:

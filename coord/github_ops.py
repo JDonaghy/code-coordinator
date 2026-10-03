@@ -562,6 +562,19 @@ def _gh(*args: str, caller: str = "", force_through_backoff: bool = False) -> st
             )
         if backoff_sleep_s > 0:
             time.sleep(backoff_sleep_s)
+    # #3536: proactive pacing, ahead of any 403 -- a reactive backoff above
+    # has nothing to say about a caller that hasn't been rate-limited yet,
+    # which is exactly the mass-resume shape #3536 describes (a dozen
+    # newly-unblocked rows each making their own first live `gh` call with
+    # no shared history of a hit). Every `gh` call funnels through here, so
+    # pacing it once at this seam paces every polling path (drive-queue
+    # merge-wait re-checks, the merge-queue sweep, `coord notify` ticks)
+    # without each one needing its own call to `github_throttle.pace()`.
+    # Skipped entirely whenever the backoff branch above already raised —
+    # there is no call left to pace at that point.
+    pace_sleep_s = github_throttle.pace()
+    if pace_sleep_s > 0:
+        time.sleep(pace_sleep_s)
     # #1896 Phase 0: time + classify every `gh` invocation through this one
     # seam so `coord diagnose --forge-availability` has real data on how
     # often the forge is actually unreachable, not just anecdote from one
