@@ -335,7 +335,16 @@ def approve(
     # CAVEAT: this is predictive only while headless usage still draws the
     # subscription windows `/usage` reports (paused rollout as of
     # 2026-06-15) rather than a separate monthly credit pool.
-    if cfg.usage_gate.mode != "disabled":
+    # #1649: `mode="reroute"` needs the per-proposal `assignment_type`
+    # (`models.pinned` exemption) and `effective_provider_name` (which
+    # provider THIS proposal would use) neither of which is known yet at
+    # batch granularity — both are resolved a few dozen lines below, inside
+    # the per-proposal loop, which is where reroute's gate call actually
+    # lives (see the "usage-gate reroute" comment there). This batch-level
+    # check stays exactly as it was for every other mode (#2096: one
+    # question, one answer — "disabled"/"warn"/"block" must answer it
+    # identically here and inside the loop).
+    if cfg.usage_gate.mode not in ("disabled", "reroute"):
         from coord.usage_limits import evaluate_usage_gate, get_plan_limits
 
         gate_result = evaluate_usage_gate(get_plan_limits(), cfg.usage_gate)
@@ -639,6 +648,56 @@ def approve(
             cfg.providers,
             issue_labels=work_issue_labels,
         )
+
+        # ── usage-gate reroute (#1649) ──────────────────────────────────
+        # Per-proposal, not batch-level like the "disabled"/"warn"/"block"
+        # pre-check above — needs `p.type` (the `models.pinned` exemption)
+        # and the `effective_provider_name` just resolved above (which
+        # provider THIS proposal was about to use, i.e. the one the probed
+        # window would constrain). Must run BEFORE `resolve_dispatch_model_
+        # alias` below so a chosen reroute route can win as this proposal's
+        # *explicit_model* — the pin-exemption inside `evaluate_usage_gate`
+        # already guarantees a pinned type never reaches the "reroute"
+        # branch, so there's no precedence conflict with that call's own
+        # pin check.
+        reroute_explicit_model: str | None = None
+        if cfg.usage_gate.mode == "reroute":
+            from coord.usage_limits import evaluate_usage_gate, get_plan_limits  # noqa: PLC0415
+
+            gate_result = evaluate_usage_gate(
+                get_plan_limits(),
+                cfg.usage_gate,
+                models_cfg=cfg.models,
+                effective_provider_name=effective_provider_name,
+                assignment_type=p.type,
+            )
+            if gate_result.action == "block":
+                click.echo(
+                    f"[{p.id}] error: {gate_result.message} — refusing to "
+                    f"dispatch {p.repo_name} #{p.issue_number} (usage_gate."
+                    "reroute_fallback: block). Wait for the window to "
+                    "reset, or set usage_gate.reroute_fallback: warn in "
+                    "coordinator.yml.",
+                    err=True,
+                )
+                continue
+            if gate_result.action in ("warn", "reroute"):
+                # #1649: loud, once per dispatch — names the trigger, the
+                # reset time, and (for "reroute") what it rerouted from and
+                # to. Printed regardless of whether the model-resolution
+                # echo below also manages to attribute it (next block),
+                # so a silent downgrade can never happen even if that
+                # attribution misses a corner case.
+                click.echo(f"[{p.id}] warning: {gate_result.message}", err=True)
+            if gate_result.action == "reroute":
+                assert gate_result.route is not None  # action=="reroute" always sets it
+                from coord.config import parse_model_route  # noqa: PLC0415
+
+                new_provider, new_model = parse_model_route(gate_result.route)
+                p.provider = new_provider
+                effective_provider_name = new_provider
+                reroute_explicit_model = new_model or None
+
         # #1706 review fix: don't force `models.default` (a Claude model
         # alias) onto a non-claude/claude-pty provider that pins its own
         # `model` in `providers.definitions.<name>.model` — see
@@ -650,7 +709,13 @@ def approve(
         from coord.dispatch import resolve_dispatch_model_alias  # noqa: PLC0415
 
         p.model = resolve_dispatch_model_alias(
-            explicit_model=None,
+            # #1649: a chosen reroute route wins as THIS proposal's
+            # explicit override — safe because `evaluate_usage_gate`'s own
+            # pin check already guarantees `reroute_explicit_model` is only
+            # ever set when `p.type` is NOT pinned (a pinned type can't
+            # reach the "reroute" action), so there's no precedence clash
+            # with `models.pinned` here.
+            explicit_model=reroute_explicit_model,
             label_model=label_model,
             config=cfg,
             effective_provider_name=effective_provider_name,
@@ -665,7 +730,11 @@ def approve(
                 "     model: "
                 + describe_model_choice(
                     resolved_model=p.model,
-                    explicit_reason="resolved at plan time" if used_plan_time_snapshot else None,
+                    explicit_reason=(
+                        "usage-gate reroute (#1649)" if reroute_explicit_model
+                        else "resolved at plan time" if used_plan_time_snapshot
+                        else None
+                    ),
                     matched_label=matched_label,
                     shadowed_labels=shadowed_labels,
                     pinned_type=_pinned_type,

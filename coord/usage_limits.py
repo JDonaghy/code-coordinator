@@ -7,8 +7,8 @@ sign was a worker dying mid-task with the branch stranded (see
 ``coord.worker_events.detect_usage_limit_kill`` for the *mid-flight* half of
 that signal).  This module is the *pre-flight* half: probe the plan bars
 before dispatching, so ``coord drive``'s ``preflight()`` and ``coord
-approve`` can warn (or, once trusted, refuse) instead of finding out the
-hard way.
+approve`` can warn, refuse, or (#1649) reroute to a different provider's
+rung of the escalation ladder instead of finding out the hard way.
 
 THE PROBE.  ``claude -p "/usage" --output-format json`` returns the same
 live plan bars the interactive statusline shows, at essentially no cost
@@ -66,7 +66,7 @@ from typing import TYPE_CHECKING
 from coord.test_orchestrator import resolve_claude_bin
 
 if TYPE_CHECKING:
-    from coord.config import UsageGateConfig
+    from coord.config import ModelsConfig, UsageGateConfig
 
 # How long a cached probe stays valid. The `/usage` endpoint is itself
 # rate-limited and Claude Code serves bars up to 60 minutes stale anyway, so
@@ -288,10 +288,18 @@ def reset_cache() -> None:
 
 @dataclass(frozen=True)
 class UsageGateResult:
-    """What :func:`evaluate_usage_gate` decided, and why."""
+    """What :func:`evaluate_usage_gate` decided, and why.
 
-    action: str  # "proceed" | "warn" | "block"
+    ``route`` is set only when ``action == "reroute"`` (#1649): the chosen
+    ``models.escalation`` rung — a bare model alias or a ``provider/model``
+    pair (see :func:`coord.config.parse_model_route`) — that the caller
+    should dispatch on instead of the constrained provider. Every other
+    action leaves it ``None``.
+    """
+
+    action: str  # "proceed" | "warn" | "block" | "reroute"
     message: str = ""
+    route: str | None = None
 
     @property
     def blocks(self) -> bool:
@@ -303,19 +311,126 @@ def _format_trigger(label: str, pct: float, resets_at: str | None) -> str:
     return f"{label} {pct:.0f}% used{reset_note}"
 
 
-def evaluate_usage_gate(limits: PlanLimits, gate_cfg: "UsageGateConfig") -> UsageGateResult:
+def select_reroute_route(escalation: list[str], constrained_provider: str) -> str | None:
+    """The first rung of *escalation* whose provider differs from
+    *constrained_provider* (#1649) — the route :func:`evaluate_usage_gate`
+    reroutes a ``mode="reroute"`` dispatch to.
+
+    Each rung is resolved via :func:`coord.config.parse_model_route` (same
+    ``"/"`` convention as ``models.pinned`` — a bare alias is implicitly on
+    ``"claude"``). ``None`` when every rung shares *constrained_provider*,
+    which is every deployment today: until #55's cross-provider routes
+    land, ``models.escalation`` is entirely bare aliases, so this always
+    returns ``None`` and :func:`evaluate_usage_gate` falls back to
+    ``reroute_fallback`` — exactly the safety property the issue asked for
+    (no rung to escape to is never treated as "dispatch anyway").
+    """
+    from coord.config import parse_model_route  # noqa: PLC0415 — avoid import cycle at module load
+
+    for rung in escalation:
+        provider_name, _ = parse_model_route(rung)
+        if provider_name != constrained_provider:
+            return rung
+    return None
+
+
+def _reroute_fallback_result(gate_cfg: "UsageGateConfig", message: str) -> UsageGateResult:
+    """``mode="reroute"``'s own fallback — never a silent "dispatch
+    anyway" (see :attr:`coord.config.UsageGateConfig.reroute_fallback`)."""
+    action = "block" if gate_cfg.reroute_fallback == "block" else "warn"
+    return UsageGateResult(action, message)
+
+
+def _evaluate_reroute(
+    *,
+    message: str,
+    gate_cfg: "UsageGateConfig",
+    models_cfg: "ModelsConfig | None",
+    effective_provider_name: str,
+    assignment_type: str | None,
+) -> UsageGateResult:
+    """``mode="reroute"``'s branch of :func:`evaluate_usage_gate` — split out
+    for readability, not reused elsewhere.
+
+    *message* already names what tripped (trigger + reset time); this adds
+    the "what it rerouted from and to" half the issue asked be loud about,
+    or — when reroute can't apply — exactly why, before falling back to
+    :attr:`coord.config.UsageGateConfig.reroute_fallback`.
+    """
+    if models_cfg is not None and models_cfg.model_for_type(assignment_type) is not None:
+        # #1650: a pinned stage (``"review"`` by default) must never be
+        # degraded by ANY mechanism, including this one — warn/block per
+        # the configured fallback instead of rerouting it.
+        return _reroute_fallback_result(
+            gate_cfg,
+            f"{message} — type={assignment_type!r} is pinned (models.pinned); "
+            "usage-gate reroute does not apply to pinned stages "
+            f"(usage_gate.reroute_fallback: {gate_cfg.reroute_fallback})",
+        )
+
+    escalation = models_cfg.escalation if models_cfg is not None else []
+    route = select_reroute_route(escalation, effective_provider_name)
+    if route is None:
+        return _reroute_fallback_result(
+            gate_cfg,
+            f"{message} — usage_gate.mode is reroute, but no models.escalation "
+            f"rung avoids provider {effective_provider_name!r} "
+            f"(usage_gate.reroute_fallback: {gate_cfg.reroute_fallback})",
+        )
+
+    return UsageGateResult(
+        "reroute",
+        f"{message} — rerouting from {effective_provider_name!r} to "
+        f"{route!r} (usage_gate.mode: reroute)",
+        route=route,
+    )
+
+
+def evaluate_usage_gate(
+    limits: PlanLimits,
+    gate_cfg: "UsageGateConfig",
+    *,
+    models_cfg: "ModelsConfig | None" = None,
+    effective_provider_name: str = "claude",
+    assignment_type: str | None = None,
+) -> UsageGateResult:
     """Pure decision: given a probed :class:`PlanLimits` and a
     ``coord.config.UsageGateConfig``, what should dispatch do?
 
     - ``gate_cfg.mode == "disabled"`` (the on/off switch) → always proceed, no
       message — the gate is not consulted at all.
     - ``limits`` not ``ok`` (probe unavailable/unknown, including non-OAuth
-      auth) → always proceed. A probe we can't trust must never block or
-      even warn — see the module docstring.
+      auth) → always proceed. A probe we can't trust must never block,
+      warn, or reroute — see the module docstring.
     - Below both thresholds → proceed, no message.
-    - At/above a threshold → ``"warn"`` or ``"block"`` per ``gate_cfg.mode``
-      (default ``"warn"`` — see ``UsageGateConfig`` for why), with a message
-      naming which window(s) tripped and their reset time(s).
+    - At/above a threshold:
+      - ``"warn"``/``"block"`` (default ``"warn"`` — see ``UsageGateConfig``
+        for why) → a message naming which window(s) tripped and their reset
+        time(s).
+      - ``"reroute"`` (#1649) → pick the first ``models.escalation`` rung
+        whose provider is NOT *effective_provider_name* (the provider this
+        dispatch was about to use) and return ``action="reroute"`` with
+        that rung on :attr:`UsageGateResult.route`. Falls back to
+        ``gate_cfg.reroute_fallback`` (``"warn"``/``"block"``) when
+        *assignment_type* is pinned (``models.pinned`` — #1650, never
+        degraded) or no rung escapes the constrained provider — see
+        :func:`_evaluate_reroute`.
+
+    Args:
+        limits: The already-probed usage snapshot.
+        gate_cfg: ``coordinator.yml``'s ``usage_gate:`` block.
+        models_cfg: ``coordinator.yml``'s ``models:`` block — only
+            consulted for ``mode="reroute"`` (``models.escalation``,
+            ``models.pinned``). ``None`` behaves like an empty ladder (no
+            rung to reroute to), never raises.
+        effective_provider_name: The provider this dispatch was about to
+            use, before any reroute — defaults to ``"claude"``, the only
+            provider the ``/usage`` probe ever measures. Only consulted for
+            ``mode="reroute"``.
+        assignment_type: The dispatch's assignment ``type`` (e.g.
+            ``"work"``, ``"review"``), checked against ``models.pinned``
+            for the reroute pin-exemption. Only consulted for
+            ``mode="reroute"``.
     """
     if gate_cfg.mode == "disabled":
         return UsageGateResult("proceed")
@@ -332,6 +447,16 @@ def evaluate_usage_gate(limits: PlanLimits, gate_cfg: "UsageGateConfig") -> Usag
         return UsageGateResult("proceed")
 
     message = "Max-plan usage near limit: " + "; ".join(triggers)
+
+    if gate_cfg.mode == "reroute":
+        return _evaluate_reroute(
+            message=message,
+            gate_cfg=gate_cfg,
+            models_cfg=models_cfg,
+            effective_provider_name=effective_provider_name,
+            assignment_type=assignment_type,
+        )
+
     action = "block" if gate_cfg.mode == "block" else "warn"
     return UsageGateResult(action, message)
 

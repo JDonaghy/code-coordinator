@@ -45,10 +45,41 @@ def test_usage_gate_parses_disabled(tmp_path: Path) -> None:
     assert cfg.usage_gate.mode == "disabled"
 
 
+def test_usage_gate_parses_reroute(tmp_path: Path) -> None:
+    """#1649."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE + "usage_gate:\n  mode: reroute\n")
+    cfg = load(p)
+    assert cfg.usage_gate.mode == "reroute"
+    assert cfg.usage_gate.reroute_fallback == "warn"  # the safe default
+
+
+def test_usage_gate_parses_reroute_fallback_block(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE + "usage_gate:\n  mode: reroute\n  reroute_fallback: block\n"
+    )
+    cfg = load(p)
+    assert cfg.usage_gate.reroute_fallback == "block"
+
+
+def test_usage_gate_reroute_fallback_rejects_invalid_value(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE + "usage_gate:\n  mode: reroute\n  reroute_fallback: yell\n"
+    )
+    with pytest.raises(ConfigError, match="usage_gate.reroute_fallback"):
+        load(p)
+
+
 def test_usage_gate_mode_rejects_invalid_value(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(BASE + "usage_gate:\n  mode: yell\n")
     with pytest.raises(ConfigError, match="usage_gate.mode"):
+        load(p)
+    # "reroute" is now a valid mode (#1649) — assert the error message
+    # actually names it, rather than just happening to still raise.
+    with pytest.raises(ConfigError, match="reroute"):
         load(p)
 
 

@@ -8,8 +8,11 @@ Covers:
   timeout, malformed JSON) — all degrade to status="unknown", never raise.
 - get_plan_limits: ~60s caching so a dispatch batch doesn't hammer the
   (itself rate-limited) /usage endpoint.
-- evaluate_usage_gate: the pure gate decision — off/warn/block modes,
-  threshold comparisons, and "unknown never blocks or warns".
+- evaluate_usage_gate: the pure gate decision — off/warn/block/reroute
+  modes, threshold comparisons, and "unknown never blocks, warns, or
+  reroutes".
+- select_reroute_route: the first escalation rung whose provider escapes
+  the constrained one (#1649).
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from coord.config import UsageGateConfig
+from coord.config import ModelsConfig, UsageGateConfig
 from coord.usage_limits import (
     ModelWeekUsage,
     PlanLimits,
@@ -29,6 +32,7 @@ from coord.usage_limits import (
     parse_usage_probe_output,
     probe_plan_limits,
     reset_cache,
+    select_reroute_route,
 )
 
 
@@ -257,6 +261,159 @@ class TestEvaluateUsageGate:
         result = evaluate_usage_gate(limits, cfg)
         assert result.action == "warn"
         assert result.blocks is False
+
+
+# ── select_reroute_route (pure) ─────────────────────────────────────────────
+
+
+class TestSelectRerouteRoute:
+    def test_every_bare_rung_is_implicitly_the_constrained_provider(self) -> None:
+        """#1649: until #55's cross-provider routes land, every bare rung
+        is implicitly on "claude" — there is nothing to reroute to yet,
+        and this must say so rather than guess."""
+        assert select_reroute_route(["haiku", "sonnet", "opus"], "claude") is None
+
+    def test_first_non_constrained_rung_wins(self) -> None:
+        route = select_reroute_route(
+            ["haiku", "sonnet", "opencode/glm-5.2", "opus"], "claude",
+        )
+        assert route == "opencode/glm-5.2"
+
+    def test_a_non_constrained_rung_before_a_constrained_one_still_wins(self) -> None:
+        route = select_reroute_route(["opencode/glm-5.2", "opus"], "claude")
+        assert route == "opencode/glm-5.2"
+
+    def test_empty_ladder_has_nothing_to_reroute_to(self) -> None:
+        assert select_reroute_route([], "claude") is None
+
+
+# ── evaluate_usage_gate (mode="reroute") ─────────────────────────────────────
+
+
+class TestEvaluateUsageGateReroute:
+    def test_reroute_picks_first_non_constrained_rung(self) -> None:
+        cfg = UsageGateConfig(mode="reroute", session_threshold_pct=85.0)
+        models = ModelsConfig(escalation=["haiku", "sonnet", "opencode/glm-5.2"])
+        limits = PlanLimits(status="ok", session_pct=92.0, session_resets_at="8pm (UTC)")
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="claude", assignment_type="work",
+        )
+        assert result.action == "reroute"
+        assert result.route == "opencode/glm-5.2"
+        # Loud, once per dispatch: names the trigger, the old and new
+        # route, and the reset time (#1649).
+        assert "session" in result.message
+        assert "92" in result.message
+        assert "8pm (UTC)" in result.message
+        assert "claude" in result.message
+        assert "opencode/glm-5.2" in result.message
+
+    def test_falls_back_to_warn_when_no_rung_escapes_the_constrained_provider(
+        self,
+    ) -> None:
+        """Regression guard (#1649): the default `models.escalation` is
+        entirely bare (implicitly-claude) aliases — this must never be
+        mistaken for "nothing to do" and silently dispatch anyway."""
+        cfg = UsageGateConfig(
+            mode="reroute", session_threshold_pct=85.0, reroute_fallback="warn",
+        )
+        models = ModelsConfig()  # default escalation: haiku/sonnet/opus, all bare
+        limits = PlanLimits(status="ok", session_pct=92.0)
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="claude", assignment_type="work",
+        )
+        assert result.action == "warn"
+        assert result.route is None
+
+    def test_falls_back_to_block_when_configured_and_no_rung_escapes(self) -> None:
+        cfg = UsageGateConfig(
+            mode="reroute", session_threshold_pct=85.0, reroute_fallback="block",
+        )
+        models = ModelsConfig()
+        limits = PlanLimits(status="ok", session_pct=92.0)
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="claude", assignment_type="work",
+        )
+        assert result.action == "block"
+        assert result.blocks is True
+        assert result.route is None
+
+    def test_no_models_cfg_behaves_like_an_empty_ladder(self) -> None:
+        cfg = UsageGateConfig(mode="reroute", session_threshold_pct=85.0)
+        limits = PlanLimits(status="ok", session_pct=92.0)
+        result = evaluate_usage_gate(limits, cfg, effective_provider_name="claude")
+        assert result.action == "warn"
+        assert result.route is None
+
+    def test_pinned_stage_is_never_rerouted(self) -> None:
+        """#1650 crossing: a type pinned via `models.pinned` (e.g.
+        "review") must warn/block per config instead of degrading, even
+        though its own pinned route stays on the constrained provider and
+        an escape rung genuinely exists on the ladder."""
+        cfg = UsageGateConfig(
+            mode="reroute", session_threshold_pct=85.0, reroute_fallback="block",
+        )
+        models = ModelsConfig(
+            pinned={"review": "opus"},
+            escalation=["haiku", "sonnet", "opencode/glm-5.2"],
+        )
+        limits = PlanLimits(status="ok", session_pct=92.0)
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="claude", assignment_type="review",
+        )
+        assert result.action == "block"
+        assert result.route is None
+        assert "pinned" in result.message
+
+    def test_unpinned_type_on_the_same_ladder_still_reroutes(self) -> None:
+        """Same config as the pinned-stage test above, but for an unpinned
+        type — proves the exemption is keyed to the type, not some global
+        "reroute is broken" state."""
+        cfg = UsageGateConfig(mode="reroute", session_threshold_pct=85.0)
+        models = ModelsConfig(
+            pinned={"review": "opus"},
+            escalation=["haiku", "sonnet", "opencode/glm-5.2"],
+        )
+        limits = PlanLimits(status="ok", session_pct=92.0)
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="claude", assignment_type="work",
+        )
+        assert result.action == "reroute"
+        assert result.route == "opencode/glm-5.2"
+
+    def test_unknown_probe_never_reroutes_warns_or_blocks(self) -> None:
+        """Regression guard on the #1466 safety property, inherited
+        exactly for reroute mode (#1649) — an unparseable/failed probe must
+        never be mistaken for "at limit"."""
+        cfg = UsageGateConfig(mode="reroute", session_threshold_pct=1.0)
+        models = ModelsConfig(escalation=["haiku", "opencode/glm-5.2"])
+        limits = PlanLimits(status="unknown", error="probe timed out")
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="claude", assignment_type="work",
+        )
+        assert result.action == "proceed"
+        assert result.route is None
+
+    def test_disabled_warn_block_modes_are_byte_identical_to_before(self) -> None:
+        """Regression guard: calling evaluate_usage_gate the OLD way (no
+        new kwargs) for every pre-#1649 mode must produce the exact same
+        result it always did."""
+        limits = PlanLimits(status="ok", session_pct=92.0, session_resets_at="8pm (UTC)")
+        for mode in ("disabled", "warn", "block"):
+            cfg = UsageGateConfig(mode=mode, session_threshold_pct=85.0)
+            old_style = evaluate_usage_gate(limits, cfg)
+            new_style = evaluate_usage_gate(
+                limits, cfg,
+                models_cfg=ModelsConfig(), effective_provider_name="claude",
+                assignment_type="work",
+            )
+            assert old_style == new_style
 
 
 # ── format_plan_limits ───────────────────────────────────────────────────────

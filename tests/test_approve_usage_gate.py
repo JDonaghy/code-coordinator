@@ -133,3 +133,166 @@ class TestApproveUsageGate:
             result = _invoke_approve(config_file)
         assert result.exit_code == 0, result.output
         mock_probe.assert_not_called()
+
+
+# ── #1649: usage_gate.mode: reroute ──────────────────────────────────────────
+
+
+def _invoke_approve_for_dispatch(config_file: Path):
+    """Like `_invoke_approve`, but WITHOUT `--dry-run` — needed to exercise
+    the actual per-proposal reroute application (`p.provider`/`p.model`
+    override), which only happens on the real dispatch path."""
+    from coord.cli import main
+
+    runner = CliRunner()
+    with patch("coord.claim.find_work_claim", return_value=None), patch(
+        "coord.github_ops.get_issue", return_value={"labels": []}
+    ), patch(
+        "coord.dispatch.dispatch_with_retry", return_value={"id": "f-1", "_provider_name": "opencode"},
+    ) as mock_dispatch, patch("coord.dispatch.post_briefing"), patch(
+        "coord.network.fetch_repos",
+        return_value={"api": {"sha": "X", "branch": "main", "dirty": False}},
+    ):
+        result = runner.invoke(
+            main, ["approve", "1", "--config", str(config_file)]
+        )
+    return result, mock_dispatch
+
+
+def _config_file_with_escalation(tmp_path: Path, *, usage_gate_yaml: str) -> Path:
+    # "opencode/opencode/glm-5.2": first segment ("opencode") is OUR
+    # registry provider name (`providers.definitions`, parsed by
+    # `coord.config.parse_model_route`); the rest ("opencode/glm-5.2") is
+    # the real OpenCode Zen model string, itself vendor/model-shaped per
+    # `coord.config.model_plausible_for_provider_type`'s docstring — same
+    # double-segment convention a `models.pinned` route to a non-claude
+    # provider already uses.
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
+        "providers:\n  definitions:\n    opencode:\n      type: opencode\n"
+        "models:\n  escalation: [haiku, sonnet, 'opencode/opencode/glm-5.2']\n"
+        + usage_gate_yaml
+    )
+    return p
+
+
+class TestApproveUsageGateReroute:
+    def test_above_threshold_dispatches_on_the_fallback_route(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """Black-box acceptance: with a stubbed probe above threshold, the
+        dispatch lands on the fallback (non-constrained-provider) route,
+        and the CLI output names the trigger, the old route, the new
+        route, and the reset time."""
+        from coord.state import save_proposals
+
+        save_proposals([_make_proposal()])
+        config_file = _config_file_with_escalation(
+            tmp_path,
+            usage_gate_yaml="usage_gate:\n  mode: reroute\n  session_threshold_pct: 85\n",
+        )
+        with patch(
+            "coord.usage_limits.get_plan_limits",
+            return_value=PlanLimits(
+                status="ok", session_pct=92.0, session_resets_at="8pm (UTC)",
+            ),
+        ):
+            result, mock_dispatch = _invoke_approve_for_dispatch(config_file)
+
+        assert result.exit_code == 0, result.output
+        # Names the trigger (which threshold fired, and its reset time)...
+        assert "session" in result.output
+        assert "92" in result.output
+        assert "8pm (UTC)" in result.output
+        # ...and what it rerouted from and to.
+        assert "claude" in result.output
+        assert "opencode/opencode/glm-5.2" in result.output
+
+        # The dispatch itself landed on the rerouted provider/model.
+        mock_dispatch.assert_called_once()
+        dispatched_proposal = mock_dispatch.call_args[0][0]
+        assert dispatched_proposal.provider == "opencode"
+        assert dispatched_proposal.model == "opencode/glm-5.2"
+
+    def test_below_threshold_dispatches_on_the_original_route(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        from coord.state import save_proposals
+
+        save_proposals([_make_proposal()])
+        config_file = _config_file_with_escalation(
+            tmp_path,
+            usage_gate_yaml="usage_gate:\n  mode: reroute\n  session_threshold_pct: 85\n",
+        )
+        with patch(
+            "coord.usage_limits.get_plan_limits",
+            return_value=PlanLimits(status="ok", session_pct=10.0),
+        ):
+            result, mock_dispatch = _invoke_approve_for_dispatch(config_file)
+
+        assert result.exit_code == 0, result.output
+        assert "rerouting" not in result.output
+        dispatched_proposal = mock_dispatch.call_args[0][0]
+        assert dispatched_proposal.provider is None
+
+    def test_pinned_type_warns_but_still_dispatches_on_the_original_route(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """#1650 crossing: `review` is pinned by default — even above
+        threshold with a genuine escape rung on the ladder, a pinned
+        dispatch must warn (per `reroute_fallback`), never reroute."""
+        from coord.models import Proposal
+        from coord.state import save_proposals
+
+        save_proposals(
+            [
+                Proposal(
+                    id=1, machine_name="m", repo_name="api", issue_number=42,
+                    issue_title="review it", rationale="review", type="review",
+                    files_likely=["api/a.py"],
+                ),
+            ]
+        )
+        config_file = _config_file_with_escalation(
+            tmp_path,
+            usage_gate_yaml=(
+                "usage_gate:\n  mode: reroute\n  session_threshold_pct: 85\n"
+                "  reroute_fallback: warn\n"
+            ),
+        )
+        with patch(
+            "coord.usage_limits.get_plan_limits",
+            return_value=PlanLimits(status="ok", session_pct=92.0),
+        ):
+            result, mock_dispatch = _invoke_approve_for_dispatch(config_file)
+
+        assert result.exit_code == 0, result.output
+        assert "warning" in result.output.lower()
+        assert "pinned" in result.output
+        dispatched_proposal = mock_dispatch.call_args[0][0]
+        # Never rerouted: provider is unchanged (pin's own route — "opus",
+        # implicitly on "claude" — is what dispatched, not opencode).
+        assert dispatched_proposal.provider is None
+
+    def test_probe_unavailable_never_reroutes_warns_or_blocks(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        from coord.state import save_proposals
+
+        save_proposals([_make_proposal()])
+        config_file = _config_file_with_escalation(
+            tmp_path,
+            usage_gate_yaml="usage_gate:\n  mode: reroute\n  session_threshold_pct: 1\n",
+        )
+        with patch(
+            "coord.usage_limits.get_plan_limits",
+            return_value=PlanLimits(status="unknown", error="probe timed out"),
+        ):
+            result, mock_dispatch = _invoke_approve_for_dispatch(config_file)
+
+        assert result.exit_code == 0, result.output
+        assert "rerouting" not in result.output
+        dispatched_proposal = mock_dispatch.call_args[0][0]
+        assert dispatched_proposal.provider is None
