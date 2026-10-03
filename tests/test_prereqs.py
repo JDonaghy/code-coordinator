@@ -784,7 +784,9 @@ class TestLaneDriverDependencyPrereqs:
         (`coord.win_native_bridge.ensure_windows_win_native_venv` bootstraps)
         instead of this interpreter's own `find_spec`.
 
-        #3550: the bridge venv's `python.exe` is Windows-path-shaped
+        #3565 (filed as a duplicate of #3550, whose own fix landed on
+        `main` mislabeled under #3550's number): the bridge venv's
+        `python.exe` is Windows-path-shaped
         (`C:\\...`) — Linux `exec` can't resolve that directly, so the
         probe must translate `argv[0]` WSL-ward (`wslpath -u`, via
         `_windows_exec_argv`) before actually exec'ing it. The scripted
@@ -851,8 +853,8 @@ class TestLaneDriverDependencyPrereqs:
         assert probe.ok is False
 
     def test_comtypes_probe_wsl_path_translation_failure_is_unmet(self) -> None:
-        """#3550 regression: if `wslpath` itself isn't runnable (missing,
-        times out, or exits non-zero), `_windows_exec_argv` raises
+        """#3565 regression (duplicate of #3550): if `wslpath` itself isn't
+        runnable (missing, times out, or exits non-zero), `_windows_exec_argv` raises
         `WinNativeBridgeError` — the probe must degrade that to
         `found=False` exactly like an `OSError`/`TimeoutExpired`, never let
         it bubble up and take down the whole `/health` sweep. The real

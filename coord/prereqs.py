@@ -384,7 +384,8 @@ def _probe_comtypes(prereq: Prereq, timeout: float) -> ToolProbe:
     (`C:\\...`), which Linux's own `exec` can never resolve directly, so the
     `argv[0]` is translated WSL-ward through
     `coord.win_native_bridge._windows_exec_argv` first (#3519's fix,
-    originally missed here — #3550) before the subprocess call. A missing
+    originally missed here — #3565, filed as a duplicate of #3550 whose own
+    fix landed on `main` mislabeled) before the subprocess call. A missing
     Windows-side venv (never bootstrapped, `python.exe` unreachable through
     interop, or the `wslpath` translation itself failing) degrades to
     `found=False`, the same honest "not met yet" every other prereq in this
@@ -409,7 +410,7 @@ def _probe_comtypes(prereq: Prereq, timeout: float) -> ToolProbe:
     try:
         # `venv_python` is Windows-path-shaped (`C:\...`) — Linux `exec`
         # can't resolve that directly, so translate `argv[0]` WSL-ward
-        # first (#3519's fix, missed here originally — #3550). A
+        # first (#3519's fix, missed here originally — #3565). A
         # translation failure (e.g. `wslpath` missing) degrades to
         # `found=False` exactly like the OSError/TimeoutExpired cases
         # below, never a crash.
