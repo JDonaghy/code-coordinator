@@ -521,6 +521,41 @@ def test_post_comments_sync_matches_issue_comments_sync(cli, rw_db, monkeypatch)
     assert rest["synced"] == rpc["synced"]
 
 
+def test_post_comments_upsert_matches_issue_comments_upsert(cli, rw_db, monkeypatch):
+    """``action=upsert`` (#2109) through the resource route must behave
+    identically to the RPC ``/issue-comments`` route: post when nothing
+    matches the body's own marker, edit in place when something does."""
+    posted: list[tuple] = []
+    updated: list[tuple] = []
+    monkeypatch.setattr("coord.github_ops.get_issue_comments", lambda slug, n: [])
+    monkeypatch.setattr(
+        "coord.github_ops.post_issue_comment",
+        lambda slug, n, body: posted.append((slug, n, body)),
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.update_issue_comment",
+        lambda slug, n, cid, body: updated.append((slug, n, cid, body)),
+    )
+
+    marked = "<!-- coord:event=verification issue=1 -->\nnote"
+    rpc = cli.post(
+        "/issue-comments",
+        json={"action": "upsert", "repo_name": "api", "issue_number": RPC_ISSUE, "body": marked},
+    )
+    rest = cli.post(
+        f"/issue/api/{REST_ISSUE}/comments", json={"action": "upsert", "body": marked},
+    )
+
+    assert rpc.status_code == 200 and rpc.json() == {"ok": True}
+    assert rest.status_code == 200
+    assert rest.json() == {"ok": True, "action": "upsert", "synced": None}
+    assert posted == [
+        ("api", RPC_ISSUE, marked),
+        ("api", REST_ISSUE, marked),
+    ]
+    assert updated == []
+
+
 @pytest.mark.parametrize(
     ("body", "needle"),
     [
@@ -528,6 +563,7 @@ def test_post_comments_sync_matches_issue_comments_sync(cli, rw_db, monkeypatch)
         ({"action": "delete", "body": "x"}, "unknown action"),
         ({"action": "post"}, "body is required"),
         ({"action": "capture"}, "body is required"),
+        ({"action": "upsert"}, "body is required"),
     ],
 )
 def test_post_comments_refuses_bad_bodies(cli, rw_db, body, needle):

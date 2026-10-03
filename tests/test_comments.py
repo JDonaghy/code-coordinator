@@ -5,14 +5,19 @@ from __future__ import annotations
 import pytest
 
 from coord.comments import (
+    DEFAULT_HARNESS_LIMIT_CAVEAT,
     EVENT_BRIEFING,
     EVENT_COMPLETION,
     EVENT_FAILURE,
     EVENT_PHANTOM_HEALED,
+    EVENT_VERIFICATION,
+    extract_repro_section,
     format_briefing,
     format_completion,
     format_failure,
     format_phantom_row_healed,
+    format_verification,
+    harness_limits_caveat,
     parse_coord_comment_marker,
     parse_marker,
 )
@@ -256,3 +261,99 @@ class TestParseCoordCommentMarker:
         # generic marker also fails (no event=), so the whole comment is
         # correctly unrecognised rather than half-parsed.
         assert parse_coord_comment_marker("<!-- coord:review reviewer=x -->") is None
+
+
+class TestExtractReproSection:
+    def test_extracts_repro_heading(self) -> None:
+        body = (
+            "## Repro\n\n1. Open the app\n2. Click the button\n\n"
+            "## Acceptance\n\nSomething else entirely."
+        )
+        assert extract_repro_section(body) == "1. Open the app\n2. Click the button"
+
+    def test_extracts_repro_steps_variant(self) -> None:
+        body = "### Repro steps\n\nDo the thing.\n\n### Notes\n\nirrelevant"
+        assert extract_repro_section(body) == "Do the thing."
+
+    def test_extracts_last_section_to_end_of_body(self) -> None:
+        body = "## Repro\n\nOnly section, no trailing heading."
+        assert extract_repro_section(body) == "Only section, no trailing heading."
+
+    def test_none_when_absent(self) -> None:
+        assert extract_repro_section("## Acceptance\n\nNo repro here.") is None
+
+    def test_none_for_blank_body(self) -> None:
+        assert extract_repro_section(None) is None
+        assert extract_repro_section("") is None
+
+    def test_none_for_blank_section(self) -> None:
+        body = "## Repro\n\n## Acceptance\n\nstuff"
+        assert extract_repro_section(body) is None
+
+
+class TestHarnessLimitsCaveat:
+    def test_known_capability_returns_its_caveat(self) -> None:
+        text = harness_limits_caveat(["gtk"])
+        assert "GtkDriver" in text
+        assert "GDK signal delivery" in text
+
+    def test_tui_capability(self) -> None:
+        text = harness_limits_caveat(["tui"])
+        assert "TestBackend" in text
+
+    def test_first_known_capability_wins(self) -> None:
+        text = harness_limits_caveat(["unknown-cap", "gtk"])
+        assert "GtkDriver" in text
+
+    def test_falls_back_to_default_when_no_match(self) -> None:
+        assert harness_limits_caveat([]) == DEFAULT_HARNESS_LIMIT_CAVEAT
+        assert harness_limits_caveat(["windows"]) == DEFAULT_HARNESS_LIMIT_CAVEAT
+
+
+class TestFormatVerification:
+    def test_includes_every_field_and_a_parseable_marker(self) -> None:
+        body = format_verification(
+            assignment_id="abc123",
+            repo_name="api-gateway",
+            issue_number=553,
+            branch="issue-553-fix",
+            merge_sha="deadbeef1234",
+            pr_number=42,
+            test_files=["tests/test_auth.py"],
+            test_verdict="passed",
+            test_machine="precision",
+            review_verdict="approve",
+            review_machine="dellserver",
+            harness_caveat="Some caveat text.",
+            repro="1. Do the repro thing.",
+        )
+        marker = parse_marker(body)
+        assert marker is not None
+        assert marker.event == EVENT_VERIFICATION
+        assert marker.fields["assignment"] == "abc123"
+        assert marker.fields["repo"] == "api-gateway"
+        assert marker.fields["issue"] == "553"
+
+        assert "`issue-553-fix`" in body
+        assert "PR #42" in body
+        assert "`deadbeef1234`" in body
+        assert "`tests/test_auth.py`" in body
+        assert "**Test:** passed" in body
+        assert "ran on `precision`" in body
+        assert "**Review:** approve" in body
+        assert "ran on `dellserver`" in body
+        assert "Some caveat text." in body
+        assert "1. Do the repro thing." in body
+        assert "not worker-authored" in body
+
+    def test_missing_fields_render_placeholders_not_crash(self) -> None:
+        body = format_verification(
+            assignment_id="abc123",
+            repo_name="api-gateway",
+            issue_number=7,
+            branch="issue-7-fix",
+        )
+        assert "(not recorded)" in body  # merge commit
+        assert "(none detected in the diff)" in body  # test files
+        assert "(no verdict recorded)" in body  # test + review verdicts
+        assert "No `## Repro` section found on issue #7" in body

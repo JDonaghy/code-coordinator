@@ -7709,6 +7709,90 @@ def comment_on_issue(
     _comment_on_issue_local(repo_name, issue_number, body, repo_github=repo_github)
 
 
+def upsert_issue_comment(
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    *,
+    repo_github: str | None = None,
+) -> None:
+    """Post *body* on *issue_number* — OR, when a comment already exists on
+    that issue carrying the SAME ``coord:event=...`` marker, edit that
+    comment in place instead of appending a duplicate (#2109).
+
+    Keyed purely on the marker's ``event=`` field (parsed straight back off
+    *body* itself via :func:`coord.comments.parse_coord_comment_marker`),
+    scoped to this one issue's own comments — a second merge of the same
+    issue (a fix-1/retry landing a second branch) updates the standing
+    verification note rather than piling up a new one each time.
+
+    Routes to the daemon (``POST /issue-comments``, ``action="upsert"``)
+    when ``board_service`` is set — mirroring ``record_issue_comment_
+    capture``'s routing, since this (like that write) needs the SAME
+    ``/issue-comments`` RPC shape rather than ``comment_on_issue``'s
+    resource-addressable ``/issue-comment`` — else writes locally.
+    """
+    svc = _board_service()
+    resp = _route_issue_comment(
+        svc,
+        repo_name,
+        issue_number,
+        {"action": "upsert", "body": body, "repo_github": repo_github},
+        rpc_endpoint="/issue-comments",
+        rpc_payload={
+            "action": "upsert",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "body": body,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return
+    _upsert_issue_comment_local(repo_name, issue_number, body, repo_github=repo_github)
+
+
+def _upsert_issue_comment_local(
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    *,
+    repo_github: str | None = None,
+) -> None:
+    """Backend adapter (GitHub today): see :func:`upsert_issue_comment`.
+
+    Scans the issue's OWN live comments (``github_ops.get_issue_comments``)
+    for one carrying the identical marker ``event=`` — not the local
+    ``issue_comments`` DB mirror, so this is correct even against a comment
+    some other coord instance (or an earlier process on this same machine)
+    posted. Falls back to a plain post when no marker is found on *body*,
+    no existing comment matches, or the scan itself fails — never blocks
+    the write.
+    """
+    from coord import github_ops  # noqa: PLC0415
+    from coord.comments import parse_coord_comment_marker  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    marker = parse_coord_comment_marker(body)
+    event = marker.get("event") if marker else None
+    existing_id: int | None = None
+    if event:
+        try:
+            for c in github_ops.get_issue_comments(slug, issue_number):
+                m = parse_coord_comment_marker(c.get("body") or "")
+                if m and m.get("event") == event:
+                    cid = github_ops.parse_comment_id(c.get("url") or "")
+                    if cid is not None:
+                        existing_id = cid
+                        break
+        except Exception:  # noqa: BLE001 — best-effort; falls through to post
+            existing_id = None
+    if existing_id is not None:
+        github_ops.update_issue_comment(slug, issue_number, existing_id, body)
+    else:
+        github_ops.post_issue_comment(slug, issue_number, body)
+
+
 def _comment_on_issue_local(
     repo_name: str,
     issue_number: int,

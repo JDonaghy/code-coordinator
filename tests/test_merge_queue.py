@@ -38,6 +38,39 @@ from tests.test_db import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_verification_note(monkeypatch):
+    """#2109: `process()` now posts a verification note on every successful
+    `CLOSES_ISSUE_TYPES` merge via the REAL `coord.state.upsert_issue_comment`
+    (the same real-seam convention `comment_on_issue`'s `merged_partial`
+    branch already uses) — unlike every OTHER `GhOps` call in this module,
+    that one is not routed through the test's injected `gh_ops` stub, so it
+    would otherwise reach the real `gh` CLI from every test in this file
+    that merges successfully, not just the handful that actually care about
+    this hook. No-ops it fleet-wide for this module, mirroring
+    `conftest.py`'s own `_no_board_service` pattern; the dedicated
+    black-box coverage for the real behaviour lives in
+    `tests/test_merge_verification.py`, which overrides this per-test via
+    its own explicit `patch(...)`.
+    """
+    monkeypatch.setattr("coord.merge_queue.upsert_issue_comment", lambda *a, **kw: None)
+
+
+def _event(events: list, kind: str):
+    """The one event in *events* with ``kind == kind``.
+
+    #2109: `process()` now appends a trailing verification-note event to
+    every successful `CLOSES_ISSUE_TYPES` merge, so the event a test is
+    actually asserting on is no longer necessarily ``events[-1]`` — this
+    replaces that bare-index pattern with a kind-keyed lookup, asserting
+    exactly the same uniqueness every ``events[-1]`` call site already
+    implicitly assumed.
+    """
+    matches = [e for e in events if e.kind == kind]
+    assert len(matches) == 1, f"expected exactly one {kind!r} event, got {matches!r}"
+    return matches[0]
+
+
 def _check(
     name: str,
     *,
@@ -1849,8 +1882,8 @@ class TestExpectedRedClearForRelocatedMilestone:
             skip_review=True, skip_smoke=True,
         )
 
-        assert events[-1].kind == "expected_red_clear"
-        assert "ms01::a" in events[-1].message
+        clear_event = _event(events, "expected_red_clear")
+        assert "ms01::a" in clear_event.message
         assert gh.update_repo_file_calls
         assert gh.update_repo_file_calls[0][0] == _RelocatedExpectedRedGh.RELOCATED
         assert "expected_red" not in gh.update_repo_file_calls[0][1]
@@ -1885,8 +1918,8 @@ class TestExpectedRedClearForRelocatedMilestone:
             skip_review=True, skip_smoke=True,
         )
 
-        assert events[-1].kind == "expected_red_clear_skipped_no_acceptance"
-        assert "coord acceptance record" in events[-1].message
+        skip_event = _event(events, "expected_red_clear_skipped_no_acceptance")
+        assert "coord acceptance record" in skip_event.message
 
     def test_out_of_scope_merge_stays_silent_with_a_config(self) -> None:
         """#2199 review finding 2, preserved: an issue with no
@@ -1934,8 +1967,8 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear"
-        assert "ms01::a" in events[-1].message
+        clear_event = _event(events, "expected_red_clear")
+        assert "ms01::a" in clear_event.message
         assert gh.update_repo_file_calls  # the manifest text was actually edited
         assert "expected_red" not in gh.update_repo_file_calls[0][1]
 
@@ -1971,7 +2004,7 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear_noop"
+        _event(events, "expected_red_clear_noop")
         assert not gh.update_repo_file_calls
         assert not coord_db.execute(
             "SELECT 1 FROM audit_log WHERE event_type LIKE 'expected_red_clear%'",
@@ -1990,9 +2023,9 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear_skipped_no_acceptance"
-        assert "acceptance_state=None" in events[-1].message
-        assert "coord acceptance record" in events[-1].message
+        skip_event = _event(events, "expected_red_clear_skipped_no_acceptance")
+        assert "acceptance_state=None" in skip_event.message
+        assert "coord acceptance record" in skip_event.message
         assert not gh.update_repo_file_calls
 
     def test_no_acceptance_skip_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
@@ -2022,8 +2055,8 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear_skipped_no_acceptance"
-        assert "acceptance_state='failed'" in events[-1].message
+        skip_event = _event(events, "expected_red_clear_skipped_no_acceptance")
+        assert "acceptance_state='failed'" in skip_event.message
         assert not gh.update_repo_file_calls
 
     def test_no_diagnostic_when_the_manifest_has_no_expected_red_for_this_issue(self) -> None:
@@ -2070,7 +2103,7 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear_skipped"
+        _event(events, "expected_red_clear_skipped")
         assert not gh.update_repo_file_calls
 
     def test_sha_mismatch_skip_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
@@ -2112,7 +2145,7 @@ class TestExpectedRedClearOnMerge:
         but #2199 still names it rather than staying silent."""
         gh = _ExpectedRedGh()
         events = process([_q("w1", size=10)], gh, board=None)
-        assert events[-1].kind == "expected_red_clear_skipped_no_work"
+        _event(events, "expected_red_clear_skipped_no_work")
 
     def test_gh_ops_lacking_the_api_surface_degrades_to_a_warning(self) -> None:
         """An older GhOps stub (predates #2164) that doesn't implement the
@@ -2134,8 +2167,8 @@ class TestExpectedRedClearOnMerge:
         # the rest of the sweep uses when the API surface is missing
         # (`find_ms_manifest_for_issue_via_api` itself degrades to
         # "nothing found" for the same reason).
-        assert events[-1].kind == "expected_red_clear_noop"
-        assert events[-1].entry.state == MERGED
+        noop_event = _event(events, "expected_red_clear_noop")
+        assert noop_event.entry.state == MERGED
 
     def test_a_failed_clear_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
         """#2266 scope 2: `clear_expected_red_via_pr` never raises — every
@@ -2180,9 +2213,9 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear"
-        assert "ms01::a" in events[-1].message
-        assert "patch-id" in events[-1].message  # names the arm it took
+        clear_event = _event(events, "expected_red_clear")
+        assert "ms01::a" in clear_event.message
+        assert "patch-id" in clear_event.message  # names the arm it took
         assert gh.update_repo_file_calls  # the manifest text was actually edited
 
     def test_still_skips_when_sha_mismatches_and_patch_id_also_differs(self) -> None:
@@ -2198,7 +2231,7 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear_skipped"
+        _event(events, "expected_red_clear_skipped")
         assert not gh.update_repo_file_calls
 
     def test_still_skips_when_patch_id_is_unavailable(self) -> None:
@@ -2211,7 +2244,7 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert events[-1].kind == "expected_red_clear_skipped"
+        _event(events, "expected_red_clear_skipped")
         assert not gh.update_repo_file_calls
 
     def test_patch_id_verified_clear_writes_a_distinct_durable_audit_row(
@@ -2250,7 +2283,8 @@ class TestExpectedRedClearOnMerge:
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert "coord acceptance expected-red api --clear --issue 1" in events[-1].message
+        skip_event = _event(events, "expected_red_clear_skipped")
+        assert "coord acceptance expected-red api --clear --issue 1" in skip_event.message
 
 
 class _StubResponse:
@@ -2767,9 +2801,9 @@ class TestStatusPushOnMerge:
             config=cfg, board=self._board(),
         )
 
-        assert events[-1].kind == "status_queued"
-        assert "sub_1" in events[-1].message
-        assert "shipped" in events[-1].message
+        status_event = _event(events, "status_queued")
+        assert "sub_1" in status_event.message
+        assert "shipped" in status_event.message
 
         from coord import portal_store
         rows = portal_store.outbox_for_submission("sub_1")
@@ -2800,9 +2834,9 @@ class TestStatusPushOnMerge:
             config=cfg, board=self._board(),
         )
 
-        assert events[-1].kind == "status_queued"
-        assert "sub_2" in events[-1].message
-        assert "shipped" in events[-1].message
+        status_event = _event(events, "status_queued")
+        assert "sub_2" in status_event.message
+        assert "shipped" in status_event.message
 
     def test_milestone_less_unlinked_issue_stays_a_silent_no_op(self) -> None:
         """The overwhelmingly common case — no link on file — must still cost
@@ -2858,7 +2892,7 @@ class TestStatusPushOnMerge:
             config=cfg, board=self._board(),
         )
 
-        assert events[-1].kind == "status_push_failed"
+        _event(events, "status_push_failed")
         # The merge itself still went through — this hook never undoes it.
         assert any(e.kind == "merged" for e in events)
 

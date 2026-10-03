@@ -84,6 +84,20 @@ EVENT_PHANTOM_HEALED = "phantom_row_healed"
 # the two are complementary, not overlapping. Like EVENT_PHANTOM_HEALED,
 # this narrates an action ALREADY TAKEN, not only a finding.
 EVENT_STUCK_TEST_STATE_HEALED = "stuck_test_state_healed"
+# #2109: the merge-time verification note — coordinator-assembled facts
+# (merge SHA, tests touched, Test/Review verdicts + machines, a harness-
+# limits caveat, a manual spot-check pointer) posted on the issue the
+# instant a `type="work"`-like entry merges. Distinct from every event
+# above: those all narrate a PIPELINE condition (stuck, stalled, healed);
+# this one exists so the richest account of a fix — today reachable only
+# via `git show` on the worker's own commit message (see #2109's own
+# issue body) — lands somewhere a human actually looks. Never worker-
+# authored prose: every field is derived from board state or the diff
+# (`coord.merge_queue._build_verification_comment`). Kept to exactly one
+# comment per issue — a second merge on the same issue (fix-1/retry
+# landing a second branch) UPDATES this comment in place
+# (`coord.state.upsert_issue_comment`) rather than appending a duplicate.
+EVENT_VERIFICATION = "verification"
 
 
 @dataclass
@@ -964,4 +978,152 @@ def format_plan(
         lines.append("### Estimate")
         lines.append(estimate.strip())
 
+    return "\n".join(lines)
+
+
+# ── Verification note (#2109) ────────────────────────────────────────────────
+
+_REPRO_HEADING_RE = re.compile(
+    r"^#{1,6}\s*Repro(?:duction|\s+steps)?\b.*?\n(?P<body>.*?)(?=\n#{1,6}\s|\Z)",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
+
+def extract_repro_section(issue_body: str | None) -> str | None:
+    """Pull the ``## Repro`` (or ``## Reproduction`` / ``## Repro steps``)
+    section out of an issue body, or ``None`` when absent/blank.
+
+    Used by the #2109 verification note's manual spot-check section — the
+    one piece of the note that is quoted, not derived, and quoted from the
+    issue's OWN pre-fix text (never worker prose) so a human has concrete
+    steps to re-check against, not a restatement of the fix.
+    """
+    if not issue_body:
+        return None
+    m = _REPRO_HEADING_RE.search(issue_body)
+    if not m:
+        return None
+    body = m.group("body").strip()
+    return body or None
+
+
+_HARNESS_LIMIT_CAVEATS: dict[str, str] = {
+    "gtk": (
+        "This diff matched this repo's `gtk` capability rule. `GtkDriver` "
+        "synthesises `UiEvent`s directly, so a passing GTK Test/Review leg "
+        "does **not** exercise real GDK signal delivery, `EventController` "
+        "wiring, IME/dead keys, or painted geometry at real DPI."
+    ),
+    "tui": (
+        "This diff matched this repo's `tui` capability rule. `TestBackend` "
+        "does not parse real ANSI/SGR sequences, so a passing TUI Test/"
+        "Review leg does **not** confirm raw-mode input, real terminal "
+        "rendering, or mouse-event delivery."
+    ),
+    "browser": (
+        "This diff matched this repo's `browser` capability rule. A "
+        "headless-browser Test leg exercises the DOM but not every real "
+        "input path (native OS file pickers, drag-and-drop from outside "
+        "the browser, platform IME) — treat it as a strong but incomplete "
+        "proxy for a human driving the real UI."
+    ),
+}
+
+DEFAULT_HARNESS_LIMIT_CAVEAT = (
+    "No repo-specific harness-limits caveat is on file for the capability "
+    "(if any) this diff's `smoke_tests.capability_rules` matched — a green "
+    "Test/Review gate does not by itself prove every layer the change "
+    "touches was actually exercised."
+)
+
+
+def harness_limits_caveat(matched_capabilities: Iterable[str]) -> str:
+    """The standing #2109 caveat for the first of *matched_capabilities*
+    (in order) this module has a caveat on file for, or
+    :data:`DEFAULT_HARNESS_LIMIT_CAVEAT` when none match.
+
+    *matched_capabilities* is expected to come straight out of
+    ``coord.smoke.match_rules`` — the SAME `smoke_tests.capability_rules`
+    matcher Test-stage routing already uses, never a second,
+    independently-maintained file-pattern list (#2096, one question one
+    answer).
+    """
+    for cap in matched_capabilities:
+        caveat = _HARNESS_LIMIT_CAVEATS.get(cap)
+        if caveat:
+            return caveat
+    return DEFAULT_HARNESS_LIMIT_CAVEAT
+
+
+def format_verification(
+    *,
+    assignment_id: str,
+    repo_name: str,
+    issue_number: int,
+    branch: str,
+    merge_sha: str | None = None,
+    pr_number: int | None = None,
+    test_files: Iterable[str] = (),
+    test_verdict: str | None = None,
+    test_machine: str | None = None,
+    review_verdict: str | None = None,
+    review_machine: str | None = None,
+    harness_caveat: str = DEFAULT_HARNESS_LIMIT_CAVEAT,
+    repro: str | None = None,
+) -> str:
+    """Build the #2109 coordinator-assembled verification note.
+
+    Every field here is a fact the coordinator already holds — a merge SHA,
+    a diff-derived file list, a recorded gate verdict + the machine that
+    produced it, a repo-config-derived caveat, a quote from the issue's own
+    pre-fix ``## Repro`` section — never worker-authored prose. Posted (or
+    updated in place, see ``coord.state.upsert_issue_comment``) by
+    ``coord.merge_queue._maybe_post_verification`` the instant a merge
+    lands.
+    """
+    marker = _marker(
+        EVENT_VERIFICATION,
+        assignment=assignment_id,
+        repo=repo_name,
+        issue=issue_number,
+    )
+    branch_line = f"**Branch:** `{branch}`"
+    if pr_number is not None:
+        branch_line += f" (PR #{pr_number})"
+    test_files = list(test_files)
+    lines = [
+        "## 🔍 Coordinator: Verification note",
+        marker,
+        branch_line,
+        f"**Merge commit:** `{merge_sha}`" if merge_sha else "**Merge commit:** (not recorded)",
+        "",
+        "### Tests added/changed",
+        _fmt_files(test_files) if test_files else "(none detected in the diff)",
+        "",
+        "### Gate verdicts",
+        (
+            f"- **Test:** {test_verdict or '(no verdict recorded)'}"
+            + (f" — ran on `{test_machine}`" if test_machine else "")
+        ),
+        (
+            f"- **Review:** {review_verdict or '(no verdict recorded)'}"
+            + (f" — ran on `{review_machine}`" if review_machine else "")
+        ),
+        "",
+        "### Harness-limits caveat",
+        harness_caveat,
+        "",
+        "### Manual spot-check",
+        (
+            repro.strip()
+            if repro and repro.strip()
+            else (
+                f"No `## Repro` section found on issue #{issue_number} — "
+                "check the issue body directly."
+            )
+        ),
+        "",
+        "_Assembled automatically by the coordinator from board state and "
+        "the merged diff — not worker-authored._",
+    ]
     return "\n".join(lines)
