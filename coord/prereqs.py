@@ -380,9 +380,15 @@ def _probe_comtypes(prereq: Prereq, timeout: float) -> ToolProbe:
     bootstraps instead (`import comtypes` run on THAT interpreter via a
     direct subprocess call, never the bootstrap itself — a probe must not
     have the side effect of installing something on every `/health` poll).
-    A missing Windows-side venv (never bootstrapped, or `python.exe`
-    unreachable through interop) degrades to `found=False`, the same honest
-    "not met yet" every other prereq in this module reports, never a crash.
+    `windows_venv_python` returns a Windows-path-shaped executable
+    (`C:\\...`), which Linux's own `exec` can never resolve directly, so the
+    `argv[0]` is translated WSL-ward through
+    `coord.win_native_bridge._windows_exec_argv` first (#3519's fix,
+    originally missed here — #3550) before the subprocess call. A missing
+    Windows-side venv (never bootstrapped, `python.exe` unreachable through
+    interop, or the `wslpath` translation itself failing) degrades to
+    `found=False`, the same honest "not met yet" every other prereq in this
+    module reports, never a crash.
 
     Everywhere else (native Windows, or a test harness with no `windows`
     capability in play at all) this is exactly
@@ -390,6 +396,8 @@ def _probe_comtypes(prereq: Prereq, timeout: float) -> ToolProbe:
     """
     from coord.win_native_bridge import (  # noqa: PLC0415 — avoid an import cycle
         DEFAULT_WINDOWS_VENV_DIR,
+        WinNativeBridgeError,
+        _windows_exec_argv,
         is_wsl_host,
         windows_venv_python,
     )
@@ -399,12 +407,21 @@ def _probe_comtypes(prereq: Prereq, timeout: float) -> ToolProbe:
 
     venv_python = windows_venv_python(DEFAULT_WINDOWS_VENV_DIR)
     try:
+        # `venv_python` is Windows-path-shaped (`C:\...`) — Linux `exec`
+        # can't resolve that directly, so translate `argv[0]` WSL-ward
+        # first (#3519's fix, missed here originally — #3550). A
+        # translation failure (e.g. `wslpath` missing) degrades to
+        # `found=False` exactly like the OSError/TimeoutExpired cases
+        # below, never a crash.
+        exec_argv = _windows_exec_argv(
+            [venv_python, "-c", "import comtypes"], run=subprocess.run,
+        )
         result = subprocess.run(
-            [venv_python, "-c", "import comtypes"],
+            exec_argv,
             capture_output=True, text=True, timeout=timeout,
         )
         found = result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, WinNativeBridgeError):
         found = False
     return ToolProbe(
         tool=prereq.tool, capability=prereq.capability, found=found,
