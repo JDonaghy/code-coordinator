@@ -5477,6 +5477,13 @@ def _public_row_identity_columns(
     this module uses by convention, for a report that declares no
     ``row_identity`` at all (``drive-queue-status``, ``decisions``, ...) or
     when called with ``report=None`` (a bare ``ReportResult`` fixture).
+
+    This identifies only the row's OWN ``(repo, issue)`` — it says nothing
+    about ``"repo#issue"``-shaped cross-references a row may *embed* in a
+    ``list``/``text`` column (``queue-outcomes``' ``issues``, ``decisions``'
+    ``downstream``, ``drive-queue-status``'s ``after``). Those are scrubbed
+    separately by :func:`_redact_repo_issue_refs`, run over every row
+    regardless of whether this function found a repo column at all.
     """
     if report is not None and report.row_identity is not None:
         repo_col: str | None = report.row_identity.repo_column
@@ -5486,6 +5493,59 @@ def _public_row_identity_columns(
         issue_col = "issue" if "issue" in columns else None
     title_col = "title" if "title" in columns else None
     return repo_col, issue_col, title_col
+
+
+def _redact_repo_issue_refs(value: Any, allowed: frozenset[str]) -> Any:
+    """Scrub ``"repo#issue"``-shaped strings naming a non-allowlisted repo
+    out of *value* (#3474 review).
+
+    Targets exactly the shape :func:`coord.drive_queue.entry_key` produces
+    and :func:`coord.drive_queue.parse_key` parses back — the cross-
+    reference strings ``queue-outcomes``' ``issues``, ``decisions``'
+    ``downstream`` and ``drive-queue-status``'s ``after`` columns embed for
+    OTHER rows/entries, which a row's own ``(repo, issue)`` redaction (see
+    :func:`_public_row_identity_columns`) never inspects. A list value has
+    each matching, non-allowlisted element replaced with
+    :data:`PUBLIC_PRIVATE_REPO_LABEL` (count preserved, identity dropped);
+    every non-matching element (a plain machine name, an option dict, ...)
+    passes through untouched so this never disturbs a column that merely
+    happens to also be ``kind: list``. Anything other than a list (a lone
+    string, ``None``, ...) passes through untouched — ``repo``/``issue``/
+    ``title`` are already handled by the row-identity path, and a free-text
+    column (``why``, ``last_reason``) can embed a private name in prose no
+    regex here safely disambiguates from an unrelated word.
+    """
+    if not isinstance(value, list):
+        return value
+    from coord.drive_queue import parse_key  # noqa: PLC0415
+
+    out: list[Any] = []
+    for item in value:
+        if isinstance(item, str):
+            parsed = parse_key(item)
+            if parsed is not None and parsed[0] not in allowed:
+                out.append(PUBLIC_PRIVATE_REPO_LABEL)
+                continue
+        out.append(item)
+    return out
+
+
+def _redact_row_repo_issue_refs(
+    row: Mapping[str, Any],
+    columns: Sequence[str],
+    column_meta: Mapping[str, Mapping[str, Any]],
+    allowed: frozenset[str],
+) -> dict[str, Any]:
+    """Apply :func:`_redact_repo_issue_refs` to every ``kind: list`` column
+    of *row*. Run over EVERY row — kept, dropped-into-the-private-bucket, or
+    (when the report has no row identity at all) the only pass a row gets —
+    so a cross-reference embedded in an otherwise-kept row can never survive
+    redaction unscrubbed (#3474 review)."""
+    out = dict(row)
+    for c in columns:
+        if (column_meta.get(c) or {}).get("kind") == "list":
+            out[c] = _redact_repo_issue_refs(out.get(c), allowed)
+    return out
 
 
 def _accumulate_private_row(
@@ -5584,14 +5644,22 @@ def redact_report_for_public(
     ``columns``** — any extra per-row key (``first_event_at``, the raw
     ``session_name``, ...) is dropped unconditionally, allowlisted or not,
     so a field nobody has audited against this policy can never leak
-    through it even for a named repo.
+    through it even for a named repo. EVERY row — kept, folded into the
+    private bucket, or (no row identity) passed through as-is — also has
+    :func:`_redact_row_repo_issue_refs` applied first, so a ``"repo#issue"``
+    cross-reference embedded in a ``list`` column (``decisions``'
+    ``downstream``, ``drive-queue-status``'s ``after``, ``queue-outcomes``'
+    ``issues``) naming a different, non-allowlisted repo cannot ride along
+    inside an otherwise-kept row (#3474 review).
 
     A report with no per-row repo identity at all (no declared
-    ``row_identity`` and no conventional ``repo`` column — the release
-    parity matrix, keyed by a single ``repo`` *parameter* rather than a
-    per-row repo) has nothing structural to redact; its rows still get the
-    same "``columns``-only" trim, and its notes are left untouched since
-    nothing here can tell whether they name a private repo.
+    ``row_identity`` and no conventional ``repo`` column — ``queue-
+    outcomes``' period/bucket aggregates, or the release parity matrix,
+    keyed by a single ``repo`` *parameter* rather than a per-row repo) has
+    nothing a ROW-identity redaction can act on; its rows still get the
+    same "``columns``-only" trim PLUS the :func:`_redact_row_repo_issue_refs`
+    scrub below, and its notes are left untouched since nothing here can
+    tell whether free text names a private repo.
     """
     data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
     allowed = frozenset(allowed_repos)
@@ -5605,7 +5673,10 @@ def redact_report_for_public(
 
     if repo_col is None or repo_col not in columns:
         rows = [
-            {c: (row or {}).get(c) for c in columns} for row in (data.get("rows") or [])
+            _redact_row_repo_issue_refs(
+                {c: (row or {}).get(c) for c in columns}, columns, column_meta, allowed
+            )
+            for row in (data.get("rows") or [])
         ]
         data["rows"] = rows
         return data
@@ -5617,6 +5688,7 @@ def redact_report_for_public(
     had_private = False
     for row in data.get("rows") or []:
         raw_row = {c: (row or {}).get(c) for c in columns}
+        raw_row = _redact_row_repo_issue_refs(raw_row, columns, column_meta, allowed)
         repo_value = raw_row.get(repo_col)
         if repo_value in allowed:
             kept_rows.append(raw_row)
@@ -5847,6 +5919,18 @@ def result_to_public_html(result: "ReportResult | Mapping[str, Any]") -> str:
             default=str,
             sort_keys=False,
         )
+        # #3474 review: `json.dumps` does not escape `/`, so a row value
+        # containing a literal `</script>` (an allowlisted repo's issue
+        # title is attacker-/contributor-controlled and rendered here raw)
+        # would otherwise break out of the inline `<script>` block below and
+        # inject arbitrary markup into a page whose whole purpose is to be
+        # handed to an audience OUTSIDE the trust boundary. Escaping every
+        # `<` as its JS unicode escape is valid inside both a JS string
+        # literal's source text and a bare numeric/object literal, and
+        # un-does the ONE character that can open a new HTML tag — so this
+        # also neutralises `<!--`/`<script`/`<style` breakouts, not just
+        # `</script>`.
+        payload = payload.replace("<", "\\u003c")
         chart_html = (
             '<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/'
             'dist/echarts.min.js"></script>\n'
