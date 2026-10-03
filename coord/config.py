@@ -1021,10 +1021,25 @@ class UsageGateConfig:
       (``.result`` is NOT a stable contract, see ``coord.usage_limits``'s
       docstring) has enough field mileage to trust for blocking real work.
     - ``"block"`` — refuse to dispatch above threshold.
+    - ``"reroute"`` (#1649) — above threshold, don't refuse OR silently
+      proceed: pick the first rung of ``models.escalation`` whose provider
+      is NOT the one the usage window is constraining, and dispatch there
+      instead. Exists because once the escalation ladder can name a
+      non-``claude`` provider (``provider/model`` rungs, same ``"/"``
+      convention as ``models.pinned`` — see :func:`parse_model_route`), the
+      operator's actual want when approaching a wall is "keep working on a
+      cheaper/different backend", not "stop". Two cases fall back to
+      ``reroute_fallback`` (never a silent dispatch anyway):
+      :attr:`coord.config.ModelsConfig.pinned` stages (``"review"`` by
+      default) are exempt from reroute by design — the sibling pin issue
+      (#1650) says a pinned stage's model must never be degraded by ANY
+      mechanism, including this one; and a ladder with no rung on a
+      different provider (true for every deployment until #55's routes
+      land, since every bare rung is implicitly ``claude``).
 
     A probe that fails or returns "unknown" (no OAuth subscription session,
-    unparseable output, timeout, ...) NEVER blocks or warns regardless of
-    ``mode`` — see ``coord.usage_limits.evaluate_usage_gate``.
+    unparseable output, timeout, ...) NEVER blocks, warns, or reroutes
+    regardless of ``mode`` — see ``coord.usage_limits.evaluate_usage_gate``.
 
     CAVEAT: Anthropic announced ``claude -p``/Agent SDK usage moving off the
     subscription windows onto a separate monthly credit pool; that rollout
@@ -1034,9 +1049,16 @@ class UsageGateConfig:
     would need to switch to tracking credit balance instead.
     """
 
-    mode: str = "warn"  # "disabled" | "warn" | "block"
+    mode: str = "warn"  # "disabled" | "warn" | "block" | "reroute"
     session_threshold_pct: float = 85.0
     week_threshold_pct: float = 90.0
+    # ``mode="reroute"``'s own fallback when it can't reroute (pinned stage,
+    # or no escalation rung escapes the constrained provider) — "warn" or
+    # "block", same vocabulary as ``mode`` itself minus "disabled"/"reroute"
+    # (a fallback that itself reroutes, or does nothing, would defeat the
+    # "never silently dispatch anyway" guarantee above). Defaults to "warn"
+    # — the same safe default ``mode`` itself ships with.
+    reroute_fallback: str = "warn"  # "warn" | "block"
 
 
 @dataclass
@@ -2290,6 +2312,29 @@ def native_execution_capability(capability: str) -> str:
     question, one answer").
     """
     return f"{capability}-native"
+
+
+def parse_model_route(route: str, *, default_provider: str = "claude") -> tuple[str, str]:
+    """Split a ``models.*`` route string into ``(provider_name, model_alias)``.
+
+    A route is either a bare model alias — implicitly on *default_provider*
+    (the ``claude``/``claude-pty`` namespace every pre-#1650 route lived
+    in) — or a ``provider/model`` pair (e.g. ``"opencode/glm-5.2"``).
+    Single source of truth for that ``"/"`` convention (#2096, "one
+    question, one answer"): :func:`_validate_pinned_route`
+    (``models.pinned``) and :func:`coord.usage_limits.select_reroute_route`
+    (``models.escalation``, #1649) both ask "what provider does this route
+    name" and must agree on the answer rather than re-deriving it with a
+    second ``partition("/")`` that could silently drift from this one.
+
+    Never raises: an empty *route* (not expected to reach here — both
+    callers validate non-empty strings upstream) parses as
+    ``(default_provider, "")``, same shape as any other no-``"/"`` input.
+    """
+    provider_name, sep, model = route.partition("/")
+    if not sep:
+        return default_provider, route
+    return provider_name, model
 
 
 def model_plausible_for_provider_type(model: str, provider_type: str) -> bool:
@@ -4261,7 +4306,7 @@ def _validate_pinned_route(
     ``ProviderDef.model`` isn't validated anywhere else in this module.
     """
     if "/" in route:
-        provider_name, _, model = route.partition("/")
+        provider_name, model = parse_model_route(route)
         if provider_name not in known_providers:
             raise ConfigError(
                 f"models.pinned[{assignment_type!r}] references unknown "
@@ -4591,8 +4636,10 @@ def _parse_usage_gate(raw: Any) -> UsageGateConfig:
 
     if "mode" in raw:
         value = raw["mode"]
-        if value not in ("disabled", "warn", "block"):
-            raise ConfigError("usage_gate.mode must be one of: disabled, warn, block")
+        if value not in ("disabled", "warn", "block", "reroute"):
+            raise ConfigError(
+                "usage_gate.mode must be one of: disabled, warn, block, reroute"
+            )
         cfg.mode = value
 
     for key in ("session_threshold_pct", "week_threshold_pct"):
@@ -4601,6 +4648,12 @@ def _parse_usage_gate(raw: Any) -> UsageGateConfig:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0 <= value <= 100):
                 raise ConfigError(f"usage_gate.{key} must be a number between 0 and 100")
             setattr(cfg, key, float(value))
+
+    if "reroute_fallback" in raw:
+        value = raw["reroute_fallback"]
+        if value not in ("warn", "block"):
+            raise ConfigError("usage_gate.reroute_fallback must be one of: warn, block")
+        cfg.reroute_fallback = value
 
     return cfg
 

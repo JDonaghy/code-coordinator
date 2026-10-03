@@ -13,6 +13,10 @@ the thing a cost-driven ladder economises on. These tests cover:
     ladder-escalated models; only an explicit --model still wins),
   - the usage gate's independence from model routing (a pin can't be
     rerouted by something that never even looks at it),
+  - `parse_model_route`, the shared "/" route-parsing helper,
+  - #1649's own reroute mode treating a pinned stage as exempt (warn/block
+    per config, never degraded, even when the ladder has a genuine escape
+    rung available),
   - `describe_model_choice`'s "(pinned for type=X)" reason, and
   - the black-box `coord assign --dry-run` echo of that reason.
 """
@@ -34,6 +38,7 @@ from coord.config import (
     UsageGateConfig,
     describe_model_choice,
     load,
+    parse_model_route,
 )
 from coord.dispatch import resolve_dispatch_model_alias
 from coord.usage_limits import PlanLimits, evaluate_usage_gate
@@ -240,6 +245,75 @@ class TestUsageGateIndependence:
             config=cfg_no_pressure, effective_provider_name="claude", assignment_type="review",
         )
         assert resolved_under_pressure == resolved_without_pressure == "opus"
+
+
+class TestParseModelRoute:
+    """#1649: the shared "/" route-parsing helper — single source of truth
+    between `_validate_pinned_route` (`models.pinned`) and
+    `select_reroute_route` (`models.escalation`)."""
+
+    def test_bare_alias_is_implicitly_claude(self) -> None:
+        assert parse_model_route("opus") == ("claude", "opus")
+
+    def test_provider_model_pair_splits(self) -> None:
+        assert parse_model_route("opencode/glm-5.2") == ("opencode", "glm-5.2")
+
+    def test_default_provider_is_overridable(self) -> None:
+        assert parse_model_route("opus", default_provider="fast-claude") == (
+            "fast-claude", "opus",
+        )
+
+
+class TestUsageGateRerouteExemptsPinnedStage:
+    """#1649 x #1650 crossing: the sibling pin issue's own requirement —
+    "stages pinned by the sibling pin issue (notably review) are exempt
+    from reroute. If a pinned stage's provider is the constrained one,
+    that stage warns or blocks per config — it does not degrade." The
+    crossing must stay true even when the ladder genuinely has a rung
+    that would otherwise let it escape the constrained provider."""
+
+    def test_pinned_review_warns_instead_of_rerouting_even_with_an_escape_rung(
+        self,
+    ) -> None:
+        cfg = Config(
+            repos=[], machines=[],
+            models=ModelsConfig(
+                pinned={"review": "opus"},
+                escalation=["haiku", "sonnet", "opencode/glm-5.2"],
+            ),
+            usage_gate=UsageGateConfig(
+                mode="reroute", session_threshold_pct=10.0, reroute_fallback="warn",
+            ),
+        )
+        limits = PlanLimits(status="ok", session_pct=99.0)
+        result = evaluate_usage_gate(
+            limits, cfg.usage_gate,
+            models_cfg=cfg.models, effective_provider_name="claude",
+            assignment_type="review",
+        )
+        assert result.action == "warn"
+        assert result.route is None
+        assert "review" in result.message
+
+    def test_pinned_review_blocks_when_fallback_is_block(self) -> None:
+        cfg = Config(
+            repos=[], machines=[],
+            models=ModelsConfig(
+                pinned={"review": "opus"},
+                escalation=["haiku", "sonnet", "opencode/glm-5.2"],
+            ),
+            usage_gate=UsageGateConfig(
+                mode="reroute", session_threshold_pct=10.0, reroute_fallback="block",
+            ),
+        )
+        limits = PlanLimits(status="ok", session_pct=99.0)
+        result = evaluate_usage_gate(
+            limits, cfg.usage_gate,
+            models_cfg=cfg.models, effective_provider_name="claude",
+            assignment_type="review",
+        )
+        assert result.action == "block"
+        assert result.route is None
 
 
 class TestDescribeModelChoicePinned:

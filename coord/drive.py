@@ -2157,7 +2157,17 @@ def check_usage_gate(
         return None
     gate_cfg = config.usage_gate
     limits = usage_limits if usage_limits is not None else PlanLimits(status="unknown")
-    gate_result = evaluate_usage_gate(limits, gate_cfg)
+    # #1649: `models_cfg`/`effective_provider_name` only matter for
+    # `mode="reroute"` — a generic ("claude", the only provider `/usage`
+    # measures) best-effort stand-in, since this layer has no single
+    # assignment in hand yet (`preflight()`'s one-time call predates
+    # knowing which stage runs next; the per-poll re-check spans the whole
+    # multi-stage loop) the way `coord approve`'s per-proposal call does.
+    gate_result = evaluate_usage_gate(
+        limits, gate_cfg,
+        models_cfg=getattr(config, "models", None),
+        effective_provider_name="claude",
+    )
     if gate_result.action == "block":
         raise DriveError(
             f"{gate_result.message} (usage_gate.mode: block) — refusing to "
@@ -2168,6 +2178,21 @@ def check_usage_gate(
         )
     if gate_result.action == "warn":
         return f"{gate_result.message} (usage_gate.mode: warn — proceeding anyway)"
+    if gate_result.action == "reroute":
+        # #1649: `coord drive`'s RUN actions shell out to `coord assign` /
+        # `coord fix` / etc, none of which take a provider override wired
+        # from here today — only `coord approve`'s per-proposal usage-gate
+        # call can actually apply a reroute (it owns the Proposal before
+        # dispatch). Reporting "reroute" as applied here, with nothing
+        # downstream to back it up, is exactly the unconfirmed-success this
+        # gate exists to prevent — surface the same loud message as a
+        # warning instead, naming that it was NOT applied.
+        return (
+            f"{gate_result.message} — NOT applied: `coord drive` does not "
+            "yet thread a provider override into its RUN actions; "
+            "dispatch proceeds on the original provider (usage_gate.mode: "
+            "reroute)"
+        )
     return None
 
 
