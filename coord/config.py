@@ -4230,6 +4230,33 @@ def _parse_models(raw: Any, known_providers: set[str] | None = None) -> ModelsCo
         if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
             raise ConfigError("models.escalation must be a list of non-empty strings")
         cfg.escalation = list(value)
+        # #1649 review (non-blocking finding 1): a "provider/model" rung's
+        # provider half is now load-bearing for usage-gate reroute
+        # (`select_reroute_route`) — previously irrelevant for disabled/
+        # warn/block modes, where `models.escalation` is only ever consulted
+        # for Claude-model-alias escalation. Validate it the same way
+        # `_validate_pinned_route` already validates `models.pinned`'s
+        # provider half, so a typo'd provider name fails loudly at config
+        # load instead of silently falling through to "no rung escapes the
+        # constrained provider" at actual reroute/dispatch time. The model
+        # half is deliberately NOT checked here, same exemption
+        # `_validate_pinned_route` applies to a non-claude provider's model:
+        # it's a backend-specific free string, not validated anywhere else
+        # in this module.
+        for rung in cfg.escalation:
+            if "/" not in rung:
+                continue
+            rung_provider, rung_model = parse_model_route(rung)
+            if rung_provider not in (known_providers or {"claude"}):
+                raise ConfigError(
+                    f"models.escalation references unknown provider "
+                    f"{rung_provider!r} (got rung {rung!r})"
+                )
+            if not rung_model:
+                raise ConfigError(
+                    f"models.escalation rung {rung!r} is missing a model "
+                    "after the provider"
+                )
 
     if "labels" in raw:
         value = raw["labels"]

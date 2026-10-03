@@ -1107,7 +1107,7 @@ def retry_on_locked(
 # isn't permanently stranded — a successful post leaves the claim in place
 # forever, which is harmless since `review_posted_at` being set already
 # excludes the row from both callers' candidate queries.
-_DB_SCHEMA_VERSION = 22
+_DB_SCHEMA_VERSION = 23
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1273,7 +1273,16 @@ _SCHEMA_SQL = """
             cost_usd REAL,
             smoke_tests TEXT,
             review_findings TEXT,
-            test_plan TEXT
+            test_plan TEXT,
+            -- #1649 review: WHY `provider_name`/`model` were overridden from
+            -- what plan/label/pin resolution would otherwise have chosen —
+            -- today only the usage-gate reroute writes this (`coord
+            -- approve`'s per-proposal loop, `describe_model_choice`'s
+            -- reason string), so NULL means "no override reason recorded"
+            -- (including every row predating this column, and every normal
+            -- dispatch that was never rerouted). See
+            -- coord.models.Assignment.model_reason.
+            model_reason TEXT
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -2622,6 +2631,9 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # migration, which reproduces the pre-#3463 `work_leg_count - 1` formula
     # unchanged for that row.
     "ALTER TABLE drive_queue ADD COLUMN legs_at_enqueue INTEGER NOT NULL DEFAULT 0",
+    # #1649 review: see the CREATE TABLE comment above — NULL for every row
+    # predating this column and for every dispatch that wasn't rerouted.
+    "ALTER TABLE assignments ADD COLUMN model_reason TEXT",
 ]
 
 

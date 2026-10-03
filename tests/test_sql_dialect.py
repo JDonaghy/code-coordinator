@@ -1252,12 +1252,13 @@ def test_state_upserts_are_accepted_by_a_real_postgres_server(pg_conn):
     _ensure_schema(pg_conn)
     pg_conn.commit()
 
-    # #1553's correlated-subquery upsert: 21 parameters, and the four after
-    # the "child's Pipeline row" comment are the ones that used to vanish.
+    # #1553's correlated-subquery upsert: 22 parameters (21 + #1649's
+    # trailing model_reason), and the four after the "child's Pipeline row"
+    # comment are the ones that used to vanish.
     dispatch_params = (
         "aid-1", "m1", "repo", "acme/repo", 7, "title", "work", "briefing",
         "[]", "model", 1000.0, None, None, "[]", 0, "claude", "issue-7", None,
-        None, None, None,
+        None, None, None, None,
     )
     assert len(dispatch_params) == _qmark_placeholder_count(_DISPATCHED_UPSERT_SQL)
     sql.execute(pg_conn, _DISPATCHED_UPSERT_SQL, dispatch_params)
@@ -1777,7 +1778,7 @@ class TestSignaturePlaceholderCountMismatch:
         dispatch_params = (
             "aid-1", "m1", "repo", "acme/repo", 7, "title", "work", "briefing",
             "[]", "model", 1000.0, None, None, "[]", 0, "claude", "issue-7",
-            None, None, None, None,
+            None, None, None, None, None,
         )
         assert len(dispatch_params) == _qmark_placeholder_count(_DISPATCHED_UPSERT_SQL)
         sql.execute(coord_db, _DISPATCHED_UPSERT_SQL, dispatch_params)

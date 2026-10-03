@@ -945,9 +945,19 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 if a.provider_name and a.provider_name != "claude"
                 else ""
             )
+            # #1649 review: once `coord approve`'s terminal output has
+            # scrolled away, this is the only place left that says a
+            # dispatch ran on a degraded provider/model BECAUSE of a
+            # usage-gate reroute, as opposed to any other mechanism (a
+            # label, a repo override, ...) — see
+            # `coord.models.Assignment.model_reason`'s docstring. Just a
+            # terse marker, not the full reason prose — the full message is
+            # one DB column away (``coord status --json``,
+            # ``asdict(assignment)``) for anyone who needs it verbatim.
+            reroute_tag = "  [usage-gate reroute]" if a.model_reason else ""
             click.echo(
                 f"  #{a.issue_number}: {a.issue_title} ({a.repo_name})"
-                f"{provider_tag}{rs_suffix}"
+                f"{provider_tag}{reroute_tag}{rs_suffix}"
             )
 
     notified = {} if svc else load_notified()

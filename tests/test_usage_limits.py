@@ -400,6 +400,43 @@ class TestEvaluateUsageGateReroute:
         assert result.action == "proceed"
         assert result.route is None
 
+    def test_non_claude_effective_provider_is_never_rerouted(self) -> None:
+        """#1649 review (blocking finding): the `/usage` probe only ever
+        measures Claude's own session/week windows. A proposal whose
+        effective provider was already resolved to something else (e.g.
+        `providers.labels`'s `harness:opencode` -> "opencode", entirely
+        independent of usage-gate state) must never be rerouted — even
+        though a ladder rung genuinely escapes "claude" and the gate is
+        triggered. Rerouting it anyway would pick a bare (implicitly-
+        claude) rung and dispatch this proposal ONTO the exact provider
+        under capacity pressure — the opposite of the feature's purpose."""
+        cfg = UsageGateConfig(mode="reroute", session_threshold_pct=85.0)
+        models = ModelsConfig(escalation=["haiku", "sonnet", "opencode/glm-5.2"])
+        limits = PlanLimits(status="ok", session_pct=92.0, session_resets_at="8pm (UTC)")
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="opencode", assignment_type="work",
+        )
+        assert result.action == "proceed"
+        assert result.route is None
+        assert result.message == ""
+
+    def test_non_claude_effective_provider_never_warns_or_blocks_either(self) -> None:
+        """Same guard, but for the reroute_fallback paths — a non-claude
+        dispatch must not warn/block just because Claude's OWN window is
+        near a threshold either; the gate does not apply to it at all."""
+        cfg = UsageGateConfig(
+            mode="reroute", session_threshold_pct=85.0, reroute_fallback="block",
+        )
+        models = ModelsConfig()  # no escape rung — would normally fall back
+        limits = PlanLimits(status="ok", session_pct=92.0)
+        result = evaluate_usage_gate(
+            limits, cfg,
+            models_cfg=models, effective_provider_name="opencode", assignment_type="work",
+        )
+        assert result.action == "proceed"
+        assert result.route is None
+
     def test_disabled_warn_block_modes_are_byte_identical_to_before(self) -> None:
         """Regression guard: calling evaluate_usage_gate the OLD way (no
         new kwargs) for every pre-#1649 mode must produce the exact same
@@ -414,6 +451,23 @@ class TestEvaluateUsageGateReroute:
                 assignment_type="work",
             )
             assert old_style == new_style
+
+    def test_warn_and_block_modes_ignore_effective_provider_name(self) -> None:
+        """The new provider-mismatch guard is scoped to `mode="reroute"`
+        only (#1649 review) — "warn"/"block" never consulted
+        `effective_provider_name` before this issue and must not start
+        now, regardless of what it's set to."""
+        limits = PlanLimits(status="ok", session_pct=92.0, session_resets_at="8pm (UTC)")
+        for mode in ("warn", "block"):
+            cfg = UsageGateConfig(mode=mode, session_threshold_pct=85.0)
+            claude_result = evaluate_usage_gate(
+                limits, cfg, effective_provider_name="claude",
+            )
+            other_result = evaluate_usage_gate(
+                limits, cfg, effective_provider_name="opencode",
+            )
+            assert claude_result == other_result
+            assert claude_result.action == mode
 
 
 # ── format_plan_limits ───────────────────────────────────────────────────────

@@ -138,7 +138,12 @@ from coord.models import (
     PREMISE_REFUSAL_MARKER,
 )
 from coord.self_health import self_freshness
-from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
+from coord.usage_limits import (
+    PROBE_CONSTRAINED_PROVIDER,
+    PlanLimits,
+    evaluate_usage_gate,
+    get_plan_limits,
+)
 # Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
 # import lived in a hunk #1590 rewrote, so the merge came out textually clean
 # and semantically broken (NameError at coord/drive.py:1162). Same symbol and
@@ -2158,15 +2163,32 @@ def check_usage_gate(
     gate_cfg = config.usage_gate
     limits = usage_limits if usage_limits is not None else PlanLimits(status="unknown")
     # #1649: `models_cfg`/`effective_provider_name` only matter for
-    # `mode="reroute"` — a generic ("claude", the only provider `/usage`
-    # measures) best-effort stand-in, since this layer has no single
-    # assignment in hand yet (`preflight()`'s one-time call predates
-    # knowing which stage runs next; the per-poll re-check spans the whole
-    # multi-stage loop) the way `coord approve`'s per-proposal call does.
+    # `mode="reroute"` — a generic (`PROBE_CONSTRAINED_PROVIDER`, the only
+    # provider `/usage` measures) best-effort stand-in, since this layer has
+    # no single assignment in hand yet (`preflight()`'s one-time call
+    # predates knowing which stage runs next; the per-poll re-check spans
+    # the whole multi-stage loop) the way `coord approve`'s per-proposal
+    # call does. #1649 review: this MUST stay the hardcoded probe-
+    # constrained provider, never a resolved-per-proposal value the way
+    # `coord approve`'s call site has one — `evaluate_usage_gate` now
+    # asserts that invariant itself (any other value here makes the gate
+    # inapplicable and silently returns "proceed", same as the real
+    # providers.labels case `coord approve` guards against).
+    #
+    # `assignment_type` is also left at its default (`None`) — this layer
+    # never actually applies a reroute (see the "reroute" branch below), so
+    # the `models.pinned` pin-exemption (#1650) never changing this
+    # function's OWN return value is harmless today. But the message text
+    # below still claims "rerouting ... to X" as if the gate applied — if a
+    # future change threads a real provider override into `coord drive`'s
+    # RUN actions, this call must also thread the actual next stage's
+    # `assignment_type` through, or a pinned stage (e.g. "review") could be
+    # reported as reroutable when `evaluate_usage_gate` would, correctly,
+    # refuse to reroute it.
     gate_result = evaluate_usage_gate(
         limits, gate_cfg,
         models_cfg=getattr(config, "models", None),
-        effective_provider_name="claude",
+        effective_provider_name=PROBE_CONSTRAINED_PROVIDER,
     )
     if gate_result.action == "block":
         raise DriveError(

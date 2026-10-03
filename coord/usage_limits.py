@@ -74,6 +74,16 @@ if TYPE_CHECKING:
 # tripping that same rate limit ourselves.
 CACHE_TTL_SECS = 60.0
 
+# The ONLY provider the `/usage` probe ever measures (module docstring, AUTH
+# SCOPE section) — `evaluate_usage_gate` must never reroute/warn/block a
+# dispatch whose *own* effective provider isn't this one, no matter how
+# close to the wall Claude's own session/week windows are (#1649 review:
+# `effective_provider_name` is whatever `resolve_provider_name` already
+# resolved for THIS proposal — which can legitimately be a non-"claude"
+# provider via `providers.labels`/a repo override, entirely independent of
+# this probe's reading). See the guard at the top of `evaluate_usage_gate`.
+PROBE_CONSTRAINED_PROVIDER = "claude"
+
 
 # ── data classes ─────────────────────────────────────────────────────────────
 
@@ -391,7 +401,7 @@ def evaluate_usage_gate(
     gate_cfg: "UsageGateConfig",
     *,
     models_cfg: "ModelsConfig | None" = None,
-    effective_provider_name: str = "claude",
+    effective_provider_name: str = PROBE_CONSTRAINED_PROVIDER,
     assignment_type: str | None = None,
 ) -> UsageGateResult:
     """Pure decision: given a probed :class:`PlanLimits` and a
@@ -402,6 +412,18 @@ def evaluate_usage_gate(
     - ``limits`` not ``ok`` (probe unavailable/unknown, including non-OAuth
       auth) → always proceed. A probe we can't trust must never block,
       warn, or reroute — see the module docstring.
+    - ``mode == "reroute"`` and *effective_provider_name* is not
+      :data:`PROBE_CONSTRAINED_PROVIDER` (``"claude"``) → always proceed, no
+      message. The ``/usage`` probe only ever measures Claude's own
+      session/week windows (module docstring, AUTH SCOPE), so a dispatch
+      that was already resolved onto a different provider (``providers.
+      labels``, a repo/global override) was never going near the window
+      this gate is reading — applying ANY ``reroute`` action to it would
+      either reroute a dispatch that didn't need it, or (worse) reroute it
+      straight onto the very provider under capacity pressure (#1649
+      review). This check only applies to ``mode="reroute"``: ``"warn"``/
+      ``"block"`` never took `effective_provider_name` into account before
+      this issue and are unchanged (regression guard).
     - Below both thresholds → proceed, no message.
     - At/above a threshold:
       - ``"warn"``/``"block"`` (default ``"warn"`` — see ``UsageGateConfig``
@@ -424,9 +446,10 @@ def evaluate_usage_gate(
             ``models.pinned``). ``None`` behaves like an empty ladder (no
             rung to reroute to), never raises.
         effective_provider_name: The provider this dispatch was about to
-            use, before any reroute — defaults to ``"claude"``, the only
+            use, before any reroute — defaults to
+            :data:`PROBE_CONSTRAINED_PROVIDER` (``"claude"``), the only
             provider the ``/usage`` probe ever measures. Only consulted for
-            ``mode="reroute"``.
+            ``mode="reroute"`` — see the guard above.
         assignment_type: The dispatch's assignment ``type`` (e.g.
             ``"work"``, ``"review"``), checked against ``models.pinned``
             for the reroute pin-exemption. Only consulted for
@@ -435,6 +458,13 @@ def evaluate_usage_gate(
     if gate_cfg.mode == "disabled":
         return UsageGateResult("proceed")
     if not limits.ok:
+        return UsageGateResult("proceed")
+    if gate_cfg.mode == "reroute" and effective_provider_name != PROBE_CONSTRAINED_PROVIDER:
+        # #1649 review: this dispatch's own effective provider isn't the
+        # one the probe constrains — the gate does not apply to it at all,
+        # regardless of trigger state. Never fall through to the trigger
+        # check below, which would otherwise reroute (or warn/block) a
+        # dispatch that was never headed for the constrained window.
         return UsageGateResult("proceed")
 
     triggers: list[str] = []
