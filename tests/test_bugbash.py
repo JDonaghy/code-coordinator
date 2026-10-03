@@ -8,7 +8,19 @@ loop-termination (zero-findings, round cap, cost cap, lane failure), and
 iteration 1, #3487: a lane's dispatch/poll/log failure must be
 distinguishable from a genuine zero-findings pass, and the production
 explorer must reuse the shared `poll_until_terminal` poller rather than a
-third hand-rolled one)."""
+third hand-rolled one).
+
+#3569 adds: a fixed 30-minute lane timeout used to orphan a still-running
+explorer and discard its findings. `TestDispatchAndAwaitLane` now also
+covers the keep-polling/stall/cancel behaviour (a lane still producing
+output and under its cost cap keeps waiting past `--lane-timeout`; a
+genuine stall gets cancelled, never left running unattended; a cancel
+racing a just-finished explorer harvests it inline instead of discarding
+it); `TestHarvestOutcome` covers the `coord bugbash harvest` recovery path
+(`harvest_outcome`) against the SAME dedupe/file logic `run_bugbash` uses;
+`TestBugbashCli` covers the `--lane-timeout` CLI flag reaching
+`_dispatch_and_await_lane`, and the `run`/`harvest` subcommand group
+wiring via Click's `CliRunner`."""
 
 from __future__ import annotations
 
@@ -29,6 +41,7 @@ from coord.bugbash import (
     dedupe_finding,
     discover_lanes,
     file_finding,
+    harvest_outcome,
     parse_findings_block,
     parse_unavailable_report,
     run_bugbash,
@@ -1186,7 +1199,18 @@ class TestDispatchAndAwaitLane:
         assert outcome.ok is False
         assert "not found" in outcome.notes
 
-    def test_poll_timeout_is_ok_false(self, monkeypatch):
+    class _FakeCancelResult:
+        def __init__(self, ok, status=None, error=None):
+            self.ok = ok
+            self.status = status
+            self.error = error
+
+    def test_poll_timeout_with_no_new_output_cancels_the_explorer(self, monkeypatch):
+        """#3569: a genuinely stalled lane (no new transcript output across
+        a full --lane-timeout window) must never be left running
+        unattended — the controller tries to cancel it, and says so in
+        `notes` (#2096: this is a post-cancel observation, not just proof
+        the request was sent)."""
         from coord.commands import bugbash as cmd_bugbash
 
         cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
@@ -1195,11 +1219,196 @@ class TestDispatchAndAwaitLane:
             "coord.commands._common.poll_until_terminal",
             lambda *a, **k: _FakePollOutcome("timeout"),
         )
+        # Same transcript length on every peek -> never "progressed".
+        monkeypatch.setattr(cmd_bugbash, "_peek_log_text", lambda machine, aid: "same log text")
+        monkeypatch.setattr(
+            "coord.network.cancel_assignment",
+            lambda *a, **k: self._FakeCancelResult(ok=True, status="cancelled"),
+        )
+
         outcome = cmd_bugbash._dispatch_and_await_lane(
             _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+            timeout=1.0,
         )
         assert outcome.ok is False
         assert "timed out" in outcome.notes
+        assert "no new output" in outcome.notes
+        assert "cancelled the explorer" in outcome.notes
+
+    def test_poll_timeout_cancel_failure_reports_may_still_be_running(self, monkeypatch):
+        """#3569 ask #4: when the cancel attempt itself fails (agent
+        unreachable, etc.), the explorer is NOT confirmed stopped — the
+        notes must say it may still be running and point at the recovery
+        command, never silently read as "handled"."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("timeout"),
+        )
+        monkeypatch.setattr(cmd_bugbash, "_peek_log_text", lambda machine, aid: "same log text")
+        monkeypatch.setattr(
+            "coord.network.cancel_assignment",
+            lambda *a, **k: self._FakeCancelResult(ok=False, status=None, error="connection refused"),
+        )
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+            timeout=1.0,
+        )
+        assert outcome.ok is False
+        assert "may still be running" in outcome.notes
+        assert "coord bugbash harvest" in outcome.notes
+
+    def test_poll_timeout_cancel_races_a_just_finished_explorer_and_harvests_inline(self, monkeypatch):
+        """#3569's concrete instance: the explorer actually finished
+        between the controller's last poll and its cancel call. Rather
+        than discarding that result (the original bug — $6 of valid
+        findings lost), the cancel's own `status="completed"` response is
+        used to harvest it right there."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("timeout"),
+        )
+        monkeypatch.setattr(cmd_bugbash, "_peek_log_text", lambda machine, aid: "same log text")
+        monkeypatch.setattr(
+            "coord.network.cancel_assignment",
+            lambda *a, **k: self._FakeCancelResult(ok=False, status="completed"),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "done.\\n```bugbash-findings\\n'
+            '[{\\"title\\": \\"Crash on install\\", \\"expected\\": \\"e\\", '
+            '\\"actual\\": \\"a\\", \\"repro\\": \\"r\\", \\"evidence\\": \\"ev\\"}]\\n'
+            '```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 6.08, "num_turns": 168}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+            timeout=1.0,
+        )
+        assert outcome.ok is True
+        assert len(outcome.findings) == 1
+        assert outcome.findings[0].title == "Crash on install"
+        assert outcome.cost == 6.08
+        assert "harvested inline" in outcome.notes
+
+    def test_poll_timeout_keeps_waiting_while_explorer_still_progresses_under_cost_cap(self, monkeypatch):
+        """#3569's "better" option: a lane still producing new transcript
+        output and still under its own --cost-cap-per-lane is NOT a stall —
+        the controller keeps polling past `--lane-timeout` rather than
+        cancelling a still-productive explorer, and files its findings once
+        it genuinely finishes."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+
+        poll_calls = {"n": 0}
+
+        def fake_poll(*a, **k):
+            poll_calls["n"] += 1
+            if poll_calls["n"] < 3:
+                return _FakePollOutcome("timeout")
+            return _FakePollOutcome("completed", exit_code=0)
+
+        monkeypatch.setattr("coord.commands._common.poll_until_terminal", fake_poll)
+
+        peek_calls = {"n": 0}
+
+        def fake_peek(machine, aid):
+            peek_calls["n"] += 1
+            return "x" * peek_calls["n"]  # strictly growing -> always "progressed"
+
+        monkeypatch.setattr(cmd_bugbash, "_peek_log_text", fake_peek)
+
+        cancel_called = {"called": False}
+        monkeypatch.setattr(
+            "coord.network.cancel_assignment",
+            lambda *a, **k: cancel_called.update(called=True) or self._FakeCancelResult(ok=True, status="cancelled"),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "done.\\n```bugbash-findings\\n[]\\n```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 2.5}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+            timeout=1.0, cost_cap=100.0,
+        )
+        assert outcome.ok is True
+        assert outcome.findings == ()
+        assert outcome.cost == 2.5
+        # Never cancelled -- it finished on its own while still progressing.
+        assert cancel_called["called"] is False
+
+    def test_poll_timeout_cost_cap_exceeded_while_progressing_still_cancels(self, monkeypatch):
+        """Even a lane that's still producing new output must be cancelled
+        once it crosses its own --cost-cap-per-lane — the cost cap is the
+        real budget control, and "still talking" is not a license to spend
+        past it."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("timeout"),
+        )
+
+        peek_calls = {"n": 0}
+
+        def fake_peek(machine, aid):
+            peek_calls["n"] += 1
+            # Growing transcript (always "progressed") but a cost readout
+            # already past the cap on every check.
+            return (
+                '{"type": "result", "total_cost_usd": 999.0}\n' + ("x" * peek_calls["n"])
+            )
+
+        monkeypatch.setattr(cmd_bugbash, "_peek_log_text", fake_peek)
+        monkeypatch.setattr(
+            "coord.network.cancel_assignment",
+            lambda *a, **k: self._FakeCancelResult(ok=True, status="cancelled"),
+        )
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+            timeout=1.0, cost_cap=20.0,
+        )
+        assert outcome.ok is False
+        assert "per-lane cap" in outcome.notes
+        assert "cancelled the explorer" in outcome.notes
 
     def test_nonzero_exit_code_is_ok_false(self, monkeypatch):
         from coord.commands import bugbash as cmd_bugbash
@@ -1447,3 +1656,264 @@ class TestDispatchAndAwaitLane:
         )
         assert report.rounds[-1].unavailable_lanes.get("mac-native") is not None
         assert report.termination_reason == "lanes_unavailable"
+
+
+# ── coord bugbash harvest (#3569: recover a late-finishing explorer) ─────
+#
+# `harvest_outcome` is the engine-level recovery path `coord bugbash
+# harvest` drives after `_dispatch_and_await_lane`'s controller stopped
+# waiting on a lane (its cancel attempt failed, or the explorer kept
+# running past --lane-timeout on purpose). It must reuse the EXACT same
+# bucketing/dedupe/file logic `run_bugbash`'s own round loop uses — these
+# tests exercise it directly against the same fakes the rest of this file
+# already uses (FakeRunner, _finding, _lane).
+
+
+class TestHarvestOutcome:
+    def test_new_finding_is_filed_and_queued(self):
+        outcome = ExploreOutcome(findings=(_finding(title="Crash on install"),), cost=6.08)
+        runner = FakeRunner(next_issue_number=500)
+        report = harvest_outcome(
+            outcome, _lane(platform="win-native", machine="pc1"), repo="vimcode",
+            runner=runner, open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.new_count == 1
+        assert len(report.filings) == 1
+        assert report.filings[0].filed is True
+        assert report.filings[0].issue_number == 500
+        assert report.lane_cost.get("win-native") == 6.08
+        # `coord issue create` AND `coord drive-queue add` both actually ran.
+        assert runner.calls[0][:2] == ["issue", "create"]
+        assert runner.calls[1][:2] == ["drive-queue", "add"]
+
+    def test_dry_run_files_nothing(self):
+        outcome = ExploreOutcome(findings=(_finding(),), cost=1.0)
+        runner = FakeRunner()
+        report = harvest_outcome(
+            outcome, _lane(), repo="vimcode", runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+            dry_run=True,
+        )
+        assert report.filings[0].filed is False
+        assert report.filings[0].preview_title is not None
+        assert runner.calls == []
+
+    def test_duplicate_against_open_issue_is_not_refiled(self):
+        finding = _finding(title="Extension install flow crashes on Windows")
+        outcome = ExploreOutcome(findings=(finding,), cost=0.5)
+        runner = FakeRunner()
+        open_issues = [
+            {"number": 42, "title": "[bugbash:win-native] Extension install flow crashes on Windows"},
+        ]
+        report = harvest_outcome(
+            outcome, _lane(), repo="vimcode", runner=runner,
+            open_issues_fetcher=lambda r: open_issues, closed_issues_fetcher=lambda r: [],
+        )
+        assert report.filings[0].filed is False
+        assert report.filings[0].issue_number == 42
+        assert runner.calls == []
+
+    def test_unavailable_outcome_is_bucketed_not_filed(self):
+        outcome = ExploreOutcome(unavailable=True, notes="the screen is locked", cost=0.1)
+        runner = FakeRunner()
+        report = harvest_outcome(
+            outcome, _lane(platform="mac-native"), repo="vimcode", runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.unavailable_lanes.get("mac-native") == "the screen is locked"
+        assert report.findings == []
+        assert report.filings == []
+        assert runner.calls == []
+
+    def test_protocol_error_outcome_is_bucketed_not_filed(self):
+        outcome = ExploreOutcome(ok=True, protocol_error="no fence found", cost=1.0)
+        runner = FakeRunner()
+        report = harvest_outcome(
+            outcome, _lane(), repo="vimcode", runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.protocol_error_lanes.get("win-native") == "no fence found"
+        assert report.findings == []
+        assert runner.calls == []
+
+    def test_lane_failure_outcome_ok_false_is_bucketed(self):
+        outcome = ExploreOutcome(ok=False, notes="still running on pc1")
+        runner = FakeRunner()
+        report = harvest_outcome(
+            outcome, _lane(), repo="vimcode", runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.lane_failures.get("win-native") == "still running on pc1"
+        assert report.findings == []
+        assert runner.calls == []
+
+
+# ── coord bugbash CLI (#3569: --lane-timeout, run/harvest subcommands) ───
+
+
+class TestBugbashCli:
+    """CLI-level coverage for #3569: the `--lane-timeout` flag threading
+    through to the production explorer seam, and the `run`/`harvest`
+    subcommand group wiring (`coord bugbash REPO ...` must keep working
+    exactly as before even though `harvest` is now a real second
+    subcommand)."""
+
+    def test_bare_repo_invocation_still_resolves_to_the_run_subcommand(self):
+        from click.testing import CliRunner
+        import coord.commands.bugbash as cmd_bugbash
+
+        result = CliRunner().invoke(cmd_bugbash.bugbash_cmd, ["vimcode", "--help"])
+        assert result.exit_code == 0
+        assert "Usage: bugbash run" in result.output
+        assert "--lane-timeout" in result.output
+
+    def test_harvest_is_a_real_subcommand(self):
+        from click.testing import CliRunner
+        import coord.commands.bugbash as cmd_bugbash
+
+        result = CliRunner().invoke(cmd_bugbash.bugbash_cmd, ["harvest", "--help"])
+        assert result.exit_code == 0
+        assert "Usage: bugbash harvest" in result.output
+
+    def test_lane_timeout_and_cost_cap_reach_dispatch_and_await_lane(self, monkeypatch):
+        """#3569 acceptance: `--lane-timeout` (plus `--cost-cap-per-lane`,
+        the real budget control the stall loop is bounded by) must reach
+        `_dispatch_and_await_lane`, not just be parsed and dropped."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: object()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
+        )
+
+        captured = {}
+
+        def fake_run_bugbash(bb_config, *, explorer, runner, open_issues_fetcher, closed_issues_fetcher, confirm):
+            captured["bb_config"] = bb_config
+            captured["explorer"] = explorer
+            return BugbashReport(repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0)
+
+        monkeypatch.setattr(cmd_bugbash, "run_bugbash", fake_run_bugbash)
+
+        dispatch_kwargs = {}
+
+        def fake_dispatch(lane, round_num, **kwargs):
+            dispatch_kwargs.update(kwargs)
+            return ExploreOutcome(ok=True)
+
+        monkeypatch.setattr(cmd_bugbash, "_dispatch_and_await_lane", fake_dispatch)
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            [
+                "vimcode", "--reference", "win-native",
+                "--lane-timeout", "777", "--cost-cap-per-lane", "33",
+                "--dry-run", "-y",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "explorer" in captured
+
+        # Drive the captured `explorer` closure to confirm it forwards the
+        # CLI's --lane-timeout/--cost-cap-per-lane straight through to the
+        # production seam.
+        captured["explorer"](_prod_lane(machine="pc1", platform="win-native"), 1)
+        assert dispatch_kwargs.get("timeout") == 777.0
+        assert dispatch_kwargs.get("cost_cap") == 33.0
+
+    def test_harvest_command_files_a_recovered_finding(self, monkeypatch):
+        """End-to-end `coord bugbash harvest` against faked seams: an
+        assignment that's already completed on its machine gets its
+        findings parsed and filed through the normal dedupe/file/queue
+        path — the #3569 recovery path for a lane that finished after the
+        controller stopped waiting on it."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(cmd_bugbash, "discover_lanes", lambda cfg, repo, reference_backend="": [])
+
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "done.\\n```bugbash-findings\\n'
+            '[{\\"title\\": \\"Crash on install\\", \\"expected\\": \\"e\\", '
+            '\\"actual\\": \\"a\\", \\"repro\\": \\"r\\", \\"evidence\\": \\"ev\\"}]\\n'
+            '```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 6.08}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        fake_runner_calls = []
+
+        def fake_runner(args):
+            args = list(args)
+            fake_runner_calls.append(args)
+            if args[:2] == ["issue", "create"]:
+                return "#900 (vimcode) created\n"
+            return "queued\n"
+
+        monkeypatch.setattr(cmd_bugbash, "subprocess_coord_runner", fake_runner)
+        monkeypatch.setattr(cmd_bugbash.github_ops, "get_open_issues", lambda slug: [])
+        monkeypatch.setattr(cmd_bugbash, "_fetch_recently_closed_issues", lambda slug: [])
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            [
+                "harvest", "asg-late-1",
+                "--repo", "vimcode", "--machine", "pc1", "--lane", "win-native",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "filed+queued: #900" in result.output
+        assert fake_runner_calls[0][:2] == ["issue", "create"]
+        assert fake_runner_calls[1][:2] == ["drive-queue", "add"]
+
+    def test_harvest_command_reports_still_running_without_filing(self, monkeypatch):
+        """A harvest attempt against an assignment that hasn't actually
+        finished yet must say so and exit nonzero — never silently read as
+        "harvested, found nothing"."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: object()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(cmd_bugbash, "discover_lanes", lambda cfg, repo, reference_backend="": [])
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("timeout"),
+        )
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            [
+                "harvest", "asg-still-running",
+                "--repo", "vimcode", "--machine", "pc1", "--lane", "win-native",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "still running" in result.output

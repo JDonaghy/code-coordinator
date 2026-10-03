@@ -1187,6 +1187,209 @@ class BugbashReport:
         return any(r.protocol_error_lanes for r in self.rounds)
 
 
+def _apply_outcome_to_round(report: RoundReport, lane: BugbashLane, outcome: ExploreOutcome) -> None:
+    """Classify one lane's :class:`ExploreOutcome` into *report*'s
+    findings/unavailable/lane-failure/protocol-error buckets — the SAME
+    bucketing both :func:`run_bugbash`'s inline round loop and
+    :func:`harvest_outcome` (#3569) use, so a lane explorer that finishes
+    AFTER its ``--lane-timeout`` already elapsed and is picked up through
+    ``coord bugbash harvest`` is judged by identically the same rules as
+    one observed inline within its deadline — never a second, independently
+    -drifting copy of this decision (#2096 "one question, one answer").
+
+    Does NOT touch :attr:`RoundReport.lane_cost` — that's cumulative-across-
+    rounds bookkeeping only :func:`run_bugbash`'s own loop needs (a harvest
+    has no prior rounds to accumulate against), so callers set it
+    themselves.
+    """
+    if outcome.unavailable:
+        # #3510: a locked/absent GUI session (or missing display) is a host
+        # condition, not a finding — recorded separately from both a clean
+        # pass and a dispatch/poll failure, and NEVER contributes findings
+        # this round, even defensively if the explorer happened to also
+        # hand some back.
+        report.unavailable_lanes[lane.platform] = (
+            outcome.notes or "lane unavailable — no usable GUI session/display"
+        )
+        return
+    report.findings.extend(outcome.findings)
+    if not outcome.ok:
+        # #2096: this lane's "findings" (almost certainly empty) are NOT a
+        # verified observation — record why, so a round whose every lane
+        # failed this way can never render identically to a round that
+        # actually looked and found nothing.
+        report.lane_failures[lane.platform] = outcome.notes or "explorer reported failure"
+    elif outcome.protocol_error:
+        # #3517: the lane DID complete, but its final message could not be
+        # trusted as a findings report at all — a malformed/missing block,
+        # never silently read as "zero findings observed" (that conflation
+        # is exactly what let a real finding disappear and pass the #3488
+        # release gate).
+        report.protocol_error_lanes[lane.platform] = outcome.protocol_error
+
+
+def _dedupe_and_file_round(
+    findings: Sequence[Finding],
+    *,
+    repo: str,
+    dry_run: bool,
+    require_confirm: bool,
+    confirm: Callable[[int, list[Finding]], bool] | None,
+    round_num: int,
+    runner: CoordRunner,
+    open_issues: list[dict],
+    closed_issues: list[dict],
+    lanes_by_platform: dict[str, BugbashLane],
+    run_filed_issues: list[dict],
+    run_filed_by_title: dict[str, int],
+) -> tuple[list[FilingResult], int, bool]:
+    """Dedupe *findings* against *open_issues*/*closed_issues* (the caller
+    has already merged in this run's own already-filed issues, #3546) and
+    file/queue every non-duplicate.
+
+    This is the SAME dedupe/confirm/file/queue path both :func:`run_bugbash`
+    's round loop and :func:`harvest_outcome` (#3569) drive — a finding
+    recovered through ``coord bugbash harvest`` after its lane's own
+    ``--lane-timeout`` elapsed goes through identically the same rules
+    (platform-gated title dedupe, the operator-confirm gate, the mandatory
+    acceptance line, ``suspected_repo`` routing) as one filed inline, never
+    a second, looser copy of this decision (#2096 "one question, one
+    answer").
+
+    Returns ``(filings, new_count, declined)``: *new_count* is every
+    finding whose verdict was NOT :data:`DedupeVerdict.DUPLICATE` (what
+    moves round-cap/zero-findings termination upstream); *declined* is
+    whether an operator declined to file this round's candidates via
+    *confirm* (always ``False`` when *require_confirm* is ``False`` — e.g.
+    a harvest's standalone recovery never re-gates behind a second
+    confirmation prompt).
+
+    Mutates *run_filed_issues*/*run_filed_by_title* in place exactly as the
+    original inline loop did, so a caller running multiple rounds
+    (:func:`run_bugbash`) keeps seeing this run's own earlier filings
+    across calls.
+    """
+    dedupes = _dedupe_round_findings(findings, open_issues, closed_issues)
+
+    candidates = [
+        f for f, d in zip(findings, dedupes) if d.verdict != DedupeVerdict.DUPLICATE
+    ]
+    declined = require_confirm and bool(candidates) and not (confirm and confirm(round_num, candidates))
+
+    filings: list[FilingResult] = []
+    new_count = 0
+    for finding, dedupe in zip(findings, dedupes):
+        lane = lanes_by_platform.get(finding.platform)
+        if dedupe.verdict != DedupeVerdict.DUPLICATE:
+            new_count += 1
+        if dedupe.verdict != DedupeVerdict.DUPLICATE and declined:
+            # Operator declined this round's filings — record the would-be
+            # preview (same shape a dry run produces) without ever invoking
+            # the runner.
+            title = compose_finding_issue_title(finding)
+            body = format_bug_report(
+                expected=finding.expected, actual=finding.actual,
+                repro=finding.repro,
+                evidence=_evidence_with_acceptance(finding, dedupe),
+            )
+            filings.append(
+                FilingResult(
+                    finding=finding, verdict=dedupe.verdict,
+                    filed=False, queued=False,
+                    preview_title=title, preview_body=body,
+                )
+            )
+            continue
+        if dedupe.verdict is DedupeVerdict.DUPLICATE and dedupe.matched_number is None:
+            # #3546: a within-round duplicate from `_dedupe_round_findings`
+            # — its sibling finding may have already been filed earlier in
+            # THIS loop (in which case its real issue number is now in
+            # `run_filed_by_title`). Resolve it so the report/CLI shows the
+            # real number instead of a permanent "duplicate of #None".
+            resolved = run_filed_by_title.get(dedupe.matched_title or "")
+            if resolved is not None:
+                dedupe = DedupeResult(
+                    verdict=dedupe.verdict, matched_number=resolved,
+                    matched_title=dedupe.matched_title, score=dedupe.score,
+                )
+        # An unresolvable lane (finding.platform not in lanes_by_platform)
+        # is only a problem when it would actually be queued — file_finding
+        # raises in that case, never silently drops the machine target
+        # (#2096: a gate must be able to fail).
+        result = file_finding(finding, dedupe, lane, runner, dry_run=dry_run)
+        filings.append(result)
+        if result.filed and result.issue_number is not None:
+            # Only track filings that landed in *repo*'s own namespace — a
+            # finding routed elsewhere via `finding_target_repo` (#3546
+            # requirement 2) dedupes against THAT repo's issues, not this
+            # one's.
+            if finding_target_repo(finding) == repo:
+                filed_title = compose_finding_issue_title(finding)
+                run_filed_issues.append({"number": result.issue_number, "title": filed_title})
+                run_filed_by_title[filed_title] = result.issue_number
+
+    return filings, new_count, declined
+
+
+def harvest_outcome(
+    outcome: ExploreOutcome,
+    lane: BugbashLane,
+    *,
+    repo: str,
+    runner: CoordRunner,
+    open_issues_fetcher: Callable[[str], list[dict]],
+    closed_issues_fetcher: Callable[[str], list[dict]],
+    dry_run: bool = False,
+) -> RoundReport:
+    """File (or preview) the findings in a single lane's late-arriving
+    :class:`ExploreOutcome` — the #3569 recovery path for an explorer that
+    finished AFTER its lane's ``--lane-timeout`` had already elapsed and
+    the controller had stopped waiting on it (``coord bugbash harvest``,
+    wired in :mod:`coord.commands.bugbash`).
+
+    Reuses the identical bucketing (:func:`_apply_outcome_to_round`) and
+    dedupe/file path (:func:`_dedupe_and_file_round`) :func:`run_bugbash`'s
+    own round loop uses — a harvested result is subject to the exact same
+    rules (unavailable/protocol-error/incomplete handling, platform-gated
+    dedupe, the mandatory acceptance line) as one observed inline, never a
+    parallel, looser path (#2096 "one question, one answer").
+
+    Always treated as a standalone round 1 with no prior in-run filings to
+    cross-reference — a harvest recovers ONE lane's result after the fact,
+    it is not itself a multi-round run — and never gated behind an operator
+    confirmation: :func:`run_bugbash`'s ``confirm_rounds`` gate exists to
+    let an operator preview the FIRST rounds of a live, automatically-
+    filing run before it starts; a harvest is already a single, deliberate,
+    after-the-fact operator action (``coord bugbash harvest``), so gating
+    it behind a second prompt would just be an extra step for no added
+    safety. ``dry_run=True`` still skips filing/queuing exactly like a live
+    run's ``--dry-run`` does — the runner is never invoked on that path.
+    """
+    report = RoundReport(round_num=1)
+    report.lane_cost[lane.platform] = outcome.cost
+    _apply_outcome_to_round(report, lane, outcome)
+
+    open_issues = list(open_issues_fetcher(repo))
+    closed_issues = closed_issues_fetcher(repo)
+    filings, new_count, _declined = _dedupe_and_file_round(
+        report.findings,
+        repo=repo,
+        dry_run=dry_run,
+        require_confirm=False,
+        confirm=None,
+        round_num=1,
+        runner=runner,
+        open_issues=open_issues,
+        closed_issues=closed_issues,
+        lanes_by_platform={lane.platform: lane},
+        run_filed_issues=[],
+        run_filed_by_title={},
+    )
+    report.filings = filings
+    report.new_count = new_count
+    return report
+
+
 def run_bugbash(
     config: BugbashConfig,
     *,
@@ -1284,30 +1487,12 @@ def run_bugbash(
             lane_cost[lane.platform] += outcome.cost
             report.lane_cost[lane.platform] = lane_cost[lane.platform]
             total_cost += outcome.cost
-            if outcome.unavailable:
-                # #3510: a locked/absent GUI session (or missing display)
-                # is a host condition, not a finding — recorded separately
-                # from both a clean pass and a dispatch/poll failure, and
-                # NEVER contributes findings this round, even defensively
-                # if the explorer happened to also hand some back.
-                report.unavailable_lanes[lane.platform] = (
-                    outcome.notes or "lane unavailable — no usable GUI session/display"
-                )
-                continue
-            report.findings.extend(outcome.findings)
-            if not outcome.ok:
-                # #2096: this lane's "findings" (almost certainly empty) are
-                # NOT a verified observation — record why, so a round whose
-                # every lane failed this way can never render identically to
-                # a round that actually looked and found nothing.
-                report.lane_failures[lane.platform] = outcome.notes or "explorer reported failure"
-            elif outcome.protocol_error:
-                # #3517: the lane DID complete, but its final message could
-                # not be trusted as a findings report at all — a malformed/
-                # missing block, never silently read as "zero findings
-                # observed" (that conflation is exactly what let a real
-                # finding disappear and pass the #3488 release gate).
-                report.protocol_error_lanes[lane.platform] = outcome.protocol_error
+            # #3569: the SAME bucketing `coord bugbash harvest`'s
+            # `harvest_outcome` uses for a late-arriving explorer — one
+            # question ("how does this ExploreOutcome classify"), one
+            # answer, whether it's observed inline here or recovered after
+            # the fact.
+            _apply_outcome_to_round(report, lane, outcome)
 
         # #3546: merge the fresh fetch with every issue THIS RUN has already
         # filed — a finding matching one of this run's own earlier filings
@@ -1316,72 +1501,24 @@ def run_bugbash(
         open_issues = list(open_issues_fetcher(config.repo)) + run_filed_issues
         closed_issues = closed_issues_fetcher(config.repo)
 
-        # Dedupe every finding exactly once (one question, one answer) —
-        # everything below (the confirm gate's candidate list, new_count,
-        # and the actual filing decision) reads off this SAME verdict per
-        # finding rather than re-asking dedupe with a chance to disagree
-        # with itself. `_dedupe_round_findings` also catches two lanes
-        # reporting the same bug in THIS round against each other, not just
-        # against issues that existed before the round started.
-        dedupes = _dedupe_round_findings(report.findings, open_issues, closed_issues)
-
         require_confirm = (not config.dry_run) and round_num <= config.confirm_rounds
-        candidates = [
-            f for f, d in zip(report.findings, dedupes) if d.verdict != DedupeVerdict.DUPLICATE
-        ]
-        declined = require_confirm and candidates and not (confirm and confirm(round_num, candidates))
-        report.declined = bool(declined)
-
-        for finding, dedupe in zip(report.findings, dedupes):
-            lane = lanes_by_platform.get(finding.platform)
-            if dedupe.verdict != DedupeVerdict.DUPLICATE:
-                report.new_count += 1
-            if dedupe.verdict != DedupeVerdict.DUPLICATE and declined:
-                # Operator declined this round's filings — record the
-                # would-be preview (same shape a dry run produces) without
-                # ever invoking the runner.
-                title = compose_finding_issue_title(finding)
-                body = format_bug_report(
-                    expected=finding.expected, actual=finding.actual,
-                    repro=finding.repro,
-                    evidence=_evidence_with_acceptance(finding, dedupe),
-                )
-                report.filings.append(
-                    FilingResult(
-                        finding=finding, verdict=dedupe.verdict,
-                        filed=False, queued=False,
-                        preview_title=title, preview_body=body,
-                    )
-                )
-                continue
-            if dedupe.verdict is DedupeVerdict.DUPLICATE and dedupe.matched_number is None:
-                # #3546: a within-round duplicate from `_dedupe_round_findings`
-                # — its sibling finding may have already been filed earlier
-                # in THIS loop (in which case its real issue number is now in
-                # `run_filed_by_title`). Resolve it so the report/CLI shows
-                # the real number instead of a permanent "duplicate of
-                # #None".
-                resolved = run_filed_by_title.get(dedupe.matched_title or "")
-                if resolved is not None:
-                    dedupe = DedupeResult(
-                        verdict=dedupe.verdict, matched_number=resolved,
-                        matched_title=dedupe.matched_title, score=dedupe.score,
-                    )
-            # An unresolvable lane (finding.platform not in this run's
-            # config.lanes) is only a problem when it would actually be
-            # queued — file_finding raises in that case, never silently
-            # drops the machine target (#2096: a gate must be able to fail).
-            result = file_finding(finding, dedupe, lane, runner, dry_run=config.dry_run)
-            report.filings.append(result)
-            if result.filed and result.issue_number is not None:
-                # Only track filings that landed in config.repo's own
-                # namespace — a finding routed elsewhere via
-                # `finding_target_repo` (#3546 requirement 2) dedupes
-                # against THAT repo's issues, not this one's.
-                if finding_target_repo(finding) == config.repo:
-                    filed_title = compose_finding_issue_title(finding)
-                    run_filed_issues.append({"number": result.issue_number, "title": filed_title})
-                    run_filed_by_title[filed_title] = result.issue_number
+        filings, new_count, declined = _dedupe_and_file_round(
+            report.findings,
+            repo=config.repo,
+            dry_run=config.dry_run,
+            require_confirm=require_confirm,
+            confirm=confirm,
+            round_num=round_num,
+            runner=runner,
+            open_issues=open_issues,
+            closed_issues=closed_issues,
+            lanes_by_platform=lanes_by_platform,
+            run_filed_issues=run_filed_issues,
+            run_filed_by_title=run_filed_by_title,
+        )
+        report.filings = filings
+        report.new_count = new_count
+        report.declined = declined
 
         rounds.append(report)
 
