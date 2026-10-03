@@ -797,10 +797,16 @@ class GitHubCi:
         # out to `gh pr checks` directly (a non-zero exit there can still
         # carry usable JSON on stdout, which `_gh()`'s raise-on-nonzero
         # contract can't express, see `get_pr_checks`'s own docstring) — so
-        # this call is the *only* forge-availability observation this read
-        # produces. It stands alone, not "layered on top" of anything.
-        # Only fires on a real cache miss — a cached `list_checks_for_pr`
-        # hit never reaches here, so this costs nothing extra either.
+        # the `record_ci_check_fetch` call below is the only *CI-outcome*
+        # observation this read produces: the distribution of pass/fail/
+        # pending per check. (#3536 review follow-up: `get_pr_checks` itself
+        # now also feeds the generic, caller-attributed `record_gh_call` seam
+        # and the shared `github_throttle` pacing/backoff — same as every
+        # `_gh()`-backed call — so this is no longer the *only*
+        # forge-availability signal the read produces, just the only
+        # CI-specific one.) Only fires on a real cache miss — a cached
+        # `list_checks_for_pr` hit never reaches here, so this costs nothing
+        # extra either.
         _t0 = time.monotonic()
         try:
             raw = github_ops.get_pr_checks(repo, number)

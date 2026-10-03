@@ -438,18 +438,22 @@ def is_permanent_block_reason(text: str | None) -> bool:
 # the ceiling is reached.
 MAX_BLOCKED_RESUMES = 3
 
-# #3536: default cap on how many `_reconcile_blocked` CONFIRMED-CLEAR
-# resumes/merge-only releases one `plan_tick` call grants per repo. A latch
-# clearing for a whole repo's worth of `blocked` rows at once (#3386's
-# baseline-red gate, cleared by #3532) otherwise releases every one of them
-# on the SAME tick — each then driving its own live `gh` re-checks on the
-# very next poll, which is exactly the synchronized-poll pattern that trips
-# GitHub's secondary rate limit fleet-wide (the 2026-10-02 incident). 2 is
-# deliberately small: large enough that a single or double blocked entry
-# (the overwhelming common case, and every pre-#3536 test fixture) still
-# resumes in the same tick it clears, small enough that a dozen-row mass
-# clear spreads over several ticks instead of one. `None`/`0` disables the
-# cap entirely (unstaggered, pre-#3536 behaviour) — see `plan_tick`'s
+# #3536: default cap on how many CONFIRMED-CLEAR `blocked`-entry resumes/
+# merge-only releases one `plan_tick` call grants per repo, from EITHER
+# `_reconcile_blocked`'s gate-clear check (#2230) or `_reconcile_blocked_
+# after`'s `after=` prereq-chain resume (#2362/#2756) -- a latch clearing
+# for a whole repo's worth of `blocked` rows at once (#3386's baseline-red
+# gate, cleared by #3532) and a single landed prereq clearing every row
+# chained `--after` it are the SAME synchronized-poll shape, so both count
+# against one cap. Either one otherwise releases every row on the SAME
+# tick -- each then driving its own live `gh` re-checks on the very next
+# poll, which is exactly the pattern that trips GitHub's secondary rate
+# limit fleet-wide (the 2026-10-02 incident). 2 is deliberately small:
+# large enough that a single or double blocked entry (the overwhelming
+# common case, and every pre-#3536 test fixture) still resumes in the same
+# tick it clears, small enough that a dozen-row mass clear spreads over
+# several ticks instead of one. `None`/`0` disables the cap entirely
+# (unstaggered, pre-#3536 behaviour) — see `plan_tick`'s
 # `max_resumes_per_tick_per_repo` parameter.
 DEFAULT_MAX_RESUMES_PER_TICK_PER_REPO = 2
 
@@ -2539,15 +2543,17 @@ class Reconcile:
       see :func:`coord.commands.drive_queue._run_merge_only_candidates`),
       which is why this Reconcile's own ``updates`` stays empty: neither
       outcome is knowable at the moment :func:`plan_tick` returns.
-    * ``resume_staggered`` — #3536: `_reconcile_blocked`'s gate-clear check
-      read CONFIRMED CLEAR (same evidence ``resumed``/``merge_only`` act on),
-      but this tick's *max_resumes_per_tick_per_repo* cap for this entry's
-      repo was already spent by an earlier entry THIS SAME tick — a mass
-      latch clear releasing a dozen rows at once, the exact synchronized-poll
-      shape that trips GitHub's secondary rate limiter. Writes NO state:
-      the entry stays `blocked` and gets first refusal at the same check
-      next tick, so a repo's worth of newly-clear rows releases gradually
-      over several ticks instead of one.
+    * ``resume_staggered`` — #3536: either `_reconcile_blocked`'s gate-clear
+      check or `_reconcile_blocked_after`'s `after=` prereq-chain resume
+      read CONFIRMED CLEAR (same evidence ``resumed``/``merge_only`` act
+      on), but this tick's *max_resumes_per_tick_per_repo* cap for this
+      entry's repo was already spent by an earlier entry THIS SAME tick —
+      a mass latch clear, or a single landed prereq clearing many rows
+      chained `--after` it, releasing a dozen rows at once, the exact
+      synchronized-poll shape that trips GitHub's secondary rate limiter.
+      Writes NO state: the entry stays `blocked` and gets first refusal at
+      the same check next tick, so a repo's worth of newly-clear rows
+      releases gradually over several ticks instead of one.
     """
 
     key: str
@@ -6736,19 +6742,18 @@ def plan_tick(
     ``None`` (the default) falls back to :data:`DEFAULT_TICK_MAX_FIX_ROUNDS`,
     same as every other caller of :func:`effective_max_fix_rounds`.
 
-    *max_resumes_per_tick_per_repo* (#3536) caps how many `_reconcile_
-    blocked` CONFIRMED-CLEAR resumes/merge-only releases THIS tick grants
-    per repo — see :data:`DEFAULT_MAX_RESUMES_PER_TICK_PER_REPO` for why.
-    The ``resumed``/``merge_only`` reconciles beyond the cap are replaced
-    with a ``resume_staggered`` one: no state write, so the entry stays
-    `blocked` and re-enters the SAME gate-clear check next tick, where it
-    either wins a slot then or is staggered again. Only ``_reconcile_
-    blocked``'s own gate-clear path counts against the cap —
-    ``_reconcile_blocked_after``'s prereq-chain resume (a `waiting`-side
-    cascade, not a latch clearing) is unaffected, and so is every state
-    other than `blocked`. ``None`` or ``0`` disables the cap entirely
-    (unstaggered — the only behaviour this repo's test suite exercised
-    before #3536).
+    *max_resumes_per_tick_per_repo* (#3536) caps how many CONFIRMED-CLEAR
+    `blocked`-entry resumes/merge-only releases THIS tick grants per repo,
+    from EITHER `_reconcile_blocked`'s gate-clear check or
+    `_reconcile_blocked_after`'s `after=` prereq-chain resume (#2362/#2756)
+    — see :data:`DEFAULT_MAX_RESUMES_PER_TICK_PER_REPO` for why both count
+    against the same cap. The ``resumed``/``merge_only`` reconciles beyond
+    the cap are replaced with a ``resume_staggered`` one: no state write,
+    so the entry stays `blocked` and re-enters this same check next tick,
+    where it either wins a slot then or is staggered again. Every state
+    other than `blocked` is unaffected. ``None`` or ``0`` disables the cap
+    entirely (unstaggered — the only behaviour this repo's test suite
+    exercised before #3536).
     """
     ordered = sorted(entries, key=lambda e: (e.position, e.key))
     states: dict[str, str] = {e.key: e.state for e in ordered}
@@ -7014,53 +7019,59 @@ def plan_tick(
                     live_blocked_unreadable,
                     live_blocked_gate_reason,
                 )
-                # #3536: a latch that was gating many entries at once (#3386's
-                # baseline-red gate, cleared by one merge) reads CONFIRMED
-                # CLEAR for every one of them on the SAME tick — without a
-                # cap, `_reconcile_blocked` hands back `resumed`/`merge_only`
-                # for all of them here, and every one of those rows then
-                # drives its OWN live `gh` re-checks (branch head, CI status)
-                # on this same tick's very next poll. A dozen rows doing that
-                # together is exactly the synchronized-poll pattern
-                # `coord.github_throttle`'s module docstring identifies as
-                # what trips GitHub's secondary rate limiter — the 2026-10-02
-                # incident this issue describes. Stagger it: only the first
-                # `max_resumes_per_tick_per_repo` CONFIRMED-CLEAR resumes per
-                # repo actually release this tick; the rest stay `blocked`
-                # (no state write, so they re-enter this exact branch next
-                # tick and get first refusal then) with a reason explaining
-                # why, instead of all firing at once. Scoped to `_reconcile_
-                # blocked`'s own gate-clear path only — `_reconcile_blocked_
-                # after`'s prereq-chain resume above is a `waiting`-side
-                # cascade, not a merge-gate latch clearing, and is not the
-                # shape that trips a rate limit the same way.
-                if (
-                    blocked_reconcile is not None
-                    and blocked_reconcile.outcome in ("resumed", "merge_only")
-                    and max_resumes_per_tick_per_repo is not None
-                    and max_resumes_per_tick_per_repo > 0
-                ):
-                    used = resume_quota_used.get(entry.repo, 0)
-                    if used >= max_resumes_per_tick_per_repo:
-                        reason = (
-                            f"{entry.key}'s merge gate reads clear now, but "
-                            f"this tick already released "
-                            f"{max_resumes_per_tick_per_repo}/"
-                            f"{max_resumes_per_tick_per_repo} {entry.repo} "
-                            "resume slot(s) — staggering the rest to avoid "
-                            "a mass gate-clear tripping GitHub's secondary "
-                            "rate limit fleet-wide (#3536); resuming on a "
-                            "later tick"
-                        )
-                        blocked_reconcile = Reconcile(
-                            entry.key,
-                            "resume_staggered",
-                            reason,
-                            occupies=False,
-                            updates=_refresh_only(reason, entry.last_reason),
-                        )
-                    else:
-                        resume_quota_used[entry.repo] = used + 1
+            # #3536: a latch that was gating many entries at once (#3386's
+            # baseline-red gate, cleared by one merge) reads CONFIRMED CLEAR
+            # for every one of them on the SAME tick — without a cap, EITHER
+            # `_reconcile_blocked`'s gate-clear check above OR
+            # `_reconcile_blocked_after`'s prereq-chain resume (#2362/#2756:
+            # one landed dep clearing the SAME unsatisfiable verdict for
+            # every row chained `--after` it) hands back `resumed`/
+            # `merge_only` for all of them here, and every one of those rows
+            # then drives its OWN live `gh` re-checks (branch head, CI
+            # status) on this same tick's very next poll. A dozen rows doing
+            # that together is exactly the synchronized-poll pattern
+            # `coord.github_throttle`'s module docstring identifies as what
+            # trips GitHub's secondary rate limiter — the 2026-10-02 incident
+            # this issue describes, and issue #3536 itself names BOTH the
+            # #2230 and #2362 paths as in scope for the stagger (a review
+            # round of this same fix caught that an earlier version capped
+            # only `_reconcile_blocked`'s gate-clear path, leaving the
+            # `after=` cascade above unstaggered even though a many-rows-
+            # chained-on-one-prereq clear is the identical synchronized-poll
+            # shape). Stagger it: only the first
+            # `max_resumes_per_tick_per_repo` CONFIRMED-CLEAR resumes per
+            # repo actually release this tick, from EITHER path; the rest
+            # stay `blocked` (no state write, so they re-enter this exact
+            # branch next tick and get first refusal then) with a reason
+            # explaining why, instead of all firing at once.
+            if (
+                blocked_reconcile is not None
+                and blocked_reconcile.outcome in ("resumed", "merge_only")
+                and max_resumes_per_tick_per_repo is not None
+                and max_resumes_per_tick_per_repo > 0
+            ):
+                used = resume_quota_used.get(entry.repo, 0)
+                if used >= max_resumes_per_tick_per_repo:
+                    reason = (
+                        f"{entry.key}'s block cleared (merge gate reads "
+                        "clear, or a chained `after=` prereq landed), but "
+                        f"this tick already released "
+                        f"{max_resumes_per_tick_per_repo}/"
+                        f"{max_resumes_per_tick_per_repo} {entry.repo} "
+                        "resume slot(s) — staggering the rest to avoid "
+                        "a mass clear tripping GitHub's secondary "
+                        "rate limit fleet-wide (#3536); resuming on a "
+                        "later tick"
+                    )
+                    blocked_reconcile = Reconcile(
+                        entry.key,
+                        "resume_staggered",
+                        reason,
+                        occupies=False,
+                        updates=_refresh_only(reason, entry.last_reason),
+                    )
+                else:
+                    resume_quota_used[entry.repo] = used + 1
             if blocked_reconcile is not None:
                 reconciles.append(blocked_reconcile)
                 if blocked_reconcile.outcome == "merge_only":
