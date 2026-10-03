@@ -658,6 +658,27 @@ def test_maybe_bash_wrap_helper() -> None:
     assert wrapped == ["bash", "-c", "exec claude -p --allowedTools Read,Bash"]
 
 
+def test_maybe_bash_wrap_is_a_noop_on_win32(monkeypatch) -> None:
+    """#2843: the whole point of the fix, pinned platform-independently.
+
+    `_maybe_bash_wrap` must return the bare argv on win32 even when
+    `enabled=True` — this is what makes `bash_wrap_spawn`'s default-True
+    harmless there instead of routing every assignment through a `bash`
+    that isn't guaranteed present (and, where it is — Git for Windows'
+    MSYS bash — doesn't preserve the same-PID invariant the wrap exists
+    for). Runs on every platform (monkeypatches `coord.agent.sys.platform`
+    rather than requiring an actual win32 host), so this regression-guards
+    the fix on the Linux/macOS CI that actually exercises it.
+    """
+    import coord.agent as agent_mod
+    from coord.agent import _maybe_bash_wrap
+
+    argv = ["claude", "-p"]
+    monkeypatch.setattr(agent_mod.sys, "platform", "win32")
+    assert _maybe_bash_wrap(argv, enabled=True) == argv
+    assert _maybe_bash_wrap(argv, enabled=False) == argv
+
+
 @_bash_wrap_posix_only
 def test_spawn_bash_wrap_enabled_routes_through_bash(tmp_path: Path) -> None:
     """With bash_wrap_spawn=True, _spawn launches via bash -c 'exec ...'."""
