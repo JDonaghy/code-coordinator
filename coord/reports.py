@@ -4409,6 +4409,21 @@ def _validate_issue_cost_status(value: str) -> None:
 # the corpus level: if literally zero deprecation-category rows exist
 # anywhere (any route), collection cannot be confirmed live, so EVERY route
 # reads `no_data` rather than the misleadingly reassuring `zero_calls`.
+#
+# #1947's gate needs one more number this report didn't used to carry: NOT
+# just "zero calls ever recorded" but "zero calls across a window of at
+# least 30 days" — a route deprecated yesterday with zero calls so far is
+# not evidence of anything yet. `observed_secs`/`eligible` below answer that
+# without a second config read or a second place to get it wrong (#2085):
+# `observed_secs` is seeded from the EARLIEST deprecation-category row across
+# the whole corpus (a lower bound on how long telemetry has been live — it
+# can only ever UNDERSTATE the true window, never overstate it, which is the
+# safe direction for a retirement gate) and then capped at
+# `audit.operational_retention_days` via `coord.audit.
+# resolve_operational_retention_days` — the same cap that module's own sweep
+# enforces — because a row older than retention could have been swept
+# without a trace, so claiming a window longer than retention allows would
+# be exactly the "belief" #1945/#1947 exist to rule out.
 
 DEPRECATED_ROUTES_COLUMNS = [
     "route",
@@ -4417,6 +4432,8 @@ DEPRECATED_ROUTES_COLUMNS = [
     "last_call",
     "call_count",
     "clients",
+    "observed_secs",
+    "eligible",
 ]
 
 # One entry per DEPRECATED_ROUTES_COLUMNS entry, same order (#1760).
@@ -4427,6 +4444,8 @@ DEPRECATED_ROUTES_COLUMN_META = [
     ColumnMeta(id="last_call", label="Last Call", kind="timestamp"),
     ColumnMeta(id="call_count", label="Calls", kind="int", align="right"),
     ColumnMeta(id="clients", label="Clients", kind="list"),
+    ColumnMeta(id="observed_secs", label="Observed For", kind="duration", align="right"),
+    ColumnMeta(id="eligible", label="Retirement", kind="enum"),
 ]
 
 # `status` values.  `no_data` and `zero_calls` are BOTH "nothing seen for
@@ -4436,12 +4455,26 @@ DEPRECATED_ROUTE_NO_DATA = "no_data"
 DEPRECATED_ROUTE_ZERO_CALLS = "zero_calls"
 DEPRECATED_ROUTE_IN_USE = "in_use"
 
+# `eligible` values (#1947) — the gate's own verdict, never the belief of
+# whoever is reading the table. `not_yet` covers every disqualifying case
+# (in_use, no_data, or zero_calls but not observed long enough) on purpose:
+# a reader who only checks for the literal string `eligible` can never be
+# fooled by a value this report predates adding.
+DEPRECATED_ROUTE_ELIGIBLE = "eligible"
+DEPRECATED_ROUTE_NOT_ELIGIBLE = "not_yet"
+
+# The gate's own number (issue #1947): "a window of at least 30 days".
+# Named so it cannot silently drift between the report and anything that
+# later re-checks its verdict.
+DEPRECATION_RETIREMENT_WINDOW_DAYS = 30.0
+
 
 def fold_deprecated_routes(
     entries: Iterable[Mapping[str, Any]],
     generated_at: float,
     *,
     routes: Mapping[str, str] | None = None,
+    retention_days: float | None = None,
 ) -> ReportResult:
     """Fold already-fetched deprecation-telemetry audit rows into a
     per-route snapshot.  **Pure** — no DB, no daemon, no clock.
@@ -4456,14 +4489,32 @@ def fold_deprecated_routes(
     report reads it rather than redeclaring it (the ``routes=`` override
     exists purely so this stays a pure function a test can call without
     importing the daemon module).
+
+    ``retention_days`` defaults to :func:`coord.audit.
+    resolve_operational_retention_days` (``0`` disables the cap) — overridable
+    for the same reason ``routes=`` is: so this stays callable without a
+    daemon/config/DB in the loop.
     """
     if routes is None:
         from coord.serve_app import RPC_SUPERSEDED_BY_RESOURCE  # noqa: PLC0415
 
         routes = RPC_SUPERSEDED_BY_RESOURCE
 
+    if retention_days is None:
+        from coord.audit import resolve_operational_retention_days  # noqa: PLC0415
+
+        retention_days = resolve_operational_retention_days()
+
     entries = list(entries)
     any_data = bool(entries)
+    # `or generated_at` would be wrong here: a `ts` of exactly `0.0` (epoch,
+    # or a deliberately-zeroed test fixture) is falsy and must still count
+    # as a real, very-old timestamp — not get silently replaced by "now".
+    earliest_ts = (
+        min(e.get("ts") if e.get("ts") is not None else generated_at for e in entries)
+        if entries
+        else None
+    )
 
     by_route: dict[str, list[Mapping[str, Any]]] = {r: [] for r in routes}
     for entry in entries:
@@ -4495,6 +4546,17 @@ def fold_deprecated_routes(
             status = DEPRECATED_ROUTE_ZERO_CALLS
         else:
             status = DEPRECATED_ROUTE_NO_DATA
+
+        observed_secs: float | None = None
+        eligible = DEPRECATED_ROUTE_NOT_ELIGIBLE
+        if status == DEPRECATED_ROUTE_ZERO_CALLS:
+            # `any_data` is True here, so `earliest_ts` is always set.
+            observed_secs = max(0.0, generated_at - earliest_ts)  # type: ignore[operator]
+            if retention_days and retention_days > 0:
+                observed_secs = min(observed_secs, retention_days * 86400.0)
+            if observed_secs >= DEPRECATION_RETIREMENT_WINDOW_DAYS * 86400.0:
+                eligible = DEPRECATED_ROUTE_ELIGIBLE
+
         rows.append(
             {
                 "route": route,
@@ -4503,6 +4565,8 @@ def fold_deprecated_routes(
                 "last_call": last_call,
                 "call_count": len(calls),
                 "clients": clients,
+                "observed_secs": observed_secs,
+                "eligible": eligible,
             }
         )
 
@@ -4516,6 +4580,14 @@ def fold_deprecated_routes(
             "the audit table's own retention trim). Every row above reads "
             "`no_data`, not `zero_calls` — treat it as UNKNOWN, never as "
             "evidence it is safe to retire."
+        )
+    if any_data and retention_days and 0 < retention_days < DEPRECATION_RETIREMENT_WINDOW_DAYS:
+        notes.append(
+            f"audit.operational_retention_days is {retention_days:g}, below "
+            f"the {DEPRECATION_RETIREMENT_WINDOW_DAYS:g}-day window #1947's "
+            "retirement gate requires — a `zero_calls` route can never "
+            "accumulate enough trustworthy observed time to read `eligible` "
+            "until this is raised (or disabled with `0`)."
         )
 
     return ReportResult(
@@ -4540,29 +4612,38 @@ def run_deprecated_routes(
     now: float | None = None,
     fetch: Callable[[float], tuple[Sequence[Mapping[str, Any]], bool]] | None = None,
     routes: Mapping[str, str] | None = None,
+    retention_days: float | None = None,
 ) -> ReportResult:
     """Fetch every recorded deprecated-RPC-route call and fold it (#1945).
 
-    ``fetch``/``routes`` are test seams (mirrors every other ``run_*``'s
-    ``fetch=`` seam). Production always walks the FULL audit history
-    (``since=0``), never a recent window — "this route has not been called
-    in months" is exactly the number #1945 exists to produce, and a
-    windowed report would silently hide the very evidence retirement needs.
-    ``query_audit_log`` orders newest-first, so ``last_call`` is accurate
-    even if the walk is truncated by the page cap; only the full
-    client/version set and total ``call_count`` could then be incomplete,
-    which is called out in a note exactly like every other truncated fold
-    in this module.
+    ``fetch``/``routes``/``retention_days`` are test seams (mirrors every
+    other ``run_*``'s ``fetch=`` seam). Production always walks the FULL
+    audit history (``since=0``), never a recent window — "this route has not
+    been called in months" is exactly the number #1945 exists to produce,
+    and a windowed report would silently hide the very evidence retirement
+    needs. ``query_audit_log`` orders newest-first, so ``last_call`` is
+    accurate even if the walk is truncated by the page cap; ``clients``/
+    ``call_count``, and ``observed_secs``/``eligible`` (#1947) — which is
+    seeded from the OLDEST entry in the walk — could then UNDERSTATE the
+    true observed window (the oldest rows are exactly what truncation drops
+    first), which is called out in a note exactly like every other truncated
+    fold in this module. Understating is the safe direction for a
+    retirement gate: it can only make `eligible` harder to earn, never
+    easier.
     """
     generated_at = time.time() if now is None else float(now)
     fetch_fn = _default_fetch_deprecation_entries if fetch is None else fetch
     entries, truncated = fetch_fn(generated_at)
-    result = fold_deprecated_routes(entries, generated_at, routes=routes)
+    result = fold_deprecated_routes(
+        entries, generated_at, routes=routes, retention_days=retention_days
+    )
     if truncated:
         result.notes.append(
             "Audit history walk hit its page cap before covering the full "
             "history — `clients`/`call_count` may be missing older calls, "
-            "though `last_call` (newest-first order) is still accurate."
+            "and `observed_secs` may understate the true window (the "
+            "oldest rows are dropped first), though `last_call` "
+            "(newest-first order) is still accurate."
         )
     return result
 
@@ -4959,7 +5040,14 @@ DEPRECATED_ROUTES = ReportDef(
         "count — evidence for retirement instead of belief (#1945). "
         "`status` distinguishes `in_use` from `zero_calls` (a real, "
         "actionable signal) from `no_data` (telemetry not confirmed live — "
-        "never safe to read as `zero_calls`)."
+        "never safe to read as `zero_calls`). `eligible` is #1947's own "
+        "gate verdict: `eligible` only when `status` is `zero_calls` AND "
+        "`observed_secs` (capped at `audit.operational_retention_days`, "
+        "never a config-trusting guess) covers at least 30 days — `not_yet` "
+        "otherwise. A route's own `eligible` reading is still only one of "
+        "#1947's three gate conditions; `coord release verify` showing "
+        "every lane past the client migration is the other, checked "
+        "separately."
     ),
     params=(),
     run=run_deprecated_routes,
