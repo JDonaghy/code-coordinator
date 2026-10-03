@@ -24,6 +24,7 @@ from coord.agent_update import (
     perform_update,
     rollback,
 )
+from coord.dirlink import is_dir_link
 from coord.platform_paths import venv_bin, venv_exe, venv_pip, venv_python
 
 #: #2684 (W4): `current_slot()`/`ensure_symlink_layout()` call `Path.resolve()`
@@ -159,7 +160,7 @@ class TestSymlinkLayout:
         active = ensure_symlink_layout(venv_dir)
 
         assert active == tmp_path / ".coord-venv.blue"
-        assert venv_dir.is_symlink()
+        assert is_dir_link(venv_dir)
         assert _same_path(current_slot(venv_dir), active)
         assert (venv_dir / "marker").read_text() == "original install\n"
 
