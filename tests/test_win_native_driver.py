@@ -16,7 +16,9 @@ from __future__ import annotations
 import base64
 import ctypes
 import os
+import select
 import subprocess
+import sys
 import time
 
 import pytest
@@ -1238,10 +1240,14 @@ class TestWin32CallsLaunchDoesNotInheritStdHandles:
     never let it see EOF, so the bridge call hangs for the full
     `bridge_timeout` and the launched exe is left orphaned — see
     `coord.win_native_driver._NO_HANDLE_INHERITANCE` and
-    `coord.win_native_bridge.run_native_spec_via_bridge`). These assert
-    against a scripted fake `subprocess.Popen`, since the real handle-
-    inheritance hang can only be observed on a real WSL<->Windows pairing
-    (confirmed on dell64 per #3544's repro)."""
+    `coord.win_native_bridge.run_native_spec_via_bridge`). These two tests
+    only characterize *which kwargs* reach a scripted fake `Popen` — they
+    cannot demonstrate the redirect actually prevents the hang.
+    `TestLaunchPipeInheritanceRealSubprocess` below does that with a real,
+    unmocked OS pipe + subprocess tree; the real handle-inheritance hang on
+    the exact Windows/WSL topology the issue reports can still only be
+    observed on a real WSL<->Windows pairing (confirmed on dell64 per
+    #3544's repro, not re-run against this fix)."""
 
     def test_launch_redirects_all_three_std_handles_to_devnull(
         self, monkeypatch,
@@ -1284,6 +1290,131 @@ class TestWin32CallsLaunchDoesNotInheritStdHandles:
         assert captured.get("stdin") is subprocess.DEVNULL
         assert captured.get("stdout") is subprocess.DEVNULL
         assert captured.get("stderr") is subprocess.DEVNULL
+
+
+class TestLaunchPipeInheritanceRealSubprocess:
+    """#3544 review follow-up: a real, unmocked reproduction of the exact
+    EOF-blocking mechanism the issue describes, using real OS pipes and a
+    real subprocess tree instead of a scripted fake `Popen`.
+
+    This is the closest in-repo stand-in for the issue's own mandatory
+    acceptance line ("a Tier-1 shared conformance scenario or a Tier-2
+    smoke-spec step that fails first, covering this exact behaviour") that
+    this repo can host on its own: the actual Tier-2 `win-native` smoke
+    spec (`tests/smoke-spec/win-gui.yaml`-style) lives in the *app* repo
+    (vimcode) that declares the `win-native` acceptance driver, not here —
+    `coord` only ships the driver engine, and this worktree runs on Linux
+    with no real Windows/WSL pairing available. What *is* reproducible
+    here, with no Windows dependency at all, is the general OS mechanism:
+    an un-redirected standard handle can be inherited by a long-lived
+    child and keep a reader from ever seeing EOF, independent of platform.
+    That is the behaviour `Win32Calls.launch` must avoid, whatever the
+    exact Win32-side inheritance rule turns out to be (see the review
+    discussion captured in `_NO_HANDLE_INHERITANCE`'s own docstring, which
+    is honest that the Windows mechanism remains unconfirmed on real
+    hardware).
+
+    - `test_shell_true_with_no_redirect_leaks_stdout_to_grandchild`
+      reproduces the pre-fix shape in isolation (a bare
+      `subprocess.Popen(cmd, shell=True)` with no stdin=/stdout=/stderr=,
+      exactly what `Win32Calls.launch` did before #3544) and shows it
+      really does let a long-lived grandchild hold the runner's own stdout
+      pipe open past the runner's own exit — i.e. this test *fails first*
+      against the pre-fix code shape (and would fail again if someone
+      reintroduced it).
+    - `test_real_launch_does_not_leak_stdout_to_grandchild` drives the
+      actual production `Win32Calls.launch` (called unbound — it never
+      touches `self`) through the identical pipe setup and asserts EOF
+      arrives promptly even with its own long-lived grandchild still
+      running: revert `_NO_HANDLE_INHERITANCE` and this test fails the
+      same way the one above does.
+    """
+
+    @staticmethod
+    def _read_until_eof_or_timeout(fd: int, timeout: float) -> tuple[bytes, bool]:
+        """Read *fd* until EOF (empty read) or *timeout* seconds elapse.
+
+        Returns ``(data_read, hit_eof)`` — ``hit_eof`` is `False` when the
+        deadline passed with the pipe's write end still open (some writer
+        — e.g. a leaked grandchild — is still holding it), `True` once a
+        zero-length read confirms every write end has closed.
+        """
+        deadline = time.monotonic() + timeout
+        data = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return data, False
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                return data, True
+            data += chunk
+
+    def test_shell_true_with_no_redirect_leaks_stdout_to_grandchild(self) -> None:
+        """Pre-fix shape in isolation: a bare `Popen(cmd, shell=True)` with
+        no std-handle redirection really does let a long-lived grandchild
+        hold the parent's own stdout pipe open past the parent's exit."""
+        r, w = os.pipe()
+        try:
+            runner = subprocess.Popen(
+                [
+                    sys.executable, "-c",
+                    "import subprocess, sys\n"
+                    "subprocess.Popen('sleep 2', shell=True)\n"
+                    "sys.stdout.write('runner-done\\n')\n"
+                    "sys.stdout.flush()\n",
+                ],
+                stdout=w,
+            )
+            os.close(w)
+            w = -1
+            assert runner.wait(timeout=10) == 0
+            data, hit_eof = self._read_until_eof_or_timeout(r, timeout=0.8)
+            assert data == b"runner-done\n"
+            assert not hit_eof, (
+                "expected the un-redirected grandchild to still be holding "
+                "the pipe open at this point — if this starts passing, the "
+                "repro no longer demonstrates the mechanism #3544 reports"
+            )
+        finally:
+            if w != -1:
+                os.close(w)
+            os.close(r)
+
+    def test_real_launch_does_not_leak_stdout_to_grandchild(self) -> None:
+        """The actual fix: the real `Win32Calls.launch` (called unbound —
+        it never touches `self`) must not let its own long-lived `sleep`
+        grandchild hold the runner's stdout pipe open."""
+        r, w = os.pipe()
+        try:
+            runner = subprocess.Popen(
+                [
+                    sys.executable, "-c",
+                    "import sys\n"
+                    "from coord.win_native_driver import Win32Calls\n"
+                    "Win32Calls.launch(None, 'sleep 2', '.')\n"
+                    "sys.stdout.write('runner-done\\n')\n"
+                    "sys.stdout.flush()\n",
+                ],
+                stdout=w,
+            )
+            os.close(w)
+            w = -1
+            assert runner.wait(timeout=10) == 0
+            data, hit_eof = self._read_until_eof_or_timeout(r, timeout=0.8)
+            assert data == b"runner-done\n"
+            assert hit_eof, (
+                "pipe never hit EOF while the launched grandchild was "
+                "still alive — Win32Calls.launch is leaking a standard "
+                "handle to it again (#3544)"
+            )
+        finally:
+            if w != -1:
+                os.close(w)
+            os.close(r)
 
 
 class TestImportUia:

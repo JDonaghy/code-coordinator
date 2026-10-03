@@ -834,10 +834,48 @@ def _popen_command_and_cwd(command: str, cwd: str) -> tuple[str, str | None]:
 #:
 #: Redirecting all three standard streams to ``DEVNULL`` severs that
 #: inheritance: the child gets its own private, already-closed-on-the-
-#: parent-side handles, never a dup of this process's own pipe. This is the
-#: fix, not a workaround — nothing in this driver ever reads a launched
-#: app's stdout/stderr (the whole point of `win-native` is observing the
-#: real OS/window state, not console text), so there is no output to lose.
+#: parent-side handles, never a dup of this process's own pipe — nothing in
+#: this driver ever reads a launched app's stdout/stderr (the whole point
+#: of `win-native` is observing the real OS/window state, not console
+#: text), so there is no output to lose.
+#:
+#: **Mechanism caveat (review finding on #3544, unresolved).** CPython's
+#: own Windows ``subprocess._execute_child`` computes ``bInheritHandles``
+#: as ``int(not close_fds)``, and ``close_fds`` defaults to ``True``
+#: (Python 3.7+) and is never overridden anywhere in this module — so by
+#: that code path alone, a bare ``Popen(command, shell=True, cwd=...)``
+#: with no ``stdin=``/``stdout=``/``stderr=`` should *already* pass
+#: ``bInheritHandles=False`` to ``CreateProcess``, meaning CPython's own
+#: handle-inheritance bookkeeping is probably *not* the actual leak
+#: mechanism. The hang itself is real and reproduced (``Get-Process``
+#: showing the launched exe still running minutes after a timed-out bridge
+#: call — see #3544's repro), but the likelier remaining culprit is
+#: something outside CPython's control for this specific topology: the
+#: bridge runner is itself started from WSL via ``wsl.exe``/interop, not a
+#: plain native parent process, and WSL interop's own console/job-object
+#: handling for the Windows-side process tree it creates can share or
+#: re-parent handles differently than a same-OS parent/child pair would.
+#:
+#: This redirect is still the right thing to do regardless of which exact
+#: mechanism turns out to be responsible: explicit ``DEVNULL`` handles are
+#: a private pair nothing downstream can keep open, so it closes off every
+#: plausible inheritance path at once rather than betting on one theory of
+#: the leak being correct. Treat it as the best available fix, **not** a
+#: hardware-confirmed root-cause diagnosis — it has not been re-run against
+#: the issue's own two repro scripts on a real WSL<->Windows pairing
+#: (dell64). ``tests/test_win_native_driver.py``'s
+#: ``TestLaunchPipeInheritanceRealSubprocess`` is the closest reproduction
+#: available without that hardware: a real (unmocked) OS pipe + subprocess
+#: tree showing a long-lived grandchild can hold a parent's un-redirected
+#: stdout pipe open past the parent's own exit, and that the real
+#: ``Win32Calls.launch`` no longer does so once its grandchild's handles
+#: are redirected.
+#:
+#: ``launch_in_terminal`` already passes ``creationflags=CREATE_NEW_CONSOLE``
+#: for its spawned process, which per Windows' own docs already gives the
+#: child its own console instead of sharing/inheriting the parent's — so
+#: applying this redirect there too is defensive-in-depth, not evidence
+#: that call site was equally exposed to the leak this fix targets.
 _NO_HANDLE_INHERITANCE: dict = {
     "stdin": subprocess.DEVNULL,
     "stdout": subprocess.DEVNULL,
