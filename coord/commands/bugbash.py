@@ -276,10 +276,22 @@ def _dispatch_and_await_lane(
       still be running, and the notes point at ``coord bugbash harvest`` to
       recover it later once it does finish.
     """
+    from coord.agent import ADVISORY, DONE, FAILED, REFUSED_POLICY, REFUSED_PREMISE
     from coord.commands._common import poll_until_terminal
     from coord.dispatch import dispatch_with_retry
     from coord.models import Proposal
     from coord.network import cancel_assignment, claude_credential_reachable
+
+    # #3569 fix-round-1: `cancel_assignment()`'s `status` mirrors
+    # `AgentAssignment.status` straight from the agent's own idempotent
+    # `/cancel` response (`AgentServer.cancel`: when the assignment is
+    # already terminal it just returns it unchanged) -- NOT the unrelated
+    # `PollOutcome` vocabulary (`"completed"`/`"timeout"`/...) used by
+    # `poll_until_terminal`. The race this function needs to detect is "the
+    # explorer reached a terminal state between our last poll and this
+    # cancel call", which shows up here as any of THESE statuses -- never
+    # `"completed"`, which `/cancel` can never produce.
+    _RACED_TO_TERMINAL = (DONE, FAILED, ADVISORY, REFUSED_POLICY, REFUSED_PREMISE)
 
     machine = next((m for m in config.machines if m.name == lane.machine), None)
     if machine is None:
@@ -324,8 +336,18 @@ def _dispatch_and_await_lane(
         if outcome.status != "timeout":
             break
         log_text = _peek_log_text(machine, assignment_id)
-        progressed = log_text is not None and len(log_text) != last_log_len
-        current_cost = _cost_so_far(log_text) if log_text is not None else 0.0
+        if log_text is None:
+            # #3569 fix-round-1: a transient fetch error (Tailscale blip,
+            # agent momentarily unreachable) means "couldn't tell if it
+            # progressed", never "it definitely didn't". Folding this into
+            # `progressed = False` would cancel a possibly perfectly
+            # healthy, still-productive explorer on a one-off network
+            # hiccup — exactly the premature-kill failure mode #3569 was
+            # filed over, just with a shorter trigger. Retry next window
+            # without counting this peek toward the stall decision at all.
+            continue
+        progressed = len(log_text) != last_log_len
+        current_cost = _cost_so_far(log_text)
         if progressed:
             last_log_len = len(log_text)
         if progressed and current_cost < cost_cap:
@@ -353,7 +375,7 @@ def _dispatch_and_await_lane(
             return ExploreOutcome(
                 ok=False, notes=f"{base_notes} — cancelled the explorer",
             )
-        if cancel.status == "completed":
+        if cancel.status in _RACED_TO_TERMINAL:
             # Race: it actually finished between our last poll and the
             # cancel call — harvest it right now instead of discarding a
             # real result.
@@ -558,7 +580,10 @@ def bugbash_cmd() -> None:
     "--lane-timeout", type=float, default=DEFAULT_LANE_TIMEOUT, show_default=True,
     help="Seconds with no new transcript output from a lane's explorer before treating it as "
     "stalled and cancelling it (#3569) -- NOT a hard cap on the whole exploration; genuine "
-    "progress under --cost-cap-per-lane keeps extending the wait.",
+    "progress under --cost-cap-per-lane keeps extending the wait, re-applying this SAME "
+    "value as each new window's stall threshold -- so this is a per-window length, not the "
+    "total patience budget before a cost-cap failure; --cost-cap-per-lane is the real ceiling "
+    "on overall wait/spend.",
 )
 @click.option("--dry-run", is_flag=True, help="List what would be filed; never calls `coord issue create` / `coord drive-queue add`.")
 @click.option("--yes", "-y", is_flag=True, help="Skip the interactive confirmation prompt on the first --confirm-rounds rounds.")

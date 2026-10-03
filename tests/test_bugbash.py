@@ -1266,8 +1266,17 @@ class TestDispatchAndAwaitLane:
         """#3569's concrete instance: the explorer actually finished
         between the controller's last poll and its cancel call. Rather
         than discarding that result (the original bug — $6 of valid
-        findings lost), the cancel's own `status="completed"` response is
-        used to harvest it right there."""
+        findings lost), the cancel's own real post-cancel status is used to
+        harvest it right there.
+
+        `cancel_assignment()`'s `status` mirrors `AgentAssignment.status`
+        straight from the agent's idempotent `/cancel` response
+        (`AgentServer.cancel`: already-terminal assignments are returned
+        unchanged) — one of `done`/`failed`/`advisory`/`refused_policy`/
+        `refused_premise` here, never the unrelated `PollOutcome` value
+        `"completed"` (that vocabulary belongs to `poll_until_terminal`,
+        not to `/cancel`)."""
+        from coord.agent import DONE
         from coord.commands import bugbash as cmd_bugbash
 
         cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
@@ -1279,7 +1288,7 @@ class TestDispatchAndAwaitLane:
         monkeypatch.setattr(cmd_bugbash, "_peek_log_text", lambda machine, aid: "same log text")
         monkeypatch.setattr(
             "coord.network.cancel_assignment",
-            lambda *a, **k: self._FakeCancelResult(ok=False, status="completed"),
+            lambda *a, **k: self._FakeCancelResult(ok=False, status=DONE),
         )
 
         log_line = (
@@ -1409,6 +1418,71 @@ class TestDispatchAndAwaitLane:
         assert outcome.ok is False
         assert "per-lane cap" in outcome.notes
         assert "cancelled the explorer" in outcome.notes
+
+    def test_poll_timeout_transient_peek_failure_is_not_treated_as_a_stall(self, monkeypatch):
+        """#3569 fix-round-1: `_peek_log_text` returning `None` (a transient
+        HTTP failure talking to the agent — a Tailscale blip, not a real
+        stall) must read as "couldn't tell if it progressed", never as "it
+        definitely didn't" — so it must NOT cancel a perfectly healthy,
+        still-productive explorer. The window that saw the `None` is
+        retried rather than counted toward the stall decision; once a real
+        peek succeeds and shows growth, the explorer is left running."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+
+        poll_calls = {"n": 0}
+
+        def fake_poll(*a, **k):
+            poll_calls["n"] += 1
+            if poll_calls["n"] < 3:
+                return _FakePollOutcome("timeout")
+            return _FakePollOutcome("completed", exit_code=0)
+
+        monkeypatch.setattr("coord.commands._common.poll_until_terminal", fake_poll)
+
+        peek_calls = {"n": 0}
+
+        def fake_peek(machine, aid):
+            peek_calls["n"] += 1
+            if peek_calls["n"] == 2:
+                # One transient fetch failure mid-stall-loop.
+                return None
+            return "x" * peek_calls["n"]  # otherwise strictly growing
+
+        monkeypatch.setattr(cmd_bugbash, "_peek_log_text", fake_peek)
+
+        cancel_called = {"called": False}
+        monkeypatch.setattr(
+            "coord.network.cancel_assignment",
+            lambda *a, **k: cancel_called.update(called=True) or self._FakeCancelResult(ok=True, status="cancelled"),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "done.\\n```bugbash-findings\\n[]\\n```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 2.5}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+            timeout=1.0, cost_cap=100.0,
+        )
+        assert outcome.ok is True
+        assert outcome.cost == 2.5
+        # The transient None peek must never trigger a cancel.
+        assert cancel_called["called"] is False
 
     def test_nonzero_exit_code_is_ok_false(self, monkeypatch):
         from coord.commands import bugbash as cmd_bugbash
