@@ -231,6 +231,8 @@ class FakeMacCalls:
         closes_after_n_polls: int | None = None,
         session_ok: bool = True,
         session_reason: str = "",
+        ax_trust_ok: bool = True,
+        ax_trust_reason: str = "",
         frontmost: bool = True,
         frontmost_pid: int | None = None,
     ) -> None:
@@ -242,6 +244,11 @@ class FakeMacCalls:
         self._alive_poll_count = 0
         self._session_ok = session_ok
         self._session_reason = session_reason
+        # #3566: whether this process identity holds Accessibility trust —
+        # defaults to trusted so every test that isn't specifically about
+        # the trust precheck is unaffected.
+        self._ax_trust_ok = ax_trust_ok
+        self._ax_trust_reason = ax_trust_reason
         # #3566: whether the launched pid is frontmost — `frontmost_pid`
         # lets a test name a SPECIFIC other pid "stealing" focus (mirroring
         # the real incident's iTerm2 pid) rather than just a bare bool.
@@ -259,6 +266,9 @@ class FakeMacCalls:
 
     def session_available(self) -> tuple[bool, str]:
         return self._session_ok, self._session_reason
+
+    def ax_trust_available(self) -> tuple[bool, str]:
+        return self._ax_trust_ok, self._ax_trust_reason
 
     def is_frontmost(self, pid: int) -> tuple[bool, int]:
         self.frontmost_checks.append(pid)
@@ -376,6 +386,53 @@ class TestNativeRunnerSessionPrecheck:
 
     def test_unlocked_session_runs_normally(self) -> None:
         calls = FakeMacCalls(session_ok=True)
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch")]))
+        assert results == [{"id": "000 launch", "status": "pass", "message": ""}]
+        assert calls.launched
+
+
+class TestNativeRunnerAxTrustPrecheck:
+    """#3566: the Accessibility-trust precheck — the literal incident this
+    issue is about. A denied grant must be reported as a distinct
+    ``unavailable`` verdict, checked AFTER the session precheck but still
+    BEFORE any step (not even ``launch``) runs."""
+
+    def test_denied_trust_reports_unavailable_and_runs_no_step(self) -> None:
+        calls = FakeMacCalls(
+            ax_trust_ok=False,
+            ax_trust_reason="AXIsProcessTrusted() is False for this process identity",
+        )
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch")]))
+        assert results == [{
+            "id": "ax-trust", "status": "unavailable",
+            "message": "AXIsProcessTrusted() is False for this process identity",
+        }]
+        assert calls.launched == []
+
+    def test_denied_trust_never_a_failed_step(self) -> None:
+        calls = FakeMacCalls(ax_trust_ok=False, ax_trust_reason="denied")
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch")]))
+        assert all(r["status"] != "fail" for r in results)
+
+    def test_session_precheck_runs_before_trust_precheck(self) -> None:
+        """A locked screen is reported as 'session' unavailable even when
+        trust is ALSO denied — the session check still runs first (#3510
+        predates this precheck and keeps its own id/ordering)."""
+        calls = FakeMacCalls(
+            session_ok=False, session_reason="the screen is locked",
+            ax_trust_ok=False, ax_trust_reason="denied",
+        )
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch")]))
+        assert results == [
+            {"id": "session", "status": "unavailable", "message": "the screen is locked"}
+        ]
+
+    def test_trusted_identity_runs_normally(self) -> None:
+        calls = FakeMacCalls(ax_trust_ok=True)
         runner = _runner(calls)
         results = runner.run(_spec([_step("launch")]))
         assert results == [{"id": "000 launch", "status": "pass", "message": ""}]

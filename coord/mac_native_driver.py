@@ -111,6 +111,30 @@ launches anything it calls :meth:`MacCalls.session_available` — real check:
 unavailable, the run returns a single ``status="unavailable"`` result —
 never a ``"fail"`` — and no step (not even ``launch``) runs. See
 :mod:`coord.win_native_driver`'s own module docstring for the same shape.
+
+**Accessibility-trust precheck, in production, not just in a test fixture
+(#3566).** The locked-screen precheck above answers "is there a session to
+launch into" — it says nothing about whether THIS process identity actually
+holds Accessibility trust, which is the exact incident this driver exists to
+prevent: the first live `mac-native` bugbash attempt found
+`AXIsProcessTrusted() == False` deep inside a worker and, with nothing in
+the driver itself to catch it, improvised unsafe workarounds instead (see
+the frontmost-refusal note above). Immediately after `session_available`,
+:meth:`NativeRunner.run` also calls :meth:`MacCalls.ax_trust_available` —
+real check: `ApplicationServices.AXIsProcessTrusted()`, asked IN-PROCESS
+(unlike `coord.prereqs`'s own `/health` probe, which deliberately asks from
+a fresh subprocess because it runs inside the long-lived `coord agent`
+process — a different identity than the worker that will actually drive
+input; here, `NativeRunner.run` already runs INSIDE the worker's own
+process, so asking in-process asks the right identity directly). A denied
+grant returns a single `status="unavailable"` result — same shape and same
+non-"fail" treatment as the session precheck — before `launch` or any other
+step runs, so a missing grant fails fast with a real, worker-emitted verdict
+instead of every subsequent `send_key`/`send_click` silently (or unsafely)
+failing later. The message text deliberately matches
+`coord.bugbash._UNAVAILABLE_SIGNATURES`'s `"AXIsProcessTrusted() is False"`
+entry, so a worker's raw transcript carries the real driver's own words, not
+just a hand-written test string.
 """
 
 from __future__ import annotations
@@ -339,6 +363,18 @@ class MacCalls(Protocol):
         crash."""
         ...
 
+    def ax_trust_available(self) -> tuple[bool, str]:
+        """``(True, "")`` when THIS process identity currently holds
+        Accessibility trust (``AXIsProcessTrusted()``); ``(False, reason)``
+        when it does not (#3566) — checked by :meth:`NativeRunner.run`
+        immediately after :meth:`session_available`, BEFORE any step
+        (including ``launch``) runs, so a missing grant is reported as
+        ``status="unavailable"`` rather than every subsequent key/click
+        step failing (or, worse, a worker improvising an unsafe workaround
+        around it). Never raises — a probe failure here is itself an
+        "unavailable" verdict, not a crash."""
+        ...
+
 
 def _find_a11y_match(elements: list[dict], role: str, name: str) -> dict | None:
     """The first *elements* entry whose ``role`` matches exactly
@@ -392,10 +428,12 @@ class NativeRunner:
 
     def run(self, spec: NativeSpec) -> list[dict]:
         """Run *spec*, first checking :meth:`MacCalls.session_available`
-        (#3510). A locked screen or absent GUI session is an environment
-        condition, not an app bug: when unavailable, this returns a single
-        ``status="unavailable"`` entry and runs NO step at all (not even
-        ``launch``) — never folding it into an ordinary ``"fail"``."""
+        (#3510) and then :meth:`MacCalls.ax_trust_available` (#3566). A
+        locked screen, absent GUI session, or missing Accessibility grant is
+        an environment condition, not an app bug: when either is
+        unavailable, this returns a single ``status="unavailable"`` entry
+        and runs NO step at all (not even ``launch``) — never folding it
+        into an ordinary ``"fail"``."""
         self._spec = spec
         available, reason = self._calls.session_available()
         if not available:
@@ -403,6 +441,13 @@ class NativeRunner:
                 "id": "session",
                 "status": "unavailable",
                 "message": reason or "no unlocked GUI session is available",
+            }]
+        trusted, trust_reason = self._calls.ax_trust_available()
+        if not trusted:
+            return [{
+                "id": "ax-trust",
+                "status": "unavailable",
+                "message": trust_reason or "AXIsProcessTrusted() is False",
             }]
         results: list[dict] = []
         try:
@@ -675,6 +720,33 @@ class MacOSCalls:
         if not bool(session_info.get("kCGSessionOnConsoleKey", True)):
             return False, (
                 "the session is not on the console (fast user switched away)"
+            )
+        return True, ""
+
+    # -- Accessibility-trust precheck (#3566) --
+
+    def ax_trust_available(self) -> tuple[bool, str]:
+        """Real check: ``ApplicationServices.AXIsProcessTrusted()``, asked
+        IN-PROCESS. Unlike :mod:`coord.prereqs`'s own ``/health`` probe
+        (which deliberately shells out to a fresh ``sys.executable``
+        subprocess because IT runs inside the long-lived ``coord agent``
+        process, a different identity than a dispatched worker), this call
+        already runs inside the worker process that will actually drive
+        input — so asking in-process asks exactly the identity that
+        matters, with no subprocess indirection needed. The message text
+        deliberately matches
+        :data:`coord.bugbash._UNAVAILABLE_SIGNATURES`'s
+        ``"AXIsProcessTrusted() is False"`` entry."""
+        ax = self._ax
+        try:
+            trusted = bool(ax.AXIsProcessTrusted())
+        except Exception as e:  # noqa: BLE001 — a probe failure IS the verdict
+            return False, f"AXIsProcessTrusted() probe raised: {e}"
+        if not trusted:
+            return False, (
+                "AXIsProcessTrusted() is False for this process identity — "
+                "grant Accessibility to it in System Settings -> Privacy & "
+                "Security -> Accessibility, then relaunch the agent (#3566)"
             )
         return True, ""
 

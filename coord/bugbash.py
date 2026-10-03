@@ -54,11 +54,25 @@ lane for the round (:attr:`RoundReport.unavailable_lanes`) rather than
 running the exploration checklist against it or filing any finding from it
 — a locked desktop is an environment condition for the operator to fix,
 not evidence of an app bug. This engine-level behavior is unit-tested
-against a fake explorer in ``tests/test_bugbash.py``; the production
-explorer (:func:`coord.commands.bugbash._dispatch_and_await_lane`) does
-not itself set ``unavailable`` yet — see its own module docstring's
-"KNOWN GAP" note — so a live ``coord bugbash`` run does not currently
-benefit from this skip until that wiring lands.
+against a fake explorer in ``tests/test_bugbash.py``; as of #3566 the
+production explorer (:func:`coord.commands.bugbash._dispatch_and_await_lane`)
+also sets ``unavailable`` — it detects a lane worker's own "unavailable"
+report (:func:`parse_unavailable_report`) and the real ``mac-native`` driver
+now emits a genuine ``status="unavailable"`` verdict for a denied
+Accessibility-trust grant (see :mod:`coord.mac_native_driver`'s own module
+docstring), so this is reachable in production, not just in a test fixture.
+A real two-lane live dry run against the fleet is still outstanding — see
+``coord.commands.bugbash``'s own "KNOWN GAP" note.
+
+**#3566: lane routing cross-references live ``/health`` probes, not just the
+static ``coordinator.yml`` claim.** :func:`_pick_lane_machine` mirrors
+:mod:`coord.smoke`'s ``dispatch_smoke`` cross-check
+(:func:`coord.smoke._capability_probe_reasons`): a machine whose declared
+capability is contradicted by its own live probe (e.g. ``macos`` declared
+but Accessibility trust denied, or Screen Recording denied) is skipped
+rather than picked, so ``coord bugbash`` refuses to route to it the same way
+``dispatch_smoke`` already does — not just in `/health`'s own JSON, but in
+the machine selection that actually dispatches a worker.
 """
 
 from __future__ import annotations
@@ -356,10 +370,17 @@ _UNAVAILABLE_FENCE_RE = re.compile(
 #: still has one of these strings somewhere in its raw transcript. Matched
 #: against the FULL log text (not just the final assistant message), so a
 #: worker that reported the condition mid-session and then crashed is still
-#: caught. Kept narrow and literal — these are the exact strings
-#: `coord.mac_native_driver`/`coord.win_native_driver`/
-#: `coord.gtk_native_driver`'s own session/trust probes emit, never a vague
-#: substring that could false-positive on an unrelated mention of
+#: caught. Kept narrow and literal: `"no unlocked GUI session is available"`/
+#: `"the screen is locked"`/`"is not on the console"`/
+#: `"AXIsProcessTrusted() is False"` are the exact strings
+#: `coord.mac_native_driver`'s own `session_available`/`ax_trust_available`
+#: precheck now actually emits in production (#3566) — reachable, not just
+#: hand-written in a test. `"AXIsProcessTrusted() returned False"` and
+#: `"CGPreflightScreenCaptureAccess"` are defensive-only: no in-tree driver
+#: emits that exact phrasing today, but `coord.prereqs`'s own `/health` probe
+#: text and a future Screen-Recording driver precheck are plausible sources,
+#: and keeping the signature narrow and literal costs nothing. None of these
+#: are a vague substring that could false-positive on an unrelated mention of
 #: "unavailable" in a finding's prose.
 _UNAVAILABLE_SIGNATURES: tuple[str, ...] = (
     '"status": "unavailable"',
@@ -590,7 +611,9 @@ class BugbashLane:
     reference: bool = False
 
 
-def discover_lanes(config: Any, repo_name: str, *, reference_backend: str = "") -> list[BugbashLane]:
+def discover_lanes(
+    config: Any, repo_name: str, *, reference_backend: str = "", http_client: Any = None,
+) -> list[BugbashLane]:
     """Derive *repo_name*'s bugbash lanes from its acceptance drivers,
     routed to a capable machine the same way
     :mod:`coord.smoke`'s ``capability_rules`` routes smoke legs.
@@ -598,11 +621,15 @@ def discover_lanes(config: Any, repo_name: str, *, reference_backend: str = "") 
     Walks the repo's top-level driver plus every ``routes:`` entry (mirrors
     :meth:`coord.config.AcceptanceConfig.entrypoints`'s walk), keeps only
     :data:`LANE_DRIVER_KINDS` entries, and drops any that has no configured
-    machine listing both *repo_name* and the driver's ``capability`` — a
-    lane with no capable machine is omitted rather than returned with
-    ``machine=""``, so a caller never has to separately check "is this lane
-    actually runnable." *reference_backend*, when it names one of the
-    surviving lanes' ``platform``, marks that lane's ``reference=True``.
+    machine listing both *repo_name* and the driver's ``capability`` AND
+    whose live ``/health`` probe doesn't contradict that claim (#3566, see
+    :func:`_pick_lane_machine`) — a lane with no capable machine is omitted
+    rather than returned with ``machine=""``, so a caller never has to
+    separately check "is this lane actually runnable." *reference_backend*,
+    when it names one of the surviving lanes' ``platform``, marks that
+    lane's ``reference=True``. *http_client*, when given, is forwarded to
+    the ``/health`` cross-check (tests inject a fake; production leaves it
+    ``None`` and gets a real ``httpx`` call).
     """
     entry = config.acceptance.drivers.get(repo_name)
     if entry is None:
@@ -613,7 +640,7 @@ def discover_lanes(config: Any, repo_name: str, *, reference_backend: str = "") 
     for cfg in candidates:
         if cfg.kind not in LANE_DRIVER_KINDS:
             continue
-        machine = _pick_lane_machine(config, repo_name, cfg.capability)
+        machine = _pick_lane_machine(config, repo_name, cfg.capability, http_client=http_client)
         if machine is None:
             continue
         lanes.append(
@@ -628,10 +655,42 @@ def discover_lanes(config: Any, repo_name: str, *, reference_backend: str = "") 
     return lanes
 
 
-def _pick_lane_machine(config: Any, repo_name: str, capability: str) -> str | None:
+def _pick_lane_machine(
+    config: Any, repo_name: str, capability: str, *, http_client: Any = None,
+) -> str | None:
+    """The first configured machine that both claims *capability* in
+    ``coordinator.yml`` AND repo-membership for *repo_name* — cross-checked
+    against that machine's own live ``/health`` tool probes (#3566) before
+    it's picked, not just the static claim.
+
+    Before this fix, this function (and therefore every ``coord bugbash``
+    dispatch) only ever asked ``capability in m.capabilities`` — a
+    hand-written ``coordinator.yml`` claim nothing verified — while
+    :mod:`coord.smoke`'s own ``dispatch_smoke`` already cross-referenced
+    ``/health``'s ``tool_versions`` (:func:`coord.smoke
+    ._capability_probe_reasons`) before routing smoke work. A ``macos``
+    machine whose Accessibility/Screen-Recording trust (:mod:`coord.prereqs`'s
+    ``macos-accessibility-trust``/``macos-screen-recording`` probes) was
+    revoked therefore still looked dispatchable to bugbash even though
+    ``/health`` itself would have said otherwise — the exact gap the first
+    live ``mac-native`` attempt hit. Reusing
+    :func:`coord.smoke._capability_probe_reasons` here (rather than a second,
+    independently-drifting copy of the same dict) means ``coord bugbash``
+    now refuses to route to a machine with a known-unmet required-capability
+    prereq the same way ``dispatch_smoke`` already does, falling through to
+    the next capable-on-paper machine (or returning ``None`` if none remain)
+    instead of dispatching a worker that can never actually run the lane.
+    """
+    from coord.smoke import _capability_probe_reasons  # noqa: PLC0415 — avoid an import cycle
+
     for m in config.machines:
-        if repo_name in m.repos and (not capability or capability in m.capabilities):
-            return m.name
+        if repo_name not in m.repos:
+            continue
+        if capability and capability not in m.capabilities:
+            continue
+        if capability and _capability_probe_reasons(m, [capability], http_client=http_client):
+            continue  # declared but the machine's own /health probe denies it
+        return m.name
     return None
 
 
