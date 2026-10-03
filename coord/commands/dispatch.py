@@ -1733,6 +1733,76 @@ def _build_interactive_launch_setup(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _InjectTarget:
+    """Resolved (machine, repo_name, issue_number) for an `inject` call —
+    repo_name/issue_number are display-only (the final "delivered to ..."
+    line), never used to route the POST itself (that's machine + the
+    assignment id alone)."""
+
+    machine: "Machine"
+    repo_name: str
+    issue_number: int
+
+
+def _resolve_inject_target(assignment_id: str, board, cfg) -> tuple[_InjectTarget | None, str]:
+    """Resolve *assignment_id* to a machine, preferring the board but
+    falling back to scanning every configured machine's own `/status`
+    (#3566 ask #6). Returns ``(target, "")`` on success, or ``(None,
+    reason)`` naming exactly why resolution failed.
+
+    `coord inject` used to refuse outright on any assignment not on the
+    board (``assignment '<id>' not found in board``) — but a dispatched
+    `bugbash-explore` worker (``issue_number=0``, no GitHub issue, by
+    construction never written to the board) has no board row to find.
+    That left an operator who needed to redirect a runaway lane worker
+    (the exact #3566 incident: injecting guidance into a worker that was
+    about to send unsafe input) with no `coord inject` path at all, only a
+    raw ``POST /inject/{id}`` straight to the agent.
+
+    The board lookup stays first and is unchanged for every ordinary
+    (board-tracked) assignment — this is additive, never a behaviour
+    change for the common case. The fallback is a live, per-machine
+    ``GET /status`` scan (#2096: an agent's own current state, not a
+    locally-cached guess) — the SAME ``{"active": [...], "completed":
+    [...]}`` shape the chat-continue session-id fallback above this
+    function already reads, so "which machine is this assignment on" has
+    one answer, reached one way, for everyone who needs it (#2096's "one
+    question, one answer")."""
+    assignment = board.find_by_id(assignment_id)
+    if assignment is not None:
+        machine = next(
+            (m for m in cfg.machines if m.name == assignment.machine_name), None
+        )
+        if machine is None:
+            return None, f"machine {assignment.machine_name!r} not in config"
+        return _InjectTarget(
+            machine=machine, repo_name=assignment.repo_name,
+            issue_number=assignment.issue_number,
+        ), ""
+
+    from coord.network import fetch_status  # noqa: PLC0415
+
+    for machine in cfg.machines:
+        status_result = fetch_status(machine)
+        if not status_result.ok or not status_result.data:
+            continue
+        for bucket in ("active", "completed"):
+            for entry in status_result.data.get(bucket, []):
+                if entry.get("id") != assignment_id:
+                    continue
+                spec = entry.get("spec") or {}
+                return _InjectTarget(
+                    machine=machine,
+                    repo_name=spec.get("repo_name", "") or "",
+                    issue_number=int(spec.get("issue_number", 0) or 0),
+                ), ""
+    return None, (
+        f"assignment {assignment_id!r} not found in board or on any "
+        "configured machine's /status"
+    )
+
+
 @click.command(help="Send a user message to a running worker mid-session.")
 @click.argument("assignment_id")
 @click.argument("text", nargs=-1, required=True)
@@ -1743,6 +1813,10 @@ def inject(assignment_id: str, text: tuple[str, ...], config_path: Path) -> None
     The worker picks the message up at its next turn boundary — between
     tool calls, not mid-tool.  Useful for adding guidance to a worker
     that's going off the rails without having to stop + re-dispatch.
+
+    Resolves the target machine via :func:`_resolve_inject_target` — the
+    board when the assignment is board-tracked, or a live per-machine
+    `/status` scan when it isn't (e.g. a `bugbash-explore` worker, #3566).
     """
     from coord.board_service import read_board
     from coord.network import inject_message
@@ -1750,16 +1824,9 @@ def inject(assignment_id: str, text: tuple[str, ...], config_path: Path) -> None
     cfg = _load_config(config_path)
     board = read_board()
 
-    assignment = board.find_by_id(assignment_id)
-    if assignment is None:
-        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
-        sys.exit(1)
-
-    machine = next(
-        (m for m in cfg.machines if m.name == assignment.machine_name), None
-    )
-    if machine is None:
-        click.echo(f"error: machine {assignment.machine_name!r} not in config", err=True)
+    target, reason = _resolve_inject_target(assignment_id, board, cfg)
+    if target is None:
+        click.echo(f"error: {reason}", err=True)
         sys.exit(1)
 
     message = " ".join(text).strip()
@@ -1768,16 +1835,17 @@ def inject(assignment_id: str, text: tuple[str, ...], config_path: Path) -> None
         sys.exit(2)
 
     try:
-        status, body = inject_message(machine, assignment_id, message)
+        status, body = inject_message(target.machine, assignment_id, message)
     except (httpx.HTTPError, httpx.TimeoutException) as e:
-        click.echo(f"error: could not reach agent on {machine.name}: {e}", err=True)
+        click.echo(f"error: could not reach agent on {target.machine.name}: {e}", err=True)
         sys.exit(1)
 
     if status == 202:
-        click.echo(
-            f"Message delivered to {assignment.repo_name} #{assignment.issue_number} "
-            f"on {machine.name}"
+        destination = (
+            f"{target.repo_name} #{target.issue_number}"
+            if target.repo_name else "(no board/repo info — board-less assignment)"
         )
+        click.echo(f"Message delivered to {destination} on {target.machine.name}")
     else:
         click.echo(
             f"error: agent rejected message (HTTP {status}): {body.get('error', body)}",

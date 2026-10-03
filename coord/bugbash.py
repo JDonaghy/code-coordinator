@@ -339,6 +339,69 @@ def parse_findings_block(text: str, *, platform: str, repo: str) -> FindingsPars
     return FindingsParseResult(findings=findings)
 
 
+#: #3566 ask #4/#5: the briefing's hard-rule reporting contract for a lane
+#: worker that hits a missing permission (Accessibility/Screen Recording
+#: trust, a locked/absent GUI session, ...) instead of improvising a
+#: workaround. Mirrors :data:`FINDINGS_FENCE`'s "one constant, used by both
+#: the briefing and the parser" discipline so the two can never drift apart.
+UNAVAILABLE_FENCE = "bugbash-unavailable"
+
+_UNAVAILABLE_FENCE_RE = re.compile(
+    rf"```{re.escape(UNAVAILABLE_FENCE)}\s*\n(.*?)```", re.DOTALL,
+)
+
+#: Fallback signatures (#3566 ask #5, "a driver session/permission
+#: failure") — a worker that forgot to fence its unavailable report, or
+#: whose own driver call surfaced the condition directly in a tool result,
+#: still has one of these strings somewhere in its raw transcript. Matched
+#: against the FULL log text (not just the final assistant message), so a
+#: worker that reported the condition mid-session and then crashed is still
+#: caught. Kept narrow and literal — these are the exact strings
+#: `coord.mac_native_driver`/`coord.win_native_driver`/
+#: `coord.gtk_native_driver`'s own session/trust probes emit, never a vague
+#: substring that could false-positive on an unrelated mention of
+#: "unavailable" in a finding's prose.
+_UNAVAILABLE_SIGNATURES: tuple[str, ...] = (
+    '"status": "unavailable"',
+    '"status":"unavailable"',
+    "no unlocked GUI session is available",
+    "the screen is locked",
+    "is not on the console",
+    "AXIsProcessTrusted() is False",
+    "AXIsProcessTrusted() returned False",
+    "CGPreflightScreenCaptureAccess",
+)
+
+
+def parse_unavailable_report(text: str) -> str:
+    """The lane-unavailable reason from *text* (a lane worker's full
+    transcript), or ``""`` if none is present (#3566).
+
+    First checks for the authoritative fenced
+    ```` ```bugbash-unavailable ```` block the briefing instructs a worker
+    to write when it hits a missing permission or absent session rather
+    than improvising a workaround (ask #4's hard rule). Falls back to
+    :data:`_UNAVAILABLE_SIGNATURES` — a driver-level session/permission
+    failure surfacing directly in a tool result even without the worker's
+    own cooperation.
+
+    Never raises. The caller
+    (:func:`coord.commands.bugbash._dispatch_and_await_lane`) treats a
+    non-empty return as :attr:`ExploreOutcome.unavailable`, never
+    ``ok=False``/a protocol error — #2096's "one question, one answer":
+    this is the ONE place that question is answered.
+    """
+    match = _UNAVAILABLE_FENCE_RE.search(text)
+    if match:
+        reason = match.group(1).strip()
+        if reason:
+            return reason
+    for signature in _UNAVAILABLE_SIGNATURES:
+        if signature in text:
+            return f"driver/session signal found in transcript: {signature!r}"
+    return ""
+
+
 # ── dedupe ───────────────────────────────────────────────────────────────
 
 
@@ -592,6 +655,16 @@ def build_exploration_briefing(
         "",
         f"Reference backend for comparison: {reference_backend or '(none configured)'}",
         "",
+        "HARD RULE — drive the app ONLY through this lane's own driver "
+        "(coord.mac_native_driver / coord.win_native_driver / "
+        "coord.gtk_native_driver, whichever this lane is). Never use "
+        "osascript, System Events, a Terminal/iTerm `do script`, a "
+        "home-made input-injection helper, or System Settings. If a "
+        "required permission (Accessibility, Screen Recording, a locked/"
+        "absent GUI session, ...) is missing, STOP IMMEDIATELY and report "
+        "the lane unavailable (see below) — do NOT improvise a workaround, "
+        "and do NOT send any key or click to recover (#3566).",
+        "",
         "1. Run this repo's Tier-2 smoke spec for this driver to completion.",
         "2. Then walk the exploration checklist below on the real app, using "
         "the native driver's own probes/captures as evidence:",
@@ -603,7 +676,13 @@ def build_exploration_briefing(
         "For anything that behaves differently from the reference backend, "
         "or crashes, hangs, or renders wrong, report it as a finding.",
         "",
-        "When done, end your final message with a fenced "
+        "If the HARD RULE above fires (a required permission/session is "
+        "missing), skip the findings fence entirely and end your final "
+        "message with a fenced "
+        f"```{UNAVAILABLE_FENCE}``` block containing one line: the reason "
+        "the lane is unavailable.",
+        "",
+        "Otherwise, when done, end your final message with a fenced "
         f"```{FINDINGS_FENCE}``` block containing a JSON array of finding "
         "objects, each with: title, expected, actual, repro, evidence, "
         "suspected_repo (the repo the FIX belongs in — the app, its UI "
@@ -657,9 +736,10 @@ class ExploreOutcome:
     :attr:`RoundReport.lane_failures` — and never file findings from it
     this round, even defensively, regardless of what ``findings`` carries.
     The production explorer,
-    :func:`coord.commands.bugbash._dispatch_and_await_lane`, does not yet
-    set this flag (tracked as a KNOWN GAP in that module's docstring) —
-    today this is exercised only at the engine/unit-test level.
+    :func:`coord.commands.bugbash._dispatch_and_await_lane`, sets this flag
+    too (#3566): it detects a worker's own "lane unavailable" report (or a
+    driver session/permission failure surfacing directly in the transcript)
+    via :func:`parse_unavailable_report`.
 
     ``protocol_error`` is a FOURTH, separate outcome (#3517): the lane
     worker DID run to completion (``ok=True``, unlike a dispatch/poll/log

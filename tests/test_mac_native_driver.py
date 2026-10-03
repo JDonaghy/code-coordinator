@@ -231,6 +231,8 @@ class FakeMacCalls:
         closes_after_n_polls: int | None = None,
         session_ok: bool = True,
         session_reason: str = "",
+        frontmost: bool = True,
+        frontmost_pid: int | None = None,
     ) -> None:
         self.launch_fails = launch_fails
         self.window_never_appears = window_never_appears
@@ -240,17 +242,29 @@ class FakeMacCalls:
         self._alive_poll_count = 0
         self._session_ok = session_ok
         self._session_reason = session_reason
+        # #3566: whether the launched pid is frontmost — `frontmost_pid`
+        # lets a test name a SPECIFIC other pid "stealing" focus (mirroring
+        # the real incident's iTerm2 pid) rather than just a bare bool.
+        self._frontmost = frontmost
+        self._frontmost_pid = frontmost_pid if frontmost_pid is not None else 424242
 
         self.launched: list[tuple[str, str]] = []
         self.moved: list[tuple[int, int, int, int, int, int]] = []
-        self.clicks: list[tuple[int, int, int, str]] = []
+        self.clicks: list[tuple[int, int, int, int, str]] = []
         self.keys: list[tuple[int, str]] = []
         self.killed: list[int] = []
+        self.frontmost_checks: list[int] = []
         self._next_pid = 1000
         self._window_id = 5555
 
     def session_available(self) -> tuple[bool, str]:
         return self._session_ok, self._session_reason
+
+    def is_frontmost(self, pid: int) -> tuple[bool, int]:
+        self.frontmost_checks.append(pid)
+        if self._frontmost:
+            return True, pid
+        return False, self._frontmost_pid
 
     def launch(self, command: str, cwd: str) -> int:
         if self.launch_fails:
@@ -275,8 +289,8 @@ class FakeMacCalls:
         self._alive_poll_count += 1
         return self._alive_poll_count <= self._closes_after_n_polls
 
-    def send_click(self, window_id: int, x: int, y: int, button: str) -> None:
-        self.clicks.append((window_id, x, y, button))
+    def send_click(self, pid: int, window_id: int, x: int, y: int, button: str) -> None:
+        self.clicks.append((pid, window_id, x, y, button))
 
     def send_key(self, pid: int, key: str) -> None:
         self.keys.append((pid, key))
@@ -381,13 +395,13 @@ class TestNativeRunnerActions:
         runner.run(_spec([
             _step("launch", 0), _step("click", 1, x=42, y=7, button="right"),
         ]))
-        assert calls.clicks == [(calls._window_id, 42, 7, "right")]
+        assert calls.clicks == [(calls._next_pid, calls._window_id, 42, 7, "right")]
 
     def test_click_defaults_to_left_button(self) -> None:
         calls = FakeMacCalls()
         runner = _runner(calls)
         runner.run(_spec([_step("launch", 0), _step("click", 1, x=1, y=1)]))
-        assert calls.clicks == [(calls._window_id, 1, 1, "left")]
+        assert calls.clicks == [(calls._next_pid, calls._window_id, 1, 1, "left")]
 
     def test_wait_step_sleeps_approximately_ms(self) -> None:
         calls = FakeMacCalls()
@@ -403,6 +417,58 @@ class TestNativeRunnerActions:
         capture_entry = results[1]
         assert capture_entry["status"] == "pass"
         assert base64.b64decode(capture_entry["capture_b64"]) == b"one-frame"
+
+
+class TestNativeRunnerFrontmostRefusal:
+    """#3566: the first live `mac-native` bugbash attempt sent keys/clicks
+    while `AXIsProcessTrusted() == False` with the real frontmost pid
+    belonging to the operator's iTerm2 — `NativeRunner` must refuse any
+    key/click unless the launched pid is confirmed frontmost immediately
+    before the event, every single time (never a cached "was frontmost
+    once" flag)."""
+
+    def test_key_refused_when_not_frontmost(self) -> None:
+        calls = FakeMacCalls(frontmost=False, frontmost_pid=777)
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("key", 1, key="a")]))
+        assert results[1]["status"] == "fail"
+        assert "not frontmost" in results[1]["message"]
+        assert "777" in results[1]["message"]
+        assert calls.keys == []  # never actually sent
+
+    def test_click_refused_when_not_frontmost(self) -> None:
+        calls = FakeMacCalls(frontmost=False, frontmost_pid=777)
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0), _step("click", 1, x=1, y=1),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "not frontmost" in results[1]["message"]
+        assert calls.clicks == []  # never actually sent
+
+    def test_focus_failure_is_a_plain_step_failure_not_a_retry(self) -> None:
+        """A refused step must behave exactly like any other failing step
+        (one result entry, run continues to the next step) — there is no
+        retry path anywhere in `NativeRunner` that could resend into
+        whatever window is in front."""
+        calls = FakeMacCalls(frontmost=False)
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0), _step("key", 1, key="a"), _step("wait", 2, ms=1),
+        ]))
+        assert [r["status"] for r in results] == ["pass", "fail", "pass"]
+        # exactly one frontmost check per key/click step — no retry loop
+        assert calls.frontmost_checks == [calls._next_pid]
+
+    def test_key_and_click_allowed_when_frontmost(self) -> None:
+        calls = FakeMacCalls(frontmost=True)
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0), _step("key", 1, key="a"), _step("click", 2, x=1, y=1),
+        ]))
+        assert [r["status"] for r in results] == ["pass", "pass", "pass"]
+        assert calls.keys == [(calls._next_pid, "a")]
+        assert calls.clicks == [(calls._next_pid, calls._window_id, 1, 1, "left")]
 
 
 class TestNativeRunnerExpectA11y:
@@ -535,6 +601,30 @@ class TestNativeRunnerTeardownAndSafety:
 
         sig = inspect.signature(module.MacOSCalls.kill)
         assert list(sig.parameters) == ["self", "pid"]
+
+    def test_input_posted_to_pid_never_the_global_hid_tap(self) -> None:
+        """#3566: `send_click`/`send_key` must post via `CGEventPostToPid`
+        — addressed to the launched process — never the global
+        `CGEventPost(kCGHIDEventTap, ...)` tap the first live bugbash
+        incident effectively fell back to (clicks/keys landing on whatever
+        window the real OS focus was on, which was the operator's
+        iTerm2)."""
+        import coord.mac_native_driver as module
+
+        source = open(module.__file__, encoding="utf-8").read()
+        assert "CGEventPostToPid" in source
+        # No bare `CGEventPost(` call anywhere in the actual code (prose
+        # mentions in docstrings/comments are fine and deliberately
+        # excluded by only walking ast.Call nodes).
+        import ast
+
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                assert node.func.attr != "CGEventPost", (
+                    "found a bare CGEventPost(...) call — must be "
+                    "CGEventPostToPid(...) instead (#3566)"
+                )
 
 
 class TestNativeRunnerDriverLevelTimeout:

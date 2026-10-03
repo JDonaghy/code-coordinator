@@ -913,6 +913,135 @@ def _probe_nvim(prereq: Prereq, timeout: float) -> ToolProbe:
     )
 
 
+# --- `macos` capability: Accessibility / Screen Recording TRUST, not just
+# the pyobjc bindings being importable (#3566) ---------------------------
+#
+# 2026-10-03's live `mac-native` bugbash attempts established that
+# `pyobjc-quartz`/`pyobjc-application-services` being importable (the two
+# `_probe_python_module` entries just below) says nothing about whether
+# macOS's TCC subsystem has actually GRANTED this identity Accessibility or
+# Screen Recording — `AXIsProcessTrusted()` came back `False` in every
+# dispatched worker even after granting Accessibility to Homebrew's
+# `Python.app` and restarting the agent. `/health` had nothing that could
+# have caught this: no prereq asked the trust question at all, so a `macos`
+# machine with the binding installed but untrusted read as fully healthy
+# right up until a worker's first real `CGEventPost`/AX call silently did
+# nothing (or, worse, got worked around unsafely — see
+# `coord.mac_native_driver`'s frontmost-refusal docstring for what that
+# looked like in practice).
+#
+# **Identity decision (ask #1).** `AXIsProcessTrusted()`/
+# `CGPreflightScreenCaptureAccess()` are per-PROCESS-IDENTITY questions, not
+# per-binary-on-PATH ones — TCC's grant is keyed to a specific executable
+# (its code signature / ad-hoc identity), so asking the question from the
+# wrong process proves nothing. Granting Homebrew's `Python.app` and asking
+# from the long-lived `coord agent` process (as the first live attempt did)
+# answers "does the AGENT have trust", not "does a WORKER have trust" —
+# those are different processes (`launchd -> Python.app (agent) -> claude -p
+# -> shell -> python`), and granting the versioned `claude` binary a build
+# number ago would silently stop working on the next Claude Code update.
+# Neither identity is stable enough to be "the" answer long-term — the
+# durable fix is the one named in the issue: a small SIGNED HELPER binary at
+# a fixed, unversioned path that owns every real AX/CGEvent/screencapture
+# call, granted trust exactly once. Until that helper exists, these two
+# probes ask the question the same way :class:`coord.mac_native_driver
+# .MacOSCalls` itself will be asked it at run time: a fresh `sys.executable`
+# subprocess (never the long-lived agent process's own cached TCC state),
+# the same interpreter a dispatched worker's `shell -> python` hop resolves
+# to. This is deliberately injectable via `subprocess.run` (patched in
+# `tests/test_prereqs.py` with a scripted fake) rather than importing
+# `ApplicationServices`/`Quartz` in-process — unlike the presence-only
+# `_probe_python_module` checks above, these calls are NOT side-effect-free
+# across every macOS version (older releases could resurface a one-time
+# consent prompt), so they must never run inside the long-lived `/health`
+# process itself.
+_AX_TRUST_SCRIPT = (
+    "import sys\n"
+    "import ApplicationServices\n"
+    "sys.exit(0 if ApplicationServices.AXIsProcessTrusted() else 1)\n"
+)
+
+_SCREEN_RECORDING_SCRIPT = (
+    "import sys\n"
+    "import Quartz\n"
+    "sys.exit(0 if Quartz.CGPreflightScreenCaptureAccess() else 1)\n"
+)
+
+
+def _run_macos_trust_probe(
+    prereq: Prereq, timeout: float, *, script: str, denied_reason: str,
+) -> ToolProbe:
+    """Shared body for :func:`_probe_macos_accessibility_trust` and
+    :func:`_probe_macos_screen_recording` — runs *script* in a fresh
+    `sys.executable` subprocess and classifies its exit code / stderr. See
+    the module comment above for why this is a subprocess probe rather than
+    an in-process import."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"the trust-check subprocess hung or could not run — "
+                f"{prereq.what_breaks}"
+            ),
+        )
+    if result.returncode == 0:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=True,
+            version="trusted", min_version=prereq.min_version, meets_floor=None,
+            what_breaks=prereq.what_breaks,
+        )
+    stderr = (result.stderr or "").strip()
+    if "ModuleNotFoundError" in stderr or "ImportError" in stderr:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=(
+                f"pyobjc is not importable from {sys.executable} — "
+                f"{prereq.what_breaks}"
+            ),
+        )
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=False,
+        version=None, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=f"{denied_reason} — {prereq.what_breaks}",
+    )
+
+
+def _probe_macos_accessibility_trust(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `macos` capability's Accessibility-trust
+    check (#3566, ask #2) — see the module comment above
+    `_AX_TRUST_SCRIPT` for the identity rationale."""
+    return _run_macos_trust_probe(
+        prereq, timeout, script=_AX_TRUST_SCRIPT,
+        denied_reason=(
+            "AXIsProcessTrusted() is False for this process identity — "
+            "grant Accessibility to it in System Settings -> Privacy & "
+            "Security -> Accessibility, then relaunch the agent (#3566)"
+        ),
+    )
+
+
+def _probe_macos_screen_recording(prereq: Prereq, timeout: float) -> ToolProbe:
+    """`custom_probe` backing the `macos` capability's Screen-Recording-trust
+    check (#3566, ask #2) — see the module comment above
+    `_SCREEN_RECORDING_SCRIPT` for the identity rationale."""
+    return _run_macos_trust_probe(
+        prereq, timeout, script=_SCREEN_RECORDING_SCRIPT,
+        denied_reason=(
+            "CGPreflightScreenCaptureAccess() is False for this process "
+            "identity — grant Screen Recording in System Settings -> "
+            "Privacy & Security -> Screen Recording, then relaunch the "
+            "agent (#3566)"
+        ),
+    )
+
+
 # Required on every machine, no matter its declared capabilities — coord
 # itself doesn't function without these.
 BASELINE_PREREQS: tuple[Prereq, ...] = (
@@ -1174,6 +1303,32 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
         min_version=None, capability="macos",
         what_breaks=_TUI_PTY_WHAT_BREAKS,
         custom_probe=_probe_python_module("pyte"),
+    ),
+    # #3566: TRUST, not just the binding being importable — see the module
+    # comment above `_AX_TRUST_SCRIPT` for the full identity rationale. A
+    # `macos` machine whose pyobjc bindings import fine but whose worker
+    # identity was never granted Accessibility/Screen Recording must read
+    # as UNMET here, so `dispatch_smoke`/bugbash refuse to route to it
+    # instead of discovering the gap mid-run (ask #2's acceptance bar).
+    Prereq(
+        tool="macos-accessibility-trust", binary="", version_args=(),
+        version_re="", min_version=None, capability="macos",
+        what_breaks=(
+            "the mac-native driver cannot send any CGEvent key/click or "
+            "read the AX tree — every step after `launch` would fail (or, "
+            "worse, a worker could improvise an unsafe workaround, #3566)"
+        ),
+        custom_probe=_probe_macos_accessibility_trust,
+    ),
+    Prereq(
+        tool="macos-screen-recording", binary="", version_args=(),
+        version_re="", min_version=None, capability="macos",
+        what_breaks=(
+            "the mac-native driver's `capture` / failing-step evidence "
+            "step (`screencapture -l <window_id>`) produces an empty or "
+            "permission-denied image — failures ship with no evidence"
+        ),
+        custom_probe=_probe_macos_screen_recording,
     ),
     # #3233: backs the `azure` capability routing `**/*.tf` (terraform
     # driver, #3230 child 1). See the module comment above
