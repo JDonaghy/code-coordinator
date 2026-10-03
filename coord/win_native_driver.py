@@ -51,6 +51,19 @@ operator's own work, not just this driver's child. See
 ``test_no_image_name_kill_path_exists_in_the_module`` — a source-level
 regression guard, not just a behavioral one.
 
+**UNC ``cwd`` (#3543).** A WSL-hosted agent's repo worktree translates
+(``coord.win_native_bridge.translate_to_windows_path``) to a UNC path
+(``\\wsl.localhost\\Ubuntu-24.04\\...``) — the normal case for dell64, this
+fleet's only WSL-hosted ``windows``-capability agent. ``cmd.exe`` (what
+``subprocess.Popen(..., shell=True)`` always launches on Windows)
+categorically refuses a UNC current directory at its own startup and
+silently falls back to ``%windir%`` instead, breaking every relative path
+in ``run_command``. :func:`_popen_command_and_cwd` folds cmd.exe's own
+``pushd`` UNC-to-drive-letter workaround into the launched command for a
+UNC ``cwd`` rather than ever handing cmd.exe one directly; see
+:class:`Win32Calls`'s :meth:`~Win32Calls.launch`/
+:meth:`~Win32Calls.launch_in_terminal`.
+
 **Spec steps** (:func:`parse_native_spec`, YAML — the ``win-native``
 sibling of ``tui-pty``'s smoke spec):
 
@@ -762,6 +775,41 @@ def _vkey_for(key: str) -> tuple[int, bool]:
     raise WinNativeSpecError(f"unrecognized key {key!r}")
 
 
+def _is_unc_path(path: str) -> bool:
+    """True for a UNC path (``\\\\server\\share\\...``) — the shape
+    :func:`coord.win_native_bridge.translate_to_windows_path` returns for a
+    WSL-hosted repo (``\\\\wsl.localhost\\<distro>\\...``, #3543)."""
+    return path.startswith("\\\\")
+
+
+def _popen_command_and_cwd(command: str, cwd: str) -> tuple[str, str | None]:
+    """Resolve the ``command``/``cwd`` pair to actually hand
+    ``subprocess.Popen(..., shell=True)`` (#3543).
+
+    ``shell=True`` on Windows always runs *command* via ``cmd.exe /c`` —
+    and cmd.exe's own startup categorically refuses a UNC current
+    directory: confirmed directly (``cmd.exe /c "cd \\\\wsl.localhost\\...
+    && dir"`` prints "CMD does not support UNC paths as current
+    directories.") and **silently** falls back to ``%windir%``
+    (``C:\\Windows\\System32``) instead of raising — this is cmd.exe's own
+    initialization check, not a ``CreateProcess``/``lpCurrentDirectory``
+    limitation (that accepts a UNC path fine, which is exactly why the
+    failure is silent: nothing downstream of ``Popen`` ever sees an error,
+    every relative path in *command* just silently resolves against the
+    wrong directory instead).
+
+    For a UNC *cwd* this folds cmd.exe's own standard UNC workaround —
+    ``pushd`` (maps an unused drive letter to the UNC path, cds into it) —
+    into *command* itself, and returns ``cwd=None`` so ``Popen`` never
+    hands cmd.exe a UNC starting directory it cannot use in the first
+    place. A non-UNC (drive-letter) *cwd* is returned unchanged — the
+    common case, where ``Popen``'s own ``cwd=`` already works correctly.
+    """
+    if cwd and _is_unc_path(cwd):
+        return f'pushd "{cwd}" && {command}', None
+    return command, (cwd or None)
+
+
 class Win32Calls:
     """The real :class:`WinCalls` implementation — ``ctypes`` for window
     management, input injection, menu/hit-test probing and ``PrintWindow``;
@@ -789,7 +837,8 @@ class Win32Calls:
     # -- process lifecycle --
 
     def launch(self, command: str, cwd: str) -> int:
-        proc = subprocess.Popen(command, shell=True, cwd=cwd or None)
+        full_command, popen_cwd = _popen_command_and_cwd(command, cwd)
+        proc = subprocess.Popen(full_command, shell=True, cwd=popen_cwd)
         return proc.pid
 
     def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int:
@@ -798,8 +847,9 @@ class Win32Calls:
             full_command = f"wt.exe {command}"
         else:
             full_command = command
+        full_command, popen_cwd = _popen_command_and_cwd(full_command, cwd)
         proc = subprocess.Popen(
-            full_command, shell=True, cwd=cwd or None, creationflags=create_new_console,
+            full_command, shell=True, cwd=popen_cwd, creationflags=create_new_console,
         )
         return proc.pid
 

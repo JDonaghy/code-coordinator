@@ -28,6 +28,8 @@ from coord.win_native_driver import (
     WinNativeSpecError,
     Win32Calls,
     _find_a11y_match,
+    _is_unc_path,
+    _popen_command_and_cwd,
     _summarize_elements,
     _vkey_for,
     parse_native_spec,
@@ -1099,6 +1101,130 @@ class TestSessionAvailable:
         available, reason = calls.session_available()
         assert available is False
         assert "OpenInputDesktop" in reason
+
+
+# ── UNC cwd (#3543) ──────────────────────────────────────────────────────────
+
+
+class TestIsUncPath:
+    def test_unc_path_is_detected(self) -> None:
+        assert _is_unc_path(r"\\wsl.localhost\Ubuntu-24.04\home\me\repo")
+
+    def test_drive_letter_path_is_not_unc(self) -> None:
+        assert not _is_unc_path(r"C:\Users\me\repo")
+
+    def test_empty_string_is_not_unc(self) -> None:
+        assert not _is_unc_path("")
+
+
+class TestPopenCommandAndCwd:
+    """#3543: `translate_to_windows_path` renders a WSL-hosted repo's `cwd`
+    as a UNC path (`\\wsl.localhost\\...`), but `cmd.exe` — what
+    `subprocess.Popen(..., shell=True)` always launches on Windows —
+    categorically refuses a UNC current directory at its own startup and
+    silently falls back to `%windir%`, breaking every relative path in the
+    launched command. These are the "fails first" unit-level reproduction
+    the issue's acceptance bar asks for: without the `pushd` fold-in below,
+    `_popen_command_and_cwd` would hand `Popen` a `cwd=` cmd.exe cannot
+    use."""
+
+    def test_unc_cwd_is_folded_into_a_pushd_prefix_and_cwd_is_cleared(self) -> None:
+        unc = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        command, cwd = _popen_command_and_cwd("../target/app.exe sample.txt", unc)
+        assert command == f'pushd "{unc}" && ../target/app.exe sample.txt'
+        # Never hand cmd.exe a UNC `cwd=` — it refuses it regardless of
+        # what the command string itself does.
+        assert cwd is None
+
+    def test_drive_letter_cwd_passes_through_unchanged(self) -> None:
+        command, cwd = _popen_command_and_cwd("app.exe", r"C:\Users\me\repo")
+        assert command == "app.exe"
+        assert cwd == r"C:\Users\me\repo"
+
+    def test_empty_cwd_passes_through_as_none(self) -> None:
+        command, cwd = _popen_command_and_cwd("app.exe", "")
+        assert command == "app.exe"
+        assert cwd is None
+
+
+class TestWin32CallsLaunchAvoidsUncCwd:
+    """#3543: `Win32Calls.launch`/`launch_in_terminal` must never hand
+    `subprocess.Popen(..., shell=True)` a UNC `cwd=` — reproduces the exact
+    bridge-to-Windows shape (`run_native_spec_via_bridge` translates this
+    repo's WSL-hosted worktree to a UNC path and hands it to `launch`)
+    against a scripted fake `subprocess.Popen`, since the real cmd.exe
+    UNC-refusal behaviour can only be observed on a real Windows host."""
+
+    def test_launch_never_passes_a_unc_cwd_to_popen(self, monkeypatch) -> None:
+        unc = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 4242
+
+        def fake_popen(command, *, shell, cwd=None, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            captured["shell"] = shell
+            return _FakeProc()
+
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", fake_popen,
+        )
+        pid = calls.launch("cd .smoke && ../target/app.exe sample.txt", unc)
+        assert pid == 4242
+        assert captured["shell"] is True
+        assert captured["cwd"] is None  # never a UNC cwd handed to Popen
+        assert captured["command"] == (
+            f'pushd "{unc}" && cd .smoke && ../target/app.exe sample.txt'
+        )
+
+    def test_launch_in_terminal_never_passes_a_unc_cwd_to_popen(
+        self, monkeypatch,
+    ) -> None:
+        unc = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 9999
+
+        def fake_popen(command, *, shell, cwd=None, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            return _FakeProc()
+
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", fake_popen,
+        )
+        pid = calls.launch_in_terminal("app.exe", unc, "windows-terminal")
+        assert pid == 9999
+        assert captured["cwd"] is None
+        assert captured["command"] == f'pushd "{unc}" && wt.exe app.exe'
+
+    def test_launch_with_drive_letter_cwd_still_uses_popens_cwd(
+        self, monkeypatch,
+    ) -> None:
+        """Backward-compatible: the common (non-WSL) case keeps relying on
+        `Popen`'s own `cwd=`, not a `pushd` prefix."""
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 1
+
+        def fake_popen(command, *, shell, cwd=None, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            return _FakeProc()
+
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", fake_popen,
+        )
+        calls.launch("app.exe", r"C:\Users\me\repo")
+        assert captured["command"] == "app.exe"
+        assert captured["cwd"] == r"C:\Users\me\repo"
 
 
 class TestImportUia:
