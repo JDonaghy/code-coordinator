@@ -5340,7 +5340,19 @@ class TestSmokeGate:
     def test_process_hoists_target_branch_head_sha_fetch_per_group(self) -> None:
         """#1479-review (non-blocking): entries grouped under the same
         (repo_github, target_branch) share an identical target_branch_head_sha
-        — process() must fetch it once per group, not once per entry."""
+        for the PRE-merge staleness check — process() must fetch that once
+        per group, not once per entry.
+
+        #2109 review follow-up: that pre-merge, once-per-group fetch is a
+        DIFFERENT question from the verification note's post-merge fetch
+        (coord.merge_queue._build_verification_comment) — the pre-merge SHA
+        is the parent commit, the post-merge one is what each entry's own
+        merge actually produced, and the latter must NOT be hoisted (every
+        entry in the group moves the shared target branch again). So the
+        total call count here is `1` (the hoisted pre-merge fetch) plus `1`
+        per entry (each entry's own fresh post-merge verification fetch) —
+        not `1` outright.
+        """
         sha_calls: list[tuple[str, str]] = []
 
         class _TrackingGh(FakeGh):
@@ -5359,9 +5371,11 @@ class TestSmokeGate:
         process(items, _TrackingGh(), config=cfg, board=board)
 
         target_calls = [c for c in sha_calls if c == ("acme/api", "main")]
-        assert len(target_calls) == 1, (
-            "target_branch_head_sha must be fetched once per group, "
-            f"got {len(target_calls)} calls: {sha_calls}"
+        assert len(target_calls) == 1 + len(items), (
+            "target_branch_head_sha must be fetched once per group for the "
+            "pre-merge staleness check, PLUS once per entry for the #2109 "
+            f"post-merge verification note — got {len(target_calls)} calls: "
+            f"{sha_calls}"
         )
         assert items[0].target_branch_head_sha == "main-sha-shared"
         assert items[1].target_branch_head_sha == "main-sha-shared"

@@ -142,6 +142,86 @@ class TestVerificationCommentOnMerge:
         assert any(e.kind == "verification_note_failed" for e in events)
         assert any(e.kind == "merged" for e in events)
 
+    def test_merge_commit_sha_is_fresh_even_when_smoke_gate_cached_the_pre_merge_sha(
+        self,
+    ) -> None:
+        """#2109 review (blocking): `process()` caches a target-branch SHA on
+        `entry.target_branch_head_sha` BEFORE the merge happens, purely so the
+        smoke gate's own staleness check (`has_smoke_verdict`) can tell whether
+        the target moved since the test verdict was recorded. That cached
+        value is the PARENT commit — never the commit this merge actually
+        produces — so the verification note must never reuse it; it must ask
+        `gh_ops.get_branch_sha` again, strictly after the merge, for the SHA
+        the merge really produced.
+
+        Drives the smoke-gated path for real (``pipeline.default_gates``
+        includes ``"test"``) — the production path the original test suite
+        for this feature never exercised, per the review finding — with a
+        ``get_branch_sha`` stub that returns a DIFFERENT value on each call,
+        so a stale reuse and a fresh fetch are distinguishable in the
+        rendered comment body.
+        """
+        from dataclasses import dataclass, field as dc_field
+        from unittest.mock import patch
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = False  # isolate the smoke gate from the review gate
+
+        @dataclass
+        class _Cfg:
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+
+        cfg = _Cfg()
+        cfg.pipeline.default_gates = ["test", "merge"]
+
+        @dataclass
+        class _ShaSequenceGh(_VerificationGh):
+            sha_sequence: list[str] = dc_field(default_factory=list)
+            sha_calls: list[tuple[str, str]] = dc_field(default_factory=list)
+
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                self.sha_calls.append((repo, branch))
+                idx = len(self.sha_calls) - 1
+                return self.sha_sequence[idx] if idx < len(self.sha_sequence) else None
+
+        # `process()` calls `get_branch_sha` three times here: once for the
+        # entry's OWN branch head (irrelevant to this test), once for the
+        # pre-merge staleness-check fetch of the TARGET branch (#1479 — the
+        # value that ends up cached on `entry.target_branch_head_sha`), and
+        # finally the verification note's own fresh post-merge fetch. Only
+        # the last one may appear in the posted comment.
+        gh = _ShaSequenceGh(sha_sequence=[
+            "worker-branch-sha-irrelevant",
+            "parent-sha-before-merge",
+            "real-sha-after-merge",
+        ])
+
+        board = _board_with_work_test_review(test_verdict="passed")
+        items = [_q("a", issue_number=553, required_gates=["test", "merge"])]
+
+        posted: dict = {}
+
+        def _fake_upsert(repo_name, issue_number, body, *, repo_github=None):
+            posted["body"] = body
+
+        with patch("coord.merge_queue.upsert_issue_comment", side_effect=_fake_upsert):
+            events = process(items, gh, config=cfg, board=board)
+
+        assert any(e.kind == "merged" for e in events)
+        assert any(e.kind == "verification_note_posted" for e in events)
+        # The pre-merge value really was cached (proves the gate actually ran).
+        assert items[0].target_branch_head_sha == "parent-sha-before-merge"
+        # But the posted comment must carry the POST-merge SHA, not the cached
+        # pre-merge one.
+        assert "`real-sha-after-merge`" in posted["body"]
+        assert "parent-sha-before-merge" not in posted["body"]
+
 
 class TestVerificationCommentUpsertEndToEnd:
     """Drives `coord.state.upsert_issue_comment` for real (no board_service
