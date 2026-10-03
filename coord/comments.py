@@ -984,14 +984,19 @@ def format_plan(
 # ── Verification note (#2109) ────────────────────────────────────────────────
 
 _REPRO_HEADING_RE = re.compile(
-    r"^#{1,6}\s*Repro(?:duction|\s+steps)?\b.*?\n(?P<body>.*?)(?=\n#{1,6}\s|\Z)",
+    r"^#{1,6}\s*(?:Repro(?:duce|duction)?(?:\s+steps)?|Steps\s+to\s+reproduce)\b"
+    r".*?\n(?P<body>.*?)(?=\n#{1,6}\s|\Z)",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
 
 def extract_repro_section(issue_body: str | None) -> str | None:
-    """Pull the ``## Repro`` (or ``## Reproduction`` / ``## Repro steps``)
-    section out of an issue body, or ``None`` when absent/blank.
+    """Pull the repro/reproduction section out of an issue body, or
+    ``None`` when absent/blank.
+
+    Recognises ``## Repro``, ``## Reproduction``, ``## Repro steps``,
+    ``## Reproduce``, and ``## Steps to reproduce`` headings (#2109 review
+    nit — real issue bodies vary more than the original fixtures assumed).
 
     Used by the #2109 verification note's manual spot-check section — the
     one piece of the note that is quoted, not derived, and quoted from the

@@ -7406,7 +7406,9 @@ def _latest_smoke_assignment_for_entry(
     return max(smokes, key=lambda a: getattr(a, "dispatched_at", None) or 0.0)
 
 
-def _changed_test_files(entry: "QueuedMerge", gh_ops: "GhOps") -> list[str]:
+def _changed_test_files(
+    entry: "QueuedMerge", gh_ops: "GhOps", *, touched: list[str] | None = None,
+) -> list[str]:
     """Test files touched by the branch that just merged, derived straight
     from the diff (``gh_ops.get_compare_files``) — never from worker prose.
 
@@ -7416,13 +7418,21 @@ def _changed_test_files(entry: "QueuedMerge", gh_ops: "GhOps") -> list[str]:
     naming conventions. Best-effort — a lookup failure (or a stub ``GhOps``
     that doesn't support ``get_compare_files`` returning falsy) yields an
     empty list, never raises.
+
+    *touched*, when supplied, is an already-fetched ``get_compare_files``
+    result for this exact ``(target_branch, branch)`` pair — passed in by
+    ``_build_verification_comment`` so the two callers don't make the same
+    ``gh api compare`` round trip twice per merge (#2109 review, #2096: one
+    question, one answer). ``None`` (the default) fetches it here, unchanged
+    from this function's original standalone behaviour.
     """
-    try:
-        touched = gh_ops.get_compare_files(
-            entry.repo_github, entry.target_branch, entry.branch,
-        )
-    except Exception:  # noqa: BLE001 — best-effort, see docstring
-        touched = None
+    if touched is None:
+        try:
+            touched = gh_ops.get_compare_files(
+                entry.repo_github, entry.target_branch, entry.branch,
+            )
+        except Exception:  # noqa: BLE001 — best-effort, see docstring
+            touched = None
     if not touched:
         return []
     out = []
@@ -7468,23 +7478,24 @@ def _build_verification_comment(
     except Exception:  # noqa: BLE001 — best-effort
         touched = []
 
-    # Reuse the SHA `process()` already fetched for THIS entry's own
-    # staleness check (`entry.target_branch_head_sha`, #1479) when present,
-    # rather than asking `gh_ops` the identical question a second time
-    # (#2096, one question one answer) — this is also what keeps a smoke-
-    # gated group's `get_branch_sha` call count exactly as pinned by
-    # `TestSmokeGate.test_process_hoists_target_branch_head_sha_fetch_
-    # per_group`. Only falls back to a fresh fetch when nothing was cached
-    # (smoke wasn't gated, or no board was supplied).
-    if entry.target_branch_head_sha is not None:
-        merge_sha = entry.target_branch_head_sha
-    else:
-        try:
-            merge_sha = gh_ops.get_branch_sha(entry.repo_github, entry.target_branch)
-        except Exception:  # noqa: BLE001 — best-effort
-            merge_sha = None
+    # #2109 review: `entry.target_branch_head_sha` is captured BEFORE the
+    # merge (at the gating/staleness check, so `has_smoke_verdict` can tell
+    # whether the target moved since the test verdict was recorded) — it is
+    # by construction the PARENT commit, never the commit this merge just
+    # produced. Reusing it here would silently mislabel the verification
+    # note's headline "Merge commit" field with a stale pre-merge SHA (and,
+    # in a batch sharing one target branch, the same stale SHA across every
+    # entry in the group). This function is only ever called from
+    # `_maybe_post_verification`, strictly after `gh_ops.merge_pr(...)` has
+    # already succeeded, so a fresh fetch here is a genuinely different
+    # question from the pre-merge one above — not a redundant repeat of it —
+    # and is the only way to report the SHA the merge actually produced.
+    try:
+        merge_sha = gh_ops.get_branch_sha(entry.repo_github, entry.target_branch)
+    except Exception:  # noqa: BLE001 — best-effort
+        merge_sha = None
 
-    test_files = _changed_test_files(entry, gh_ops)
+    test_files = _changed_test_files(entry, gh_ops, touched=touched)
 
     work = _work_assignment_for_entry(entry, board)
     test_verdict = getattr(work, "test_state", None) if work is not None else None
