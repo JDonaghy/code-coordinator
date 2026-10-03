@@ -203,10 +203,22 @@ suite off and stopping there prints no marker, so the Test stage records NO \
 verdict and re-dispatches; because the ceiling is deterministic, every \
 re-dispatch does exactly the same thing, which is why this loop bills \
 indefinitely. Instead: POLL the backgrounded task to completion from THIS \
-same session, in bounded steps, with `BashOutput`/`TaskOutput` and the task \
-id, and read its REAL exit status before you report anything. Do NOT use a \
-foreground `until ! pgrep ...; do sleep ...; done` wait — it hits the \
-identical 600s wall.
+same session with `BashOutput`/`TaskOutput` and the task id, and read its \
+REAL exit status before you report anything.
+- WAIT IN LONG, BOUNDED SLEEPS BETWEEN POLLS — DO NOT BUSY-POLL (#3571). \
+Checking the backgrounded task again the instant you get an answer, every \
+single turn, is what makes a long build expensive: a smoke leg has been \
+measured at 721 turns / $16 and 515 turns / $8 doing exactly this, because \
+each check is a full turn that re-reads the whole (growing) transcript, so \
+cost grows roughly with the SQUARE of how long the build takes. Before every \
+poll after the first, run `sleep 300` (never more than ~540s — still safely \
+under the 600s ceiling) as its own Bash call, and only check status once \
+that call returns; do not check more than once per sleep. A single bounded \
+`sleep 300; <status check>` call like that is fine and the cheap way to \
+wait — it is well under the ceiling. What is still banned is an UNBOUNDED \
+foreground wait such as `until ! pgrep ...; do sleep ...; done`: that \
+command can itself run past 600s and get backgrounded, which is the exact \
+silent-mute failure the previous bullet exists to prevent.
 - NEVER USE `Monitor` OR ANY OTHER AWAIT-A-NOTIFICATION TOOL TO WAIT FOR A \
 RESULT (#2301). Those tools work by ending your turn so the harness can wake \
 the model back up once the condition they're watching fires — that only \
@@ -1431,9 +1443,24 @@ def build_smoke_briefing(
         "hands you a task id instead of an exit status. That is not a result. "
         "**Do not end your turn there** — poll the backgrounded task to "
         "completion from this same session (`BashOutput`/`TaskOutput` with "
-        "the id, in bounded steps) and read its real exit status before "
-        "reporting. A foreground `until ! pgrep ...; do sleep ...; done` wait "
-        "hits the identical wall, so don't."
+        "the id) and read its real exit status before reporting."
+    )
+    lines.append("")
+    lines.append(
+        "**Wait in long, bounded sleeps between polls — do not busy-poll "
+        "(#3571).** Checking again the instant you get an answer, every "
+        "single turn, is what makes a long build expensive: real legs have "
+        "run 500-700+ turns and $8-16 doing exactly this, because each "
+        "check is a full turn that re-reads the whole growing transcript, "
+        "so cost grows roughly with the square of how long the build "
+        "takes. Before every poll after the first, run `sleep 300` (never "
+        "more than ~540s — still safely under the 600s ceiling) as its own "
+        "Bash call, then check status once it returns; don't check more "
+        "than once per sleep. That single bounded `sleep 300; <status "
+        "check>` call is fine — it's the cheap way to wait. What's still "
+        "banned is an UNBOUNDED foreground wait like `until ! pgrep ...; do "
+        "sleep ...; done` — that command can itself run past 600s and get "
+        "backgrounded, defeating the point."
     )
     lines.append("")
     lines.append(

@@ -1204,6 +1204,67 @@ def test_briefing_tells_the_worker_to_poll_a_backgrounded_run() -> None:
     assert not any(line.startswith("SMOKE:") for line in briefing.splitlines())
 
 
+# ── #3571: bounded-sleep polling, not a busy-poll loop every turn ───────────
+
+
+def test_smoke_system_prompt_tells_the_worker_to_sleep_between_polls() -> None:
+    """The root cause of the $16/721-turn and $8/515-turn legs: the prompt
+    told the worker to poll "in bounded steps" and separately banned any
+    foreground sleep, which in practice reads as "check again immediately,
+    every turn" — and each such check is a full turn re-reading the whole
+    growing transcript, so cost grows roughly quadratically with build time.
+    The fix is a concrete, bounded wait between polls, not a ban on sleeping
+    at all."""
+    prompt = SMOKE_SYSTEM_PROMPT
+    assert "#3571" in prompt
+    assert "sleep 300" in prompt
+    lowered = prompt.lower()
+    assert "busy-poll" in lowered
+    # The instruction must be actionable: a number, not just "wait a bit".
+    assert "300" in prompt
+    # No line of the prompt may itself parse as a verdict.
+    assert not any(line.startswith("SMOKE:") for line in prompt.splitlines())
+
+
+def test_smoke_system_prompt_still_allows_a_single_bounded_sleep_call() -> None:
+    """#2272's original wording banned *any* foreground
+    `until ! pgrep ...; do sleep ...; done` wait, worded broadly enough that
+    a worker reading it avoided sleeping at all. The ban must survive
+    narrowed to the genuinely unbounded case — a single bounded
+    `sleep 300; <check>` call is explicitly endorsed, not merely untouched
+    by the ban."""
+    prompt = SMOKE_SYSTEM_PROMPT
+    assert "until ! pgrep" in prompt, (
+        "the unbounded foreground loop must still be named and banned"
+    )
+    assert "unbounded" in prompt.lower()
+    assert "sleep 300; <status check>" in prompt
+
+
+def test_smoke_system_prompt_caps_the_sleep_below_the_bash_ceiling() -> None:
+    """The sleep must stay comfortably under the 600s Bash ceiling, or the
+    wait call itself gets backgrounded and defeats the point."""
+    prompt = SMOKE_SYSTEM_PROMPT
+    assert "540s" in prompt
+    assert "600s" in prompt
+
+
+def test_briefing_tells_the_worker_to_sleep_between_polls() -> None:
+    """The briefing carries the same bounded-sleep instruction as the system
+    prompt — it is what the worker re-reads while deciding what to do next."""
+    briefing = build_smoke_briefing(
+        repo_github="acme/api", repo_name="api", branch="b",
+        issue_number=1, issue_title="X", smoke_command="pytest -q",
+        required_caps=[], timeout_seconds=60, is_worker=False,
+        parent_assignment_id="884e2fe6eb5b",
+    )
+    assert "#3571" in briefing
+    assert "sleep 300" in briefing
+    assert "busy-poll" in briefing.lower()
+    assert "until ! pgrep" in briefing
+    assert not any(line.startswith("SMOKE:") for line in briefing.splitlines())
+
+
 @pytest.mark.parametrize(
     "reason, expected",
     [
