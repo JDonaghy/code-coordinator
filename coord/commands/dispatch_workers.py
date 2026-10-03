@@ -4753,11 +4753,17 @@ def _dispatch_headless(
         if not effective_plan_only
         else (None, None, [])
     )
+    # #1650: computed once — both the actual routing decision
+    # (`resolve_dispatch_model_alias` below) and the `Proposal.type` it's
+    # keyed against must agree, or the echoed "pinned for type=X" reason
+    # could name a type that isn't the one actually dispatched.
+    effective_assignment_type = "plan" if effective_plan_only else (dispatch_type or "work")
     resolved_model = resolve_dispatch_model_alias(
         explicit_model=model,
         label_model=label_model,
         config=cfg,
         effective_provider_name=effective_provider_name,
+        assignment_type=effective_assignment_type,
     )
 
     proposal = Proposal(
@@ -4769,7 +4775,7 @@ def _dispatch_headless(
         rationale="manual assignment via coord assign",
         briefing=briefing,
         model=resolved_model,
-        type="plan" if effective_plan_only else (dispatch_type or "work"),
+        type=effective_assignment_type,
         required_gates=resolved_gates,
         issue_labels=issue_labels,
         driven_by=driven_by,
@@ -4795,6 +4801,15 @@ def _dispatch_headless(
         # from an intentional default in this same line of output.
         from coord.config import describe_model_choice  # noqa: PLC0415
 
+        # #1650: only report the pin when it's actually what won — an
+        # explicit --model still overrides it (see
+        # `resolve_dispatch_model_alias`'s precedence), so don't claim
+        # "pinned" for a human's own override.
+        _pinned_type = (
+            effective_assignment_type
+            if not model and cfg.models.model_for_type(effective_assignment_type)
+            else None
+        )
         click.echo(
             "  model: "
             + describe_model_choice(
@@ -4802,6 +4817,7 @@ def _dispatch_headless(
                 explicit_reason="explicit --model" if model else None,
                 matched_label=matched_label,
                 shadowed_labels=shadowed_labels,
+                pinned_type=_pinned_type,
             )
         )
     else:

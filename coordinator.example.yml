@@ -458,6 +458,21 @@ models:
   #   haiku:  claude-haiku-4-5
   #   sonnet: claude-sonnet-5
   #   opus:   claude-opus-4-8
+  #
+  # pinned (#1650): assignment type -> model route that must never be
+  # silently degraded by the escalation ladder, by `labels` above, or by a
+  # usage-gate reroute. A pinned type's route wins outright over all three
+  # — the final review gates every merge and must never be the thing a
+  # cost-driven ladder economises on. Defaults to `{review: opus}` when
+  # this key is absent entirely; an explicit `pinned: {}` opts out. A
+  # route is either a bare alias (checked against this block's own
+  # default/escalation/labels/versions, plus the haiku/sonnet/opus
+  # baseline) or a `provider/model` pair naming a `providers.definitions`
+  # entry — both are validated at config-load time, so a typo is a
+  # ConfigError at load, not a silent fall-through discovered at 2am.
+  # pinned:
+  #   review: opus
+  #   merge: claude/sonnet
 
 # providers: worker-command backend registry (#322 / #323).
 #

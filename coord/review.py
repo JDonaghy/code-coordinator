@@ -3886,7 +3886,12 @@ def dispatch_review(
         # #1430: deliberately not consulting models.labels — the reviewer's
         # effort scales with diff size, not the original work issue's tier
         # label, and #911 already pins this deliberately.
-        review_model_alias = config.models.default
+        # #1650: `models.pinned["review"]` (default: "opus") wins over
+        # `models.default` outright — the final review gates every merge
+        # and must never be silently degraded by a cost-driven ladder or a
+        # usage-gate reroute, so this is checked ahead of (and instead of)
+        # `models.default`, never folded into it.
+        review_model_alias = config.models.model_for_type("review") or config.models.default
         review_model_wire = config.models.resolve(review_model_alias)
 
         # #821: capture branch HEAD SHA once; staleness detected post-review.
@@ -5003,7 +5008,10 @@ def dispatch_scoped_review(
     if not candidates:
         return None
 
-    review_model_alias = config.models.default
+    # #1650: see the #911/#1650 comment at the other `review_model_alias`
+    # assignment site (`dispatch_review` above) — `models.pinned["review"]`
+    # wins outright over `models.default` here too.
+    review_model_alias = config.models.model_for_type("review") or config.models.default
     review_model_wire = config.models.resolve(review_model_alias)
 
     _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
