@@ -1448,6 +1448,7 @@ def dispatch_entry(
         label_model=label_model,
         config=config,
         effective_provider_name=effective_provider_name,
+        assignment_type=proposal_type,
     )
     # #1454: surfaced on the outcome so `coord milestone dispatch`'s CLI
     # output states *why* this model was picked, same as `coord assign` /
@@ -1457,11 +1458,19 @@ def dispatch_entry(
     # earlier `coord plan`/`coord milestone plan` run.
     from coord.config import describe_model_choice  # noqa: PLC0415
 
+    # #1650: a pinned type's route is the SAME one `resolve_dispatch_model_
+    # alias` above just returned (no `explicit_model` reaches this call
+    # site) — naming it here is purely a reporting concern, not a second
+    # routing decision.
+    pinned_type = (
+        proposal_type if config.models.model_for_type(proposal_type) else None
+    )
     if resolved_model:
         model_reason = describe_model_choice(
             resolved_model=resolved_model,
             matched_label=matched_label,
             shadowed_labels=shadowed_labels,
+            pinned_type=pinned_type,
         )
     else:
         # #1706/#1798: resolved_model is None when the effective provider's

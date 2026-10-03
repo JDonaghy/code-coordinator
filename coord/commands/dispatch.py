@@ -654,8 +654,13 @@ def approve(
             label_model=label_model,
             config=cfg,
             effective_provider_name=effective_provider_name,
+            assignment_type=p.type,
         )
         if p.model:
+            # #1650: a pinned type's route is the SAME one just resolved
+            # above (no `explicit_model` reaches this call site) — naming
+            # it here is a reporting concern, not a second routing decision.
+            _pinned_type = p.type if cfg.models.model_for_type(p.type) else None
             click.echo(
                 "     model: "
                 + describe_model_choice(
@@ -663,6 +668,7 @@ def approve(
                     explicit_reason="resolved at plan time" if used_plan_time_snapshot else None,
                     matched_label=matched_label,
                     shadowed_labels=shadowed_labels,
+                    pinned_type=_pinned_type,
                 )
             )
         else:

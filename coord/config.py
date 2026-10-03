@@ -755,6 +755,31 @@ class ModelsConfig:
     ``claude -p --model`` on the worker.  Aliases not present in the map
     pass through unchanged, so ``claude -p`` falls back to its CLI default
     (which today is whatever the installed claude-cli treats as latest).
+
+    `pinned` (#1650) maps an assignment ``type`` (``"review"``, ``"merge"``,
+    ...) to a model route that must never be silently degraded by the
+    escalation ladder, by ``labels``-derived routing, or by a usage-gate
+    reroute — the final review gates every merge and is never skippable,
+    so the model that performs it must never be the thing a cost-driven
+    ladder economises on. A pinned type's route wins outright: every
+    resolver in this module, and :func:`coord.dispatch.
+    resolve_dispatch_model_alias`, checks ``pinned`` FIRST and returns
+    immediately when it matches, so the ladder/labels/usage-gate are never
+    even consulted for that dispatch — see :meth:`model_for_type`.
+
+    A route is either a bare model alias (resolved against the implicit
+    ``claude`` provider's known aliases — ``default``/``escalation``/
+    ``labels.values()``/``versions`` keys, plus the baseline
+    ``haiku``/``sonnet``/``opus`` trio) or a ``provider/model`` pair (e.g.
+    ``claude/opus``) naming a provider registered in ``providers.
+    definitions``. Both forms are validated at config-parse time
+    (``_parse_models``) — an unknown provider or an unrecognised model
+    alias is a ``ConfigError`` at load, not a silent fall-through to the
+    ladder discovered at 2am.
+
+    Ships with a **default pin on `"review"`** (``opus``) rather than an
+    empty mapping — an operator who never reads #1650 still gets the safe
+    behaviour. An explicit ``pinned: {}`` in ``coordinator.yml`` opts out.
     """
 
     default: str = "sonnet"
@@ -763,6 +788,24 @@ class ModelsConfig:
     )
     labels: dict[str, str] = field(default_factory=dict)
     versions: dict[str, str] = field(default_factory=dict)
+    pinned: dict[str, str] = field(default_factory=lambda: {"review": "opus"})
+
+    def model_for_type(self, assignment_type: str | None) -> str | None:
+        """Return the pinned route for *assignment_type*, if configured.
+
+        #1650: this is the ONE question every resolver asks before
+        consulting the escalation ladder, ``labels``, or a usage-gate
+        reroute — callers short-circuit on a non-``None`` result and never
+        fall through to those mechanisms, so a pin can't be shadowed by
+        whatever any of them (including a not-yet-built usage-aware
+        reroute) would otherwise have computed. Returns ``None`` (never
+        ``default``) when *assignment_type* isn't pinned, or is ``None``
+        itself — mirroring the None-passthrough style of :meth:`resolve`/
+        :meth:`model_for_labels`.
+        """
+        if assignment_type is None:
+            return None
+        return self.pinned.get(assignment_type)
 
     def next_model(self, current: str) -> str:
         """Return the next model in the escalation ladder.
@@ -893,6 +936,7 @@ def describe_model_choice(
     explicit_reason: str | None = None,
     matched_label: str | None = None,
     shadowed_labels: list[str] | None = None,
+    pinned_type: str | None = None,
 ) -> str:
     """Format a one-line explanation of why *resolved_model* was chosen.
 
@@ -900,6 +944,13 @@ def describe_model_choice(
     mis-route to ``models.default`` (e.g. a tier label that hadn't been
     picked up yet) read identically to an intentional default — the exact
     ambiguity that made the stale-label-cache bug expensive to notice.
+
+    *pinned_type*, when set (#1650), wins outright and reports
+    ``"(pinned for type=<pinned_type>)"`` — a :attr:`ModelsConfig.pinned`
+    match is a stronger, operator-declared signal than any label match or
+    explicit reason, so callers pass it only when
+    :meth:`ModelsConfig.model_for_type` actually matched for this
+    dispatch.
 
     *explicit_reason*, when set, wins outright (e.g. ``"explicit --model"``
     or ``"resolved at plan time"``) — the caller already knows the model
@@ -913,6 +964,8 @@ def describe_model_choice(
     self-explaining at dispatch time instead of reading like the older,
     order-dependent bug.
     """
+    if pinned_type:
+        return f"{resolved_model} (pinned for type={pinned_type})"
     if explicit_reason:
         return f"{resolved_model} ({explicit_reason})"
     if matched_label:
@@ -2998,7 +3051,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     concurrency = _parse_concurrency(raw.get("concurrency"))
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
     acceptance = _parse_acceptance(raw.get("acceptance"))
-    models = _parse_models(raw.get("models"))
+    models = _parse_models(raw.get("models"), set(providers.definitions))
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
     usage_gate = _parse_usage_gate(raw.get("usage_gate"))
@@ -4114,7 +4167,7 @@ def _acceptance_entrypoint(entry: dict, label: str) -> str:
     return value
 
 
-def _parse_models(raw: Any) -> ModelsConfig:
+def _parse_models(raw: Any, known_providers: set[str] | None = None) -> ModelsConfig:
     if raw is None:
         return ModelsConfig()
     if not isinstance(raw, dict):
@@ -4154,7 +4207,90 @@ def _parse_models(raw: Any) -> ModelsConfig:
             )
         cfg.versions = dict(value)
 
+    # #1650: `pinned` is validated LAST — it references `cfg.default`/
+    # `cfg.escalation`/`cfg.labels`/`cfg.versions` (all parsed above) to
+    # build the known-alias vocabulary a bare (no-provider-prefix) route is
+    # checked against.
+    if "pinned" in raw:
+        value = raw["pinned"]
+        if not isinstance(value, dict) or not all(
+            isinstance(k, str) and k and isinstance(v, str) and v
+            for k, v in value.items()
+        ):
+            raise ConfigError(
+                "models.pinned must be a mapping of assignment type → model route"
+            )
+        cfg.pinned = dict(value)
+        for assignment_type, route in cfg.pinned.items():
+            _validate_pinned_route(
+                assignment_type, route, cfg, known_providers or {"claude"},
+            )
+    # Explicit `pinned: {}` is a deliberate opt-out — otherwise the dataclass
+    # default (`{"review": "opus"}`) already stands and needs no validation
+    # here (it's valid by construction: "opus" is in the baseline alias set
+    # checked below regardless of a custom `escalation`/`labels`/`versions`).
+
     return cfg
+
+
+#: #1650: the baseline Anthropic model aliases recognised regardless of what
+#: `models.escalation`/`models.labels`/`models.versions` a deployment
+#: configures — keeps the shipped default pin (`review: opus`) valid even
+#: for a coordinator.yml that never mentions "opus" anywhere else.
+_BASELINE_MODEL_ALIASES: frozenset[str] = frozenset({"haiku", "sonnet", "opus"})
+
+
+def _validate_pinned_route(
+    assignment_type: str, route: str, cfg: ModelsConfig, known_providers: set[str],
+) -> None:
+    """Validate one ``models.pinned[assignment_type]`` route at parse time.
+
+    #1650: a typo here must fail loudly at config load, not silently fall
+    through to the ladder/labels at dispatch time. A route is either a bare
+    model alias (checked against the known alias vocabulary for the
+    implicit ``claude`` provider — see :data:`_BASELINE_MODEL_ALIASES`) or a
+    ``provider/model`` pair, e.g. ``claude/opus`` — the provider half is
+    checked against *known_providers* (``providers.definitions``, which
+    always includes the implicit ``"claude"`` entry); the model half is only
+    checked when that provider is ``claude``/``claude-pty``-shaped (named
+    ``"claude"`` here, since ``_parse_providers`` hasn't run far enough by
+    this point to carry provider *types* — every registered claude-backed
+    provider is reachable by its own name, so this only validates the
+    common, un-aliased case). A non-claude provider's model half is a
+    backend-specific free string — not validated here, same as
+    ``ProviderDef.model`` isn't validated anywhere else in this module.
+    """
+    if "/" in route:
+        provider_name, _, model = route.partition("/")
+        if provider_name not in known_providers:
+            raise ConfigError(
+                f"models.pinned[{assignment_type!r}] references unknown "
+                f"provider {provider_name!r} (got route {route!r})"
+            )
+        if not model:
+            raise ConfigError(
+                f"models.pinned[{assignment_type!r}] is missing a model "
+                f"after the provider (got route {route!r})"
+            )
+        if provider_name != "claude":
+            return
+        model_alias = model
+    else:
+        model_alias = route
+
+    known_aliases = (
+        _BASELINE_MODEL_ALIASES
+        | {cfg.default}
+        | set(cfg.escalation)
+        | set(cfg.labels.values())
+        | set(cfg.versions.keys())
+    )
+    if model_alias not in known_aliases:
+        raise ConfigError(
+            f"models.pinned[{assignment_type!r}] references unknown model "
+            f"{model_alias!r} (got route {route!r}); known aliases: "
+            f"{sorted(known_aliases)!r}"
+        )
 
 
 def _parse_pipeline(raw: Any) -> PipelineConfig:

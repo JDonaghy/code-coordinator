@@ -442,19 +442,29 @@ def resolve_dispatch_model_alias(
     label_model: str | None,
     config: Config,
     effective_provider_name: str,
+    assignment_type: str | None = None,
 ) -> str | None:
     """Resolve the dispatch model *alias* (before ``models.resolve()``).
 
-    Precedence: *explicit_model* → the effective provider's own pinned
-    ``ProviderDef.model`` (for non-claude/claude-pty backends only) →
-    *label_model* → ``models.default``. The board/DB stores this alias for
-    legibility; the caller is responsible for the final
-    ``config.models.resolve()`` translation to an exact model id (typically
-    deferred to :func:`dispatch`/:func:`resolve_dispatch_model`, which run
-    at actual-wire-payload time — see the module docstring of each CLI
-    entry point that calls this function for why: re-resolving here would
-    bake an exact id into ``Proposal.model``/board bookkeeping instead of
-    the human-legible alias).
+    Precedence: *explicit_model* → ``models.pinned[assignment_type]``
+    (#1650) → the effective provider's own pinned ``ProviderDef.model``
+    (for non-claude/claude-pty backends only) → *label_model* →
+    ``models.default``. The board/DB stores this alias for legibility; the
+    caller is responsible for the final ``config.models.resolve()``
+    translation to an exact model id (typically deferred to
+    :func:`dispatch`/:func:`resolve_dispatch_model`, which run at
+    actual-wire-payload time — see the module docstring of each CLI entry
+    point that calls this function for why: re-resolving here would bake
+    an exact id into ``Proposal.model``/board bookkeeping instead of the
+    human-legible alias).
+
+    #1650: a type pinned via ``models.pinned`` wins over the provider pin
+    AND *label_model* — it ignores the escalation ladder, label-derived
+    routing, and a usage-gate reroute entirely, by never even reaching the
+    code that would compute those (see :meth:`coord.config.ModelsConfig.
+    model_for_type`). Only an *explicit_model* (a human being specific
+    right now, same precedent as the provider pin below) still overrides
+    it.
 
     #1798: *label_model* comes from ``models.labels``, which maps to
     Anthropic aliases (``tier:small -> haiku``) — a namespace that means
@@ -533,19 +543,26 @@ def resolve_dispatch_model_alias(
             name (spec > repo > ``providers.default``), as returned by
             :func:`coord.providers.resolve_provider_name` or
             :func:`coord.providers.guard_unattended_dispatch`.
+        assignment_type: The dispatch's assignment ``type`` (e.g.
+            ``"work"``, ``"review"``), consulted against ``models.pinned``
+            (#1650). ``None`` when the caller has no type to offer —
+            behaves exactly like an unpinned type.
 
     Returns:
         The model alias (NOT yet passed through ``config.models.resolve()``),
         or ``None`` to omit ``--model``.
     """
+    if explicit_model:
+        return explicit_model
+    pinned_model = config.models.model_for_type(assignment_type)
+    if pinned_model:
+        return pinned_model
     provider_def = config.providers.definitions.get(effective_provider_name)
     provider_pins_model = (
         provider_def is not None
         and provider_def.type not in ("claude", "claude-pty")
         and provider_def.model is not None
     )
-    if explicit_model:
-        return explicit_model
     if provider_pins_model:
         return None
     if label_model:
@@ -596,6 +613,7 @@ def resolve_dispatch_model(
         label_model=label_model,
         config=config,
         effective_provider_name=effective_provider_name,
+        assignment_type=proposal.type,
     )
     return config.models.resolve(alias)
 
