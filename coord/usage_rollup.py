@@ -46,24 +46,42 @@ from coord.config import ModelRates, PricingConfig
 
 # ── Model normalization ──────────────────────────────────────────────────────
 
-# Canonical keys this module recognizes out of the box. Anything else is
-# "(unknown)" — never guessed, never silently priced at $0.
+# Canonical keys this module recognizes out of the box (the four Anthropic
+# tiers). Anything else PASSES THROUGH verbatim (lowercased/stripped) rather
+# than collapsing to "(unknown)" — see #1651: once the escalation ladder
+# (#55) routes to a non-Anthropic model, its board `model` field is whatever
+# key that route identifies itself by (e.g. the OpenCode Zen `provider/model`
+# shape, `"opencode/glm-5.2"`, `"deepseek/deepseek-chat"` — see
+# `coord.config.model_plausible_for_provider_type`). A `pricing.models` entry
+# keyed with that EXACT string (same spelling as the route/`ProviderDef.model`
+# that produced it — there is deliberately only one spelling, never a second
+# "friendly" alias to keep in sync) now reaches `PricingConfig.rates_for`
+# instead of being shadowed by a hardcoded "(unknown)". A key with no such
+# entry still resolves to no rate (`rates_for` returns `None`) and is flagged
+# unknown exactly as before — nothing is ever *guessed* into a tier.
 _KNOWN_CANONICAL = ("sonnet", "opus", "haiku", "fable")
 
 UNKNOWN_MODEL = "(unknown)"
 
 
 def normalize_model(model: str | None) -> str:
-    """Normalize a raw ``model`` field to a canonical pricing key.
+    """Normalize a raw ``model`` field to a pricing key.
 
-    Handles bare aliases (``"sonnet"``, ``"opus"``, ``"haiku"``, ``"fable"``),
-    versioned ids (``"claude-sonnet-4-6"``, ``"claude-opus-4-7"``,
+    Handles bare Anthropic aliases (``"sonnet"``, ``"opus"``, ``"haiku"``,
+    ``"fable"``), versioned ids (``"claude-sonnet-4-6"``, ``"claude-opus-4-7"``,
     ``"claude-haiku-4-5"``, ``"claude-fable-5"``, and future dated variants —
     matched by substring so a new date suffix doesn't need a code change),
-    and the empty/``None``/``"(unknown)"`` cases. Anything that doesn't match
-    one of the four known tiers returns ``"(unknown)"`` — the estimator
-    treats that as "no rate available" and flags it, rather than defaulting
-    to a tier that might be wrong.
+    and the empty/``None``/``"(unknown)"`` cases, which all map to
+    ``"(unknown)"``.
+
+    Anything else — notably a non-Anthropic route key from the escalation
+    ladder (#55), e.g. ``"opencode/glm-5.2"`` — is returned **unchanged**
+    (just lowercased/stripped) rather than forced to ``"(unknown)"``. That
+    passthrough is what lets :meth:`coord.config.PricingConfig.rates_for`
+    see the model's own key and find an operator-configured rate for it
+    (#1651); a key nobody configured still produces no rate there (``None``)
+    and the estimator flags it unknown exactly as before — this function
+    never *guesses* a tier for an unrecognized string.
     """
     if not model:
         return UNKNOWN_MODEL
@@ -75,7 +93,7 @@ def normalize_model(model: str | None) -> str:
     for canonical in _KNOWN_CANONICAL:
         if canonical in text:
             return canonical
-    return UNKNOWN_MODEL
+    return text
 
 
 # ── Timestamp parsing ─────────────────────────────────────────────────────────
@@ -232,9 +250,11 @@ def leg_cost(row: dict, pricing: PricingConfig) -> tuple[float, float, bool]:
     verbatim as ``cost_captured`` and never also gets an estimate (no
     double-counting). A leg with ``cost_usd`` in ``{None, 0}`` **and** any
     tokens gets an estimate from *pricing*, keyed by the leg's normalized
-    model — unless the model doesn't map to a priced tier, in which case no
-    estimate is produced and ``unknown_model`` is ``True`` (never a silent
-    $0). A leg with no tokens and no captured cost is simply zero everywhere.
+    model (see :func:`normalize_model` — a canonical Anthropic tier, or a
+    non-Anthropic model's own route key, e.g. ``"opencode/glm-5.2"``) —
+    unless *pricing* has no rate for that key, in which case no estimate is
+    produced and ``unknown_model`` is ``True`` (never a silent $0). A leg
+    with no tokens and no captured cost is simply zero everywhere.
     """
     raw_cost = row.get("cost_usd")
     try:

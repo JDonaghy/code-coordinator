@@ -854,6 +854,44 @@ class TestFormatUsageByIssue:
         assert "unknown-model:1" in row_11
         assert "unknown-model" not in row_10
 
+    def test_priced_non_canonical_and_unpriced_rung_render_distinguishably(self) -> None:
+        """#1651 black-box: a rollup spanning one ladder rung that HAS a
+        configured rate (prices as a real dollar figure) and one that does
+        NOT (flagged unknown, never summed in as $0) must render the two
+        states distinguishably in the same report."""
+        from coord.config import ModelRates, PricingConfig
+        from coord.usage_rollup import Window, aggregate
+
+        rows = [
+            dict(
+                self._ROWS[0],
+                issue_number=20,
+                model="opencode/glm-5.2",
+                cost_usd=None,
+                input_tokens=1_000_000,
+                output_tokens=1_000_000,
+            ),
+            dict(self._ROWS[1], issue_number=21, model="qwen3-coder", cost_usd=None),
+        ]
+        pricing = PricingConfig(
+            models={
+                **PricingConfig().models,
+                "opencode/glm-5.2": ModelRates(input=0.60, output=2.20),
+            }
+        )
+        window = Window(start=0.0, end=10_000.0, label="test")
+        result = aggregate(
+            rows, by="issue", window=window, pricing=pricing_dict_from_config(pricing)
+        )
+        out = format_usage_by_issue(result, window.label)
+        row_20 = next(line for line in out.splitlines() if "#20" in line)
+        row_21 = next(line for line in out.splitlines() if "#21" in line)
+        # Priced rung: a real estimated dollar figure, no unknown flag.
+        assert "unknown-model" not in row_20
+        assert "$2.8000" in row_20
+        # Unpriced rung: flagged, and never silently folded into a $0 total.
+        assert "unknown-model:1" in row_21
+
 
 class TestFormatUsageIssueDrill:
     def test_no_rows_returns_a_clear_message(self) -> None:

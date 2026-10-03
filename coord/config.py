@@ -1933,21 +1933,44 @@ def _default_pricing() -> dict[str, ModelRates]:
 
 @dataclass
 class PricingConfig:
-    """``pricing:`` block (#1118) — per-canonical-model per-1M-token USD rates.
+    """``pricing:`` block (#1118) — per-1M-token USD rates, keyed by model.
 
-    ``models`` maps a canonical model key (``"sonnet"``, ``"opus"``,
-    ``"haiku"``, or any operator-added key) to its :class:`ModelRates`. An
-    absent ``pricing:`` block in coordinator.yml still yields the built-in
-    defaults via :func:`_default_pricing`. A model key with no entry here
-    (e.g. ``"(unknown)"``, or a genuinely unrecognized model string) has no
-    rate — :mod:`coord.usage_rollup` treats that as "no estimate possible"
-    and flags the group rather than silently reporting $0.
+    ``models`` maps a pricing key to its :class:`ModelRates`. The key shape
+    is whatever :func:`coord.usage_rollup.normalize_model` resolves a leg's
+    raw ``model`` field to, and there are exactly two cases (#1651):
+
+    - One of the four built-in Anthropic tiers — ``"sonnet"``, ``"opus"``,
+      ``"haiku"``, ``"fable"`` — which ``normalize_model`` also maps every
+      versioned id of (e.g. ``"claude-sonnet-4-6"``) onto.
+    - Any other model's **own route key, spelled exactly as the route that
+      dispatches it identifies it** — e.g. the escalation ladder's (#55)
+      OpenCode Zen ``provider/model`` strings, ``"opencode/glm-5.2"`` or
+      ``"deepseek/deepseek-chat"`` (see ``ProviderDef.model`` /
+      ``coord.config.model_plausible_for_provider_type``). There is
+      deliberately only ONE spelling of a given non-Anthropic model across
+      this config — the same string ``coordinator.yml``'s ``providers:`` /
+      ``models.labels``/``escalation`` already uses to route to it — rather
+      than a second "pricing alias" that could drift out of sync with the
+      routing key.
+
+    An absent ``pricing:`` block in coordinator.yml still yields the
+    built-in Anthropic defaults via :func:`_default_pricing`; a
+    non-Anthropic key is simply absent until an operator adds it. A model
+    key with no entry here (e.g. ``"(unknown)"``, a genuinely unrecognized
+    model string, or a real but un-configured route key) has no rate —
+    :mod:`coord.usage_rollup` treats that as "no estimate possible" and
+    flags the leg/group as unknown rather than silently reporting $0.
     """
 
     models: dict[str, ModelRates] = field(default_factory=_default_pricing)
 
     def rates_for(self, canonical_model: str) -> ModelRates | None:
-        """Look up rates for a canonical model key, or ``None`` if unpriced."""
+        """Look up rates for a pricing key, or ``None`` if unpriced.
+
+        *canonical_model* is whatever :func:`coord.usage_rollup.
+        normalize_model` returned — a built-in Anthropic tier name, or a
+        passed-through non-Anthropic route key (see the class docstring).
+        """
         return self.models.get(canonical_model)
 
 

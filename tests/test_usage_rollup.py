@@ -378,7 +378,18 @@ def test_leg_rows_retained_for_drill_down() -> None:
         ("(unknown)", "(unknown)"),
         ("", "(unknown)"),
         (None, "(unknown)"),
-        ("some-future-model-nobody-mapped-yet", "(unknown)"),
+        # #1651: a non-Anthropic route key (no "sonnet"/"opus"/"haiku"/
+        # "fable" substring) passes through verbatim (lowercased/stripped)
+        # rather than collapsing to "(unknown)" -- this is what lets an
+        # operator-configured `pricing.models` entry for it be found by
+        # `PricingConfig.rates_for`. A key nobody configured still produces
+        # no rate there (see test_pricing_unmapped_model_has_no_rates in
+        # tests/test_config_pricing.py) -- normalize_model itself never
+        # guesses a tier for it.
+        ("some-future-model-nobody-mapped-yet", "some-future-model-nobody-mapped-yet"),
+        ("opencode/glm-5.2", "opencode/glm-5.2"),
+        ("DeepSeek/DeepSeek-Chat", "deepseek/deepseek-chat"),
+        (" qwen3-coder ", "qwen3-coder"),
     ],
 )
 def test_normalize_model(raw: str | None, expected: str) -> None:
@@ -431,6 +442,62 @@ def test_estimate_fable_model_priced_not_flagged() -> None:
     captured, est, unknown = leg_cost(row, pricing)
     assert captured == 0.0
     assert est == pytest.approx(0.01 + 0.05)
+    assert unknown is False
+
+
+def test_estimate_non_canonical_route_key_priced_when_configured() -> None:
+    """#1651: a non-Anthropic ladder route (e.g. an OpenCode Zen model) with
+    its own `pricing.models` entry, keyed by its exact route string, prices
+    correctly -- it is no longer shadowed by normalize_model forcing every
+    non-Anthropic string to "(unknown)"."""
+    pricing = PricingConfig(
+        models={
+            **FIXTURE_PRICING.models,
+            "opencode/glm-5.2": ModelRates(
+                input=0.60, output=2.20, cache_read=0.06, cache_creation=0.75
+            ),
+        }
+    )
+    row = _leg(
+        issue_number=1, repo_name="r", type="work", model="opencode/glm-5.2",
+        is_interactive=False, cost_usd=None, input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_read_tokens=0, dispatched_at=_t(9, 0), finished_at=_t(9, 10),
+    )
+    captured, est, unknown = leg_cost(row, pricing)
+    assert captured == 0.0
+    assert est == pytest.approx(0.60 + 2.20)
+    assert unknown is False
+
+
+def test_estimate_non_canonical_route_key_unknown_when_unconfigured() -> None:
+    """#1651: a ladder rung nobody priced yet stays unknown -- never a
+    silent $0 -- distinguishing it from a genuinely free/zero-cost leg."""
+    row = _leg(
+        issue_number=1, repo_name="r", type="work", model="qwen3-coder",
+        is_interactive=False, cost_usd=None, input_tokens=1_000, output_tokens=1_000,
+        cache_read_tokens=0, dispatched_at=_t(9, 0), finished_at=_t(9, 1),
+    )
+    captured, est, unknown = leg_cost(row, FIXTURE_PRICING)
+    assert captured == 0.0
+    assert est == 0.0
+    assert unknown is True
+
+
+def test_canonical_tier_pricing_unchanged_by_passthrough_change() -> None:
+    """Regression guard: adding passthrough for non-canonical keys must not
+    touch how a canonical Anthropic tier (and its versioned ids) resolve."""
+    assert normalize_model("sonnet") == "sonnet"
+    assert normalize_model("claude-sonnet-4-6") == "sonnet"
+    assert normalize_model("opus") == "opus"
+    assert normalize_model("claude-opus-4-7") == "opus"
+    row = _leg(
+        issue_number=1, repo_name="r", type="work", model="claude-sonnet-4-6",
+        is_interactive=False, cost_usd=None, input_tokens=2_000, output_tokens=50_000,
+        cache_read_tokens=500_000, dispatched_at=_t(9, 0), finished_at=_t(9, 5),
+    )
+    captured, est, unknown = leg_cost(row, FIXTURE_PRICING)
+    assert captured == 0.0
+    assert est == pytest.approx(0.9060)
     assert unknown is False
 
 
