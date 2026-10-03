@@ -634,8 +634,31 @@ def _maybe_bash_wrap(argv: list[str], enabled: bool) -> list[str]:
     stdin pipe, and process-group kills all behave identically to a bare
     spawn. This is the upstream headline fix for the daemon-spawn freeze
     (anthropics/claude-code#56268). When disabled, the bare argv is returned.
+
+    #2843: a no-op on win32 regardless of *enabled*. `bash_wrap_spawn`
+    defaults to ``True`` (``ConcurrencyConfig.bash_wrap_spawn`` /
+    ``AgentServer.__init__``'s own default) with no platform guard anywhere
+    upstream of this call, so every assignment on a win32 agent — including
+    every fixture across ``tests/test_agent*.py`` that never explicitly sets
+    ``bash_wrap_spawn=False`` — silently routed through here. Two independent
+    reasons this must not reach a real ``bash`` on win32, not one:
+    (1) a POSIX shell is not guaranteed present at all (no shell, no
+    worktree-isolation guarantee the wrap exists to provide); and (2) even
+    where one IS present (Git for Windows' bundled MSYS bash on the
+    `windows-latest` runner), its `exec` builtin does not replace the process
+    image for a native (non-Cygwin/MSYS) executable the way POSIX `exec()`
+    does — so the "same PID, process-group kills behave identically to a
+    bare spawn" invariant this whole mitigation depends on does not hold,
+    and wrapping would be actively wrong there, not merely unavailable.
+    Measured root cause of the W11 cluster (#2843, child of #2680): the
+    worker process never spawned (or spawned under a PID the reaper's
+    bookkeeping didn't expect), so `_reap` observed a failure shape and the
+    assignment landed FAILED where every one of these tests expects
+    DONE/ADVISORY/REFUSED_*. This is a platform-assumption bug in THIS
+    function, not a process-group/Job-Objects runtime dependency — #1163
+    (CP-7, Job Objects) is unrelated and not needed to fix it.
     """
-    if not enabled:
+    if not enabled or sys.platform == "win32":
         return argv
     return ["bash", "-c", "exec " + shlex.join(argv)]
 
