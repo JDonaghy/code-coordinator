@@ -2927,7 +2927,7 @@ RPC_SUPERSEDED_BY_RESOURCE: dict[str, str] = {
     "/issue-comment": 'POST /issue/{repo_name}/{number}/comments ("action": "post")',
     "/issue-comments": (
         "GET /issue/{repo_name}/{number}/comments, or POST the same path with "
-        '"action": "capture" / "sync"'
+        '"action": "capture" / "sync" / "upsert"'
     ),
     "/assignment-usage": "PATCH /assignment/{assignment_id}",
     "/assignment-session-id": "PATCH /assignment/{assignment_id} (claude_session_id)",
@@ -3195,7 +3195,8 @@ def openapi_spec() -> dict:
                 "summary": (
                     "#1944: create or mirror one comment — the resource-shaped "
                     "stand-in for POST /issue-comment (action=post, the default) "
-                    "and POST /issue-comments (action=capture / action=sync)."
+                    "and POST /issue-comments (action=capture / action=sync / "
+                    "action=upsert, #2109)."
                 ),
                 "parameters": issue_path_params,
                 "requestBody": {
@@ -9940,6 +9941,9 @@ def build_app(
     async def post_issue_comments(request: Request) -> Response:
         # #873: capture-at-write / backfill-sync into the durable
         # issue_comments mirror on the canonical DB.
+        # #2109: also the ``"upsert"`` write for the merge-time verification
+        # note — edits a standing marked comment in place rather than
+        # posting a duplicate.
         from coord import state  # noqa: PLC0415
 
         body = await _read_json(request)
@@ -9964,6 +9968,14 @@ def build_app(
                     repo_github=body.get("repo_github"),
                 )
                 return JSONResponse({"synced": n})
+            if action == "upsert":
+                state._upsert_issue_comment_local(
+                    body["repo_name"],
+                    body["issue_number"],
+                    body["body"],
+                    repo_github=body.get("repo_github"),
+                )
+                return JSONResponse({"ok": True})
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001
@@ -10167,7 +10179,8 @@ def build_app(
     async def post_issue_comments_resource(request: Request) -> Response:
         """#1944: ``POST /issue/{repo}/{n}/comments`` — the resource-shaped
         stand-in for /issue-comment (``action="post"``, the default) and
-        /issue-comments (``action="capture"`` / ``"sync"``)."""
+        /issue-comments (``action="capture"`` / ``"sync"`` / ``"upsert"``,
+        #2109)."""
         from coord import state  # noqa: PLC0415
 
         key = _resource_issue_key(request)
@@ -10184,11 +10197,11 @@ def build_app(
                 {"error": f"unknown field(s): {', '.join(unknown)}"}, status_code=400
             )
         action = body.get("action") or "post"
-        if action not in ("post", "capture", "sync"):
+        if action not in ("post", "capture", "sync", "upsert"):
             return JSONResponse(
                 {"error": f"unknown action: {action!r}"}, status_code=400
             )
-        if action in ("post", "capture") and not body.get("body"):
+        if action in ("post", "capture", "upsert") and not body.get("body"):
             return JSONResponse(
                 {"error": f"body is required for action {action!r}"}, status_code=400
             )
@@ -10209,6 +10222,13 @@ def build_app(
                     gh_comment_id=body.get("gh_comment_id"),
                     author=body.get("author"),
                     created_at=body.get("created_at"),
+                )
+            elif action == "upsert":
+                state._upsert_issue_comment_local(
+                    repo_name,
+                    number,
+                    body["body"],
+                    repo_github=body.get("repo_github"),
                 )
             else:
                 synced = state._sync_issue_comments_local(

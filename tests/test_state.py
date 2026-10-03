@@ -6137,3 +6137,101 @@ class TestRenderIssueContextResolvedMarker:
         out = state.render_issue_context_entries(entries)
         assert "RESOLVED" not in out
         assert "- x" in out
+
+
+class TestUpsertIssueCommentLocal:
+    """#2109: `_upsert_issue_comment_local` — post when no comment on the
+    issue carries the SAME `coord:event=...` marker, else edit that one in
+    place. Pins the decision at the layer that makes it, independent of any
+    particular caller (`coord.merge_queue`'s own black-box coverage lives in
+    `tests/test_merge_verification.py`)."""
+
+    def _marked_body(self, event: str, **fields: str) -> str:
+        extra = "".join(f" {k}={v}" for k, v in fields.items())
+        return f"<!-- coord:event={event}{extra} -->\n## Note\n\nsomething"
+
+    def test_posts_when_no_comment_exists_yet(self, monkeypatch) -> None:
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "get_issue_comments", lambda repo, n: [])
+        calls = {}
+        monkeypatch.setattr(
+            github_ops, "post_issue_comment",
+            lambda repo, n, body: calls.setdefault("post", (repo, n, body)),
+        )
+        monkeypatch.setattr(
+            github_ops, "update_issue_comment",
+            lambda *a, **kw: pytest.fail("must not update when nothing exists"),
+        )
+
+        body = self._marked_body("verification", issue=42)
+        state._upsert_issue_comment_local("api", 42, body, repo_github="acme/api")
+
+        assert calls["post"] == ("acme/api", 42, body)
+
+    def test_updates_the_matching_comment_instead_of_posting_a_duplicate(
+        self, monkeypatch,
+    ) -> None:
+        from coord import github_ops
+
+        existing = self._marked_body("verification", issue=42, assignment="first")
+        monkeypatch.setattr(
+            github_ops, "get_issue_comments",
+            lambda repo, n: [
+                {"url": "https://github.com/acme/api/issues/42#issuecomment-777",
+                 "body": existing},
+                {"url": "https://github.com/acme/api/issues/42#issuecomment-778",
+                 "body": "an unrelated human comment"},
+            ],
+        )
+        monkeypatch.setattr(
+            github_ops, "post_issue_comment",
+            lambda *a, **kw: pytest.fail("must not post a duplicate"),
+        )
+        calls = {}
+        monkeypatch.setattr(
+            github_ops, "update_issue_comment",
+            lambda repo, n, cid, body: calls.setdefault("update", (repo, n, cid, body)),
+        )
+
+        new_body = self._marked_body("verification", issue=42, assignment="second")
+        state._upsert_issue_comment_local("api", 42, new_body, repo_github="acme/api")
+
+        assert calls["update"] == ("acme/api", 42, 777, new_body)
+
+    def test_unmarked_body_always_posts(self, monkeypatch) -> None:
+        """A body with no coord marker at all has nothing to key an update
+        on — always posts, never scans (let alone edits) anything."""
+        from coord import github_ops
+
+        monkeypatch.setattr(
+            github_ops, "get_issue_comments",
+            lambda *a, **kw: pytest.fail("must not scan when body carries no marker"),
+        )
+        calls = {}
+        monkeypatch.setattr(
+            github_ops, "post_issue_comment",
+            lambda repo, n, body: calls.setdefault("post", (repo, n, body)),
+        )
+
+        state._upsert_issue_comment_local("api", 42, "plain text, no marker")
+
+        assert calls["post"] == ("api", 42, "plain text, no marker")
+
+    def test_scan_failure_falls_back_to_post(self, monkeypatch) -> None:
+        from coord import github_ops
+
+        monkeypatch.setattr(
+            github_ops, "get_issue_comments",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("gh unreachable")),
+        )
+        calls = {}
+        monkeypatch.setattr(
+            github_ops, "post_issue_comment",
+            lambda repo, n, body: calls.setdefault("post", (repo, n, body)),
+        )
+
+        body = self._marked_body("verification", issue=42)
+        state._upsert_issue_comment_local("api", 42, body)
+
+        assert calls["post"] == ("api", 42, body)

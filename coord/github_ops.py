@@ -1592,6 +1592,28 @@ def post_issue_comment(repo: str, issue_number: int, body: str):
     _capture_comment_write(repo, issue_number, body, url)
 
 
+def update_issue_comment(repo: str, issue_number: int, comment_id: int, body: str) -> None:
+    """Overwrite an existing issue comment's body in place (#2109) — the
+    update half of :func:`post_issue_comment`, so a standing marked comment
+    (e.g. the merge-time verification note, ``coord.state.
+    upsert_issue_comment``) can be refreshed on a second merge of the same
+    issue instead of appended as a duplicate.
+
+    *comment_id* is the numeric REST id (``parse_comment_id`` on a comment's
+    ``url``), not the GraphQL node id ``get_issue_comments`` returns as
+    ``id``. *issue_number* isn't read by the PATCH itself (GitHub addresses
+    a comment purely by its own id) — it's accepted anyway so the #873
+    capture-at-write mirror below is keyed exactly like
+    :func:`post_issue_comment`'s.
+    """
+    _gh(
+        "api", f"repos/{repo}/issues/comments/{comment_id}", "-X", "PATCH",
+        "-f", f"body={body}", caller="github_ops.update_issue_comment",
+    )
+    fake_url = f"https://github.com/{repo}/issues/{issue_number}#issuecomment-{comment_id}"
+    _capture_comment_write(repo, issue_number, body, fake_url)
+
+
 def _capture_comment_write(repo: str, issue_number: int, body: str, url: str) -> None:
     """Best-effort mirror of a just-posted comment into the durable
     ``issue_comments`` table (#873).

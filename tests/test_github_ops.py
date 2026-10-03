@@ -1205,6 +1205,39 @@ class TestPostIssueCommentCaptureAtWrite:
         assert mock_capture.call_args.kwargs["body"] == "closing this out"
 
 
+class TestUpdateIssueCommentCaptureAtWrite:
+    """update_issue_comment (#2109) — the edit half of post_issue_comment,
+    used to refresh a standing marked comment in place rather than appending
+    a duplicate. Must hit the PATCH endpoint for the right comment id and
+    mirror the new body into the #873 capture table keyed to that SAME id."""
+
+    def setup_method(self) -> None:
+        github_ops._login_cache.clear()
+
+    def test_patches_the_comment_and_captures_it(self) -> None:
+        with patch("coord.github_ops._gh", return_value="") as mock_gh:
+            with patch("coord.state.record_issue_comment_capture") as mock_capture:
+                github_ops.update_issue_comment("acme/api", 42, 123456, "refreshed body")
+        assert mock_gh.call_args_list[0].args == (
+            "api", "repos/acme/api/issues/comments/123456", "-X", "PATCH",
+            "-f", "body=refreshed body",
+        )
+        mock_capture.assert_called_once()
+        kwargs = mock_capture.call_args.kwargs
+        assert kwargs["repo_name"] == "acme/api"
+        assert kwargs["issue_number"] == 42
+        assert kwargs["body"] == "refreshed body"
+        assert kwargs["gh_comment_id"] == 123456
+
+    def test_capture_failure_never_raises(self) -> None:
+        with patch("coord.github_ops._gh", return_value=""):
+            with patch(
+                "coord.state.record_issue_comment_capture",
+                side_effect=RuntimeError("db exploded"),
+            ):
+                github_ops.update_issue_comment("acme/api", 42, 1, "body")  # must not raise
+
+
 class TestCurrentGhLogin:
     def setup_method(self) -> None:
         github_ops._login_cache.clear()

@@ -126,11 +126,14 @@ class IssueCommentCreate:
       durable ``issue_comments`` mirror (``/issue-comments`` ``capture``).
     * ``"sync"`` — backfill the mirror from the tracker
       (``/issue-comments`` ``sync``); ``body`` is not read.
+    * ``"upsert"`` (#2109) — post *body*, or edit an existing comment on the
+      same issue carrying the identical ``coord:event=...`` marker in place,
+      instead of appending a duplicate (``coord.state.upsert_issue_comment``).
     """
 
-    #: The comment text.  Required for ``post`` and ``capture``.
+    #: The comment text.  Required for ``post``, ``capture``, and ``upsert``.
     body: str | None = None
-    #: ``"post"`` | ``"capture"`` | ``"sync"``.  Defaults to ``"post"``.
+    #: ``"post"`` | ``"capture"`` | ``"sync"`` | ``"upsert"``.  Defaults to ``"post"``.
     action: str | None = None
     #: ``capture`` only: the tracker's own comment id, when known.
     gh_comment_id: int | None = None

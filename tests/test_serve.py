@@ -4506,6 +4506,48 @@ def test_serve_issue_comments_sync(file_db: Path, valid_config_path: Path, rw_db
     ).fetchone()["c"] == 1
 
 
+def test_serve_issue_comments_upsert_posts_then_updates(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch,
+):
+    """#2109: ``action=upsert`` posts when no comment on the issue carries
+    the body's own marker, then edits that SAME comment in place on a
+    second call instead of appending a duplicate."""
+    from coord import github_ops
+
+    store: dict[int, str] = {}
+
+    def _fake_post(slug, number, body):
+        store[9001] = body
+        return f"https://github.com/{slug}/issues/{number}#issuecomment-9001"
+
+    def _fake_get_comments(slug, number):
+        return [
+            {"url": f"https://github.com/{slug}/issues/{number}#issuecomment-{cid}", "body": b}
+            for cid, b in store.items()
+        ]
+
+    def _fake_update(slug, number, comment_id, body):
+        store[comment_id] = body
+
+    monkeypatch.setattr(github_ops, "post_issue_comment", _fake_post)
+    monkeypatch.setattr(github_ops, "get_issue_comments", _fake_get_comments)
+    monkeypatch.setattr(github_ops, "update_issue_comment", _fake_update)
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    marked_v1 = "<!-- coord:event=verification issue=7 --> v1"
+    marked_v2 = "<!-- coord:event=verification issue=7 --> v2"
+    with TestClient(app) as cli:
+        r1 = cli.post("/issue-comments", json={
+            "action": "upsert", "repo_name": "acme/api", "issue_number": 7, "body": marked_v1,
+        })
+        assert r1.status_code == 200 and r1.json() == {"ok": True}
+        r2 = cli.post("/issue-comments", json={
+            "action": "upsert", "repo_name": "acme/api", "issue_number": 7, "body": marked_v2,
+        })
+        assert r2.status_code == 200 and r2.json() == {"ok": True}
+    assert store == {9001: marked_v2}
+
+
 def test_serve_issue_comments_unknown_action_400(file_db: Path, valid_config_path: Path, rw_db):
     app = build_app(SqliteStore(file_db), load_config(valid_config_path))
     with TestClient(app) as cli:
