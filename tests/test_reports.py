@@ -749,7 +749,7 @@ class TestFoldDriveQueueStatus:
         result = fold_drive_queue_status([_dq_row(1)], 1000.0)
         assert [m.id for m in result.column_meta] == result.columns
         assert result.columns == [
-            "position", "repo", "issue", "title", "state", "machine",
+            "band", "position", "repo", "issue", "title", "state", "machine",
             "attempts", "deferrals", "last_reason", "reason_at", "enqueued_at",
             "launched_at", "hold_state", "after",
         ]
@@ -816,12 +816,110 @@ class TestFoldDriveQueueStatus:
         assert "0 entries queued" in headline
         assert "3 done" in headline
 
-    def test_run_order_preserved_from_input_not_resorted(self) -> None:
-        # list_drive_queue already returns ORDER BY position, id — the fold
-        # must not reorder it.
+    def test_same_band_rows_sorted_by_position_ascending(self) -> None:
+        # #1909: all three rows are `waiting` (same band, "pending"), so the
+        # fold's re-sort collapses to position order regardless of the
+        # input's own order — unlike the pre-#1909 "never re-sorts" fold,
+        # which would have preserved the input's [3, 1, 2].
         rows = [_dq_row(3, position=2), _dq_row(1, position=0), _dq_row(2, position=1)]
         result = fold_drive_queue_status(rows, 1000.0)
-        assert [r["issue"] for r in result.rows] == [3, 1, 2]
+        assert [r["issue"] for r in result.rows] == [1, 2, 3]
+
+    def test_lifecycle_bands_ordered_terminal_then_running_then_pending(self) -> None:
+        # #1909's own regression shape: a running item, pending entries
+        # interleaved with done ones at arbitrary positions, and a blocked
+        # (terminal) row thrown in — the fold must emit terminal rows first,
+        # then running, then pending in ascending position, regardless of
+        # the raw position/arrival order.
+        rows = [
+            _dq_row(1891, position=0, state_="running"),
+            _dq_row(1904, position=1, state_="waiting"),
+            _dq_row(9001, position=2, state_="done", reason_at=500.0),
+            _dq_row(1895, position=28, state_="waiting"),
+            _dq_row(1156, position=29, state_="waiting"),
+            _dq_row(1547, position=30, state_="blocked", reason_at=600.0),
+            _dq_row(1889, position=31, state_="done", reason_at=700.0),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        bands = [r["band"] for r in result.rows]
+        issues = [r["issue"] for r in result.rows]
+        # Terminal rows (done, blocked) come first — most-recently-finished
+        # (highest reason_at) first — then the single running row, then the
+        # pending rows in ascending position.
+        assert issues == [1889, 1547, 9001, 1891, 1904, 1895, 1156]
+        assert bands == [
+            "terminal", "terminal", "terminal",
+            "running",
+            "pending", "pending", "pending",
+        ]
+
+    def test_terminal_band_most_recently_finished_first(self) -> None:
+        rows = [
+            _dq_row(1, state_="done", reason_at=100.0),
+            _dq_row(2, state_="done", reason_at=300.0),
+            _dq_row(3, state_="done", reason_at=200.0),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        assert [r["issue"] for r in result.rows] == [2, 3, 1]
+
+    def test_terminal_band_falls_back_to_launched_at_when_no_reason_at(self) -> None:
+        rows = [
+            _dq_row(1, state_="done", launched_at=50.0),
+            _dq_row(2, state_="done", launched_at=90.0),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        assert [r["issue"] for r in result.rows] == [2, 1]
+
+    def test_terminal_band_falls_back_to_enqueued_at_when_no_reason_at_or_launched_at(
+        self,
+    ) -> None:
+        rows = [
+            _dq_row(1, state_="done", launched_at=None, enqueued_at=10.0),
+            _dq_row(2, state_="done", launched_at=None, enqueued_at=20.0),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        assert [r["issue"] for r in result.rows] == [2, 1]
+
+    def test_pending_band_order_matches_the_launch_walk(self) -> None:
+        # The issue's own framing: pending must be in ascending `position`
+        # — the order `plan_tick`'s launch walk reaches them — regardless
+        # of state (`waiting` vs `parked`) or input arrival order.
+        rows = [
+            _dq_row(30, position=3, state_="waiting"),
+            _dq_row(10, position=1, state_="parked"),
+            _dq_row(20, position=2, state_="waiting"),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        assert [r["issue"] for r in result.rows] == [10, 20, 30]
+
+    def test_held_entry_still_bands_pending_not_a_fourth_band(self) -> None:
+        # `hold_state` is orthogonal to `state` — a fired deploy gate leaves
+        # `state` at `waiting`, so it already lands in `pending` with no
+        # extra handling (the issue's "waiting (and any held)" wording).
+        result = fold_drive_queue_status(
+            [_dq_row(1, state_="waiting", hold_state="fired")], 1000.0
+        )
+        assert result.rows[0]["band"] == "pending"
+
+    def test_band_column_present_for_every_row(self) -> None:
+        rows = [
+            _dq_row(1, state_="running"),
+            _dq_row(2, state_="waiting"),
+            _dq_row(3, state_="done"),
+            _dq_row(4, state_="blocked"),
+            _dq_row(5, state_="failed"),
+            _dq_row(6, state_="merged-partial"),
+            _dq_row(7, state_="parked"),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        by_issue = {r["issue"]: r["band"] for r in result.rows}
+        assert by_issue[1] == "running"
+        assert by_issue[2] == "pending"
+        assert by_issue[3] == "terminal"
+        assert by_issue[4] == "terminal"
+        assert by_issue[5] == "terminal"
+        assert by_issue[6] == "terminal"
+        assert by_issue[7] == "pending"
 
     def test_attempts_ge_1_named_in_notes(self) -> None:
         rows = [
