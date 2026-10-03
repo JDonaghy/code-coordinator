@@ -5150,6 +5150,50 @@ def test_the_stagger_cap_is_scoped_per_repo():
     assert outcomes[entry_key("otherrepo", 402)] == "resumed"
 
 
+def test_a_mass_after_prereq_cascade_is_also_staggered():
+    """#3536 review follow-up: the stagger cap above was initially scoped
+    to `_reconcile_blocked`'s own gate-clear path only, excluding
+    `_reconcile_blocked_after`'s `after=` prereq-chain resume (#2362) on
+    the theory that a `waiting`-side cascade "is not the shape that trips
+    a rate limit the same way." But issue #3536's own ask #1 explicitly
+    names the #2362 path alongside #2230/#3386, and the underlying danger
+    is identical: one dep (1650) landing clears the SAME unsatisfiable
+    verdict for every row chained `--after` it, all on the SAME tick, each
+    then driving its own live `gh` re-checks on the very next poll. This
+    pins the fix: the `after=` cascade now counts against the SAME
+    per-repo stagger cap as a merge-gate latch clear."""
+    dep_key = entry_key(REPO, 1650)
+    entries = [entry(1650, position=0, state=STATE_DONE)] + [
+        entry(
+            1654 + i,
+            position=1 + i,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        )
+        for i in range(3)
+    ]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=4)
+
+    by_key = {r.key: r for r in plan.reconciles}
+    resumed = [k for k, r in by_key.items() if r.outcome == "resumed"]
+    staggered = [k for k, r in by_key.items() if r.outcome == "resume_staggered"]
+    # Default cap is 2 — the two earliest-positioned rows win this tick's
+    # slots; the third is staggered exactly like a #2230 gate-clear mass
+    # resume would be.
+    assert sorted(resumed) == sorted(
+        [entry_key(REPO, 1654), entry_key(REPO, 1655)]
+    )
+    assert staggered == [entry_key(REPO, 1656)]
+
+    staggered_reconcile = by_key[entry_key(REPO, 1656)]
+    assert "state" not in staggered_reconcile.updates  # stays blocked
+    assert "resumes" not in staggered_reconcile.updates  # budget not spent
+    assert "#3536" in staggered_reconcile.reason
+
+
 # ── #2935: a never-dispatched after=-blocked entry must never reach the ────
 # merge-gate sweep at all
 #

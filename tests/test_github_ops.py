@@ -2992,6 +2992,215 @@ class TestGetPrChecks:
         assert not isinstance(exc_info.value, github_ops.GhTooOldForJsonChecks)
 
 
+class TestGetPrChecksThrottling:
+    """#3536 review follow-up: `get_pr_checks` is the single `gh` sink for
+    `coord.ci_github.GitHubCi` — the dominant CI-check/branch-head read
+    #3521's drive actually stalled on for 40+ minutes — but it cannot
+    funnel through `_gh()` itself (see `get_pr_checks`'s own docstring), so
+    a `pace()` call added only inside `_gh()` left this exact path unpaced.
+    These tests cover the fix: `get_pr_checks` now calls the same
+    `_precall_throttle` seam `_gh()` does, both consulting an active
+    backoff BEFORE the network call and feeding a rate-limit hit it
+    detects itself back into the shared `github_throttle` state."""
+
+    def test_deep_inside_backoff_skips_the_network_call(self, coord_db) -> None:
+        from coord import github_throttle
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="orig-request-id", retry_after_s=600.0,
+        )
+        run_mock = MagicMock()
+        with patch("coord.github_ops.subprocess.run", run_mock):
+            with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                github_ops.get_pr_checks("acme/api", 42)
+        run_mock.assert_not_called()
+        assert excinfo.value.from_cache is True
+        assert excinfo.value.request_id == "orig-request-id"
+
+    def test_near_end_of_backoff_sleeps_then_proceeds(self, coord_db) -> None:
+        from coord import github_throttle
+
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id=None, retry_after_s=2.0,
+        )
+        sleeps = []
+        with patch("coord.github_ops.time.sleep", side_effect=sleeps.append), patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="[]", stderr=""),
+        ) as run_mock:
+            checks = github_ops.get_pr_checks("acme/api", 42)
+        assert checks == []
+        run_mock.assert_called_once()
+        assert len(sleeps) == 1
+        assert sleeps[0] > 0
+
+    def test_no_backoff_still_takes_a_pacing_token(self, coord_db) -> None:
+        """No reactive backoff active, but the proactive token bucket
+        (#3536) is still consulted -- draining it below one token forces
+        the NEXT call to sleep, proving `get_pr_checks` shares the same
+        bucket `_gh()`-backed calls draw from."""
+        from coord import github_throttle
+
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="[]", stderr=""),
+        ):
+            # Drain the burst allowance directly through the real bucket
+            # `get_pr_checks` now shares.
+            for _ in range(int(github_throttle.PACE_DEFAULT_BURST)):
+                github_ops.get_pr_checks("acme/api", 1)
+            sleeps = []
+            with patch("coord.github_ops.time.sleep", side_effect=sleeps.append):
+                github_ops.get_pr_checks("acme/api", 1)
+        assert sleeps and sleeps[0] > 0
+
+    def test_a_live_secondary_rate_limit_hit_is_recorded_into_the_shared_backoff(
+        self, coord_db,
+    ) -> None:
+        """Before this fix, `get_pr_checks` hitting a 403 itself was
+        invisible to every OTHER `gh` caller on the host -- only hits
+        observed through `_gh()` ever reached `github_throttle.record()`.
+        Now it feeds the same shared state, so a `_gh()`-backed caller's
+        very next call learns about it."""
+        from coord import github_throttle
+
+        assert github_throttle.current() is None
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(
+                returncode=1, stdout="",
+                stderr="gh: You have exceeded a secondary rate limit (HTTP 403)",
+            ),
+        ):
+            with pytest.raises(RuntimeError):
+                github_ops.get_pr_checks("acme/api", 42)
+        active = github_throttle.current()
+        assert active is not None
+        assert active.reason == "secondary_rate_limit"
+
+
+def _run_outcome(*, returncode: int = 0, stdout: str = "[]", stderr: str = "") -> MagicMock:
+    return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class _FakeClock:
+    """A controllable stand-in for the wall clock (#3536 burst-integration
+    test below): `time()` reads the current simulated instant, `sleep()`
+    advances it by exactly the requested amount instead of actually
+    blocking, so a scenario spanning a full 60s backoff window runs in
+    real milliseconds."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+        self.sleep_log: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleep_log.append(seconds)
+        self.now += seconds
+
+
+class _FakeSecondaryRateLimiter:
+    """Stands in for `subprocess.run` (patched over `coord.github_ops.
+    subprocess.run`): simulates GitHub's own secondary (abuse-detection)
+    limiter as a sliding window -- more than *limit* `gh` invocations
+    within *window_s* of (simulated) wall-clock time trips it, exactly the
+    "request rate/concurrency, not cumulative volume" shape
+    `coord.github_throttle`'s module docstring describes."""
+
+    def __init__(self, *, limit: int, window_s: float, clock: _FakeClock) -> None:
+        self.limit = limit
+        self.window_s = window_s
+        self._clock = clock
+        self.calls: list[float] = []
+        self.trip_count = 0
+
+    def __call__(self, argv, **kwargs):  # noqa: ANN001 -- mirrors subprocess.run's signature
+        now = self._clock.time()
+        self.calls = [t for t in self.calls if now - t < self.window_s]
+        self.calls.append(now)
+        if len(self.calls) > self.limit:
+            self.trip_count += 1
+            return _run_outcome(
+                returncode=1,
+                stderr="gh: You have exceeded a secondary rate limit (HTTP 403)",
+            )
+        return _run_outcome()
+
+
+class TestMassResumeBurstIntegration:
+    """#3536 acceptance: "a simulated burst (>= 12 rows resumed at once,
+    with the GitHub client faked to 403 above N requests/minute) completes
+    without re-tripping the limit after the first backoff." A prior review
+    round found no test actually combined the stagger/token-bucket/backoff
+    mechanisms through a faked `gh` client -- each was unit-tested in
+    isolation only. This drives the REAL `github_ops.get_pr_checks`
+    implementation (the dominant CI-check read #3521 stalled on, and the
+    one the previous round found unpaced) against a faked secondary-limit
+    `subprocess.run`, with a `_FakeClock` standing in for `time.time`/
+    `time.sleep` so a 60s+ incident runs instantly and deterministically.
+    """
+
+    def test_burst_makes_no_calls_during_an_active_backoff_then_recovers(
+        self, coord_db,
+    ) -> None:
+        from coord import github_throttle
+
+        clock = _FakeClock()
+        limiter = _FakeSecondaryRateLimiter(limit=20, window_s=30.0, clock=clock)
+
+        # The fleet already tripped GitHub's secondary limit from OTHER
+        # traffic a moment before this burst -- the #3536 incident's own
+        # shape: the latch-clear landed while the fleet was already mid
+        # rate-limit-and-backoff. `retry_after_s=60.0` matches the
+        # incident's own observed "~60s windows, repeatedly renewed."
+        github_throttle.record(
+            reason="secondary_rate_limit", status=403,
+            request_id="precursor-incident", retry_after_s=60.0, now=0.0,
+        )
+
+        with patch("coord.github_ops.time.time", clock.time), patch(
+            "coord.github_ops.time.sleep", clock.sleep,
+        ), patch("coord.github_throttle.time.time", clock.time), patch(
+            "coord.github_ops.subprocess.run", side_effect=limiter,
+        ):
+            # Phase 1: a dozen rows resume at once while the backoff above
+            # is still deep (60s window, 0s elapsed) -- #3536's own mass-
+            # resume shape. None of them should ever reach the fake
+            # GitHub: `get_pr_checks` must consult the shared backoff
+            # BEFORE its network call, same as `_gh()` always has.
+            for row in range(12):
+                with pytest.raises(github_ops.GhRateLimitError) as excinfo:
+                    github_ops.get_pr_checks("acme/api", 100 + row)
+                assert excinfo.value.from_cache is True
+            assert limiter.calls == []
+            assert limiter.trip_count == 0
+
+            # Phase 2: time passes well past the backoff window (as if
+            # several ticks have gone by). The same dozen rows retry --
+            # `get_pr_checks` must now succeed for every one of them, with
+            # the shared token bucket smoothing the still-simultaneous
+            # retries rather than letting them all fire unthrottled.
+            clock.sleep(61.0)
+            for row in range(12):
+                checks = github_ops.get_pr_checks("acme/api", 200 + row)
+                assert checks == []
+
+        # The fake limiter is never tripped a SECOND time -- the whole
+        # point of #3536: a mass resume riding out an already-active
+        # backoff, then recovering, must not re-trip the real limiter.
+        assert limiter.trip_count == 0
+        # Pacing actually delayed some of phase 2's dozen calls (the token
+        # bucket's burst allowance is smaller than 12) -- confirms the
+        # token bucket was exercised end to end, not just the backoff's
+        # pre-emptive skip in phase 1.
+        assert len(clock.sleep_log) > 1
+
+
 class TestRerunWorkflowRun:
     """#1851: the single gh sink for coord.ci_github.GitHubCi.rerun_for_pr."""
 

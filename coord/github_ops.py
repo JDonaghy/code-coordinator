@@ -486,6 +486,67 @@ def _resolve_caller(explicit: str) -> str:
         return "unknown"
 
 
+def _precall_throttle(
+    args: Sequence[str], caller: str, *, force_through_backoff: bool = False,
+) -> None:
+    """Shared pre-call seam: consult the reactive backoff, then take a token
+    from the proactive pacing bucket (#3536 review follow-up).
+
+    Extracted out of :func:`_gh` so :func:`get_pr_checks` — which cannot
+    funnel through ``_gh()`` itself, because a non-zero ``gh pr checks`` exit
+    can still carry usable JSON on stdout and ``_gh()``'s raise-on-nonzero
+    contract can't express that, see that function's own docstring — still
+    gets paced and damped the same way every ``_gh()``-backed call does.
+    ``get_pr_checks`` is the single ``gh`` sink for
+    :class:`coord.ci_github.GitHubCi`, i.e. the dominant CI-check/branch-head
+    read the #3536 incident actually stalled on; a `pace()` call added only
+    inside `_gh()` would leave exactly that path unpaced, which an earlier
+    review round of this issue caught.
+
+    Raises :class:`GhRateLimitError` when deep inside an active backoff
+    window (same as ``_gh()``); otherwise sleeps for the jittered amount
+    ``consult()``/``pace()`` compute (possibly ``0.0``) and returns.
+    """
+    backoff_sleep_s, active_backoff = github_throttle.consult()
+    if active_backoff is not None:
+        remaining = active_backoff.until - time.time()
+        if remaining > github_throttle.MAX_PRECALL_SLEEP_S and not force_through_backoff:
+            # Still well inside a known backoff window -- don't add another
+            # request to a limiter that only recovers when the rate drops.
+            # This is not a fresh observation, so it is not re-recorded.
+            record_gh_call(
+                args, outcome="transient", duration_s=0.0, caller=caller,
+                detail=(
+                    f"skipped: coordinated backoff active ({active_backoff.reason}, "
+                    f"{remaining:.0f}s remaining)"
+                ),
+            )
+            raise GhRateLimitError(
+                f"gh {' '.join(args)} skipped: GitHub {active_backoff.reason} "
+                f"backoff active for {remaining:.0f}s more "
+                f"(status={active_backoff.status}, request_id={active_backoff.request_id})",
+                status_code=active_backoff.status,
+                request_id=active_backoff.request_id,
+                retry_after_s=remaining,
+                secondary=active_backoff.reason == "secondary_rate_limit",
+                from_cache=True,
+            )
+        if backoff_sleep_s > 0:
+            time.sleep(backoff_sleep_s)
+    # #3536: proactive pacing, ahead of any 403 -- a reactive backoff above
+    # has nothing to say about a caller that hasn't been rate-limited yet,
+    # which is exactly the mass-resume shape #3536 describes (a dozen
+    # newly-unblocked rows each making their own first live `gh` call with
+    # no shared history of a hit). Both ``_gh()`` and ``get_pr_checks()``
+    # call this one seam, so pacing it once here paces every polling path
+    # (drive-queue merge-wait re-checks -- including the CI-check read
+    # itself -- the merge-queue sweep, `coord notify` ticks) without each one
+    # needing its own call to `github_throttle.pace()`.
+    pace_sleep_s = github_throttle.pace()
+    if pace_sleep_s > 0:
+        time.sleep(pace_sleep_s)
+
+
 def _gh(*args: str, caller: str = "", force_through_backoff: bool = False) -> str:
     """Run ``gh`` with *args* and return its stdout, or raise :class:`GhError`.
 
@@ -536,45 +597,7 @@ def _gh(*args: str, caller: str = "", force_through_backoff: bool = False) -> st
     low-frequency caller from being permanently outbid by them.
     """
     caller = _resolve_caller(caller)
-    backoff_sleep_s, active_backoff = github_throttle.consult()
-    if active_backoff is not None:
-        remaining = active_backoff.until - time.time()
-        if remaining > github_throttle.MAX_PRECALL_SLEEP_S and not force_through_backoff:
-            # Still well inside a known backoff window -- don't add another
-            # request to a limiter that only recovers when the rate drops.
-            # This is not a fresh observation, so it is not re-recorded.
-            record_gh_call(
-                args, outcome="transient", duration_s=0.0, caller=caller,
-                detail=(
-                    f"skipped: coordinated backoff active ({active_backoff.reason}, "
-                    f"{remaining:.0f}s remaining)"
-                ),
-            )
-            raise GhRateLimitError(
-                f"gh {' '.join(args)} skipped: GitHub {active_backoff.reason} "
-                f"backoff active for {remaining:.0f}s more "
-                f"(status={active_backoff.status}, request_id={active_backoff.request_id})",
-                status_code=active_backoff.status,
-                request_id=active_backoff.request_id,
-                retry_after_s=remaining,
-                secondary=active_backoff.reason == "secondary_rate_limit",
-                from_cache=True,
-            )
-        if backoff_sleep_s > 0:
-            time.sleep(backoff_sleep_s)
-    # #3536: proactive pacing, ahead of any 403 -- a reactive backoff above
-    # has nothing to say about a caller that hasn't been rate-limited yet,
-    # which is exactly the mass-resume shape #3536 describes (a dozen
-    # newly-unblocked rows each making their own first live `gh` call with
-    # no shared history of a hit). Every `gh` call funnels through here, so
-    # pacing it once at this seam paces every polling path (drive-queue
-    # merge-wait re-checks, the merge-queue sweep, `coord notify` ticks)
-    # without each one needing its own call to `github_throttle.pace()`.
-    # Skipped entirely whenever the backoff branch above already raised —
-    # there is no call left to pace at that point.
-    pace_sleep_s = github_throttle.pace()
-    if pace_sleep_s > 0:
-        time.sleep(pace_sleep_s)
+    _precall_throttle(args, caller, force_through_backoff=force_through_backoff)
     # #1896 Phase 0: time + classify every `gh` invocation through this one
     # seam so `coord diagnose --forge-availability` has real data on how
     # often the forge is actually unreachable, not just anecdote from one
@@ -2758,28 +2781,62 @@ def get_pr_checks(repo: str, number: int) -> list[dict]:
     empty (a real lookup failure: bad PR number, auth, rate-limit, an old gh
     that doesn't support ``--json`` at all, ...). The single ``gh`` sink for
     :class:`coord.ci_github.GitHubCi`, the CI backend behind the merge gate
-    (#1483).
+    (#1483) — and, per #3536's incident narrative, the dominant call the
+    merge gate's CI-wait polling actually makes, so it is paced and damped
+    the same way ``_gh()``-backed calls are even though it cannot itself
+    route through ``_gh()`` (see the non-zero-exit-with-usable-stdout note
+    above).
 
     Raises :class:`GhTooOldForJsonChecks` — instead of the generic
     ``RuntimeError`` below — when the installed ``gh`` doesn't recognise
     ``--json`` on ``pr checks`` at all (#1564 Addendum 2), so callers can
     surface a distinct, actionable "upgrade gh" message rather than lumping
     it in with ordinary read failures.
+
+    #3536 review follow-up: this used to shell out directly with no pacing
+    or backoff of its own, which meant the module-wide claim "every `gh`
+    call funnels through `_gh()`, so pacing it once there paces every
+    polling path" was false for exactly the path #3521 stalled on for 40+
+    minutes. It now calls :func:`_precall_throttle` (the same seam ``_gh()``
+    calls) before the network call, and feeds a rate-limit hit it detects
+    itself back into :mod:`coord.github_throttle` the same way ``_gh()``
+    does, so every OTHER caller on this host learns about a 403 this read
+    hits, not just the ones that happen to go through ``_gh()``.
     """
+    caller = _resolve_caller("github_ops.get_pr_checks")
+    args = (
+        "pr", "checks", str(number),
+        "--repo", repo,
+        "--json", ",".join(PR_CHECKS_JSON_FIELDS),
+    )
+    _precall_throttle(args, caller)
+    _t0 = time.monotonic()
     result = subprocess.run(
-        [
-            "gh", "pr", "checks", str(number),
-            "--repo", repo,
-            "--json", ",".join(PR_CHECKS_JSON_FIELDS),
-        ],
+        ["gh", *args],
         capture_output=True, text=True, timeout=30,
     )
+    duration = time.monotonic() - _t0
     stdout = (result.stdout or "").strip()
     if result.returncode != 0 and not stdout:
         stderr = result.stderr.strip()
         if _GH_UNKNOWN_JSON_FLAG_MARKER in stderr:
+            record_gh_call(args, outcome="unreachable", duration_s=duration,
+                            detail=stderr, caller=caller)
             raise GhTooOldForJsonChecks(_gh_too_old_message(stderr))
+        is_rate_limit, is_secondary = _classify_rate_limit(stderr)
+        if is_rate_limit:
+            if not is_secondary and _primary_quota_healthy():
+                is_secondary = True
+            text_meta = _extract_rate_limit_detail(stderr)
+            github_throttle.record(
+                reason="secondary_rate_limit" if is_secondary else "primary_rate_limit",
+                status=text_meta.status, request_id=text_meta.request_id,
+                retry_after_s=text_meta.retry_after_s,
+            )
+        record_gh_call(args, outcome=_classify_gh_exit(stderr), duration_s=duration,
+                        detail=stderr, caller=caller)
         raise RuntimeError(f"gh pr checks failed: {stderr}")
+    record_gh_call(args, outcome="ok", duration_s=duration, caller=caller)
     # #1525: unlike the fail-open sites elsewhere in this module, a malformed
     # (non-empty) response here must NOT be swallowed to a quiet ``[]`` —
     # ``ci_github.GitHubCi._fetch`` deliberately catches the ``ValueError``
