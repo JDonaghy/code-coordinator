@@ -921,6 +921,76 @@ def test_add_still_refuses_a_requeue_over_an_already_blocked_entry_with_a_green_
     assert f"coord merge --only {REPO}#1753" in result.output
 
 
+def test_add_accepts_a_requeue_over_a_blocked_entry_with_a_green_pr_missing_gates(
+    cli, seed, monkeypatch
+):
+    """#3539's actual end-to-end fix, driven through the real CLI: the exact
+    shape `test_add_still_refuses_a_requeue_over_an_already_blocked_entry_
+    with_a_green_pr` above pins as a REFUSAL (a `blocked` entry with a green
+    matching PR) must now instead be ACCEPTED when that PR's Test and/or
+    Review were never recorded — the quadraui#1109/PR#1253 incident: CI
+    green, `coord gates` showing both BLOCKED, and the old 'merge it
+    instead' advice impossible (`coord merge --only` itself refused). The
+    `add` must succeed and print the new resume note naming the PR and the
+    still-missing gate(s), never the #2377 refusal exception."""
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={1753: "open"})
+    cli("add", REPO, "1753")
+    state._update_drive_queue_entry_local(REPO, 1753, state=STATE_BLOCKED)
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=4242,
+            branch="issue-1753-some-fix",
+            url="https://github.com/example/claude-coordinator/pull/4242",
+            all_green=True,
+            missing_gates=("review", "test"),
+        ),
+    )
+
+    result = cli("add", REPO, "1753", "--max-fix-rounds", "3")
+
+    assert result.exit_code == 0, result.output
+    assert "4242" in result.output
+    assert "resuming on existing PR #4242" in result.output
+    assert "review and test" in result.output
+    assert "gates are not yet recorded" in result.output
+    assert f"coord gates {REPO} 1753" in result.output
+    # Accepted, not refused — never the #2377 merge-it exception text.
+    assert f"coord merge --only {REPO}#1753" not in result.output
+    assert queued(1753) is not None
+
+
+def test_add_resume_note_names_a_single_missing_gate_in_the_singular(
+    cli, seed, monkeypatch
+):
+    """Same accept path, but only ONE gate missing — the note's wording must
+    track the singular/plural split (`existing_pr_resume_note`'s own
+    ``'gate is' if len(...) == 1 else 'gates are'`` branch)."""
+    from coord.drive_queue import ExistingPrMatch
+
+    seed(issues={1753: "open"})
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=4242,
+            branch="issue-1753-some-fix",
+            url="https://github.com/example/claude-coordinator/pull/4242",
+            all_green=True,
+            missing_gates=("test",),
+        ),
+    )
+
+    result = cli("add", REPO, "1753")
+
+    assert result.exit_code == 0, result.output
+    assert "resuming on existing PR #4242" in result.output
+    assert "test gate is not yet recorded" in result.output
+
+
 def test_blocked_escalation_command_proposes_merge_over_requeue_when_pr_is_green(
     monkeypatch, config_file,
 ):
@@ -984,6 +1054,43 @@ def test_blocked_escalation_command_still_requeues_when_no_pr_matches(
     assert command == (
         f"coord drive-queue remove {REPO} 1762 && coord drive-queue add {REPO} 1762"
     )
+
+
+def test_blocked_escalation_command_proposes_a_plain_add_when_pr_is_green_but_ungated(
+    monkeypatch, config_file,
+):
+    """#3539's non-blocking follow-up: a green PR whose gates were never
+    recorded makes `existing_pr_relaunch_remedy` return `None` for a REASON
+    other than 'no PR matched' (see that function's own docstring). This
+    call site must not conflate the two `None` shapes and fall through to
+    `_requeue_command`'s blind `remove && add` — that would discard a
+    completed, green work cycle for nothing. It must propose a plain `add`
+    (no `remove` first) instead, same as the #3539 `drive-queue add` fix
+    itself resumes on."""
+    from coord.commands.drive_queue import _blocked_escalation_command
+    from coord.drive_queue import ExistingPrMatch, entry_key
+
+    monkeypatch.setattr(
+        "coord.commands.drive_queue._existing_pr_match",
+        lambda config_path, repo, issue: ExistingPrMatch(
+            number=1253,
+            branch="issue-1109-fix",
+            url="https://github.com/example/quadraui/pull/1253",
+            all_green=True,
+            missing_gates=("review", "test"),
+        ),
+    )
+    reason = (
+        "work adv-1 exited ADVISORY with no commits on its branch "
+        "(3/3 attempts) — nothing was pushed, so there is nothing to test, "
+        "review, or merge, and retrying has not produced a different outcome."
+    )
+    key = entry_key(OTHER_REPO, 1109)
+
+    command = _blocked_escalation_command(None, key, reason, config_path=config_file)
+
+    assert command == f"coord drive-queue add {OTHER_REPO} 1109"
+    assert "remove" not in command
 
 
 def test_a_declared_file_is_checked_against_a_live_branchs_real_diff(
