@@ -888,6 +888,162 @@ def _make_win32_calls(user32, kernel32) -> Win32Calls:
     return calls
 
 
+class _FakeKernel32ProcessTree:
+    """``CreateToolhelp32Snapshot``/``Process32First``/``Process32Next``
+    stand-in that replays a scripted list of ``(pid, parent_pid,
+    exe_name)`` rows — enough for :meth:`Win32Calls._snapshot_processes`
+    and :meth:`Win32Calls._descendant_pids` (#3542) to walk a fake process
+    tree exactly the way they'd walk a real one."""
+
+    def __init__(self, processes: list[tuple[int, int, bytes]]) -> None:
+        self._processes = processes
+        self._iter = iter(())
+
+    def CreateToolhelp32Snapshot(self, *_args, **_kwargs):
+        return 1  # non-zero, non -1 "handle"
+
+    def Process32First(self, _snapshot, entry_ref) -> bool:
+        self._iter = iter(self._processes)
+        return self._advance(entry_ref)
+
+    def Process32Next(self, _snapshot, entry_ref) -> bool:
+        return self._advance(entry_ref)
+
+    def _advance(self, entry_ref) -> bool:
+        try:
+            pid, ppid, name = next(self._iter)
+        except StopIteration:
+            return False
+        entry = ctypes.cast(entry_ref, ctypes.POINTER(_ProcessEntry32Mirror)).contents
+        entry.th32ProcessID = pid
+        entry.th32ParentProcessID = ppid
+        entry.szExeFile = name
+        return True
+
+    def CloseHandle(self, _handle) -> None:
+        pass
+
+
+class _FakeUser32Windows:
+    """``EnumWindows``/``GetWindowThreadProcessId``/``IsWindowVisible``
+    stand-in: *windows* maps a fake ``hwnd`` to ``(owner_pid, visible)``.
+    ``EnumWindows`` replays them in insertion order and stops as soon as
+    the real callback returns ``False`` (a match), exactly like the real
+    Win32 ``EnumWindows`` short-circuiting on its callback's return value.
+    """
+
+    def __init__(self, windows: dict[int, tuple[int, bool]]) -> None:
+        self._windows = windows
+
+    def EnumWindows(self, callback, lparam) -> None:
+        for hwnd, (_owner_pid, _visible) in self._windows.items():
+            if not callback(hwnd, lparam):
+                break
+
+    def GetWindowThreadProcessId(self, hwnd, owner_pid_ref) -> None:
+        owner_pid_ref._obj.value = self._windows[hwnd][0]
+
+    def IsWindowVisible(self, hwnd) -> bool:
+        return self._windows[hwnd][1]
+
+
+class TestFindTopWindowFollowsDescendantProcesses:
+    """#3542: ``Win32Calls.launch()`` is ``subprocess.Popen(command,
+    shell=True)``, which on Windows always spawns ``cmd.exe`` as the
+    immediate child and returns *its* pid — the real GUI app
+    (``vimcode.exe``) is a grandchild with a different pid, and ``cmd.exe``
+    itself never owns a window. These tests reproduce that exact shape with
+    a fake process tree + fake window table and confirm
+    ``find_top_window`` now searches the whole descendant tree rather than
+    matching the returned pid alone."""
+
+    def test_follows_shell_wrapped_launch_to_the_real_apps_window(self) -> None:
+        cmd_pid, vimcode_pid = 4242, 4321
+        kernel32 = _FakeKernel32ProcessTree([
+            (1, 0, b"System"),
+            (cmd_pid, 1, b"cmd.exe"),
+            (vimcode_pid, cmd_pid, b"vimcode.exe"),
+        ])
+        # cmd.exe (cmd_pid) owns no window at all — only its child does.
+        user32 = _FakeUser32Windows({777: (vimcode_pid, True)})
+        calls = _make_win32_calls(user32, kernel32)
+        assert calls.find_top_window(cmd_pid, timeout_s=1.0) == 777
+
+    def test_follows_a_grandchild_process_two_levels_deep(self) -> None:
+        wt_pid, conhost_pid, app_pid = 10, 20, 30
+        kernel32 = _FakeKernel32ProcessTree([
+            (wt_pid, 1, b"wt.exe"),
+            (conhost_pid, wt_pid, b"OpenConsole.exe"),
+            (app_pid, conhost_pid, b"vimcode.exe"),
+        ])
+        user32 = _FakeUser32Windows({99: (app_pid, True)})
+        calls = _make_win32_calls(user32, kernel32)
+        assert calls.find_top_window(wt_pid, timeout_s=1.0) == 99
+
+    def test_still_matches_when_the_launched_pid_owns_the_window_directly(
+        self,
+    ) -> None:
+        """Backward-compatible: an exe launched without an intervening
+        shell still has its own pid in its own descendant set (the root is
+        always included), so the pre-#3542 direct-match case keeps
+        working."""
+        pid = 555
+        kernel32 = _FakeKernel32ProcessTree([(pid, 1, b"vimcode.exe")])
+        user32 = _FakeUser32Windows({1: (pid, True)})
+        calls = _make_win32_calls(user32, kernel32)
+        assert calls.find_top_window(pid, timeout_s=1.0) == 1
+
+    def test_ignores_invisible_windows_even_on_a_matching_descendant(
+        self,
+    ) -> None:
+        cmd_pid, vimcode_pid = 1, 2
+        kernel32 = _FakeKernel32ProcessTree([
+            (cmd_pid, 0, b"cmd.exe"), (vimcode_pid, cmd_pid, b"vimcode.exe"),
+        ])
+        user32 = _FakeUser32Windows({9: (vimcode_pid, False)})
+        calls = _make_win32_calls(user32, kernel32)
+        with pytest.raises(WinNativeRuntimeError, match="no visible top-level window"):
+            calls.find_top_window(cmd_pid, timeout_s=0.05)
+
+    def test_raises_when_no_descendant_owns_any_window(self) -> None:
+        cmd_pid = 1
+        kernel32 = _FakeKernel32ProcessTree([(cmd_pid, 0, b"cmd.exe")])
+        user32 = _FakeUser32Windows({})
+        calls = _make_win32_calls(user32, kernel32)
+        with pytest.raises(WinNativeRuntimeError, match=f"pid={cmd_pid}"):
+            calls.find_top_window(cmd_pid, timeout_s=0.05)
+
+    def test_unrelated_processes_window_is_not_matched(self) -> None:
+        """A visible window owned by some other, unrelated process must
+        never be treated as a match just because it exists."""
+        cmd_pid, vimcode_pid, unrelated_pid = 1, 2, 999
+        kernel32 = _FakeKernel32ProcessTree([
+            (cmd_pid, 0, b"cmd.exe"), (vimcode_pid, cmd_pid, b"vimcode.exe"),
+        ])
+        user32 = _FakeUser32Windows({8: (unrelated_pid, True)})
+        calls = _make_win32_calls(user32, kernel32)
+        with pytest.raises(WinNativeRuntimeError):
+            calls.find_top_window(cmd_pid, timeout_s=0.05)
+
+
+class TestDescendantPids:
+    def test_includes_root_and_all_transitive_children(self) -> None:
+        kernel32 = _FakeKernel32ProcessTree([
+            (1, 0, b"System"),
+            (10, 1, b"cmd.exe"),
+            (20, 10, b"vimcode.exe"),
+            (30, 20, b"helper.exe"),
+            (999, 1, b"unrelated.exe"),
+        ])
+        calls = _make_win32_calls(_FakeUser32Windows({}), kernel32)
+        assert calls._descendant_pids(10) == {10, 20, 30}
+
+    def test_pid_with_no_children_returns_itself_only(self) -> None:
+        kernel32 = _FakeKernel32ProcessTree([(10, 1, b"vimcode.exe")])
+        calls = _make_win32_calls(_FakeUser32Windows({}), kernel32)
+        assert calls._descendant_pids(10) == {10}
+
+
 class TestSessionAvailable:
     """#3521: ``WTSGetActiveConsoleSessionId`` lives on kernel32, not
     wtsapi32 — the old code crashed every win-native run with an
