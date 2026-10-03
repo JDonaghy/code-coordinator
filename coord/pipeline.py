@@ -114,6 +114,20 @@ class PipelineView:
     # recently made progress) — see compute_pipeline for the derivation.
     # None only when nothing involved has finished yet (still coding).
     finished_at: float | None = None
+    # #1277: True when this is a `current_stage == "failed"` row AND a later
+    # work assignment for the same (repo_name, issue_number) reached a
+    # genuinely successful terminal status ("done"/"merged") — i.e. a
+    # retry/fix/rework attempt superseded this failure and the issue
+    # shipped. Always False for any other current_stage. Pure — derived
+    # entirely from the already-passed-in `board` (every work assignment
+    # ever dispatched for this issue), no I/O — so it recomputes fresh on
+    # every call rather than needing a persisted flag, and self-corrects the
+    # instant a pending retry's own status flips to "done"/"merged". The
+    # dashboard (coord/dashboard/server.py's api_pipeline) uses this to
+    # suppress stale failed rows from the default view while leaving the DB
+    # rows themselves untouched (#1041 audit trail) — `?include=all` still
+    # surfaces them.
+    superseded: bool = False
 
 
 # ── GateSpec registry (#3261 S-2) ────────────────────────────────────────────
@@ -602,6 +616,32 @@ def compute_pipeline(
         review_of_assignment_id=assignment.review_of_assignment_id,
     )
 
+    # #1277: a failed row is "superseded" once a LATER work assignment for
+    # the same (repo, issue) actually succeeded ("done"/"merged" — not
+    # merely dispatched again; an in-flight retry doesn't supersede anything
+    # until it itself lands). Ordered by `dispatched_at` — the attempt
+    # order, and per the #2066 docstring above the one timestamp every
+    # assignment is unconditionally stamped with, unlike `finished_at`.
+    # Scoped to `current_stage == "failed"` only: a review/smoke failure on
+    # the SAME work assignment (review_failed/smoke_failed) isn't this kind
+    # of "stale duplicate row" — the work assignment itself is still the
+    # live one.
+    superseded = False
+    if current_stage == "failed":
+        this_dispatched = assignment.dispatched_at
+        for other in all_assignments:
+            if (
+                other.assignment_id != aid
+                and other.type in ("work", None, "")
+                and other.repo_name == assignment.repo_name
+                and other.issue_number == assignment.issue_number
+                and other.status in ("done", "merged")
+                and other.dispatched_at is not None
+                and (this_dispatched is None or other.dispatched_at > this_dispatched)
+            ):
+                superseded = True
+                break
+
     # #1218: most-recent finished_at across the work assignment and any
     # linked review/smoke assignment — whichever last made progress. This is
     # what the dashboard sorts the collapsed "Work done" section by, so it
@@ -641,4 +681,5 @@ def compute_pipeline(
         needs_attention_reason=needs_attention_reason,
         needs_attention_detail=needs_attention_detail,
         finished_at=finished_at,
+        superseded=superseded,
     )

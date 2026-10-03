@@ -524,6 +524,85 @@ class TestFinishedAtField:
         assert pv.finished_at == 100.0
 
 
+# ── #1277: superseded field (stale failed row hidden after a later success) ─
+
+
+class TestSupersededField:
+    def test_failed_with_no_sibling_is_not_superseded(self) -> None:
+        a = _work(aid="work-1", status="failed")
+        pv = compute_pipeline(a, _board(a), [], _config())
+        assert pv.current_stage == "failed"
+        assert pv.superseded is False
+
+    def test_failed_superseded_by_later_successful_retry(self) -> None:
+        """The canonical #790 shape: a failed attempt, then a later retry
+        (different assignment_id, same repo+issue) that actually succeeded."""
+        failed = _work(aid="work-1", status="failed")
+        failed.dispatched_at = 100.0
+        retry = _work(aid="work-2", status="done")
+        retry.dispatched_at = 200.0
+        board = Board(active=[], completed=[failed, retry])
+        pv = compute_pipeline(failed, board, [], _config())
+        assert pv.current_stage == "failed"
+        assert pv.superseded is True
+
+    def test_merged_retry_also_supersedes(self) -> None:
+        failed = _work(aid="work-1", status="failed")
+        failed.dispatched_at = 100.0
+        retry = _work(aid="work-2", status="merged")
+        retry.dispatched_at = 200.0
+        board = Board(active=[], completed=[failed, retry])
+        pv = compute_pipeline(failed, board, [], _config())
+        assert pv.superseded is True
+
+    def test_earlier_success_does_not_supersede_a_later_failure(self) -> None:
+        """Ordering matters: a success dispatched BEFORE this failure doesn't
+        make the failure stale — it's the live, most-recent attempt."""
+        earlier_success = _work(aid="work-1", status="done")
+        earlier_success.dispatched_at = 100.0
+        failed = _work(aid="work-2", status="failed")
+        failed.dispatched_at = 200.0
+        board = Board(active=[], completed=[earlier_success, failed])
+        pv = compute_pipeline(failed, board, [], _config())
+        assert pv.current_stage == "failed"
+        assert pv.superseded is False
+
+    def test_later_in_flight_retry_does_not_supersede_yet(self) -> None:
+        """A retry that hasn't itself succeeded (still running/pending)
+        doesn't retroactively clear the earlier failure — only an actual
+        success does."""
+        failed = _work(aid="work-1", status="failed")
+        failed.dispatched_at = 100.0
+        retry = _work(aid="work-2", status="running")
+        retry.dispatched_at = 200.0
+        board = Board(active=[retry], completed=[failed])
+        pv = compute_pipeline(failed, board, [], _config())
+        assert pv.superseded is False
+
+    def test_sibling_in_a_different_repo_does_not_supersede(self) -> None:
+        failed = _work(aid="work-1", status="failed")
+        failed.dispatched_at = 100.0
+        other_repo_success = Assignment(
+            machine_name="laptop", repo_name="other-repo",
+            issue_number=42, issue_title="Fix auth", assignment_id="work-2",
+            status="done", type="work", dispatched_at=200.0,
+        )
+        board = Board(active=[], completed=[failed, other_repo_success])
+        pv = compute_pipeline(failed, board, [], _config())
+        assert pv.superseded is False
+
+    def test_non_failed_stage_is_never_superseded(self) -> None:
+        """superseded is scoped to current_stage == 'failed' — a review/smoke
+        failure on the SAME still-live work assignment isn't this kind of
+        stale duplicate row."""
+        a = _work(status="done")
+        smk = _smoke(of_aid="work-1", status="failed")
+        board = Board(active=[], completed=[a, smk])
+        pv = compute_pipeline(a, board, [], _config())
+        assert pv.current_stage == "smoke_failed"
+        assert pv.superseded is False
+
+
 # ── #846: needs_attention field ─────────────────────────────────────────────
 
 
@@ -990,6 +1069,94 @@ class TestPipelineRetention:
             r = client.get("/api/pipeline")
         assert r.status_code == 200
         assert r.json() == []
+
+
+class TestPipelineAPISupersededFiltering:
+    """#1277: /api/pipeline suppresses a `failed` row by default once a
+    later retry/fix for the same (repo, issue) actually succeeded — one
+    current-stage row per issue, not a growing pile of dead retries."""
+
+    def test_failed_then_succeeded_yields_one_row_by_default(self) -> None:
+        """The exact scenario from the issue: two assignments for the same
+        issue — one failed, one later succeeded — yields a single
+        current-stage pipeline row, not two."""
+        import time
+
+        now = time.time()
+        failed = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=790, issue_title="Flaky thing",
+            assignment_id="w-fail", status="failed", type="work",
+            dispatched_at=now - 3600, finished_at=now - 3600,
+        )
+        succeeded = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=790, issue_title="Flaky thing",
+            assignment_id="w-retry", status="done", type="work",
+            dispatched_at=now - 1800, finished_at=now - 1800,
+        )
+        board = Board(active=[], completed=[failed, succeeded])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        data = r.json()
+        ids = [pv["assignment_id"] for pv in data]
+        assert ids == ["w-retry"]
+
+    def test_include_all_still_returns_the_superseded_failed_row(self) -> None:
+        """Display-layer filter, not a delete (#1041): the full history is
+        still reachable via ?include=all."""
+        import time
+
+        now = time.time()
+        failed = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=790, issue_title="Flaky thing",
+            assignment_id="w-fail", status="failed", type="work",
+            dispatched_at=now - 3600, finished_at=now - 3600,
+        )
+        succeeded = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=790, issue_title="Flaky thing",
+            assignment_id="w-retry", status="done", type="work",
+            dispatched_at=now - 1800, finished_at=now - 1800,
+        )
+        board = Board(active=[], completed=[failed, succeeded])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline?include=all")
+        assert r.status_code == 200
+        ids = {pv["assignment_id"] for pv in r.json()}
+        assert ids == {"w-fail", "w-retry"}
+
+    def test_still_open_failure_with_no_later_success_stays_visible(self) -> None:
+        """#772's shape — only failed row for an issue, never retried — must
+        not be swept away by this filter."""
+        import time
+
+        failed = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=772, issue_title="Optional thing",
+            assignment_id="w-fail-only", status="failed", type="work",
+            dispatched_at=time.time() - 3600, finished_at=time.time() - 3600,
+        )
+        board = Board(active=[], completed=[failed])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        ids = [pv["assignment_id"] for pv in r.json()]
+        assert ids == ["w-fail-only"]
 
 
 class TestPipelineActionAPI:

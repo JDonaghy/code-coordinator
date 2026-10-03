@@ -4329,6 +4329,19 @@ def build_app(
         ``dispatched_at`` is unconditionally stamped at dispatch time by
         every code path, so the bound holds even for a row whose
         ``finished_at`` never got recorded.
+
+        #1277: separately from the age-based cutoff above, a ``failed`` row
+        is also dropped (default view only — ``?include=all`` still returns
+        it) once ``PipelineView.superseded`` says a LATER work assignment
+        for the same ``(repo, issue)`` actually succeeded — a retry/fix/
+        rework attempt shipped the issue, so the earlier failed attempt is
+        pure historical noise, no matter how recent it was. This is
+        deliberately narrower than "the GitHub issue is closed": that would
+        also cover a failure resolved by hand with no coord-dispatched
+        retry, but checking it here would mean a live ``gh`` call on every
+        failed row of every ``/api/pipeline`` request — left as a follow-up
+        rather than risking the hot GET path on GitHub API latency/rate
+        limits (and `compute_pipeline`'s pure-computation contract above).
         """
         from dataclasses import asdict
 
@@ -4377,6 +4390,15 @@ def build_app(
                 ts = pv.finished_at if pv.finished_at is not None else a.dispatched_at
                 if ts is not None and ts < cutoff:
                     continue
+            # #1277: a `failed` row whose issue later shipped via a
+            # different (retry/fix/rework) assignment is pure historical
+            # noise on the default view — suppress it regardless of its own
+            # age (unlike the recency cutoff above, this doesn't depend on
+            # how recently the failure happened, only on whether a later
+            # attempt superseded it). `?include=all` still returns it — this
+            # is a display-layer filter, the DB row is untouched (#1041).
+            if cutoff is not None and pv.superseded:
+                continue
             rev_aid = review_by_work.get(a.assignment_id)
             if rev_aid:
                 found = (
