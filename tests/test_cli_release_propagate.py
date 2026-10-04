@@ -1888,6 +1888,83 @@ def test_3588_a_staged_restart_deferred_to_the_idle_watcher_does_not_roll_back(
     assert "idle self-restart watcher" in result.output
 
 
+def test_3588_a_staged_restart_on_the_daemon_host_is_scored_as_a_real_failure(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """Review follow-up: `agent_app._idle_restart_target` refuses to ever
+    fire on the daemon host (`_daemon_runs_here()` is true there) — so a
+    `"staged"` result from THIS host's own `/update` is not the pending,
+    self-resolving case the python lane's `ok=None` exists for everywhere
+    else. It is permanently stuck: nothing will ever restart that process
+    on its own. The roll loop must score it as a plain failure — land it
+    in `attempted_scope`, fail the gate, and exit non-zero — never take the
+    `deferred` path, never claim `verified`, and never release the
+    #2052-era deploy-gate holds over a host it knows is still mid-swap."""
+    from coord import release_verify as rv
+
+    _stub_lanes(monkeypatch)
+
+    def _python(machine, **kwargs):
+        if machine.name == "server":
+            # `server` is `--daemon-host` below — this is exactly the
+            # "staged" outcome `_roll_python` reports for ANY host with a
+            # live assignment at `/update` time, daemon or not.
+            return None, (
+                "swapped to v0.4.111; 1 active assignment(s) still "
+                "running — restart deferred to this agent's idle "
+                "self-restart watcher (#2139)"
+            ), False
+        return True, "now v0.4.111", True
+
+    monkeypatch.setattr(release_cmd, "_roll_python", _python)
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+        findings=[
+            rv.Finding(severity="crit", host="server",
+                       lane="coord-agent process",
+                       summary="on 0.4.110, expected 0.4.111"),
+        ],
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server",
+         # `--no-rollback-on-red`: this test is about the GATE correctly
+         # going red on the daemon host, not about rollback mechanics —
+         # `server`'s python lane never reaches `updated_hosts` (its `ok`
+         # is `False`), so there would be nothing for `--rollback-on-red`
+         # (the default) to act on anyway.
+         "--no-rollback-on-red"],
+    )
+    assert result.exit_code == 1, result.output
+
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_FAILED
+
+    server_python = next(
+        l for l in record["lanes"] if l["lane"] == "python" and l["host"] == "server"
+    )
+    # Scored as a real failure, not the pending/self-resolving case.
+    assert server_python["ok"] is False
+    assert server_python.get("deferred") is not True
+
+    # laptop's python lane was never attempted — the 405 invariant still
+    # holds the rest of the fleet back once the daemon's own lane failed.
+    laptop_python = next(
+        l for l in record["lanes"] if l["lane"] == "python" and l["host"] == "laptop"
+    )
+    assert laptop_python["ok"] is None
+    assert laptop_python.get("deferred") is not True
+
+    # The gate actually fails on this — the whole point of the fix.
+    assert record["gate"]["severity"] == "crit"
+    assert len(record["gate"]["blocking"]) == 1
+    # No deploy-gate hold may be released over a host this run knows is
+    # still mid-swap.
+    assert record["released_holds"] == []
+
+
 def test_the_outside_reach_message_names_the_manual_remedy(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
@@ -2492,6 +2569,85 @@ def test_roll_python_omits_extras_field_when_none_given(monkeypatch):
 
     update_payload = next(p for u, p in posts if u.endswith("/update"))
     assert "extras" not in update_payload
+
+
+def test_roll_python_reports_a_staged_restart_as_ok_none(monkeypatch):
+    """#3588 review: the one new production branch, exercised directly
+    through `_roll_python` itself rather than a test that monkeypatches
+    `_roll_python` out wholesale (as the pre-existing end-to-end #3588 test
+    does) — this is the only test that would catch production returning
+    anything other than `None` for a real `"staged"` outcome (e.g. a typo'd
+    literal), since the end-to-end test hand-returns the tuple itself."""
+    monkeypatch.setattr(release_cmd, "_post", lambda url, payload, *, timeout: (202, {}, ""))
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._fetch_pre_started_at", lambda machines: {}
+    )
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._wait_agents_updated",
+        lambda machines, *, target_version, timeout, pre_started_at: {
+            m.name: {
+                "matched": False,
+                "result": "staged",
+                "version_now": "0.4.110",
+                "error": None,
+            }
+            for m in machines
+        },
+    )
+
+    ok, detail, serve_unit_ok = release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
+    )
+    assert ok is None
+    assert "restart deferred" in detail
+    assert serve_unit_ok is False
+
+
+def test_roll_python_still_fails_a_genuinely_unmatched_outcome(monkeypatch):
+    """Sibling to the test above: a non-`"staged"` unmatched outcome — the
+    agent never reports the target version at all, pip failed outright, or
+    merely resolved to the same version — must still come back `False`, not
+    `None`. The #3588 fix narrows exactly one `result` value into a pending
+    outcome; every other unmatched result must still be able to fail the
+    gate through this function, or the fix would have gone too far."""
+    monkeypatch.setattr(release_cmd, "_post", lambda url, payload, *, timeout: (202, {}, ""))
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._fetch_pre_started_at", lambda machines: {}
+    )
+
+    for result in ("failed", "no_change"):
+        monkeypatch.setattr(
+            "coord.commands.agent_ops._wait_agents_updated",
+            lambda machines, *, target_version, timeout, pre_started_at, _r=result: {
+                m.name: {
+                    "matched": False,
+                    "result": _r,
+                    "version_now": "0.4.110",
+                    "error": None,
+                }
+                for m in machines
+            },
+        )
+        ok, detail, serve_unit_ok = release_cmd._roll_python(
+            _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0,
+            force=False,
+        )
+        assert ok is False, f"result={result!r} must still be a plain failure"
+        assert serve_unit_ok is False
+
+
+def test_outcome_is_staged_is_the_one_shared_answer():
+    """#3588 review (non-blocking): `coord agent update`'s own echo loop and
+    `_roll_python` both recognize a `"staged"` outcome off the identical
+    `_wait_agents_updated` dict through this one predicate now, not two
+    copies of the magic string. Pinned directly so the two can't drift the
+    next time the agent grows another pending `result` value."""
+    from coord.commands.agent_ops import outcome_is_staged
+
+    assert outcome_is_staged({"result": "staged"}) is True
+    assert outcome_is_staged({"result": "failed"}) is False
+    assert outcome_is_staged({"result": "no_change"}) is False
+    assert outcome_is_staged({}) is False
 
 
 # ──────────────────────────────────────────────────────────────────────────
