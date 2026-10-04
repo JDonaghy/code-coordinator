@@ -622,6 +622,14 @@ def attempted_scope(lanes: Iterable[Mapping[str, Any]]) -> set[tuple[str, str]]:
       through the one ``ok is None`` test below, not two parallel ones,
       so a row can never be "attempted and blocking" through one flag
       while reading as unattempted through the other.
+
+      NEVER the daemon host's own python lane: ``agent_app.
+      _idle_restart_target`` refuses to ever fire there on purpose
+      (``_daemon_runs_here()`` true), so a "staged" result on that host is
+      permanently stuck, not pending — ``coord.commands.release``'s roll
+      loop scores it as a plain ``ok=False`` failure instead, specifically
+      so it can never reach this exclusion and can never make the gate
+      report ``verified``/exit 0 while the daemon sits on the old version.
     """
     scope: set[tuple[str, str]] = set()
     for row in lanes:
@@ -1724,6 +1732,32 @@ _STATUS_MARK = {
 }
 
 
+def lane_mark(ok: bool | None, *, deferred: bool = False) -> str:
+    """The one-character glyph a single lane row's ``(ok, deferred)`` pair
+    renders as.
+
+    #3588 review: `coord.commands.release`'s roll loop computes this exact
+    mark for its own live `_out` echo of a lane the moment it is rolled, and
+    :func:`render_record` computes it again later for the same row once it
+    has round-tripped through the journal. Two independent copies of the
+    same ternary is exactly the "one question, one answer" trap #2085 named
+    for `finding_pairs` — sharing this one function is what keeps a future
+    change to the mark scheme (a new lane outcome, a new glyph) from
+    reaching one call site and not the other.
+
+    ``ok is None`` is "excluded from the gate" either way (see
+    :func:`attempted_scope`) but is NOT one situation — ``deferred=True`` is
+    "attempted, pending this host's own idle self-restart watcher (#2139)";
+    ``deferred=False`` is "no channel for this lane on this host at all" (a
+    remote `coord-tui` with no install path, most commonly). Collapsing
+    those back to one glyph would re-hide the distinction the `deferred`
+    flag exists to keep legible.
+    """
+    if ok is None:
+        return "⧗" if deferred else "·"
+    return "✓" if ok else "✗"
+
+
 def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
     """Human-readable lines for one attempt."""
     data = record.to_dict() if isinstance(record, PropagationRecord) else dict(record)
@@ -1766,21 +1800,11 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
 
     for lane in data.get("lanes") or []:
         ok = lane.get("ok")
-        # #3588: a lane this run attempted but whose restart is pending the
-        # agent's own idle self-restart watcher (#2139) reads as `⧗`, not
-        # the generic `·` a lane with no channel at all uses — the two are
-        # excluded from the gate for the same reason but are not the same
-        # situation, and collapsing them back together in the one place
-        # history is read from would re-hide the distinction the gate itself
-        # now keeps (see `coord.commands.release._roll_python`).
-        if ok is None:
-            lane_mark = "⧗" if lane.get("deferred") else "·"
-        else:
-            lane_mark = "✓" if ok else "✗"
+        mark = lane_mark(ok, deferred=bool(lane.get("deferred")))
         detail = lane.get("detail") or ""
         channel = lane.get("channel")
         lines.append(
-            f"    {lane_mark} {lane.get('lane')}@{lane.get('host')}"
+            f"    {mark} {lane.get('lane')}@{lane.get('host')}"
             + (f" [{channel}]" if channel else "")
             + (f" — {detail}" if detail else "")
         )

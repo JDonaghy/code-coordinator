@@ -452,6 +452,23 @@ def _start_agent_server(
         server.shutdown()
 
 
+def outcome_is_staged(outcome: "dict[str, Any] | Any") -> bool:
+    """True when *outcome* — one host's row out of :func:`_wait_agents_updated`
+    — is the #2139 "venv swap landed, restart deliberately deferred to the
+    agent's own idle self-restart watcher" case, not a failure.
+
+    #3588 review: this exact question — "is this `_wait_agents_updated`
+    outcome a staged restart?" — used to be answered twice off the identical
+    dict, by this module's own `agent_update` echo loop and separately by
+    `coord.commands.release._roll_python`, each spelling the magic string
+    ``"staged"`` out by hand. That is the "one question, one answer" rule
+    (#2085) this PR's own `finding_pairs` already follows elsewhere; a
+    shared predicate is what stops the two answers drifting the next time
+    the agent grows another pending ``result`` value.
+    """
+    return outcome.get("result") == "staged"
+
+
 def _resolve_target_version(
     explicit_version: str | None,
     *,
@@ -704,7 +721,7 @@ def agent_update(
                 continue
 
             result = outcome.get("result")
-            if result == "staged":
+            if outcome_is_staged(outcome):
                 # #2139: the swap landed but the agent had live assignments
                 # when it did — restart is intentionally deferred to that
                 # agent's own idle self-restart watcher, not something this

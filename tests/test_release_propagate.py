@@ -1072,6 +1072,42 @@ def test_an_unrecognised_lane_keeps_the_gate_rather_than_slipping_through():
     assert rp.scope_verification(verification, lanes=_run_lanes()).red
 
 
+def test_a_deferred_python_lane_is_out_of_scope_like_unrollable_but_distinct():
+    """#3588: a python lane whose swap landed but whose restart this run's
+    own `/update` deferred to the agent's idle self-restart watcher (#2139)
+    must be excluded from the gate the same way `unrollable` already is —
+    see `attempted_scope`'s own docstring for why these are the SAME
+    exclusion test (`ok is None`) reached for two different reasons, not
+    two parallel mechanisms."""
+    lanes = _run_lanes({
+        ("python", "elitebook"): {
+            "ok": None, "deferred": True,
+            "detail": "swapped to v0.5.8; restart deferred to this agent's "
+                      "idle self-restart watcher (#2139)",
+        },
+    })
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "elitebook", "~/.coord-venv (elitebook)")],
+    }
+    verdict = rp.scope_verification(verification, lanes=lanes)
+    assert not verdict.red
+    # Distinct from `unrollable` — this host very much has a channel and
+    # just used it, so it must not be reported as having none.
+    assert "~/.coord-venv@elitebook" not in verdict.unrollable
+
+
+def test_lane_mark_distinguishes_deferred_from_no_channel():
+    """`render_record` and `coord.commands.release`'s own roll-loop echo
+    must agree on what `ok is None` renders as — see `lane_mark`'s
+    docstring for why this is the one shared function, not two ternaries."""
+    assert rp.lane_mark(True) == "✓"
+    assert rp.lane_mark(False) == "✗"
+    assert rp.lane_mark(None) == "·"
+    assert rp.lane_mark(None, deferred=False) == "·"
+    assert rp.lane_mark(None, deferred=True) == "⧗"
+
+
 def test_an_unreachable_host_is_never_silently_exempted():
     verification = {
         "severity": "unknown",

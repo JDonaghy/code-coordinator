@@ -1237,9 +1237,14 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # #3588: the set of (lane, host) pairs this run itself staged but
         # deliberately left running on the old version — see `_roll_python`
         # and the `deferred` entries the roll loop above stamps onto
-        # `record.lanes`. A verify finding naming one of these is advisory
-        # for the right reason (it will resolve on its own, not "fix it by
-        # hand") and must say so rather than reusing the generic "outside
+        # `record.lanes`. Never the daemon host: the roll loop's own
+        # daemon-host override scores a "staged" result there as a plain
+        # `ok=False` failure, not `deferred`, precisely so it can never
+        # reach this exclusion (`agent_app._idle_restart_target` refuses to
+        # ever fire on that host — see that override's comment). A verify
+        # finding naming one of these pairs is advisory for the right
+        # reason — it was genuinely attempted and could resolve on its own —
+        # and must say exactly that rather than reusing the generic "outside
         # propagation's reach" wording, which is simply false here — this
         # run DID reach it, it is mid-flight.
         deferred_pairs = {
@@ -1247,6 +1252,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             for row in record.lanes
             if row.get("deferred")
         }
+
         def _is_deferred_finding(finding: dict[str, Any]) -> bool:
             # #2085's rule applied: this is the same "which (host, lane)
             # pairs does a grouped finding actually name" question
@@ -1261,12 +1267,18 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         for finding in gate.advisory:
             host = finding.get("host")
             if _is_deferred_finding(finding):
+                # #3588 review: state what was actually observed — the swap
+                # landed and this host's own idle self-restart watcher
+                # (#2139) is now the only thing left to act — rather than
+                # asserting it "will resolve", a claim nothing here checked.
+                # The python lane line printed a few lines earlier (step 4)
+                # already named the #2139 mechanism in full; this does not
+                # repeat that explanation, only ties the finding to it.
                 click.echo(
                     f"  ~ advisory [{finding.get('severity')}] {host} "
                     f"{finding.get('lane')}: {finding.get('summary')} "
-                    "— restart deferred to this agent's idle self-restart "
-                    "watcher (#2139); no action needed, it will resolve once "
-                    "the agent's live assignment(s) finish",
+                    "— swap staged; waiting on this host's own idle "
+                    "self-restart watcher (see the python lane line above)",
                     err=True,
                 )
                 continue
@@ -1718,21 +1730,53 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
                     tui_pty_repos=tui_pty_repos,
                 ),
             )
-            deferred = ok is None
+            if ok is None and roll.host == daemon_name:
+                # #3588 review: a "staged" outcome from THIS host is not the
+                # pending, self-resolving case `ok is None` means everywhere
+                # else in this lane. `agent_app._idle_restart_target` refuses
+                # to ever fire while `_daemon_runs_here()` is true
+                # (agent_app.py:541-579) — coord-serve being a unit on this
+                # host, or that being undeterminable, both read as "stay on
+                # the existing ordered /update+/restart-services path". A
+                # "staged" result here is proof that watcher will never act,
+                # not a promise it eventually will — so it must be scored as
+                # the plain restart failure it actually is: it lands in
+                # `attempted_scope`, can block `--rollback-on-red`/verify the
+                # same way any other failed python lane does, and the run
+                # must not exit `verified`/0 while the daemon sits mid-swap.
+                # (The agent is ALSO permanently stuck this way whenever
+                # `_host_has_live_interactive_session()` holds — a `--tmux`
+                # pane that outlived its assignment — which this file has no
+                # way to tell apart from the live-assignment case below; both
+                # are "never resolves on its own" regardless.)
+                ok = False
+                detail = (
+                    f"{detail} — but this IS the daemon host, whose idle "
+                    "self-restart watcher never fires (agent_app."
+                    "_idle_restart_target refuses here on purpose); the "
+                    "swap is staged but permanently stuck until restarted "
+                    "by hand"
+                )
             if ok:
                 updated_hosts.append(roll.host)
             elif roll.host == daemon_name and not serve_unit_ok:
                 daemon_python_failed = True
         elif roll.lane == rp.LANE_UNITS:
-            deferred = False
             ok, detail = _roll_units(machine, agent_port=AGENT_PORT)
         else:
             # #2898: no target_version — the tui lane resolves its own
             # channel's latest (see _roll_tui). record.target_version names a
             # tag in the coordinator's channel, which coord-tui's Releases
             # have never heard of.
-            deferred = False
             ok, detail = _roll_tui(machine, local_name=local_name)
+
+        # #3588 nit: `deferred` can only ever be true for a python lane (the
+        # only lane `_roll_python` can report a "staged, pending the agent's
+        # own idle watcher" outcome for, and only once the daemon-host
+        # override just above has already ruled out the permanently-stuck
+        # case) — computed once here rather than once per branch above, so a
+        # future fourth branch can't forget to set it.
+        deferred = ok is None and roll.lane == rp.LANE_PYTHON
 
         # #2052: `ok is None` from a lane executor means "there is no channel
         # for this lane on this host" — not a failure, and emphatically not
@@ -1758,8 +1802,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             else:
                 entry["unrollable"] = True
         record.lanes.append(entry)
-        _out(f"  {('⧗' if deferred else '·') if ok is None else ('✓' if ok else '✗')} "
-             f"{roll.label}: {detail}")
+        _out(f"  {rp.lane_mark(ok, deferred=deferred)} {roll.label}: {detail}")
 
     # ── 4b. uncordon what just rolled, immediately (#2101) ───────────────
     #
@@ -2626,7 +2669,28 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
       does for a lane with no channel at all (see
       ``coord.release_propagate.attempted_scope``) — reusing that one
       exclusion is deliberate, not a second mechanism for "don't block
-      on this".
+      on this". The caller ALSO overrides this back to a plain ``False``
+      when *machine* is the daemon host, because a "staged" result there
+      can never resolve on its own (see the roll loop's own comment) —
+      this function has no way to know that about its own caller, so it
+      always reports the pending case honestly and leaves that one
+      exception to whoever knows which host is the daemon.
+
+      #3588 review (considered, not closed here): a host already sitting
+      on this ``ok=None``/``deferred`` outcome from an earlier attempt
+      whose watcher has not yet fired, re-rolled by a later ``--drain``
+      attempt once the board happens to see it as idle, is *not*
+      guaranteed to produce the same pending outcome a second time. Its
+      venv is already on *target_version*; depending on timing either the
+      watcher restarts it first (``_wait_agents_updated`` then reports
+      ``matched``, a clean ``✓``) or this second ``/update`` lands first
+      and finds ``version_before == version_after`` with nothing left to
+      swap, which reads as ``result: "no_change"`` — an ordinary failure
+      this function cannot currently tell apart from a real stuck pip
+      resolve. Treating "venv already on target, process merely behind"
+      as its own pending state (rather than `no_change`) would close that
+      gap; flagged here for whoever picks it up next rather than folded
+      into this fix.
     * ``serve_unit_ok`` is narrower and answers a different question: is
       *coord-serve itself* — the unit whose version every other host's
       caller depends on, and the entire reason the main roll loop's
@@ -2655,6 +2719,7 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     from coord.commands.agent_ops import (  # noqa: PLC0415
         _fetch_pre_started_at,
         _wait_agents_updated,
+        outcome_is_staged,
     )
     from coord.release_verify import DAEMON_UNIT  # noqa: PLC0415
 
@@ -2689,13 +2754,17 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     )
     outcome = outcomes.get(machine.name) or {}
     if not outcome.get("matched"):
-        if outcome.get("result") == "staged":
+        if outcome_is_staged(outcome):
             # #3588: the swap landed; the restart is intentionally deferred
             # to this agent's own idle self-restart watcher (#2139) because
             # it had live assignments the instant `/update` tried to
             # restart it. `ok=None` (not `False`) is load-bearing — see this
             # function's own docstring for why a pending, self-resolving
-            # outcome must not be scored the same as a real failure.
+            # outcome must not be scored the same as a real failure. The
+            # CALLER (`coord.commands.release`'s own roll loop) still must
+            # override this back to a plain failure when *machine* is the
+            # daemon host — see that loop's own comment for why a "staged"
+            # result there is provably permanent, never pending.
             return None, str(
                 outcome.get("error")
                 or f"swapped to v{target_version}; restart deferred to "
