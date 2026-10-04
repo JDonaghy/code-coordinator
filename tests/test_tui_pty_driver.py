@@ -22,6 +22,19 @@ exact failure mode the companion bugbash finding reported (51 orphaned
 ``vcd`` processes reparented to ``systemd --user``). Against the pre-#3583
 code (``preexec_fn=os.setsid`` with no parent-death signal) this test fails:
 the grandchild survives its manager's SIGKILL indefinitely.
+
+:class:`TestWrapLaunchCommand` and
+:class:`TestUnixPtyChildRealCompoundCommand` are review-round-1 additions
+(#3583): the first ``exec``-wrapping fix unconditionally prefixed the
+*entire* command string with ``exec ``, which breaks the one real
+production ``tui-pty`` route (``~/.coord/coordinator.remote.yml``'s
+``vimcode`` route) — its ``run:`` is a compound ``cd X && ENV=Y bin arg``
+shell script, and ``exec`` can be applied to neither a leading ``cd``
+(a builtin, not an executable) nor an inline env-var assignment (not
+``exec``'s own argument-list syntax). These tests drive exactly that
+shape — the first against the pure string transform, the second end-to-end
+against a real pty — so a regression here fails loudly rather than only
+surfacing against the live fleet config.
 """
 
 from __future__ import annotations
@@ -41,6 +54,7 @@ from coord.tui_pty_driver import (
     TuiPtySpecError,
     UnixPtyChild,
     VtScreen,
+    _wrap_launch_command,
     encode_click,
     encode_key,
     parse_smoke_spec,
@@ -628,6 +642,91 @@ class TestUnixPtyChildReal:
         finally:
             child.close()
         assert not child.is_alive()
+
+
+# ── #3583 review round 1: the exec-wrapping fix must not break the real
+# compound-command + inline-env-var `run:` shape it is meant to protect ────
+
+
+class TestWrapLaunchCommand:
+    """Unit coverage for the pure string transform, isolated from spawning
+    any real process — see the module docstring's review-round-1 note."""
+
+    def test_simple_command_gets_exec_prefixed(self) -> None:
+        assert _wrap_launch_command("sleep 60") == "exec sleep 60"
+
+    def test_already_exec_prefixed_is_left_alone(self) -> None:
+        assert _wrap_launch_command("exec sleep 60") == "exec sleep 60"
+
+    def test_already_exec_prefixed_tolerates_leading_whitespace(self) -> None:
+        assert _wrap_launch_command("  exec sleep 60") == "  exec sleep 60"
+
+    def test_leading_cd_and_compound_is_preserved_not_execed(self) -> None:
+        # `exec cd ...` fails outright — `cd` is a shell builtin, not an
+        # executable — so the leading `cd .smoke &&` must survive
+        # untouched; only the final simple command is rewritten.
+        wrapped = _wrap_launch_command("cd .smoke && ../target/release/vcd sample.txt")
+        assert wrapped == "cd .smoke && exec ../target/release/vcd sample.txt"
+
+    def test_inline_env_assignment_is_rewritten_via_env(self) -> None:
+        # `exec HOME=x ./bin` would try (and fail) to execve a program
+        # literally named `HOME=x` — `env` doesn't have that restriction.
+        wrapped = _wrap_launch_command("HOME=$PWD/home ./bin arg")
+        assert wrapped == "exec env HOME=$PWD/home ./bin arg"
+
+    def test_real_production_route_shape_cd_and_inline_env(self) -> None:
+        # The exact `~/.coord/coordinator.remote.yml` vimcode `tui-pty`
+        # route's `run:` shape the review round reported as broken.
+        wrapped = _wrap_launch_command(
+            "cd .smoke && HOME=$PWD/home ../target/release/vcd sample.txt"
+        )
+        assert wrapped == (
+            "cd .smoke && exec env HOME=$PWD/home ../target/release/vcd sample.txt"
+        )
+
+    def test_multiple_compound_segments_only_the_last_is_execed(self) -> None:
+        wrapped = _wrap_launch_command("cd a && cd b && HOME=x ./bin arg")
+        assert wrapped == "cd a && cd b && exec env HOME=x ./bin arg"
+
+    def test_double_ampersand_inside_a_quoted_argument_is_not_a_split_point(self) -> None:
+        wrapped = _wrap_launch_command("./bin 'a && b'")
+        assert wrapped == "exec ./bin 'a && b'"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="UnixPtyChild requires a POSIX platform")
+class TestUnixPtyChildRealCompoundCommand:
+    """End-to-end regression (#3583 review round 1): drive a real
+    ``UnixPtyChild`` with the exact production ``run:`` shape — a leading
+    ``cd`` plus an inline env-var assignment on the final simple command —
+    and prove it still launches. Against the broken fix (unconditional
+    whole-command ``exec`` prefix), this fails immediately: the wrapped
+    command becomes ``exec cd workdir && ...``, ``sh`` reports ``exec: cd:
+    not found`` (exit 127), and the child is dead before ``is_alive()`` is
+    ever checked.
+    """
+
+    def test_cd_and_inline_env_assignment_shape_still_launches(self, tmp_path) -> None:
+        subdir = tmp_path / "workdir"
+        subdir.mkdir()
+        command = (
+            f"cd workdir && HOME=$PWD/home {sys.executable} -c "
+            "\"import os, sys; "
+            "sys.stdout.write('HOME=' + os.environ['HOME'] + '\\r\\n'); "
+            "sys.stdout.flush(); import time; time.sleep(2)\""
+        )
+        child = UnixPtyChild(command, str(tmp_path), cols=80, rows=24)
+        try:
+            collected = b""
+            deadline = time.monotonic() + 5
+            while b"HOME=" not in collected and time.monotonic() < deadline:
+                collected += child.read(0.2)
+            assert child.is_alive(), (
+                "child exited immediately — the cd+inline-env-var launch "
+                "command failed to start"
+            )
+            assert f"HOME={subdir}/home".encode() in collected
+        finally:
+            child.close()
 
 
 # ── #3583: the pty child must be reaped even if its manager never gets to
