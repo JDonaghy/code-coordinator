@@ -98,7 +98,9 @@ from __future__ import annotations
 import os
 import queue
 import re
+import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -461,10 +463,108 @@ class PtyChild(Protocol):
     def close(self) -> None: ...
 
 
+#: Linux's ``prctl(2)`` opcode for ``PR_SET_PDEATHSIG`` — not exposed by the
+#: stdlib, so :func:`_arm_parent_death_signal` calls it via ``ctypes``
+#: against ``libc.so.6`` rather than pulling in a dependency for one int.
+_PR_SET_PDEATHSIG = 1
+
+
+def _arm_parent_death_signal() -> None:
+    """Run in the forked child, before ``exec`` (#3583): arm a
+    kernel-enforced "kill me if my parent dies" signal, so the real binary
+    this driver launches is reaped even if the Python process managing it
+    is killed abnormally (SIGKILL, OOM, crash) — the one case no userspace
+    cleanup code (``close()``, ``__del__``, ``atexit``, a signal handler)
+    can ever run for, since SIGKILL cannot be caught.
+
+    ``os.setsid()`` detaches the child into its own session/process group
+    (needed so it gets its own controlling tty from the pty) — which also
+    means it is no longer reachable by a plain ``kill`` of the parent's
+    process group, so a death signal is the only remaining guarantee.
+    ``PR_SET_PDEATHSIG`` is preserved across ``execve()`` (POSIX.1-2001),
+    so it still applies to the real compiled binary this ``shell=True``
+    command ultimately execs into — **provided** that exec genuinely
+    replaces this process rather than a shell forking a fresh grandchild
+    for it (see :data:`_EXEC_PREFIX` on why the launch command is wrapped
+    in ``exec`` to force exactly that).
+
+    Linux-only (``prctl`` doesn't exist on macOS/BSD); best-effort — a
+    missing/broken ``libc`` symbol must never prevent the pty from
+    launching at all, so failures here are swallowed rather than raised.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes  # noqa: PLC0415
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except OSError:
+        pass
+
+
+def _unix_pty_preexec() -> None:
+    """``preexec_fn`` for :class:`UnixPtyChild`'s ``subprocess.Popen`` —
+    gives the child its own session (for proper tty signal delivery) and
+    arms its parent-death signal (#3583). Order matters: ``setsid()`` does
+    not fork and does not clear a death signal armed before or after it,
+    but a careless addition of a *fork* between these two calls would."""
+    os.setsid()
+    _arm_parent_death_signal()
+
+
+#: Prefix :func:`_wrap_launch_command` adds to every ``UnixPtyChild``
+#: command (#3583). Measured directly against this machine's ``/bin/sh``
+#: (``dash``): ``Popen("sleep 60", shell=True, preexec_fn=...)`` leaves TWO
+#: processes — ``dash`` (the one ``preexec_fn``/``PR_SET_PDEATHSIG`` ran
+#: in) as a *parent*, and a separate forked ``sleep`` grandchild that never
+#: had a death signal armed on it at all (``PR_SET_PDEATHSIG`` is cleared
+#: on every ``fork()``, including the shell's own). dash never applies
+#: bash's "tail call" exec-optimization for a ``-c`` simple command, so
+#: without this, killing the manager reaps the shell but **leaks exactly
+#: the grandchild this issue's evidence found** (51 ``vcd``s reparented to
+#: ``systemd --user``). ``exec`` is the POSIX shell builtin that replaces
+#: the shell's own process image via ``execve()`` instead of forking —
+#: verified empirically to collapse the above down to one process (the
+#: real binary, same pid throughout), onto which the armed death signal
+#: then actually applies.
+_EXEC_PREFIX = "exec "
+
+
+def _wrap_launch_command(command: str) -> str:
+    """Prefix *command* with ``exec`` (#3583) so the ``/bin/sh -c`` this
+    class's ``subprocess.Popen`` runs always collapses into the real
+    binary via ``execve()`` rather than potentially forking a grandchild
+    for it — see :data:`_EXEC_PREFIX`. Idempotent: a caller-supplied
+    command that already starts with ``exec `` is left alone rather than
+    double-prefixed.
+
+    Caveat, documented rather than silently mishandled: this assumes
+    *command* is a single executable invocation (the driver's own
+    contract — a binary path plus arguments, matching every real
+    ``tui-pty`` route's ``run:``). A command relying on a *leading inline
+    env-var assignment* (``FOO=bar ./binary``) would break under a plain
+    ``exec`` prefix — POSIX's assignment-prefix parsing does not apply to
+    ``exec``'s own argument list, so ``exec FOO=bar ./binary`` tries (and
+    fails) to execve a program literally named ``FOO=bar``. No route uses
+    that shape today; if one needs to, set the variable via the pty's
+    environment rather than inline in the command string.
+    """
+    return command if command.startswith(_EXEC_PREFIX) else _EXEC_PREFIX + command
+
+
 class UnixPtyChild:
     """A real Unix pty running *command* under a real child process (#3483)
     — not an in-process harness. Requires a POSIX platform (:mod:`pty` is
-    POSIX-only in the standard library)."""
+    POSIX-only in the standard library).
+
+    #3583: the spawned child also has a kernel-enforced parent-death signal
+    armed (:func:`_arm_parent_death_signal`, Linux-only) so it is reaped
+    even if this driver's own Python process is killed abnormally before
+    :meth:`close` ever runs — see that function's docstring. This is a
+    defense in depth with, not a replacement for, :meth:`close`: a normal
+    teardown still explicitly terminates/kills the child.
+    """
 
     def __init__(self, command: str, cwd: str, cols: int, rows: int) -> None:
         if os.name != "posix":
@@ -481,9 +581,9 @@ class UnixPtyChild:
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         try:
             self._proc = subprocess.Popen(
-                command, shell=True, cwd=cwd or None,
+                _wrap_launch_command(command), shell=True, cwd=cwd or None,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                preexec_fn=os.setsid, close_fds=True,
+                preexec_fn=_unix_pty_preexec, close_fds=True,
             )
         finally:
             os.close(slave_fd)
