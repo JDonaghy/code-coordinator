@@ -498,8 +498,20 @@ def _arm_parent_death_signal() -> None:
         import ctypes  # noqa: PLC0415
 
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # Explicit, rather than relying on ctypes' default-`c_int`
+        # argument-promotion guess for an unannotated function pointer —
+        # `prctl(2)`'s real signature is `int prctl(int, unsigned long,
+        # unsigned long, unsigned long, unsigned long)`.
+        libc.prctl.argtypes = [
+            ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ]
+        libc.prctl.restype = ctypes.c_int
         libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
-    except OSError:
+    except (OSError, AttributeError):
+        # OSError: libc.so.6 can't be loaded (unlikely on real Linux glibc).
+        # AttributeError: the `prctl` symbol lookup itself fails — ctypes
+        # raises this, not OSError, so it must be caught here too for the
+        # "never raised, best-effort" guarantee to actually hold.
         pass
 
 
@@ -509,48 +521,125 @@ def _unix_pty_preexec() -> None:
     arms its parent-death signal (#3583). Order matters: ``setsid()`` does
     not fork and does not clear a death signal armed before or after it,
     but a careless addition of a *fork* between these two calls would."""
-    os.setsid()
-    _arm_parent_death_signal()
+    os.setsid()  # NOTE: order vs the next line doesn't matter today (see
+    # docstring) — but a fork inserted between them would break that.
+    _arm_parent_death_signal()  # NOTE: see the NOTE above this call.
 
 
-#: Prefix :func:`_wrap_launch_command` adds to every ``UnixPtyChild``
-#: command (#3583). Measured directly against this machine's ``/bin/sh``
-#: (``dash``): ``Popen("sleep 60", shell=True, preexec_fn=...)`` leaves TWO
-#: processes — ``dash`` (the one ``preexec_fn``/``PR_SET_PDEATHSIG`` ran
-#: in) as a *parent*, and a separate forked ``sleep`` grandchild that never
-#: had a death signal armed on it at all (``PR_SET_PDEATHSIG`` is cleared
-#: on every ``fork()``, including the shell's own). dash never applies
-#: bash's "tail call" exec-optimization for a ``-c`` simple command, so
-#: without this, killing the manager reaps the shell but **leaks exactly
-#: the grandchild this issue's evidence found** (51 ``vcd``s reparented to
-#: ``systemd --user``). ``exec`` is the POSIX shell builtin that replaces
-#: the shell's own process image via ``execve()`` instead of forking —
-#: verified empirically to collapse the above down to one process (the
-#: real binary, same pid throughout), onto which the armed death signal
-#: then actually applies.
+#: Prefix :func:`_wrap_launch_command` adds to the *final simple command* of
+#: every ``UnixPtyChild`` command (#3583). Measured directly against this
+#: machine's ``/bin/sh`` (``dash``): ``Popen("sleep 60", shell=True,
+#: preexec_fn=...)`` leaves TWO processes — ``dash`` (the one
+#: ``preexec_fn``/``PR_SET_PDEATHSIG`` ran in) as a *parent*, and a separate
+#: forked ``sleep`` grandchild that never had a death signal armed on it at
+#: all (``PR_SET_PDEATHSIG`` is cleared on every ``fork()``, including the
+#: shell's own). dash never applies bash's "tail call" exec-optimization for
+#: a ``-c`` simple command, so without this, killing the manager reaps the
+#: shell but **leaks exactly the grandchild this issue's evidence found**
+#: (51 ``vcd``s reparented to ``systemd --user``). ``exec`` is the POSIX
+#: shell builtin that replaces the shell's own process image via
+#: ``execve()`` instead of forking — verified empirically to collapse the
+#: above down to one process (the real binary, same pid throughout), onto
+#: which the armed death signal then actually applies.
 _EXEC_PREFIX = "exec "
+
+#: Matches one leading ``VAR=value`` assignment (plus its trailing
+#: whitespace) at the front of a shell simple command — the shape
+#: ``_wrap_launch_command`` must convert to an ``env VAR=value`` argument
+#: *before* the ``exec`` prefix, because POSIX's assignment-prefix parsing
+#: (where a shell applies ``VAR=value`` only to the one command it
+#: precedes) does not apply to ``exec``'s own argument list: ``exec
+#: FOO=bar ./binary`` tries — and fails — to execve a program literally
+#: named ``FOO=bar``. ``env`` has no such restriction (it's a real
+#: executable, not a builtin with special parsing), and `/usr/bin/env`
+#: itself ``execve()``s straight into its target rather than forking, so
+#: ``exec env FOO=bar ./binary`` still collapses to one process.
+_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=\S*)[ \t]+")
+
+
+def _find_last_top_level_and(command: str) -> int | None:
+    """Return the string index of the ``&`` that starts the *last*
+    top-level ``&&`` operator in *command*, or ``None`` if there isn't one.
+
+    "Top-level" means not inside a single- or double-quoted string (the
+    only nesting a real ``tui-pty`` ``run:`` needs to care about today,
+    e.g. ``cd .smoke && HOME=$PWD/home ../target/release/vcd sample.txt``)
+    — quote state and backslash escapes are tracked so a literal ``&&``
+    living inside a quoted argument is correctly skipped rather than
+    mistaken for a command separator. Subshells (``( ... )``) and command
+    substitution (``$( ... )``/backticks) are out of scope: no real route
+    uses them, and misreading one only costs an extra, harmless shell fork
+    on the mis-split segment — it can never leak a process the way a
+    missed ``exec`` would.
+    """
+    in_single = in_double = escaped = False
+    last_idx = None
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if escaped:
+            escaped = False
+        elif ch == "\\" and not in_single:
+            escaped = True
+        elif ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double and ch == "&" and command[i + 1:i + 2] == "&":
+            last_idx = i
+            i += 1  # skip the second '&' of this pair
+        i += 1
+    return last_idx
 
 
 def _wrap_launch_command(command: str) -> str:
-    """Prefix *command* with ``exec`` (#3583) so the ``/bin/sh -c`` this
-    class's ``subprocess.Popen`` runs always collapses into the real
-    binary via ``execve()`` rather than potentially forking a grandchild
-    for it — see :data:`_EXEC_PREFIX`. Idempotent: a caller-supplied
-    command that already starts with ``exec `` is left alone rather than
-    double-prefixed.
+    """Rewrite *command* (#3583) so the ``/bin/sh -c`` this class's
+    ``subprocess.Popen`` runs always ends by collapsing into the real
+    binary via a single ``execve()`` — never a shell forking a grandchild
+    for it — so the parent-death signal armed in :func:`_unix_pty_preexec`
+    actually reaches the real process. See :data:`_EXEC_PREFIX`.
 
-    Caveat, documented rather than silently mishandled: this assumes
-    *command* is a single executable invocation (the driver's own
-    contract — a binary path plus arguments, matching every real
-    ``tui-pty`` route's ``run:``). A command relying on a *leading inline
-    env-var assignment* (``FOO=bar ./binary``) would break under a plain
-    ``exec`` prefix — POSIX's assignment-prefix parsing does not apply to
-    ``exec``'s own argument list, so ``exec FOO=bar ./binary`` tries (and
-    fails) to execve a program literally named ``FOO=bar``. No route uses
-    that shape today; if one needs to, set the variable via the pty's
-    environment rather than inline in the command string.
+    *command* may be a compound script (``cmd1 && cmd2 && ...``, the real
+    ``vimcode`` ``tui-pty`` route's shape: a leading ``cd`` followed by the
+    launch): only the **final** simple command is rewritten — everything
+    before the last top-level ``&&`` (:func:`_find_last_top_level_and`) is
+    left exactly as the caller wrote it, since ``exec cd ...`` fails
+    outright (``cd`` is a shell builtin, not an executable) and earlier
+    steps genuinely need to run as normal shell commands, not replace the
+    shell.
+
+    That final simple command may itself open with one or more *inline
+    env-var assignments* (``HOME=$PWD/home ./binary``, also a real route's
+    shape) — :data:`_ENV_ASSIGNMENT_RE` peels those off and re-emits them
+    as ``env``'s own arguments instead of ``exec``'s, so the result is
+    ``exec env VAR=val ... binary args`` rather than the broken ``exec
+    VAR=val ... binary args`` (see :data:`_ENV_ASSIGNMENT_RE` for why).
+
+    Idempotent at the whole-*command* level: a caller-supplied command
+    that already starts with ``exec `` (leading/trailing whitespace
+    tolerated) is returned unchanged rather than double-prefixed or
+    re-split.
     """
-    return command if command.startswith(_EXEC_PREFIX) else _EXEC_PREFIX + command
+    if command.strip().startswith(_EXEC_PREFIX):
+        return command
+
+    split = _find_last_top_level_and(command)
+    if split is None:
+        head, tail = "", command.strip()
+    else:
+        head, tail = command[:split].strip(), command[split + 2:].strip()
+
+    assignments: list[str] = []
+    while True:
+        m = _ENV_ASSIGNMENT_RE.match(tail)
+        if not m:
+            break
+        assignments.append(m.group(1))
+        tail = tail[m.end():]
+
+    env_prefix = f"env {' '.join(assignments)} " if assignments else ""
+    wrapped_tail = f"{_EXEC_PREFIX}{env_prefix}{tail}"
+    return f"{head} && {wrapped_tail}" if head else wrapped_tail
 
 
 class UnixPtyChild:
