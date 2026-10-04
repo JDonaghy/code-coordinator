@@ -13,11 +13,21 @@ level instead — see this issue's PR description.
 Unix-pty-backed test (skipped off POSIX) that proves
 :class:`~coord.tui_pty_driver.UnixPtyChild` itself genuinely drives a real
 child process through a real pseudo-terminal, not just against the fake.
+
+:class:`TestUnixPtyChildSurvivesAbnormalParentDeath` is a second, deliberate
+exception (#3583): it SIGKILLs the *managing* process (a throwaway
+``python -c`` subprocess that constructs a real ``UnixPtyChild`` and never
+calls ``close()``) and asserts the real grandchild is reaped anyway — the
+exact failure mode the companion bugbash finding reported (51 orphaned
+``vcd`` processes reparented to ``systemd --user``). Against the pre-#3583
+code (``preexec_fn=os.setsid`` with no parent-death signal) this test fails:
+the grandchild survives its manager's SIGKILL indefinitely.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 
@@ -618,3 +628,60 @@ class TestUnixPtyChildReal:
         finally:
             child.close()
         assert not child.is_alive()
+
+
+# ── #3583: the pty child must be reaped even if its manager never gets to
+# run close() (killed abnormally rather than exiting normally) ────────────
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or sys.platform != "linux",
+    reason="the #3583 fix (PR_SET_PDEATHSIG) is Linux-only; UnixPtyChild "
+    "requires POSIX but macOS has no prctl()",
+)
+class TestUnixPtyChildSurvivesAbnormalParentDeath:
+    def test_child_is_reaped_when_manager_is_sigkilled(self, tmp_path) -> None:
+        marker = tmp_path / "child.pid"
+        script = (
+            "import sys; sys.path.insert(0, " + repr(os.getcwd()) + ")\n"
+            "from coord.tui_pty_driver import UnixPtyChild\n"
+            "child = UnixPtyChild('sleep 60', " + repr(str(tmp_path)) + ", 80, 24)\n"
+            "open(" + repr(str(marker)) + ", 'w').write(str(child._proc.pid))\n"
+            "import time; time.sleep(60)\n"
+        )
+        manager = subprocess.Popen([sys.executable, "-c", script])
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.exists(), "manager process never reported a child pid"
+            child_pid = int(marker.read_text())
+            assert _pid_alive(child_pid), "child process never started"
+
+            # Kill the manager WITHOUT ever letting it call close() — the
+            # one case no userspace cleanup code can run for.
+            manager.kill()
+            manager.wait(timeout=5)
+
+            # #2096: don't just check "no exception" — actually re-observe
+            # the real OS process after giving the kernel a bounded window
+            # to deliver the parent-death signal.
+            deadline = time.monotonic() + 5
+            while _pid_alive(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert not _pid_alive(child_pid), (
+                f"pid {child_pid} is still alive {5}s after its managing "
+                "process was SIGKILLed — the pty child was not reaped"
+            )
+        finally:
+            if manager.poll() is None:
+                manager.kill()
+                manager.wait(timeout=5)
