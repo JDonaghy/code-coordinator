@@ -1234,8 +1234,42 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         gate = rp.scope_verification(report.to_dict(), lanes=record.lanes)
         record.verification = report.to_dict()
         record.gate = gate.to_dict()
+        # #3588: the set of (lane, host) pairs this run itself staged but
+        # deliberately left running on the old version — see `_roll_python`
+        # and the `deferred` entries the roll loop above stamps onto
+        # `record.lanes`. A verify finding naming one of these is advisory
+        # for the right reason (it will resolve on its own, not "fix it by
+        # hand") and must say so rather than reusing the generic "outside
+        # propagation's reach" wording, which is simply false here — this
+        # run DID reach it, it is mid-flight.
+        deferred_pairs = {
+            (rp.verify_lane_kind(row.get("lane") or "") or row.get("lane"), row.get("host"))
+            for row in record.lanes
+            if row.get("deferred")
+        }
+        def _is_deferred_finding(finding: dict[str, Any]) -> bool:
+            # #2085's rule applied: this is the same "which (host, lane)
+            # pairs does a grouped finding actually name" question
+            # `scope_verification` already answers via `rp.finding_pairs` —
+            # call that, don't re-derive the `"lane (host)"` parsing here.
+            for host, lane in rp.finding_pairs(finding):
+                kind = rp.verify_lane_kind(lane) or lane
+                if (kind, host) in deferred_pairs:
+                    return True
+            return False
+
         for finding in gate.advisory:
             host = finding.get("host")
+            if _is_deferred_finding(finding):
+                click.echo(
+                    f"  ~ advisory [{finding.get('severity')}] {host} "
+                    f"{finding.get('lane')}: {finding.get('summary')} "
+                    "— restart deferred to this agent's idle self-restart "
+                    "watcher (#2139); no action needed, it will resolve once "
+                    "the agent's live assignment(s) finish",
+                    err=True,
+                )
+                continue
             # #2403: elitebook sat on 0.5.146 (expected 0.5.148) for the
             # length of a cordon's full lifetime with this line as the ONLY
             # signal an operator got — "fix by hand" with no hand to
@@ -1684,17 +1718,20 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
                     tui_pty_repos=tui_pty_repos,
                 ),
             )
+            deferred = ok is None
             if ok:
                 updated_hosts.append(roll.host)
             elif roll.host == daemon_name and not serve_unit_ok:
                 daemon_python_failed = True
         elif roll.lane == rp.LANE_UNITS:
+            deferred = False
             ok, detail = _roll_units(machine, agent_port=AGENT_PORT)
         else:
             # #2898: no target_version — the tui lane resolves its own
             # channel's latest (see _roll_tui). record.target_version names a
             # tag in the coordinator's channel, which coord-tui's Releases
             # have never heard of.
+            deferred = False
             ok, detail = _roll_tui(machine, local_name=local_name)
 
         # #2052: `ok is None` from a lane executor means "there is no channel
@@ -1703,12 +1740,25 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # coord-tui binary is the canonical case: propagation itself reports
         # there is no remote install path, so counting its staleness as
         # grounds for rolling back a good python roll is a category error.
+        #
+        # #3588: a python lane's `ok is None` means something different —
+        # NOT "no channel" but "attempted, swap landed, restart pending this
+        # agent's own idle self-restart watcher" (see `_roll_python`). Both
+        # share the one property that actually matters here — excluded from
+        # `attempted_scope`, so neither blocks `--rollback-on-red` or holds
+        # the post-roll gate — but flagging them identically as
+        # ``unrollable`` would print the "no channel from this host" advisory
+        # over a host that very much has one and just used it. `deferred`
+        # keeps the two legible as the different things they are.
         entry = {"lane": roll.lane, "host": roll.host, "ok": ok,
                  "channel": roll.channel, "detail": detail}
         if ok is None:
-            entry["unrollable"] = True
+            if deferred:
+                entry["deferred"] = True
+            else:
+                entry["unrollable"] = True
         record.lanes.append(entry)
-        _out(f"  {'·' if ok is None else ('✓' if ok else '✗')} "
+        _out(f"  {('⧗' if deferred else '·') if ok is None else ('✓' if ok else '✗')} "
              f"{roll.label}: {detail}")
 
     # ── 4b. uncordon what just rolled, immediately (#2101) ───────────────
@@ -2549,7 +2599,8 @@ def _local_machine_name(config) -> str | None:
 
 
 def _roll_python(machine, *, target_version: str, agent_port: int, timeout: float,
-                 force: bool, extras: "list[str] | None" = None) -> tuple[bool, str, bool]:
+                 force: bool, extras: "list[str] | None" = None
+                 ) -> "tuple[bool | None, str, bool]":
     """POST /update and wait for the agent to actually report the version.
 
     Success is judged by the version the agent reports, never by "the POST
@@ -2562,7 +2613,20 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     * ``ok`` is the whole lane's own verdict, exactly as before — #2095
       correctly made this ``False`` whenever ANY restarted sibling failed,
       coord-web included, so the lane never prints a `✓` over a real
-      outage.
+      outage. #3588: ``ok`` is ``None`` — not ``False`` — in exactly one
+      other case: the venv swap landed but the agent had live assignments
+      at that instant and deliberately deferred its own restart to its
+      idle self-restart watcher (``last_update.result == "staged"``, see
+      ``agent_app.py``'s ``/update``). That is a pending, safe outcome on
+      a schedule this call has no way to predict (the watcher fires
+      whenever THAT host next goes idle) — not a failure this run caused
+      or can fix by retrying harder, so it must not read as one. The
+      caller excludes a ``None`` lane from ``--rollback-on-red``'s and
+      ``coord release verify``'s blocking scope the same way it already
+      does for a lane with no channel at all (see
+      ``coord.release_propagate.attempted_scope``) — reusing that one
+      exclusion is deliberate, not a second mechanism for "don't block
+      on this".
     * ``serve_unit_ok`` is narrower and answers a different question: is
       *coord-serve itself* — the unit whose version every other host's
       caller depends on, and the entire reason the main roll loop's
@@ -2625,6 +2689,18 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     )
     outcome = outcomes.get(machine.name) or {}
     if not outcome.get("matched"):
+        if outcome.get("result") == "staged":
+            # #3588: the swap landed; the restart is intentionally deferred
+            # to this agent's own idle self-restart watcher (#2139) because
+            # it had live assignments the instant `/update` tried to
+            # restart it. `ok=None` (not `False`) is load-bearing — see this
+            # function's own docstring for why a pending, self-resolving
+            # outcome must not be scored the same as a real failure.
+            return None, str(
+                outcome.get("error")
+                or f"swapped to v{target_version}; restart deferred to "
+                   "this agent's idle self-restart watcher (#2139)"
+            ), False
         return False, str(
             outcome.get("error")
             or f"still reporting v{outcome.get('version_now', '?')} after "

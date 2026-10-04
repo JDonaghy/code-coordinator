@@ -1796,6 +1796,98 @@ def test_2981_an_empty_tui_channel_does_not_roll_back_the_python_lanes(
     assert "advisory" in result.output
 
 
+def test_3588_a_staged_restart_deferred_to_the_idle_watcher_does_not_roll_back(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """THE #3588 regression, end to end.
+
+    `laptop` had a live assignment the instant its `/update` tried to
+    restart it, so the agent swapped the venv and deferred the actual
+    restart to its own idle self-restart watcher (#2139) — `_roll_python`
+    reports that as `(None, "...restart deferred...", False)`, never
+    `False`. `coord release verify` still (correctly) sees `laptop`'s
+    *running process* on the old version and reports CRIT — that process
+    genuinely hasn't restarted yet. Before this fix, `_roll_python`
+    collapsed "deferred" into a plain `ok=False` lane, which put
+    `(python, laptop)` inside this run's attempted scope, turned the CRIT
+    blocking, and `--rollback-on-red` "rolled back" a host that was never
+    actually reverted (nothing to roll back — the venv really is on the new
+    version) while every other cordoned host sat abandoned once the run
+    exited non-zero. None of that may happen: a staged/deferred restart is
+    a pending, safe outcome, not a red gate."""
+    from coord import release_verify as rv
+
+    _stub_lanes(monkeypatch)
+
+    def _python(machine, **kwargs):
+        if machine.name == "laptop":
+            return None, (
+                "swapped to v0.4.111; 1 active assignment(s) still "
+                "running — restart deferred to this agent's idle "
+                "self-restart watcher (#2139)"
+            ), False
+        return True, "now v0.4.111", True
+
+    monkeypatch.setattr(release_cmd, "_roll_python", _python)
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+        findings=[
+            # The live process on `laptop` genuinely hasn't restarted yet —
+            # verify is right to call this CRIT. The gate must still not
+            # act on it.
+            rv.Finding(severity="crit", host="laptop",
+                       lane="coord-agent process",
+                       summary="on 0.4.110, expected 0.4.111"),
+        ],
+    )
+    monkeypatch.setattr(
+        release_cmd, "_rollback_host",
+        lambda *a, **k: pytest.fail(
+            "a restart deferred to the idle self-restart watcher is a "
+            "pending, safe outcome — it must never trigger --rollback-on-red"
+        ),
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server",
+         "--rollback-on-red"],
+    )
+    assert result.exit_code == 0, result.output
+
+    record = _records(state_dir)[0]
+    # The run completed and verified — it was never reverted.
+    assert record["status"] == rp.STATUS_VERIFIED
+    assert record["rolled_back"] == []
+
+    # The daemon's good python roll survives untouched.
+    server_python = next(
+        l for l in record["lanes"] if l["lane"] == "python" and l["host"] == "server"
+    )
+    assert server_python["ok"] is True
+
+    # laptop's python lane is recorded as deferred, not failed and not
+    # "no channel" (it has one — it just used it and is mid-flight).
+    laptop_python = next(
+        l for l in record["lanes"] if l["lane"] == "python" and l["host"] == "laptop"
+    )
+    assert laptop_python["ok"] is None
+    assert laptop_python.get("deferred") is True
+    assert laptop_python.get("unrollable") is not True
+
+    # The verify finding is still journalled in full...
+    assert record["verification"]["severity"] == "crit"
+    assert len(record["verification"]["findings"]) == 1
+    # ...but the gate `--rollback-on-red` acts on is clean, and does not
+    # claim laptop has "no channel" — it has one, and used it.
+    assert record["gate"]["severity"] == "ok"
+    assert len(record["gate"]["blocking"]) == 0
+    assert len(record["gate"]["advisory"]) == 1
+    assert record["gate"]["unrollable"] == []
+    assert "idle self-restart watcher" in result.output
+
+
 def test_the_outside_reach_message_names_the_manual_remedy(
     valid_config_path, state_dir, no_network, monkeypatch
 ):
