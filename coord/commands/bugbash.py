@@ -486,15 +486,25 @@ def _fetch_recently_closed_issues(slug: str, *, limit: int = 200) -> list[dict]:
         return []
 
 
-def _fetch_catalogue_text(slug: str) -> str | None:
+def _fetch_catalogue_text(slug: str, branch: str) -> str | None:
     """Best-effort fetch of *slug*'s :data:`CATALOGUE_PATH` (#3580) —
-    ``None`` when the file doesn't exist on the repo's default branch, or
-    the fetch itself fails, so a repo with no catalogue (the overwhelming
-    majority, today) degrades to :func:`build_exploration_briefing`'s own
+    ``None`` when the file doesn't exist on *branch* (the repo's own
+    configured default branch — threaded through like every other
+    :func:`github_ops.get_repo_file` call site, e.g.
+    :mod:`coord.milestone_dispatch`, :mod:`coord.gate_b`), or the fetch
+    itself fails, so a repo with no catalogue (the overwhelming majority,
+    today) degrades to :func:`build_exploration_briefing`'s own
     :data:`EXPLORATION_CHECKLIST` fallback rather than aborting the run.
-    Never raises."""
+    Never raises.
+
+    #3580 review: previously called :func:`github_ops.get_repo_file`
+    without a ``branch=`` argument, which defaults to ``"develop"`` — so
+    any repo whose default branch isn't literally named ``develop`` (e.g.
+    ``main``) 404'd and silently fell back to the checklist even when a
+    real catalogue sat on its actual default branch.
+    """
     try:
-        return github_ops.get_repo_file(slug, CATALOGUE_PATH)
+        return github_ops.get_repo_file(slug, CATALOGUE_PATH, branch=branch)
     except Exception:  # noqa: BLE001
         return None
 
@@ -688,7 +698,7 @@ def bugbash_run_cmd(
     # use (or the fallback) up front, so a `--dry-run` operator can see
     # which journeys would actually be walked without reading a lane
     # worker's transcript.
-    catalogue_text = _fetch_catalogue_text(repo_cfg.github)
+    catalogue_text = _fetch_catalogue_text(repo_cfg.github, repo_cfg.default_branch)
     click.echo(_describe_catalogue(catalogue_text, lanes))
 
     bb_config = BugbashConfig(

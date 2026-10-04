@@ -2308,6 +2308,88 @@ class TestBugbashCli:
         assert result.exit_code == 0
         assert "Usage: bugbash harvest" in result.output
 
+    def test_fetch_catalogue_text_forwards_repo_default_branch(self, monkeypatch):
+        """#3580 review: `_fetch_catalogue_text` must thread the repo's own
+        configured default branch through to `github_ops.get_repo_file`
+        (like every other call site does), not rely on that function's
+        `branch="develop"` default — otherwise any repo whose default
+        branch isn't literally "develop" (e.g. "main") 404s and silently
+        falls back to the checklist even with a real catalogue present."""
+        import coord.commands.bugbash as cmd_bugbash
+
+        captured = {}
+
+        def fake_get_repo_file(slug, path, branch="develop"):
+            captured["slug"] = slug
+            captured["path"] = path
+            captured["branch"] = branch
+            return "version: 1\njourneys: []\n"
+
+        monkeypatch.setattr(cmd_bugbash.github_ops, "get_repo_file", fake_get_repo_file)
+
+        result = cmd_bugbash._fetch_catalogue_text("acme/quadraui", "main")
+
+        assert result == "version: 1\njourneys: []\n"
+        assert captured["slug"] == "acme/quadraui"
+        assert captured["path"] == cmd_bugbash.CATALOGUE_PATH
+        assert captured["branch"] == "main"
+
+    def test_fetch_catalogue_text_missing_on_default_branch_returns_none(self, monkeypatch):
+        """A genuine 404 (no catalogue on the repo's real default branch)
+        must still degrade to `None` (the fallback path), not raise."""
+        import coord.commands.bugbash as cmd_bugbash
+
+        def fake_get_repo_file(slug, path, branch="develop"):
+            raise RuntimeError(f"not found on {branch}")
+
+        monkeypatch.setattr(cmd_bugbash.github_ops, "get_repo_file", fake_get_repo_file)
+
+        assert cmd_bugbash._fetch_catalogue_text("acme/quadraui", "main") is None
+
+    def test_cli_forwards_repo_default_branch_to_fetch_catalogue_text(self, monkeypatch):
+        """#3580 review: the `bugbash run` CLI must pass `repo_cfg
+        .default_branch` — not a hardcoded/omitted value — to
+        `_fetch_catalogue_text`, so a repo configured with `default_branch:
+        main` (the common case; see coordinator.example.yml) is actually
+        looked up on `main`, not `develop`."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        class _FakeRepoCfg:
+            github = "acme/quadraui"
+            default_branch = "main"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
+        )
+        captured = {}
+
+        def fake_fetch(slug, branch):
+            captured["slug"] = slug
+            captured["branch"] = branch
+            return None
+
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", fake_fetch)
+        monkeypatch.setattr(
+            cmd_bugbash, "run_bugbash",
+            lambda bb_config, **kw: BugbashReport(
+                repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["quadraui", "--reference", "win-native", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["slug"] == "acme/quadraui"
+        assert captured["branch"] == "main"
+
     def test_dry_run_names_catalogue_in_use_and_journey_count_per_lane(self, monkeypatch):
         """#3580 acceptance: `coord bugbash <repo> --dry-run` output names
         the catalogue in use (or the fallback) and the journey count per
@@ -2318,6 +2400,7 @@ class TestBugbashCli:
 
         class _FakeRepoCfg:
             github = "acme/vimcode"
+            default_branch = "develop"
 
         fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
         fake_cfg.repo = lambda name: _FakeRepoCfg()
@@ -2345,7 +2428,7 @@ class TestBugbashCli:
             "    steps: \"s\"\n"
             "    priority: 2\n"
         )
-        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: catalogue_text)
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: catalogue_text)
         monkeypatch.setattr(
             cmd_bugbash, "run_bugbash",
             lambda bb_config, **kw: BugbashReport(
@@ -2370,6 +2453,7 @@ class TestBugbashCli:
 
         class _FakeRepoCfg:
             github = "acme/vimcode"
+            default_branch = "develop"
 
         fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
         fake_cfg.repo = lambda name: _FakeRepoCfg()
@@ -2378,7 +2462,7 @@ class TestBugbashCli:
             cmd_bugbash, "discover_lanes",
             lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
         )
-        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: None)
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: None)
         monkeypatch.setattr(
             cmd_bugbash, "run_bugbash",
             lambda bb_config, **kw: BugbashReport(
@@ -2404,6 +2488,7 @@ class TestBugbashCli:
 
         class _FakeRepoCfg:
             github = "acme/vimcode"
+            default_branch = "develop"
 
         fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
         fake_cfg.repo = lambda name: _FakeRepoCfg()
@@ -2415,7 +2500,7 @@ class TestBugbashCli:
         # #3580: this test is about --lane-timeout/--cost-cap-per-lane
         # reaching the dispatch seam, not the catalogue fetch — stub it out
         # rather than hitting a real `gh` call.
-        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: None)
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: None)
 
         captured = {}
 
@@ -2462,6 +2547,7 @@ class TestBugbashCli:
 
         class _FakeRepoCfg:
             github = "acme/vimcode"
+            default_branch = "develop"
 
         fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
         fake_cfg.repo = lambda name: _FakeRepoCfg()
@@ -2471,7 +2557,7 @@ class TestBugbashCli:
             lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
         )
         catalogue_text = "version: 1\njourneys: [{id: j1, lanes: [win-native], reference: spec, expected: e, steps: s}]\n"
-        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: catalogue_text)
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: catalogue_text)
 
         captured = {}
 
@@ -2508,6 +2594,7 @@ class TestBugbashCli:
 
         class _FakeRepoCfg:
             github = "acme/vimcode"
+            default_branch = "develop"
 
         fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
         fake_cfg.repo = lambda name: _FakeRepoCfg()
