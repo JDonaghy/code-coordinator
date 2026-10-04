@@ -18,6 +18,28 @@ then queued through ``coord drive-queue add --machine <lane host>``
 (:func:`run_bugbash`) until a round finds nothing new, or a round/cost cap
 fires.
 
+**#3580: a repo-supplied behaviour catalogue replaces the hardcoded
+checklist when one exists.** :data:`EXPLORATION_CHECKLIST` is a cross-
+backend differential tester with no product knowledge — it can never find
+a bug every backend shares, and it can't judge editing behaviour at all.
+When the app repo has a ``tests/smoke-spec/catalogue.yaml`` (schema in the
+issue body; parsed by :func:`parse_catalogue` into :class:`Journey`
+objects), :func:`build_exploration_briefing` walks that lane's journeys
+instead — filtered by :attr:`BugbashLane.driver_kind`, ordered by
+``priority`` (:func:`journeys_for_lane`), each with its own declared
+``expected``/``reference``/``reference_detail`` given to the worker
+verbatim. A ``reference: nvim`` journey's expected outcome must be
+established by actually running the same keystrokes through
+``nvim --headless`` (never reasoned from memory); a ``mode: vscode``
+journey must be run after switching the app into that mode. A missing or
+invalid catalogue falls back to :data:`EXPLORATION_CHECKLIST` with a
+visible ``NOTE:`` in the briefing — never silently, never crashing the
+run. Findings may carry an optional :attr:`Finding.journey_id`, and every
+lane worker also reports per-journey coverage
+(:data:`COVERAGE_FENCE`/:func:`parse_coverage_block`/
+:class:`CoverageSummary`) so a clean round reads as "N journeys passed,"
+not "nothing was reported."
+
 Two seams keep the engine (this module) testable without a live fleet:
 
 - **Explorer** (``Callable[[BugbashLane, int], ExploreOutcome]``) — "go run
@@ -84,6 +106,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Sequence
 
+import yaml
+
 from coord.bug_intake import format_bug_report
 
 # ── constants ────────────────────────────────────────────────────────────
@@ -108,6 +132,37 @@ EXPLORATION_CHECKLIST: tuple[str, ...] = (
     "panels", "menus", "extension install flow", "terminal", "splits",
     "themes", "idle stability",
 )
+
+#: Repo-root-relative path of the optional behaviour catalogue this module
+#: walks instead of :data:`EXPLORATION_CHECKLIST` when the app repo supplies
+#: one (#3580) — the shared contract between claude-coordinator and the app
+#: repo, documented in this module's own docstring and the issue body.
+CATALOGUE_PATH = "tests/smoke-spec/catalogue.yaml"
+
+#: The only catalogue schema version this module understands (#3580). A
+#: catalogue naming any other value is treated as invalid (falls back to
+#: :data:`EXPLORATION_CHECKLIST`, never guessed at) rather than parsed
+#: best-effort against a schema it might not actually match.
+CATALOGUE_VERSION = 1
+
+#: ``reference`` values whose expected outcome requires establishing it by
+#: running the SAME keystrokes through a live oracle rather than reasoning
+#: from memory — currently just ``"nvim"`` (#3580 requirement 3). Kept as
+#: its own constant (rather than a literal string check) so a future
+#: oracle-backed reference doesn't require hunting down every place
+#: ``"nvim"`` is compared.
+ORACLE_BACKED_REFERENCES: tuple[str, ...] = ("nvim",)
+
+#: Fenced-code-block language tag a lane worker's final message must use to
+#: report its PER-JOURNEY coverage (#3580 requirement 5) — attempted/passed/
+#: found/skipped, so a bugbash run summary can report "N journeys passed"
+#: instead of inferring coverage from the findings list alone (a lane that
+#: silently skipped half its journeys would otherwise look identical to one
+#: that ran everything and found nothing wrong). Reported for every item the
+#: worker walked, whether it came from a repo catalogue journey or the
+#: fallback :data:`EXPLORATION_CHECKLIST` (using the checklist item's own
+#: text as its id) — see :func:`build_exploration_briefing`.
+COVERAGE_FENCE = "bugbash-coverage"
 
 #: Fenced-code-block language tag a lane worker's final message must use to
 #: report its findings — mirrors how :mod:`coord.acceptance_drivers` forces
@@ -173,6 +228,18 @@ class Finding:
     #: missing/blank in the raw JSON entry this finding was built from —
     #: empty whenever :attr:`incomplete` is ``False``.
     missing_fields: tuple[str, ...] = ()
+    #: #3580 requirement 2: the catalogue :class:`Journey` id this finding
+    #: relates to, when the lane worker was walking a repo-supplied
+    #: catalogue rather than the generic checklist — ``""`` when there was
+    #: no catalogue, the journey didn't come from one (fallback checklist
+    #: item), or the worker simply didn't name one. Optional — never
+    #: required, never defaulted to a placeholder (unlike
+    #: :data:`_REQUIRED_FINDING_FIELDS`), since plenty of real findings
+    #: genuinely have no journey to cite. Round-trips verbatim into the
+    #: filed issue body (:func:`_evidence_with_acceptance`) so the fixer
+    #: knows which journey — and therefore which reference oracle — the
+    #: expected behaviour came from.
+    journey_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -286,6 +353,7 @@ def _finding_from_entry(entry: dict, *, platform: str, repo: str) -> Finding:
         repro=repro,
         evidence=evidence,
         captures=captures,
+        journey_id=str(entry.get("journey_id", "")).strip(),
         incomplete=bool(missing),
         missing_fields=tuple(missing),
     )
@@ -596,6 +664,254 @@ def dedupe_finding(
     return DedupeResult(verdict=DedupeVerdict.NEW)
 
 
+# ── behaviour catalogue (#3580) ─────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Journey:
+    """One journey declared in a repo's :data:`CATALOGUE_PATH` (#3580's
+    catalogue schema v1). Every field here mirrors the YAML schema in the
+    issue body exactly — this is the shared contract between
+    claude-coordinator and the app repo, so field names must never drift
+    from what a repo's ``catalogue.yaml`` actually writes.
+    """
+
+    id: str
+    area: str = ""
+    #: ``"vim"`` | ``"vscode"`` | ``"any"``.
+    mode: str = "any"
+    lanes: tuple[str, ...] = ()
+    #: ``"nvim"`` | ``"vscode"`` | ``"platform"`` | ``"spec"`` — where
+    #: ``expected`` comes from. See :data:`ORACLE_BACKED_REFERENCES`.
+    reference: str = ""
+    reference_detail: str = ""
+    steps: str = ""
+    expected: str = ""
+    #: 1 = must work for the release, 3 = nice to have. Lower sorts first
+    #: (:func:`journeys_for_lane`) so a worker that runs out of budget
+    #: mid-walk still covered the highest-priority journeys first.
+    priority: int = 3
+
+
+@dataclass(frozen=True)
+class CatalogueResult:
+    """What :func:`parse_catalogue` extracted from a repo's
+    ``catalogue.yaml`` text (#3580).
+
+    ``warning`` is non-empty for EVERY problem short of a perfectly clean
+    catalogue — missing/blank text, unparseable YAML, the wrong top-level
+    shape, an unsupported ``version``, a catalogue with no valid journeys
+    at all, or (non-fatally) one or more individual journey entries that
+    had to be dropped for missing a required field. ``journeys`` is never
+    partially trusted silently: either the catalogue produced at least one
+    valid journey (``journeys`` non-empty, ``warning`` possibly still
+    non-empty if SOME entries were dropped) or it produced none at all
+    (``journeys == ()``, ``warning`` always non-empty) — a caller never has
+    to guess which case it's in, since checking ``bool(journeys)`` alone is
+    always the right test for "do I have anything to walk."
+    """
+
+    journeys: tuple[Journey, ...] = ()
+    warning: str = ""
+    #: :data:`CATALOGUE_PATH` when at least one journey parsed successfully
+    #: (even if the catalogue carries other problems); ``""`` otherwise —
+    #: lets a caller distinguish "used the catalogue" from "fell back"
+    #: without re-deriving that from ``journeys``/``warning`` itself.
+    source: str = ""
+
+
+#: Per-journey-entry fields with no reasonable default — an entry missing
+#: any of these is dropped (not fatal to the rest of the catalogue) by
+#: :func:`parse_catalogue`.
+_REQUIRED_JOURNEY_FIELDS: tuple[str, ...] = ("id", "lanes", "reference", "expected")
+
+
+def parse_catalogue(yaml_text: str | None) -> CatalogueResult:
+    """Parse and validate a repo's :data:`CATALOGUE_PATH` text (#3580).
+
+    NEVER raises — every failure mode (missing/blank text, invalid YAML,
+    the wrong top-level shape, an unsupported ``version``, individual
+    journey entries missing a required field, a catalogue with zero valid
+    journeys) becomes a non-empty :attr:`CatalogueResult.warning` with
+    ``journeys=()`` (or, for a per-entry drop, journeys minus the dropped
+    entries) rather than a crash or a silent empty catalogue indistinguishable
+    from "repo declared zero journeys on purpose." :func:`build_exploration_briefing`
+    is the sole caller that turns a non-empty ``warning``/empty ``journeys``
+    into the :data:`EXPLORATION_CHECKLIST` fallback — this function only
+    decides what's valid, never what to do about it.
+    """
+    if not yaml_text or not yaml_text.strip():
+        return CatalogueResult(
+            warning=f"no catalogue found at {CATALOGUE_PATH}",
+        )
+    try:
+        raw = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        return CatalogueResult(warning=f"{CATALOGUE_PATH} failed to parse as YAML: {e}")
+    if not isinstance(raw, dict):
+        return CatalogueResult(
+            warning=f"{CATALOGUE_PATH} must be a YAML mapping at the top level, "
+            f"got {type(raw).__name__}",
+        )
+    version = raw.get("version")
+    if version != CATALOGUE_VERSION:
+        return CatalogueResult(
+            warning=f"{CATALOGUE_PATH} version {version!r} is not supported "
+            f"(expected {CATALOGUE_VERSION})",
+        )
+    raw_journeys = raw.get("journeys")
+    if not isinstance(raw_journeys, list) or not raw_journeys:
+        return CatalogueResult(warning=f"{CATALOGUE_PATH} has no `journeys` list")
+
+    journeys: list[Journey] = []
+    dropped: list[str] = []
+    seen_ids: set[str] = set()
+    for entry in raw_journeys:
+        if not isinstance(entry, dict):
+            dropped.append("<non-mapping journey entry>")
+            continue
+        jid = str(entry.get("id", "")).strip()
+        lanes_raw = entry.get("lanes")
+        missing = [
+            f for f in _REQUIRED_JOURNEY_FIELDS
+            if not (
+                str(entry.get(f, "")).strip()
+                if f != "lanes" else isinstance(lanes_raw, list) and lanes_raw
+            )
+        ]
+        if missing:
+            dropped.append(f"{jid or '<missing id>'} (missing: {', '.join(missing)})")
+            continue
+        if jid in seen_ids:
+            dropped.append(f"{jid} (duplicate id)")
+            continue
+        seen_ids.add(jid)
+        try:
+            priority = int(entry.get("priority", 3))
+        except (TypeError, ValueError):
+            priority = 3
+        journeys.append(
+            Journey(
+                id=jid,
+                area=str(entry.get("area", "")).strip(),
+                mode=str(entry.get("mode", "any")).strip() or "any",
+                lanes=tuple(str(l) for l in lanes_raw),
+                reference=str(entry.get("reference", "")).strip(),
+                reference_detail=str(entry.get("reference_detail", "")).strip(),
+                steps=str(entry.get("steps", "")).strip(),
+                expected=str(entry.get("expected", "")).strip(),
+                priority=priority,
+            )
+        )
+
+    if not journeys:
+        return CatalogueResult(
+            warning=f"{CATALOGUE_PATH} had no valid journeys (all "
+            f"{len(dropped)} entr{'y' if len(dropped) == 1 else 'ies'} invalid/dropped)",
+        )
+    warning = ""
+    if dropped:
+        warning = (
+            f"{CATALOGUE_PATH}: dropped {len(dropped)} invalid journey "
+            f"entr{'y' if len(dropped) == 1 else 'ies'}: {'; '.join(dropped)}"
+        )
+    return CatalogueResult(journeys=tuple(journeys), warning=warning, source=CATALOGUE_PATH)
+
+
+def journeys_for_lane(journeys: Sequence[Journey], driver_kind: str) -> list[Journey]:
+    """Journeys from *journeys* applicable to *driver_kind*, in priority
+    order (1 first), ties broken by ``id`` for a deterministic walk order
+    (#3580 requirement 1: "a worker that runs out of budget has covered
+    priority 1 first")."""
+    matching = [j for j in journeys if driver_kind in j.lanes]
+    return sorted(matching, key=lambda j: (j.priority, j.id))
+
+
+@dataclass(frozen=True)
+class JourneyOutcome:
+    """One line of a lane worker's per-journey coverage report
+    (:data:`COVERAGE_FENCE`, #3580 requirement 5)."""
+
+    journey_id: str
+    #: ``"passed"`` | ``"found"`` | ``"skipped"``.
+    status: str
+    #: Required (by convention of the briefing, not enforced here) when
+    #: ``status == "skipped"`` — e.g. ``"no nvim"`` (#3580 requirement 3).
+    reason: str = ""
+
+
+_VALID_JOURNEY_STATUSES: tuple[str, ...] = ("passed", "found", "skipped")
+
+_COVERAGE_FENCE_RE = re.compile(
+    rf"```{re.escape(COVERAGE_FENCE)}\s*\n(.*?)```", re.DOTALL,
+)
+
+
+def parse_coverage_block(text: str) -> tuple[JourneyOutcome, ...]:
+    """Extract the ```` ```bugbash-coverage ```` fenced JSON array from a
+    lane worker's final message (#3580 requirement 5).
+
+    Deliberately lenient — unlike :func:`parse_findings_block`, a missing or
+    malformed coverage block is NOT a protocol error: the findings fence
+    remains the authoritative "did this lane produce a trustworthy report"
+    signal, and coverage is purely an informational summary layered on top.
+    A missing fence, invalid JSON, a non-list payload, or an individual
+    entry missing ``journey_id``/a recognised ``status`` simply contributes
+    nothing to the summary rather than failing the round. Never raises.
+    """
+    match = _COVERAGE_FENCE_RE.search(text)
+    if match is None:
+        return ()
+    try:
+        raw = json.loads(match.group(1))
+    except (ValueError, TypeError):
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    outcomes: list[JourneyOutcome] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        journey_id = str(entry.get("journey_id", "")).strip()
+        status = str(entry.get("status", "")).strip().lower()
+        if not journey_id or status not in _VALID_JOURNEY_STATUSES:
+            continue
+        outcomes.append(
+            JourneyOutcome(
+                journey_id=journey_id,
+                status=status,
+                reason=str(entry.get("reason", "")).strip(),
+            )
+        )
+    return tuple(outcomes)
+
+
+@dataclass(frozen=True)
+class CoverageSummary:
+    """Per-lane journey coverage counts (#3580 requirement 5) — "N journeys
+    passed" instead of inferring coverage from the findings list alone."""
+
+    attempted: int = 0
+    passed: int = 0
+    found: int = 0
+    skipped: int = 0
+    #: One entry per skipped journey, in report order — e.g. ``("no nvim",)``
+    #: — so an operator can see WHY without cross-referencing the raw
+    #: transcript.
+    skip_reasons: tuple[str, ...] = ()
+
+    @classmethod
+    def from_outcomes(cls, outcomes: Sequence[JourneyOutcome]) -> "CoverageSummary":
+        skipped_outcomes = [o for o in outcomes if o.status == "skipped"]
+        return cls(
+            attempted=len(outcomes),
+            passed=sum(1 for o in outcomes if o.status == "passed"),
+            found=sum(1 for o in outcomes if o.status == "found"),
+            skipped=len(skipped_outcomes),
+            skip_reasons=tuple(o.reason or "no reason recorded" for o in skipped_outcomes),
+        )
+
+
 # ── lanes ────────────────────────────────────────────────────────────────
 
 
@@ -699,16 +1015,51 @@ def build_exploration_briefing(
     *,
     reference_backend: str,
     checklist: Sequence[str] = EXPLORATION_CHECKLIST,
+    catalogue_text: str | None = None,
 ) -> str:
     """Compose the seed briefing for a lane's headless exploration worker.
 
     Tells the worker to run the repo's Tier-2 smoke spec first, then walk
-    *checklist* against the real app, comparing behaviour to
-    *reference_backend* and capturing evidence through the native driver's
-    own probes. Ends with the exact contract :func:`parse_findings_block`
-    parses back out, so the briefing and the parser can never silently
-    drift apart (one constant, :data:`FINDINGS_FENCE`, used by both).
+    either this lane's slice of a repo-supplied behaviour catalogue
+    (#3580) or, absent/invalid one, the generic *checklist* — comparing
+    behaviour to *reference_backend* (for checklist items) or to each
+    journey's own declared ``reference``/``reference_detail`` (for
+    catalogue journeys) and capturing evidence through the native driver's
+    own probes. Ends with the exact contracts :func:`parse_findings_block`/
+    :func:`parse_coverage_block` parse back out, so the briefing and the
+    parsers can never silently drift apart (:data:`FINDINGS_FENCE`/
+    :data:`COVERAGE_FENCE`, each used by both).
+
+    *catalogue_text* is the raw text of the repo's :data:`CATALOGUE_PATH`
+    (``None`` when the repo has none, or the fetch failed — see
+    :func:`coord.commands.bugbash._fetch_catalogue_text`). Parsed via
+    :func:`parse_catalogue` and filtered/ordered for this lane via
+    :func:`journeys_for_lane`. Whenever that yields zero journeys — no
+    *catalogue_text* at all, invalid YAML, a valid catalogue with no
+    journey declaring this lane's :attr:`BugbashLane.driver_kind` in its
+    ``lanes`` — this falls back to *checklist* (#3580's "A missing or
+    invalid catalogue falls back to the current checklist with a visible
+    warning. It must never fail silently or crash the run."): a ``NOTE:``
+    line naming the reason is always included in that case, never a quiet
+    substitution.
     """
+    catalogue_warning = ""
+    lane_journeys: list[Journey] = []
+    if catalogue_text is not None:
+        catalogue = parse_catalogue(catalogue_text)
+        catalogue_warning = catalogue.warning
+        if catalogue.journeys:
+            lane_journeys = journeys_for_lane(catalogue.journeys, lane.driver_kind)
+            if not lane_journeys:
+                no_lane_note = (
+                    f"{CATALOGUE_PATH} has no journey declaring lane "
+                    f"{lane.driver_kind!r} — falling back to the generic checklist"
+                )
+                catalogue_warning = (
+                    f"{catalogue_warning}; {no_lane_note}" if catalogue_warning
+                    else no_lane_note
+                )
+
     lines = [
         f"=== coord bugbash: {lane.platform} lane ===",
         "",
@@ -725,15 +1076,59 @@ def build_exploration_briefing(
         "and do NOT send any key or click to recover (#3566).",
         "",
         "1. Run this repo's Tier-2 smoke spec for this driver to completion.",
-        "2. Then walk the exploration checklist below on the real app, using "
-        "the native driver's own probes/captures as evidence:",
     ]
-    for item in checklist:
-        lines.append(f"   - {item}")
+    if catalogue_warning:
+        lines += ["", f"NOTE: {catalogue_warning}"]
+
+    if lane_journeys:
+        lines += [
+            "",
+            f"2. Then walk the {len(lane_journeys)} journey(s) below from "
+            f"{CATALOGUE_PATH}, in this exact (priority) order, using the "
+            "native driver's own probes/captures as evidence:",
+        ]
+        for j in lane_journeys:
+            lines.append(f"   - [{j.id}] (priority {j.priority}, area: {j.area or 'unspecified'})")
+            lines.append(f"     steps: {j.steps}")
+            lines.append(f"     expected: {j.expected}")
+            ref_line = f"     reference ({j.reference})"
+            if j.reference_detail:
+                ref_line += f": {j.reference_detail}"
+            lines.append(ref_line)
+            if j.reference in ORACLE_BACKED_REFERENCES:
+                lines.append(
+                    "     ORACLE: establish the expected outcome by running these "
+                    "exact keystrokes through `nvim --headless` on the same buffer "
+                    "and comparing buffer text and cursor — do NOT reason from "
+                    "memory about what real Neovim does. If `nvim` is not "
+                    "available on this host, do NOT guess: report this journey's "
+                    'coverage as `"skipped"` with reason `"no nvim"` (#3580).'
+                )
+            if j.mode == "vscode":
+                lines.append(
+                    "     MODE: run this journey only after switching the app "
+                    "into VS Code mode (Alt-M, or the `editor_mode` setting in "
+                    "this lane's isolated settings.json)."
+                )
+            elif j.mode == "vim":
+                lines.append(
+                    "     MODE: run this journey in the app's default Vim mode."
+                )
+    else:
+        lines += [
+            "",
+            "2. Then walk the exploration checklist below on the real app, using "
+            "the native driver's own probes/captures as evidence:",
+        ]
+        for item in checklist:
+            lines.append(f"   - {item}")
+
     lines += [
         "",
-        "For anything that behaves differently from the reference backend, "
-        "or crashes, hangs, or renders wrong, report it as a finding.",
+        "For anything that behaves differently from the reference backend "
+        "(checklist items) or from a journey's own declared `expected` "
+        "outcome, or crashes, hangs, or renders wrong, report it as a "
+        "finding.",
         "",
         "If the HARD RULE above fires (a required permission/session is "
         "missing), skip the findings fence entirely and end your final "
@@ -749,8 +1144,22 @@ def build_exploration_briefing(
         "claude-coordinator, if the bug is actually in this bugbash driver "
         "or its WSL/native bridge rather than in the app under test), "
         "captures (list of "
-        "capture paths/descriptions, may be empty). An empty array means "
-        "zero findings this round.",
+        "capture paths/descriptions, may be empty), journey_id (the id of "
+        "the catalogue journey above this finding relates to, if any — "
+        "omit/blank if there was no catalogue or this finding doesn't come "
+        "from one of its journeys). An empty array means zero findings "
+        "this round.",
+        "",
+        f"ALSO end your final message with a fenced ```{COVERAGE_FENCE}``` "
+        "block: a JSON array covering EVERY item you walked above (every "
+        "journey, or every checklist item), each as "
+        '{"journey_id": <the id above, or the checklist item\'s own text>, '
+        '"status": "passed" | "found" | "skipped", "reason": <non-empty '
+        'when status is "skipped", e.g. "no nvim">}. Use "found" for an '
+        "item you filed a finding for above, \"passed\" for one that "
+        "behaved as expected, \"skipped\" for one you could not actually "
+        "run (missing oracle, unreachable mode, etc. — never guess at "
+        "what would have happened).",
     ]
     return "\n".join(lines)
 
@@ -823,6 +1232,12 @@ class ExploreOutcome:
     ok: bool = True
     unavailable: bool = False
     protocol_error: str = ""
+    #: #3580 requirement 5: this lane's per-journey coverage report
+    #: (:func:`parse_coverage_block`'s output) — informational, never part
+    #: of the ``ok``/``unavailable``/``protocol_error`` trust decision.
+    #: Empty when the worker's message carried no (or an unparseable)
+    #: ```` ```bugbash-coverage ```` block.
+    journey_outcomes: tuple["JourneyOutcome", ...] = ()
 
 
 #: ``(lane, round_num) -> ExploreOutcome`` — "go run this lane's
@@ -867,6 +1282,12 @@ def _evidence_with_acceptance(finding: Finding, dedupe: DedupeResult) -> str:
     parts = [finding.evidence.strip()] if finding.evidence.strip() else []
     if finding.captures:
         parts.append("Captures: " + ", ".join(finding.captures))
+    if finding.journey_id:
+        # #3580 requirement 2: name the catalogue journey this finding
+        # relates to, so a fixer can go find its `reference`/`reference_detail`
+        # in tests/smoke-spec/catalogue.yaml rather than guessing where the
+        # expected behaviour came from.
+        parts.append(f"Journey: {finding.journey_id} (see {CATALOGUE_PATH})")
     if finding.incomplete:
         # #3517: a finding filed from a lane report missing one or more
         # required fields must say so on the issue itself, not just in the
@@ -1083,6 +1504,14 @@ class RoundReport:
     #: reporting contract, so it must never be read as "zero findings
     #: observed" (that silent collapse is exactly bug #3517).
     protocol_error_lanes: dict[str, str] = field(default_factory=dict)
+    #: ``{platform: CoverageSummary}`` for every lane explored this round
+    #: whose :attr:`ExploreOutcome.journey_outcomes` was non-empty (#3580
+    #: requirement 5) — "N journeys passed" instead of inferring coverage
+    #: from the findings list alone. Absent for a lane whose worker didn't
+    #: report a (parseable) coverage block at all — never defaulted to a
+    #: zeroed :class:`CoverageSummary`, which would misrepresent "no
+    #: coverage report" as "zero journeys attempted."
+    lane_coverage: dict[str, "CoverageSummary"] = field(default_factory=dict)
 
     @property
     def explored_lanes(self) -> set[str]:
@@ -1226,6 +1655,12 @@ def _apply_outcome_to_round(report: RoundReport, lane: BugbashLane, outcome: Exp
         # is exactly what let a real finding disappear and pass the #3488
         # release gate).
         report.protocol_error_lanes[lane.platform] = outcome.protocol_error
+    if outcome.journey_outcomes:
+        # #3580 requirement 5: purely informational — never gates the
+        # round's termination reason, just the coverage summary.
+        report.lane_coverage[lane.platform] = CoverageSummary.from_outcomes(
+            outcome.journey_outcomes
+        )
 
 
 def _dedupe_and_file_round(

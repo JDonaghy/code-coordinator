@@ -31,10 +31,17 @@ import pytest
 from coord.bugbash import (
     BugbashConfig,
     BugbashLane,
+    CATALOGUE_PATH,
+    COVERAGE_FENCE,
+    CoverageSummary,
     DedupeVerdict,
     ExploreOutcome,
     Finding,
+    Journey,
+    JourneyOutcome,
+    RoundReport,
     UNAVAILABLE_FENCE,
+    _apply_outcome_to_round,
     _pick_lane_machine,
     build_exploration_briefing,
     compose_finding_issue_title,
@@ -42,6 +49,9 @@ from coord.bugbash import (
     discover_lanes,
     file_finding,
     harvest_outcome,
+    journeys_for_lane,
+    parse_catalogue,
+    parse_coverage_block,
     parse_findings_block,
     parse_unavailable_report,
     run_bugbash,
@@ -158,6 +168,19 @@ class TestParseFindingsBlock:
         assert result.findings[0].platform == "win-native"
         assert result.findings[0].repo == "vimcode"
         assert result.findings[0].incomplete is False
+        assert result.findings[0].journey_id == ""
+
+    def test_journey_id_is_parsed_through_from_the_entry(self):
+        """#3580 requirement 2: a `journey_id` in the worker's JSON entry
+        makes it onto the parsed Finding."""
+        text = (
+            "```bugbash-findings\n"
+            '[{"title": "t", "expected": "e", "actual": "a", "repro": "r", '
+            '"evidence": "ev", "journey_id": "vim-dd-deletes-line"}]\n'
+            "```\n"
+        )
+        result = parse_findings_block(text, platform="win-native", repo="vimcode")
+        assert result.findings[0].journey_id == "vim-dd-deletes-line"
 
     def test_no_block_with_no_clean_statement_is_a_protocol_error(self):
         # #3517: a dropped/forgotten fence must NOT silently read as a clean
@@ -476,6 +499,327 @@ class TestBuildExplorationBriefing:
         assert UNAVAILABLE_FENCE in out
         assert "stop" in out.lower()
 
+    # ── #3580: repo-supplied catalogue ────────────────────────────────
+
+    def test_catalogue_present_lists_lane_filtered_journeys_in_priority_order(self):
+        """#3580 acceptance: catalogue present -> briefing lists the
+        lane-filtered journeys in priority order, with expected/reference
+        text."""
+        catalogue_text = """
+version: 1
+journeys:
+  - id: p3-journey
+    area: chrome
+    mode: any
+    lanes: [tui-pty]
+    reference: spec
+    reference_detail: "some spec detail"
+    steps: "do the low priority thing"
+    expected: "low priority expected outcome"
+    priority: 3
+  - id: p1-journey
+    area: vim-mode
+    mode: vim
+    lanes: [tui-pty, win-native]
+    reference: nvim
+    reference_detail: "real Neovim for the same buffer"
+    steps: "press dd on line 2"
+    expected: "line 2 is deleted"
+    priority: 1
+  - id: other-lane-journey
+    area: chrome
+    mode: any
+    lanes: [mac-native]
+    reference: spec
+    reference_detail: "n/a"
+    steps: "n/a"
+    expected: "n/a"
+    priority: 1
+"""
+        lane = BugbashLane(platform="tui-pty", driver_kind="tui-pty", machine="pc1", capability="")
+        out = build_exploration_briefing(
+            lane, reference_backend="win-native", catalogue_text=catalogue_text,
+        )
+        # Lane-filtered: `other-lane-journey` (mac-native only) must not appear.
+        assert "other-lane-journey" not in out
+        # Priority order: p1-journey (priority 1) before p3-journey (priority 3).
+        assert out.index("p1-journey") < out.index("p3-journey")
+        assert "line 2 is deleted" in out
+        assert "real Neovim for the same buffer" in out
+        assert "low priority expected outcome" in out
+        # #3580 requirement 3: the nvim differential-oracle instruction.
+        assert "nvim --headless" in out
+        assert "no nvim" in out
+        # #3580 requirement 4: mode awareness is stated per journey.
+        assert "Vim mode" in out
+        assert COVERAGE_FENCE in out
+
+    def test_catalogue_absent_falls_back_to_checklist_with_warning(self):
+        lane = BugbashLane(platform="win-native", driver_kind="win-native", machine="pc1", capability="")
+        out = build_exploration_briefing(
+            lane, reference_backend="mac-native", checklist=("panels", "menus"),
+            catalogue_text=None,
+        )
+        assert "panels" in out
+        assert "menus" in out
+        # No catalogue_text given at all -> no warning needed, this is just
+        # the ordinary no-catalogue path.
+        assert "NOTE:" not in out
+
+    def test_catalogue_invalid_falls_back_to_checklist_with_visible_warning(self):
+        """#3580 acceptance: catalogue absent or invalid -> fallback
+        checklist plus a warning. Must never fail silently or crash."""
+        lane = BugbashLane(platform="win-native", driver_kind="win-native", machine="pc1", capability="")
+        out = build_exploration_briefing(
+            lane, reference_backend="mac-native", checklist=("panels", "menus"),
+            catalogue_text="not: [valid, yaml: at: all",
+        )
+        assert "panels" in out
+        assert "menus" in out
+        assert "NOTE:" in out
+
+    def test_catalogue_valid_but_no_journey_for_this_lane_falls_back_with_warning(self):
+        catalogue_text = """
+version: 1
+journeys:
+  - id: mac-only
+    lanes: [mac-native]
+    reference: spec
+    expected: "something"
+    steps: "n/a"
+    priority: 1
+"""
+        lane = BugbashLane(platform="win-native", driver_kind="win-native", machine="pc1", capability="")
+        out = build_exploration_briefing(
+            lane, reference_backend="mac-native", checklist=("panels",),
+            catalogue_text=catalogue_text,
+        )
+        assert "panels" in out
+        assert "NOTE:" in out
+        assert "win-native" in out
+
+    def test_vscode_mode_journey_says_which_mode_to_run_in(self):
+        catalogue_text = """
+version: 1
+journeys:
+  - id: vscode-ctrl-d
+    lanes: [tui-pty]
+    mode: vscode
+    reference: vscode
+    reference_detail: "VS Code default keybinding"
+    steps: "press Ctrl+D twice"
+    expected: "two selections"
+    priority: 1
+"""
+        lane = BugbashLane(platform="tui-pty", driver_kind="tui-pty", machine="pc1", capability="")
+        out = build_exploration_briefing(
+            lane, reference_backend="win-native", catalogue_text=catalogue_text,
+        )
+        assert "Alt-M" in out
+        assert "editor_mode" in out
+
+
+class TestParseCatalogue:
+    def test_valid_catalogue_parses_all_fields(self):
+        catalogue_text = """
+version: 1
+journeys:
+  - id: j1
+    area: vim-mode
+    mode: vim
+    lanes: [tui-pty, win-native]
+    reference: nvim
+    reference_detail: "detail"
+    steps: "steps text"
+    expected: "expected text"
+    priority: 2
+"""
+        result = parse_catalogue(catalogue_text)
+        assert result.warning == ""
+        assert result.source == CATALOGUE_PATH
+        assert len(result.journeys) == 1
+        j = result.journeys[0]
+        assert j.id == "j1"
+        assert j.area == "vim-mode"
+        assert j.mode == "vim"
+        assert j.lanes == ("tui-pty", "win-native")
+        assert j.reference == "nvim"
+        assert j.reference_detail == "detail"
+        assert j.steps == "steps text"
+        assert j.expected == "expected text"
+        assert j.priority == 2
+
+    def test_missing_text_warns_and_returns_no_journeys(self):
+        result = parse_catalogue(None)
+        assert result.journeys == ()
+        assert result.warning != ""
+        assert result.source == ""
+
+    def test_blank_text_warns_and_returns_no_journeys(self):
+        result = parse_catalogue("   \n  ")
+        assert result.journeys == ()
+        assert result.warning != ""
+
+    def test_malformed_yaml_never_raises(self):
+        result = parse_catalogue("not: [valid, yaml: at: all")
+        assert result.journeys == ()
+        assert result.warning != ""
+
+    def test_wrong_top_level_shape_warns(self):
+        result = parse_catalogue("- just\n- a\n- list\n")
+        assert result.journeys == ()
+        assert result.warning != ""
+
+    def test_unsupported_version_warns(self):
+        result = parse_catalogue("version: 2\njourneys: []\n")
+        assert result.journeys == ()
+        assert result.warning != ""
+
+    def test_no_journeys_list_warns(self):
+        result = parse_catalogue("version: 1\n")
+        assert result.journeys == ()
+        assert result.warning != ""
+
+    def test_entry_missing_required_field_is_dropped_but_others_survive(self):
+        catalogue_text = """
+version: 1
+journeys:
+  - id: broken
+    lanes: [tui-pty]
+    reference: spec
+    steps: "n/a"
+    # missing `expected`
+  - id: fine
+    lanes: [tui-pty]
+    reference: spec
+    expected: "ok"
+    steps: "n/a"
+    priority: 1
+"""
+        result = parse_catalogue(catalogue_text)
+        assert len(result.journeys) == 1
+        assert result.journeys[0].id == "fine"
+        assert result.warning != ""
+        assert "broken" in result.warning
+
+    def test_all_entries_invalid_warns_with_no_journeys(self):
+        catalogue_text = """
+version: 1
+journeys:
+  - id: broken
+    lanes: [tui-pty]
+"""
+        result = parse_catalogue(catalogue_text)
+        assert result.journeys == ()
+        assert result.warning != ""
+
+    def test_duplicate_ids_drops_the_second(self):
+        catalogue_text = """
+version: 1
+journeys:
+  - id: dup
+    lanes: [tui-pty]
+    reference: spec
+    expected: "first"
+    steps: "n/a"
+    priority: 1
+  - id: dup
+    lanes: [tui-pty]
+    reference: spec
+    expected: "second"
+    steps: "n/a"
+    priority: 1
+"""
+        result = parse_catalogue(catalogue_text)
+        assert len(result.journeys) == 1
+        assert result.journeys[0].expected == "first"
+        assert result.warning != ""
+
+
+class TestJourneysForLane:
+    def test_filters_and_orders_by_priority_then_id(self):
+        journeys = (
+            Journey(id="z", lanes=("tui-pty",), reference="spec", expected="e", priority=1),
+            Journey(id="a", lanes=("tui-pty",), reference="spec", expected="e", priority=1),
+            Journey(id="m", lanes=("mac-native",), reference="spec", expected="e", priority=1),
+            Journey(id="b", lanes=("tui-pty",), reference="spec", expected="e", priority=2),
+        )
+        result = journeys_for_lane(journeys, "tui-pty")
+        assert [j.id for j in result] == ["a", "z", "b"]
+
+
+class TestParseCoverageBlock:
+    def test_parses_valid_coverage_array(self):
+        text = (
+            'done.\n```bugbash-coverage\n'
+            '[{"journey_id": "j1", "status": "passed"}, '
+            '{"journey_id": "j2", "status": "found"}, '
+            '{"journey_id": "j3", "status": "skipped", "reason": "no nvim"}]\n'
+            '```'
+        )
+        outcomes = parse_coverage_block(text)
+        assert len(outcomes) == 3
+        assert outcomes[0] == JourneyOutcome(journey_id="j1", status="passed", reason="")
+        assert outcomes[2] == JourneyOutcome(journey_id="j3", status="skipped", reason="no nvim")
+
+    def test_no_fence_returns_empty_tuple(self):
+        assert parse_coverage_block("done, no coverage reported") == ()
+
+    def test_invalid_json_never_raises_and_returns_empty(self):
+        text = '```bugbash-coverage\nnot valid json\n```'
+        assert parse_coverage_block(text) == ()
+
+    def test_entries_missing_required_fields_are_skipped(self):
+        text = (
+            '```bugbash-coverage\n'
+            '[{"journey_id": "j1"}, {"status": "passed"}, '
+            '{"journey_id": "j2", "status": "bogus-status"}, '
+            '{"journey_id": "j3", "status": "passed"}]\n'
+            '```'
+        )
+        outcomes = parse_coverage_block(text)
+        assert len(outcomes) == 1
+        assert outcomes[0].journey_id == "j3"
+
+
+class TestCoverageSummary:
+    def test_from_outcomes_counts_each_bucket(self):
+        outcomes = (
+            JourneyOutcome(journey_id="j1", status="passed"),
+            JourneyOutcome(journey_id="j2", status="passed"),
+            JourneyOutcome(journey_id="j3", status="found"),
+            JourneyOutcome(journey_id="j4", status="skipped", reason="no nvim"),
+        )
+        summary = CoverageSummary.from_outcomes(outcomes)
+        assert summary.attempted == 4
+        assert summary.passed == 2
+        assert summary.found == 1
+        assert summary.skipped == 1
+        assert summary.skip_reasons == ("no nvim",)
+
+
+class TestApplyOutcomeToRoundCoverage:
+    def test_journey_outcomes_populate_lane_coverage(self):
+        report = RoundReport(round_num=1)
+        lane = _lane(platform="win-native")
+        outcome = ExploreOutcome(
+            journey_outcomes=(
+                JourneyOutcome(journey_id="j1", status="passed"),
+                JourneyOutcome(journey_id="j2", status="skipped", reason="no nvim"),
+            ),
+        )
+        _apply_outcome_to_round(report, lane, outcome)
+        assert report.lane_coverage["win-native"].attempted == 2
+        assert report.lane_coverage["win-native"].passed == 1
+        assert report.lane_coverage["win-native"].skipped == 1
+
+    def test_no_journey_outcomes_leaves_lane_coverage_empty(self):
+        report = RoundReport(round_num=1)
+        lane = _lane(platform="win-native")
+        outcome = ExploreOutcome(findings=())
+        _apply_outcome_to_round(report, lane, outcome)
+        assert report.lane_coverage == {}
+
 
 # ── filing (coord seam faked) ────────────────────────────────────────────
 
@@ -595,6 +939,30 @@ class TestFileFinding:
         create_call = runner.calls[0]
         evidence_idx = create_call.index("--evidence") + 1
         assert "Tier-1 shared conformance scenario" in create_call[evidence_idx]
+
+    def test_journey_id_round_trips_into_filed_issue_body(self):
+        """#3580 requirement 2/acceptance: a finding carrying `journey_id`
+        round-trips into the filed issue body, so the fixer knows which
+        catalogue journey (and therefore which reference oracle) the
+        expected behaviour came from."""
+        finding = _finding(journey_id="vim-dd-deletes-line")
+        dedupe = dedupe_finding(finding, [], [])
+        runner = FakeRunner()
+        file_finding(finding, dedupe, _lane(), runner, dry_run=False)
+        create_call = runner.calls[0]
+        evidence_idx = create_call.index("--evidence") + 1
+        assert "vim-dd-deletes-line" in create_call[evidence_idx]
+        assert CATALOGUE_PATH in create_call[evidence_idx]
+
+    def test_no_journey_id_omits_journey_line(self):
+        finding = _finding()
+        assert finding.journey_id == ""
+        dedupe = dedupe_finding(finding, [], [])
+        runner = FakeRunner()
+        file_finding(finding, dedupe, _lane(), runner, dry_run=False)
+        create_call = runner.calls[0]
+        evidence_idx = create_call.index("--evidence") + 1
+        assert "Journey:" not in create_call[evidence_idx]
 
     def test_missing_lane_for_real_filing_raises(self):
         finding = _finding()
@@ -1563,6 +1931,52 @@ class TestDispatchAndAwaitLane:
         assert outcome.findings[0].title == "Crash on install"
         assert outcome.protocol_error == ""
 
+    def test_coverage_block_is_parsed_into_journey_outcomes(self, monkeypatch):
+        """#3580 requirement 5: the production explorer parses the lane
+        worker's ```` ```bugbash-coverage ```` block into
+        `ExploreOutcome.journey_outcomes`, independent of the findings
+        fence/protocol-error decision."""
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = (
+            '{"type": "assistant", "message": {"content": [{"type": "text", '
+            '"text": "done.\\n```bugbash-findings\\n[]\\n```\\n'
+            '```bugbash-coverage\\n'
+            '[{\\"journey_id\\": \\"j1\\", \\"status\\": \\"passed\\"}, '
+            '{\\"journey_id\\": \\"j2\\", \\"status\\": \\"skipped\\", '
+            '\\"reason\\": \\"no nvim\\"}]\\n'
+            '```"}]}}\n'
+            '{"type": "result", "total_cost_usd": 2.0}'
+        )
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(), 1, repo_name="vimcode", config=cfg, reference_backend="mac-native",
+        )
+        assert outcome.ok is True
+        assert outcome.findings == ()
+        assert len(outcome.journey_outcomes) == 2
+        assert outcome.journey_outcomes[0].journey_id == "j1"
+        assert outcome.journey_outcomes[0].status == "passed"
+        assert outcome.journey_outcomes[1].status == "skipped"
+        assert outcome.journey_outcomes[1].reason == "no nvim"
+
     def test_cost_with_no_result_event_defaults_to_zero_not_a_flat_placeholder(self, monkeypatch):
         """A log with no terminal `result` event (e.g. truncated) must never
         fall back to a made-up flat cost — `0.0` is the honest "we don't
@@ -1772,6 +2186,28 @@ class TestHarvestOutcome:
         assert report.filings[0].preview_title is not None
         assert runner.calls == []
 
+    def test_journey_outcomes_populate_coverage_summary(self):
+        """#3580 requirement 5: harvesting a late-arriving explorer still
+        reports its per-journey coverage, same as an inline round."""
+        outcome = ExploreOutcome(
+            findings=(),
+            cost=0.5,
+            journey_outcomes=(
+                JourneyOutcome(journey_id="j1", status="passed"),
+                JourneyOutcome(journey_id="j2", status="skipped", reason="no nvim"),
+            ),
+        )
+        runner = FakeRunner()
+        report = harvest_outcome(
+            outcome, _lane(platform="win-native"), repo="vimcode", runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        cov = report.lane_coverage["win-native"]
+        assert cov.attempted == 2
+        assert cov.passed == 1
+        assert cov.skipped == 1
+        assert cov.skip_reasons == ("no nvim",)
+
     def test_duplicate_against_open_issue_is_not_refiled(self):
         finding = _finding(title="Extension install flow crashes on Windows")
         outcome = ExploreOutcome(findings=(finding,), cost=0.5)
@@ -1822,6 +2258,29 @@ class TestHarvestOutcome:
         assert runner.calls == []
 
 
+class TestPrintRoundCoverage:
+    """#3580 requirement 5: a clean round's CLI output must read as "N
+    journeys passed", not just a quiet "0 finding(s)" line."""
+
+    def test_coverage_summary_is_printed_per_lane(self, capsys):
+        from coord.commands.bugbash import _print_round
+        from coord.bugbash import BugbashReport
+
+        report_round = RoundReport(round_num=1)
+        report_round.lane_coverage["win-native"] = CoverageSummary(
+            attempted=5, passed=3, found=1, skipped=1, skip_reasons=("no nvim",),
+        )
+        wrapped = BugbashReport(repo="vimcode", rounds=[report_round], termination_reason="zero_findings")
+        _print_round(wrapped)
+        out = capsys.readouterr().out
+        assert "coverage (win-native)" in out
+        assert "5 attempted" in out
+        assert "3 passed" in out
+        assert "1 found" in out
+        assert "1 skipped" in out
+        assert "no nvim" in out
+
+
 # ── coord bugbash CLI (#3569: --lane-timeout, run/harvest subcommands) ───
 
 
@@ -1849,6 +2308,92 @@ class TestBugbashCli:
         assert result.exit_code == 0
         assert "Usage: bugbash harvest" in result.output
 
+    def test_dry_run_names_catalogue_in_use_and_journey_count_per_lane(self, monkeypatch):
+        """#3580 acceptance: `coord bugbash <repo> --dry-run` output names
+        the catalogue in use (or the fallback) and the journey count per
+        lane."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [
+                _prod_lane(machine="pc1", platform="win-native"),
+                _prod_lane(machine="pc1", platform="tui-pty"),
+            ],
+        )
+        catalogue_text = (
+            "version: 1\n"
+            "journeys:\n"
+            "  - id: j1\n"
+            "    lanes: [win-native]\n"
+            "    reference: spec\n"
+            "    expected: \"e\"\n"
+            "    steps: \"s\"\n"
+            "    priority: 1\n"
+            "  - id: j2\n"
+            "    lanes: [tui-pty]\n"
+            "    reference: spec\n"
+            "    expected: \"e\"\n"
+            "    steps: \"s\"\n"
+            "    priority: 2\n"
+        )
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: catalogue_text)
+        monkeypatch.setattr(
+            cmd_bugbash, "run_bugbash",
+            lambda bb_config, **kw: BugbashReport(
+                repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "win-native", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "catalogue:" in result.output
+        assert CATALOGUE_PATH in result.output
+        assert "win-native=1" in result.output
+        assert "tui-pty=1" in result.output
+
+    def test_dry_run_names_the_fallback_when_no_catalogue(self, monkeypatch):
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
+        )
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: None)
+        monkeypatch.setattr(
+            cmd_bugbash, "run_bugbash",
+            lambda bb_config, **kw: BugbashReport(
+                repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "win-native", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "catalogue:" in result.output
+        assert "falling back to the built-in exploration checklist" in result.output
+
     def test_lane_timeout_and_cost_cap_reach_dispatch_and_await_lane(self, monkeypatch):
         """#3569 acceptance: `--lane-timeout` (plus `--cost-cap-per-lane`,
         the real budget control the stall loop is bounded by) must reach
@@ -1857,13 +2402,20 @@ class TestBugbashCli:
         from click.testing import CliRunner
         from coord.bugbash import BugbashReport
 
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+
         fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
-        fake_cfg.repo = lambda name: object()
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
         monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
         monkeypatch.setattr(
             cmd_bugbash, "discover_lanes",
             lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
         )
+        # #3580: this test is about --lane-timeout/--cost-cap-per-lane
+        # reaching the dispatch seam, not the catalogue fetch — stub it out
+        # rather than hitting a real `gh` call.
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: None)
 
         captured = {}
 
@@ -1899,6 +2451,51 @@ class TestBugbashCli:
         captured["explorer"](_prod_lane(machine="pc1", platform="win-native"), 1)
         assert dispatch_kwargs.get("timeout") == 777.0
         assert dispatch_kwargs.get("cost_cap") == 33.0
+
+    def test_catalogue_text_reaches_dispatch_and_await_lane(self, monkeypatch):
+        """#3580: the catalogue fetched once per run must reach
+        `_dispatch_and_await_lane` (and therefore `build_exploration_briefing`)
+        for every lane/round, not just be fetched and printed."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
+        )
+        catalogue_text = "version: 1\njourneys: [{id: j1, lanes: [win-native], reference: spec, expected: e, steps: s}]\n"
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug: catalogue_text)
+
+        captured = {}
+
+        def fake_run_bugbash(bb_config, *, explorer, runner, open_issues_fetcher, closed_issues_fetcher, confirm):
+            captured["explorer"] = explorer
+            return BugbashReport(repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0)
+
+        monkeypatch.setattr(cmd_bugbash, "run_bugbash", fake_run_bugbash)
+
+        dispatch_kwargs = {}
+
+        def fake_dispatch(lane, round_num, **kwargs):
+            dispatch_kwargs.update(kwargs)
+            return ExploreOutcome(ok=True)
+
+        monkeypatch.setattr(cmd_bugbash, "_dispatch_and_await_lane", fake_dispatch)
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "win-native", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        captured["explorer"](_prod_lane(machine="pc1", platform="win-native"), 1)
+        assert dispatch_kwargs.get("catalogue_text") == catalogue_text
 
     def test_harvest_command_files_a_recovered_finding(self, monkeypatch):
         """End-to-end `coord bugbash harvest` against faked seams: an

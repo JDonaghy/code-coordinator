@@ -77,6 +77,7 @@ import click
 import httpx
 
 from coord.bugbash import (
+    CATALOGUE_PATH,
     BugbashConfig,
     BugbashLane,
     BugbashReport,
@@ -86,6 +87,9 @@ from coord.bugbash import (
     discover_lanes,
     finding_target_repo,
     harvest_outcome,
+    journeys_for_lane,
+    parse_catalogue,
+    parse_coverage_block,
     parse_findings_block,
     parse_unavailable_report,
     run_bugbash,
@@ -206,6 +210,12 @@ def _fetch_and_parse_outcome(machine, assignment_id: str, *, platform: str, repo
             unavailable=True, cost=summary.total_cost_usd, notes=unavailable_reason,
         )
 
+    # #3580 requirement 5: purely informational per-journey coverage — never
+    # part of the protocol-error/clean-pass decision below, so it's parsed
+    # unconditionally off the SAME last-assistant text regardless of which
+    # branch fires.
+    journey_outcomes = parse_coverage_block(last_assistant_text)
+
     parsed = parse_findings_block(last_assistant_text, platform=platform, repo=repo)
     if parsed.protocol_error:
         # #3517: the worker completed, but its report can't be trusted as a
@@ -216,8 +226,12 @@ def _fetch_and_parse_outcome(machine, assignment_id: str, *, platform: str, repo
             cost=summary.total_cost_usd,
             notes=f"protocol error: {parsed.protocol_error}",
             protocol_error=parsed.protocol_error,
+            journey_outcomes=journey_outcomes,
         )
-    return ExploreOutcome(findings=parsed.findings, cost=summary.total_cost_usd, notes="status=completed")
+    return ExploreOutcome(
+        findings=parsed.findings, cost=summary.total_cost_usd, notes="status=completed",
+        journey_outcomes=journey_outcomes,
+    )
 
 
 def _dispatch_and_await_lane(
@@ -228,6 +242,7 @@ def _dispatch_and_await_lane(
     config,
     reference_backend: str,
     checklist=EXPLORATION_CHECKLIST,
+    catalogue_text: str | None = None,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     timeout: float = DEFAULT_LANE_TIMEOUT,
     cost_cap: float = float("inf"),
@@ -299,6 +314,7 @@ def _dispatch_and_await_lane(
 
     briefing = build_exploration_briefing(
         lane, reference_backend=reference_backend, checklist=checklist,
+        catalogue_text=catalogue_text,
     )
     proposal = Proposal(
         id=0,
@@ -470,6 +486,44 @@ def _fetch_recently_closed_issues(slug: str, *, limit: int = 200) -> list[dict]:
         return []
 
 
+def _fetch_catalogue_text(slug: str) -> str | None:
+    """Best-effort fetch of *slug*'s :data:`CATALOGUE_PATH` (#3580) —
+    ``None`` when the file doesn't exist on the repo's default branch, or
+    the fetch itself fails, so a repo with no catalogue (the overwhelming
+    majority, today) degrades to :func:`build_exploration_briefing`'s own
+    :data:`EXPLORATION_CHECKLIST` fallback rather than aborting the run.
+    Never raises."""
+    try:
+        return github_ops.get_repo_file(slug, CATALOGUE_PATH)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _describe_catalogue(catalogue_text: str | None, lanes: list[BugbashLane]) -> str:
+    """One line naming the catalogue in use (or the fallback) and the
+    journey count per lane (#3580 acceptance: ``coord bugbash <repo>
+    --dry-run`` output must say this) — the SAME :func:`parse_catalogue`/
+    :func:`journeys_for_lane` calls :func:`build_exploration_briefing` makes
+    per lane, so this line can never disagree with what a lane's worker was
+    actually told to walk (#2096 "one question, one answer")."""
+    catalogue = parse_catalogue(catalogue_text)
+    if not catalogue.journeys:
+        reason = catalogue.warning or f"no catalogue found at {CATALOGUE_PATH}"
+        return (
+            f"catalogue: {reason} — falling back to the built-in exploration "
+            f"checklist ({len(EXPLORATION_CHECKLIST)} item(s)) for every lane"
+        )
+    per_lane = ", ".join(
+        f"{lane.platform}={len(journeys_for_lane(catalogue.journeys, lane.driver_kind))}"
+        for lane in lanes
+    )
+    warning_note = f" (warning: {catalogue.warning})" if catalogue.warning else ""
+    return (
+        f"catalogue: {catalogue.source} ({len(catalogue.journeys)} journey(s) "
+        f"total){warning_note} — lane journey counts: {per_lane or '(no lanes)'}"
+    )
+
+
 def _print_round(report: BugbashReport) -> None:
     """Render every round's findings/filings/failures — shared by
     ``coord bugbash run``'s multi-round report and ``coord bugbash
@@ -499,6 +553,15 @@ def _print_round(report: BugbashReport) -> None:
         # round.
         for platform, note in r.protocol_error_lanes.items():
             click.secho(f"  lane PROTOCOL ERROR ({platform}): {note}", fg="red")
+        # #3580 requirement 5: a clean round should read as "N journeys
+        # passed", not just a quiet "0 finding(s)" line.
+        for platform, cov in r.lane_coverage.items():
+            skip_detail = f" [{', '.join(cov.skip_reasons)}]" if cov.skip_reasons else ""
+            click.echo(
+                f"  coverage ({platform}): {cov.attempted} attempted, "
+                f"{cov.passed} passed, {cov.found} found, {cov.skipped} skipped"
+                f"{skip_detail}"
+            )
         for f in r.filings:
             incomplete = " [INCOMPLETE REPORT]" if f.finding.incomplete else ""
             # #3546: a finding routed by `suspected_repo` away from the app
@@ -620,6 +683,14 @@ def bugbash_run_cmd(
 
     click.echo(f"lanes: {', '.join(f'{l.platform}@{l.machine}' for l in lanes)}")
 
+    # #3580: fetch the repo's behaviour catalogue ONCE per run (not per
+    # lane/round — it's the same file for all of them) and name what's in
+    # use (or the fallback) up front, so a `--dry-run` operator can see
+    # which journeys would actually be walked without reading a lane
+    # worker's transcript.
+    catalogue_text = _fetch_catalogue_text(repo_cfg.github)
+    click.echo(_describe_catalogue(catalogue_text, lanes))
+
     bb_config = BugbashConfig(
         repo=repo,
         lanes=lanes,
@@ -634,6 +705,7 @@ def bugbash_run_cmd(
     def explorer(lane: BugbashLane, round_num: int) -> ExploreOutcome:
         return _dispatch_and_await_lane(
             lane, round_num, repo_name=repo, config=cfg, reference_backend=reference,
+            catalogue_text=catalogue_text,
             timeout=lane_timeout, cost_cap=cost_cap_per_lane,
         )
 
