@@ -4721,6 +4721,48 @@ def _augment_backoff_reason(previous_reason: str, backoff_text: str) -> str:
     return f"{base}\n   {backoff_text}"
 
 
+def _running_merge_gate_reading(
+    entry: QueueEntry,
+    facts: IssueFacts,
+    live_running_merge_gate: Mapping[str, bool] | None,
+) -> bool | None:
+    """Whether #3577's fix-round-ceiling exemption currently has evidence
+    that *entry*'s merge gate is :data:`coord.merge_queue.PLAN_READY` —
+    the ``running`` counterpart of :func:`_blocked_gate_reading`, same
+    contract:
+
+    ``True``  — confirmed still shut (not ``PLAN_READY``); the ceiling
+                 applies normally.
+    ``False`` — confirmed :data:`coord.merge_queue.PLAN_READY`; the ceiling
+                 is exempt.
+    ``None``  — no evidence either way; the ceiling applies normally (never
+                 guess an exemption into existence).
+
+    Two sources, checked in order, the first one PRESENT wins:
+
+    * *live_running_merge_gate* — a FRESH, single-entry re-derivation the
+      shell took THIS tick, via the same ``coord.merge_queue.
+      entry_gate_status`` call ``coord merge --plan``/``--only`` itself
+      uses (see ``coord.commands.drive_queue.
+      _fetch_live_running_merge_gate``'s docstring). This is what actually
+      fires in production: the daemon-host tick never computes a
+      ``merge_plan`` section at all, so without this override the
+      exemption below would have no evidence whatsoever.
+    * ``facts.merge_gate_status`` — the passive board reading, free on any
+      lane that DOES serve a ``merge_plan`` section (a thin client's live
+      ``/board``, or a test that builds ``IssueFacts`` directly).
+      ``PLAN_READY`` reads as cleared; any other non-empty status reads as
+      still shut; ``''`` (no merge-queue row at all right now) is no
+      evidence.
+    """
+    live = (live_running_merge_gate or {}).get(entry.key)
+    if live is not None:
+        return live
+    if facts.merge_gate_status:
+        return facts.merge_gate_status != PLAN_READY
+    return None
+
+
 def _reconcile_running(
     entry: QueueEntry,
     board: BoardView,
@@ -4734,6 +4776,8 @@ def _reconcile_running(
     exit_dead_end: Mapping[str, bool] | None = None,
     live_prereq_terminal: Mapping[str, bool] | None = None,
     fix_round_config_default: int | None = None,
+    live_running_merge_gate: Mapping[str, bool] | None = None,
+    live_running_merge_gate_reason: Mapping[str, str] | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -4871,29 +4915,46 @@ def _reconcile_running(
     death whose own evidence shows no further work/fix leg would even be
     attempted. When *own_reason* already names a merge-gate block
     (:func:`_is_merge_gate_block_reason` — "merge attempted N times without
-    landing", a stale smoke verdict, red CI, ...) AND the board's own
-    merge-plan reading for this entry is :data:`coord.merge_queue.PLAN_READY`
-    (#776 — review approved, test passed/skipped, CI green, nothing left but
-    the merge mechanics themselves), the ceiling is skipped outright and the
-    entry falls through to the ordinary ``attempts``-based retry/exhausted
-    logic below instead. The incident this closes
-    (vimcode#1703/PR#1714, 2026-10-04 UTC): a drive died with "merge
-    attempted 3 times without landing" while Review/Test were already green
-    on its SHA; the #2972 ceiling (4 work legs against a budget of 3)
-    permanently blocked it with #3454's "Stopped — remove+add is the only
-    way" wording, and the daemon's own auto-drain merged the PR four minutes
-    later anyway — both halves of that verdict were wrong. A merge-stage
-    death has nothing to do with the WORK budget at all; the row's real
-    remaining problem is merge mechanics (behind, not mergeable, needs a
-    rebase/conflict-fix), which is exactly what falling through here keeps
-    reachable: no `(#2972)` marker means `is_permanent_block_reason` reads
-    it as an ordinary, re-evaluable block, so `_reconcile_blocked`'s gate
-    sweep (including the merge-only fast path and auto-dispatched
-    stale-rebase conflict-fix) can still act on it. `facts.merge_gate_status`
-    is deliberately the SAME field :func:`_reconcile_blocked`'s own gate read
-    already trusts (#2096: one question, one answer) — not a second,
-    independently-derived "is this really ready" check that could disagree
-    with it.
+    landing", a stale smoke verdict, red CI, ...) AND the merge-plan reading
+    for this entry is :data:`coord.merge_queue.PLAN_READY` (#776 — review
+    approved, test passed/skipped, CI green, nothing left but the merge
+    mechanics themselves), the ceiling is skipped outright and the entry
+    falls through to the ordinary ``attempts``-based retry/exhausted logic
+    below instead. The incident this closes (vimcode#1703/PR#1714,
+    2026-10-04 UTC): a drive died with "merge attempted 3 times without
+    landing" while Review/Test were already green on its SHA; the #2972
+    ceiling (4 work legs against a budget of 3) permanently blocked it with
+    #3454's "Stopped — remove+add is the only way" wording, and the
+    daemon's own auto-drain merged the PR four minutes later anyway — both
+    halves of that verdict were wrong. A merge-stage death has nothing to
+    do with the WORK budget at all; the row's real remaining problem is
+    merge mechanics (behind, not mergeable, needs a rebase/conflict-fix),
+    which is exactly what falling through here keeps reachable: no
+    `(#2972)` marker means `is_permanent_block_reason` reads it as an
+    ordinary, re-evaluable block, so `_reconcile_blocked`'s gate sweep
+    (including the merge-only fast path and auto-dispatched stale-rebase
+    conflict-fix) can still act on it.
+
+    THAT READING COMES FROM TWO SOURCES, not one, checked by
+    :func:`_running_merge_gate_reading` in the same order
+    :func:`_blocked_gate_reading` already checks them for ``blocked``:
+    *live_running_merge_gate* — a FRESH, single-entry re-derivation the
+    shell took THIS tick (:func:`coord.commands.drive_queue.
+    _fetch_live_running_merge_gate`, mirroring ``_fetch_live_ci_gate``/
+    ``_fetch_live_blocked_gate``) — wins when present; ``facts.
+    merge_gate_status`` (the board's cached ``merge_plan`` reading) is only
+    the FALLBACK for a caller with no live reading to offer. This matters
+    because on the daemon host — the only host ``coord drive-queue tick``
+    ever runs on — the board's own ``merge_plan`` section is never
+    populated at all (``BoardFetcher._fetch_local()``'s own docstring), so
+    without the live override ``facts.merge_gate_status`` is unconditionally
+    ``""`` there and this exemption could never fire in the deployed daemon
+    loop — exactly the gap #2182/#2230 already closed for ``parked``/
+    ``blocked`` the same way. ``facts.merge_gate_status`` is still the SAME
+    field :func:`_reconcile_blocked`'s own gate read trusts (#2096: one
+    question, one answer) for whichever caller — a thin client, a test — DOES
+    serve a populated ``merge_plan`` section; it is simply no longer trusted
+    ALONE here, the gap the original #3577 patch left open.
     """
     facts = board.facts(entry.key)
 
@@ -5549,10 +5610,16 @@ def _reconcile_running(
     # leg to spend in the first place — see the docstring's #3577 paragraph
     # for the incident this closes. Checked here, not folded into the
     # ceiling condition below, so the exemption is visible on its own line
-    # rather than buried in a compound boolean.
+    # rather than buried in a compound boolean. The reading itself prefers
+    # *live_running_merge_gate* (this tick's live re-derivation) over
+    # ``facts.merge_gate_status`` (the board's cached — on the daemon host,
+    # ALWAYS EMPTY — reading); see `_running_merge_gate_reading`'s
+    # docstring for why that order is the whole fix.
     ceiling_exempt_merge_stage_exit = _is_merge_gate_block_reason(
         own_reason
-    ) and facts.merge_gate_status == PLAN_READY
+    ) and _running_merge_gate_reading(
+        entry, facts, live_running_merge_gate
+    ) is False
     if (
         not ceiling_exempt_merge_stage_exit
         and remaining_fix_rounds(entry, facts, fix_round_config_default) <= 0
@@ -5569,14 +5636,27 @@ def _reconcile_running(
         # the raw `facts.work_leg_count` here would misstate a re-added
         # row's spend as its predecessors' lifetime total.
         row_legs = max(facts.work_leg_count - entry.legs_at_enqueue, 0)
+        # #3577: when own_reason is merge-gate-shaped but the ceiling still
+        # fired (the live/board reading confirmed the gate is NOT
+        # PLAN_READY after all), say why — the same live reason
+        # `_fetch_live_running_merge_gate` already carries — rather than
+        # leaving an operator to wonder why a "merge attempted" death didn't
+        # get the exemption.
+        live_merge_reason = (
+            (live_running_merge_gate_reason or {}).get(entry.key)
+            if _is_merge_gate_block_reason(own_reason)
+            else None
+        )
+        gate_note = f" (merge gate: {live_merge_reason})" if live_merge_reason else ""
         reason = (
             f"fix-round ceiling reached across relaunches (#2972): "
             f"{row_legs} work leg(s) already run against this row's own "
             f"budget of {budget} (1 work dispatch + "
             f"{effective_max_fix_rounds(entry, fix_round_config_default)} fix "
             f"round(s)) — giving up rather than relaunching with a fresh "
-            f"budget{dispatch_note}. Stopped (#3454): no further relaunch, "
-            f"gate-clear resume, or auto-dispatched stale-rebase conflict-fix "
+            f"budget{dispatch_note}{gate_note}. Stopped (#3454): no further "
+            f"relaunch, gate-clear resume, or auto-dispatched stale-rebase "
+            f"conflict-fix "
             f"(from any of this fleet's independent dispatchers) will fire "
             f"for this entry — `coord drive-queue remove {entry.repo} "
             f"{entry.issue}` + `add` (a fresh row, #3463: with its own fresh "
@@ -6456,6 +6536,8 @@ def plan_tick(
     live_prereq_terminal: Mapping[str, bool] | None = None,
     fix_round_config_default: int | None = None,
     max_resumes_per_tick_per_repo: int | None = DEFAULT_MAX_RESUMES_PER_TICK_PER_REPO,
+    live_running_merge_gate: Mapping[str, bool] | None = None,
+    live_running_merge_gate_reason: Mapping[str, str] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -6783,6 +6865,26 @@ def plan_tick(
     ``None`` (the default) falls back to :data:`DEFAULT_TICK_MAX_FIX_ROUNDS`,
     same as every other caller of :func:`effective_max_fix_rounds`.
 
+    *live_running_merge_gate* (#3577) maps a ``running`` entry's key to
+    whether a FRESH, single-entry re-derivation of its merge gate — taken
+    live THIS tick by :func:`coord.commands.drive_queue.
+    _fetch_live_running_merge_gate`, the same mechanism *live_ci_gate*/
+    *live_blocked_gate* already use for ``parked``/``blocked`` — still
+    finds it shut. Threaded straight through to :func:`_reconcile_running`'s
+    #2972 ceiling exemption check (:func:`_running_merge_gate_reading`),
+    where it is preferred OVER ``facts.merge_gate_status`` — the board's
+    cached ``merge_plan`` reading, which the daemon-host tick never
+    populates at all, so without this override the exemption could never
+    fire there. A key ABSENT here falls back to ``facts.merge_gate_status``,
+    unchanged from the original #3577 behaviour — the live override, not
+    the cached fallback, is what actually fires in production.
+
+    *live_running_merge_gate_reason* (#3577) is *live_running_merge_gate*'s
+    own reason-text sibling, surfaced in the #2972 ceiling's own ``exhausted``
+    message when the gate is confirmed still shut despite *own_reason*
+    naming a merge-gate block — so an operator reading the block sees WHY
+    the exemption did not apply, not just that it didn't.
+
     *max_resumes_per_tick_per_repo* (#3536) caps how many CONFIRMED-CLEAR
     `blocked`-entry resumes/merge-only releases THIS tick grants per repo,
     from EITHER `_reconcile_blocked`'s gate-clear check or
@@ -6904,6 +7006,8 @@ def plan_tick(
             exit_dead_end=exit_dead_end,
             live_prereq_terminal=live_prereq_terminal,
             fix_round_config_default=fix_round_config_default,
+            live_running_merge_gate=live_running_merge_gate,
+            live_running_merge_gate_reason=live_running_merge_gate_reason,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:

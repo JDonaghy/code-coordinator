@@ -5406,6 +5406,98 @@ def _fetch_live_blocked_gate(
     return overrides, reasons, unreadable
 
 
+def _fetch_live_running_merge_gate(
+    entries: list, exit_reasons: Mapping[str, str], config_path: Path | None
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """``({entry_key: still_blocked}, {entry_key: gate_reason})`` for every
+    ``running`` entry whose OWN exit reason THIS tick already names a
+    merge-gate block (#3577) — the third sibling of ``_fetch_live_ci_gate``/
+    ``_fetch_live_blocked_gate``: same bounded, single-entry
+    :func:`coord.merge_queue.entry_gate_status` re-derivation, taken live,
+    this tick, against the SAME live backend those two already pay for —
+    only against ``running`` entries instead of ``parked``/``blocked`` ones.
+
+    THE GAP THIS CLOSES. ``_reconcile_running``'s #2972 fix-round ceiling is
+    a WORK budget; #3577 added an exemption for a death whose own evidence
+    already shows no further work/fix leg is even on the table — a
+    merge-stage death ("merge attempted N times without landing") with
+    Review approved and Test passed/skipped already on the latest leg's SHA
+    (``facts.merge_gate_status == coord.merge_queue.PLAN_READY``). But
+    ``facts.merge_gate_status`` comes from the board's ``merge_plan``
+    section (``build_board_view``), and on the daemon host — the only
+    machine ``coord drive-queue tick`` ever runs on — ``BoardFetcher.
+    _fetch_local()`` never populates that section at all (see its own
+    docstring: "Deliberately NOT ... backfilled here"). Exactly the gap
+    #2182/#2230 already closed for ``parked``/``blocked`` via
+    ``_fetch_live_ci_gate``/``_fetch_live_blocked_gate`` — without THIS
+    fetch, ``_reconcile_running``'s #3577 exemption has no evidence on the
+    one lane it exists for, and the vimcode#1703/PR#1714 incident it was
+    written to close recurs unchanged.
+
+    Scoped to the bounded few ``running`` entries whose exit THIS tick
+    already named a merge-gate block (typically 0-1, never the whole
+    queue) — the same "small and predictable" per-tick cost its two
+    siblings already pay, not unbounded polling.
+
+    Fails OPEN per entry and CLOSED overall, identically to
+    ``_fetch_live_ci_gate``: a key ABSENT from the first dict (an unreadable
+    config, a ``ci_store`` that failed to build, no merge-queue row for this
+    entry yet, a missing PR number, or any other exception) leaves that
+    entry to ``_reconcile_running``'s own ``facts.merge_gate_status``
+    fallback — "no live evidence this tick, fall back to the board's cached
+    reading" — exactly #3577's original (daemon-host-inert, thin-client-live)
+    behaviour, never a wedge and never a wrongly-forced exemption.
+
+    Gated on ``resolve_board_service() is None`` for the same reason as its
+    two siblings: a thin client's live ``/board`` already carries a
+    populated ``merge_plan`` section, so ``facts.merge_gate_status`` already
+    answers this for free there.
+    """
+    targets = [
+        e for e in entries
+        if e.state == STATE_RUNNING
+        and is_merge_gate_block_reason(exit_reasons.get(e.key))
+    ]
+    if not targets:
+        return {}, {}
+
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return {}, {}
+
+    try:
+        from coord import github_ops as _gh_ops  # noqa: PLC0415
+        from coord import merge_queue as _mq  # noqa: PLC0415
+        from coord.ci_store import build_ci_store  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.state import load_board as _load_board  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        board = _load_board()
+        ci_store = build_ci_store(
+            cfg.ci_store.type, host=cfg.ci_store.host, token_env=cfg.ci_store.token_env
+        )
+        queue_by_key = _index_merge_queue_by_key(_mq.load_queue(), board)
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return {}, {}
+
+    overrides: dict[str, bool] = {}
+    reasons: dict[str, str] = {}
+    for e in targets:
+        q = queue_by_key.get(e.key)
+        if q is None or not q.pr_number:
+            continue
+        try:
+            status, reason = _mq.entry_gate_status(q, board, cfg, ci_store, _gh_ops)
+        except Exception:  # noqa: BLE001 — leave this one entry to the fallback
+            continue
+        overrides[e.key] = status != _mq.PLAN_READY
+        if reason:
+            reasons[e.key] = reason
+    return overrides, reasons
+
+
 def _fetch_live_prereq_terminal(
     entries: list, board: Any, config_path: Path | None
 ) -> dict[str, bool]:
@@ -7022,6 +7114,17 @@ def drive_queue_tick(
             _fetch_live_blocked_gate(entries, config_path)
         )
 
+        # #3577: the same live re-derivation, for `running` entries whose
+        # OWN exit this tick already named a merge-gate block — see
+        # `_fetch_live_running_merge_gate`'s docstring for the gap this
+        # closes (`_reconcile_running`'s fix-round-ceiling exemption reads
+        # `facts.merge_gate_status`, which — like the CI/blocked gates above
+        # — is never populated on the daemon-host tick without a live
+        # re-derivation).
+        live_running_merge_gate, live_running_merge_gate_reason = (
+            _fetch_live_running_merge_gate(entries, exit_reasons, config_path)
+        )
+
         # #2350: for every entry the two live re-checks above just found
         # clear, also confirm — from the board's own recorded Test/Review
         # verdicts — that Merge was the only gate ever still shut, so
@@ -7091,6 +7194,8 @@ def drive_queue_tick(
             # — so `_reconcile_running`'s fix-round ceiling and the launch it
             # gates never disagree about the budget.
             fix_round_config_default=_pipeline_max_fix_rounds_default(config_path),
+            live_running_merge_gate=live_running_merge_gate,
+            live_running_merge_gate_reason=live_running_merge_gate_reason,
         )
 
         if roll_pending is not None:

@@ -248,12 +248,26 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # `merge_queue.save_queue`, which the extended scan below already covers),
     # and the whole block is wrapped in a fail-soft `except Exception: return`
     # that degrades to exactly the pre-#2535 "wait for an operator" behaviour.
+    # #3577-guarded: `_fetch_live_running_merge_gate` is the fourth member of
+    # the `_fetch_live_*` family above, identical guard, identical place —
+    # it re-derives, live THIS tick, the merge gate behind a `running`
+    # entry's own merge-stage death, so `_reconcile_running`'s #2972
+    # fix-round-ceiling exemption has real evidence on the daemon host
+    # instead of always reading `facts.merge_gate_status` as `""` (that
+    # field's board-build path never populates `merge_plan` there either).
+    # The `if resolve_board_service() is not None: return {}, {}` early
+    # return sits ABOVE the `from coord.state import load_board` import, so
+    # a thin client returns before the local read is even imported; only
+    # the daemon host (#1870) reaches it. Read-only: load_board only, no
+    # save_board, wrapped in the same fail-soft `except Exception: return
+    # {}, {}` that degrades to the pre-#3577-live-fix board-only fallback.
     "drive_queue.py": {
         ("_fetch_live_ci_gate", "load_board"),
         ("_fetch_live_blocked_gate", "load_board"),
         ("_fetch_merge_only_ready", "load_board"),
         ("_run_auto_revalidate_checks_stale", "load_board"),
         ("drive_queue_diagnose", "build_board"),
+        ("_fetch_live_running_merge_gate", "load_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
