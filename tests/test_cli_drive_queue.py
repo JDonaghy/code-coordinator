@@ -4625,6 +4625,144 @@ def test_fetch_live_blocked_gate_confirms_still_shut_for_a_queue_row_with_no_pr_
     assert "no PR number" not in str(unreadable)
 
 
+# ── #3577: the `running` sibling of the live CI/blocked gate re-derivation ──
+#
+# `_reconcile_running`'s #2972 fix-round-ceiling exemption needs to know
+# whether a merge-stage death's gate is PLAN_READY, but the daemon-host
+# tick's board never populates `merge_plan` (`facts.merge_gate_status` is
+# always `""` there) — the exact gap #2182/#2230 already closed for
+# `parked`/`blocked` via `_fetch_live_ci_gate`/`_fetch_live_blocked_gate`.
+# `_fetch_live_running_merge_gate` is the same fix, one queue state over.
+
+
+def test_fetch_live_running_merge_gate_confirms_plan_ready_for_a_merge_stage_death(
+    monkeypatch, coord_db,
+):
+    """The vimcode#1703/PR#1714 shape: a `running` entry's own exit THIS
+    tick named a merge-gate block, and a live `entry_gate_status` call
+    confirms `PLAN_READY` — `overrides[key]` must read `False` (not still
+    blocked), so `_reconcile_running`'s ceiling exemption has real evidence
+    to act on."""
+    import types
+
+    import coord.board_service as board_service
+    import coord.ci_store as ci_store_mod
+    import coord.commands._common as common
+    import coord.merge_queue as mq
+    import coord.state as state_mod
+    from coord.commands.drive_queue import _fetch_live_running_merge_gate
+    from coord.drive_queue import STATE_RUNNING, QueueEntry, entry_key
+
+    entry = QueueEntry(repo=REPO, issue=1714, position=1, state=STATE_RUNNING)
+    key = entry_key(REPO, 1714)
+    exit_reasons = {
+        key: f"drive exited for {key} (exit_code=1): merge attempted 3 "
+        "times without landing."
+    }
+    row = types.SimpleNamespace(repo_name=REPO, issue_number=1714, pr_number=1714)
+
+    def fake_entry_gate_status(q, board, cfg, ci_store, gh_ops):
+        assert q is row
+        return mq.PLAN_READY, None
+
+    monkeypatch.setattr(mq, "load_queue", lambda: [row])
+    monkeypatch.setattr(mq, "entry_gate_status", fake_entry_gate_status)
+    monkeypatch.setattr(board_service, "resolve", lambda: None)
+    monkeypatch.setattr(common, "_load_config", lambda path: _fake_cfg())
+    monkeypatch.setattr(state_mod, "load_board", lambda: object())
+    monkeypatch.setattr(ci_store_mod, "build_ci_store", lambda *a, **k: object())
+
+    overrides, reasons = _fetch_live_running_merge_gate([entry], exit_reasons, None)
+
+    assert overrides == {key: False}
+    assert reasons == {}
+
+
+def test_fetch_live_running_merge_gate_confirms_still_blocked(monkeypatch, coord_db):
+    """Same merge-gate-shaped death, but the live read confirms the gate is
+    NOT ready (e.g. Review came back request-changes on the latest SHA) —
+    `overrides[key]` must read `True`, carrying the reason, so the ceiling
+    still applies."""
+    import types
+
+    import coord.board_service as board_service
+    import coord.ci_store as ci_store_mod
+    import coord.commands._common as common
+    import coord.merge_queue as mq
+    import coord.state as state_mod
+    from coord.commands.drive_queue import _fetch_live_running_merge_gate
+    from coord.drive_queue import STATE_RUNNING, QueueEntry, entry_key
+
+    entry = QueueEntry(repo=REPO, issue=1650, position=1, state=STATE_RUNNING)
+    key = entry_key(REPO, 1650)
+    exit_reasons = {
+        key: f"drive exited for {key} (exit_code=1): merge attempted 3 "
+        "times without landing."
+    }
+    row = types.SimpleNamespace(repo_name=REPO, issue_number=1650, pr_number=1650)
+
+    def fake_entry_gate_status(q, board, cfg, ci_store, gh_ops):
+        return mq.PLAN_BLOCKED, "review not approved"
+
+    monkeypatch.setattr(mq, "load_queue", lambda: [row])
+    monkeypatch.setattr(mq, "entry_gate_status", fake_entry_gate_status)
+    monkeypatch.setattr(board_service, "resolve", lambda: None)
+    monkeypatch.setattr(common, "_load_config", lambda path: _fake_cfg())
+    monkeypatch.setattr(state_mod, "load_board", lambda: object())
+    monkeypatch.setattr(ci_store_mod, "build_ci_store", lambda *a, **k: object())
+
+    overrides, reasons = _fetch_live_running_merge_gate([entry], exit_reasons, None)
+
+    assert overrides == {key: True}
+    assert reasons == {key: "review not approved"}
+
+
+def test_fetch_live_running_merge_gate_skips_entries_without_a_merge_gate_exit(
+    monkeypatch, coord_db,
+):
+    """A `running` entry whose own exit was NOT merge-gate-shaped (an
+    ordinary drive death) is not a target at all — no live call is paid
+    for it, and the pre-#3577 `facts.merge_gate_status` fallback stays in
+    charge for `_reconcile_running`."""
+    from coord.commands.drive_queue import _fetch_live_running_merge_gate
+    from coord.drive_queue import STATE_RUNNING, QueueEntry, entry_key
+
+    entry = QueueEntry(repo=REPO, issue=99, position=1, state=STATE_RUNNING)
+    key = entry_key(REPO, 99)
+    exit_reasons = {key: "drive session died without landing the work"}
+
+    overrides, reasons = _fetch_live_running_merge_gate([entry], exit_reasons, None)
+
+    assert overrides == {}
+    assert reasons == {}
+
+
+def test_fetch_live_running_merge_gate_is_a_noop_on_a_thin_client(
+    monkeypatch, coord_db,
+):
+    """Gated the same way as its `_fetch_live_ci_gate`/
+    `_fetch_live_blocked_gate` siblings: a thin client's live `/board`
+    already serves a populated `merge_plan`, so this never even imports
+    `load_board`."""
+    import coord.board_service as board_service
+    from coord.commands.drive_queue import _fetch_live_running_merge_gate
+    from coord.drive_queue import STATE_RUNNING, QueueEntry, entry_key
+
+    entry = QueueEntry(repo=REPO, issue=1714, position=1, state=STATE_RUNNING)
+    key = entry_key(REPO, 1714)
+    exit_reasons = {
+        key: f"drive exited for {key} (exit_code=1): merge attempted 3 "
+        "times without landing."
+    }
+
+    monkeypatch.setattr(board_service, "resolve", lambda: object())
+
+    overrides, reasons = _fetch_live_running_merge_gate([entry], exit_reasons, None)
+
+    assert overrides == {}
+    assert reasons == {}
+
+
 # ── tick: the cross-host guard (#1870) ───────────────────────────────────────
 #
 # 2026-08-06: a drive launched by hand on `elitebook` was 47 minutes into a

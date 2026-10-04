@@ -1304,6 +1304,119 @@ def test_a_merge_stage_exit_still_blocks_the_ceiling_without_a_clear_gate():
     assert len(plan.blocked) == 1
 
 
+def test_the_daemon_host_shape_never_exempts_the_ceiling_without_a_live_override():
+    """Review finding (fix round 1): on the daemon host `facts.
+    merge_gate_status` is ALWAYS `""` — `BoardFetcher._fetch_local()` never
+    populates `merge_plan` at all — so the ORIGINAL #3577 patch's exemption
+    (gated solely on `facts.merge_gate_status == PLAN_READY`) could never
+    fire there, even for the exact vimcode#1703/PR#1714 shape it was written
+    to close. This pins that gap: the SAME work-leg count and merge-gate
+    death as test_a_merge_stage_exit_with_a_clear_gate_is_exempt_from_the_
+    ceiling above, but with `merge_gate_status=""` (the daemon-host reading)
+    and NO `live_running_merge_gate` override — the ceiling still fires."""
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): merge attempted 3 times "
+        "without landing."
+    )
+    facts = IssueFacts(
+        known=True,
+        issue_state="open",
+        work_leg_count=4,
+        merge_gate_status="",
+    )
+    view = BoardView(issues={key: facts})
+    plan = plan_tick(
+        [_dead_running_entry(max_fix_rounds=2, attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "exhausted"
+    assert "fix-round ceiling" in reconcile.reason
+    assert "(#2972)" in reconcile.reason
+    assert len(plan.blocked) == 1
+
+
+def test_a_live_running_merge_gate_override_exempts_the_ceiling_on_the_daemon_host_shape():
+    """The actual fix (#3577 fix round 1): with the SAME daemon-host shape
+    as test_the_daemon_host_shape_never_exempts_the_ceiling_without_a_live_
+    override (``merge_gate_status=""``), a `live_running_merge_gate`
+    override confirming `PLAN_READY` for this entry — exactly what
+    `coord.commands.drive_queue._fetch_live_running_merge_gate`'s bounded,
+    THIS-tick `entry_gate_status` re-derivation would hand `plan_tick` in
+    production — IS enough to exempt the ceiling. This is the evidence the
+    exemption is actually reachable on the one host `coord drive-queue
+    tick` ever runs on, not just in a test that hands `IssueFacts` a
+    pre-populated `merge_plan` reading no production caller ever builds."""
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): merge attempted 3 times "
+        "without landing."
+    )
+    facts = IssueFacts(
+        known=True,
+        issue_state="open",
+        work_leg_count=4,
+        merge_gate_status="",
+    )
+    view = BoardView(issues={key: facts})
+    plan = plan_tick(
+        [_dead_running_entry(max_fix_rounds=2, attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+        live_running_merge_gate={key: False},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"
+    assert own_reason in reconcile.reason
+    assert "fix-round ceiling" not in reconcile.reason
+    assert "(#2972)" not in reconcile.reason
+    assert len(plan.blocked) == 0
+
+
+def test_a_live_running_merge_gate_override_confirming_still_blocked_keeps_the_ceiling():
+    """The inverse: a `live_running_merge_gate` override confirming the
+    gate is STILL shut (``True``) must not be mistaken for an exemption —
+    only a confirmed-`False` (PLAN_READY) reading exempts the ceiling. Also
+    pins that the live override's reason surfaces in the ceiling's own
+    message for operator visibility."""
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): merge attempted 3 times "
+        "without landing."
+    )
+    facts = IssueFacts(
+        known=True,
+        issue_state="open",
+        work_leg_count=4,
+        merge_gate_status="",
+    )
+    view = BoardView(issues={key: facts})
+    plan = plan_tick(
+        [_dead_running_entry(max_fix_rounds=2, attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+        live_running_merge_gate={key: True},
+        live_running_merge_gate_reason={key: "review not approved"},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "exhausted"
+    assert "fix-round ceiling" in reconcile.reason
+    assert "(#2972)" in reconcile.reason
+    assert "review not approved" in reconcile.reason
+    assert len(plan.blocked) == 1
+
+
 def test_the_fix_round_ceiling_reads_pipeline_max_fix_rounds_when_the_entry_has_no_override():
     """`fix_round_config_default` (the shell's `pipeline.max_fix_rounds`
     read) resolves the SAME way `effective_max_fix_rounds` always has — an
