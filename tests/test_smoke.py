@@ -610,6 +610,124 @@ def test_partition_unroutable_reports_files_from_every_rule_sharing_the_set() ->
     assert bad.rule_files == ("src/cuda/kernels/", "src/cuda/tests/")
 
 
+# ── `platforms` — one partition per OS (#3581) ──────────────────────────────
+#
+# vimcode's `tui-pty` shape: one driver (`UnixPtyChild`) covers BOTH Linux
+# and macOS behind a single `requires: [rust]` — so flat capability routing
+# always picked whichever Rust box sorted first (in practice always Linux)
+# and macOS never got smoke-tested at all. `precision` below has the base
+# capability + `linux`; `macmini` has it + `macos`; neither is a stand-in
+# for the other.
+
+_TUI_PTY_MACHINE_CAPS = {
+    "precision": {"rust", "linux"},
+    "macmini": {"rust", "macos"},
+}
+
+
+def _tui_pty_capable_for(caps: list[str]) -> bool:
+    wanted = set(caps)
+    return any(wanted <= have for have in _TUI_PTY_MACHINE_CAPS.values())
+
+
+def test_partition_platforms_yields_one_partition_per_os() -> None:
+    rules = [
+        SmokeRule(files=["tui/"], requires=["rust"], platforms=["linux", "macos"]),
+    ]
+    partitions, unroutable = partition_capability_requirements(
+        ["tui/src/app.rs"], rules, _tui_pty_capable_for,
+    )
+    assert unroutable == []
+    cap_sets = {frozenset(p.capabilities) for p in partitions}
+    assert cap_sets == {frozenset({"rust", "linux"}), frozenset({"rust", "macos"})}
+    # Both partitions were put on the board by the SAME touched file — the
+    # one rule matched once per platform, not once total.
+    assert all(p.files == ("tui/src/app.rs",) for p in partitions)
+
+
+def test_partition_platform_with_no_capable_host_is_unroutable_not_dropped() -> None:
+    """Only `precision` (rust+linux) is configured — macOS has no capable
+    host at all. The linux half must still resolve to a routable partition;
+    the macOS half must be reported, not silently absent."""
+    capable_for = lambda caps: set(caps) <= {"rust", "linux"}  # noqa: E731
+    rules = [
+        SmokeRule(files=["tui/"], requires=["rust"], platforms=["linux", "macos"]),
+    ]
+    partitions, unroutable = partition_capability_requirements(
+        ["tui/src/app.rs"], rules, capable_for,
+    )
+    assert partitions == [
+        SmokePartition(capabilities=("linux", "rust"), files=("tui/src/app.rs",)),
+    ]
+    assert len(unroutable) == 1
+    assert set(unroutable[0].capabilities) == {"rust", "macos"}
+
+
+def test_partition_platforms_rule_with_empty_requires_still_partitions() -> None:
+    """A rule can declare `platforms` with no extra `requires` at all — each
+    OS name alone is still a real capability requirement. `capable_for`
+    mirrors two single-OS machines (no machine has both), so the generic
+    greedy merge in `partition_capability_requirements` must NOT fold
+    `{linux}`/`{macos}` back into one partition."""
+    rules = [SmokeRule(files=["tui/"], requires=[], platforms=["linux", "macos"])]
+    capable_for = lambda caps: set(caps) <= {"linux"} or set(caps) <= {"macos"}  # noqa: E731
+    partitions, unroutable = partition_capability_requirements(
+        ["tui/src/app.rs"], rules, capable_for,
+    )
+    assert unroutable == []
+    cap_sets = {frozenset(p.capabilities) for p in partitions}
+    assert cap_sets == {frozenset({"linux"}), frozenset({"macos"})}
+
+
+def test_partition_rule_without_platforms_is_unchanged() -> None:
+    """A rule that never sets `platforms` (every rule predating #3581)
+    produces exactly its one `requires`-keyed partition, same as before."""
+    rules = [SmokeRule(files=["tui/"], requires=["rust"])]
+    partitions, unroutable = partition_capability_requirements(
+        ["tui/src/app.rs"], rules, lambda caps: True,
+    )
+    assert unroutable == []
+    assert partitions == [SmokePartition(capabilities=("rust",), files=("tui/src/app.rs",))]
+
+
+def test_dispatch_smoke_fans_out_one_leg_per_platform(repo: Repo) -> None:
+    """End-to-end #3581: a `tui-pty`-shaped rule with `platforms:
+    [linux, macos]` dispatches ONE leg to each OS's own capable host —
+    never both legs to whichever Rust box sorts first."""
+    from coord.smoke import _dispatch_smoke_legs, smoke_leg_capabilities
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("precision", "precision.tail", caps=["rust", "linux"], path="/p/api"),
+            _machine("macmini", "macmini.tail", caps=["rust", "macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["tui/"], requires=["rust"], platforms=["linux", "macos"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    board = Board()
+    client = _MultiHostClient(assign={
+        "precision.tail": {"id": "precision-leg"},
+        "macmini.tail": {"id": "macmini-leg"},
+    })
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client,
+        diff_lookup=lambda r, b: ["tui/src/app.rs"],
+    )
+
+    assert len(legs) == 2
+    by_machine = {a.machine_name: a for a in legs}
+    assert set(by_machine) == {"precision", "macmini"}
+    assert smoke_leg_capabilities(by_machine["precision"].issue_title) == ("linux", "rust")
+    assert smoke_leg_capabilities(by_machine["macmini"].issue_title) == ("macos", "rust")
+    assert completed.test_state == "running"
+
+
 # ── Rule command override (#3056) ───────────────────────────────────────────
 
 

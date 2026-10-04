@@ -179,6 +179,99 @@ acceptance:
         load(p)
 
 
+# ── platforms (#3581) ────────────────────────────────────────────────────────
+
+
+def test_acceptance_driver_platforms_absent_defaults_to_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test"
+"""
+    )
+    driver = load(p).acceptance.driver_for("coord-tui")
+    assert driver.platforms == []
+
+
+def test_acceptance_driver_platforms_round_trips(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-pty
+      run: "cargo test --test tui_pty"
+      capability: rust
+      platforms: [linux, macos]
+"""
+    )
+    driver = load(p).acceptance.driver_for("coord-tui")
+    assert driver.platforms == ["linux", "macos"]
+
+
+def test_acceptance_driver_platforms_non_list_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-pty
+      run: "cargo test --test tui_pty"
+      platforms: macos
+"""
+    )
+    with pytest.raises(ConfigError, match="platforms must be a list of strings"):
+        load(p)
+
+
+def test_acceptance_driver_platforms_non_string_entries_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-pty
+      run: "cargo test --test tui_pty"
+      platforms: [1, 2]
+"""
+    )
+    with pytest.raises(ConfigError, match="platforms must be a list of strings"):
+        load(p)
+
+
+def test_acceptance_routes_and_flat_platforms_raises(tmp_path: Path) -> None:
+    """#1125 review finding 5's rule extends to `platforms`: a routed entry
+    sets flat fields per-route only, so a flat `platforms` alongside
+    `routes` is rejected exactly like `kind`/`capability`/etc already are."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      platforms: [linux, macos]
+      routes:
+        - match: "tui/**"
+          kind: tui-pty
+          run: "cargo test --test tui_pty"
+"""
+    )
+    with pytest.raises(ConfigError, match=r"sets both 'routes' and flat field\(s\)"):
+        load(p)
+
+
 # --- #1125: in-repo path routing -------------------------------------------
 
 ROUTED_CONFIG = """\
@@ -226,6 +319,55 @@ def test_driver_for_routes_rust_path_to_tui_tuidriver(tmp_path: Path) -> None:
     assert driver.match == "tui/**"
     assert driver.mock == "*.screen"
     assert driver.capability == "rust"
+
+
+def test_route_platforms_round_trips(tmp_path: Path) -> None:
+    """#3581: vimcode's `tui-pty` route — the exact snippet an operator adds
+    to `coordinator.yml` to get Linux + macOS lanes instead of just one."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "vimcode")
+        + """\
+acceptance:
+  drivers:
+    vimcode:
+      routes:
+        - match: "tests/smoke-spec/tui.yaml"
+          kind: tui-pty
+          run: "coord acceptance run-lane tui-pty"
+          capability: rust
+          platforms: [linux, macos]
+"""
+    )
+    driver = load(p).acceptance.driver_for("vimcode", "tests/smoke-spec/tui.yaml")
+    assert driver.kind == "tui-pty"
+    assert driver.capability == "rust"
+    assert driver.platforms == ["linux", "macos"]
+
+
+def test_route_platforms_absent_defaults_to_empty(tmp_path: Path) -> None:
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for("claude-coordinator", "tui/src/app.rs")
+    assert driver.platforms == []
+
+
+def test_route_platforms_non_list_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "tui/**"
+          kind: tui-pty
+          run: "coord acceptance run-lane tui-pty"
+          platforms: macos
+"""
+    )
+    with pytest.raises(ConfigError, match=r"routes\[0\]\.platforms must be a list of strings"):
+        load(p)
 
 
 # ── #1540: coord/dashboard/webapp/** -> web-playwright + browser ─────────────

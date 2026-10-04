@@ -95,6 +95,21 @@ but Accessibility trust denied, or Screen Recording denied) is skipped
 rather than picked, so ``coord bugbash`` refuses to route to it the same way
 ``dispatch_smoke`` already does — not just in `/health`'s own JSON, but in
 the machine selection that actually dispatches a worker.
+
+**#3581: a route can ask to run once per OS, not once on any capable
+machine.** Before this, lane discovery picked exactly ONE machine per
+driver ``kind`` — fine for ``win-native``/``mac-native``/``gtk-native``
+(genuinely one OS each), but wrong for ``tui-pty``: its ``UnixPtyChild``
+covers BOTH Linux and macOS, declared via a single ``capability: rust``, so
+discovery always landed on whichever Rust box sorted first (in practice
+always the Linux one) and macOS never got a lane at all. A route now
+declares :attr:`coord.config.AcceptanceDriverConfig.platforms` (e.g.
+``[linux, macos]``) to get one :class:`BugbashLane` per listed platform,
+labelled ``f"{kind}:{os_name}"`` (e.g. ``"tui-pty:macos"``) so dedupe/
+titles never conflate a macOS-only finding with a Linux one. A listed
+platform with no capable machine is reported as an :class:`UnavailableLane`
+rather than silently omitted (see :func:`discover_lanes`). A route that
+doesn't set ``platforms`` is completely unaffected.
 """
 
 from __future__ import annotations
@@ -918,7 +933,15 @@ class CoverageSummary:
 @dataclass(frozen=True)
 class BugbashLane:
     """One platform lane: a native/PTY acceptance driver paired with a
-    specific capable machine to run it on."""
+    specific capable machine to run it on.
+
+    ``platform`` is the lane's display/dedupe label — ``driver_kind`` for a
+    single-platform driver (today's behaviour, unchanged), or
+    ``f"{driver_kind}:{os_name}"`` (e.g. ``"tui-pty:macos"``) for one lane
+    of a :attr:`coord.config.AcceptanceDriverConfig.platforms`-bearing
+    route (#3581) — so a macOS-only finding from a route that also runs on
+    Linux is never deduped/titled as if it were the same lane.
+    """
 
     platform: str
     driver_kind: str
@@ -927,8 +950,35 @@ class BugbashLane:
     reference: bool = False
 
 
+@dataclass(frozen=True)
+class UnavailableLane:
+    """A :attr:`coord.config.AcceptanceDriverConfig.platforms` (#3581) entry
+    with no configured machine that both claims *capability* AND that OS —
+    discovery-time absence, reported through :func:`discover_lanes`'s
+    *unavailable_out* rather than silently dropped the way a plain
+    (non-``platforms``) route with no capable machine always has been
+    (there, "no lane" already fully describes the situation; here, the
+    sibling platform DOES have a lane, so silently omitting this one would
+    read as "every platform was checked" when one never was)."""
+
+    driver_kind: str
+    os_name: str
+    capability: str
+
+    @property
+    def platform(self) -> str:
+        """Same ``driver_kind:os_name`` label a resolved lane for this same
+        route/platform would have carried, had a machine been found."""
+        return f"{self.driver_kind}:{self.os_name}"
+
+
 def discover_lanes(
-    config: Any, repo_name: str, *, reference_backend: str = "", http_client: Any = None,
+    config: Any,
+    repo_name: str,
+    *,
+    reference_backend: str = "",
+    http_client: Any = None,
+    unavailable_out: "list[UnavailableLane] | None" = None,
 ) -> list[BugbashLane]:
     """Derive *repo_name*'s bugbash lanes from its acceptance drivers,
     routed to a capable machine the same way
@@ -946,6 +996,21 @@ def discover_lanes(
     lane's ``reference=True``. *http_client*, when given, is forwarded to
     the ``/health`` cross-check (tests inject a fake; production leaves it
     ``None`` and gets a real ``httpx`` call).
+
+    **#3581: a route declaring ``platforms`` (e.g. ``[linux, macos]``)
+    yields one lane PER listed platform**, each independently resolved to a
+    machine claiming BOTH the route's ``capability`` and that platform name
+    (the same free-string capability vocabulary every other capability
+    already uses — see :class:`coord.config.SmokeRule.platforms`'s
+    docstring for why this doesn't invent a second "what OS is this
+    machine" mechanism). A platform with no such machine is NOT silently
+    dropped — unlike every other gap in this function, it is reported via
+    *unavailable_out* (when the caller passes a list; appended to, never
+    replaced) as an :class:`UnavailableLane`, since its sibling platform(s)
+    DO get a lane and a caller needs to be able to tell "every platform ran"
+    from "one platform silently never got picked." A route with an empty
+    (the default) ``platforms`` behaves exactly as before #3581 — one lane,
+    ``platform == driver_kind``.
     """
     entry = config.acceptance.drivers.get(repo_name)
     if entry is None:
@@ -956,28 +1021,58 @@ def discover_lanes(
     for cfg in candidates:
         if cfg.kind not in LANE_DRIVER_KINDS:
             continue
-        machine = _pick_lane_machine(config, repo_name, cfg.capability, http_client=http_client)
-        if machine is None:
-            continue
-        lanes.append(
-            BugbashLane(
-                platform=cfg.kind,
-                driver_kind=cfg.kind,
-                machine=machine,
-                capability=cfg.capability,
-                reference=(cfg.kind == reference_backend),
+        platforms = getattr(cfg, "platforms", None) or ()
+        if not platforms:
+            machine = _pick_lane_machine(
+                config, repo_name, cfg.capability, http_client=http_client,
             )
-        )
+            if machine is None:
+                continue
+            lanes.append(
+                BugbashLane(
+                    platform=cfg.kind,
+                    driver_kind=cfg.kind,
+                    machine=machine,
+                    capability=cfg.capability,
+                    reference=(cfg.kind == reference_backend),
+                )
+            )
+            continue
+        for os_name in platforms:
+            machine = _pick_lane_machine(
+                config, repo_name, cfg.capability,
+                os_name=os_name, http_client=http_client,
+            )
+            label = f"{cfg.kind}:{os_name}"
+            if machine is None:
+                if unavailable_out is not None:
+                    unavailable_out.append(
+                        UnavailableLane(
+                            driver_kind=cfg.kind, os_name=os_name, capability=cfg.capability,
+                        )
+                    )
+                continue
+            lanes.append(
+                BugbashLane(
+                    platform=label,
+                    driver_kind=cfg.kind,
+                    machine=machine,
+                    capability=cfg.capability,
+                    reference=(label == reference_backend),
+                )
+            )
     return lanes
 
 
 def _pick_lane_machine(
-    config: Any, repo_name: str, capability: str, *, http_client: Any = None,
+    config: Any, repo_name: str, capability: str, *, os_name: str = "", http_client: Any = None,
 ) -> str | None:
-    """The first configured machine that both claims *capability* in
-    ``coordinator.yml`` AND repo-membership for *repo_name* — cross-checked
-    against that machine's own live ``/health`` tool probes (#3566) before
-    it's picked, not just the static claim.
+    """The first configured machine that both claims *capability* (and, when
+    given, *os_name* — #3581's one-lane-per-OS field, just another entry in
+    the same capability vocabulary) in ``coordinator.yml`` AND
+    repo-membership for *repo_name* — cross-checked against that machine's
+    own live ``/health`` tool probes (#3566) before it's picked, not just
+    the static claim.
 
     Before this fix, this function (and therefore every ``coord bugbash``
     dispatch) only ever asked ``capability in m.capabilities`` — a
@@ -999,12 +1094,13 @@ def _pick_lane_machine(
     """
     from coord.smoke import _capability_probe_reasons  # noqa: PLC0415 — avoid an import cycle
 
+    required = [c for c in (capability, os_name) if c]
     for m in config.machines:
         if repo_name not in m.repos:
             continue
-        if capability and capability not in m.capabilities:
+        if required and not all(c in m.capabilities for c in required):
             continue
-        if capability and _capability_probe_reasons(m, [capability], http_client=http_client):
+        if required and _capability_probe_reasons(m, required, http_client=http_client):
             continue  # declared but the machine's own /health probe denies it
         return m.name
     return None
