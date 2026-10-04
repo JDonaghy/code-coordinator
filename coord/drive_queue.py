@@ -4866,6 +4866,34 @@ def _reconcile_running(
     max_fix_rounds`` — the same value :func:`effective_max_fix_rounds`
     resolves against for the entry actually being launched, so this check
     and the launch it gates read the identical number.
+
+    #3577: the ceiling above is a WORK budget — it must never fire for a
+    death whose own evidence shows no further work/fix leg would even be
+    attempted. When *own_reason* already names a merge-gate block
+    (:func:`_is_merge_gate_block_reason` — "merge attempted N times without
+    landing", a stale smoke verdict, red CI, ...) AND the board's own
+    merge-plan reading for this entry is :data:`coord.merge_queue.PLAN_READY`
+    (#776 — review approved, test passed/skipped, CI green, nothing left but
+    the merge mechanics themselves), the ceiling is skipped outright and the
+    entry falls through to the ordinary ``attempts``-based retry/exhausted
+    logic below instead. The incident this closes
+    (vimcode#1703/PR#1714, 2026-10-04 UTC): a drive died with "merge
+    attempted 3 times without landing" while Review/Test were already green
+    on its SHA; the #2972 ceiling (4 work legs against a budget of 3)
+    permanently blocked it with #3454's "Stopped — remove+add is the only
+    way" wording, and the daemon's own auto-drain merged the PR four minutes
+    later anyway — both halves of that verdict were wrong. A merge-stage
+    death has nothing to do with the WORK budget at all; the row's real
+    remaining problem is merge mechanics (behind, not mergeable, needs a
+    rebase/conflict-fix), which is exactly what falling through here keeps
+    reachable: no `(#2972)` marker means `is_permanent_block_reason` reads
+    it as an ordinary, re-evaluable block, so `_reconcile_blocked`'s gate
+    sweep (including the merge-only fast path and auto-dispatched
+    stale-rebase conflict-fix) can still act on it. `facts.merge_gate_status`
+    is deliberately the SAME field :func:`_reconcile_blocked`'s own gate read
+    already trusts (#2096: one question, one answer) — not a second,
+    independently-derived "is this really ready" check that could disagree
+    with it.
     """
     facts = board.facts(entry.key)
 
@@ -5515,7 +5543,20 @@ def _reconcile_running(
     # attempts=N` under-report how many drive sessions this entry actually
     # ran.
     budget = total_fix_round_budget(entry, fix_round_config_default)
-    if remaining_fix_rounds(entry, facts, fix_round_config_default) <= 0:
+    # #3577: a merge-stage death with the board already showing Review
+    # approved + Test passed/skipped (and CI green — `PLAN_READY` is ALL of
+    # `_entry_gate_status`'s gates, not just these two) has no new work/fix
+    # leg to spend in the first place — see the docstring's #3577 paragraph
+    # for the incident this closes. Checked here, not folded into the
+    # ceiling condition below, so the exemption is visible on its own line
+    # rather than buried in a compound boolean.
+    ceiling_exempt_merge_stage_exit = _is_merge_gate_block_reason(
+        own_reason
+    ) and facts.merge_gate_status == PLAN_READY
+    if (
+        not ceiling_exempt_merge_stage_exit
+        and remaining_fix_rounds(entry, facts, fix_round_config_default) <= 0
+    ):
         # #3454: this block now DOES mean "stop" — see
         # `_PERMANENT_BLOCK_MARKERS`'s `(#2972)` entry and
         # `is_fix_round_ceiling_reason` above for the mechanics. Say so

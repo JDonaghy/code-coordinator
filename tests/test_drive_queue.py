@@ -1223,6 +1223,87 @@ def test_a_relaunch_past_the_ceiling_also_blocks():
     assert plan.reconciles[0].outcome == "exhausted"
 
 
+# ── #3577: a merge-stage exit must not be charged to the fix-round budget ───
+#
+# vimcode#1703/PR#1714, 2026-10-04 UTC: a drive died with "merge attempted 3
+# times without landing" while Review/Test were already green on its SHA.
+# The #2972 ceiling (4 work legs against a budget of 3) still fired,
+# permanently blocking the row with #3454's "Stopped — remove+add is the
+# only way" wording — and the daemon's own auto-drain merged the PR four
+# minutes later anyway. Both halves of that verdict were wrong: a
+# merge-stage death spends no new work/fix leg, so the WORK budget was never
+# the real constraint, and "nothing more will fire" was false in practice.
+
+
+def test_a_merge_stage_exit_with_a_clear_gate_is_exempt_from_the_ceiling():
+    """Work legs are AT the ceiling, but `own_reason` names a merge-gate
+    block and the board's merge-plan reading is already `PLAN_READY`
+    (review approved, test passed, nothing left but merge mechanics) — the
+    #2972 ceiling must not fire. The entry falls through to the ordinary
+    attempts-based `retry` instead, with no `(#2972)` marker, so it stays
+    reachable by `_reconcile_blocked`'s gate sweep rather than stranded
+    behind a permanent stop."""
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): merge attempted 3 times "
+        "without landing."
+    )
+    facts = IssueFacts(
+        known=True,
+        issue_state="open",
+        work_leg_count=4,
+        merge_gate_status="READY",
+    )
+    view = BoardView(issues={key: facts})
+    plan = plan_tick(
+        [_dead_running_entry(max_fix_rounds=2, attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"
+    assert own_reason in reconcile.reason
+    assert "fix-round ceiling" not in reconcile.reason
+    assert "(#2972)" not in reconcile.reason
+    assert len(plan.blocked) == 0
+
+
+def test_a_merge_stage_exit_still_blocks_the_ceiling_without_a_clear_gate():
+    """Same work-leg count, same merge-gate-block reason text — but the
+    board does NOT (yet) show `PLAN_READY`, e.g. the latest leg's Review
+    came back `request-changes` or Test is still `failing`. The #2972
+    ceiling must still fire: this entry DOES need a new work/fix leg, which
+    is exactly the budget it has run out of."""
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): merge attempted 3 times "
+        "without landing."
+    )
+    facts = IssueFacts(
+        known=True,
+        issue_state="open",
+        work_leg_count=4,
+        merge_gate_status="BLOCKED",
+    )
+    view = BoardView(issues={key: facts})
+    plan = plan_tick(
+        [_dead_running_entry(max_fix_rounds=2, attempts=0)],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "exhausted"
+    assert "fix-round ceiling" in reconcile.reason
+    assert "(#2972)" in reconcile.reason
+    assert len(plan.blocked) == 1
+
+
 def test_the_fix_round_ceiling_reads_pipeline_max_fix_rounds_when_the_entry_has_no_override():
     """`fix_round_config_default` (the shell's `pipeline.max_fix_rounds`
     read) resolves the SAME way `effective_max_fix_rounds` always has — an
