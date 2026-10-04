@@ -144,7 +144,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import yaml
 
@@ -955,6 +955,81 @@ def _import_ax():
             "  Install it with:  pip install 'code-coordinator[mac-native]'"
         ) from exc
     return ApplicationServices
+
+
+class MacNativeSession:
+    """Persistent mac-native ``coord app-drive`` session (#3590) — mirrors
+    :class:`coord.tui_pty_driver.TuiPtySession`'s "sanctioned driver, one
+    verb per call" shape: drives the exact same :class:`MacCalls` real-OS
+    implementation :class:`NativeRunner`'s own ``launch``/``key``/``click``/
+    ``capture`` step handlers use (same frontmost-before-input check, #3566;
+    same PID-only ``kill``, never by bundle id), just invoked on demand
+    rather than against one fixed step list.
+
+    Callers (:mod:`coord.app_drive`'s daemon dispatch) MUST confirm
+    :meth:`MacCalls.session_available`/:meth:`MacCalls.ax_trust_available`
+    themselves BEFORE constructing this — exactly like :meth:`NativeRunner
+    .run` only reaches its own per-step handlers after that same check;
+    this class assumes an already-confirmed-available session.
+    """
+
+    def __init__(
+        self, launch_command: str, cwd: str, *, width: int = 1024, height: int = 768,
+        calls: MacCalls | None = None, timeout_s: float = 10.0,
+    ) -> None:
+        self._calls: MacCalls = calls if calls is not None else MacOSCalls()
+        self._pid = self._calls.launch(launch_command, cwd)
+        self._window_id = self._calls.find_top_window(self._pid, timeout_s)
+        self._calls.move_window(self._pid, self._window_id, 0, 0, width, height)
+
+    def _require_frontmost(self) -> None:
+        is_front, front_pid = self._calls.is_frontmost(self._pid)
+        if not is_front:
+            raise MacNativeRuntimeError(
+                f"refusing to send input — pid={self._pid} is not frontmost "
+                f"right now (actual frontmost pid={front_pid}); a focus "
+                f"failure is reported, never a blind retry (#3566)"
+            )
+
+    def send_key(self, key: str) -> None:
+        self._require_frontmost()
+        self._calls.send_key(self._pid, key)
+
+    def send_click(self, x: int, y: int, button: str = "left") -> None:
+        self._require_frontmost()
+        self._calls.send_click(self._pid, self._window_id, x, y, button)
+
+    def capture(self) -> bytes:
+        return self._calls.capture(self._window_id)
+
+    def probe(self, name: str, **kwargs: Any) -> Any:
+        if name == "ax_elements":
+            return self._calls.ax_elements(self._pid)
+        if name == "is_window_alive":
+            return self._calls.is_window_alive(self._window_id)
+        if name == "find_a11y":
+            elements = self._calls.ax_elements(self._pid)
+            match = _find_a11y_match(elements, kwargs.get("role", ""), kwargs.get("name", ""))
+            return {
+                "found": match is not None, "element": match,
+                "tree": _summarize_elements(elements),
+            }
+        raise ValueError(
+            f"unknown probe {name!r} — expected one of: ax_elements, "
+            "is_window_alive, find_a11y"
+        )
+
+    def is_alive(self) -> bool:
+        return self._calls.is_window_alive(self._window_id)
+
+    def close(self) -> None:
+        """Kills only the PID this session itself launched (see the module
+        docstring's safety note) — mirrors :meth:`NativeRunner._teardown`'s
+        own "teardown must not mask the real result" swallow."""
+        try:
+            self._calls.kill(self._pid)
+        except Exception:  # noqa: BLE001 — teardown must not raise
+            pass
 
 
 # ── top-level entry point ───────────────────────────────────────────────────

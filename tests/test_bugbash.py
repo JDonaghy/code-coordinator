@@ -601,6 +601,38 @@ class TestBuildExplorationBriefing:
         for forbidden in ("osascript", "System Events", "do script", "System Settings"):
             assert forbidden in out
 
+    def test_each_lane_kind_names_its_own_runnable_command_never_anothers(self):
+        """#3590 acceptance: for each `LANE_DRIVER_KINDS` kind, the briefing
+        names a concrete, runnable command (`coord app-drive <kind>`), and
+        no lane's briefing names a DIFFERENT lane's driver — the exact gap
+        that left every real bugbash run unrunnable (workers searching
+        their tool list for a bare Python module path, or being told
+        `mac_native_driver` while running under `tui-pty`)."""
+        from coord.bugbash import LANE_DRIVER_KINDS, driver_command_for_lane
+
+        for kind in LANE_DRIVER_KINDS:
+            lane = BugbashLane(platform=kind, driver_kind=kind, machine="m1", capability="")
+            out = build_exploration_briefing(lane, reference_backend="win-native")
+            command = driver_command_for_lane(lane)
+            assert command == f"coord app-drive {kind}"
+            assert command in out, f"{kind} briefing does not name its own command: {out!r}"
+            for other_kind in LANE_DRIVER_KINDS:
+                if other_kind == kind:
+                    continue
+                assert f"coord app-drive {other_kind}" not in out, (
+                    f"{kind} briefing wrongly names {other_kind}'s driver command"
+                )
+                # Also guard the OLD (buggy) module-path naming this issue
+                # reports, so a regression back to it is caught even if
+                # someone restores the module names alongside the command.
+                other_module = {
+                    "tui-pty": "coord.tui_pty_driver", "win-native": "coord.win_native_driver",
+                    "mac-native": "coord.mac_native_driver", "gtk-native": "coord.gtk_native_driver",
+                }[other_kind]
+                assert other_module not in out, (
+                    f"{kind} briefing wrongly names {other_kind}'s driver module {other_module!r}"
+                )
+
     def test_includes_the_unavailable_reporting_contract(self):
         lane = BugbashLane(platform="mac-native", driver_kind="mac-native", machine="macmini", capability="macos")
         out = build_exploration_briefing(lane, reference_backend="win-native")
@@ -2253,6 +2285,82 @@ class TestDispatchAndAwaitLane:
         assert report.rounds[-1].unavailable_lanes.get("mac-native") is not None
         assert report.termination_reason == "lanes_unavailable"
 
+    #: #3590's two real evidence transcripts' exact final-message text,
+    #: verbatim from the issue — each ends with a well-formed
+    #: ` ```bugbash-unavailable ``` ` block whose reason does NOT happen to
+    #: match any of `_UNAVAILABLE_SIGNATURES`'s fallback substrings (unlike
+    #: this test module's other fixtures above, which all incidentally use
+    #: a signature phrase like "AXIsProcessTrusted" or "screen is locked" —
+    #: so none of them actually exercised the fence-matching path against a
+    #: REAL transcript).
+    _EVIDENCE_FINAL_MESSAGES = {
+        "tui-pty:macos (0138d740a9f5)": (
+            "The only deferred tools available in this session are Monitor, "
+            "TaskStop, WebFetch, and WebSearch — none of which is the "
+            "mac native driver this lane requires.\n\n"
+            "```bugbash-unavailable\n"
+            "coord.mac_native_driver tool is not present/loaded in this "
+            "session\n"
+            "```\n"
+        ),
+        "mac-native (080701430ba6)": (
+            "there is no coord.mac_native_driver (or any native-driver "
+            "equivalent) exposed as a tool here.\n\n"
+            "```bugbash-unavailable\n"
+            "coord.mac_native_driver tool is not available in this session\n"
+            "```\n"
+        ),
+    }
+
+    @pytest.mark.parametrize(
+        "final_message", _EVIDENCE_FINAL_MESSAGES.values(), ids=_EVIDENCE_FINAL_MESSAGES.keys(),
+    )
+    def test_well_formed_unavailable_fence_in_a_real_ndjson_log_is_not_a_protocol_error(
+        self, monkeypatch, final_message,
+    ):
+        """#3590 regression: both of the issue's real evidence transcripts
+        (:data:`_EVIDENCE_FINAL_MESSAGES`) must parse as `unavailable=True`,
+        never `protocol_error`. A real `/logs/{id}` response is NDJSON: a
+        message's own newlines/quotes are JSON-escaped, not literal bytes —
+        built here with `json.dumps` (not a hand-typed `\\n`) so this test
+        fails the same way the real run did if the fence regex is ever
+        matched against the raw, still-escaped log text again instead of
+        the decoded message text."""
+        import json
+
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        log_line = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": final_message}]},
+        }) + "\n" + json.dumps({"type": "result", "total_cost_usd": 0.07})
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(machine="pc1", platform="mac-native"), 1,
+            repo_name="vimcode", config=cfg, reference_backend="win-native",
+        )
+        assert outcome.unavailable is True
+        assert outcome.protocol_error == ""
+        assert "mac_native_driver" in outcome.notes
+        assert outcome.findings == ()
+
 
 # ── coord bugbash harvest (#3569: recover a late-finishing explorer) ─────
 #
@@ -2553,6 +2661,46 @@ class TestBugbashCli:
         assert CATALOGUE_PATH in result.output
         assert "win-native=1" in result.output
         assert "tui-pty=1" in result.output
+
+    def test_dry_run_prints_the_per_lane_driver_command(self, monkeypatch):
+        """#3590 acceptance: `coord bugbash REPO --dry-run` prints the exact
+        `coord app-drive <kind>` command each lane's worker will be handed
+        — the SAME `driver_command_for_lane` the briefing's own HARD RULE
+        calls (#2096 "one question, one answer"), so this can never drift
+        from what a worker is actually told to run."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport, driver_command_for_lane
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+            default_branch = "develop"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        lanes = [
+            _prod_lane(machine="pc1", platform="win-native"),
+            _prod_lane(machine="pc1", platform="tui-pty"),
+        ]
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes", lambda cfg, repo, reference_backend="": lanes,
+        )
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: None)
+        monkeypatch.setattr(
+            cmd_bugbash, "run_bugbash",
+            lambda bb_config, **kw: BugbashReport(
+                repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "win-native", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        for lane in lanes:
+            assert driver_command_for_lane(lane) in result.output
 
     def test_dry_run_names_the_fallback_when_no_catalogue(self, monkeypatch):
         import coord.commands.bugbash as cmd_bugbash

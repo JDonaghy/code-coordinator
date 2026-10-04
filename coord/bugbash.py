@@ -139,6 +139,61 @@ LANE_DRIVER_KINDS: tuple[str, ...] = (
     "tui-pty", "win-native", "mac-native", "gtk-native",
 )
 
+#: #3590: the ONE place a lane's `driver_kind` maps to the `coord app-drive`
+#: invocation a worker actually runs for it — named here, by
+#: `LANE_DRIVER_KINDS` value, so :func:`build_exploration_briefing`'s HARD
+#: RULE and :func:`driver_command_for_lane` (both the briefing's own text
+#: AND `coord bugbash REPO --dry-run`'s per-lane preview,
+#: :mod:`coord.commands.bugbash`) can never name two different commands for
+#: the same lane, or a lane's briefing accidentally name ANOTHER lane's
+#: driver (#2096 "one question, one answer"). Each entry is a 2-line usage
+#: example: ``open`` a session once, then drive it with ``send``/``screen``/
+#: ``probe``/``close`` (see `coord/app_drive.py`'s module docstring for the
+#: full verb list and the cross-platform teardown guarantee).
+_APP_DRIVE_USAGE: dict[str, tuple[str, str]] = {
+    "tui-pty": (
+        "coord app-drive tui-pty open --launch '<app launch command>' --cwd <repo checkout dir>",
+        "coord app-drive tui-pty send --session <id> --key Enter   # or --text/--click/--screen/--probe/--close",
+    ),
+    "win-native": (
+        "coord app-drive win-native open --launch '<app launch command>' --cwd <repo checkout dir>",
+        "coord app-drive win-native send --session <id> --key Enter   # or --click/--screen/--probe/--close",
+    ),
+    "mac-native": (
+        "coord app-drive mac-native open --launch '<app launch command>' --cwd <repo checkout dir>",
+        "coord app-drive mac-native send --session <id> --key Enter   # or --click/--screen/--probe/--close",
+    ),
+    "gtk-native": (
+        "coord app-drive gtk-native open --launch '<app launch command>' --cwd <repo checkout dir>",
+        "coord app-drive gtk-native send --session <id> --key Enter   # or --click/--screen/--probe/--close",
+    ),
+}
+
+
+def driver_command_for_lane(lane: "BugbashLane") -> str:
+    """The exact `coord app-drive` command name this lane's worker runs —
+    e.g. ``"coord app-drive tui-pty"`` for a ``driver_kind="tui-pty"`` lane
+    (#3590). The ONE function both :func:`build_exploration_briefing`'s HARD
+    RULE and ``coord bugbash REPO --dry-run``'s per-lane preview
+    (:mod:`coord.commands.bugbash`) call, so the two surfaces can never
+    drift apart (#2096 "one question, one answer") — fixing the bug this
+    issue reports: a briefing that named a DIFFERENT lane's driver module,
+    or no runnable command at all.
+    """
+    return f"coord app-drive {lane.driver_kind}"
+
+
+def _app_drive_usage_lines(driver_kind: str) -> tuple[str, str]:
+    """The 2-line usage example for *driver_kind* (:data:`_APP_DRIVE_USAGE`),
+    falling back to a generic (still runnable) template for any future
+    :data:`LANE_DRIVER_KINDS` entry this mapping hasn't been updated for
+    yet — never silently omitting a usage example rather than naming a
+    kind this dict doesn't recognize."""
+    return _APP_DRIVE_USAGE.get(driver_kind) or (
+        f"coord app-drive {driver_kind} open --launch '<app launch command>' --cwd <repo checkout dir>",
+        f"coord app-drive {driver_kind} send --session <id> --key Enter   # or --click/--screen/--probe/--close",
+    )
+
 #: The exploration checklist every lane walks on top of the repo's Tier-2
 #: smoke spec (issue #3487's "panels, menus, extension install flow,
 #: terminal, splits, themes, idle stability"). Ordered so a worker that runs
@@ -1156,22 +1211,28 @@ def build_exploration_briefing(
                     else no_lane_note
                 )
 
+    command = driver_command_for_lane(lane)
+    usage_line_1, usage_line_2 = _app_drive_usage_lines(lane.driver_kind)
     lines = [
         f"=== coord bugbash: {lane.platform} lane ===",
         "",
         f"Reference backend for comparison: {reference_backend or '(none configured)'}",
         "",
-        "HARD RULE — drive the app ONLY through this lane's own driver "
-        "(coord.mac_native_driver / coord.win_native_driver / "
-        "coord.gtk_native_driver, whichever this lane is). Never use "
-        "osascript, System Events, a Terminal/iTerm `do script`, a "
-        "home-made input-injection helper, or System Settings. If a "
-        "required permission (Accessibility, Screen Recording, a locked/"
-        "absent GUI session, ...) is missing, STOP IMMEDIATELY and report "
-        "the lane unavailable (see below) — do NOT improvise a workaround, "
-        "and do NOT send any key or click to recover (#3566).",
+        f"HARD RULE — drive the app ONLY through `{command}` (this lane's own "
+        "sanctioned entry point — see `coord app-drive --help` for the full "
+        "verb list: open/send/wait-idle/screen/probe/close/run-spec). Never "
+        "use osascript, System Events, a Terminal/iTerm `do script`, "
+        "xdotool/AppleScript/win32 calls run directly, a home-made "
+        "input-injection helper, or System Settings. Two-line usage "
+        f"example:\n  {usage_line_1}\n  {usage_line_2}\nIf a required "
+        "permission (Accessibility, Screen Recording, a locked/absent GUI "
+        "session, ...) is missing, STOP IMMEDIATELY and report the lane "
+        "unavailable (see below) — do NOT improvise a workaround, and do "
+        "NOT send any key or click to recover (#3566).",
         "",
-        "1. Run this repo's Tier-2 smoke spec for this driver to completion.",
+        f"1. Run this repo's Tier-2 smoke spec for this driver to completion "
+        f"(`{command} run-spec <spec-file> --launch '<app launch command>' "
+        "--cwd <repo checkout dir>` runs it end to end in one command).",
     ]
     if catalogue_warning:
         lines += ["", f"NOTE: {catalogue_warning}"]
