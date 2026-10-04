@@ -334,6 +334,24 @@ class SmokeRule:
     files: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
     command: str | None = None
+    #: #3581: run this rule once per listed OS, each resolved to its OWN
+    #: capable host, instead of once on whichever capable machine sorts
+    #: first — the gap that left vimcode's `tui-pty` route (Linux+macOS via
+    #: one shared `UnixPtyChild`, `capability: rust`) with no macOS lane at
+    #: all: `requires`/capability routing picks exactly one machine, which in
+    #: practice was always the Linux Rust box. There is no dedicated
+    #: machine-OS field in this config (the `os:*` capability convention
+    #: docs/CROSS_PLATFORM.md's #1159 sketches is still unbuilt) — rather
+    #: than invent a second, parallel "what OS is this machine" vocabulary,
+    #: each entry here is just another capability string a machine declares
+    #: in its own `capabilities:` list (e.g. `macos`, `linux`), resolved by
+    #: the EXACT SAME `capability in machine.capabilities` + `/health`
+    #: probe-cross-check every other capability already uses (#2096 "one
+    #: question, one answer") — see `coord.smoke.partition_capability_
+    #: requirements` and `coord.bugbash._pick_lane_machine`. Empty (the
+    #: default, and every rule written before #3581) means "behaves exactly
+    #: as before this field existed" — one leg, routed by `requires` alone.
+    platforms: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -441,6 +459,14 @@ class AcceptanceDriverConfig:
     unrestricted, but removing or rewriting a pre-existing line is still a
     mandatory ``request-changes``.
 
+    ``platforms`` (#3581) runs this driver once per listed OS instead of
+    once on whichever capable machine sorts first — see
+    :func:`coord.bugbash.discover_lanes` and :class:`SmokeRule.platforms`
+    for the shared reasoning (same free-string-capability vocabulary, no
+    dedicated machine-OS field). Empty (the default) means "behaves exactly
+    as before this field existed" — one lane, routed by ``capability``
+    alone, same as every driver declared before #3581.
+
     ``match`` and ``routes`` implement #1125's in-repo path routing: a repo
     entry with a non-empty ``routes`` list is a *router* — its own
     ``kind``/``run``/``mock``/``capability``/``setup``/``entrypoint`` are
@@ -474,6 +500,7 @@ class AcceptanceDriverConfig:
     setup: str = ""
     entrypoint: str = ""
     match: str = ""
+    platforms: list[str] = field(default_factory=list)
     routes: list["AcceptanceDriverConfig"] = field(default_factory=list)
 
 
@@ -4006,9 +4033,20 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
             raise ConfigError(
                 f"smoke_tests.capability_rules[{i}].files must be non-empty"
             )
-        if not requires:
+        platforms = entry.get("platforms", []) or []
+        if not isinstance(platforms, list) or not all(isinstance(p, str) for p in platforms):
             raise ConfigError(
-                f"smoke_tests.capability_rules[{i}].requires must be non-empty"
+                f"smoke_tests.capability_rules[{i}].platforms must be a list of strings"
+            )
+        # #3581: `requires` alone used to be mandatory -- a rule now
+        # satisfies that same "name at least one capability" intent via
+        # `platforms` instead (each platform IS a capability requirement,
+        # just resolved once per OS rather than once overall), so the
+        # not-both-empty check below replaces the old requires-only one
+        # rather than narrowing it.
+        if not requires and not platforms:
+            raise ConfigError(
+                f"smoke_tests.capability_rules[{i}] must set 'requires' and/or 'platforms'"
             )
         command = entry.get("command")
         if command is not None:
@@ -4020,7 +4058,9 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
                 raise ConfigError(
                     f"smoke_tests.capability_rules[{i}].command must be non-empty"
                 )
-        rules.append(SmokeRule(files=files, requires=requires, command=command))
+        rules.append(
+            SmokeRule(files=files, requires=requires, command=command, platforms=platforms)
+        )
     cfg.capability_rules = rules
     return cfg
 
@@ -4057,7 +4097,7 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
             # other, so reject it rather than silently discarding the flat
             # fields.
             flat_fields = [
-                f for f in ("kind", "run", "mock", "capability", "setup", "entrypoint")
+                f for f in ("kind", "run", "mock", "capability", "setup", "entrypoint", "platforms")
                 if entry.get(f)
             ]
             if flat_fields:
@@ -4098,12 +4138,26 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
             entry, f"acceptance.drivers[{repo_name!r}].entrypoint"
         )
 
+        platforms = _acceptance_platforms(entry, f"acceptance.drivers[{repo_name!r}].platforms")
+
         drivers[repo_name] = AcceptanceDriverConfig(
             kind=kind, run=run, mock=mock, capability=capability, setup=setup,
-            entrypoint=entrypoint,
+            entrypoint=entrypoint, platforms=platforms,
         )
 
     return AcceptanceConfig(drivers=drivers)
+
+
+def _acceptance_platforms(entry: dict, field_path: str) -> list[str]:
+    """Parse a driver/route entry's ``platforms`` (#3581) — a list of OS
+    names (free-form strings, the same vocabulary ``capability`` already
+    uses) this driver runs once per, each on its own capable host. Empty
+    (the default) is the pre-#3581 behaviour: one lane, routed by
+    ``capability`` alone."""
+    platforms = entry.get("platforms", []) or []
+    if not isinstance(platforms, list) or not all(isinstance(p, str) for p in platforms):
+        raise ConfigError(f"{field_path} must be a list of strings")
+    return platforms
 
 
 def _parse_acceptance_routes(
@@ -4168,10 +4222,14 @@ def _parse_acceptance_routes(
             route_entry, f"acceptance.drivers[{repo_name!r}].routes[{i}].entrypoint"
         )
 
+        platforms = _acceptance_platforms(
+            route_entry, f"acceptance.drivers[{repo_name!r}].routes[{i}].platforms"
+        )
+
         routes.append(
             AcceptanceDriverConfig(
                 kind=kind, run=run, mock=mock, capability=capability, setup=setup,
-                match=match, entrypoint=entrypoint,
+                match=match, entrypoint=entrypoint, platforms=platforms,
             )
         )
 

@@ -41,6 +41,7 @@ from coord.bugbash import (
     JourneyOutcome,
     RoundReport,
     UNAVAILABLE_FENCE,
+    UnavailableLane,
     _apply_outcome_to_round,
     _pick_lane_machine,
     build_exploration_briefing,
@@ -325,6 +326,7 @@ class _FakeDriverCfg:
     kind: str = ""
     capability: str = ""
     routes: list = field(default_factory=list)
+    platforms: list = field(default_factory=list)
 
 
 @dataclass
@@ -472,6 +474,112 @@ class TestDiscoverLanes:
             _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig({})),
             "vimcode", "macos", http_client=_FakeHealthClient({}),
         ) == "macmini"
+
+
+class TestDiscoverLanesPlatforms:
+    """#3581: a route's `platforms` field yields one lane per OS, each
+    resolved to its own capable host, instead of one lane on whichever
+    capable machine sorts first."""
+
+    def test_two_platforms_with_capable_hosts_yields_two_lanes_on_the_right_os(self):
+        precision = _FakeMachine(name="precision", repos=["vimcode"], capabilities=["rust", "linux"])
+        macmini = _FakeMachine(name="macmini", repos=["vimcode"], capabilities=["rust", "macos"])
+        entry = _FakeDriverCfg(
+            routes=[
+                _FakeDriverCfg(kind="tui-pty", capability="rust", platforms=["linux", "macos"]),
+            ]
+        )
+        cfg = _FakeConfig(
+            machines=[precision, macmini], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}),
+        )
+        lanes = discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient())
+        assert {l.platform: l.machine for l in lanes} == {
+            "tui-pty:linux": "precision",
+            "tui-pty:macos": "macmini",
+        }
+        # driver_kind stays the bare kind (journey/catalogue matching keys
+        # off this, not the OS-qualified label) for every lane.
+        assert {l.driver_kind for l in lanes} == {"tui-pty"}
+
+    def test_platform_with_no_capable_host_is_reported_unavailable_not_dropped(self):
+        precision = _FakeMachine(name="precision", repos=["vimcode"], capabilities=["rust", "linux"])
+        entry = _FakeDriverCfg(
+            routes=[
+                _FakeDriverCfg(kind="tui-pty", capability="rust", platforms=["linux", "macos"]),
+            ]
+        )
+        cfg = _FakeConfig(
+            machines=[precision], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}),
+        )
+        unavailable: list[UnavailableLane] = []
+        lanes = discover_lanes(
+            cfg, "vimcode", http_client=_FakeHealthClient(), unavailable_out=unavailable,
+        )
+        assert [l.platform for l in lanes] == ["tui-pty:linux"]
+        assert len(unavailable) == 1
+        assert unavailable[0] == UnavailableLane(
+            driver_kind="tui-pty", os_name="macos", capability="rust",
+        )
+        assert unavailable[0].platform == "tui-pty:macos"
+
+    def test_unavailable_out_defaults_to_none_and_is_optional(self):
+        """A caller that doesn't care about unavailable platforms (every
+        pre-#3581 call site) passes nothing and gets exactly the resolved
+        lanes, no error."""
+        precision = _FakeMachine(name="precision", repos=["vimcode"], capabilities=["rust", "linux"])
+        entry = _FakeDriverCfg(
+            routes=[
+                _FakeDriverCfg(kind="tui-pty", capability="rust", platforms=["linux", "macos"]),
+            ]
+        )
+        cfg = _FakeConfig(
+            machines=[precision], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}),
+        )
+        lanes = discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient())
+        assert [l.platform for l in lanes] == ["tui-pty:linux"]
+
+    def test_route_without_platforms_field_is_unchanged(self):
+        """A route that never declares `platforms` behaves exactly as
+        before #3581 — one lane, `platform == kind`."""
+        machine = _FakeMachine(name="pc1", repos=["vimcode"], capabilities=["windows"])
+        entry = _FakeDriverCfg(routes=[_FakeDriverCfg(kind="win-native", capability="windows")])
+        cfg = _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
+        unavailable: list[UnavailableLane] = []
+        lanes = discover_lanes(
+            cfg, "vimcode", reference_backend="win-native", http_client=_FakeHealthClient(),
+            unavailable_out=unavailable,
+        )
+        assert len(lanes) == 1
+        assert lanes[0].platform == "win-native"
+        assert lanes[0].machine == "pc1"
+        assert lanes[0].reference is True
+        assert unavailable == []
+
+    def test_reference_backend_matches_the_platform_qualified_label(self):
+        precision = _FakeMachine(name="precision", repos=["vimcode"], capabilities=["rust", "linux"])
+        macmini = _FakeMachine(name="macmini", repos=["vimcode"], capabilities=["rust", "macos"])
+        entry = _FakeDriverCfg(
+            routes=[
+                _FakeDriverCfg(kind="tui-pty", capability="rust", platforms=["linux", "macos"]),
+            ]
+        )
+        cfg = _FakeConfig(
+            machines=[precision, macmini], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}),
+        )
+        lanes = discover_lanes(
+            cfg, "vimcode", reference_backend="tui-pty:macos", http_client=_FakeHealthClient(),
+        )
+        by_platform = {l.platform: l.reference for l in lanes}
+        assert by_platform == {"tui-pty:linux": False, "tui-pty:macos": True}
+
+    def test_pick_lane_machine_requires_both_capability_and_os_name(self):
+        """A machine declaring the base capability but not the OS name is
+        not picked for that platform."""
+        rust_only = _FakeMachine(name="pc1", repos=["vimcode"], capabilities=["rust"])
+        assert _pick_lane_machine(
+            _FakeConfig(machines=[rust_only], acceptance=_FakeAcceptanceConfig({})),
+            "vimcode", "rust", os_name="macos", http_client=_FakeHealthClient(),
+        ) is None
 
 
 class TestBuildExplorationBriefing:

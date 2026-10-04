@@ -88,7 +88,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -536,9 +536,21 @@ def partition_capability_requirements(
     docstring's GTK+Windows / macOS example, where greedy already finds the
     2-partition optimum).
 
-    Rules with an empty `requires` never enter this — they mean "no extra
-    capability needed", already handled by the existing any-capable-machine
-    path in `dispatch_smoke`, not a partition of their own.
+    Rules with an empty `requires` AND an empty `platforms` never enter this
+    — they mean "no extra capability needed", already handled by the
+    existing any-capable-machine path in `dispatch_smoke`, not a partition
+    of their own.
+
+    #3581: a rule's `platforms` (e.g. `["linux", "macos"]`) produces ONE KEY
+    PER PLATFORM — `frozenset(rule.requires) | {platform}` — instead of the
+    single `frozenset(rule.requires)` key a plain rule produces. This is
+    what makes a `tui-pty`-style rule (one `UnixPtyChild` suite, two OSes)
+    land in two separate partitions rather than one union a single machine
+    would need to satisfy alone: no configured machine ever declares two
+    OS capabilities together, so `capable_for` naturally keeps them from
+    merging back into one partition below — no extra guard needed. A rule
+    with no `platforms` (the default, every rule declared before #3581)
+    produces exactly the one key it always has.
 
     #3298: each returned :class:`SmokePartition` also carries `files` — the
     touched paths matched by whichever rule(s) contributed its capabilities
@@ -557,15 +569,22 @@ def partition_capability_requirements(
     seen: dict[frozenset[str], list[int]] = {}
     order: list[frozenset[str]] = []
     for i, rule in enumerate(rules):
-        if not rule.requires:
+        if not rule.requires and not rule.platforms:
             continue
         if not _rule_matches(touched_files, rule):
             continue
-        key = frozenset(rule.requires)
-        if key not in seen:
-            seen[key] = []
-            order.append(key)
-        seen[key].append(i)
+        # #3581: one key per platform when `platforms` is set; otherwise the
+        # original single-key behaviour (`platform_values = [None]`).
+        platform_values: Sequence[str | None] = rule.platforms if rule.platforms else [None]
+        for platform in platform_values:
+            caps = set(rule.requires)
+            if platform:
+                caps.add(platform)
+            key = frozenset(caps)
+            if key not in seen:
+                seen[key] = []
+                order.append(key)
+            seen[key].append(i)
 
     groups: list[set[str]] = []
     group_rule_indices: list[list[int]] = []
@@ -2473,7 +2492,21 @@ def _dispatch_smoke_legs(
         _report_unroutable_partitions(completed, unroutable)
         return []
 
-    if len(partitions) <= 1:
+    # #3581: a `platforms`-bearing rule must always take the per-partition
+    # path below, even when exactly one partition survives (e.g. a
+    # single-element `platforms` list, or every-but-one platform being
+    # unroutable would already have returned above). The single-leg path
+    # resolves its capabilities via `required_capabilities`/`match_rules`,
+    # which know nothing about `platforms` and would route on `rule.requires`
+    # alone — silently losing the OS constraint `partition_capability_
+    # requirements` already baked into this partition's own
+    # `SmokePartition.capabilities`.
+    has_platform_rule = any(
+        rule.platforms and _rule_matches(touched, rule)
+        for rule in smoke_cfg.capability_rules
+    )
+
+    if len(partitions) <= 1 and not has_platform_rule:
         # Exactly today's behaviour — the pre-#3182 single-leg path.
         leg = _dispatch_smoke_single_leg(
             completed, board, config, touched=touched,

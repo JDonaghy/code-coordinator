@@ -2611,6 +2611,88 @@ def test_capability_rule_command_index_named_for_second_rule(tmp_path: Path) -> 
         )
 
 
+# ── smoke_tests.capability_rules[].platforms (#3581) ────────────────────────
+
+
+def test_capability_rule_platforms_absent_defaults_to_empty(tmp_path: Path) -> None:
+    """A rule that never sets `platforms` behaves exactly as before #3581."""
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['src/win/']\n      requires: [windows]\n",
+        )
+    )
+    assert cfg.smoke_tests.capability_rules[0].platforms == []
+
+
+def test_capability_rule_platforms_round_trips(tmp_path: Path) -> None:
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['tui/']\n"
+            "      requires: [rust]\n"
+            "      platforms: [linux, macos]\n",
+        )
+    )
+    rule = cfg.smoke_tests.capability_rules[0]
+    assert rule.requires == ["rust"]
+    assert rule.platforms == ["linux", "macos"]
+
+
+def test_capability_rule_platforms_rejects_non_list(tmp_path: Path) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"capability_rules\[0\]\.platforms must be a list of strings",
+    ):
+        load(
+            _write_smoke_config(
+                tmp_path,
+                "    - files: ['tui/']\n"
+                "      requires: [rust]\n"
+                "      platforms: macos\n",
+            )
+        )
+
+
+def test_capability_rule_platforms_rejects_non_string_entries(tmp_path: Path) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"capability_rules\[0\]\.platforms must be a list of strings",
+    ):
+        load(
+            _write_smoke_config(
+                tmp_path,
+                "    - files: ['tui/']\n"
+                "      requires: [rust]\n"
+                "      platforms: [42]\n",
+            )
+        )
+
+
+def test_capability_rule_requires_optional_when_platforms_set(tmp_path: Path) -> None:
+    """#3581 relaxes the old "requires is always mandatory" rule — a rule
+    naming only `platforms` (each OS name IS a capability requirement) is
+    valid without a separate `requires` list."""
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['tui/']\n"
+            "      platforms: [linux, macos]\n",
+        )
+    )
+    rule = cfg.smoke_tests.capability_rules[0]
+    assert rule.requires == []
+    assert rule.platforms == ["linux", "macos"]
+
+
+def test_capability_rule_rejects_neither_requires_nor_platforms(tmp_path: Path) -> None:
+    with pytest.raises(
+        ConfigError,
+        match=r"capability_rules\[0\] must set 'requires' and/or 'platforms'",
+    ):
+        load(_write_smoke_config(tmp_path, "    - files: ['tui/']\n"))
+
+
 # ── smoke_tests.native_execution_capabilities (#3455) ───────────────────────
 
 
