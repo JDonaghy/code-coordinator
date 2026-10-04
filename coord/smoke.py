@@ -2484,29 +2484,50 @@ def _dispatch_smoke_legs(
         touched, smoke_cfg.capability_rules, _capable_for
     )
 
-    if unroutable:
-        # A config error (a rule asks for a capability NO machine declares at
-        # all), never a routing puzzle — fails LOUDLY at dispatch time,
-        # naming the capability and the rule, rather than looping every tick
-        # against hardware that will never appear (#1678's shape).
+    if not partitions and unroutable:
+        # Nothing is routable at all — every matched rule's capability set
+        # (a config error: a rule asks for a capability NO machine declares
+        # at all) has no capable host, so there is no sibling partition to
+        # protect. Fails LOUDLY at dispatch time, naming the capability and
+        # the rule, rather than looping every tick against hardware that
+        # will never appear (#1678's shape).
+        #
+        # Deliberately NOT just `if not partitions:` — `partitions` is also
+        # empty, with `unroutable` ALSO empty, whenever no matched rule
+        # contributes a `requires`/`platforms` at all (the ordinary, far
+        # more common case: no capability-rule-worthy file was touched).
+        # That case must fall through to the single-leg path below exactly
+        # as it always has — it is not an unroutable diagnosis at all.
         _report_unroutable_partitions(completed, unroutable)
         return []
 
+    # #3581 fix-round-1: a non-empty `unroutable` alongside at least one
+    # routable partition must NOT abort the routable ones — that was exactly
+    # this review's blocking finding. A `platforms`-bearing rule where only
+    # SOME platforms have a capable host (the issue's own rollout scenario:
+    # macOS not onboarded yet) used to report-and-return here, silently
+    # dropping the Linux leg that was perfectly routable. `_dispatch_smoke_
+    # fanout` already has the "report, don't drop, don't abort siblings"
+    # shape for its own per-partition `blocking`/`unconfigured` cases — route
+    # `unroutable` through it too instead of handling it here, so the
+    # STILL-unroutable capability set is reported at the SAME point in the
+    # fan-out (before the "running" stamp, so a mixed round correctly lands
+    # on TEST_STATE_BLOCKED rather than a misleadingly clean "running").
+    #
     # #3581: a `platforms`-bearing rule must always take the per-partition
     # path below, even when exactly one partition survives (e.g. a
     # single-element `platforms` list, or every-but-one platform being
-    # unroutable would already have returned above). The single-leg path
-    # resolves its capabilities via `required_capabilities`/`match_rules`,
-    # which know nothing about `platforms` and would route on `rule.requires`
-    # alone — silently losing the OS constraint `partition_capability_
-    # requirements` already baked into this partition's own
-    # `SmokePartition.capabilities`.
+    # unroutable). The single-leg path resolves its capabilities via
+    # `required_capabilities`/`match_rules`, which know nothing about
+    # `platforms` and would route on `rule.requires` alone — silently
+    # losing the OS constraint `partition_capability_requirements` already
+    # baked into this partition's own `SmokePartition.capabilities`.
     has_platform_rule = any(
         rule.platforms and _rule_matches(touched, rule)
         for rule in smoke_cfg.capability_rules
     )
 
-    if len(partitions) <= 1 and not has_platform_rule:
+    if len(partitions) <= 1 and not has_platform_rule and not unroutable:
         # Exactly today's behaviour — the pre-#3182 single-leg path.
         leg = _dispatch_smoke_single_leg(
             completed, board, config, touched=touched,
@@ -2516,6 +2537,7 @@ def _dispatch_smoke_legs(
 
     return _dispatch_smoke_fanout(
         completed, board, config, touched=touched, partitions=partitions,
+        unroutable=unroutable,
         http_client=http_client, now=now,
     )
 
@@ -2868,6 +2890,7 @@ def _dispatch_smoke_fanout(
     *,
     touched: list[str],
     partitions: list[SmokePartition],
+    unroutable: Sequence[UnroutableCapability] = (),
     http_client: httpx.Client | None = None,
     now: float | None = None,
 ) -> list[Assignment]:
@@ -2890,6 +2913,20 @@ def _dispatch_smoke_fanout(
     probe contradiction, a missing `repo_paths` entry) is reported exactly
     like the single-leg unroutable case (`_report_unroutable_smoke`), naming
     that capability set — never a silent retry (#1678).
+
+    *unroutable* (#3581 fix-round-1) is the OTHER, static flavour of the same
+    "don't abort routable siblings" rule: capability sets that
+    `partition_capability_requirements` could not even turn into a
+    `SmokePartition` because NO configured machine declares them at all — the
+    rollout-gap case the issue is named for (a `platforms`-bearing route with
+    one OS not yet onboarded). `_dispatch_smoke_legs` used to report these and
+    return `[]` BEFORE this function ever ran, which silently dropped every
+    sibling platform partition that WAS routable too. Reported here instead,
+    after every routable *partitions* entry above has already been
+    dispatched — same place, same "report, don't drop" shape as the
+    `blocking`/`unconfigured` loops below, and before the "running" stamp so
+    a mixed round correctly lands on `TEST_STATE_BLOCKED` rather than a
+    misleadingly clean "running" (see the comment above that stamp).
 
     #3298: the Test-stage command is resolved ONCE PER PARTITION, scoped to
     that partition's own `SmokePartition.files` — not once, up front, against
@@ -3116,6 +3153,15 @@ def _dispatch_smoke_fanout(
     for caps in unconfigured:
         _report_unconfigured_smoke_command(completed, caps)
 
+    # #3581 fix-round-1: capability sets `partition_capability_requirements`
+    # found NO configured machine for at all (e.g. a `platforms` entry with
+    # no capable host for that OS) — reported here, AFTER every routable
+    # partition above has already been dispatched, so this never drops the
+    # sibling partitions that WERE routable. One report, same idempotent
+    # once-per-row guard `_report_unroutable_partitions` already has.
+    if unroutable:
+        _report_unroutable_partitions(completed, list(unroutable))
+
     # Stamp the parent's aggregate "running" — carrying the manifest so
     # `finalize_smoke_fanout` can find every leg again from just this row —
     # covering EVERY known partition so far, even on a partial round (some
@@ -3123,9 +3169,11 @@ def _dispatch_smoke_fanout(
     # verdict already on the row. TEST_STATE_BLOCKED is included alongside
     # ("passed", "skipped", "failed") — NOT just those three — because a
     # mixed round (one partition durably unroutable via
-    # `_report_unroutable_smoke` above, a sibling partition dispatched fine)
-    # leaves `completed.test_state` freshly set to TEST_STATE_BLOCKED by that
-    # very call, a few lines up, in this same synchronous invocation. Without
+    # `_report_unroutable_smoke`, or one capability set no machine declares
+    # at all via `_report_unroutable_partitions` — #3581 — either above, a
+    # sibling partition dispatched fine) leaves `completed.test_state`
+    # freshly set to TEST_STATE_BLOCKED by that very call, a few lines up, in
+    # this same synchronous invocation. Without
     # this exclusion the unconditional "running" stamp below would silently
     # clobber that blocked verdict back to "running" on the very next line,
     # AND the blocked partition is never added to `leg_manifest` (only

@@ -3782,11 +3782,16 @@ def test_dispatch_smoke_unroutable_partition_fails_loudly_at_dispatch(
     """#3182 acceptance: a matched rule's capability that NO configured
     machine declares at all is a config error, not a routing puzzle — it
     must fail loudly (naming the capability and the rule) at dispatch time,
-    never a silent retry loop (#1678's shape)."""
+    never a silent retry loop (#1678's shape). Neither rule has a capable
+    machine here (dell64 only has `windows`), so there is no routable
+    sibling to protect — the dispatch-everything-routable case this would
+    otherwise collide with is covered separately by
+    `test_dispatch_smoke_fanout_dispatches_routable_sibling_when_one_
+    capability_set_is_wholly_unroutable` below (#3581 fix-round-1)."""
     cfg = Config(
         repos=[repo],
         machines=[
-            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("dell64", "dell64.tail", caps=["windows"], path="/d/api"),
         ],
         smoke_tests=SmokeTestsConfig(
             auto_queue=True,
@@ -3808,6 +3813,57 @@ def test_dispatch_smoke_unroutable_partition_fails_loudly_at_dispatch(
     assert "macos" in reason
     assert "capability_rules[1]" in reason
     assert "quadraui/src/macos/" in reason
+
+
+def test_dispatch_smoke_fanout_dispatches_routable_sibling_when_one_capability_set_is_wholly_unroutable(
+    repo: Repo,
+) -> None:
+    """#3581 fix-round-1 (the review's blocking finding): a `platforms`-
+    bearing rule where only SOME platforms have a capable host — the
+    issue's own rollout scenario, a macOS host not yet onboarded — must
+    still dispatch the routable Linux leg. Before this fix,
+    `_dispatch_smoke_legs` reported the unroutable macOS capability set and
+    returned `[]` BEFORE ever looking at the routable Linux partition,
+    silently dropping a leg that was perfectly routable — smoke-testing the
+    diff on NEITHER OS, which is exactly the regression the review called
+    out against the issue's own stated goal."""
+    from coord.smoke import TEST_STATE_BLOCKED, _dispatch_smoke_legs, smoke_leg_capabilities
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            # Only linux is onboarded — no machine anywhere declares macos.
+            _machine("precision", "precision.tail", caps=["rust", "linux"], path="/p/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["tui/"], requires=["rust"], platforms=["linux", "macos"]),
+            ],
+        ),
+    )
+    completed = _completed()
+    board = Board()
+    client = _MultiHostClient(assign={"precision.tail": {"id": "precision-leg"}})
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client,
+        diff_lookup=lambda r, b: ["tui/src/app.rs"],
+    )
+
+    # The routable Linux partition still dispatches — a sibling platform
+    # with no capable host must not hold it back.
+    assert len(legs) == 1
+    assert legs[0].machine_name == "precision"
+    assert smoke_leg_capabilities(legs[0].issue_title) == ("linux", "rust")
+    assert board.active == legs
+
+    # The unroutable macOS capability set is reported on the parent row —
+    # never silently dropped — and the aggregate lands on BLOCKED (not a
+    # misleadingly clean "running") so an operator sees the gap.
+    assert completed.test_state == TEST_STATE_BLOCKED
+    reason = completed.test_reason or ""
+    assert "macos" in reason
+    assert "rust" in reason
 
 
 def test_dispatch_smoke_fanout_mixed_round_keeps_blocked_partition_visible(
