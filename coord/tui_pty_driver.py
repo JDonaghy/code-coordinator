@@ -1021,6 +1021,109 @@ def spawn_real_pty(command: str, cwd: str, cols: int, rows: int) -> PtyChild:
     return UnixPtyChild(command, cwd, cols, rows)
 
 
+class TuiPtySession:
+    """A persistent, interactively-driven tui-pty session (#3590) — the
+    backend ``coord app-drive tui-pty`` (:mod:`coord.app_drive_daemon`)
+    holds open across ``send``/``screen``/``wait-idle``/``close`` calls
+    that each arrive as a SEPARATE, short-lived ``coord app-drive`` CLI
+    invocation (a worker's Bash tool cannot keep one process's stdin open
+    across tool calls), rather than :class:`SmokeRunner`'s own "walk one
+    fixed step list end to end in a single call" shape.
+
+    Mirrors :class:`SmokeRunner`'s reader-loop/lock discipline and reuses
+    the exact same primitives (:func:`encode_key`/:func:`encode_click`/
+    :class:`VtScreen`/:func:`spawn_real_pty`) it's built from — this is NOT
+    a second, home-made input-injection path (#3566's HARD RULE): it is
+    the sanctioned driver, just finally invokable one verb at a time
+    instead of only as a whole pre-scripted spec.
+
+    Teardown (:meth:`close`) delegates straight to the child's own
+    :meth:`PtyChild.close` — for a real :class:`UnixPtyChild` that is the
+    SAME confirmed terminate-then-kill-with-a-timeout teardown every other
+    tui-pty caller gets, backed by the kernel-enforced parent-death signal
+    armed at launch time (#3583, Linux-only): even an abnormal death of
+    whatever process is holding this session (this one, or
+    ``coord.app_drive``'s own daemon wrapping it) still reaps the real
+    child.
+    """
+
+    def __init__(
+        self, launch_command: str, cwd: str, cols: int = 80, rows: int = 24,
+        spawn_child: Callable[[str, str, int, int], PtyChild] | None = None,
+    ) -> None:
+        self._cols, self._rows = cols, rows
+        self._child: PtyChild = (spawn_child or spawn_real_pty)(launch_command, cwd, cols, rows)
+        self._screen = VtScreen(cols, rows)
+        self._lock = threading.Lock()
+        self._last_byte_time = time.monotonic()
+        self._stop = threading.Event()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+        # Same startup-failure confirmation `SmokeRunner._do_launch` makes
+        # (#2096: an "opened" verdict must be an observation, not the mere
+        # absence of an exception from `Popen`) — a bad launch command
+        # dies near-instantly, so catch that here with an actionable
+        # message rather than every later verb failing against a dead
+        # child with no context.
+        time.sleep(0.2)
+        if not self._child.is_alive():
+            self.close()
+            raise TuiPtyRuntimeError(
+                "child process exited immediately after launch (command failed to start?)"
+            )
+
+    def _reader_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                data = self._child.read(_READ_POLL_S)
+            except Exception:  # noqa: BLE001 — child may have exited underneath us
+                return
+            if not data:
+                if not self._child.is_alive():
+                    return
+                continue
+            with self._lock:
+                self._last_byte_time = time.monotonic()
+                self._screen.feed(data)
+
+    def send_key(self, key: str) -> None:
+        self._child.write(encode_key(key))
+
+    def send_text(self, text: str) -> None:
+        self._child.write(text.encode("utf-8"))
+
+    def send_click(self, row: int, col: int, button: str = "left") -> None:
+        self._child.write(encode_click(row, col, button))
+
+    def wait_idle(self, ms: int = 500, timeout_ms: int = 5000) -> bool:
+        """Block until the stream has gone quiet for *ms* milliseconds, or
+        *timeout_ms* elapses — returns whether it actually settled (#2096:
+        an observed verdict, never assumed from a fixed sleep). Never
+        raises."""
+        idle_for = ms / 1000
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            with self._lock:
+                since = time.monotonic() - self._last_byte_time
+            if since >= idle_for:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.02, idle_for) if idle_for > 0 else 0.02)
+
+    def screen_text(self, region: dict | None = None) -> str:
+        with self._lock:
+            return self._screen.text(region)
+
+    def is_alive(self) -> bool:
+        return self._child.is_alive()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._reader_thread.join(timeout=2)
+        self._child.close()
+
+
 def run_smoke_spec(
     spec_text: str, *, launch_command: str, cwd: str,
     spawn_child: Callable[[int, int], PtyChild] | None = None,

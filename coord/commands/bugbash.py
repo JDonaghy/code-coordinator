@@ -85,6 +85,7 @@ from coord.bugbash import (
     ExploreOutcome,
     build_exploration_briefing,
     discover_lanes,
+    driver_command_for_lane,
     finding_target_repo,
     harvest_outcome,
     journeys_for_lane,
@@ -180,31 +181,63 @@ def _fetch_and_parse_outcome(machine, assignment_id: str, *, platform: str, repo
     from coord.worker_events import (
         WorkerSummary,
         _assistant_text,
+        _iter_content_blocks,
+        _tool_result_output,
         iter_events_from_text,
         update_summary,
     )
 
     last_assistant_text = ""
+    # #3590: every message's DECODED text, concatenated — never the raw
+    # NDJSON `log_resp.text` itself. The transcript file is a stream of
+    # JSON objects, so a real newline (or a literal `"`) inside a message's
+    # `text` field is encoded as the two characters `\` `n` (resp. `\` `"`),
+    # not the real byte; `parse_unavailable_report`'s fence regex requires a
+    # real newline right after the fence opener, and its fallback
+    # `_UNAVAILABLE_SIGNATURES` are quoted literally, so matching either
+    # against the raw JSON bytes silently never matches at all — a
+    # well-formed ` ```bugbash-unavailable ``` ` block in the worker's own
+    # final message then fell through to `parse_findings_block` and came
+    # back as a protocol error instead (#3590's actual bug: both evidence
+    # transcripts hit exactly this). Decoding first (the same
+    # `_assistant_text` extraction used for `last_assistant_text` below,
+    # plus `_tool_result_output` for a driver failure surfacing in a tool's
+    # own output rather than the model's prose) restores real characters so
+    # both the fence and the fallback signatures are reachable again.
+    all_decoded_text_parts: list[str] = []
     summary = WorkerSummary()
     for event in iter_events_from_text(log_resp.text):
         update_summary(summary, event)
-        if event.type != "assistant":
-            continue
-        text = _assistant_text(event)
-        if text.strip():
-            last_assistant_text = text
+        if event.type == "assistant":
+            text = _assistant_text(event)
+            if text.strip():
+                last_assistant_text = text
+                all_decoded_text_parts.append(text)
+        elif event.type == "user":
+            for block in _iter_content_blocks(event.raw.get("message") or {}):
+                if block.get("type") != "tool_result":
+                    continue
+                out = _tool_result_output(block, event.raw)
+                if out:
+                    all_decoded_text_parts.append(out)
+        elif event.type == "tool_result":
+            out = _tool_result_output(event.raw, event.raw)
+            if out:
+                all_decoded_text_parts.append(out)
 
     # #3566 ask #5: a worker's own "lane unavailable" report (the
     # briefing's hard rule — a missing permission/session, never an
     # improvised workaround) OR a driver session/permission failure
     # surfacing directly in the transcript is a THIRD outcome, distinct
-    # from both a clean pass and a protocol error — checked against the
-    # FULL raw log text (not just the last assistant message) so it's
-    # caught even if the worker reported it mid-session before crashing.
+    # from both a clean pass and a protocol error — checked against EVERY
+    # decoded message (not just the last assistant one) so it's caught even
+    # if the worker reported it mid-session before crashing, or it
+    # surfaced in a tool's own output (#3590: decoded text, NOT the raw log
+    # text — see the note above).
     # Must be checked BEFORE `parse_findings_block`: an unavailable report
     # deliberately carries no findings fence (the briefing tells the
     # worker to skip it), which would otherwise read as a protocol error.
-    unavailable_reason = parse_unavailable_report(log_resp.text)
+    unavailable_reason = parse_unavailable_report("\n\n".join(all_decoded_text_parts))
     if unavailable_reason:
         return ExploreOutcome(
             unavailable=True, cost=summary.total_cost_usd, notes=unavailable_reason,
@@ -692,6 +725,13 @@ def bugbash_run_cmd(
         sys.exit(1)
 
     click.echo(f"lanes: {', '.join(f'{l.platform}@{l.machine}' for l in lanes)}")
+    # #3590: name the exact `coord app-drive` command each lane's worker
+    # will be told to run, via the SAME `driver_command_for_lane` the
+    # briefing's own HARD RULE calls (#2096 "one question, one answer") —
+    # so `--dry-run` (and every real run) always shows what a worker was
+    # actually handed, never a second, independently-drifting guess at it.
+    for l in lanes:
+        click.echo(f"  [{l.platform}] driver: {driver_command_for_lane(l)}")
 
     # #3580: fetch the repo's behaviour catalogue ONCE per run (not per
     # lane/round — it's the same file for all of them) and name what's in

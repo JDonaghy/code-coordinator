@@ -144,7 +144,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import yaml
 
@@ -1277,6 +1277,72 @@ def _import_uia():
 
 
 # ── top-level entry point ───────────────────────────────────────────────────
+
+class WinNativeSession:
+    """Persistent win-native ``coord app-drive`` session (#3590) — mirrors
+    :class:`coord.tui_pty_driver.TuiPtySession`'s "sanctioned driver, one
+    verb per call" shape: drives the exact same :class:`WinCalls` real-OS
+    implementation :class:`NativeRunner`'s own ``launch``/``key``/``click``/
+    ``capture`` step handlers use (same PID-only ``kill``, never by image
+    name), just invoked on demand rather than against one fixed step list.
+
+    Callers (:mod:`coord.app_drive`'s daemon dispatch) MUST confirm
+    :meth:`WinCalls.session_available` themselves BEFORE constructing this
+    — exactly like :meth:`NativeRunner.run` only reaches its own per-step
+    handlers after that same check; this class assumes an
+    already-confirmed-available session.
+    """
+
+    def __init__(
+        self, launch_command: str, cwd: str, *, width: int = 1024, height: int = 768,
+        calls: WinCalls | None = None, timeout_s: float = 10.0,
+    ) -> None:
+        self._calls: WinCalls = calls if calls is not None else Win32Calls()
+        self._pid = self._calls.launch(launch_command, cwd)
+        self._hwnd = self._calls.find_top_window(self._pid, timeout_s)
+        self._calls.move_window(self._hwnd, 0, 0, width, height)
+
+    def send_key(self, key: str) -> None:
+        self._calls.send_key(self._hwnd, key)
+
+    def send_click(self, x: int, y: int, button: str = "left") -> None:
+        self._calls.send_click(self._hwnd, x, y, button)
+
+    def capture(self) -> bytes:
+        return self._calls.capture(self._hwnd)
+
+    def probe(self, name: str, **kwargs: Any) -> Any:
+        if name == "uia_elements":
+            return self._calls.uia_elements(self._hwnd)
+        if name == "is_window_alive":
+            return self._calls.is_window_alive(self._hwnd)
+        if name == "get_menu_items":
+            return self._calls.get_menu_items(self._hwnd)
+        if name == "hit_test":
+            return self._calls.hit_test(self._hwnd, int(kwargs.get("x", 0)), int(kwargs.get("y", 0)))
+        if name == "find_a11y":
+            elements = self._calls.uia_elements(self._hwnd)
+            match = _find_a11y_match(elements, kwargs.get("role", ""), kwargs.get("name", ""))
+            return {
+                "found": match is not None, "element": match,
+                "tree": _summarize_elements(elements),
+            }
+        raise ValueError(
+            f"unknown probe {name!r} — expected one of: uia_elements, "
+            "is_window_alive, get_menu_items, hit_test, find_a11y"
+        )
+
+    def is_alive(self) -> bool:
+        return self._calls.is_window_alive(self._hwnd)
+
+    def close(self) -> None:
+        """Kills only the PID this session itself launched (see the module
+        docstring's safety note)."""
+        try:
+            self._calls.kill(self._pid)
+        except Exception:  # noqa: BLE001 — teardown must not raise
+            pass
+
 
 def run_native_spec(
     spec_text: str, *, launch_command: str, cwd: str,

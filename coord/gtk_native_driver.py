@@ -129,7 +129,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import yaml
 
@@ -802,6 +802,69 @@ def _import_atspi():
 
 
 # ── top-level entry point ───────────────────────────────────────────────────
+
+class GtkNativeSession:
+    """Persistent gtk-native ``coord app-drive`` session (#3590) — mirrors
+    :class:`coord.tui_pty_driver.TuiPtySession`'s "sanctioned driver, one
+    verb per call" shape: drives the exact same :class:`GtkCalls` real-OS
+    implementation :class:`NativeRunner`'s own ``launch``/``key``/``click``/
+    ``capture`` step handlers use (same PID-only ``kill``, never by binary
+    or window-class name), just invoked on demand rather than against one
+    fixed step list.
+
+    Callers (:mod:`coord.app_drive`'s daemon dispatch) MUST confirm
+    :meth:`GtkCalls.session_available` themselves BEFORE constructing this
+    — exactly like :meth:`NativeRunner.run` only reaches its own per-step
+    handlers after that same check; this class assumes an
+    already-confirmed-available session.
+    """
+
+    def __init__(
+        self, launch_command: str, cwd: str, *, width: int = 1024, height: int = 768,
+        calls: GtkCalls | None = None, timeout_s: float = 10.0,
+    ) -> None:
+        self._calls: GtkCalls = calls if calls is not None else LinuxGtkCalls()
+        self._pid = self._calls.launch(launch_command, cwd)
+        self._window_id = self._calls.find_top_window(self._pid, timeout_s)
+        self._calls.move_window(self._window_id, 0, 0, width, height)
+
+    def send_key(self, key: str) -> None:
+        self._calls.send_key(self._window_id, key)
+
+    def send_click(self, x: int, y: int, button: str = "left") -> None:
+        self._calls.send_click(self._window_id, x, y, button)
+
+    def capture(self) -> bytes:
+        return self._calls.capture(self._window_id)
+
+    def probe(self, name: str, **kwargs: Any) -> Any:
+        if name == "ax_elements":
+            return self._calls.ax_elements(self._pid)
+        if name == "is_window_alive":
+            return self._calls.is_window_alive(self._window_id)
+        if name == "find_a11y":
+            elements = self._calls.ax_elements(self._pid)
+            match = _find_a11y_match(elements, kwargs.get("role", ""), kwargs.get("name", ""))
+            return {
+                "found": match is not None, "element": match,
+                "tree": _summarize_elements(elements),
+            }
+        raise ValueError(
+            f"unknown probe {name!r} — expected one of: ax_elements, "
+            "is_window_alive, find_a11y"
+        )
+
+    def is_alive(self) -> bool:
+        return self._calls.is_window_alive(self._window_id)
+
+    def close(self) -> None:
+        """Kills only the PID this session itself launched (see the module
+        docstring's safety note)."""
+        try:
+            self._calls.kill(self._pid)
+        except Exception:  # noqa: BLE001 — teardown must not raise
+            pass
+
 
 def run_native_spec(
     spec_text: str, *, launch_command: str, cwd: str,
