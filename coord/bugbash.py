@@ -131,6 +131,31 @@ disambiguates two sibling routes that share one ``kind`` (e.g. vimcode's
 distinct lane labels (``"win-native:gui"`` / ``"win-native:terminal"``)
 the same way #3581 disambiguates ``platforms`` — so ``--lane`` can select
 one without the other.
+
+**#3620: one worker per lane per round covered about 20% of a catalogue**
+(vimcode's ~167-journey ``tui-pty`` lane: 32 passed + 2 found out of 167
+attempted in round 1, and round 2 re-walked from the top instead of
+picking up where round 1 left off — two rounds together barely covered
+more than one). :func:`plan_lane_chunks`/:func:`chunk_journeys` split a
+lane's (optionally ``--max-priority``-filtered, see
+:func:`journeys_for_lane`) journey list into chunks of
+``--journeys-per-worker`` (:data:`DEFAULT_JOURNEYS_PER_WORKER`, ~25),
+dispatching one worker per chunk — serially for a GUI lane (one desktop,
+one focus: :func:`max_concurrent_chunks_for_lane` always returns ``1`` for
+:data:`GUI_LANE_DRIVER_KINDS`), or concurrently up to the host's own
+``max_workers`` for ``tui-pty`` (each worker gets its own pty, nothing to
+contend over). :class:`JourneyScheduler` is the coverage-aware part: one
+instance per lane, kept for the whole run, that hands back each round's
+chunk list ordered skipped-or-not-yet-reached FIRST, then already-passed
+journeys — so round N+1 picks up where round N left off instead of
+re-walking from the top — and never auto-requeues a journey that already
+produced a finding. :func:`explore_lane_sharded` is the ONE function that
+ties chunking, the scheduler, and a run-wide chunk-level cost accumulator
+(:class:`_ShardCostState` — #3620 requirement 4: a cap must stop a NEW
+chunk from starting mid-round, not just between rounds) together into a
+single aggregate :class:`ExploreOutcome` per lane per round — a drop-in
+:data:`Explorer`, so :func:`run_bugbash`'s own round loop needed zero
+changes to support sharding at all.
 """
 
 from __future__ import annotations
@@ -975,13 +1000,204 @@ def parse_catalogue(yaml_text: str | None) -> CatalogueResult:
     return CatalogueResult(journeys=tuple(journeys), warning=warning, source=CATALOGUE_PATH)
 
 
-def journeys_for_lane(journeys: Sequence[Journey], driver_kind: str) -> list[Journey]:
+def journeys_for_lane(
+    journeys: Sequence[Journey], driver_kind: str, *, max_priority: int | None = None,
+) -> list[Journey]:
     """Journeys from *journeys* applicable to *driver_kind*, in priority
     order (1 first), ties broken by ``id`` for a deterministic walk order
     (#3580 requirement 1: "a worker that runs out of budget has covered
-    priority 1 first")."""
+    priority 1 first").
+
+    *max_priority* (#3620 requirement 2) drops any journey whose own
+    ``priority`` is numerically GREATER than it — e.g. ``max_priority=1``
+    keeps only priority-1 journeys — applied BEFORE the priority/id sort,
+    so a lower cap never changes the relative order of what's left.
+    ``None`` (the default, and every pre-#3620 caller) applies no filter
+    at all, so this stays fully backward compatible."""
     matching = [j for j in journeys if driver_kind in j.lanes]
+    if max_priority is not None:
+        matching = [j for j in matching if j.priority <= max_priority]
     return sorted(matching, key=lambda j: (j.priority, j.id))
+
+
+#: #3620 requirement 1: the default chunk size `coord bugbash run
+#: --journeys-per-worker` splits a lane's (post `--max-priority`) journey
+#: list into — one worker dispatched per chunk, instead of the whole lane's
+#: catalogue slice handed to a single time-boxed session (which measured
+#: ~20% coverage per round on vimcode's ~60/80/18 priority tiers, #3620).
+DEFAULT_JOURNEYS_PER_WORKER = 25
+
+#: The GUI driver kinds among :data:`LANE_DRIVER_KINDS` — derived, never a
+#: hand-maintained parallel list, so a future `LANE_DRIVER_KINDS` entry is
+#: automatically classified as GUI (one desktop, one focus, chunks must
+#: serialize) unless it's `tui-pty` (own pty per worker, chunks may
+#: overlap) — see :func:`max_concurrent_chunks_for_lane`.
+GUI_LANE_DRIVER_KINDS: frozenset[str] = frozenset(LANE_DRIVER_KINDS) - {"tui-pty"}
+
+
+def chunk_journeys(journeys: Sequence[Journey], size: int) -> list[tuple[Journey, ...]]:
+    """Split *journeys* (already ordered by the caller — see
+    :func:`journeys_for_lane`/:class:`JourneyScheduler`) into chunks of at
+    most *size* each, in order (#3620 requirement 1) — e.g. 60 journeys at
+    ``size=25`` yields 3 chunks (25/25/10). ``size <= 0`` is treated
+    defensively as "everything in one chunk" (the CLI's own
+    ``--journeys-per-worker`` is validated to be a positive int, but this
+    function must never divide by zero or infinite-loop for a caller that
+    skips that check). Empty *journeys* yields ``[]`` — zero chunks, the
+    signal a lane has nothing (left) to shard, handled by
+    :func:`explore_lane_sharded`'s checklist fallback."""
+    if not journeys:
+        return []
+    if size <= 0:
+        size = len(journeys)
+    return [tuple(journeys[i:i + size]) for i in range(0, len(journeys), size)]
+
+
+@dataclass(frozen=True)
+class LaneChunkPlan:
+    """What ``--dry-run`` and the live sharded dispatcher both compute for
+    ONE lane's chunking (#3620 requirements 1/2): the journeys left after
+    ``--max-priority`` filtering, and the resulting ordered chunk list.
+    :func:`plan_lane_chunks` is the ONE function both
+    :mod:`coord.commands.bugbash`'s ``--dry-run`` preview and (via
+    :class:`JourneyScheduler`, which is seeded from this same journeys
+    list) the live dispatcher consult, so the two can never report a
+    different chunk count for the same lane (#2096 "one question, one
+    answer")."""
+
+    platform: str
+    journeys: tuple[Journey, ...]
+    chunks: tuple[tuple[Journey, ...], ...]
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self.chunks)
+
+
+def plan_lane_chunks(
+    lane: "BugbashLane",
+    catalogue_journeys: Sequence[Journey],
+    *,
+    journeys_per_worker: int = DEFAULT_JOURNEYS_PER_WORKER,
+    max_priority: int | None = None,
+) -> LaneChunkPlan:
+    """*lane*'s journeys (from the repo's full *catalogue_journeys* list,
+    filtered to this lane's ``driver_kind`` and *max_priority* via
+    :func:`journeys_for_lane`), split into chunks of *journeys_per_worker*
+    (#3620 requirements 1/2)."""
+    lane_journeys = journeys_for_lane(catalogue_journeys, lane.driver_kind, max_priority=max_priority)
+    chunks = chunk_journeys(lane_journeys, journeys_per_worker)
+    return LaneChunkPlan(platform=lane.platform, journeys=tuple(lane_journeys), chunks=tuple(chunks))
+
+
+def max_concurrent_chunks_for_lane(lane: "BugbashLane", host_max_workers: int) -> int:
+    """How many of *lane*'s chunks may be dispatched to its host at once
+    this round (#3620 requirement 1).
+
+    GUI lanes (:data:`GUI_LANE_DRIVER_KINDS` — ``win-native``/
+    ``mac-native``/``gtk-native``) always return ``1``: they share one
+    desktop and one input focus, so two chunks running concurrently would
+    fight over it exactly the way two concurrent GUI *lanes* already would
+    (#3602's own per-host lane serialization) — *host_max_workers* is
+    irrelevant for these. A ``tui-pty`` lane returns
+    ``max(1, host_max_workers)``: each worker gets its own pty, so there is
+    nothing to contend over, and the host's own configured capacity
+    (``machines[].max_workers`` / ``concurrency.max_workers``) is the only
+    real ceiling."""
+    if lane.driver_kind in GUI_LANE_DRIVER_KINDS:
+        return 1
+    return max(1, host_max_workers)
+
+
+#: Per-journey cumulative status :class:`JourneyScheduler` tracks across
+#: every round/chunk dispatched so far this run (#3620 requirement 3) —
+#: distinct from :class:`JourneyOutcome.status`, which is what ONE chunk's
+#: worker reported for ONE round; this is the latest-known value, carried
+#: forward whennever a journey isn't re-walked in a later round.
+_JOURNEY_NOT_RUN = "not_run"
+
+
+@dataclass
+class JourneyScheduler:
+    """Coverage-aware per-lane journey scheduler (#3620 requirement 3):
+    decides which of *journeys* the lane's NEXT round should walk, and
+    tracks the cumulative, latest-known status of every one of them across
+    every round/chunk dispatched so far this run — the data
+    :func:`explore_lane_sharded` consults every time it's asked for this
+    lane's next round, and the source a run's final cumulative-coverage
+    summary is built from (never re-derived by summing each round's own
+    :class:`CoverageSummary`, which would double-count a journey re-walked
+    in a later round).
+
+    :meth:`chunks_for_round` orders *journeys* skipped-or-not-yet-run
+    FIRST (in their original priority order), then already-passed ones —
+    so a lane with chunk budget left after clearing its backlog
+    re-verifies past journeys rather than sitting idle. A journey that
+    produced a FINDING is never automatically re-queued by this scheduler
+    (#3620: "re-run only to confirm a fix, if at all" — there is no
+    automatic "a fix landed" signal this engine can observe; a deliberate
+    re-walk of a `found` journey, if it ever happens, is a separate,
+    explicit invocation, not something this scheduler does on its own).
+
+    One instance is created per lane for the whole run (not per round) and
+    threaded into every round's :func:`explore_lane_sharded` call for that
+    lane — it is the ONLY place "what has this lane covered so far"
+    lives, across however many chunks/rounds that took.
+    """
+
+    journeys: tuple[Journey, ...]
+    journeys_per_worker: int = DEFAULT_JOURNEYS_PER_WORKER
+    _status: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        for j in self.journeys:
+            self._status.setdefault(j.id, _JOURNEY_NOT_RUN)
+
+    def _ordered_for_round(self) -> list[Journey]:
+        rank = {_JOURNEY_NOT_RUN: 0, "skipped": 0, "passed": 1}
+        pending = [
+            j for j in self.journeys if self._status.get(j.id, _JOURNEY_NOT_RUN) != "found"
+        ]
+        return sorted(
+            pending,
+            key=lambda j: (rank.get(self._status.get(j.id, _JOURNEY_NOT_RUN), 0), j.priority, j.id),
+        )
+
+    def chunks_for_round(self) -> list[tuple[Journey, ...]]:
+        """This round's ordered chunk list (#3620 requirements 1 + 3) —
+        empty when every journey already produced a finding (nothing left
+        this scheduler will auto re-queue) or *journeys* is empty (no
+        catalogue journeys for this lane at all)."""
+        return chunk_journeys(self._ordered_for_round(), self.journeys_per_worker)
+
+    def record(self, outcomes: Sequence["JourneyOutcome"]) -> None:
+        """Update the cumulative status for every journey *outcomes*
+        reports on — called once per CHUNK's coverage report (never once
+        per round, since #3620 lets a round dispatch several chunks). An
+        outcome naming a journey id this scheduler doesn't track (e.g. a
+        checklist item's own text, when this lane fell back to the
+        checklist) is silently ignored — only catalogue journeys are
+        scheduled/tracked here."""
+        for outcome in outcomes:
+            if outcome.journey_id in self._status:
+                self._status[outcome.journey_id] = outcome.status
+
+    def cumulative_summary(self) -> "CoverageSummary":
+        """"N journeys passed" across EVERY round/chunk dispatched so far
+        this run (#3620 requirement 3) — not just the terminating round's
+        own report, which is all :attr:`RoundReport.lane_coverage` ever
+        showed before this. ``attempted`` counts only journeys that have
+        actually been given to a chunk worker at least once (i.e. not
+        :data:`_JOURNEY_NOT_RUN`) — a journey never yet reached is not
+        "attempted" any more than it would be mid-round; ``len(journeys) -
+        attempted`` is how many are still not yet reached."""
+        statuses = list(self._status.values())
+        return CoverageSummary(
+            attempted=sum(1 for s in statuses if s != _JOURNEY_NOT_RUN),
+            passed=sum(1 for s in statuses if s == "passed"),
+            found=sum(1 for s in statuses if s == "found"),
+            skipped=sum(1 for s in statuses if s == "skipped"),
+        )
 
 
 @dataclass(frozen=True)
@@ -1292,6 +1508,7 @@ def build_exploration_briefing(
     reference_backend: str,
     checklist: Sequence[str] = EXPLORATION_CHECKLIST,
     catalogue_text: str | None = None,
+    journeys_override: Sequence[Journey] | None = None,
 ) -> str:
     """Compose the seed briefing for a lane's headless exploration worker.
 
@@ -1318,10 +1535,23 @@ def build_exploration_briefing(
     warning. It must never fail silently or crash the run."): a ``NOTE:``
     line naming the reason is always included in that case, never a quiet
     substitution.
+
+    *journeys_override* (#3620), when given (not ``None``), is used
+    VERBATIM as this worker's journey list instead of re-deriving one from
+    *catalogue_text* — the sharded dispatcher
+    (:func:`explore_lane_sharded`) has already resolved exactly which
+    journeys this CHUNK owns via :class:`JourneyScheduler`, and re-parsing
+    *catalogue_text* here could in principle disagree with that (#2096
+    "one question, one answer"). An empty tuple is a valid override
+    (falls through to the *checklist* branch below, exactly like "no
+    catalogue journeys for this lane" always has) — only ``None`` means
+    "no override, derive it from *catalogue_text* the old way."
     """
     catalogue_warning = ""
     lane_journeys: list[Journey] = []
-    if catalogue_text is not None:
+    if journeys_override is not None:
+        lane_journeys = list(journeys_override)
+    elif catalogue_text is not None:
         catalogue = parse_catalogue(catalogue_text)
         catalogue_warning = catalogue.warning
         if catalogue.journeys:
@@ -1541,6 +1771,182 @@ Explorer = Callable[[BugbashLane, int], ExploreOutcome]
 #: ``(argv) -> stdout`` — "run this `coord` subcommand." Used only for
 #: ``coord issue create`` / ``coord drive-queue add`` (:func:`file_finding`).
 CoordRunner = Callable[[Sequence[str]], str]
+
+
+# ── journey sharding: one worker per chunk (#3620) ──────────────────────────
+
+#: ``(lane, round_num, journeys) -> ExploreOutcome`` — "go run ONE chunk of
+#: a lane's sharded exploration and hand back what it found." *journeys* is
+#: the exact (possibly empty — meaning "fall back to the checklist")
+#: ordered slice this chunk owns, as computed by
+#: :meth:`JourneyScheduler.chunks_for_round`. The production implementation
+#: (:mod:`coord.commands.bugbash`) wraps :func:`coord.commands.bugbash
+#: ._dispatch_and_await_lane` with ``journeys_override=journeys``; tests
+#: inject a fake.
+ChunkExplorer = Callable[[BugbashLane, int, "tuple[Journey, ...]"], ExploreOutcome]
+
+
+@dataclass
+class _ShardCostState:
+    """Run-wide (never reset per round) cost accumulator a sharded lane
+    dispatch consults BEFORE starting each new chunk (#3620 requirement 4:
+    "no new chunk dispatched after cap trips"). ONE instance is shared
+    across every lane's sharded dispatch for the whole ``coord bugbash
+    run`` invocation — mirrors :class:`_RoundExploreState`'s own
+    lock-guarded accumulator, but at CHUNK granularity: a single lane-round
+    can now spend several chunks' worth of cost before
+    :func:`run_bugbash`'s own per-round cap check (which only sees the
+    AGGREGATE cost :func:`explore_lane_sharded` hands back once the whole
+    round's chunks are done) ever gets a look — this is the layer that
+    actually stops a NEW chunk from starting mid-round once a cap trips,
+    not just between rounds."""
+
+    lane_cost: dict[str, float] = field(default_factory=dict)
+    total_cost: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def try_reserve(self, platform: str, cap_per_lane: float, cap_total: float) -> str:
+        """``""`` when a new chunk for *platform* may start; otherwise the
+        human-readable reason it may not (a cap already tripped) — checked
+        under the lock, with the chunk's own dispatch (and its eventual
+        :meth:`record` call) left to the caller to run OUTSIDE the lock, the
+        same check-then-run-outside-the-lock split
+        :func:`_explore_round_lanes` already uses for lane-level caps."""
+        with self.lock:
+            spent = self.lane_cost.get(platform, 0.0)
+            if spent >= cap_per_lane:
+                return f"cumulative cost {spent:.2f} already >= per-lane cap {cap_per_lane:.2f}"
+            if self.total_cost >= cap_total:
+                return f"total cost {self.total_cost:.2f} already >= total cap {cap_total:.2f}"
+            return ""
+
+    def record(self, platform: str, cost: float) -> None:
+        with self.lock:
+            self.lane_cost[platform] = self.lane_cost.get(platform, 0.0) + cost
+            self.total_cost += cost
+
+
+def explore_lane_sharded(
+    lane: BugbashLane,
+    round_num: int,
+    *,
+    chunk_explorer: ChunkExplorer,
+    scheduler: JourneyScheduler,
+    cost_state: _ShardCostState,
+    cost_cap_per_lane: float,
+    cost_cap_total: float,
+    max_concurrent_chunks: int = 1,
+) -> ExploreOutcome:
+    """The sharded :data:`Explorer` (#3620): walks *lane*'s next round of
+    journeys (via *scheduler*) split into chunks of at most
+    ``scheduler.journeys_per_worker``, dispatching one *chunk_explorer*
+    call per chunk — serially when ``max_concurrent_chunks <= 1`` (every
+    GUI lane: one desktop, one focus — see
+    :func:`max_concurrent_chunks_for_lane`), or up to
+    ``max_concurrent_chunks`` concurrently (a ``tui-pty`` lane, bounded by
+    its host's own ``max_workers`` — each worker gets its own pty, nothing
+    to contend over). Returns ONE aggregate :class:`ExploreOutcome` —
+    :func:`run_bugbash`'s own round loop is completely unaware chunking
+    happened at all, so its cap/termination logic (#2096, #3510, #3517)
+    needs no changes: this is a drop-in :data:`Explorer` exactly like the
+    unsharded production one.
+
+    Stops starting new chunks the moment *cost_state* reports either cap
+    already tripped (#3620 requirement 4, checked per chunk, not just once
+    per round) — a chunk already in flight always finishes and has its
+    cost recorded, but no further chunk for ANY lane sharing *cost_state*
+    starts once a cap trips.
+
+    The first chunk reporting ``unavailable=True`` stops every remaining
+    chunk this round from starting (the lane's own session/permission
+    problem applies identically to every chunk, so there is nothing to
+    gain by burning further chunks against it) — the aggregate outcome is
+    ``unavailable=True`` with that chunk's notes.
+
+    When *scheduler* has nothing to shard this round (no catalogue
+    journeys for this lane at all, or every journey already produced a
+    finding), this dispatches exactly ONE chunk with an empty journeys
+    tuple — the production chunk explorer asks
+    :func:`build_exploration_briefing` to fall back to the checklist
+    exactly like it always has, so a repo with no catalogue sees no
+    behaviour change from this feature existing.
+    """
+    chunks = scheduler.chunks_for_round()
+    if not chunks:
+        chunks = [()]
+
+    outcomes: list[ExploreOutcome | None] = [None] * len(chunks)
+    lock = threading.Lock()
+    stopped = {"flag": False}
+
+    def attempt(index: int) -> None:
+        with lock:
+            if stopped["flag"]:
+                return
+            reason = cost_state.try_reserve(lane.platform, cost_cap_per_lane, cost_cap_total)
+            if reason:
+                return
+        outcome = chunk_explorer(lane, round_num, chunks[index])
+        cost_state.record(lane.platform, outcome.cost)
+        outcomes[index] = outcome
+        if outcome.unavailable:
+            with lock:
+                stopped["flag"] = True
+
+    if max_concurrent_chunks <= 1:
+        for i in range(len(chunks)):
+            attempt(i)
+    else:
+        with ThreadPoolExecutor(max_workers=max_concurrent_chunks) as pool:
+            futures = [pool.submit(attempt, i) for i in range(len(chunks))]
+            for f in futures:
+                f.result()  # re-raise any exception from a chunk's thread
+
+    findings: list[Finding] = []
+    journey_outcomes: list[JourneyOutcome] = []
+    total_cost = 0.0
+    ok = True
+    unavailable = False
+    unavailable_notes = ""
+    protocol_errors: list[str] = []
+    notes_parts: list[str] = []
+    skipped_count = 0
+
+    for outcome in outcomes:
+        if outcome is None:
+            skipped_count += 1
+            continue
+        total_cost += outcome.cost
+        if outcome.unavailable:
+            unavailable = True
+            unavailable_notes = unavailable_notes or outcome.notes
+            continue
+        findings.extend(outcome.findings)
+        journey_outcomes.extend(outcome.journey_outcomes)
+        scheduler.record(outcome.journey_outcomes)
+        if not outcome.ok:
+            ok = False
+            notes_parts.append(outcome.notes or "chunk explorer reported failure")
+        elif outcome.protocol_error:
+            protocol_errors.append(outcome.protocol_error)
+
+    if skipped_count:
+        notes_parts.append(
+            f"{skipped_count}/{len(chunks)} chunk(s) not dispatched this round "
+            "(cost cap already tripped, or a sibling chunk reported the lane unavailable)"
+        )
+
+    if unavailable:
+        return ExploreOutcome(unavailable=True, cost=total_cost, notes=unavailable_notes)
+
+    return ExploreOutcome(
+        findings=tuple(findings),
+        cost=total_cost,
+        ok=ok,
+        protocol_error="; ".join(protocol_errors),
+        journey_outcomes=tuple(journey_outcomes),
+        notes="; ".join(notes_parts) or "status=completed",
+    )
 
 
 def subprocess_coord_runner(args: Sequence[str]) -> str:
