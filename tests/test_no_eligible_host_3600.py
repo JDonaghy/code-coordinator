@@ -159,7 +159,7 @@ def test_fetch_no_eligible_host_when_every_capable_machine_is_paused(
     mp.pause("server")
     out = _fetch_no_eligible_host(entries, valid_config_path)
     assert "api" in out
-    assert "paused or cordoned" in out["api"]
+    assert "paused, cordoned, or unreachable" in out["api"]
 
 
 def test_fetch_no_eligible_host_skips_pinned_entries(tmp_home, valid_config_path):

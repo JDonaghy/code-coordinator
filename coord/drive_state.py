@@ -830,6 +830,85 @@ def _unreachable_machine_names(payload: dict) -> set[str]:
     return out
 
 
+def eligible_hosts_for_repo(
+    payload: dict,
+    repo: str,
+    config: Any,
+    *,
+    credential_fetcher=None,
+) -> tuple[list[Any], str]:
+    """``(hosts, pause_read_error)`` — the machines that declare *repo* and
+    currently survive pause/cordon, fleet-health unreachability (#2807), and
+    credential filtering (#3371).
+
+    This is the PRE-PROVIDER half of :func:`pick_machine_choice`'s own
+    candidate filter, factored out so a second caller can reuse the real
+    predicate instead of re-deriving "is this host routable" a second,
+    driftable way (#2085, #3600) — before this split,
+    ``coord.commands.drive_queue._fetch_no_eligible_host`` filtered on
+    ``can_work_on(repo)`` + ``coord.machine_pause.paused_set()`` only, which
+    silently disagreed with this function the moment #2807's unreachable
+    exclusion (or a future credential/#3371 one) fired: a host this function
+    would exclude as unroutable still read as "eligible" to that launch-time
+    net, so a launch into a fully-unreachable (not just paused/cordoned)
+    fleet still burned an attempt. One implementation now answers "is REPO
+    routable right now" for both call sites.
+
+    *pause_read_error* is non-empty only when reading the pause store itself
+    raised — see :func:`pick_machine_choice`'s own docstring for why this
+    still fails OPEN (treats the read failure as "nothing is paused") rather
+    than refusing to pick at all.
+
+    An empty *hosts* list conflates two causes a caller may need to tell
+    apart: no machine in *config* declares *repo* at all (nothing to do with
+    pause/cordon/health — callers that care check
+    ``any(repo in (m.repos or []) for m in config.machines)`` themselves),
+    or at least one machine declares it but every one was filtered out.
+    Provider capability is NOT applied here — that is
+    :func:`pick_machine_choice`'s own next filtering stage, over the hosts
+    this function already narrowed to, and a provider mismatch is a
+    *configuration* defect (#1906) distinct from "nothing survived
+    pause/health filtering" (#3600) — conflating the two would let a launch
+    into a provider-mismatched (but otherwise healthy) fleet skate past
+    attempt-charging the way #3600's launch-time net originally did.
+    """
+    pause_read_error = ""
+    try:
+        from coord.machine_pause import paused_set  # noqa: PLC0415
+
+        paused = paused_set(config.machines)
+    except Exception as exc:  # noqa: BLE001 — #2807: still fails OPEN here,
+        # matching `coord.machine_pause`'s own documented fail-soft contract
+        # for every other reader (module docstring: "a transient network
+        # blip degrades to 'nothing is paused' rather than wedging the
+        # dispatcher") — this function does not get to invent a stricter
+        # rule than the rest of the fleet's dispatchers share. What it must
+        # not do is stay SILENT about it: `pause_read_error` carries the
+        # failure back to the caller (`coord.drive`), which warns loudly
+        # instead of an operator's pause silently evaporating with nobody
+        # the wiser.
+        paused = set()
+        pause_read_error = f"{type(exc).__name__}: {exc}"
+
+    # #2807: exclude machines the fleet-health poll confidently reports as
+    # unreachable — independent of whether anyone remembered to `coord
+    # pause` them. Before this, a dead machine's load counted as 0 (it is
+    # running nothing), which made it sort FIRST — the deader the box, the
+    # more attractive it looked. See `_unreachable_machine_names` for what
+    # "confidently" means and why it stays narrower than the advisory-only
+    # health block.
+    unreachable = _unreachable_machine_names(payload)
+
+    hosts = [
+        m for m in config.machines
+        if repo in (m.repos or [])
+        and m.name not in paused
+        and m.name not in unreachable
+        and (credential_fetcher is None or credential_fetcher(m))
+    ]
+    return hosts, pause_read_error
+
+
 def pick_machine_choice(
     payload: dict,
     repo: str,
@@ -886,48 +965,22 @@ def pick_machine_choice(
     but capability filtering still applies (repo/``providers.default`` can
     still name a non-implicit provider).
     """
-    pause_read_error = ""
-    try:
-        from coord.machine_pause import paused_set  # noqa: PLC0415
-
-        paused = paused_set(config.machines)
-    except Exception as exc:  # noqa: BLE001 — #2807: still fails OPEN here,
-        # matching `coord.machine_pause`'s own documented fail-soft contract
-        # for every other reader (module docstring: "a transient network
-        # blip degrades to 'nothing is paused' rather than wedging the
-        # dispatcher") — this function does not get to invent a stricter
-        # rule than the rest of the fleet's dispatchers share. What it must
-        # not do is stay SILENT about it: `pause_read_error` carries the
-        # failure back to the caller (`coord.drive`), which warns loudly
-        # instead of an operator's pause silently evaporating with nobody
-        # the wiser.
-        paused = set()
-        pause_read_error = f"{type(exc).__name__}: {exc}"
-
-    # #2807: exclude machines the fleet-health poll confidently reports as
-    # unreachable — independent of whether anyone remembered to `coord
-    # pause` them. Before this, a dead machine's load counted as 0 (it is
-    # running nothing), which made it sort FIRST — the deader the box, the
-    # more attractive it looked. See `_unreachable_machine_names` for what
-    # "confidently" means and why it stays narrower than the advisory-only
-    # health block.
-    unreachable = _unreachable_machine_names(payload)
+    # #3600/#2085: the pause/cordon/unreachable/credential filter itself now
+    # lives in `eligible_hosts_for_repo` — see that function's docstring for
+    # why this moved, and for the "no host declares repo at all" vs. "every
+    # declaring host was filtered" distinction it deliberately leaves to its
+    # own callers rather than collapsing here.
+    hosts, pause_read_error = eligible_hosts_for_repo(
+        payload, repo, config, credential_fetcher=credential_fetcher,
+    )
+    if not hosts:
+        return MachineChoice(pause_read_error=pause_read_error)
 
     load: dict[str, int] = {}
     for a in payload.get("assignments") or []:
         if (a.get("status") or "") not in TERMINAL_STATUSES:
             name = a.get("machine_name") or ""
             load[name] = load.get(name, 0) + 1
-
-    hosts = [
-        m for m in config.machines
-        if repo in (m.repos or [])
-        and m.name not in paused
-        and m.name not in unreachable
-        and (credential_fetcher is None or credential_fetcher(m))
-    ]
-    if not hosts:
-        return MachineChoice(pause_read_error=pause_read_error)
 
     candidates = hosts
     provider_name = ""
