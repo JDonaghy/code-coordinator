@@ -297,6 +297,16 @@ COVERAGE_FENCE = "bugbash-coverage"
 #: each framework's own structured report format rather than parsing prose.
 FINDINGS_FENCE = "bugbash-findings"
 
+#: Shared with :func:`parse_unavailable_report` (#3628): the ONE regex both
+#: :func:`parse_findings_block` and the unavailable-signature guard use to
+#: detect a well-formed ```` ```bugbash-findings ```` fence — so "does this
+#: text carry a findings fence" is answered identically everywhere (#2096
+#: "one question, one answer"), rather than two independently-drifting
+#: `re.compile` calls.
+_FINDINGS_FENCE_RE = re.compile(
+    rf"```{re.escape(FINDINGS_FENCE)}\s*\n(.*?)```", re.DOTALL,
+)
+
 #: Mandatory acceptance line stamped onto every filed finding's issue body
 #: (#3487 requirement 5): a bugbash finding must not be closeable by a fix
 #: alone — it must also leave behind permanent automated coverage so the
@@ -513,10 +523,7 @@ def parse_findings_block(text: str, *, platform: str, repo: str) -> FindingsPars
     still parsed as a valid JSON list, so this is not elevated to a protocol
     error).
     """
-    pattern = re.compile(
-        rf"```{re.escape(FINDINGS_FENCE)}\s*\n(.*?)```", re.DOTALL,
-    )
-    match = pattern.search(text)
+    match = _FINDINGS_FENCE_RE.search(text)
     if match is None:
         if _is_explicit_clean_statement(text):
             return FindingsParseResult()
@@ -590,17 +597,34 @@ _UNAVAILABLE_SIGNATURES: tuple[str, ...] = (
 )
 
 
-def parse_unavailable_report(text: str) -> str:
+def parse_unavailable_report(text: str, *, final_message: str = "") -> str:
     """The lane-unavailable reason from *text* (a lane worker's full
     transcript), or ``""`` if none is present (#3566).
 
     First checks for the authoritative fenced
     ```` ```bugbash-unavailable ```` block the briefing instructs a worker
     to write when it hits a missing permission or absent session rather
-    than improvising a workaround (ask #4's hard rule). Falls back to
-    :data:`_UNAVAILABLE_SIGNATURES` — a driver-level session/permission
-    failure surfacing directly in a tool result even without the worker's
-    own cooperation.
+    than improvising a workaround (ask #4's hard rule), searched over the
+    full *text* so it is still caught even if reported mid-session before a
+    crash. Falls back to :data:`_UNAVAILABLE_SIGNATURES` — a driver-level
+    session/permission failure surfacing directly in a tool result even
+    without the worker's own cooperation.
+
+    *final_message* — the lane worker's own LAST assistant message, as
+    opposed to the full transcript in *text* — decides whether that
+    signature fallback is even reachable (#3628). A driver call that
+    returned ``"status": "unavailable"`` mid-session and was then worked
+    around still leaves that literal string somewhere in *text*; if the
+    worker's final message goes on to carry a well-formed
+    ```` ```bugbash-findings ```` fence, that fence is the worker's own
+    authoritative report and must decide the outcome, so the stale
+    mid-session signature is never allowed to override it. Only when
+    *final_message* carries NEITHER a findings fence NOR an unavailable
+    fence does the transcript-wide signature scan run. Passing
+    ``final_message=""`` (the default) disables this guard — callers that
+    cannot distinguish the final message from the full transcript keep the
+    pre-#3628 behavior, which only ever makes the fallback MORE eager, never
+    less.
 
     Never raises. The caller
     (:func:`coord.commands.bugbash._dispatch_and_await_lane`) treats a
@@ -613,6 +637,11 @@ def parse_unavailable_report(text: str) -> str:
         reason = match.group(1).strip()
         if reason:
             return reason
+    if final_message and (
+        _FINDINGS_FENCE_RE.search(final_message)
+        or _UNAVAILABLE_FENCE_RE.search(final_message)
+    ):
+        return ""
     for signature in _UNAVAILABLE_SIGNATURES:
         if signature in text:
             return f"driver/session signal found in transcript: {signature!r}"

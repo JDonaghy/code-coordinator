@@ -239,7 +239,16 @@ def _fetch_and_parse_outcome(machine, assignment_id: str, *, platform: str, repo
     # Must be checked BEFORE `parse_findings_block`: an unavailable report
     # deliberately carries no findings fence (the briefing tells the
     # worker to skip it), which would otherwise read as a protocol error.
-    unavailable_reason = parse_unavailable_report("\n\n".join(all_decoded_text_parts))
+    # #3628: `final_message=last_assistant_text` lets `parse_unavailable_report`
+    # tell a real, final-message unavailable report apart from a stale
+    # mid-session driver signature (e.g. an early failed `app-drive open`
+    # the worker then worked around) — a well-formed findings fence in the
+    # worker's OWN final message must decide the outcome, never be
+    # overridden by a signature that only ever appeared earlier in the
+    # transcript.
+    unavailable_reason = parse_unavailable_report(
+        "\n\n".join(all_decoded_text_parts), final_message=last_assistant_text,
+    )
     if unavailable_reason:
         return ExploreOutcome(
             unavailable=True, cost=summary.total_cost_usd, notes=unavailable_reason,
