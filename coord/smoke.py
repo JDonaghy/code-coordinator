@@ -983,18 +983,21 @@ def rank_smoke_machines(
 
     Returns an empty list when capabilities can't be matched.
 
-    #2636: candidates are also filtered through ``follow_on_paused_set`` —
-    **not** ``paused_set`` — before ranking. A smoke leg is the tail of work
-    already in flight (the Test stage that certifies a `done` work row), the
-    same shape #2240 established for a review leg, so a release cordon
-    ("route no NEW work here") must not filter its host out — that would
-    reproduce the 2026-08-14 drain deadlock, just in the Test stage instead
-    of Review. An explicit `coord pause` and a `quiet_hours` window both
-    still apply in full: the incident this closes was a smoke leg landing on
-    elitebook 82 minutes into its declared quiet-hours window, ten minutes
-    before the operator suspended it.
+    #2636: candidates are also filtered through pause/cordon state before
+    ranking. #2636 originally routed this through ``follow_on_paused_set``
+    (cordon-exempt), on the #2240 theory that a smoke leg is the tail of
+    work already in flight and so must not be filtered by a release cordon.
+    #3599 (2026-10-04) reverted that: a cordoned host kept getting fed
+    smoke/review/fix legs round after round of a multi-leg drive, which is
+    exactly what stopped it from ever draining. This now uses the FULL
+    ``paused_set`` — a release cordon filters a smoke candidate out same as
+    any other pause, routing to another capable, uncordoned machine or
+    leaving the row to wait. An explicit `coord pause` and a `quiet_hours`
+    window both still apply in full: the incident #2636 closed was a smoke
+    leg landing on elitebook 82 minutes into its declared quiet-hours
+    window, ten minutes before the operator suspended it.
 
-    *now* (#2636) is forwarded to ``follow_on_paused_set`` untouched —
+    *now* (#2636) is forwarded to ``paused_set`` untouched —
     ``None`` (the default, and every production call site) evaluates quiet
     hours against the real clock. The seam exists purely so a test can pin a
     specific wall-clock moment instead of depending on whatever instant the
@@ -1004,9 +1007,9 @@ def rank_smoke_machines(
     if not candidates:
         return []
 
-    from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+    from coord.machine_pause import paused_set  # noqa: PLC0415
 
-    paused = follow_on_paused_set(config.machines, now=now)
+    paused = paused_set(config.machines, now=now)
     candidates = [m for m in candidates if m.name not in paused]
     if not candidates:
         return []
@@ -1928,8 +1931,9 @@ def _report_unroutable_smoke(
       instead, and leave the row re-dispatchable.
 
     *paused_capable* (#2636): machine names that matched capability but were
-    filtered out of `rank_smoke_machines`'s ranking by `follow_on_paused_set`
-    — an explicit `coord pause` or a `quiet_hours` window — before
+    filtered out of `rank_smoke_machines`'s ranking by `paused_set` — an
+    explicit `coord pause`, a `quiet_hours` window, or (#3599) a release
+    cordon — before
     `dispatch_smoke` ever got to try them, so `attempts` is empty for a
     reason that has nothing to do with capability. Naming that here keeps the
     recorded reason from reading as "no capable machine" while capable
@@ -2694,9 +2698,9 @@ def _dispatch_smoke_single_leg(
             required_caps, completed.repo_name, config
         )
         if capable:
-            from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+            from coord.machine_pause import paused_set  # noqa: PLC0415
 
-            paused = follow_on_paused_set(config.machines)
+            paused = paused_set(config.machines)
             paused_capable = sorted(m.name for m in capable if m.name in paused)
 
     # #2168: pin the Test stage's model to avoid the agent falling through to

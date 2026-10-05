@@ -3604,15 +3604,13 @@ class TestRouteWorkByCapability:
         assert result.unmet_capabilities == ("macos",)
 
     def test_paused_machine_is_never_a_reroute_target(self) -> None:
-        """#3241 review: every other machine-selection path in this file
-        (`rank_smoke_machines`/`_capability_matched_machines` in
-        coord/smoke.py, #2636; `select_fix_machine`, #2240) cordons via
-        `follow_on_paused_set`. Work dispatch is NEW work, not the tail of
-        a leg already in flight, so it must use the FULL `paused_set()` —
-        the same one `coord.brain.propose()` and `coord assign`'s CLI both
-        gate a `type="work"` proposal's machine on. A reroute must not
-        silently land the work on a machine the operator explicitly
-        `coord pause`d."""
+        """#3241 review: this reroute path has always used the FULL
+        `paused_set()` — the same one `coord.brain.propose()` and `coord
+        assign`'s CLI both gate a `type="work"` proposal's machine on. A
+        reroute must not silently land the work on a machine the operator
+        explicitly `coord pause`d. (`rank_smoke_machines`/`select_fix_machine`
+        also resolve the FULL `paused_set()` now too, since #3599 — a
+        release cordon is no longer exempted for a follow-on leg either.)"""
         from coord.machine_pause import local_pause
 
         local_pause("macmini")

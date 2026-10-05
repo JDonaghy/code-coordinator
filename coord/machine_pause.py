@@ -76,7 +76,7 @@ else:
   for a cordon to lapse; the live loop renews on every run while the host is
   still behind (#2101 trap B).
 
-#2240: A CORDON MEANS "NO NEW WORK", AND A FOLLOW-ON LEG IS NOT NEW WORK.
+#2240/#3599: A CORDON MEANS "NO NEW WORK" — INCLUDING A FOLLOW-ON LEG.
 Folding cordons into the one `paused_set()` is what made #2101 buildable, but
 it also gave a cordon a reach a *drain* must not have.  Observed 2026-08-14:
 the fleet cordoned to drain for v0.5.77; an entry that had finished Work and
@@ -86,15 +86,31 @@ machine configured"; the entry therefore stayed `running` forever; a
 perpetually-running entry defers the roll; a deferred roll leaves the cordon
 up.  Four cycles, 70 minutes, three idle machines, no exit without a human.
 
-The cordon was blocking the completion of the very work it was waiting to
-drain.  So `paused_set(..., include_cordons=False)` — reached through
-`follow_on_paused_set()` — is the set a dispatch consults when it is
-finishing work already in flight rather than starting new work.  It still
-honours explicit `coord pause` and quiet hours: those are an operator's or a
-policy's decision about a machine and mean what they say.  A cordon is this
-fleet's own drain asking a host to go idle, and refusing to dispatch the leg
-that would make it idle is self-defeating (a `--merge-of`/review dispatch
-onto a cordoned host is what the drain WANTS — it is what ends the work).
+#2240's fix was `paused_set(..., include_cordons=False)` — reached through
+`follow_on_paused_set()` below — on the theory that a review/fix/smoke leg
+for work already in flight is "the tail of" that work, not new work, so a
+cordon must not filter its host out: the drain WANTS that leg to finish.
+#3599 (2026-10-04) found the theory's flaw: a `request-changes` round can
+chain review -> fix -> review indefinitely, so a leg is not reliably
+terminal, and the bypass kept re-landing each round of a multi-leg drive
+onto the exact host the cordon was waiting to drain — the host never
+reached zero active work, the roll never found its window, and the drive
+kept the cordon (and the bypass) alive indefinitely instead of for one
+short review. `follow_on_paused_set()` is therefore no longer used for
+dispatch TARGET selection anywhere (`select_fix_machine`,
+`pick_reviewer_machine`, `_ranked_reviewer_candidates`, `rank_smoke_machines`
+all read the FULL `paused_set()` now, same as new work) — a cordoned host
+routes exactly like a paused one: candidates fall through to another
+configured machine, or the leg waits if the whole fleet is cordoned. The
+one remaining caller, `coord.commands.release._paused_machine_busy`, uses it
+for a different question entirely — "is this machine busy for QUIESCENCE
+purposes" — where excluding the cordon is still correct: a cordon is this
+command's own drain mechanism, not a sign the host was already idle, and
+feeding it back in as "busy" would make the roll defer on itself. The
+#2741/#3336 deferral-pressure stall floor (`coord.release_cordon`) is what
+now bounds how long a wholly-cordoned fleet can leave a leg waiting,
+replacing the per-dispatch bypass as the backstop against #2240's original
+70-minute deadlock.
 
 #2146: OPERATOR-SET quiet hours.  #1862's window can only be declared in
 `coordinator.yml`, which on a thin client is a read-only cache that is
@@ -197,13 +213,13 @@ def paused_set(
     own in-process tick-loop calls (no board service configured for
     itself), and any solo/local use with no daemon at all.
 
-    *include_cordons* (#2240) is False only for a dispatch that FINISHES work
-    already in flight — see `follow_on_paused_set()`, which is the name every
-    caller should use, and the module docstring for the 70-minute fleet-wide
-    deadlock that made this necessary. It never widens the set: explicit
-    pauses and quiet hours are untouched, and a cordon read that fails is
-    left IN (a cordon we could not resolve stays a pause, the same direction
-    every other read here fails in).
+    *include_cordons* (#2240, narrowed by #3599) is False only for
+    `follow_on_paused_set()`'s one remaining caller — a quiescence BUSY
+    signal, not a dispatch-target decision; see that function's docstring
+    and the module docstring's "#2240/#3599" section. It never widens the
+    set: explicit pauses and quiet hours are untouched, and a cordon read
+    that fails is left IN (a cordon we could not resolve stays a pause, the
+    same direction every other read here fails in).
     """
     svc = _resolve_service()
     if svc is not None:
@@ -229,19 +245,26 @@ def paused_set(
 def follow_on_paused_set(
     machines: Sequence["Machine"] | None = None, *, now: datetime | None = None,
 ) -> set[str]:
-    """The pause set for a dispatch that COMPLETES in-flight work (#2240).
+    """`paused_set()` minus release cordons (#2240, narrowed by #3599).
 
-    `paused_set()` minus release cordons. Use this — and only this — for a
-    review / smoke / fix leg of an assignment that is already running: a
-    cordon means "route no NEW work here", and the tail of the work the
-    cordon is explicitly waiting to drain is not new work. Blocking it is
-    self-defeating in the precise way #2240 observed, because the entry can
-    then never finish, so the host never drains, so the cordon never lifts,
-    so the roll defers and re-cordons.
+    #3599: NOT for picking a dispatch TARGET any more — every candidate
+    selector that used to call this for a review/fix/smoke leg
+    (`select_fix_machine`, `pick_reviewer_machine`,
+    `_ranked_reviewer_candidates`, `rank_smoke_machines`) now reads the FULL
+    `paused_set()` instead, because a leg is not reliably terminal (a
+    `request-changes` round can chain review -> fix -> review indefinitely)
+    and the bypass kept re-landing each round onto the exact host the
+    cordon was waiting to drain. See the module docstring's "#2240/#3599"
+    section for the full incident history.
 
-    Everything else still applies: an explicit `coord pause` and a quiet-hours
-    window both mean "this machine is unavailable, full stop", and neither is
-    this fleet's own drain talking to itself.
+    What this is still for: `coord.commands.release._paused_machine_busy`
+    asks a different question — "is this machine busy for QUIESCENCE
+    purposes" — and there excluding the cordon is correct, because a cordon
+    is that command's own drain mechanism, not a sign the host was already
+    idle; feeding it back in as "busy" would make the roll defer on itself.
+    Do not reach for this function for a NEW dispatch-target decision —
+    use `paused_set()` there, same as this module's other callers always
+    have.
     """
     return paused_set(machines, now=now, include_cordons=False)
 
@@ -357,11 +380,12 @@ def local_paused_set(
     so quiet hours apply), and what `paused_set()` itself falls through to
     when no board service is configured.
 
-    *include_cordons* (#2240) drops the cordon half for a dispatch that
-    finishes work already in flight — see `follow_on_paused_set()`. The
-    daemon's own `/pause` handler must never pass it: what that endpoint
-    publishes is the full routing set, and the subtraction is the caller's
-    decision to make, per dispatch.
+    *include_cordons* (#2240, narrowed by #3599) drops the cordon half for
+    `follow_on_paused_set()`'s one remaining caller, a quiescence busy
+    signal — see that function's docstring. The daemon's own `/pause`
+    handler must never pass it: what that endpoint publishes is the full
+    routing set, and the subtraction is the caller's decision to make, per
+    use.
     """
     effective = _explicit_paused_set()
     if include_cordons:

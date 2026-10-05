@@ -181,6 +181,46 @@ count alone) — never the reverse, which would fail toward holding the fleet
 cordoned longer on missing data, the same wrong direction #2101's read-side
 failures already refuse everywhere else in this module.
 
+#3599: THE FOLLOW-ON-BLIND PREMISE ITSELF WAS THE DEEPER BUG
+----------------------------------------------------------------
+#2741 corrected *how the deferral-release reads* a cordon-blind leg
+dispatch; it still took "a review, fix, or smoke leg dispatches onto a
+cordoned host exactly as if it were not cordoned" as a given. Observed
+2026-10-04 (vimcode#1745): a `request-changes` review can produce a fix
+round, which produces another review, with no bound on the cycle — so a
+leg is not reliably "the tail of" the work the cordon is draining, the
+premise #2240's bypass rested on. Each round of that cycle kept landing on
+precision, the exact host `coord release propagate` had cordoned, so
+precision never reached zero active work, the roll never found a
+quiescent window, and the drive-queue entry's own `running` status kept
+deferring the roll on top of that — the cordon and the bypass sustained
+each other instead of either resolving.
+
+:func:`coord.machine_pause.follow_on_paused_set` is therefore no longer
+used for ANY dispatch-target decision — `select_fix_machine`,
+`pick_reviewer_machine`, `_ranked_reviewer_candidates` and
+`rank_smoke_machines` all resolve candidates against the FULL
+`paused_set()` now, cordons included, same as a brand-new dispatch. A
+cordoned host routes a follow-on leg exactly like a paused one: fall
+through to another configured, uncordoned machine, or — if the whole
+fleet is cordoned — leave the entry `running` with no live assignment and
+let it wait.
+
+This does not retire the machinery above. `deferral_pressure`'s
+``progressed`` check is not actually about legs landing on cordoned hosts
+specifically — it compares the fleet's busy signal between deferred ticks,
+which stays meaningful however that busy signal was produced (a leg
+finishing and another starting on an UNCORDONED host converges the drain
+exactly the same way). What changes is only the shape of the stall this
+whole mechanism now has to catch: with the per-dispatch bypass gone, a
+wholly-cordoned fleet with a multi-leg drive produces the SAME-looking
+unattributable-or-unmoving busy signal on every tick (no leg landing
+anywhere to change it), which is precisely the ``progressed=False`` case
+this module's count-and-time floor already releases. The deferral-pressure
+stall floor (:data:`DEFAULT_CORDON_STALL_SECONDS`, #3336) is now the sole
+backstop against #2240's original 70-minute deadlock — not a second
+mechanism alongside the bypass, its replacement.
+
 #3336: A TICK COUNT MEANS A DIFFERENT DURATION AT EVERY POLL CADENCE
 ------------------------------------------------------------------------
 ``DEFAULT_MAX_DEFERRALS`` (2) was calibrated against one specific caller:
