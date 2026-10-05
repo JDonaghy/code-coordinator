@@ -91,6 +91,7 @@ from coord.bugbash import (
     LaneChunkPlan,
     _ShardCostState,
     build_exploration_briefing,
+    catalogue_warning_for_lane,
     discover_lanes,
     driver_command_for_lane,
     explore_lane_sharded,
@@ -296,6 +297,7 @@ def _dispatch_and_await_lane(
     checklist=EXPLORATION_CHECKLIST,
     catalogue_text: str | None = None,
     journeys_override: list[Journey] | tuple[Journey, ...] | None = None,
+    catalogue_warning: str = "",
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     timeout: float = DEFAULT_LANE_TIMEOUT,
     cost_cap: float = float("inf"),
@@ -315,6 +317,15 @@ def _dispatch_and_await_lane(
     :data:`coord.bugbash.ChunkExplorer` (one journeys-bearing call per
     chunk) without needing two separate dispatch implementations (#2096
     "one question, one answer").
+
+    *catalogue_warning* (#3620 review finding 4) is threaded through
+    alongside *journeys_override*, also verbatim, to
+    :func:`coord.bugbash.build_exploration_briefing`'s own
+    *catalogue_warning* parameter — the caller (``bugbash_run_cmd``)
+    precomputes it once per lane via
+    :func:`coord.bugbash.catalogue_warning_for_lane` so a worker handed an
+    empty chunk still sees the ``NOTE:`` explaining why, exactly like the
+    unsharded path always has.
 
     Never raises on a dispatch/poll/log failure — every such path returns
     ``ok=False`` with the reason folded into ``notes`` (#2096: this must
@@ -380,6 +391,7 @@ def _dispatch_and_await_lane(
     briefing = build_exploration_briefing(
         lane, reference_backend=reference_backend, checklist=checklist,
         catalogue_text=catalogue_text, journeys_override=journeys_override,
+        catalogue_warning=catalogue_warning,
     )
     proposal = Proposal(
         id=0,
@@ -635,8 +647,23 @@ def _describe_lane_chunk_plan(
     )
 
 
+def _lane_key(lane: BugbashLane) -> tuple[str, str]:
+    """The key every per-lane dict in this module uses for *lane* (#3620
+    review non-blocking note): ``(platform, machine)``, not bare
+    ``platform`` — the real fleet can have two lanes sharing a platform
+    on different hosts (see :class:`coord.bugbash._RoundExploreState`'s
+    own docstring), and keying by platform alone would hand both the SAME
+    scheduler/warning. Value-based (not ``id(lane)``) on purpose: a lane
+    is a plain, frozen, equality-comparable value (no two lanes this
+    module discovers legitimately share both platform AND machine), so a
+    caller holding its own equal-but-distinct ``BugbashLane`` instance
+    (e.g. a test driving the ``explorer`` closure directly) still looks
+    up the same entry."""
+    return (lane.platform, lane.machine)
+
+
 def _print_cumulative_coverage(
-    lanes: list[BugbashLane], schedulers: dict[str, JourneyScheduler],
+    lanes: list[BugbashLane], schedulers: dict[tuple[str, str], JourneyScheduler],
 ) -> None:
     """``coord bugbash run``'s final "cumulative coverage per lane"
     summary (#3620 requirement 3: "attempted/passed/found/skipped across
@@ -648,9 +675,12 @@ def _print_cumulative_coverage(
     cleared). Silent for a lane whose scheduler tracks no catalogue
     journeys at all (checklist-fallback lanes) — there is nothing
     cumulative to report there beyond what :func:`_print_round` already
-    printed per round."""
+    printed per round.
+
+    Keyed by :func:`_lane_key` — see its docstring for why bare
+    ``lane.platform`` is not enough."""
     for lane in lanes:
-        scheduler = schedulers.get(lane.platform)
+        scheduler = schedulers.get(_lane_key(lane))
         if scheduler is None or not scheduler.journeys:
             continue
         cov = scheduler.cumulative_summary()
@@ -803,7 +833,8 @@ def bugbash_cmd() -> None:
     "on overall wait/spend.",
 )
 @click.option(
-    "--journeys-per-worker", type=int, default=DEFAULT_JOURNEYS_PER_WORKER, show_default=True,
+    "--journeys-per-worker", type=click.IntRange(min=1), default=DEFAULT_JOURNEYS_PER_WORKER,
+    show_default=True,
     help="#3620: split each lane's (post --max-priority) journey list into chunks of at most "
     "this many journeys, dispatching one worker per chunk instead of the whole lane to a "
     "single time-boxed session. GUI lanes (win-native/mac-native/gtk-native) run their "
@@ -811,7 +842,7 @@ def bugbash_cmd() -> None:
     "host's own max_workers.",
 )
 @click.option(
-    "--max-priority", type=int, default=None,
+    "--max-priority", type=click.IntRange(min=1), default=None,
     help="#3620: only walk catalogue journeys with priority <= this (e.g. 1 = priority-1 "
     "only), applied BEFORE sharding into chunks. Unset (default): no filter.",
 )
@@ -875,14 +906,27 @@ def bugbash_run_cmd(
     # was previewed.
     catalogue = parse_catalogue(catalogue_text)
     machines_by_name = {m.name: m for m in cfg.machines}
-    schedulers: dict[str, JourneyScheduler] = {}
+    schedulers: dict[tuple[str, str], JourneyScheduler] = {}
+    # #3620 review finding 4: the catalogue-fallback `NOTE:` precomputed
+    # once per lane here (via the SAME `plan.journeys` the scheduler is
+    # seeded from, so it can never disagree with what was actually
+    # dispatched) and threaded through `chunk_explorer` below — otherwise
+    # `chunk_explorer` always passes a (possibly empty) `journeys_override`
+    # tuple, never `None`, so `build_exploration_briefing` could never
+    # derive this warning itself.
+    catalogue_warnings: dict[tuple[str, str], str] = {}
     for lane in lanes:
         plan = plan_lane_chunks(
             lane, catalogue.journeys,
             journeys_per_worker=journeys_per_worker, max_priority=max_priority,
         )
-        schedulers[lane.platform] = JourneyScheduler(
+        # Keyed by `_lane_key(lane)` -- see its docstring for why bare
+        # `lane.platform` is not enough (#3620 review non-blocking note).
+        schedulers[_lane_key(lane)] = JourneyScheduler(
             journeys=plan.journeys, journeys_per_worker=journeys_per_worker,
+        )
+        catalogue_warnings[_lane_key(lane)] = catalogue_warning_for_lane(
+            catalogue, lane.driver_kind, plan.journeys,
         )
         host_max_workers = 1
         machine = machines_by_name.get(lane.machine)
@@ -920,6 +964,7 @@ def bugbash_run_cmd(
         return _dispatch_and_await_lane(
             lane, round_num, repo_name=repo, config=cfg, reference_backend=reference,
             catalogue_text=catalogue_text, journeys_override=journeys,
+            catalogue_warning=catalogue_warnings.get(_lane_key(lane), ""),
             timeout=lane_timeout, cost_cap=cost_cap_per_lane,
         )
 
@@ -934,7 +979,7 @@ def bugbash_run_cmd(
         outcome = explore_lane_sharded(
             lane, round_num,
             chunk_explorer=chunk_explorer,
-            scheduler=schedulers[lane.platform],
+            scheduler=schedulers[_lane_key(lane)],
             cost_state=shard_cost_state,
             cost_cap_per_lane=cost_cap_per_lane,
             cost_cap_total=cost_cap_total,

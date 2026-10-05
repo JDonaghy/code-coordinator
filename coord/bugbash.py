@@ -1075,7 +1075,7 @@ class LaneChunkPlan:
 
 
 def plan_lane_chunks(
-    lane: "BugbashLane",
+    lane: BugbashLane,
     catalogue_journeys: Sequence[Journey],
     *,
     journeys_per_worker: int = DEFAULT_JOURNEYS_PER_WORKER,
@@ -1090,7 +1090,7 @@ def plan_lane_chunks(
     return LaneChunkPlan(platform=lane.platform, journeys=tuple(lane_journeys), chunks=tuple(chunks))
 
 
-def max_concurrent_chunks_for_lane(lane: "BugbashLane", host_max_workers: int) -> int:
+def max_concurrent_chunks_for_lane(lane: BugbashLane, host_max_workers: int) -> int:
     """How many of *lane*'s chunks may be dispatched to its host at once
     this round (#3620 requirement 1).
 
@@ -1113,7 +1113,7 @@ def max_concurrent_chunks_for_lane(lane: "BugbashLane", host_max_workers: int) -
 #: every round/chunk dispatched so far this run (#3620 requirement 3) —
 #: distinct from :class:`JourneyOutcome.status`, which is what ONE chunk's
 #: worker reported for ONE round; this is the latest-known value, carried
-#: forward whennever a journey isn't re-walked in a later round.
+#: forward whenever a journey isn't re-walked in a later round.
 _JOURNEY_NOT_RUN = "not_run"
 
 
@@ -1147,7 +1147,7 @@ class JourneyScheduler:
 
     journeys: tuple[Journey, ...]
     journeys_per_worker: int = DEFAULT_JOURNEYS_PER_WORKER
-    _status: dict[str, str] = field(default_factory=dict, repr=False)
+    _status: dict[str, str] = field(default_factory=dict, repr=False, init=False)
 
     def __post_init__(self) -> None:
         for j in self.journeys:
@@ -1177,7 +1177,18 @@ class JourneyScheduler:
         outcome naming a journey id this scheduler doesn't track (e.g. a
         checklist item's own text, when this lane fell back to the
         checklist) is silently ignored — only catalogue journeys are
-        scheduled/tracked here."""
+        scheduled/tracked here.
+
+        **Caller contract (#3620 review finding 1):** only call this with
+        outcomes from a chunk the caller has already classified as
+        trustworthy (``outcome.ok and not outcome.protocol_error`` — see
+        :func:`explore_lane_sharded`). A ``found``/``passed`` status
+        recorded here is PERMANENT — :meth:`_ordered_for_round` never
+        re-queues a ``found`` journey, and :meth:`cumulative_summary`
+        counts a ``passed`` one as covered — so recording from a chunk
+        whose findings fence was unparseable (#3517) would both silently
+        drop the finding and permanently stop re-walking the journey that
+        produced it."""
         for outcome in outcomes:
             if outcome.journey_id in self._status:
                 self._status[outcome.journey_id] = outcome.status
@@ -1502,6 +1513,34 @@ def _pick_lane_machine(
     return None
 
 
+def catalogue_warning_for_lane(
+    catalogue: CatalogueResult, driver_kind: str, lane_journeys: Sequence[Journey],
+) -> str:
+    """The #3580-required ``NOTE:`` text for ONE lane: *catalogue*'s own
+    ``warning`` (missing/invalid catalogue, dropped entries, ...) combined
+    with the lane-specific reason when *lane_journeys* (this lane's own
+    post-filter slice, already computed by the caller — e.g.
+    :func:`journeys_for_lane` or :func:`plan_lane_chunks`) comes back empty
+    despite *catalogue* having parsed at least one journey overall.
+    ``""`` when there's nothing to warn about for this lane.
+
+    The ONE place this reasoning lives, so it produces the identical text
+    whether called from :func:`build_exploration_briefing`'s own
+    unsharded (``journeys_override=None``) path or precomputed once per
+    lane by :mod:`coord.commands.bugbash` and threaded through
+    *catalogue_warning* for the sharded path (#3620 review finding 4) —
+    the latter must never go silently warning-less just because a chunk's
+    journeys were resolved up front instead of re-derived here."""
+    warning = catalogue.warning
+    if catalogue.journeys and not lane_journeys:
+        no_lane_note = (
+            f"{CATALOGUE_PATH} has no journey declaring lane "
+            f"{driver_kind!r} — falling back to the generic checklist"
+        )
+        warning = f"{warning}; {no_lane_note}" if warning else no_lane_note
+    return warning
+
+
 def build_exploration_briefing(
     lane: BugbashLane,
     *,
@@ -1509,6 +1548,7 @@ def build_exploration_briefing(
     checklist: Sequence[str] = EXPLORATION_CHECKLIST,
     catalogue_text: str | None = None,
     journeys_override: Sequence[Journey] | None = None,
+    catalogue_warning: str = "",
 ) -> str:
     """Compose the seed briefing for a lane's headless exploration worker.
 
@@ -1546,25 +1586,25 @@ def build_exploration_briefing(
     (falls through to the *checklist* branch below, exactly like "no
     catalogue journeys for this lane" always has) — only ``None`` means
     "no override, derive it from *catalogue_text* the old way."
+
+    *catalogue_warning* (#3620 review finding 4) is the ``NOTE:`` text to
+    show when *journeys_override* is given — since the override already
+    resolved which journeys this chunk owns, this function can't re-derive
+    the warning from *catalogue_text* itself (that's exactly what
+    *journeys_override* exists to avoid, #2096), so the caller (normally
+    :mod:`coord.commands.bugbash`, via :func:`catalogue_warning_for_lane`)
+    must compute and pass it. Ignored when *journeys_override* is
+    ``None`` — that path still derives its own warning from
+    *catalogue_text* below, unchanged from before #3620.
     """
-    catalogue_warning = ""
     lane_journeys: list[Journey] = []
     if journeys_override is not None:
         lane_journeys = list(journeys_override)
     elif catalogue_text is not None:
         catalogue = parse_catalogue(catalogue_text)
-        catalogue_warning = catalogue.warning
         if catalogue.journeys:
             lane_journeys = journeys_for_lane(catalogue.journeys, lane.driver_kind)
-            if not lane_journeys:
-                no_lane_note = (
-                    f"{CATALOGUE_PATH} has no journey declaring lane "
-                    f"{lane.driver_kind!r} — falling back to the generic checklist"
-                )
-                catalogue_warning = (
-                    f"{catalogue_warning}; {no_lane_note}" if catalogue_warning
-                    else no_lane_note
-                )
+        catalogue_warning = catalogue_warning_for_lane(catalogue, lane.driver_kind, lane_journeys)
 
     usage_line_1, usage_line_2 = _app_drive_usage_lines(lane.driver_kind, lane.launch_command)
     run_spec_usage = app_drive_run_spec_usage(lane.driver_kind, lane.launch_command)
@@ -1811,7 +1851,20 @@ class _ShardCostState:
         under the lock, with the chunk's own dispatch (and its eventual
         :meth:`record` call) left to the caller to run OUTSIDE the lock, the
         same check-then-run-outside-the-lock split
-        :func:`_explore_round_lanes` already uses for lane-level caps."""
+        :func:`_explore_round_lanes` already uses for lane-level caps.
+
+        **Not a true reserve-then-commit (#3620 review non-blocking
+        note):** this only READS the cost booked so far — nothing is
+        booked for a chunk until it finishes and calls :meth:`record`.
+        A chunk's cost is unknown until it completes, so there is no
+        value to pre-book. Consequence: in the concurrent (``tui-pty``)
+        path, every one of ``max_concurrent_chunks`` threads can pass
+        this check before any of them finishes and records, so "no new
+        chunk starts once a cap trips" can overshoot by up to
+        ``max_concurrent_chunks - 1`` chunks already in flight at the
+        moment the cap tripped — those always finish and have their cost
+        recorded (never abandoned), only a chunk that has NOT yet called
+        this is ever held back."""
         with self.lock:
             spent = self.lane_cost.get(platform, 0.0)
             if spent >= cap_per_lane:
@@ -1870,28 +1923,50 @@ def explore_lane_sharded(
     :func:`build_exploration_briefing` to fall back to the checklist
     exactly like it always has, so a repo with no catalogue sees no
     behaviour change from this feature existing.
+
+    Three trust-preserving rules (#3620 review round 1), each a direct
+    consequence of chunking introducing a NEW aggregation step the
+    unsharded path never needed:
+
+    - A chunk's ``journey_outcomes`` are only handed to
+      ``scheduler.record()`` — the PERMANENT, cross-round record of what
+      this lane has covered — when that chunk is itself trustworthy
+      (``outcome.ok and not outcome.protocol_error``). A chunk whose
+      findings fence was unparseable must never get to silently mark a
+      journey ``found``/``passed`` forever.
+    - If every chunk this round was skipped before it ever ran (a cap
+      already tripped at the very first reservation check — see
+      :class:`_ShardCostState`), the aggregate comes back ``ok=False``,
+      never the default ``ok=True, findings=()`` ("we looked, there
+      weren't any") — a round that explored NOTHING must be
+      distinguishable from a round that explored everything and found
+      nothing clean, so :func:`run_bugbash`'s termination-reason logic
+      (#3546) doesn't fall through to ``"zero_findings"``.
+    - If a LATER chunk reports ``unavailable=True`` after an EARLIER
+      chunk already produced real findings/coverage this round, those
+      earlier results are never discarded: the aggregate reports
+      ``ok=False`` (not ``unavailable=True``) with the findings intact
+      and the unavailability folded into ``notes`` — only when NO chunk
+      produced anything usable does this report ``unavailable=True``.
     """
     chunks = scheduler.chunks_for_round()
     if not chunks:
         chunks = [()]
 
     outcomes: list[ExploreOutcome | None] = [None] * len(chunks)
-    lock = threading.Lock()
-    stopped = {"flag": False}
+    stopped = threading.Event()
 
     def attempt(index: int) -> None:
-        with lock:
-            if stopped["flag"]:
-                return
-            reason = cost_state.try_reserve(lane.platform, cost_cap_per_lane, cost_cap_total)
-            if reason:
-                return
+        if stopped.is_set():
+            return
+        reason = cost_state.try_reserve(lane.platform, cost_cap_per_lane, cost_cap_total)
+        if reason:
+            return
         outcome = chunk_explorer(lane, round_num, chunks[index])
         cost_state.record(lane.platform, outcome.cost)
         outcomes[index] = outcome
         if outcome.unavailable:
-            with lock:
-                stopped["flag"] = True
+            stopped.set()
 
     if max_concurrent_chunks <= 1:
         for i in range(len(chunks)):
@@ -1923,7 +1998,14 @@ def explore_lane_sharded(
             continue
         findings.extend(outcome.findings)
         journey_outcomes.extend(outcome.journey_outcomes)
-        scheduler.record(outcome.journey_outcomes)
+        if outcome.ok and not outcome.protocol_error:
+            # #3620 review finding 1: never let the scheduler's PERMANENT
+            # cross-round record treat a chunk the trust layer has just
+            # classified as failed/unparseable as a verified
+            # "found"/"passed" journey — that would both drop the
+            # finding silently (a `found` journey is never auto-requeued)
+            # and permanently stop re-walking it.
+            scheduler.record(outcome.journey_outcomes)
         if not outcome.ok:
             ok = False
             notes_parts.append(outcome.notes or "chunk explorer reported failure")
@@ -1936,7 +2018,43 @@ def explore_lane_sharded(
             "(cost cap already tripped, or a sibling chunk reported the lane unavailable)"
         )
 
+    if skipped_count == len(chunks):
+        # #3620 review finding 2: every chunk was dropped before it ever
+        # ran (a cap already tripped at the very first reservation
+        # check) — nothing was exercised this round at all, which must
+        # never come back as `ExploreOutcome()`'s default `ok=True,
+        # findings=()` ("we looked, there weren't any"): that would let
+        # `all_explored_lanes_failed`/`all_explored_lanes_unavailable_or_
+        # failed` stay False for a round that explored nothing, and
+        # `run_bugbash` would fall through to `reason="zero_findings"`
+        # exactly like the #3546 bug this module was already fixed for.
+        return ExploreOutcome(
+            ok=False,
+            cost=total_cost,
+            notes="; ".join(notes_parts)
+            or "every chunk skipped this round (cost cap already tripped)",
+        )
+
     if unavailable:
+        if findings or journey_outcomes:
+            # #3620 review finding 3: a LATER chunk reporting the lane
+            # unavailable must never discard real findings/coverage an
+            # EARLIER chunk already verified this round — report
+            # `ok=False` (never `unavailable=True`, which
+            # `_apply_outcome_to_round` treats as "never contributes
+            # findings this round, even defensively") with the
+            # unavailability folded into `notes` instead.
+            notes_parts.insert(
+                0, f"lane became unavailable partway through this round: {unavailable_notes}"
+            )
+            return ExploreOutcome(
+                findings=tuple(findings),
+                cost=total_cost,
+                ok=False,
+                protocol_error="; ".join(protocol_errors),
+                journey_outcomes=tuple(journey_outcomes),
+                notes="; ".join(notes_parts),
+            )
         return ExploreOutcome(unavailable=True, cost=total_cost, notes=unavailable_notes)
 
     return ExploreOutcome(
