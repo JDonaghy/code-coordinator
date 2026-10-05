@@ -8349,7 +8349,9 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         repo_limited = any(item.repo_limited for item in plan.deferrals)
         backing_off = any(item.backing_off for item in plan.deferrals)
         no_eligible_host = any(item.no_eligible_host for item in plan.deferrals)
-        active = [c for c in (cordoned, repo_limited, backing_off, no_eligible_host) if c]
+        active = [
+            c for c in (cordoned, repo_limited, backing_off, no_eligible_host) if c
+        ]
         if len(active) > 1:
             # Post-review fix: a MIXED benign set (e.g. one cordoned entry,
             # one backing off) used to have the cordon branch's message

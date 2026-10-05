@@ -7316,6 +7316,47 @@ def test_die_exit_message_is_written_to_the_run_log_not_just_the_pane(
     assert "Last board state: status='CONFLICT' reason='rebase failed'" in log_text
 
 
+def test_a_die_exit_does_not_duplicate_its_reason_in_the_run_log(
+    driver_factory, tmp_path, monkeypatch,
+):
+    """#3600 review round 1 non-blocking finding: `run()` used to append its
+    own `drive_exited` summary on EVERY exit, including the ordinary
+    `_die()`/`_succeed()` path `_loop` itself already appends
+    `action.message` to (#2712) — so a `_die()` exit's explanation ended up
+    in the run log TWICE (once plain, once re-wrapped as "drive exited for
+    ... (exit_code=N): <same text>"), and even a clean run gained a
+    redundant "drive exited for ... (exit_code=0): ok" line it never used
+    to have. `run()` now skips its own append for that one path
+    (`_exit_action_logged`) — every other terminal path is unaffected, see
+    the sibling test below."""
+    driver = driver_factory([board(status="done", test_state="")])
+
+    def fake_decide(*a, **kw):
+        return _die("boom — distinctive once-only text")
+
+    monkeypatch.setattr("coord.drive.decide", fake_decide)
+    exit_code = driver.run()
+    assert exit_code == EXIT_TERMINAL_FAILURE
+    log_text = (tmp_path / f"{REPO}-{ISSUE}.log").read_text(encoding="utf-8")
+    assert log_text.count("boom — distinctive once-only text") == 1
+    assert "drive exited for" not in log_text
+
+
+def test_a_deadline_exit_still_logs_its_summary_exactly_once(driver_factory, tmp_path):
+    """Unlike the `_die()`/`_succeed()` path above, `EXIT_DEADLINE` never
+    goes through `_loop`'s `action.is_exit` branch — `self.warn()` only
+    reaches the tmux pane, not `_run_log` — so `run()`'s own `drive_exited`
+    summary append must stay the ONLY record for this path, unaffected by
+    the #3600 review round 1 de-duplication above."""
+    driver = driver_factory(
+        [board(status="running")],
+        opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=2.5 / 60.0),
+    )
+    assert driver.run() == EXIT_DEADLINE
+    log_text = (tmp_path / f"{REPO}-{ISSUE}.log").read_text(encoding="utf-8")
+    assert log_text.count("drive exited for") == 1
+
+
 def test_driver_writes_a_start_marker_even_when_the_loop_never_spawns_anything(
     driver_factory, tmp_path
 ):

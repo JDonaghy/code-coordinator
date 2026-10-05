@@ -22,6 +22,7 @@ from coord.drive_state import (
     DriveStateError,
     IssueState,
     MachineChoice,
+    eligible_hosts_for_repo,
     pick_machine,
     pick_machine_choice,
     project,
@@ -1247,6 +1248,76 @@ def test_pick_machine_no_signal_or_stale_signal_stays_a_candidate(row_or_absent)
     health = {"machine_health": [row_or_absent]} if row_or_absent else {"machine_health": []}
     payload = {"fleet_health": health}
     assert pick_machine(payload, REPO, config) == "idle-or-dead"
+
+
+# ── eligible_hosts_for_repo (#3600 review round 1) ───────────────────────────
+#
+# Factored out of `pick_machine_choice`'s own candidate filter so a second
+# caller (`coord.commands.drive_queue._fetch_no_eligible_host`) can reuse the
+# REAL predicate instead of re-deriving "is this host routable" its own,
+# driftable way (#2085). These tests pin down that `pick_machine_choice` and
+# `eligible_hosts_for_repo` agree — the whole point of the extraction.
+
+
+def test_eligible_hosts_for_repo_excludes_unreachable_like_pick_machine_choice():
+    """The #2807 case this split exists to close: before #3600's review
+    round 1, `_fetch_no_eligible_host` filtered on `paused_set()` only, so a
+    host excluded here for being confidently UNREACHABLE (not paused/
+    cordoned) still read as "eligible" to that launch-time net."""
+    config = make_config(
+        machines=[
+            Machine(name="dead", host="dead", repos=[REPO]),
+            Machine(name="busy", host="busy", repos=[REPO]),
+        ]
+    )
+    payload = {
+        "fleet_health": {
+            "machine_health": [
+                _health_row("dead", "timeout"),
+                _health_row("busy", "online"),
+            ]
+        },
+    }
+    hosts, pause_read_error = eligible_hosts_for_repo(payload, REPO, config)
+    assert [m.name for m in hosts] == ["busy"]
+    assert pause_read_error == ""
+
+
+def test_eligible_hosts_for_repo_empty_when_every_declared_host_is_unreachable():
+    config = make_config(
+        machines=[Machine(name="dead", host="dead", repos=[REPO])],
+    )
+    payload = {
+        "fleet_health": {"machine_health": [_health_row("dead", "timeout")]},
+    }
+    hosts, _ = eligible_hosts_for_repo(payload, REPO, config)
+    assert hosts == []
+
+
+def test_eligible_hosts_for_repo_and_pick_machine_choice_agree():
+    """Same predicate, exercised through both entry points — if these two
+    ever disagree on a repo with a real candidate, the #2085 split-brain
+    this extraction exists to close has come back."""
+    config = make_config(
+        machines=[
+            Machine(name="dead", host="dead", repos=[REPO]),
+            Machine(name="busy", host="busy", repos=[REPO]),
+        ]
+    )
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", machine_name="busy", status="running"),
+        ],
+        "fleet_health": {
+            "machine_health": [
+                _health_row("dead", "timeout"),
+                _health_row("busy", "online"),
+            ]
+        },
+    }
+    hosts, _ = eligible_hosts_for_repo(payload, REPO, config)
+    assert [m.name for m in hosts] == ["busy"]
+    assert pick_machine(payload, REPO, config) == "busy"
 
 
 def test_pick_machine_choice_surfaces_an_unreadable_pause_set_without_refusing(monkeypatch):
