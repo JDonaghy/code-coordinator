@@ -21,8 +21,11 @@ This driver launches the driven repo's real compiled GTK binary under a real
   window is covered by another one, unlike a full-screen grab), attached as
   evidence to every *failing* step (see
   :meth:`NativeRunner._attach_capture_if_possible`).
-- ``xdotool search --pid`` — finding the launched process's real window and
-  polling whether it still exists (``expect_closed``).
+- ``xdotool search --onlyvisible --pid`` — finding the launched process's
+  real, *mapped* window (``--onlyvisible`` matters: GTK4-on-X11 also creates
+  an invisible internal helper top-level with a lower XID than the real
+  window — see :meth:`LinuxGtkCalls.find_top_window`, #3605) and polling
+  whether it still exists (``expect_closed``).
 
 **Headless by construction.** Unlike ``win-native``/``mac-native`` (which
 drive a real, already-running desktop session), a Linux fleet host has no
@@ -298,11 +301,20 @@ class GtkCalls(Protocol):
     def launch(self, command: str, cwd: str) -> int: ...
 
     def find_top_window(self, pid: int, timeout_s: float) -> int:
-        """Poll for the launched process's real window, returning its X11
-        window id once found. Raises :class:`GtkNativeRuntimeError` if none
-        appears within *timeout_s* — this is the "launch" step's own
-        confirmation that the process didn't just start, but actually
-        produced a window (#2096)."""
+        """Poll for the launched process's real, *visible* top-level window,
+        returning its X11 window id once found. Raises
+        :class:`GtkNativeRuntimeError` if none appears within *timeout_s* —
+        this is the "launch" step's own confirmation that the process didn't
+        just start, but actually produced a window (#2096).
+
+        Must filter to windows that are actually mapped/viewable (#3605):
+        GTK4-on-X11 creates an internal, invisible helper top-level before
+        the real app window, with a lower XID, so a plain
+        ``xdotool search --pid`` lists it first. Returning that helper
+        corrupts every subsequent ``move_window``/``send_click``/
+        ``send_key``/``capture`` call against this window id — clicks land
+        nowhere a user can see, and ``capture`` fails outright
+        (``xwd``/``XGetImage`` can't read an unmapped window)."""
         ...
 
     def move_window(self, window_id: int, x: int, y: int, width: int, height: int) -> None: ...
@@ -645,10 +657,19 @@ class LinuxGtkCalls:
             pass
 
     def find_top_window(self, pid: int, timeout_s: float) -> int:
+        # #3605: `--onlyvisible` is load-bearing. GTK4-on-X11 creates an
+        # invisible internal helper top-level *before* the real app window,
+        # so it gets a lower XID and a plain `xdotool search --pid` lists it
+        # first — `list[0]` would then be the helper, not the real, visible
+        # app window, and every subsequent move/click/key/capture call
+        # against that window id silently targets an unmapped window
+        # (xwd/XGetImage can't even read one). `--onlyvisible` makes
+        # xdotool itself filter to windows that are actually mapped
+        # (IsViewable), which is exactly the distinction that failed here.
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             proc = subprocess.run(
-                ["xdotool", "search", "--pid", str(pid)],
+                ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
                 capture_output=True, text=True, timeout=10,
             )
             ids = [int(tok) for tok in proc.stdout.split() if tok.strip().isdigit()]
@@ -656,7 +677,7 @@ class LinuxGtkCalls:
                 return ids[0]
             time.sleep(0.1)
         raise GtkNativeRuntimeError(
-            f"no window appeared for pid={pid} within {timeout_s}s"
+            f"no visible window appeared for pid={pid} within {timeout_s}s"
         )
 
     def is_window_alive(self, window_id: int) -> bool:
