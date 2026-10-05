@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import socket
 import sys
@@ -308,6 +309,13 @@ def serve(
     # directly signal) it too, not just this daemon's own pid — see
     # `coord.app_drive.SessionHandle.app_pid`.
     app_pid = getattr(backend, "pid", None)
+    # #3617 review: non-None only for a `win-native` backend that skipped
+    # local-filesystem launch staging on a UNC `cwd` (and why) — see
+    # `coord.win_native_driver.WinNativeSession.staging_warning`. `None`
+    # for every other kind (no such attribute at all).
+    staging_warning = getattr(backend, "staging_warning", None)
+    if staging_warning:
+        logging.getLogger(__name__).warning("%s", staging_warning)
 
     if control_dir is not None:
         # #3611: no socket at all in bridge mode — see `_serve_fs_control`.
@@ -316,7 +324,10 @@ def serve(
         control_dir.mkdir(parents=True, exist_ok=True)
         _write_ready_file(
             ready_file,
-            {"pid": os.getpid(), "port": 0, "app_pid": app_pid, "transport": "fs"},
+            {
+                "pid": os.getpid(), "port": 0, "app_pid": app_pid,
+                "transport": "fs", "staging_warning": staging_warning,
+            },
         )
         try:
             _serve_fs_control(backend, kind, control_dir, idle_timeout=idle_timeout, token=token)
@@ -333,7 +344,13 @@ def serve(
     sock.listen(8)
     port = sock.getsockname()[1]
 
-    _write_ready_file(ready_file, {"pid": os.getpid(), "port": port, "app_pid": app_pid, "transport": "tcp"})
+    _write_ready_file(
+        ready_file,
+        {
+            "pid": os.getpid(), "port": port, "app_pid": app_pid,
+            "transport": "tcp", "staging_warning": staging_warning,
+        },
+    )
 
     stop = threading.Event()
     last_activity = [time.monotonic()]
