@@ -1884,12 +1884,39 @@ class SmokeAttempt:
         return f"{self.machine_name}: {self.reason}"
 
 
+def _describe_cordoned_capable(names: list[str]) -> str:
+    """Human detail for cordoned machine *names* — ``"name (cordoned:
+    draining for v0.5.598)"`` pairs, so the operator-facing reason names the
+    cordon's own `reason`/`target_version` instead of leaving a release
+    cordon reading like an indistinguishable `coord pause` (#3599 review).
+
+    Display only: a failure to read the cordon store degrades to the bare
+    name, never raises, and never affects the dispatch decision itself —
+    that was already made by the caller before this is reached.
+    """
+    if not names:
+        return ""
+    try:
+        from coord.machine_pause import cordons  # noqa: PLC0415
+
+        records = cordons()
+    except Exception:  # noqa: BLE001 — display only, never block on this
+        records = {}
+    parts = []
+    for name in names:
+        record = records.get(name)
+        describe = getattr(record, "describe", None)
+        parts.append(f"{name} ({describe()})" if callable(describe) else name)
+    return ", ".join(parts)
+
+
 def _report_unroutable_smoke(
     completed: Assignment,
     required_caps: list[str],
     attempts: list[SmokeAttempt],
     *,
     paused_capable: list[str] | None = None,
+    cordon_only_capable: list[str] | None = None,
 ) -> None:
     """Report — once — that the Test stage has no machine it can run on.
 
@@ -1914,44 +1941,86 @@ def _report_unroutable_smoke(
     host — the #1616 failure shape again: the pipeline stops and the product
     says nothing.
 
-    Two outcomes, split on whether the condition can clear by itself:
+    Three outcomes, split on whether the condition can clear by itself:
 
     * **Durable** (every candidate hard-refused, there were no candidates at
-      all, or every capability-matched candidate was paused/quiet-covered —
-      see *paused_capable*) — record ``test_state=TEST_STATE_BLOCKED`` with
-      the full reason on the parent work row. That is board state: `coord
-      gates` prints it, the TUI reads it off the row, and
-      `record_test_verdict` writes an ``test_blocked`` audit row. It also
-      ends the spin, because `dispatch_pending_smoke` skips rows that
-      already carry a verdict — the escalation happens once, not every tick.
-    * **Transient** (at least one candidate failed only on connectivity) — do
-      NOT poison the row. A machine that is rebooting comes back, and marking
-      the row blocked would demand a manual `coord diagnose --reset` for what
-      the next tick would have fixed for free. Log it once per process
-      instead, and leave the row re-dispatchable.
+      all, or every capability-matched candidate was explicitly
+      paused/quiet-covered — see *paused_capable*) — record
+      ``test_state=TEST_STATE_BLOCKED`` with the full reason on the parent
+      work row. That is board state: `coord gates` prints it, the TUI reads
+      it off the row, and `record_test_verdict` writes an ``test_blocked``
+      audit row. It also ends the spin, because `dispatch_pending_smoke`
+      skips rows that already carry a verdict — the escalation happens
+      once, not every tick.
+    * **Transient-connectivity** (at least one candidate failed only on
+      connectivity) — do NOT poison the row. A machine that is rebooting
+      comes back, and marking the row blocked would demand a manual
+      `coord diagnose --reset` for what the next tick would have fixed for
+      free. Log it once per process instead, and leave the row
+      re-dispatchable.
+    * **Transient-cordon** (#3599 — see *cordon_only_capable*): every
+      capable candidate was filtered SOLELY by an active release cordon,
+      with no explicit pause and no quiet-hours window in the mix. A cordon
+      is this fleet's own bounded drain mechanism (it expires, or is lifted
+      the moment the roll lands) — unlike an explicit pause, it is not an
+      operator decision that needs a human to undo. Durably blocking here
+      would wedge the row until a manual `coord diagnose --stage test
+      --reset`, converting the TTL-bounded cordon wait into an unbounded
+      one — exactly the #3599 failure this carve-out closes. Logged once
+      and left re-dispatchable, same as transient-connectivity.
 
     *paused_capable* (#2636): machine names that matched capability but were
     filtered out of `rank_smoke_machines`'s ranking by `paused_set` — an
     explicit `coord pause`, a `quiet_hours` window, or (#3599) a release
-    cordon — before
-    `dispatch_smoke` ever got to try them, so `attempts` is empty for a
-    reason that has nothing to do with capability. Naming that here keeps the
-    recorded reason from reading as "no capable machine" while capable
-    machines are sitting right there, merely unavailable right now — #1678's
-    failure mode by a different route. Always durable: cleared the same way
-    (`coord diagnose --stage test --reset`) once the machine is unpaused or
-    its quiet-hours window ends, same as any other exhausted candidate list.
+    cordon — before `dispatch_smoke` ever got to try them, so `attempts` is
+    empty for a reason that has nothing to do with capability. Naming that
+    here keeps the recorded reason from reading as "no capable machine"
+    while capable machines are sitting right there, merely unavailable
+    right now — #1678's failure mode by a different route.
+
+    *cordon_only_capable* (#3599): the subset of *paused_capable* whose SOLE
+    reason for being filtered is an active release cordon — i.e. none of
+    them are also in `follow_on_paused_set()` (explicit pause ∪ quiet
+    hours). When this is a non-empty subset of *paused_capable* that covers
+    it entirely, the whole dead end is attributable to the cordon alone and
+    is treated as transient (see above). When it is a STRICT subset (some
+    capable machines are cordoned, others genuinely paused/quiet), the
+    durable branch still applies — lifting the cordon alone would not make
+    the row dispatchable, so a human still needs to look at the
+    non-cordoned ones.
 
     Never raises: a board-write failure must not take the caller down.
     """
     transient = any(a.transient for a in attempts)
+    cordon_only_capable = cordon_only_capable or []
+    cordon_fully_explains = bool(paused_capable) and set(paused_capable) <= set(
+        cordon_only_capable
+    )
     caps = ", ".join(required_caps) if required_caps else "(none — any capable machine)"
-    if paused_capable:
+    if paused_capable and cordon_fully_explains:
+        message = (
+            f"Test stage cannot be routed: every machine that declares "
+            f"capability [{caps}] for repo {completed.repo_name!r} is "
+            f"cordoned for a release right now: "
+            f"{_describe_cordoned_capable(cordon_only_capable)}. (#3599)"
+        )
+    elif paused_capable:
+        # #3599 non-blocking review note: keep the pre-existing substring
+        # ("paused or inside its quiet-hours window right now") byte-for-
+        # byte so this stays backward compatible with #2636's own test —
+        # only APPEND the cordon detail, parenthetically, when some (but
+        # not all — see `cordon_fully_explains` above) of the capable
+        # machines are cordoned rather than paused/quiet.
+        cordon_note = (
+            f" (cordoned for a release: {_describe_cordoned_capable(cordon_only_capable)})"
+            if cordon_only_capable
+            else ""
+        )
         message = (
             f"Test stage cannot be routed: every machine that declares "
             f"capability [{caps}] for repo {completed.repo_name!r} is "
             f"paused or inside its quiet-hours window right now: "
-            f"{', '.join(paused_capable)}. (#2636)"
+            f"{', '.join(paused_capable)}{cordon_note}. (#2636)"
         )
     elif attempts:
         message = (
@@ -1988,6 +2057,16 @@ def _report_unroutable_smoke(
             level, "dispatch_smoke: %s#%s — %s",
             completed.repo_name, completed.issue_number, text,
         )
+
+    if cordon_fully_explains:
+        _log_once(
+            logging.WARNING,
+            f"{message} A release cordon is this fleet's own bounded drain "
+            "mechanism, not an operator pause — leaving the row "
+            "re-dispatchable; it retries once the cordon lifts or expires "
+            "(#3599).",
+        )
+        return
 
     if transient:
         _log_once(
@@ -2691,17 +2770,35 @@ def _dispatch_smoke_single_leg(
     # capability-only set (cheap: config-only, no network) so a downstream
     # unroutable report can name the real cause instead of the generic
     # "no capable machine" message while capable machines sit idle behind a
-    # pause or a quiet-hours window.
+    # pause, a quiet-hours window, or (#3599) a release cordon.
     paused_capable: list[str] = []
+    cordon_only_capable: list[str] = []
     if not candidates:
         capable = _capability_matched_machines(
             required_caps, completed.repo_name, config
         )
         if capable:
-            from coord.machine_pause import paused_set  # noqa: PLC0415
+            from coord.machine_pause import (  # noqa: PLC0415
+                follow_on_paused_set,
+                paused_set,
+            )
 
             paused = paused_set(config.machines)
             paused_capable = sorted(m.name for m in capable if m.name in paused)
+            if paused_capable:
+                # #3599: of the capable machines filtered out above, which
+                # ones are filtered SOLELY by an active release cordon — not
+                # also by an explicit pause or a quiet-hours window.
+                # `follow_on_paused_set` is exactly `paused_set` minus
+                # cordons, so a name present in `paused` but absent here has
+                # no OTHER reason to be unavailable; see
+                # `_report_unroutable_smoke`'s docstring for how this
+                # distinguishes a bounded, self-clearing dead end from a
+                # genuine one.
+                non_cordon_paused = follow_on_paused_set(config.machines)
+                cordon_only_capable = sorted(
+                    name for name in paused_capable if name not in non_cordon_paused
+                )
 
     # #2168: pin the Test stage's model to avoid the agent falling through to
     # the machine's ambient `claude -p` default (Opus). Mirrors the review
@@ -2746,6 +2843,7 @@ def _dispatch_smoke_single_leg(
         # can show it, exactly once — never the silent 30 s spin of #1678.
         _report_unroutable_smoke(
             completed, required_caps, attempts, paused_capable=paused_capable,
+            cordon_only_capable=cordon_only_capable,
         )
         return None
 

@@ -2943,6 +2943,101 @@ def test_dispatch_smoke_blocked_reason_names_pause_not_capability(
     assert "no configured machine declares capability" not in reason
 
 
+def test_dispatch_smoke_a_wholly_cordoned_fleet_leaves_the_row_waiting(
+    three_gtk_config: Config,
+) -> None:
+    """#3599 blocking review finding: with `rank_smoke_machines` now
+    cordon-aware, every capability-matched machine being cordoned (and
+    NOTHING ELSE — no explicit pause, no quiet-hours window) must NOT
+    durably poison the row the way an explicit pause does. A release
+    cordon is a bounded, self-clearing drain mechanism; stamping
+    `test_state=blocked` here would wedge the row until a human runs
+    `coord diagnose --stage test --reset`, converting the cordon's own
+    TTL-bounded wait into an unbounded one — exactly the bug this closes."""
+    from coord.machine_pause import local_set_cordon
+
+    for name in ("desktop-a", "desktop-b", "desktop-c"):
+        local_set_cordon(name, target_version="0.5.598")
+
+    completed = _completed(machine="server")
+    board = Board(completed=[completed])
+    result = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=_MultiHostClient(),
+        diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is None
+    # The whole point: NOT durably blocked. `test_state` must stay whatever
+    # it was before this call (not the sticky "blocked") so a later tick —
+    # once the cordon lifts or expires — genuinely retries dispatch instead
+    # of finding a verdict already recorded and skipping the row forever.
+    assert completed.test_state != "blocked"
+
+
+def test_dispatch_smoke_a_cordoned_fleet_still_recovers_after_the_cordon_lifts(
+    three_gtk_config: Config,
+) -> None:
+    """End-to-end consequence of the fix above: the row is still
+    re-dispatchable after the cordon that caused the dead end is cleared —
+    the exact assertion the #3599 review called for, not just the
+    picker-level `== []`."""
+    from coord.machine_pause import local_clear_cordon, local_set_cordon
+
+    for name in ("desktop-a", "desktop-b", "desktop-c"):
+        local_set_cordon(name, target_version="0.5.598")
+
+    completed = _completed(machine="server")
+    board = Board(completed=[completed])
+    client = _MultiHostClient()
+    first = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert first is None
+    assert completed.test_state != "blocked"
+
+    for name in ("desktop-a", "desktop-b", "desktop-c"):
+        local_clear_cordon(name)
+
+    second = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert second is not None, (
+        "the row must still be re-dispatchable once the cordon clears — a "
+        "durable block here would require a manual `coord diagnose --reset`"
+    )
+    assert completed.test_state == "running"
+
+
+def test_dispatch_smoke_a_mixed_pause_and_cordon_fleet_still_durably_blocks(
+    three_gtk_config: Config,
+) -> None:
+    """The flip side of the cordon-only carve-out: when AT LEAST ONE
+    capable machine is unavailable for a reason that will NOT self-clear
+    (an explicit pause here), lifting the cordon alone would not make the
+    row dispatchable — the durable block must still fire, same as before
+    #3599, so this doesn't regress into never blocking at all."""
+    from coord.machine_pause import local_pause, local_set_cordon
+
+    local_set_cordon("desktop-a", target_version="0.5.598")
+    for name in ("desktop-b", "desktop-c"):
+        local_pause(name)
+
+    completed = _completed(machine="server")
+    board = Board(completed=[completed])
+    result = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=_MultiHostClient(),
+        diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is None
+    assert completed.test_state == "blocked"
+    reason = completed.test_reason or ""
+    assert "cordoned for a release" in reason
+    assert "desktop-a" in reason and "desktop-b" in reason and "desktop-c" in reason
+
+
 # ── Fallback: try the NEXT capability-matched machine ───────────────────────
 
 

@@ -7807,6 +7807,115 @@ def test_dispatch_review_blocks_and_sets_state_when_branch_not_on_remote_and_wor
     assert completed.review_state == "branch_not_on_remote"
 
 
+def test_dispatch_review_branch_not_on_remote_leaves_review_pending_when_worker_is_cordoned(
+    two_machine_config: Config,
+) -> None:
+    """#3599 blocking review finding: when the branch isn't on the remote
+    and the ONLY candidate that could take it (the original worker) is
+    cordoned for a release — not explicitly paused, not quiet-hours
+    covered — the sticky `review_state="branch_not_on_remote"` must NOT be
+    set. That state is denied forever: bulk review dispatch only ever
+    reconsiders `review_state in (None, "pending")`, and nothing resets
+    this value once set, even after the branch is pushed and the cordon
+    lifts. A cordon is this fleet's own bounded, self-clearing drain
+    mechanism, so the honest answer is to leave the row pending so a later
+    tick genuinely retries it."""
+    from coord.machine_pause import local_set_cordon
+
+    local_set_cordon("laptop", target_version="0.5.598")
+
+    board = Board()
+    completed = _completed_assignment(machine="laptop", branch="issue-1-fix")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "should-not-fire"}),
+        pr_lookup=lambda repo_github, **kw: {"number": 10, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: False,
+    )
+
+    assert result is None
+    assert board.active == []
+    # The whole point: NOT the sticky state — left exactly as it started
+    # (None/pending) so bulk dispatch reconsiders this row on a later tick.
+    assert completed.review_state != "branch_not_on_remote"
+    assert "cordon" in (completed.review_dispatch_reason or "").lower()
+
+
+def test_dispatch_review_branch_not_on_remote_recovers_once_the_cordon_lifts(
+    two_machine_config: Config,
+) -> None:
+    """End-to-end consequence of the fix above: once the cordon that caused
+    the dead end is cleared AND the branch is pushed, the review genuinely
+    dispatches on a later tick — the exact assertion the #3599 review
+    called for, not just the picker-level denial."""
+    from coord.machine_pause import local_clear_cordon, local_set_cordon
+
+    local_set_cordon("laptop", target_version="0.5.598")
+
+    board = Board()
+    completed = _completed_assignment(machine="laptop", branch="issue-1-fix")
+
+    first = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "should-not-fire"}),
+        pr_lookup=lambda repo_github, **kw: {"number": 10, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: False,
+    )
+    assert first is None
+    assert completed.review_state != "branch_not_on_remote"
+
+    local_clear_cordon("laptop")
+    client = _FakeHTTPClient({"id": "review-local-1"})
+    second = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 10, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: False,
+    )
+    assert second is not None, (
+        "the review must still be dispatchable once the cordon clears — a "
+        "sticky branch_not_on_remote state here would require a human to "
+        "intervene for what the cordon's own TTL already resolves"
+    )
+    assert second.machine_name == "laptop"
+
+
+def test_dispatch_review_branch_not_on_remote_still_sets_sticky_state_when_worker_is_paused(
+    two_machine_config: Config,
+) -> None:
+    """The flip side of the cordon-only carve-out above: an EXPLICIT
+    `coord pause` on the worker machine (not a cordon) is an operator
+    decision that needs a human to undo, so the pre-#3599 durable
+    `branch_not_on_remote` behaviour must still fire — this doesn't
+    regress into never blocking at all."""
+    from coord.machine_pause import local_pause
+
+    local_pause("laptop")
+
+    board = Board()
+    completed = _completed_assignment(machine="laptop", branch="issue-1-fix")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "should-not-fire"}),
+        pr_lookup=lambda repo_github, **kw: {"number": 10, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: False,
+    )
+
+    assert result is None
+    assert board.active == []
+    assert completed.review_state == "branch_not_on_remote"
+
+
 def test_dispatch_review_passes_through_normally_when_branch_on_remote(
     two_machine_config: Config,
 ) -> None:

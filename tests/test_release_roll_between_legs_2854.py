@@ -14,15 +14,23 @@ Follow-up to #2618 (which found the premise but deferred the fix) and #2741
    idle-restart debounce for the identical busy→idle→busy flapping risk) as
    genuinely rollable, without waiting for the row to go `done`.
 
-2. **The "no-new-work" gate already exists** — #2240/#2741 already made a
-   release cordon follow-on-blind for review and fix legs
+2. **The "no-new-work" gate, REVERSED by #3599** — #2240/#2741 originally
+   made a release cordon follow-on-blind for review and fix legs
    (`coord.machine_pause.follow_on_paused_set`), and #2240's own smoke-leg
-   fix (`coord/smoke.py`) does the same. What was never directly confirmed
-   is the THIRD leg #2854 names explicitly: a merge-side conflict-fix.
-   `pick_conflict_fix_machine` turns out to consult neither `paused_set()`
-   nor the cordon store at all, so it was already cordon-blind by
-   construction — this file is the regression test that pins that down
-   rather than assuming it stays true.
+   fix (`coord/smoke.py`) did the same; the merge-side conflict-fix leg
+   #2854 named was confirmed cordon-blind by construction (never consulted
+   `paused_set()` or the cordon store at all). #3599 (2026-10-04) found the
+   shared premise wrong: a `request-changes` round chains review -> fix ->
+   review indefinitely, so a follow-on leg is NOT reliably terminal, and
+   the bypass kept re-landing each round of a multi-leg drive onto the
+   exact host a cordon was waiting to drain — the host never reached zero
+   active work, so the roll never found its window. Every dispatch-target
+   picker now reads the FULL cordon-inclusive `paused_set()` instead,
+   including the merge-side conflict-fix picker this file originally
+   pinned as exempt — see `coord.machine_pause`'s module docstring
+   ("#2240/#3599") for the full incident history. The tests below assert
+   the NEW contract (every follow-on leg type waits on a wholly cordoned
+   fleet, same as new work) rather than the old one.
 """
 
 from __future__ import annotations
@@ -204,8 +212,9 @@ def test_the_boundary_is_at_least_settle_seconds_not_more(delta):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# The "no-new-work" gate: already-narrowed cordon (#2240/#2741) covers
-# review/fix/smoke; the merge-side conflict-fix leg is confirmed here.
+# The "no-new-work" gate (#3599 REVERSAL): a release cordon now refuses
+# every follow-on leg type too, including the merge-side conflict-fix this
+# file originally pinned as a deliberate (now reverted) exemption.
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -231,10 +240,13 @@ def _repo_config():
     )
 
 
-def test_a_conflict_fix_still_picks_a_machine_on_a_wholly_cordoned_fleet(tmp_home):
-    """The merge-pipeline analogue of #2240's review/fix regression tests:
-    a mechanical-conflict rebase is the tail of work already merging, not
-    new work, so a release cordon must not be able to strand it either."""
+def test_a_conflict_fix_waits_on_a_wholly_cordoned_fleet(tmp_home):
+    """#3599 reversal of this file's original #2240/#2741-shaped test: a
+    mechanical-conflict rebase is NEW work for whichever machine it lands
+    on (there is no #2240 "tail of an in-flight leg" argument for it, since
+    nothing was ever dispatched for this entry's conflict-fix before), so a
+    release cordon must refuse it exactly like it refuses `type="work"` —
+    the opposite of what this test asserted before #3599."""
     from coord import machine_pause as mp
     from coord.conflict_fix import pick_conflict_fix_machine
     from coord.models import Board
@@ -245,38 +257,53 @@ def test_a_conflict_fix_still_picks_a_machine_on_a_wholly_cordoned_fleet(tmp_hom
 
     machine = pick_conflict_fix_machine("api", Board(), config,
                                          prefer_machine="laptop")
-    assert machine is not None, (
-        "a wholly cordoned fleet must not be able to strand a conflict-fix "
-        "dispatch — the same #2240/#2741 shape, one leg later"
+    assert machine is None, (
+        "a wholly cordoned fleet must refuse a conflict-fix dispatch too "
+        "(#3599) — it must wait for the cordon to lift/expire, not land on "
+        "a host the roll is trying to drain"
     )
-    assert machine.name == "laptop"
 
 
-def test_conflict_fix_machine_selection_never_reads_the_pause_or_cordon_store(tmp_home):
-    """Pin down WHY the test above passes, not just that it does: this
-    picker has no dependency on `machine_pause` at all, so it was cordon
-    (and pause) blind before #2854 as well as after — nothing here changed
-    its behaviour, this just makes the invariant explicit and load-bearing."""
+def test_a_conflict_fix_routes_to_the_one_uncordoned_host(tmp_home):
+    """The reroute half of #3599's "route to an uncordoned capable host, or
+    wait" contract for the conflict-fix picker: with one of two capable
+    machines cordoned, the pick lands on the other one, not `None`."""
+    from coord import machine_pause as mp
+    from coord.conflict_fix import pick_conflict_fix_machine
+    from coord.models import Board
+
+    config = _repo_config()
+    mp.local_set_cordon("laptop", target_version="0.5.77")
+
+    machine = pick_conflict_fix_machine("api", Board(), config,
+                                         prefer_machine="laptop")
+    assert machine is not None and machine.name == "server"
+
+
+def test_conflict_fix_machine_selection_now_reads_the_cordon_store(tmp_home):
+    """#3599 inverts this file's original pin: the picker used to have no
+    dependency on `machine_pause` at all (the 'always cordon-blind' claim);
+    it now does, on purpose, via the full `paused_set()`. Pinning the
+    presence rather than the absence keeps this file from silently
+    re-certifying the exemption #3599 just removed."""
     import inspect
 
     import coord.conflict_fix as cf
 
-    source = inspect.getsource(cf.pick_conflict_fix_machine)
-    for forbidden in ("machine_pause", "paused_set", "cordon"):
-        assert forbidden not in source, (
-            f"pick_conflict_fix_machine now reads {forbidden!r} — the "
-            "'always cordon-blind' claim this test pins down needs a fresh "
-            "look, not a silent pass"
-        )
+    source = inspect.getsource(cf.select_conflict_fix_machine)
+    assert "paused_set" in source, (
+        "select_conflict_fix_machine no longer consults paused_set() — "
+        "the #3599 cordon-aware fix this file pins down has regressed"
+    )
 
 
-def test_the_no_new_work_level_permits_every_follow_on_leg_type(tmp_home):
-    """#2854's proposal names three follow-on leg types a `no-new-work`
-    cordon must still allow through: review, test/smoke, and merge. All
-    three already bypass a release cordon (review/fix via
-    `follow_on_paused_set`, smoke via the same, merge-side conflict-fix by
-    never consulting the store at all) — asserted together so the three
-    mechanisms cannot silently drift apart from #2854's stated contract."""
+def test_the_no_new_work_level_now_refuses_every_follow_on_leg_type(tmp_home):
+    """#2854's proposal named three follow-on leg types; #3599 found the
+    bypass unsound for all of them (a `request-changes` round chains
+    review -> fix -> review indefinitely, so none of these legs are
+    reliably terminal). A wholly cordoned fleet now refuses review/fix,
+    smoke, AND merge-side conflict-fix alike — asserted together so the
+    three mechanisms cannot silently drift apart from the NEW contract."""
     from coord import machine_pause as mp
     from coord.conflict_fix import pick_conflict_fix_machine
     from coord.models import Board
@@ -285,9 +312,7 @@ def test_the_no_new_work_level_permits_every_follow_on_leg_type(tmp_home):
     for name in ("laptop", "server"):
         mp.local_set_cordon(name, target_version="0.5.77")
 
-    # review / fix
-    assert mp.follow_on_paused_set() == set()
-    # new work is still refused — the OTHER half of the same rule
+    # review / fix / smoke all read the FULL paused_set() now — no bypass.
     assert mp.paused_set() == {"laptop", "server"}
-    # merge-side conflict-fix
-    assert pick_conflict_fix_machine("api", Board(), config) is not None
+    # merge-side conflict-fix: same refusal, same store.
+    assert pick_conflict_fix_machine("api", Board(), config) is None

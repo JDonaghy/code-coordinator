@@ -663,18 +663,92 @@ def test_a_fix_does_not_dispatch_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
     mock_http.post.return_value.json.return_value = {"id": "fix-2240"}
     mock_http.post.return_value.raise_for_status = MagicMock()
 
+    # #3208: `_dispatch_fix` probes reachability before picking a machine —
+    # `laptop.tail`/`server.tail` don't actually resolve, so without this
+    # stub every candidate would look unreachable for a reason that has
+    # nothing to do with the cordon this test is actually about. With both
+    # machines now cordoned (#3599), `select_fix_machine` filters them out
+    # of `paused_set()` before reachability is ever checked, so this stub
+    # is never actually called here — kept anyway so the test does not
+    # start depending on real DNS resolution if the cordon-filtering order
+    # ever changes.
+    failure_detail: list[str] = []
     with patch("coord.auto_loop.record_dispatched_assignment"):
+        result = _dispatch_fix(
+            work, "Fix briefing.", board, config, iteration=1,
+            http_client=mock_http,
+            status_fetcher=lambda machine, timeout=3.0: StatusResult(data={}),
+            failure_detail=failure_detail,
+        )
+
+    # A bare `assert result is None` passes for ANY decline reason
+    # (unreachable agent, missing repo_path, a record-dispatch failure) —
+    # assert the ATTRIBUTED reason instead, so this can only pass for the
+    # cordon it names, and confirm the agent was never even POSTed to.
+    assert result is None, (
+        "a wholly cordoned fleet must leave the fix leg waiting rather than "
+        "re-busy the exact host the cordon is draining — this is the #3599 "
+        "reversal of the pre-existing #2240 bypass"
+    )
+    assert failure_detail, "no failure reason was recorded for the decline"
+    assert "paused via `coord pause`" in failure_detail[0], failure_detail
+    assert "laptop" in failure_detail[0] and "server" in failure_detail[0], failure_detail
+    mock_http.post.assert_not_called()
+
+
+def test_a_fix_routes_to_the_one_uncordoned_host(tmp_home) -> None:
+    """The reroute half of #3599's "route to an uncordoned capable host, or
+    wait" contract for `select_fix_machine` — the counterpart to
+    `test_a_review_routes_to_the_one_uncordoned_host` above. Only the
+    ORIGINAL worker machine (laptop) is cordoned; the fix must land on the
+    other capable machine (server) instead of waiting, proving this is a
+    genuine fallback and not just a refusal dressed up as one."""
+    from unittest.mock import MagicMock, patch
+
+    from coord.auto_loop import _dispatch_fix
+    from coord.models import Assignment, Board
+    from coord.network import StatusResult
+
+    config = _review_config()
+    mp.local_set_cordon("laptop", target_version="0.5.77")
+
+    work = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=2240,
+        issue_title="Deadlock",
+        briefing="Original briefing.",
+        assignment_id="work-2240",
+        status="done",
+        branch="issue-2240-fix",
+        dispatched_at=0.0,
+        finished_at=1.0,
+        type="work",
+    )
+    board = Board(completed=[work])
+    mock_http = MagicMock()
+    mock_http.post.return_value.json.return_value = {"id": "fix-2240"}
+    mock_http.post.return_value.raise_for_status = MagicMock()
+
+    with (
+        patch("coord.auto_loop.record_dispatched_assignment"),
+        patch(
+            "coord.auto_loop.github_ops.branch_exists_on_remote",
+            return_value=True,
+        ),
+    ):
         result = _dispatch_fix(
             work, "Fix briefing.", board, config, iteration=1,
             http_client=mock_http,
             status_fetcher=lambda machine, timeout=3.0: StatusResult(data={}),
         )
 
-    assert result is None, (
-        "a wholly cordoned fleet must leave the fix leg waiting rather than "
-        "re-busy the exact host the cordon is draining — this is the #3599 "
-        "reversal of the pre-existing #2240 bypass"
+    assert result is not None, (
+        "server was never cordoned and is reachable — the fix must reroute "
+        "there instead of waiting just because the ORIGINAL machine is "
+        "cordoned"
     )
+    assert result.machine_name == "server"
 
 
 def test_a_cordoned_host_still_refuses_NEW_work(tmp_home) -> None:
@@ -688,7 +762,7 @@ def test_a_cordoned_host_still_refuses_NEW_work(tmp_home) -> None:
     assert "server" not in mp.follow_on_paused_set()
 
 
-def test_an_operator_pause_still_narrows_the_review_to_the_cordoned_host(
+def test_an_operator_pause_plus_a_cordon_leaves_nothing_to_route_to(
     tmp_home,
 ) -> None:
     """#3599: `paused_set()` already unions explicit pause, quiet hours and
