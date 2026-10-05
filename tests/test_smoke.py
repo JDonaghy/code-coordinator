@@ -2775,9 +2775,12 @@ def test_rank_smoke_machines_native_preference_does_not_affect_other_caps(
 # minutes into its declared `quiet_hours` window, and the operator suspended
 # the machine ten minutes later — exactly what "no new dispatch in this
 # window" invites. `rank_smoke_machines` consulted no pause state of any
-# kind. The fix routes candidates through `follow_on_paused_set` — the
-# #2240 spelling, NOT `paused_set`, so a release cordon (which must not
-# block the tail of work already in flight) keeps working.
+# kind. The fix routes candidates through `paused_set` — #2636 originally
+# used the #2240 `follow_on_paused_set` spelling so a release cordon would
+# not block the tail of work already in flight, but #3599 (2026-10-04)
+# found that bypass kept re-landing a multi-leg drive's smoke/review/fix
+# legs on the exact host the cordon was waiting to drain, so a cordon now
+# filters a smoke candidate out same as any other pause.
 
 
 def test_rank_smoke_machines_skips_a_machine_inside_quiet_hours(
@@ -2863,16 +2866,16 @@ def test_rank_smoke_machines_skips_an_explicitly_paused_machine(
     assert names == ["desktop-b", "desktop-c"]
 
 
-def test_rank_smoke_machines_still_ranks_a_cordoned_machine(
+def test_rank_smoke_machines_filters_a_cordoned_machine(
     three_gtk_config: Config,
 ) -> None:
-    """The #2240 regression guard: a release cordon means "no NEW work", but
-    a smoke leg is the tail of work already in flight (the Test stage for a
-    completed work row), so it must NOT be filtered — the same reasoning
-    `pick_reviewer_machine` already applies via `follow_on_paused_set`. If
-    this ever starts filtering cordoned machines, it silently reaches for
-    `paused_set` instead of `follow_on_paused_set` and reproduces the
-    2026-08-14 drain deadlock in the Test stage."""
+    """#3599: a release cordon means "no NEW work", and a smoke leg is no
+    longer exempt from that — #2240/#2636 originally exempted it on the
+    theory that a smoke leg is the tail of work already in flight, but a
+    multi-leg drive can re-dispatch indefinitely, and the exemption kept
+    re-landing legs on the exact host the cordon was waiting to drain
+    (vimcode#1745). A cordoned machine is now filtered out of the ranking
+    exactly like an explicitly paused one."""
     from coord.machine_pause import local_set_cordon
     from coord.smoke import rank_smoke_machines
 
@@ -2880,7 +2883,8 @@ def test_rank_smoke_machines_still_ranks_a_cordoned_machine(
 
     ranked = rank_smoke_machines(["gtk"], "api", "server", Board(), three_gtk_config)
     names = [c.machine.name for c in ranked]
-    assert names == ["desktop-a", "desktop-b", "desktop-c"]
+    assert "desktop-a" not in names
+    assert names == ["desktop-b", "desktop-c"]
 
 
 def test_rank_smoke_machines_operator_set_quiet_hours_bind_same_as_config(

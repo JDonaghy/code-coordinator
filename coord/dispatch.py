@@ -1929,17 +1929,32 @@ def select_fix_machine(
     *status_fetcher* defaults to :func:`coord.network.fetch_status` — the
     same liveness probe ``coord status`` already uses — and is injectable
     so tests never make a real network call.
+
+    #3599: this used to resolve cordons via `follow_on_paused_set()` — the
+    #2240 theory that "a fix leg is the tail of already-running work, not
+    new work, so a release cordon must not filter its host out." Observed
+    2026-10-04: a `request-changes` round can itself spawn another fix leg
+    after another review, with no bound on how many times that repeats —
+    so "tail of already-running work" is not actually a terminal fact about
+    a fix leg, and the bypass kept re-busying a cordoned host every time the
+    drive produced another leg, which is precisely what stops it from ever
+    draining to the quiescent state `coord release propagate` is waiting
+    for. The FULL `paused_set()` (cordon-inclusive) is used here now, same
+    as new-work routing: a cordoned original machine is skipped like any
+    other paused one, falling through to another configured machine (the
+    branch lives on the remote, so any capable machine can take over) or
+    reporting none reachable — the drive-queue entry waits rather than
+    perpetually feeding the host the cordon is trying to drain. The
+    #2741/#3336 deferral-pressure stall floor is what now bounds how long a
+    wholly-cordoned fleet can hold a fix leg waiting, not a per-dispatch
+    bypass.
     """
-    from coord.machine_pause import follow_on_paused_set
+    from coord.machine_pause import paused_set
     from coord.network import fetch_status as _fetch_status
     from coord.network import probe_reachable
 
     fetch = status_fetcher or _fetch_status
-    # #2240: the same follow-on cordon `_dispatch_fix` has always used — a
-    # fix leg is the tail of already-running work, not new work, so an
-    # explicit release pause (not a routing-only `coord pause`) must not
-    # filter its host out.
-    paused = follow_on_paused_set(machines)
+    paused = paused_set(machines)
 
     def _capable(m: Machine) -> bool:
         return m.can_work_on(repo_name) and m.repo_path(repo_name) is not None

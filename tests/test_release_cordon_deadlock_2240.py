@@ -557,10 +557,19 @@ def test_no_cordon_still_beats_the_release_path() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Fix 2: "a cordoned host still accepts review/smoke/fix dispatches for
-# entries already in flight". This is the link the incident proved directly:
-# with the cordon up, `coord review <aid>` answered "no eligible reviewer
-# machine configured"; with it cleared, the identical command dispatched.
+# Fix 2 (2026-08-14, #2240): "a cordoned host still accepts review/smoke/fix
+# dispatches for entries already in flight" — reasoning that held up until
+# #3599 (2026-10-04) found a `request-changes` round can chain
+# review -> fix -> review indefinitely, so a leg is not reliably the tail of
+# anything, and the bypass just kept re-landing each round onto the host the
+# cordon was waiting to drain. The dispatch-target assertions below are now
+# the OPPOSITE of what they asserted under #2240: a cordoned host refuses a
+# follow-on leg exactly like a paused one. `follow_on_paused_set()` itself
+# still exists and is still cordon-blind (the tests of the raw function,
+# further down, are unchanged) — it is simply no longer consulted by any of
+# these dispatch-target pickers; see `coord.machine_pause`'s module
+# docstring and `coord.release_cordon`'s "#3599" section for the full
+# history.
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -580,10 +589,14 @@ def _review_config():
     )
 
 
-def test_a_review_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
-    """THE regression. Every host cordoned, and the review still routes —
-    otherwise the entry can never finish, so the host never drains, so the
-    cordon never lifts, so the roll defers and re-cordons."""
+def test_a_review_does_not_dispatch_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
+    """#3599: every host cordoned, and the review must NOT route anywhere —
+    dispatching it bypassed the cordon on exactly the host the drain was
+    waiting to go idle, which is the #3599 incident (vimcode#1745): a
+    `request-changes` round re-landed on the cordoned host every time,
+    which is what stopped it from ever draining. The entry now waits; the
+    #2741/#3336 deferral-pressure stall floor is what eventually breaks a
+    GENUINE deadlock, not this picker."""
     from coord.models import Board
     from coord.review import _ranked_reviewer_candidates, pick_reviewer_machine
 
@@ -592,28 +605,36 @@ def test_a_review_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
         mp.local_set_cordon(name, target_version="0.5.77")
 
     choice = pick_reviewer_machine("laptop", "api", Board(), config)
-    assert choice is not None, (
-        "this returned None on 2026-08-14 and produced 'no eligible reviewer "
-        "machine configured for repo ...' for 70 minutes"
+    assert choice is None, (
+        "a wholly cordoned fleet must leave the review waiting, not "
+        "dispatch onto the host the drain is trying to empty"
     )
+    assert _ranked_reviewer_candidates("laptop", "api", Board(), config) == []
+
+
+def test_a_review_routes_to_the_one_uncordoned_host(tmp_home) -> None:
+    """#3599's own "or wait" clause has a companion: when an UNCORDONED
+    capable host exists, the review must route there instead of either
+    dispatching onto the cordoned one or refusing outright."""
+    from coord.models import Board
+    from coord.review import _ranked_reviewer_candidates, pick_reviewer_machine
+
+    config = _review_config()
+    mp.local_set_cordon("laptop", target_version="0.5.77")
+
+    choice = pick_reviewer_machine("laptop", "api", Board(), config)
+    assert choice is not None
     assert choice.machine.name == "server"
     assert [m.name for m, _ in _ranked_reviewer_candidates(
         "laptop", "api", Board(), config
-    )] == ["server", "laptop"]
+    )] == ["server"]
 
 
-def test_a_fix_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
-    """The same regression, one leg later (#2240 fix-review finding):
-    `_dispatch_fix` (reached via `_dispatch_fix_for_review` after a
-    `request-changes` verdict) is the tail of work already running, exactly
-    like the review dispatch above — so a release cordon must not filter its
-    candidate machines either. Before this fix `_dispatch_fix` still resolved
-    machines with `machine_pause.paused_set()` (cordons included): with the
-    worker's own machine cordoned, the primary pick was excluded, and the
-    fallback candidate list excluded every cordoned host too — so a wholly
-    cordoned fleet left the fix leg permanently un-dispatched, reproducing
-    the same 'running with no live assignment' deadlock shape for the fix
-    leg instead of the review leg."""
+def test_a_fix_does_not_dispatch_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
+    """The same #3599 reversal, one leg later: `_dispatch_fix` (reached via
+    `_dispatch_fix_for_review` after a `request-changes` verdict) must not
+    bypass a cordon either — a fix round can itself produce another review,
+    so it is no more reliably terminal than the review leg above."""
     from unittest.mock import MagicMock, patch
 
     from coord.auto_loop import _dispatch_fix
@@ -642,10 +663,6 @@ def test_a_fix_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
     mock_http.post.return_value.json.return_value = {"id": "fix-2240"}
     mock_http.post.return_value.raise_for_status = MagicMock()
 
-    # #3208: `_dispatch_fix` now probes reachability before picking a
-    # machine — `laptop.tail`/`server.tail` don't actually resolve, so
-    # without this stub every candidate would look unreachable regardless
-    # of the cordon this test is actually about. Default both reachable.
     with patch("coord.auto_loop.record_dispatched_assignment"):
         result = _dispatch_fix(
             work, "Fix briefing.", board, config, iteration=1,
@@ -653,28 +670,32 @@ def test_a_fix_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
             status_fetcher=lambda machine, timeout=3.0: StatusResult(data={}),
         )
 
-    assert result is not None, (
-        "this returned None pre-fix — a wholly cordoned fleet left the fix "
-        "leg permanently un-dispatched, the same shape as the review-leg "
-        "deadlock this whole issue is about"
+    assert result is None, (
+        "a wholly cordoned fleet must leave the fix leg waiting rather than "
+        "re-busy the exact host the cordon is draining — this is the #3599 "
+        "reversal of the pre-existing #2240 bypass"
     )
-    assert result.machine_name == "laptop", "the original worker's own machine"
 
 
 def test_a_cordoned_host_still_refuses_NEW_work(tmp_home) -> None:
-    """The other half of the same rule, and the one that must not regress:
-    the cordon still routes new work away, which is the entire point of
-    #2101. Only the FOLLOW-ON set is cordon-blind."""
+    """The raw `machine_pause` function is unchanged by #3599 — it is simply
+    no longer consulted for a dispatch-TARGET decision (see the tests
+    above); it still backs `coord.commands.release._paused_machine_busy`'s
+    quiescence-busy computation, where excluding the cordon remains
+    correct."""
     mp.local_set_cordon("server", target_version="0.5.77")
     assert "server" in mp.local_paused_set()
     assert "server" not in mp.follow_on_paused_set()
 
 
-def test_an_operator_pause_still_blocks_a_review(tmp_home) -> None:
-    """`coord pause` is an operator's decision about a machine and means what
-    it says. A cordon is this fleet's own drain talking to itself — that is
-    the whole distinction, and collapsing it would make #2240's fix a way to
-    dispatch onto a machine somebody deliberately took out of rotation."""
+def test_an_operator_pause_still_narrows_the_review_to_the_cordoned_host(
+    tmp_home,
+) -> None:
+    """#3599: `paused_set()` already unions explicit pause, quiet hours and
+    cordons — an operator `coord pause` on one machine and a release cordon
+    on the other now both exclude their host from review candidates, same
+    mechanism, same result. With both of `_review_config()`'s two machines
+    excluded, nothing is left to pick."""
     from coord.models import Board
     from coord.review import pick_reviewer_machine
 
@@ -683,14 +704,16 @@ def test_an_operator_pause_still_blocks_a_review(tmp_home) -> None:
     mp.local_set_cordon("laptop", target_version="0.5.77")
 
     choice = pick_reviewer_machine("laptop", "api", Board(), config)
-    assert choice is not None
-    assert choice.machine.name == "laptop", "the cordoned host, not the paused one"
-    assert choice.same_as_worker is True
+    assert choice is None, (
+        "both machines are unavailable (one paused, one cordoned) — there "
+        "is nothing left to route to, and #3599 means the cordon no longer "
+        "gets a pass here"
+    )
 
 
 def test_quiet_hours_still_block_the_follow_on_set(tmp_home) -> None:
-    """Same reasoning as an explicit pause: a quiet-hours window is a policy
-    about the machine, not the release loop waiting on itself."""
+    """The raw function's quiet-hours behaviour is unchanged by #3599 —
+    see `test_a_cordoned_host_still_refuses_NEW_work` above."""
     from datetime import datetime, time, timezone
 
     from coord.models import Machine, QuietHours
@@ -715,11 +738,10 @@ def _remote(monkeypatch, url="http://daemon:7435"):
 
 
 def test_a_thin_client_subtracts_the_cordons_it_fetched(monkeypatch) -> None:
-    """The daemon publishes ONE union (`local_paused_set`), so on a thin
-    client the cordon half has to come off from its own endpoint. Without
-    this, every review dispatched from a laptop keeps the pre-#2240
-    behaviour while the daemon host gets the fix — a split-brain, which in
-    this fleet is its own recurring incident class."""
+    """The raw function's thin-client behaviour is unchanged by #3599 — the
+    daemon publishes ONE union (`local_paused_set`), so on a thin client the
+    cordon half still has to come off from its own endpoint for this
+    function's own callers (now just the quiescence-busy computation)."""
     from coord.release_cordon import Cordon
 
     coord_client = _remote(monkeypatch)
@@ -739,9 +761,10 @@ def test_a_thin_client_subtracts_the_cordons_it_fetched(monkeypatch) -> None:
 
 
 def test_an_unreadable_cordon_store_leaves_the_host_paused(monkeypatch) -> None:
-    """The one direction this must never fail in. Widening the dispatchable
-    set on a failed read would route a review onto a host whose cordon we
-    could not resolve — the safe read of "unknown" is "still cordoned"."""
+    """The one direction this must never fail in, unchanged by #3599.
+    Widening the dispatchable set on a failed read would route a review
+    onto a host whose cordon we could not resolve — the safe read of
+    "unknown" is "still cordoned"."""
     import httpx
 
     coord_client = _remote(monkeypatch)

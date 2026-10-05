@@ -3634,7 +3634,7 @@ class TestSelectFixMachine:
         from coord.dispatch import select_fix_machine
 
         with patch(
-            "coord.machine_pause.follow_on_paused_set", return_value={"laptop"}
+            "coord.machine_pause.paused_set", return_value={"laptop"}
         ):
             selection = select_fix_machine(
                 original_machine_name="laptop",

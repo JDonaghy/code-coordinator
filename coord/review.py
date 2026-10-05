@@ -1244,13 +1244,23 @@ def pick_reviewer_machine(
 
     Returns None when no machine can handle this repo.
 
-    #2240: the pause set here is `follow_on_paused_set()`, NOT `paused_set()`
-    — a review is the tail of work that is already running, so a release
-    cordon ("route no NEW work here") must not filter its host out. It did,
-    on 2026-08-14, and the result was a fleet-wide 70-minute deadlock: the
-    cordon blocked the review, the unreviewable entry stayed `running`, the
-    running entry deferred the roll, and the deferred roll left the cordon
-    up. Explicit pauses and quiet hours still apply.
+    #3599: the pause set here is the FULL `paused_set()` — cordon-inclusive,
+    same as any new dispatch. #2240 (2026-08-14) used `follow_on_paused_set()`
+    instead, on the theory that "a review is the tail of work that is
+    already running, so a release cordon must not filter its host out" —
+    but a review can itself produce a `request-changes` fix round, which
+    produces another review, with no bound on the cycle. Observed
+    2026-10-04: that bypass kept re-dispatching each round's review onto the
+    very host the cordon was waiting to drain, so the host never reached
+    zero active work and the roll never found its window. A cordoned host
+    now routes exactly like a paused one: candidates fall through to any
+    other configured machine, and if the whole fleet is cordoned this
+    returns `None` — the entry waits rather than perpetually re-busying the
+    host the cordon exists to drain. The #2741/#3336 deferral-pressure stall
+    floor (`coord.release_cordon.plan_cordons`) is the backstop that bounds
+    how long a wholly-cordoned fleet can leave a review waiting; this
+    function no longer tries to solve that itself. Explicit pauses and quiet
+    hours still apply, as before.
 
     #697: the ``busy`` set is :func:`busy_machine_names`, which drops
     ``pending``/``running`` rows too old to still be believed — a zombie row
@@ -1268,8 +1278,8 @@ def pick_reviewer_machine(
     consistent here anyway so a future caller of this public function
     isn't silently missing the #3371 gate the wired path has.
     """
-    from coord.machine_pause import follow_on_paused_set
-    paused = follow_on_paused_set(config.machines)
+    from coord.machine_pause import paused_set
+    paused = paused_set(config.machines)
     candidates = [
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
@@ -1344,18 +1354,20 @@ def _ranked_reviewer_candidates(
     a single pick, so a rejected agent (e.g. a 400 from config drift) can
     fall through to the next rather than silently failing (#904).
 
-    #2240: cordon-blind, like ``pick_reviewer_machine`` above and for the
-    same reason — this is the function whose empty return produced the
-    literal "no eligible reviewer machine configured for repo
-    'claude-coordinator'" that a cordoned fleet answered every review
-    dispatch with for 70 minutes.
+    #3599: cordon-aware, like ``pick_reviewer_machine`` above — the FULL
+    `paused_set()`, not the #2240 `follow_on_paused_set()` this used to
+    read. See that function's docstring for why: a review-leg cordon bypass
+    that seemed terminal in 2026-08 turned out not to be, once a
+    `request-changes` round can chain review -> fix -> review indefinitely,
+    and the bypass kept re-landing each round on the host the cordon was
+    draining.
 
     #697: shares :func:`busy_machine_names` with ``pick_reviewer_machine``, so
     tier 1 vs tier 2 here is decided on *believable* in-flight rows only.
     """
-    from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+    from coord.machine_pause import paused_set  # noqa: PLC0415
 
-    paused = follow_on_paused_set(config.machines)
+    paused = paused_set(config.machines)
     candidates = [
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
@@ -3667,12 +3679,17 @@ def dispatch_review(
                     "to original worker machine %s to avoid cross-machine fetch failure",
                     completed.branch, completed.assignment_id, completed.machine_name,
                 )
-                # #2240: same cordon-blind set as the candidate ranking above —
-                # this branch NARROWS to the worker machine, so reading a
-                # cordoned worker as "unavailable" here would strand the review
-                # at `branch_not_on_remote` for exactly the reason #2240 names.
-                from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
-                paused = follow_on_paused_set(config.machines)
+                # #3599: same cordon-aware set as the candidate ranking above
+                # — the FULL `paused_set()`. A cordoned worker here really is
+                # unavailable: dispatching onto it anyway is the exact bypass
+                # #3599 removed, and this branch has no OTHER candidate to
+                # fall through to regardless (the branch only exists locally
+                # on the original worker), so the honest answer is to stall
+                # visibly at `branch_not_on_remote` and let the drive-queue
+                # entry wait, rather than re-busy the host the cordon is
+                # draining.
+                from coord.machine_pause import paused_set  # noqa: PLC0415
+                paused = paused_set(config.machines)
                 worker_machine = next(
                     (m for m in config.machines if m.name == completed.machine_name),
                     None,
