@@ -5404,8 +5404,25 @@ def launch_drive_in_tmux(
         if grew or not alive:
             break
     if not alive:
+        # #3600: the pane this dead session wrote to is already gone by the
+        # time anyone reads this message — `log_path` is the ONLY surviving
+        # record of why, and (since `Driver.run()` now appends its own
+        # `drive_exited` summary there, same file, on every exit) its last
+        # non-empty line names the real reason rather than the generic
+        # "never wrote anything"/"did write something" guess this used to
+        # settle for. That specific text (e.g. "no unpaused machine hosts
+        # ... — pass --machine") is what lets a caller distinguish "every
+        # host was paused/cordoned at launch time" from an ordinary crash.
+        tail = ""
+        if grew:
+            try:
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+                tail = next((ln for ln in reversed(lines) if ln.strip()), "")
+            except OSError:
+                tail = ""
         detail = (
-            "it did write to its log before exiting" if grew
+            f"it exited after logging: {tail}" if tail
+            else "it did write to its log before exiting" if grew
             else "it never wrote anything to its log"
         )
         raise DriveError(
@@ -5909,10 +5926,22 @@ class Driver:
             exit_code = self._loop()
         except BaseException as exc:  # noqa: BLE001 — narrate every exit, then re-raise unchanged
             summary, details = self._drive_exit_summary(None, exc)
+            # #3600: the audit row above lands in the audit DB, not this
+            # run's OWN log file — fine for a `coord drive` run attended at
+            # a terminal (the traceback/DriveError message already printed
+            # to stderr), but a `--tmux` launch's pane is gone the instant
+            # the session dies, which is exactly how quadraui#1102/#1103
+            # died silently: the log held only the "drive loop started"
+            # marker and nothing else. Appending the SAME summary here
+            # means `launch_drive_in_tmux`'s post-launch verification
+            # (which polls this file, not the pane) can read back why, and
+            # relay it to whatever actually launched this session.
+            self._append_run_log(f"{self._stamp()}  {summary}\n")
             self._record_drive_audit("drive_exited", summary, details=details)
             raise
         else:
             summary, details = self._drive_exit_summary(exit_code, None)
+            self._append_run_log(f"{self._stamp()}  {summary}\n")
             self._record_drive_audit("drive_exited", summary, details=details)
             return exit_code
         finally:

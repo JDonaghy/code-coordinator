@@ -5602,6 +5602,73 @@ def test_a_failed_launch_is_a_consumed_attempt_not_a_running_entry(
     assert "tmux: no server running" in entry["last_reason"]
 
 
+def test_the_tick_defers_an_unpinned_entry_with_no_eligible_host(
+    cli, seed, launches, monkeypatch,
+):
+    """#3600: wired through the real `coord drive-queue tick` — when the
+    shell's own `_fetch_no_eligible_host` reports a repo as having no
+    surviving candidate, nothing is spawned for it at all, and a later tick
+    (once the fleet is reported eligible again) launches normally."""
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+
+    monkeypatch.setattr(
+        drive_queue_cmd, "_fetch_no_eligible_host",
+        lambda entries, config_path: {REPO: "every host ... is paused or cordoned"},
+    )
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+    entry = queued(1650)
+    assert entry["state"] == "waiting"
+    assert entry["attempts"] == 0
+
+    monkeypatch.setattr(
+        drive_queue_cmd, "_fetch_no_eligible_host", lambda entries, config_path: {},
+    )
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert launches and "1650" in " ".join(launches[0])
+
+
+def test_a_no_eligible_host_launch_failure_spends_no_attempt(cli, seed, launches):
+    """#3600's launch-time safety net: a residual race between this tick's
+    own `no_eligible_host` precheck and the moment the launch subprocess
+    actually resolved its machine (every capable host became paused or
+    cordoned in that window) must not be charged against the entry's
+    attempts — the exact failure mode that sent quadraui#1102/#1103 to
+    `blocked` while a `--dry-run` run, moments later, resolved cleanly.
+
+    `launch_drive_in_tmux` folds `preflight()`'s own refusal message into
+    this stderr via the drive loop's run-log tail (see `coord/drive.py`);
+    simulated here directly, since the subprocess itself is mocked out by
+    `launches`.
+    """
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+    launches.outcome["returncode"] = 2
+    launches.outcome["stderr"] = (
+        "tmux session 'drive-claude-coordinator-1650' for claude-coordinator "
+        "#1650 already exited (it exited after logging: 12:00:00  drive "
+        "exited for claude-coordinator#1650: no unpaused machine hosts "
+        "claude-coordinator — pass --machine (exit_code=2)) — the drive "
+        "loop did not stay running, so this is not a live background run. "
+        "Check the log: /tmp/x.log\n"
+        "   Re-run without --tmux to see the failure inline instead."
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1650)
+    assert entry["state"] == "waiting"
+    assert entry["attempts"] == 0
+    assert not entry["session_name"]
+    assert "no unpaused machine" in entry["last_reason"]
+    assert "#3600" in entry["last_reason"]
+
+
 # ── status ───────────────────────────────────────────────────────────────────
 
 

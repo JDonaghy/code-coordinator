@@ -2610,6 +2610,20 @@ class Deferral:
     cadence, because nothing paced the SECOND attempt; alerting on every tick
     of the pacing that now exists would just be a slower version of the same
     noise the repo-limit/cordon flags above already learned to suppress.
+
+    ``no_eligible_host=True`` is #3600's sibling of ``cordoned``: the entry
+    is UNPINNED and every machine that could auto-pick its repo is paused or
+    cordoned right now (see :func:`_no_eligible_host_reason`).  Before #3600
+    this case had no deferral at all — the tick launched anyway, `coord
+    drive --tmux` resolved zero candidates, and the drive loop died inside
+    its startup grace window having burned an attempt for a condition
+    retrying could never fix (quadraui#1102/#1103, both went `blocked` on
+    attempts=2 during a fleet-wide release cordon). A separate flag rather
+    than reusing ``cordoned`` because that flag's own prose says "pinned to a
+    machine" — true only for `_cordon_reason`'s case — and a render that
+    tells an operator to look at a `--machine` pin that doesn't exist sends
+    them to the wrong knob, same reasoning as ``repo_limited`` vs
+    ``cordoned`` above.
     """
 
     key: str
@@ -2619,6 +2633,7 @@ class Deferral:
     repo_limited: bool = False
     cordoned: bool = False
     backing_off: bool = False
+    no_eligible_host: bool = False
 
     @property
     def benign(self) -> bool:
@@ -2628,7 +2643,12 @@ class Deferral:
         consult, so a future third benign cause cannot be added to one and
         forgotten in the other.
         """
-        return self.repo_limited or self.cordoned or self.backing_off
+        return (
+            self.repo_limited
+            or self.cordoned
+            or self.backing_off
+            or self.no_eligible_host
+        )
 
 
 @dataclass(frozen=True)
@@ -6525,6 +6545,7 @@ def plan_tick(
     exit_dead_end: Mapping[str, bool] | None = None,
     gate_a_pending: Mapping[str, bool] | None = None,
     cordons: Mapping[str, str] | None = None,
+    no_eligible_host: Mapping[str, str] | None = None,
     live_ci_gate: Mapping[str, bool] | None = None,
     live_ci_gate_reason: Mapping[str, str] | None = None,
     live_blocked_gate: Mapping[str, bool] | None = None,
@@ -6624,6 +6645,21 @@ def plan_tick(
     leave a finished drive's `running` row pinning propagation forever — the
     #2110 deadlock, re-created by the very mechanism meant to end it.  A
     cordoned tick is exactly `--reconcile-only`.
+
+    *no_eligible_host* (#3600) maps a REPO name to the reason every machine
+    that could run it is currently paused or cordoned — ``{"quadraui":
+    "every host that can run quadraui is paused or cordoned right now ..."}``
+    — precomputed by the shell from the SAME full, cordon-inclusive
+    ``coord.machine_pause.paused_set()`` that ``coord.drive_state.
+    pick_machine_choice`` filters its candidates against at actual-launch
+    time (one question, one answer — #2096/#2085), restricted to repos that
+    actually have an UNPINNED waiting entry so a fleet with none costs
+    nothing to compute. ``cordons`` above answers "is a PINNED entry's named
+    destination cordoned"; this answers the equivalent question for an
+    unpinned entry, whose destination is never named until launch — see
+    :func:`_no_eligible_host_reason`. A repo absent from the mapping (or the
+    mapping being ``None``) behaves exactly like pre-#3600: nothing deferred
+    on this account.
 
     *editable_drift* is ``(repo_root, shown)`` (a rendered branch label —
     see :func:`coord.cli._editable_checkout_drift`) when THIS host's own
@@ -7788,8 +7824,14 @@ def plan_tick(
         Only an explicit ``--machine`` pin is checked here; an unpinned entry
         auto-picks its host at dispatch time, where `coord.drive_state`'s
         machine picker already skips paused machines (a cordon IS a routing
-        pause — see `coord.machine_pause`), so guessing a destination here
-        would be a second, weaker copy of that decision.
+        pause — see `coord.machine_pause`), so guessing which ONE destination
+        it will land on here would be a second, weaker copy of that decision.
+
+        That does not mean an unpinned entry goes unchecked, though (#3600):
+        :func:`_no_eligible_host_reason` below answers the DIFFERENT question
+        this function deliberately leaves alone — not "which one host will it
+        land on", but "are ALL of them unavailable right now" — from a
+        precomputed per-repo map rather than guessing a single destination.
         """
         if not candidate.machine:
             return ""
@@ -7800,6 +7842,41 @@ def plan_tick(
             f"{candidate.machine} is {reason} — deferring rather than "
             "dispatching into a host that is draining for a release (#2101)"
         )
+
+    no_eligible_host_map: dict[str, str] = {
+        repo: str(reason)
+        for repo, reason in (no_eligible_host or {}).items()
+        if reason
+    }
+
+    def _no_eligible_host_reason(candidate: QueueEntry) -> str:
+        """#3600: '' unless this entry is UNPINNED and every machine that
+        could auto-pick for its repo is paused or cordoned right now.
+
+        A DEFER, never a block: nothing is wrong with the entry, its
+        position does not move and no attempt is spent — same posture as
+        `_cordon_reason` above, whose job this function deliberately does
+        NOT duplicate: a PINNED entry is that function's to judge (an
+        explicit `--machine` already names a single destination, so "is the
+        WHOLE FLEET unavailable" is the wrong question to ask it); this one
+        only fires for an entry that would otherwise auto-pick.
+
+        Before #3600 an unpinned entry was launched unconditionally and left
+        to discover at ACTUAL launch time (`coord.drive_state.
+        pick_machine_choice`, inside `coord drive --tmux`) that its
+        candidate list was empty — by then the entry had already spent an
+        attempt on a drive loop that died within its startup grace window
+        having written nothing past its "drive loop started" marker
+        (quadraui#1102/#1103, both `blocked` at attempts=2 during a
+        fleet-wide release cordon that a `--dry-run` run moments later, once
+        the cordon lifted, resolved cleanly). `no_eligible_host_map` is
+        built by the shell from the exact same full, cordon-inclusive
+        `coord.machine_pause.paused_set()` that pick does — this is that
+        same verdict, read early enough to defer instead of burn.
+        """
+        if candidate.machine:
+            return ""
+        return no_eligible_host_map.get(candidate.repo, "")
 
     launch: QueueEntry | None = None
     # #1873: keys that reconciled straight to `done` in the walk below —
@@ -7876,6 +7953,18 @@ def plan_tick(
                         counted=False,
                         cordoned=True,
                         updates=_refresh_only(cordoned, entry.last_reason),
+                    )
+                )
+                continue
+            no_host = _no_eligible_host_reason(entry)
+            if no_host:
+                deferrals.append(
+                    Deferral(
+                        entry.key,
+                        no_host,
+                        counted=False,
+                        no_eligible_host=True,
+                        updates=_refresh_only(no_host, entry.last_reason),
                     )
                 )
                 continue
@@ -8014,6 +8103,29 @@ def plan_tick(
                     # drain.  The cordon has its OWN alert when it is THIS
                     # host that is stopped — see `_cordon_alert`.
                     cordoned=True,
+                )
+            )
+            continue
+        # #3600, same position and same reasoning as the cordon check just
+        # above: an unpinned entry whose repo has no eligible host right now
+        # must defer, not launch into a `coord drive --tmux` that would
+        # resolve zero candidates and burn an attempt for nothing it could
+        # have controlled.
+        no_host = _no_eligible_host_reason(entry)
+        if no_host:
+            deferrals.append(
+                Deferral(
+                    entry.key,
+                    no_host,
+                    updates={
+                        "deferrals": entry.deferrals + 1,
+                        "last_reason": no_host,
+                    },
+                    # Same posture as the cordon/repo-limit deferrals above:
+                    # the fleet working as designed (a release draining every
+                    # capable host), not a stalled queue — no queue-level
+                    # alert for the duration.
+                    no_eligible_host=True,
                 )
             )
             continue
@@ -8236,7 +8348,8 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         cordoned = any(item.cordoned for item in plan.deferrals)
         repo_limited = any(item.repo_limited for item in plan.deferrals)
         backing_off = any(item.backing_off for item in plan.deferrals)
-        active = [c for c in (cordoned, repo_limited, backing_off) if c]
+        no_eligible_host = any(item.no_eligible_host for item in plan.deferrals)
+        active = [c for c in (cordoned, repo_limited, backing_off, no_eligible_host) if c]
         if len(active) > 1:
             # Post-review fix: a MIXED benign set (e.g. one cordoned entry,
             # one backing off) used to have the cordon branch's message
@@ -8252,6 +8365,10 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
                     "pinned to a machine under a release cordon "
                     "(draining to be rolled)"
                 )
+            if no_eligible_host:
+                parts.append(
+                    "unpinned with every capable host paused or cordoned (#3600)"
+                )
             if repo_limited:
                 parts.append(f"repo-limited ({_repo_limit_summary(plan)})")
             if backing_off:
@@ -8264,6 +8381,12 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
             lines.append(
                 "  no launch — every waiting entry is pinned to a machine "
                 "under a release cordon (draining to be rolled)"
+            )
+        elif no_eligible_host:
+            lines.append(
+                "  no launch — every waiting entry is unpinned and every "
+                "host capable of its repo is paused or cordoned right now "
+                "(#3600); it resumes once a host is uncordoned"
             )
         elif repo_limited:
             lines.append(

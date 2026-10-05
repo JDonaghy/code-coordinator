@@ -3477,6 +3477,65 @@ def _fetch_cordons() -> dict[str, str]:
         return {}
 
 
+def _fetch_no_eligible_host(
+    entries: Sequence[QueueEntry], config_path: Path,
+) -> dict[str, str]:
+    """``{repo: "every host that can run REPO is paused or cordoned..."}``
+    for every repo with at least one UNPINNED waiting entry, when NONE of
+    its capable machines currently survive `coord.machine_pause.
+    paused_set()` (#3600).
+
+    Restricted to repos actually present among *entries* with an unpinned
+    row — a fleet with none costs nothing beyond building that set. Reuses
+    `paused_set()` (full cordon-inclusive) rather than re-deriving "is this
+    host routable" a second way — the SAME predicate
+    `coord.drive_state.pick_machine_choice` filters its own candidates
+    against at actual-launch time, and the same one `coord.dispatch`'s
+    `route_work_by_capability`/`route_work_by_liveness` gate a `type="work"`
+    reroute on (#2096/#2085, "one question, one answer").
+
+    Fail-SOFT exactly like `_fetch_cordons` just above, for the identical
+    reason its own docstring gives: a missed defer here costs one burned
+    attempt (the pre-#3600 status quo), whereas failing the whole tick
+    closed on an unreadable config/pause store would stop the queue outright
+    on a transient blip — worse than the thing #3600 exists to fix.
+    """
+    repos = {e.repo for e in entries if not e.machine}
+    if not repos:
+        return {}
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.machine_pause import paused_set  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        paused = paused_set(cfg.machines)
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        click.echo(
+            f"warning: could not resolve eligible hosts ({exc}) — "
+            "treating every repo as having an eligible host", err=True,
+        )
+        return {}
+
+    out: dict[str, str] = {}
+    for repo in repos:
+        hosts = [m for m in cfg.machines if m.can_work_on(repo)]
+        if not hosts:
+            # Unrelated to #3600: no machine declares this repo at all.
+            # `coord.drive_state.pick_machine_choice`'s own "no unpaused
+            # machine hosts {repo}" message already distinguishes that from
+            # a cordon/pause — conflating the two here would blame the
+            # wrong knob.
+            continue
+        if any(m.name not in paused for m in hosts):
+            continue
+        out[repo] = (
+            f"every host that can run {repo} is paused or cordoned right "
+            "now — deferring rather than launching into a `coord drive` "
+            "that would resolve zero candidates (#3600)"
+        )
+    return out
+
+
 def _fetch_editable_drift() -> tuple[str, str] | None:
     """``(repo_root, shown)`` when THIS host's own `coord` is an editable
     checkout that has drifted off its default branch, else ``None`` (#2314).
@@ -7148,6 +7207,16 @@ def drive_queue_tick(
         # a rollable state.
         cordons = _fetch_cordons()
 
+        # #3600: for every UNPINNED waiting entry, is EVERY machine capable
+        # of its repo currently paused or cordoned? Before this, only a
+        # PINNED entry's own cordon was checked (`_cordon_reason` above) —
+        # an unpinned entry launched unconditionally and discovered the
+        # empty candidate list only at actual `coord drive --tmux` launch
+        # time, dying within its startup grace window having burned an
+        # attempt (quadraui#1102/#1103, both went `blocked` during a
+        # fleet-wide release cordon).
+        no_eligible_host = _fetch_no_eligible_host(entries, config_path)
+
         # #2314: is THIS host's own `coord` a drifted editable checkout?
         # Escalates `coord.cli._warn_if_editable_checkout_moved` from an
         # advisory-only startup warning (nothing unattended ever reads) to
@@ -7180,6 +7249,7 @@ def drive_queue_tick(
             exit_dead_end=exit_dead_end,
             gate_a_pending=gate_a_pending,
             cordons=cordons,
+            no_eligible_host=no_eligible_host,
             live_ci_gate=live_ci_gate,
             live_ci_gate_reason=live_ci_gate_reason,
             live_blocked_gate=live_blocked_gate,
@@ -7577,10 +7647,48 @@ def drive_queue_tick(
                 timeout=_LAUNCH_TIMEOUT_SECONDS,
             )
             returncode = result.returncode
-            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            full_output = (result.stderr or result.stdout or "").strip()
+            detail = full_output.splitlines()
             message = detail[-1] if detail else ""
         except (subprocess.SubprocessError, OSError) as exc:
             returncode, message = 1, str(exc)
+            full_output = message
+
+        # #3600: every host capable of this repo was paused/cordoned at the
+        # instant `coord drive --tmux` actually resolved its machine — a
+        # race against THIS tick's own `no_eligible_host` precheck above
+        # (built from a snapshot that is, by the time the subprocess here
+        # actually ran, a few hundred ms stale), not anything wrong with the
+        # entry. Searched over the FULL captured output, not `message`
+        # (which is deliberately only the LAST line — see below — and for
+        # this specific error that line is the generic "Re-run without
+        # --tmux ..." hint, not `preflight()`'s actual "no unpaused machine
+        # hosts ..." sentence `launch_drive_in_tmux` now folds into the log
+        # tail it relays). Charging an attempt for a condition no retry
+        # could have avoided is exactly the #3600 incident
+        # (quadraui#1102/#1103 going `blocked` on attempts=2 while a
+        # `--dry-run` moments later, once the cordon lifted, resolved
+        # cleanly) — stay `waiting`, attempts untouched, same posture as the
+        # benign deferrals `plan_tick` itself never charges.
+        if returncode != 0 and "no unpaused machine" in full_output:
+            marker_line = next(
+                (ln for ln in full_output.splitlines() if "no unpaused machine" in ln),
+                message,
+            )
+            reason = (
+                f"no eligible host at launch time for {target.key} — "
+                f"{marker_line.strip()} (not counted against attempts — #3600)"
+            )
+            update_drive_queue_entry(
+                target.repo,
+                target.issue,
+                state=STATE_WAITING,
+                last_reason=reason,
+            )
+            click.echo(
+                f"no launch for {target.key}: {reason}"
+            )
+            return
 
         if returncode == 0:
             from coord.drive import drive_session_name  # noqa: PLC0415
