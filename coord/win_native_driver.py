@@ -1302,6 +1302,21 @@ class WinNativeSession:
         self._hwnd = self._calls.find_top_window(self._pid, timeout_s)
         self._calls.move_window(self._hwnd, 0, 0, width, height)
 
+    @property
+    def pid(self) -> int:
+        """The pid :meth:`WinCalls.launch` returned (#3590) — read by
+        :mod:`coord.app_drive_daemon` for its ready-file's ``app_pid`` so
+        :func:`coord.app_drive.close_session` can re-observe/re-signal the
+        process this session itself launched, not just the daemon.
+
+        See :meth:`_descendant_pids`'s own docstring (#3542): this is
+        ``cmd.exe``'s pid, not the real app's — ``Win32Calls.launch``'s
+        ``shell=True`` makes the real app a grandchild this pid never
+        owns a window for. Killing this pid alone can leave that
+        grandchild running; tracked separately from #3590, same class as
+        the mac-native/gtk-native shell-vs-app gap."""
+        return self._pid
+
     def send_key(self, key: str) -> None:
         self._calls.send_key(self._hwnd, key)
 

@@ -64,13 +64,32 @@ _KIND_ARG = click.argument("kind", type=click.Choice(APP_DRIVE_KINDS))
 @click.option("--cols", type=int, default=80, show_default=True, help="tui-pty terminal columns.")
 @click.option("--rows", type=int, default=24, show_default=True, help="tui-pty terminal rows.")
 @click.option(
+    "--width", type=int, default=None,
+    help="Native-kind window width in pixels (mac-native/win-native/gtk-native only). "
+    "Defaults to a size DERIVED from --cols (#3590 review: the derived default is "
+    "800x480 at this command's own --cols/--rows defaults, not the 1024x768 a bare "
+    "reading of the driver's fallback might suggest) — pass this explicitly for a "
+    "real pixel size instead.",
+)
+@click.option(
+    "--height", type=int, default=None,
+    help="Native-kind window height in pixels (mac-native/win-native/gtk-native only). "
+    "See --width.",
+)
+@click.option(
     "--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT, show_default=True,
     help="Seconds of no command before the session self-tears-down even without an explicit close.",
 )
-def app_drive_open(kind: str, launch: str, cwd: str, cols: int, rows: int, idle_timeout: float) -> None:
+def app_drive_open(
+    kind: str, launch: str, cwd: str, cols: int, rows: int,
+    width: int | None, height: int | None, idle_timeout: float,
+) -> None:
     """Open a new KIND session. Prints ``{"session_id": ...}`` on success."""
     try:
-        handle = open_session(kind, launch=launch, cwd=cwd, cols=cols, rows=rows, idle_timeout=idle_timeout)
+        handle = open_session(
+            kind, launch=launch, cwd=cwd, cols=cols, rows=rows,
+            width=width, height=height, idle_timeout=idle_timeout,
+        )
     except AppDriveUnavailableError as e:
         click.echo(json.dumps({"status": "unavailable", "reason": e.reason}))
         sys.exit(3)
@@ -228,6 +247,12 @@ def app_drive_run_spec(kind: str, spec_file: str, launch: str, cwd: str, timeout
     # #2096: judged from the tests' own reported verdicts, not merely the
     # run command's exit code (`result.ok`) — a driver can exit 0 while
     # individually reporting a failing/unavailable step (see
-    # `DriverResult.ok`'s own docstring).
+    # `DriverResult.ok`'s own docstring). An EMPTY `result.tests` must not
+    # pass either (#3590 review) — a gate reporting success against zero
+    # observations is exactly the "unconfirmed success" epic #2096 exists
+    # to catch, not a real pass.
+    if not result.tests:
+        click.echo("error: run-spec reported zero tests — treating as a failure, not a pass", err=True)
+        sys.exit(1)
     if not result.ok or any(t.get("status") in ("fail", "unavailable") for t in result.tests):
         sys.exit(1)

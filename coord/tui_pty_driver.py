@@ -694,6 +694,18 @@ class UnixPtyChild:
         except OSError:
             return b""
 
+    @property
+    def pid(self) -> int:
+        """The real pty child's pid (#3590) — for the common
+        single-simple-command launch, :func:`_wrap_launch_command`'s
+        ``exec`` means this ``Popen`` pid IS the real binary's own pid
+        (the shell process image was replaced, not forked), so this is
+        safe to re-observe/re-signal directly as the driven app's pid —
+        unlike the native drivers' own ``Calls.launch()``, which has no
+        such exec-wrap and returns a shell pid instead (see
+        :class:`coord.mac_native_driver.MacNativeSession.pid`)."""
+        return self._proc.pid
+
     def is_alive(self) -> bool:
         return self._proc.poll() is None
 
@@ -707,6 +719,18 @@ class UnixPtyChild:
                 self._proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+                # #3590 review: re-observe after the kill too — the
+                # previous version sent SIGKILL and declared victory
+                # without ever confirming it landed, overstating what
+                # "confirmed terminate-then-kill" (this class's own
+                # module/TuiPtySession docstrings) actually means. SIGKILL
+                # cannot be blocked, so this wait is bounded and
+                # best-effort only against a process already wedged in
+                # uninterruptible kernel sleep.
+                try:
+                    self._proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
             os.close(self._master_fd)
         except OSError:
@@ -758,6 +782,13 @@ class WindowsConPtyChild:
             return self._chunks.get(timeout=timeout)
         except queue.Empty:
             return b""
+
+    @property
+    def pid(self) -> int | None:
+        """``pywinpty``'s own child pid (#3590), when it exposes one —
+        best-effort, since this is read via ``getattr`` by callers rather
+        than assumed present on every ``pywinpty`` version."""
+        return getattr(self._proc, "pid", None)
 
     def is_alive(self) -> bool:
         return bool(self._proc.isalive())
@@ -1085,6 +1116,16 @@ class TuiPtySession:
             with self._lock:
                 self._last_byte_time = time.monotonic()
                 self._screen.feed(data)
+
+    @property
+    def pid(self) -> int | None:
+        """The real pty child's pid (#3590), when the underlying
+        :class:`PtyChild` exposes one (both :class:`UnixPtyChild` and
+        :class:`WindowsConPtyChild` do) — read by
+        :mod:`coord.app_drive_daemon` for its ready-file's ``app_pid`` so
+        :func:`coord.app_drive.close_session` can re-observe/re-signal the
+        driven app itself, not just the daemon wrapping this session."""
+        return getattr(self._child, "pid", None)
 
     def send_key(self, key: str) -> None:
         self._child.write(encode_key(key))

@@ -44,18 +44,30 @@ WHOLE session, held by the daemon.
    a network partition), the daemon self-expires after *idle_timeout*
    seconds with no command (default 30 minutes) — see
    :mod:`coord.app_drive_daemon`'s accept-loop — tearing its backend down
-   the same way. This is deliberately NOT process-group-based (the daemon
-   is spawned detached so it survives independently of any one Bash tool
-   call's own process group, which is exactly what "session alive across
-   calls" requires) — the idle self-expiry is what prevents that same
-   detachment from leaking a session forever if nobody ever calls
-   ``close``.
+   the same way. This is deliberately NOT process-group-based: the daemon
+   is spawned detached (:func:`open_session` passes `start_new_session=True`
+   on POSIX, `CREATE_NEW_PROCESS_GROUP` on Windows) so it survives
+   independently of whatever process group the ``coord app-drive open``
+   invocation itself ran in — exactly what "session alive across calls"
+   requires when a Bash tool reaps its own command's process group on
+   completion/timeout (a common sandbox configuration, and the reason
+   #3583 exists at all: killing that group must not take the daemon with
+   it). The idle self-expiry is what prevents that same detachment from
+   leaking a session forever if nobody ever calls ``close``.
+3. :func:`close_session` does not stop at observing the *daemon's* own
+   pid — it also re-observes (and, if necessary, directly signals) the
+   real app/pty-child pid the daemon reported at ``open`` time
+   (``SessionHandle.app_pid``), so a daemon that had to be SIGKILLed
+   before its own ``finally: backend.close()`` ever ran does not leave
+   the driven app itself running underneath (#3590 review: "unconfirmed
+   success is a defect", epic #2096).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -96,7 +108,13 @@ class AppDriveUnavailableError(AppDriveError):
     as unavailable, never improvise past. Distinct from every other
     :class:`AppDriveError` so a caller (``coord app-drive <kind> open``)
     can print the exact ``reason`` text a worker folds straight into its
-    own ```` ```bugbash-unavailable ```` fence."""
+    own ```` ```bugbash-unavailable ```` fence.
+
+    This is the ONE definition — :mod:`coord.app_drive_daemon` imports it
+    from here rather than keeping its own copy, so a future in-process
+    caller of :func:`coord.app_drive_daemon._build_backend` can never end
+    up catching the wrong class for what is, on the wire, the exact same
+    signal (a ready-file ``{"error": "unavailable", ...}``)."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -118,20 +136,40 @@ class SessionHandle:
     """What :func:`open_session` hands back, and what every later verb
     (:func:`send_command`/:func:`close_session`) re-reads from disk by
     *session_id* — never trusted as a long-lived in-memory object, since
-    each CLI invocation is a fresh process with no memory of the last one."""
+    each CLI invocation is a fresh process with no memory of the last one.
+
+    ``app_pid`` is the backend's own best-known pid for the real app/pty
+    child it launched (``getattr(backend, "pid", None)`` in
+    :mod:`coord.app_drive_daemon`'s ready-file write) — distinct from
+    ``pid``, the app-drive *daemon's* own pid. ``None`` when a backend has
+    no such pid to report. :func:`close_session` re-observes (and, if
+    necessary, directly signals) THIS pid too, not just the daemon's, so a
+    SIGKILLed daemon cannot silently leave the real app running (#3590
+    review). ``token`` authenticates every command sent to the daemon's
+    control socket (#3590 review: the socket has no other authentication,
+    and the port is already world-readable from this very session file —
+    a stolen token is no bigger a leak than a stolen port, but it does
+    stop an unrelated local process from merely *guessing* the port and
+    injecting commands)."""
 
     session_id: str
     kind: str
     pid: int
     port: int
+    token: str
+    app_pid: int | None = None
 
 
 def _write_session_file(handle: SessionHandle) -> None:
     path = _session_file(handle.session_id)
-    tmp = path.with_suffix(".tmp")
+    # #3590 review (nit): a distinct suffix from the daemon's own
+    # `<id>.ready` -> `<id>.tmp` so the two atomic-write temp files can
+    # never collide even if their write windows ever overlapped.
+    tmp = path.with_suffix(".session.tmp")
     tmp.write_text(json.dumps({
         "session_id": handle.session_id, "kind": handle.kind,
-        "pid": handle.pid, "port": handle.port,
+        "pid": handle.pid, "port": handle.port, "token": handle.token,
+        "app_pid": handle.app_pid,
     }))
     tmp.replace(path)
 
@@ -151,6 +189,8 @@ def load_session(session_id: str) -> SessionHandle:
         return SessionHandle(
             session_id=raw["session_id"], kind=raw["kind"],
             pid=int(raw["pid"]), port=int(raw["port"]),
+            token=raw.get("token", ""),
+            app_pid=int(raw["app_pid"]) if raw.get("app_pid") is not None else None,
         )
     except (KeyError, TypeError, ValueError) as e:
         raise AppDriveError(f"corrupt app-drive session file for {session_id!r}: {e}") from e
@@ -224,7 +264,10 @@ def send_command(handle: SessionHandle, command: dict, *, timeout: float = 30.0)
 
     Raises :class:`AppDriveError` on a connection failure (the daemon is
     gone/unreachable — a stale session, never silently treated as "the verb
-    succeeded") or a reply the daemon itself flagged as an error."""
+    succeeded") or a reply the daemon itself flagged as an error. Stamps
+    *handle*'s own ``token`` onto *command* (#3590 review: the only
+    authentication the control socket has — see :class:`SessionHandle`)."""
+    command = {**command, "token": handle.token}
     try:
         with socket.create_connection(("127.0.0.1", handle.port), timeout=timeout) as sock:
             sock.sendall((json.dumps(command) + "\n").encode("utf-8"))
@@ -257,6 +300,7 @@ def send_command(handle: SessionHandle, command: dict, *, timeout: float = 30.0)
 
 def open_session(
     kind: str, *, launch: str, cwd: str, cols: int = 80, rows: int = 24,
+    width: int | None = None, height: int | None = None,
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT, ready_timeout: float = 30.0,
     python: str | None = None,
 ) -> SessionHandle:
@@ -265,16 +309,23 @@ def open_session(
     observation of the daemon's own ready-file, never the mere fact that
     ``Popen`` didn't raise).
 
-    The daemon is spawned as a plain (non-detached) child so platform job
-    control still reaches it like any other subprocess of this one — but
-    see this module's docstring: that alone is not a sufficient teardown
-    guarantee on its own, hence the idle self-expiry
-    (:mod:`coord.app_drive_daemon`) as the backstop.
+    The daemon is spawned genuinely DETACHED — ``start_new_session=True``
+    on POSIX (``setsid()``: a new session AND a new process group),
+    ``CREATE_NEW_PROCESS_GROUP`` on Windows — so it is never a member of
+    whatever process group this ``coord app-drive open`` invocation itself
+    ran in. This is load-bearing, not cosmetic (#3590 review): an agent
+    Bash tool that reaps its own command's process group on
+    completion/timeout (a common sandbox configuration, and the reason
+    #3583 exists at all) would otherwise take the daemon down with the
+    very CLI call that started it, failing the very next ``send``. The
+    idle self-expiry (:mod:`coord.app_drive_daemon`) remains the backstop
+    for the case nobody ever calls ``close`` at all.
     """
     if kind not in APP_DRIVE_KINDS:
         raise AppDriveError(f"unknown app-drive kind {kind!r} — expected one of {APP_DRIVE_KINDS}")
 
     session_id = uuid.uuid4().hex[:12]
+    token = secrets.token_hex(16)
     ready_file = _sessions_dir() / f"{session_id}.ready"
     if ready_file.exists():
         ready_file.unlink()
@@ -284,62 +335,108 @@ def open_session(
         "--kind", kind, "--launch", launch, "--cwd", cwd,
         "--cols", str(cols), "--rows", str(rows),
         "--idle-timeout", str(idle_timeout), "--ready-file", str(ready_file),
+        "--token", token,
     ]
+    if width is not None:
+        argv += ["--width", str(width)]
+    if height is not None:
+        argv += ["--height", str(height)]
+    detach_kwargs: dict = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
     proc = subprocess.Popen(  # noqa: S603 — *launch* is the lane worker's own, not untrusted input
-        argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, **detach_kwargs,
     )
 
-    deadline = time.monotonic() + ready_timeout
-    while time.monotonic() < deadline:
-        if ready_file.exists():
-            try:
-                ready = json.loads(ready_file.read_text())
-                ready_file.unlink()
-            except (OSError, ValueError):
-                time.sleep(0.05)
-                continue
-            if ready.get("error") == "unavailable":
-                # #3510/#3566: the backend's own session-available/
-                # permission precheck failed BEFORE launching anything —
-                # surface this as the dedicated unavailable signal, not a
-                # generic open failure, so a worker's own open-time check
-                # can fold `reason` straight into its unavailable fence.
-                raise AppDriveUnavailableError(ready.get("reason", "lane unavailable"))
-            if ready.get("error"):
-                raise AppDriveError(
-                    f"app-drive daemon for kind {kind!r} failed to open: "
-                    f"{ready.get('reason', ready['error'])}"
+    try:
+        deadline = time.monotonic() + ready_timeout
+        while time.monotonic() < deadline:
+            if ready_file.exists():
+                try:
+                    ready = json.loads(ready_file.read_text())
+                    ready_file.unlink()
+                except (OSError, ValueError):
+                    time.sleep(0.05)
+                    continue
+                if ready.get("error") == "unavailable":
+                    # #3510/#3566: the backend's own session-available/
+                    # permission precheck failed BEFORE launching anything
+                    # — surface this as the dedicated unavailable signal,
+                    # not a generic open failure, so a worker's own
+                    # open-time check can fold `reason` straight into its
+                    # unavailable fence.
+                    raise AppDriveUnavailableError(ready.get("reason", "lane unavailable"))
+                if ready.get("error"):
+                    raise AppDriveError(
+                        f"app-drive daemon for kind {kind!r} failed to open: "
+                        f"{ready.get('reason', ready['error'])}"
+                    )
+                handle = SessionHandle(
+                    session_id=session_id, kind=kind,
+                    pid=int(ready["pid"]), port=int(ready["port"]), token=token,
+                    app_pid=int(ready["app_pid"]) if ready.get("app_pid") is not None else None,
                 )
-            handle = SessionHandle(
-                session_id=session_id, kind=kind,
-                pid=int(ready["pid"]), port=int(ready["port"]),
-            )
-            _write_session_file(handle)
-            return handle
-        if proc.poll() is not None:
-            stderr = proc.stderr.read() if proc.stderr else ""
-            raise AppDriveError(
-                f"app-drive daemon for kind {kind!r} exited before becoming "
-                f"ready (code {proc.returncode}): {stderr.strip()}"
-            )
-        time.sleep(0.05)
-    proc.kill()
-    raise AppDriveError(
-        f"app-drive daemon for kind {kind!r} did not become ready within "
-        f"{ready_timeout:.0f}s"
-    )
+                _write_session_file(handle)
+                return handle
+            if proc.poll() is not None:
+                stderr = proc.stderr.read() if proc.stderr else ""
+                raise AppDriveError(
+                    f"app-drive daemon for kind {kind!r} exited before becoming "
+                    f"ready (code {proc.returncode}): {stderr.strip()}"
+                )
+            time.sleep(0.05)
+        proc.kill()
+        raise AppDriveError(
+            f"app-drive daemon for kind {kind!r} did not become ready within "
+            f"{ready_timeout:.0f}s"
+        )
+    finally:
+        # #3590 review (nit): close the stderr pipe we opened above on
+        # every exit path — the daemon keeps running past this function
+        # returning on the success path, so there is nothing to `wait()`
+        # for, but the now-unread pipe FD itself must still be closed or
+        # a long-lived in-process caller accumulates `ResourceWarning`s.
+        if proc.stderr is not None:
+            proc.stderr.close()
+
+
+def _target_pids(handle: SessionHandle) -> tuple[int, ...]:
+    """Every pid a confirmed teardown of *handle* must observe dead — the
+    daemon's own pid, PLUS the real app/pty-child pid it reported at open
+    time (``app_pid``), when that's known and distinct (#3590 review: a
+    ``closed: true`` that only proves the daemon died is not teardown
+    confirmation for the app it was driving)."""
+    if handle.app_pid is not None and handle.app_pid != handle.pid:
+        return (handle.pid, handle.app_pid)
+    return (handle.pid,)
+
+
+def _all_dead(pids: tuple[int, ...]) -> bool:
+    return all(not _pid_alive(pid) for pid in pids)
 
 
 def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
     """Tear *handle* down and confirm it (#2096) — only reports success once
-    the daemon process is OBSERVED gone, escalating from "ask nicely" to
-    SIGTERM to SIGKILL rather than trusting any one step blindly. Removes
-    the on-disk session file only once confirmed dead (or already gone).
+    BOTH the daemon process AND the real app/pty-child it was driving
+    (``handle.app_pid``, when known) are OBSERVED gone, escalating from
+    "ask nicely" to SIGTERM to SIGKILL against each rather than trusting
+    any one step — or the daemon's own cooperation — blindly. Removes the
+    on-disk session file only once confirmed dead (or already gone).
 
-    Returns ``False`` — never raises — if *handle*'s pid is still alive
+    This closes the gap #3590's review flagged: the escalation path used
+    to SIGKILL only the daemon. If that SIGKILL fires before the daemon's
+    own ``finally: backend.close()`` ever runs, the real app survived
+    while this function still reported ``closed: true`` — now this
+    function independently re-observes, and if necessary directly
+    signals, ``app_pid`` too, so that gap cannot reopen regardless of
+    whether the daemon cooperates.
+
+    Returns ``False`` — never raises — if any target pid is still alive
     after every escalation: a gate that reports teardown success must be
     able to actually fail that report (epic #2096), not default to "assume
     it worked"."""
+    targets = _target_pids(handle)
     try:
         send_command(handle, {"op": "close"}, timeout=min(timeout, 10.0))
     except AppDriveError:
@@ -347,7 +444,7 @@ def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _pid_alive(handle.pid):
+        if _all_dead(targets):
             _forget_session(handle.session_id)
             return True
         time.sleep(0.1)
@@ -359,13 +456,16 @@ def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
     # Windows actually has.
     escalation = (signal.SIGTERM, signal.SIGKILL) if hasattr(signal, "SIGKILL") else (signal.SIGTERM, signal.SIGTERM)
     for sig in escalation:
-        try:
-            os.kill(handle.pid, sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        for pid in targets:
+            if not _pid_alive(pid):
+                continue
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
         escalate_deadline = time.monotonic() + 3.0
         while time.monotonic() < escalate_deadline:
-            if not _pid_alive(handle.pid):
+            if _all_dead(targets):
                 _forget_session(handle.session_id)
                 return True
             time.sleep(0.1)

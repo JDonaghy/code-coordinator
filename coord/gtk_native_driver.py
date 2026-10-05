@@ -828,6 +828,21 @@ class GtkNativeSession:
         self._window_id = self._calls.find_top_window(self._pid, timeout_s)
         self._calls.move_window(self._window_id, 0, 0, width, height)
 
+    @property
+    def pid(self) -> int:
+        """The pid :meth:`GtkCalls.launch` returned (#3590) — read by
+        :mod:`coord.app_drive_daemon` for its ready-file's ``app_pid`` so
+        :func:`coord.app_drive.close_session` can re-observe/re-signal the
+        process this session itself launched, not just the daemon.
+
+        NOT guaranteed to be the real app's own pid: :meth:`LinuxGtkCalls
+        .launch` is a plain ``subprocess.Popen(command, shell=True)``, so
+        this is the shell's pid whenever *command* forks rather than execs
+        into the real binary — the same gap documented on
+        :class:`coord.mac_native_driver.MacNativeSession.pid`; tracked
+        separately from #3590."""
+        return self._pid
+
     def send_key(self, key: str) -> None:
         self._calls.send_key(self._window_id, key)
 
