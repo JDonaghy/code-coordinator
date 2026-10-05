@@ -27,8 +27,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from coord.app_drive import AppDriveUnavailableError
 
-def _build_backend(kind: str, launch: str, cwd: str, cols: int, rows: int) -> Any:
+
+def _build_backend(
+    kind: str, launch: str, cwd: str, cols: int, rows: int,
+    *, width: int | None = None, height: int | None = None,
+) -> Any:
     """Construct the kind-specific session backend — the ONE place that
     maps an app-drive ``kind`` string to the real driver class
     (:class:`coord.tui_pty_driver.TuiPtySession` /
@@ -43,11 +48,24 @@ def _build_backend(kind: str, launch: str, cwd: str, cols: int, rows: int) -> An
     anything — the native-lane analogue of :class:`coord.bugbash
     .ExploreOutcome.unavailable`: an environment condition, never an
     ordinary open failure.
+
+    *width*/*height* (native kinds only) are an explicit pixel size for
+    the launched window; when omitted (``None``) this falls back to the
+    previous ``cols * 10 or 1024`` / ``rows * 20 or 768`` derivation
+    (#3590 review: at this CLI's own ``--cols 80 --rows 24`` defaults,
+    that derivation is always 800x480 — the ``or 1024``/``or 768``
+    fallbacks are unreachable dead code unless ``--cols``/``--rows`` is
+    explicitly 0 — so a caller that actually wants 1024x768, or any other
+    real size, should pass *width*/*height* directly rather than fight
+    the terminal-geometry multiplier).
     """
     if kind == "tui-pty":
         from coord.tui_pty_driver import TuiPtySession  # noqa: PLC0415
 
         return TuiPtySession(launch, cwd, cols=cols, rows=rows)
+
+    native_width = width if width is not None else (cols * 10 or 1024)
+    native_height = height if height is not None else (rows * 20 or 768)
 
     if kind == "mac-native":
         from coord.mac_native_driver import MacNativeSession, MacOSCalls  # noqa: PLC0415
@@ -59,7 +77,7 @@ def _build_backend(kind: str, launch: str, cwd: str, cols: int, rows: int) -> An
         trusted, reason = calls.ax_trust_available()
         if not trusted:
             raise AppDriveUnavailableError(reason or "AXIsProcessTrusted() is False")
-        return MacNativeSession(launch, cwd, width=cols * 10 or 1024, height=rows * 20 or 768, calls=calls)
+        return MacNativeSession(launch, cwd, width=native_width, height=native_height, calls=calls)
 
     if kind == "win-native":
         from coord.win_native_driver import Win32Calls, WinNativeSession  # noqa: PLC0415
@@ -68,7 +86,7 @@ def _build_backend(kind: str, launch: str, cwd: str, cols: int, rows: int) -> An
         available, reason = calls.session_available()
         if not available:
             raise AppDriveUnavailableError(reason or "no interactive Windows session is available")
-        return WinNativeSession(launch, cwd, width=cols * 10 or 1024, height=rows * 20 or 768, calls=calls)
+        return WinNativeSession(launch, cwd, width=native_width, height=native_height, calls=calls)
 
     if kind == "gtk-native":
         from coord.gtk_native_driver import GtkNativeSession, LinuxGtkCalls  # noqa: PLC0415
@@ -77,15 +95,9 @@ def _build_backend(kind: str, launch: str, cwd: str, cols: int, rows: int) -> An
         available, reason = calls.session_available()
         if not available:
             raise AppDriveUnavailableError(reason or "no usable display is available")
-        return GtkNativeSession(launch, cwd, width=cols * 10 or 1024, height=rows * 20 or 768, calls=calls)
+        return GtkNativeSession(launch, cwd, width=native_width, height=native_height, calls=calls)
 
     raise ValueError(f"unknown app-drive kind {kind!r}")
-
-
-class AppDriveUnavailableError(Exception):
-    """A lane's own driver observed a locked/absent session (#3510/#3566) —
-    never improvise past this; report ``unavailable``, exactly what the
-    bugbash HARD RULE tells a worker to do by hand."""
 
 
 def _dispatch(backend: Any, kind: str, command: dict) -> dict:
@@ -144,23 +156,42 @@ def _dispatch(backend: Any, kind: str, command: dict) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _write_ready_file(ready_file: Path, payload: dict) -> None:
+    """Write *payload* to *ready_file* atomically (#3590 review nit): the
+    success path already did this via a ``.tmp`` + ``replace()``; the
+    error paths used a plain ``write_text`` instead, an avoidable
+    asymmetry — :func:`coord.app_drive.open_session`'s retry loop papers
+    over a torn read either way, but there's no reason to rely on that."""
+    tmp = ready_file.with_suffix(".ready.tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(ready_file)
+
+
 def serve(
     kind: str, launch: str, cwd: str, cols: int, rows: int,
-    *, idle_timeout: float, ready_file: Path,
+    *, idle_timeout: float, ready_file: Path, token: str,
+    width: int | None = None, height: int | None = None,
 ) -> int:
     """Build *kind*'s backend, bind an ephemeral localhost port, announce
     readiness via *ready_file*, then serve one JSON command per connection
     until ``close`` arrives or *idle_timeout* elapses with none. Always
     tears the backend down before returning — the SAME guarantee whichever
     path got it there (explicit close, idle self-expiry, or an exception
-    while opening/serving)."""
+    while opening/serving).
+
+    Every command must carry ``"token": token`` to be dispatched (#3590
+    review: the control socket otherwise has no authentication at all,
+    and the port is already discoverable from the world-readable session
+    file) — an unauthenticated connection gets an ``{"error": ...}`` reply
+    and is never passed to :func:`_dispatch`, so it can never fire
+    ``send_text``/``close`` against the app being driven."""
     try:
-        backend = _build_backend(kind, launch, cwd, cols, rows)
+        backend = _build_backend(kind, launch, cwd, cols, rows, width=width, height=height)
     except AppDriveUnavailableError as e:
-        ready_file.write_text(json.dumps({"error": "unavailable", "reason": str(e)}))
+        _write_ready_file(ready_file, {"error": "unavailable", "reason": str(e)})
         return 1
     except Exception as e:  # noqa: BLE001 — surface the failure via the ready file, not a bare traceback
-        ready_file.write_text(json.dumps({"error": "open_failed", "reason": f"{type(e).__name__}: {e}"}))
+        _write_ready_file(ready_file, {"error": "open_failed", "reason": f"{type(e).__name__}: {e}"})
         return 1
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -169,9 +200,12 @@ def serve(
     sock.listen(8)
     port = sock.getsockname()[1]
 
-    tmp = ready_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"pid": os.getpid(), "port": port}))
-    tmp.replace(ready_file)
+    # #3590 review: the real app/pty-child pid this backend launched, so
+    # a client-side `close_session` can re-observe (and if necessary
+    # directly signal) it too, not just this daemon's own pid — see
+    # `coord.app_drive.SessionHandle.app_pid`.
+    app_pid = getattr(backend, "pid", None)
+    _write_ready_file(ready_file, {"pid": os.getpid(), "port": port, "app_pid": app_pid})
 
     stop = threading.Event()
     last_activity = [time.monotonic()]
@@ -205,6 +239,12 @@ def serve(
                         pass
                     continue
                 last_activity[0] = time.monotonic()
+                if command.get("token") != token:
+                    try:
+                        conn.sendall((json.dumps({"error": "unauthorized"}) + "\n").encode())
+                    except OSError:
+                        pass
+                    continue
                 reply = _dispatch(backend, kind, command)
                 try:
                     conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
@@ -230,10 +270,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rows", type=int, default=24)
     parser.add_argument("--idle-timeout", type=float, default=1800.0)
     parser.add_argument("--ready-file", required=True)
+    parser.add_argument("--token", required=True)
+    parser.add_argument("--width", type=int, default=None, help="Native-kind window width in pixels.")
+    parser.add_argument("--height", type=int, default=None, help="Native-kind window height in pixels.")
     ns = parser.parse_args(argv)
     return serve(
         ns.kind, ns.launch, ns.cwd, ns.cols, ns.rows,
-        idle_timeout=ns.idle_timeout, ready_file=Path(ns.ready_file),
+        idle_timeout=ns.idle_timeout, ready_file=Path(ns.ready_file), token=ns.token,
+        width=ns.width, height=ns.height,
     )
 
 

@@ -715,7 +715,7 @@ def bugbash_run_cmd(
 
     lanes = discover_lanes(cfg, repo, reference_backend=reference)
     if lane_filter:
-        lanes = [l for l in lanes if l.platform in lane_filter]
+        lanes = [lane for lane in lanes if lane.platform in lane_filter]
     if not lanes:
         click.echo(
             f"error: no capable lane found for {repo!r} "
@@ -724,14 +724,14 @@ def bugbash_run_cmd(
         )
         sys.exit(1)
 
-    click.echo(f"lanes: {', '.join(f'{l.platform}@{l.machine}' for l in lanes)}")
+    click.echo(f"lanes: {', '.join(f'{lane.platform}@{lane.machine}' for lane in lanes)}")
     # #3590: name the exact `coord app-drive` command each lane's worker
     # will be told to run, via the SAME `driver_command_for_lane` the
     # briefing's own HARD RULE calls (#2096 "one question, one answer") —
     # so `--dry-run` (and every real run) always shows what a worker was
     # actually handed, never a second, independently-drifting guess at it.
-    for l in lanes:
-        click.echo(f"  [{l.platform}] driver: {driver_command_for_lane(l)}")
+    for lane in lanes:
+        click.echo(f"  [{lane.platform}] driver: {driver_command_for_lane(lane)}")
 
     # #3580: fetch the repo's behaviour catalogue ONCE per run (not per
     # lane/round — it's the same file for all of them) and name what's in

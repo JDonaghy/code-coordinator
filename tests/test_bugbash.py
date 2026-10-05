@@ -24,6 +24,7 @@ wiring via Click's `CliRunner`."""
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass, field
 
 import pytest
@@ -601,26 +602,77 @@ class TestBuildExplorationBriefing:
         for forbidden in ("osascript", "System Events", "do script", "System Settings"):
             assert forbidden in out
 
-    def test_each_lane_kind_names_its_own_runnable_command_never_anothers(self):
+    def test_each_lane_kind_names_its_own_runnable_command_never_anothers(self, tmp_path, monkeypatch):
         """#3590 acceptance: for each `LANE_DRIVER_KINDS` kind, the briefing
-        names a concrete, runnable command (`coord app-drive <kind>`), and
-        no lane's briefing names a DIFFERENT lane's driver — the exact gap
-        that left every real bugbash run unrunnable (workers searching
-        their tool list for a bare Python module path, or being told
-        `mac_native_driver` while running under `tui-pty`)."""
-        from coord.bugbash import LANE_DRIVER_KINDS, driver_command_for_lane
+        names a concrete, runnable command (`coord app-drive open <kind>
+        ...`), and no lane's briefing names a DIFFERENT lane's driver — the
+        exact gap that left every real bugbash run unrunnable (workers
+        searching their tool list for a bare Python module path, or being
+        told `mac_native_driver` while running under `tui-pty`).
+
+        "Runnable" is checked for real (review fix round 1): every usage
+        line this briefing prints is fed through Click's own `CliRunner`
+        against the actual `coord app-drive` CLI group, asserting it is
+        NOT a usage error — a substring check alone previously passed for
+        a command Click rejected outright (`coord app-drive tui-pty open
+        ...` — kind/verb reversed), which is exactly how the unrunnable
+        bug shipped undetected the first time. `$COORD_DIR` is sandboxed to
+        *tmp_path* since `open`'s own real session bookkeeping (and
+        whatever short-lived daemon subprocess it spawns before failing
+        against the placeholder `--cwd`) must never touch the real
+        `~/.coord`."""
+        from click.testing import CliRunner
+
+        from coord.bugbash import (
+            LANE_DRIVER_KINDS,
+            app_drive_open_usage,
+            app_drive_run_spec_usage,
+            driver_command_for_lane,
+        )
+        from coord.commands.app_drive import app_drive_group
+
+        monkeypatch.setenv("COORD_DIR", str(tmp_path))
+        # `run-spec`'s SPEC_FILE argument is a `click.Path(exists=True)` —
+        # the literal `<spec-file>` placeholder text can never satisfy
+        # that (a Click-level UsageError, exit 2), which would be a false
+        # positive for the very defect this test exists to catch. Swap it
+        # for a real (if deliberately empty/invalid) file so the ONLY
+        # thing being checked for that line is argument ORDER/SHAPE —
+        # whether its own contents parse as a valid spec is a separate
+        # concern :mod:`coord.tui_pty_driver` etc. already test.
+        real_spec_file = tmp_path / "placeholder-spec.yaml"
+        real_spec_file.write_text("version: 1\nsteps: []\n")
 
         for kind in LANE_DRIVER_KINDS:
             lane = BugbashLane(platform=kind, driver_kind=kind, machine="m1", capability="")
             out = build_exploration_briefing(lane, reference_backend="win-native")
             command = driver_command_for_lane(lane)
-            assert command == f"coord app-drive {kind}"
+            assert command == app_drive_open_usage(kind)
             assert command in out, f"{kind} briefing does not name its own command: {out!r}"
+
+            open_line = app_drive_open_usage(kind)
+            run_spec_line = app_drive_run_spec_usage(kind)
+            assert open_line in out, f"{kind} briefing missing its own open usage line: {out!r}"
+            assert run_spec_line in out, f"{kind} briefing missing its own run-spec usage line: {out!r}"
+            for usage_line in (open_line, run_spec_line):
+                argv = shlex.split(usage_line)
+                assert argv[0] == "coord" and argv[1] == "app-drive"
+                rest = argv[2:]
+                rest = [str(real_spec_file) if tok == "<spec-file>" else tok for tok in rest]
+                result = CliRunner().invoke(app_drive_group, rest)
+                assert result.exit_code != 2, (
+                    f"{kind} briefing's usage example is not Click-parseable "
+                    f"(exit {result.exit_code}): {usage_line!r}\n{result.output}"
+                )
+
             for other_kind in LANE_DRIVER_KINDS:
                 if other_kind == kind:
                     continue
-                assert f"coord app-drive {other_kind}" not in out, (
-                    f"{kind} briefing wrongly names {other_kind}'s driver command"
+                assert app_drive_open_usage(other_kind) not in out, (
+                    f"{kind} briefing wrongly names {other_kind}'s open command"
+                )
+                assert app_drive_run_spec_usage(other_kind) not in out, (
+                    f"{kind} briefing wrongly names {other_kind}'s run-spec command"
                 )
                 # Also guard the OLD (buggy) module-path naming this issue
                 # reports, so a regression back to it is caught even if
@@ -632,6 +684,17 @@ class TestBuildExplorationBriefing:
                 assert other_module not in out, (
                     f"{kind} briefing wrongly names {other_kind}'s driver module {other_module!r}"
                 )
+
+    def test_app_drive_kinds_stay_in_sync_with_lane_driver_kinds(self):
+        """#3590 review (non-blocking, made a real assertion): `coord
+        .app_drive.APP_DRIVE_KINDS` is documented as kept in sync BY HAND
+        with `LANE_DRIVER_KINDS` — assert it, so a kind added to one but
+        not the other fails loudly instead of silently drifting (#2085
+        "one question, one answer")."""
+        from coord.app_drive import APP_DRIVE_KINDS
+        from coord.bugbash import LANE_DRIVER_KINDS
+
+        assert set(APP_DRIVE_KINDS) == set(LANE_DRIVER_KINDS)
 
     def test_includes_the_unavailable_reporting_contract(self):
         lane = BugbashLane(platform="mac-native", driver_kind="mac-native", machine="macmini", capability="macos")

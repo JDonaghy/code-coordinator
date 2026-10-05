@@ -982,6 +982,22 @@ class MacNativeSession:
         self._window_id = self._calls.find_top_window(self._pid, timeout_s)
         self._calls.move_window(self._pid, self._window_id, 0, 0, width, height)
 
+    @property
+    def pid(self) -> int:
+        """The pid :meth:`MacCalls.launch` returned (#3590) — read by
+        :mod:`coord.app_drive_daemon` for its ready-file's ``app_pid`` so
+        :func:`coord.app_drive.close_session` can re-observe/re-signal the
+        process this session itself launched, not just the daemon.
+
+        NOT guaranteed to be the real app's own pid: :meth:`MacOSCalls
+        .launch` is a plain ``subprocess.Popen(command, shell=True)``, so
+        this is ``/bin/sh``'s pid whenever *command* forks rather than
+        execs into the real binary — the same shell-vs-app gap
+        :data:`coord.win_native_driver.WinCalls` already documents on its
+        own ``launch``/``kill`` (tracked separately from #3590; the
+        tui-pty lane's #3583 exec-wrap fix does not apply here)."""
+        return self._pid
+
     def _require_frontmost(self) -> None:
         is_front, front_pid = self._calls.is_frontmost(self._pid)
         if not is_front:

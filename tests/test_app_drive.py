@@ -39,6 +39,31 @@ def _pid_exists(pid: int) -> bool:
     return os.path.exists(f"/proc/{pid}")
 
 
+@pytest.fixture(autouse=True)
+def _sandbox_coord_dir(tmp_path, monkeypatch):
+    """#3590 review: every real ``open_session`` in this module writes a
+    session file under ``$COORD_DIR/app-drive`` and spawns a real daemon
+    subprocess (with up to a 30-minute idle timeout by default) — without
+    this, that lands in the live ``~/.coord/app-drive`` on whatever
+    machine runs the suite. Sandbox ``$COORD_DIR`` to a throwaway
+    *tmp_path* for every test in this file, and sweep any session file
+    still sitting there at teardown (closing — and so reaping — its
+    daemon and the real app/pty child underneath it), so a test that
+    asserts on a failure path midway through and never reaches its own
+    ``close_session`` still doesn't leak for the life of the host."""
+    monkeypatch.setenv("COORD_DIR", str(tmp_path))
+    yield
+    sessions_dir = tmp_path / "app-drive"
+    if not sessions_dir.is_dir():
+        return
+    for session_file in sessions_dir.glob("*.json"):
+        try:
+            handle = load_session(session_file.stem)
+        except AppDriveError:
+            continue
+        close_session(handle)
+
+
 class TestTuiPtyAppDriveBlackBox:
     """#3590 acceptance: the new entry point launches a trivial TUI child
     under tui-pty, sends a key, captures the screen, tears down, and
@@ -57,6 +82,18 @@ class TestTuiPtyAppDriveBlackBox:
         session_id = json.loads(opened.output)["session_id"]
         handle = load_session(session_id)
         assert _pid_exists(handle.pid)
+
+        # #3590 review: the acceptance criterion this test exists for is
+        # "leaves no CHILD process behind" (run 1 leaked 134 orphaned
+        # `vcd`s, #3583) — asserting only on `handle.pid` (the app-drive
+        # DAEMON) would still pass if the real `cat` child it launched
+        # were orphaned, since that's a distinct process. Capture it via
+        # `app_pid` (the daemon's own ready-file report) and assert on
+        # THAT, not just the daemon.
+        assert handle.app_pid is not None, "daemon did not report the real app's pid"
+        assert handle.app_pid != handle.pid
+        app_pid = handle.app_pid
+        assert _pid_exists(app_pid)
 
         sent = runner.invoke(
             app_drive_group, ["send", "--session", session_id, "--text", "hi there\n"],
@@ -78,12 +115,13 @@ class TestTuiPtyAppDriveBlackBox:
         assert closed.exit_code == 0, closed.output
         assert json.loads(closed.output)["closed"] is True
 
-        # #2096: confirmed by re-observing the pid, never assumed from the
-        # mere absence of an error above.
+        # #2096: confirmed by re-observing BOTH pids, never assumed from
+        # the mere absence of an error above.
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and _pid_exists(handle.pid):
+        while time.monotonic() < deadline and (_pid_exists(handle.pid) or _pid_exists(app_pid)):
             time.sleep(0.1)
         assert not _pid_exists(handle.pid), "daemon process leaked after close"
+        assert not _pid_exists(app_pid), "the real app/pty child process leaked after close (#3583 leak class)"
 
         with pytest.raises(AppDriveError):
             load_session(session_id)
@@ -128,7 +166,7 @@ class TestOpenSessionCloseSession:
     def test_send_command_to_a_dead_session_raises_app_drive_error(self):
         # A handle naming a port nothing listens on — simulates a session
         # whose daemon already died without an explicit close.
-        fake = SessionHandle(session_id="deadbeef0000", kind="tui-pty", pid=999999999, port=1)
+        fake = SessionHandle(session_id="deadbeef0000", kind="tui-pty", pid=999999999, port=1, token="x")
         with pytest.raises(AppDriveError):
             send_command(fake, {"op": "screen", "args": {}})
 

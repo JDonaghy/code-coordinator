@@ -139,60 +139,71 @@ LANE_DRIVER_KINDS: tuple[str, ...] = (
     "tui-pty", "win-native", "mac-native", "gtk-native",
 )
 
-#: #3590: the ONE place a lane's `driver_kind` maps to the `coord app-drive`
-#: invocation a worker actually runs for it — named here, by
-#: `LANE_DRIVER_KINDS` value, so :func:`build_exploration_briefing`'s HARD
-#: RULE and :func:`driver_command_for_lane` (both the briefing's own text
-#: AND `coord bugbash REPO --dry-run`'s per-lane preview,
-#: :mod:`coord.commands.bugbash`) can never name two different commands for
-#: the same lane, or a lane's briefing accidentally name ANOTHER lane's
-#: driver (#2096 "one question, one answer"). Each entry is a 2-line usage
-#: example: ``open`` a session once, then drive it with ``send``/``screen``/
-#: ``probe``/``close`` (see `coord/app_drive.py`'s module docstring for the
-#: full verb list and the cross-platform teardown guarantee).
-_APP_DRIVE_USAGE: dict[str, tuple[str, str]] = {
-    "tui-pty": (
-        "coord app-drive tui-pty open --launch '<app launch command>' --cwd <repo checkout dir>",
-        "coord app-drive tui-pty send --session <id> --key Enter   # or --text/--click/--screen/--probe/--close",
-    ),
-    "win-native": (
-        "coord app-drive win-native open --launch '<app launch command>' --cwd <repo checkout dir>",
-        "coord app-drive win-native send --session <id> --key Enter   # or --click/--screen/--probe/--close",
-    ),
-    "mac-native": (
-        "coord app-drive mac-native open --launch '<app launch command>' --cwd <repo checkout dir>",
-        "coord app-drive mac-native send --session <id> --key Enter   # or --click/--screen/--probe/--close",
-    ),
-    "gtk-native": (
-        "coord app-drive gtk-native open --launch '<app launch command>' --cwd <repo checkout dir>",
-        "coord app-drive gtk-native send --session <id> --key Enter   # or --click/--screen/--probe/--close",
-    ),
-}
+#: #3590: `coord app-drive`'s CLI puts the `kind` argument INSIDE each
+#: subcommand (`_KIND_ARG` in `coord/commands/app_drive.py` is applied to
+#: `open` and `run-spec` individually), so the real invocation order is
+#: ``coord app-drive open KIND ...`` / ``coord app-drive run-spec KIND
+#: SPEC ...`` — never ``coord app-drive KIND open ...``. These three
+#: helpers build that order directly from `driver_kind`, computed, not
+#: hand-maintained per kind, so a new :data:`LANE_DRIVER_KINDS` entry is
+#: automatically runnable with no parallel table to keep in sync (closing
+#: the exact drift #3590 reports: a briefing that reversed the argument
+#: order, or named a DIFFERENT lane's driver). `build_exploration_briefing`'s
+#: HARD RULE/usage example AND `coord bugbash REPO --dry-run`'s per-lane
+#: preview (:func:`driver_command_for_lane`, :mod:`coord.commands.bugbash`)
+#: both call these, so the two surfaces can never name two different
+#: commands for the same lane (#2096 "one question, one answer").
+def app_drive_open_usage(driver_kind: str) -> str:
+    """The exact, runnable ``coord app-drive open KIND ...`` invocation for
+    *driver_kind*."""
+    return f"coord app-drive open {driver_kind} --launch '<app launch command>' --cwd '<repo checkout dir>'"
+
+
+def app_drive_run_spec_usage(driver_kind: str) -> str:
+    """The exact, runnable ``coord app-drive run-spec KIND SPEC ...``
+    invocation for *driver_kind*."""
+    return (
+        f"coord app-drive run-spec {driver_kind} <spec-file> "
+        "--launch '<app launch command>' --cwd '<repo checkout dir>'"
+    )
+
+
+#: The second usage line (sending one input event to an already-open
+#: session). `send`/`screen`/`probe`/`close`/`wait-idle` are all SIBLING
+#: subcommands of `coord app-drive` (none of them take `kind` — the open
+#: session file already carries it), so this line is identical for every
+#: lane kind; it is not a per-kind table. `--screen`/`--probe`/`--close`
+#: are NOT options of `send` (they are the separate subcommands named in
+#: the trailing comment) — advertising them as `send` flags was the other
+#: half of #3590's unrunnable-command bug.
+_APP_DRIVE_SEND_USAGE_LINE = (
+    "coord app-drive send --session <id> --key Enter   # or --text/--click; "
+    "see also: screen/probe/close --session <id>"
+)
 
 
 def driver_command_for_lane(lane: "BugbashLane") -> str:
-    """The exact `coord app-drive` command name this lane's worker runs —
-    e.g. ``"coord app-drive tui-pty"`` for a ``driver_kind="tui-pty"`` lane
-    (#3590). The ONE function both :func:`build_exploration_briefing`'s HARD
-    RULE and ``coord bugbash REPO --dry-run``'s per-lane preview
-    (:mod:`coord.commands.bugbash`) call, so the two surfaces can never
-    drift apart (#2096 "one question, one answer") — fixing the bug this
-    issue reports: a briefing that named a DIFFERENT lane's driver module,
-    or no runnable command at all.
+    """The exact, runnable `coord app-drive` command this lane's worker
+    opens a session with — e.g. ``"coord app-drive open tui-pty --launch "
+    "'<app launch command>' --cwd '<repo checkout dir>'"`` for a
+    ``driver_kind="tui-pty"`` lane (#3590). The ONE function both
+    :func:`build_exploration_briefing`'s HARD RULE and ``coord bugbash REPO
+    --dry-run``'s per-lane preview (:mod:`coord.commands.bugbash`) call, so
+    the two surfaces can never drift apart (#2096 "one question, one
+    answer") — fixing the bug this issue reports: a briefing that named a
+    DIFFERENT lane's driver module, reversed `open`/`kind` argument order,
+    or named no runnable command at all.
     """
-    return f"coord app-drive {lane.driver_kind}"
+    return app_drive_open_usage(lane.driver_kind)
 
 
 def _app_drive_usage_lines(driver_kind: str) -> tuple[str, str]:
-    """The 2-line usage example for *driver_kind* (:data:`_APP_DRIVE_USAGE`),
-    falling back to a generic (still runnable) template for any future
-    :data:`LANE_DRIVER_KINDS` entry this mapping hasn't been updated for
-    yet — never silently omitting a usage example rather than naming a
-    kind this dict doesn't recognize."""
-    return _APP_DRIVE_USAGE.get(driver_kind) or (
-        f"coord app-drive {driver_kind} open --launch '<app launch command>' --cwd <repo checkout dir>",
-        f"coord app-drive {driver_kind} send --session <id> --key Enter   # or --click/--screen/--probe/--close",
-    )
+    """The 2-line usage example for *driver_kind*: open the lane's own
+    kind, then send one input event to the resulting session. Built
+    directly from `driver_kind` (see the helpers above) — never a by-hand
+    per-kind table, so there is nothing to fall out of sync."""
+    return app_drive_open_usage(driver_kind), _APP_DRIVE_SEND_USAGE_LINE
+
 
 #: The exploration checklist every lane walks on top of the repo's Tier-2
 #: smoke spec (issue #3487's "panels, menus, extension install flow,
@@ -1211,17 +1222,18 @@ def build_exploration_briefing(
                     else no_lane_note
                 )
 
-    command = driver_command_for_lane(lane)
     usage_line_1, usage_line_2 = _app_drive_usage_lines(lane.driver_kind)
+    run_spec_usage = app_drive_run_spec_usage(lane.driver_kind)
     lines = [
         f"=== coord bugbash: {lane.platform} lane ===",
         "",
         f"Reference backend for comparison: {reference_backend or '(none configured)'}",
         "",
-        f"HARD RULE — drive the app ONLY through `{command}` (this lane's own "
-        "sanctioned entry point — see `coord app-drive --help` for the full "
-        "verb list: open/send/wait-idle/screen/probe/close/run-spec). Never "
-        "use osascript, System Events, a Terminal/iTerm `do script`, "
+        f"HARD RULE — drive the app ONLY through `coord app-drive` for kind "
+        f"`{lane.driver_kind}` (this lane's own sanctioned entry point — see "
+        "`coord app-drive --help` for the full verb list: "
+        "open/send/wait-idle/screen/probe/close/run-spec). Never use "
+        "osascript, System Events, a Terminal/iTerm `do script`, "
         "xdotool/AppleScript/win32 calls run directly, a home-made "
         "input-injection helper, or System Settings. Two-line usage "
         f"example:\n  {usage_line_1}\n  {usage_line_2}\nIf a required "
@@ -1231,8 +1243,7 @@ def build_exploration_briefing(
         "NOT send any key or click to recover (#3566).",
         "",
         f"1. Run this repo's Tier-2 smoke spec for this driver to completion "
-        f"(`{command} run-spec <spec-file> --launch '<app launch command>' "
-        "--cwd <repo checkout dir>` runs it end to end in one command).",
+        f"(`{run_spec_usage}` runs it end to end in one command).",
     ]
     if catalogue_warning:
         lines += ["", f"NOTE: {catalogue_warning}"]
