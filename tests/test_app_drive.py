@@ -20,10 +20,12 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
+import coord.win_native_bridge as _win_native_bridge
 from coord.app_drive import (
     AppDriveError,
     AppDriveUnavailableError,
@@ -35,6 +37,75 @@ from coord.app_drive import (
     send_command,
 )
 from coord.commands.app_drive import app_drive_group
+
+#: #3617 review round 2: ``tests/conftest.py``'s autouse, function-scoped
+#: ``_non_wsl_host_by_default`` fixture (#3532) monkeypatches
+#: ``coord.win_native_bridge.is_wsl_host`` to ``lambda: False`` for EVERY
+#: test in the suite — deliberately, because dell64 is a genuine WSL2 host
+#: and the scripted ``win-native`` driver tests need a hermetic answer.
+#: Conftest-level autouse fixtures set up before class-level ones, so any
+#: test that reads ``win_native_bridge.is_wsl_host`` through the module
+#: attribute sees ``False`` unconditionally — which made
+#: :class:`TestWinNativeStagingRootOnRealWindows` skip on every machine in
+#: the fleet, dell64 included, i.e. a hardware gate whose failing verdict
+#: was unreachable by construction.
+#:
+#: Binding the callable HERE, at module-import time (collection, strictly
+#: before any fixture runs), captures the REAL host detector, immune to
+#: that patch. Use this — never ``win_native_bridge.is_wsl_host`` — for a
+#: "is the machine actually running this suite a WSL host" question.
+_REAL_IS_WSL_HOST = _win_native_bridge.is_wsl_host
+
+#: A pid no process can plausibly hold — see `_FakeProc` in
+#: :class:`TestStagingWarningPlumbing`.
+_UNALLOCATED_PID = 999999999
+
+#: The one skip reason that means "this host has no Windows side at all".
+#: Named so :class:`TestRealWindowsSideGateIsReachable` can assert the gate
+#: does NOT produce it on a WSL host.
+_NOT_WSL_SKIP_REASON = (
+    "TestWinNativeStagingRootOnRealWindows needs a genuine WSL host "
+    "(checked via the REAL detector captured at import time, not the "
+    "suite-wide patched one) to reach a real Windows-side interpreter at "
+    "all — see that class's own docstring for why nothing else in this "
+    "suite can substitute for that"
+)
+
+
+def _real_windows_side_python() -> tuple[str | None, str | None]:
+    """``(wsl_path_to_the_windows_interpreter, None)`` when this host can
+    actually reach a real Windows-side Python, else ``(None, reason)``.
+
+    Deliberately a module-level function rather than fixture-inline logic
+    so :class:`TestRealWindowsSideGateIsReachable` can drive it directly
+    and prove the WSL branch is REACHABLE — the #3617 review round-2
+    blocking finding was precisely a gate that could only ever produce
+    its skip verdict.
+
+    READ-ONLY: resolves the already-provisioned venv rather than calling
+    ``ensure_windows_win_native_venv()``, which would run ``python -m
+    venv`` + ``pip install --upgrade code-coordinator[win-native]`` into
+    ``C:\\ProgramData\\coord-win-native-venv`` — a shared, machine-global
+    fleet directory, with a 300s timeout each. A test observes the host;
+    it never provisions it (CLAUDE.md's Development section).
+    """
+    if not _REAL_IS_WSL_HOST():
+        return None, _NOT_WSL_SKIP_REASON
+    windows_python = _win_native_bridge.windows_venv_python(
+        _win_native_bridge.DEFAULT_WINDOWS_VENV_DIR,
+    )
+    try:
+        argv0 = _win_native_bridge.windows_path_to_wsl_path(windows_python)
+    except _win_native_bridge.WinNativeBridgeError as e:
+        return None, f"cannot translate the Windows venv python path: {e}"
+    if not os.path.exists(argv0):
+        return None, (
+            "no provisioned win-native Windows venv at "
+            f"{_win_native_bridge.DEFAULT_WINDOWS_VENV_DIR} (open one "
+            "`coord app-drive` win-native session on this host to create "
+            "it) — this test never provisions it itself"
+        )
+    return argv0, None
 
 
 def _pid_exists(pid: int) -> bool:
@@ -492,6 +563,70 @@ class TestOpenSessionWslBridge:
             send_command(handle, {"op": "is_alive"})
 
 
+class TestRealWindowsSideGateIsReachable:
+    """#3617 review round 2, the blocking finding: the on-WSL hardware gate
+    guarding :class:`TestWinNativeStagingRootOnRealWindows` used to read
+    ``coord.win_native_bridge.is_wsl_host`` — the very attribute
+    ``tests/conftest.py``'s autouse ``_non_wsl_host_by_default`` fixture
+    (#3532) pins to ``lambda: False`` for every test in the suite. The gate
+    therefore skipped on EVERY machine in the fleet, dell64 included:
+    unconditional by construction, so the deliverable's one hardware check
+    could never fail.
+
+    These tests are host-independent on purpose (they pass identically on
+    plain Linux and on dell64) and are what keeps that regression from
+    coming back: revert :data:`_REAL_IS_WSL_HOST` to the module attribute
+    and the first one goes red."""
+
+    def test_the_captured_detector_dodges_the_suite_wide_patch(self):
+        """The conftest patch is live right now (that's the point — it is
+        autouse). The captured detector must still give the honest answer
+        for a WSL-looking host; reading it through the module attribute
+        cannot."""
+        assert _win_native_bridge.is_wsl_host() is False, (
+            "conftest's autouse _non_wsl_host_by_default is expected to be "
+            "in force here — this test is meaningless without it"
+        )
+        assert _REAL_IS_WSL_HOST(
+            environ={"WSL_DISTRO_NAME": "Ubuntu-24.04"},
+            version_path=Path("/nonexistent/proc/version"),
+        ) is True
+
+    def test_the_captured_detector_still_says_no_for_a_non_wsl_host(self, tmp_path):
+        """The other verdict, so this isn't a detector that just says
+        "yes" — a plain-Linux ``/proc/version`` with no WSL env var."""
+        version = tmp_path / "version"
+        version.write_text("Linux version 6.17.0-23-generic (buildd@lcy02)")
+        assert _REAL_IS_WSL_HOST(environ={}, version_path=Path(version)) is False
+        version.write_text("Linux version 5.15.0-microsoft-standard-WSL2")
+        assert _REAL_IS_WSL_HOST(environ={}, version_path=Path(version)) is True
+
+    def test_the_gate_gets_past_the_wsl_check_on_a_wsl_host(self, monkeypatch):
+        """THE finding, directly: with the host looking like WSL (the real
+        detector's own ``WSL_DISTRO_NAME`` input) and conftest's patch
+        still forcing ``is_wsl_host() -> False``, the gate must NOT return
+        the not-WSL skip reason. Any remaining skip has to be about the
+        Windows-side venv — i.e. on dell64, where that venv exists, the
+        gate opens and the black-box test runs for real."""
+        monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu-24.04")
+        _argv0, reason = _real_windows_side_python()
+        assert reason != _NOT_WSL_SKIP_REASON
+        # Whatever it *is* (None on dell64, the venv reason on a WSL box
+        # with no provisioned Windows venv) must never be a silent pass
+        # dressed up as a skip.
+        assert reason is None or "venv" in reason
+
+    def test_the_gate_reports_not_wsl_off_wsl(self):
+        """The documented off-WSL skip (the issue allows "a clearly
+        documented skip off-WSL") is still produced on a non-WSL host,
+        rather than the check having been dropped outright. Self-skipping
+        on a genuine WSL host, where the premise doesn't hold."""
+        if _REAL_IS_WSL_HOST():
+            pytest.skip("this host really is WSL — nothing to assert about the off-WSL verdict")
+        _argv0, reason = _real_windows_side_python()
+        assert reason == _NOT_WSL_SKIP_REASON
+
+
 class TestWinNativeStagingRootOnRealWindows:
     """#3617 deliverable: "a black-box check on a WSL host (or a clearly
     documented skip off-WSL) that a session's exe path is under the
@@ -512,60 +647,331 @@ class TestWinNativeStagingRootOnRealWindows:
     doesn't fake that boundary, and so is the one place that can actually
     observe where a real Windows process's files would land.
 
-    Doesn't need a real app/exe to launch at all — ``_staging_root()`` is
-    a pure path-resolution read, no process spawn, no window, no built
-    artifact required — which is what makes this both minimal AND a
-    direct, literal check of the issue's own ask (a session's exe path
-    resolves under the Windows filesystem, not a UNC ``\\\\wsl...`` one).
+    Needs no real app/exe and launches no window: the first test is a pure
+    path-resolution read, and the second builds its own dummy "exe" in the
+    WSL tree and runs the real ``_plan_staging``/``_execute_staging``
+    against its genuine UNC view — which is what makes this both minimal
+    AND a direct, literal check of the issue's own ask (a session's exe
+    path resolves under, and really exists on, the Windows filesystem
+    rather than a UNC ``\\\\wsl...`` one).
 
-    **Skips everywhere except a real WSL<->Windows pairing (e.g. dell64).**
-    Every sandbox this PR was developed and reviewed in is plain Linux, so
-    neither precondition below ever holds there — this is EXPECTED to (and
-    does) skip in this PR's own CI run. Treat a pass here as a built,
-    ready gate, not a hardware-confirmed one; it has not been exercised
-    against real dell64 hardware as part of this change (same caveat this
-    module's own #3544 handle-inheritance fix already carries for the same
-    reason — no such hardware was available)."""
+    **It is THIS branch's code that runs on the Windows side, not the
+    PyPI release.** The bridge venv holds ``code-coordinator[win-native]``
+    from PyPI, which on dell64 today predates this change entirely — a
+    probe against it would fail with ``AttributeError: _staging_root``
+    for a reason unrelated to the diff (#3617 review round 2). So the
+    probe prepends THIS worktree's repo root (translated to its Windows
+    form, reachable over ``\\\\wsl.localhost``) onto the Windows-side
+    ``sys.path``, shadowing the installed package: the dependencies come
+    from the venv, the ``coord`` source under test comes from the branch.
+    The probe reports the resolved ``coord.win_native_driver.__file__``
+    back and this test asserts it is the injected copy, so a silently
+    unshadowed import can never masquerade as a pass.
+
+    **Skips only on a non-WSL host (where there is no Windows side to
+    reach) or when no provisioned win-native venv exists** — see
+    :func:`_real_windows_side_python`, whose WSL branch
+    :class:`TestRealWindowsSideGateIsReachable` proves is actually
+    REACHABLE (round 1's version read the suite-wide-patched
+    ``is_wsl_host`` attribute and so skipped unconditionally, on dell64
+    too). On plain-Linux CI this still skips, but for the real
+    environmental reason; on dell64 it runs and can genuinely fail."""
 
     @pytest.fixture(autouse=True)
     def _require_real_windows_side(self):
-        import coord.win_native_bridge as bridge_mod
+        self._bridge_mod = _win_native_bridge
+        argv0, reason = _real_windows_side_python()
+        if reason is not None:
+            pytest.skip(reason)
+        self._argv0 = argv0
 
-        self._bridge_mod = bridge_mod
-        if not bridge_mod.is_wsl_host():
-            pytest.skip(
-                "TestWinNativeStagingRootOnRealWindows needs a genuine WSL "
-                "host (coord.win_native_bridge.is_wsl_host()) to reach a "
-                "real Windows-side interpreter at all — see this class's "
-                "own docstring for why nothing else in this suite can "
-                "substitute for that"
-            )
-        try:
-            self._windows_python = bridge_mod.ensure_windows_win_native_venv()
-        except bridge_mod.WinNativeBridgeError as e:
-            pytest.skip(f"no provisioned win-native Windows venv reachable: {e}")
+    #: This worktree's repo root — the parent of ``tests/``.
+    @property
+    def _repo_root(self) -> str:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _run_windows_probe(self, body: str, *extra_argv: str) -> list[str]:
+        """Run *body* on the real Windows-side interpreter with THIS
+        branch's ``coord`` package shadowing the venv's installed one,
+        returning its stdout lines. *body* reads ``sys.argv[2:]`` for
+        *extra_argv*; ``d`` is bound to ``coord.win_native_driver``."""
+        windows_repo_root = self._bridge_mod.translate_to_windows_path(self._repo_root)
+        probe = (
+            "import sys; sys.path.insert(0, sys.argv[1]);\n"
+            "import coord.win_native_driver as d\n"
+            "print('MODULE=' + d.__file__)\n"
+        ) + body
+        result = subprocess.run(  # noqa: S603
+            [self._argv0, "-c", probe, windows_repo_root, *extra_argv],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+        lines = result.stdout.strip().splitlines()
+        module_file = next(ln[len("MODULE="):] for ln in lines if ln.startswith("MODULE="))
+        # The branch's own source really is what ran — not the PyPI wheel
+        # in the venv (which predates #3617 and has no `_staging_root`).
+        assert "site-packages" not in module_file, (
+            "the Windows-side import resolved to the venv's INSTALLED "
+            f"code-coordinator ({module_file}) instead of this branch's "
+            "source — the sys.path injection failed, so this test would be "
+            "asserting about a release that does not contain the diff"
+        )
+        return lines
 
     def test_staging_root_resolves_to_a_real_local_windows_path(self) -> None:
-        bridge_mod = self._bridge_mod
-        # `ensure_windows_win_native_venv` already confirmed (via its own
-        # idempotency probe) that `coord.win_native_driver` imports fine
-        # on this venv — no extra bootstrap needed here.
-        probe = (
-            "from coord.win_native_driver import Win32Calls; "
-            "print(Win32Calls()._staging_root())"
+        """The staging root a session's exe is copied into and launched
+        from resolves, on the real Windows side, to a local drive-letter
+        path — never the ``\\\\wsl...`` UNC one #3617 exists to escape."""
+        lines = self._run_windows_probe(
+            "print('ROOT=' + d.Win32Calls()._staging_root())\n",
         )
-        argv0 = bridge_mod.windows_path_to_wsl_path(self._windows_python)
-        result = subprocess.run(  # noqa: S603
-            [argv0, "-c", probe], capture_output=True, text=True, timeout=30,
-        )
-        assert result.returncode == 0, result.stderr
-        staging_root = result.stdout.strip()
+        staging_root = next(ln[len("ROOT="):] for ln in lines if ln.startswith("ROOT="))
         # Never a UNC path (`\\wsl.localhost\...`, `\\server\share\...`)
         # — the whole point of #3617.
         assert not staging_root.startswith("\\\\")
         # A real drive-letter-rooted Windows path (`C:\...`), not a bare
         # relative string or something `%LOCALAPPDATA%` guessed wrong.
         assert staging_root[1:3] == ":\\"
+
+    #: The fleet's own ``win-native`` route ``run:`` string
+    #: (``~/.coord/coordinator.yml``) — the exact shape #3617 exists to
+    #: make fast, driven here verbatim.
+    FLEET_RUN_COMMAND = (
+        "cd .smoke && ../target/x86_64-pc-windows-msvc/release/vimcode.exe sample.txt"
+    )
+
+    def test_a_session_exe_staged_from_a_unc_cwd_lands_on_the_windows_filesystem(
+        self, tmp_path,
+    ) -> None:
+        """The issue's literal ask: "a black-box check on a WSL host ...
+        that a session's exe path is under the Windows filesystem".
+
+        Builds a real source tree in the WSL ext4 filesystem (``tmp_path``
+        — exactly where a real ``cargo build`` puts ``vimcode.exe`` on
+        dell64), hands the Windows side that tree's genuine
+        ``\\\\wsl...`` UNC view, and runs the REAL ``_plan_staging`` +
+        ``_execute_staging`` against it. Then observes, after the fact and
+        on the real Windows filesystem, that the image path cmd.exe would
+        actually load — resolving ``command`` from ``plan.cwd`` the way
+        cmd.exe itself does — is a drive-letter path that genuinely
+        exists, holds the real bytes, and is NOT the UNC source. That last
+        inequality is what makes this gate able to FAIL: a regression that
+        declines staging, stages to the wrong offset, or leaves ``cwd`` on
+        the UNC path lands here as a red assertion, not a 10s
+        ``find_top_window`` timeout three layers away."""
+        src = tmp_path / "repo"
+        rel = "target/x86_64-pc-windows-msvc/release"
+        (src / rel).mkdir(parents=True)
+        (src / rel / "vimcode.exe").write_bytes(b"MZ-not-a-real-exe")
+        (src / ".smoke").mkdir()
+        (src / ".smoke" / "sample.txt").write_text("hello from the wsl tree")
+        unc_cwd = self._bridge_mod.translate_to_windows_path(str(src))
+        if not unc_cwd.startswith("\\\\"):
+            # Genuinely environmental, not a product bug: `$TMPDIR` is on a
+            # Windows-mounted path (`/mnt/c/...`), so there is no \\wsl$
+            # source tree to stage FROM and `_plan_staging` would rightly
+            # decline. The sibling `_staging_root` test above still gates
+            # unconditionally on this host.
+            pytest.skip(
+                f"$TMPDIR ({src}) is not on the WSL filesystem — it "
+                f"translates to {unc_cwd!r}, not a UNC path, so the premise "
+                "of #3617 (a build sitting behind \\\\wsl$ 9P) doesn't hold here"
+            )
+
+        body = (
+            "import ntpath, os, shutil, uuid\n"
+            "unc_cwd, command = sys.argv[2], sys.argv[3]\n"
+            "session_root = ntpath.join(\n"
+            "    d.Win32Calls()._staging_root(), 'probe-' + uuid.uuid4().hex[:8])\n"
+            "plan = d._plan_staging(command, unc_cwd, session_root=session_root)\n"
+            "print('STAGED=' + repr(plan.staged))\n"
+            "if plan.staged:\n"
+            "    d._execute_staging(plan)\n"
+            # cmd.exe's own semantics, reproduced exactly: start in
+            # `plan.cwd`, run `command`'s own `cd .smoke`, then resolve the
+            # relative exe token from there. That is the path Windows
+            # actually loads the image from.
+            "    resolved = ntpath.normpath(ntpath.join(\n"
+            "        plan.cwd, '.smoke',\n"
+            "        '../target/x86_64-pc-windows-msvc/release/vimcode.exe'))\n"
+            "    print('CWD=' + plan.cwd)\n"
+            "    print('RESOLVED=' + resolved)\n"
+            "    print('EXISTS=' + repr(os.path.isfile(resolved)))\n"
+            "    print('BYTES=' + repr(\n"
+            "        os.path.isfile(resolved) and open(resolved, 'rb').read()))\n"
+            "    print('FIXTURE=' + repr(os.path.isfile(\n"
+            "        ntpath.join(plan.cwd, '.smoke', 'sample.txt'))))\n"
+            "    print('SOURCE=' + plan.source_exe)\n"
+            "    shutil.rmtree(session_root, ignore_errors=True)\n"
+        )
+        lines = self._run_windows_probe(body, unc_cwd, self.FLEET_RUN_COMMAND)
+        got = dict(ln.split("=", 1) for ln in lines if "=" in ln)
+        assert got["STAGED"] == "True", f"staging declined on the real host: {lines}"
+        # `cwd` is the session root itself — never pre-navigated into
+        # `.smoke`, which would make `command`'s own `cd .smoke` fail and
+        # short-circuit the launch (#3617 review round 1, finding 1).
+        assert not got["CWD"].endswith("\\.smoke"), got["CWD"]
+        resolved = got["RESOLVED"]
+        # THE deliverable: the image the launch loads is a local
+        # drive-letter path on the Windows filesystem, it really exists
+        # there with the real bytes, and it is NOT the \\wsl... source.
+        assert resolved[1:3] == ":\\", resolved
+        assert not resolved.startswith("\\\\"), resolved
+        assert got["EXISTS"] == "True", f"staged exe missing at {resolved}"
+        assert got["BYTES"] == repr(b"MZ-not-a-real-exe"), got["BYTES"]
+        assert got["FIXTURE"] == "True", "the fixture dir was not staged alongside"
+        assert resolved.lower() != got["SOURCE"].lower()
+
+
+class TestStagingWarningPlumbing:
+    """#3617 review: when launch staging is skipped, the fallback to the
+    slow ``\\\\wsl$`` launch must be OBSERVABLE rather than silent — the
+    whole point of round 1's ``staging_warning``. That value crosses four
+    seams (``Win32Calls`` -> ``WinNativeSession.staging_warning`` ->
+    :func:`coord.app_drive_daemon.serve`'s ready file ->
+    :class:`coord.app_drive.SessionHandle` -> the on-disk session file),
+    and EVERY read along the way is a permissive ``getattr(..., None)`` /
+    ``.get(...)`` that defaults to the "no warning" branch. So a rename
+    anywhere in that chain restores the exact silence this round removed,
+    with no test failing — unless these run."""
+
+    WARNING = "win-native launch staging (#3617) skipped: no %LOCALAPPDATA%"
+
+    class _FakeBackend:
+        """Minimal stand-in for a `win-native` backend that skipped
+        staging — only the attributes `serve()` itself reads."""
+
+        pid = 4242
+
+        def __init__(self, staging_warning):
+            self.staging_warning = staging_warning
+
+        def close(self):
+            pass
+
+    def _serve_until_ready(self, monkeypatch, tmp_path, *, staging_warning, control_dir=None):
+        """Run the REAL :func:`coord.app_drive_daemon.serve` against a fake
+        backend in a thread, returning the ready-file payload it wrote."""
+        import threading
+
+        import coord.app_drive_daemon as daemon
+
+        monkeypatch.setattr(
+            daemon, "_build_backend",
+            lambda *a, **kw: self._FakeBackend(staging_warning),
+        )
+        ready_file = tmp_path / "ready.json"
+        done = threading.Event()
+
+        def run():
+            try:
+                daemon.serve(
+                    "win-native", "vimcode.exe", str(tmp_path), 80, 24,
+                    idle_timeout=0.5, ready_file=ready_file, token="tok",
+                    control_dir=control_dir,
+                )
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not ready_file.exists():
+                time.sleep(0.02)
+            assert ready_file.exists(), "serve() never announced readiness"
+            return json.loads(ready_file.read_text())
+        finally:
+            done.wait(timeout=10)
+            thread.join(timeout=10)
+
+    def test_serve_puts_the_backends_warning_in_the_tcp_ready_file(
+        self, monkeypatch, tmp_path,
+    ):
+        payload = self._serve_until_ready(
+            monkeypatch, tmp_path, staging_warning=self.WARNING,
+        )
+        assert payload["transport"] == "tcp"
+        assert payload["staging_warning"] == self.WARNING
+
+    def test_serve_puts_the_backends_warning_in_the_bridge_ready_file(
+        self, monkeypatch, tmp_path,
+    ):
+        """The #3611 bridge (fs-control) ready-file shape — the one dell64
+        actually takes — is a SEPARATE `_write_ready_file` call site, so it
+        needs its own observation."""
+        payload = self._serve_until_ready(
+            monkeypatch, tmp_path, staging_warning=self.WARNING,
+            control_dir=tmp_path / "ipc",
+        )
+        assert payload["transport"] == "fs"
+        assert payload["staging_warning"] == self.WARNING
+
+    def test_serve_reports_no_warning_for_a_backend_that_has_none(
+        self, monkeypatch, tmp_path,
+    ):
+        """The negative half: a backend with no warning (or no such
+        attribute at all — every non-`win-native` kind) must report
+        ``None``, not the string "None" or a missing key."""
+        payload = self._serve_until_ready(monkeypatch, tmp_path, staging_warning=None)
+        assert payload["staging_warning"] is None
+
+    def _open_with_ready_payload(self, monkeypatch, payload: dict):
+        """Drive the REAL :func:`coord.app_drive.open_session` against a
+        daemon stand-in that writes *payload* as its ready file — the one
+        seam that turns a ready file into a :class:`SessionHandle`."""
+        import coord.app_drive as app_drive_mod
+
+        class _FakeProc:
+            #: Deliberately NOT `os.getpid()`: `_sandbox_coord_dir`'s
+            #: teardown `close_session`s every session file still on disk,
+            #: which signals `handle.pid` — this process' own pid there
+            #: SIGTERMs the test run itself. A never-allocated pid makes
+            #: that sweep a harmless no-op.
+            pid = _UNALLOCATED_PID
+            stderr = None
+
+            def kill(self):
+                pass
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(argv, **kwargs):
+            ready_file = argv[argv.index("--ready-file") + 1]
+            with open(ready_file, "w") as fh:
+                json.dump(payload, fh)
+            return _FakeProc()
+
+        monkeypatch.setattr(app_drive_mod.subprocess, "Popen", fake_popen)
+        return open_session("win-native", launch="vimcode.exe", cwd="/tmp")
+
+    def test_open_session_surfaces_the_warning_and_persists_it(self, monkeypatch):
+        monkeypatch.setattr(_win_native_bridge, "is_wsl_host", lambda: False)
+        handle = self._open_with_ready_payload(
+            monkeypatch,
+            {
+                "pid": _UNALLOCATED_PID, "port": 0, "app_pid": None,
+                "transport": "tcp", "staging_warning": self.WARNING,
+            },
+        )
+        assert handle.staging_warning == self.WARNING
+        # ... and survives the on-disk session-file round trip, which is
+        # how a later `coord app-drive` invocation (a different process)
+        # sees it at all.
+        assert load_session(handle.session_id).staging_warning == self.WARNING
+
+    def test_open_session_leaves_the_warning_none_when_staging_worked(self, monkeypatch):
+        monkeypatch.setattr(_win_native_bridge, "is_wsl_host", lambda: False)
+        handle = self._open_with_ready_payload(
+            monkeypatch,
+            {"pid": _UNALLOCATED_PID, "port": 0, "app_pid": None, "transport": "tcp"},
+        )
+        assert handle.staging_warning is None
+        assert load_session(handle.session_id).staging_warning is None
 
 
 class _FakeNativeCalls:

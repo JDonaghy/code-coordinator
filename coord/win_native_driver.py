@@ -1290,6 +1290,19 @@ class Win32Calls:
         #: even applies) — so a silent fallback to the slow UNC launch is
         #: observable rather than surfacing only much later as a
         #: `find_top_window` timeout. See `WinNativeSession.staging_warning`.
+        #:
+        #: Reset (to ``None``) at the top of every `_stage_if_needed` —
+        #: which is only reached for a UNC `cwd`, so an instance reused for
+        #: a LATER non-UNC launch keeps the earlier warning. There is
+        #: exactly one `Win32Calls` per daemon/session
+        #: (`coord.app_drive_daemon` builds it once, `coord.app_drive
+        #: .SessionHandle` reads the warning once) and a given session's
+        #: `cwd` never changes UNC-ness mid-flight, so that cannot happen
+        #: today; clearing it in `launch` itself is deliberately NOT done
+        #: because the non-UNC path must stay `self`-independent (see
+        #: `launch`'s own comment). `tests/test_win_native_driver.py`'s
+        #: `_make_win32_calls` initialises this too, so a test fake and a
+        #: real instance agree on the starting value.
         self.staging_warning: str | None = None
 
     # -- process lifecycle --
