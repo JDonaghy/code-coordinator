@@ -330,6 +330,9 @@ class _FakeDriverCfg:
     capability: str = ""
     routes: list = field(default_factory=list)
     platforms: list = field(default_factory=list)
+    setup: str = ""
+    run: str = ""
+    label: str = ""
 
 
 @dataclass
@@ -585,6 +588,68 @@ class TestDiscoverLanesPlatforms:
         ) is None
 
 
+class TestDiscoverLanesLabel:
+    """#3615: a route's own `label` disambiguates two sibling routes that
+    share one `kind` (e.g. vimcode's win-gui/win-terminal routes, both
+    `kind: win-native`) into distinct lanes, and each lane carries its
+    route's own `setup`/`run` strings."""
+
+    def test_two_routes_with_same_kind_get_distinct_labelled_platforms(self):
+        machine = _FakeMachine(name="dell64", repos=["vimcode"], capabilities=["windows"])
+        entry = _FakeDriverCfg(
+            routes=[
+                _FakeDriverCfg(
+                    kind="win-native", capability="windows", label="gui",
+                    setup="cargo xwin build --features win --bin vimcode",
+                    run="../target/release/vimcode.exe sample.txt",
+                ),
+                _FakeDriverCfg(
+                    kind="win-native", capability="windows", label="terminal",
+                    run="../target/release/vimcode-term.exe sample.txt",
+                ),
+            ]
+        )
+        cfg = _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
+        lanes = discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient())
+        by_platform = {l.platform: l for l in lanes}
+        assert set(by_platform) == {"win-native:gui", "win-native:terminal"}
+        assert by_platform["win-native:gui"].setup == "cargo xwin build --features win --bin vimcode"
+        assert by_platform["win-native:gui"].launch_command == "../target/release/vimcode.exe sample.txt"
+        assert by_platform["win-native:terminal"].setup == ""
+        assert by_platform["win-native:terminal"].launch_command == "../target/release/vimcode-term.exe sample.txt"
+        # driver_kind stays the bare kind so catalogue/journey lane-matching
+        # (keyed off driver_kind, not the disambiguated label) is unaffected.
+        assert {l.driver_kind for l in lanes} == {"win-native"}
+
+    def test_route_without_label_is_unaffected(self):
+        machine = _FakeMachine(name="pc1", repos=["vimcode"], capabilities=["windows"])
+        entry = _FakeDriverCfg(
+            routes=[
+                _FakeDriverCfg(kind="win-native", capability="windows", run="vimcode.exe"),
+            ]
+        )
+        cfg = _FakeConfig(machines=[machine], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
+        lanes = discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient())
+        assert [l.platform for l in lanes] == ["win-native"]
+        assert lanes[0].launch_command == "vimcode.exe"
+
+    def test_label_combines_with_platforms_suffix(self):
+        """A labelled route that also declares `platforms` gets
+        `kind:label:os_name` — label and OS-qualification compose rather
+        than one silently overriding the other."""
+        precision = _FakeMachine(name="precision", repos=["vimcode"], capabilities=["rust", "linux"])
+        entry = _FakeDriverCfg(
+            routes=[
+                _FakeDriverCfg(
+                    kind="tui-pty", capability="rust", label="smoke", platforms=["linux"],
+                ),
+            ]
+        )
+        cfg = _FakeConfig(machines=[precision], acceptance=_FakeAcceptanceConfig(drivers={"vimcode": entry}))
+        lanes = discover_lanes(cfg, "vimcode", http_client=_FakeHealthClient())
+        assert [l.platform for l in lanes] == ["tui-pty:smoke:linux"]
+
+
 class TestBuildExplorationBriefing:
     def test_includes_reference_backend_and_checklist(self):
         lane = BugbashLane(platform="win-native", driver_kind="win-native", machine="pc1", capability="windows")
@@ -703,6 +768,58 @@ class TestBuildExplorationBriefing:
         out = build_exploration_briefing(lane, reference_backend="win-native")
         assert UNAVAILABLE_FENCE in out
         assert "stop" in out.lower()
+
+    # ── #3615: real setup/launch command, not a literal placeholder ────
+
+    def test_lane_with_launch_command_names_it_in_the_open_usage_line(self):
+        """#3615: a lane carrying its route's own `run:` must have that
+        EXACT string in the `--launch` value — never the
+        `'<app launch command>'` placeholder a worker would otherwise have
+        to guess at."""
+        from coord.bugbash import driver_command_for_lane
+
+        lane = BugbashLane(
+            platform="win-native", driver_kind="win-native", machine="pc1", capability="windows",
+            launch_command="cd .smoke && ../target/release/vimcode.exe sample.txt",
+        )
+        out = build_exploration_briefing(lane, reference_backend="win-native")
+        assert "cd .smoke && ../target/release/vimcode.exe sample.txt" in out
+        assert "<app launch command>" not in out
+        assert driver_command_for_lane(lane) == (
+            "coord app-drive open win-native --launch "
+            "'cd .smoke && ../target/release/vimcode.exe sample.txt' "
+            "--cwd '<repo checkout dir>'"
+        )
+
+    def test_lane_without_launch_command_still_uses_the_placeholder(self):
+        """Unchanged behaviour for a lane built without route context
+        (e.g. an older/direct `BugbashLane(...)` construction) — the
+        placeholder fallback, never a crash or an empty `--launch ''`."""
+        lane = BugbashLane(platform="win-native", driver_kind="win-native", machine="pc1", capability="windows")
+        out = build_exploration_briefing(lane, reference_backend="win-native")
+        assert "<app launch command>" in out
+
+    def test_lane_with_setup_gets_an_explicit_build_step_the_worker_must_run(self):
+        """#3615 requirement: the worker builds/provisions using the
+        route's own `setup:`, rather than inferring from repo docs — the
+        exact failure mode that produced "No win-native backend exists to
+        launch" against a backend that actually builds fine."""
+        lane = BugbashLane(
+            platform="win-native", driver_kind="win-native", machine="pc1", capability="windows",
+            setup="cargo xwin build --release --features win --bin vimcode",
+            launch_command="../target/release/vimcode.exe sample.txt",
+        )
+        out = build_exploration_briefing(lane, reference_backend="win-native")
+        assert "cargo xwin build --release --features win --bin vimcode" in out
+        assert "Build/provision" in out
+
+    def test_lane_without_setup_has_no_build_step_line(self):
+        lane = BugbashLane(
+            platform="win-native", driver_kind="win-native", machine="pc1", capability="windows",
+            launch_command="../target/release/vimcode.exe sample.txt",
+        )
+        out = build_exploration_briefing(lane, reference_backend="win-native")
+        assert "Build/provision" not in out
 
     # ── #3580: repo-supplied catalogue ────────────────────────────────
 

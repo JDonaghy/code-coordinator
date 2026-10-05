@@ -1016,6 +1016,99 @@ acceptance:
         load(p)
 
 
+# ── label (#3615) ────────────────────────────────────────────────────────────
+
+
+def test_route_label_parses(tmp_path: Path) -> None:
+    """#3615: a `label` disambiguates two sibling routes sharing one `kind`
+    into distinct `coord bugbash` lanes (`win-native:gui` / `win-native:
+    terminal`)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "vimcode")
+        + """\
+acceptance:
+  drivers:
+    vimcode:
+      routes:
+        - match: ".smoke/win-gui/**"
+          kind: win-native
+          label: gui
+          run: "cd .smoke && ../target/release/vimcode.exe sample.txt"
+          setup: "cargo build --release --bin vimcode"
+        - match: ".smoke/win-terminal/**"
+          kind: win-native
+          label: terminal
+          run: "cd .smoke && ../target/release/vimcode-term.exe sample.txt"
+"""
+    )
+    cfg = load(p)
+    gui = cfg.acceptance.driver_for("vimcode", ".smoke/win-gui/spec.yaml")
+    assert gui is not None
+    assert gui.label == "gui"
+    term = cfg.acceptance.driver_for("vimcode", ".smoke/win-terminal/spec.yaml")
+    assert term is not None
+    assert term.label == "terminal"
+
+
+def test_route_label_absent_defaults_to_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    cfg = load(p)
+    driver = cfg.acceptance.driver_for("claude-coordinator", "coord/review.py")
+    assert driver.label == ""
+
+
+def test_route_label_non_string_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+          label: true
+"""
+    )
+    with pytest.raises(ConfigError, match="label must be a string"):
+        load(p)
+
+
+def test_routes_and_flat_label_raises(tmp_path: Path) -> None:
+    """Mirrors test_routes_and_flat_setup_raises, now covering `label`."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      label: whoops
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
+        load(p)
+
+
 # ── #3509: Tier-2 lane-kind entrypoints are additive-only, not sealed ───────
 #
 # `coord bugbash` (#3487) files every finding with the acceptance line "the
