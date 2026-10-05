@@ -24,8 +24,10 @@ This driver launches the driven repo's real compiled GTK binary under a real
 - ``xdotool search --onlyvisible --pid`` — finding the launched process's
   real, *mapped* window (``--onlyvisible`` matters: GTK4-on-X11 also creates
   an invisible internal helper top-level with a lower XID than the real
-  window — see :meth:`LinuxGtkCalls.find_top_window`, #3605) and polling
-  whether it still exists (``expect_closed``).
+  window — see :meth:`LinuxGtkCalls.find_top_window`, #3605), searched
+  across the launched pid's whole descendant-process tree since ``launch``
+  returns a ``/bin/sh -c`` wrapper pid that never owns the real window
+  itself (#3613), and polling whether it still exists (``expect_closed``).
 
 **Headless by construction.** Unlike ``win-native``/``mac-native`` (which
 drive a real, already-running desktop session), a Linux fleet host has no
@@ -314,7 +316,16 @@ class GtkCalls(Protocol):
         corrupts every subsequent ``move_window``/``send_click``/
         ``send_key``/``capture`` call against this window id — clicks land
         nowhere a user can see, and ``capture`` fails outright
-        (``xwd``/``XGetImage`` can't read an unmapped window)."""
+        (``xwd``/``XGetImage`` can't read an unmapped window).
+
+        Must also search *pid*'s whole descendant-process tree, not just
+        *pid* itself (#3613): :meth:`LinuxGtkCalls.launch` is a plain
+        ``subprocess.Popen(command, shell=True)``, which always spawns
+        ``/bin/sh -c <command>`` as the immediate child and returns that
+        wrapper's pid — the real GTK process is a separately-pid'd child
+        that owns the real window, while ``/bin/sh`` itself never owns
+        one. Searching only *pid* makes this method time out even while
+        the real window is already up and interactive."""
         ...
 
     def move_window(self, window_id: int, x: int, y: int, width: int, height: int) -> None: ...
@@ -666,19 +677,79 @@ class LinuxGtkCalls:
         # (xwd/XGetImage can't even read one). `--onlyvisible` makes
         # xdotool itself filter to windows that are actually mapped
         # (IsViewable), which is exactly the distinction that failed here.
+        #
+        # #3613: `pid` itself is frequently not the real app's own pid.
+        # `launch()` is `subprocess.Popen(command, shell=True)`, which
+        # always spawns `/bin/sh -c <command>` as the immediate child and
+        # returns *that wrapper's* pid — the real GTK process is a
+        # separately-pid'd child (or grandchild, through further wrapper
+        # layers) that owns the actual X11 window, while `/bin/sh` itself
+        # never owns one. Searching only `pid` therefore always timed out
+        # even though the real window was up and interactive within
+        # ~0.2s. Walking the whole descendant-process tree (mirroring
+        # :meth:`coord.win_native_driver.Win32Calls.find_top_window`'s own
+        # #3542 fix for the identical shape on Windows) finds the real
+        # window regardless of how many shell layers sit between the
+        # returned pid and it.
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            proc = subprocess.run(
-                ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
-                capture_output=True, text=True, timeout=10,
-            )
-            ids = [int(tok) for tok in proc.stdout.split() if tok.strip().isdigit()]
-            if ids:
-                return ids[0]
+            for candidate in sorted(self._descendant_pids(pid)):
+                proc = subprocess.run(
+                    ["xdotool", "search", "--onlyvisible", "--pid", str(candidate)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                ids = [int(tok) for tok in proc.stdout.split() if tok.strip().isdigit()]
+                if ids:
+                    return ids[0]
             time.sleep(0.1)
         raise GtkNativeRuntimeError(
-            f"no visible window appeared for pid={pid} within {timeout_s}s"
+            f"no visible window appeared for pid={pid} or any of its child "
+            f"processes within {timeout_s}s"
         )
+
+    def _descendant_pids(self, root_pid: int) -> set[int]:
+        """*root_pid* plus every process it transitively spawned (child,
+        grandchild, ...) — the Linux analogue of
+        :meth:`coord.win_native_driver.Win32Calls._descendant_pids`
+        (#3542), read fresh from the live process table (``ps -eo
+        pid,ppid``) every call rather than a cached snapshot, since the
+        real app may not have forked yet the first time this is polled.
+
+        #3613: ``launch()`` is a plain ``subprocess.Popen(command,
+        shell=True)``, so the pid it returns is ``/bin/sh -c``'s own pid,
+        not the real GTK app's — the real process is a child (or deeper
+        descendant) that owns the real X11 window, while the shell itself
+        never does. Searching the whole descendant tree finds the real
+        window regardless of how many shell layers sit between the
+        returned pid and it. A ``ps`` failure (missing binary, transient
+        error) degrades to "no descendants" rather than raising — the
+        caller still gets to search *root_pid* itself."""
+        children: dict[int, list[int]] = {}
+        try:
+            proc = subprocess.run(
+                ["ps", "-eo", "pid,ppid", "--no-headers"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return {root_pid}
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            try:
+                child_pid, parent_pid = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            children.setdefault(parent_pid, []).append(child_pid)
+        result = {root_pid}
+        frontier = [root_pid]
+        while frontier:
+            current = frontier.pop()
+            for child in children.get(current, ()):
+                if child not in result:
+                    result.add(child)
+                    frontier.append(child)
+        return result
 
     def is_window_alive(self, window_id: int) -> bool:
         proc = subprocess.run(
