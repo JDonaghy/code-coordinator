@@ -579,14 +579,33 @@ class VtScreen:
 
     def text(self, region: dict | None = None) -> str:
         """The rendered lines within *region* (or the whole screen when
-        ``None``), one screen row per output line."""
-        lines = self._screen.display
-        total_rows = len(lines)
-        total_cols = len(lines[0]) if lines else 0
+        ``None``), one screen row per output line.
+
+        Built from the raw cell buffer rather than ``pyte``'s own
+        ``Screen.display`` property. ``display`` *skips* the stub cell
+        that trails a double-width glyph (CJK, emoji, ...) instead of
+        padding it, so any row containing even one wide character
+        renders exactly one character shorter than ``self.columns`` —
+        silently truncating whatever text follows the glyph on that
+        row (e.g. a right-flushed status-bar field). We render each
+        stub cell back as a single space so every returned row is
+        always exactly ``self._screen.columns`` characters wide,
+        regardless of what the row contains.
+        """
+        screen = self._screen
+        total_rows = screen.lines
+        total_cols = screen.columns
         row0, col0, height, width = _region_bounds(region, total_rows, total_cols)
-        return "\n".join(
-            line[col0:col0 + width] for line in lines[row0:row0 + height]
-        )
+
+        def render_row(y: int) -> str:
+            row = screen.buffer[y]
+            # A stub cell (the trailing half of a double-width glyph)
+            # has ``data == ""``; every other cell — including a
+            # genuinely blank one — has at least a space.
+            return "".join(row[x].data or " " for x in range(total_cols))
+
+        lines = [render_row(y) for y in range(row0, row0 + height)]
+        return "\n".join(line[col0:col0 + width] for line in lines)
 
     def cell_attr(self, row: int, col: int, attr: str):
         """One SGR/text attribute (``bold``, ``italics``, ``underscore``,

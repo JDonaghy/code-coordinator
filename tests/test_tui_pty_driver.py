@@ -35,6 +35,14 @@ shell script, and ``exec`` can be applied to neither a leading ``cd``
 shape — the first against the pure string transform, the second end-to-end
 against a real pty — so a regression here fails loudly rather than only
 surfacing against the live fleet config.
+
+:class:`TestVtScreen`'s ``test_*wide_glyph*`` case (#3618) is the
+conformance scenario for a bugbash finding that every ``screen`` capture
+came back ``cols - 1`` wide: the root cause is ``pyte``'s own
+``Screen.display`` skipping the stub cell that trails a double-width
+glyph (CJK, emoji, ...) instead of padding it, fixed in
+``VtScreen.text()`` by rendering from the raw cell buffer instead. It
+fails against the pre-fix implementation and passes against the fix.
 """
 
 from __future__ import annotations
@@ -454,25 +462,58 @@ class TestVtScreen:
         this must come back the full requested width, last character
         intact, not ``cols - 1``.
 
-        Investigation note: this already passes against the unmodified
-        driver — direct measurement here, through a real
-        :class:`UnixPtyChild` (:class:`TestUnixPtyChildReal`-style) and
-        through the full ``open_session``/``send_command`` round trip,
-        found no off-by-one at the kernel ``TIOCSWINSZ``, ``pyte``
-        capture, or CLI-JSON layers. This conformance scenario is added
-        per the issue's own acceptance bar as a regression guard for this
-        exact behaviour; the root cause (if real) was not found in this
-        repo's driver — see the PR description.
+        This pure-ASCII shape already passed before this issue's fix —
+        ``len(line) == cols`` here is a property of ``pyte`` itself, not
+        of anything this repo's driver does, so on its own this case
+        cannot have caught the real regression. See
+        ``test_right_flushed_status_line_survives_a_leading_wide_glyph``
+        below for the case that actually reproduces and guards it.
         """
         cols, rows = 100, 10
         screen = VtScreen(cols=cols, rows=rows)
         text = "Ln 1, Col 100"
+        # The literal digits are cosmetic; the invariant under test is
+        # the string's LAST character landing exactly on column `cols`.
         col_start = cols - len(text) + 1  # 1-indexed CUP column of the first char
         screen.feed(f"\x1b[{rows};{col_start}H{text}".encode())
         lines = screen.text().split("\n")
         assert len(lines) == rows
         assert all(len(line) == cols for line in lines)
         assert lines[-1].endswith(text)
+
+    def test_right_flushed_status_line_survives_a_leading_wide_glyph(self) -> None:
+        """#3618's actual root cause, isolated and fixed: ``pyte``'s own
+        ``Screen.display`` (which ``VtScreen.text()`` used to return
+        verbatim) *skips* the stub cell that trails a double-width glyph
+        (CJK, emoji, a nerd-font icon, ...) instead of padding it, so any
+        row containing even one such glyph renders exactly one character
+        shorter than ``self.columns`` — collapsing whatever right-flushed
+        text follows it on that row, the reported symptom exactly
+        (vimcode's ruler loses its last digit whenever the status line
+        also carries a wide glyph earlier in the row, e.g. a mode icon).
+
+        This is the one mechanism inside this repo's own capture path
+        that can genuinely produce a short row; the pure-ASCII case
+        above cannot exercise it. Against the pre-fix ``VtScreen.text()``
+        (``"\\n".join(line[...] for line in self._screen.display)``)
+        this fails with every row one character short and the glyph's
+        trailing text shifted left by one; against the fix (rendering
+        from the raw cell buffer and padding the stub cell back to a
+        single column) it passes.
+        """
+        cols, rows = 100, 10
+        screen = VtScreen(cols=cols, rows=rows)
+        glyph = "文"  # East-Asian Wide: occupies 2 display columns.
+        glyph_width = 2
+        text = "Ln 1, Col 100"
+        col_start = cols - glyph_width - len(text) + 1  # 1-indexed CUP column
+        screen.feed(f"\x1b[{rows};{col_start}H{glyph}{text}".encode())
+        lines = screen.text().split("\n")
+        assert len(lines) == rows
+        widths = [(i, len(line)) for i, line in enumerate(lines) if len(line) != cols]
+        assert not widths, f"rows not exactly {cols} wide: {widths}"
+        assert lines[-1].endswith(text)
+        assert glyph in lines[-1]
 
     def test_missing_pyte_raises_actionable_error(self, monkeypatch) -> None:
         import builtins
@@ -833,22 +874,16 @@ class TestTuiPtySessionDragAndResize:
 
 
 class TestTuiPtySessionScreenWidth:
-    """#3618's own Tier-1 conformance scenario: ``coord app-drive tui-pty
-    open --cols N ...`` followed by ``screen`` must come back with every
-    row exactly N characters wide — the bugbash finding reported N - 1,
-    truncating a right-flush-justified status segment's last character
-    (vimcode's ruler losing its trailing digit). Drives the exact
-    ``open``/``screen`` path (:class:`TuiPtySession`, the daemon's own
-    backend for the ``screen`` op — see
-    :func:`coord.app_drive_daemon._dispatch`) against a scripted child
-    that emits a full-width, right-flushed line, the same shape the
-    bugbash evidence described.
-
-    Investigation note: this passes unmodified. Direct measurement
-    through a real :class:`UnixPtyChild` and the full
-    ``open_session``/``send_command`` round trip (outside this test
-    suite) found no off-by-one here either — see this issue's PR
-    description for what was ruled out."""
+    """A :class:`TuiPtySession`-level companion to
+    :class:`TestVtScreen`'s ``VtScreen.text()`` conformance scenario
+    (#3618): calls :meth:`TuiPtySession.screen_text` directly against a
+    scripted :class:`FakePtyChild`, so it exercises this session
+    wrapper's locking/region plumbing on top of ``VtScreen`` — it does
+    NOT drive :func:`coord.app_drive_daemon._dispatch`, the daemon
+    socket, or the CLI's JSON round trip; that real-daemon layer is
+    covered separately by ``tests/test_app_drive.py``'s
+    ``TestTuiPtyAppDriveBlackBox``/``TestOpenSessionCloseSession``
+    real-daemon tests."""
 
     def test_screen_rows_are_exactly_cols_wide_not_cols_minus_one(self) -> None:
         cols, rows = 100, 30
@@ -860,15 +895,36 @@ class TestTuiPtySessionScreenWidth:
             spawn_child=lambda launch, cwd, cols, rows: child,
         )
         try:
-            deadline = time.monotonic() + 2.0
-            lines: list[str] = []
-            while time.monotonic() < deadline:
-                lines = session.screen_text().split("\n")
-                if lines[-1].strip():
-                    break
-                time.sleep(0.02)
+            session.wait_idle(ms=200, timeout_ms=2000)
+            lines = session.screen_text().split("\n")
             assert len(lines) == rows
-            assert all(len(line) == cols for line in lines)
+            widths = [(i, len(line)) for i, line in enumerate(lines) if len(line) != cols]
+            assert not widths, f"rows not exactly {cols} wide: {widths}"
+            assert lines[-1].endswith(text)
+        finally:
+            session.close()
+
+    def test_screen_rows_survive_a_leading_wide_glyph(self) -> None:
+        """The :class:`TuiPtySession` counterpart to
+        ``test_right_flushed_status_line_survives_a_leading_wide_glyph``
+        — confirms the fix holds through this session wrapper's own
+        ``screen_text()``, not just a bare :class:`VtScreen`."""
+        cols, rows = 100, 30
+        glyph = "文"
+        glyph_width = 2
+        text = "Ln 1, Col 100"
+        col_start = cols - glyph_width - len(text) + 1
+        child = FakePtyChild(script=[(0.0, f"\x1b[{rows};{col_start}H{glyph}{text}".encode())])
+        session = TuiPtySession(
+            "unused", ".", cols=cols, rows=rows,
+            spawn_child=lambda launch, cwd, cols, rows: child,
+        )
+        try:
+            session.wait_idle(ms=200, timeout_ms=2000)
+            lines = session.screen_text().split("\n")
+            assert len(lines) == rows
+            widths = [(i, len(line)) for i, line in enumerate(lines) if len(line) != cols]
+            assert not widths, f"rows not exactly {cols} wide: {widths}"
             assert lines[-1].endswith(text)
         finally:
             session.close()

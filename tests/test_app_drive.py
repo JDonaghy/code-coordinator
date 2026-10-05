@@ -184,6 +184,17 @@ class TestTuiPtyAppDriveBlackBox:
         screen_text = json.loads(screen.output)["text"]
         assert "hi there" in screen_text
 
+        # #3618: a bugbash finding reported every row of a `screen`
+        # capture one character narrower than the requested `--cols`
+        # (truncating a right-flush-justified status field) -- through
+        # exactly this real CLI/daemon/JSON round trip, the one layer
+        # the issue's own evidence pointed at. Confirm every row of
+        # THIS capture is the full `--cols 40` wide, not 39.
+        lines = screen_text.split("\n")
+        assert len(lines) == 5
+        widths = [(i, len(line)) for i, line in enumerate(lines) if len(line) != 40]
+        assert not widths, f"rows not exactly --cols=40 wide: {widths}"
+
         closed = runner.invoke(app_drive_group, ["close", "--session", session_id])
         assert closed.exit_code == 0, closed.output
         assert json.loads(closed.output)["closed"] is True
@@ -285,6 +296,37 @@ class TestOpenSessionCloseSession:
             assert "x" * 60 in screen["text"]
         finally:
             close_session(handle)
+
+    def test_screen_rows_are_exactly_cols_wide_through_a_real_daemon(self):
+        """#3618 Tier-1 regression guard at the exact layer the issue's
+        own evidence fingers: a real daemon subprocess (not
+        ``FakePtyChild``, not a bare ``pyte.Screen``) constructing a
+        ``TuiPtySession``, driven over the real ``open_session`` ->
+        ``send_command`` -> daemon-socket -> JSON round trip that
+        ``coord app-drive screen`` itself uses. Two different ``--cols``
+        values so the width expectation can't be hardcoded by the test,
+        and each session's row carries one double-width glyph (CJK)
+        plus enough ASCII padding to reach the very last column -- the
+        one mechanism inside ``VtScreen.text()`` that can genuinely
+        yield a row shorter than ``cols`` (``pyte``'s own
+        ``Screen.display`` skips the stub cell after a wide character
+        instead of padding it; see ``coord/tui_pty_driver.py``). Against
+        the pre-fix ``VtScreen.text()`` this fails with every row one
+        character short; against the fix it passes.
+        """
+        for cols, rows in ((40, 5), (61, 7)):
+            handle = open_session("tui-pty", launch="cat", cwd="/tmp", cols=cols, rows=rows)
+            try:
+                payload = "文" + ("x" * (cols - 2)) + "\n"
+                send_command(handle, {"op": "send_text", "args": {"text": payload}})
+                time.sleep(0.5)
+                screen = send_command(handle, {"op": "screen", "args": {}})
+                lines = screen["text"].split("\n")
+                assert len(lines) == rows
+                widths = [(i, len(line)) for i, line in enumerate(lines) if len(line) != cols]
+                assert not widths, f"cols={cols}: rows not exactly {cols} wide: {widths}"
+            finally:
+                close_session(handle)
 
     def test_open_gtk_native_on_a_headless_box_reports_unavailable_not_a_crash(self):
         """#3510/#3566, exercised for real (no fake): this CI sandbox has
