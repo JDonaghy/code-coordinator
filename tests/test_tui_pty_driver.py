@@ -51,6 +51,7 @@ from coord.tui_pty_driver import (
     SmokeSpec,
     SmokeStep,
     TuiPtyRuntimeError,
+    TuiPtySession,
     TuiPtySpecError,
     UnixPtyChild,
     VtScreen,
@@ -574,6 +575,45 @@ class TestSmokeRunnerCprAutoReply:
         replies = [w for w in child.writes if w.startswith(b"\x1b[") and w.endswith(b"R")]
         assert len(replies) == 1
         assert replies[0] == b"\x1b[1;1R"
+
+
+# ── TuiPtySession (#3590's `open`/`send`/`screen`/`close` driver) ──────────
+
+
+class TestTuiPtySessionCprAutoReply:
+    """#3603: ``coord app-drive tui-pty open`` launched a real app under a
+    real pty exactly like ``run-spec`` does, but the real app died silently
+    within a few seconds, screen still blank, even with no input sent at
+    all — while the IDENTICAL launch command through ``run-spec``
+    (:class:`SmokeRunner`) ran a 490-step spec with no instability.
+
+    Root cause: :class:`TuiPtySession` never answered the ``ESC[6n``
+    cursor-position query :class:`SmokeRunner` already answered (a
+    startup-blocking app — ratatui's ``Terminal::new()`` is one — never
+    paints, and some give up and exit outright after a few seconds with no
+    reply at all). This is the Tier-1 conformance scenario the issue's own
+    acceptance bar requires: it fails first against the pre-fix
+    `TuiPtySession` (no responder thread, no reply ever written), and
+    passes once `TuiPtySession` shares `SmokeRunner`'s own
+    `_CprResponder` (#2096 "one question, one answer")."""
+
+    def test_cpr_query_gets_a_reply_through_the_open_send_screen_session(self) -> None:
+        child = FakePtyChild(script=[(0.0, b"\x1b[6n")])
+        session = TuiPtySession(
+            "unused", ".", cols=80, rows=24,
+            spawn_child=lambda launch, cwd, cols, rows: child,
+        )
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not any(
+                w.startswith(b"\x1b[") and w.endswith(b"R") for w in child.writes
+            ):
+                time.sleep(0.02)
+            replies = [w for w in child.writes if w.startswith(b"\x1b[") and w.endswith(b"R")]
+            assert len(replies) == 1
+            assert replies[0] == b"\x1b[1;1R"
+        finally:
+            session.close()
 
 
 class TestSmokeRunnerDeadline:
