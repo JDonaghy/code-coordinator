@@ -38,6 +38,7 @@ from coord.bugbash import (
     BugbashLane,
     CATALOGUE_PATH,
     COVERAGE_FENCE,
+    CatalogueResult,
     CoverageSummary,
     DedupeVerdict,
     ExploreOutcome,
@@ -53,6 +54,7 @@ from coord.bugbash import (
     _pick_lane_machine,
     _ShardCostState,
     build_exploration_briefing,
+    catalogue_warning_for_lane,
     chunk_journeys,
     compose_finding_issue_title,
     dedupe_finding,
@@ -981,6 +983,72 @@ journeys:
         assert "Alt-M" in out
         assert "editor_mode" in out
 
+    # ── #3620 review finding 4: catalogue_warning threaded through
+    # journeys_override, for the sharded dispatcher ───────────────────────
+
+    def test_journeys_override_with_explicit_catalogue_warning_shows_note(self):
+        # chunk_explorer (coord/commands/bugbash.py) always passes a
+        # journeys_override (possibly empty), never None, so the ONLY way
+        # a worker handed an empty chunk sees the #3580-required NOTE is
+        # if the caller computes and passes catalogue_warning explicitly.
+        lane = BugbashLane(platform="win-native", driver_kind="win-native", machine="pc1", capability="")
+        out = build_exploration_briefing(
+            lane, reference_backend="mac-native", checklist=("panels",),
+            journeys_override=(), catalogue_warning="catalogue.yaml has no journey for win-native",
+        )
+        assert "panels" in out
+        assert "NOTE: catalogue.yaml has no journey for win-native" in out
+
+    def test_journeys_override_with_no_catalogue_warning_passed_shows_no_note(self):
+        # A non-empty override needs no warning at all -- confirms the
+        # parameter is additive, never forced on.
+        lane = BugbashLane(platform="tui-pty", driver_kind="tui-pty", machine="pc1", capability="")
+        journeys = _synthetic_journeys(1, lane="tui-pty")
+        out = build_exploration_briefing(
+            lane, reference_backend="win-native", journeys_override=journeys,
+        )
+        assert "NOTE:" not in out
+
+    def test_journeys_override_none_still_derives_its_own_warning(self):
+        # Backward compatibility: the unsharded path (journeys_override is
+        # explicitly None, never an override) must keep deriving its own
+        # warning from catalogue_text exactly as before #3620, regardless
+        # of whatever catalogue_warning default is passed.
+        lane = BugbashLane(platform="win-native", driver_kind="win-native", machine="pc1", capability="")
+        out = build_exploration_briefing(
+            lane, reference_backend="mac-native", checklist=("panels",),
+            catalogue_text="not: [valid, yaml: at: all",
+        )
+        assert "NOTE:" in out
+
+
+class TestCatalogueWarningForLane:
+    def test_no_warning_when_catalogue_clean_and_lane_has_journeys(self):
+        catalogue = CatalogueResult(journeys=_synthetic_journeys(1), source=CATALOGUE_PATH)
+        assert catalogue_warning_for_lane(catalogue, "tui-pty", _synthetic_journeys(1)) == ""
+
+    def test_catalogue_level_warning_passed_through_when_no_journeys_at_all(self):
+        catalogue = CatalogueResult(warning="no catalogue found at catalogue.yaml")
+        assert catalogue_warning_for_lane(catalogue, "tui-pty", ()) == (
+            "no catalogue found at catalogue.yaml"
+        )
+
+    def test_lane_specific_note_added_when_catalogue_has_journeys_but_none_for_this_lane(self):
+        catalogue = CatalogueResult(journeys=_synthetic_journeys(1, lane="mac-native"), source=CATALOGUE_PATH)
+        warning = catalogue_warning_for_lane(catalogue, "win-native", ())
+        assert "no journey declaring lane" in warning
+        assert "win-native" in warning
+
+    def test_catalogue_level_and_lane_specific_warnings_both_present(self):
+        catalogue = CatalogueResult(
+            journeys=_synthetic_journeys(1, lane="mac-native"),
+            warning="catalogue.yaml: dropped 1 invalid journey entry: bad (missing: expected)",
+            source=CATALOGUE_PATH,
+        )
+        warning = catalogue_warning_for_lane(catalogue, "win-native", ())
+        assert "dropped 1 invalid journey entry" in warning
+        assert "no journey declaring lane" in warning
+
 
 class TestParseCatalogue:
     def test_valid_catalogue_parses_all_fields(self):
@@ -1178,6 +1246,15 @@ class TestPlanLaneChunks:
         plan = plan_lane_chunks(lane, _synthetic_journeys(10, lane="tui-pty"), journeys_per_worker=25)
         assert plan.journeys == ()
         assert plan.chunk_count == 0
+
+    def test_returns_a_lane_chunk_plan_with_default_journeys_per_worker(self):
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        plan = plan_lane_chunks(lane, _synthetic_journeys(DEFAULT_JOURNEYS_PER_WORKER + 5))
+        assert isinstance(plan, LaneChunkPlan)
+        # Default --journeys-per-worker (unset) must match the CLI's own
+        # documented default, not an independently-drifting hardcoded
+        # value here.
+        assert plan.chunk_count == 2
 
 
 class TestMaxConcurrentChunksForLane:
@@ -1428,6 +1505,95 @@ class TestExploreLaneSharded:
         )
         assert dispatched_per_round[1] == ["j1", "j2"]
         assert dispatched_per_round[2] == ["j3", "j0"]
+
+    def test_protocol_error_chunk_never_recorded_by_scheduler(self):
+        # #3620 review finding 1: a chunk whose findings fence was
+        # unparseable (`protocol_error` non-empty) still carries
+        # `journey_outcomes` (see coord/commands/bugbash.py's
+        # `_dispatch_and_await_lane`), but marking a journey `found` from
+        # an untrustworthy report would both drop the finding silently
+        # (a `found` journey is never auto-requeued) and permanently stop
+        # re-walking it. The journey must stay schedulable for round 2.
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        journeys = _synthetic_journeys(2)
+        scheduler = JourneyScheduler(journeys=journeys, journeys_per_worker=10)
+
+        def chunk_explorer(lane, round_num, chunk):
+            return ExploreOutcome(
+                cost=1.0,
+                protocol_error="no parseable findings fence",
+                journey_outcomes=(JourneyOutcome(journey_id="j0", status="found"),),
+            )
+
+        outcome = explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=100.0, cost_cap_total=100.0,
+            max_concurrent_chunks=1,
+        )
+        assert outcome.protocol_error == "no parseable findings fence"
+        # The scheduler's own cumulative record must be untouched -- j0 is
+        # still schedulable, not permanently excluded as `found`.
+        ordered = [j.id for j in scheduler._ordered_for_round()]
+        assert "j0" in ordered
+
+    def test_all_chunks_skipped_by_cost_cap_returns_ok_false(self):
+        # #3620 review finding 2: if the cost cap already tripped (from a
+        # sibling lane sharing `cost_state`) BEFORE this lane's very first
+        # chunk reservation, every chunk is skipped and nothing was
+        # exercised this round at all -- this must never come back as the
+        # default `ok=True, findings=()` ("we looked, there weren't any"),
+        # or `run_bugbash` falls through to `reason="zero_findings"` for a
+        # round that explored nothing (the #3546 bug, routed around).
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(4), journeys_per_worker=1)
+        cost_state = _ShardCostState()
+        cost_state.record("tui-pty", 1000.0)  # cap already tripped before we start
+        calls = []
+
+        def chunk_explorer(lane, round_num, journeys):
+            calls.append(journeys)
+            return ExploreOutcome(cost=1.0)
+
+        outcome = explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=cost_state, cost_cap_per_lane=100.0, cost_cap_total=15.0,
+            max_concurrent_chunks=1,
+        )
+        assert calls == []
+        assert outcome.ok is False
+        assert outcome.unavailable is False
+        assert outcome.findings == ()
+
+    def test_unavailable_chunk_preserves_earlier_chunks_findings(self):
+        # #3620 review finding 3: an earlier chunk's real, verified
+        # findings/coverage must never be discarded just because a LATER
+        # chunk this round reports the lane unavailable -- the aggregate
+        # must report `ok=False` (never `unavailable=True`, which
+        # `_apply_outcome_to_round` treats as "never contributes findings
+        # this round, even defensively") with the findings intact.
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(2), journeys_per_worker=1)
+        finding = _finding(title="real bug seen before the session locked")
+        calls = []
+
+        def chunk_explorer(lane, round_num, chunk):
+            calls.append(chunk)
+            if len(calls) == 1:
+                return ExploreOutcome(
+                    cost=1.0, findings=(finding,),
+                    journey_outcomes=(JourneyOutcome(journey_id="j0", status="found"),),
+                )
+            return ExploreOutcome(unavailable=True, notes="session locked mid-round")
+
+        outcome = explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=100.0, cost_cap_total=100.0,
+            max_concurrent_chunks=1,
+        )
+        assert outcome.unavailable is False
+        assert outcome.ok is False
+        assert outcome.findings == (finding,)
+        assert "session locked mid-round" in outcome.notes
 
 
 class TestParseCoverageBlock:
@@ -3412,6 +3578,36 @@ class TestPrintRoundCoverage:
         assert "lanes unavailable: win-native" in out
 
 
+class TestPrintCumulativeCoverage:
+    def test_two_lanes_sharing_a_platform_on_different_hosts_report_separately(self, capsys):
+        # #3620 review non-blocking note: the real fleet can have two
+        # lanes sharing a platform on different hosts (see
+        # `_RoundExploreState`'s own docstring). `schedulers` must be
+        # keyed by `(platform, machine)`, not bare `lane.platform` --
+        # keying by platform alone would hand both lanes the SAME
+        # scheduler and print its coverage line twice instead of each
+        # lane's own.
+        from coord.commands.bugbash import _lane_key, _print_cumulative_coverage
+
+        lane_a = _prod_lane(machine="pc1", platform="tui-pty")
+        lane_b = _prod_lane(machine="pc2", platform="tui-pty")
+        scheduler_a = JourneyScheduler(journeys=_synthetic_journeys(2, prefix="a"), journeys_per_worker=10)
+        scheduler_a.record([JourneyOutcome(journey_id="a0", status="passed")])
+        scheduler_b = JourneyScheduler(journeys=_synthetic_journeys(3, prefix="b"), journeys_per_worker=10)
+        scheduler_b.record([
+            JourneyOutcome(journey_id="b0", status="passed"),
+            JourneyOutcome(journey_id="b1", status="found"),
+        ])
+        schedulers = {_lane_key(lane_a): scheduler_a, _lane_key(lane_b): scheduler_b}
+
+        _print_cumulative_coverage([lane_a, lane_b], schedulers)
+        out = capsys.readouterr().out
+        lines = [l for l in out.splitlines() if "cumulative coverage" in l]
+        assert len(lines) == 2
+        assert "1/2 attempted, 1 passed, 0 found" in lines[0]
+        assert "2/3 attempted, 1 passed, 1 found" in lines[1]
+
+
 # ── coord bugbash CLI (#3569: --lane-timeout, run/harvest subcommands) ───
 
 
@@ -3625,6 +3821,32 @@ class TestBugbashCli:
         assert result.exit_code == 0, result.output
         assert "journeys: 60" in result.output
         assert "chunks: 3" in result.output
+
+    def test_max_priority_zero_is_rejected_by_cli_validation(self):
+        # #3620 review non-blocking note: `--max-priority 0` (or negative)
+        # used to silently filter every journey out of every lane, falling
+        # back to the generic checklist with no warning. `click.IntRange`
+        # now rejects it outright instead.
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "tui-pty", "--max-priority", "0", "--dry-run", "-y"],
+        )
+        assert result.exit_code != 0
+        assert "max-priority" in result.output.lower()
+
+    def test_journeys_per_worker_zero_is_rejected_by_cli_validation(self):
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "tui-pty", "--journeys-per-worker", "0", "--dry-run", "-y"],
+        )
+        assert result.exit_code != 0
+        assert "journeys-per-worker" in result.output.lower()
 
     def test_dry_run_prints_the_per_lane_driver_command(self, monkeypatch):
         """#3590 acceptance: `coord bugbash REPO --dry-run` prints the exact
