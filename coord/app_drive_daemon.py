@@ -129,6 +129,22 @@ def _dispatch(backend: Any, kind: str, command: dict) -> dict:
             else:
                 backend.send_click(int(args["x"]), int(args["y"]), args.get("button", "left"))
             return {"ok": True}
+        if op == "send_drag":
+            # #3604: a press-drag-release gesture — tui-pty-only, same as
+            # send_text/wait_idle/screen above, since the native kinds
+            # have no gesture primitive of their own wired through here yet.
+            if kind != "tui-pty":
+                return {"error": f"send_drag is tui-pty-only (kind={kind!r})"}
+            backend.send_drag(
+                int(args["row"]), int(args["col"]),
+                int(args["to_row"]), int(args["to_col"]), args.get("button", "left"),
+            )
+            return {"ok": True}
+        if op == "resize":
+            if kind != "tui-pty":
+                return {"error": f"resize is tui-pty-only (kind={kind!r})"}
+            backend.resize(int(args["cols"]), int(args["rows"]))
+            return {"ok": True}
         if op == "wait_idle":
             if kind != "tui-pty":
                 return {"error": f"wait_idle is tui-pty-only (kind={kind!r})"}

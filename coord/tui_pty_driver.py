@@ -32,11 +32,24 @@ is threaded through as the driver's ``entrypoint:``). Steps:
 - ``key: <name>`` — send one key (named: ``enter``, ``esc``, ``tab``,
   ``backspace``, ``space``, arrow keys, ``home``/``end``, ``pageup``/
   ``pagedown``, ``delete``, ``insert``, ``f1``-``f12``, ``ctrl+<letter>``; or
-  any single literal character).
+  any single literal character). #3604: also any modifier combo of the
+  form ``<mod>+<base>``/``<mod>-<base>`` (``+``/``-`` both accepted, since
+  real journeys spell this both ways — ``alt+m``, ``M-m``, ``shift+right``,
+  ``ctrl+home``) — see :func:`encode_key` for exactly which modifiers/bases
+  are recognized and how each is encoded.
 - ``click: {row, col, button}`` — an SGR mouse click at 0-indexed
   ``(row, col)``; ``button`` is ``left`` (default), ``middle``, ``right``, or
   ``wheel-up``/``wheel-down`` (single-shot, no release event — mirrors a
   real wheel).
+- ``drag: {row, col, to_row, to_col, button}`` (#3604) — a press at
+  0-indexed ``(row, col)``, one SGR motion event at ``(to_row, to_col)``
+  with the button-held bit set, then a release there; ``button`` is
+  ``left`` (default)/``middle``/``right`` (no wheel — a wheel has no
+  "held" state to drag with). See :func:`encode_drag`.
+- ``resize: {cols, rows}`` (#3604) — live-resize the pty/ConPTY itself to
+  *cols* x *rows* (``TIOCSWINSZ`` on Unix, ``PtyProcess.setwinsize`` on
+  Windows) and resize the VT screen the same way, so a reflow step can run
+  mid-spec rather than only at ``launch``. See :meth:`SmokeRunner._do_resize`.
 - ``wait_idle: {ms, timeout_ms}`` — block until the byte stream has been
   quiet for ``ms`` milliseconds, or fail after ``timeout_ms`` without ever
   reaching that quiet window (default 5000ms) — a precondition step, not an
@@ -128,6 +141,8 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "launch": (),
     "key": ("key",),
     "click": ("row", "col"),
+    "drag": ("row", "col", "to_row", "to_col"),
+    "resize": ("cols", "rows"),
     "wait_idle": (),
     "expect_screen": (),
     "expect_silent": (),
@@ -135,6 +150,9 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 _VALID_BUTTONS = ("left", "middle", "right", "wheel-up", "wheel-down")
+#: #3604: a drag has no "release" concept for a wheel notch, so it's
+#: restricted to the buttons that genuinely support press-hold-release.
+_DRAG_BUTTONS = ("left", "middle", "right")
 
 
 @dataclass(frozen=True)
@@ -152,6 +170,8 @@ class SmokeStep:
     key: str = ""
     row: int = 0
     col: int = 0
+    to_row: int = 0
+    to_col: int = 0
     button: str = "left"
     ms: int = 200
     timeout_ms: int = 5000
@@ -159,6 +179,8 @@ class SmokeStep:
     text: str = ""
     region: dict | None = None
     attr: dict | None = None
+    cols: int = 0
+    rows: int = 0
 
     @property
     def step_id(self) -> str:
@@ -244,6 +266,12 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
                 f"steps[{i}]: unrecognized button {button!r} — expected one "
                 f"of {', '.join(_VALID_BUTTONS)}"
             )
+        if kind == "drag" and button not in _DRAG_BUTTONS:
+            raise TuiPtySpecError(
+                f"steps[{i}]: unrecognized drag button {button!r} — "
+                f"expected one of {', '.join(_DRAG_BUTTONS)} (a wheel has "
+                f"no held state to drag with)"
+            )
         region = entry.get("region")
         if region is not None and not isinstance(region, dict):
             raise TuiPtySpecError(f"steps[{i}].region must be a mapping")
@@ -289,6 +317,8 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
             key=str(entry.get("key", "") or ""),
             row=_int_default(entry.get("row"), 0),
             col=_int_default(entry.get("col"), 0),
+            to_row=_int_default(entry.get("to_row"), 0),
+            to_col=_int_default(entry.get("to_col"), 0),
             button=button,
             ms=_int_default(entry.get("ms"), 200),
             timeout_ms=_int_default(entry.get("timeout_ms"), 5000),
@@ -296,6 +326,8 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
             text=str(entry.get("text", "") or ""),
             region=region,
             attr=attr,
+            cols=_int_default(entry.get("cols"), 0),
+            rows=_int_default(entry.get("rows"), 0),
         ))
 
     return SmokeSpec(
@@ -329,16 +361,104 @@ _NAMED_KEYS = {
 
 _CTRL_KEY_RE = re.compile(r"ctrl\+([a-z])")
 
+#: #3604: every spelling a run-spec/catalogue journey actually uses for the
+#: Alt modifier, normalized to the canonical ``"alt"`` token —
+#: ``meta``/``option`` are the names macOS/other platforms use for the same
+#: physical key, ``m``/``a`` are the single-letter dash forms (``M-m``,
+#: ``a-m``) emacs/readline-style bindings use. ``ctrl``/``control`` and
+#: ``shift`` need no aliasing: no journey or driver trial ever spelled those
+#: two any other way.
+_MODIFIER_ALIASES = {
+    "ctrl": "ctrl", "control": "ctrl",
+    "shift": "shift",
+    "alt": "alt", "meta": "alt", "option": "alt", "opt": "alt",
+    "m": "alt", "a": "alt",
+}
+
+#: xterm's modifyOtherKeys modifier parameter for the CSI forms below
+#: (``CSI 1 ; <code> <letter>`` for arrows/home/end, ``CSI <num> ; <code> ~``
+#: for pageup/pagedown/delete/insert) — the same encoding real terminals
+#: (and crossterm/ratatui's own decoder, what vimcode is built on) use for
+#: every modified non-letter key.
+_MOD_CODE = {
+    frozenset({"shift"}): 2,
+    frozenset({"alt"}): 3,
+    frozenset({"shift", "alt"}): 4,
+    frozenset({"ctrl"}): 5,
+    frozenset({"shift", "ctrl"}): 6,
+    frozenset({"ctrl", "alt"}): 7,
+    frozenset({"shift", "ctrl", "alt"}): 8,
+}
+
+_ARROW_FINAL = {"up": "A", "down": "B", "right": "C", "left": "D"}
+_HOME_END_FINAL = {"home": "H", "end": "F"}
+_TILDE_CODE = {"pageup": "5", "pagedown": "6", "delete": "3", "insert": "2"}
+
+
+def _parse_modified_key(key: str) -> bytes | None:
+    """The general ``<mod>(+|-)<mod>...(+|-)<base>`` path :func:`encode_key`
+    falls back to once the fixed-table lookups above it miss — ``None``
+    (never raises) when *key* doesn't even look like a modifier combo, so
+    the caller can still try its own "bare single character" fallback.
+
+    Covers exactly the combos #3604 reports missing: Alt+a single
+    character (``alt+m``/``meta+m``/``M-m``/``a-m``/``option+m`` — the
+    universal terminal "meta sends ESC" convention: an ESC byte followed by
+    the character's own encoding) and Shift/Ctrl/Alt combined with an
+    arrow or ``home``/``end``/``pageup``/``pagedown``/``delete``/``insert``
+    (the xterm ``CSI 1 ; <code> <letter>`` / ``CSI <num> ; <code> ~`` forms
+    — see :data:`_MOD_CODE`).
+    """
+    parts = re.split(r"[+\-]", key)
+    if len(parts) < 2:
+        return None
+    *mod_tokens, base = parts
+    mods: set[str] = set()
+    for tok in mod_tokens:
+        canon = _MODIFIER_ALIASES.get(tok.lower())
+        if canon is None:
+            return None
+        mods.add(canon)
+    if not mods:
+        return None
+    base_lower = base.lower()
+
+    if mods == {"alt"} and len(base) == 1:
+        return b"\x1b" + base.encode("utf-8")
+
+    mod_code = _MOD_CODE.get(frozenset(mods))
+    if mod_code is None:
+        return None
+    if base_lower in _ARROW_FINAL:
+        return f"\x1b[1;{mod_code}{_ARROW_FINAL[base_lower]}".encode("ascii")
+    if base_lower in _HOME_END_FINAL:
+        return f"\x1b[1;{mod_code}{_HOME_END_FINAL[base_lower]}".encode("ascii")
+    if base_lower in _TILDE_CODE:
+        return f"\x1b[{_TILDE_CODE[base_lower]};{mod_code}~".encode("ascii")
+    if mods == {"alt"} and base_lower in _NAMED_KEYS:
+        # Alt + any other named key (e.g. alt+enter): the same "ESC
+        # prefix" convention as alt+<letter>, generalized to the key's own
+        # byte sequence instead of a single UTF-8 character.
+        return b"\x1b" + _NAMED_KEYS[base_lower]
+    return None
+
 
 def encode_key(key: str) -> bytes:
     """Encode one spec ``key:`` name into the raw bytes a real terminal
     would send for it.
 
     Named keys (:data:`_NAMED_KEYS`) and ``ctrl+<letter>`` (control-code
-    ``chr(ord(letter) - ord('a') + 1)``) are recognized case-insensitively;
-    any other single character is sent as its own UTF-8 encoding. Raises
+    ``chr(ord(letter) - ord('a') + 1)``) are recognized case-insensitively,
+    exactly as before. #3604 adds a general modifier-combo path
+    (:func:`_parse_modified_key`) for everything neither of those cover:
+    Alt+a single character under any of its aliases (``alt+m``, ``meta+m``,
+    ``M-m``, ``a-m``, ``option+m``) and Shift/Ctrl/Alt combined with an
+    arrow/``home``/``end``/``pageup``/``pagedown``/``delete``/``insert``
+    (``shift+right``, ``ctrl+home``, ``ctrl+end``, ...). Any other single
+    character is sent as its own UTF-8 encoding. Raises
     :class:`TuiPtySpecError` for anything else (an empty string, a
-    multi-character name that isn't a recognized named key).
+    multi-character name that isn't a recognized named key or modifier
+    combo).
     """
     lowered = key.lower()
     if lowered in _NAMED_KEYS:
@@ -346,6 +466,9 @@ def encode_key(key: str) -> bytes:
     m = _CTRL_KEY_RE.fullmatch(lowered)
     if m:
         return bytes([ord(m.group(1)) - ord("a") + 1])
+    modified = _parse_modified_key(key)
+    if modified is not None:
+        return modified
     if len(key) == 1:
         return key.encode("utf-8")
     raise TuiPtySpecError(f"unrecognized key {key!r}")
@@ -379,6 +502,41 @@ def encode_click(row: int, col: int, button: str = "left") -> bytes:
         return press
     release = f"\x1b[<{code};{x};{y}m".encode("ascii")
     return press + release
+
+
+#: SGR mouse-motion events set bit 32 (``0x20``) on the button code —
+#: "this button is still held while the pointer moves" — the same bit real
+#: terminals set for a press-drag sequence; see ``encode_drag``.
+_SGR_MOTION_BIT = 32
+
+
+def encode_drag(row: int, col: int, to_row: int, to_col: int, button: str = "left") -> bytes:
+    """Encode a press-drag-release gesture (#3604) as three SGR mouse
+    events: a press at 0-indexed ``(row, col)``, one motion event at
+    ``(to_row, to_col)`` with the button-held bit set
+    (:data:`_SGR_MOTION_BIT`) — a real terminal reports every intermediate
+    cell the pointer crosses, but one motion event at the endpoint is
+    enough for an app that reacts to "where did the drag end", which is
+    every selection/resize-handle journey this exists for — and a release
+    there.
+
+    ``button`` is ``left``/``middle``/``right`` only (:data:`_DRAG_BUTTONS`
+    — a wheel notch has no held state to drag with). Raises
+    :class:`TuiPtySpecError` for anything else, including a wheel button.
+    """
+    if button not in _DRAG_BUTTONS:
+        raise TuiPtySpecError(
+            f"unrecognized drag button {button!r} — expected one of "
+            f"{', '.join(_DRAG_BUTTONS)} (a wheel has no held state to "
+            f"drag with)"
+        )
+    code = _BUTTON_CODES[button]
+    x0, y0 = col + 1, row + 1
+    x1, y1 = to_col + 1, to_row + 1
+    press = f"\x1b[<{code};{x0};{y0}M".encode("ascii")
+    motion = f"\x1b[<{code + _SGR_MOTION_BIT};{x1};{y1}M".encode("ascii")
+    release = f"\x1b[<{code};{x1};{y1}m".encode("ascii")
+    return press + motion + release
 
 
 # ── VT screen ────────────────────────────────────────────────────────────────
@@ -442,6 +600,13 @@ class VtScreen:
         cursor = self._screen.cursor
         return cursor.y, cursor.x
 
+    def resize(self, rows: int, cols: int) -> None:
+        """Resize the VT screen to match a real ``resize`` step (#3604) —
+        a thin wrapper over pyte's own ``Screen.resize(lines, columns)``;
+        this module keeps its own parameter order (rows first) to match
+        every other ``resize``-shaped call in this module."""
+        self._screen.resize(rows, cols)
+
 
 # ── pty/ConPTY child process ────────────────────────────────────────────────
 
@@ -461,6 +626,13 @@ class PtyChild(Protocol):
     def is_alive(self) -> bool: ...
 
     def close(self) -> None: ...
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Live-resize the pty/ConPTY itself to *cols* x *rows* (#3604) —
+        the kernel/ConPTY side of a ``resize`` step; the VT screen side is
+        :meth:`VtScreen.resize`, called separately by
+        :meth:`SmokeRunner._do_resize`."""
+        ...
 
 
 #: Linux's ``prctl(2)`` opcode for ``PR_SET_PDEATHSIG`` — not exposed by the
@@ -709,6 +881,19 @@ class UnixPtyChild:
     def is_alive(self) -> bool:
         return self._proc.poll() is None
 
+    def resize(self, cols: int, rows: int) -> None:
+        """Live-resize this pty (#3604) via the same ``TIOCSWINSZ`` ioctl
+        used at launch — issuing it against the (still-open) master fd
+        changes the slave's reported window size and the kernel delivers
+        ``SIGWINCH`` to the slave's foreground process group automatically;
+        no separate signal call is needed, unlike a real terminal emulator
+        which issues both itself for the same reason."""
+        import fcntl  # noqa: PLC0415
+        import struct  # noqa: PLC0415
+        import termios  # noqa: PLC0415
+
+        fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
     def close(self) -> None:
         if self._closed:
             return
@@ -792,6 +977,13 @@ class WindowsConPtyChild:
 
     def is_alive(self) -> bool:
         return bool(self._proc.isalive())
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Live-resize this ConPTY session (#3604) via ``pywinpty``'s own
+        ``setwinsize`` — the Windows analogue of :meth:`UnixPtyChild.resize`'s
+        ``TIOCSWINSZ`` ioctl; ``pywinpty`` takes the same ``(rows, cols)``
+        order :meth:`__init__` already passes it as ``dimensions``."""
+        self._proc.setwinsize(rows, cols)
 
     def close(self) -> None:
         try:
@@ -914,6 +1106,8 @@ class SmokeRunner:
             "launch": self._do_launch,
             "key": self._do_key,
             "click": self._do_click,
+            "drag": self._do_drag,
+            "resize": self._do_resize,
             "wait_idle": self._do_wait_idle,
             "expect_screen": self._do_expect_screen,
             "expect_silent": self._do_expect_silent,
@@ -961,6 +1155,26 @@ class SmokeRunner:
 
     def _do_click(self, step: SmokeStep) -> None:
         self._require_child().write(encode_click(step.row, step.col, step.button))
+
+    def _do_drag(self, step: SmokeStep) -> None:
+        self._require_child().write(
+            encode_drag(step.row, step.col, step.to_row, step.to_col, step.button)
+        )
+
+    def _do_resize(self, step: SmokeStep) -> None:
+        """Live-resize both halves #3604 needs kept in sync: the real
+        pty/ConPTY (so the driven app's own ``SIGWINCH``/resize-event
+        handling actually fires) and this runner's :class:`VtScreen` (so
+        the NEXT ``expect_screen``/``expect_within`` step reads the new
+        dimensions rather than the stale launch-time ones) — done under
+        the same lock :meth:`_do_expect_screen` takes, so neither can
+        observe the screen mid-resize."""
+        child = self._require_child()
+        child.resize(step.cols, step.rows)
+        with self._lock:
+            assert self._screen is not None
+            self._screen.resize(step.rows, step.cols)
+        self._cols, self._rows = step.cols, step.rows
 
     def _do_wait_idle(self, step: SmokeStep) -> None:
         idle_for = step.ms / 1000
@@ -1189,6 +1403,22 @@ class TuiPtySession:
 
     def send_click(self, row: int, col: int, button: str = "left") -> None:
         self._child.write(encode_click(row, col, button))
+
+    def send_drag(self, row: int, col: int, to_row: int, to_col: int, button: str = "left") -> None:
+        """#3604: same primitive :meth:`SmokeRunner._do_drag` uses
+        (:func:`encode_drag`) — kept here too so this interactively-driven
+        session doesn't drift from the smoke-spec runner (#2096 "one
+        question, one answer")."""
+        self._child.write(encode_drag(row, col, to_row, to_col, button))
+
+    def resize(self, cols: int, rows: int) -> None:
+        """#3604: same two-sided resize :meth:`SmokeRunner._do_resize`
+        does — the real pty/ConPTY AND this session's own :class:`VtScreen`,
+        under the same lock :meth:`screen_text` takes."""
+        self._child.resize(cols, rows)
+        with self._lock:
+            self._screen.resize(rows, cols)
+        self._cols, self._rows = cols, rows
 
     def wait_idle(self, ms: int = 500, timeout_ms: int = 5000) -> bool:
         """Block until the stream has gone quiet for *ms* milliseconds, or
