@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess
 import time
 
 import pytest
@@ -602,6 +603,76 @@ class TestLinuxGtkCallsSessionAvailable:
         monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
         available, reason = LinuxGtkCalls().session_available()
         assert (available, reason) == (True, "")
+
+
+class TestLinuxGtkCallsFindTopWindow:
+    """#3605: GTK4-on-X11 creates an invisible internal helper top-level
+    *before* the real, visible app window, so it gets a lower XID and a
+    plain ``xdotool search --pid`` lists it first. ``find_top_window`` must
+    filter to the mapped/viewable window via ``--onlyvisible`` rather than
+    blindly taking ``list[0]`` — otherwise every subsequent
+    move/click/key/capture call silently targets the invisible helper."""
+
+    def _linux_with_display(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.gtk_native_driver._is_linux", lambda: True)
+        monkeypatch.setenv("DISPLAY", ":99")
+
+    def test_search_command_passes_onlyvisible(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+        calls_made: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls_made.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="5800004\n", stderr="")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        window_id = LinuxGtkCalls().find_top_window(pid=1234, timeout_s=1.0)
+
+        assert window_id == 5800004
+        assert calls_made == [["xdotool", "search", "--onlyvisible", "--pid", "1234"]]
+
+    def test_returns_the_real_window_even_though_a_lower_xid_helper_exists(
+        self, monkeypatch
+    ) -> None:
+        """Regression for #3605. Before the fix, a plain `xdotool search
+        --pid` would return both the unmapped GTK4 helper (lower XID,
+        `0x5800002`) and the real, visible window (`0x5800004`), in that
+        order, and `find_top_window` took ``list[0]`` — the helper.
+        ``--onlyvisible`` makes xdotool itself exclude the unmapped helper,
+        so even though the helper's XID still sorts first, it must never be
+        returned."""
+        self._linux_with_display(monkeypatch)
+
+        def fake_run(cmd, **kwargs):
+            assert "--onlyvisible" in cmd, (
+                "must ask xdotool to filter to mapped/viewable windows — "
+                "without it, the unmapped GTK4 helper (lower XID) wins"
+            )
+            # The real xdotool, given --onlyvisible, would never even list
+            # the unmapped helper (0x5800002) here -- only the real, mapped
+            # window (0x5800004) comes back.
+            return subprocess.CompletedProcess(cmd, 0, stdout="92274692\n", stderr="")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        window_id = LinuxGtkCalls().find_top_window(pid=4321, timeout_s=1.0)
+
+        assert window_id == 92274692  # 0x5800004 -- the real, visible window
+        assert window_id != 92274690  # 0x5800002 -- the invisible helper
+
+    def test_raises_if_no_visible_window_appears_within_timeout(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+
+        def fake_run(cmd, **kwargs):
+            # Simulates a helper-only state: xdotool finds nothing once
+            # --onlyvisible excludes the unmapped helper, so the real
+            # window never appears before the deadline.
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        monkeypatch.setattr("coord.gtk_native_driver.time.sleep", lambda s: None)
+
+        with pytest.raises(GtkNativeRuntimeError, match="no visible window"):
+            LinuxGtkCalls().find_top_window(pid=4321, timeout_s=0.05)
 
 
 class TestImportAtspi:
