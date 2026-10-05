@@ -806,6 +806,61 @@ _CPR_QUERY = b"\x1b[6n"
 _READ_POLL_S = 0.05
 
 
+class _CprResponder:
+    """Answers a VT100 cursor-position-report query (``ESC[6n``) with the
+    current cursor position — the ONE implementation both
+    :class:`SmokeRunner` and :class:`TuiPtySession` share (#3603, #2096
+    "one question, one answer").
+
+    Before this, :class:`TuiPtySession` had no CPR-reply logic at all,
+    while :class:`SmokeRunner` did — two independent implementations of
+    "does this reader loop answer a terminal query" that had already
+    drifted. The practical effect (#3603): ``coord app-drive tui-pty open``
+    launched ``vcd`` under a real pty exactly like ``run-spec`` does, but
+    never answered its startup ``ESC[6n`` query, so the app gave up and
+    exited within a few seconds with the screen still blank — while the
+    identical launch command through ``run-spec`` (:class:`SmokeRunner`,
+    which DID answer it) ran a 490-step spec with no instability.
+
+    Reading and replying are split across two threads for the reason this
+    module's own docstring documents: on a real Windows ConPTY, answering
+    synchronously from inside the byte-stream reader callback deadlocks the
+    session. :meth:`observe` is called from the reader thread, AFTER the
+    caller has already fed *data* to its :class:`VtScreen` (so
+    :meth:`VtScreen.cursor` reflects it); the reply is only ever WRITTEN
+    from this class's own responder thread.
+    """
+
+    def __init__(self, child: PtyChild) -> None:
+        self._child = child
+        self._queue: "queue.Queue[bytes]" = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def observe(self, data: bytes, screen: VtScreen) -> None:
+        """If *data* contains a CPR query, enqueue the reply the responder
+        thread will write. A no-op when it doesn't."""
+        if _CPR_QUERY in data:
+            row, col = screen.cursor()
+            self._queue.put(f"\x1b[{row + 1};{col + 1}R".encode("ascii"))
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                reply = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._child.write(reply)
+            except Exception:  # noqa: BLE001 — child may have exited underneath us
+                return
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+
 class SmokeRunner:
     """Drives one :class:`SmokeSpec` against a real :class:`PtyChild`,
     producing coord's normalized ``{"id", "status", "message"}`` verdict
@@ -830,9 +885,8 @@ class SmokeRunner:
         self._total_bytes = 0
         self._last_byte_time = 0.0
         self._stop = threading.Event()
-        self._cpr_queue: "queue.Queue[bytes]" = queue.Queue()
+        self._cpr_responder: _CprResponder | None = None
         self._reader_thread: threading.Thread | None = None
-        self._responder_thread: threading.Thread | None = None
 
     def run(self, spec: SmokeSpec) -> list[dict]:
         self._cols, self._rows = spec.cols, spec.rows
@@ -883,10 +937,9 @@ class SmokeRunner:
             # which would otherwise read as "already idle" the instant any
             # step runs, regardless of whether the app has settled.
             self._last_byte_time = time.monotonic()
+        self._cpr_responder = _CprResponder(self._child)
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._responder_thread = threading.Thread(target=self._responder_loop, daemon=True)
         self._reader_thread.start()
-        self._responder_thread.start()
         # A brief startup grace window — a binary that fails to exec at all
         # (bad path, missing binary) dies near-instantly; catch that here
         # with an actionable message rather than letting every later step
@@ -1011,34 +1064,20 @@ class SmokeRunner:
                 # their own `text()`/`cell_attr()` reads, so neither can
                 # observe a `VtScreen` mid-mutation.
                 screen.feed(data)
-                if _CPR_QUERY in data:
-                    row, col = screen.cursor()
-            if _CPR_QUERY in data:
-                # Reply enqueued here, WRITTEN from `_responder_loop` — never
-                # write the child's stdin synchronously from this thread.
-                # See this module's docstring: doing so deadlocks a real
-                # Windows ConPTY session.
-                self._cpr_queue.put(f"\x1b[{row + 1};{col + 1}R".encode("ascii"))
-
-    def _responder_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                reply = self._cpr_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            child = self._child
-            if child is None:
-                return
-            try:
-                child.write(reply)
-            except Exception:  # noqa: BLE001 — child may have exited underneath us
-                return
+                # Reply (if any) is enqueued here, WRITTEN from
+                # `_CprResponder`'s own thread — never write the child's
+                # stdin synchronously from this thread. See this module's
+                # docstring: doing so deadlocks a real Windows ConPTY
+                # session.
+                assert self._cpr_responder is not None
+                self._cpr_responder.observe(data, screen)
 
     def _teardown(self) -> None:
         self._stop.set()
-        for t in (self._reader_thread, self._responder_thread):
-            if t is not None:
-                t.join(timeout=2)
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2)
+        if self._cpr_responder is not None:
+            self._cpr_responder.close()
         if self._child is not None:
             self._child.close()
 
@@ -1076,6 +1115,16 @@ class TuiPtySession:
     whatever process is holding this session (this one, or
     ``coord.app_drive``'s own daemon wrapping it) still reaps the real
     child.
+
+    Also answers the ``ESC[6n`` cursor-position query via the same
+    :class:`_CprResponder` :class:`SmokeRunner` uses (#3603): without this,
+    a startup-blocking app (ratatui's ``Terminal::new()``, among others —
+    see #3603's own evidence) never gets a reply when driven through
+    ``coord app-drive tui-pty open`` and gives up within a few seconds,
+    even though the identical launch command ran fine through
+    :func:`run_smoke_spec`/``run-spec`` — the only thing that differed was
+    which of the two reader loops answered this query, so this class now
+    shares the ONE answer instead of having none of its own (#2096).
     """
 
     def __init__(
@@ -1088,6 +1137,7 @@ class TuiPtySession:
         self._lock = threading.Lock()
         self._last_byte_time = time.monotonic()
         self._stop = threading.Event()
+        self._cpr_responder = _CprResponder(self._child)
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
         # Same startup-failure confirmation `SmokeRunner._do_launch` makes
@@ -1116,6 +1166,10 @@ class TuiPtySession:
             with self._lock:
                 self._last_byte_time = time.monotonic()
                 self._screen.feed(data)
+                # See `_CprResponder`'s own docstring and this class's:
+                # the reply (if any) is enqueued here but WRITTEN from the
+                # responder's own thread, never synchronously from this one.
+                self._cpr_responder.observe(data, self._screen)
 
     @property
     def pid(self) -> int | None:
@@ -1162,6 +1216,7 @@ class TuiPtySession:
     def close(self) -> None:
         self._stop.set()
         self._reader_thread.join(timeout=2)
+        self._cpr_responder.close()
         self._child.close()
 
 
