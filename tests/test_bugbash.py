@@ -312,6 +312,38 @@ class TestParseUnavailableReport:
         text = f"```{UNAVAILABLE_FENCE}\n```\nthe screen is locked for this session"
         assert parse_unavailable_report(text) != ""
 
+    def test_final_message_with_findings_fence_suppresses_stale_signature(self):
+        """#3628: a signature earlier in the transcript (a failed
+        `app-drive open` call) must not override a final message that goes
+        on to carry a well-formed `bugbash-findings` fence."""
+        text = (
+            'early tool_result: {"status": "unavailable", "reason": "no session"}\n\n'
+            "worked around it and drove the app.\n\n"
+            "```bugbash-findings\n"
+            '[{"title": "x"}]\n'
+            "```"
+        )
+        final_message = text.rsplit("worked around", 1)[-1]
+        final_message = "worked around" + final_message
+        assert parse_unavailable_report(text, final_message=final_message) == ""
+
+    def test_final_message_without_either_fence_still_falls_back_to_signature(self):
+        """The #3628 guard only suppresses the fallback when the final
+        message itself carries a fence — a final message with neither
+        fence still lets an earlier signature decide the outcome."""
+        text = (
+            'early tool_result: {"status": "unavailable", "reason": "no session"}\n\n'
+            "stopped without reporting anything structured."
+        )
+        final_message = "stopped without reporting anything structured."
+        assert parse_unavailable_report(text, final_message=final_message) != ""
+
+    def test_default_final_message_keeps_pre_3628_behavior(self):
+        """Omitting `final_message` (every pre-#3628 call site) must not
+        change: the signature fallback still fires over the whole text."""
+        text = '{"status": "unavailable", "reason": "no session"}'
+        assert parse_unavailable_report(text) != ""
+
 
 # ── discover_lanes ────────────────────────────────────────────────────────
 
@@ -2790,6 +2822,79 @@ class TestDispatchAndAwaitLane:
         assert outcome.protocol_error == ""
         assert "mac_native_driver" in outcome.notes
         assert outcome.findings == ()
+
+    def test_findings_fence_in_final_message_overrides_stale_unavailable_signature(
+        self, monkeypatch,
+    ):
+        """#3628 regression: a lane's EARLY `app-drive open` call surfaced
+        `"status": "unavailable"` in a tool result (one of
+        `_UNAVAILABLE_SIGNATURES`'s literal strings) — matching the real
+        `ed4cd8c232af` mac-native evidence transcript, where the worker then
+        found a working launch form, drove the app, and ended its session
+        with a well-formed `bugbash-findings` fence. That final message must
+        decide the outcome: the stale mid-session signature must never void
+        it back to `unavailable=True`/zero findings filed."""
+        import json
+
+        from coord.commands import bugbash as cmd_bugbash
+
+        cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        self._dispatch_ok(monkeypatch)
+        monkeypatch.setattr(
+            "coord.commands._common.poll_until_terminal",
+            lambda *a, **k: _FakePollOutcome("completed", exit_code=0),
+        )
+
+        early_tool_result = json.dumps({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "content": (
+                        'app-drive open failed: {"status": "unavailable", '
+                        '"reason": "no session"}'
+                    ),
+                }],
+            },
+        })
+        final_message = (
+            "Found a working launch form after the first attempt failed, "
+            "drove the app, and completed every journey.\n\n"
+            "```bugbash-findings\n"
+            '[{"title": "x", "expected": "e", "actual": "a", "repro": "r", '
+            '"evidence": "ev"}]\n'
+            "```\n"
+            "```bugbash-coverage\n"
+            '[{"journey_id": "j1", "attempted": true, "passed": true, '
+            '"found": 1, "skipped": false}]\n'
+            "```"
+        )
+        assistant_event = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": final_message}]},
+        })
+        result_event = json.dumps({"type": "result", "total_cost_usd": 3.97})
+        log_line = "\n".join([early_tool_result, assistant_event, result_event])
+
+        class _Resp:
+            status_code = 200
+            text = log_line
+
+            def raise_for_status(self):
+                pass
+
+        import httpx as httpx_mod
+        monkeypatch.setattr(httpx_mod, "get", lambda *a, **k: _Resp())
+
+        outcome = cmd_bugbash._dispatch_and_await_lane(
+            _prod_lane(machine="pc1", platform="mac-native"), 1,
+            repo_name="vimcode", config=cfg, reference_backend="win-native",
+        )
+        assert outcome.unavailable is False
+        assert outcome.protocol_error == ""
+        [finding] = outcome.findings
+        assert finding.title == "x"
+        assert outcome.cost == 3.97
 
 
 # ── coord bugbash harvest (#3569: recover a late-finishing explorer) ─────
