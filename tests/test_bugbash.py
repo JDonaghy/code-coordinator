@@ -1634,21 +1634,48 @@ class TestRunBugbashConcurrency:
         assert len(report.rounds) == 1
         assert len(intervals) == 6
         # Generous margin for scheduler noise, but well under half of the
-        # fully-sequential 6 * SLEEP — proves hosts ran in parallel.
-        assert elapsed < SLEEP * 4, (
+        # fully-sequential 6 * SLEEP — proves hosts ran in parallel. Kept
+        # as a loose secondary signal; the overlap assertions below are
+        # the real (environment-independent) proof.
+        assert elapsed < SLEEP * 5, (
             f"expected lanes on different hosts to overlap; took {elapsed:.2f}s "
             f"for 6 lanes of {SLEEP}s each"
         )
 
-        # Two lanes on the SAME host must never overlap.
         by_host: dict[str, list[tuple[float, float]]] = {}
         for host, start, end in intervals:
             by_host.setdefault(host, []).append((start, end))
+
+        # Two lanes on the SAME host must never overlap.
         for host, spans in by_host.items():
             spans.sort()
             assert len(spans) == 2
             (s1, e1), (s2, e2) = spans
             assert e1 <= s2, f"{host}'s two lanes overlapped: {spans}"
+
+        # Different hosts' own two-lane windows DID overlap in wall-clock
+        # time — the actual proof of concurrency, measured on the
+        # recorded intervals themselves rather than on a wall-clock
+        # ceiling that could flake under scheduler noise (#3602 review
+        # round 1).
+        host_spans = {
+            host: (min(s for s, _ in spans), max(e for _, e in spans))
+            for host, spans in by_host.items()
+        }
+
+        def overlaps(a: tuple[float, float], b: tuple[float, float]) -> bool:
+            return a[0] < b[1] and b[0] < a[1]
+
+        hosts = list(host_spans)
+        any_cross_host_overlap = any(
+            overlaps(host_spans[hosts[i]], host_spans[hosts[j]])
+            for i in range(len(hosts))
+            for j in range(i + 1, len(hosts))
+        )
+        assert any_cross_host_overlap, (
+            f"expected at least one pair of different hosts to overlap; "
+            f"got spans {host_spans}"
+        )
 
     def test_total_cost_cap_trips_mid_round_blocks_new_lanes(self):
         # 4 lanes on the SAME host (so exploration order is deterministic,
@@ -1681,6 +1708,139 @@ class TestRunBugbashConcurrency:
             assert "total cost" in report.rounds[0].skip_reasons[platform]
         assert report.total_cost == 2.0
         assert report.termination_reason == "cost_cap"
+
+    def test_cap_trip_on_one_host_blocks_unstarted_lane_on_another_host(self):
+        # #3602 review round 1: `test_total_cost_cap_trips_mid_round_
+        # blocks_new_lanes` above puts every lane on ONE host, which is
+        # exactly the old single-threaded path — it proves the cap still
+        # works sequentially, not that a lane on host B is actually
+        # blocked by a cap tripped by a lane on host A. This uses a
+        # `threading.Event` as a deterministic barrier so hostB's first
+        # lane can only return AFTER hostA's first lane has already
+        # written the tripped total under the shared lock — exercising
+        # the real cross-host race this PR is built around, rather than
+        # relying on scheduling luck.
+        # Two barriers pin down the exact interleaving: b1 must already
+        # be IN FLIGHT (past its own cap check, inside the explorer call)
+        # before a1 is allowed to finish and write the tripped total —
+        # otherwise b1 itself could race a1's cap check and get skipped
+        # too, which would test nothing about a cross-host race.
+        b1_started = threading.Event()
+        a1_done = threading.Event()
+        config = _config(
+            lanes=[
+                _lane(platform="a1", machine="hostA"),
+                _lane(platform="a2", machine="hostA"),
+                _lane(platform="b1", machine="hostB"),
+                _lane(platform="b2", machine="hostB"),
+            ],
+            max_rounds=1, cost_cap_total=1.0,
+        )
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+
+        def explorer(lane, round_num):
+            with calls_lock:
+                calls.append(lane.platform)
+            if lane.platform == "a1":
+                # Don't trip the cap until hostB's first lane has
+                # already passed its own (pre-trip) cap check and is
+                # genuinely in flight.
+                assert b1_started.wait(timeout=5), "b1 never started"
+                outcome = ExploreOutcome(
+                    findings=(_finding(title="Bug A1", platform="a1"),), cost=1.0,
+                )
+                a1_done.set()
+                return outcome
+            if lane.platform == "b1":
+                b1_started.set()
+                # Must not return (and so must not let hostB's thread
+                # move on to check b2's cap) until hostA's lane has
+                # already pushed the total cap past its limit under the
+                # lock.
+                assert a1_done.wait(timeout=5), "a1 never signalled completion"
+                return ExploreOutcome(
+                    findings=(_finding(title="Bug B1", platform="b1"),), cost=0.0,
+                )
+            raise AssertionError(f"{lane.platform} should never have been asked")
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert sorted(calls) == ["a1", "b1"]
+        # a2 (hostA, chained after a1) and b2 (hostB, chained after b1 —
+        # which only returns once a1 already tripped the cap) must both
+        # have been skipped without ever being asked.
+        assert sorted(report.rounds[0].skipped_lanes) == ["a2", "b2"]
+        for platform in ("a2", "b2"):
+            assert "total cost" in report.rounds[0].skip_reasons[platform]
+        assert report.total_cost == 1.0
+        assert report.termination_reason == "cost_cap"
+
+    def test_duplicate_finding_winner_is_configured_order_not_thread_completion_order(self):
+        # #3602 review round 1: two lanes on DIFFERENT hosts report the
+        # identical bug. `lane_a` is listed FIRST in `config.lanes` but
+        # takes noticeably longer, so `lane_b`'s thread actually finishes
+        # first. Before the fix, outcomes were applied to `report` in
+        # THREAD-COMPLETION order, so `lane_b` (suspected_repo="repo-b")
+        # would win the within-round dedupe and get filed — meaning the
+        # SAME bug could land in a different repo from run to run,
+        # depending on scheduling. The fix replays outcomes in
+        # `config.lanes`'s own order, so `lane_a` (suspected_repo=
+        # "repo-a") must win every time, regardless of which thread
+        # actually finished first.
+        lane_a = _lane(platform="win-native", machine="hostA")
+        lane_b = _lane(platform="win-native", machine="hostB")
+        config = _config(lanes=[lane_a, lane_b], max_rounds=1)
+
+        def explorer(lane, round_num):
+            if lane.machine == "hostA":
+                time.sleep(0.2)
+                repo = "repo-a"
+            else:
+                repo = "repo-b"
+            return ExploreOutcome(
+                findings=(
+                    _finding(title="Shared bug", platform="win-native", repo=repo),
+                ),
+            )
+
+        runner = FakeRunner(next_issue_number=4200)
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        create_calls = [c for c in runner.calls if c[:2] == ["issue", "create"]]
+        assert len(create_calls) == 1
+        assert create_calls[0][2] == "repo-a"
+        filings = report.rounds[0].filings
+        assert sum(1 for f in filings if f.filed) == 1
+        filed = next(f for f in filings if f.filed)
+        assert filed.issue_number == 4200
+
+    def test_max_rounds_zero_returns_empty_report_without_crashing(self):
+        # #3602 review round 1: `total_cost` used to be bound only INSIDE
+        # the round loop (via the now-removed `total_cost_box` cell read
+        # at the end of each iteration) — with `max_rounds <= 0` the loop
+        # body never ran at all, so the final `return
+        # BugbashReport(..., total_cost=total_cost)` raised
+        # `UnboundLocalError`. Reachable straight from the CLI: `--max-
+        # rounds` has no lower bound.
+        config = _config(max_rounds=0)
+        runner = FakeRunner()
+
+        def explorer(lane, round_num):
+            raise AssertionError("no lane should ever be asked with max_rounds=0")
+
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        assert report.rounds == []
+        assert report.total_cost == 0.0
+        assert report.termination_reason == "round_cap"
 
 
 class TestRunBugbashDryRun:
@@ -2991,6 +3151,62 @@ class TestBugbashCli:
         assert result.exit_code == 0, result.output
         captured["explorer"](_prod_lane(machine="pc1", platform="win-native"), 1)
         assert dispatch_kwargs.get("catalogue_text") == catalogue_text
+
+    def test_explorer_progress_lines_are_lane_prefixed(self, monkeypatch, capsys):
+        """#3602 review round 1: the new lane-prefixed progress lines
+        (``[platform@machine] round N: dispatching...`` / ``...: done in
+        ...``) are user-visible CLI output, printed from the real
+        `explorer` closure `bugbash_run_cmd` builds — not from
+        `run_bugbash` (which every other CLI test fakes). Capture the
+        closure and drive it directly against a faked
+        `_dispatch_and_await_lane`, so the actual prefixing/formatting
+        code runs and is asserted on, rather than assumed from reading
+        the source."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+            default_branch = "develop"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="win-native")],
+        )
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: None)
+
+        captured = {}
+
+        def fake_run_bugbash(bb_config, *, explorer, runner, open_issues_fetcher, closed_issues_fetcher, confirm):
+            captured["explorer"] = explorer
+            return BugbashReport(repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0)
+
+        monkeypatch.setattr(cmd_bugbash, "run_bugbash", fake_run_bugbash)
+        monkeypatch.setattr(
+            cmd_bugbash, "_dispatch_and_await_lane",
+            lambda lane, round_num, **kwargs: ExploreOutcome(ok=True, findings=(), cost=1.5),
+        )
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "win-native", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "explorer" in captured
+
+        # CliRunner's own stdout capture is already torn down by the time
+        # `invoke` returns, so this is a clean slate for the manual
+        # closure call below.
+        capsys.readouterr()
+        captured["explorer"](_prod_lane(machine="pc1", platform="win-native"), 3)
+        out = capsys.readouterr().out
+        assert "[win-native@pc1] round 3: dispatching..." in out
+        assert "[win-native@pc1] round 3: done in" in out
+        assert "cost=1.50" in out
 
     def test_harvest_command_files_a_recovered_finding(self, monkeypatch):
         """End-to-end `coord bugbash harvest` against faked seams: an

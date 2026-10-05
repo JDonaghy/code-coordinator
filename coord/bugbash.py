@@ -2009,16 +2009,33 @@ def _group_lanes_by_host(lanes: Sequence[BugbashLane]) -> dict[str, list[Bugbash
     return groups
 
 
+@dataclass
+class _RoundExploreState:
+    """Mutable cross-host bookkeeping for one round's
+    :func:`_explore_round_lanes` call — bundles what used to be three
+    separate parameters (``lane_cost``, a ``total_cost`` mutable cell, and
+    the lock guarding both) behind one name (#3602 review round 1 nit).
+    ``lane_cost`` is keyed by :attr:`BugbashLane.platform` — pre-existing
+    from before #3602, and still true under concurrency: two lanes sharing
+    a platform on DIFFERENT hosts (the real fleet's two ``win-native``
+    lanes) share one bucket and one per-lane cap. See
+    :func:`_explore_round_lanes`'s docstring for exactly what that costs
+    under concurrency that it didn't cost sequentially."""
+
+    lane_cost: dict[str, float]
+    total_cost: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 def _explore_round_lanes(
+    lanes: Sequence[BugbashLane],
     lanes_by_host: dict[str, list[BugbashLane]],
     round_num: int,
     explorer: Explorer,
     report: RoundReport,
-    lane_cost: dict[str, float],
+    state: _RoundExploreState,
     cost_cap_per_lane: float,
     cost_cap_total: float,
-    total_cost_box: list[float],
-    state_lock: threading.Lock,
 ) -> None:
     """Explores every lane configured for this round, one worker thread per
     HOST (#3602) — a host's own lanes run strictly in the order given (the
@@ -2029,47 +2046,85 @@ def _explore_round_lanes(
     wall-clock cost is the slowest HOST's own lane chain, never the sum
     over every lane.
 
-    Both cost caps are read and updated only under *state_lock*, with the
+    Both cost caps are read and updated only under *state*'s lock, with the
     :data:`Explorer` call itself made OUTSIDE the lock (a real lane can take
     many minutes) — so the "check cap, then mark started" step is atomic
-    across hosts. The only overshoot the total cap can ever see is from
+    across hosts. The only overshoot the TOTAL cap can ever see is from
     lane(s) ALREADY in flight (their :data:`Explorer` call already started)
     at the moment a sibling's completion pushes the running total to/over
     the cap — a lane that hasn't started yet always sees the tripped cap
     under the same lock its sibling just wrote through, and is skipped
     (recorded in ``skip_reasons``, same as a per-lane cap skip) rather than
     started.
+
+    The PER-LANE cap is weaker under concurrency than it was sequentially
+    for two lanes sharing a platform on different hosts (``lane_cost`` is
+    keyed by platform, see :class:`_RoundExploreState`): sequentially, the
+    second such lane always saw the first one's already-applied cost.
+    Concurrently, both can read the same pre-update value under the lock
+    before either has run its :data:`Explorer` call, so both start — the
+    per-lane cap can be overshot by a whole sibling lane's cost on top of
+    the triggering lane's own. Not fixed here (it would mean keying every
+    per-platform ``RoundReport`` bucket — ``lane_cost``, ``lane_failures``,
+    ``unavailable_lanes``, ``protocol_error_lanes``, ``lane_coverage`` — by
+    lane identity instead, a much larger, pre-existing-schema change);
+    operators relying on a tight per-lane budget for a platform run on
+    multiple hosts should account for this extra headroom.
+
+    *lanes* is *lanes_by_host*'s own input, flattened back into its
+    ORIGINAL configured order — the order every outcome is replayed onto
+    *report* in once every host's thread has joined, below. A host thread
+    only ever decides WHETHER a lane ran (the cap check has to happen live,
+    interleaved with every other host, under the lock); it never writes an
+    outcome straight onto the shared *report* itself, because thread-
+    completion order is not deterministic and both
+    :func:`_dedupe_round_findings` (which of two lanes' duplicate findings
+    this round wins and gets filed, into which repo) and an operator
+    reading ``skipped_lanes``/``skip_reasons`` depend on seeing *report* in
+    *lanes*' own configured order — unchanged from before #3602 (#3602
+    review round 1).
+
+    A ``KeyboardInterrupt`` raised while this is running still has to wait
+    for every lane ALREADY in flight on every host before it can
+    propagate — there is no mid-lane cancellation, and with
+    ``max_workers == len(lanes_by_host)`` every host's thread starts
+    immediately on submission, so there is nothing queued at the pool level
+    left to drop either. An operator who needs to abort a bugbash run
+    promptly still has to wait out the slowest lane's own timeout, same as
+    before this changed lanes to run one thread per host instead of one
+    thread total.
     """
+    # Buffered per-lane results, replayed onto *report* in *lanes*' own
+    # order after the pool joins (see docstring above). Keyed by `id(lane)`
+    # rather than `lane.platform` — two lanes CAN share a platform on
+    # different hosts (the real fleet's two `win-native` lanes), and each
+    # one's own outcome must still reach `report` even though they'd
+    # collide on a platform-keyed dict.
+    results: dict[int, tuple[str, str] | tuple[str, ExploreOutcome]] = {}
 
     def run_host(host_lanes: list[BugbashLane]) -> None:
         for lane in host_lanes:
-            with state_lock:
-                if lane_cost[lane.platform] >= cost_cap_per_lane:
-                    report.skipped_lanes.append(lane.platform)
-                    report.skip_reasons[lane.platform] = (
-                        f"cumulative cost {lane_cost[lane.platform]:.2f} already "
-                        f">= per-lane cap {cost_cap_per_lane:.2f}"
+            with state.lock:
+                if state.lane_cost[lane.platform] >= cost_cap_per_lane:
+                    results[id(lane)] = (
+                        "skip",
+                        f"cumulative cost {state.lane_cost[lane.platform]:.2f} already "
+                        f">= per-lane cap {cost_cap_per_lane:.2f}",
                     )
                     continue
-                if total_cost_box[0] >= cost_cap_total:
-                    report.skipped_lanes.append(lane.platform)
-                    report.skip_reasons[lane.platform] = (
-                        f"total cost {total_cost_box[0]:.2f} already >= total cap "
+                if state.total_cost >= cost_cap_total:
+                    results[id(lane)] = (
+                        "skip",
+                        f"total cost {state.total_cost:.2f} already >= total cap "
                         f"{cost_cap_total:.2f} (cap already tripped by another lane "
-                        "this round)"
+                        "this round)",
                     )
                     continue
             outcome = explorer(lane, round_num)
-            with state_lock:
-                lane_cost[lane.platform] += outcome.cost
-                report.lane_cost[lane.platform] = lane_cost[lane.platform]
-                total_cost_box[0] += outcome.cost
-                # #3569: the SAME bucketing `coord bugbash harvest`'s
-                # `harvest_outcome` uses for a late-arriving explorer — one
-                # question ("how does this ExploreOutcome classify"), one
-                # answer, whether it's observed inline here or recovered
-                # after the fact.
-                _apply_outcome_to_round(report, lane, outcome)
+            with state.lock:
+                state.lane_cost[lane.platform] += outcome.cost
+                state.total_cost += outcome.cost
+                results[id(lane)] = ("explored", outcome)
 
     if not lanes_by_host:
         return
@@ -2077,6 +2132,26 @@ def _explore_round_lanes(
         futures = [pool.submit(run_host, host_lanes) for host_lanes in lanes_by_host.values()]
         for future in futures:
             future.result()  # re-raise any exception from a host's thread
+
+    for lane in lanes:
+        result = results.get(id(lane))
+        if result is None:
+            # A host thread raised before reaching this lane — already
+            # re-raised by `future.result()` above, so this round never
+            # gets this far for that lane. Defensive only.
+            continue
+        kind, payload = result
+        if kind == "skip":
+            report.skipped_lanes.append(lane.platform)
+            report.skip_reasons[lane.platform] = payload  # type: ignore[assignment]
+        else:
+            report.lane_cost[lane.platform] = state.lane_cost[lane.platform]
+            # #3569: the SAME bucketing `coord bugbash harvest`'s
+            # `harvest_outcome` uses for a late-arriving explorer — one
+            # question ("how does this ExploreOutcome classify"), one
+            # answer, whether it's observed inline here or recovered
+            # after the fact.
+            _apply_outcome_to_round(report, lane, payload)  # type: ignore[arg-type]
 
 
 def run_bugbash(
@@ -2156,10 +2231,16 @@ def run_bugbash(
     lane_cost: dict[str, float] = {lane.platform: 0.0 for lane in config.lanes}
     lanes_by_platform: dict[str, BugbashLane] = {lane.platform: lane for lane in config.lanes}
     lanes_by_host = _group_lanes_by_host(config.lanes)
-    total_cost_box: list[float] = [0.0]
-    state_lock = threading.Lock()
+    state = _RoundExploreState(lane_cost=lane_cost)
     rounds: list[RoundReport] = []
     reason = "round_cap"
+    # Bound even when `config.max_rounds <= 0` skips the loop below entirely
+    # (reachable from the CLI: `--max-rounds` has no lower bound) — the
+    # round loop's own `total_cost = state.total_cost` re-binds this every
+    # iteration, but the final `return` needs a value regardless of
+    # whether any round ever ran (#3602 review round 1: this used to be an
+    # `UnboundLocalError` for `--max-rounds 0`).
+    total_cost = 0.0
     # #3546: every issue THIS RUN has actually filed into config.repo,
     # across every round so far — consulted alongside each round's FRESH
     # open-issues fetch so a finding matching an issue this run itself
@@ -2176,17 +2257,16 @@ def run_bugbash(
         report = RoundReport(round_num=round_num)
 
         _explore_round_lanes(
+            config.lanes,
             lanes_by_host,
             round_num,
             explorer,
             report,
-            lane_cost,
+            state,
             config.cost_cap_per_lane,
             config.cost_cap_total,
-            total_cost_box,
-            state_lock,
         )
-        total_cost = total_cost_box[0]
+        total_cost = state.total_cost
 
         # #3546: merge the fresh fetch with every issue THIS RUN has already
         # filed — a finding matching one of this run's own earlier filings
