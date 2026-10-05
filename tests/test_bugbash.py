@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 import pytest
 
 from coord.bugbash import (
+    DEFAULT_JOURNEYS_PER_WORKER,
+    GUI_LANE_DRIVER_KINDS,
     BugbashConfig,
     BugbashLane,
     CATALOGUE_PATH,
@@ -42,22 +44,29 @@ from coord.bugbash import (
     Finding,
     Journey,
     JourneyOutcome,
+    JourneyScheduler,
+    LaneChunkPlan,
     RoundReport,
     UNAVAILABLE_FENCE,
     UnavailableLane,
     _apply_outcome_to_round,
     _pick_lane_machine,
+    _ShardCostState,
     build_exploration_briefing,
+    chunk_journeys,
     compose_finding_issue_title,
     dedupe_finding,
     discover_lanes,
+    explore_lane_sharded,
     file_finding,
     harvest_outcome,
     journeys_for_lane,
+    max_concurrent_chunks_for_lane,
     parse_catalogue,
     parse_coverage_block,
     parse_findings_block,
     parse_unavailable_report,
+    plan_lane_chunks,
     run_bugbash,
 )
 
@@ -1101,6 +1110,325 @@ class TestJourneysForLane:
         result = journeys_for_lane(journeys, "tui-pty")
         assert [j.id for j in result] == ["a", "z", "b"]
 
+    def test_max_priority_drops_lower_priority_journeys(self):
+        # #3620 requirement 2: --max-priority is applied BEFORE sharding.
+        journeys = (
+            Journey(id="p1", lanes=("tui-pty",), reference="spec", expected="e", priority=1),
+            Journey(id="p2", lanes=("tui-pty",), reference="spec", expected="e", priority=2),
+            Journey(id="p3", lanes=("tui-pty",), reference="spec", expected="e", priority=3),
+        )
+        result = journeys_for_lane(journeys, "tui-pty", max_priority=1)
+        assert [j.id for j in result] == ["p1"]
+
+    def test_max_priority_none_keeps_pre_3620_behavior(self):
+        journeys = (
+            Journey(id="p1", lanes=("tui-pty",), reference="spec", expected="e", priority=1),
+            Journey(id="p3", lanes=("tui-pty",), reference="spec", expected="e", priority=3),
+        )
+        result = journeys_for_lane(journeys, "tui-pty")
+        assert [j.id for j in result] == ["p1", "p3"]
+
+
+# ── journey sharding / coverage-aware scheduling (#3620) ────────────────────
+
+
+def _synthetic_journeys(n: int, *, prefix: str = "j", lane: str = "tui-pty", priority: int = 1):
+    return tuple(
+        Journey(id=f"{prefix}{i}", lanes=(lane,), reference="spec", expected="e", priority=priority)
+        for i in range(n)
+    )
+
+
+class TestChunkJourneys:
+    def test_60_journeys_25_per_worker_yields_3_chunks(self):
+        chunks = chunk_journeys(_synthetic_journeys(60), 25)
+        assert [len(c) for c in chunks] == [25, 25, 10]
+
+    def test_empty_journeys_yields_no_chunks(self):
+        assert chunk_journeys((), 25) == []
+
+    def test_nonpositive_size_falls_back_to_one_chunk(self):
+        journeys = _synthetic_journeys(5)
+        assert chunk_journeys(journeys, 0) == [tuple(journeys)]
+
+
+class TestPlanLaneChunks:
+    def test_60_journey_lane_with_25_per_worker_plans_3_chunks(self):
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        plan = plan_lane_chunks(lane, _synthetic_journeys(60), journeys_per_worker=25)
+        assert len(plan.journeys) == 60
+        assert plan.chunk_count == 3
+
+    def test_max_priority_filters_before_chunking(self):
+        # Mirrors vimcode's real tui-pty catalogue shape (#3620 issue body):
+        # ~60 priority-1, ~80 priority-2, ~18 priority-3.
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        journeys = (
+            _synthetic_journeys(60, prefix="p1-", priority=1)
+            + _synthetic_journeys(80, prefix="p2-", priority=2)
+            + _synthetic_journeys(18, prefix="p3-", priority=3)
+        )
+        plan = plan_lane_chunks(lane, journeys, journeys_per_worker=25, max_priority=1)
+        assert len(plan.journeys) == 60
+        assert all(j.priority == 1 for j in plan.journeys)
+        assert plan.chunk_count == 3
+
+    def test_no_journeys_for_this_lane_plans_zero_chunks(self):
+        lane = _lane(platform="win-native", machine="pc1")
+        plan = plan_lane_chunks(lane, _synthetic_journeys(10, lane="tui-pty"), journeys_per_worker=25)
+        assert plan.journeys == ()
+        assert plan.chunk_count == 0
+
+
+class TestMaxConcurrentChunksForLane:
+    def test_gui_lanes_always_serialize_regardless_of_host_capacity(self):
+        for kind in GUI_LANE_DRIVER_KINDS:
+            lane = _lane(platform=kind, machine="m1")
+            assert max_concurrent_chunks_for_lane(lane, host_max_workers=8) == 1
+
+    def test_tui_pty_bounded_by_host_max_workers(self):
+        lane = _lane(platform="tui-pty", machine="m1")
+        assert max_concurrent_chunks_for_lane(lane, host_max_workers=4) == 4
+
+    def test_tui_pty_never_below_one(self):
+        lane = _lane(platform="tui-pty", machine="m1")
+        assert max_concurrent_chunks_for_lane(lane, host_max_workers=0) == 1
+
+
+class TestJourneyScheduler:
+    def test_first_round_walks_everything_in_priority_order(self):
+        journeys = (
+            Journey(id="j1", lanes=("tui-pty",), reference="spec", expected="e", priority=1),
+            Journey(id="j2", lanes=("tui-pty",), reference="spec", expected="e", priority=1),
+            Journey(id="j3", lanes=("tui-pty",), reference="spec", expected="e", priority=2),
+            Journey(id="j4", lanes=("tui-pty",), reference="spec", expected="e", priority=3),
+        )
+        scheduler = JourneyScheduler(journeys=journeys, journeys_per_worker=2)
+        chunks = scheduler.chunks_for_round()
+        assert [j.id for c in chunks for j in c] == ["j1", "j2", "j3", "j4"]
+        assert [len(c) for c in chunks] == [2, 2]
+
+    def test_round_2_prioritizes_skipped_and_not_reached_over_passed(self):
+        journeys = _synthetic_journeys(4)  # j0..j3, all priority 1
+        scheduler = JourneyScheduler(journeys=journeys, journeys_per_worker=10)
+        # j0 passed, j1 was explicitly skipped; j2/j3 were never reached at
+        # all this round (never recorded).
+        scheduler.record([
+            JourneyOutcome(journey_id="j0", status="passed"),
+            JourneyOutcome(journey_id="j1", status="skipped", reason="no nvim"),
+        ])
+        ordered = [j.id for j in scheduler._ordered_for_round()]
+        assert ordered[-1] == "j0"
+        assert set(ordered[:-1]) == {"j1", "j2", "j3"}
+
+    def test_found_journeys_are_never_auto_requeued(self):
+        journeys = _synthetic_journeys(3)
+        scheduler = JourneyScheduler(journeys=journeys, journeys_per_worker=10)
+        scheduler.record([JourneyOutcome(journey_id="j0", status="found")])
+        ordered = [j.id for j in scheduler._ordered_for_round()]
+        assert "j0" not in ordered
+        assert set(ordered) == {"j1", "j2"}
+
+    def test_cumulative_summary_never_counts_a_not_reached_journey_as_attempted(self):
+        journeys = _synthetic_journeys(4)
+        scheduler = JourneyScheduler(journeys=journeys, journeys_per_worker=10)
+        scheduler.record([
+            JourneyOutcome(journey_id="j0", status="passed"),
+            JourneyOutcome(journey_id="j1", status="skipped", reason="no nvim"),
+        ])
+        summary = scheduler.cumulative_summary()
+        assert summary.attempted == 2
+        assert summary.passed == 1
+        assert summary.skipped == 1
+        assert summary.found == 0
+        assert len(scheduler.journeys) - summary.attempted == 2
+
+    def test_record_ignores_journey_ids_it_does_not_track(self):
+        # A chunk that fell back to the checklist reports coverage keyed by
+        # checklist item text, not a catalogue journey id -- must be a
+        # silent no-op, never a KeyError or a phantom tracked journey.
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(2), journeys_per_worker=10)
+        scheduler.record([JourneyOutcome(journey_id="panels", status="passed")])
+        assert scheduler.cumulative_summary().attempted == 0
+
+
+class TestExploreLaneSharded:
+    def test_dispatches_one_chunk_explorer_call_per_chunk(self):
+        # #3620 acceptance: a 60-journey lane with --journeys-per-worker 25
+        # dispatches 3 chunks.
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(60), journeys_per_worker=25)
+        calls = []
+
+        def chunk_explorer(lane, round_num, journeys):
+            calls.append(len(journeys))
+            return ExploreOutcome(
+                cost=1.0,
+                journey_outcomes=tuple(
+                    JourneyOutcome(journey_id=j.id, status="passed") for j in journeys
+                ),
+            )
+
+        outcome = explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=100.0, cost_cap_total=100.0,
+            max_concurrent_chunks=1,
+        )
+        assert calls == [25, 25, 10]
+        assert outcome.cost == 3.0
+        assert outcome.ok is True
+
+    def test_gui_lane_chunks_never_overlap_on_one_host(self):
+        lane = _lane(platform="win-native", machine="pc1")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(4), journeys_per_worker=1)
+        active = {"count": 0, "max": 0}
+        guard = threading.Lock()
+
+        def chunk_explorer(lane, round_num, journeys):
+            with guard:
+                active["count"] += 1
+                active["max"] = max(active["max"], active["count"])
+            time.sleep(0.05)
+            with guard:
+                active["count"] -= 1
+            return ExploreOutcome(cost=0.1)
+
+        explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=100.0, cost_cap_total=100.0,
+            max_concurrent_chunks=max_concurrent_chunks_for_lane(lane, host_max_workers=8),
+        )
+        assert active["max"] == 1
+
+    def test_tui_pty_chunks_overlap_up_to_max_workers(self):
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(4), journeys_per_worker=1)
+        active = {"count": 0, "max": 0}
+        guard = threading.Lock()
+
+        def chunk_explorer(lane, round_num, journeys):
+            with guard:
+                active["count"] += 1
+                active["max"] = max(active["max"], active["count"])
+            time.sleep(0.1)
+            with guard:
+                active["count"] -= 1
+            return ExploreOutcome(cost=0.1)
+
+        explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=100.0, cost_cap_total=100.0,
+            max_concurrent_chunks=max_concurrent_chunks_for_lane(lane, host_max_workers=3),
+        )
+        assert active["max"] >= 2
+
+    def test_total_cap_stops_new_chunks(self):
+        # #3620 acceptance: "the total cap stops new chunks."
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(4), journeys_per_worker=1)
+        calls = []
+
+        def chunk_explorer(lane, round_num, journeys):
+            calls.append(journeys)
+            return ExploreOutcome(cost=10.0)
+
+        outcome = explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=1000.0, cost_cap_total=15.0,
+            max_concurrent_chunks=1,
+        )
+        assert len(calls) < 4
+        assert outcome.cost == 10.0 * len(calls)
+
+    def test_per_lane_cap_stops_new_chunks_for_that_lane(self):
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(4), journeys_per_worker=1)
+        calls = []
+
+        def chunk_explorer(lane, round_num, journeys):
+            calls.append(journeys)
+            return ExploreOutcome(cost=10.0)
+
+        explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=15.0, cost_cap_total=1000.0,
+            max_concurrent_chunks=1,
+        )
+        assert len(calls) < 4
+
+    def test_unavailable_chunk_stops_remaining_chunks(self):
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=_synthetic_journeys(4), journeys_per_worker=1)
+        calls = []
+
+        def chunk_explorer(lane, round_num, journeys):
+            calls.append(journeys)
+            return ExploreOutcome(unavailable=True, notes="no pty available")
+
+        outcome = explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=100.0, cost_cap_total=100.0,
+            max_concurrent_chunks=1,
+        )
+        assert len(calls) == 1
+        assert outcome.unavailable is True
+
+    def test_no_catalogue_journeys_falls_back_to_single_checklist_chunk(self):
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        scheduler = JourneyScheduler(journeys=(), journeys_per_worker=25)
+        calls = []
+
+        def chunk_explorer(lane, round_num, journeys):
+            calls.append(journeys)
+            return ExploreOutcome(cost=1.0)
+
+        explore_lane_sharded(
+            lane, 1, chunk_explorer=chunk_explorer, scheduler=scheduler,
+            cost_state=_ShardCostState(), cost_cap_per_lane=100.0, cost_cap_total=100.0,
+            max_concurrent_chunks=1,
+        )
+        assert calls == [()]
+
+    def test_round_2_dispatches_round_1_skipped_journeys_first(self):
+        # #3620 acceptance: "round 2 dispatches round 1's skipped journeys
+        # first."
+        lane = _lane(platform="tui-pty", machine="linuxbox")
+        journeys = _synthetic_journeys(4)  # j0, j1, j2, j3, priority 1
+        scheduler = JourneyScheduler(journeys=journeys, journeys_per_worker=2)
+        dispatched_per_round: list[list[str]] = []
+
+        def make_chunk_explorer(outcomes_by_id):
+            def chunk_explorer(lane, round_num, chunk):
+                dispatched_per_round.append([j.id for j in chunk])
+                return ExploreOutcome(
+                    cost=1.0,
+                    journey_outcomes=tuple(
+                        JourneyOutcome(journey_id=j.id, status=outcomes_by_id.get(j.id, "passed"))
+                        for j in chunk
+                    ),
+                )
+            return chunk_explorer
+
+        # Round 1: first chunk [j0, j1] dispatches (j1 comes back skipped);
+        # the per-lane cap trips right after it, so the second chunk
+        # ([j2, j3]) never gets dispatched at all this round.
+        explore_lane_sharded(
+            lane, 1, chunk_explorer=make_chunk_explorer({"j1": "skipped"}),
+            scheduler=scheduler, cost_state=_ShardCostState(),
+            cost_cap_per_lane=1.0, cost_cap_total=1000.0, max_concurrent_chunks=1,
+        )
+        assert dispatched_per_round == [["j0", "j1"]]
+
+        # Round 2, fresh budget: j1 (skipped) and j2/j3 (never reached) must
+        # all come before j0 (already passed).
+        explore_lane_sharded(
+            lane, 2, chunk_explorer=make_chunk_explorer({}),
+            scheduler=scheduler, cost_state=_ShardCostState(),
+            cost_cap_per_lane=1000.0, cost_cap_total=1000.0, max_concurrent_chunks=1,
+        )
+        assert dispatched_per_round[1] == ["j1", "j2"]
+        assert dispatched_per_round[2] == ["j3", "j0"]
+
 
 class TestParseCoverageBlock:
     def test_parses_valid_coverage_array(self):
@@ -2090,12 +2418,22 @@ class _FakeRealMachine:
     host: str
     capabilities: list = field(default_factory=list)
     repos: list = field(default_factory=list)
+    # #3620: `None` mirrors `coord.models.Machine.max_workers`'s own default
+    # ("no override, use the fleet-wide concurrency.max_workers") — needed
+    # now that `_effective_host_max_workers` resolves real chunk concurrency
+    # for every lane `bugbash_run_cmd` discovers, even in tests that don't
+    # care about sharding at all.
+    max_workers: int | None = None
 
 
 @dataclass
 class _FakeConcurrency:
     max_retries: int = 3
     backoff_base: float = 1.0
+    # #3620: mirrors `coord.config.ConcurrencyConfig.max_workers`'s own
+    # default — the fleet-wide fallback `_effective_host_max_workers`
+    # resolves to when a machine doesn't set its own override.
+    max_workers: int = 2
 
 
 @dataclass
@@ -3239,6 +3577,55 @@ class TestBugbashCli:
         assert "win-native=1" in result.output
         assert "tui-pty=1" in result.output
 
+    def test_dry_run_with_max_priority_shows_filtered_journey_and_chunk_counts(self, monkeypatch):
+        """#3620 acceptance: `coord bugbash vimcode --max-priority 1
+        --dry-run` shows ~60 journeys and 3 chunks per lane (vimcode's real
+        tui-pty catalogue shape from the issue body: ~60 priority-1, ~80
+        priority-2, ~18 priority-3; DEFAULT_JOURNEYS_PER_WORKER=25)."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+            default_branch = "develop"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="tui-pty")],
+        )
+
+        lines = ["version: 1", "journeys:"]
+        for priority, count in ((1, 60), (2, 80), (3, 18)):
+            for i in range(count):
+                lines += [
+                    f"  - id: p{priority}-{i}",
+                    "    lanes: [tui-pty]",
+                    "    reference: spec",
+                    "    expected: \"e\"",
+                    "    steps: \"s\"",
+                    f"    priority: {priority}",
+                ]
+        catalogue_text = "\n".join(lines) + "\n"
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: catalogue_text)
+        monkeypatch.setattr(
+            cmd_bugbash, "run_bugbash",
+            lambda bb_config, **kw: BugbashReport(
+                repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0,
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "tui-pty", "--max-priority", "1", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "journeys: 60" in result.output
+        assert "chunks: 3" in result.output
+
     def test_dry_run_prints_the_per_lane_driver_command(self, monkeypatch):
         """#3590 acceptance: `coord bugbash REPO --dry-run` prints the exact
         `coord app-drive <kind>` command each lane's worker will be handed
@@ -3415,6 +3802,65 @@ class TestBugbashCli:
         assert result.exit_code == 0, result.output
         captured["explorer"](_prod_lane(machine="pc1", platform="win-native"), 1)
         assert dispatch_kwargs.get("catalogue_text") == catalogue_text
+
+    def test_explorer_shards_a_large_catalogue_into_multiple_dispatch_calls(self, monkeypatch):
+        """#3620 end-to-end: the real `explorer` closure `bugbash_run_cmd`
+        builds must shard a lane with more journeys than
+        --journeys-per-worker into several `_dispatch_and_await_lane`
+        calls, each carrying its own `journeys_override` slice — not one
+        call handed the whole catalogue (the bug this issue reports)."""
+        import coord.commands.bugbash as cmd_bugbash
+        from click.testing import CliRunner
+        from coord.bugbash import BugbashReport
+
+        class _FakeRepoCfg:
+            github = "acme/vimcode"
+            default_branch = "develop"
+
+        fake_cfg = _FakeRealConfig(machines=[_FakeRealMachine(name="pc1", host="pc1.local")])
+        fake_cfg.repo = lambda name: _FakeRepoCfg()
+        monkeypatch.setattr(cmd_bugbash, "_load_config", lambda path: fake_cfg)
+        monkeypatch.setattr(
+            cmd_bugbash, "discover_lanes",
+            lambda cfg, repo, reference_backend="": [_prod_lane(machine="pc1", platform="tui-pty")],
+        )
+        lines = ["version: 1", "journeys:"]
+        for i in range(60):
+            lines += [
+                f"  - id: j{i}",
+                "    lanes: [tui-pty]",
+                "    reference: spec",
+                "    expected: \"e\"",
+                "    steps: \"s\"",
+                "    priority: 1",
+            ]
+        catalogue_text = "\n".join(lines) + "\n"
+        monkeypatch.setattr(cmd_bugbash, "_fetch_catalogue_text", lambda slug, branch: catalogue_text)
+
+        captured = {}
+
+        def fake_run_bugbash(bb_config, *, explorer, runner, open_issues_fetcher, closed_issues_fetcher, confirm):
+            captured["explorer"] = explorer
+            return BugbashReport(repo=bb_config.repo, rounds=[], termination_reason="round_cap", total_cost=0.0)
+
+        monkeypatch.setattr(cmd_bugbash, "run_bugbash", fake_run_bugbash)
+
+        dispatch_calls = []
+
+        def fake_dispatch(lane, round_num, **kwargs):
+            dispatch_calls.append(kwargs.get("journeys_override"))
+            return ExploreOutcome(ok=True, cost=1.0)
+
+        monkeypatch.setattr(cmd_bugbash, "_dispatch_and_await_lane", fake_dispatch)
+
+        result = CliRunner().invoke(
+            cmd_bugbash.bugbash_cmd,
+            ["vimcode", "--reference", "tui-pty", "--dry-run", "-y"],
+        )
+        assert result.exit_code == 0, result.output
+        outcome = captured["explorer"](_prod_lane(machine="pc1", platform="tui-pty"), 1)
+        assert [len(c) for c in dispatch_calls] == [25, 25, 10]
+        assert outcome.cost == 3.0
 
     def test_explorer_progress_lines_are_lane_prefixed(self, monkeypatch, capsys):
         """#3602 review round 1: the new lane-prefixed progress lines

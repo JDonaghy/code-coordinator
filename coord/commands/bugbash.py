@@ -83,18 +83,26 @@ from coord.bugbash import (
     BugbashConfig,
     BugbashLane,
     BugbashReport,
+    DEFAULT_JOURNEYS_PER_WORKER,
     EXPLORATION_CHECKLIST,
     ExploreOutcome,
+    Journey,
+    JourneyScheduler,
+    LaneChunkPlan,
+    _ShardCostState,
     build_exploration_briefing,
     discover_lanes,
     driver_command_for_lane,
+    explore_lane_sharded,
     finding_target_repo,
     harvest_outcome,
     journeys_for_lane,
+    max_concurrent_chunks_for_lane,
     parse_catalogue,
     parse_coverage_block,
     parse_findings_block,
     parse_unavailable_report,
+    plan_lane_chunks,
     run_bugbash,
     subprocess_coord_runner,
 )
@@ -287,13 +295,26 @@ def _dispatch_and_await_lane(
     reference_backend: str,
     checklist=EXPLORATION_CHECKLIST,
     catalogue_text: str | None = None,
+    journeys_override: list[Journey] | tuple[Journey, ...] | None = None,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     timeout: float = DEFAULT_LANE_TIMEOUT,
     cost_cap: float = float("inf"),
 ) -> ExploreOutcome:
-    """Production :data:`coord.bugbash.Explorer`: dispatch a headless
+    """Production :data:`coord.bugbash.Explorer`/
+    :data:`coord.bugbash.ChunkExplorer`: dispatch a headless
     exploration worker to *lane*'s machine and wait for it to finish, then
     parse its findings out of the transcript.
+
+    *journeys_override* (#3620), when given, is threaded straight through
+    to :func:`coord.bugbash.build_exploration_briefing` — the sharded
+    dispatcher (:func:`coord.bugbash.explore_lane_sharded`) calls this
+    function once per CHUNK, each with its own slice of the lane's
+    journeys, so this one function serves as both the unsharded
+    :data:`coord.bugbash.Explorer` (``journeys_override=None``, the
+    pre-#3620 behaviour, unchanged) and the sharded
+    :data:`coord.bugbash.ChunkExplorer` (one journeys-bearing call per
+    chunk) without needing two separate dispatch implementations (#2096
+    "one question, one answer").
 
     Never raises on a dispatch/poll/log failure — every such path returns
     ``ok=False`` with the reason folded into ``notes`` (#2096: this must
@@ -358,7 +379,7 @@ def _dispatch_and_await_lane(
 
     briefing = build_exploration_briefing(
         lane, reference_backend=reference_backend, checklist=checklist,
-        catalogue_text=catalogue_text,
+        catalogue_text=catalogue_text, journeys_override=journeys_override,
     )
     proposal = Proposal(
         id=0,
@@ -578,6 +599,69 @@ def _describe_catalogue(catalogue_text: str | None, lanes: list[BugbashLane]) ->
     )
 
 
+def _effective_host_max_workers(machine, config) -> int:
+    """*machine*'s real dispatch capacity (#3620 requirement 1, "`tui-pty`
+    chunks may run concurrently up to the host's `max_workers`") —
+    delegates to the SAME per-machine capacity resolution
+    (``machines[].max_workers`` override, else ``concurrency.max_workers``)
+    :func:`coord.reconcile._machine_capacity` already uses for dispatch
+    capacity (#2096 "one question, one answer"): a `tui-pty` lane's own
+    chunk concurrency bound must never silently diverge from what the rest
+    of the coordinator considers that host's real capacity."""
+    from coord.reconcile import _machine_capacity  # noqa: PLC0415 — avoid an import cycle
+
+    return _machine_capacity(machine, config)
+
+
+def _describe_lane_chunk_plan(
+    plan: LaneChunkPlan, *, max_priority: int | None, concurrent_workers: int,
+) -> str:
+    """One line naming *plan*'s chunk breakdown for ``--dry-run`` (#3620
+    requirement 2: "journeys after the filter, the number of chunks, and
+    the estimated workers") — the SAME :func:`coord.bugbash.plan_lane_chunks`
+    call the live sharded dispatcher seeds its :class:`JourneyScheduler`
+    from, so this line can never show a different chunk count than what a
+    real run would actually dispatch (#2096 "one question, one answer")."""
+    priority_note = f" (--max-priority {max_priority})" if max_priority is not None else ""
+    if plan.chunk_count == 0:
+        return (
+            f"  [{plan.platform}] journeys: 0{priority_note} — no catalogue journeys "
+            "for this lane, falls back to the exploration checklist (1 worker)"
+        )
+    return (
+        f"  [{plan.platform}] journeys: {len(plan.journeys)}{priority_note}, "
+        f"chunks: {plan.chunk_count}, estimated workers: up to "
+        f"{min(concurrent_workers, plan.chunk_count)} concurrent"
+    )
+
+
+def _print_cumulative_coverage(
+    lanes: list[BugbashLane], schedulers: dict[str, JourneyScheduler],
+) -> None:
+    """``coord bugbash run``'s final "cumulative coverage per lane"
+    summary (#3620 requirement 3: "attempted/passed/found/skipped across
+    all rounds and chunks") — read straight off each lane's own
+    :class:`JourneyScheduler` (the ONE place that state lives across every
+    round/chunk of this run), never re-summed from
+    :attr:`RoundReport.lane_coverage` (which would double-count a journey
+    deliberately re-walked in a later round once its lane's backlog was
+    cleared). Silent for a lane whose scheduler tracks no catalogue
+    journeys at all (checklist-fallback lanes) — there is nothing
+    cumulative to report there beyond what :func:`_print_round` already
+    printed per round."""
+    for lane in lanes:
+        scheduler = schedulers.get(lane.platform)
+        if scheduler is None or not scheduler.journeys:
+            continue
+        cov = scheduler.cumulative_summary()
+        not_reached = len(scheduler.journeys) - cov.attempted
+        click.echo(
+            f"cumulative coverage ({lane.platform}): {cov.attempted}/{len(scheduler.journeys)} "
+            f"attempted, {cov.passed} passed, {cov.found} found, {cov.skipped} skipped"
+            + (f", {not_reached} not yet reached" if not_reached else "")
+        )
+
+
 def _print_round(report: BugbashReport) -> None:
     """Render every round's findings/filings/failures — shared by
     ``coord bugbash run``'s multi-round report and ``coord bugbash
@@ -718,6 +802,19 @@ def bugbash_cmd() -> None:
     "total patience budget before a cost-cap failure; --cost-cap-per-lane is the real ceiling "
     "on overall wait/spend.",
 )
+@click.option(
+    "--journeys-per-worker", type=int, default=DEFAULT_JOURNEYS_PER_WORKER, show_default=True,
+    help="#3620: split each lane's (post --max-priority) journey list into chunks of at most "
+    "this many journeys, dispatching one worker per chunk instead of the whole lane to a "
+    "single time-boxed session. GUI lanes (win-native/mac-native/gtk-native) run their "
+    "chunks one after another on their host; tui-pty chunks may run concurrently up to the "
+    "host's own max_workers.",
+)
+@click.option(
+    "--max-priority", type=int, default=None,
+    help="#3620: only walk catalogue journeys with priority <= this (e.g. 1 = priority-1 "
+    "only), applied BEFORE sharding into chunks. Unset (default): no filter.",
+)
 @click.option("--dry-run", is_flag=True, help="List what would be filed; never calls `coord issue create` / `coord drive-queue add`.")
 @click.option("--yes", "-y", is_flag=True, help="Skip the interactive confirmation prompt on the first --confirm-rounds rounds.")
 @_CONFIG_OPTION
@@ -730,6 +827,8 @@ def bugbash_run_cmd(
     cost_cap_total: float,
     confirm_rounds: int,
     lane_timeout: float,
+    journeys_per_worker: int,
+    max_priority: int | None,
     dry_run: bool,
     yes: bool,
     config_path: Path,
@@ -768,6 +867,36 @@ def bugbash_run_cmd(
     catalogue_text = _fetch_catalogue_text(repo_cfg.github, repo_cfg.default_branch)
     click.echo(_describe_catalogue(catalogue_text, lanes))
 
+    # #3620: shard each lane's (post --max-priority) journey list into
+    # chunks of at most --journeys-per-worker, and seed one coverage-aware
+    # `JourneyScheduler` per lane from the SAME `plan_lane_chunks` call
+    # --dry-run prints below (#2096 "one question, one answer") — so a
+    # real run can never dispatch a different chunk breakdown than what
+    # was previewed.
+    catalogue = parse_catalogue(catalogue_text)
+    machines_by_name = {m.name: m for m in cfg.machines}
+    schedulers: dict[str, JourneyScheduler] = {}
+    for lane in lanes:
+        plan = plan_lane_chunks(
+            lane, catalogue.journeys,
+            journeys_per_worker=journeys_per_worker, max_priority=max_priority,
+        )
+        schedulers[lane.platform] = JourneyScheduler(
+            journeys=plan.journeys, journeys_per_worker=journeys_per_worker,
+        )
+        host_max_workers = 1
+        machine = machines_by_name.get(lane.machine)
+        if machine is not None:
+            host_max_workers = _effective_host_max_workers(machine, cfg)
+        concurrency = max_concurrent_chunks_for_lane(lane, host_max_workers)
+        click.echo(_describe_lane_chunk_plan(plan, max_priority=max_priority, concurrent_workers=concurrency))
+
+    # #3620 requirement 4: a run-wide (not per-round) cost accumulator
+    # shared by every lane's sharded dispatch, so a cap trips across ALL
+    # chunks of ALL lanes/rounds, not just between `run_bugbash`'s own
+    # per-round checks.
+    shard_cost_state = _ShardCostState()
+
     bb_config = BugbashConfig(
         repo=repo,
         lanes=lanes,
@@ -787,14 +916,29 @@ def bugbash_run_cmd(
     # mess of partial writes.
     print_lock = threading.Lock()
 
+    def chunk_explorer(lane: BugbashLane, round_num: int, journeys) -> ExploreOutcome:
+        return _dispatch_and_await_lane(
+            lane, round_num, repo_name=repo, config=cfg, reference_backend=reference,
+            catalogue_text=catalogue_text, journeys_override=journeys,
+            timeout=lane_timeout, cost_cap=cost_cap_per_lane,
+        )
+
     def explorer(lane: BugbashLane, round_num: int) -> ExploreOutcome:
         with print_lock:
             click.echo(f"[{lane.platform}@{lane.machine}] round {round_num}: dispatching...")
         started = time.monotonic()
-        outcome = _dispatch_and_await_lane(
-            lane, round_num, repo_name=repo, config=cfg, reference_backend=reference,
-            catalogue_text=catalogue_text,
-            timeout=lane_timeout, cost_cap=cost_cap_per_lane,
+        host_max_workers = 1
+        machine = machines_by_name.get(lane.machine)
+        if machine is not None:
+            host_max_workers = _effective_host_max_workers(machine, cfg)
+        outcome = explore_lane_sharded(
+            lane, round_num,
+            chunk_explorer=chunk_explorer,
+            scheduler=schedulers[lane.platform],
+            cost_state=shard_cost_state,
+            cost_cap_per_lane=cost_cap_per_lane,
+            cost_cap_total=cost_cap_total,
+            max_concurrent_chunks=max_concurrent_chunks_for_lane(lane, host_max_workers),
         )
         elapsed = time.monotonic() - started
         with print_lock:
@@ -822,6 +966,10 @@ def bugbash_run_cmd(
     )
 
     _print_round(report)
+    # #3620 requirement 3: cumulative per-lane coverage across EVERY round
+    # and chunk this run dispatched — read off each lane's own
+    # `JourneyScheduler`, the one place that running total lives.
+    _print_cumulative_coverage(lanes, schedulers)
     click.echo(
         f"done: {len(report.rounds)} round(s), terminated={report.termination_reason!r}, "
         f"filed={report.total_filed}, total_cost={report.total_cost:.2f}"
