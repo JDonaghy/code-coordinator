@@ -210,6 +210,69 @@ class TestTuiPtyAppDriveBlackBox:
         with pytest.raises(AppDriveError):
             load_session(session_id)
 
+    def test_screen_rows_stay_cols_wide_with_a_wide_glyph_via_the_real_cli(self):
+        """#3618 at the EXACT surface the issue's reproduction names —
+        ``coord app-drive open tui-pty --cols N`` followed by ``coord
+        app-drive screen``, through the real CLI, the real daemon socket
+        and the real JSON payload — carrying the one content shape that
+        can actually produce the reported ``N - 1`` rows.
+
+        The ASCII capture asserted in
+        ``test_open_send_screen_close_cycle_via_cli_leaves_no_child``
+        above measures ``N`` on both sides of this issue's fix: pyte pads
+        a plain row to ``columns`` by itself, so that assertion pins the
+        invariant but could never have gone red. The mechanism that does
+        is a double-width glyph — ``pyte``'s ``Screen.display`` SKIPS the
+        stub cell trailing a wide character instead of padding it, so a
+        row containing one renders ``columns - 1`` and every right-flushed
+        field on it loses its last character (vimcode's ``Ln 1, Col N``
+        ruler losing its final digit, the reported symptom). Driving that
+        shape through the CLI is what makes this a regression guard for
+        the reported behaviour rather than for a bare ``VtScreen``:
+        against the pre-fix ``VtScreen.text()`` the glyph row comes back
+        39 characters here, against the fix it is 40.
+        """
+        runner = CliRunner()
+        cols, rows = 40, 5
+        opened = runner.invoke(
+            app_drive_group,
+            ["open", "tui-pty", "--launch", "cat", "--cwd", "/tmp",
+             "--cols", str(cols), "--rows", str(rows)],
+        )
+        assert opened.exit_code == 0, opened.output
+        session_id = json.loads(opened.output)["session_id"]
+        try:
+            # "文" is East-Asian Wide: 2 display columns, 1 cell + 1 stub.
+            # The ASCII tail then runs out to the very last column, so a
+            # dropped stub cell is visible as a short row.
+            glyph = "文"
+            tail = "x" * (cols - 2)
+            sent = runner.invoke(
+                app_drive_group,
+                ["send", "--session", session_id, "--text", f"{glyph}{tail}\n"],
+            )
+            assert sent.exit_code == 0, sent.output
+
+            # Same inherent pty echo race the ASCII cycle above waits on.
+            time.sleep(0.5)
+
+            screen = runner.invoke(app_drive_group, ["screen", "--session", session_id])
+            assert screen.exit_code == 0, screen.output
+            lines = json.loads(screen.output)["text"].split("\n")
+
+            assert len(lines) == rows
+            widths = [(i, len(line)) for i, line in enumerate(lines) if len(line) != cols]
+            assert not widths, f"rows not exactly --cols={cols} wide: {widths}"
+            # The glyph really did land in the capture (otherwise the width
+            # assertion above would be passing for want of a wide cell at
+            # all), and the text after it still reaches the last column.
+            glyph_rows = [line for line in lines if glyph in line]
+            assert glyph_rows, f"the wide glyph never reached the capture: {lines!r}"
+            assert glyph_rows[0].endswith("x")
+        finally:
+            closed = runner.invoke(app_drive_group, ["close", "--session", session_id])
+            assert closed.exit_code == 0, closed.output
+
     def test_open_bad_launch_command_reports_failure_not_a_stuck_session(self):
         runner = CliRunner()
         opened = runner.invoke(
