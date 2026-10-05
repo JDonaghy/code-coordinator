@@ -25,6 +25,8 @@ wiring via Click's `CliRunner`."""
 from __future__ import annotations
 
 import shlex
+import threading
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -1591,6 +1593,94 @@ class TestRunBugbashTermination:
         )
         assert report.termination_reason == "zero_findings"
         assert report.rounds[0].all_lanes_skipped is False
+
+
+class TestRunBugbashConcurrency:
+    """#3602: a round's lanes run concurrently across HOSTS, but lanes
+    sharing a host still serialize — and the total cost cap still trips
+    mid-round, blocking any lane that hasn't started yet."""
+
+    def test_lanes_on_different_hosts_overlap_same_host_lanes_never_do(self):
+        # 3 hosts x 2 lanes each = 6 lanes. Run strictly sequentially (the
+        # old behaviour) this would take >= 6 * SLEEP; concurrent-across-
+        # hosts should take roughly 2 * SLEEP (each host's own two-lane
+        # chain, overlapping with the other two hosts' chains).
+        SLEEP = 0.15
+        lanes = [
+            _lane(platform=f"{host}-{i}", machine=host)
+            for host in ("hostA", "hostB", "hostC")
+            for i in range(2)
+        ]
+        config = _config(lanes=lanes, max_rounds=1)
+        intervals: list[tuple[str, float, float]] = []
+        lock = threading.Lock()
+
+        def explorer(lane, round_num):
+            start = time.monotonic()
+            time.sleep(SLEEP)
+            end = time.monotonic()
+            with lock:
+                intervals.append((lane.machine, start, end))
+            return ExploreOutcome(findings=())
+
+        runner = FakeRunner()
+        wall_start = time.monotonic()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        elapsed = time.monotonic() - wall_start
+
+        assert len(report.rounds) == 1
+        assert len(intervals) == 6
+        # Generous margin for scheduler noise, but well under half of the
+        # fully-sequential 6 * SLEEP — proves hosts ran in parallel.
+        assert elapsed < SLEEP * 4, (
+            f"expected lanes on different hosts to overlap; took {elapsed:.2f}s "
+            f"for 6 lanes of {SLEEP}s each"
+        )
+
+        # Two lanes on the SAME host must never overlap.
+        by_host: dict[str, list[tuple[float, float]]] = {}
+        for host, start, end in intervals:
+            by_host.setdefault(host, []).append((start, end))
+        for host, spans in by_host.items():
+            spans.sort()
+            assert len(spans) == 2
+            (s1, e1), (s2, e2) = spans
+            assert e1 <= s2, f"{host}'s two lanes overlapped: {spans}"
+
+    def test_total_cost_cap_trips_mid_round_blocks_new_lanes(self):
+        # 4 lanes on the SAME host (so exploration order is deterministic,
+        # not a function of thread scheduling): cost 1.0 each, cap_total
+        # 2.0 — the cap is tripped the instant lane 1's cost lands, so
+        # lanes 2 and 3 (not yet started) must never be asked at all.
+        # Each explored lane reports its own (non-duplicate) finding, so
+        # the round's new_count is nonzero and the cost-cap check (not the
+        # zero-findings one) decides the termination reason.
+        lanes = [_lane(platform=f"lane{i}", machine="onehost") for i in range(4)]
+        config = _config(lanes=lanes, max_rounds=1, cost_cap_total=2.0)
+        calls: list[str] = []
+
+        def explorer(lane, round_num):
+            calls.append(lane.platform)
+            finding = _finding(title=f"Bug {lane.platform}", platform=lane.platform)
+            return ExploreOutcome(findings=(finding,), cost=1.0)
+
+        runner = FakeRunner()
+        report = run_bugbash(
+            config, explorer=explorer, runner=runner,
+            open_issues_fetcher=lambda r: [], closed_issues_fetcher=lambda r: [],
+        )
+        # Only the first two lanes (combined cost 2.0) ever ran the
+        # explorer — the third and fourth never started once the shared
+        # total hit the cap.
+        assert calls == ["lane0", "lane1"]
+        assert report.rounds[0].skipped_lanes == ["lane2", "lane3"]
+        for platform in ("lane2", "lane3"):
+            assert "total cost" in report.rounds[0].skip_reasons[platform]
+        assert report.total_cost == 2.0
+        assert report.termination_reason == "cost_cap"
 
 
 class TestRunBugbashDryRun:
