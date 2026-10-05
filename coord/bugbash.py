@@ -110,6 +110,27 @@ titles never conflate a macOS-only finding with a Linux one. A listed
 platform with no capable machine is reported as an :class:`UnavailableLane`
 rather than silently omitted (see :func:`discover_lanes`). A route that
 doesn't set ``platforms`` is completely unaffected.
+
+**#3615: the briefing/dry-run name the matching route's real setup and
+launch command, not a ``'<app launch command>'`` placeholder.** Before
+this, every lane's ``coord app-drive open``/``run-spec`` usage line in both
+:func:`build_exploration_briefing` and ``coord bugbash --dry-run``
+(:mod:`coord.commands.bugbash`) carried the literal placeholder text
+regardless of what ``coordinator.yml`` actually declared for that route —
+a lane worker had to guess the build/launch recipe from repo docs, which
+once led a worker to trust a stale doc claiming a backend had been removed
+and give up rather than build it. :func:`discover_lanes` now copies each
+resolved route's own ``setup``/``run`` strings onto the
+:class:`BugbashLane` it returns (:attr:`BugbashLane.setup`/
+:attr:`BugbashLane.launch_command`), and :func:`driver_command_for_lane` /
+:func:`build_exploration_briefing` substitute them into the ``--launch``
+value and an explicit "build/provision this lane once" step. A route's own
+``label`` (:attr:`coord.config.AcceptanceDriverConfig.label`) also now
+disambiguates two sibling routes that share one ``kind`` (e.g. vimcode's
+``win-gui``/``win-terminal`` routes, both ``kind: win-native``) into
+distinct lane labels (``"win-native:gui"`` / ``"win-native:terminal"``)
+the same way #3581 disambiguates ``platforms`` — so ``--lane`` can select
+one without the other.
 """
 
 from __future__ import annotations
@@ -155,18 +176,38 @@ LANE_DRIVER_KINDS: tuple[str, ...] = (
 #: preview (:func:`driver_command_for_lane`, :mod:`coord.commands.bugbash`)
 #: both call these, so the two surfaces can never name two different
 #: commands for the same lane (#2096 "one question, one answer").
-def app_drive_open_usage(driver_kind: str) -> str:
+#:
+#: **#3615: `--launch` is the matching route's own `run:` command, not a
+#: literal placeholder.** *launch_command*, when given, is the exact
+#: ``run:`` shell command declared for this lane's route in
+#: ``coordinator.yml`` (threaded through via :attr:`BugbashLane.
+#: launch_command`, set by :func:`discover_lanes`) — the same string
+#: :func:`coord.acceptance_drivers.run_driver` passes as ``launch_command``/
+#: ``run_command`` when `coord acceptance run` drives this kind, so a
+#: bugbash worker and the acceptance driver are told to launch the
+#: identical command. Left empty (no lane context, or an older caller),
+#: this falls back to the ``'<app launch command>'`` placeholder it always
+#: used — never a hard requirement, since a worker could in principle be
+#: pointed at a lane this module doesn't know the route config for.
+#: ``--cwd`` stays a placeholder either way: it is the worker's own
+#: checkout path, which only the dispatched worker (not this module) knows.
+def app_drive_open_usage(driver_kind: str, launch_command: str = "") -> str:
     """The exact, runnable ``coord app-drive open KIND ...`` invocation for
-    *driver_kind*."""
-    return f"coord app-drive open {driver_kind} --launch '<app launch command>' --cwd '<repo checkout dir>'"
+    *driver_kind*, with ``--launch`` filled in from *launch_command* when
+    given (#3615) rather than left as the ``'<app launch command>'``
+    placeholder."""
+    launch = launch_command or "<app launch command>"
+    return f"coord app-drive open {driver_kind} --launch '{launch}' --cwd '<repo checkout dir>'"
 
 
-def app_drive_run_spec_usage(driver_kind: str) -> str:
+def app_drive_run_spec_usage(driver_kind: str, launch_command: str = "") -> str:
     """The exact, runnable ``coord app-drive run-spec KIND SPEC ...``
-    invocation for *driver_kind*."""
+    invocation for *driver_kind*, with ``--launch`` filled in from
+    *launch_command* when given (#3615)."""
+    launch = launch_command or "<app launch command>"
     return (
         f"coord app-drive run-spec {driver_kind} <spec-file> "
-        "--launch '<app launch command>' --cwd '<repo checkout dir>'"
+        f"--launch '{launch}' --cwd '<repo checkout dir>'"
     )
 
 
@@ -188,23 +229,27 @@ def driver_command_for_lane(lane: "BugbashLane") -> str:
     """The exact, runnable `coord app-drive` command this lane's worker
     opens a session with — e.g. ``"coord app-drive open tui-pty --launch "
     "'<app launch command>' --cwd '<repo checkout dir>'"`` for a
-    ``driver_kind="tui-pty"`` lane (#3590). The ONE function both
-    :func:`build_exploration_briefing`'s HARD RULE and ``coord bugbash REPO
-    --dry-run``'s per-lane preview (:mod:`coord.commands.bugbash`) call, so
-    the two surfaces can never drift apart (#2096 "one question, one
-    answer") — fixing the bug this issue reports: a briefing that named a
-    DIFFERENT lane's driver module, reversed `open`/`kind` argument order,
-    or named no runnable command at all.
+    ``driver_kind="tui-pty"`` lane (#3590), with ``--launch`` filled in from
+    :attr:`BugbashLane.launch_command` (#3615) when the lane carries one.
+    The ONE function both :func:`build_exploration_briefing`'s HARD RULE and
+    ``coord bugbash REPO --dry-run``'s per-lane preview (:mod:`coord.
+    commands.bugbash`) call, so the two surfaces can never drift apart
+    (#2096 "one question, one answer") — fixing the bug this issue reports:
+    a briefing that named a DIFFERENT lane's driver module, reversed
+    `open`/`kind` argument order, named no runnable command at all, or (#3615)
+    handed the worker an unresolved ``'<app launch command>'`` placeholder
+    to guess at.
     """
-    return app_drive_open_usage(lane.driver_kind)
+    return app_drive_open_usage(lane.driver_kind, lane.launch_command)
 
 
-def _app_drive_usage_lines(driver_kind: str) -> tuple[str, str]:
+def _app_drive_usage_lines(driver_kind: str, launch_command: str = "") -> tuple[str, str]:
     """The 2-line usage example for *driver_kind*: open the lane's own
     kind, then send one input event to the resulting session. Built
     directly from `driver_kind` (see the helpers above) — never a by-hand
-    per-kind table, so there is nothing to fall out of sync."""
-    return app_drive_open_usage(driver_kind), _APP_DRIVE_SEND_USAGE_LINE
+    per-kind table, so there is nothing to fall out of sync. *launch_command*
+    (#3615) threads through to :func:`app_drive_open_usage`."""
+    return app_drive_open_usage(driver_kind, launch_command), _APP_DRIVE_SEND_USAGE_LINE
 
 
 #: The exploration checklist every lane walks on top of the repo's Tier-2
@@ -1004,11 +1049,26 @@ class BugbashLane:
     specific capable machine to run it on.
 
     ``platform`` is the lane's display/dedupe label — ``driver_kind`` for a
-    single-platform driver (today's behaviour, unchanged), or
+    single-platform driver (today's behaviour, unchanged),
     ``f"{driver_kind}:{os_name}"`` (e.g. ``"tui-pty:macos"``) for one lane
     of a :attr:`coord.config.AcceptanceDriverConfig.platforms`-bearing
     route (#3581) — so a macOS-only finding from a route that also runs on
-    Linux is never deduped/titled as if it were the same lane.
+    Linux is never deduped/titled as if it were the same lane — or
+    ``f"{driver_kind}:{label}"`` (e.g. ``"win-native:gui"``) for a route
+    that sets :attr:`coord.config.AcceptanceDriverConfig.label` (#3615)
+    because a sibling route shares the same ``kind`` (e.g. vimcode's
+    ``win-gui``/``win-terminal`` routes, both ``kind: win-native``) — see
+    :func:`discover_lanes`.
+
+    ``setup``/``launch_command`` (#3615) carry the matching route's own
+    ``setup:``/``run:`` strings from ``coordinator.yml`` verbatim — the
+    SAME strings :func:`coord.acceptance_drivers.run_driver` runs/launches
+    for ``coord acceptance run`` — so :func:`driver_command_for_lane` and
+    :func:`build_exploration_briefing` can hand a lane worker the real
+    build-and-launch recipe instead of a ``'<app launch command>'``
+    placeholder it would otherwise have to guess at (the bug this issue
+    reports). Both default to ``""`` — unchanged behaviour (the placeholder
+    fallback) for a lane built without route context.
     """
 
     platform: str
@@ -1016,6 +1076,8 @@ class BugbashLane:
     machine: str
     capability: str
     reference: bool = False
+    setup: str = ""
+    launch_command: str = ""
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1141,21 @@ def discover_lanes(
     from "one platform silently never got picked." A route with an empty
     (the default) ``platforms`` behaves exactly as before #3581 — one lane,
     ``platform == driver_kind``.
+
+    **#3615: a route's own ``label`` (:attr:`coord.config.
+    AcceptanceDriverConfig.label`) disambiguates sibling routes that share
+    one ``kind``** — e.g. vimcode's ``win-gui``/``win-terminal`` routes are
+    BOTH ``kind: win-native``, so without this every such route produced a
+    lane whose ``platform`` was just ``"win-native"`` for both, making
+    ``--lane win-native`` (and dedupe/titling) unable to tell them apart.
+    When a route sets ``label``, its lane's ``platform`` becomes
+    ``f"{kind}:{label}"`` (e.g. ``"win-native:gui"``) the same way #3581's
+    ``platforms`` already appends ``:{os_name}`` — a route with no
+    ``label`` (the default) is completely unaffected. Every resolved lane
+    also carries the route's own ``setup``/``run`` strings verbatim (see
+    :attr:`BugbashLane.setup`/:attr:`BugbashLane.launch_command`) so a
+    briefing/dry-run can hand the worker the real build-and-launch command
+    instead of a placeholder.
     """
     entry = config.acceptance.drivers.get(repo_name)
     if entry is None:
@@ -1089,6 +1166,8 @@ def discover_lanes(
     for cfg in candidates:
         if cfg.kind not in LANE_DRIVER_KINDS:
             continue
+        route_label = getattr(cfg, "label", "") or ""
+        base_platform = f"{cfg.kind}:{route_label}" if route_label else cfg.kind
         platforms = getattr(cfg, "platforms", None) or ()
         if not platforms:
             machine = _pick_lane_machine(
@@ -1098,11 +1177,13 @@ def discover_lanes(
                 continue
             lanes.append(
                 BugbashLane(
-                    platform=cfg.kind,
+                    platform=base_platform,
                     driver_kind=cfg.kind,
                     machine=machine,
                     capability=cfg.capability,
-                    reference=(cfg.kind == reference_backend),
+                    reference=(base_platform == reference_backend),
+                    setup=cfg.setup,
+                    launch_command=cfg.run,
                 )
             )
             continue
@@ -1111,7 +1192,7 @@ def discover_lanes(
                 config, repo_name, cfg.capability,
                 os_name=os_name, http_client=http_client,
             )
-            label = f"{cfg.kind}:{os_name}"
+            label = f"{base_platform}:{os_name}"
             if machine is None:
                 if unavailable_out is not None:
                     unavailable_out.append(
@@ -1127,6 +1208,8 @@ def discover_lanes(
                     machine=machine,
                     capability=cfg.capability,
                     reference=(label == reference_backend),
+                    setup=cfg.setup,
+                    launch_command=cfg.run,
                 )
             )
     return lanes
@@ -1224,8 +1307,8 @@ def build_exploration_briefing(
                     else no_lane_note
                 )
 
-    usage_line_1, usage_line_2 = _app_drive_usage_lines(lane.driver_kind)
-    run_spec_usage = app_drive_run_spec_usage(lane.driver_kind)
+    usage_line_1, usage_line_2 = _app_drive_usage_lines(lane.driver_kind, lane.launch_command)
+    run_spec_usage = app_drive_run_spec_usage(lane.driver_kind, lane.launch_command)
     lines = [
         f"=== coord bugbash: {lane.platform} lane ===",
         "",
@@ -1244,6 +1327,16 @@ def build_exploration_briefing(
         "unavailable (see below) — do NOT improvise a workaround, and do "
         "NOT send any key or click to recover (#3566).",
         "",
+    ]
+    if lane.setup:
+        lines += [
+            f"0. Build/provision this lane ONCE before opening any session "
+            f"(run from the repo checkout root — this is the route's own "
+            f"`setup:`, not something to infer from repo docs): "
+            f"`{lane.setup}`",
+            "",
+        ]
+    lines += [
         f"1. Run this repo's Tier-2 smoke spec for this driver to completion "
         f"(`{run_spec_usage}` runs it end to end in one command).",
     ]

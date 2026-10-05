@@ -467,6 +467,20 @@ class AcceptanceDriverConfig:
     as before this field existed" — one lane, routed by ``capability``
     alone, same as every driver declared before #3581.
 
+    ``label`` (#3615) disambiguates two sibling ``routes:`` entries that
+    declare the SAME ``kind`` for different purposes — e.g. vimcode's
+    ``win-gui``/``win-terminal`` routes are both ``kind: win-native`` (one
+    opens the GUI window, the other the console build), so without a
+    ``label`` a bugbash lane built from either route carried the identical
+    ``platform`` string ``"win-native"``, making ``coord bugbash --lane
+    win-native`` unable to select just one of them and dedupe/titling
+    unable to tell their findings apart (see :func:`coord.bugbash.
+    discover_lanes`, which folds ``label`` into the lane's
+    ``f"{kind}:{label}"`` platform string the same way #3581's
+    ``platforms`` folds in ``:{os_name}``). Empty (the default) means "no
+    change" — a route whose ``kind`` has no sibling in the same repo's
+    ``routes:`` doesn't need one.
+
     ``match`` and ``routes`` implement #1125's in-repo path routing: a repo
     entry with a non-empty ``routes`` list is a *router* — its own
     ``kind``/``run``/``mock``/``capability``/``setup``/``entrypoint`` are
@@ -500,6 +514,7 @@ class AcceptanceDriverConfig:
     setup: str = ""
     entrypoint: str = ""
     match: str = ""
+    label: str = ""
     platforms: list[str] = field(default_factory=list)
     routes: list["AcceptanceDriverConfig"] = field(default_factory=list)
 
@@ -4097,7 +4112,7 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
             # other, so reject it rather than silently discarding the flat
             # fields.
             flat_fields = [
-                f for f in ("kind", "run", "mock", "capability", "setup", "entrypoint", "platforms")
+                f for f in ("kind", "run", "mock", "capability", "setup", "entrypoint", "platforms", "label")
                 if entry.get(f)
             ]
             if flat_fields:
@@ -4167,8 +4182,8 @@ def _parse_acceptance_routes(
     ``AcceptanceDriverConfig`` route entries, each with ``match`` set.
 
     Each element is validated the same way as a flat driver entry
-    (``kind``/``run`` required, ``mock``/``capability``/``setup`` optional
-    strings), plus a required ``match`` glob.
+    (``kind``/``run`` required, ``mock``/``capability``/``setup``/``label``
+    optional strings), plus a required ``match`` glob.
     """
     if not isinstance(routes_raw, list) or not routes_raw:
         raise ConfigError(
@@ -4218,6 +4233,12 @@ def _parse_acceptance_routes(
                 f"acceptance.drivers[{repo_name!r}].routes[{i}].setup must be a string"
             )
 
+        label = route_entry.get("label", "") or ""
+        if not isinstance(label, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}].label must be a string"
+            )
+
         entrypoint = _acceptance_entrypoint(
             route_entry, f"acceptance.drivers[{repo_name!r}].routes[{i}].entrypoint"
         )
@@ -4229,7 +4250,7 @@ def _parse_acceptance_routes(
         routes.append(
             AcceptanceDriverConfig(
                 kind=kind, run=run, mock=mock, capability=capability, setup=setup,
-                match=match, entrypoint=entrypoint, platforms=platforms,
+                match=match, entrypoint=entrypoint, platforms=platforms, label=label,
             )
         )
 
