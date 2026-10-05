@@ -1,18 +1,26 @@
 """``python -m coord.app_drive_daemon`` (#3590): the long-lived process one
 ``coord app-drive <kind> open`` spawns and that every later ``send``/
 ``screen``/``probe``/``wait-idle``/``close`` call (each its own short-lived
-``coord app-drive`` invocation) talks to over a fresh TCP connection.
+``coord app-drive`` invocation) talks to.
 
 Not meant to be run by hand — :func:`coord.app_drive.open_session` is the
 supported way to start one. See :mod:`coord.app_drive`'s module docstring
 for the full design rationale (why a daemon at all, the two-layer teardown
 guarantee).
 
-Wire protocol: one JSON object per connection, one line
-(``json.dumps(...) + "\n"``), one JSON object back, then the connection
-closes. Never multiplexes multiple commands over one connection — this
-keeps a half-open/duplicated client trivially recoverable (it just reconnects
-for the next verb) rather than needing its own framing/pipelining logic.
+**Two transports, chosen by the caller, never by this module guessing.**
+The default (no ``--control-dir``) binds an ephemeral localhost TCP port:
+one JSON object per connection, one line (``json.dumps(...) + "\n"``), one
+JSON object back, then the connection closes — never multiplexed, so a
+half-open/duplicated client just reconnects for the next verb rather than
+needing its own framing/pipelining logic. ``--control-dir`` (#3611)
+switches to :func:`_serve_fs_control` instead: a WSL-hosted ``win-native``
+session runs this daemon on the real Windows-side interpreter
+(:mod:`coord.win_native_bridge`), where a loopback-bound TCP socket is
+unreachable from the WSL side no matter what — see
+:mod:`coord.app_drive`'s module docstring for why — so that one case
+carries commands over the shared filesystem instead, the same mechanism
+the ready-file handshake already proves reachable in both directions.
 """
 
 from __future__ import annotations
@@ -183,24 +191,109 @@ def _write_ready_file(ready_file: Path, payload: dict) -> None:
     tmp.replace(ready_file)
 
 
+def _serve_fs_control(
+    backend: Any, kind: str, control_dir: Path, *, idle_timeout: float, token: str,
+) -> None:
+    """Bridge-mode (#3611) control loop: a WSL-hosted `coord app-drive`
+    client cannot reach a TCP socket bound on the real Windows host's own
+    loopback interface at all (WSL2's `localhostForwarding` only covers
+    Windows -> WSL, and the control socket is loopback-bound to begin
+    with — see the module docstring's "#3611" section) — but the shared
+    filesystem the ready-file handshake already proves reachable in BOTH
+    directions (:func:`coord.win_native_bridge.translate_to_windows_path`)
+    can carry commands too. Each client call
+    (:func:`coord.app_drive.send_command`) writes one
+    ``req-<id>.json`` file into *control_dir* (atomically — see
+    :func:`coord.app_drive._send_command_via_control_dir`) and polls for
+    the matching ``reply-<id>.json``; this loop polls the other direction,
+    dispatching each request through the exact same :func:`_dispatch`
+    every TCP-transport command goes through, so a bridge session behaves
+    identically to every other kind from the dispatch layer down.
+
+    Mirrors the TCP loop's own contract: every request must carry
+    ``"token": token`` to be dispatched (same #3590 authentication), idle
+    self-expiry after *idle_timeout* seconds with no request, and a
+    ``close`` request ends the loop (the caller tears the backend down
+    right after, same as the TCP path)."""
+    last_activity = time.monotonic()
+    while True:
+        if time.monotonic() - last_activity > idle_timeout:
+            return
+        try:
+            requests = sorted(control_dir.glob("req-*.json"))
+        except OSError:
+            requests = []
+        if not requests:
+            # Coarser than the TCP loop's accept() poll on purpose: each
+            # iteration here is a directory listing, not a cheap socket
+            # wait, and there's no reason to busy-poll the filesystem
+            # faster than a human-driven verb cadence needs.
+            time.sleep(0.1)
+            continue
+        for req_path in requests:
+            try:
+                raw = req_path.read_text()
+            except OSError:
+                continue
+            try:
+                req_path.unlink()
+            except OSError:
+                pass
+            last_activity = time.monotonic()
+            parse_error: str | None = None
+            command: dict = {}
+            try:
+                parsed = json.loads(raw) if raw.strip() else {}
+                if isinstance(parsed, dict):
+                    command = parsed
+                else:
+                    parse_error = f"request was not a JSON object: {parsed!r}"
+            except ValueError as e:
+                parse_error = f"bad request: {e}"
+            req_id = command.pop("_id", None)
+            if parse_error is not None:
+                reply = {"error": parse_error}
+            elif command.get("token") != token:
+                reply = {"error": "unauthorized"}
+            else:
+                reply = _dispatch(backend, kind, command)
+            if req_id:
+                reply_path = control_dir / f"reply-{req_id}.json"
+                tmp = reply_path.with_suffix(".tmp")
+                try:
+                    tmp.write_text(json.dumps(reply))
+                    tmp.replace(reply_path)
+                except OSError:
+                    pass  # the client's own poll will time out and report unreachable
+            if command.get("op") == "close":
+                return
+
+
 def serve(
     kind: str, launch: str, cwd: str, cols: int, rows: int,
     *, idle_timeout: float, ready_file: Path, token: str,
-    width: int | None = None, height: int | None = None,
+    width: int | None = None, height: int | None = None, control_dir: Path | None = None,
 ) -> int:
-    """Build *kind*'s backend, bind an ephemeral localhost port, announce
-    readiness via *ready_file*, then serve one JSON command per connection
-    until ``close`` arrives or *idle_timeout* elapses with none. Always
-    tears the backend down before returning — the SAME guarantee whichever
-    path got it there (explicit close, idle self-expiry, or an exception
-    while opening/serving).
+    """Build *kind*'s backend, announce readiness via *ready_file*, then
+    serve one command at a time until ``close`` arrives or *idle_timeout*
+    elapses with none. Always tears the backend down before returning —
+    the SAME guarantee whichever path got it there (explicit close, idle
+    self-expiry, or an exception while opening/serving).
 
-    Every command must carry ``"token": token`` to be dispatched (#3590
-    review: the control socket otherwise has no authentication at all,
-    and the port is already discoverable from the world-readable session
-    file) — an unauthenticated connection gets an ``{"error": ...}`` reply
-    and is never passed to :func:`_dispatch`, so it can never fire
-    ``send_text``/``close`` against the app being driven."""
+    *control_dir* (#3611) selects the transport: ``None`` (the overwhelming
+    common case — every non-bridge session) binds an ephemeral localhost
+    TCP port and serves one JSON command per connection, exactly as
+    before. A real path routes through :func:`_serve_fs_control` instead —
+    :func:`coord.app_drive.open_session`'s WSL bridge branch is the only
+    caller that ever passes one, because the TCP transport cannot cross
+    the WSL<->Windows boundary at all in that case (see this module's own
+    docstring). Every command must carry ``"token": token`` to be
+    dispatched either way (#3590 review: the control channel otherwise has
+    no authentication at all, and it's already discoverable from the
+    world-readable session file) — an unauthenticated request gets an
+    ``{"error": ...}`` reply and is never passed to :func:`_dispatch`, so
+    it can never fire ``send_text``/``close`` against the app being
+    driven."""
     try:
         backend = _build_backend(kind, launch, cwd, cols, rows, width=width, height=height)
     except AppDriveUnavailableError as e:
@@ -210,18 +303,37 @@ def serve(
         _write_ready_file(ready_file, {"error": "open_failed", "reason": f"{type(e).__name__}: {e}"})
         return 1
 
+    # #3590 review: the real app/pty-child pid this backend launched, so
+    # a client-side `close_session` can re-observe (and if necessary
+    # directly signal) it too, not just this daemon's own pid — see
+    # `coord.app_drive.SessionHandle.app_pid`.
+    app_pid = getattr(backend, "pid", None)
+
+    if control_dir is not None:
+        # #3611: no socket at all in bridge mode — see `_serve_fs_control`.
+        # `port: 0` is a placeholder a bridge `SessionHandle` never reads
+        # (its `control_dir` is what `send_command` actually uses).
+        control_dir.mkdir(parents=True, exist_ok=True)
+        _write_ready_file(
+            ready_file,
+            {"pid": os.getpid(), "port": 0, "app_pid": app_pid, "transport": "fs"},
+        )
+        try:
+            _serve_fs_control(backend, kind, control_dir, idle_timeout=idle_timeout, token=token)
+        finally:
+            try:
+                backend.close()
+            except Exception:  # noqa: BLE001 — teardown must not raise past this point
+                pass
+        return 0
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 0))
     sock.listen(8)
     port = sock.getsockname()[1]
 
-    # #3590 review: the real app/pty-child pid this backend launched, so
-    # a client-side `close_session` can re-observe (and if necessary
-    # directly signal) it too, not just this daemon's own pid — see
-    # `coord.app_drive.SessionHandle.app_pid`.
-    app_pid = getattr(backend, "pid", None)
-    _write_ready_file(ready_file, {"pid": os.getpid(), "port": port, "app_pid": app_pid})
+    _write_ready_file(ready_file, {"pid": os.getpid(), "port": port, "app_pid": app_pid, "transport": "tcp"})
 
     stop = threading.Event()
     last_activity = [time.monotonic()]
@@ -289,11 +401,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", required=True)
     parser.add_argument("--width", type=int, default=None, help="Native-kind window width in pixels.")
     parser.add_argument("--height", type=int, default=None, help="Native-kind window height in pixels.")
+    parser.add_argument(
+        "--control-dir", default=None,
+        help="#3611: serve commands via this directory instead of a TCP port — the WSL->Windows "
+        "bridge path, since a loopback-bound TCP socket on the real Windows host is unreachable "
+        "from the WSL side. Unset for every other (TCP) session.",
+    )
     ns = parser.parse_args(argv)
     return serve(
         ns.kind, ns.launch, ns.cwd, ns.cols, ns.rows,
         idle_timeout=ns.idle_timeout, ready_file=Path(ns.ready_file), token=ns.token,
         width=ns.width, height=ns.height,
+        control_dir=Path(ns.control_dir) if ns.control_dir else None,
     )
 
 

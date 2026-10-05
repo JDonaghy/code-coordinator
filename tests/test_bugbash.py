@@ -2832,6 +2832,25 @@ class TestPrintRoundCoverage:
         assert "lane UNAVAILABLE (win-native): win-native driver requires a real Windows host" in out
         assert "lane UNAVAILABLE (mac-native): the screen is locked" in out
 
+    def test_round_header_names_unavailable_lanes_too(self, capsys):
+        """#3611 review nit: the per-lane `lane UNAVAILABLE (...)` lines
+        above exist, but the round HEADER itself (`round N: 0 finding(s),
+        ...`) only grew a `(lanes skipped: ...)` clause for
+        `skipped_lanes` — an all-unavailable round still read as a bare
+        "0 finding(s)" at a one-line scan, identically to a genuinely
+        clean round. Mirrors the existing `lanes skipped:` clause."""
+        from coord.commands.bugbash import _print_round
+        from coord.bugbash import BugbashReport
+
+        report_round = RoundReport(round_num=1)
+        report_round.unavailable_lanes["win-native"] = "no interactive Windows session"
+        wrapped = BugbashReport(
+            repo="vimcode", rounds=[report_round], termination_reason="lanes_unavailable",
+        )
+        _print_round(wrapped)
+        out = capsys.readouterr().out
+        assert "lanes unavailable: win-native" in out
+
 
 # ── coord bugbash CLI (#3569: --lane-timeout, run/harvest subcommands) ───
 
