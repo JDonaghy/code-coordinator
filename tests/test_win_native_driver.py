@@ -29,6 +29,7 @@ from coord.win_native_driver import (
     NativeSpec,
     NativeStep,
     WinNativeRuntimeError,
+    WinNativeSession,
     WinNativeSpecError,
     Win32Calls,
     _execute_staging,
@@ -908,6 +909,7 @@ def _make_win32_calls(user32, kernel32) -> Win32Calls:
     calls._user32 = user32
     calls._kernel32 = kernel32
     calls._staged_session_dirs = {}  # #3617 — normally set by `__init__`
+    calls.staging_warning = None  # #3617 — normally set by `__init__`
     return calls
 
 
@@ -1488,8 +1490,14 @@ class TestWin32CallsLocalStaging:
             captured_plan_args["command"] = command
             captured_plan_args["cwd"] = cwd
             captured_plan_args["session_root"] = session_root
+            # Mirrors the real planner's own shape (`cwd` IS the session
+            # root — `command` keeps its own `cd .smoke &&`, which does
+            # the navigating). This test only proves `Win32Calls` USES
+            # whatever plan it is handed; that the real planner produces
+            # this shape rather than the pre-review `session_root\.smoke`
+            # one is `TestLaunchRealPlanStagingEndToEnd`'s job.
             return _StagingPlan(
-                staged=True, cwd=f"{session_root}\\.smoke",
+                staged=True, cwd=session_root,
                 source_exe=f"{cwd}\\target\\vimcode.exe",
                 dest_exe=f"{session_root}\\target\\vimcode.exe",
             )
@@ -1515,7 +1523,7 @@ class TestWin32CallsLocalStaging:
         # `_popen_command_and_cwd`'s own non-UNC passthrough, since the
         # staged cwd is a real local path, not a UNC one needing `pushd`.
         assert "coord-app-drive" in captured_plan_args["session_root"]
-        assert captured_popen["cwd"].endswith("\\.smoke")
+        assert captured_popen["cwd"] == captured_plan_args["session_root"]
         assert "wsl.localhost" not in captured_popen["cwd"]
         # The staged dir is tracked against the real PID `Popen` returned,
         # for `kill` to clean up later.
@@ -1527,8 +1535,22 @@ class TestWin32CallsLocalStaging:
         """#3617 is a performance optimization, not a correctness
         requirement — when `%LOCALAPPDATA%` can't be resolved at all, a
         caller still gets a working (if UNC-slow) launch via the
-        pre-#3617 `pushd` wrap, rather than this failing outright."""
+        pre-#3617 `pushd` wrap, rather than this failing outright.
+
+        Both resolution tiers are forced to fail EXPLICITLY: the env var
+        is deleted, and `_staging_root`'s own `known_folder_resolver`
+        kwarg (which exists for exactly this) is pinned to `lambda: None`.
+        Deleting the env var alone would be platform-dependent — off
+        Windows the `SHGetKnownFolderPath` fallback returns `None` only
+        because `os.name != "nt"`, so on a real Windows host the resolver
+        would succeed, `_plan_staging` would be reached and `_boom` would
+        fire (#3617 review round 2)."""
         monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        real_staging_root = Win32Calls._staging_root
+        monkeypatch.setattr(
+            Win32Calls, "_staging_root",
+            lambda self: real_staging_root(self, known_folder_resolver=lambda: None),
+        )
 
         def _boom(*a, **kw):
             raise AssertionError("must never attempt to stage without %LOCALAPPDATA%")
@@ -1542,6 +1564,9 @@ class TestWin32CallsLocalStaging:
         calls.launch("cd .smoke && vimcode.exe sample.txt", self.UNC)
         assert captured_popen["command"] == f'pushd "{self.UNC}" && cd .smoke && vimcode.exe sample.txt'
         assert captured_popen["cwd"] is None
+        # ... and the fallback is OBSERVABLE, never silent (#3617 review).
+        assert calls.staging_warning is not None
+        assert "LOCALAPPDATA" in calls.staging_warning
 
     def test_launch_in_terminal_also_stages(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
@@ -2046,3 +2071,36 @@ class TestRunNativeSpec:
             {"id": "session", "status": "unavailable", "message": "desktop is locked"}
         ]
         assert calls.launched == []
+
+
+class TestWinNativeSessionStagingWarning:
+    """#3617 review: `WinNativeSession.staging_warning` is the seam
+    :mod:`coord.app_drive_daemon` reads to put a skipped-staging warning
+    in its ready file (and from there into
+    :class:`coord.app_drive.SessionHandle`). It is a `getattr`-based read,
+    so a rename on either side silently restores the pre-review silence —
+    these are what make that rename fail instead.
+
+    The rest of the chain (`serve()` -> ready file -> `SessionHandle` ->
+    the on-disk session file) is covered by
+    `tests/test_app_drive.py::TestStagingWarningPlumbing`."""
+
+    def test_session_surfaces_the_calls_warning(self) -> None:
+        calls = FakeWinCalls()
+        calls.staging_warning = "staging skipped: no %LOCALAPPDATA%"
+        session = WinNativeSession("vimcode.exe", "/repo", calls=calls)
+        assert session.staging_warning == "staging skipped: no %LOCALAPPDATA%"
+
+    def test_session_reports_none_when_staging_engaged(self) -> None:
+        calls = FakeWinCalls()
+        calls.staging_warning = None
+        session = WinNativeSession("vimcode.exe", "/repo", calls=calls)
+        assert session.staging_warning is None
+
+    def test_session_reports_none_for_a_backend_without_the_attribute(self) -> None:
+        """A scripted fake (and any non-`Win32Calls` implementation) has no
+        `staging_warning` at all — must read as "no warning", never raise."""
+        calls = FakeWinCalls()
+        assert not hasattr(calls, "staging_warning")
+        session = WinNativeSession("vimcode.exe", "/repo", calls=calls)
+        assert session.staging_warning is None
