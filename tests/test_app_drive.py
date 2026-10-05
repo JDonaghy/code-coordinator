@@ -492,6 +492,82 @@ class TestOpenSessionWslBridge:
             send_command(handle, {"op": "is_alive"})
 
 
+class TestWinNativeStagingRootOnRealWindows:
+    """#3617 deliverable: "a black-box check on a WSL host (or a clearly
+    documented skip off-WSL) that a session's exe path is under the
+    Windows filesystem."
+
+    Spawns the REAL Windows-side interpreter over the WSL bridge
+    (:mod:`coord.win_native_bridge`, the exact mechanism
+    :func:`coord.app_drive.open_session`'s ``win-native`` route already
+    uses) and asks the REAL ``Win32Calls._staging_root()`` — the exact
+    directory a session's staged exe is copied into and launched from
+    (#3617) — to resolve itself, for real, on whatever Windows host this
+    WSL guest is paired with. Every other ``win-native``/bridge test in
+    this module (:class:`TestOpenSessionWslBridge`) fakes
+    ``is_wsl_host()``/``translate_to_windows_path`` and therefore can
+    never actually reach ``Win32Calls`` at all — it refuses construction
+    with ``os.name != "nt"`` the moment anything tries, on every sandbox
+    those tests run in. This class is the one place in the suite that
+    doesn't fake that boundary, and so is the one place that can actually
+    observe where a real Windows process's files would land.
+
+    Doesn't need a real app/exe to launch at all — ``_staging_root()`` is
+    a pure path-resolution read, no process spawn, no window, no built
+    artifact required — which is what makes this both minimal AND a
+    direct, literal check of the issue's own ask (a session's exe path
+    resolves under the Windows filesystem, not a UNC ``\\\\wsl...`` one).
+
+    **Skips everywhere except a real WSL<->Windows pairing (e.g. dell64).**
+    Every sandbox this PR was developed and reviewed in is plain Linux, so
+    neither precondition below ever holds there — this is EXPECTED to (and
+    does) skip in this PR's own CI run. Treat a pass here as a built,
+    ready gate, not a hardware-confirmed one; it has not been exercised
+    against real dell64 hardware as part of this change (same caveat this
+    module's own #3544 handle-inheritance fix already carries for the same
+    reason — no such hardware was available)."""
+
+    @pytest.fixture(autouse=True)
+    def _require_real_windows_side(self):
+        import coord.win_native_bridge as bridge_mod
+
+        self._bridge_mod = bridge_mod
+        if not bridge_mod.is_wsl_host():
+            pytest.skip(
+                "TestWinNativeStagingRootOnRealWindows needs a genuine WSL "
+                "host (coord.win_native_bridge.is_wsl_host()) to reach a "
+                "real Windows-side interpreter at all — see this class's "
+                "own docstring for why nothing else in this suite can "
+                "substitute for that"
+            )
+        try:
+            self._windows_python = bridge_mod.ensure_windows_win_native_venv()
+        except bridge_mod.WinNativeBridgeError as e:
+            pytest.skip(f"no provisioned win-native Windows venv reachable: {e}")
+
+    def test_staging_root_resolves_to_a_real_local_windows_path(self) -> None:
+        bridge_mod = self._bridge_mod
+        # `ensure_windows_win_native_venv` already confirmed (via its own
+        # idempotency probe) that `coord.win_native_driver` imports fine
+        # on this venv — no extra bootstrap needed here.
+        probe = (
+            "from coord.win_native_driver import Win32Calls; "
+            "print(Win32Calls()._staging_root())"
+        )
+        argv0 = bridge_mod.windows_path_to_wsl_path(self._windows_python)
+        result = subprocess.run(  # noqa: S603
+            [argv0, "-c", probe], capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        staging_root = result.stdout.strip()
+        # Never a UNC path (`\\wsl.localhost\...`, `\\server\share\...`)
+        # — the whole point of #3617.
+        assert not staging_root.startswith("\\\\")
+        # A real drive-letter-rooted Windows path (`C:\...`), not a bare
+        # relative string or something `%LOCALAPPDATA%` guessed wrong.
+        assert staging_root[1:3] == ":\\"
+
+
 class _FakeNativeCalls:
     """A scripted fake standing in for `MacOSCalls`/`Win32Calls`/
     `LinuxGtkCalls` — mirrors the existing `tests/test_*_native_driver.py`

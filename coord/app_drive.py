@@ -198,7 +198,17 @@ class SessionHandle:
     ``control_dir`` is the WSL-visible directory :func:`send_command` and
     the bridge daemon's ``_serve_fs_control`` exchange ``req-*.json``/
     ``reply-*.json`` files through — set only when ``bridge`` is ``True``;
-    ``port`` is a meaningless placeholder (``0``) on a bridge handle."""
+    ``port`` is a meaningless placeholder (``0``) on a bridge handle.
+
+    ``staging_warning`` (#3617 review) is non-``None`` only for a
+    ``win-native`` session that skipped local-filesystem launch staging on
+    a UNC ``cwd`` (and why) —
+    :attr:`coord.win_native_driver.WinNativeSession.staging_warning`,
+    folded into the daemon's own ready-file so a silent fallback to the
+    slow UNC launch is observable from the CLI handle itself, not just a
+    log line on a machine the caller may have no access to. ``None`` for
+    every other kind, and ``None`` for a ``win-native`` session where
+    staging either didn't apply (non-UNC ``cwd``) or succeeded."""
 
     session_id: str
     kind: str
@@ -208,6 +218,7 @@ class SessionHandle:
     app_pid: int | None = None
     bridge: bool = False
     control_dir: str | None = None
+    staging_warning: str | None = None
 
 
 def _write_session_file(handle: SessionHandle) -> None:
@@ -221,6 +232,7 @@ def _write_session_file(handle: SessionHandle) -> None:
         "pid": handle.pid, "port": handle.port, "token": handle.token,
         "app_pid": handle.app_pid, "bridge": handle.bridge,
         "control_dir": handle.control_dir,
+        "staging_warning": handle.staging_warning,
     }))
     tmp.replace(path)
 
@@ -248,6 +260,9 @@ def load_session(session_id: str) -> SessionHandle:
             # field existed), not a parse error.
             bridge=bool(raw.get("bridge", False)),
             control_dir=raw.get("control_dir"),
+            # #3617: same "absence means None" convention — a session
+            # file written before this field existed has no key at all.
+            staging_warning=raw.get("staging_warning"),
         )
     except (KeyError, TypeError, ValueError) as e:
         raise AppDriveError(f"corrupt app-drive session file for {session_id!r}: {e}") from e
@@ -620,6 +635,10 @@ def open_session(
                     app_pid=int(ready["app_pid"]) if ready.get("app_pid") is not None else None,
                     bridge=bridge_mode,
                     control_dir=str(control_dir) if control_dir is not None else None,
+                    # #3617: non-None only for a `win-native` session that
+                    # skipped local-filesystem launch staging on a UNC
+                    # `cwd` — see `SessionHandle`'s own docstring.
+                    staging_warning=ready.get("staging_warning"),
                 )
                 if bridge_mode:
                     # #2096/#3611 review: the ready-file only proves the
