@@ -57,6 +57,7 @@ from coord.tui_pty_driver import (
     VtScreen,
     _wrap_launch_command,
     encode_click,
+    encode_drag,
     encode_key,
     parse_smoke_spec,
     run_smoke_spec,
@@ -171,6 +172,42 @@ steps:
     def test_click_missing_row_col_raises(self) -> None:
         with pytest.raises(TuiPtySpecError, match="row"):
             parse_smoke_spec("steps:\n  - type: click\n")
+
+    def test_drag_step_parses_fields(self) -> None:
+        # #3604: press-drag-release had no step at all before this issue.
+        spec = parse_smoke_spec(
+            "steps:\n  - type: drag\n    row: 1\n    col: 2\n"
+            "    to_row: 5\n    to_col: 9\n    button: left\n"
+        )
+        step = spec.steps[0]
+        assert step.kind == "drag"
+        assert (step.row, step.col, step.to_row, step.to_col, step.button) == (1, 2, 5, 9, "left")
+
+    def test_drag_missing_to_row_to_col_raises(self) -> None:
+        with pytest.raises(TuiPtySpecError, match="to_row"):
+            parse_smoke_spec("steps:\n  - type: drag\n    row: 0\n    col: 0\n")
+
+    def test_drag_wheel_button_raises(self) -> None:
+        # (#2096 a gate must be able to fail) a wheel has no held state to
+        # drag with — this must be rejected at parse time, not silently
+        # produce a meaningless SGR sequence.
+        with pytest.raises(TuiPtySpecError, match="drag"):
+            parse_smoke_spec(
+                "steps:\n  - type: drag\n    row: 0\n    col: 0\n"
+                "    to_row: 1\n    to_col: 1\n    button: wheel-up\n"
+            )
+
+    def test_resize_step_parses_fields(self) -> None:
+        # #3604: the YAML schema had no live-resize action at all before
+        # this issue — only the top-level launch-time cols/rows.
+        spec = parse_smoke_spec("steps:\n  - type: resize\n    cols: 120\n    rows: 40\n")
+        step = spec.steps[0]
+        assert step.kind == "resize"
+        assert (step.cols, step.rows) == (120, 40)
+
+    def test_resize_missing_cols_rows_raises(self) -> None:
+        with pytest.raises(TuiPtySpecError, match="cols"):
+            parse_smoke_spec("steps:\n  - type: resize\n")
 
     def test_expect_within_missing_text_raises(self) -> None:
         with pytest.raises(TuiPtySpecError, match="text"):
@@ -287,6 +324,40 @@ class TestEncodeKey:
         with pytest.raises(TuiPtySpecError, match="unrecognized key"):
             encode_key("moonwalk")
 
+    def test_alt_m_and_its_aliases_all_produce_the_same_meta_escape(self) -> None:
+        # #3604: direct run-spec trials of each of these failed with
+        # 'unrecognized key' before this fix — all are the same physical
+        # Alt+m combo under a different spelling, and must encode
+        # identically to the universal terminal "meta sends ESC" sequence.
+        expected = b"\x1bm"
+        for spelling in ("alt+m", "meta+m", "M-m", "a-m", "option+m", "Alt+m", "ALT+M".lower()):
+            assert encode_key(spelling) == expected, spelling
+        # "ALT+M" (uppercase base) is the Alt+Shift+m combo, not Alt+m —
+        # case must be preserved on the base character, not folded away.
+        assert encode_key("alt+M") == b"\x1bM"
+
+    def test_shift_arrow_combos(self) -> None:
+        # #3604: every VS Code-style Shift+-selection journey needs this.
+        assert encode_key("shift+right") == b"\x1b[1;2C"
+        assert encode_key("shift+left") == b"\x1b[1;2D"
+        assert encode_key("shift+up") == b"\x1b[1;2A"
+        assert encode_key("shift+down") == b"\x1b[1;2B"
+
+    def test_ctrl_home_and_ctrl_end(self) -> None:
+        # #3604: both failed with 'unrecognized key' before this fix.
+        assert encode_key("ctrl+home") == b"\x1b[1;5H"
+        assert encode_key("ctrl+end") == b"\x1b[1;5F"
+
+    def test_ctrl_shift_and_ctrl_alt_combos(self) -> None:
+        assert encode_key("ctrl+shift+right") == b"\x1b[1;6C"
+        assert encode_key("ctrl+alt+right") == b"\x1b[1;7C"
+
+    def test_plain_ctrl_letter_combo_unaffected(self) -> None:
+        # The pre-existing ctrl+<letter> control-code path must still win
+        # over the new general modifier parser for the case it already
+        # handled correctly.
+        assert encode_key("ctrl+c") == b"\x03"
+
 
 class TestEncodeClick:
     def test_left_click_is_press_and_release(self) -> None:
@@ -306,6 +377,30 @@ class TestEncodeClick:
     def test_unrecognized_button_raises(self) -> None:
         with pytest.raises(TuiPtySpecError, match="unrecognized mouse button"):
             encode_click(0, 0, "super-click")
+
+
+class TestEncodeDrag:
+    """#3604: press-drag-release had no primitive at all before this
+    issue — every drag-to-select/resize-handle journey needs it."""
+
+    def test_press_motion_release_sequence(self) -> None:
+        data = encode_drag(0, 0, 2, 4, "left")
+        press = b"\x1b[<0;1;1M"
+        motion = b"\x1b[<32;5;3M"  # button code 0 + the 32 motion-held bit
+        release = b"\x1b[<0;5;3m"
+        assert data == press + motion + release
+
+    def test_right_drag_uses_button_code_2(self) -> None:
+        data = encode_drag(1, 1, 3, 3, "right")
+        assert data == b"\x1b[<2;2;2M" + b"\x1b[<34;4;4M" + b"\x1b[<2;4;4m"
+
+    def test_wheel_button_raises(self) -> None:
+        with pytest.raises(TuiPtySpecError, match="drag"):
+            encode_drag(0, 0, 1, 1, "wheel-up")
+
+    def test_unrecognized_button_raises(self) -> None:
+        with pytest.raises(TuiPtySpecError, match="unrecognized drag button"):
+            encode_drag(0, 0, 1, 1, "super-click")
 
 
 # ── VtScreen ─────────────────────────────────────────────────────────────────
@@ -335,6 +430,16 @@ class TestVtScreen:
         screen = VtScreen(cols=20, rows=5)
         screen.feed(b"HI")
         assert screen.cursor() == (0, 2)
+
+    def test_resize_grows_the_screen_so_a_wider_write_is_fully_visible(self) -> None:
+        # #3604: a reflow journey resizes mid-run; the VT screen must track
+        # it or a post-resize `expect_screen` would read stale, truncated
+        # dimensions. Write a string that overflows the original 10-col
+        # width — it must still be entirely present only AFTER resize.
+        screen = VtScreen(cols=10, rows=5)
+        screen.resize(5, 20)
+        screen.feed(b"0123456789ABCDEF")
+        assert "0123456789ABCDEF" in screen.text()
 
     def test_missing_pyte_raises_actionable_error(self, monkeypatch) -> None:
         import builtins
@@ -369,10 +474,14 @@ class FakePtyChild:
         self._start = time.monotonic()
         self._alive = not dies_immediately
         self.writes: list[bytes] = []
+        self.resizes: list[tuple[int, int]] = []
         self._closed = False
 
     def write(self, data: bytes) -> None:
         self.writes.append(data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self.resizes.append((cols, rows))
 
     def read(self, timeout: float) -> bytes:
         deadline = time.monotonic() + timeout
@@ -441,6 +550,44 @@ class TestSmokeRunnerActions:
             _step("click", 1, row=3, col=7, button="right"),
         ]))
         assert encode_click(3, 7, "right") in child.writes
+
+    def test_key_step_handles_alt_and_shift_combos(self) -> None:
+        # #3604: this is the exact run-spec shape the issue's own
+        # reproduction describes — `key: 'alt+m'`/`key: 'shift+right'` as
+        # a YAML smoke-spec step, not just a direct `encode_key` call.
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("key", 1, id="alt-m", key="alt+m"),
+            _step("key", 2, id="shift-right", key="shift+right"),
+            _step("key", 3, id="ctrl-home", key="ctrl+home"),
+        ]))
+        assert [r["status"] for r in results] == ["pass", "pass", "pass", "pass"]
+        assert b"\x1bm" in child.writes
+        assert b"\x1b[1;2C" in child.writes
+        assert b"\x1b[1;5H" in child.writes
+
+    def test_drag_step_writes_press_motion_release(self) -> None:
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("drag", 1, row=0, col=0, to_row=2, to_col=4, button="left"),
+        ]))
+        assert results[1]["status"] == "pass"
+        assert encode_drag(0, 0, 2, 4, "left") in child.writes
+
+    def test_resize_step_resizes_both_the_pty_and_the_vt_screen(self) -> None:
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("resize", 1, cols=120, rows=40),
+        ], cols=80, rows=24))
+        assert results[1]["status"] == "pass"
+        assert child.resizes == [(120, 40)]
+        assert (runner._cols, runner._rows) == (120, 40)
 
 
 class TestSmokeRunnerWaitIdle:
@@ -612,6 +759,42 @@ class TestTuiPtySessionCprAutoReply:
             replies = [w for w in child.writes if w.startswith(b"\x1b[") and w.endswith(b"R")]
             assert len(replies) == 1
             assert replies[0] == b"\x1b[1;1R"
+        finally:
+            session.close()
+
+
+class TestTuiPtySessionDragAndResize:
+    """#3604: the interactively-driven session (``coord app-drive tui-pty
+    send --drag``/``resize``) must not drift from :class:`SmokeRunner`'s
+    own drag/resize handling — same primitives, same two-sided resize
+    (#2096 'one question, one answer')."""
+
+    def test_send_drag_writes_the_same_bytes_encode_drag_would(self) -> None:
+        child = FakePtyChild()
+        session = TuiPtySession(
+            "unused", ".", cols=80, rows=24,
+            spawn_child=lambda launch, cwd, cols, rows: child,
+        )
+        try:
+            session.send_drag(1, 1, 3, 3, "right")
+            assert encode_drag(1, 1, 3, 3, "right") in child.writes
+        finally:
+            session.close()
+
+    def test_resize_resizes_both_the_child_and_the_vt_screen(self) -> None:
+        child = FakePtyChild()
+        session = TuiPtySession(
+            "unused", ".", cols=80, rows=24,
+            spawn_child=lambda launch, cwd, cols, rows: child,
+        )
+        try:
+            session.resize(120, 40)
+            # The real pty/ConPTY side.
+            assert child.resizes == [(120, 40)]
+            # The VT screen side — pyte's own Screen tracks its dimensions
+            # as `.columns`/`.lines`; both must reflect the resize, not
+            # just the real pty half.
+            assert (session._screen._screen.columns, session._screen._screen.lines) == (120, 40)
         finally:
             session.close()
 

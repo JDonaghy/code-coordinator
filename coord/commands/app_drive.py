@@ -9,8 +9,13 @@ Subcommands:
 - ``open --kind K --launch CMD --cwd DIR`` — spawn a session; prints
   ``{"session_id": ...}``. Kept alive by a background daemon
   (:mod:`coord.app_drive_daemon`) until ``close`` or its own idle timeout.
-- ``send --session ID --key K|--text T|--click R,C[,BUTTON]`` — one input
-  event against the live session.
+- ``send --session ID --key K|--text T|--click R,C[,BUTTON]|--drag
+  R,C,TO_R,TO_C[,BUTTON]`` — one input event against the live session.
+  ``--key`` accepts modifier combos (``alt+m``, ``shift+right``,
+  ``ctrl+home``, #3604 — see :func:`coord.tui_pty_driver.encode_key` for
+  exactly which are recognized); ``--drag`` is tui-pty only.
+- ``resize --session ID --cols N --rows N`` — live-resize the tui-pty
+  session's pty/VT screen (#3604), tui-pty only.
 - ``wait-idle --session ID [--ms N] [--timeout-ms N]`` — tui-pty only.
 - ``screen --session ID`` / ``capture --session ID`` — current rendered
   text (tui-pty) or a PNG/BMP/XWD-style image capture (native kinds),
@@ -115,11 +120,17 @@ def _resolve(session: str):
     "--click", "click_spec", default=None,
     help="'ROW,COL[,BUTTON]' (tui-pty) or 'X,Y[,BUTTON]' (native kinds).",
 )
-def app_drive_send(session_id: str, key: str | None, text: str | None, click_spec: str | None) -> None:
-    """Send exactly one input event to an open session (--key, --text, or --click)."""
-    chosen = [v for v in (key, text, click_spec) if v is not None]
+@click.option(
+    "--drag", "drag_spec", default=None,
+    help="'ROW,COL,TO_ROW,TO_COL[,BUTTON]' — a press-drag-release gesture (#3604, tui-pty only).",
+)
+def app_drive_send(
+    session_id: str, key: str | None, text: str | None, click_spec: str | None, drag_spec: str | None,
+) -> None:
+    """Send exactly one input event to an open session (--key, --text, --click, or --drag)."""
+    chosen = [v for v in (key, text, click_spec, drag_spec) if v is not None]
     if len(chosen) != 1:
-        click.echo("error: pass exactly one of --key / --text / --click", err=True)
+        click.echo("error: pass exactly one of --key / --text / --click / --drag", err=True)
         sys.exit(2)
     handle = _resolve(session_id)
     try:
@@ -127,7 +138,7 @@ def app_drive_send(session_id: str, key: str | None, text: str | None, click_spe
             reply = send_command(handle, {"op": "send_key", "args": {"key": key}})
         elif text is not None:
             reply = send_command(handle, {"op": "send_text", "args": {"text": text}})
-        else:
+        elif click_spec is not None:
             parts = click_spec.split(",")
             if len(parts) not in (2, 3):
                 click.echo("error: --click expects 'A,B' or 'A,B,BUTTON'", err=True)
@@ -138,6 +149,32 @@ def app_drive_send(session_id: str, key: str | None, text: str | None, click_spe
                 reply = send_command(handle, {"op": "send_click", "args": {"row": a, "col": b, "button": button}})
             else:
                 reply = send_command(handle, {"op": "send_click", "args": {"x": a, "y": b, "button": button}})
+        else:
+            parts = drag_spec.split(",")
+            if len(parts) not in (4, 5):
+                click.echo("error: --drag expects 'ROW,COL,TO_ROW,TO_COL' or '...,BUTTON'", err=True)
+                sys.exit(2)
+            row, col, to_row, to_col = (int(p) for p in parts[:4])
+            button = parts[4] if len(parts) == 5 else "left"
+            reply = send_command(
+                handle,
+                {"op": "send_drag", "args": {"row": row, "col": col, "to_row": to_row, "to_col": to_col, "button": button}},
+            )
+    except AppDriveError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo(json.dumps(reply))
+
+
+@app_drive_group.command("resize")
+@click.option("--session", "session_id", required=True)
+@click.option("--cols", type=int, required=True)
+@click.option("--rows", type=int, required=True)
+def app_drive_resize(session_id: str, cols: int, rows: int) -> None:
+    """Live-resize a tui-pty session's pty/VT screen (#3604, tui-pty only)."""
+    handle = _resolve(session_id)
+    try:
+        reply = send_command(handle, {"op": "resize", "args": {"cols": cols, "rows": rows}})
     except AppDriveError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)

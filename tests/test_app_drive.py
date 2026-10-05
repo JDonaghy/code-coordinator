@@ -186,6 +186,33 @@ class TestOpenSessionCloseSession:
         with pytest.raises(AppDriveError):
             open_session("not-a-real-kind", launch="cat", cwd="/tmp")
 
+    def test_send_drag_and_resize_round_trip_through_a_real_daemon(self):
+        """#3604: against a real `cat`-under-tui-pty daemon (not a fake),
+        exercises the whole `open -> send_drag/resize -> close` path this
+        issue's CLI wiring added — the end-to-end counterpart to
+        :class:`TestAppDriveDaemonDispatch`'s mocked-backend coverage."""
+        handle = open_session("tui-pty", launch="cat", cwd="/tmp", cols=40, rows=5)
+        try:
+            drag_reply = send_command(
+                handle,
+                {"op": "send_drag", "args": {"row": 0, "col": 0, "to_row": 2, "to_col": 4, "button": "left"}},
+            )
+            assert drag_reply == {"ok": True}
+
+            resize_reply = send_command(handle, {"op": "resize", "args": {"cols": 80, "rows": 24}})
+            assert resize_reply == {"ok": True}
+
+            # The resize must actually be visible to the NEXT `screen` read
+            # (#2096: observed, not just "no error was raised") — write
+            # text wider than the original 40-col width and confirm it's
+            # fully present, which is only possible post-resize.
+            send_command(handle, {"op": "send_text", "args": {"text": "x" * 60 + "\n"}})
+            time.sleep(0.5)
+            screen = send_command(handle, {"op": "screen", "args": {}})
+            assert "x" * 60 in screen["text"]
+        finally:
+            close_session(handle)
+
     def test_open_gtk_native_on_a_headless_box_reports_unavailable_not_a_crash(self):
         """#3510/#3566, exercised for real (no fake): this CI sandbox has
         neither `$DISPLAY` nor `$WAYLAND_DISPLAY` set, so `gtk-native`'s own
@@ -317,4 +344,53 @@ class TestAppDriveDaemonDispatch:
             pass
 
         reply = _dispatch(_Backend(), "mac-native", {"op": "screen", "args": {}})
+        assert "error" in reply
+
+    def test_send_drag_routes_to_backend_send_drag(self):
+        # #3604: the daemon-side half of `coord app-drive send --drag`.
+        from coord.app_drive_daemon import _dispatch
+
+        calls = []
+
+        class _Backend:
+            def send_drag(self, row, col, to_row, to_col, button):
+                calls.append((row, col, to_row, to_col, button))
+
+        reply = _dispatch(
+            _Backend(), "tui-pty",
+            {"op": "send_drag", "args": {"row": 1, "col": 2, "to_row": 5, "to_col": 9, "button": "right"}},
+        )
+        assert reply == {"ok": True}
+        assert calls == [(1, 2, 5, 9, "right")]
+
+    def test_send_drag_is_rejected_for_non_tui_pty_kinds(self):
+        from coord.app_drive_daemon import _dispatch
+
+        class _Backend:
+            pass
+
+        reply = _dispatch(_Backend(), "mac-native", {"op": "send_drag", "args": {}})
+        assert "error" in reply
+
+    def test_resize_routes_to_backend_resize(self):
+        # #3604: the daemon-side half of `coord app-drive resize`.
+        from coord.app_drive_daemon import _dispatch
+
+        calls = []
+
+        class _Backend:
+            def resize(self, cols, rows):
+                calls.append((cols, rows))
+
+        reply = _dispatch(_Backend(), "tui-pty", {"op": "resize", "args": {"cols": 120, "rows": 40}})
+        assert reply == {"ok": True}
+        assert calls == [(120, 40)]
+
+    def test_resize_is_rejected_for_non_tui_pty_kinds(self):
+        from coord.app_drive_daemon import _dispatch
+
+        class _Backend:
+            pass
+
+        reply = _dispatch(_Backend(), "win-native", {"op": "resize", "args": {"cols": 80, "rows": 24}})
         assert "error" in reply
