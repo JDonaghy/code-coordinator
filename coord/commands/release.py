@@ -451,8 +451,15 @@ def _paused_machine_busy(config) -> list:
 
     Thin-client aware for free: `follow_on_paused_set` routes through the
     daemon's `/pause` endpoint when a board service is configured (#1563),
-    so this reads the one copy of pause state that actually governs
-    dispatch — same as every other pause-aware call site in the fleet.
+    so this reads the one copy of pause state the daemon maintains.
+    #3599: it is no longer "the same set that governs dispatch" though —
+    every dispatch-target picker (`select_fix_machine`, `pick_reviewer_machine`,
+    `_ranked_reviewer_candidates`, `rank_smoke_machines`) now reads the FULL
+    cordon-inclusive `paused_set()` instead, because a cordon answers a
+    genuinely different question here (see this function's own docstring
+    above) than it does for them. This is the ONE remaining caller of
+    `follow_on_paused_set` for exactly that reason — not because it still
+    shares dispatch's answer, but because it doesn't.
     """
     from coord.machine_pause import (  # noqa: PLC0415
         describe_pause_state,

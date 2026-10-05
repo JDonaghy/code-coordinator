@@ -3684,11 +3684,11 @@ def dispatch_review(
                 # unavailable: dispatching onto it anyway is the exact bypass
                 # #3599 removed, and this branch has no OTHER candidate to
                 # fall through to regardless (the branch only exists locally
-                # on the original worker), so the honest answer is to stall
-                # visibly at `branch_not_on_remote` and let the drive-queue
-                # entry wait, rather than re-busy the host the cordon is
-                # draining.
-                from coord.machine_pause import paused_set  # noqa: PLC0415
+                # on the original worker).
+                from coord.machine_pause import (  # noqa: PLC0415
+                    follow_on_paused_set,
+                    paused_set,
+                )
                 paused = paused_set(config.machines)
                 worker_machine = next(
                     (m for m in config.machines if m.name == completed.machine_name),
@@ -3702,7 +3702,48 @@ def dispatch_review(
                     # Restrict to just the worker machine — it has the branch locally.
                     candidates = [(worker_machine, True)]
                 else:
-                    # Original machine also unavailable — stall visibly.
+                    # #3599 (review finding): a cordon is this fleet's own
+                    # bounded, self-clearing drain mechanism — unlike an
+                    # explicit pause or "machine not in config", it is not a
+                    # condition that needs a human to undo. Setting the
+                    # sticky `branch_not_on_remote` state here for a
+                    # cordon-only unavailability would deny this review
+                    # FOREVER: bulk dispatch only ever reconsiders
+                    # `review_state in (None, "pending")`, and nothing resets
+                    # this value once set, even after the branch is pushed
+                    # and the cordon lifts. So when the worker machine's
+                    # SOLE reason for being unavailable is an active cordon
+                    # (not also an explicit pause or a quiet-hours window —
+                    # `follow_on_paused_set` is `paused_set` minus cordons),
+                    # leave `review_state` untouched (same as the sibling
+                    # "no candidates" denial above) so the next bulk-dispatch
+                    # tick genuinely retries it, instead of stalling visibly
+                    # in a state nothing but a human clears.
+                    non_cordon_paused = follow_on_paused_set(config.machines)
+                    cordon_only = (
+                        worker_machine is not None
+                        and worker_machine.can_work_on(completed.repo_name)
+                        and worker_machine.name in paused
+                        and worker_machine.name not in non_cordon_paused
+                    )
+                    if cordon_only:
+                        log.warning(
+                            "[review] branch %r not on remote for %s and original "
+                            "machine %s is cordoned for a release (not paused or "
+                            "quiet-hours-covered) — leaving the review pending; "
+                            "it retries once the cordon lifts or expires (#3599)",
+                            completed.branch, completed.assignment_id,
+                            completed.machine_name,
+                        )
+                        return _deny(
+                            f"branch {completed.branch!r} not on remote and "
+                            f"original worker machine {completed.machine_name!r} "
+                            "is cordoned for a release — waiting for the cordon "
+                            "to lift or expire (#3599)"
+                        )
+                    # Original machine also unavailable for a durable reason
+                    # (explicit pause, quiet hours, or not configured/cannot
+                    # build this repo) — stall visibly.
                     log.error(
                         "[review] branch %r not on remote for %s and original machine "
                         "%s is unavailable (paused or not configured) — "

@@ -1497,16 +1497,17 @@ def route_work_by_capability(
       before the caller ever sees the `ValueError`;
     - not in `paused_set(machines)` — the FULL cordon-inclusive set, the
       same one `coord.brain.propose()` and `coord assign`'s CLI both gate a
-      `type="work"` proposal's machine on before it is ever chosen. This is
-      new work, not the tail of a leg already in flight, so this
-      deliberately does NOT use `follow_on_paused_set()` — that one exists
-      for `select_fix_machine`/`rank_smoke_machines`, which finish work
-      that already started elsewhere (#2240, #2636). A reroute here must
-      not land a `type="work"` leg on a machine the operator explicitly
-      `coord pause`d or that is inside its declared `quiet_hours` window —
-      `dispatch()` itself has no other pause/quiet-hours check anywhere in
-      its body, since that filtering has always been done upstream, and
-      this new gate runs strictly after `coord plan` already did it once.
+      `type="work"` proposal's machine on before it is ever chosen, and
+      (#3599) the same set `select_fix_machine`/`rank_smoke_machines` now
+      read too — `follow_on_paused_set()` is no longer used for ANY
+      dispatch-target decision (see its docstring in
+      `coord.machine_pause`). A reroute here must not land a `type="work"`
+      leg on a machine the operator explicitly `coord pause`d, that is
+      inside its declared `quiet_hours` window, or that a release cordon is
+      draining — `dispatch()` itself has no other pause/quiet-hours check
+      anywhere in its body, since that filtering has always been done
+      upstream, and this new gate runs strictly after `coord plan` already
+      did it once.
 
     *now* is forwarded to `paused_set()` untouched, exactly like
     `rank_smoke_machines`'s own *now* parameter — `None` (the default, and
@@ -1641,8 +1642,9 @@ def route_work_by_liveness(
     (#3241 review): `can_work_on(repo_name)`, a configured `repo_path`, and
     not in the FULL cordon-inclusive `paused_set()` — this is new work
     being routed for the first time, not the tail of a leg already running
-    elsewhere, so (like that function, and unlike `select_fix_machine`
-    below) it deliberately does NOT use `follow_on_paused_set()`.
+    elsewhere. (#3599: `select_fix_machine` below reads the same FULL
+    `paused_set()` now too — `follow_on_paused_set()` is no longer used for
+    any dispatch-target decision anywhere in this module.)
 
     *files_likely* / *capability_rules* make that filter CAPABILITY-AWARE
     (#3353 review round 3), closing the gap between this gate and the

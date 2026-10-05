@@ -24,6 +24,7 @@ import pytest
 
 from coord.config import Config, PipelineConfig, ReviewsConfig
 from coord.conflict_fix import (
+    ALL_CANDIDATES_PAUSED,
     ALL_CANDIDATES_UNREACHABLE,
     ALREADY_UPSTREAM_MARKER,
     ASSIGN_POST_FAILED,
@@ -901,6 +902,83 @@ class TestLivenessAwareMachineSelection:
         assert pick.machine is not None
         assert pick.machine.name == "server"
         assert pick.reason == ""
+
+
+# ── #3599: cordon-aware machine selection ───────────────────────────────────
+#
+# This picker used to consult neither `paused_set()` nor the cordon store at
+# all (see tests/test_release_roll_between_legs_2854.py's own history) — a
+# mechanical-conflict rebase is NEW work for whichever machine it lands on,
+# so unlike the review/fix/smoke pickers there was never a #2240 "tail of an
+# in-flight leg" argument for exempting it from a release cordon to begin
+# with.
+
+
+class TestCordonAwareMachineSelection:
+    def test_a_wholly_cordoned_fleet_waits_instead_of_picking_a_machine(
+        self, two_machine_config: Config,
+    ) -> None:
+        from coord.machine_pause import local_set_cordon
+
+        for name in ("laptop", "server"):
+            local_set_cordon(name, target_version="0.5.598")
+
+        pick = select_conflict_fix_machine("api", Board(), two_machine_config)
+        assert pick.machine is None
+        assert pick.reason == ALL_CANDIDATES_PAUSED
+        assert pick.reason != ALL_CANDIDATES_UNREACHABLE, (
+            "a cordon is a bounded, self-clearing wait, not an agent/"
+            "network problem — the two must stay distinguishable"
+        )
+
+    def test_a_partially_cordoned_fleet_routes_to_the_uncordoned_host(
+        self, two_machine_config: Config,
+    ) -> None:
+        from coord.machine_pause import local_set_cordon
+
+        local_set_cordon("laptop", target_version="0.5.598")
+
+        pick = select_conflict_fix_machine(
+            "api", Board(), two_machine_config, prefer_machine="laptop",
+        )
+        assert pick.machine is not None
+        assert pick.machine.name == "server"
+
+    def test_an_explicit_pause_is_reported_under_the_same_reason_as_a_cordon(
+        self, two_machine_config: Config,
+    ) -> None:
+        from coord.machine_pause import local_pause
+
+        for name in ("laptop", "server"):
+            local_pause(name)
+
+        pick = select_conflict_fix_machine("api", Board(), two_machine_config)
+        assert pick.machine is None
+        assert pick.reason == ALL_CANDIDATES_PAUSED
+
+    def test_a_cordoned_machine_is_filtered_out_before_the_busy_fallback(
+        self, two_machine_config: Config,
+    ) -> None:
+        """Pre-#3599, "no liveness signal at all" fell all the way back to
+        `candidates[0]` (config order) even if that machine was busy. A
+        cordoned machine must never be reachable through that fallback
+        either — it is removed from `candidates` entirely, before busy/
+        liveness ranking ever runs."""
+        from coord.machine_pause import local_set_cordon
+
+        local_set_cordon("laptop", target_version="0.5.598")
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            status="running",
+        ))
+
+        pick = select_conflict_fix_machine("api", board, two_machine_config)
+        assert pick.machine is not None
+        assert pick.machine.name == "server", (
+            "server is busy but not cordoned — it must still be preferred "
+            "over the cordoned laptop, even though laptop is idle"
+        )
 
 
 # ── Dispatch ────────────────────────────────────────────────────────────────

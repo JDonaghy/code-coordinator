@@ -1404,6 +1404,20 @@ def has_prior_conflict_fix(
 # always actually the second thing.
 NO_MACHINE_CONFIGURED = "no_capable_machine"
 ALL_CANDIDATES_UNREACHABLE = "all_candidates_unreachable"
+# #3599: every machine that declares this repo is paused, inside its
+# quiet-hours window, or (the issue's own scope — "a cordoned host accepts
+# NO new assignment of any type") under an active release cordon right now.
+# This picker is reached from the MERGE side (`coord merge`'s conflict-fix
+# dispatch, `coord/notify.py`'s stalled-pipeline arms) for a mechanical
+# rebase that is new work for the machine it lands on — it did not
+# previously exist anywhere, so there is no "tail of an in-flight leg"
+# exemption to reach for here even in #2240's original theory. Distinct
+# from ALL_CANDIDATES_UNREACHABLE (an agent/network problem) and
+# NO_MACHINE_CONFIGURED (nobody declares the repo at all) — this is "every
+# declared candidate is routable in principle, just not accepting new work
+# right now", the same bounded, self-clearing wait every other #3599 picker
+# leaves the row in rather than forcing it onto a draining host.
+ALL_CANDIDATES_PAUSED = "all_candidates_paused"
 # #3353 review (round 2): selection SUCCEEDED — a machine was picked and
 # passed its liveness probe — and then the `POST /assign` to that very
 # machine failed anyway. This is the "flapping machine" case the issue's
@@ -1438,6 +1452,9 @@ class ConflictFixMachinePick:
       repo, but a live reachability check (only performed when the caller
       opts in via *status_fetcher* — see that parameter below) found every
       one of them down right now. ``unreachable`` names them.
+    - :data:`ALL_CANDIDATES_PAUSED` (#3599) — one or more machines declare
+      the repo, but every one of them is currently paused, quiet-hours
+      covered, or under a release cordon — see that constant.
 
     Never returned for "everyone's busy" — a busy-but-reachable machine is
     still picked (queues on the agent), exactly like before #3353.
@@ -1494,10 +1511,29 @@ def select_conflict_fix_machine(
     :data:`NO_MACHINE_CONFIGURED`, and from the retry-cap "already in
     flight" refusal callers check for separately before ever reaching this
     function.
+
+    #3599: candidates are filtered through the FULL cordon-inclusive
+    `paused_set()` BEFORE any of the busy/liveness ranking above runs — the
+    issue's own scope statement ("a cordoned host accepts NO new assignment
+    of any type") names a conflict-fix leg explicitly, and unlike
+    `select_fix_machine`/`pick_reviewer_machine`/`rank_smoke_machines`
+    there was never a #2240 "tail of an in-flight leg" argument for this
+    picker to begin with — a mechanical rebase is new work for whichever
+    machine it lands on. A capable machine that is merely paused/quiet/
+    cordoned is excluded the same way an unreachable one is, but reported
+    under the distinct :data:`ALL_CANDIDATES_PAUSED` reason — this is a
+    bounded, self-clearing wait (a pause lifts, a cordon expires), never an
+    agent/network problem.
     """
-    candidates = [m for m in config.machines if m.can_work_on(repo_name)]
-    if not candidates:
+    from coord.machine_pause import paused_set  # noqa: PLC0415
+
+    all_capable = [m for m in config.machines if m.can_work_on(repo_name)]
+    if not all_capable:
         return ConflictFixMachinePick(None, reason=NO_MACHINE_CONFIGURED)
+    paused = paused_set(config.machines)
+    candidates = [m for m in all_capable if m.name not in paused]
+    if not candidates:
+        return ConflictFixMachinePick(None, reason=ALL_CANDIDATES_PAUSED)
 
     busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
     live_check = status_fetcher is not None
@@ -1627,6 +1663,12 @@ def describe_conflict_fix_decline(
         )
     if pick.reason == NO_MACHINE_CONFIGURED:
         return "no configured machine can work on this repo"
+    if pick.reason == ALL_CANDIDATES_PAUSED:
+        return (
+            "every capable machine is paused, quiet-hours covered, or "
+            "cordoned for a release right now — waiting; none of those "
+            "need a human to clear (#3599)"
+        )
     if pick.reason == ASSIGN_POST_FAILED:
         # Selection ran and PICKED a machine; the `/assign` POST to it then
         # failed. The "flapping machine" the issue's Second half warns
