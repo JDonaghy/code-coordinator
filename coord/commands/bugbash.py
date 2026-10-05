@@ -598,6 +598,16 @@ def _print_round(report: BugbashReport) -> None:
         # round.
         for platform, note in r.protocol_error_lanes.items():
             click.secho(f"  lane PROTOCOL ERROR ({platform}): {note}", fg="red")
+        # #3611: an unavailable lane (#3510 — a locked/absent GUI session,
+        # a missing permission grant; NOT a bug finding) must be just as
+        # visible as a SKIPPED/FAILED one — previously this bucket was
+        # tracked on `RoundReport.unavailable_lanes` and fed into the
+        # round's own termination reason, but never actually PRINTED, so a
+        # round where every lane came back unavailable (e.g. every
+        # win-native/mac-native lane on a host with no real GUI session)
+        # read as silently empty instead of naming which lane(s) and why.
+        for platform, reason in r.unavailable_lanes.items():
+            click.secho(f"  lane UNAVAILABLE ({platform}): {reason}", fg="yellow")
         # #3580 requirement 5: a clean round should read as "N journeys
         # passed", not just a quiet "0 finding(s)" line.
         for platform, cov in r.lane_coverage.items():

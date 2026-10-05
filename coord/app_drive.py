@@ -150,7 +150,18 @@ class SessionHandle:
     and the port is already world-readable from this very session file —
     a stolen token is no bigger a leak than a stolen port, but it does
     stop an unrelated local process from merely *guessing* the port and
-    injecting commands)."""
+    injecting commands).
+
+    ``bridge`` is ``True`` only for a ``win-native`` session opened on a
+    WSL host (#3611) — the daemon this session names was spawned on the
+    real Windows-side interpreter via :mod:`coord.win_native_bridge`, so
+    ``pid``/``app_pid`` are genuine Windows PIDs, not Linux ones.
+    Everything that signals/probes those pids (:func:`_pid_alive`,
+    :func:`close_session`) must branch on this — a Windows PID is not a
+    Linux PID, so a POSIX ``os.kill``/``/proc`` probe against one is not
+    merely wrong, it can read as a false "alive" (collision with an
+    unrelated, actually-alive Linux PID sharing the same small
+    integer)."""
 
     session_id: str
     kind: str
@@ -158,6 +169,7 @@ class SessionHandle:
     port: int
     token: str
     app_pid: int | None = None
+    bridge: bool = False
 
 
 def _write_session_file(handle: SessionHandle) -> None:
@@ -169,7 +181,7 @@ def _write_session_file(handle: SessionHandle) -> None:
     tmp.write_text(json.dumps({
         "session_id": handle.session_id, "kind": handle.kind,
         "pid": handle.pid, "port": handle.port, "token": handle.token,
-        "app_pid": handle.app_pid,
+        "app_pid": handle.app_pid, "bridge": handle.bridge,
     }))
     tmp.replace(path)
 
@@ -191,6 +203,11 @@ def load_session(session_id: str) -> SessionHandle:
             pid=int(raw["pid"]), port=int(raw["port"]),
             token=raw.get("token", ""),
             app_pid=int(raw["app_pid"]) if raw.get("app_pid") is not None else None,
+            # `.get(..., False)`: a session file written before #3611 has
+            # no `bridge` key at all — absence means "not a bridge
+            # session" (the only meaning it could have had before this
+            # field existed), not a parse error.
+            bridge=bool(raw.get("bridge", False)),
         )
     except (KeyError, TypeError, ValueError) as e:
         raise AppDriveError(f"corrupt app-drive session file for {session_id!r}: {e}") from e
@@ -203,9 +220,21 @@ def _forget_session(session_id: str) -> None:
         pass
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid: int, *, bridge: bool = False) -> bool:
     """Whether *pid* is still a live process right now — an OBSERVATION
     (#2096), never inferred from "we haven't been told otherwise".
+
+    *bridge* (#3611) routes the probe through
+    :func:`coord.win_native_bridge.windows_pid_alive` instead of every
+    POSIX/Windows branch below — *pid* is a genuine Windows PID there (a
+    bridge-spawned ``win-native`` daemon runs on the real Windows-side
+    interpreter, see :class:`SessionHandle`), and none of
+    ``os.waitpid``/``os.kill``/``ctypes``'s ``OpenProcess`` mean anything
+    against a pid from a different OS's pid namespace — `os.kill` against
+    an arbitrary small integer on THIS (WSL/Linux) host would either
+    always report "dead" (no such Linux pid) or, worse, collide with an
+    unrelated, actually-alive Linux process that happens to reuse the
+    same number.
 
     First tries a non-blocking reap (``waitpid(pid, WNOHANG)``): when
     *pid* is a direct child of THIS process (true for a caller that opened
@@ -228,6 +257,14 @@ def _pid_alive(pid: int) -> bool:
     ``OpenProcess`` existence check via ``ctypes`` instead of reusing the
     POSIX call under a different OS.
     """
+    if bridge:
+        # Deferred: this module has no other reason to import
+        # `coord.win_native_bridge` (every non-bridge session never
+        # touches it) — module-level would add a needless import for the
+        # common (non-WSL) case.
+        from coord.win_native_bridge import windows_pid_alive  # noqa: PLC0415
+
+        return windows_pid_alive(pid)
     if sys.platform != "win32":
         try:
             reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
@@ -320,6 +357,31 @@ def open_session(
     very CLI call that started it, failing the very next ``send``. The
     idle self-expiry (:mod:`coord.app_drive_daemon`) remains the backstop
     for the case nobody ever calls ``close`` at all.
+
+    **The WSL case (#3611).** ``win-native``'s own backend
+    (:class:`coord.win_native_driver.Win32Calls`) raises at construction on
+    any host where ``os.name != "nt"`` — including a WSL-hosted ``windows``-
+    capability agent (dell64, :mod:`coord.win_native_bridge`'s own module
+    docstring), since ``ctypes.windll``/``comtypes`` have no meaning there
+    no matter what gets pip-installed into that (Linux) venv. On
+    :func:`coord.win_native_bridge.is_wsl_host`, this spawns the SAME
+    :mod:`coord.app_drive_daemon` module but on the REAL Windows-side
+    interpreter (:func:`coord.win_native_bridge.ensure_windows_win_native_venv`)
+    reached through WSL interop — exactly the mechanism
+    :func:`coord.acceptance_drivers._run_win_native` already uses for the
+    whole-spec ``run-spec``/smoke path, just spawning a long-lived daemon
+    instead of a one-shot spec run. *cwd* and *ready_file* are translated to
+    their Windows-visible form (:func:`coord.win_native_bridge
+    .translate_to_windows_path` — the Windows-side process can resolve a
+    ``\\\\wsl.localhost\\...`` UNC path back into this same WSL session's
+    own filesystem, so this function's own *ready_file* polling loop below
+    needs no change at all) before being handed to the bridge python;
+    *launch* is passed through unchanged, same as the smoke bridge — it
+    names the real Windows exe to launch, which is the caller's own
+    responsibility to express in a form the Windows side can resolve. The
+    resulting :class:`SessionHandle` is marked ``bridge=True`` so
+    :func:`close_session` knows its ``pid``/``app_pid`` are genuine
+    Windows PIDs, not Linux ones.
     """
     if kind not in APP_DRIVE_KINDS:
         raise AppDriveError(f"unknown app-drive kind {kind!r} — expected one of {APP_DRIVE_KINDS}")
@@ -330,11 +392,36 @@ def open_session(
     if ready_file.exists():
         ready_file.unlink()
 
+    bridge_mode = False
+    spawn_argv0 = python or sys.executable
+    spawn_cwd = cwd
+    spawn_ready_file = str(ready_file)
+
+    if kind == "win-native":
+        from coord.win_native_bridge import is_wsl_host  # noqa: PLC0415 — see `_pid_alive`'s own deferred import
+
+        if is_wsl_host():
+            from coord.win_native_bridge import (  # noqa: PLC0415
+                WinNativeBridgeError,
+                ensure_windows_win_native_venv,
+                translate_to_windows_path,
+                windows_path_to_wsl_path,
+            )
+
+            bridge_mode = True
+            try:
+                windows_python = python or ensure_windows_win_native_venv()
+                spawn_argv0 = windows_path_to_wsl_path(windows_python)
+                spawn_cwd = translate_to_windows_path(cwd)
+                spawn_ready_file = translate_to_windows_path(str(ready_file))
+            except WinNativeBridgeError as e:
+                raise AppDriveError(f"win-native WSL bridge could not be prepared: {e}") from e
+
     argv = [
-        python or sys.executable, "-m", "coord.app_drive_daemon",
-        "--kind", kind, "--launch", launch, "--cwd", cwd,
+        spawn_argv0, "-m", "coord.app_drive_daemon",
+        "--kind", kind, "--launch", launch, "--cwd", spawn_cwd,
         "--cols", str(cols), "--rows", str(rows),
-        "--idle-timeout", str(idle_timeout), "--ready-file", str(ready_file),
+        "--idle-timeout", str(idle_timeout), "--ready-file", spawn_ready_file,
         "--token", token,
     ]
     if width is not None:
@@ -376,6 +463,7 @@ def open_session(
                     session_id=session_id, kind=kind,
                     pid=int(ready["pid"]), port=int(ready["port"]), token=token,
                     app_pid=int(ready["app_pid"]) if ready.get("app_pid") is not None else None,
+                    bridge=bridge_mode,
                 )
                 _write_session_file(handle)
                 return handle
@@ -412,8 +500,8 @@ def _target_pids(handle: SessionHandle) -> tuple[int, ...]:
     return (handle.pid,)
 
 
-def _all_dead(pids: tuple[int, ...]) -> bool:
-    return all(not _pid_alive(pid) for pid in pids)
+def _all_dead(handle: SessionHandle, pids: tuple[int, ...]) -> bool:
+    return all(not _pid_alive(pid, bridge=handle.bridge) for pid in pids)
 
 
 def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
@@ -444,10 +532,32 @@ def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if _all_dead(targets):
+        if _all_dead(handle, targets):
             _forget_session(handle.session_id)
             return True
         time.sleep(0.1)
+
+    if handle.bridge:
+        # #3611: `targets` are genuine Windows PIDs here (a bridge-spawned
+        # `win-native` daemon runs on the real Windows-side interpreter —
+        # see `SessionHandle.bridge`) — `os.kill` cannot address them at
+        # all from this (WSL/Linux) side. `taskkill.exe`'s own `/F` is the
+        # exact same weaker-then-stronger escalation `SIGTERM`/`SIGKILL`
+        # gives every other kind, just reached through WSL interop instead
+        # of a POSIX signal.
+        from coord.win_native_bridge import kill_windows_pid  # noqa: PLC0415 — see `_pid_alive`'s own deferred import
+
+        for force in (False, True):
+            for pid in targets:
+                if _pid_alive(pid, bridge=True):
+                    kill_windows_pid(pid, force=force)
+            escalate_deadline = time.monotonic() + 3.0
+            while time.monotonic() < escalate_deadline:
+                if _all_dead(handle, targets):
+                    _forget_session(handle.session_id)
+                    return True
+                time.sleep(0.1)
+        return False
 
     # `SIGKILL` doesn't exist on Windows (`signal` there defines no POSIX
     # kill signals beyond `SIGTERM`/`SIGBREAK`) — `os.kill(pid, SIGTERM)`
@@ -465,7 +575,7 @@ def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
                 pass
         escalate_deadline = time.monotonic() + 3.0
         while time.monotonic() < escalate_deadline:
-            if _all_dead(targets):
+            if _all_dead(handle, targets):
                 _forget_session(handle.session_id)
                 return True
             time.sleep(0.1)

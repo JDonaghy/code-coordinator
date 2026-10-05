@@ -2809,6 +2809,29 @@ class TestPrintRoundCoverage:
         assert "1 skipped" in out
         assert "no nvim" in out
 
+    def test_unavailable_lane_is_printed_with_its_reason(self, capsys):
+        """#3611: a round where a lane never ran at all (its driver's own
+        session-availability precheck refused, #3510) must say so by name
+        — previously `RoundReport.unavailable_lanes` fed the round's
+        termination reason but was never actually rendered here, so e.g.
+        every win-native/mac-native lane coming back unavailable read as a
+        silent, unexplained empty round."""
+        from coord.commands.bugbash import _print_round
+        from coord.bugbash import BugbashReport
+
+        report_round = RoundReport(round_num=1)
+        report_round.unavailable_lanes["win-native"] = (
+            "win-native driver requires a real Windows host"
+        )
+        report_round.unavailable_lanes["mac-native"] = "the screen is locked"
+        wrapped = BugbashReport(
+            repo="vimcode", rounds=[report_round], termination_reason="lanes_unavailable",
+        )
+        _print_round(wrapped)
+        out = capsys.readouterr().out
+        assert "lane UNAVAILABLE (win-native): win-native driver requires a real Windows host" in out
+        assert "lane UNAVAILABLE (mac-native): the screen is locked" in out
+
 
 # ── coord bugbash CLI (#3569: --lane-timeout, run/harvest subcommands) ───
 

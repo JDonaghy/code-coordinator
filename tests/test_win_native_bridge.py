@@ -20,14 +20,18 @@ import pytest
 from coord.win_native_bridge import (
     DEFAULT_PACKAGE_SPEC,
     POWERSHELL_EXE,
+    TASKKILL_EXE,
+    TASKLIST_EXE,
     WINDOWS_PYTHON_OVERRIDE_ENV,
     WinNativeBridgeError,
     ensure_windows_win_native_venv,
     find_windows_python,
     is_wsl_host,
+    kill_windows_pid,
     run_native_spec_via_bridge,
     translate_to_windows_path,
     windows_path_to_wsl_path,
+    windows_pid_alive,
     windows_venv_python,
     _main,
 )
@@ -243,6 +247,101 @@ def test_windows_venv_python_path() -> None:
     assert windows_venv_python("C:\\coord-win-native-venv") == (
         "C:\\coord-win-native-venv\\Scripts\\python.exe"
     )
+
+
+# ── windows_pid_alive / kill_windows_pid (#3611) ─────────────────────────────
+
+
+class TestWindowsPidAlive:
+    def test_true_when_tasklist_reports_a_matching_row(self) -> None:
+        run = _FakeRun({
+            (TASKLIST_EXE,): lambda argv, **kw: _proc(stdout='"vimcode.exe","4242","Console","1","12,345 K"\n'),
+        })
+        assert windows_pid_alive(4242, run=run) is True
+
+    def test_false_when_tasklist_reports_no_rows(self) -> None:
+        run = _FakeRun({
+            (TASKLIST_EXE,): lambda argv, **kw: _proc(stdout=""),
+        })
+        assert windows_pid_alive(4242, run=run) is False
+
+    def test_false_does_not_substring_match_an_unrelated_digit_run(self) -> None:
+        """#2096: a gate that can never fail is not a gate — this asserts
+        the match is against *pid* as its own quoted CSV field, not a
+        substring of some other column (e.g. a memory/session value that
+        happens to contain the same digits) that would make this read
+        "alive" for a process that was never actually found."""
+        run = _FakeRun({
+            (TASKLIST_EXE,): lambda argv, **kw: _proc(stdout='"other.exe","99","Console","1","424,200 K"\n'),
+        })
+        assert windows_pid_alive(4242, run=run) is False
+
+    def test_false_on_nonzero_exit(self) -> None:
+        run = _FakeRun({
+            (TASKLIST_EXE,): lambda argv, **kw: _proc(returncode=1, stderr="not found"),
+        })
+        assert windows_pid_alive(4242, run=run) is False
+
+    def test_false_when_tasklist_missing_never_raises(self) -> None:
+        def _run(argv, **kw):
+            raise FileNotFoundError("no tasklist.exe")
+
+        assert windows_pid_alive(4242, run=_run) is False
+
+    def test_false_on_timeout_never_raises(self) -> None:
+        def _run(argv, **kw):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=15.0)
+
+        assert windows_pid_alive(4242, run=_run) is False
+
+
+class TestKillWindowsPid:
+    def test_graceful_kill_confirmed_by_a_second_tasklist_probe(self) -> None:
+        calls = []
+
+        def _run(argv, **kw):
+            calls.append(tuple(argv))
+            if argv[0] == TASKKILL_EXE:
+                return _proc(returncode=0)
+            return _proc(stdout="")  # tasklist: gone
+
+        assert kill_windows_pid(4242, run=_run) is True
+        assert calls[0] == (TASKKILL_EXE, "/PID", "4242")
+
+    def test_force_kill_passes_the_f_flag(self) -> None:
+        calls = []
+
+        def _run(argv, **kw):
+            calls.append(tuple(argv))
+            if argv[0] == TASKKILL_EXE:
+                return _proc(returncode=0)
+            return _proc(stdout="")
+
+        assert kill_windows_pid(4242, force=True, run=_run) is True
+        assert calls[0] == (TASKKILL_EXE, "/PID", "4242", "/F")
+
+    def test_returns_false_when_still_alive_after_taskkill(self) -> None:
+        """#2096: the verdict comes from a FRESH `tasklist` observation
+        taken after the kill, never from `taskkill`'s own exit code (which
+        is 0 for "signalled", even against a process that ignores it)."""
+
+        def _run(argv, **kw):
+            if argv[0] == TASKKILL_EXE:
+                return _proc(returncode=0)
+            return _proc(stdout='"stubborn.exe","4242","Console","1","1 K"\n')
+
+        assert kill_windows_pid(4242, run=_run) is False
+
+    def test_taskkill_exec_failure_still_confirms_via_tasklist(self) -> None:
+        """An unreachable `taskkill.exe` must not raise — it's folded into
+        the same confirmed-by-observation verdict every other path uses."""
+
+        def _run(argv, **kw):
+            if argv[0] == TASKKILL_EXE:
+                raise FileNotFoundError("no taskkill.exe")
+            return _proc(stdout="")
+
+        assert kill_windows_pid(4242, run=_run) is True
 
 
 # ── ensure_windows_win_native_venv ───────────────────────────────────────────

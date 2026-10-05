@@ -229,6 +229,132 @@ class TestOpenSessionCloseSession:
         assert exc_info.value.reason
 
 
+class TestOpenSessionWslBridge:
+    """#3611: ``win-native`` on a WSL host must spawn
+    :mod:`coord.app_drive_daemon` on the real Windows-side interpreter via
+    :mod:`coord.win_native_bridge`, not in-process on the WSL agent's own
+    (Linux) Python — the same bridge :func:`coord.acceptance_drivers
+    ._run_win_native` already uses for ``run-spec``/smoke. Every real
+    WSL/Windows interaction is faked (no real WSL host in this suite),
+    mirroring :mod:`tests.test_win_native_bridge`'s own injected-``run``
+    convention."""
+
+    def test_non_wsl_host_never_touches_the_bridge(self, monkeypatch):
+        """The overwhelming common case (a native Windows agent, or any
+        non-WSL host) must take the exact pre-#3611 code path — asserted
+        here by making every bridge seam explode if called at all."""
+        import coord.win_native_bridge as bridge_mod
+
+        monkeypatch.setattr(bridge_mod, "is_wsl_host", lambda: False)
+
+        def _boom(*a, **kw):
+            raise AssertionError("bridge seam called on a non-WSL host")
+
+        monkeypatch.setattr(bridge_mod, "ensure_windows_win_native_venv", _boom)
+        monkeypatch.setattr(bridge_mod, "translate_to_windows_path", _boom)
+
+        # Real (non-bridge) win-native open on this Linux box still fails —
+        # `Win32Calls` itself refuses off-Windows — but it must fail with
+        # THAT message, not anything bridge-shaped, proving the bridge
+        # branch was never entered.
+        with pytest.raises(AppDriveError, match="requires Windows"):
+            open_session("win-native", launch="true", cwd="/tmp")
+
+    def test_wsl_host_spawns_the_daemon_on_the_bridge_python_with_translated_paths(self, monkeypatch, tmp_path):
+        """On a WSL host, `open_session` must: (1) resolve the Windows-side
+        bridge python (skipped here via the `python=` override, mirroring
+        how `run_native_spec_via_bridge` accepts a `venv_python` override),
+        (2) translate `cwd`/`ready_file` to their Windows-visible form
+        BEFORE handing them to the spawned process, and (3) mark the
+        resulting failure/handle as a bridge session. Exercised by letting
+        a REAL subprocess run (this test's own `sys.executable`, standing
+        in for "the bridge python") so the whole `open_session` ready-file
+        protocol runs for real — only the WSL/Windows-translation seams
+        are faked."""
+        import coord.win_native_bridge as bridge_mod
+
+        monkeypatch.setattr(bridge_mod, "is_wsl_host", lambda: True)
+        translate_calls = []
+
+        def _fake_translate(path, **kw):
+            # Identity: a real WSL `\\wsl.localhost\...` UNC path and its
+            # WSL-side POSIX path alias the SAME underlying file — this
+            # fake can't reproduce that cross-OS aliasing on a single real
+            # Linux test box, so it returns *path* unchanged, which is the
+            # one translation that keeps this test's own ready-file
+            # polling (done against the ORIGINAL, untranslated path) still
+            # pointed at whatever the spawned daemon actually writes.
+            # Recording the call is what proves the bridge branch invoked
+            # translation at all.
+            translate_calls.append(path)
+            return path
+
+        monkeypatch.setattr(bridge_mod, "translate_to_windows_path", _fake_translate)
+
+        def _boom(*a, **kw):
+            raise AssertionError("ensure_windows_win_native_venv called despite an explicit python= override")
+
+        monkeypatch.setattr(bridge_mod, "ensure_windows_win_native_venv", _boom)
+
+        # `windows_path_to_wsl_path` is exercised for real (not faked): a
+        # plain POSIX `sys.executable` path is not Windows-shaped, so it's
+        # correctly returned unchanged with no `wslpath` call at all — see
+        # `tests.test_win_native_bridge.TestWindowsPathToWslPath`.
+        import sys as _sys
+
+        with pytest.raises(AppDriveError) as exc_info:
+            open_session(
+                "win-native", launch="true", cwd=str(tmp_path), python=_sys.executable,
+                ready_timeout=10.0,
+            )
+        # The real daemon subprocess genuinely ran (as `kind=win-native`,
+        # confirming the spawned argv was actually executable) and failed
+        # for the expected off-Windows reason — `Win32Calls` itself refuses
+        # construction with `os.name != "nt"` — proving this went through
+        # the real `coord.app_drive_daemon` module, not a short-circuit.
+        assert "requires Windows" in str(exc_info.value)
+        # `translate_to_windows_path` was actually called for BOTH `cwd`
+        # and the ready-file path — the bridge branch's whole reason to
+        # exist (#3611: the Windows-side process can't resolve a bare WSL
+        # path at all).
+        assert str(tmp_path) in translate_calls
+        assert any(c.endswith(".ready") for c in translate_calls)
+
+    def test_close_session_on_a_bridge_handle_signals_via_taskkill_not_os_kill(self, monkeypatch):
+        """#3611: a bridge session's `pid`/`app_pid` are genuine Windows
+        PIDs — `close_session`'s escalation must reach them through
+        `coord.win_native_bridge.kill_windows_pid` (taskkill.exe over WSL
+        interop), never `os.kill` (which would either always miss, or
+        false-positive-collide with an unrelated Linux pid of the same
+        number)."""
+        import coord.win_native_bridge as bridge_mod
+
+        alive = {4242}
+        kill_calls = []
+
+        def _fake_alive(pid, **kw):
+            return pid in alive
+
+        def _fake_kill(pid, *, force=False, **kw):
+            kill_calls.append((pid, force))
+            if force:
+                alive.discard(pid)
+            return pid not in alive
+
+        monkeypatch.setattr(bridge_mod, "windows_pid_alive", _fake_alive)
+        monkeypatch.setattr(bridge_mod, "kill_windows_pid", _fake_kill)
+
+        handle = SessionHandle(
+            session_id="bridgefake01", kind="win-native", pid=4242, port=1, token="x", bridge=True,
+        )
+        assert close_session(handle, timeout=0.2) is True
+        # The graceful tier (`force=False`) must be tried before the
+        # forceful one — same weaker-then-stronger shape every other kind
+        # gets from `SIGTERM` then `SIGKILL`.
+        assert kill_calls[0] == (4242, False)
+        assert (4242, True) in kill_calls
+
+
 class _FakeNativeCalls:
     """A scripted fake standing in for `MacOSCalls`/`Win32Calls`/
     `LinuxGtkCalls` — mirrors the existing `tests/test_*_native_driver.py`
