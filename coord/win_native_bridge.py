@@ -94,6 +94,15 @@ DEFAULT_PACKAGE_SPEC = "code-coordinator[win-native]"
 #: ships PowerShell at.
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
+#: #3611: same reasoning as :data:`POWERSHELL_EXE` — `tasklist.exe`/
+#: `taskkill.exe` are the WSL-reachable way to ask about (and tear down) a
+#: *Windows* PID from a WSL-hosted process, where `os.kill`/`/proc` mean
+#: nothing (a Windows PID is not a Linux PID — see
+#: :func:`windows_pid_alive`/:func:`kill_windows_pid`). Both ship at this
+#: exact, version-independent System32 path on every Windows install.
+TASKLIST_EXE = "/mnt/c/Windows/System32/tasklist.exe"
+TASKKILL_EXE = "/mnt/c/Windows/System32/taskkill.exe"
+
 #: #3519: explicit escape hatch for `find_windows_python` — set this to a
 #: known-good Windows-side `python.exe`/`py.exe` path (Windows-form or
 #: WSL-form, either is accepted — see :func:`windows_path_to_wsl_path`) to
@@ -315,6 +324,78 @@ def find_windows_python(
 def windows_venv_python(venv_dir: str) -> str:
     """The `Scripts\\python.exe` path for a Windows venv rooted at *venv_dir*."""
     return f"{venv_dir.rstrip(chr(92))}\\Scripts\\python.exe"
+
+
+def windows_pid_alive(pid: int, *, run: RunFn = subprocess.run, timeout: float = 15.0) -> bool:
+    """Whether *pid* — a genuine Windows PID, e.g. one a bridge-spawned
+    `coord.app_drive_daemon` self-reported from its own `os.getpid()` when
+    running on the real Windows-side interpreter — is still alive, asked
+    through `tasklist.exe` over WSL interop (:data:`TASKLIST_EXE`).
+
+    This is the WSL-reachable analogue of
+    :func:`coord.app_drive._pid_alive` — that function's `os.kill(pid, 0)`/
+    `/proc` probes mean nothing here: a Windows PID is not a Linux PID, so
+    probing it with a POSIX syscall from the WSL side would either raise
+    `ProcessLookupError` for every real, live Windows PID (a false "dead")
+    or — worse — collide with an unrelated, actually-alive Linux PID that
+    happens to share the same small integer (a false "alive"). Never
+    raises (#2096: an OBSERVATION, not an inferred default) — any failure
+    to even run the probe (`tasklist.exe` missing/unreachable, a timeout)
+    is treated as "not confirmed alive", the same conservative default
+    :func:`coord.app_drive._pid_alive` already uses for its own OSError
+    branch.
+
+    `tasklist.exe /FI "PID eq N"` prints a header plus one data row when
+    *pid* exists, and ONLY the header (or, with `/NH`, a "No tasks..."
+    message / nothing at all depending on Windows version) when it
+    doesn't — checked by searching for *pid* as a column value, not by
+    row-counting the output (far less sensitive to the exact header/locale
+    formatting across Windows versions).
+    """
+    try:
+        proc = run(
+            [TASKLIST_EXE, "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    output = proc.stdout or ""
+    # Each matching row is CSV `"image.exe","1234",...` — *pid* appears as
+    # its own quoted CSV field, not a substring match against the whole
+    # line (which could false-positive against e.g. a session/window ID
+    # that happens to contain the same digits).
+    return any(f'"{pid}"' in line for line in output.splitlines())
+
+
+def kill_windows_pid(
+    pid: int, *, force: bool = False, run: RunFn = subprocess.run, timeout: float = 15.0,
+) -> bool:
+    """Terminate the real Windows process *pid* from WSL via
+    `taskkill.exe` (:data:`TASKKILL_EXE`) — the WSL-reachable analogue of
+    `os.kill(pid, SIGTERM/SIGKILL)` for a Windows PID (see
+    :func:`windows_pid_alive` for why a POSIX signal can't target one
+    directly). *force* selects `/F` (the SIGKILL-equivalent escalation),
+    same two-tier shape :func:`coord.app_drive.close_session` already
+    uses for every other kind.
+
+    Returns whether *pid* is confirmed gone immediately after
+    (:func:`windows_pid_alive` — #2096: "did the kill work" is an
+    OBSERVATION, never inferred from `taskkill`'s own exit code, which is
+    0 for "signalled" even for a graceful close a stubborn process can
+    still ignore). Never raises — an unreachable `taskkill.exe` is
+    reported as "did not confirm dead", the same as a kill that
+    genuinely failed.
+    """
+    argv = [TASKKILL_EXE, "/PID", str(pid)]
+    if force:
+        argv.append("/F")
+    try:
+        run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return not windows_pid_alive(pid, run=run, timeout=timeout)
 
 
 def _run_checked(run: RunFn, argv: list[str], *, timeout: float, step: str) -> "subprocess.CompletedProcess[str]":
