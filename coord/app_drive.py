@@ -23,13 +23,29 @@ there is no way to keep a single process's stdin open across separate tool
 calls, so "keep a session alive across calls" requires the session itself
 to live in its OWN process, outside the lifetime of any one ``coord
 app-drive`` invocation. ``open`` spawns that process (:mod:`coord
-.app_drive_daemon`) once; it listens on an ephemeral localhost TCP port
-(works identically on Linux/macOS/the dell64 win-native WSL bridge — no
-``AF_UNIX`` availability gamble on Windows) for one-shot JSON-line
-connections, each carrying exactly one verb. ``send``/``screen``/``probe``/
-``close`` are each a fresh, short connection; the app being driven (a real
-pty child, or a real native GUI process) stays open underneath for the
-WHOLE session, held by the daemon.
+.app_drive_daemon`) once; for every kind except the dell64 win-native WSL
+bridge, it listens on an ephemeral localhost TCP port (no ``AF_UNIX``
+availability gamble on Windows) for one-shot JSON-line connections, each
+carrying exactly one verb. ``send``/``screen``/``probe``/``close`` are each
+a fresh, short connection; the app being driven (a real pty child, or a
+real native GUI process) stays open underneath for the WHOLE session, held
+by the daemon.
+
+**The WSL bridge is NOT the same transport (#3611).** A loopback-bound TCP
+socket on the real Windows host is unreachable from the WSL2 guest no
+matter what: WSL2's ``localhostForwarding`` only covers Windows -> WSL, the
+reverse direction needs the host gateway IP even for a non-loopback bind,
+and this repo's own ``docs/WSL_WINDOWS_WORKER.md`` already records that the
+fleet deliberately avoids WSL<->Windows port plumbing (``netsh
+portproxy``/firewall rules) for exactly that reason — so a bridge session
+(:attr:`SessionHandle.bridge`) carries commands over the shared filesystem
+instead (:func:`_send_command_via_control_dir`,
+:mod:`coord.app_drive_daemon`'s ``_serve_fs_control``), the same mechanism
+the ready-file handshake below already proves reachable in both
+directions. :func:`open_session` also confirms the channel actually works
+— an ``is_alive`` round trip right after the daemon reports ready — before
+handing back a handle, rather than trusting the ready-file alone (#2096: a
+"ready" that was never actually exercised is not an observation).
 
 **Teardown is guaranteed two ways, not one:**
 
@@ -74,10 +90,22 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from coord.platform_paths import default_coord_dir
+
+#: The injectable subprocess-runner seam :mod:`coord.win_native_bridge`
+#: already threads through every one of its own calls (``RunFn`` there) —
+#: `open_session`'s WSL bridge branch forwards its own `run=` through to
+#: `ensure_windows_win_native_venv`/`translate_to_windows_path`/
+#: `windows_path_to_wsl_path` (#3611 review nit) rather than defaulting
+#: every one of those to `subprocess.run` itself, which is what forced
+#: `tests.test_app_drive`'s bridge tests to monkeypatch module attributes
+#: instead of injecting a scripted fake the way `tests.test_win_native_bridge`
+#: does for the exact same calls.
+BridgeRunFn = Callable[..., "subprocess.CompletedProcess[str]"]
 
 #: Every lane kind this module knows how to drive — kept in sync BY HAND
 #: with :data:`coord.bugbash.LANE_DRIVER_KINDS` (this module intentionally
@@ -160,8 +188,17 @@ class SessionHandle:
     :func:`close_session`) must branch on this — a Windows PID is not a
     Linux PID, so a POSIX ``os.kill``/``/proc`` probe against one is not
     merely wrong, it can read as a false "alive" (collision with an
-    unrelated, actually-alive Linux PID sharing the same small
-    integer)."""
+    unrelated, actually-alive Linux PID sharing the same small integer).
+    It also selects the control TRANSPORT: :func:`send_command` routes a
+    ``bridge=True`` handle through ``control_dir`` (the filesystem — see
+    the module docstring's "#3611" section) instead of ``port`` (TCP),
+    since a bridge daemon's loopback-bound socket is unreachable from this
+    (WSL) side no matter what.
+
+    ``control_dir`` is the WSL-visible directory :func:`send_command` and
+    the bridge daemon's ``_serve_fs_control`` exchange ``req-*.json``/
+    ``reply-*.json`` files through — set only when ``bridge`` is ``True``;
+    ``port`` is a meaningless placeholder (``0``) on a bridge handle."""
 
     session_id: str
     kind: str
@@ -170,6 +207,7 @@ class SessionHandle:
     token: str
     app_pid: int | None = None
     bridge: bool = False
+    control_dir: str | None = None
 
 
 def _write_session_file(handle: SessionHandle) -> None:
@@ -182,6 +220,7 @@ def _write_session_file(handle: SessionHandle) -> None:
         "session_id": handle.session_id, "kind": handle.kind,
         "pid": handle.pid, "port": handle.port, "token": handle.token,
         "app_pid": handle.app_pid, "bridge": handle.bridge,
+        "control_dir": handle.control_dir,
     }))
     tmp.replace(path)
 
@@ -208,6 +247,7 @@ def load_session(session_id: str) -> SessionHandle:
             # session" (the only meaning it could have had before this
             # field existed), not a parse error.
             bridge=bool(raw.get("bridge", False)),
+            control_dir=raw.get("control_dir"),
         )
     except (KeyError, TypeError, ValueError) as e:
         raise AppDriveError(f"corrupt app-drive session file for {session_id!r}: {e}") from e
@@ -220,7 +260,7 @@ def _forget_session(session_id: str) -> None:
         pass
 
 
-def _pid_alive(pid: int, *, bridge: bool = False) -> bool:
+def _pid_alive(pid: int, *, bridge: bool = False, probe_timeout: float = 15.0) -> bool:
     """Whether *pid* is still a live process right now — an OBSERVATION
     (#2096), never inferred from "we haven't been told otherwise".
 
@@ -234,7 +274,18 @@ def _pid_alive(pid: int, *, bridge: bool = False) -> bool:
     an arbitrary small integer on THIS (WSL/Linux) host would either
     always report "dead" (no such Linux pid) or, worse, collide with an
     unrelated, actually-alive Linux process that happens to reuse the
-    same number.
+    same number. *probe_timeout* is forwarded to that bridge probe only
+    (every other branch has no comparable notion of a probe timeout).
+
+    ``windows_pid_alive`` is tri-state (``True``/``False``/``None`` — see
+    its own docstring, #3611 review): ``None`` means the probe itself
+    could not even be asked (an unreachable/missing ``tasklist.exe``, a
+    timeout), which is NOT the same thing as a confirmed-dead pid. This
+    function folds that ``None`` into ``True`` ("still must be treated as
+    possibly alive") so a caller — in practice
+    :func:`close_session`'s ``_all_dead`` — can never read "we couldn't
+    ask" as "confirmed gone" and report a teardown that was never actually
+    observed.
 
     First tries a non-blocking reap (``waitpid(pid, WNOHANG)``): when
     *pid* is a direct child of THIS process (true for a caller that opened
@@ -264,7 +315,10 @@ def _pid_alive(pid: int, *, bridge: bool = False) -> bool:
         # common (non-WSL) case.
         from coord.win_native_bridge import windows_pid_alive  # noqa: PLC0415
 
-        return windows_pid_alive(pid)
+        alive = windows_pid_alive(pid, timeout=probe_timeout)
+        if alive is None:
+            return True  # "could not ask" must never read as "confirmed gone" (#2096)
+        return alive
     if sys.platform != "win32":
         try:
             reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
@@ -295,16 +349,104 @@ def _pid_alive(pid: int, *, bridge: bool = False) -> bool:
     return True
 
 
-def send_command(handle: SessionHandle, command: dict, *, timeout: float = 30.0) -> dict:
-    """Send one JSON *command* to *handle*'s daemon over a fresh TCP
-    connection and return its one JSON-line reply.
+def _parse_reply(raw: str) -> dict:
+    """Shared by both transports below: parse one reply line/file into a
+    dict, raising :class:`AppDriveError` for anything that isn't a clean
+    ``{"ok": ...}``/``{"error": ...}`` object — never let a malformed reply
+    read as a silent success."""
+    line = raw.strip().splitlines()[0] if raw.strip() else ""
+    try:
+        reply = json.loads(line)
+    except ValueError as e:
+        raise AppDriveError(f"app-drive daemon sent an unparseable reply: {e}") from e
+    if not isinstance(reply, dict):
+        raise AppDriveError(f"app-drive daemon reply was not a JSON object: {reply!r}")
+    if reply.get("error"):
+        raise AppDriveError(str(reply["error"]))
+    return reply
 
-    Raises :class:`AppDriveError` on a connection failure (the daemon is
-    gone/unreachable — a stale session, never silently treated as "the verb
-    succeeded") or a reply the daemon itself flagged as an error. Stamps
-    *handle*'s own ``token`` onto *command* (#3590 review: the only
-    authentication the control socket has — see :class:`SessionHandle`)."""
+
+def _send_command_via_control_dir(handle: SessionHandle, command: dict, *, timeout: float) -> dict:
+    """The bridge transport (#3611): write *command* into
+    ``handle.control_dir`` as ``req-<id>.json`` (atomically — tmp +
+    rename, same convention the ready-file handshake already uses) and
+    poll for the matching ``reply-<id>.json`` the bridge daemon's
+    ``_serve_fs_control`` writes back. This directory is the SAME one the
+    ready-file handshake already proves reachable from both the WSL side
+    (this function, reading/writing the original path) and the real
+    Windows side (the daemon, reading/writing the
+    ``translate_to_windows_path``-translated alias of the exact same
+    filesystem location) — no network crossing at all, unlike the TCP
+    transport every other kind uses.
+
+    Raises :class:`AppDriveError` when ``control_dir`` is missing from the
+    handle (a session file from before #3611, or a non-bridge handle
+    misrouted here) or no reply shows up within *timeout* — the control
+    channel being unreachable must fail loudly, never silently read as
+    "the verb succeeded" (#2096)."""
+    if not handle.control_dir:
+        raise AppDriveError(
+            f"bridge app-drive session {handle.session_id!r} has no control directory recorded"
+        )
+    control_dir = Path(handle.control_dir)
+    req_id = uuid.uuid4().hex
+    command = {**command, "_id": req_id}
+    req_path = control_dir / f"req-{req_id}.json"
+    reply_path = control_dir / f"reply-{req_id}.json"
+    tmp = req_path.with_suffix(".tmp")
+    try:
+        control_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(command))
+        tmp.replace(req_path)
+    except OSError as e:
+        raise AppDriveError(
+            f"could not reach app-drive session {handle.session_id!r} via its bridge control "
+            f"directory {handle.control_dir!r}: {e}"
+        ) from e
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if reply_path.exists():
+            try:
+                raw = reply_path.read_text()
+            except OSError:
+                time.sleep(0.02)
+                continue
+            try:
+                reply_path.unlink()
+            except OSError:
+                pass
+            return _parse_reply(raw)
+        time.sleep(0.02)
+
+    for stray in (req_path, reply_path):
+        try:
+            stray.unlink()
+        except OSError:
+            pass
+    raise AppDriveError(
+        f"could not reach app-drive session {handle.session_id!r} via its bridge control "
+        f"directory {handle.control_dir!r}: no reply within {timeout:.0f}s"
+    )
+
+
+def send_command(handle: SessionHandle, command: dict, *, timeout: float = 30.0) -> dict:
+    """Send one JSON *command* to *handle*'s daemon and return its one
+    JSON reply.
+
+    Routes through :func:`_send_command_via_control_dir` for a bridge
+    handle (#3611 — a loopback-bound TCP socket on the real Windows host
+    is unreachable from the WSL side no matter what, see the module
+    docstring) and a fresh TCP connection for every other kind. Raises
+    :class:`AppDriveError` on an unreachable channel (the daemon is gone,
+    or the WSL<->Windows control directory never got a reply — a stale
+    session either way, never silently treated as "the verb succeeded")
+    or a reply the daemon itself flagged as an error. Stamps *handle*'s
+    own ``token`` onto *command* (#3590 review: the only authentication
+    the control channel has — see :class:`SessionHandle`)."""
     command = {**command, "token": handle.token}
+    if handle.bridge:
+        return _send_command_via_control_dir(handle, command, timeout=timeout)
     try:
         with socket.create_connection(("127.0.0.1", handle.port), timeout=timeout) as sock:
             sock.sendall((json.dumps(command) + "\n").encode("utf-8"))
@@ -323,23 +465,14 @@ def send_command(handle: SessionHandle, command: dict, *, timeout: float = 30.0)
             f"could not reach app-drive session {handle.session_id!r} on port "
             f"{handle.port}: {e}"
         ) from e
-    line = raw.strip().splitlines()[0] if raw.strip() else ""
-    try:
-        reply = json.loads(line)
-    except ValueError as e:
-        raise AppDriveError(f"app-drive daemon sent an unparseable reply: {e}") from e
-    if not isinstance(reply, dict):
-        raise AppDriveError(f"app-drive daemon reply was not a JSON object: {reply!r}")
-    if reply.get("error"):
-        raise AppDriveError(str(reply["error"]))
-    return reply
+    return _parse_reply(raw)
 
 
 def open_session(
     kind: str, *, launch: str, cwd: str, cols: int = 80, rows: int = 24,
     width: int | None = None, height: int | None = None,
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT, ready_timeout: float = 30.0,
-    python: str | None = None,
+    python: str | None = None, run: BridgeRunFn | None = None,
 ) -> SessionHandle:
     """Spawn :mod:`coord.app_drive_daemon` for *kind* and wait for it to
     confirm it's actually listening before returning (#2096: "opened" is an
@@ -381,7 +514,24 @@ def open_session(
     responsibility to express in a form the Windows side can resolve. The
     resulting :class:`SessionHandle` is marked ``bridge=True`` so
     :func:`close_session` knows its ``pid``/``app_pid`` are genuine
-    Windows PIDs, not Linux ones.
+    Windows PIDs, not Linux ones, and routes :func:`send_command` through
+    the shared-filesystem control directory this function also creates
+    and translates (``--control-dir``, see :mod:`coord.app_drive_daemon`)
+    instead of the TCP port every other kind uses — a loopback-bound
+    socket on the real Windows host is unreachable from the WSL side no
+    matter what (this module's own docstring). Before returning, this
+    function sends that fresh control channel one real ``is_alive`` round
+    trip (#2096/#3611 review: a ready-file alone proves the daemon
+    STARTED, never that its control channel is actually reachable FROM
+    HERE) — a session whose channel doesn't work is torn down and reported
+    as a loud :class:`AppDriveError`, not handed back dead-on-arrival.
+
+    *run* (bridge-mode only) is forwarded to every
+    :mod:`coord.win_native_bridge` call this makes
+    (``ensure_windows_win_native_venv``/``translate_to_windows_path``/
+    ``windows_path_to_wsl_path``) instead of each defaulting to
+    ``subprocess.run`` independently — ``None`` (the default) means
+    exactly that default, just resolved once here.
     """
     if kind not in APP_DRIVE_KINDS:
         raise AppDriveError(f"unknown app-drive kind {kind!r} — expected one of {APP_DRIVE_KINDS}")
@@ -393,28 +543,31 @@ def open_session(
         ready_file.unlink()
 
     bridge_mode = False
+    control_dir: Path | None = None
+    spawn_control_dir: str | None = None
     spawn_argv0 = python or sys.executable
     spawn_cwd = cwd
     spawn_ready_file = str(ready_file)
 
     if kind == "win-native":
-        from coord.win_native_bridge import is_wsl_host  # noqa: PLC0415 — see `_pid_alive`'s own deferred import
+        # #3611 review nit: one module import, not two separate `from`
+        # imports — also keeps `coord.win_native_bridge.is_wsl_host`
+        # patchable by the exact `monkeypatch.setattr(bridge_mod, ...)`
+        # convention this module's own tests already use.
+        import coord.win_native_bridge as bridge  # noqa: PLC0415 — see `_pid_alive`'s own deferred import
 
-        if is_wsl_host():
-            from coord.win_native_bridge import (  # noqa: PLC0415
-                WinNativeBridgeError,
-                ensure_windows_win_native_venv,
-                translate_to_windows_path,
-                windows_path_to_wsl_path,
-            )
-
+        if bridge.is_wsl_host():
             bridge_mode = True
+            bridge_run = run if run is not None else subprocess.run
             try:
-                windows_python = python or ensure_windows_win_native_venv()
-                spawn_argv0 = windows_path_to_wsl_path(windows_python)
-                spawn_cwd = translate_to_windows_path(cwd)
-                spawn_ready_file = translate_to_windows_path(str(ready_file))
-            except WinNativeBridgeError as e:
+                windows_python = python or bridge.ensure_windows_win_native_venv(run=bridge_run)
+                spawn_argv0 = bridge.windows_path_to_wsl_path(windows_python, run=bridge_run)
+                spawn_cwd = bridge.translate_to_windows_path(cwd, run=bridge_run)
+                spawn_ready_file = bridge.translate_to_windows_path(str(ready_file), run=bridge_run)
+                control_dir = _sessions_dir() / f"{session_id}.ipc"
+                control_dir.mkdir(parents=True, exist_ok=True)
+                spawn_control_dir = bridge.translate_to_windows_path(str(control_dir), run=bridge_run)
+            except bridge.WinNativeBridgeError as e:
                 raise AppDriveError(f"win-native WSL bridge could not be prepared: {e}") from e
 
     argv = [
@@ -428,6 +581,8 @@ def open_session(
         argv += ["--width", str(width)]
     if height is not None:
         argv += ["--height", str(height)]
+    if spawn_control_dir is not None:
+        argv += ["--control-dir", spawn_control_dir]
     detach_kwargs: dict = (
         {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
         else {"start_new_session": True}
@@ -464,7 +619,24 @@ def open_session(
                     pid=int(ready["pid"]), port=int(ready["port"]), token=token,
                     app_pid=int(ready["app_pid"]) if ready.get("app_pid") is not None else None,
                     bridge=bridge_mode,
+                    control_dir=str(control_dir) if control_dir is not None else None,
                 )
+                if bridge_mode:
+                    # #2096/#3611 review: the ready-file only proves the
+                    # daemon STARTED — it says nothing about whether ITS
+                    # control channel is actually reachable from here. A
+                    # real round trip, right now, is what turns "we hope
+                    # this works" into an observation; a channel that
+                    # can't carry even this must fail loudly rather than
+                    # hand back a handle that is dead on arrival.
+                    try:
+                        send_command(handle, {"op": "is_alive"}, timeout=min(ready_timeout, 15.0))
+                    except AppDriveError as e:
+                        proc.kill()
+                        raise AppDriveError(
+                            f"win-native bridge session opened but its control channel is "
+                            f"unreachable: {e}"
+                        ) from e
                 _write_session_file(handle)
                 return handle
             if proc.poll() is not None:
@@ -500,17 +672,37 @@ def _target_pids(handle: SessionHandle) -> tuple[int, ...]:
     return (handle.pid,)
 
 
+#: #3611 review (non-blocking): a bridge pid-liveness probe reaches
+#: `tasklist.exe` over WSL interop (~100ms+ per call) rather than a cheap
+#: in-process `kill(pid, 0)`/`/proc` check — polling at the same 0.1s
+#: cadence every other kind uses would spawn a fresh Windows process
+#: roughly every 100ms for the whole wait/escalation window (on the order
+#: of 100+ spawns per `close`). These give the bridge path its own,
+#: coarser cadence and a probe timeout well under the 3.0s escalation
+#: window it's polling inside (a 15s-default probe could otherwise outlast
+#: the window entirely).
+_BRIDGE_POLL_INTERVAL = 0.5
+_BRIDGE_PROBE_TIMEOUT = 1.5
+
+
 def _all_dead(handle: SessionHandle, pids: tuple[int, ...]) -> bool:
-    return all(not _pid_alive(pid, bridge=handle.bridge) for pid in pids)
+    probe_timeout = _BRIDGE_PROBE_TIMEOUT if handle.bridge else 15.0
+    return all(not _pid_alive(pid, bridge=handle.bridge, probe_timeout=probe_timeout) for pid in pids)
 
 
-def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
+def close_session(handle: SessionHandle, *, timeout: float = 15.0, escalate_window: float = 3.0) -> bool:
     """Tear *handle* down and confirm it (#2096) — only reports success once
     BOTH the daemon process AND the real app/pty-child it was driving
     (``handle.app_pid``, when known) are OBSERVED gone, escalating from
     "ask nicely" to SIGTERM to SIGKILL against each rather than trusting
     any one step — or the daemon's own cooperation — blindly. Removes the
     on-disk session file only once confirmed dead (or already gone).
+
+    *escalate_window* (#3611 review) is how long each post-signal
+    escalation tier waits for confirmation before moving to the next —
+    parameterized (rather than the previous hardcoded ``3.0``) so a test
+    exercising the escalation path doesn't have to actually sit through a
+    full production-sized window per tier.
 
     This closes the gap #3590's review flagged: the escalation path used
     to SIGKILL only the daemon. If that SIGKILL fires before the daemon's
@@ -530,12 +722,13 @@ def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
     except AppDriveError:
         pass  # already gone, or refused — the pid-based confirmation below is authoritative
 
+    poll_interval = _BRIDGE_POLL_INTERVAL if handle.bridge else 0.1
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _all_dead(handle, targets):
             _forget_session(handle.session_id)
             return True
-        time.sleep(0.1)
+        time.sleep(poll_interval)
 
     if handle.bridge:
         # #3611: `targets` are genuine Windows PIDs here (a bridge-spawned
@@ -549,14 +742,14 @@ def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
 
         for force in (False, True):
             for pid in targets:
-                if _pid_alive(pid, bridge=True):
-                    kill_windows_pid(pid, force=force)
-            escalate_deadline = time.monotonic() + 3.0
+                if _pid_alive(pid, bridge=True, probe_timeout=_BRIDGE_PROBE_TIMEOUT):
+                    kill_windows_pid(pid, force=force, timeout=_BRIDGE_PROBE_TIMEOUT)
+            escalate_deadline = time.monotonic() + escalate_window
             while time.monotonic() < escalate_deadline:
                 if _all_dead(handle, targets):
                     _forget_session(handle.session_id)
                     return True
-                time.sleep(0.1)
+                time.sleep(poll_interval)
         return False
 
     # `SIGKILL` doesn't exist on Windows (`signal` there defines no POSIX
@@ -573,7 +766,7 @@ def close_session(handle: SessionHandle, *, timeout: float = 15.0) -> bool:
                 os.kill(pid, sig)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-        escalate_deadline = time.monotonic() + 3.0
+        escalate_deadline = time.monotonic() + escalate_window
         while time.monotonic() < escalate_deadline:
             if _all_dead(handle, targets):
                 _forget_session(handle.session_id)

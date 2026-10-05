@@ -326,7 +326,7 @@ def windows_venv_python(venv_dir: str) -> str:
     return f"{venv_dir.rstrip(chr(92))}\\Scripts\\python.exe"
 
 
-def windows_pid_alive(pid: int, *, run: RunFn = subprocess.run, timeout: float = 15.0) -> bool:
+def windows_pid_alive(pid: int, *, run: RunFn = subprocess.run, timeout: float = 15.0) -> bool | None:
     """Whether *pid* — a genuine Windows PID, e.g. one a bridge-spawned
     `coord.app_drive_daemon` self-reported from its own `os.getpid()` when
     running on the real Windows-side interpreter — is still alive, asked
@@ -338,12 +338,20 @@ def windows_pid_alive(pid: int, *, run: RunFn = subprocess.run, timeout: float =
     probing it with a POSIX syscall from the WSL side would either raise
     `ProcessLookupError` for every real, live Windows PID (a false "dead")
     or — worse — collide with an unrelated, actually-alive Linux PID that
-    happens to share the same small integer (a false "alive"). Never
-    raises (#2096: an OBSERVATION, not an inferred default) — any failure
-    to even run the probe (`tasklist.exe` missing/unreachable, a timeout)
-    is treated as "not confirmed alive", the same conservative default
-    :func:`coord.app_drive._pid_alive` already uses for its own OSError
-    branch.
+    happens to share the same small integer (a false "alive").
+
+    **Tri-state, deliberately (#3611 review).** Returns `True`/`False`
+    only when `tasklist.exe` actually ran and gave a definitive answer —
+    `None` when the probe itself could not be asked at all (missing/
+    unreachable `tasklist.exe`, a timeout, or a non-zero exit, e.g. a bad
+    filter). An earlier version folded all three of those "could not ask"
+    cases into `False` ("not confirmed alive"), which reads identically to
+    a genuine "confirmed gone" to a caller that just does
+    `not windows_pid_alive(...)` — so one `tasklist.exe` hiccup (one
+    timeout, one unreachable binary) made `coord.app_drive.close_session`
+    report a CONFIRMED teardown it never actually observed, for a real,
+    still-running Windows GUI process (#2096: "could not ask" must never
+    read as "confirmed gone"). Never raises either way.
 
     `tasklist.exe /FI "PID eq N"` prints a header plus one data row when
     *pid* exists, and ONLY the header (or, with `/NH`, a "No tasks..."
@@ -358,9 +366,9 @@ def windows_pid_alive(pid: int, *, run: RunFn = subprocess.run, timeout: float =
             capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False
+        return None
     if proc.returncode != 0:
-        return False
+        return None
     output = proc.stdout or ""
     # Each matching row is CSV `"image.exe","1234",...` — *pid* appears as
     # its own quoted CSV field, not a substring match against the whole
@@ -380,13 +388,17 @@ def kill_windows_pid(
     same two-tier shape :func:`coord.app_drive.close_session` already
     uses for every other kind.
 
-    Returns whether *pid* is confirmed gone immediately after
-    (:func:`windows_pid_alive` — #2096: "did the kill work" is an
-    OBSERVATION, never inferred from `taskkill`'s own exit code, which is
-    0 for "signalled" even for a graceful close a stubborn process can
-    still ignore). Never raises — an unreachable `taskkill.exe` is
-    reported as "did not confirm dead", the same as a kill that
-    genuinely failed.
+    Returns `True` only when a FRESH :func:`windows_pid_alive` probe
+    *explicitly* returns `False` (confirmed gone) immediately after
+    (#2096: "did the kill work" is an OBSERVATION, never inferred from
+    `taskkill`'s own exit code, which is 0 for "signalled" even for a
+    graceful close a stubborn process can still ignore). `None` (the
+    probe itself could not run — #3611 review) is deliberately NOT
+    treated as success: the old `not windows_pid_alive(...)` shape
+    returned `True` whenever BOTH `taskkill.exe` and `tasklist.exe` were
+    unreachable, reporting a confirmed kill that was never actually
+    observed. Never raises — an unreachable `taskkill.exe` just means the
+    confirmation below has to carry the whole verdict.
     """
     argv = [TASKKILL_EXE, "/PID", str(pid)]
     if force:
@@ -395,7 +407,7 @@ def kill_windows_pid(
         run(argv, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return not windows_pid_alive(pid, run=run, timeout=timeout)
+    return windows_pid_alive(pid, run=run, timeout=timeout) is False
 
 
 def _run_checked(run: RunFn, argv: list[str], *, timeout: float, step: str) -> "subprocess.CompletedProcess[str]":
@@ -431,11 +443,21 @@ def ensure_windows_win_native_venv(
     return its `python.exe` path.
 
     Safe to call on every install/update (`install-agent.sh`, a fleet roll):
-    if *venv_dir* already has `comtypes` importable, this is a single cheap
-    probe and returns immediately — it never re-creates the venv or
-    re-installs the package on a host that's already current. Only a venv
-    that's missing OR doesn't yet have `comtypes` pays the `python -m venv`
-    + `pip install` cost.
+    if *venv_dir* already has both `comtypes` AND `coord.app_drive_daemon`
+    importable, this is a single cheap probe and returns immediately — it
+    never re-creates the venv or re-installs the package on a host that's
+    already current. Only a venv that's missing one of those pays the
+    `python -m venv` + `pip install` cost.
+
+    **#3611 review.** The idempotency probe used to check only `import
+    comtypes` — which can never detect a venv that has `comtypes` but
+    predates `coord.app_drive_daemon` (dell64's venv was bootstrapped under
+    #3515, before #3590 added app-drive), so the *first* bridge-spawned
+    `coord app-drive open win-native` on such a host failed opaquely with
+    `No module named coord.app_drive_daemon` instead of paying the upgrade
+    this function exists to make automatic. The probe now imports both
+    modules the caller actually needs — either missing triggers the same
+    `pip install --upgrade` path below.
 
     Raises :class:`WinNativeBridgeError` — never a bare exception — when no
     Windows-side Python can be found at all (:func:`find_windows_python`
@@ -445,7 +467,7 @@ def ensure_windows_win_native_venv(
 
     try:
         probe = run(
-            _windows_exec_argv([venv_python, "-c", "import comtypes"], run=run),
+            _windows_exec_argv([venv_python, "-c", "import comtypes, coord.app_drive_daemon"], run=run),
             capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired, WinNativeBridgeError):

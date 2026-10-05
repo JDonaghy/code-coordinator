@@ -581,6 +581,12 @@ def _print_round(report: BugbashReport) -> None:
             f"round {r.round_num}: {len(r.findings)} finding(s), "
             f"{r.new_count} new/regression, {sum(1 for f in r.filings if f.filed)} filed"
             + (f" (lanes skipped: {', '.join(r.skipped_lanes)})" if r.skipped_lanes else "")
+            # #3611 review: a round where every lane came back unavailable
+            # now gets its per-lane `lane UNAVAILABLE (...)` lines below,
+            # but without this the header itself still read as a bare "0
+            # finding(s)" — no different from a genuinely clean round at a
+            # one-line scan. Mirrors the `skipped_lanes` clause right above.
+            + (f" (lanes unavailable: {', '.join(r.unavailable_lanes)})" if r.unavailable_lanes else "")
         )
         # #3546: a skip must be as explainable as a lane failure/
         # unavailability — never a bare platform name with no reason.
