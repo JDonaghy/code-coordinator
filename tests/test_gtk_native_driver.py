@@ -617,19 +617,39 @@ class TestLinuxGtkCallsFindTopWindow:
         monkeypatch.setattr("coord.gtk_native_driver._is_linux", lambda: True)
         monkeypatch.setenv("DISPLAY", ":99")
 
+    @staticmethod
+    def _fake_run_factory(ps_lines: list[str], xdotool_stdout_by_pid: dict[int, str]):
+        """Builds a ``subprocess.run`` fake that answers both commands
+        ``find_top_window``/``_descendant_pids`` now issue: a ``ps -eo
+        pid,ppid`` process-table dump (*ps_lines*, each ``"<pid> <ppid>"``)
+        and a per-pid ``xdotool search --onlyvisible --pid <pid>`` lookup
+        (*xdotool_stdout_by_pid*, defaulting to empty stdout for any pid
+        not listed)."""
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "ps":
+                return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(ps_lines), stderr="")
+            assert cmd[0] == "xdotool"
+            target_pid = int(cmd[-1])
+            stdout = xdotool_stdout_by_pid.get(target_pid, "")
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        return fake_run
+
     def test_search_command_passes_onlyvisible(self, monkeypatch) -> None:
         self._linux_with_display(monkeypatch)
         calls_made: list[list[str]] = []
+        inner_fake_run = self._fake_run_factory([], {1234: "5800004\n"})
 
         def fake_run(cmd, **kwargs):
             calls_made.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, stdout="5800004\n", stderr="")
+            return inner_fake_run(cmd, **kwargs)
 
         monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
         window_id = LinuxGtkCalls().find_top_window(pid=1234, timeout_s=1.0)
 
         assert window_id == 5800004
-        assert calls_made == [["xdotool", "search", "--onlyvisible", "--pid", "1234"]]
+        assert ["xdotool", "search", "--onlyvisible", "--pid", "1234"] in calls_made
 
     def test_returns_the_real_window_even_though_a_lower_xid_helper_exists(
         self, monkeypatch
@@ -642,16 +662,18 @@ class TestLinuxGtkCallsFindTopWindow:
         so even though the helper's XID still sorts first, it must never be
         returned."""
         self._linux_with_display(monkeypatch)
+        inner_fake_run = self._fake_run_factory([], {4321: "92274692\n"})
 
         def fake_run(cmd, **kwargs):
-            assert "--onlyvisible" in cmd, (
-                "must ask xdotool to filter to mapped/viewable windows — "
-                "without it, the unmapped GTK4 helper (lower XID) wins"
-            )
+            if cmd[0] == "xdotool":
+                assert "--onlyvisible" in cmd, (
+                    "must ask xdotool to filter to mapped/viewable windows — "
+                    "without it, the unmapped GTK4 helper (lower XID) wins"
+                )
             # The real xdotool, given --onlyvisible, would never even list
             # the unmapped helper (0x5800002) here -- only the real, mapped
             # window (0x5800004) comes back.
-            return subprocess.CompletedProcess(cmd, 0, stdout="92274692\n", stderr="")
+            return inner_fake_run(cmd, **kwargs)
 
         monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
         window_id = LinuxGtkCalls().find_top_window(pid=4321, timeout_s=1.0)
@@ -662,17 +684,125 @@ class TestLinuxGtkCallsFindTopWindow:
     def test_raises_if_no_visible_window_appears_within_timeout(self, monkeypatch) -> None:
         self._linux_with_display(monkeypatch)
 
-        def fake_run(cmd, **kwargs):
-            # Simulates a helper-only state: xdotool finds nothing once
-            # --onlyvisible excludes the unmapped helper, so the real
-            # window never appears before the deadline.
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        # Simulates a helper-only state: xdotool finds nothing once
+        # --onlyvisible excludes the unmapped helper, so the real window
+        # never appears before the deadline.
+        fake_run = self._fake_run_factory([], {})
 
         monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
         monkeypatch.setattr("coord.gtk_native_driver.time.sleep", lambda s: None)
 
         with pytest.raises(GtkNativeRuntimeError, match="no visible window"):
             LinuxGtkCalls().find_top_window(pid=4321, timeout_s=0.05)
+
+
+class TestLinuxGtkCallsFindTopWindowFollowsShellWrapper:
+    """#3613: ``LinuxGtkCalls.launch()`` is a plain
+    ``subprocess.Popen(command, shell=True)``, which always spawns
+    ``/bin/sh -c <command>`` as the immediate child and returns *that
+    wrapper's* pid — the real GTK process is a separately-pid'd child (or
+    grandchild) that owns the real X11 window, while ``/bin/sh`` itself
+    never owns one. Before this fix, ``find_top_window`` only ever searched
+    the wrapper's own pid and always timed out, even though the real
+    window was up and interactive almost immediately (per the issue's own
+    repro). These tests reproduce that exact shape with a fake process
+    table + fake ``xdotool`` responses and confirm ``find_top_window`` now
+    follows the whole descendant-process tree — mirroring
+    ``tests.test_win_native_driver.TestFindTopWindowFollowsDescendantProcesses``'s
+    #3542 coverage of the identical shape on Windows. Each of these would
+    fail against the pre-fix code (which only ever tried the root pid)."""
+
+    def _linux_with_display(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.gtk_native_driver._is_linux", lambda: True)
+        monkeypatch.setenv("DISPLAY", ":99")
+
+    def test_follows_shell_wrapped_launch_to_the_real_apps_window(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+        wrapper_pid, app_pid = 516092, 516093
+        fake_run = TestLinuxGtkCallsFindTopWindow._fake_run_factory(
+            [f"{wrapper_pid} 1", f"{app_pid} {wrapper_pid}"],
+            # the shell wrapper itself owns no window at all -- only its
+            # forked child does.
+            {app_pid: "92274692\n"},
+        )
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+
+        window_id = LinuxGtkCalls().find_top_window(pid=wrapper_pid, timeout_s=1.0)
+
+        assert window_id == 92274692
+
+    def test_follows_a_grandchild_process_two_levels_deep(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+        sh_pid, intermediate_pid, app_pid = 10, 20, 30
+        fake_run = TestLinuxGtkCallsFindTopWindow._fake_run_factory(
+            [f"{sh_pid} 1", f"{intermediate_pid} {sh_pid}", f"{app_pid} {intermediate_pid}"],
+            {app_pid: "99\n"},
+        )
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+
+        assert LinuxGtkCalls().find_top_window(pid=sh_pid, timeout_s=1.0) == 99
+
+    def test_still_matches_when_the_launched_pid_owns_the_window_directly(
+        self, monkeypatch,
+    ) -> None:
+        """Backward-compatible: a pid launched without an intervening shell
+        still has its own pid in its own descendant set (the root is
+        always included), so the pre-#3613 direct-match case keeps
+        working."""
+        self._linux_with_display(monkeypatch)
+        pid = 555
+        fake_run = TestLinuxGtkCallsFindTopWindow._fake_run_factory(
+            [f"{pid} 1"], {pid: "1\n"},
+        )
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+
+        assert LinuxGtkCalls().find_top_window(pid=pid, timeout_s=1.0) == 1
+
+    def test_unrelated_processes_window_is_not_matched(self, monkeypatch) -> None:
+        """A visible window owned by some other, unrelated process must
+        never be treated as a match just because it exists."""
+        self._linux_with_display(monkeypatch)
+        wrapper_pid, app_pid, unrelated_pid = 100, 200, 999
+        fake_run = TestLinuxGtkCallsFindTopWindow._fake_run_factory(
+            [f"{wrapper_pid} 1", f"{app_pid} {wrapper_pid}", f"{unrelated_pid} 1"],
+            {unrelated_pid: "8\n"},
+        )
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        monkeypatch.setattr("coord.gtk_native_driver.time.sleep", lambda s: None)
+
+        with pytest.raises(GtkNativeRuntimeError):
+            LinuxGtkCalls().find_top_window(pid=wrapper_pid, timeout_s=0.05)
+
+
+class TestLinuxGtkCallsDescendantPids:
+    """Direct coverage of :meth:`LinuxGtkCalls._descendant_pids` (#3613),
+    mirroring ``tests.test_win_native_driver.TestDescendantPids``."""
+
+    def test_includes_root_and_all_transitive_children(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.gtk_native_driver._is_linux", lambda: True)
+        fake_run = TestLinuxGtkCallsFindTopWindow._fake_run_factory(
+            ["1 0", "10 1", "20 10", "30 20", "999 1"], {},
+        )
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+
+        assert LinuxGtkCalls()._descendant_pids(10) == {10, 20, 30}
+
+    def test_pid_with_no_children_returns_itself_only(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.gtk_native_driver._is_linux", lambda: True)
+        fake_run = TestLinuxGtkCallsFindTopWindow._fake_run_factory(["10 1"], {})
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+
+        assert LinuxGtkCalls()._descendant_pids(10) == {10}
+
+    def test_ps_failure_degrades_to_root_only_rather_than_raising(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.gtk_native_driver._is_linux", lambda: True)
+
+        def fake_run(cmd, **kwargs):
+            raise OSError("ps: command not found")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+
+        assert LinuxGtkCalls()._descendant_pids(10) == {10}
 
 
 class TestImportAtspi:
