@@ -441,6 +441,39 @@ class TestVtScreen:
         screen.feed(b"0123456789ABCDEF")
         assert "0123456789ABCDEF" in screen.text()
 
+    def test_right_flushed_status_line_keeps_its_last_column_not_cols_minus_one(self) -> None:
+        """#3618: a bugbash finding reported every row of a ``coord
+        app-drive tui-pty screen`` capture as exactly ``cols - 1`` wide,
+        truncating a right-flush-justified status segment's final
+        character (vimcode's own ``Ln N, Col N`` ruler, observed losing
+        its last digit). Reproduce the exact reported shape — a status
+        line whose rightmost character lands on the LAST column, written
+        via cursor positioning rather than a plain feed — against the
+        ONE :class:`VtScreen` both :class:`SmokeRunner` and
+        :class:`TuiPtySession` share (#2096 "one question, one answer"):
+        this must come back the full requested width, last character
+        intact, not ``cols - 1``.
+
+        Investigation note: this already passes against the unmodified
+        driver — direct measurement here, through a real
+        :class:`UnixPtyChild` (:class:`TestUnixPtyChildReal`-style) and
+        through the full ``open_session``/``send_command`` round trip,
+        found no off-by-one at the kernel ``TIOCSWINSZ``, ``pyte``
+        capture, or CLI-JSON layers. This conformance scenario is added
+        per the issue's own acceptance bar as a regression guard for this
+        exact behaviour; the root cause (if real) was not found in this
+        repo's driver — see the PR description.
+        """
+        cols, rows = 100, 10
+        screen = VtScreen(cols=cols, rows=rows)
+        text = "Ln 1, Col 100"
+        col_start = cols - len(text) + 1  # 1-indexed CUP column of the first char
+        screen.feed(f"\x1b[{rows};{col_start}H{text}".encode())
+        lines = screen.text().split("\n")
+        assert len(lines) == rows
+        assert all(len(line) == cols for line in lines)
+        assert lines[-1].endswith(text)
+
     def test_missing_pyte_raises_actionable_error(self, monkeypatch) -> None:
         import builtins
 
@@ -795,6 +828,48 @@ class TestTuiPtySessionDragAndResize:
             # as `.columns`/`.lines`; both must reflect the resize, not
             # just the real pty half.
             assert (session._screen._screen.columns, session._screen._screen.lines) == (120, 40)
+        finally:
+            session.close()
+
+
+class TestTuiPtySessionScreenWidth:
+    """#3618's own Tier-1 conformance scenario: ``coord app-drive tui-pty
+    open --cols N ...`` followed by ``screen`` must come back with every
+    row exactly N characters wide — the bugbash finding reported N - 1,
+    truncating a right-flush-justified status segment's last character
+    (vimcode's ruler losing its trailing digit). Drives the exact
+    ``open``/``screen`` path (:class:`TuiPtySession`, the daemon's own
+    backend for the ``screen`` op — see
+    :func:`coord.app_drive_daemon._dispatch`) against a scripted child
+    that emits a full-width, right-flushed line, the same shape the
+    bugbash evidence described.
+
+    Investigation note: this passes unmodified. Direct measurement
+    through a real :class:`UnixPtyChild` and the full
+    ``open_session``/``send_command`` round trip (outside this test
+    suite) found no off-by-one here either — see this issue's PR
+    description for what was ruled out."""
+
+    def test_screen_rows_are_exactly_cols_wide_not_cols_minus_one(self) -> None:
+        cols, rows = 100, 30
+        text = "Ln 1, Col 100"
+        col_start = cols - len(text) + 1
+        child = FakePtyChild(script=[(0.0, f"\x1b[{rows};{col_start}H{text}".encode())])
+        session = TuiPtySession(
+            "unused", ".", cols=cols, rows=rows,
+            spawn_child=lambda launch, cwd, cols, rows: child,
+        )
+        try:
+            deadline = time.monotonic() + 2.0
+            lines: list[str] = []
+            while time.monotonic() < deadline:
+                lines = session.screen_text().split("\n")
+                if lines[-1].strip():
+                    break
+                time.sleep(0.02)
+            assert len(lines) == rows
+            assert all(len(line) == cols for line in lines)
+            assert lines[-1].endswith(text)
         finally:
             session.close()
 
