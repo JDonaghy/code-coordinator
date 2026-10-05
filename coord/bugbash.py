@@ -117,6 +117,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Sequence
@@ -1993,6 +1995,90 @@ def harvest_outcome(
     return report
 
 
+def _group_lanes_by_host(lanes: Sequence[BugbashLane]) -> dict[str, list[BugbashLane]]:
+    """Groups *lanes* by :attr:`BugbashLane.machine`, preserving each
+    lane's original relative order within its own host's list — the exact
+    order :func:`_explore_round_lanes` explores that host's lanes in,
+    unchanged from the old strictly-sequential loop. Different hosts' lists
+    are explored concurrently (#3602); lanes within the SAME list never
+    are — dict iteration order is insertion order (first lane seen for a
+    new ``machine``), so this is also deterministic given *lanes*' order."""
+    groups: dict[str, list[BugbashLane]] = {}
+    for lane in lanes:
+        groups.setdefault(lane.machine, []).append(lane)
+    return groups
+
+
+def _explore_round_lanes(
+    lanes_by_host: dict[str, list[BugbashLane]],
+    round_num: int,
+    explorer: Explorer,
+    report: RoundReport,
+    lane_cost: dict[str, float],
+    cost_cap_per_lane: float,
+    cost_cap_total: float,
+    total_cost_box: list[float],
+    state_lock: threading.Lock,
+) -> None:
+    """Explores every lane configured for this round, one worker thread per
+    HOST (#3602) — a host's own lanes run strictly in the order given (the
+    thread blocks on each lane's :data:`Explorer` call before starting the
+    next lane on that SAME host, since two GUI lanes on one desktop would
+    fight over focus and a host like ``macmini`` has ``max_workers: 1``
+    anyway), but different hosts' threads run concurrently — so a round's
+    wall-clock cost is the slowest HOST's own lane chain, never the sum
+    over every lane.
+
+    Both cost caps are read and updated only under *state_lock*, with the
+    :data:`Explorer` call itself made OUTSIDE the lock (a real lane can take
+    many minutes) — so the "check cap, then mark started" step is atomic
+    across hosts. The only overshoot the total cap can ever see is from
+    lane(s) ALREADY in flight (their :data:`Explorer` call already started)
+    at the moment a sibling's completion pushes the running total to/over
+    the cap — a lane that hasn't started yet always sees the tripped cap
+    under the same lock its sibling just wrote through, and is skipped
+    (recorded in ``skip_reasons``, same as a per-lane cap skip) rather than
+    started.
+    """
+
+    def run_host(host_lanes: list[BugbashLane]) -> None:
+        for lane in host_lanes:
+            with state_lock:
+                if lane_cost[lane.platform] >= cost_cap_per_lane:
+                    report.skipped_lanes.append(lane.platform)
+                    report.skip_reasons[lane.platform] = (
+                        f"cumulative cost {lane_cost[lane.platform]:.2f} already "
+                        f">= per-lane cap {cost_cap_per_lane:.2f}"
+                    )
+                    continue
+                if total_cost_box[0] >= cost_cap_total:
+                    report.skipped_lanes.append(lane.platform)
+                    report.skip_reasons[lane.platform] = (
+                        f"total cost {total_cost_box[0]:.2f} already >= total cap "
+                        f"{cost_cap_total:.2f} (cap already tripped by another lane "
+                        "this round)"
+                    )
+                    continue
+            outcome = explorer(lane, round_num)
+            with state_lock:
+                lane_cost[lane.platform] += outcome.cost
+                report.lane_cost[lane.platform] = lane_cost[lane.platform]
+                total_cost_box[0] += outcome.cost
+                # #3569: the SAME bucketing `coord bugbash harvest`'s
+                # `harvest_outcome` uses for a late-arriving explorer — one
+                # question ("how does this ExploreOutcome classify"), one
+                # answer, whether it's observed inline here or recovered
+                # after the fact.
+                _apply_outcome_to_round(report, lane, outcome)
+
+    if not lanes_by_host:
+        return
+    with ThreadPoolExecutor(max_workers=len(lanes_by_host)) as pool:
+        futures = [pool.submit(run_host, host_lanes) for host_lanes in lanes_by_host.values()]
+        for future in futures:
+            future.result()  # re-raise any exception from a host's thread
+
+
 def run_bugbash(
     config: BugbashConfig,
     *,
@@ -2005,9 +2091,18 @@ def run_bugbash(
     """Run the find -> dedupe -> file -> queue loop for one repo until a
     round yields zero new findings, or a round/cost cap fires (#3487).
 
-    Each round: every lane is explored (unless it has already exceeded
-    ``cost_cap_per_lane``, in which case it is skipped and recorded in
-    ``skipped_lanes``/``skip_reasons`` — never silently dropped), findings
+    Each round: every lane is explored CONCURRENTLY ACROSS HOSTS (#3602,
+    see :func:`_explore_round_lanes`) — lanes sharing a host (e.g. two
+    routes both landing on ``macmini``) are still run strictly one after
+    another, but lanes on different hosts overlap, so a round's wall-clock
+    time is the slowest HOST's own lane chain, not the sum over every lane.
+    A lane is skipped (never silently dropped — recorded in
+    ``skipped_lanes``/``skip_reasons``) when it has already exceeded
+    ``cost_cap_per_lane``, OR when ``cost_cap_total`` was already tripped by
+    a sibling lane earlier in THIS round (mid-round, not just at the round
+    boundary — see :func:`_explore_round_lanes`'s docstring for exactly how
+    much overshoot that still allows). Once every host's lanes for the
+    round have reported, findings
     are deduped via :func:`_dedupe_round_findings` against a FRESH fetch of
     open/closed issues MERGED with every issue THIS RUN has already filed
     (#3546: a finding filed earlier in the same run — this round or an
@@ -2060,7 +2155,9 @@ def run_bugbash(
     """
     lane_cost: dict[str, float] = {lane.platform: 0.0 for lane in config.lanes}
     lanes_by_platform: dict[str, BugbashLane] = {lane.platform: lane for lane in config.lanes}
-    total_cost = 0.0
+    lanes_by_host = _group_lanes_by_host(config.lanes)
+    total_cost_box: list[float] = [0.0]
+    state_lock = threading.Lock()
     rounds: list[RoundReport] = []
     reason = "round_cap"
     # #3546: every issue THIS RUN has actually filed into config.repo,
@@ -2078,24 +2175,18 @@ def run_bugbash(
     for round_num in range(1, config.max_rounds + 1):
         report = RoundReport(round_num=round_num)
 
-        for lane in config.lanes:
-            if lane_cost[lane.platform] >= config.cost_cap_per_lane:
-                report.skipped_lanes.append(lane.platform)
-                report.skip_reasons[lane.platform] = (
-                    f"cumulative cost {lane_cost[lane.platform]:.2f} already "
-                    f">= per-lane cap {config.cost_cap_per_lane:.2f}"
-                )
-                continue
-            outcome = explorer(lane, round_num)
-            lane_cost[lane.platform] += outcome.cost
-            report.lane_cost[lane.platform] = lane_cost[lane.platform]
-            total_cost += outcome.cost
-            # #3569: the SAME bucketing `coord bugbash harvest`'s
-            # `harvest_outcome` uses for a late-arriving explorer — one
-            # question ("how does this ExploreOutcome classify"), one
-            # answer, whether it's observed inline here or recovered after
-            # the fact.
-            _apply_outcome_to_round(report, lane, outcome)
+        _explore_round_lanes(
+            lanes_by_host,
+            round_num,
+            explorer,
+            report,
+            lane_cost,
+            config.cost_cap_per_lane,
+            config.cost_cap_total,
+            total_cost_box,
+            state_lock,
+        )
+        total_cost = total_cost_box[0]
 
         # #3546: merge the fresh fetch with every issue THIS RUN has already
         # filed — a finding matching one of this run's own earlier filings

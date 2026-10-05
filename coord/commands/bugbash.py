@@ -70,6 +70,8 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -752,12 +754,30 @@ def bugbash_run_cmd(
         confirm_rounds=confirm_rounds,
     )
 
+    # #3602: lanes on different hosts now run concurrently (coord.bugbash
+    # ._explore_round_lanes), so a bare `click.echo` from each host's thread
+    # could interleave mid-line with another host's — print under a shared
+    # lock, and prefix every line with the lane label, so a long concurrent
+    # round still reads as one lane's story per line rather than a shuffled
+    # mess of partial writes.
+    print_lock = threading.Lock()
+
     def explorer(lane: BugbashLane, round_num: int) -> ExploreOutcome:
-        return _dispatch_and_await_lane(
+        with print_lock:
+            click.echo(f"[{lane.platform}@{lane.machine}] round {round_num}: dispatching...")
+        started = time.monotonic()
+        outcome = _dispatch_and_await_lane(
             lane, round_num, repo_name=repo, config=cfg, reference_backend=reference,
             catalogue_text=catalogue_text,
             timeout=lane_timeout, cost_cap=cost_cap_per_lane,
         )
+        elapsed = time.monotonic() - started
+        with print_lock:
+            click.echo(
+                f"[{lane.platform}@{lane.machine}] round {round_num}: done in "
+                f"{elapsed:.0f}s ({len(outcome.findings)} finding(s), cost={outcome.cost:.2f})"
+            )
+        return outcome
 
     def confirm(round_num: int, candidates: list) -> bool:
         if yes:
