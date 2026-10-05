@@ -30,9 +30,16 @@ from coord.win_native_driver import (
     WinNativeRuntimeError,
     WinNativeSpecError,
     Win32Calls,
+    _execute_staging,
     _find_a11y_match,
     _is_unc_path,
+    _leading_token,
+    _looks_shell_composed,
+    _plan_staging,
     _popen_command_and_cwd,
+    _StagingPlan,
+    _STALE_SESSION_MAX_AGE_S,
+    _strip_cd_prefix,
     _summarize_elements,
     _vkey_for,
     parse_native_spec,
@@ -862,6 +869,15 @@ class _FakeKernel32NoSession:
     def CloseHandle(self, _handle) -> None:
         pass
 
+    def OpenProcess(self, *_args, **_kwargs):
+        # #3617: `kill`'s own `OpenProcess`/`TerminateProcess` — no real
+        # process to terminate in these tests, so this reports "no such
+        # handle" (falsy), the same as a pid that's already gone.
+        return 0
+
+    def TerminateProcess(self, *_args, **_kwargs) -> None:
+        raise AssertionError("TerminateProcess must not be called when OpenProcess returned no handle")
+
 
 def _ensure_mbcs_codec_available() -> None:
     """``_logonui_running_in_session`` decodes ``szExeFile`` with Windows'
@@ -890,6 +906,7 @@ def _make_win32_calls(user32, kernel32) -> Win32Calls:
     calls._ctypes = ctypes
     calls._user32 = user32
     calls._kernel32 = kernel32
+    calls._staged_session_dirs = {}  # #3617 — normally set by `__init__`
     return calls
 
 
@@ -1228,6 +1245,389 @@ class TestWin32CallsLaunchAvoidsUncCwd:
         calls.launch("app.exe", r"C:\Users\me\repo")
         assert captured["command"] == "app.exe"
         assert captured["cwd"] == r"C:\Users\me\repo"
+
+
+# ── #3617: local-filesystem launch staging ──────────────────────────────────
+
+
+class TestPlanStaging:
+    """:func:`_plan_staging` — pure Windows-path string math, no real
+    filesystem I/O, so these use fabricated path strings directly (works
+    identically on any host OS, since `ntpath` is a pure algorithm)."""
+
+    UNC = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+    SESSION = r"C:\Users\me\AppData\Local\Temp\coord-app-drive\abc123"
+
+    def test_cd_fixture_dir_then_relative_exe_is_staged(self) -> None:
+        """The real coordinator.yml shape (#3617's own motivating case,
+        also covered pre-existing-ly by
+        `TestWin32CallsLaunchAvoidsUncCwd`'s `cd .smoke && ...`): `cwd`
+        moves into the staged `.smoke`, the exe is staged at the SAME
+        path relative to the new session root that it held relative to
+        the old (UNC) `cwd`, and the fixture dir itself is queued for a
+        wholesale copy."""
+        plan = _plan_staging(
+            "cd .smoke && ../target/release/vimcode.exe sample.txt",
+            self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is True
+        assert plan.cwd == f"{self.SESSION}\\.smoke"
+        assert plan.source_exe == f"{self.UNC}\\target\\release\\vimcode.exe"
+        assert plan.dest_exe == f"{self.SESSION}\\target\\release\\vimcode.exe"
+        assert (f"{self.UNC}\\.smoke", f"{self.SESSION}\\.smoke") in plan.fixture_copies
+
+    def test_bare_exe_with_no_cd_prefix_is_staged_relative_to_cwd(self) -> None:
+        """No `cd` at all: the exe is resolved directly against `cwd`,
+        `cwd` itself becomes the session root unchanged in shape, and the
+        conventional `.smoke` dir is still queued (opportunistically,
+        whether or not the command ever names it) in case the exe reads
+        it without a `cd`."""
+        plan = _plan_staging("vimcode.exe sample.txt", self.UNC, session_root=self.SESSION)
+        assert plan.staged is True
+        assert plan.cwd == self.SESSION
+        assert plan.source_exe == f"{self.UNC}\\vimcode.exe"
+        assert plan.dest_exe == f"{self.SESSION}\\vimcode.exe"
+        assert (f"{self.UNC}\\.smoke", f"{self.SESSION}\\.smoke") in plan.fixture_copies
+
+    def test_quoted_exe_with_embedded_space_is_staged(self) -> None:
+        plan = _plan_staging('"My App.exe" sample.txt', self.UNC, session_root=self.SESSION)
+        assert plan.staged is True
+        assert plan.source_exe == f"{self.UNC}\\My App.exe"
+        assert plan.dest_exe == f"{self.SESSION}\\My App.exe"
+
+    def test_non_unc_cwd_is_never_staged(self) -> None:
+        """A same-host (non-WSL) `win-native` agent's `cwd` is already
+        local — nothing to stage, and this driver must not even attempt
+        to resolve `%LOCALAPPDATA%` for it."""
+        plan = _plan_staging("vimcode.exe", r"C:\Users\me\repo", session_root=self.SESSION)
+        assert plan.staged is False
+
+    def test_a_second_shell_operator_is_left_alone(self) -> None:
+        """Anything beyond the ONE recognized `cd <dir> && ` prefix is an
+        opaque shell pipeline this driver will not guess at rewriting."""
+        plan = _plan_staging(
+            "cd .smoke && a.exe && b.exe", self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is False
+
+    def test_a_pipe_or_redirection_is_left_alone(self) -> None:
+        for command in ("a.exe | b.exe", "a.exe > out.txt", "a.exe & b.exe"):
+            assert _plan_staging(command, self.UNC, session_root=self.SESSION).staged is False
+
+    def test_an_absolute_exe_token_is_left_alone(self) -> None:
+        """Nothing under `cwd`'s own tree to stage for an exe that's
+        already an absolute path — left alone rather than guessed at."""
+        plan = _plan_staging(
+            r"C:\Tools\vimcode.exe sample.txt", self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is False
+
+    def test_empty_command_is_left_alone(self) -> None:
+        assert _plan_staging("", self.UNC, session_root=self.SESSION).staged is False
+
+    def test_an_exe_that_escapes_cwd_with_no_cd_to_cancel_it_is_left_alone(self) -> None:
+        """A bare (no `cd` prefix) `../target/release/vimcode.exe` climbs
+        ABOVE `cwd` itself — staged at the same offset from
+        `session_root`, it would land OUTSIDE this session's own
+        directory (in the shared parent every session's own root lives
+        under), a leak `kill`'s session-scoped delete would never reach.
+        Left alone rather than risked."""
+        plan = _plan_staging(
+            "../target/release/vimcode.exe sample.txt", self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is False
+
+    def test_a_cd_dir_that_cancels_out_the_exes_escape_is_still_staged(self) -> None:
+        """The actual motivating shape (`test_cd_fixture_dir_then_relative
+        _exe_is_staged` above): the SAME `../target/...` exe token, but
+        with a `cd .smoke` ahead of it that cancels the `..` back inside
+        `cwd` — this one must still stage, distinguishing "escapes `cwd`
+        entirely" from "escapes the post-`cd` directory but stays inside
+        `cwd`"."""
+        plan = _plan_staging(
+            "cd .smoke && ../target/release/vimcode.exe sample.txt",
+            self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is True
+
+
+class TestStripCdPrefixAndLeadingToken:
+    """The two small parsers :func:`_plan_staging` is built from."""
+
+    def test_strip_cd_prefix_recognizes_the_convention(self) -> None:
+        assert _strip_cd_prefix("cd .smoke && a.exe") == (".smoke", "a.exe")
+        assert _strip_cd_prefix("CD .smoke && a.exe") == (".smoke", "a.exe")  # case-insensitive
+        assert _strip_cd_prefix('cd "my dir" && a.exe') == ("my dir", "a.exe")
+
+    def test_strip_cd_prefix_is_a_no_op_without_the_exact_shape(self) -> None:
+        assert _strip_cd_prefix("a.exe") == ("", "a.exe")
+        assert _strip_cd_prefix("echo cd .smoke && a.exe") == ("", "echo cd .smoke && a.exe")
+
+    def test_leading_token_handles_quoting_and_bare_tokens(self) -> None:
+        assert _leading_token('"My App.exe" sample.txt') == ("My App.exe", "sample.txt")
+        assert _leading_token("vimcode.exe sample.txt") == ("vimcode.exe", "sample.txt")
+        assert _leading_token("vimcode.exe") == ("vimcode.exe", "")
+        assert _leading_token("   ") == ("", "")
+
+    def test_looks_shell_composed(self) -> None:
+        assert _looks_shell_composed("a.exe && b.exe") is True
+        assert _looks_shell_composed("a.exe | b.exe") is True
+        assert _looks_shell_composed("a.exe sample.txt") is False
+
+
+class TestExecuteStaging:
+    """:func:`_execute_staging` — the real filesystem side, exercised
+    against plain local `tmp_path` directories (the function itself is
+    OS-agnostic string/`os`/`shutil` plumbing; only :class:`Win32Calls`
+    ever feeds it genuinely Windows-shaped strings, on real Windows)."""
+
+    def test_copies_the_exe_and_every_fixture_dir_that_exists(self, tmp_path) -> None:
+        source_exe_dir = tmp_path / "target" / "release"
+        source_exe_dir.mkdir(parents=True)
+        source_exe = source_exe_dir / "vimcode.exe"
+        source_exe.write_text("binary")
+        fixture_dir = tmp_path / ".smoke"
+        fixture_dir.mkdir()
+        (fixture_dir / "sample.txt").write_text("hi")
+        (fixture_dir / "settings.json").write_text("{}")
+
+        session = tmp_path / "session"
+        plan = _StagingPlan(
+            staged=True,
+            cwd=str(session / ".smoke"),
+            source_exe=str(source_exe),
+            dest_exe=str(session / "target" / "release" / "vimcode.exe"),
+            fixture_copies=((str(fixture_dir), str(session / ".smoke")),),
+        )
+        _execute_staging(plan)
+
+        assert (session / "target" / "release" / "vimcode.exe").is_file()
+        assert (session / ".smoke" / "sample.txt").read_text() == "hi"
+        assert (session / ".smoke" / "settings.json").read_text() == "{}"
+
+    def test_a_missing_fixture_dir_is_skipped_not_an_error(self, tmp_path) -> None:
+        source_exe = tmp_path / "vimcode.exe"
+        source_exe.write_text("binary")
+        session = tmp_path / "session"
+        plan = _StagingPlan(
+            staged=True, cwd=str(session), source_exe=str(source_exe),
+            dest_exe=str(session / "vimcode.exe"),
+            fixture_copies=((str(tmp_path / "no-such-fixture-dir"), str(session / ".smoke")),),
+        )
+        _execute_staging(plan)  # must not raise
+        assert (session / "vimcode.exe").is_file()
+        assert not (session / ".smoke").exists()
+
+    def test_a_missing_exe_raises(self, tmp_path) -> None:
+        session = tmp_path / "session"
+        plan = _StagingPlan(
+            staged=True, cwd=str(session),
+            source_exe=str(tmp_path / "no-such.exe"),
+            dest_exe=str(session / "no-such.exe"),
+        )
+        with pytest.raises(WinNativeRuntimeError, match="exe not found"):
+            _execute_staging(plan)
+
+    def test_an_unstaged_plan_is_a_pure_no_op(self, tmp_path) -> None:
+        calls_made = []
+
+        def _boom(*a, **kw):
+            calls_made.append((a, kw))
+            raise AssertionError("must never touch the filesystem for an unstaged plan")
+
+        _execute_staging(
+            _StagingPlan(staged=False),
+            isfile=_boom, makedirs=_boom, copy_file=_boom, copy_tree=_boom,
+        )
+        assert calls_made == []
+
+
+class TestWin32CallsLocalStaging:
+    """:class:`Win32Calls`'s own wiring of the #3617 staging helpers into
+    `launch`/`launch_in_terminal`/`kill` — the planning/execution logic
+    itself is `TestPlanStaging`/`TestExecuteStaging`'s job; these confirm
+    `Win32Calls` actually calls them, uses their result for `Popen`, and
+    cleans the staged directory up on `kill`."""
+
+    UNC = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+
+    def _fake_popen(self, captured: dict):
+        class _FakeProc:
+            pid = 7777
+
+        def fake_popen(command, *, shell, cwd=None, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            return _FakeProc()
+
+        return fake_popen
+
+    def test_launch_stages_and_rewrites_cwd_when_localappdata_is_set(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+        captured_plan_args: dict = {}
+        executed: list = []
+
+        def fake_plan_staging(command, cwd, *, session_root):
+            captured_plan_args["command"] = command
+            captured_plan_args["cwd"] = cwd
+            captured_plan_args["session_root"] = session_root
+            return _StagingPlan(
+                staged=True, cwd=f"{session_root}\\.smoke",
+                source_exe=f"{cwd}\\target\\vimcode.exe",
+                dest_exe=f"{session_root}\\target\\vimcode.exe",
+            )
+
+        def fake_execute_staging(plan):
+            executed.append(plan)
+
+        monkeypatch.setattr("coord.win_native_driver._plan_staging", fake_plan_staging)
+        monkeypatch.setattr("coord.win_native_driver._execute_staging", fake_execute_staging)
+        captured_popen: dict = {}
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(captured_popen),
+        )
+
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        pid = calls.launch("cd .smoke && vimcode.exe sample.txt", self.UNC)
+
+        assert pid == 7777
+        assert captured_plan_args["cwd"] == self.UNC
+        assert len(executed) == 1  # staging was actually performed, not just planned
+        # The STAGED cwd (a local path under the session root), not the
+        # original UNC one, is what reached `Popen` — via `cwd=None` +
+        # `_popen_command_and_cwd`'s own non-UNC passthrough, since the
+        # staged cwd is a real local path, not a UNC one needing `pushd`.
+        assert "coord-app-drive" in captured_plan_args["session_root"]
+        assert captured_popen["cwd"].endswith("\\.smoke")
+        assert "wsl.localhost" not in captured_popen["cwd"]
+        # The staged dir is tracked against the real PID `Popen` returned,
+        # for `kill` to clean up later.
+        assert calls._staged_session_dirs[7777] is not None
+
+    def test_launch_falls_back_to_pushd_when_localappdata_is_unset(
+        self, monkeypatch,
+    ) -> None:
+        """#3617 is a performance optimization, not a correctness
+        requirement — when `%LOCALAPPDATA%` can't be resolved at all, a
+        caller still gets a working (if UNC-slow) launch via the
+        pre-#3617 `pushd` wrap, rather than this failing outright."""
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+
+        def _boom(*a, **kw):
+            raise AssertionError("must never attempt to stage without %LOCALAPPDATA%")
+
+        monkeypatch.setattr("coord.win_native_driver._plan_staging", _boom)
+        captured_popen: dict = {}
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(captured_popen),
+        )
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        calls.launch("cd .smoke && vimcode.exe sample.txt", self.UNC)
+        assert captured_popen["command"] == f'pushd "{self.UNC}" && cd .smoke && vimcode.exe sample.txt'
+        assert captured_popen["cwd"] is None
+
+    def test_launch_in_terminal_also_stages(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+
+        def fake_plan_staging(command, cwd, *, session_root):
+            return _StagingPlan(
+                staged=True, cwd=session_root,
+                source_exe=f"{cwd}\\vimcode.exe", dest_exe=f"{session_root}\\vimcode.exe",
+            )
+
+        monkeypatch.setattr("coord.win_native_driver._plan_staging", fake_plan_staging)
+        monkeypatch.setattr("coord.win_native_driver._execute_staging", lambda plan: None)
+        captured_popen: dict = {}
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(captured_popen),
+        )
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        pid = calls.launch_in_terminal("vimcode.exe", self.UNC, "windows-terminal")
+        assert pid == 7777
+        assert captured_popen["command"].startswith("wt.exe vimcode.exe")
+        assert "wsl.localhost" not in captured_popen["cwd"]
+
+    def test_kill_deletes_the_staged_session_dir_it_tracked(self, tmp_path) -> None:
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        staged_dir = tmp_path / "session1"
+        staged_dir.mkdir()
+        (staged_dir / "vimcode.exe").write_text("binary")
+        calls._staged_session_dirs[4242] = str(staged_dir)
+
+        calls.kill(4242)
+
+        assert not staged_dir.exists()
+        assert 4242 not in calls._staged_session_dirs
+
+    def test_kill_with_no_staged_dir_for_that_pid_is_a_no_op(self) -> None:
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        calls.kill(1)  # must not raise even with an empty tracking dict
+
+
+class TestStagingRootAndSweep:
+    """:meth:`Win32Calls._staging_root`/:meth:`~Win32Calls._sweep_stale_sessions`
+    — real `os` calls, but exercised against plain local `tmp_path`
+    directories (this method only ever runs for real on Windows, where
+    `os.path` already IS `ntpath` — nothing here is Windows-path-specific)."""
+
+    def _calls(self):
+        return _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+
+    def test_staging_root_uses_localappdata_not_hardcoded(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        calls = self._calls()
+        root = calls._staging_root()
+        assert root == os.path.join(str(tmp_path), "Temp", "coord-app-drive")
+
+    def test_staging_root_raises_when_localappdata_is_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        calls = self._calls()
+        with pytest.raises(WinNativeRuntimeError, match="LOCALAPPDATA"):
+            calls._staging_root()
+
+    def test_sweep_deletes_only_sessions_older_than_the_max_age(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        calls = self._calls()
+        root = calls._staging_root()
+        os.makedirs(root)
+        old_dir = os.path.join(root, "old-session")
+        fresh_dir = os.path.join(root, "fresh-session")
+        os.makedirs(old_dir)
+        os.makedirs(fresh_dir)
+        stale_time = time.time() - (_STALE_SESSION_MAX_AGE_S + 3600)
+        os.utime(old_dir, (stale_time, stale_time))
+
+        calls._sweep_stale_sessions()
+
+        assert not os.path.exists(old_dir)
+        assert os.path.exists(fresh_dir)
+
+    def test_sweep_on_a_missing_root_is_a_no_op(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "does-not-exist-yet"))
+        calls = self._calls()
+        calls._sweep_stale_sessions()  # must not raise
+
+
+class TestWin32CallsLaunchUnboundNeverTouchesSelfForNonUncPaths:
+    """#3617 review: `launch`/`launch_in_terminal` must still be callable
+    completely unbound (`self=None`) for a non-UNC `cwd` — the exact shape
+    `TestLaunchPipeInheritanceRealSubprocess` already relies on — since
+    the new staging lookup is gated on `_is_unc_path(cwd)` BEFORE `self`
+    is ever touched."""
+
+    def test_launch_unbound_with_non_unc_cwd_never_touches_self(self, monkeypatch) -> None:
+        class _FakeProc:
+            pid = 1
+
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen",
+            lambda *a, **kw: _FakeProc(),
+        )
+        assert Win32Calls.launch(None, "vimcode.exe", r"C:\Users\me\repo") == 1
 
 
 class TestWin32CallsLaunchDoesNotInheritStdHandles:

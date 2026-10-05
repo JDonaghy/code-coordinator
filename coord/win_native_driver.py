@@ -64,6 +64,37 @@ UNC ``cwd`` rather than ever handing cmd.exe one directly; see
 :class:`Win32Calls`'s :meth:`~Win32Calls.launch`/
 :meth:`~Win32Calls.launch_in_terminal`.
 
+**Local-filesystem staging (#3617).** ``pushd``-into-a-UNC-path (above)
+only stops cmd.exe's own startup refusal — it does nothing about the cost
+of actually *running* from one. Once launched, Windows reads the exe and
+every file it touches (a route's fixture/working files) over ``\\wsl$``'s
+9P protocol, which the dell64 operator found "horrible" (2026-10-05) next
+to real local NTFS. Whenever ``cwd`` is a UNC path AND the launch command
+is a shape this driver can parse with confidence (:func:`_plan_staging`'s
+own docstring names exactly which two shapes qualify — a bare leading exe
+token, optionally preceded by one ``cd <fixture-dir> && ``, the fleet's
+own convention for entering a route's working directory first), both
+:meth:`Win32Calls.launch` and :meth:`~Win32Calls.launch_in_terminal` copy
+the resolved exe (plus that fixture dir, and/or a conventional ``.smoke``
+one, when present) onto the real local Windows filesystem — a fresh
+``%LOCALAPPDATA%\\Temp\\coord-app-drive\\<session>\\`` directory — and
+launch from there instead, with ``cwd`` rewritten to match. Anything more
+complex (a second shell operator, an absolute/off-``cwd`` exe) is left
+alone, falling back to the ``pushd`` wrap above unchanged — this driver
+only ever rewrites the ONE leading executable token of a command it can
+parse with confidence, never an opaque shell pipeline.
+
+:meth:`Win32Calls.kill` deletes the staged session directory it created,
+once it has signalled that launch's own pid — the normal (``close``/
+``NativeRunner`` teardown) path. There is no Windows analogue of #3583's
+``PR_SET_PDEATHSIG`` for "also delete a directory" on an abnormal (e.g.
+SIGKILLed) exit, so :meth:`~Win32Calls.launch`/
+:meth:`~Win32Calls.launch_in_terminal` additionally sweep (and delete) any
+session directory older than a day on every call — the same "idle
+self-expiry is the backstop, the explicit teardown is the normal path"
+shape :data:`coord.app_drive.DEFAULT_IDLE_TIMEOUT` already uses, just
+applied to a directory instead of a process.
+
 **Spec steps** (:func:`parse_native_spec`, YAML — the ``win-native``
 sibling of ``tui-pty``'s smoke spec):
 
@@ -140,9 +171,13 @@ blocking-but-unavailable rather than failed.
 from __future__ import annotations
 
 import base64
+import ntpath
 import os
+import re
+import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -810,6 +845,218 @@ def _popen_command_and_cwd(command: str, cwd: str) -> tuple[str, str | None]:
     return command, (cwd or None)
 
 
+# ── local-filesystem launch staging (#3617) ────────────────────────────────
+#
+# See the module docstring's own "#3617" section for the why. Split into a
+# pure planning step (`_plan_staging`, Windows-path string math only, via
+# `ntpath` — never touches a real filesystem, so it's testable with
+# fabricated paths on any host OS) and a filesystem-executing step
+# (`_execute_staging`, every real I/O call injectable and defaulting to the
+# real `os`/`shutil` one) — the same "injectable OS-call seam" shape
+# `WinCalls`/`Win32Calls` already use one level up, just for this one
+# narrower concern.
+
+#: Where staged sessions live, relative to `%LOCALAPPDATA%\Temp\` — real
+#: local NTFS on every Windows host, never a UNC path.
+_STAGING_ROOT_DIRNAME = "coord-app-drive"
+
+#: The fleet's own convention (coordinator.yml's win-native `routes:`) for
+#: a route's sample/settings working files — copied opportunistically
+#: whenever present under `cwd`, regardless of whether the launch command
+#: itself names it via a `cd` prefix.
+_STAGING_FIXTURE_DIRNAME = ".smoke"
+
+#: `%LOCALAPPDATA%` is only ever read for this one purpose.
+_LOCALAPPDATA_ENV = "LOCALAPPDATA"
+
+#: A command containing any of these (beyond the one recognized `cd <dir>
+#: && ` prefix `_strip_cd_prefix` already peels off) is an opaque shell
+#: pipeline this driver will not guess at rewriting — `_plan_staging`
+#: leaves it, and its UNC `cwd`, completely alone (falling back to
+#: `_popen_command_and_cwd`'s own `pushd` wrap).
+_SHELL_METACHARACTERS = ("&&", "&", "|", ">", "<", ";")
+
+_CD_PREFIX_RE = re.compile(r'^cd\s+"?([^"&]+?)"?\s*&&\s*', re.IGNORECASE)
+
+
+def _strip_cd_prefix(command: str) -> tuple[str, str]:
+    """``("", command)`` unless *command* starts with a plain ``cd <dir>
+    && `` prefix (case-insensitive, optionally quoted) — the fleet's own
+    convention for entering a route's fixture/working directory before
+    launching (e.g. ``cd .smoke && ../target/release/vimcode.exe
+    sample.txt``) — in which case returns ``(dir, remainder)``."""
+    m = _CD_PREFIX_RE.match(command)
+    if not m:
+        return "", command
+    return m.group(1), command[m.end():]
+
+
+def _looks_shell_composed(command: str) -> bool:
+    return any(token in command for token in _SHELL_METACHARACTERS)
+
+
+def _leading_token(command: str) -> tuple[str, str]:
+    """*command*'s leading whitespace-delimited token (optionally
+    double-quoted, to allow an embedded space) and the unparsed remainder
+    — e.g. ``'"My App.exe" sample.txt'`` -> ``('My App.exe',
+    'sample.txt')``. ``("", "")`` for an empty/all-whitespace *command*."""
+    stripped = command.strip()
+    if not stripped:
+        return "", ""
+    if stripped[0] == '"':
+        end = stripped.find('"', 1)
+        if end != -1:
+            return stripped[1:end], stripped[end + 1:].strip()
+    parts = stripped.split(None, 1)
+    return parts[0], (parts[1] if len(parts) > 1 else "")
+
+
+@dataclass(frozen=True)
+class _StagingPlan:
+    """What :func:`_plan_staging` decided — ``staged=False`` means "leave
+    *command*/*cwd* exactly as given", the caller's cue to fall back to
+    :func:`_popen_command_and_cwd`'s own UNC ``pushd`` wrap unchanged."""
+
+    staged: bool
+    cwd: str = ""
+    source_exe: str = ""
+    dest_exe: str = ""
+    #: ``(source_dir, dest_dir)`` pairs to copy wholesale when the source
+    #: exists — never an error when one doesn't (an optional fixture dir
+    #: nobody provided this time).
+    fixture_copies: tuple[tuple[str, str], ...] = ()
+
+
+def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
+    """Decide whether/how to stage *command*'s exe (plus its fixture
+    dir(s)) from *cwd* into *session_root* instead of launching straight
+    off *cwd* (#3617).
+
+    Only engages when *cwd* is a UNC path (:func:`_is_unc_path`) — a
+    same-host (non-WSL) ``win-native`` agent's ``cwd`` is already local,
+    nothing to stage. Recognizes exactly two *command* shapes: a bare
+    leading executable token (optionally quoted) with trailing arguments,
+    and that same shape preceded by one ``cd <fixture-dir> && ``. Declines
+    (``staged=False``) for anything else containing a shell metacharacter
+    (:data:`_SHELL_METACHARACTERS` — a second ``&&``, a pipe, a
+    redirection, ...) this driver cannot safely rewrite with confidence,
+    an already-absolute exe token (nothing of *cwd*'s own tree to stage
+    for it), or an exe whose path relative to ``cwd``/``cd_dir`` climbs
+    ABOVE ``cwd`` itself without a ``cd_dir`` to cancel it back out
+    (staged at the same offset from ``session_root``, it would escape
+    this session's own directory into the shared parent every other
+    session's own root also lives under).
+
+    *command* itself is returned unchanged in the resulting plan — only
+    ``cwd`` moves (to ``session_root``, or ``session_root/<fixture-dir>``
+    when a ``cd`` prefix was recognized) — because the exe is copied to
+    the SAME path, relative to *session_root*, that it already held
+    relative to *cwd* (:func:`ntpath.normpath` applied to ``cd_dir`` +
+    the exe token), so every relative reference in *command* — the ``cd``
+    itself, a ``../`` the exe token carries, a trailing argument resolved
+    against the post-``cd`` directory — keeps resolving correctly against
+    the new, local root exactly as it did against the old, UNC one.
+    """
+    if not _is_unc_path(cwd):
+        return _StagingPlan(staged=False)
+    cd_dir, remainder = _strip_cd_prefix(command)
+    if _looks_shell_composed(remainder):
+        return _StagingPlan(staged=False)
+    exe_token, _rest = _leading_token(remainder)
+    if not exe_token or ntpath.isabs(exe_token):
+        return _StagingPlan(staged=False)
+
+    exe_rel = ntpath.normpath(ntpath.join(cd_dir, exe_token)) if cd_dir else ntpath.normpath(exe_token)
+    if exe_rel == ".." or exe_rel.startswith(f"..{ntpath.sep}"):
+        # The exe's path, relative to *cwd* (after any `cd_dir`), climbs
+        # ABOVE `cwd` itself (e.g. a bare `../target/release/vimcode.exe`
+        # with no `cd` to cancel it out) — staged at the same relative
+        # offset from `session_root`, it would land OUTSIDE this
+        # session's own directory, in the shared parent every concurrent
+        # session's staging root lives under: a leak `kill`'s own
+        # (session-scoped) delete would never reach, and a collision with
+        # another session's identically-named escape. Left alone rather
+        # than risked — the `cd .smoke && ../target/...` shape above
+        # cancels its own `..` back inside `cwd` and is unaffected by
+        # this guard.
+        return _StagingPlan(staged=False)
+    new_cwd = ntpath.join(session_root, cd_dir) if cd_dir else session_root
+
+    fixture_dirnames: list[str] = []
+    for name in (cd_dir, _STAGING_FIXTURE_DIRNAME):
+        if name and name not in fixture_dirnames:
+            fixture_dirnames.append(name)
+    fixture_copies = tuple(
+        (ntpath.join(cwd, name), ntpath.join(session_root, name))
+        for name in fixture_dirnames
+    )
+
+    return _StagingPlan(
+        staged=True,
+        cwd=new_cwd,
+        source_exe=ntpath.join(cwd, exe_rel),
+        dest_exe=ntpath.join(session_root, exe_rel),
+        fixture_copies=fixture_copies,
+    )
+
+
+def _execute_staging(
+    plan: _StagingPlan,
+    *,
+    isfile=os.path.isfile,
+    isdir=os.path.isdir,
+    makedirs=os.makedirs,
+    dirname=os.path.dirname,
+    copy_file=shutil.copy2,
+    copy_tree=shutil.copytree,
+) -> None:
+    """The filesystem side of a staging *plan* (#3617) — split from
+    :func:`_plan_staging` so the decision logic there stays testable with
+    fabricated Windows-style path strings alone; every kwarg here
+    defaults to the real ``os``/``shutil`` call (what :class:`Win32Calls`
+    actually runs) and is injectable for a test using plain local paths.
+    A no-op for a ``staged=False`` plan.
+
+    Raises :class:`WinNativeRuntimeError` when the resolved exe doesn't
+    exist — a copy step that silently skipped it would hand back a
+    session dir with no exe in it, surfacing as a confusing failure much
+    later at ``launch`` itself rather than here, where the real cause is
+    actually known (#2096: a gate must be able to fail with an answer
+    that actually says why).
+    """
+    if not plan.staged:
+        return
+    if not isfile(plan.source_exe):
+        raise WinNativeRuntimeError(
+            f"win-native launch staging (#3617): exe not found at "
+            f"{plan.source_exe!r} — nothing to copy onto the local "
+            "Windows filesystem"
+        )
+    makedirs(dirname(plan.dest_exe), exist_ok=True)
+    copy_file(plan.source_exe, plan.dest_exe)
+    for source_dir, dest_dir in plan.fixture_copies:
+        if isdir(source_dir):
+            copy_tree(source_dir, dest_dir, dirs_exist_ok=True)
+
+
+def _remove_staged_dir(path: str) -> None:
+    """Best-effort recursive delete — never raises, mirroring every other
+    teardown step in this module (#2096: cleanup must not mask whatever
+    real result it's running alongside)."""
+    shutil.rmtree(path, ignore_errors=True)
+
+
+#: #3617: a session whose owning `Win32Calls` got killed/crashed before its
+#: own `kill()` ever ran has no Windows analogue of #3583's
+#: `PR_SET_PDEATHSIG` to delete its staged directory for it — swept once per
+#: `launch`/`launch_in_terminal` call instead (the same "idle self-expiry is
+#: the backstop, not the primary path" shape `coord.app_drive
+#: .DEFAULT_IDLE_TIMEOUT` already uses), generous enough that a normal
+#: `kill()`-driven delete (the primary path) is always what actually cleans
+#: up a session that closed normally.
+_STALE_SESSION_MAX_AGE_S = 24.0 * 3600.0
+
+
 #: #3544: every kwarg :meth:`Win32Calls.launch`/:meth:`~Win32Calls.launch_in_terminal`
 #: must pass to ``subprocess.Popen`` so the launched ``cmd.exe`` (and whatever
 #: GUI-subsystem grandchild it execs) never inherits this *process's own*
@@ -906,17 +1153,34 @@ class Win32Calls:
         self._ctypes = ctypes
         self._user32 = ctypes.windll.user32
         self._kernel32 = ctypes.windll.kernel32
+        #: #3617: pid -> the local session directory `launch`/
+        #: `launch_in_terminal` staged for it, so `kill` can delete it once
+        #: that pid has actually been signalled.
+        self._staged_session_dirs: dict[int, str] = {}
 
     # -- process lifecycle --
 
     def launch(self, command: str, cwd: str) -> int:
+        # #3617: the UNC check is done BEFORE ever touching `self` — the
+        # overwhelming common (non-UNC) case must stay exactly as cheap
+        # (and as `self`-independent — see
+        # `TestLaunchPipeInheritanceRealSubprocess`'s own unbound
+        # `Win32Calls.launch(None, ...)` call) as it was pre-#3617.
+        staged_dir = None
+        if _is_unc_path(cwd):
+            command, cwd, staged_dir = self._stage_if_needed(command, cwd)
         full_command, popen_cwd = _popen_command_and_cwd(command, cwd)
         proc = subprocess.Popen(
             full_command, shell=True, cwd=popen_cwd, **_NO_HANDLE_INHERITANCE,
         )
+        if staged_dir is not None:
+            self._staged_session_dirs[proc.pid] = staged_dir
         return proc.pid
 
     def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int:
+        staged_dir = None
+        if _is_unc_path(cwd):
+            command, cwd, staged_dir = self._stage_if_needed(command, cwd)
         create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         if terminal_app == "windows-terminal":
             full_command = f"wt.exe {command}"
@@ -927,6 +1191,8 @@ class Win32Calls:
             full_command, shell=True, cwd=popen_cwd, creationflags=create_new_console,
             **_NO_HANDLE_INHERITANCE,
         )
+        if staged_dir is not None:
+            self._staged_session_dirs[proc.pid] = staged_dir
         return proc.pid
 
     def kill(self, pid: int) -> None:
@@ -939,6 +1205,74 @@ class Win32Calls:
                 self._kernel32.TerminateProcess(handle, 0)
             finally:
                 self._kernel32.CloseHandle(handle)
+        # #3617: the normal (non-abnormal-exit) cleanup path for a staged
+        # session directory — see `_sweep_stale_sessions` for the backstop.
+        staged_dir = self._staged_session_dirs.pop(pid, None)
+        if staged_dir is not None:
+            _remove_staged_dir(staged_dir)
+
+    # -- local-filesystem launch staging (#3617) --
+
+    def _staging_root(self) -> str:
+        """``%LOCALAPPDATA%\\Temp\\coord-app-drive`` — real local NTFS on
+        every Windows host, never a UNC path. Raises
+        :class:`WinNativeRuntimeError` when ``%LOCALAPPDATA%`` isn't set
+        in this process's own environment (never hardcoded/guessed — the
+        issue's own requirement); :meth:`_stage_if_needed` treats that as
+        "best-effort staging unavailable" and falls back to the pre-#3617
+        ``pushd`` wrap rather than failing the whole launch over it."""
+        local_app_data = os.environ.get(_LOCALAPPDATA_ENV)
+        if not local_app_data:
+            raise WinNativeRuntimeError(
+                f"win-native launch staging (#3617) needs %{_LOCALAPPDATA_ENV}% "
+                "to pick a per-session directory on the local Windows "
+                "filesystem, but it is not set in this process's environment"
+            )
+        return os.path.join(local_app_data, "Temp", _STAGING_ROOT_DIRNAME)
+
+    def _sweep_stale_sessions(self) -> None:
+        """Best-effort GC backstop for an abandoned staged session (#3617,
+        see the module docstring) — deletes any direct child of
+        :meth:`_staging_root` whose mtime is older than
+        :data:`_STALE_SESSION_MAX_AGE_S`. Never raises: a missing/unreadable
+        root, or an entry that disappears mid-sweep (another process
+        already cleaned it up), is not an error here."""
+        try:
+            root = self._staging_root()
+            entries = os.listdir(root)
+        except (OSError, WinNativeRuntimeError):
+            return
+        now = time.time()
+        for name in entries:
+            path = os.path.join(root, name)
+            try:
+                age = now - os.path.getmtime(path)
+            except OSError:
+                continue
+            if age > _STALE_SESSION_MAX_AGE_S:
+                _remove_staged_dir(path)
+
+    def _stage_if_needed(self, command: str, cwd: str) -> tuple[str, str, str | None]:
+        """Returns ``(command, cwd, staged_dir)`` — *command*/*cwd*
+        rewritten per :func:`_plan_staging` (with the staging actually
+        performed) when it decided to, or *command*/*cwd* UNCHANGED (and
+        ``staged_dir=None``) in every skip case: a non-UNC ``cwd``, an
+        unparseable/opaque *command*, or ``%LOCALAPPDATA%`` itself being
+        unavailable right now. Staging is a performance optimization, not
+        a correctness requirement — a caller that can't stage still gets
+        a working (if UNC-slow) launch via :func:`_popen_command_and_cwd`'s
+        own ``pushd`` wrap, rather than this call failing outright."""
+        try:
+            root = self._staging_root()
+        except WinNativeRuntimeError:
+            return command, cwd, None
+        session_root = os.path.join(root, uuid.uuid4().hex[:12])
+        plan = _plan_staging(command, cwd, session_root=session_root)
+        if not plan.staged:
+            return command, cwd, None
+        self._sweep_stale_sessions()
+        _execute_staging(plan)
+        return command, plan.cwd, session_root
 
     # -- session precheck (#3510) --
 
