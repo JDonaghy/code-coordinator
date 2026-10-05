@@ -7252,6 +7252,32 @@ def test_driver_reports_an_unconfigured_repo_as_a_usage_error(driver_factory):
     assert exc.value.exit_code == EXIT_USAGE
 
 
+def test_a_driveerror_raised_before_the_poll_loop_is_written_to_the_run_log(
+    driver_factory, tmp_path,
+):
+    """#3600: `preflight()`'s own refusals (e.g. "no unpaused machine hosts
+    ... — pass --machine", raised when a release cordon leaves an unpinned
+    entry with zero candidates) happen BEFORE the poll loop's `decide()`
+    ever runs — unlike #2712's `_die()` case, there is no `Action` for
+    `run()`'s normal exit-narration to fold into the log, only a raised
+    `DriveError` the surrounding `except BaseException` catches. Before this
+    fix the run log held only the "drive loop started" marker: `self.log`/
+    `self.warn` reach `self.out`/`self.err` only, and for a `--tmux` drive
+    those are the tmux pane, destroyed the instant the session dies —
+    exactly how quadraui#1102/#1103 died leaving nothing to diagnose from.
+    Reusing the SAME failure this test's sibling above raises (an
+    unconfigured repo) is enough to exercise the gap: any pre-loop
+    `DriveError` takes the identical `run()` code path."""
+    driver = driver_factory([board()])
+    driver.repo = "not-a-repo"
+    with pytest.raises(DriveError):
+        driver.run()
+    log_text = (tmp_path / f"not-a-repo-{ISSUE}.log").read_text(encoding="utf-8")
+    assert "drive loop started" in log_text
+    assert "drive exited" in log_text
+    assert "not-a-repo" in log_text
+
+
 def test_driver_writes_the_per_issue_run_log(driver_factory, tmp_path):
     payload = board(status="done", test_state="")
     driver = driver_factory(

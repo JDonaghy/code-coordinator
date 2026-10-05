@@ -201,6 +201,38 @@ class TestLaunchDriveInTmux:
                     verify_checks=1, sleeper=lambda _: None,
                 )
 
+    def test_session_dies_after_logging_relays_the_real_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """#3600: when the dead session DID write something before exiting
+        (`Driver.run()`'s `except BaseException` handler now appends its own
+        `drive_exited` summary to the run log — see `coord/drive.py`), the
+        raised `DriveError` must relay that line verbatim rather than the
+        old generic "it did write to its log before exiting" — this is the
+        ONLY channel that survives once the tmux pane is gone, and it is
+        what lets a caller (the drive queue's launcher) distinguish "every
+        host was paused/cordoned at launch time" from an ordinary crash."""
+        log_path = tmp_path / "myrepo-42.log"
+
+        def fake_sleeper(_: float) -> None:
+            log_path.write_text(
+                "12:00:00  drive loop started for myrepo#42\n"
+                "12:00:01  drive exited for myrepo#42: no unpaused machine "
+                "hosts myrepo — pass --machine (exit_code=2)\n"
+            )
+
+        with (
+            patch("coord.drive.tmux_available", return_value=True),
+            patch("coord.drive.tmux_session_alive", side_effect=[False, False]),
+            patch("coord.drive.scratch_dir", return_value=tmp_path),
+            patch("coord.drive.subprocess.run", return_value=_completed(0)),
+        ):
+            with pytest.raises(DriveError, match="no unpaused machine hosts myrepo"):
+                launch_drive_in_tmux(
+                    ["coord", "drive", "myrepo", "42"], repo="myrepo", issue=42,
+                    verify_checks=1, sleeper=fake_sleeper,
+                )
+
     def test_session_alive_but_log_never_grows_raises(self, tmp_path: Path) -> None:
         """#1606: still tmux-alive but never wrote a single log line within
         the verify window — stuck before `Driver.run()`'s first `self.log()`
