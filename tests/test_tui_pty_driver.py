@@ -43,6 +43,14 @@ came back ``cols - 1`` wide: the root cause is ``pyte``'s own
 glyph (CJK, emoji, ...) instead of padding it, fixed in
 ``VtScreen.text()`` by rendering from the raw cell buffer instead. It
 fails against the pre-fix implementation and passes against the fix.
+
+:class:`TestUnixPtyChildRealCwdContainsASpace` is the Tier-1 conformance
+scenario for #3629: a coordinator worktree on macOS always lives under
+``~/Library/Application Support/coord/worktrees/...``, so
+:func:`_wrap_launch_command`'s ``VAR=value`` → ``env VAR=value`` rewrite
+must not lose POSIX's no-word-splitting treatment for the assignment once
+``$PWD`` expands to a path containing a space. It fails against the
+pre-fix (unquoted) transform and passes once the value is re-quoted.
 """
 
 from __future__ import annotations
@@ -1092,7 +1100,11 @@ steps:
 @pytest.mark.skipif(os.name != "posix", reason="UnixPtyChild requires a POSIX platform")
 class TestUnixPtyChildReal:
     def test_real_process_output_is_read_back_through_a_real_pty(self, tmp_path) -> None:
-        command = f"{sys.executable} -c \"import sys; sys.stdout.write('HELLO FROM REAL PTY\\r\\n'); sys.stdout.flush(); import time; time.sleep(2)\""
+        # Interpreter path double-quoted (#3629): this repo's own worktrees
+        # live under a macOS ``Application Support`` path, so an unquoted
+        # `sys.executable` here would itself get word-split by the shell —
+        # unrelated to anything this test means to exercise.
+        command = f"\"{sys.executable}\" -c \"import sys; sys.stdout.write('HELLO FROM REAL PTY\\r\\n'); sys.stdout.flush(); import time; time.sleep(2)\""
         child = UnixPtyChild(command, str(tmp_path), cols=80, rows=24)
         try:
             collected = b""
@@ -1134,7 +1146,7 @@ class TestWrapLaunchCommand:
         # `exec HOME=x ./bin` would try (and fail) to execve a program
         # literally named `HOME=x` — `env` doesn't have that restriction.
         wrapped = _wrap_launch_command("HOME=$PWD/home ./bin arg")
-        assert wrapped == "exec env HOME=$PWD/home ./bin arg"
+        assert wrapped == 'exec env HOME="$PWD/home" ./bin arg'
 
     def test_real_production_route_shape_cd_and_inline_env(self) -> None:
         # The exact `~/.coord/coordinator.remote.yml` vimcode `tui-pty`
@@ -1143,16 +1155,32 @@ class TestWrapLaunchCommand:
             "cd .smoke && HOME=$PWD/home ../target/release/vcd sample.txt"
         )
         assert wrapped == (
-            "cd .smoke && exec env HOME=$PWD/home ../target/release/vcd sample.txt"
+            'cd .smoke && exec env HOME="$PWD/home" ../target/release/vcd sample.txt'
         )
 
     def test_multiple_compound_segments_only_the_last_is_execed(self) -> None:
         wrapped = _wrap_launch_command("cd a && cd b && HOME=x ./bin arg")
-        assert wrapped == "cd a && cd b && exec env HOME=x ./bin arg"
+        assert wrapped == 'cd a && cd b && exec env HOME="x" ./bin arg'
 
     def test_double_ampersand_inside_a_quoted_argument_is_not_a_split_point(self) -> None:
         wrapped = _wrap_launch_command("./bin 'a && b'")
         assert wrapped == "exec ./bin 'a && b'"
+
+    # ── #3629: a $VAR expansion that contains a space (every macOS
+    # worktree, under `~/Library/Application Support/...`) must not get
+    # word-split once it becomes a plain `env` argument ───────────────────
+
+    def test_env_assignment_value_is_double_quoted_so_a_space_does_not_split_it(self) -> None:
+        # Against the pre-fix transform this is `exec env HOME=$PWD/home
+        # ./bin arg` — once `$PWD` expands to a path containing a space,
+        # `env` sees TWO arguments where it expected one, and tries (and
+        # fails) to execve the stray fragment after the space.
+        wrapped = _wrap_launch_command("HOME=$PWD/home ./bin arg")
+        assert wrapped == 'exec env HOME="$PWD/home" ./bin arg'
+
+    def test_env_assignment_value_already_containing_quotes_is_escaped(self) -> None:
+        wrapped = _wrap_launch_command('FOO=a"b ./bin')
+        assert wrapped == 'exec env FOO="a\\"b" ./bin'
 
 
 @pytest.mark.skipif(os.name != "posix", reason="UnixPtyChild requires a POSIX platform")
@@ -1170,8 +1198,13 @@ class TestUnixPtyChildRealCompoundCommand:
     def test_cd_and_inline_env_assignment_shape_still_launches(self, tmp_path) -> None:
         subdir = tmp_path / "workdir"
         subdir.mkdir()
+        # Double-quoted interpreter path (#3629): this repo's own worktrees
+        # live under a macOS ``Application Support`` path, so an unquoted
+        # ``sys.executable`` here would itself contain a space unrelated
+        # to the thing this scenario drives — the compound `cd` + inline
+        # env-var shape, not the interpreter's own path.
         command = (
-            f"cd workdir && HOME=$PWD/home {sys.executable} -c "
+            f'cd workdir && HOME=$PWD/home "{sys.executable}" -c '
             "\"import os, sys; "
             "sys.stdout.write('HOME=' + os.environ['HOME'] + '\\r\\n'); "
             "sys.stdout.flush(); import time; time.sleep(2)\""
@@ -1185,6 +1218,57 @@ class TestUnixPtyChildRealCompoundCommand:
             assert child.is_alive(), (
                 "child exited immediately — the cd+inline-env-var launch "
                 "command failed to start"
+            )
+            assert f"HOME={subdir}/home".encode() in collected
+        finally:
+            child.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="UnixPtyChild requires a POSIX platform")
+class TestUnixPtyChildRealCwdContainsASpace:
+    """Tier-1 conformance scenario for #3629: every coordinator worktree on
+    macOS lives under ``~/Library/Application Support/coord/worktrees/...``
+    — a path that always contains a space — and the ``tui-pty`` driver's
+    own exec-wrapping (:func:`_wrap_launch_command`) must still launch a
+    compound ``cd ... && VAR=$PWD/... bin`` command from it.
+
+    Against the pre-fix transform (an unquoted ``env VAR=$PWD/...``
+    argument) this fails: once ``$PWD`` expands to a path containing a
+    space, the shell's normal field-splitting applies (the assignment is no
+    longer in POSIX's no-split assignment-prefix position, just a bare
+    argument to ``env``), so ``env`` receives the tail of the path as a
+    second, bogus argument and tries — and fails — to execve it (``env:
+    .../No such file or directory``), and the real child never starts.
+    """
+
+    def test_cd_and_inline_env_assignment_launches_from_a_cwd_with_a_space(
+        self, tmp_path
+    ) -> None:
+        workdir_root = tmp_path / "Application Support"
+        workdir_root.mkdir()
+        subdir = workdir_root / "workdir"
+        subdir.mkdir()
+        # The interpreter path is double-quoted here deliberately: this
+        # scenario isolates the bug to the `$PWD`-derived assignment VALUE
+        # (the thing :func:`_wrap_launch_command` rewrites), not to an
+        # unrelated, already-unquoted binary path — a caller's own
+        # unquoted command text is its own responsibility either way, with
+        # or without the exec-wrap.
+        command = (
+            f'cd workdir && HOME=$PWD/home "{sys.executable}" -c '
+            "\"import os, sys; "
+            "sys.stdout.write('HOME=' + os.environ['HOME'] + '\\r\\n'); "
+            "sys.stdout.flush(); import time; time.sleep(2)\""
+        )
+        child = UnixPtyChild(command, str(workdir_root), cols=80, rows=24)
+        try:
+            collected = b""
+            deadline = time.monotonic() + 5
+            while b"HOME=" not in collected and time.monotonic() < deadline:
+                collected += child.read(0.2)
+            assert child.is_alive(), (
+                "child exited immediately — the cd+inline-env-var launch "
+                "command failed to start from a cwd containing a space"
             )
             assert f"HOME={subdir}/home".encode() in collected
         finally:
