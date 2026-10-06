@@ -4030,7 +4030,23 @@ class TestBugbashCli:
         builds must shard a lane with more journeys than
         --journeys-per-worker into several `_dispatch_and_await_lane`
         calls, each carrying its own `journeys_override` slice — not one
-        call handed the whole catalogue (the bug this issue reports)."""
+        call handed the whole catalogue (the bug this issue reports).
+
+        A `tui-pty` lane's chunks are dispatched CONCURRENTLY (up to the
+        host's own `max_workers` — `_FakeConcurrency.max_workers` is 2
+        here), so the order in which the fake dispatcher is *entered* is a
+        genuine race and must not be asserted on: with 3 chunks and 2 pool
+        threads, `[25, 10, 25]` is as correct an interleaving as
+        `[25, 25, 10]`. Asserting the literal call order made this test
+        fail deterministically on a CPU-starved runner (CI's `test (3.13)`
+        leg) while passing on a 20-core workstation. What #3620 actually
+        requires — 3 chunks, sized 25/25/10, together covering all 60
+        journeys exactly once — is order-independent, so that is what is
+        pinned here. The serial (GUI-lane) path's exact chunk ORDER is
+        still pinned, deterministically, by
+        `TestExploreLaneSharded.test_dispatches_one_chunk_explorer_call_per_chunk`
+        (`max_concurrent_chunks=1`, so `[25, 25, 10]` there is a real
+        invariant rather than a race)."""
         import coord.commands.bugbash as cmd_bugbash
         from click.testing import CliRunner
         from coord.bugbash import BugbashReport
@@ -4068,9 +4084,14 @@ class TestBugbashCli:
         monkeypatch.setattr(cmd_bugbash, "run_bugbash", fake_run_bugbash)
 
         dispatch_calls = []
+        # Several pool threads call `fake_dispatch` at once for a `tui-pty`
+        # lane, so guard the shared list rather than relying on `append`
+        # happening to be atomic.
+        dispatch_lock = threading.Lock()
 
         def fake_dispatch(lane, round_num, **kwargs):
-            dispatch_calls.append(kwargs.get("journeys_override"))
+            with dispatch_lock:
+                dispatch_calls.append(kwargs.get("journeys_override"))
             return ExploreOutcome(ok=True, cost=1.0)
 
         monkeypatch.setattr(cmd_bugbash, "_dispatch_and_await_lane", fake_dispatch)
@@ -4081,7 +4102,12 @@ class TestBugbashCli:
         )
         assert result.exit_code == 0, result.output
         outcome = captured["explorer"](_prod_lane(machine="pc1", platform="tui-pty"), 1)
-        assert [len(c) for c in dispatch_calls] == [25, 25, 10]
+        # Order-independent (see the docstring): 3 chunks, sized 25/25/10...
+        assert sorted(len(c) for c in dispatch_calls) == [10, 25, 25]
+        # ...and between them every one of the 60 journeys exactly once —
+        # no chunk handed the whole catalogue, none dropped, none doubled.
+        dispatched_ids = [j.id for call in dispatch_calls for j in call]
+        assert sorted(dispatched_ids) == sorted(f"j{i}" for i in range(60))
         assert outcome.cost == 3.0
 
     def test_explorer_progress_lines_are_lane_prefixed(self, monkeypatch, capsys):
