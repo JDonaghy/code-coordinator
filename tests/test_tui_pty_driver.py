@@ -378,6 +378,13 @@ class TestEncodeKey:
             encode_key("cmd+c")
         assert "tui-pty" in str(exc_info.value)
 
+    def test_unsupported_key_message_spells_modifiers_in_canonical_order(self) -> None:
+        # #3639 review nit: `_describe_chord` used to sort modifiers
+        # alphabetically (`alt+ctrl+shift+...`) rather than the canonical
+        # `ctrl+alt+shift` order the usage line advertises.
+        with pytest.raises(UnsupportedKey, match=r"'ctrl\+alt\+shift\+cmd\+c'"):
+            encode_key("shift+cmd+alt+ctrl+c")
+
     def test_shift_arrow_combos(self) -> None:
         # #3604: every VS Code-style Shift+-selection journey needs this.
         assert encode_key("shift+right") == b"\x1b[1;2C"
@@ -1050,6 +1057,33 @@ steps:
                 spawn_child=lambda cols, rows: spawned.append(1) or FakePtyChild(),
             )
         assert spawned == []
+
+    def test_unsupported_key_fails_only_that_step_not_the_whole_run(self) -> None:
+        # #3639 review finding: `UnsupportedKey` only subclassed `Exception`,
+        # so it escaped `_run_step`'s closed except-tuple and aborted the
+        # whole run instead of failing one step — exactly the issue's own
+        # example (`key: cmd+c` on tui-pty, a very likely copy-paste from a
+        # mac journey). The run must keep going and the later step must
+        # still execute.
+        spec_text = """
+steps:
+  - type: launch
+  - type: key
+    key: cmd+c
+  - type: wait_idle
+    ms: 10
+    timeout_ms: 1000
+"""
+        child = FakePtyChild()
+        results = run_smoke_spec(
+            spec_text, launch_command="unused", cwd=".",
+            spawn_child=lambda cols, rows: child,
+        )
+        assert [r["id"] for r in results] == ["000 launch", "001 key", "002 wait_idle"]
+        assert results[0]["status"] == "pass"
+        assert results[1]["status"] == "fail"
+        assert "tui-pty" in results[1]["message"]
+        assert results[2]["status"] == "pass"
 
 
 # ── a real Unix pty (not the fake) — proves UnixPtyChild itself works ──────

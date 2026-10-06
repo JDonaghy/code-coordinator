@@ -395,10 +395,17 @@ _F_TILDE_NUM = {
 }
 
 
+#: The canonical modifier order the usage line advertises
+#: (``ctrl+alt+shift``) — used to spell an :class:`UnsupportedKey` message
+#: the same way, rather than alphabetically (#3639 review nit: alphabetical
+#: sort reads ``alt+ctrl+shift``).
+_MOD_ORDER: tuple[str, ...] = ("ctrl", "alt", "shift", "cmd")
+
+
 def _describe_chord(chord: KeyChord) -> str:
     """A human-readable ``mod+mod+base`` spelling of *chord*, for an
     :class:`~coord.key_spec.UnsupportedKey` message."""
-    mods = "+".join(sorted(chord.modifiers))
+    mods = "+".join(m for m in _MOD_ORDER if m in chord.modifiers)
     return f"{mods}+{chord.base}" if mods else chord.base
 
 
@@ -1170,7 +1177,7 @@ class SmokeRunner:
         }
         try:
             handlers[step.kind](step)
-        except (TuiPtySpecError, TuiPtyRuntimeError, AssertionError) as e:
+        except (TuiPtySpecError, TuiPtyRuntimeError, UnsupportedKey, AssertionError) as e:
             return {"id": step.step_id, "status": "fail", "message": str(e)}
         return {"id": step.step_id, "status": "pass", "message": ""}
 

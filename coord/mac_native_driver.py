@@ -486,7 +486,7 @@ class NativeRunner:
             extra = handlers[step.kind](step)
             if extra:
                 entry.update(extra)
-        except (MacNativeSpecError, MacNativeRuntimeError, AssertionError) as e:
+        except (MacNativeSpecError, MacNativeRuntimeError, UnsupportedKey, AssertionError) as e:
             entry["status"] = "fail"
             entry["message"] = str(e)
             self._attach_capture_if_possible(entry)
@@ -654,6 +654,37 @@ _VKEY_DIGITS: dict[str, int] = {
     "5": 0x17, "6": 0x16, "7": 0x1A, "8": 0x1C, "9": 0x19,
 }
 
+#: macOS virtual keycodes (US ANSI layout) for punctuation. Each physical
+#: key produces two characters (unshifted/shifted); both map to the SAME
+#: vkey — the bool says whether Shift must be held for the posted event to
+#: actually produce *that* character (mirrors the uppercase-letter
+#: convention above). Review finding (#3639): without this table,
+#: ``cmd+[``/``cmd+]``/``cmd+/`` were posted with virtual keycode 0
+#: (``kVK_ANSI_A``) plus the Cmd flag — i.e. silently delivered as Cmd+A to
+#: any consumer that reads ``keyCode`` rather than
+#: ``charactersIgnoringModifiers``, while still reporting success.
+_VKEY_PUNCT: dict[str, tuple[int, bool]] = {
+    ";": (0x29, False), ":": (0x29, True),
+    "[": (0x21, False), "{": (0x21, True),
+    "]": (0x1E, False), "}": (0x1E, True),
+    "/": (0x2C, False), "?": (0x2C, True),
+    ",": (0x2B, False), "<": (0x2B, True),
+    ".": (0x2F, False), ">": (0x2F, True),
+    "-": (0x1B, False), "_": (0x1B, True),
+    "=": (0x18, False), "+": (0x18, True),
+    "'": (0x27, False), '"': (0x27, True),
+    "\\": (0x2A, False), "|": (0x2A, True),
+    "`": (0x32, False), "~": (0x32, True),
+}
+
+#: The digit-row symbols produced with Shift on a US ANSI layout — each
+#: maps to the SAME vkey as the underlying digit (:data:`_VKEY_DIGITS`),
+#: always with Shift held.
+_SHIFTED_DIGIT_SYMBOLS: dict[str, str] = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+}
+
 
 @dataclass(frozen=True)
 class MacKeyEncoding:
@@ -704,8 +735,34 @@ def _encode_mac_chord(chord: KeyChord) -> MacKeyEncoding:
             shift = True
         return MacKeyEncoding(vkey=vkey, unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd)
 
-    # Punctuation (or any other printable character outside the letter/digit
-    # tables): no vkey guess — sent as a Unicode-string event instead (#3639).
+    punct = _VKEY_PUNCT.get(ch)
+    if punct is not None:
+        vkey, shift_implied = punct
+        if shift_implied:
+            shift = True
+        return MacKeyEncoding(vkey=vkey, unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd)
+
+    digit = _SHIFTED_DIGIT_SYMBOLS.get(ch)
+    if digit is not None:
+        return MacKeyEncoding(
+            vkey=_VKEY_DIGITS[digit], unicode_char=None, shift=True, ctrl=ctrl, alt=alt, cmd=cmd
+        )
+
+    # No real macOS keycode for this character. Posting it with vkey=0
+    # (kVK_ANSI_A) alongside a non-Shift modifier would silently deliver
+    # e.g. Cmd+A instead of the requested chord — exactly the bug this
+    # review finding closes. A bare character with no ctrl/alt/cmd held can
+    # still go through the Unicode-string event with vkey=0 and no flags
+    # (the standard pyobjc idiom for literal character insertion); anything
+    # combined with ctrl/alt/cmd genuinely cannot be delivered this way,
+    # since most apps resolve a modified keystroke from (keyCode, flags)
+    # via the active keyboard layout, not from the Unicode override.
+    if ctrl or alt or cmd:
+        raise UnsupportedKey(
+            "mac-native", chord.base,
+            "no macOS virtual keycode for this character — cannot combine "
+            "with ctrl/alt/cmd without silently posting the wrong key",
+        )
     return MacKeyEncoding(vkey=None, unicode_char=ch, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd)
 
 
@@ -904,9 +961,11 @@ class MacOSCalls:
             down = quartz.CGEventCreateKeyboardEvent(None, vkey, True)
             up = quartz.CGEventCreateKeyboardEvent(None, vkey, False)
             if enc.unicode_char is not None:
-                code = ord(enc.unicode_char)
-                quartz.CGEventKeyboardSetUnicodeString(down, 1, [code])
-                quartz.CGEventKeyboardSetUnicodeString(up, 1, [code])
+                # The conventional pyobjc idiom passes the string itself
+                # (length + the str), not a list of codepoint ints — pyobjc's
+                # bridge marshals a `str` to `const UniChar *` for us.
+                quartz.CGEventKeyboardSetUnicodeString(down, len(enc.unicode_char), enc.unicode_char)
+                quartz.CGEventKeyboardSetUnicodeString(up, len(enc.unicode_char), enc.unicode_char)
             flags = 0
             if enc.shift:
                 flags |= quartz.kCGEventFlagMaskShift

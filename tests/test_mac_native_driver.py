@@ -195,9 +195,37 @@ class TestMacKeyEncodings:
     def test_shift_f3(self) -> None:
         assert _mac_key_encodings("shift+f3") == [_enc(vkey=0x63, shift=True)]
 
-    def test_punctuation_goes_through_unicode_string(self) -> None:
-        assert _mac_key_encodings(":") == [_enc(unicode_char=":")]
-        assert _mac_key_encodings("@") == [_enc(unicode_char="@")]
+    def test_bare_unmapped_character_goes_through_unicode_string(self) -> None:
+        # Every ASCII punctuation character now has a real macOS keycode
+        # (see the chord/digit-symbol tests below), so only a character
+        # entirely outside that table — e.g. a non-ASCII letter — still
+        # goes through the plain Unicode-string event path when unadorned.
+        assert _mac_key_encodings("é") == [_enc(unicode_char="é")]
+
+    def test_punctuation_with_real_keycode_maps_colon_and_at(self) -> None:
+        # `:` is Shift+; and `@` is Shift+2 on a US ANSI layout — both now
+        # carry a real vkey (+ implied Shift) rather than vkey=0.
+        assert _mac_key_encodings(":") == [_enc(vkey=0x29, shift=True)]
+        assert _mac_key_encodings("@") == [_enc(vkey=0x13, shift=True)]
+
+    def test_shifted_digit_row_symbol_maps_to_digit_vkey(self) -> None:
+        # `$` is Shift+4 on a US ANSI layout.
+        assert _mac_key_encodings("$") == [_enc(vkey=0x15, shift=True)]
+
+    def test_cmd_bracket_and_slash_use_real_keycodes_not_vkey_zero(self) -> None:
+        # #3639 review finding: `cmd+[`/`cmd+]`/`cmd+/` previously posted
+        # vkey=0 (kVK_ANSI_A) + the Cmd flag — i.e. silently delivered as
+        # Cmd+A. They must now carry the real punctuation keycode.
+        assert _mac_key_encodings("cmd+[") == [_enc(vkey=0x21, cmd=True)]
+        assert _mac_key_encodings("cmd+]") == [_enc(vkey=0x1E, cmd=True)]
+        assert _mac_key_encodings("cmd+/") == [_enc(vkey=0x2C, cmd=True)]
+
+    def test_modifier_plus_unmappable_char_raises_unsupported(self) -> None:
+        # A character with no real macOS keycode at all (outside the
+        # letter/digit/punctuation tables) combined with a non-shift
+        # modifier must raise rather than silently post vkey=0.
+        with pytest.raises(UnsupportedKey):
+            _mac_key_encodings("cmd+é")
 
     def test_chord_sequence_ctrl_k_ctrl_w(self) -> None:
         assert _mac_key_encodings("ctrl+k ctrl+w") == [
@@ -762,6 +790,94 @@ class TestMacOSCallsPlatformGuard:
             pytest.skip("this guard only fires off macOS")
         with pytest.raises(MacNativeRuntimeError, match="macOS"):
             MacOSCalls()
+
+
+class _FakeQuartz:
+    """Records every posted ``CGEvent`` as a plain dict — enough to assert
+    the real ``send_key`` sequence (vkey, modifier flags, the Unicode
+    override) without pyobjc installed (#3639 review non-blocking concern:
+    the mac tests used to stop at the intermediate :class:`MacKeyEncoding`
+    dataclass, leaving the brand-new punctuation-keycode path and the
+    ``CGEventKeyboardSetUnicodeString`` call shape entirely unverified)."""
+
+    kCGEventFlagMaskShift = 0x00020000
+    kCGEventFlagMaskControl = 0x00040000
+    kCGEventFlagMaskAlternate = 0x00080000
+    kCGEventFlagMaskCommand = 0x00100000
+
+    def __init__(self) -> None:
+        self.posted: list[dict] = []
+
+    def CGEventCreateKeyboardEvent(self, _source, vkey, key_down):
+        return {"vkey": vkey, "down": key_down, "flags": 0, "unicode": None}
+
+    def CGEventKeyboardSetUnicodeString(self, event, _length, chars) -> None:
+        event["unicode"] = chars
+
+    def CGEventSetFlags(self, event, flags) -> None:
+        event["flags"] = flags
+
+    def CGEventPostToPid(self, _pid, event) -> None:
+        self.posted.append(dict(event))
+
+
+def _make_mac_calls(quartz: _FakeQuartz) -> MacOSCalls:
+    """Build a :class:`MacOSCalls` bypassing ``__init__``'s platform guard
+    (construction requires real macOS) with a fake ``quartz``."""
+    calls = object.__new__(MacOSCalls)
+    calls._quartz = quartz
+    return calls
+
+
+class TestSendKeyRealSequence:
+    def test_cmd_bracket_posts_the_real_vkey_not_zero(self) -> None:
+        # #3639 blocking review finding: `cmd+[` used to post vkey=0
+        # (kVK_ANSI_A) plus the Cmd flag.
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.send_key(1, "cmd+[")
+        down, up = quartz.posted
+        assert down["vkey"] == 0x21
+        assert down["down"] is True
+        assert down["flags"] == quartz.kCGEventFlagMaskCommand
+        assert up["vkey"] == 0x21
+        assert up["down"] is False
+        assert up["flags"] == quartz.kCGEventFlagMaskCommand
+
+    def test_cmd_slash_posts_the_real_vkey(self) -> None:
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.send_key(1, "cmd+/")
+        down, _up = quartz.posted
+        assert down["vkey"] == 0x2C
+
+    def test_bare_unmapped_char_passes_the_string_itself_not_a_list(self) -> None:
+        # Pins the conventional pyobjc call shape (#3639 review concern):
+        # the string itself, not a one-element list of codepoint ints.
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.send_key(1, "é")
+        down, up = quartz.posted
+        assert down["vkey"] == 0
+        assert down["unicode"] == "é"
+        assert up["unicode"] == "é"
+
+    def test_chord_sequence_posts_each_chord_as_its_own_down_up_pair(self) -> None:
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.send_key(1, "ctrl+k ctrl+w")
+        assert len(quartz.posted) == 4
+        assert [e["vkey"] for e in quartz.posted] == [0x28, 0x28, 0x0D, 0x0D]
+
+    def test_delete_and_backspace_post_different_vkeys(self) -> None:
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.send_key(1, "delete")
+        delete_vkey = quartz.posted[0]["vkey"]
+        quartz.posted.clear()
+        calls.send_key(1, "backspace")
+        backspace_vkey = quartz.posted[0]["vkey"]
+        assert delete_vkey != backspace_vkey
 
 
 class TestImportQuartz:
