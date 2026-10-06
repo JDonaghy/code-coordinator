@@ -295,6 +295,43 @@ class TestTuiPtyAppDriveBlackBox:
         assert opened.exit_code != 0
         assert "win-native" in opened.output
 
+    def test_open_mode_and_terminal_app_reach_open_session_via_the_real_cli(self, monkeypatch):
+        """#3640 review nit: the existing argv assertion
+        (``test_mode_and_terminal_app_reach_the_spawned_daemon_argv``)
+        calls :func:`coord.app_drive.open_session` directly — it never
+        proves the Click ``--mode``/``--terminal-app`` options actually
+        reach it. This drives the real CLI end to end instead, spying on
+        the REAL (non-mocked) ``subprocess.Popen`` the CLI's own
+        ``open_session`` call makes, the same way the direct-call test
+        does for the daemon argv."""
+        popen_calls = []
+        real_popen = subprocess.Popen
+
+        def _spy_popen(argv, *a, **kw):
+            popen_calls.append(list(argv))
+            return real_popen(argv, *a, **kw)
+
+        monkeypatch.setattr(subprocess, "Popen", _spy_popen)
+
+        runner = CliRunner()
+        opened = runner.invoke(
+            app_drive_group,
+            [
+                "open", "win-native", "--launch", "true", "--cwd", "/tmp",
+                "--mode", "terminal", "--terminal-app", "conhost",
+            ],
+        )
+
+        # Real (non-Windows) win-native open still fails on this Linux box
+        # (`Win32Calls` refuses off-Windows) — this test only cares what
+        # the CLI handed to `open_session` (and, through it, the spawned
+        # daemon's own argv) before that.
+        assert opened.exit_code != 0
+        assert len(popen_calls) == 1
+        argv = popen_calls[0]
+        assert "--mode" in argv and argv[argv.index("--mode") + 1] == "terminal"
+        assert "--terminal-app" in argv and argv[argv.index("--terminal-app") + 1] == "conhost"
+
 
 class TestOpenSessionCloseSession:
     """Exercises :mod:`coord.app_drive`'s client-side seams directly

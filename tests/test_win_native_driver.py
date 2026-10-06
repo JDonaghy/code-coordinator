@@ -3072,27 +3072,70 @@ class TestPeSubsystem:
 
 class TestGuessExePath:
     def test_extracts_the_only_exe_token(self) -> None:
-        assert _guess_exe_path("vcd.exe sample.txt", "/cwd") == ntpath.join("/cwd", "vcd.exe")
+        assert _guess_exe_path("vcd.exe sample.txt", "/cwd") == "/cwd/vcd.exe"
 
-    def test_extracts_the_first_exe_token_from_a_cd_prefixed_command(self) -> None:
+    def test_resolves_the_exe_token_relative_to_the_cd_prefixed_dir(self) -> None:
         """#3640's own reproduction: ``coord app-drive open win-native
         --launch "cd .smoke && ../target/x86_64-pc-windows-msvc/release/
-        vcd.exe sample.txt"``."""
+        vcd.exe sample.txt"``. The exe is reachable as ``../target/...``
+        only AFTER the ``cd .smoke`` — so the resolved path must be
+        relative to ``cwd/.smoke``, never to ``cwd`` itself (the #3640
+        review finding: the previous revision joined the token straight
+        onto ``cwd``, landing one directory above the worktree)."""
         command = "cd .smoke && ../target/x86_64-pc-windows-msvc/release/vcd.exe sample.txt"
         token = "../target/x86_64-pc-windows-msvc/release/vcd.exe"
-        assert _guess_exe_path(command, "/cwd") == ntpath.join("/cwd", token)
+        assert _guess_exe_path(command, "/cwd") == f"/cwd/.smoke/{token}"
+
+    def test_quoted_exe_with_embedded_space_resolves_the_whole_quoted_token(self) -> None:
+        """#3640 review finding (b): a quoted path containing a space —
+        the old regex-based extractor matched only ``App.exe``, the
+        substring after the last space, where the shared
+        ``_leading_token`` parser (correctly) returns the whole quoted
+        token."""
+        assert (
+            _guess_exe_path('"My App.exe" sample.txt', "/cwd") == "/cwd/My App.exe"
+        )
 
     def test_absolute_exe_token_is_returned_unchanged(self) -> None:
         assert _guess_exe_path(r"C:\tools\vimcode.exe", "/cwd") == r"C:\tools\vimcode.exe"
 
-    def test_rooted_posix_style_exe_token_is_returned_unchanged(self) -> None:
+    def test_rooted_posix_style_exe_token_is_returned_unchanged_without_a_distro_to_borrow(
+        self,
+    ) -> None:
         """A ``/``-rooted token (a WSL-side absolute path, #3633's own
         shape) must not be joined onto *cwd* either — only a genuinely
-        *cwd*-relative token should be."""
+        *cwd*-relative token should be. *cwd* here isn't a
+        ``\\\\wsl.localhost\\...`` UNC path, so there's no distro prefix
+        to normalize the token onto — left alone rather than guessed."""
         assert _guess_exe_path("/opt/tools/vcd.exe", "/cwd") == "/opt/tools/vcd.exe"
+
+    def test_rooted_posix_style_exe_token_is_normalized_onto_the_cwd_distro(self) -> None:
+        """#3640 review finding (c): a `/`-rooted WSL token must be
+        normalized onto the ``\\\\wsl.localhost\\<distro>\\...`` UNC form
+        *cwd* itself already carries — the shape the bridge host actually
+        needs to read the file at all. Returning it verbatim (the
+        previous revision's behavior) is always unreadable there, so the
+        sniff silently abstained on every WSL-rooted token."""
+        cwd = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+        assert (
+            _guess_exe_path("/home/me/other/vcd.exe", cwd)
+            == r"\\wsl.localhost\Ubuntu-24.04\home\me\other\vcd.exe"
+        )
 
     def test_no_exe_token_returns_none(self) -> None:
         assert _guess_exe_path("echo hello", "/cwd") is None
+
+    def test_a_second_shell_operator_declines_to_guess(self) -> None:
+        """Mirrors :func:`_plan_staging`'s own decline for the same
+        shape — an opaque shell pipeline this driver will not guess at
+        rewriting."""
+        assert _guess_exe_path("a.exe && b.exe", "/cwd") is None
+
+    def test_a_rooted_cd_prefix_declines_to_guess(self) -> None:
+        """Mirrors :func:`_plan_staging`'s own decline for ``cd C:\\foo
+        && ...`` — not *cwd*-relative, so there's nothing safe to join it
+        onto."""
+        assert _guess_exe_path(r"cd C:\foo && app.exe", "/cwd") is None
 
 
 class TestDetectConsoleSubsystem:
@@ -3132,6 +3175,30 @@ class TestWinNativeSessionModeSelection:
 
         assert calls.launched == []
         assert calls.launched_in_terminal == [(f"{exe} sample.txt", str(tmp_path), "windows-terminal")]
+
+    def test_auto_mode_launches_in_terminal_for_3640s_own_cd_prefixed_reproduction(
+        self, tmp_path,
+    ) -> None:
+        """#3640's own reported reproduction, end to end, with the exe
+        laid out exactly where the real worktree build puts it: a
+        ``.smoke`` fixture dir and a sibling ``target/<triple>/release/``
+        exe one level up. Pre-fix, ``_guess_exe_path`` resolved the exe
+        token against *cwd* directly (ignoring the ``cd .smoke &&``
+        prefix), landed one directory too high, found nothing, and this
+        fell back to the broken ``mode="window"`` path — this test fails
+        against that revision."""
+        exe_dir = tmp_path / "target" / "x86_64-pc-windows-msvc" / "release"
+        exe_dir.mkdir(parents=True)
+        exe = exe_dir / "vcd.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        (tmp_path / ".smoke").mkdir()
+        calls = FakeWinCalls()
+
+        launch = "cd .smoke && ../target/x86_64-pc-windows-msvc/release/vcd.exe sample.txt"
+        WinNativeSession(launch, str(tmp_path), calls=calls)
+
+        assert calls.launched == []
+        assert calls.launched_in_terminal == [(launch, str(tmp_path), "windows-terminal")]
 
     def test_auto_mode_launches_normally_for_a_detected_gui_exe(self, tmp_path) -> None:
         exe = tmp_path / "vimcode.exe"

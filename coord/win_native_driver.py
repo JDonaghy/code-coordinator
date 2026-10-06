@@ -2664,32 +2664,68 @@ def _import_uia():
 IMAGE_SUBSYSTEM_WINDOWS_GUI = 2
 IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
 
-#: The first ``....exe`` token in a shell command line, in command order —
-#: deliberately excludes whitespace/``&``/``|``/``;``/quote characters so
-#: ``"cd .smoke && ../target/x86_64-pc-windows-msvc/release/vcd.exe
-#: sample.txt"`` (#3640's own reproduction) yields exactly
-#: ``../target/x86_64-pc-windows-msvc/release/vcd.exe``, not the whole
-#: ``cd``-prefixed command or a trailing argument.
-_EXE_TOKEN_RE = re.compile(r"[^\s&|;\"']+\.exe\b", re.IGNORECASE)
+def _join_relative(base: str, segment: str) -> str:
+    """Join *segment* onto *base* with a single ``/`` — deliberately NOT
+    :func:`ntpath.join`, which always inserts a ``\\`` at the join point
+    even when neither operand already has one. That matters here because,
+    unlike :func:`_plan_staging` (pure path-string math whose OUTPUT is
+    executed elsewhere, by :func:`_execute_staging`, against separately
+    -built strings), this helper's result is handed straight to
+    :func:`_pe_subsystem`'s own ``open()`` in the SAME process — so on a
+    non-Windows test host (a plain ``tmp_path``, no backslash anywhere in
+    sight) an injected ``\\`` would make the join point an illegal
+    filename character instead of a separator, and the real on-disk file
+    would never be found. Windows' own file APIs accept ``/`` as a
+    separator interchangeably with ``\\`` — including mixed into an
+    already-``\\``-separated *base* (this driver's only real caller,
+    :class:`WinNativeSession`, always gets a ``\\``-separated UNC *cwd*,
+    #3543) — so this is safe there too."""
+    return f"{base.rstrip('/\\')}/{segment}"
 
 
 def _guess_exe_path(command: str, cwd: str) -> str | None:
     """Best-effort extraction of the real ``.exe`` *command* (a raw shell
     command string, not a parsed argv — see :func:`coord.app_drive
-    .open_session`) launches, resolved against *cwd* when relative — via
-    :func:`_is_rooted_or_drive_qualified`/``ntpath.join``, the SAME
-    absolute-vs-relative test and join :func:`_plan_staging` already uses
-    for this exact "is this exe token rooted, or *cwd*-relative" question
-    (#2096 "one question, one answer"), rather than a second,
-    independently-written check that could silently drift from it.
-    Returns ``None`` (never raises) when no ``.exe`` token is found at
-    all — :func:`_detect_console_subsystem` treats that exactly like "PE
-    header unreadable", i.e. "couldn't tell", never an error."""
-    match = _EXE_TOKEN_RE.search(command)
-    if match is None:
+    .open_session`) launches, resolved against *cwd* when relative.
+
+    Driven off the EXACT same small parsers :func:`_plan_staging` answers
+    this identical "which exe does this launch command run, relative to
+    which directory" question with — :func:`_strip_cd_prefix`,
+    :func:`_leading_token`, :func:`_is_rooted_or_drive_qualified`, and
+    :func:`_normalize_posix_exe_token` for a `/`-rooted WSL token — rather
+    than a second, independently-written extractor that could (and, pre
+    -fix, did: #3640 review) silently disagree with it on a `cd <dir> &&
+    ` prefix, a quoted path containing a space, or a `/`-rooted WSL token
+    (#2096 "one question, one answer").
+
+    Returns ``None`` (never raises) — exactly like :func:`_plan_staging`
+    returning ``staged=False`` for the same shapes — when: *command* has
+    no recognizable leading ``.exe`` token at all; its ``cd <dir> && ``
+    prefix (if any) is itself rooted/drive-qualified (ambiguous relative
+    to *cwd*, same guard :func:`_plan_staging` applies); or *command*
+    contains a shell metacharacter beyond that one recognized prefix
+    (:func:`_looks_shell_composed`) — an opaque pipeline this driver will
+    not guess at. :func:`_detect_console_subsystem` treats every ``None``
+    exactly like "PE header unreadable", i.e. "couldn't tell", never an
+    error."""
+    cd_dir, remainder = _strip_cd_prefix(command)
+    if cd_dir and _is_rooted_or_drive_qualified(cd_dir):
         return None
-    token = match.group(0)
-    return token if _is_rooted_or_drive_qualified(token) else ntpath.join(cwd, token)
+    if _looks_shell_composed(remainder):
+        return None
+    exe_token, _rest = _leading_token(remainder)
+    if not exe_token or not exe_token.lower().endswith(".exe"):
+        return None
+    if _is_rooted_or_drive_qualified(exe_token):
+        if exe_token.startswith("//"):
+            # Altsep-spelled UNC token — same shape `_plan_staging` respells.
+            return exe_token.replace("/", "\\")
+        if exe_token.startswith("/"):
+            normalized = _normalize_posix_exe_token(exe_token, cwd)
+            return normalized if normalized is not None else exe_token
+        return exe_token
+    base = _join_relative(cwd, cd_dir) if cd_dir else cwd
+    return _join_relative(base, exe_token)
 
 
 def _pe_subsystem(path: str) -> int | None:
@@ -2726,7 +2762,13 @@ def _pe_subsystem(path: str) -> int | None:
             if len(subsystem_bytes) < 2:
                 return None
             return struct.unpack("<H", subsystem_bytes)[0]
-    except OSError:
+    except (OSError, ValueError):
+        # `OSError` covers "doesn't exist"/"not readable"; `ValueError`
+        # covers `open()` itself rejecting *path* (e.g. an embedded NUL
+        # byte, or a name this host's filesystem encoding can't
+        # represent) — both are "couldn't tell", matching the docstring's
+        # claim that every failure mode here collapses to that rather
+        # than raising (#3640 review nit).
         return None
 
 
