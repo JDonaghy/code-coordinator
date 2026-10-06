@@ -24,14 +24,17 @@ import time
 
 import pytest
 
+from coord.key_spec import UnsupportedKey
 from coord.win_native_driver import (
     NativeRunner,
     NativeSpec,
     NativeStep,
+    WinKeyEncoding,
     WinNativeRuntimeError,
     WinNativeSession,
     WinNativeSpecError,
     Win32Calls,
+    _encode_win_chord,
     _execute_staging,
     _find_a11y_match,
     _is_unc_path,
@@ -43,7 +46,7 @@ from coord.win_native_driver import (
     _STALE_SESSION_MAX_AGE_S,
     _strip_cd_prefix,
     _summarize_elements,
-    _vkey_for,
+    _win_key_encodings,
     parse_native_spec,
     run_native_spec,
 )
@@ -238,27 +241,85 @@ steps:
             )
 
 
-# ── _vkey_for ────────────────────────────────────────────────────────────────
+# ── _win_key_encodings / _encode_win_chord (#3639) ──────────────────────────
 
 
-class TestVkeyFor:
+def _enc(vk=None, unicode_char=None, shift=False, ctrl=False, alt=False, win=False):
+    return WinKeyEncoding(vk=vk, unicode_char=unicode_char, shift=shift, ctrl=ctrl, alt=alt, win=win)
+
+
+class TestWinKeyEncodings:
     def test_named_keys_case_insensitive(self) -> None:
-        assert _vkey_for("enter") == (0x0D, False)
-        assert _vkey_for("ENTER") == (0x0D, False)
-        assert _vkey_for("Esc") == (0x1B, False)
+        assert _win_key_encodings("enter") == [_enc(vk=0x0D)]
+        assert _win_key_encodings("ENTER") == [_enc(vk=0x0D)]
+        assert _win_key_encodings("Esc") == [_enc(vk=0x1B)]
 
     def test_ctrl_combo(self) -> None:
-        assert _vkey_for("ctrl+c") == (ord("C"), False)
+        assert _win_key_encodings("ctrl+c") == [_enc(vk=ord("C"), ctrl=True)]
 
     def test_lowercase_literal_needs_no_shift(self) -> None:
-        assert _vkey_for("a") == (ord("A"), False)
+        assert _win_key_encodings("a") == [_enc(vk=ord("A"))]
 
     def test_uppercase_literal_needs_shift(self) -> None:
-        assert _vkey_for("A") == (ord("A"), True)
+        assert _win_key_encodings("A") == [_enc(vk=ord("A"), shift=True)]
 
     def test_unrecognized_key_raises(self) -> None:
         with pytest.raises(WinNativeSpecError, match="unrecognized key"):
-            _vkey_for("moonwalk")
+            _win_key_encodings("moonwalk")
+
+    def test_alt_m(self) -> None:
+        # #3636: `Alt+m` previously raised "unrecognized key".
+        assert _win_key_encodings("alt+m") == [_enc(vk=ord("M"), alt=True)]
+
+    def test_alt_up_and_alt_f4(self) -> None:
+        assert _win_key_encodings("Alt+Up") == [_enc(vk=0x26, alt=True)]
+        assert _win_key_encodings("Alt+F4") == [_enc(vk=0x73, alt=True)]
+
+    def test_shift_right_and_shift_end(self) -> None:
+        assert _win_key_encodings("Shift+Right") == [_enc(vk=0x27, shift=True)]
+        assert _win_key_encodings("Shift+End") == [_enc(vk=0x23, shift=True)]
+
+    def test_ctrl_shift_right(self) -> None:
+        assert _win_key_encodings("Ctrl+Shift+Right") == [_enc(vk=0x27, ctrl=True, shift=True)]
+
+    def test_shift_f3(self) -> None:
+        assert _win_key_encodings("shift+f3") == [_enc(vk=0x72, shift=True)]
+
+    def test_punctuation_sent_as_unicode_never_a_silent_no_op(self) -> None:
+        # #3635: `$`/`.`/`:` previously returned `{"ok": true}` with no
+        # effect at all — must now actually encode something.
+        assert _win_key_encodings("$") == [_enc(unicode_char="$")]
+        assert _win_key_encodings(".") == [_enc(unicode_char=".")]
+        assert _win_key_encodings(":") == [_enc(unicode_char=":")]
+        assert _win_key_encodings("@") == [_enc(unicode_char="@")]
+
+    def test_chord_sequence_ctrl_k_ctrl_w(self) -> None:
+        assert _win_key_encodings("ctrl+k ctrl+w") == [
+            _enc(vk=ord("K"), ctrl=True),
+            _enc(vk=ord("W"), ctrl=True),
+        ]
+
+    def test_cmd_maps_to_vk_lwin(self) -> None:
+        assert _win_key_encodings("cmd+r") == [_enc(vk=ord("R"), win=True)]
+
+    def test_encode_win_chord_raises_unsupported_for_an_unknown_named_key(self) -> None:
+        # Every grammar-level named key (enter/esc/tab/.../f1-f24) happens
+        # to have a real VK_* code today, so this path can't be reached
+        # through `_win_key_encodings` right now — exercised directly so the
+        # raise itself (never a silent fallthrough) is proven reachable
+        # (#2096: a gate must be able to fail).
+        from coord.key_spec import KeyChord
+
+        bogus = KeyChord(modifiers=frozenset(), base="nonexistent", is_char=False)
+        with pytest.raises(UnsupportedKey):
+            _encode_win_chord(bogus)
+
+    def test_f25_is_not_even_a_valid_spec(self) -> None:
+        # The grammar caps named function keys at f24 — f25 fails to parse
+        # at all (:class:`WinNativeSpecError` wraps the shared parser's
+        # :class:`~coord.key_spec.KeySpecError`), never silently no-ops.
+        with pytest.raises(WinNativeSpecError):
+            _win_key_encodings("f25")
 
 
 # ── _find_a11y_match / _summarize_elements ──────────────────────────────────

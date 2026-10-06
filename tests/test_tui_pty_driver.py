@@ -54,6 +54,7 @@ import time
 
 import pytest
 
+from coord.key_spec import UnsupportedKey
 from coord.tui_pty_driver import (
     SmokeRunner,
     SmokeSpec,
@@ -67,6 +68,7 @@ from coord.tui_pty_driver import (
     encode_click,
     encode_drag,
     encode_key,
+    encode_key_sequence,
     parse_smoke_spec,
     run_smoke_spec,
 )
@@ -337,12 +339,44 @@ class TestEncodeKey:
         # 'unrecognized key' before this fix — all are the same physical
         # Alt+m combo under a different spelling, and must encode
         # identically to the universal terminal "meta sends ESC" sequence.
+        # #3639: the shared grammar's alt/option aliasing covers this now —
+        # "meta"/"M-m"/"a-m" are no longer Alt spellings (see the dedicated
+        # tests below: "meta" is canonically Cmd/Super under the grammar all
+        # four drivers share, and "M-m"/"a-m" never parsed under it at all).
         expected = b"\x1bm"
-        for spelling in ("alt+m", "meta+m", "M-m", "a-m", "option+m", "Alt+m", "ALT+M".lower()):
+        for spelling in ("alt+m", "option+m", "opt+m", "Alt+m", "ALT+M".lower()):
             assert encode_key(spelling) == expected, spelling
         # "ALT+M" (uppercase base) is the Alt+Shift+m combo, not Alt+m —
         # case must be preserved on the base character, not folded away.
         assert encode_key("alt+M") == b"\x1bM"
+
+    def test_meta_is_cmd_not_alt_under_the_shared_grammar(self) -> None:
+        # #3639: unlike tui-pty's own pre-#3639 "meta sends ESC" aliasing,
+        # the grammar SHARED by all four drivers canonicalizes
+        # cmd/super/meta to one modifier distinct from alt/option — a
+        # terminal has no Cmd/Super/Meta key at all, so this must raise
+        # UnsupportedKey, never silently fall back to the old Alt behavior.
+        with pytest.raises(UnsupportedKey, match="tui-pty"):
+            encode_key("meta+m")
+
+    def test_legacy_dash_form_no_longer_parses(self) -> None:
+        # #3639: the pre-#3604 "M-m"/"a-m" emacs-style dash spellings were a
+        # tui-pty-only extension on top of its own ad hoc parser. The
+        # grammar shared by all four drivers only recognizes "+" as the
+        # modifier separator (`ctrl+shift+p`, `Alt+M`, `cmd+option+f`) — a
+        # bare "M-m" is just an unrecognized multi-character key now.
+        with pytest.raises(TuiPtySpecError, match="unrecognized key"):
+            encode_key("M-m")
+        with pytest.raises(TuiPtySpecError, match="unrecognized key"):
+            encode_key("a-m")
+
+    def test_cmd_to_a_terminal_raises_unsupported_key_naming_the_platform(self) -> None:
+        # #3639 acceptance: "a key a platform genuinely can't deliver (e.g.
+        # cmd to a terminal) raises a clear UnsupportedKey naming the
+        # platform" — never a silent no-op.
+        with pytest.raises(UnsupportedKey) as exc_info:
+            encode_key("cmd+c")
+        assert "tui-pty" in str(exc_info.value)
 
     def test_shift_arrow_combos(self) -> None:
         # #3604: every VS Code-style Shift+-selection journey needs this.
@@ -365,6 +399,32 @@ class TestEncodeKey:
         # over the new general modifier parser for the case it already
         # handled correctly.
         assert encode_key("ctrl+c") == b"\x03"
+
+    def test_shift_f3(self) -> None:
+        # #3630: `shift+f3` previously raised TuiPtySpecError — F-keys were
+        # only on the Alt+named-key path.
+        assert encode_key("shift+f3") == b"\x1b[1;2R"
+
+    def test_colon_and_at_punctuation(self) -> None:
+        assert encode_key(":") == b":"
+        assert encode_key("@") == b"@"
+
+    def test_delete_and_backspace_are_different_bytes(self) -> None:
+        # #3627 (folded in, mac-only fix — tui-pty already had this right,
+        # asserted here for parity/regression coverage across all drivers).
+        assert encode_key("delete") == b"\x1b[3~"
+        assert encode_key("backspace") == b"\x7f"
+        assert encode_key("delete") != encode_key("backspace")
+
+    def test_chord_sequence_ctrl_k_ctrl_w(self) -> None:
+        assert encode_key_sequence("ctrl+k ctrl+w") == [b"\x0b", b"\x17"]
+
+    def test_encode_key_rejects_a_chord_sequence(self) -> None:
+        # `encode_key` is the single-chord encoder — a chord SEQUENCE must
+        # go through `encode_key_sequence` instead, never silently encode
+        # only the first chord.
+        with pytest.raises(TuiPtySpecError, match="chord sequence"):
+            encode_key("ctrl+k ctrl+w")
 
 
 class TestEncodeClick:
@@ -641,6 +701,20 @@ class TestSmokeRunnerActions:
         assert b"\x1bm" in child.writes
         assert b"\x1b[1;2C" in child.writes
         assert b"\x1b[1;5H" in child.writes
+
+    def test_key_step_sends_a_chord_sequence_as_separate_writes_in_order(self) -> None:
+        # #3639: `key: 'ctrl+k ctrl+w'` must write BOTH chords, in order —
+        # not just the first.
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("key", 1, id="chord", key="ctrl+k ctrl+w"),
+        ]))
+        assert [r["status"] for r in results] == ["pass", "pass"]
+        ctrl_k_index = child.writes.index(b"\x0b")
+        ctrl_w_index = child.writes.index(b"\x17")
+        assert ctrl_k_index < ctrl_w_index
 
     def test_drag_step_writes_press_motion_release(self) -> None:
         child = FakePtyChild()

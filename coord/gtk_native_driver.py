@@ -86,6 +86,11 @@ and ``mac-native`` rely on (#966/#3241), not a new one.
   deterministically via ``xdotool windowmove``/``windowsize``.
 - ``key: <name>`` / ``click: {x, y, button}`` — real input at *window-local*
   pixel coordinates, via :meth:`GtkCalls.send_key`/:meth:`GtkCalls.send_click`.
+  ``key:`` is parsed under the grammar shared by all four drivers
+  (:mod:`coord.key_spec`, #3639): any combination of
+  ``ctrl``/``alt``/``shift``/``cmd``(``super``) modifiers, a named key or any
+  single printable character (including punctuation), and a space-separated
+  chord sequence (``ctrl+k ctrl+w``) — see :func:`_xdotool_args_for_key`.
 - ``wait: {ms}`` — a plain deterministic pause.
 - ``capture`` — an explicit ``xwd -id <windowid>`` evidence snapshot,
   attached to this step's own result (pass or fail) as ``capture_b64``.
@@ -137,6 +142,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import yaml
+
+from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
 
 
 class GtkNativeSpecError(Exception):
@@ -577,35 +584,83 @@ _NAMED_KEYSYMS: dict[str, str] = {
     # X11 keysym names a spec author can reference by the same lowercase
     # vocabulary :mod:`coord.mac_native_driver`/:mod:`coord.win_native_driver`
     # already use — translated to xdotool's own (mostly self-explanatory)
-    # keysym spelling.
-    "enter": "Return", "return": "Return", "esc": "Escape", "escape": "Escape",
+    # keysym spelling. F13-F24 are standard X11 keysyms too — no formula
+    # needed, "F" + the number IS the keysym name.
+    "enter": "Return", "esc": "Escape",
     "tab": "Tab", "backspace": "BackSpace", "delete": "Delete", "space": "space",
     "up": "Up", "down": "Down", "left": "Left", "right": "Right",
     "home": "Home", "end": "End", "pageup": "Prior", "pagedown": "Next",
-    "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4", "f5": "F5", "f6": "F6",
-    "f7": "F7", "f8": "F8", "f9": "F9", "f10": "F10", "f11": "F11", "f12": "F12",
+    "insert": "Insert",
+    **{f"f{n}": f"F{n}" for n in range(1, 25)},
 }
 
 _BUTTON_NUMBERS: dict[str, int] = {"left": 1, "middle": 2, "right": 3}
 
+#: X11 keysym names for printable-ASCII punctuation that isn't its own
+#: keysym name (unlike letters/digits, which xdotool accepts verbatim).
+_PUNCT_KEYSYMS: dict[str, str] = {
+    "`": "grave", "~": "asciitilde", "!": "exclam", "@": "at",
+    "#": "numbersign", "$": "dollar", "%": "percent", "^": "asciicircum",
+    "&": "ampersand", "*": "asterisk", "(": "parenleft", ")": "parenright",
+    "-": "minus", "_": "underscore", "=": "equal", "+": "plus",
+    "[": "bracketleft", "]": "bracketright", "{": "braceleft", "}": "braceright",
+    "\\": "backslash", "|": "bar", ";": "semicolon", ":": "colon",
+    "'": "apostrophe", '"': "quotedbl", ",": "comma", "<": "less",
+    ".": "period", ">": "greater", "/": "slash", "?": "question",
+    " ": "space",
+}
 
-def _xdotool_key_for(key: str) -> str:
-    """The ``xdotool key``/``keydown`` argument for one spec ``key:`` name.
-    Raises :class:`GtkNativeSpecError` for anything unrecognized. Mirrors
-    :func:`coord.mac_native_driver._vkey_for`'s/
-    :func:`coord.win_native_driver._vkey_for`'s contract, just against
-    xdotool's own (mostly pass-through) keysym naming — ``xdotool`` already
-    accepts ``ctrl+c``-style modifier combos and single-character keysyms
-    (including uppercase, which it shifts for automatically) verbatim, so
-    there is no separate needs-shift bit to track here."""
-    lowered = key.lower()
-    if lowered in _NAMED_KEYSYMS:
-        return _NAMED_KEYSYMS[lowered]
-    if lowered.startswith("ctrl+") and len(lowered) == 6:
-        return f"ctrl+{lowered[5]}"
-    if len(key) == 1:
-        return key
-    raise GtkNativeSpecError(f"unrecognized key {key!r}")
+#: :class:`~coord.key_spec.KeyChord` modifier token -> the xdotool/X11
+#: modifier name, emitted in this fixed order for a deterministic argument
+#: string (xdotool itself doesn't care about order).
+_XDOTOOL_MODS: tuple[tuple[str, str], ...] = (
+    ("ctrl", "ctrl"), ("alt", "alt"), ("shift", "shift"), ("cmd", "super"),
+)
+
+
+def _xdotool_keysym_for_char(ch: str) -> str:
+    """The xdotool/X11 keysym name for one printable character. Letters and
+    digits are already valid keysym names as themselves — xdotool shifts
+    uppercase for itself, so there is no separate needs-shift bit to track
+    here (unlike the vkey-based mac/win encoders). Punctuation goes through
+    :data:`_PUNCT_KEYSYMS` (#3639: `:`/`@`/etc. have no keysym name that is
+    just the character itself)."""
+    if ch in _PUNCT_KEYSYMS:
+        return _PUNCT_KEYSYMS[ch]
+    if len(ch) == 1 and ch.isascii() and (ch.isalnum()):
+        return ch
+    raise GtkNativeSpecError(f"unrecognized key {ch!r}")
+
+
+def _xdotool_arg_for_chord(chord: KeyChord) -> str:
+    """The one ``xdotool key``/``keydown`` argument for an already-parsed
+    :class:`~coord.key_spec.KeyChord` — e.g. ``"ctrl+shift+Return"``.
+    Raises :class:`UnsupportedKey` (naming ``"gtk-native"``) for a named key
+    with no X11 keysym at all — never a silent no-op (#3639)."""
+    if not chord.is_char:
+        keysym = _NAMED_KEYSYMS.get(chord.base)
+        if keysym is None:
+            raise UnsupportedKey("gtk-native", chord.base, "no X11 keysym for this named key")
+    else:
+        keysym = _xdotool_keysym_for_char(chord.base)
+    prefix = "".join(f"{xdotool_name}+" for token, xdotool_name in _XDOTOOL_MODS if token in chord.modifiers)
+    return f"{prefix}{keysym}"
+
+
+def _xdotool_args_for_key(key: str) -> list[str]:
+    """Parse *key* — one chord, or a space-separated chord sequence
+    (``ctrl+k ctrl+w``) — under the shared grammar
+    (:mod:`coord.key_spec`) and encode each chord in order. ``xdotool key``
+    natively accepts multiple space-separated arguments as a chord sequence,
+    so :meth:`LinuxGtkCalls.send_key` passes this list straight through as
+    its own argv. Raises :class:`GtkNativeSpecError` for a spec that
+    doesn't parse under the grammar at all, :class:`UnsupportedKey` for a
+    chord this driver genuinely cannot deliver."""
+    try:
+        event = parse_key_spec(key)
+    except KeySpecError as e:
+        raise GtkNativeSpecError(f"unrecognized key {key!r}: {e}") from e
+    return [_xdotool_arg_for_chord(chord) for chord in event.chords]
 
 
 class LinuxGtkCalls:
@@ -781,9 +836,14 @@ class LinuxGtkCalls:
         )
 
     def send_key(self, window_id: int, key: str) -> None:
-        xdotool_key = _xdotool_key_for(key)
+        """#3639: *key* is parsed under the shared grammar
+        (:func:`_xdotool_args_for_key`) and may be a space-separated chord
+        sequence (``ctrl+k ctrl+w``) — ``xdotool key`` natively sends
+        multiple arguments as separate keystrokes in order, so the whole
+        list is passed through in one call."""
+        xdotool_args = _xdotool_args_for_key(key)
         subprocess.run(
-            ["xdotool", "key", "--window", str(window_id), xdotool_key],
+            ["xdotool", "key", "--window", str(window_id), *xdotool_args],
             capture_output=True, timeout=10,
         )
 

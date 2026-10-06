@@ -29,14 +29,16 @@ of ``tui-tuidriver``'s ``tui/tests/acceptance.rs`` entrypoint; see
 is threaded through as the driver's ``entrypoint:``). Steps:
 
 - ``launch`` — spawn the real binary under the pty/ConPTY.
-- ``key: <name>`` — send one key (named: ``enter``, ``esc``, ``tab``,
-  ``backspace``, ``space``, arrow keys, ``home``/``end``, ``pageup``/
-  ``pagedown``, ``delete``, ``insert``, ``f1``-``f12``, ``ctrl+<letter>``; or
-  any single literal character). #3604: also any modifier combo of the
-  form ``<mod>+<base>``/``<mod>-<base>`` (``+``/``-`` both accepted, since
-  real journeys spell this both ways — ``alt+m``, ``M-m``, ``shift+right``,
-  ``ctrl+home``) — see :func:`encode_key` for exactly which modifiers/bases
-  are recognized and how each is encoded.
+- ``key: <name>`` — send one key, or a space-separated chord sequence
+  (``ctrl+k ctrl+w``). Parsed under the grammar shared by all four drivers
+  (:mod:`coord.key_spec`, #3639): any combination of
+  ``ctrl``/``alt``/``shift`` modifiers (``cmd``/``super``/``meta`` parse but
+  always raise :class:`~coord.key_spec.UnsupportedKey` here — terminals have
+  no such key), a named key (``enter``, ``esc``, ``tab``, ``backspace``,
+  ``delete``, ``insert``, ``space``, arrow keys, ``home``/``end``,
+  ``pageup``/``pagedown``, ``f1``-``f24``) or any single printable
+  character, including punctuation — see :func:`encode_key`/
+  :func:`encode_key_sequence` for exactly how each is encoded.
 - ``click: {row, col, button}`` — an SGR mouse click at 0-indexed
   ``(row, col)``; ``button`` is ``left`` (default), ``middle``, ``right``, or
   ``wheel-up``/``wheel-down`` (single-shot, no release event — mirrors a
@@ -120,6 +122,8 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 import yaml
+
+from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
 
 
 class TuiPtySpecError(Exception):
@@ -344,11 +348,17 @@ _F_KEYS = {
     "f1": b"\x1bOP", "f2": b"\x1bOQ", "f3": b"\x1bOR", "f4": b"\x1bOS",
     "f5": b"\x1b[15~", "f6": b"\x1b[17~", "f7": b"\x1b[18~", "f8": b"\x1b[19~",
     "f9": b"\x1b[20~", "f10": b"\x1b[21~", "f11": b"\x1b[23~", "f12": b"\x1b[24~",
+    # F13-F20: the same xterm tilde-encoding convention, continued. F21-F24
+    # have no standardized xterm encoding at all — deliberately absent, so
+    # :func:`_encode_tui_chord` raises :class:`~coord.key_spec.UnsupportedKey`
+    # for them rather than guessing (#3639).
+    "f13": b"\x1b[25~", "f14": b"\x1b[26~", "f15": b"\x1b[28~", "f16": b"\x1b[29~",
+    "f17": b"\x1b[31~", "f18": b"\x1b[32~", "f19": b"\x1b[33~", "f20": b"\x1b[34~",
 }
 
 _NAMED_KEYS = {
-    "enter": b"\r", "return": b"\r",
-    "esc": b"\x1b", "escape": b"\x1b",
+    "enter": b"\r",
+    "esc": b"\x1b",
     "tab": b"\t",
     "backspace": b"\x7f",
     "space": b" ",
@@ -359,27 +369,11 @@ _NAMED_KEYS = {
     **_F_KEYS,
 }
 
-_CTRL_KEY_RE = re.compile(r"ctrl\+([a-z])")
-
-#: #3604: every spelling a run-spec/catalogue journey actually uses for the
-#: Alt modifier, normalized to the canonical ``"alt"`` token —
-#: ``meta``/``option`` are the names macOS/other platforms use for the same
-#: physical key, ``m``/``a`` are the single-letter dash forms (``M-m``,
-#: ``a-m``) emacs/readline-style bindings use. ``ctrl``/``control`` and
-#: ``shift`` need no aliasing: no journey or driver trial ever spelled those
-#: two any other way.
-_MODIFIER_ALIASES = {
-    "ctrl": "ctrl", "control": "ctrl",
-    "shift": "shift",
-    "alt": "alt", "meta": "alt", "option": "alt", "opt": "alt",
-    "m": "alt", "a": "alt",
-}
-
 #: xterm's modifyOtherKeys modifier parameter for the CSI forms below
-#: (``CSI 1 ; <code> <letter>`` for arrows/home/end, ``CSI <num> ; <code> ~``
-#: for pageup/pagedown/delete/insert) — the same encoding real terminals
-#: (and crossterm/ratatui's own decoder, what vimcode is built on) use for
-#: every modified non-letter key.
+#: (``CSI 1 ; <code> <letter>`` for arrows/home/end/F1-F4, ``CSI <num> ;
+#: <code> ~`` for pageup/pagedown/delete/insert/F5+) — the same encoding
+#: real terminals (and crossterm/ratatui's own decoder, what vimcode is
+#: built on) use for every modified non-character key.
 _MOD_CODE = {
     frozenset({"shift"}): 2,
     frozenset({"alt"}): 3,
@@ -393,85 +387,127 @@ _MOD_CODE = {
 _ARROW_FINAL = {"up": "A", "down": "B", "right": "C", "left": "D"}
 _HOME_END_FINAL = {"home": "H", "end": "F"}
 _TILDE_CODE = {"pageup": "5", "pagedown": "6", "delete": "3", "insert": "2"}
+_F_LETTER_FINAL = {"f1": "P", "f2": "Q", "f3": "R", "f4": "S"}
+_F_TILDE_NUM = {
+    "f5": "15", "f6": "17", "f7": "18", "f8": "19", "f9": "20", "f10": "21",
+    "f11": "23", "f12": "24", "f13": "25", "f14": "26", "f15": "28",
+    "f16": "29", "f17": "31", "f18": "32", "f19": "33", "f20": "34",
+}
 
 
-def _parse_modified_key(key: str) -> bytes | None:
-    """The general ``<mod>(+|-)<mod>...(+|-)<base>`` path :func:`encode_key`
-    falls back to once the fixed-table lookups above it miss — ``None``
-    (never raises) when *key* doesn't even look like a modifier combo, so
-    the caller can still try its own "bare single character" fallback.
+def _describe_chord(chord: KeyChord) -> str:
+    """A human-readable ``mod+mod+base`` spelling of *chord*, for an
+    :class:`~coord.key_spec.UnsupportedKey` message."""
+    mods = "+".join(sorted(chord.modifiers))
+    return f"{mods}+{chord.base}" if mods else chord.base
 
-    Covers exactly the combos #3604 reports missing: Alt+a single
-    character (``alt+m``/``meta+m``/``M-m``/``a-m``/``option+m`` — the
-    universal terminal "meta sends ESC" convention: an ESC byte followed by
-    the character's own encoding) and Shift/Ctrl/Alt combined with an
-    arrow or ``home``/``end``/``pageup``/``pagedown``/``delete``/``insert``
-    (the xterm ``CSI 1 ; <code> <letter>`` / ``CSI <num> ; <code> ~`` forms
-    — see :data:`_MOD_CODE`).
-    """
-    parts = re.split(r"[+\-]", key)
-    if len(parts) < 2:
-        return None
-    *mod_tokens, base = parts
-    mods: set[str] = set()
-    for tok in mod_tokens:
-        canon = _MODIFIER_ALIASES.get(tok.lower())
-        if canon is None:
-            return None
-        mods.add(canon)
+
+def _encode_modified_named(chord: KeyChord) -> bytes:
+    """The CSI/ESC-prefixed encoding for a NAMED key with at least one
+    modifier. Raises :class:`~coord.key_spec.UnsupportedKey` for a
+    modifier combination with no terminal encoding at all (``cmd`` — a
+    terminal has no Cmd/Super/Meta key, #3639) or an F-key beyond F20."""
+    base = chord.base
+    if "cmd" in chord.modifiers:
+        raise UnsupportedKey(
+            "tui-pty", _describe_chord(chord),
+            "terminals have no Cmd/Super/Meta key — only Ctrl/Alt/Shift",
+        )
+    mod_code = _MOD_CODE.get(chord.modifiers)
+    if mod_code is not None:
+        if base in _ARROW_FINAL:
+            return f"\x1b[1;{mod_code}{_ARROW_FINAL[base]}".encode("ascii")
+        if base in _HOME_END_FINAL:
+            return f"\x1b[1;{mod_code}{_HOME_END_FINAL[base]}".encode("ascii")
+        if base in _TILDE_CODE:
+            return f"\x1b[{_TILDE_CODE[base]};{mod_code}~".encode("ascii")
+        if base in _F_LETTER_FINAL:
+            return f"\x1b[1;{mod_code}{_F_LETTER_FINAL[base]}".encode("ascii")
+        if base in _F_TILDE_NUM:
+            return f"\x1b[{_F_TILDE_NUM[base]};{mod_code}~".encode("ascii")
+    if chord.modifiers == frozenset({"alt"}) and base in _NAMED_KEYS:
+        # Alt + a named key with no CSI form above (enter/esc/tab/
+        # backspace/space): the universal terminal "meta sends ESC"
+        # convention — an ESC byte followed by the key's own encoding.
+        return b"\x1b" + _NAMED_KEYS[base]
+    raise UnsupportedKey(
+        "tui-pty", _describe_chord(chord),
+        "no terminal encoding for this modifier combination",
+    )
+
+
+def _encode_tui_chord(chord: KeyChord) -> bytes:
+    """The raw terminal bytes for one already-parsed
+    :class:`~coord.key_spec.KeyChord`. Raises
+    :class:`~coord.key_spec.UnsupportedKey` (naming ``"tui-pty"``) for a
+    chord no real terminal byte stream can express: ``cmd``/``super``/
+    ``meta`` (terminals have no such key — the #3639 acceptance example),
+    an F-key beyond F20, or a modifier combination on a plain character
+    with no terminal convention — never a silent no-op."""
+    if not chord.is_char:
+        if not chord.modifiers:
+            encoded = _NAMED_KEYS.get(chord.base)
+            if encoded is None:
+                raise UnsupportedKey(
+                    "tui-pty", chord.base, "no terminal encoding for this named key"
+                )
+            return encoded
+        return _encode_modified_named(chord)
+
+    ch = chord.base
+    mods = chord.modifiers
     if not mods:
-        return None
-    base_lower = base.lower()
-
-    if mods == {"alt"} and len(base) == 1:
-        return b"\x1b" + base.encode("utf-8")
-
-    mod_code = _MOD_CODE.get(frozenset(mods))
-    if mod_code is None:
-        return None
-    if base_lower in _ARROW_FINAL:
-        return f"\x1b[1;{mod_code}{_ARROW_FINAL[base_lower]}".encode("ascii")
-    if base_lower in _HOME_END_FINAL:
-        return f"\x1b[1;{mod_code}{_HOME_END_FINAL[base_lower]}".encode("ascii")
-    if base_lower in _TILDE_CODE:
-        return f"\x1b[{_TILDE_CODE[base_lower]};{mod_code}~".encode("ascii")
-    if mods == {"alt"} and base_lower in _NAMED_KEYS:
-        # Alt + any other named key (e.g. alt+enter): the same "ESC
-        # prefix" convention as alt+<letter>, generalized to the key's own
-        # byte sequence instead of a single UTF-8 character.
-        return b"\x1b" + _NAMED_KEYS[base_lower]
-    return None
+        return ch.encode("utf-8")
+    if mods == frozenset({"ctrl"}) and len(ch) == 1 and ch.isalpha():
+        # Case-insensitive: Ctrl+c and Ctrl+C are the same physical
+        # keystroke and the same control code on every real terminal.
+        return bytes([ord(ch.lower()) - ord("a") + 1])
+    if mods == frozenset({"alt"}):
+        # The universal terminal "meta sends ESC" convention — case
+        # preserved, so `alt+M` (Alt+Shift+m) differs from `alt+m`.
+        return b"\x1b" + ch.encode("utf-8")
+    if mods == frozenset({"shift"}) and len(ch) == 1 and ch.isalpha():
+        return ch.upper().encode("utf-8")
+    raise UnsupportedKey(
+        "tui-pty", _describe_chord(chord),
+        "no terminal encoding for this modifier combination on a plain character",
+    )
 
 
 def encode_key(key: str) -> bytes:
-    """Encode one spec ``key:`` name into the raw bytes a real terminal
-    would send for it.
+    """Encode one ``key:`` token — a single chord, not a chord sequence —
+    into the raw bytes a real terminal would send for it. Parsed under the
+    grammar shared by all four drivers (:mod:`coord.key_spec`, #3639).
 
-    Named keys (:data:`_NAMED_KEYS`) and ``ctrl+<letter>`` (control-code
-    ``chr(ord(letter) - ord('a') + 1)``) are recognized case-insensitively,
-    exactly as before. #3604 adds a general modifier-combo path
-    (:func:`_parse_modified_key`) for everything neither of those cover:
-    Alt+a single character under any of its aliases (``alt+m``, ``meta+m``,
-    ``M-m``, ``a-m``, ``option+m``) and Shift/Ctrl/Alt combined with an
-    arrow/``home``/``end``/``pageup``/``pagedown``/``delete``/``insert``
-    (``shift+right``, ``ctrl+home``, ``ctrl+end``, ...). Any other single
-    character is sent as its own UTF-8 encoding. Raises
-    :class:`TuiPtySpecError` for anything else (an empty string, a
-    multi-character name that isn't a recognized named key or modifier
-    combo).
+    Raises :class:`TuiPtySpecError` for a *key* that doesn't parse under the
+    shared grammar at all (wraps :class:`~coord.key_spec.KeySpecError`) or
+    that parses as more than one chord (use :func:`encode_key_sequence` for
+    a chord sequence like ``ctrl+k ctrl+w``), and
+    :class:`~coord.key_spec.UnsupportedKey` for a chord that parses fine but
+    has no terminal byte encoding (``cmd+c`` — see :func:`_encode_tui_chord`).
     """
-    lowered = key.lower()
-    if lowered in _NAMED_KEYS:
-        return _NAMED_KEYS[lowered]
-    m = _CTRL_KEY_RE.fullmatch(lowered)
-    if m:
-        return bytes([ord(m.group(1)) - ord("a") + 1])
-    modified = _parse_modified_key(key)
-    if modified is not None:
-        return modified
-    if len(key) == 1:
-        return key.encode("utf-8")
-    raise TuiPtySpecError(f"unrecognized key {key!r}")
+    try:
+        event = parse_key_spec(key)
+    except KeySpecError as e:
+        raise TuiPtySpecError(f"unrecognized key {key!r}: {e}") from e
+    if len(event.chords) != 1:
+        raise TuiPtySpecError(
+            f"{key!r} is a chord sequence, not one key — call "
+            f"encode_key_sequence for that"
+        )
+    return _encode_tui_chord(event.chords[0])
+
+
+def encode_key_sequence(key: str) -> list[bytes]:
+    """Encode *key* — one chord, or a space-separated chord sequence
+    (``ctrl+k ctrl+w``) — into the raw bytes for each chord, in order. What
+    :meth:`SmokeRunner._do_key` actually calls, so a single-chord ``key:``
+    value still goes through exactly one :func:`_encode_tui_chord` call."""
+    try:
+        event = parse_key_spec(key)
+    except KeySpecError as e:
+        raise TuiPtySpecError(f"unrecognized key {key!r}: {e}") from e
+    return [_encode_tui_chord(chord) for chord in event.chords]
 
 
 # SGR extended mouse-reporting protocol (`ESC [ < Cb ; Cx ; Cy M` for
@@ -1170,7 +1206,12 @@ class SmokeRunner:
         return self._child
 
     def _do_key(self, step: SmokeStep) -> None:
-        self._require_child().write(encode_key(step.key))
+        """#3639: *step.key* may be a space-separated chord sequence
+        (``ctrl+k ctrl+w``) — each chord is written as its own byte
+        sequence, in order."""
+        child = self._require_child()
+        for chord_bytes in encode_key_sequence(step.key):
+            child.write(chord_bytes)
 
     def _do_click(self, step: SmokeStep) -> None:
         self._require_child().write(encode_click(step.row, step.col, step.button))
@@ -1415,7 +1456,11 @@ class TuiPtySession:
         return getattr(self._child, "pid", None)
 
     def send_key(self, key: str) -> None:
-        self._child.write(encode_key(key))
+        """#3639: *key* may be a space-separated chord sequence
+        (``ctrl+k ctrl+w``) — see :meth:`SmokeRunner._do_key`'s own
+        docstring for the same contract against a YAML spec step."""
+        for chord_bytes in encode_key_sequence(key):
+            self._child.write(chord_bytes)
 
     def send_text(self, text: str) -> None:
         self._child.write(text.encode("utf-8"))

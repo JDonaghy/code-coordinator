@@ -19,16 +19,19 @@ import time
 
 import pytest
 
+from coord.key_spec import UnsupportedKey
 from coord.mac_native_driver import (
+    MacKeyEncoding,
     MacNativeRuntimeError,
     MacNativeSpecError,
     MacOSCalls,
     NativeRunner,
     NativeSpec,
     NativeStep,
+    _encode_mac_chord,
     _find_a11y_match,
+    _mac_key_encodings,
     _summarize_elements,
-    _vkey_for,
     parse_native_spec,
     run_native_spec,
 )
@@ -150,30 +153,81 @@ steps:
             )
 
 
-# ── _vkey_for ────────────────────────────────────────────────────────────────
+# ── _mac_key_encodings / _encode_mac_chord (#3639) ──────────────────────────
 
 
-class TestVkeyFor:
+def _enc(vkey=None, unicode_char=None, shift=False, ctrl=False, alt=False, cmd=False):
+    return MacKeyEncoding(vkey=vkey, unicode_char=unicode_char, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd)
+
+
+class TestMacKeyEncodings:
     def test_named_keys_case_insensitive(self) -> None:
-        assert _vkey_for("enter") == (0x24, False)
-        assert _vkey_for("ENTER") == (0x24, False)
-        assert _vkey_for("Esc") == (0x35, False)
+        assert _mac_key_encodings("enter") == [_enc(vkey=0x24)]
+        assert _mac_key_encodings("ENTER") == [_enc(vkey=0x24)]
+        assert _mac_key_encodings("Esc") == [_enc(vkey=0x35)]
 
     def test_ctrl_combo(self) -> None:
-        assert _vkey_for("ctrl+c") == (0x08, False)
+        assert _mac_key_encodings("ctrl+c") == [_enc(vkey=0x08, ctrl=True)]
 
     def test_lowercase_literal_needs_no_shift(self) -> None:
-        assert _vkey_for("a") == (0x00, False)
+        assert _mac_key_encodings("a") == [_enc(vkey=0x00)]
 
     def test_uppercase_literal_needs_shift(self) -> None:
-        assert _vkey_for("A") == (0x00, True)
+        assert _mac_key_encodings("A") == [_enc(vkey=0x00, shift=True)]
 
     def test_digit_key(self) -> None:
-        assert _vkey_for("5") == (0x17, False)
+        assert _mac_key_encodings("5") == [_enc(vkey=0x17)]
 
     def test_unrecognized_key_raises(self) -> None:
         with pytest.raises(MacNativeSpecError, match="unrecognized key"):
-            _vkey_for("moonwalk")
+            _mac_key_encodings("moonwalk")
+
+    def test_alt_m(self) -> None:
+        # #3625: `alt+m` previously raised "unrecognized key".
+        assert _mac_key_encodings("alt+m") == [_enc(vkey=0x2E, alt=True)]
+
+    def test_cmd_shift_p(self) -> None:
+        assert _mac_key_encodings("cmd+shift+p") == [_enc(vkey=0x23, shift=True, cmd=True)]
+
+    def test_ctrl_shift_right(self) -> None:
+        assert _mac_key_encodings("ctrl+shift+right") == [_enc(vkey=0x7C, ctrl=True, shift=True)]
+
+    def test_shift_f3(self) -> None:
+        assert _mac_key_encodings("shift+f3") == [_enc(vkey=0x63, shift=True)]
+
+    def test_punctuation_goes_through_unicode_string(self) -> None:
+        assert _mac_key_encodings(":") == [_enc(unicode_char=":")]
+        assert _mac_key_encodings("@") == [_enc(unicode_char="@")]
+
+    def test_chord_sequence_ctrl_k_ctrl_w(self) -> None:
+        assert _mac_key_encodings("ctrl+k ctrl+w") == [
+            _enc(vkey=0x28, ctrl=True),
+            _enc(vkey=0x0D, ctrl=True),
+        ]
+
+    def test_delete_and_backspace_use_different_keycodes(self) -> None:
+        # #3627: forward-delete and backspace are different physical keys.
+        delete = _mac_key_encodings("delete")[0]
+        backspace = _mac_key_encodings("backspace")[0]
+        assert delete.vkey != backspace.vkey
+        assert delete.vkey == 0x75
+        assert backspace.vkey == 0x33
+
+    def test_f21_has_no_macos_keycode_and_raises_unsupported(self) -> None:
+        with pytest.raises(UnsupportedKey):
+            _mac_key_encodings("f21")
+
+    def test_encode_mac_chord_raises_unsupported_for_an_unknown_named_key(self) -> None:
+        # Exercises `_encode_mac_chord` directly (what `_mac_key_encodings`
+        # calls per chord) so the raise itself (never a silent fallthrough)
+        # is proven reachable even for a named key the grammar accepts but
+        # this platform has no keycode for (#2096: a gate must be able to
+        # fail).
+        from coord.key_spec import KeyChord
+
+        bogus = KeyChord(modifiers=frozenset(), base="nonexistent", is_char=False)
+        with pytest.raises(UnsupportedKey):
+            _encode_mac_chord(bogus)
 
 
 # ── _find_a11y_match / _summarize_elements ──────────────────────────────────
