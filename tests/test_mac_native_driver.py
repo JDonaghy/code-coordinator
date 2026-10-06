@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -827,6 +829,99 @@ def _make_mac_calls(quartz: _FakeQuartz) -> MacOSCalls:
     calls = object.__new__(MacOSCalls)
     calls._quartz = quartz
     return calls
+
+
+# ── #3622: MacOSCalls.launch() must track the REAL process's pid, not
+# ``/bin/sh``'s, for the lane's own prescribed compound ``--launch`` shape ──
+
+
+class TestMacOSCallsLaunchExecWraps:
+    """Tier-1 conformance guard for the bugbash finding (#3622): a bugbash
+    run of ``coord app-drive open mac-native --launch 'cd .smoke && HOME=
+    $PWD/home "<bin>" sample.txt'`` — the exact compound form this lane's
+    own HARD RULE prescribes — always failed with ``no on-screen window
+    appeared for pid=<N>``, because ``MacOSCalls.launch()`` tracked a bare
+    ``subprocess.Popen(command, shell=True)``'s own pid, and ``/bin/sh``
+    forks a child for the final (real-binary) command of a ``&&`` chain
+    instead of exec'ing into it in place — so the tracked pid never
+    matches the real window-owning process's pid.
+
+    Both tests construct a real :class:`MacOSCalls` (bypassing
+    ``__init__``'s macOS-only platform guard — exactly like
+    :func:`_make_mac_calls` above; ``launch()`` itself touches no
+    Quartz/AX call, so this is safe and real-process-exercising on any
+    POSIX platform, not just real macOS hardware) and fail against the
+    pre-fix ``launch()`` (a bare ``Popen(command, shell=True)``, which
+    leaves two live processes — ``/bin/sh`` and the real child — with
+    different pids) and pass against the fix (``Popen(
+    wrap_launch_command(command), shell=True)``, which collapses the
+    compound command's final simple command into a single ``execve()``).
+    """
+
+    @pytest.mark.skipif(os.name != "posix", reason="shell=True compound commands are POSIX here")
+    def test_compound_launch_pid_is_the_real_binary_not_the_shell(self, tmp_path) -> None:
+        marker = tmp_path / "pid.txt"
+        subdir = tmp_path / ".smoke"
+        subdir.mkdir()
+        # The lane's own prescribed shape: a leading `cd` plus an inline
+        # env-var assignment on the final simple command.
+        command = (
+            f"cd .smoke && HOME=$PWD/home {sys.executable} -c "
+            "\"import os, pathlib, time; "
+            f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid())); "
+            "time.sleep(5)\""
+        )
+        calls = object.__new__(MacOSCalls)
+        pid = calls.launch(command, str(tmp_path))
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.exists(), (
+                "the launched process never wrote its own pid — the "
+                "compound launch command failed to start at all"
+            )
+            real_pid = int(marker.read_text())
+            assert pid == real_pid, (
+                f"MacOSCalls.launch() returned pid={pid} but the real "
+                f"binary's own pid is {real_pid} — the tracked pid is "
+                f"/bin/sh's, not the real process (#3622)"
+            )
+        finally:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+            try:
+                os.kill(real_pid, 9)
+            except (ProcessLookupError, NameError):
+                pass
+
+    def test_launch_hands_popen_the_exec_wrapped_command(self, monkeypatch) -> None:
+        """Faster, non-spawning companion: pins that ``launch()`` really
+        does route through :func:`coord.shell_exec_wrap.wrap_launch_command`
+        rather than handing ``Popen`` the caller's command verbatim — so a
+        future edit that silently drops the wrap call fails here even
+        without spawning a real process."""
+        captured: dict[str, object] = {}
+
+        class _FakeProc:
+            pid = 4242
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return _FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        calls = object.__new__(MacOSCalls)
+        pid = calls.launch("cd .smoke && HOME=$PWD/home ./bin sample.txt", "/repo")
+        assert pid == 4242
+        assert captured["command"] == (
+            "cd .smoke && exec env HOME=$PWD/home ./bin sample.txt"
+        )
+        assert captured["kwargs"]["shell"] is True
+        assert captured["kwargs"]["cwd"] == "/repo"
 
 
 class TestSendKeyRealSequence:

@@ -154,6 +154,7 @@ from typing import Any, Protocol
 import yaml
 
 from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
+from coord.shell_exec_wrap import wrap_launch_command
 
 
 class MacNativeSpecError(Exception):
@@ -803,7 +804,21 @@ class MacOSCalls:
     # -- process lifecycle --
 
     def launch(self, command: str, cwd: str) -> int:
-        proc = subprocess.Popen(command, shell=True, cwd=cwd or None)
+        """#3622: *command* is wrapped via :func:`wrap_launch_command` (the
+        same ``exec``-wrapping transform :mod:`coord.tui_pty_driver`'s
+        ``UnixPtyChild`` already uses for the identical reason, #3583)
+        before being handed to ``shell=True`` — so the returned
+        ``Popen.pid`` collapses into the real binary's own pid instead of
+        staying ``/bin/sh``'s, for the exact compound ``cd .smoke &&
+        HOME=$PWD/home ../target/release/vimcode sample.txt`` shape this
+        lane's own prescribed ``--launch`` form uses. Without this,
+        :meth:`find_top_window`'s ``CGWindowOwnerPID`` check — and every
+        pid-addressed input call (``CGEventPostToPid`` in
+        :meth:`send_key`/:meth:`send_click`, the ``is_frontmost`` check) —
+        never matches the real window-owning process, since ``/bin/sh``
+        forks a child for the final command rather than exec'ing into it in
+        place."""
+        proc = subprocess.Popen(wrap_launch_command(command), shell=True, cwd=cwd or None)
         return proc.pid
 
     def kill(self, pid: int) -> None:
@@ -1119,13 +1134,19 @@ class MacNativeSession:
         :func:`coord.app_drive.close_session` can re-observe/re-signal the
         process this session itself launched, not just the daemon.
 
-        NOT guaranteed to be the real app's own pid: :meth:`MacOSCalls
-        .launch` is a plain ``subprocess.Popen(command, shell=True)``, so
-        this is ``/bin/sh``'s pid whenever *command* forks rather than
-        execs into the real binary — the same shell-vs-app gap
-        :data:`coord.win_native_driver.WinCalls` already documents on its
-        own ``launch``/``kill`` (tracked separately from #3590; the
-        tui-pty lane's #3583 exec-wrap fix does not apply here)."""
+        For the common case this IS the real app's own pid (#3622):
+        :meth:`MacOSCalls.launch` wraps *command* via
+        :func:`coord.shell_exec_wrap.wrap_launch_command` before handing it
+        to ``subprocess.Popen(..., shell=True)`` — the same ``exec``-wrap
+        the tui-pty lane's #3583 fix uses — so the final simple command
+        collapses into a single ``execve()`` instead of ``/bin/sh`` forking
+        a grandchild for it. A command this repo's grammar can't rewrite
+        into an ``exec`` tail (e.g. one ending in a subshell or a pipeline)
+        would still leave this as ``/bin/sh``'s own pid — the same
+        shell-vs-app gap :data:`coord.win_native_driver.WinCalls` documents
+        on its own ``launch``/``kill`` — but no real route uses such a
+        shape (see :func:`coord.shell_exec_wrap.wrap_launch_command`'s own
+        docstring on scope)."""
         return self._pid
 
     def _require_frontmost(self) -> None:
