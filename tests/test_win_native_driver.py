@@ -1500,13 +1500,67 @@ class TestPlanStaging:
         for command in ("a.exe | b.exe", "a.exe > out.txt", "a.exe & b.exe"):
             assert _plan_staging(command, self.UNC, session_root=self.SESSION).staged is False
 
-    def test_an_absolute_exe_token_is_left_alone(self) -> None:
+    def test_a_genuinely_local_absolute_exe_token_is_left_alone(self) -> None:
         """Nothing under `cwd`'s own tree to stage for an exe that's
-        already an absolute path — left alone rather than guessed at."""
+        already an absolute, LOCAL path — left alone rather than guessed
+        at."""
         plan = _plan_staging(
             r"C:\Tools\vimcode.exe sample.txt", self.UNC, session_root=self.SESSION,
         )
         assert plan.staged is False
+
+    def test_an_absolute_unc_exe_token_is_staged_by_basename(self) -> None:
+        """#3633: a route's relative `../target/.../X.exe` doesn't exist
+        under this fleet's actual (shared) `CARGO_TARGET_DIR`, so a worker
+        substitutes the real, absolute build path instead — one the
+        Windows side still only ever reaches as a UNC path. That still
+        pays the same `\\wsl$` 9P cost staging exists to avoid, so it must
+        be staged too, not left alone the way a genuinely local absolute
+        exe is. Staged by basename alone (an absolute token carries no
+        position relative to `cwd` to preserve), and `command`'s own
+        leading token is rewritten to the staged, quoted copy."""
+        absolute_exe = (
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\.coord\cargo-target\vimcode"
+            r"\x86_64-pc-windows-msvc\release\vimcode.exe"
+        )
+        plan = _plan_staging(
+            f"{absolute_exe} sample.txt", self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is True
+        assert plan.cwd == self.SESSION
+        assert plan.source_exe == absolute_exe
+        assert plan.dest_exe == f"{self.SESSION}\\vimcode.exe"
+        assert plan.command == f'"{self.SESSION}\\vimcode.exe" sample.txt'
+        # The fixture dir is still queued opportunistically, exactly as
+        # the relative-exe case does.
+        assert (f"{self.UNC}\\.smoke", f"{self.SESSION}\\.smoke") in plan.fixture_copies
+
+    def test_a_cd_prefix_then_absolute_unc_exe_is_staged_and_command_rewritten(
+        self,
+    ) -> None:
+        """The same #3633 shape, but preceded by the fleet's own
+        `cd <fixture-dir> && ` convention — the `cd` prefix is carried
+        through unchanged ahead of the rewritten, staged exe token."""
+        absolute_exe = (
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\.coord\cargo-target\vimcode"
+            r"\x86_64-pc-windows-msvc\release\vimcode.exe"
+        )
+        plan = _plan_staging(
+            f"cd .smoke && {absolute_exe} sample.txt", self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is True
+        assert plan.cwd == self.SESSION
+        assert plan.dest_exe == f"{self.SESSION}\\vimcode.exe"
+        assert plan.command == f'cd ".smoke" && "{self.SESSION}\\vimcode.exe" sample.txt'
+        assert (f"{self.UNC}\\.smoke", f"{self.SESSION}\\.smoke") in plan.fixture_copies
+
+    def test_relative_exe_plan_leaves_command_empty_meaning_unchanged(self) -> None:
+        """The common (relative-exe) case never sets `plan.command` —
+        `""` is the caller's cue (`Win32Calls._stage_if_needed`) to keep
+        using the *command* it already has, since it already resolves
+        correctly against the staged `cwd` unchanged."""
+        plan = _plan_staging("vimcode.exe sample.txt", self.UNC, session_root=self.SESSION)
+        assert plan.command == ""
 
     def test_empty_command_is_left_alone(self) -> None:
         assert _plan_staging("", self.UNC, session_root=self.SESSION).staged is False
@@ -1898,6 +1952,50 @@ class TestLaunchRealPlanStagingEndToEnd:
             ntpath.join(post_cd, "..", "target", "x86_64-pc-windows-msvc", "release", "vimcode.exe")
         )
         assert resolved_exe == ntpath.normpath(plan.dest_exe)
+
+    def test_worker_substituted_absolute_unc_exe_is_staged_and_rewritten_end_to_end(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """#3633: when the route's own relative exe path doesn't exist
+        (this fleet's actual `CARGO_TARGET_DIR` lives elsewhere) and a
+        worker substitutes the real, absolute build path instead, that
+        path reaching `Popen` must be the STAGED copy, not the original
+        UNC one — unlike the relative-exe case above, this one DOES need
+        `command` itself rewritten, since the absolute token carries no
+        `cwd`-relative position to simply re-root."""
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+        executed: list = []
+        monkeypatch.setattr(
+            "coord.win_native_driver._execute_staging", lambda plan: executed.append(plan),
+        )
+        captured_popen: dict = {}
+
+        class _FakeProc:
+            pid = 6666
+
+        def fake_popen(command, *, shell, cwd=None, **kwargs):
+            captured_popen["command"] = command
+            captured_popen["cwd"] = cwd
+            return _FakeProc()
+
+        monkeypatch.setattr("coord.win_native_driver.subprocess.Popen", fake_popen)
+
+        worker_substituted_command = (
+            "cd .smoke && "
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\.coord\cargo-target\vimcode"
+            r"\x86_64-pc-windows-msvc\release\vimcode.exe sample.txt"
+        )
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        pid = calls.launch(worker_substituted_command, self.UNC)
+
+        assert pid == 6666
+        assert len(executed) == 1
+        plan = executed[0]
+        assert "wsl.localhost" not in captured_popen["command"]
+        assert captured_popen["command"] == plan.command
+        assert captured_popen["command"] == f'cd ".smoke" && "{plan.dest_exe}" sample.txt'
+        assert captured_popen["cwd"] == plan.cwd
+        assert "wsl.localhost" not in captured_popen["cwd"]
 
 
 class TestStageIfNeededFallsBackRatherThanRaising:
