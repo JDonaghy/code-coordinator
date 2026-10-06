@@ -79,12 +79,14 @@ the resolved exe (plus that fixture dir, and/or a conventional ``.smoke``
 one, when present) onto the real local Windows filesystem — a fresh
 ``%LOCALAPPDATA%\\Temp\\coord-app-drive\\<session>\\`` directory — and
 launch from there instead, with ``cwd`` rewritten to match. An exe token
-that is itself absolute is staged too when it's still a UNC path (#3633 —
-see below) and left alone only when it's already genuinely local.
-Anything more complex (a second shell operator) is left alone, falling
-back to the ``pushd`` wrap above unchanged — this driver only ever
-rewrites the ONE leading executable token of a command it can parse with
-confidence, never an opaque shell pipeline.
+that is itself absolute is staged too when it's reachable only over the
+network — a UNC path, a drive letter mapped to one, or a `/`-rooted
+WSL-style token normalized onto the UNC form (#3633 — see below) — and
+left alone only when it's already genuinely local. Anything more complex
+(a second shell operator) is left alone, falling back to the ``pushd``
+wrap above unchanged — this driver only ever rewrites the ONE leading
+executable token of a command it can parse with confidence, never an
+opaque shell pipeline.
 
 **#3633: a route's own relative exe path can disagree with where the
 fleet actually built it.** A ``run:`` naming ``../target/<triple>/
@@ -92,15 +94,26 @@ release/X.exe`` assumes cargo's default in-tree ``target/``, but this
 fleet builds with a shared, per-repo ``CARGO_TARGET_DIR``
 (``coord.cargo_cache``, #1402) — so that relative path resolves to
 nothing, and a worker substitutes the real, absolute build path instead.
-That absolute path is still only ever UNC from the Windows side
-(:func:`coord.win_native_bridge.translate_to_windows_path`'s own output
-shape), so launching straight off it pays the exact same ``\\wsl$`` 9P
-cost #3617 exists to avoid — and pre-#3633, :func:`_plan_staging` declined
-to stage ANY absolute exe token, so this case silently never staged at
-all. :func:`_plan_staging` now stages an absolute-but-still-UNC exe too
-(by basename alone, rewriting *command*'s own leading token to the staged
-copy), leaving alone only an exe token that's already genuinely local
-(nothing to gain from staging that).
+Nothing in this repo normalizes that substituted text — it is whatever
+the worker typed — and it does NOT reliably come out as a UNC path: the
+issue's own dell64 evidence showed every launch running from
+``Z:\\home\\john\\.coord\\cargo-target\\...``, a drive letter MAPPED to
+the WSL tree, which ``ntpath.isabs``/:func:`_is_unc_path` alone cannot
+tell apart from a genuinely local ``C:\\...`` exe. Launching straight off
+either unstaged shape pays the exact same ``\\wsl$`` 9P cost #3617 exists
+to avoid — and pre-#3633, :func:`_plan_staging` declined to stage ANY
+absolute exe token, so this case silently never staged at all.
+:func:`_plan_staging` now stages an absolute exe token whenever
+:func:`_is_remote_exe_token` says it's reachable only over the network
+(UNC outright, or a drive letter :func:`_get_drive_type` reports as
+mapped/remote — real Windows' own ``GetDriveTypeW``, injectable for
+testing), after first normalizing a bare `/`-rooted WSL-style token
+(``/home/...``) onto the ``\\wsl.localhost\\<distro>\\...`` UNC shape
+(:func:`_normalize_posix_exe_token`, borrowing *cwd*'s own distro
+prefix). Staged by basename alone, rewriting *command*'s own leading
+token to the staged copy; left alone only when the token is already
+genuinely local, or is a `/`-rooted one with no distro to borrow from
+*cwd* (nothing to safely guess either way).
 
 :meth:`Win32Calls.kill` deletes the staged session directory it created,
 once it has signalled that launch's own pid — the normal (``close``/
@@ -983,6 +996,95 @@ def _is_unc_path(path: str) -> bool:
     return path.startswith("\\\\")
 
 
+#: Win32 ``GetDriveTypeW``'s own ``DRIVE_REMOTE`` constant — a drive letter
+#: mapped to a network share (``net use Z: \\wsl$\Ubuntu...``), the exact
+#: shape #3633's own dell64 evidence showed (every staged-looking exe still
+#: running from ``Z:\home\john\.coord\cargo-target\...``): ``ntpath.isabs``
+#: reports ``True`` for it and :func:`_is_unc_path` reports ``False``, so
+#: neither of #3617's original checks ever caught it — it was mislabelled
+#: "already genuinely local" and the 9P cost staging exists to avoid was
+#: paid anyway.
+_DRIVE_REMOTE = 4
+
+
+def _get_drive_type(path: str) -> int:
+    """``GetDriveTypeW`` for the drive letter *path* starts with — a real
+    (cheap, read-only) Win32 call, injectable via :func:`_is_remote_exe_token`'s
+    ``get_drive_type`` kwarg so the decision logic built on top of it stays
+    pure/testable with fabricated path strings on any host OS, the same
+    shape :func:`_local_app_data_via_known_folder`'s caller
+    (:meth:`Win32Calls._staging_root`) already uses its own
+    ``known_folder_resolver`` kwarg for. Returns ``0`` (``DRIVE_UNKNOWN`` —
+    never ``DRIVE_REMOTE``, so callers never mistake "couldn't ask" for "is
+    local") on any non-Windows platform, a path with no drive letter at
+    all (a UNC path, or one with no root), or any failure. The real call
+    only ever happens on a real Windows host, where ``os.path`` already IS
+    ``ntpath``.
+    """
+    if os.name != "nt":
+        return 0
+    drive = ntpath.splitdrive(path)[0]
+    if not drive:
+        return 0
+    try:
+        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\")
+    except Exception:  # noqa: BLE001 — best-effort only, never worth crashing a launch over
+        return 0
+
+
+#: The ``\\wsl.localhost\<distro>`` prefix :func:`coord.win_native_bridge
+#: .translate_to_windows_path` puts on a translated ``cwd`` (#3543) —
+#: reused by :func:`_normalize_posix_exe_token` to turn a bare `/`-rooted
+#: exe token into that same UNC shape, without ever having to guess a
+#: distro name from nowhere.
+_WSL_LOCALHOST_PREFIX_RE = re.compile(r"^\\\\wsl\.localhost\\[^\\]+", re.IGNORECASE)
+
+
+def _normalize_posix_exe_token(exe_token: str, cwd: str) -> str | None:
+    """A `/`-rooted POSIX/WSL-style exe token (``/home/john/...``) that
+    reached the Windows side unmapped — #3633's fix option (b) names this
+    shape explicitly alongside the UNC one. It is never a real Windows
+    path: Windows path APIs resolve a bare leading ``/`` against the
+    *current drive's* root directory, not WSL's filesystem, so launching
+    (or even just ``isfile``-checking) it unchanged would silently fail
+    or — worse — resolve to an unrelated file on whatever drive happens
+    to be current.
+
+    Rewrites it onto the ``\\wsl.localhost\\<distro>\\...`` UNC shape
+    instead, borrowing *cwd*'s own ``\\wsl.localhost\\<distro>`` prefix —
+    *cwd* is already known to be exactly that shape whenever this is
+    reached (the :func:`_is_unc_path` gate at the top of
+    :func:`_plan_staging`) — rather than fabricating a distro name from
+    nothing. Returns ``None`` when *cwd* doesn't carry that prefix (a
+    same-host, non-WSL UNC share, e.g. ``\\fileserver\\tools\\...``, has
+    no WSL distro to borrow one from); the caller then leaves the token
+    alone rather than guess.
+    """
+    match = _WSL_LOCALHOST_PREFIX_RE.match(cwd)
+    if match is None:
+        return None
+    return match.group(0) + exe_token.replace("/", "\\")
+
+
+def _is_remote_exe_token(exe_token: str, *, get_drive_type=_get_drive_type) -> bool:
+    """True when *exe_token* — already known to be an absolute path,
+    and already run through :func:`_normalize_posix_exe_token` when it
+    started life as a `/`-rooted one — is reachable only over the network,
+    i.e. genuinely worth staging onto the local filesystem (#3633):
+
+    - a UNC path (:func:`_is_unc_path` — ``\\\\server\\share\\...`` /
+      ``\\\\wsl.localhost\\...``), or
+    - a drive-letter path whose drive is itself a mapped network drive
+      (*get_drive_type* reports :data:`_DRIVE_REMOTE` — dell64's own
+      observed shape, ``Z:\\home\\...``).
+
+    False for a drive-letter path on a genuinely local (fixed/removable)
+    drive — nothing to stage for an exe already on local NTFS."""
+    if _is_unc_path(exe_token):
+        return True
+    return get_drive_type(exe_token) == _DRIVE_REMOTE
+
+
 def _popen_command_and_cwd(command: str, cwd: str) -> tuple[str, str | None]:
     """Resolve the ``command``/``cwd`` pair to actually hand
     ``subprocess.Popen(..., shell=True)`` (#3543).
@@ -1147,21 +1249,31 @@ class _StagingPlan:
     *command*/*cwd* exactly as given", the caller's cue to fall back to
     :func:`_popen_command_and_cwd`'s own UNC ``pushd`` wrap unchanged.
 
-    ``command`` is ``""`` (the default) whenever the original *command*
+    ``command`` is ``None`` (the default) whenever the original *command*
     text stays correct unchanged — the common (relative-exe) case, where
     only ``cwd`` moves and every relative reference in *command* keeps
     resolving against the new root exactly as it did against the old one
-    (see the function docstring). It is non-empty only for the #3633
-    absolute-UNC-exe case below, where the exe token itself must be
-    rewritten to point at its staged copy; :meth:`Win32Calls._stage_if_needed`
-    treats ``""`` as "use the *command* I was called with unchanged", never
-    as a literal empty command."""
+    (see the function docstring). It is set only for the #3633
+    absolute-exe case below, where the exe token itself must be rewritten
+    to point at its staged copy; :meth:`Win32Calls._stage_if_needed`
+    treats ``None`` as "use the *command* I was called with unchanged"
+    (#3617/#3633 review: a plain ``str`` field defaulting to ``""`` made
+    "unchanged" and "a literal empty command" indistinguishable by
+    construction — ``None`` says the same thing without that footgun).
+
+    ``skip_reason`` is set (and non-empty) on EVERY ``staged=False``
+    return — never on a ``staged=True`` one — so
+    :meth:`Win32Calls._stage_if_needed` can log/warn something more
+    useful than one generic "could not parse" message for every skip
+    reason, including the deliberate "parsed fine, already genuinely
+    local, nothing to gain" case (#3633 review nit)."""
 
     staged: bool
     cwd: str = ""
-    command: str = ""
+    command: str | None = None
     source_exe: str = ""
     dest_exe: str = ""
+    skip_reason: str = ""
     #: ``(source_dir, dest_dir)`` pairs to copy wholesale when the source
     #: exists — never an error when one doesn't (an optional fixture dir
     #: nobody provided this time).
@@ -1179,10 +1291,22 @@ class _StagingPlan:
     #: from pre-#3617, where the app edited the tree directly. No current
     #: spec asserts on post-run fixture content, but a future one that
     #: does must read it from the staged dir, not the WSL tree.
+    #:
+    #: Also (#3633 review, non-blocking): the absolute-exe case re-roots
+    #: ``cwd`` to ``session_root`` for a command that, pre-#3633, launched
+    #: unstaged against the real repo tree — but only ``cd_dir``/
+    #: ``.smoke`` are copied here. A route like
+    #: ``\\wsl...\x.exe docs/sample.txt`` (a relative DATA argument not
+    #: under either) silently resolves to a file that was never staged.
+    #: Pre-existing #3617 design for a relative exe; this just extends the
+    #: exposure to a shape (absolute exe) that was previously never
+    #: staged at all.
     fixture_copies: tuple[tuple[str, str], ...] = ()
 
 
-def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
+def _plan_staging(
+    command: str, cwd: str, *, session_root: str, get_drive_type=_get_drive_type,
+) -> _StagingPlan:
     """Decide whether/how to stage *command*'s exe (plus its fixture
     dir(s)) from *cwd* into *session_root* instead of launching straight
     off *cwd* (#3617).
@@ -1203,7 +1327,7 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
     ``session_root``, it would escape this session's own directory into
     the shared parent every other session's own root also lives under).
 
-    *command* itself is returned unchanged (``plan.command == ""``, the
+    *command* itself is returned unchanged (``plan.command is None``, the
     caller's cue to keep using the *command* it already has) in the
     common, relative-exe case — ``cwd`` moves to ``session_root`` ALWAYS,
     even when a ``cd <fixture-dir> && ...`` prefix was recognized —
@@ -1224,29 +1348,42 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
     post-``cd`` directory — keeps resolving correctly against the new,
     local root exactly as it did against the old, UNC one.
 
-    **#3633: an absolute exe token that is ITSELF a UNC path is staged
-    too, not left alone.** A route's ``run:`` naming a relative exe path
-    (e.g. ``../target/<triple>/release/vimcode.exe``) assumes cargo's
-    default in-tree ``target/`` — but this fleet builds with a shared,
-    per-repo ``CARGO_TARGET_DIR`` (``coord.cargo_cache``, #1402), so that
-    relative path resolves to nothing and a worker substitutes the real,
-    absolute build path instead — one the Windows-side bridge still only
-    ever reaches as a UNC path (:func:`coord.win_native_bridge.
-    translate_to_windows_path`'s own output shape), so it pays the exact
-    same ``\\wsl$`` 9P cost staging exists to avoid in the first place,
-    just via an absolute token instead of one resolved against *cwd*. An
-    absolute token that is already genuinely LOCAL (e.g. a real
-    ``C:\\...`` exe) is still left alone — nothing to gain from staging
-    something already on local NTFS. Staged by basename alone, at the top
-    of *session_root* — an absolute token carries no meaningful position
-    relative to *cwd* to preserve the way a relative one does — and
-    *command*'s own leading token is rewritten (``plan.command``, always
-    non-empty here) to the staged, quoted destination path, with any
-    recognized ``cd <fixture-dir> && `` prefix and trailing arguments
+    **#3633: an absolute exe token reachable only over the network is
+    staged too, not left alone.** A route's ``run:`` naming a relative
+    exe path (e.g. ``../target/<triple>/release/vimcode.exe``) assumes
+    cargo's default in-tree ``target/`` — but this fleet builds with a
+    shared, per-repo ``CARGO_TARGET_DIR`` (``coord.cargo_cache``, #1402),
+    so that relative path resolves to nothing and a worker substitutes
+    the real, absolute build path instead. *That* substituted text is
+    whatever the worker typed — nothing in this repo normalizes it — and
+    #3633's own dell64 evidence showed it does NOT reliably come out as a
+    UNC path: ``Get-Process`` there showed every launch running from
+    ``Z:\\home\\john\\.coord\\cargo-target\\...``, a drive letter MAPPED
+    to the WSL tree (``net use Z: \\wsl$\\Ubuntu...``) — ``ntpath.isabs``
+    is ``True`` for that and :func:`_is_unc_path` is ``False``, so it
+    still paid the exact same ``\\wsl$`` 9P cost staging exists to avoid,
+    mislabelled "already genuinely local". :func:`_is_remote_exe_token`
+    (UNC, or a drive letter :data:`_get_drive_type` reports as
+    :data:`_DRIVE_REMOTE`) is what actually decides now, and a bare
+    `/`-rooted WSL-style token (``/home/...`` — the issue's other named
+    shape) is rewritten onto the ``\\wsl.localhost\\<distro>\\...`` UNC
+    form first (:func:`_normalize_posix_exe_token`, borrowing *cwd*'s own
+    distro prefix) before that same check runs. An absolute token that is
+    already genuinely LOCAL (e.g. a real ``C:\\...`` exe on a fixed
+    drive) is still left alone — nothing to gain from staging something
+    already on local NTFS — and so is a `/`-rooted token when *cwd*
+    itself isn't a ``\\wsl.localhost\\...`` UNC path to borrow a distro
+    prefix from (nothing to safely guess). Staged by basename alone, at
+    the top of *session_root* — an absolute token carries no meaningful
+    position relative to *cwd* to preserve the way a relative one does —
+    and *command*'s own leading token is rewritten (``plan.command``,
+    always set — never ``None`` — here) to the staged, quoted destination
+    path, with
+    any recognized ``cd <fixture-dir> && `` prefix and trailing arguments
     carried through unchanged.
     """
     if not _is_unc_path(cwd):
-        return _StagingPlan(staged=False)
+        return _StagingPlan(staged=False, skip_reason="cwd is not a UNC path — already local")
     cd_dir, remainder = _strip_cd_prefix(command)
     if cd_dir and ntpath.isabs(cd_dir):
         # An absolute `cd_dir` (`cd C:\foo && ...`) would collapse
@@ -1256,12 +1393,18 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
         # `SameFileError`) — the `..`-escape guard below only ever
         # assumed a relative `cd_dir`, same as `exe_token`'s own
         # `ntpath.isabs` check just below.
-        return _StagingPlan(staged=False)
+        return _StagingPlan(
+            staged=False,
+            skip_reason=f"could not parse: cd prefix {cd_dir!r} is itself absolute",
+        )
     if _looks_shell_composed(remainder):
-        return _StagingPlan(staged=False)
+        return _StagingPlan(
+            staged=False,
+            skip_reason="could not parse: command contains more than one shell operator",
+        )
     exe_token, rest = _leading_token(remainder)
     if not exe_token:
-        return _StagingPlan(staged=False)
+        return _StagingPlan(staged=False, skip_reason="could not parse: command is empty")
 
     fixture_dirnames: list[str] = []
     for name in (cd_dir, _STAGING_FIXTURE_DIRNAME):
@@ -1273,13 +1416,40 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
     )
 
     if ntpath.isabs(exe_token):
-        if not _is_unc_path(exe_token):
+        resolved_token = exe_token
+        if not _is_unc_path(exe_token) and exe_token.startswith("/"):
+            # #3633: a bare `/`-rooted WSL/POSIX-style token — never a
+            # real Windows path as-is (a leading `/` resolves against
+            # whatever drive happens to be CURRENT, not WSL's
+            # filesystem). Rewrite it onto the `\\wsl.localhost\<distro>`
+            # UNC shape by borrowing `cwd`'s own distro prefix; if `cwd`
+            # isn't that shape there's no distro to borrow, and this
+            # token is left alone rather than guessed at.
+            normalized = _normalize_posix_exe_token(exe_token, cwd)
+            if normalized is None:
+                return _StagingPlan(
+                    staged=False,
+                    skip_reason=(
+                        f"exe token {exe_token!r} is a /-rooted WSL-style path, "
+                        "but cwd has no \\\\wsl.localhost\\<distro> prefix to "
+                        "borrow a distro name from"
+                    ),
+                )
+            resolved_token = normalized
+        if not _is_remote_exe_token(resolved_token, get_drive_type=get_drive_type):
             # Already local — nothing of cwd's own tree to stage for it.
-            return _StagingPlan(staged=False)
-        # #3633: still a UNC path, just not resolved through `cwd` — stage
-        # it by basename alone and rewrite `command`'s own leading token
-        # to point at the staged copy.
-        dest_exe = ntpath.join(session_root, ntpath.basename(exe_token))
+            return _StagingPlan(
+                staged=False,
+                skip_reason=(
+                    f"exe token {resolved_token!r} is already on a local, "
+                    "non-remote drive — nothing to gain from staging it"
+                ),
+            )
+        # #3633: reachable only over the network (UNC, or a drive letter
+        # `get_drive_type` reports as mapped/remote), just not resolved
+        # through `cwd` — stage it by basename alone and rewrite
+        # `command`'s own leading token to point at the staged copy.
+        dest_exe = ntpath.join(session_root, ntpath.basename(resolved_token))
         cd_prefix = f'cd "{cd_dir}" && ' if cd_dir else ""
         rest_suffix = f" {rest}" if rest else ""
         new_command = f'{cd_prefix}"{dest_exe}"{rest_suffix}'
@@ -1287,7 +1457,7 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
             staged=True,
             cwd=session_root,
             command=new_command,
-            source_exe=exe_token,
+            source_exe=resolved_token,
             dest_exe=dest_exe,
             fixture_copies=fixture_copies,
         )
@@ -1305,7 +1475,14 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
         # than risked — the `cd .smoke && ../target/...` shape above
         # cancels its own `..` back inside `cwd` and is unaffected by
         # this guard.
-        return _StagingPlan(staged=False)
+        return _StagingPlan(
+            staged=False,
+            skip_reason=(
+                f"relative exe {exe_token!r} resolves to {exe_rel!r}, which "
+                "climbs above cwd itself with no cd prefix to cancel it back "
+                "out — staging it would escape this session's own directory"
+            ),
+        )
     # #3617 review: always `session_root` — NEVER `session_root/cd_dir`.
     # `command` still carries its own (unmodified) `cd <cd_dir> && `
     # prefix, which does the navigating into the staged fixture dir once
@@ -1359,6 +1536,19 @@ def _execute_staging(
     exercising this function with fabricated Windows-style strings on a
     non-Windows host must pass genuinely local (``tmp_path``-rooted)
     paths instead, as every test in this module already does.
+
+    Also raises when *dest_exe* still doesn't exist immediately AFTER
+    ``copy_file`` returns (#3633 review) — pre-#3633, a bad/incomplete
+    copy still left a correct, if slow, UNC command behind (staging only
+    ever moved ``cwd``); now that the absolute-exe case REWRITES
+    *command* itself to point at ``dest_exe``
+    (:attr:`_StagingPlan.command`), an exe that silently isn't actually
+    there any more degrades to a confusing, late ``find_top_window``
+    timeout instead of the documented "staging is a performance
+    optimization, not a correctness requirement" fallback
+    (:meth:`Win32Calls._stage_if_needed` catches this exactly like the
+    pre-copy ``source_exe`` check, falling back to the pre-#3617
+    ``pushd``/UNC launch).
     """
     if not plan.staged:
         return
@@ -1370,6 +1560,12 @@ def _execute_staging(
         )
     makedirs(dirname(plan.dest_exe), exist_ok=True)
     copy_file(plan.source_exe, plan.dest_exe)
+    if not isfile(plan.dest_exe):
+        raise WinNativeRuntimeError(
+            f"win-native launch staging (#3617): copy to {plan.dest_exe!r} "
+            "reported success but the file isn't there afterward — "
+            "refusing to launch a command rewritten to point at it"
+        )
     for source_dir, dest_dir in plan.fixture_copies:
         if isdir(source_dir):
             copy_tree(source_dir, dest_dir, dirs_exist_ok=True)
@@ -1684,9 +1880,9 @@ class Win32Calls:
         was ever involved.
 
         #3633: the returned *command* is ``plan.command`` when the plan set
-        one (the absolute-UNC-exe case, where the exe token itself had to
-        be rewritten to its staged copy) or the original *command* when it
-        didn't (``plan.command == ""`` — the common relative-exe case,
+        one (the absolute-exe case, where the exe token itself had to be
+        rewritten to its staged copy) or the original *command* when it
+        didn't (``plan.command is None`` — the common relative-exe case,
         where *command* already resolves correctly against the staged
         ``cwd`` unchanged)."""
         self.staging_warning = None
@@ -1699,10 +1895,16 @@ class Win32Calls:
         session_root = os.path.join(root, uuid.uuid4().hex[:12])
         plan = _plan_staging(command, cwd, session_root=session_root)
         if not plan.staged:
+            # #3633 review nit: `plan.skip_reason` distinguishes an
+            # actually-unparseable command/cwd shape from the deliberate
+            # "parsed fine, exe is already genuinely local, nothing to
+            # gain" skip — a prior, single generic "could not parse"
+            # message here claimed the latter never parsed at all, which
+            # is misleading for anyone diagnosing a lane from the log.
             self.staging_warning = (
-                "win-native launch staging (#3617) could not parse this "
-                f"launch command/cwd shape for staging — launching from "
-                f"the UNC path {cwd!r} unstaged (slow \\\\wsl$ I/O)"
+                f"win-native launch staging (#3617/#3633): {plan.skip_reason} "
+                f"— launching from the UNC path {cwd!r} unstaged (slow "
+                "\\\\wsl$ I/O)"
             )
             _log.warning("%s", self.staging_warning)
             return command, cwd, None
@@ -1713,7 +1915,7 @@ class Win32Calls:
             self.staging_warning = str(exc)
             _log.warning("%s", exc)
             return command, cwd, None
-        return (plan.command or command), plan.cwd, session_root
+        return (plan.command if plan.command is not None else command), plan.cwd, session_root
 
     # -- session precheck (#3510) --
 

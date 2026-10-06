@@ -34,12 +34,16 @@ from coord.win_native_driver import (
     WinNativeSession,
     WinNativeSpecError,
     Win32Calls,
+    _DRIVE_REMOTE,
     _encode_win_chord,
     _execute_staging,
     _find_a11y_match,
+    _get_drive_type,
+    _is_remote_exe_token,
     _is_unc_path,
     _leading_token,
     _looks_shell_composed,
+    _normalize_posix_exe_token,
     _plan_staging,
     _popen_command_and_cwd,
     _StagingPlan,
@@ -1309,6 +1313,75 @@ class TestIsUncPath:
         assert not _is_unc_path("")
 
 
+class TestGetDriveType:
+    """:func:`_get_drive_type` — the injectable `GetDriveTypeW` seam
+    #3633 widens `_is_remote_exe_token` with. The real `ctypes.windll`
+    call only exists on Windows; off it (this worktree runs on Linux)
+    it must return `0` (`DRIVE_UNKNOWN`) rather than raise or guess."""
+
+    def test_non_windows_returns_unknown(self) -> None:
+        assert _get_drive_type(r"Z:\home\me\repo") == 0
+
+    def test_a_unc_path_with_no_drive_letter_returns_unknown(self) -> None:
+        assert _get_drive_type(r"\\wsl.localhost\Ubuntu\home\me") == 0
+
+
+class TestNormalizePosixExeToken:
+    r""":func:`_normalize_posix_exe_token` — #3633's fix option (b):
+    rewrite a bare `/`-rooted WSL-style exe token onto the
+    `\\wsl.localhost\<distro>\...` UNC shape, borrowing the distro name
+    from `cwd` rather than fabricating one."""
+
+    UNC_CWD = r"\\wsl.localhost\Ubuntu-24.04\home\me\repo"
+
+    def test_borrows_the_distro_prefix_from_cwd(self) -> None:
+        normalized = _normalize_posix_exe_token(
+            "/home/me/.coord/cargo-target/vimcode/release/vimcode.exe", self.UNC_CWD,
+        )
+        assert normalized == (
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\.coord\cargo-target\vimcode"
+            r"\release\vimcode.exe"
+        )
+
+    def test_returns_none_when_cwd_has_no_wsl_localhost_prefix(self) -> None:
+        r"""A same-host, non-WSL UNC share (`\\fileserver\tools\...`) has
+        no distro to borrow — nothing to safely guess."""
+        assert _normalize_posix_exe_token(
+            "/home/me/app.exe", r"\\fileserver\tools\repo",
+        ) is None
+
+    def test_returns_none_for_a_non_unc_cwd(self) -> None:
+        assert _normalize_posix_exe_token("/home/me/app.exe", r"C:\Users\me\repo") is None
+
+
+class TestIsRemoteExeToken:
+    r""":func:`_is_remote_exe_token` — #3633: the widened "is this exe
+    reachable only over the network" predicate the review asked for,
+    replacing the pre-fix `_is_unc_path`-only check that mislabelled a
+    mapped network drive (`Z:\...`, dell64's own observed shape) as
+    "already genuinely local"."""
+
+    def test_a_unc_path_is_remote(self) -> None:
+        assert _is_remote_exe_token(r"\\wsl.localhost\Ubuntu-24.04\home\me\app.exe")
+
+    def test_a_mapped_drive_letter_is_remote_via_injected_drive_type(self) -> None:
+        assert _is_remote_exe_token(
+            r"Z:\home\me\.coord\cargo-target\vimcode\release\vimcode.exe",
+            get_drive_type=lambda _path: _DRIVE_REMOTE,
+        )
+
+    def test_a_fixed_drive_letter_is_not_remote(self) -> None:
+        _DRIVE_FIXED = 3
+        assert not _is_remote_exe_token(
+            r"C:\Tools\vimcode.exe", get_drive_type=lambda _path: _DRIVE_FIXED,
+        )
+
+    def test_drive_type_unknown_is_not_remote(self) -> None:
+        assert not _is_remote_exe_token(
+            r"C:\Tools\vimcode.exe", get_drive_type=lambda _path: 0,
+        )
+
+
 class TestPopenCommandAndCwd:
     """#3543: `translate_to_windows_path` renders a WSL-hosted repo's `cwd`
     as a UNC path (`\\wsl.localhost\\...`), but `cmd.exe` — what
@@ -1554,13 +1627,70 @@ class TestPlanStaging:
         assert plan.command == f'cd ".smoke" && "{self.SESSION}\\vimcode.exe" sample.txt'
         assert (f"{self.UNC}\\.smoke", f"{self.SESSION}\\.smoke") in plan.fixture_copies
 
-    def test_relative_exe_plan_leaves_command_empty_meaning_unchanged(self) -> None:
+    def test_a_mapped_network_drive_exe_token_is_staged(self) -> None:
+        """#3633's own dell64 evidence: every launch actually ran from
+        `Z:\\home\\john\\.coord\\cargo-target\\...` — a drive letter
+        MAPPED to the WSL tree (`net use Z: \\wsl$\\Ubuntu...`).
+        `ntpath.isabs` is `True` for that and `_is_unc_path` is `False`,
+        so the pre-fix check mislabelled it "already genuinely local" and
+        never staged it — the one shape #3633's own bug report showed,
+        reproduced here via the injected `get_drive_type` fake (the real
+        `GetDriveTypeW` call only exists on Windows)."""
+        mapped_drive_exe = r"Z:\home\john\.coord\cargo-target\vimcode\x86_64-pc-windows-msvc\release\vimcode.exe"
+        plan = _plan_staging(
+            f"{mapped_drive_exe} sample.txt", self.UNC, session_root=self.SESSION,
+            get_drive_type=lambda _path: _DRIVE_REMOTE,
+        )
+        assert plan.staged is True
+        assert plan.cwd == self.SESSION
+        assert plan.source_exe == mapped_drive_exe
+        assert plan.dest_exe == f"{self.SESSION}\\vimcode.exe"
+        assert plan.command == f'"{self.SESSION}\\vimcode.exe" sample.txt'
+
+    def test_a_fixed_drive_letter_exe_token_is_left_alone(self) -> None:
+        """The same `Z:\\...` shape as above, but `get_drive_type` now
+        reports a genuinely local (fixed) drive — nothing to stage."""
+        _DRIVE_FIXED = 3
+        plan = _plan_staging(
+            r"Z:\Tools\vimcode.exe sample.txt", self.UNC, session_root=self.SESSION,
+            get_drive_type=lambda _path: _DRIVE_FIXED,
+        )
+        assert plan.staged is False
+        assert "already" in plan.skip_reason
+
+    def test_a_posix_wsl_exe_token_is_normalized_and_staged(self) -> None:
+        r"""#3633's fix option (b): a bare `/`-rooted WSL-style exe token
+        that reached the Windows side unmapped/untranslated — normalized
+        onto the `\\wsl.localhost\<distro>\...` UNC shape (borrowing
+        `cwd`'s own distro prefix) and staged exactly like a UNC token."""
+        posix_exe = "/home/me/.coord/cargo-target/vimcode/release/vimcode.exe"
+        plan = _plan_staging(f"{posix_exe} sample.txt", self.UNC, session_root=self.SESSION)
+        assert plan.staged is True
+        assert plan.cwd == self.SESSION
+        assert plan.source_exe == (
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\.coord\cargo-target\vimcode\release\vimcode.exe"
+        )
+        assert plan.dest_exe == f"{self.SESSION}\\vimcode.exe"
+        assert plan.command == f'"{self.SESSION}\\vimcode.exe" sample.txt'
+
+    def test_a_posix_exe_token_is_left_alone_without_a_wsl_distro_to_borrow(self) -> None:
+        r"""When `cwd` itself isn't a `\\wsl.localhost\<distro>\...` UNC
+        path (a same-host, non-WSL UNC share), there's no distro name to
+        borrow for the `/`-rooted token — left alone rather than
+        guessed at."""
+        plan = _plan_staging(
+            "/home/me/app.exe sample.txt", r"\\fileserver\tools\repo",
+            session_root=self.SESSION,
+        )
+        assert plan.staged is False
+
+    def test_relative_exe_plan_leaves_command_none_meaning_unchanged(self) -> None:
         """The common (relative-exe) case never sets `plan.command` —
-        `""` is the caller's cue (`Win32Calls._stage_if_needed`) to keep
+        `None` is the caller's cue (`Win32Calls._stage_if_needed`) to keep
         using the *command* it already has, since it already resolves
         correctly against the staged `cwd` unchanged."""
         plan = _plan_staging("vimcode.exe sample.txt", self.UNC, session_root=self.SESSION)
-        assert plan.command == ""
+        assert plan.command is None
 
     def test_empty_command_is_left_alone(self) -> None:
         assert _plan_staging("", self.UNC, session_root=self.SESSION).staged is False
@@ -1680,6 +1810,48 @@ class TestExecuteStaging:
             isfile=_boom, makedirs=_boom, copy_file=_boom, copy_tree=_boom,
         )
         assert calls_made == []
+
+    def test_an_absolute_token_plan_is_actually_copied_to_its_basename_dest(
+        self, tmp_path,
+    ) -> None:
+        """#3633 review: the stubbed end-to-end test for the absolute-exe
+        case (`TestWin32CallsLocalStaging
+        .test_worker_substituted_absolute_unc_exe_is_staged_and_rewritten_end_to_end`)
+        never actually calls `_execute_staging`, so nothing in the suite
+        proved the absolute-token plan's copy really lands at
+        `dest_exe = session_root\\<basename>` (no nested subdirectory,
+        unlike the relative-exe case above). This exercises exactly that
+        shape with real `tmp_path` I/O."""
+        source_exe = tmp_path / "cargo-target" / "vimcode" / "release" / "vimcode.exe"
+        source_exe.parent.mkdir(parents=True)
+        source_exe.write_text("binary")
+        session = tmp_path / "session"
+        plan = _StagingPlan(
+            staged=True, cwd=str(session),
+            command=f'"{session / "vimcode.exe"}" sample.txt',
+            source_exe=str(source_exe),
+            dest_exe=str(session / "vimcode.exe"),
+        )
+        _execute_staging(plan)
+        assert (session / "vimcode.exe").is_file()
+        assert (session / "vimcode.exe").read_text() == "binary"
+
+    def test_a_copy_that_reports_success_but_leaves_no_file_raises(self, tmp_path) -> None:
+        """#3633 review (non-blocking): pre-copy, `_execute_staging` only
+        ever checked `source_exe` — a `copy_file` that returns without
+        raising but doesn't actually leave `dest_exe` behind degraded,
+        pre-this-fix, straight into a confusing late `find_top_window`
+        timeout once `command` had already been rewritten to point at
+        it. A post-copy check must catch that here instead."""
+        source_exe = tmp_path / "vimcode.exe"
+        source_exe.write_text("binary")
+        session = tmp_path / "session"
+        plan = _StagingPlan(
+            staged=True, cwd=str(session), source_exe=str(source_exe),
+            dest_exe=str(session / "vimcode.exe"),
+        )
+        with pytest.raises(WinNativeRuntimeError, match="isn't there afterward"):
+            _execute_staging(plan, copy_file=lambda *_a, **_kw: None)
 
 
 class TestWin32CallsLocalStaging:
