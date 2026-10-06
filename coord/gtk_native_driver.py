@@ -465,7 +465,7 @@ class NativeRunner:
             extra = handlers[step.kind](step)
             if extra:
                 entry.update(extra)
-        except (GtkNativeSpecError, GtkNativeRuntimeError, AssertionError) as e:
+        except (GtkNativeSpecError, GtkNativeRuntimeError, UnsupportedKey, AssertionError) as e:
             entry["status"] = "fail"
             entry["message"] = str(e)
             self._attach_capture_if_possible(entry)
@@ -607,7 +607,6 @@ _PUNCT_KEYSYMS: dict[str, str] = {
     "\\": "backslash", "|": "bar", ";": "semicolon", ":": "colon",
     "'": "apostrophe", '"': "quotedbl", ",": "comma", "<": "less",
     ".": "period", ">": "greater", "/": "slash", "?": "question",
-    " ": "space",
 }
 
 #: :class:`~coord.key_spec.KeyChord` modifier token -> the xdotool/X11
@@ -624,12 +623,18 @@ def _xdotool_keysym_for_char(ch: str) -> str:
     uppercase for itself, so there is no separate needs-shift bit to track
     here (unlike the vkey-based mac/win encoders). Punctuation goes through
     :data:`_PUNCT_KEYSYMS` (#3639: `:`/`@`/etc. have no keysym name that is
-    just the character itself)."""
+    just the character itself). *ch* always comes from an already-PARSED
+    :class:`~coord.key_spec.KeyChord` (the grammar only ever accepts a
+    single printable character as a char base) — so a char this table
+    can't map is parsed fine but genuinely undeliverable on X11, i.e.
+    :class:`UnsupportedKey`, never :class:`GtkNativeSpecError` (#3639
+    review: two error classes for the same condition, split only by
+    whether the base happened to be a named key or a character)."""
     if ch in _PUNCT_KEYSYMS:
         return _PUNCT_KEYSYMS[ch]
     if len(ch) == 1 and ch.isascii() and (ch.isalnum()):
         return ch
-    raise GtkNativeSpecError(f"unrecognized key {ch!r}")
+    raise UnsupportedKey("gtk-native", ch, "no X11 keysym name for this character")
 
 
 def _xdotool_arg_for_chord(chord: KeyChord) -> str:
@@ -842,10 +847,22 @@ class LinuxGtkCalls:
         multiple arguments as separate keystrokes in order, so the whole
         list is passed through in one call."""
         xdotool_args = _xdotool_args_for_key(key)
-        subprocess.run(
+        proc = subprocess.run(
             ["xdotool", "key", "--window", str(window_id), *xdotool_args],
-            capture_output=True, timeout=10,
+            capture_output=True, text=True, timeout=10,
         )
+        if proc.returncode != 0:
+            # #3639 review: `send_click`/`move_window` already check
+            # `proc.returncode` (pre-existing elsewhere in this class) —
+            # this call was the one exception, and this PR widened the
+            # keysym surface considerably (`_PUNCT_KEYSYMS`, F13-F24), so
+            # "No such key name" (or a dead window) must not still record
+            # a pass.
+            raise GtkNativeRuntimeError(
+                f"xdotool key failed for window_id={window_id}, "
+                f"args={xdotool_args}: "
+                f"{proc.stderr.strip() if proc.stderr else '(no stderr)'}"
+            )
 
     # -- AT-SPI --
 

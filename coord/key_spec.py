@@ -41,7 +41,10 @@ binding). Each chord is::
   - or **any single printable character**, including punctuation (``:``,
     ``@``, ``<``, ``$``, ``.``, `````, ``\\``, ``[``, ``]``) — case is
     preserved (``key: M`` is Shift+m; ``key: shift+m`` means the same
-    thing spelled explicitly).
+    thing spelled explicitly). A literal space character is the one
+    exception: chords are whitespace-separated, so a bare space must be
+    spelled ``space``, not ``" "`` — the string ``" "`` parses as zero
+    tokens and raises :class:`KeySpecError`.
 
 A bare ``+`` (the character itself, not a separator) is the one special
 case: ``"+"`` parses as the literal plus-sign key with no modifiers, since

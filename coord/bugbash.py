@@ -252,6 +252,8 @@ _APP_DRIVE_SEND_USAGE_LINE = (
     "coord app-drive send --session <id> --key Enter   # or --text/--click; "
     "--key also takes a modifier combo (--key 'ctrl+shift+p'), punctuation "
     "(--key ':'), or a chord sequence (--key 'ctrl+k ctrl+w'); "
+    "dash spellings like 'M-m'/'a-m' no longer parse and 'meta' now means "
+    "Cmd (not Alt) — always write 'alt+m'/'ctrl+m' etc.; "
     "see also: screen/probe/close --session <id>"
 )
 

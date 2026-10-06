@@ -209,6 +209,18 @@ class TestXdotoolKeyFor:
         with pytest.raises(UnsupportedKey):
             _xdotool_arg_for_chord(bogus)
 
+    def test_unsupported_character_raises_unsupported_key_not_spec_error(self) -> None:
+        # #3639 review nit: a character the keysym table can't map is
+        # parsed fine (the shared grammar accepts any single printable
+        # character) but genuinely undeliverable on this platform — that
+        # is UnsupportedKey, the same error family as an unsupported named
+        # key above, never GtkNativeSpecError.
+        from coord.key_spec import KeyChord
+
+        bogus = KeyChord(modifiers=frozenset(), base="é", is_char=True)
+        with pytest.raises(UnsupportedKey):
+            _xdotool_arg_for_chord(bogus)
+
 
 # ── _find_a11y_match / _summarize_elements ──────────────────────────────────
 

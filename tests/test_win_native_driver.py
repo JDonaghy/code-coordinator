@@ -285,13 +285,29 @@ class TestWinKeyEncodings:
     def test_shift_f3(self) -> None:
         assert _win_key_encodings("shift+f3") == [_enc(vk=0x72, shift=True)]
 
-    def test_punctuation_sent_as_unicode_never_a_silent_no_op(self) -> None:
-        # #3635: `$`/`.`/`:` previously returned `{"ok": true}` with no
-        # effect at all — must now actually encode something.
-        assert _win_key_encodings("$") == [_enc(unicode_char="$")]
-        assert _win_key_encodings(".") == [_enc(unicode_char=".")]
-        assert _win_key_encodings(":") == [_enc(unicode_char=":")]
-        assert _win_key_encodings("@") == [_enc(unicode_char="@")]
+    def test_punctuation_maps_to_real_vk_oem_codes_never_a_silent_no_op(self) -> None:
+        # #3635/#3639: these previously returned `{"ok": true}` with no
+        # effect at all. `.`/`:` now carry a real VK_OEM_* code (closing
+        # the "ctrl+/ does nothing" shape of the bug too); `$`/`@` are
+        # digit-row Shift symbols, mapped to their underlying digit's VK.
+        assert _win_key_encodings(".") == [_enc(vk=0xBE)]
+        assert _win_key_encodings(":") == [_enc(vk=0xBA, shift=True)]
+        assert _win_key_encodings("@") == [_enc(vk=ord("2"), shift=True)]
+        assert _win_key_encodings("$") == [_enc(vk=ord("4"), shift=True)]
+
+    def test_ctrl_slash_now_produces_a_real_accelerator(self) -> None:
+        # #3639 review finding: `ctrl+/` previously went through
+        # KEYEVENTF_UNICODE with wVk=0 while Ctrl was held, which does not
+        # generate a Windows accelerator at all — silently nothing, still
+        # reported as a pass.
+        assert _win_key_encodings("ctrl+/") == [_enc(vk=0xBF, ctrl=True)]
+
+    def test_bare_unmapped_character_still_goes_through_unicode(self) -> None:
+        assert _win_key_encodings("é") == [_enc(unicode_char="é")]
+
+    def test_modifier_plus_unmappable_char_raises_unsupported(self) -> None:
+        with pytest.raises(UnsupportedKey):
+            _win_key_encodings("ctrl+é")
 
     def test_chord_sequence_ctrl_k_ctrl_w(self) -> None:
         assert _win_key_encodings("ctrl+k ctrl+w") == [
@@ -314,12 +330,6 @@ class TestWinKeyEncodings:
         with pytest.raises(UnsupportedKey):
             _encode_win_chord(bogus)
 
-    def test_f25_is_not_even_a_valid_spec(self) -> None:
-        # The grammar caps named function keys at f24 — f25 fails to parse
-        # at all (:class:`WinNativeSpecError` wraps the shared parser's
-        # :class:`~coord.key_spec.KeySpecError`), never silently no-ops.
-        with pytest.raises(WinNativeSpecError):
-            _win_key_encodings("f25")
 
 
 # ── _find_a11y_match / _summarize_elements ──────────────────────────────────
@@ -972,6 +982,104 @@ def _make_win32_calls(user32, kernel32) -> Win32Calls:
     calls._staged_session_dirs = {}  # #3617 — normally set by `__init__`
     calls.staging_warning = None  # #3617 — normally set by `__init__`
     return calls
+
+
+class _FakeUser32SendInput:
+    """Records every ``SendInput`` call as the decoded sequence of
+    ``(vk, scan, flags)`` tuples it was asked to post — real ``ctypes``
+    structs, read back through the SAME ``_INPUT``/``_KEYBDINPUT`` layout
+    :meth:`Win32Calls.send_key` builds, so this is a genuine assertion on
+    the platform event sequence (#3639 review non-blocking concern: the
+    win/mac tests used to stop at the intermediate encoding dataclass)."""
+
+    def __init__(self, sent_count: int | None = None) -> None:
+        self.calls: list[list[tuple[int, int, int]]] = []
+        #: Override the count `SendInput` reports as actually inserted —
+        #: `None` means "report the full count" (success).
+        self._sent_count = sent_count
+
+    def SetForegroundWindow(self, _hwnd) -> None:
+        pass
+
+    def SendInput(self, count, arr, _struct_size) -> int:
+        batch = [(arr[i].ki.wVk, arr[i].ki.wScan, arr[i].ki.dwFlags) for i in range(count)]
+        self.calls.append(batch)
+        return self._sent_count if self._sent_count is not None else count
+
+
+class TestSendKeyRealSequence:
+    """:meth:`Win32Calls.send_key` against a fake ``user32`` that decodes
+    the real ``SendInput`` struct it was actually handed — not just the
+    intermediate :class:`WinKeyEncoding`."""
+
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_UNICODE = 0x0004
+    VK_CONTROL = 0x11
+    VK_SHIFT = 0x10
+
+    def test_ctrl_shift_right_posts_both_modifiers_then_key_then_releases_in_reverse(self) -> None:
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        calls.send_key(1, "ctrl+shift+right")
+        [batch] = user32.calls
+        # down: ctrl, shift, right(=0x27) ; up: shift, ctrl, right — modifier
+        # ups unwind in the OPPOSITE order from their downs.
+        assert batch == [
+            (self.VK_CONTROL, 0, 0),
+            (self.VK_SHIFT, 0, 0),
+            (0x27, 0, 0),
+            (0x27, 0, self.KEYEVENTF_KEYUP),
+            (self.VK_SHIFT, 0, self.KEYEVENTF_KEYUP),
+            (self.VK_CONTROL, 0, self.KEYEVENTF_KEYUP),
+        ]
+
+    def test_colon_posts_the_real_oem_vk_with_shift_not_keyeventf_unicode(self) -> None:
+        # #3639: `:` now has a real VK_OEM_1 (0xBA) + implied Shift.
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        calls.send_key(1, ":")
+        [batch] = user32.calls
+        assert batch == [
+            (self.VK_SHIFT, 0, 0),
+            (0xBA, 0, 0),
+            (0xBA, 0, self.KEYEVENTF_KEYUP),
+            (self.VK_SHIFT, 0, self.KEYEVENTF_KEYUP),
+        ]
+
+    def test_bare_unmapped_char_still_uses_keyeventf_unicode(self) -> None:
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        calls.send_key(1, "é")
+        [batch] = user32.calls
+        code = ord("é")
+        assert batch == [
+            (0, code, self.KEYEVENTF_UNICODE),
+            (0, code, self.KEYEVENTF_UNICODE | self.KEYEVENTF_KEYUP),
+        ]
+
+    def test_chord_sequence_sends_each_chord_as_its_own_sendinput_call(self) -> None:
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        calls.send_key(1, "ctrl+k ctrl+w")
+        assert len(user32.calls) == 2
+
+    def test_delete_and_backspace_post_different_vks(self) -> None:
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        calls.send_key(1, "delete")
+        delete_vk = user32.calls[0][0][0]
+        calls.send_key(1, "backspace")
+        backspace_vk = user32.calls[1][0][0]
+        assert delete_vk != backspace_vk
+
+    def test_send_input_short_count_raises_runtime_error_not_a_silent_ok(self) -> None:
+        # #3639 blocking review finding: `SendInput`'s return value used to
+        # be discarded entirely — a short count (UIPI-blocked input) must
+        # now raise rather than report success.
+        user32 = _FakeUser32SendInput(sent_count=0)
+        calls = _make_win32_calls(user32, kernel32=None)
+        with pytest.raises(WinNativeRuntimeError, match="SendInput"):
+            calls.send_key(1, "a")
 
 
 class _FakeKernel32ProcessTree:

@@ -188,9 +188,41 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import ctypes
+import ctypes.wintypes as _wintypes
+
 import yaml
 
 from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
+
+#: `SendInput`'s `INPUT`/`KEYBDINPUT` structs, module-level (#3639 review
+#: nit — these used to be rebuilt on every `send_key` call). Defining them
+#: needs only `ctypes`/`ctypes.wintypes`, both pure-Python and importable
+#: on any platform; only actually CALLING a Win32 API (`ctypes.windll.*`)
+#: requires Windows, and that still happens lazily inside
+#: :class:`Win32Calls.__init__`.
+_ULONG_PTR = ctypes.c_size_t
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", _wintypes.WORD), ("wScan", _wintypes.WORD),
+        ("dwFlags", _wintypes.DWORD), ("time", _wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", _wintypes.DWORD), ("ki", _KEYBDINPUT),
+        ("padding", ctypes.c_ubyte * 8),
+    ]
+
+
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+_VK_SHIFT, _VK_CONTROL, _VK_MENU, _VK_LWIN = 0x10, 0x11, 0x12, 0x5B
 
 _log = logging.getLogger(__name__)
 
@@ -589,7 +621,7 @@ class NativeRunner:
             extra = handlers[step.kind](step)
             if extra:
                 entry.update(extra)
-        except (WinNativeSpecError, WinNativeRuntimeError, AssertionError) as e:
+        except (WinNativeSpecError, WinNativeRuntimeError, UnsupportedKey, AssertionError) as e:
             entry["status"] = "fail"
             entry["message"] = str(e)
             self._attach_capture_if_possible(entry)
@@ -809,6 +841,37 @@ _NAMED_VKEYS: dict[str, int] = {
     **{f"f{n}": 0x6F + n for n in range(1, 25)},
 }
 
+#: ``VK_OEM_*`` codes for US-layout punctuation keys. Each physical key
+#: produces two characters (unshifted/shifted); both map to the SAME vk —
+#: the bool says whether Shift must be held for the posted event to
+#: actually produce *that* character. Review finding (#3639): without this
+#: table, ``ctrl+/`` (and any other modifier+punctuation chord) went
+#: through ``KEYEVENTF_UNICODE`` with ``wVk=0`` while Ctrl/Alt/Win was
+#: held — Windows does not raise a WM_*KEYDOWN-driven accelerator from
+#: that combination, so the chord silently did nothing while still being
+#: reported as a pass.
+_VKEY_OEM_PUNCT: dict[str, tuple[int, bool]] = {
+    ";": (0xBA, False), ":": (0xBA, True),
+    "=": (0xBB, False), "+": (0xBB, True),
+    ",": (0xBC, False), "<": (0xBC, True),
+    "-": (0xBD, False), "_": (0xBD, True),
+    ".": (0xBE, False), ">": (0xBE, True),
+    "/": (0xBF, False), "?": (0xBF, True),
+    "`": (0xC0, False), "~": (0xC0, True),
+    "[": (0xDB, False), "{": (0xDB, True),
+    "\\": (0xDC, False), "|": (0xDC, True),
+    "]": (0xDD, False), "}": (0xDD, True),
+    "'": (0xDE, False), '"': (0xDE, True),
+}
+
+#: The digit-row symbols produced with Shift on a US layout — each maps to
+#: the SAME vk as the underlying digit (ASCII ``'0'``-``'9'``), always with
+#: Shift held.
+_SHIFTED_DIGIT_SYMBOLS: dict[str, str] = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+}
+
 
 @dataclass(frozen=True)
 class WinKeyEncoding:
@@ -852,8 +915,32 @@ def _encode_win_chord(chord: KeyChord) -> WinKeyEncoding:
             shift = True
         return WinKeyEncoding(vk=ord(ch.upper()), unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, win=win)
 
-    # Punctuation (or any other printable character with no VK_* code):
-    # sent as a Unicode character, never a vk guess (#3639, closes #3635).
+    punct = _VKEY_OEM_PUNCT.get(ch)
+    if punct is not None:
+        vk, shift_implied = punct
+        if shift_implied:
+            shift = True
+        return WinKeyEncoding(vk=vk, unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, win=win)
+
+    digit = _SHIFTED_DIGIT_SYMBOLS.get(ch)
+    if digit is not None:
+        return WinKeyEncoding(
+            vk=ord(digit), unicode_char=None, shift=True, ctrl=ctrl, alt=alt, win=win
+        )
+
+    # No VK_* code for this character. `KEYEVENTF_UNICODE` with a held
+    # Ctrl/Alt/Win does not generate a Windows accelerator — the chord
+    # would be posted but do nothing while still reporting a pass (#3639,
+    # the win-native shape of the same bug the punctuation table above
+    # fixes for the mapped characters). A bare character with no
+    # ctrl/alt/win can still go through `KEYEVENTF_UNICODE` for literal
+    # insertion.
+    if ctrl or alt or win:
+        raise UnsupportedKey(
+            "win-native", chord.base,
+            "no VK_* code for this character — KEYEVENTF_UNICODE does not "
+            "produce an accelerator combined with ctrl/alt/win",
+        )
     return WinKeyEncoding(vk=None, unicode_char=ch, shift=shift, ctrl=ctrl, alt=alt, win=win)
 
 
@@ -1761,6 +1848,26 @@ class Win32Calls:
         self._user32.mouse_event(down, 0, 0, 0, 0)
         self._user32.mouse_event(up, 0, 0, 0, 0)
 
+    def _declare_send_input_signature(self) -> None:
+        """Declares ``SendInput``'s ``argtypes``/``restype`` once per
+        instance (#3639 review nit: previously left undeclared, so the call
+        rode on ctypes' default conversions). Idempotent and cheap to call
+        from every :meth:`send_key` — guards against a fake ``user32`` in
+        tests that has no ``argtypes``/``restype`` attributes at all."""
+        send_input = self._user32.SendInput
+        if getattr(send_input, "argtypes", None) is not None:
+            return
+        try:
+            send_input.argtypes = [
+                ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int,
+            ]
+            send_input.restype = ctypes.c_uint
+        except AttributeError:
+            # A fake `user32` in a test may not allow attribute assignment
+            # on its `SendInput` — fine, the real Windows DLL function
+            # always does.
+            pass
+
     def send_key(self, hwnd: int, key: str) -> None:
         """#3639: *key* is parsed under the shared grammar
         (:func:`_win_key_encodings`) and may be a space-separated chord
@@ -1770,56 +1877,50 @@ class Win32Calls:
         used — ``SendInput`` is what ``KEYEVENTF_UNICODE`` requires, closing
         #3635's silent no-op for punctuation)."""
         self._user32.SetForegroundWindow(hwnd)
-        ctypes = self._ctypes
-        wintypes = ctypes.wintypes
+        self._declare_send_input_signature()
 
-        ULONG_PTR = ctypes.c_size_t
+        def _one(vk: int, scan: int, flags: int) -> _INPUT:
+            return _INPUT(type=_INPUT_KEYBOARD, ki=_KEYBDINPUT(vk, scan, flags, 0, 0))
 
-        class KEYBDINPUT(ctypes.Structure):
-            _fields_ = [
-                ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                ("dwExtraInfo", ULONG_PTR),
-            ]
-
-        class INPUT(ctypes.Structure):
-            _fields_ = [
-                ("type", wintypes.DWORD), ("ki", KEYBDINPUT),
-                ("padding", ctypes.c_ubyte * 8),
-            ]
-
-        INPUT_KEYBOARD = 1
-        KEYEVENTF_KEYUP = 0x0002
-        KEYEVENTF_UNICODE = 0x0004
-        VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN = 0x10, 0x11, 0x12, 0x5B
-
-        def _one(vk: int, scan: int, flags: int) -> INPUT:
-            return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, scan, flags, 0, 0))
-
-        def _send(*inputs: INPUT) -> None:
+        def _send(*inputs: _INPUT) -> None:
             if not inputs:
                 return
-            arr = (INPUT * len(inputs))(*inputs)
-            self._user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+            arr = (_INPUT * len(inputs))(*inputs)
+            sent = self._user32.SendInput(len(inputs), arr, ctypes.sizeof(_INPUT))
+            if sent != len(inputs):
+                # #3639: SendInput returns the number of events it actually
+                # inserted and returns 0 (or a short count) when the input
+                # was blocked — e.g. UIPI, or the target window not owning
+                # the foreground/input desktop (see
+                # `_logonui_running_in_session`/`OpenInputDesktop` below). An
+                # unchecked call here would reproduce #3635's "{"ok": true}"
+                # with no effect, just one layer deeper: the process issues
+                # the call but the keystroke never lands, and nothing before
+                # this point can tell the difference.
+                raise WinNativeRuntimeError(
+                    f"SendInput delivered only {sent} of {len(inputs)} "
+                    f"input event(s) — blocked by UIPI or the input desktop "
+                    f"belongs to another session/thread"
+                )
 
         for enc in _win_key_encodings(key):
-            mod_downs: list[INPUT] = []
-            mod_ups: list[INPUT] = []
+            mod_downs: list[_INPUT] = []
+            mod_ups: list[_INPUT] = []
             for active, vk in (
-                (enc.win, VK_LWIN), (enc.ctrl, VK_CONTROL),
-                (enc.alt, VK_MENU), (enc.shift, VK_SHIFT),
+                (enc.win, _VK_LWIN), (enc.ctrl, _VK_CONTROL),
+                (enc.alt, _VK_MENU), (enc.shift, _VK_SHIFT),
             ):
                 if active:
                     mod_downs.append(_one(vk, 0, 0))
-                    mod_ups.insert(0, _one(vk, 0, KEYEVENTF_KEYUP))
+                    mod_ups.insert(0, _one(vk, 0, _KEYEVENTF_KEYUP))
 
             if enc.unicode_char is not None:
                 code = ord(enc.unicode_char)
-                key_down = _one(0, code, KEYEVENTF_UNICODE)
-                key_up = _one(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+                key_down = _one(0, code, _KEYEVENTF_UNICODE)
+                key_up = _one(0, code, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)
             else:
                 key_down = _one(enc.vk, 0, 0)
-                key_up = _one(enc.vk, 0, KEYEVENTF_KEYUP)
+                key_up = _one(enc.vk, 0, _KEYEVENTF_KEYUP)
 
             _send(*mod_downs, key_down, key_up, *mod_ups)
 

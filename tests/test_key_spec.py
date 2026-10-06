@@ -47,6 +47,15 @@ class TestNamedKeys:
             assert event.chords[0].base == name
             assert event.chords[0].is_char is False
 
+    def test_f25_is_not_a_valid_named_key(self):
+        # The grammar caps named function keys at f24 (`NAMED_KEYS`) — f25
+        # is neither a named key nor a single character, so it fails to
+        # parse at all. This is a grammar-level cap, so it belongs here
+        # rather than duplicated through any one driver (a nit from the
+        # #3639 review).
+        with pytest.raises(KeySpecError):
+            parse_key_spec("f25")
+
 
 class TestModifiers:
     def test_single_modifier_combo(self):
@@ -127,6 +136,15 @@ class TestPunctuation:
 
     def test_literal_plus_sign(self):
         assert parse_key_spec("+") == KeyEvent((_chord([], "+", True),))
+
+    def test_bare_space_character_is_spelled_space_not_a_literal_space(self):
+        # Chords are whitespace-separated, so a literal " " can't be a
+        # token by itself — it must be spelled `space`. `" "` splits into
+        # zero tokens and raises (the module docstring used to overstate
+        # this as "any single printable character" with no exception).
+        assert parse_key_spec("space").chords[0] == _chord([], "space", False)
+        with pytest.raises(KeySpecError, match="empty key spec"):
+            parse_key_spec(" ")
 
     def test_modifier_plus_literal_plus_sign_is_malformed(self):
         # "ctrl++"  splits into ["ctrl", "", ""] — ambiguous, not supported.
