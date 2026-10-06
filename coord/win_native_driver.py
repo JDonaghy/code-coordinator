@@ -88,6 +88,26 @@ wrap above unchanged — this driver only ever rewrites the ONE leading
 executable token of a command it can parse with confidence, never an
 opaque shell pipeline.
 
+**#3637: isolating the launched app's own ``%APPDATA%``.** A previously-
+documented win-native lane setup step staged a project-local ``.vimcode``-
+style fixture next to the opened file, assuming the real app would read
+settings from there — it never does; a real Windows app resolves its own
+config through ``%APPDATA%\\<app>\\...`` unconditionally, so every lane
+following that step was silently reading and writing ONE real, shared,
+persistent settings file on the bridge host no matter what it staged.
+Whenever the staging above actually engages, :meth:`Win32Calls.launch`/
+:meth:`~Win32Calls.launch_in_terminal` now also point the launched
+process's own ``%APPDATA%`` (via ``env=``, on the child only — never this
+driver's own environment) at that same staged ``.smoke`` directory — the
+fleet's existing convention for a route's own "sample/settings working
+files" — so a route that wants, say, ``vimcode``'s Nerd Fonts setting off
+stages ``.smoke/vimcode/settings.json`` (mirroring the real
+``%APPDATA%\\vimcode\\settings.json`` shape, not a project-local
+``.vimcode`` one) and it lands exactly where the launched exe actually
+looks, isolated and disposed of with the rest of the session
+(:meth:`Win32Calls.kill`). Skipped (ambient ``%APPDATA%`` left untouched)
+whenever staging itself is — see :meth:`Win32Calls._stage_if_needed`.
+
 **#3633: a route's own relative exe path can disagree with where the
 fleet actually built it.** A ``run:`` naming ``../target/<triple>/
 release/X.exe`` assumes cargo's default in-tree ``target/``, but this
@@ -1274,6 +1294,38 @@ _STAGING_FIXTURE_DIRNAME = ".smoke"
 #: `%LOCALAPPDATA%` is only ever read for this one purpose.
 _LOCALAPPDATA_ENV = "LOCALAPPDATA"
 
+#: #3637: the env var every launched app's own per-user settings/config
+#: directory resolves through (``%APPDATA%\<app>\...`` — e.g. vimcode's
+#: ``vimcode_config_dir()``) — overridden to an isolated, per-session
+#: directory on the launched process ONLY, never on this driver's own
+#: environment, so a bugbash lane never reads or writes the real, shared,
+#: persistent profile on the bridge host. See :func:`_isolated_env`.
+_APPDATA_ENV = "APPDATA"
+
+
+def _isolated_env(appdata_dir: str | None) -> dict[str, str] | None:
+    """The ``env=`` kwarg :meth:`Win32Calls.launch`/
+    :meth:`~Win32Calls.launch_in_terminal` must pass to ``subprocess.Popen``
+    (#3637) — ``None`` (the same as not passing ``env=`` at all, i.e. the
+    child inherits this process's own environment unchanged) when
+    *appdata_dir* is ``None`` — every :meth:`Win32Calls._stage_if_needed`
+    skip case (a non-UNC ``cwd``, unparseable command, ``%LOCALAPPDATA%``
+    unavailable, ...), where there is no isolated directory to point at —
+    otherwise a full copy of this process's own environment with
+    :data:`_APPDATA_ENV` overridden to *appdata_dir*.
+
+    A full copy (not a single-key dict) because the launched app still
+    needs everything else a normal Windows process expects
+    (``PATH``/``SystemRoot``/``USERPROFILE``/...) — only ``%APPDATA%``
+    itself is being redirected away from the real, shared profile that
+    motivated this fix; nothing else about the launch environment
+    changes."""
+    if appdata_dir is None:
+        return None
+    env = dict(os.environ)
+    env[_APPDATA_ENV] = appdata_dir
+    return env
+
 
 def _local_app_data_via_known_folder() -> str | None:
     """Ask Windows itself for the current user's local-appdata root via
@@ -1423,11 +1475,14 @@ class _StagingPlan:
     #: routes need one; worth revisiting if one ever does.
     #:
     #: Also (non-blocking): writes the staged app makes into a fixture dir
-    #: (e.g. ``sample.txt``/``.vimcode/settings.json``) land in the staged
-    #: COPY, not the original WSL-tree fixture — a real behaviour change
-    #: from pre-#3617, where the app edited the tree directly. No current
-    #: spec asserts on post-run fixture content, but a future one that
-    #: does must read it from the staged dir, not the WSL tree.
+    #: (e.g. ``sample.txt``, or ``vimcode/settings.json`` under the
+    #: ``.smoke`` dir that :meth:`Win32Calls._stage_if_needed` also hands
+    #: the launched process as its isolated ``%APPDATA%``, #3637) land in
+    #: the staged COPY, not the original WSL-tree fixture — a real
+    #: behaviour change from pre-#3617, where the app edited the tree
+    #: directly. No current spec asserts on post-run fixture content, but
+    #: a future one that does must read it from the staged dir, not the
+    #: WSL tree.
     #:
     #: Also (#3633 review, non-blocking): the absolute-exe case re-roots
     #: ``cwd`` to ``session_root`` for a command that, pre-#3633, launched
@@ -1893,11 +1948,13 @@ class Win32Calls:
         # thing internally (so it stays correct when called directly, as
         # the tests do), not a sign of split logic between the two.
         staged_dir = None
+        appdata_dir = None
         if _is_unc_path(cwd):
-            command, cwd, staged_dir = self._stage_if_needed(command, cwd)
+            command, cwd, staged_dir, appdata_dir = self._stage_if_needed(command, cwd)
         full_command, popen_cwd = _popen_command_and_cwd(command, cwd)
         proc = subprocess.Popen(
-            full_command, shell=True, cwd=popen_cwd, **_NO_HANDLE_INHERITANCE,
+            full_command, shell=True, cwd=popen_cwd,
+            env=_isolated_env(appdata_dir), **_NO_HANDLE_INHERITANCE,
         )
         # #3634: same unbound-`self`-safety requirement as above —
         # `TestLaunchPipeInheritanceRealSubprocess` calls this method
@@ -1917,8 +1974,9 @@ class Win32Calls:
 
     def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int:
         staged_dir = None
+        appdata_dir = None
         if _is_unc_path(cwd):
-            command, cwd, staged_dir = self._stage_if_needed(command, cwd)
+            command, cwd, staged_dir, appdata_dir = self._stage_if_needed(command, cwd)
         create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         if terminal_app == "windows-terminal":
             full_command = f"wt.exe {command}"
@@ -1927,7 +1985,7 @@ class Win32Calls:
         full_command, popen_cwd = _popen_command_and_cwd(full_command, cwd)
         proc = subprocess.Popen(
             full_command, shell=True, cwd=popen_cwd, creationflags=create_new_console,
-            **_NO_HANDLE_INHERITANCE,
+            env=_isolated_env(appdata_dir), **_NO_HANDLE_INHERITANCE,
         )
         if staged_dir is not None:
             self._staged_session_dirs[proc.pid] = staged_dir
@@ -2100,21 +2158,24 @@ class Win32Calls:
             if age > _STALE_SESSION_MAX_AGE_S:
                 _remove_staged_dir(path)
 
-    def _stage_if_needed(self, command: str, cwd: str) -> tuple[str, str, str | None]:
-        """Returns ``(command, cwd, staged_dir)`` — *command*/*cwd*
-        rewritten per :func:`_plan_staging` (with the staging actually
-        performed) when it decided to, or *command*/*cwd* UNCHANGED (and
-        ``staged_dir=None``) in every skip case: a non-UNC ``cwd``, an
-        unparseable/opaque *command*, ``%LOCALAPPDATA%`` itself being
-        unavailable right now, or the resolved exe not actually existing
-        where :func:`_plan_staging` guessed (:func:`_execute_staging`'s
-        own raise — a route whose ``run:`` doesn't match either shape
-        ``_plan_staging`` recognizes, e.g. a leading ``HOME=$PWD/home``
-        env-var assignment some routes use ahead of the real exe token).
-        Staging is a performance optimization, not a correctness
-        requirement — a caller that can't stage still gets a working (if
-        UNC-slow) launch via :func:`_popen_command_and_cwd`'s own
-        ``pushd`` wrap, rather than this call failing outright.
+    def _stage_if_needed(
+        self, command: str, cwd: str,
+    ) -> tuple[str, str, str | None, str | None]:
+        """Returns ``(command, cwd, staged_dir, appdata_dir)`` — *command*/
+        *cwd* rewritten per :func:`_plan_staging` (with the staging
+        actually performed) when it decided to, or *command*/*cwd*
+        UNCHANGED (and ``staged_dir=None``, ``appdata_dir=None``) in every
+        skip case: a non-UNC ``cwd``, an unparseable/opaque *command*,
+        ``%LOCALAPPDATA%`` itself being unavailable right now, or the
+        resolved exe not actually existing where :func:`_plan_staging`
+        guessed (:func:`_execute_staging`'s own raise — a route whose
+        ``run:`` doesn't match either shape ``_plan_staging`` recognizes,
+        e.g. a leading ``HOME=$PWD/home`` env-var assignment some routes
+        use ahead of the real exe token). Staging is a performance
+        optimization, not a correctness requirement — a caller that can't
+        stage still gets a working (if UNC-slow) launch via
+        :func:`_popen_command_and_cwd`'s own ``pushd`` wrap, rather than
+        this call failing outright.
 
         Every skip case EXCEPT the non-UNC one (the only one this is ever
         called for — see the ``_is_unc_path`` gate at both call sites)
@@ -2128,14 +2189,37 @@ class Win32Calls:
         rewritten to its staged copy) or the original *command* when it
         didn't (``plan.command is None`` — the common relative-exe case,
         where *command* already resolves correctly against the staged
-        ``cwd`` unchanged)."""
+        ``cwd`` unchanged).
+
+        **#3637: ``appdata_dir`` is the per-session directory the caller
+        must point the launched process's own ``%APPDATA%`` at.** A
+        project-local ``.vimcode``-style fixture next to the opened file
+        (the previously-documented win-native lane setup step) is silently
+        ignored — the real app reads ``%APPDATA%\\<app>\\settings.json``
+        unconditionally (see ``coord.win_native_driver``'s module
+        docstring and the issue itself), so without this every win-native
+        launch read/wrote ONE real, shared, persistent settings file on
+        the bridge host no matter what a route staged next to the exe.
+        Reuses the SAME staged :data:`_STAGING_FIXTURE_DIRNAME` (``.smoke``)
+        directory this function already stages fixture/working files
+        into — already documented above as a route's own "sample/settings
+        working files" convention — as the literal, isolated ``%APPDATA%``
+        root: a route that wants ``vimcode``'s Nerd Fonts setting off now
+        stages ``.smoke/vimcode/settings.json`` (mirroring the real
+        ``%APPDATA%\\vimcode\\settings.json`` shape exactly, not a
+        project-local ``.vimcode`` one) and it lands exactly where the
+        launched exe actually looks. ``None`` only when staging itself
+        didn't happen (every skip case above) — the caller then leaves
+        ``%APPDATA%`` at its ambient, unisolated value, same as before
+        this fix, and :attr:`staging_warning` already reports why staging
+        itself was skipped."""
         self.staging_warning = None
         try:
             root = self._staging_root()
         except WinNativeRuntimeError as exc:
             self.staging_warning = str(exc)
             _log.warning("%s", exc)
-            return command, cwd, None
+            return command, cwd, None, None
         session_root = os.path.join(root, uuid.uuid4().hex[:12])
         plan = _plan_staging(command, cwd, session_root=session_root)
         if not plan.staged:
@@ -2148,18 +2232,29 @@ class Win32Calls:
             self.staging_warning = (
                 f"win-native launch staging (#3617/#3633): {plan.skip_reason} "
                 f"— launching from the UNC path {cwd!r} unstaged (slow "
-                "\\\\wsl$ I/O)"
+                "\\\\wsl$ I/O), and %APPDATA% is NOT isolated either (#3637)"
             )
             _log.warning("%s", self.staging_warning)
-            return command, cwd, None
+            return command, cwd, None, None
         self._sweep_stale_sessions()
         try:
             _execute_staging(plan)
         except WinNativeRuntimeError as exc:
             self.staging_warning = str(exc)
             _log.warning("%s", exc)
-            return command, cwd, None
-        return (plan.command if plan.command is not None else command), plan.cwd, session_root
+            return command, cwd, None, None
+        # #3637: created even when no `.smoke` fixture exists on the route
+        # side at all — the launched process must find SOME directory at
+        # `%APPDATA%`, even an empty one, rather than a dangling path (and
+        # an empty, isolated one is still strictly better than the real,
+        # shared, persistent profile this whole fix exists to avoid
+        # touching).
+        appdata_dir = os.path.join(session_root, _STAGING_FIXTURE_DIRNAME)
+        os.makedirs(appdata_dir, exist_ok=True)
+        return (
+            (plan.command if plan.command is not None else command),
+            plan.cwd, session_root, appdata_dir,
+        )
 
     # -- session precheck (#3510) --
 
