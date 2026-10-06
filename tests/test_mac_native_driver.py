@@ -864,9 +864,13 @@ class TestMacOSCallsLaunchExecWraps:
         subdir = tmp_path / ".smoke"
         subdir.mkdir()
         # The lane's own prescribed shape: a leading `cd` plus an inline
-        # env-var assignment on the final simple command.
+        # env-var assignment on the final simple command. The interpreter
+        # path is double-quoted (#3629): this repo's own worktrees live
+        # under a macOS `Application Support` path, so an unquoted
+        # `sys.executable` here would itself get word-split, unrelated to
+        # the compound-command shape this test means to exercise.
         command = (
-            f"cd .smoke && HOME=$PWD/home {sys.executable} -c "
+            f'cd .smoke && HOME=$PWD/home "{sys.executable}" -c '
             "\"import os, pathlib, time; "
             f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid())); "
             "time.sleep(5)\""
@@ -918,7 +922,7 @@ class TestMacOSCallsLaunchExecWraps:
         pid = calls.launch("cd .smoke && HOME=$PWD/home ./bin sample.txt", "/repo")
         assert pid == 4242
         assert captured["command"] == (
-            "cd .smoke && exec env HOME=$PWD/home ./bin sample.txt"
+            'cd .smoke && exec env HOME="$PWD/home" ./bin sample.txt'
         )
         assert captured["kwargs"]["shell"] is True
         assert captured["kwargs"]["cwd"] == "/repo"

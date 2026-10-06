@@ -52,8 +52,32 @@ EXEC_PREFIX = "exec "
 #: named ``FOO=bar``. ``env`` has no such restriction (it's a real
 #: executable, not a builtin with special parsing), and `/usr/bin/env`
 #: itself ``execve()``s straight into its target rather than forking, so
-#: ``exec env FOO=bar ./binary`` still collapses to one process.
-_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=\S*)[ \t]+")
+#: ``exec env FOO=bar ./binary`` still collapses to one process. Captured
+#: as two groups — name and raw (unquoted) value — so
+#: :func:`wrap_launch_command` can re-quote the value via
+#: :func:`_quote_env_value` (#3629) before handing it to ``env``.
+_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(\S*)[ \t]+")
+
+
+def _quote_env_value(value: str) -> str:
+    """Double-quote *value* for use as a bare ``env VAR=value`` argument
+    (#3629: a leading ``VAR=value`` assignment loses POSIX's
+    assignment-prefix exemption from word-splitting the moment it becomes
+    a plain argument to ``env`` instead of a real assignment-prefix on the
+    shell's own command — so an unquoted ``$PWD`` that *expands* to a path
+    containing a space (every macOS worktree, under ``~/Library/Application
+    Support/...``) gets split into multiple ``env`` arguments, and ``env``
+    then tries — and fails — to execve the stray fragment after the space
+    as a command (``env: Support/coord/...: No such file or directory``).
+
+    Double-quoting the value restores the no-split guarantee: parameter
+    expansion (``$PWD``) still happens, but the result is kept as one shell
+    word regardless of what it expands to. ``\\``, ``"`` and `` ` `` are
+    backslash-escaped first so an embedded one of those can't prematurely
+    close the quote or trigger command substitution.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`")
+    return f'"{escaped}"'
 
 
 def find_last_top_level_and(command: str) -> int | None:
@@ -112,7 +136,11 @@ def wrap_launch_command(command: str) -> str:
     shape) — :data:`_ENV_ASSIGNMENT_RE` peels those off and re-emits them as
     ``env``'s own arguments instead of ``exec``'s, so the result is ``exec
     env VAR=val ... binary args`` rather than the broken ``exec VAR=val ...
-    binary args`` (see :data:`_ENV_ASSIGNMENT_RE` for why).
+    binary args`` (see :data:`_ENV_ASSIGNMENT_RE` for why). Each value is
+    re-emitted double-quoted (:func:`_quote_env_value`, #3629) so a ``$VAR``
+    reference that expands to a value containing whitespace — e.g. ``$PWD``
+    under a macOS ``~/Library/Application Support/...`` worktree — stays one
+    ``env`` argument instead of being word-split into several.
 
     Idempotent at the whole-*command* level: a caller-supplied command that
     already starts with ``exec `` (leading/trailing whitespace tolerated)
@@ -132,7 +160,8 @@ def wrap_launch_command(command: str) -> str:
         m = _ENV_ASSIGNMENT_RE.match(tail)
         if not m:
             break
-        assignments.append(m.group(1))
+        name, value = m.group(1), m.group(2)
+        assignments.append(f"{name}={_quote_env_value(value)}")
         tail = tail[m.end():]
 
     env_prefix = f"env {' '.join(assignments)} " if assignments else ""
