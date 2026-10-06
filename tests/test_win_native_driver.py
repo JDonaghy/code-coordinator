@@ -40,6 +40,7 @@ from coord.win_native_driver import (
     _find_a11y_match,
     _get_drive_type,
     _is_remote_exe_token,
+    _is_rooted_or_drive_qualified,
     _is_unc_path,
     _leading_token,
     _looks_shell_composed,
@@ -1313,6 +1314,64 @@ class TestIsUncPath:
         assert not _is_unc_path("")
 
 
+class TestIsRootedOrDriveQualified:
+    r""":func:`_is_rooted_or_drive_qualified` — #3633 CI: the
+    version-independent stand-in for `ntpath.isabs`, which Python 3.13
+    narrowed so that a `/`-rooted token (`/home/me/x.exe`, the WSL shape
+    #3633 normalizes and stages) is `True` on 3.12 and `False` on 3.13.
+
+    These assertions are deliberately spelled out against literal path
+    strings rather than deferred to `ntpath`, so they pin ONE answer on
+    every supported interpreter — which is the whole point of the
+    function."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/home/me/.coord/cargo-target/vimcode/release/vimcode.exe",
+            "/home/me",
+            "/",
+            r"\home\me\vimcode.exe",
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\vimcode.exe",
+            "//wsl.localhost/Ubuntu-24.04/home/me/vimcode.exe",
+            r"C:\Tools\vimcode.exe",
+            "C:/Tools/vimcode.exe",
+            # Drive-relative (no root): `ntpath.isabs` is False on BOTH
+            # 3.12 and 3.13, but it is not cwd-relative either and
+            # `ntpath.join` treats it specially, so the relative-exe
+            # branch must not see it.
+            r"C:vimcode.exe",
+        ],
+    )
+    def test_non_relative_shapes(self, path: str) -> None:
+        assert _is_rooted_or_drive_qualified(path) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "vimcode.exe",
+            r"target\release\vimcode.exe",
+            "target/release/vimcode.exe",
+            r"..\target\release\vimcode.exe",
+            "../target/release/vimcode.exe",
+            ".",
+            "",
+        ],
+    )
+    def test_genuinely_relative_shapes(self, path: str) -> None:
+        assert _is_rooted_or_drive_qualified(path) is False
+
+    def test_it_does_not_agree_with_ntpath_isabs_on_the_3_13_split(self) -> None:
+        """The regression this function exists for, stated directly: a
+        `/`-rooted token's classification must NOT be whatever this
+        interpreter's `ntpath.isabs` happens to say about it (3.12 says
+        True, 3.13 says False) — it must be `True` either way."""
+        posix_token = "/home/me/.coord/cargo-target/vimcode/release/vimcode.exe"
+        assert _is_rooted_or_drive_qualified(posix_token) is True
+        # Whichever way this interpreter answers, our own answer stood.
+        assert ntpath.isabs(posix_token) in (True, False)
+
+
 class TestGetDriveType:
     """:func:`_get_drive_type` — the injectable `GetDriveTypeW` seam
     #3633 widens `_is_remote_exe_token` with. The real `ctypes.windll`
@@ -1683,6 +1742,68 @@ class TestPlanStaging:
             session_root=self.SESSION,
         )
         assert plan.staged is False
+
+    @pytest.mark.parametrize(
+        "exe_token",
+        [
+            "/home/me/.coord/cargo-target/vimcode/release/vimcode.exe",
+            r"\home\me\.coord\cargo-target\vimcode\release\vimcode.exe",
+            "//wsl.localhost/Ubuntu-24.04/home/me/vimcode.exe",
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\vimcode.exe",
+            r"C:\Tools\vimcode.exe",
+            r"C:vimcode.exe",
+        ],
+    )
+    def test_a_rooted_exe_token_never_stages_outside_the_session_root(
+        self, exe_token: str,
+    ) -> None:
+        r"""#3633 CI regression. `_plan_staging` used `ntpath.isabs` to
+        decide "is this token absolute?", and Python 3.13 narrowed that
+        to mean drive-plus-root/UNC only — so on 3.13 (and 3.13 alone) a
+        `/`-rooted WSL token fell past the absolute-exe branch into the
+        *relative* one, where `ntpath.join(session_root, "\\home\\me\\…")`
+        discards `session_root` wholesale and produced
+        `dest_exe = C:\home\me\…`: the exe staged to the DRIVE ROOT,
+        outside this session's own directory — the exact escape the
+        `..`-guard exists to prevent, reached by a different route.
+
+        Whatever any given rooted shape's verdict is, the invariant holds
+        on every interpreter: if it stages at all, it stages INSIDE
+        `session_root`."""
+        plan = _plan_staging(
+            f"{exe_token} sample.txt", self.UNC, session_root=self.SESSION,
+            get_drive_type=lambda _path: _DRIVE_REMOTE,
+        )
+        if plan.staged:
+            assert plan.dest_exe.startswith(f"{self.SESSION}\\")
+            assert ntpath.basename(plan.dest_exe) == "vimcode.exe"
+
+    def test_an_altsep_spelled_unc_exe_token_is_respelled_and_staged(self) -> None:
+        r"""A UNC token written with forward slashes
+        (`//wsl.localhost/Ubuntu/...`) is the same path in a different
+        spelling — respelled onto `\\…` and staged, not handed to the
+        `/`-rooted branch (which would graft a SECOND
+        `\\wsl.localhost\<distro>` prefix in front of it)."""
+        plan = _plan_staging(
+            "//wsl.localhost/Ubuntu-24.04/home/me/vimcode.exe sample.txt",
+            self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is True
+        assert plan.source_exe == r"\\wsl.localhost\Ubuntu-24.04\home\me\vimcode.exe"
+        assert plan.dest_exe == f"{self.SESSION}\\vimcode.exe"
+        assert plan.command == f'"{self.SESSION}\\vimcode.exe" sample.txt'
+
+    def test_a_root_relative_cd_prefix_is_left_alone(self) -> None:
+        r"""`cd \foo && ...` is not cwd-relative, so joining it onto
+        `session_root` would discard everything but the drive — skipped
+        for the same reason `cd C:\foo && ...` is. (`ntpath.isabs` says
+        `True` for it on 3.12 and `False` on 3.13, which is why the guard
+        no longer asks `ntpath`.)"""
+        plan = _plan_staging(
+            r"cd \foo && vimcode.exe sample.txt", self.UNC, session_root=self.SESSION,
+        )
+        assert plan.staged is False
+        assert "not cwd-relative" in plan.skip_reason
 
     def test_relative_exe_plan_leaves_command_none_meaning_unchanged(self) -> None:
         """The common (relative-exe) case never sets `plan.command` —

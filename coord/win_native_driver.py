@@ -115,6 +115,13 @@ token to the staged copy; left alone only when the token is already
 genuinely local, or is a `/`-rooted one with no distro to borrow from
 *cwd* (nothing to safely guess either way).
 
+Whether a token counts as "absolute" at all is decided by
+:func:`_is_rooted_or_drive_qualified`, **not** :func:`ntpath.isabs` —
+3.13 narrowed the latter's meaning and reports ``False`` for exactly the
+``/``-rooted WSL token above, which on that interpreter alone dropped it
+into the relative-exe path and staged it to the drive root. See that
+function's docstring.
+
 :meth:`Win32Calls.kill` deletes the staged session directory it created,
 once it has signalled that launch's own pid — the normal (``close``/
 ``NativeRunner`` teardown) path. There is no Windows analogue of #3583's
@@ -1007,6 +1014,45 @@ def _is_unc_path(path: str) -> bool:
 _DRIVE_REMOTE = 4
 
 
+def _is_rooted_or_drive_qualified(path: str) -> bool:
+    r"""True when *path* is anything other than a plain, *cwd*-relative
+    path — i.e. it carries a root (``\foo``, ``/foo``), a UNC prefix
+    (``\\server\share\...``, ``//server/share/...``) or a drive letter
+    (``C:\foo``, and even the drive-relative ``C:foo``).
+
+    **This exists instead of :func:`ntpath.isabs` because `ntpath.isabs`
+    is not stable across the Python versions this repo supports (#3633
+    CI).** Python 3.13 rewrote it to mean "absolute" strictly — only a
+    drive-plus-root (``C:\``) or a UNC prefix — so a ``/``-rooted token
+    like ``/home/john/.coord/cargo-target/.../vimcode.exe``, the exact
+    WSL-style shape #3633 exists to normalize and stage, reports
+    ``True`` on 3.12 and ``False`` on 3.13.
+
+    That difference is not cosmetic: on 3.13 such a token fell past
+    :func:`_plan_staging`'s absolute-exe branch into the *relative*-exe
+    one, where ``ntpath.join(session_root, "\\home\\me\\...")`` discards
+    ``session_root`` wholesale (joining a rooted path replaces the
+    root) and yields ``dest_exe = C:\home\me\...`` — staging the exe to
+    the *drive root*, outside this session's own directory, which is
+    precisely what the ``..``-escape guard further down exists to
+    prevent. So the relative branch must only ever see genuinely
+    relative tokens, on every supported interpreter; deciding that from
+    the string itself rather than from ``ntpath``'s version-dependent
+    notion of absoluteness is what makes that true.
+
+    A drive-relative ``C:foo`` (no root — ``ntpath.isabs`` is ``False``
+    for it on *both* versions) is deliberately included: it is not
+    *cwd*-relative either, ``ntpath.join`` treats it specially too, and
+    the absolute branch's own classification safely declines to stage
+    anything it cannot prove is remote.
+    """
+    if not path:
+        return False
+    if path[0] in ("\\", "/"):
+        return True
+    return bool(ntpath.splitdrive(path)[0])
+
+
 def _get_drive_type(path: str) -> int:
     """``GetDriveTypeW`` for the drive letter *path* starts with — a real
     (cheap, read-only) Win32 call, injectable via :func:`_is_remote_exe_token`'s
@@ -1385,17 +1431,21 @@ def _plan_staging(
     if not _is_unc_path(cwd):
         return _StagingPlan(staged=False, skip_reason="cwd is not a UNC path — already local")
     cd_dir, remainder = _strip_cd_prefix(command)
-    if cd_dir and ntpath.isabs(cd_dir):
-        # An absolute `cd_dir` (`cd C:\foo && ...`) would collapse
-        # `ntpath.join(session_root, cd_dir)` down to `cd_dir` alone,
+    if cd_dir and _is_rooted_or_drive_qualified(cd_dir):
+        # A non-relative `cd_dir` (`cd C:\foo && ...`, `cd \foo && ...`)
+        # would collapse `ntpath.join(session_root, cd_dir)` down to
+        # `cd_dir` alone — or onto `session_root`'s drive ROOT —
         # discarding `session_root` entirely and landing `source_exe`/
         # `dest_exe` on the SAME absolute path (a `shutil.copy2`
         # `SameFileError`) — the `..`-escape guard below only ever
-        # assumed a relative `cd_dir`, same as `exe_token`'s own
-        # `ntpath.isabs` check just below.
+        # assumed a relative `cd_dir`, same as `exe_token`'s own check
+        # just below. #3633 CI: this deliberately uses
+        # `_is_rooted_or_drive_qualified` rather than `ntpath.isabs`,
+        # whose meaning differs between 3.12 and 3.13 (see that
+        # function's docstring).
         return _StagingPlan(
             staged=False,
-            skip_reason=f"could not parse: cd prefix {cd_dir!r} is itself absolute",
+            skip_reason=f"could not parse: cd prefix {cd_dir!r} is not cwd-relative",
         )
     if _looks_shell_composed(remainder):
         return _StagingPlan(
@@ -1415,9 +1465,20 @@ def _plan_staging(
         for name in fixture_dirnames
     )
 
-    if ntpath.isabs(exe_token):
+    if _is_rooted_or_drive_qualified(exe_token):
+        # #3633 CI: NOT `ntpath.isabs` — that would route a `/`-rooted
+        # WSL-style token here on 3.12 and into the relative branch
+        # below on 3.13 (which stages it to the drive root, escaping
+        # `session_root`). See `_is_rooted_or_drive_qualified`.
         resolved_token = exe_token
-        if not _is_unc_path(exe_token) and exe_token.startswith("/"):
+        if exe_token.startswith("//"):
+            # An altsep-spelled UNC token (`//wsl.localhost/Ubuntu/...`)
+            # — the same path, just not in Windows' own spelling. Respell
+            # it rather than letting the `/`-rooted branch below treat it
+            # as a distro-relative path and graft a second UNC prefix in
+            # front of it.
+            resolved_token = exe_token.replace("/", "\\")
+        elif exe_token.startswith("/"):
             # #3633: a bare `/`-rooted WSL/POSIX-style token — never a
             # real Windows path as-is (a leading `/` resolves against
             # whatever drive happens to be CURRENT, not WSL's
@@ -1437,12 +1498,15 @@ def _plan_staging(
                 )
             resolved_token = normalized
         if not _is_remote_exe_token(resolved_token, get_drive_type=get_drive_type):
-            # Already local — nothing of cwd's own tree to stage for it.
+            # Already local (or a root-relative `\foo` shape with no
+            # drive to classify at all) — nothing of cwd's own tree to
+            # stage for it.
             return _StagingPlan(
                 staged=False,
                 skip_reason=(
-                    f"exe token {resolved_token!r} is already on a local, "
-                    "non-remote drive — nothing to gain from staging it"
+                    f"exe token {resolved_token!r} is not on a drive we can "
+                    "see as remote — already local, nothing to gain from "
+                    "staging it"
                 ),
             )
         # #3633: reachable only over the network (UNC, or a drive letter
