@@ -133,6 +133,49 @@ self-expiry is the backstop, the explicit teardown is the normal path"
 shape :data:`coord.app_drive.DEFAULT_IDLE_TIMEOUT` already uses, just
 applied to a directory instead of a process.
 
+**Process-tree teardown, including on an abnormal exit of THIS process
+(#3634).** A 2026-10-05 bugbash lane left 4 simultaneous ``vimcode.exe``
+processes running on an operator's desktop: every failed/retried launch's
+own process survived, because :meth:`Win32Calls.kill` used to terminate
+only the exact pid it was handed — ``cmd.exe``'s pid for a ``shell=True``
+launch (#3542), never the real app grandchild cmd.exe itself never owns a
+window for — and only walked the whole descendant tree for a *staged*
+session's own cleanup, never as ``kill``'s general contract. Two fixes:
+
+1. :meth:`Win32Calls.kill` now ALWAYS terminates *pid*'s whole descendant
+   tree (:meth:`Win32Calls._descendant_pids`), not just when there's a
+   staged directory to clean up afterward — so every existing caller
+   (:meth:`NativeRunner._teardown`, :meth:`WinNativeSession.close`) that
+   already called ``kill`` now actually reaches the real app, not just
+   its shell wrapper.
+2. :class:`WinNativeSession`'s constructor now kills the pid it just
+   launched before re-raising if ``find_top_window``/``move_window``
+   fails — previously, a launch whose window never appeared left that
+   constructor's caller (:mod:`coord.app_drive_daemon`'s ``serve``) with
+   no object to ever call ``close``/``kill`` on at all, so a daemon that
+   retries ``open`` after a failed window discovery leaked one more
+   process per attempt — exactly the bugbash's 4-stray-window evidence.
+
+Neither of those alone covers the case Windows has no POSIX analogue for:
+*this* process (the ``win-native`` daemon) itself crashing or being
+force-killed before its own ``kill()``/``close()`` ever runs — there is
+no cooperating parent left to walk a descendant tree with. For that,
+:meth:`Win32Calls.launch`/:meth:`~Win32Calls.launch_in_terminal` assign
+every freshly-launched process to a fresh Windows **Job Object** with
+``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` set
+(:meth:`Win32Calls._assign_kill_on_close_job`), and keep the one handle to
+it open for the life of the session. Windows itself — not this process —
+tears down every process still assigned to that job, including a
+``cmd.exe /c`` grandchild, the instant its last handle closes; closing it
+ourselves is what :meth:`Win32Calls.kill` now does FIRST (before the
+``_descendant_pids`` walk, which stays as a backstop for a host/fake where
+job-object assignment wasn't available at launch time), and an abnormal
+exit of this very process closes it automatically too, since Windows
+closes every handle a terminated process held. Best-effort throughout:
+job-object creation/assignment never blocks or fails a launch — a host
+where it's unavailable just falls back to the weaker (but still
+code-path-correct) ``_descendant_pids``-only teardown.
+
 **Spec steps** (:func:`parse_native_spec`, YAML — the ``win-native``
 sibling of ``tui-pty``'s smoke spec):
 
@@ -261,6 +304,54 @@ _INPUT_KEYBOARD = 1
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
 _VK_SHIFT, _VK_CONTROL, _VK_MENU, _VK_LWIN = 0x10, 0x11, 0x12, 0x5B
+
+#: Windows Job Object plumbing for #3634's process-tree teardown — see the
+#: module docstring's "Process-tree teardown" paragraph and
+#: :meth:`Win32Calls._assign_kill_on_close_job`. Pure ``ctypes`` struct/
+#: constant definitions, same as ``_INPUT``/``_KEYBDINPUT`` above: these
+#: import fine on any platform; only actually calling a Job Object API
+#: through ``self._kernel32`` requires Windows.
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", _wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", _wintypes.DWORD),
+        ("Affinity", ctypes.c_void_p),
+        ("PriorityClass", _wintypes.DWORD),
+        ("SchedulingClass", _wintypes.DWORD),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
 
 _log = logging.getLogger(__name__)
 
@@ -1761,6 +1852,14 @@ class Win32Calls:
         #: itself grows unboundedly in a long-lived process that never
         #: calls `kill`.
         self._staged_session_dirs: dict[int, str] = {}
+        #: #3634: pid -> the open handle to the ``KILL_ON_JOB_CLOSE`` Job
+        #: Object `launch`/`launch_in_terminal` assigned it to (see
+        #: `_assign_kill_on_close_job`) — absent for a pid whose job
+        #: assignment failed/was unavailable (a scripted test fake, or in
+        #: principle a very old Windows missing one of these exports).
+        #: `kill` pops and closes this FIRST, before its own
+        #: `_descendant_pids` walk/`TerminateProcess` backstop.
+        self._job_handles: dict[int, int] = {}
         #: #3617 review: non-``None`` after `_stage_if_needed` skipped
         #: staging for a UNC `cwd` (as opposed to the common, unremarkable
         #: case of a same-host, already-local `cwd` where staging never
@@ -1800,8 +1899,20 @@ class Win32Calls:
         proc = subprocess.Popen(
             full_command, shell=True, cwd=popen_cwd, **_NO_HANDLE_INHERITANCE,
         )
-        if staged_dir is not None:
-            self._staged_session_dirs[proc.pid] = staged_dir
+        # #3634: same unbound-`self`-safety requirement as above —
+        # `TestLaunchPipeInheritanceRealSubprocess` calls this method
+        # completely unbound (`self=None`) to drive a REAL subprocess tree
+        # without needing a real (Windows-only) `Win32Calls` instance. Job
+        # Object assignment needs a real `self._kernel32`, so it's skipped
+        # whenever there's no `self` to assign through — exactly the case
+        # where nothing tracks this pid for `kill` to reach later either,
+        # so there is no regression in what gets torn down vs. before.
+        if self is not None:
+            if staged_dir is not None:
+                self._staged_session_dirs[proc.pid] = staged_dir
+            job = self._assign_kill_on_close_job(proc.pid)
+            if job is not None:
+                self._job_handles[proc.pid] = job
         return proc.pid
 
     def launch_in_terminal(self, command: str, cwd: str, terminal_app: str) -> int:
@@ -1820,7 +1931,70 @@ class Win32Calls:
         )
         if staged_dir is not None:
             self._staged_session_dirs[proc.pid] = staged_dir
+        job = self._assign_kill_on_close_job(proc.pid)
+        if job is not None:
+            self._job_handles[proc.pid] = job
         return proc.pid
+
+    def _assign_kill_on_close_job(self, pid: int) -> int | None:
+        """#3634: wrap *pid* (the pid `launch`/`launch_in_terminal` just
+        returned — ``cmd.exe``'s own pid for a ``shell=True`` launch, see
+        :meth:`_descendant_pids`'s docstring, #3542) in a fresh Windows Job
+        Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` set, and return
+        the handle for the caller to hold onto (:attr:`_job_handles`) —
+        ``None`` on any failure (`CreateJobObjectW` returning a null
+        handle, `SetInformationJobObject`/`OpenProcess`/
+        `AssignProcessToJobObject` returning false/null, or a scripted
+        test fake with no Job Object support at all, caught as
+        ``AttributeError``).
+
+        As long as the returned handle stays open, Windows itself — not
+        this process — tears down EVERY process still assigned to the job,
+        including a ``cmd.exe /c`` grandchild this driver never otherwise
+        tracks, the instant the job's LAST handle closes: either
+        explicitly, when :meth:`kill` closes it, or automatically, if
+        *this very process* (the ``win-native`` daemon holding the handle)
+        crashes or is force-killed before its own ``kill()``/``close()``
+        ever runs — Windows closes every handle a terminated process held,
+        which is exactly the guarantee #3634 needs and that a
+        `_descendant_pids`-walking `TerminateProcess` loop alone cannot
+        give, since that walk needs a live, cooperating process to run it.
+
+        Best-effort and silent on failure: a host where Job Objects are
+        unavailable still gets the weaker (but still code-path-correct for
+        every explicit `kill()` call) `_descendant_pids`-only teardown —
+        this never blocks or fails a launch over it."""
+        try:
+            job = self._kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not self._kernel32.SetInformationJobObject(
+                job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                self._ctypes.byref(info), self._ctypes.sizeof(info),
+            ):
+                self._kernel32.CloseHandle(job)
+                return None
+            process_handle = self._kernel32.OpenProcess(
+                _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid,
+            )
+            if not process_handle:
+                self._kernel32.CloseHandle(job)
+                return None
+            try:
+                if not self._kernel32.AssignProcessToJobObject(job, process_handle):
+                    self._kernel32.CloseHandle(job)
+                    return None
+            finally:
+                self._kernel32.CloseHandle(process_handle)
+            return job
+        except AttributeError:
+            # A scripted test fake (or, in principle, a very old Windows
+            # missing one of these exports) with no Job Object support at
+            # all — not a failure, just "unavailable"; see the docstring's
+            # best-effort note.
+            return None
 
     def kill(self, pid: int) -> None:
         # By PID (plus its own descendants) only — see the module
@@ -1828,19 +2002,25 @@ class Win32Calls:
         # anywhere in this class.
         PROCESS_TERMINATE = 0x0001
         staged_dir = self._staged_session_dirs.pop(pid, None)
-        # #3617 review: a staged session's exe is a GRANDCHILD of *pid*
-        # (`subprocess.Popen(..., shell=True)` returns cmd.exe's own pid —
-        # see `_descendant_pids`'s docstring, #3542), which a bare
-        # `TerminateProcess(pid)` never touches. Windows locks a running
-        # image's file, so deleting the staged dir while that grandchild
-        # is still alive would silently leave the exe (and therefore the
-        # directory) behind — only `_sweep_stale_sessions`'s 24h backstop
-        # would ever clean it up. Terminating the whole descendant tree
-        # FIRST — only when there's a staged dir to clean up, to keep the
-        # overwhelmingly common (non-staged) `kill` exactly as cheap as it
-        # always was — makes the delete that follows actually able to
-        # succeed.
-        targets = self._descendant_pids(pid) if staged_dir is not None else {pid}
+        # #3634: close OUR last handle to *pid*'s KILL_ON_JOB_CLOSE Job
+        # Object FIRST, if one was successfully assigned at launch time —
+        # this alone tears down the WHOLE descendant tree (including a
+        # `cmd.exe /c` grandchild, #3542) regardless of whether this
+        # process can still see/walk it. See
+        # `_assign_kill_on_close_job`'s docstring.
+        job = self._job_handles.pop(pid, None)
+        if job is not None:
+            self._kernel32.CloseHandle(job)
+        # #3634: ALWAYS terminate the whole descendant tree, not only when
+        # there's a staged dir to clean up afterward — a 2026-10-05
+        # bugbash lane showed this `kill` previously left every grandchild
+        # (the real app under `cmd.exe`, #3542) running in the
+        # overwhelmingly common (non-staged) case, since only a staged
+        # session's own cleanup needed the walk to delete its directory.
+        # Redundant with the Job Object close above whenever that
+        # succeeded, but it's the ONLY teardown on a host/fake where job
+        # assignment was unavailable, so it always runs regardless.
+        targets = self._descendant_pids(pid)
         for target in targets:
             handle = self._kernel32.OpenProcess(PROCESS_TERMINATE, False, target)
             if handle:
@@ -2401,8 +2581,25 @@ class WinNativeSession:
     ) -> None:
         self._calls: WinCalls = calls if calls is not None else Win32Calls()
         self._pid = self._calls.launch(launch_command, cwd)
-        self._hwnd = self._calls.find_top_window(self._pid, timeout_s)
-        self._calls.move_window(self._hwnd, 0, 0, width, height)
+        try:
+            self._hwnd = self._calls.find_top_window(self._pid, timeout_s)
+            self._calls.move_window(self._hwnd, 0, 0, width, height)
+        except Exception:
+            # #3634: this constructor never returns a usable session when
+            # `find_top_window`/`move_window` fails, so there is no
+            # `WinNativeSession` object for anyone to ever call
+            # `close()`/`kill()` on — without this, the process `launch`
+            # just started (and its real-app grandchild, #3542) leaked on
+            # every failed/retried open, exactly the 2026-10-05 bugbash
+            # evidence (4 simultaneous stray `vimcode.exe`). Kill it HERE,
+            # before re-raising, so a failed open — and every retry of
+            # one — cleans up after itself instead of accumulating one
+            # more stray window per attempt.
+            try:
+                self._calls.kill(self._pid)
+            except Exception:  # noqa: BLE001 — teardown-on-failure must not mask the real error
+                pass
+            raise
 
     @property
     def pid(self) -> int:
@@ -2414,9 +2611,10 @@ class WinNativeSession:
         See :meth:`_descendant_pids`'s own docstring (#3542): this is
         ``cmd.exe``'s pid, not the real app's — ``Win32Calls.launch``'s
         ``shell=True`` makes the real app a grandchild this pid never
-        owns a window for. Killing this pid alone can leave that
-        grandchild running; tracked separately from #3590, same class as
-        the mac-native/gtk-native shell-vs-app gap."""
+        owns a window for. :meth:`WinCalls.kill` (#3634) now always
+        terminates the whole descendant tree for whatever pid it's given,
+        so killing this one pid alone no longer leaves that grandchild
+        running."""
         return self._pid
 
     @property
