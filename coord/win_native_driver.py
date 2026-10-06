@@ -103,7 +103,13 @@ sibling of ``tui-pty``'s smoke spec):
   it deterministically via ``MoveWindow``.
 - ``key: <name>`` / ``click: {x, y, button}`` — real input at *screen*
   pixel coordinates relative to the window's client origin, via
-  :meth:`WinCalls.send_key`/:meth:`WinCalls.send_click`.
+  :meth:`WinCalls.send_key`/:meth:`WinCalls.send_click`. ``key:`` is parsed
+  under the grammar shared by all four drivers (:mod:`coord.key_spec`,
+  #3639): any combination of ``ctrl``/``alt``/``shift``/``cmd``(``win``)
+  modifiers, a named key or any single printable character (including
+  punctuation, sent via ``KEYEVENTF_UNICODE`` — #3635), and a
+  space-separated chord sequence (``ctrl+k ctrl+w``) — see
+  :func:`_win_key_encodings`.
 - ``wait: {ms}`` — a plain deterministic pause.
 - ``capture`` — an explicit ``PrintWindow`` evidence snapshot, attached to
   this step's own result (pass or fail) as ``capture_b64``.
@@ -183,6 +189,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import yaml
+
+from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
 
 _log = logging.getLogger(__name__)
 
@@ -791,26 +799,76 @@ class NativeRunner:
 # ── real Win32 implementation (Windows-only) ────────────────────────────────
 
 _NAMED_VKEYS: dict[str, int] = {
-    "enter": 0x0D, "return": 0x0D, "esc": 0x1B, "escape": 0x1B, "tab": 0x09,
+    "enter": 0x0D, "esc": 0x1B, "tab": 0x09,
     "backspace": 0x08, "space": 0x20, "up": 0x26, "down": 0x28, "left": 0x25,
     "right": 0x27, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
     "delete": 0x2E, "insert": 0x2D,
-    **{f"f{n}": 0x6F + n for n in range(1, 13)},
+    # VK_F1 == 0x70, and VK_F2..VK_F24 continue contiguously from there —
+    # the one native table of the four where a formula (rather than an
+    # explicit per-key literal) is actually correct.
+    **{f"f{n}": 0x6F + n for n in range(1, 25)},
 }
 
 
-def _vkey_for(key: str) -> tuple[int, bool]:
-    """``(virtual_key_code, needs_shift)`` for one spec ``key:`` name.
-    Raises :class:`WinNativeSpecError` for anything unrecognized."""
-    lowered = key.lower()
-    if lowered in _NAMED_VKEYS:
-        return _NAMED_VKEYS[lowered], False
-    if lowered.startswith("ctrl+") and len(lowered) == 6:
-        return ord(lowered[5].upper()), False
-    if len(key) == 1:
-        needs_shift = key.isalpha() and key.isupper()
-        return ord(key.upper()), needs_shift
-    raise WinNativeSpecError(f"unrecognized key {key!r}")
+@dataclass(frozen=True)
+class WinKeyEncoding:
+    """One physical key-down/key-up pair for :meth:`Win32Calls.send_key` to
+    post via ``SendInput``. Exactly one of ``vk``/``unicode_char`` is not
+    ``None`` — punctuation and any other character outside the ASCII
+    letter/digit range goes through ``unicode_char``
+    (``KEYEVENTF_UNICODE``), never a vk guess and never a silent no-op
+    (closes #3635). ``win`` is the Cmd/Super/Meta modifier — Windows calls
+    its own version of that key ``VK_LWIN``."""
+
+    vk: int | None
+    unicode_char: str | None
+    shift: bool
+    ctrl: bool
+    alt: bool
+    win: bool
+
+
+def _encode_win_chord(chord: KeyChord) -> WinKeyEncoding:
+    """The :class:`WinKeyEncoding` for one already-parsed :class:`KeyChord`.
+    Raises :class:`UnsupportedKey` (naming ``"win-native"``) for a named key
+    with no ``VK_*`` code at all — never a silent no-op (#3639)."""
+    shift = "shift" in chord.modifiers
+    ctrl = "ctrl" in chord.modifiers
+    alt = "alt" in chord.modifiers
+    win = "cmd" in chord.modifiers
+
+    if not chord.is_char:
+        vk = _NAMED_VKEYS.get(chord.base)
+        if vk is None:
+            raise UnsupportedKey("win-native", chord.base, "no VK_* code for this named key")
+        return WinKeyEncoding(vk=vk, unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, win=win)
+
+    ch = chord.base
+    if len(ch) == 1 and ch.isascii() and ch.isalnum():
+        # Windows VK codes for '0'-'9'/'A'-'Z' equal their own ASCII code
+        # points — a bare uppercase letter with no explicit `shift` implies
+        # Shift was physically held (pre-#3639 convention preserved).
+        if ch.isalpha() and ch.isupper():
+            shift = True
+        return WinKeyEncoding(vk=ord(ch.upper()), unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, win=win)
+
+    # Punctuation (or any other printable character with no VK_* code):
+    # sent as a Unicode character, never a vk guess (#3639, closes #3635).
+    return WinKeyEncoding(vk=None, unicode_char=ch, shift=shift, ctrl=ctrl, alt=alt, win=win)
+
+
+def _win_key_encodings(key: str) -> list[WinKeyEncoding]:
+    """Parse *key* — one chord, or a space-separated chord sequence
+    (``ctrl+k ctrl+w``) — under the shared grammar
+    (:mod:`coord.key_spec`) and encode each chord in order. Raises
+    :class:`WinNativeSpecError` for a spec that doesn't parse under the
+    grammar at all, :class:`UnsupportedKey` for a chord Windows genuinely
+    cannot deliver."""
+    try:
+        event = parse_key_spec(key)
+    except KeySpecError as e:
+        raise WinNativeSpecError(f"unrecognized key {key!r}: {e}") from e
+    return [_encode_win_chord(chord) for chord in event.chords]
 
 
 def _is_unc_path(path: str) -> bool:
@@ -1704,19 +1762,66 @@ class Win32Calls:
         self._user32.mouse_event(up, 0, 0, 0, 0)
 
     def send_key(self, hwnd: int, key: str) -> None:
+        """#3639: *key* is parsed under the shared grammar
+        (:func:`_win_key_encodings`) and may be a space-separated chord
+        sequence (``ctrl+k ctrl+w``) — each chord is sent as its own
+        modifier-down, key(s)-down/up, modifier-up sequence, in order, via
+        ``SendInput`` (never the legacy ``keybd_event`` the pre-#3639 code
+        used — ``SendInput`` is what ``KEYEVENTF_UNICODE`` requires, closing
+        #3635's silent no-op for punctuation)."""
         self._user32.SetForegroundWindow(hwnd)
-        vk, needs_shift = _vkey_for(key)
+        ctypes = self._ctypes
+        wintypes = ctypes.wintypes
+
+        ULONG_PTR = ctypes.c_size_t
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ULONG_PTR),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", wintypes.DWORD), ("ki", KEYBDINPUT),
+                ("padding", ctypes.c_ubyte * 8),
+            ]
+
+        INPUT_KEYBOARD = 1
         KEYEVENTF_KEYUP = 0x0002
-        if key.lower().startswith("ctrl+"):
-            self._user32.keybd_event(0x11, 0, 0, 0)  # VK_CONTROL down
-        if needs_shift:
-            self._user32.keybd_event(0x10, 0, 0, 0)  # VK_SHIFT down
-        self._user32.keybd_event(vk, 0, 0, 0)
-        self._user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        if needs_shift:
-            self._user32.keybd_event(0x10, 0, KEYEVENTF_KEYUP, 0)
-        if key.lower().startswith("ctrl+"):
-            self._user32.keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0)
+        KEYEVENTF_UNICODE = 0x0004
+        VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN = 0x10, 0x11, 0x12, 0x5B
+
+        def _one(vk: int, scan: int, flags: int) -> INPUT:
+            return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, scan, flags, 0, 0))
+
+        def _send(*inputs: INPUT) -> None:
+            if not inputs:
+                return
+            arr = (INPUT * len(inputs))(*inputs)
+            self._user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+
+        for enc in _win_key_encodings(key):
+            mod_downs: list[INPUT] = []
+            mod_ups: list[INPUT] = []
+            for active, vk in (
+                (enc.win, VK_LWIN), (enc.ctrl, VK_CONTROL),
+                (enc.alt, VK_MENU), (enc.shift, VK_SHIFT),
+            ):
+                if active:
+                    mod_downs.append(_one(vk, 0, 0))
+                    mod_ups.insert(0, _one(vk, 0, KEYEVENTF_KEYUP))
+
+            if enc.unicode_char is not None:
+                code = ord(enc.unicode_char)
+                key_down = _one(0, code, KEYEVENTF_UNICODE)
+                key_up = _one(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+            else:
+                key_down = _one(enc.vk, 0, 0)
+                key_up = _one(enc.vk, 0, KEYEVENTF_KEYUP)
+
+            _send(*mod_downs, key_down, key_up, *mod_ups)
 
     # -- UI Automation --
 

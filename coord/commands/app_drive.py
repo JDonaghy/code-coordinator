@@ -11,9 +11,14 @@ Subcommands:
   (:mod:`coord.app_drive_daemon`) until ``close`` or its own idle timeout.
 - ``send --session ID --key K|--text T|--click R,C[,BUTTON]|--drag
   R,C,TO_R,TO_C[,BUTTON]`` — one input event against the live session.
-  ``--key`` accepts modifier combos (``alt+m``, ``shift+right``,
-  ``ctrl+home``, #3604 — see :func:`coord.tui_pty_driver.encode_key` for
-  exactly which are recognized); ``--drag`` is tui-pty only.
+  ``--key`` is parsed under the ONE grammar shared by all four drivers
+  (:mod:`coord.key_spec`, #3639): any combination of
+  ``ctrl``/``alt``(``option``)/``shift``/``cmd``(``super``/``meta``)
+  modifiers, any single printable character including punctuation, and a
+  space-separated chord sequence — e.g. ``--key 'ctrl+shift+p'``,
+  ``--key ':'``, ``--key 'ctrl+k ctrl+w'``. A key a driver's platform
+  genuinely can't deliver (``cmd`` to a terminal) raises a clear error
+  naming the platform, never a silent no-op; ``--drag`` is tui-pty only.
 - ``resize --session ID --cols N --rows N`` — live-resize the tui-pty
   session's pty/VT screen (#3604), tui-pty only.
 - ``wait-idle --session ID [--ms N] [--timeout-ms N]`` — tui-pty only.
@@ -114,7 +119,15 @@ def _resolve(session: str):
 
 @app_drive_group.command("send")
 @click.option("--session", "session_id", required=True)
-@click.option("--key", default=None, help="A named key or single character (tui-pty/native).")
+@click.option(
+    "--key", default=None,
+    help=(
+        "A key or chord sequence under the shared grammar (coord.key_spec, "
+        "#3639): modifiers ctrl/alt(option)/shift/cmd(super,meta), a named "
+        "key or any single printable character, space-separated chords "
+        "(e.g. 'ctrl+shift+p', ':', 'ctrl+k ctrl+w')."
+    ),
+)
 @click.option("--text", default=None, help="Literal text to type (tui-pty only).")
 @click.option(
     "--click", "click_spec", default=None,

@@ -243,9 +243,15 @@ def app_drive_run_spec_usage(driver_kind: str, launch_command: str = "") -> str:
 #: lane kind; it is not a per-kind table. `--screen`/`--probe`/`--close`
 #: are NOT options of `send` (they are the separate subcommands named in
 #: the trailing comment) — advertising them as `send` flags was the other
-#: half of #3590's unrunnable-command bug.
+#: half of #3590's unrunnable-command bug. #3639: `--key` accepts the ONE
+#: grammar shared by all four drivers (:mod:`coord.key_spec`) — one example
+#: each of a modifier combo, a punctuation character, and a chord sequence,
+#: so a worker never has to guess whether `Alt-M`/`:`/`ctrl+k ctrl+w` are
+#: even expressible.
 _APP_DRIVE_SEND_USAGE_LINE = (
     "coord app-drive send --session <id> --key Enter   # or --text/--click; "
+    "--key also takes a modifier combo (--key 'ctrl+shift+p'), punctuation "
+    "(--key ':'), or a chord sequence (--key 'ctrl+k ctrl+w'); "
     "see also: screen/probe/close --session <id>"
 )
 

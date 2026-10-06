@@ -29,10 +29,12 @@ from coord.gtk_native_driver import (
     NativeStep,
     _find_a11y_match,
     _summarize_elements,
-    _xdotool_key_for,
+    _xdotool_arg_for_chord,
+    _xdotool_args_for_key,
     parse_native_spec,
     run_native_spec,
 )
+from coord.key_spec import UnsupportedKey, parse_key_spec
 
 # ── parse_native_spec ───────────────────────────────────────────────────────
 
@@ -151,32 +153,61 @@ steps:
             )
 
 
-# ── _xdotool_key_for ─────────────────────────────────────────────────────────
+# ── _xdotool_arg_for_chord / _xdotool_args_for_key ──────────────────────────
 
 
 class TestXdotoolKeyFor:
+    def _arg(self, key: str) -> str:
+        return _xdotool_arg_for_chord(parse_key_spec(key).chords[0])
+
     def test_named_keys_case_insensitive(self) -> None:
-        assert _xdotool_key_for("enter") == "Return"
-        assert _xdotool_key_for("ENTER") == "Return"
-        assert _xdotool_key_for("Esc") == "Escape"
+        assert self._arg("enter") == "Return"
+        assert self._arg("ENTER") == "Return"
+        assert self._arg("Esc") == "Escape"
 
     def test_ctrl_combo(self) -> None:
-        assert _xdotool_key_for("ctrl+c") == "ctrl+c"
+        assert self._arg("ctrl+c") == "ctrl+c"
 
     def test_single_lowercase_letter_passes_through(self) -> None:
-        assert _xdotool_key_for("a") == "a"
+        assert self._arg("a") == "a"
 
     def test_single_uppercase_letter_passes_through(self) -> None:
         # Unlike Win32/macOS virtual keycodes, xdotool shifts uppercase
         # keysyms for itself — no separate needs-shift bit to track.
-        assert _xdotool_key_for("A") == "A"
+        assert self._arg("A") == "A"
 
     def test_digit_key(self) -> None:
-        assert _xdotool_key_for("5") == "5"
+        assert self._arg("5") == "5"
 
     def test_unrecognized_key_raises(self) -> None:
         with pytest.raises(GtkNativeSpecError, match="unrecognized key"):
-            _xdotool_key_for("moonwalk")
+            _xdotool_args_for_key("moonwalk")
+
+    def test_alt_m(self) -> None:
+        assert self._arg("alt+m") == "alt+m"
+
+    def test_cmd_maps_to_super(self) -> None:
+        assert self._arg("cmd+shift+p") == "shift+super+p"
+
+    def test_ctrl_shift_right(self) -> None:
+        assert self._arg("ctrl+shift+right") == "ctrl+shift+Right"
+
+    def test_shift_f3(self) -> None:
+        assert self._arg("shift+f3") == "shift+F3"
+
+    def test_punctuation(self) -> None:
+        assert self._arg(":") == "colon"
+        assert self._arg("@") == "at"
+
+    def test_chord_sequence_ctrl_k_ctrl_w(self) -> None:
+        assert _xdotool_args_for_key("ctrl+k ctrl+w") == ["ctrl+k", "ctrl+w"]
+
+    def test_unsupported_named_key_raises(self) -> None:
+        from coord.key_spec import KeyChord
+
+        bogus = KeyChord(modifiers=frozenset(), base="nonexistent", is_char=False)
+        with pytest.raises(UnsupportedKey):
+            _xdotool_arg_for_chord(bogus)
 
 
 # ── _find_a11y_match / _summarize_elements ──────────────────────────────────

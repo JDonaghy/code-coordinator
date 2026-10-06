@@ -57,7 +57,12 @@ per-OS fork.
   real window, and size/position it deterministically.
 - ``key: <name>`` / ``click: {x, y, button}`` — real input at *screen* pixel
   coordinates relative to the window's origin, via
-  :meth:`MacCalls.send_key`/:meth:`MacCalls.send_click`.
+  :meth:`MacCalls.send_key`/:meth:`MacCalls.send_click`. ``key:`` is parsed
+  under the grammar shared by all four drivers (:mod:`coord.key_spec`, #3639):
+  any combination of ``ctrl``/``alt``(``option``)/``shift``/``cmd`` modifiers,
+  a named key or any single printable character (including punctuation), and
+  a space-separated chord sequence (``ctrl+k ctrl+w``) — see
+  :func:`_mac_key_encodings`.
 - ``wait: {ms}`` — a plain deterministic pause.
 - ``capture`` — an explicit ``screencapture -l <windowid>`` evidence
   snapshot, attached to this step's own result (pass or fail) as
@@ -147,6 +152,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import yaml
+
+from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
 
 
 class MacNativeSpecError(Exception):
@@ -617,12 +624,21 @@ _NAMED_VKEYS: dict[str, int] = {
     # explicit table rather than a formula (mirrors
     # :data:`coord.win_native_driver._NAMED_VKEYS`'s own "named keys a spec
     # author can reference" convention, just with macOS's own numbering).
-    "enter": 0x24, "return": 0x24, "esc": 0x35, "escape": 0x35, "tab": 0x30,
-    "backspace": 0x33, "delete": 0x33, "space": 0x31,
+    # #3627: `delete` (forward-delete, kVK_ForwardDelete) is a DIFFERENT
+    # physical key from `backspace` (kVK_Delete) — they must not share a
+    # keycode.
+    "enter": 0x24, "esc": 0x35, "tab": 0x30,
+    "backspace": 0x33, "delete": 0x75, "space": 0x31,
     "up": 0x7E, "down": 0x7D, "left": 0x7B, "right": 0x7C,
     "home": 0x73, "end": 0x77, "pageup": 0x74, "pagedown": 0x79,
     "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60, "f6": 0x61,
     "f7": 0x62, "f8": 0x64, "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F,
+    # F13-F20: real kVK_* codes (standard on extended Mac keyboards). F21-F24
+    # have no standard macOS keycode at all — deliberately absent, so
+    # :func:`_encode_mac_chord` raises :class:`UnsupportedKey` for them
+    # rather than guessing (#3639: never a silent no-op).
+    "f13": 0x69, "f14": 0x6B, "f15": 0x71, "f16": 0x6A, "f17": 0x40,
+    "f18": 0x4F, "f19": 0x50, "f20": 0x5A,
 }
 
 _VKEY_LETTERS: dict[str, int] = {
@@ -639,28 +655,72 @@ _VKEY_DIGITS: dict[str, int] = {
 }
 
 
-def _vkey_for(key: str) -> tuple[int, bool]:
-    """``(virtual_keycode, needs_shift)`` for one spec ``key:`` name.
-    Raises :class:`MacNativeSpecError` for anything unrecognized. Mirrors
-    :func:`coord.win_native_driver._vkey_for`'s contract, just against
-    macOS's own (non-ASCII-ordered) virtual-keycode table."""
-    lowered = key.lower()
-    if lowered in _NAMED_VKEYS:
-        return _NAMED_VKEYS[lowered], False
-    if lowered.startswith("ctrl+") and len(lowered) == 6:
-        ch = lowered[5]
-        code = _VKEY_LETTERS.get(ch, _VKEY_DIGITS.get(ch))
-        if code is None:
-            raise MacNativeSpecError(f"unrecognized key {key!r}")
-        return code, False
-    if len(key) == 1:
-        ch = key.lower()
-        code = _VKEY_LETTERS.get(ch, _VKEY_DIGITS.get(ch))
-        if code is None:
-            raise MacNativeSpecError(f"unrecognized key {key!r}")
-        needs_shift = key.isalpha() and key.isupper()
-        return code, needs_shift
-    raise MacNativeSpecError(f"unrecognized key {key!r}")
+@dataclass(frozen=True)
+class MacKeyEncoding:
+    """One physical key-down/key-up pair for :meth:`MacOSCalls.send_key` to
+    post. Exactly one of ``vkey``/``unicode_char`` is not ``None`` —
+    punctuation and any other character outside the fixed letter/digit
+    virtual-keycode tables goes through ``unicode_char``
+    (``CGEventKeyboardSetUnicodeString``), never a vkey guess (#3639). The
+    four modifier flags are plain booleans — translating them to
+    ``quartz.kCGEventFlagMask*`` constants is :meth:`MacOSCalls.send_key`'s
+    own job, so this type (and :func:`_encode_mac_chord` below) stays
+    importable/testable without ``pyobjc`` installed."""
+
+    vkey: int | None
+    unicode_char: str | None
+    shift: bool
+    ctrl: bool
+    alt: bool
+    cmd: bool
+
+
+def _encode_mac_chord(chord: KeyChord) -> MacKeyEncoding:
+    """The :class:`MacKeyEncoding` for one already-parsed :class:`KeyChord`.
+    Raises :class:`UnsupportedKey` (naming ``"mac-native"``) for a named key
+    with no real macOS keycode (e.g. ``f21``-``f24``, #3639) — never a
+    silent no-op."""
+    shift = "shift" in chord.modifiers
+    ctrl = "ctrl" in chord.modifiers
+    alt = "alt" in chord.modifiers
+    cmd = "cmd" in chord.modifiers
+
+    if not chord.is_char:
+        vkey = _NAMED_VKEYS.get(chord.base)
+        if vkey is None:
+            raise UnsupportedKey(
+                "mac-native", chord.base, "no macOS virtual keycode for this named key"
+            )
+        return MacKeyEncoding(vkey=vkey, unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd)
+
+    ch = chord.base
+    vkey = _VKEY_LETTERS.get(ch.lower(), _VKEY_DIGITS.get(ch.lower()))
+    if vkey is not None:
+        # A bare uppercase letter with no explicit `shift` modifier implies
+        # Shift was physically held — matches the pre-#3639 convention
+        # (`_vkey_for("A") == (vkey, True)`), so `key: M` still behaves like
+        # `key: shift+m` rather than silently dropping the capital.
+        if ch.isalpha() and ch.isupper():
+            shift = True
+        return MacKeyEncoding(vkey=vkey, unicode_char=None, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd)
+
+    # Punctuation (or any other printable character outside the letter/digit
+    # tables): no vkey guess — sent as a Unicode-string event instead (#3639).
+    return MacKeyEncoding(vkey=None, unicode_char=ch, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd)
+
+
+def _mac_key_encodings(key: str) -> list[MacKeyEncoding]:
+    """Parse *key* — one chord, or a space-separated chord sequence
+    (``ctrl+k ctrl+w``) — under the shared grammar
+    (:mod:`coord.key_spec`) and encode each chord in order. Raises
+    :class:`MacNativeSpecError` for a spec that doesn't parse under the
+    grammar at all, :class:`UnsupportedKey` for a chord macOS genuinely
+    cannot deliver."""
+    try:
+        event = parse_key_spec(key)
+    except KeySpecError as e:
+        raise MacNativeSpecError(f"unrecognized key {key!r}: {e}") from e
+    return [_encode_mac_chord(chord) for chord in event.chords]
 
 
 class MacOSCalls:
@@ -834,22 +894,33 @@ class MacOSCalls:
 
     def send_key(self, pid: int, key: str) -> None:
         """#3566: posts via ``CGEventPostToPid`` — see :meth:`send_click`'s
-        own docstring for why, same rationale."""
+        own docstring for why, same rationale. #3639: *key* is parsed under
+        the shared grammar (:func:`_mac_key_encodings`) and may be a
+        space-separated chord sequence (``ctrl+k ctrl+w``) — each chord is
+        posted as its own down/up pair, in order."""
         quartz = self._quartz
-        vkey, needs_shift = _vkey_for(key)
-        needs_ctrl = key.lower().startswith("ctrl+")
-        down = quartz.CGEventCreateKeyboardEvent(None, vkey, True)
-        up = quartz.CGEventCreateKeyboardEvent(None, vkey, False)
-        flags = 0
-        if needs_shift:
-            flags |= quartz.kCGEventFlagMaskShift
-        if needs_ctrl:
-            flags |= quartz.kCGEventFlagMaskControl
-        if flags:
-            quartz.CGEventSetFlags(down, flags)
-            quartz.CGEventSetFlags(up, flags)
-        quartz.CGEventPostToPid(pid, down)
-        quartz.CGEventPostToPid(pid, up)
+        for enc in _mac_key_encodings(key):
+            vkey = enc.vkey if enc.vkey is not None else 0
+            down = quartz.CGEventCreateKeyboardEvent(None, vkey, True)
+            up = quartz.CGEventCreateKeyboardEvent(None, vkey, False)
+            if enc.unicode_char is not None:
+                code = ord(enc.unicode_char)
+                quartz.CGEventKeyboardSetUnicodeString(down, 1, [code])
+                quartz.CGEventKeyboardSetUnicodeString(up, 1, [code])
+            flags = 0
+            if enc.shift:
+                flags |= quartz.kCGEventFlagMaskShift
+            if enc.ctrl:
+                flags |= quartz.kCGEventFlagMaskControl
+            if enc.alt:
+                flags |= quartz.kCGEventFlagMaskAlternate
+            if enc.cmd:
+                flags |= quartz.kCGEventFlagMaskCommand
+            if flags:
+                quartz.CGEventSetFlags(down, flags)
+                quartz.CGEventSetFlags(up, flags)
+            quartz.CGEventPostToPid(pid, down)
+            quartz.CGEventPostToPid(pid, up)
 
     # -- Accessibility --
 
