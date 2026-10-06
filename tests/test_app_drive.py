@@ -281,6 +281,20 @@ class TestTuiPtyAppDriveBlackBox:
         )
         assert opened.exit_code != 0
 
+    def test_open_mode_for_a_non_win_native_kind_fails_fast_via_the_real_cli(self):
+        """#3640: the CLI's own ``--mode``/``--terminal-app`` must reach
+        the same ``kind != 'win-native'`` guard :func:`coord.app_drive
+        .open_session` enforces (#2096 "one question, one answer") — a
+        tui-pty open naming ``--mode`` is rejected, not silently
+        accepted and ignored, and in particular never left running."""
+        runner = CliRunner()
+        opened = runner.invoke(
+            app_drive_group,
+            ["open", "tui-pty", "--launch", "cat", "--cwd", "/tmp", "--mode", "window"],
+        )
+        assert opened.exit_code != 0
+        assert "win-native" in opened.output
+
 
 class TestOpenSessionCloseSession:
     """Exercises :mod:`coord.app_drive`'s client-side seams directly
@@ -449,6 +463,53 @@ class TestOpenSessionWslBridge:
         # branch was never entered.
         with pytest.raises(AppDriveError, match="requires Windows"):
             open_session("win-native", launch="true", cwd="/tmp")
+
+    def test_mode_rejected_for_a_non_win_native_kind_before_any_daemon_spawns(self, monkeypatch):
+        """#3640: ``mode``/``terminal_app`` only mean anything for
+        ``win-native`` — naming them for any other kind is almost
+        certainly a mistake, so this must raise synchronously, BEFORE
+        ``subprocess.Popen`` is ever called (never a daemon that spawns
+        and then silently ignores them)."""
+
+        def _boom(*a, **kw):
+            raise AssertionError("Popen called despite a kind/mode mismatch")
+
+        monkeypatch.setattr(subprocess, "Popen", _boom)
+
+        with pytest.raises(AppDriveError, match="win-native"):
+            open_session("tui-pty", launch="cat", cwd="/tmp", mode="window")
+
+        with pytest.raises(AppDriveError, match="win-native"):
+            open_session("tui-pty", launch="cat", cwd="/tmp", terminal_app="conhost")
+
+    def test_mode_and_terminal_app_reach_the_spawned_daemon_argv(self, monkeypatch):
+        """#3640: ``open_session(..., mode=..., terminal_app=...)`` must
+        actually reach the spawned ``coord.app_drive_daemon`` argv as
+        ``--mode``/``--terminal-app`` — asserted against the REAL argv a
+        real (non-mocked) ``subprocess.Popen`` call received, not just
+        that the function accepted the kwargs. The daemon subprocess
+        still genuinely runs and still fails the same ``Win32Calls``
+        off-Windows guard as every other `win-native` test on this Linux
+        box — this test only cares what was handed to it before that."""
+        popen_calls = []
+        real_popen = subprocess.Popen
+
+        def _spy_popen(argv, *a, **kw):
+            popen_calls.append(list(argv))
+            return real_popen(argv, *a, **kw)
+
+        monkeypatch.setattr(subprocess, "Popen", _spy_popen)
+
+        with pytest.raises(AppDriveError, match="requires Windows"):
+            open_session(
+                "win-native", launch="true", cwd="/tmp",
+                mode="terminal", terminal_app="conhost",
+            )
+
+        assert len(popen_calls) == 1
+        argv = popen_calls[0]
+        assert "--mode" in argv and argv[argv.index("--mode") + 1] == "terminal"
+        assert "--terminal-app" in argv and argv[argv.index("--terminal-app") + 1] == "conhost"
 
     def test_wsl_host_spawns_the_daemon_on_the_bridge_python_with_translated_paths(self, monkeypatch, tmp_path):
         """On a WSL host, `open_session` must: (1) resolve the Windows-side

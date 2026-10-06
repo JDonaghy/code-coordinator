@@ -9,6 +9,11 @@ Subcommands:
 - ``open --kind K --launch CMD --cwd DIR`` — spawn a session; prints
   ``{"session_id": ...}``. Kept alive by a background daemon
   (:mod:`coord.app_drive_daemon`) until ``close`` or its own idle timeout.
+  ``--mode``/``--terminal-app`` (win-native only, #3640) pick between a
+  GUI launch (waits for the exe's own window) and a terminal launch
+  (routes through ``launch_in_terminal`` for a console app whose window
+  belongs to conhost.exe/Windows Terminal instead) — left unset, this
+  auto-detects from ``--launch``'s own ``.exe`` PE header.
 - ``send --session ID --key K|--text T|--click R,C[,BUTTON]|--drag
   R,C,TO_R,TO_C[,BUTTON]`` — one input event against the live session.
   ``--key`` is parsed under the ONE grammar shared by all four drivers
@@ -90,15 +95,32 @@ _KIND_ARG = click.argument("kind", type=click.Choice(APP_DRIVE_KINDS))
     "--idle-timeout", type=float, default=DEFAULT_IDLE_TIMEOUT, show_default=True,
     help="Seconds of no command before the session self-tears-down even without an explicit close.",
 )
+@click.option(
+    "--mode", type=click.Choice(("window", "terminal")), default=None,
+    help="win-native only (#3640): 'window' launches --launch directly and waits for its OWN "
+    "top-level window — the right (and only) choice for a GUI app, but a console app's window "
+    "belongs to its hosting conhost.exe/Windows Terminal instead, which 'window' then waits the "
+    "full find-window timeout for and never finds. 'terminal' routes through "
+    "launch_in_terminal for that case. Unset (the default) auto-detects from --launch's own "
+    ".exe PE header, so a console app's lane usually never needs this flag at all.",
+)
+@click.option(
+    "--terminal-app", type=click.Choice(("windows-terminal", "conhost")), default=None,
+    help="win-native only, with --mode terminal (or when auto-detection itself picks terminal "
+    "mode): which terminal host to launch into. Defaults to 'windows-terminal' when "
+    "auto-detected; required when --mode terminal is passed explicitly.",
+)
 def app_drive_open(
     kind: str, launch: str, cwd: str, cols: int, rows: int,
     width: int | None, height: int | None, idle_timeout: float,
+    mode: str | None, terminal_app: str | None,
 ) -> None:
     """Open a new KIND session. Prints ``{"session_id": ...}`` on success."""
     try:
         handle = open_session(
             kind, launch=launch, cwd=cwd, cols=cols, rows=rows,
             width=width, height=height, idle_timeout=idle_timeout,
+            mode=mode, terminal_app=terminal_app or "",
         )
     except AppDriveUnavailableError as e:
         click.echo(json.dumps({"status": "unavailable", "reason": e.reason}))

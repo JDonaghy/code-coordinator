@@ -2653,6 +2653,102 @@ def _import_uia():
     return client
 
 
+#: PE optional-header ``Subsystem`` values (``winnt.h``'s ``IMAGE_SUBSYSTEM_*``)
+#: this driver cares about for #3640's auto mode selection below — a GUI
+#: exe's top-level window belongs to its own pid (the existing, unchanged
+#: path); a CUI (console) exe's window belongs to whatever conhost.exe/
+#: Windows Terminal is hosting it, which `WinCalls.launch`'s plain
+#: ``find_top_window(pid, ...)`` wait never finds no matter how long it
+#: waits — the root cause of #3640's indefinite `coord app-drive open
+#: win-native` hang on a console app (``vcd.exe``).
+IMAGE_SUBSYSTEM_WINDOWS_GUI = 2
+IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
+
+#: The first ``....exe`` token in a shell command line, in command order —
+#: deliberately excludes whitespace/``&``/``|``/``;``/quote characters so
+#: ``"cd .smoke && ../target/x86_64-pc-windows-msvc/release/vcd.exe
+#: sample.txt"`` (#3640's own reproduction) yields exactly
+#: ``../target/x86_64-pc-windows-msvc/release/vcd.exe``, not the whole
+#: ``cd``-prefixed command or a trailing argument.
+_EXE_TOKEN_RE = re.compile(r"[^\s&|;\"']+\.exe\b", re.IGNORECASE)
+
+
+def _guess_exe_path(command: str, cwd: str) -> str | None:
+    """Best-effort extraction of the real ``.exe`` *command* (a raw shell
+    command string, not a parsed argv — see :func:`coord.app_drive
+    .open_session`) launches, resolved against *cwd* when relative — via
+    :func:`_is_rooted_or_drive_qualified`/``ntpath.join``, the SAME
+    absolute-vs-relative test and join :func:`_plan_staging` already uses
+    for this exact "is this exe token rooted, or *cwd*-relative" question
+    (#2096 "one question, one answer"), rather than a second,
+    independently-written check that could silently drift from it.
+    Returns ``None`` (never raises) when no ``.exe`` token is found at
+    all — :func:`_detect_console_subsystem` treats that exactly like "PE
+    header unreadable", i.e. "couldn't tell", never an error."""
+    match = _EXE_TOKEN_RE.search(command)
+    if match is None:
+        return None
+    token = match.group(0)
+    return token if _is_rooted_or_drive_qualified(token) else ntpath.join(cwd, token)
+
+
+def _pe_subsystem(path: str) -> int | None:
+    """The ``Subsystem`` field of *path*'s PE optional header — read
+    directly off the ``IMAGE_DOS_HEADER``/``IMAGE_NT_HEADERS`` byte
+    layout, no ``ctypes``/Windows API needed, so this is callable (and
+    unit-tested) on any platform. ``None`` when *path* doesn't exist,
+    isn't readable, or isn't a well-formed PE image (wrong ``MZ``/``PE``
+    magic, or truncated before the field) — a best-effort SNIFF for
+    :func:`_detect_console_subsystem`'s own caller, never a hard
+    requirement, so every failure mode here collapses to "couldn't tell"
+    rather than raising.
+
+    The ``Subsystem`` field sits at the IDENTICAL byte offset (68 bytes
+    into the optional header, i.e. ``e_lfanew + 4 (PE signature) + 20
+    (IMAGE_FILE_HEADER) + 68``) in both the 32-bit
+    (``IMAGE_OPTIONAL_HEADER32``) and 64-bit (``..._HEADER64``) shapes —
+    the 64-bit header drops the 4-byte ``BaseOfData`` field but widens
+    ``ImageBase`` from 4 to 8 bytes, so those two 4-byte deltas cancel out
+    before reaching ``Subsystem`` either way."""
+    import struct  # noqa: PLC0415 — same "only needed here" convention as `_bitmap_to_bmp_bytes`
+
+    try:
+        with open(path, "rb") as f:
+            dos_header = f.read(64)
+            if len(dos_header) < 64 or dos_header[:2] != b"MZ":
+                return None
+            pe_offset = struct.unpack_from("<I", dos_header, 60)[0]
+            f.seek(pe_offset)
+            if f.read(4) != b"PE\x00\x00":
+                return None
+            f.seek(pe_offset + 4 + 20 + 68)
+            subsystem_bytes = f.read(2)
+            if len(subsystem_bytes) < 2:
+                return None
+            return struct.unpack("<H", subsystem_bytes)[0]
+    except OSError:
+        return None
+
+
+def _detect_console_subsystem(command: str, cwd: str) -> bool | None:
+    """``True`` when *command*'s own ``.exe`` is a console-subsystem (CUI)
+    executable (#3640) — ``False`` for a GUI-subsystem exe, ``None`` when
+    no ``.exe`` token could be found in *command* at all, or the one found
+    can't be read/parsed as a PE image from here (missing file, wrong
+    magic, a path this host can't yet resolve, ...). ``None`` is a
+    "couldn't tell", not a verdict — :class:`WinNativeSession`'s own auto
+    mode selection falls back to the pre-#3640 ``mode="window"`` behavior
+    on it, so a GUI lane (or any lane this sniff can't read) is never
+    affected by this at all."""
+    guessed = _guess_exe_path(command, cwd)
+    if guessed is None:
+        return None
+    subsystem = _pe_subsystem(guessed)
+    if subsystem is None:
+        return None
+    return subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI
+
+
 # ── top-level entry point ───────────────────────────────────────────────────
 
 class WinNativeSession:
@@ -2673,9 +2769,59 @@ class WinNativeSession:
     def __init__(
         self, launch_command: str, cwd: str, *, width: int = 1024, height: int = 768,
         calls: WinCalls | None = None, timeout_s: float = 10.0,
+        mode: str | None = None, terminal_app: str = "",
     ) -> None:
+        """*mode* (#3640) selects how *launch_command* is started:
+        ``"window"`` launches it directly and waits for a top-level window
+        owned by ITS OWN pid tree — the original, GUI-app behavior;
+        ``"terminal"`` routes through :meth:`WinCalls.launch_in_terminal`
+        instead, required for a console-subsystem exe whose window is
+        never its own (it belongs to the conhost.exe/Windows Terminal
+        hosting it) — the ``"window"`` path waits the full *timeout_s* and
+        then fails for one of these, it never hangs past it, but it can
+        also never succeed for one either. ``None`` (the default) is
+        neither of those — it means "figure it out":
+        :func:`_detect_console_subsystem` sniffs *launch_command*'s own
+        ``.exe`` PE header and resolves to ``"terminal"`` only when that
+        sniff positively identifies a CUI (console) image; every other
+        outcome (a GUI exe, no ``.exe`` token found, the file unreadable
+        from here) resolves to ``"window"`` — the exact pre-#3640
+        behavior, so a GUI lane is never affected by this. *terminal_app*
+        is required whenever the resolved mode is ``"terminal"``; when
+        auto-detection itself picked ``"terminal"``, it defaults to
+        ``"windows-terminal"`` unless *terminal_app* was already given.
+
+        Raises :class:`WinNativeSpecError` for an invalid *mode*/
+        *terminal_app* combination — BEFORE anything is launched, so
+        there is nothing for this constructor's own teardown-on-failure
+        (below) to need to clean up for that case."""
         self._calls: WinCalls = calls if calls is not None else Win32Calls()
-        self._pid = self._calls.launch(launch_command, cwd)
+        resolved_mode = mode
+        resolved_terminal_app = terminal_app
+        if resolved_mode is None:
+            if _detect_console_subsystem(launch_command, cwd):
+                resolved_mode = "terminal"
+                if not resolved_terminal_app:
+                    resolved_terminal_app = "windows-terminal"
+            else:
+                resolved_mode = "window"
+        if resolved_mode not in _VALID_MODES:
+            raise WinNativeSpecError(
+                f"mode must be one of {', '.join(_VALID_MODES)}, got {resolved_mode!r}"
+            )
+        if resolved_mode == "terminal":
+            if not resolved_terminal_app:
+                raise WinNativeSpecError(
+                    "mode='terminal' requires terminal_app ('windows-terminal' or 'conhost')"
+                )
+            if resolved_terminal_app not in _VALID_TERMINAL_APPS:
+                raise WinNativeSpecError(
+                    f"unrecognized terminal_app {resolved_terminal_app!r} — expected one "
+                    f"of {', '.join(_VALID_TERMINAL_APPS)}"
+                )
+            self._pid = self._calls.launch_in_terminal(launch_command, cwd, resolved_terminal_app)
+        else:
+            self._pid = self._calls.launch(launch_command, cwd)
         try:
             self._hwnd = self._calls.find_top_window(self._pid, timeout_s)
             self._calls.move_window(self._hwnd, 0, 0, width, height)

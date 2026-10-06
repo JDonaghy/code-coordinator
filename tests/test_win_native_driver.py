@@ -18,6 +18,7 @@ import ctypes
 import ntpath
 import os
 import select
+import struct
 import subprocess
 import sys
 import time
@@ -26,6 +27,8 @@ import pytest
 
 from coord.key_spec import UnsupportedKey
 from coord.win_native_driver import (
+    IMAGE_SUBSYSTEM_WINDOWS_CUI,
+    IMAGE_SUBSYSTEM_WINDOWS_GUI,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     NativeRunner,
     NativeSpec,
@@ -36,10 +39,12 @@ from coord.win_native_driver import (
     WinNativeSpecError,
     Win32Calls,
     _DRIVE_REMOTE,
+    _detect_console_subsystem,
     _encode_win_chord,
     _execute_staging,
     _find_a11y_match,
     _get_drive_type,
+    _guess_exe_path,
     _is_remote_exe_token,
     _is_rooted_or_drive_qualified,
     _is_unc_path,
@@ -47,6 +52,7 @@ from coord.win_native_driver import (
     _leading_token,
     _looks_shell_composed,
     _normalize_posix_exe_token,
+    _pe_subsystem,
     _plan_staging,
     _popen_command_and_cwd,
     _StagingPlan,
@@ -3002,3 +3008,200 @@ class TestWinNativeSessionStagingWarning:
         assert not hasattr(calls, "staging_warning")
         session = WinNativeSession("vimcode.exe", "/repo", calls=calls)
         assert session.staging_warning is None
+
+
+# ── #3640: console-subsystem detection + WinNativeSession mode selection ────
+
+
+def _pe_bytes(subsystem: int, *, magic: int = 0x10B) -> bytes:
+    """A minimal, otherwise-garbage PE image carrying just enough real
+    structure for :func:`coord.win_native_driver._pe_subsystem` to read
+    *subsystem* back off it — the DOS stub's ``e_lfanew``, the ``PE\\0\\0``
+    signature, a dummy (all-zero) ``IMAGE_FILE_HEADER``, and an optional
+    header whose ``Magic``/``Subsystem`` fields are the only two actually
+    populated. *magic* (``0x10b`` PE32 / ``0x20b`` PE32+) exercises both
+    shapes — :func:`_pe_subsystem`'s own docstring explains why the
+    ``Subsystem`` offset is identical in both."""
+    dos_header = bytearray(64)
+    dos_header[0:2] = b"MZ"
+    pe_offset = 64
+    struct.pack_into("<I", dos_header, 60, pe_offset)
+    file_header = bytes(20)
+    optional_header = bytearray(70)
+    struct.pack_into("<H", optional_header, 0, magic)
+    struct.pack_into("<H", optional_header, 68, subsystem)
+    return bytes(dos_header) + b"PE\x00\x00" + file_header + bytes(optional_header)
+
+
+class TestPeSubsystem:
+    def test_reads_gui_subsystem_pe32(self, tmp_path) -> None:
+        exe = tmp_path / "app.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_GUI, magic=0x10B))
+        assert _pe_subsystem(str(exe)) == IMAGE_SUBSYSTEM_WINDOWS_GUI
+
+    def test_reads_cui_subsystem_pe32(self, tmp_path) -> None:
+        exe = tmp_path / "app.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI, magic=0x10B))
+        assert _pe_subsystem(str(exe)) == IMAGE_SUBSYSTEM_WINDOWS_CUI
+
+    def test_reads_cui_subsystem_pe32_plus_at_the_same_offset(self, tmp_path) -> None:
+        """#3640: the 64-bit (PE32+) optional header shape drops
+        ``BaseOfData`` but widens ``ImageBase`` from 4 to 8 bytes — those
+        two 4-byte deltas must cancel out, leaving ``Subsystem`` at the
+        identical byte offset as PE32's."""
+        exe = tmp_path / "app64.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI, magic=0x20B))
+        assert _pe_subsystem(str(exe)) == IMAGE_SUBSYSTEM_WINDOWS_CUI
+
+    def test_missing_file_returns_none_not_raise(self) -> None:
+        assert _pe_subsystem("/no/such/exe/anywhere.exe") is None
+
+    def test_non_pe_file_returns_none(self, tmp_path) -> None:
+        not_pe = tmp_path / "not-an-exe.exe"
+        not_pe.write_bytes(b"this is not a PE image at all, just text padding" * 4)
+        assert _pe_subsystem(str(not_pe)) is None
+
+    def test_truncated_pe_returns_none(self, tmp_path) -> None:
+        """A real ``MZ``/``PE`` signature but the file ends before the
+        ``Subsystem`` field — must report "couldn't tell", never raise or
+        read garbage past EOF."""
+        truncated = tmp_path / "truncated.exe"
+        truncated.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI)[:80])
+        assert _pe_subsystem(str(truncated)) is None
+
+
+class TestGuessExePath:
+    def test_extracts_the_only_exe_token(self) -> None:
+        assert _guess_exe_path("vcd.exe sample.txt", "/cwd") == ntpath.join("/cwd", "vcd.exe")
+
+    def test_extracts_the_first_exe_token_from_a_cd_prefixed_command(self) -> None:
+        """#3640's own reproduction: ``coord app-drive open win-native
+        --launch "cd .smoke && ../target/x86_64-pc-windows-msvc/release/
+        vcd.exe sample.txt"``."""
+        command = "cd .smoke && ../target/x86_64-pc-windows-msvc/release/vcd.exe sample.txt"
+        token = "../target/x86_64-pc-windows-msvc/release/vcd.exe"
+        assert _guess_exe_path(command, "/cwd") == ntpath.join("/cwd", token)
+
+    def test_absolute_exe_token_is_returned_unchanged(self) -> None:
+        assert _guess_exe_path(r"C:\tools\vimcode.exe", "/cwd") == r"C:\tools\vimcode.exe"
+
+    def test_rooted_posix_style_exe_token_is_returned_unchanged(self) -> None:
+        """A ``/``-rooted token (a WSL-side absolute path, #3633's own
+        shape) must not be joined onto *cwd* either — only a genuinely
+        *cwd*-relative token should be."""
+        assert _guess_exe_path("/opt/tools/vcd.exe", "/cwd") == "/opt/tools/vcd.exe"
+
+    def test_no_exe_token_returns_none(self) -> None:
+        assert _guess_exe_path("echo hello", "/cwd") is None
+
+
+class TestDetectConsoleSubsystem:
+    def test_true_for_a_cui_exe(self, tmp_path) -> None:
+        exe = tmp_path / "vcd.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        assert _detect_console_subsystem(f"{exe} sample.txt", str(tmp_path)) is True
+
+    def test_false_for_a_gui_exe(self, tmp_path) -> None:
+        exe = tmp_path / "vimcode.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_GUI))
+        assert _detect_console_subsystem(str(exe), str(tmp_path)) is False
+
+    def test_none_when_exe_is_unreadable(self, tmp_path) -> None:
+        assert _detect_console_subsystem("missing.exe", str(tmp_path)) is None
+
+    def test_none_when_no_exe_token_in_command(self, tmp_path) -> None:
+        assert _detect_console_subsystem("echo hello", str(tmp_path)) is None
+
+
+class TestWinNativeSessionModeSelection:
+    """#3640: `coord app-drive open win-native --launch '<path>/vcd.exe
+    sample.txt'` hung forever because the ONLY launch path
+    `WinNativeSession` had was the GUI one — it waits for a top-level
+    window owned by the launched pid's own tree, which a console-
+    subsystem exe's window never is (conhost.exe/Windows Terminal owns
+    it instead). These exercise the fix at the one place both `coord
+    app-drive open` and (indirectly, via `_build_backend`) the daemon
+    share — no separate code path to drift out of sync with."""
+
+    def test_auto_mode_launches_in_terminal_for_a_detected_console_exe(self, tmp_path) -> None:
+        exe = tmp_path / "vcd.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        calls = FakeWinCalls()
+
+        WinNativeSession(f"{exe} sample.txt", str(tmp_path), calls=calls)
+
+        assert calls.launched == []
+        assert calls.launched_in_terminal == [(f"{exe} sample.txt", str(tmp_path), "windows-terminal")]
+
+    def test_auto_mode_launches_normally_for_a_detected_gui_exe(self, tmp_path) -> None:
+        exe = tmp_path / "vimcode.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_GUI))
+        calls = FakeWinCalls()
+
+        WinNativeSession(str(exe), str(tmp_path), calls=calls)
+
+        assert calls.launched == [(str(exe), str(tmp_path))]
+        assert calls.launched_in_terminal == []
+
+    def test_auto_mode_falls_back_to_window_when_exe_cannot_be_sniffed(self) -> None:
+        """Pre-#3640 behavior, preserved exactly: an unreadable/undetectable
+        target (the common case for every existing caller/test that never
+        set up a real exe on disk) must still use the plain `launch` path,
+        never block on a mode it couldn't determine."""
+        calls = FakeWinCalls()
+
+        WinNativeSession("vimcode.exe", "/no/such/dir", calls=calls)
+
+        assert calls.launched == [("vimcode.exe", "/no/such/dir")]
+        assert calls.launched_in_terminal == []
+
+    def test_explicit_window_mode_overrides_auto_detection(self, tmp_path) -> None:
+        """A caller that already knows better (or wants the pre-#3640
+        behavior for some reason) can still force it — auto-detection is
+        the ``None`` default's behavior, not a mandate."""
+        exe = tmp_path / "vcd.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        calls = FakeWinCalls()
+
+        WinNativeSession(str(exe), str(tmp_path), calls=calls, mode="window")
+
+        assert calls.launched == [(str(exe), str(tmp_path))]
+        assert calls.launched_in_terminal == []
+
+    def test_explicit_terminal_app_overrides_the_auto_default(self, tmp_path) -> None:
+        exe = tmp_path / "vcd.exe"
+        exe.write_bytes(_pe_bytes(IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        calls = FakeWinCalls()
+
+        WinNativeSession(str(exe), str(tmp_path), calls=calls, terminal_app="conhost")
+
+        assert calls.launched_in_terminal == [(str(exe), str(tmp_path), "conhost")]
+
+    def test_explicit_terminal_mode_without_terminal_app_raises_before_any_launch(self) -> None:
+        calls = FakeWinCalls()
+
+        with pytest.raises(WinNativeSpecError, match="terminal_app"):
+            WinNativeSession("vimcode.exe", "/repo", calls=calls, mode="terminal")
+
+        assert calls.launched == []
+        assert calls.launched_in_terminal == []
+
+    def test_unrecognized_terminal_app_raises_before_any_launch(self) -> None:
+        calls = FakeWinCalls()
+
+        with pytest.raises(WinNativeSpecError, match="terminal_app"):
+            WinNativeSession(
+                "vimcode.exe", "/repo", calls=calls, mode="terminal", terminal_app="iterm2",
+            )
+
+        assert calls.launched == []
+        assert calls.launched_in_terminal == []
+
+    def test_unrecognized_mode_raises_before_any_launch(self) -> None:
+        calls = FakeWinCalls()
+
+        with pytest.raises(WinNativeSpecError, match="mode"):
+            WinNativeSession("vimcode.exe", "/repo", calls=calls, mode="headless")
+
+        assert calls.launched == []
+        assert calls.launched_in_terminal == []

@@ -42,6 +42,7 @@ from coord.app_drive import AppDriveUnavailableError
 def _build_backend(
     kind: str, launch: str, cwd: str, cols: int, rows: int,
     *, width: int | None = None, height: int | None = None,
+    mode: str | None = None, terminal_app: str = "",
 ) -> Any:
     """Construct the kind-specific session backend — the ONE place that
     maps an app-drive ``kind`` string to the real driver class
@@ -67,6 +68,11 @@ def _build_backend(
     explicitly 0 — so a caller that actually wants 1024x768, or any other
     real size, should pass *width*/*height* directly rather than fight
     the terminal-geometry multiplier).
+
+    *mode*/*terminal_app* (``win-native`` only, #3640) forward straight to
+    :class:`coord.win_native_driver.WinNativeSession` — ``None``/``""``
+    (the defaults) let it auto-detect a console-subsystem exe itself
+    rather than always assuming a GUI app; every other kind ignores them.
     """
     if kind == "tui-pty":
         from coord.tui_pty_driver import TuiPtySession  # noqa: PLC0415
@@ -95,7 +101,10 @@ def _build_backend(
         available, reason = calls.session_available()
         if not available:
             raise AppDriveUnavailableError(reason or "no interactive Windows session is available")
-        return WinNativeSession(launch, cwd, width=native_width, height=native_height, calls=calls)
+        return WinNativeSession(
+            launch, cwd, width=native_width, height=native_height, calls=calls,
+            mode=mode, terminal_app=terminal_app,
+        )
 
     if kind == "gtk-native":
         from coord.gtk_native_driver import GtkNativeSession, LinuxGtkCalls  # noqa: PLC0415
@@ -274,6 +283,7 @@ def serve(
     kind: str, launch: str, cwd: str, cols: int, rows: int,
     *, idle_timeout: float, ready_file: Path, token: str,
     width: int | None = None, height: int | None = None, control_dir: Path | None = None,
+    mode: str | None = None, terminal_app: str = "",
 ) -> int:
     """Build *kind*'s backend, announce readiness via *ready_file*, then
     serve one command at a time until ``close`` arrives or *idle_timeout*
@@ -296,7 +306,10 @@ def serve(
     it can never fire ``send_text``/``close`` against the app being
     driven."""
     try:
-        backend = _build_backend(kind, launch, cwd, cols, rows, width=width, height=height)
+        backend = _build_backend(
+            kind, launch, cwd, cols, rows, width=width, height=height,
+            mode=mode, terminal_app=terminal_app,
+        )
     except AppDriveUnavailableError as e:
         _write_ready_file(ready_file, {"error": "unavailable", "reason": str(e)})
         return 1
@@ -424,12 +437,27 @@ def main(argv: list[str] | None = None) -> int:
         "bridge path, since a loopback-bound TCP socket on the real Windows host is unreachable "
         "from the WSL side. Unset for every other (TCP) session.",
     )
+    parser.add_argument(
+        "--mode", default=None, choices=("window", "terminal"),
+        help="win-native only (#3640): 'window' launches --launch directly and waits for its OWN "
+        "top-level window (the original behavior); 'terminal' routes through "
+        "WinCalls.launch_in_terminal for a console-subsystem exe whose window belongs to its "
+        "hosting conhost.exe/Windows Terminal instead. Unset (the default) auto-detects from "
+        "--launch's own .exe PE header. Ignored by every other kind.",
+    )
+    parser.add_argument(
+        "--terminal-app", default="",
+        help="win-native only, with --mode terminal (or auto-detected as one): 'windows-terminal' "
+        "or 'conhost'. Defaults to 'windows-terminal' when auto-detection itself picks terminal "
+        "mode; required when --mode terminal is passed explicitly.",
+    )
     ns = parser.parse_args(argv)
     return serve(
         ns.kind, ns.launch, ns.cwd, ns.cols, ns.rows,
         idle_timeout=ns.idle_timeout, ready_file=Path(ns.ready_file), token=ns.token,
         width=ns.width, height=ns.height,
         control_dir=Path(ns.control_dir) if ns.control_dir else None,
+        mode=ns.mode, terminal_app=ns.terminal_app,
     )
 
 

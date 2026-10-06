@@ -488,6 +488,7 @@ def open_session(
     width: int | None = None, height: int | None = None,
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT, ready_timeout: float = 30.0,
     python: str | None = None, run: BridgeRunFn | None = None,
+    mode: str | None = None, terminal_app: str = "",
 ) -> SessionHandle:
     """Spawn :mod:`coord.app_drive_daemon` for *kind* and wait for it to
     confirm it's actually listening before returning (#2096: "opened" is an
@@ -547,9 +548,23 @@ def open_session(
     ``windows_path_to_wsl_path``) instead of each defaulting to
     ``subprocess.run`` independently — ``None`` (the default) means
     exactly that default, just resolved once here.
+
+    *mode*/*terminal_app* (``win-native`` only, #3640) forward straight to
+    :mod:`coord.app_drive_daemon`'s ``--mode``/``--terminal-app`` (and
+    from there to :class:`coord.win_native_driver.WinNativeSession`) —
+    see that module's own docstring for what they select and what
+    ``None``/``""`` (the defaults, auto-detection) do. Passing either for
+    a non-``win-native`` *kind* raises :class:`AppDriveError` rather than
+    being silently ignored, since a caller naming them for a kind that
+    can't honor them is almost certainly a mistake, not an intentional
+    no-op.
     """
     if kind not in APP_DRIVE_KINDS:
         raise AppDriveError(f"unknown app-drive kind {kind!r} — expected one of {APP_DRIVE_KINDS}")
+    if kind != "win-native" and (mode is not None or terminal_app):
+        raise AppDriveError(
+            f"mode/terminal_app only apply to kind='win-native', not {kind!r}"
+        )
 
     session_id = uuid.uuid4().hex[:12]
     token = secrets.token_hex(16)
@@ -598,6 +613,10 @@ def open_session(
         argv += ["--height", str(height)]
     if spawn_control_dir is not None:
         argv += ["--control-dir", spawn_control_dir]
+    if mode is not None:
+        argv += ["--mode", mode]
+    if terminal_app:
+        argv += ["--terminal-app", terminal_app]
     detach_kwargs: dict = (
         {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
         else {"start_new_session": True}
