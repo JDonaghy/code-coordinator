@@ -26,6 +26,7 @@ import pytest
 
 from coord.key_spec import UnsupportedKey
 from coord.win_native_driver import (
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     NativeRunner,
     NativeSpec,
     NativeStep,
@@ -42,6 +43,7 @@ from coord.win_native_driver import (
     _is_remote_exe_token,
     _is_rooted_or_drive_qualified,
     _is_unc_path,
+    _JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     _leading_token,
     _looks_shell_composed,
     _normalize_posix_exe_token,
@@ -985,6 +987,7 @@ def _make_win32_calls(user32, kernel32) -> Win32Calls:
     calls._user32 = user32
     calls._kernel32 = kernel32
     calls._staged_session_dirs = {}  # #3617 — normally set by `__init__`
+    calls._job_handles = {}  # #3634 — normally set by `__init__`
     calls.staging_warning = None  # #3617 — normally set by `__init__`
     return calls
 
@@ -2152,20 +2155,53 @@ class TestWin32CallsLocalStaging:
         assert set(terminated) == {cmd_pid, vimcode_pid}
         assert not staged_dir.exists()
 
-    def test_kill_without_a_staged_dir_only_terminates_the_one_pid(self) -> None:
-        """The overwhelmingly common (non-staged) case must stay exactly
-        as cheap as it was before #3617's descendant-tree change — no
-        `_descendant_pids` walk at all when there's nothing staged to
-        clean up."""
+    def test_kill_without_a_staged_dir_still_terminates_the_whole_descendant_tree(
+        self,
+    ) -> None:
+        """#3634: a 2026-10-05 bugbash lane showed `kill` leaving every
+        grandchild (the real app under `cmd.exe`, #3542) running in the
+        OVERWHELMINGLY COMMON (non-staged) case — `kill` used to walk
+        `_descendant_pids` only when there was a staged directory to
+        clean up afterward, as if that walk were solely in service of
+        that cleanup rather than `kill`'s own general contract. It must
+        now always terminate the whole tree, staged or not."""
+        cmd_pid, vimcode_pid = 4242, 9999
+        terminated: list[int] = []
 
-        class _ExplodingSnapshot(_FakeKernel32NoSession):
-            def CreateToolhelp32Snapshot(self, *_a, **_kw):
-                raise AssertionError(
-                    "must not walk the process tree when no staged dir is tracked"
-                )
+        class _TrackingKernel32(_FakeKernel32ProcessTree):
+            def OpenProcess(self, _access, _inherit, pid):
+                return pid  # any non-zero/-1 "handle"
 
-        calls = _make_win32_calls(_FakeUser32(), _ExplodingSnapshot())
-        calls.kill(1)  # must not raise / must not walk the process tree
+            def TerminateProcess(self, handle, _exit_code) -> None:
+                terminated.append(handle)
+
+        tracking_kernel32 = _TrackingKernel32([
+            (cmd_pid, 1, b"cmd.exe"), (vimcode_pid, cmd_pid, b"vimcode.exe"),
+        ])
+        calls = _make_win32_calls(_FakeUser32(), tracking_kernel32)
+
+        calls.kill(cmd_pid)  # no staged dir tracked for cmd_pid at all
+
+        assert set(terminated) == {cmd_pid, vimcode_pid}
+
+    def test_kill_closes_the_job_object_handle_assigned_at_launch(self) -> None:
+        """#3634: when `launch`/`launch_in_terminal` successfully assigned
+        *pid* to a ``KILL_ON_JOB_CLOSE`` Job Object, `kill` must close
+        that SAME handle — the mechanism that lets Windows itself tear
+        down the whole tree even if this process can no longer walk it."""
+        closed: list[int] = []
+
+        class _TrackingKernel32(_FakeKernel32NoSession):
+            def CloseHandle(self, handle) -> None:
+                closed.append(handle)
+
+        calls = _make_win32_calls(_FakeUser32(), _TrackingKernel32())
+        calls._job_handles[4242] = 0xABCD
+
+        calls.kill(4242)
+
+        assert 0xABCD in closed
+        assert 4242 not in calls._job_handles
 
 
 class TestLaunchRealPlanStagingEndToEnd:
@@ -2448,6 +2484,182 @@ class TestWin32CallsLaunchDoesNotInheritStdHandles:
         assert captured.get("stderr") is subprocess.DEVNULL
 
 
+class _FakeKernel32JobObjects(_FakeKernel32NoSession):
+    """Adds working Job Object calls (#3634) on top of
+    `_FakeKernel32NoSession`'s baseline — `CreateJobObjectW`/
+    `SetInformationJobObject`/`OpenProcess`/`AssignProcessToJobObject` all
+    succeed by default, recording exactly what
+    `Win32Calls._assign_kill_on_close_job` requested, so a test can assert
+    #3634's `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is really what gets set —
+    not just "some flag" — and that the real pid is what gets assigned.
+    Each ``*_fails`` flag scripts exactly one step of the chain failing,
+    to exercise `_assign_kill_on_close_job`'s best-effort fallback at
+    every stage."""
+
+    def __init__(
+        self, *, create_fails: bool = False, set_info_fails: bool = False,
+        open_process_fails: bool = False, assign_fails: bool = False,
+    ) -> None:
+        super().__init__()
+        self._create_fails = create_fails
+        self._set_info_fails = set_info_fails
+        self._open_process_fails = open_process_fails
+        self._assign_fails = assign_fails
+        self.jobs_created: list[int] = []
+        self.limit_flags_set: list[int] = []
+        self.assigned: list[tuple[int, int]] = []
+        self.closed: list[int] = []
+        self._next_job = 100
+
+    def CreateJobObjectW(self, _attrs, _name):
+        if self._create_fails:
+            return 0
+        job = self._next_job
+        self._next_job += 1
+        self.jobs_created.append(job)
+        return job
+
+    def SetInformationJobObject(self, _job, _info_class, info_ptr, _size):
+        if self._set_info_fails:
+            return 0
+        info = ctypes.cast(
+            info_ptr, ctypes.POINTER(_JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+        ).contents
+        self.limit_flags_set.append(info.BasicLimitInformation.LimitFlags)
+        return 1
+
+    def OpenProcess(self, _access, _inherit, pid):
+        if self._open_process_fails:
+            return 0
+        return pid  # any non-zero "handle" tied to the real pid
+
+    def AssignProcessToJobObject(self, job, process_handle):
+        if self._assign_fails:
+            return 0
+        self.assigned.append((job, process_handle))
+        return 1
+
+    def CloseHandle(self, handle) -> None:
+        self.closed.append(handle)
+
+
+class TestAssignKillOnCloseJob:
+    """#3634: `Win32Calls.launch`/`launch_in_terminal` assign the freshly
+    launched pid to a ``KILL_ON_JOB_CLOSE`` Job Object, so Windows itself
+    tears down the whole process tree (including a ``cmd.exe /c``
+    grandchild, #3542) the instant the handle closes — even if this
+    process never runs its own ``kill()`` at all (a crash/force-kill has
+    no Windows ``PR_SET_PDEATHSIG`` equivalent to lean on instead, #3583).
+    """
+
+    @staticmethod
+    def _fake_popen(pid: int):
+        class _FakeProc:
+            def __init__(self) -> None:
+                self.pid = pid
+
+        return lambda *a, **kw: _FakeProc()
+
+    def test_launch_assigns_the_pid_to_a_kill_on_close_job(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(4242),
+        )
+        kernel32 = _FakeKernel32JobObjects()
+        calls = _make_win32_calls(_FakeUser32(), kernel32)
+
+        pid = calls.launch("vimcode.exe", r"C:\Users\me\repo")
+
+        assert pid == 4242
+        assert calls._job_handles[4242] == kernel32.jobs_created[0]
+        assert kernel32.limit_flags_set == [JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE]
+        assert kernel32.assigned == [(kernel32.jobs_created[0], 4242)]
+
+    def test_launch_in_terminal_also_assigns_a_job(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(5151),
+        )
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32JobObjects())
+
+        pid = calls.launch_in_terminal(
+            "vimcode.exe", r"C:\Users\me\repo", "windows-terminal",
+        )
+
+        assert pid == 5151
+        assert 5151 in calls._job_handles
+
+    def test_create_job_object_failing_is_best_effort(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(7),
+        )
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32JobObjects(create_fails=True))
+
+        pid = calls.launch("vimcode.exe", r"C:\Users\me\repo")
+
+        assert pid == 7
+        assert calls._job_handles == {}
+
+    def test_set_information_failing_closes_the_job_and_is_best_effort(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(8),
+        )
+        kernel32 = _FakeKernel32JobObjects(set_info_fails=True)
+        calls = _make_win32_calls(_FakeUser32(), kernel32)
+
+        pid = calls.launch("vimcode.exe", r"C:\Users\me\repo")
+
+        assert pid == 8
+        assert calls._job_handles == {}
+        assert kernel32.jobs_created[0] in kernel32.closed
+
+    def test_open_process_failing_closes_the_job_and_is_best_effort(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(9),
+        )
+        kernel32 = _FakeKernel32JobObjects(open_process_fails=True)
+        calls = _make_win32_calls(_FakeUser32(), kernel32)
+
+        pid = calls.launch("vimcode.exe", r"C:\Users\me\repo")
+
+        assert pid == 9
+        assert calls._job_handles == {}
+        assert kernel32.jobs_created[0] in kernel32.closed
+
+    def test_assign_process_failing_closes_the_job_and_is_best_effort(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(10),
+        )
+        kernel32 = _FakeKernel32JobObjects(assign_fails=True)
+        calls = _make_win32_calls(_FakeUser32(), kernel32)
+
+        pid = calls.launch("vimcode.exe", r"C:\Users\me\repo")
+
+        assert pid == 10
+        assert calls._job_handles == {}
+        assert kernel32.jobs_created[0] in kernel32.closed
+
+    def test_no_job_object_support_at_all_is_best_effort(self, monkeypatch) -> None:
+        """A scripted fake kernel32 with no Job Object methods at all
+        raises `AttributeError` — the exact shape of every OTHER fake in
+        this module — and must not break `launch` at all; this is what
+        keeps #3634 from regressing every pre-existing test using
+        `_FakeKernel32NoSession`/`_FakeKernel32ProcessTree` directly."""
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(11),
+        )
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+
+        pid = calls.launch("vimcode.exe", r"C:\Users\me\repo")
+
+        assert pid == 11
+        assert calls._job_handles == {}
+
+
 class TestLaunchPipeInheritanceRealSubprocess:
     """#3544 review follow-up: a real, unmocked reproduction of the exact
     EOF-blocking mechanism the issue describes, using real OS pipes and a
@@ -2631,6 +2843,57 @@ class TestRunNativeSpec:
             {"id": "session", "status": "unavailable", "message": "desktop is locked"}
         ]
         assert calls.launched == []
+
+
+class TestWinNativeSessionKillsOnOpenFailure:
+    """#3634: a 2026-10-05 bugbash lane left 4 simultaneous stray
+    ``vimcode.exe`` processes running because a failed/retried open never
+    killed the process it had already launched — `WinNativeSession.__init__`
+    raising (window discovery failing) left no session object for anyone to
+    ever call `close()`/`kill()` on at all."""
+
+    def test_window_never_appearing_kills_the_launched_pid_before_raising(self) -> None:
+        calls = FakeWinCalls(window_never_appears=True)
+
+        with pytest.raises(WinNativeRuntimeError):
+            WinNativeSession("vimcode.exe", "/repo", calls=calls)
+
+        assert calls.launched == [("vimcode.exe", "/repo")]
+        assert calls.killed == [calls._next_pid]
+
+    def test_move_window_failing_also_kills_the_launched_pid_before_raising(self) -> None:
+        calls = FakeWinCalls()
+
+        def _explode(hwnd, x, y, width, height):
+            raise WinNativeRuntimeError("MoveWindow failed")
+
+        calls.move_window = _explode  # type: ignore[method-assign]
+
+        with pytest.raises(WinNativeRuntimeError):
+            WinNativeSession("vimcode.exe", "/repo", calls=calls)
+
+        assert calls.killed == [calls._next_pid]
+
+    def test_kill_raising_during_open_failure_cleanup_does_not_mask_the_real_error(
+        self,
+    ) -> None:
+        """Teardown-on-failure must itself never raise past the original
+        error — the ORIGINAL `find_top_window` failure is what a caller
+        needs to see, not a secondary problem in best-effort cleanup."""
+        calls = FakeWinCalls(window_never_appears=True)
+
+        def _explode(pid):
+            raise OSError("kill itself failed")
+
+        calls.kill = _explode  # type: ignore[method-assign]
+
+        with pytest.raises(WinNativeRuntimeError, match="no window for pid"):
+            WinNativeSession("vimcode.exe", "/repo", calls=calls)
+
+    def test_successful_open_never_calls_kill(self) -> None:
+        calls = FakeWinCalls()
+        WinNativeSession("vimcode.exe", "/repo", calls=calls)
+        assert calls.killed == []
 
 
 class TestWinNativeSessionStagingWarning:
