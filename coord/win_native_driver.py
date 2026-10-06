@@ -78,11 +78,29 @@ own convention for entering a route's working directory first), both
 the resolved exe (plus that fixture dir, and/or a conventional ``.smoke``
 one, when present) onto the real local Windows filesystem — a fresh
 ``%LOCALAPPDATA%\\Temp\\coord-app-drive\\<session>\\`` directory — and
-launch from there instead, with ``cwd`` rewritten to match. Anything more
-complex (a second shell operator, an absolute/off-``cwd`` exe) is left
-alone, falling back to the ``pushd`` wrap above unchanged — this driver
-only ever rewrites the ONE leading executable token of a command it can
-parse with confidence, never an opaque shell pipeline.
+launch from there instead, with ``cwd`` rewritten to match. An exe token
+that is itself absolute is staged too when it's still a UNC path (#3633 —
+see below) and left alone only when it's already genuinely local.
+Anything more complex (a second shell operator) is left alone, falling
+back to the ``pushd`` wrap above unchanged — this driver only ever
+rewrites the ONE leading executable token of a command it can parse with
+confidence, never an opaque shell pipeline.
+
+**#3633: a route's own relative exe path can disagree with where the
+fleet actually built it.** A ``run:`` naming ``../target/<triple>/
+release/X.exe`` assumes cargo's default in-tree ``target/``, but this
+fleet builds with a shared, per-repo ``CARGO_TARGET_DIR``
+(``coord.cargo_cache``, #1402) — so that relative path resolves to
+nothing, and a worker substitutes the real, absolute build path instead.
+That absolute path is still only ever UNC from the Windows side
+(:func:`coord.win_native_bridge.translate_to_windows_path`'s own output
+shape), so launching straight off it pays the exact same ``\\wsl$`` 9P
+cost #3617 exists to avoid — and pre-#3633, :func:`_plan_staging` declined
+to stage ANY absolute exe token, so this case silently never staged at
+all. :func:`_plan_staging` now stages an absolute-but-still-UNC exe too
+(by basename alone, rewriting *command*'s own leading token to the staged
+copy), leaving alone only an exe token that's already genuinely local
+(nothing to gain from staging that).
 
 :meth:`Win32Calls.kill` deletes the staged session directory it created,
 once it has signalled that launch's own pid — the normal (``close``/
@@ -1127,10 +1145,21 @@ def _leading_token(command: str) -> tuple[str, str]:
 class _StagingPlan:
     """What :func:`_plan_staging` decided — ``staged=False`` means "leave
     *command*/*cwd* exactly as given", the caller's cue to fall back to
-    :func:`_popen_command_and_cwd`'s own UNC ``pushd`` wrap unchanged."""
+    :func:`_popen_command_and_cwd`'s own UNC ``pushd`` wrap unchanged.
+
+    ``command`` is ``""`` (the default) whenever the original *command*
+    text stays correct unchanged — the common (relative-exe) case, where
+    only ``cwd`` moves and every relative reference in *command* keeps
+    resolving against the new root exactly as it did against the old one
+    (see the function docstring). It is non-empty only for the #3633
+    absolute-UNC-exe case below, where the exe token itself must be
+    rewritten to point at its staged copy; :meth:`Win32Calls._stage_if_needed`
+    treats ``""`` as "use the *command* I was called with unchanged", never
+    as a literal empty command."""
 
     staged: bool
     cwd: str = ""
+    command: str = ""
     source_exe: str = ""
     dest_exe: str = ""
     #: ``(source_dir, dest_dir)`` pairs to copy wholesale when the source
@@ -1166,32 +1195,55 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
     (``staged=False``) for anything else containing a shell metacharacter
     (:data:`_SHELL_METACHARACTERS` — a second ``&&``, a pipe, a
     redirection, ...) this driver cannot safely rewrite with confidence,
-    an already-absolute exe token (nothing of *cwd*'s own tree to stage
-    for it), or an exe whose path relative to ``cwd``/``cd_dir`` climbs
-    ABOVE ``cwd`` itself without a ``cd_dir`` to cancel it back out
-    (staged at the same offset from ``session_root``, it would escape
-    this session's own directory into the shared parent every other
-    session's own root also lives under).
+    an already-absolute-AND-already-local exe token (nothing of *cwd*'s
+    own tree to stage for it — see the #3633 paragraph below for the
+    absolute-but-still-UNC case, which IS staged), or an exe whose path
+    relative to ``cwd``/``cd_dir`` climbs ABOVE ``cwd`` itself without a
+    ``cd_dir`` to cancel it back out (staged at the same offset from
+    ``session_root``, it would escape this session's own directory into
+    the shared parent every other session's own root also lives under).
 
-    *command* itself is returned unchanged in the resulting plan — ``cwd``
-    moves to ``session_root`` ALWAYS, even when a ``cd <fixture-dir> &&
-    ...`` prefix was recognized — because *command* still carries that
-    same ``cd <fixture-dir>`` prefix unchanged, and it is *command* (run
-    from the new ``cwd``) that does the navigating into the fixture dir,
-    exactly as it did from the old (UNC) ``cwd``. (#3617 review: an
-    earlier revision set ``cwd`` to ``session_root/<fixture-dir>``
-    *itself* — i.e. pre-navigated — while leaving command's own ``cd
-    <fixture-dir> &&`` in place too, so cmd.exe ran the ``cd`` a SECOND
-    time from a directory that already had no further ``<fixture-dir>``
-    child staged under it, failed with a nonzero errorlevel, and `&&`
-    short-circuited the whole launch before the exe ever ran.) The exe
-    itself is copied to the SAME path, relative to *session_root*, that
-    it already held relative to *cwd* (:func:`ntpath.normpath` applied to
-    ``cd_dir`` + the exe token), so every relative reference in *command*
-    — the ``cd`` itself, a ``../`` the exe token carries, a trailing
-    argument resolved against the post-``cd`` directory — keeps resolving
-    correctly against the new, local root exactly as it did against the
-    old, UNC one.
+    *command* itself is returned unchanged (``plan.command == ""``, the
+    caller's cue to keep using the *command* it already has) in the
+    common, relative-exe case — ``cwd`` moves to ``session_root`` ALWAYS,
+    even when a ``cd <fixture-dir> && ...`` prefix was recognized —
+    because *command* still carries that same ``cd <fixture-dir>`` prefix
+    unchanged, and it is *command* (run from the new ``cwd``) that does
+    the navigating into the fixture dir, exactly as it did from the old
+    (UNC) ``cwd``. (#3617 review: an earlier revision set ``cwd`` to
+    ``session_root/<fixture-dir>`` *itself* — i.e. pre-navigated — while
+    leaving command's own ``cd <fixture-dir> &&`` in place too, so cmd.exe
+    ran the ``cd`` a SECOND time from a directory that already had no
+    further ``<fixture-dir>`` child staged under it, failed with a
+    nonzero errorlevel, and `&&` short-circuited the whole launch before
+    the exe ever ran.) The exe itself is copied to the SAME path, relative
+    to *session_root*, that it already held relative to *cwd*
+    (:func:`ntpath.normpath` applied to ``cd_dir`` + the exe token), so
+    every relative reference in *command* — the ``cd`` itself, a ``../``
+    the exe token carries, a trailing argument resolved against the
+    post-``cd`` directory — keeps resolving correctly against the new,
+    local root exactly as it did against the old, UNC one.
+
+    **#3633: an absolute exe token that is ITSELF a UNC path is staged
+    too, not left alone.** A route's ``run:`` naming a relative exe path
+    (e.g. ``../target/<triple>/release/vimcode.exe``) assumes cargo's
+    default in-tree ``target/`` — but this fleet builds with a shared,
+    per-repo ``CARGO_TARGET_DIR`` (``coord.cargo_cache``, #1402), so that
+    relative path resolves to nothing and a worker substitutes the real,
+    absolute build path instead — one the Windows-side bridge still only
+    ever reaches as a UNC path (:func:`coord.win_native_bridge.
+    translate_to_windows_path`'s own output shape), so it pays the exact
+    same ``\\wsl$`` 9P cost staging exists to avoid in the first place,
+    just via an absolute token instead of one resolved against *cwd*. An
+    absolute token that is already genuinely LOCAL (e.g. a real
+    ``C:\\...`` exe) is still left alone — nothing to gain from staging
+    something already on local NTFS. Staged by basename alone, at the top
+    of *session_root* — an absolute token carries no meaningful position
+    relative to *cwd* to preserve the way a relative one does — and
+    *command*'s own leading token is rewritten (``plan.command``, always
+    non-empty here) to the staged, quoted destination path, with any
+    recognized ``cd <fixture-dir> && `` prefix and trailing arguments
+    carried through unchanged.
     """
     if not _is_unc_path(cwd):
         return _StagingPlan(staged=False)
@@ -1207,9 +1259,38 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
         return _StagingPlan(staged=False)
     if _looks_shell_composed(remainder):
         return _StagingPlan(staged=False)
-    exe_token, _rest = _leading_token(remainder)
-    if not exe_token or ntpath.isabs(exe_token):
+    exe_token, rest = _leading_token(remainder)
+    if not exe_token:
         return _StagingPlan(staged=False)
+
+    fixture_dirnames: list[str] = []
+    for name in (cd_dir, _STAGING_FIXTURE_DIRNAME):
+        if name and name not in fixture_dirnames:
+            fixture_dirnames.append(name)
+    fixture_copies = tuple(
+        (ntpath.join(cwd, name), ntpath.join(session_root, name))
+        for name in fixture_dirnames
+    )
+
+    if ntpath.isabs(exe_token):
+        if not _is_unc_path(exe_token):
+            # Already local — nothing of cwd's own tree to stage for it.
+            return _StagingPlan(staged=False)
+        # #3633: still a UNC path, just not resolved through `cwd` — stage
+        # it by basename alone and rewrite `command`'s own leading token
+        # to point at the staged copy.
+        dest_exe = ntpath.join(session_root, ntpath.basename(exe_token))
+        cd_prefix = f'cd "{cd_dir}" && ' if cd_dir else ""
+        rest_suffix = f" {rest}" if rest else ""
+        new_command = f'{cd_prefix}"{dest_exe}"{rest_suffix}'
+        return _StagingPlan(
+            staged=True,
+            cwd=session_root,
+            command=new_command,
+            source_exe=exe_token,
+            dest_exe=dest_exe,
+            fixture_copies=fixture_copies,
+        )
 
     exe_rel = ntpath.normpath(ntpath.join(cd_dir, exe_token)) if cd_dir else ntpath.normpath(exe_token)
     if exe_rel == ".." or exe_rel.startswith(f"..{ntpath.sep}"):
@@ -1231,15 +1312,6 @@ def _plan_staging(command: str, cwd: str, *, session_root: str) -> _StagingPlan:
     # launched from here; pre-navigating `cwd` itself on top of that is
     # the double-`cd` bug this comment's sibling above explains.
     new_cwd = session_root
-
-    fixture_dirnames: list[str] = []
-    for name in (cd_dir, _STAGING_FIXTURE_DIRNAME):
-        if name and name not in fixture_dirnames:
-            fixture_dirnames.append(name)
-    fixture_copies = tuple(
-        (ntpath.join(cwd, name), ntpath.join(session_root, name))
-        for name in fixture_dirnames
-    )
 
     return _StagingPlan(
         staged=True,
@@ -1609,7 +1681,14 @@ class Win32Calls:
         records why on :attr:`staging_warning` and logs it — #3617 review:
         a silent fallback here would otherwise surface only much later, as
         a confusing ``find_top_window`` timeout with no indication staging
-        was ever involved."""
+        was ever involved.
+
+        #3633: the returned *command* is ``plan.command`` when the plan set
+        one (the absolute-UNC-exe case, where the exe token itself had to
+        be rewritten to its staged copy) or the original *command* when it
+        didn't (``plan.command == ""`` — the common relative-exe case,
+        where *command* already resolves correctly against the staged
+        ``cwd`` unchanged)."""
         self.staging_warning = None
         try:
             root = self._staging_root()
@@ -1634,7 +1713,7 @@ class Win32Calls:
             self.staging_warning = str(exc)
             _log.warning("%s", exc)
             return command, cwd, None
-        return command, plan.cwd, session_root
+        return (plan.command or command), plan.cwd, session_root
 
     # -- session precheck (#3510) --
 
