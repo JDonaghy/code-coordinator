@@ -446,10 +446,12 @@ def main(argv: list[str] | None = None) -> int:
         "--launch's own .exe PE header. Ignored by every other kind.",
     )
     parser.add_argument(
-        "--terminal-app", default="",
+        "--terminal-app", default="", choices=("", "windows-terminal", "conhost"),
         help="win-native only, with --mode terminal (or auto-detected as one): 'windows-terminal' "
         "or 'conhost'. Defaults to 'windows-terminal' when auto-detection itself picks terminal "
-        "mode; required when --mode terminal is passed explicitly.",
+        "mode; required when --mode terminal is passed explicitly. Unset ('') lets WinNativeSession "
+        "pick/validate it (#3640 review nit: give --mode/--terminal-app the same argparse-level "
+        "validation shape instead of deferring this one to the session).",
     )
     ns = parser.parse_args(argv)
     return serve(
