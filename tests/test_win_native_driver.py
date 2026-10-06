@@ -1991,9 +1991,10 @@ class TestWin32CallsLocalStaging:
         class _FakeProc:
             pid = 7777
 
-        def fake_popen(command, *, shell, cwd=None, **kwargs):
+        def fake_popen(command, *, shell, cwd=None, env=None, **kwargs):
             captured["command"] = command
             captured["cwd"] = cwd
+            captured["env"] = env
             return _FakeProc()
 
         return fake_popen
@@ -2048,6 +2049,51 @@ class TestWin32CallsLocalStaging:
         # for `kill` to clean up later.
         assert calls._staged_session_dirs[7777] is not None
 
+    def test_launch_isolates_appdata_to_the_staged_smoke_dir(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """#3637: the previously-documented lane setup step (a project-
+        local ``.vimcode`` fixture next to the opened file) was silently
+        ignored — a real Windows app reads its own settings from
+        ``%APPDATA%\\<app>\\...`` unconditionally, never a cwd-relative
+        folder. `launch` must therefore redirect the LAUNCHED process's
+        own ``%APPDATA%`` to the staged ``.smoke`` directory, so a route
+        that stages ``.smoke/vimcode/settings.json`` lands exactly where
+        the real app looks — isolated per session, never the real, shared
+        profile."""
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+
+        def fake_plan_staging(command, cwd, *, session_root):
+            return _StagingPlan(
+                staged=True, cwd=session_root,
+                source_exe=f"{cwd}\\target\\vimcode.exe",
+                dest_exe=f"{session_root}\\target\\vimcode.exe",
+            )
+
+        monkeypatch.setattr("coord.win_native_driver._plan_staging", fake_plan_staging)
+        monkeypatch.setattr("coord.win_native_driver._execute_staging", lambda plan: None)
+        captured_popen: dict = {}
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen", self._fake_popen(captured_popen),
+        )
+
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+        calls.launch("cd .smoke && vimcode.exe sample.txt", self.UNC)
+
+        env = captured_popen["env"]
+        assert env is not None
+        # Isolated to a directory UNDER this session's own staged root —
+        # never the real, ambient %APPDATA% this process itself inherited.
+        assert env["APPDATA"] != os.environ.get("APPDATA")
+        assert env["APPDATA"].endswith(".smoke")
+        assert ".smoke" in env["APPDATA"]
+        assert os.path.isdir(env["APPDATA"])  # created even with nothing to copy
+        # Everything else about the environment is passed through
+        # unchanged — only %APPDATA% itself is redirected.
+        for key, value in os.environ.items():
+            if key != "APPDATA":
+                assert env.get(key) == value
+
     def test_launch_falls_back_to_pushd_when_localappdata_is_unset(
         self, monkeypatch,
     ) -> None:
@@ -2086,6 +2132,12 @@ class TestWin32CallsLocalStaging:
         # ... and the fallback is OBSERVABLE, never silent (#3617 review).
         assert calls.staging_warning is not None
         assert "LOCALAPPDATA" in calls.staging_warning
+        # #3637: with no staged session to isolate %APPDATA% into, the
+        # launched process keeps the ambient (unisolated) environment
+        # rather than this silently claiming isolation it never performed
+        # — `calls.staging_warning` (asserted above) is what makes this
+        # observable rather than a quiet, unflagged regression.
+        assert captured_popen["env"] is None
 
     def test_launch_in_terminal_also_stages(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
@@ -2347,15 +2399,38 @@ class TestStageIfNeededFallsBackRatherThanRaising:
         monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
         calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
 
-        command, cwd, staged_dir = calls._stage_if_needed(
+        command, cwd, staged_dir, appdata_dir = calls._stage_if_needed(
             "cd .smoke && HOME=$PWD/home ../target/release/vimcode.exe", self.UNC,
         )
 
         assert staged_dir is None
+        assert appdata_dir is None
         assert command == "cd .smoke && HOME=$PWD/home ../target/release/vimcode.exe"
         assert cwd == self.UNC
         assert calls.staging_warning is not None
         assert "exe not found" in calls.staging_warning
+
+    def test_unparseable_command_skips_staging_and_appdata_isolation(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """#3637: when `_plan_staging` itself declines (``plan.staged is
+        False`` — here, a command with more than one shell operator), there
+        is no staged session directory to point an isolated ``%APPDATA%``
+        at either. `calls.staging_warning` must say so explicitly rather
+        than silently claiming an isolation that never happened (#2096)."""
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+        calls = _make_win32_calls(_FakeUser32(), _FakeKernel32NoSession())
+
+        command, cwd, staged_dir, appdata_dir = calls._stage_if_needed(
+            "cd .smoke && a.exe && b.exe", self.UNC,
+        )
+
+        assert staged_dir is None
+        assert appdata_dir is None
+        assert command == "cd .smoke && a.exe && b.exe"
+        assert cwd == self.UNC
+        assert calls.staging_warning is not None
+        assert "#3637" in calls.staging_warning
 
 
 class TestStagingRootAndSweep:
