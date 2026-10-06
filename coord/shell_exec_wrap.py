@@ -42,42 +42,92 @@ import re
 #: the returned `Popen.pid` is never the real binary's own pid.
 EXEC_PREFIX = "exec "
 
-#: Matches one leading ``VAR=value`` assignment (plus its trailing
-#: whitespace) at the front of a shell simple command — the shape
-#: :func:`wrap_launch_command` must convert to an ``env VAR=value`` argument
-#: *before* the ``exec`` prefix, because POSIX's assignment-prefix parsing
-#: (where a shell applies ``VAR=value`` only to the one command it
-#: precedes) does not apply to ``exec``'s own argument list: ``exec
-#: FOO=bar ./binary`` tries — and fails — to execve a program literally
-#: named ``FOO=bar``. ``env`` has no such restriction (it's a real
-#: executable, not a builtin with special parsing), and `/usr/bin/env`
-#: itself ``execve()``s straight into its target rather than forking, so
-#: ``exec env FOO=bar ./binary`` still collapses to one process. Captured
-#: as two groups — name and raw (unquoted) value — so
-#: :func:`wrap_launch_command` can re-quote the value via
-#: :func:`_quote_env_value` (#3629) before handing it to ``env``.
-_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(\S*)[ \t]+")
+#: Matches one leading ``VAR=`` assignment *name* (and its ``=``) at the
+#: front of a shell simple command — the shape :func:`wrap_launch_command`
+#: must convert to an ``env VAR=value`` argument *before* the ``exec``
+#: prefix, because POSIX's assignment-prefix parsing (where a shell applies
+#: ``VAR=value`` only to the one command it precedes) does not apply to
+#: ``exec``'s own argument list: ``exec FOO=bar ./binary`` tries — and
+#: fails — to execve a program literally named ``FOO=bar``. ``env`` has no
+#: such restriction (it's a real executable, not a builtin with special
+#: parsing), and `/usr/bin/env` itself ``execve()``s straight into its
+#: target rather than forking, so ``exec env FOO=bar ./binary`` still
+#: collapses to one process.
+#:
+#: Only the *name* is captured here — the *value* is deliberately NOT
+#: matched by ``\S*`` (#3629 review round 1: that can't see quoting, so it
+#: mis-splits a value like ``"a b"`` mid-quote). It is instead consumed as
+#: a quote-aware shell word by :func:`_consume_shell_word`, the same way
+#: :func:`find_last_top_level_and` tracks quote state.
+_ENV_ASSIGNMENT_NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 
 
-def _quote_env_value(value: str) -> str:
-    """Double-quote *value* for use as a bare ``env VAR=value`` argument
-    (#3629: a leading ``VAR=value`` assignment loses POSIX's
-    assignment-prefix exemption from word-splitting the moment it becomes
-    a plain argument to ``env`` instead of a real assignment-prefix on the
-    shell's own command — so an unquoted ``$PWD`` that *expands* to a path
-    containing a space (every macOS worktree, under ``~/Library/Application
-    Support/...``) gets split into multiple ``env`` arguments, and ``env``
-    then tries — and fails — to execve the stray fragment after the space
-    as a command (``env: Support/coord/...: No such file or directory``).
+def _consume_shell_word(text: str) -> tuple[str, str, bool]:
+    """Consume one whitespace-delimited shell word from the front of
+    *text*, tracking quote/escape state the same way
+    :func:`find_last_top_level_and` does, so a literal space *inside* a
+    quoted or backslash-escaped span (``"a b"``, ``a\\ b``) is not mistaken
+    for the word's end.
 
-    Double-quoting the value restores the no-split guarantee: parameter
-    expansion (``$PWD``) still happens, but the result is kept as one shell
-    word regardless of what it expands to. ``\\``, ``"`` and `` ` `` are
-    backslash-escaped first so an embedded one of those can't prematurely
-    close the quote or trigger command substitution.
+    Returns ``(word, rest, had_separator)``: *word* is the raw text
+    consumed (quoting/escaping left completely intact — this function only
+    decides *where* the word ends, never what it means), *rest* is
+    whatever followed the separating whitespace (with that whitespace
+    stripped), and *had_separator* is ``False`` when the word ran all the
+    way to the end of *text* without ever finding an unquoted,
+    unescaped whitespace character — e.g. an unbalanced quote that
+    swallows the remainder of the command. Callers must check it: there is
+    no real assignment-prefix without a command after it to run.
     """
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`")
-    return f'"{escaped}"'
+    in_single = in_double = escaped = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if escaped:
+            escaped = False
+        elif ch == "\\" and not in_single:
+            escaped = True
+        elif ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double and ch in " \t":
+            break
+        i += 1
+    had_separator = i < n
+    word = text[:i]
+    rest = text[i:].lstrip(" \t") if had_separator else ""
+    return word, rest, had_separator
+
+
+def _render_env_value(raw: str) -> str:
+    """Render *raw* — the exact shell-syntax text of an env assignment's
+    value, as written by the caller and consumed verbatim by
+    :func:`_consume_shell_word` — for use as a bare ``env VAR=value``
+    argument (#3629).
+
+    If *raw* already contains any shell quoting or escaping of its own
+    (``"``, ``'`` or ``\\``), it is passed through completely unchanged:
+    the caller already wrote it as a valid, self-contained shell word
+    (``"$PWD/home"``, ``'$PWD/home'``, ``"a b"``, ``a\\ b``), and ordinary
+    shell quote/escape rules apply to it exactly as they did before this
+    function existed — re-quoting it would double-escape characters that
+    already mean something (review round 1: this was the actual bug —
+    ``HOME="$PWD/home"``, the workaround #3629's own evidence says every
+    affected host already deployed, became the broken
+    ``HOME="\\"$PWD/home\\""``).
+
+    Otherwise — a plain unquoted, unescaped value such as ``$PWD/home`` —
+    it is wrapped in double quotes so a ``$VAR`` reference that expands to
+    a value containing whitespace stays one ``env`` argument instead of
+    being word-split (the original #3629 bug). Parameter expansion
+    (``$PWD``) still happens inside double quotes, and since this branch's
+    *raw* text is guaranteed to contain no quote or backslash character,
+    nothing inside it needs escaping to make the added quotes safe.
+    """
+    if any(c in raw for c in "\"'\\"):
+        return raw
+    return f'"{raw}"'
 
 
 def find_last_top_level_and(command: str) -> int | None:
@@ -133,14 +183,17 @@ def wrap_launch_command(command: str) -> str:
 
     That final simple command may itself open with one or more *inline
     env-var assignments* (``HOME=$PWD/home ./binary``, also a real route's
-    shape) — :data:`_ENV_ASSIGNMENT_RE` peels those off and re-emits them as
-    ``env``'s own arguments instead of ``exec``'s, so the result is ``exec
-    env VAR=val ... binary args`` rather than the broken ``exec VAR=val ...
-    binary args`` (see :data:`_ENV_ASSIGNMENT_RE` for why). Each value is
-    re-emitted double-quoted (:func:`_quote_env_value`, #3629) so a ``$VAR``
-    reference that expands to a value containing whitespace — e.g. ``$PWD``
-    under a macOS ``~/Library/Application Support/...`` worktree — stays one
-    ``env`` argument instead of being word-split into several.
+    shape) — :data:`_ENV_ASSIGNMENT_NAME_RE` plus :func:`_consume_shell_word`
+    peel those off and re-emit them as ``env``'s own arguments instead of
+    ``exec``'s, so the result is ``exec env VAR=val ... binary args`` rather
+    than the broken ``exec VAR=val ... binary args`` (see
+    :data:`_ENV_ASSIGNMENT_NAME_RE` for why). Each value is then rendered via
+    :func:`_render_env_value` (#3629): an unquoted value is wrapped in double
+    quotes so a ``$VAR`` reference that expands to a value containing
+    whitespace — e.g. ``$PWD`` under a macOS ``~/Library/Application
+    Support/...`` worktree — stays one ``env`` argument instead of being
+    word-split into several; a value the caller already quoted or escaped is
+    passed through unchanged instead of being re-quoted on top.
 
     Idempotent at the whole-*command* level: a caller-supplied command that
     already starts with ``exec `` (leading/trailing whitespace tolerated)
@@ -157,12 +210,20 @@ def wrap_launch_command(command: str) -> str:
 
     assignments: list[str] = []
     while True:
-        m = _ENV_ASSIGNMENT_RE.match(tail)
+        m = _ENV_ASSIGNMENT_NAME_RE.match(tail)
         if not m:
             break
-        name, value = m.group(1), m.group(2)
-        assignments.append(f"{name}={_quote_env_value(value)}")
-        tail = tail[m.end():]
+        value, rest, had_separator = _consume_shell_word(tail[m.end():])
+        if not had_separator:
+            # Ran off the end of the command without ever finding an
+            # unquoted separator — e.g. an unbalanced quote swallowed the
+            # rest of the line. There's no command left to run after this
+            # "assignment", so it isn't one; leave `tail` untouched and
+            # stop peeling (matches the pre-#3629-fix behaviour for this
+            # already-pathological shape).
+            break
+        assignments.append(f"{m.group(1)}={_render_env_value(value)}")
+        tail = rest
 
     env_prefix = f"env {' '.join(assignments)} " if assignments else ""
     wrapped_tail = f"{EXEC_PREFIX}{env_prefix}{tail}"

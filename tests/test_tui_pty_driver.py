@@ -803,7 +803,7 @@ class TestSmokeRunnerWaitIdle:
         assert results[1] == {"id": "001 wait_idle", "status": "pass", "message": ""}
 
     def test_a_gate_that_never_goes_idle_can_fail(self) -> None:
-        # Continuous output every 20ms — never a clean 60ms idle window —
+        # A stream that is never silent — never a clean 60ms idle window —
         # must time out, not hang or pass. This is the "a gate must be able
         # to fail" check for wait_idle.
         #
@@ -1229,9 +1229,44 @@ class TestWrapLaunchCommand:
         wrapped = _wrap_launch_command("HOME=$PWD/home ./bin arg")
         assert wrapped == 'exec env HOME="$PWD/home" ./bin arg'
 
-    def test_env_assignment_value_already_containing_quotes_is_escaped(self) -> None:
+    # ── #3629 review round 1: an *already*-quoted/escaped value must be
+    # passed through unchanged, not re-quoted on top of its own quoting ──
+
+    def test_env_assignment_value_already_double_quoted_is_left_unchanged(self) -> None:
+        # The exact workaround #3629's own Evidence section says every
+        # tui-pty session on the affected host already had deployed
+        # (`HOME="$PWD/home"`) — re-quoting it would turn the value into
+        # the literal 4-char string `"$PWD/home"`, quote characters
+        # included.
+        wrapped = _wrap_launch_command('HOME="$PWD/home" ./bin arg')
+        assert wrapped == 'exec env HOME="$PWD/home" ./bin arg'
+
+    def test_env_assignment_value_already_single_quoted_is_left_unchanged(self) -> None:
+        wrapped = _wrap_launch_command("HOME='$PWD/home' ./bin arg")
+        assert wrapped == "exec env HOME='$PWD/home' ./bin arg"
+
+    def test_env_assignment_value_already_double_quoted_with_a_space_is_left_unchanged(
+        self,
+    ) -> None:
+        # A quoted value containing a literal space must be consumed as
+        # ONE shell word, not split mid-quote by a naive `\S*` scan.
+        wrapped = _wrap_launch_command('HOME="a b" ./bin arg')
+        assert wrapped == 'exec env HOME="a b" ./bin arg'
+
+    def test_env_assignment_value_with_a_backslash_escaped_space_is_left_unchanged(
+        self,
+    ) -> None:
+        wrapped = _wrap_launch_command(r"FOO=a\ b ./bin arg")
+        assert wrapped == r"exec env FOO=a\ b ./bin arg"
+
+    def test_env_assignment_value_with_an_unbalanced_quote_is_not_rewritten(self) -> None:
+        # Pathological input (already broken before #3629's fix too, in a
+        # different way): an unbalanced quote has no real "rest of the
+        # command" after it to run, so this isn't treated as an
+        # assignment-prefix at all — the tail is passed through verbatim
+        # rather than crashing or mangling it further.
         wrapped = _wrap_launch_command('FOO=a"b ./bin')
-        assert wrapped == 'exec env FOO="a\\"b" ./bin'
+        assert wrapped == 'exec FOO=a"b ./bin'
 
 
 @pytest.mark.skipif(os.name != "posix", reason="UnixPtyChild requires a POSIX platform")
