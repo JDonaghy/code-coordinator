@@ -650,6 +650,45 @@ class FakePtyChild:
         self._alive = False
 
 
+class FlickeringPtyChild(FakePtyChild):
+    """A child whose stream is *never* silent: every :meth:`read` returns
+    bytes immediately, forever — vimcode#1634's actual regression shape (a
+    terminal stuck repainting), rather than a finite script of bytes at
+    hand-picked offsets.
+
+    It exists because a scripted stream cannot prove the *failing* verdict
+    of the idle-related gates (``expect_silent``, ``wait_idle``) reliably.
+    Two independent reasons, both measured on this repo's own agent
+    machines:
+
+    * a scripted delay is measured from child construction, but the step's
+      window does not open until :meth:`SmokeRunner._do_launch`'s ~0.2s
+      startup grace plus thread-startup jitter has elapsed — anywhere in
+      0.25-0.35s — so a byte scheduled at 0.3s fell on either side of the
+      boundary at random;
+    * ``time.sleep()`` on a loaded machine overshoots badly (a nominal
+      ``sleep(0.02)`` measured ~0.13s here), so *any* sleep between
+      scripted bytes is longer than the 20-60ms idle thresholds these
+      gates grade — the "continuous" stream reads as idle.
+
+    Returning data with no sleep at all sidesteps both: it is also what a
+    real pty does when bytes are already buffered. The stream is then
+    non-silent at *every* instant, so the failing verdict is reachable on
+    every run, wherever the window happens to land — which is the whole
+    point of grading both directions (#2096).
+    """
+
+    def __init__(self, data: bytes = b"repaint") -> None:
+        super().__init__()
+        self._data = data
+
+    def read(self, timeout: float) -> bytes:
+        # No sleep — see the class docstring. `sleep(0)` only yields the
+        # GIL so the gate's own polling thread still gets scheduled.
+        time.sleep(0)
+        return self._data
+
+
 def _spec(steps: list[SmokeStep], cols: int = 80, rows: int = 24) -> SmokeSpec:
     return SmokeSpec(name="test", cols=cols, rows=rows, steps=tuple(steps))
 
@@ -767,8 +806,16 @@ class TestSmokeRunnerWaitIdle:
         # Continuous output every 20ms — never a clean 60ms idle window —
         # must time out, not hang or pass. This is the "a gate must be able
         # to fail" check for wait_idle.
-        script = [(i * 0.02, b"x") for i in range(1, 20)]
-        child = FakePtyChild(script=script)
+        #
+        # The output is unbounded (:class:`FlickeringPtyChild`) rather than a
+        # finite ~0.4s script: scripted delays run from child creation, but
+        # `_do_launch`'s ~0.2s startup grace plus thread-startup jitter can
+        # consume the whole script before this step even begins, leaving the
+        # stream genuinely idle and the failing verdict unreachable. Nor can
+        # the script simply be lengthened — `time.sleep()` overshoots to
+        # ~0.13s under load here, so any sleep between scripted bytes
+        # exceeds this gate's own 60ms idle threshold.
+        child = FlickeringPtyChild(data=b"x")
         runner = SmokeRunner(lambda cols, rows: child)
         results = runner.run(_spec([
             _step("launch", 0),
@@ -828,14 +875,18 @@ class TestSmokeRunnerExpectSilent:
         assert results[1] == {"id": "idle-check", "status": "pass", "message": ""}
 
     def test_fails_when_the_stream_flickers_during_the_window(self) -> None:
-        # A byte lands mid-window — the observation must be taken AFTER the
+        # Bytes land mid-window — the observation must be taken AFTER the
         # full window elapses and re-read the counter, not merely "no
-        # exception was raised while sleeping" (#2096). The scripted delay
-        # is relative to child creation, and `_do_launch` itself blocks for
-        # a ~0.2s startup grace period before the `expect_silent` step ever
-        # starts — schedule the flicker comfortably after that so it lands
-        # inside this step's own window, not the grace period.
-        child = FakePtyChild(script=[(0.3, b"repaint")])
+        # exception was raised while sleeping" (#2096).
+        #
+        # The flicker is CONTINUOUS (:class:`FlickeringPtyChild`) rather
+        # than one byte at a scheduled offset: a scripted delay is measured
+        # from child creation, but the window's real start is `_do_launch`'s
+        # ~0.2s startup grace *plus* thread-startup jitter, so a lone byte
+        # at 0.3s straddled the boundary and this assertion was flaky. A
+        # stream that never goes quiet is observed wherever the window
+        # lands, so the failing verdict is reachable every run.
+        child = FlickeringPtyChild()
         runner = SmokeRunner(lambda cols, rows: child)
         results = runner.run(_spec([
             _step("launch", 0),
