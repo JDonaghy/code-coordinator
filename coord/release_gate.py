@@ -90,6 +90,35 @@ class LaneResult:
 
 
 @dataclass(frozen=True)
+class NightlyArtifactResult:
+    """One #3652 real-platform nightly-smoke observation for one SHIPPED
+    artifact at one commit — the nightly-runner's analogue of
+    :class:`LaneResult`.
+
+    ``artifact`` names the shipped build the nightly runner exercised
+    (e.g. ``"macos-dmg"``, ``"windows-installer"``,
+    ``"linux-gtk-appimage"``) — the per-repo set a release must cover is
+    declared in ``coordinator.yml`` as
+    ``coord.config.ReleaseGateRepoConfig.nightly_artifacts``. This is
+    deliberately the SAME shape (and the SAME #2096 staleness/missing-data
+    discipline) as :class:`LaneResult` — a real-platform run and a
+    synthetic Tier-2 lane run answer the identical question ("did this
+    pass AT the release SHA, on real hardware/a real build"), so they are
+    graded by the identical pattern (:func:`_nightly_artifact_step` mirrors
+    :func:`_lane_step` exactly) rather than two gates quietly drifting
+    apart (#2096 "one question, one answer").
+    """
+
+    artifact: str
+    sha: str
+    passed: bool
+    detail: str = ""
+    #: Epoch seconds the observation was taken — same role as
+    #: :attr:`LaneResult.checked_at`.
+    checked_at: float | None = None
+
+
+@dataclass(frozen=True)
 class BugbashRunRecord:
     """One ``coord bugbash`` run (:class:`coord.bugbash.BugbashReport`),
     reduced to what the release gate needs to grade it.
@@ -363,6 +392,58 @@ def _lane_step(
     )
 
 
+def _nightly_artifact_step(
+    artifact: str,
+    release_sha: str,
+    nightly_results: Sequence[NightlyArtifactResult],
+) -> GateStepResult:
+    """Grade one required nightly artifact (#3652) — deliberately the exact
+    same logic as :func:`_lane_step`: no result at the release SHA is a
+    FAILING step (never a default pass, #2096), a result at some OTHER SHA
+    is "too stale to certify this release" rather than silently accepted,
+    and among several results at the release SHA the most recently checked
+    one wins."""
+    at_release_sha = [
+        r for r in nightly_results if r.artifact == artifact and r.sha == release_sha
+    ]
+    if not at_release_sha:
+        any_result = [r for r in nightly_results if r.artifact == artifact]
+        if any_result:
+            stale = max(any_result, key=lambda r: r.checked_at or 0.0)
+            return GateStepResult(
+                name=f"nightly:{artifact}",
+                passed=False,
+                detail=(
+                    f"most recent nightly real-platform smoke result for "
+                    f"artifact {artifact!r} is at {stale.sha!r}, not the "
+                    f"release SHA {release_sha!r} — too stale to certify "
+                    "this release"
+                ),
+            )
+        return GateStepResult(
+            name=f"nightly:{artifact}",
+            passed=False,
+            detail=(
+                f"no nightly real-platform smoke result recorded for "
+                f"artifact {artifact!r}"
+            ),
+        )
+
+    chosen = max(at_release_sha, key=lambda r: r.checked_at or 0.0)
+    if chosen.passed:
+        return GateStepResult(
+            name=f"nightly:{artifact}", passed=True, detail=chosen.detail or "passed",
+        )
+    return GateStepResult(
+        name=f"nightly:{artifact}",
+        passed=False,
+        detail=chosen.detail or (
+            f"nightly real-platform smoke failed for artifact {artifact!r} "
+            f"at {release_sha!r}"
+        ),
+    )
+
+
 def _bugbash_step(
     release_sha: str,
     bugbash_runs: Sequence[BugbashRunRecord],
@@ -411,22 +492,35 @@ def evaluate_release_gate(
     lane_results: Sequence[LaneResult] = (),
     bugbash_required: bool = False,
     bugbash_runs: Sequence[BugbashRunRecord] = (),
+    required_nightly_artifacts: Sequence[str] = (),
+    nightly_results: Sequence[NightlyArtifactResult] = (),
     sha_is_at_or_after: ShaComparator = _default_sha_at_or_after,
 ) -> ReleaseGateVerdict:
     """Evaluate the #3488 release gate for *repo* at *release_sha*.
 
     One :class:`GateStepResult` per required lane (named ``lane:<lane>``),
-    plus one more named ``"bugbash"`` when *bugbash_required*. Every step is
-    graded from an OBSERVATION passed in — this function never assumes a
-    step passed because no data was given for it (see the module docstring
-    for the #2096 rationale behind each failure mode).
+    plus one more named ``"bugbash"`` when *bugbash_required*, plus one more
+    per *required_nightly_artifacts* entry (named ``nightly:<artifact>``,
+    #3652 — the real-platform nightly smoke runner's own per-repo gate:
+    "the latest nightly for this SHA is green across all shipped
+    artifacts"). Every step is graded from an OBSERVATION passed in — this
+    function never assumes a step passed because no data was given for it
+    (see the module docstring for the #2096 rationale behind each failure
+    mode; :func:`_nightly_artifact_step` applies the identical discipline
+    :func:`_lane_step` already does, deliberately, so the two gates can
+    never silently disagree about what "green" means — #2096 "one
+    question, one answer").
 
     Callers: :func:`coord.commands.release._release_gate_evaluate` wires
-    this to real Tier-2 lane fetchers and a real bugbash journal/git
-    ancestry check; ``tests/test_release_gate.py`` calls it directly against
-    fixtures.
+    this to real Tier-2 lane fetchers, a real bugbash journal/git ancestry
+    check, and (#3652) the nightly smoke runner's own results store;
+    ``tests/test_release_gate.py`` calls it directly against fixtures.
     """
     steps = [_lane_step(lane, release_sha, lane_results) for lane in required_lanes]
     if bugbash_required:
         steps.append(_bugbash_step(release_sha, bugbash_runs, sha_is_at_or_after))
+    steps.extend(
+        _nightly_artifact_step(artifact, release_sha, nightly_results)
+        for artifact in required_nightly_artifacts
+    )
     return ReleaseGateVerdict(repo=repo, release_sha=release_sha, steps=tuple(steps))
