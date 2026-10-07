@@ -253,6 +253,44 @@ steps:
                 "steps:\n  - type: expect_panel_switch\n    x: 0\n    y: 0\n    name: Explorer\n"
             )
 
+    # -- #3650: type_text / expect_file / expect_frontmost / region / tofu --
+
+    def test_type_text_expect_file_frontmost_region_tofu_parse(self) -> None:
+        spec = parse_native_spec(
+            "steps:\n"
+            "  - type: type_text\n"
+            "    text: hello\n"
+            "  - type: expect_file\n"
+            "    path: C:/temp/probe.txt\n"
+            "    contains: hi\n"
+            "  - type: expect_frontmost\n"
+            "  - type: expect_region_not_uniform\n"
+            "    x: 1\n    y: 2\n    width: 3\n    height: 4\n"
+            "    tolerance: 10\n"
+            "  - type: expect_no_tofu\n"
+            "    x: 5\n    y: 6\n    width: 7\n    height: 8\n"
+        )
+        kinds = [s.kind for s in spec.steps]
+        assert kinds == [
+            "type_text", "expect_file", "expect_frontmost",
+            "expect_region_not_uniform", "expect_no_tofu",
+        ]
+        type_text, expect_file, _frontmost, region, tofu = spec.steps
+        assert type_text.text == "hello"
+        assert expect_file.contains == "hi"
+        assert (region.x, region.y, region.width, region.height, region.tolerance) == (1, 2, 3, 4, 10)
+        assert (tofu.x, tofu.y, tofu.width, tofu.height) == (5, 6, 7, 8)
+
+    def test_type_text_requires_text(self) -> None:
+        with pytest.raises(WinNativeSpecError, match="text"):
+            parse_native_spec("steps:\n  - type: type_text\n")
+
+    def test_expect_region_not_uniform_requires_geometry(self) -> None:
+        with pytest.raises(WinNativeSpecError, match="width"):
+            parse_native_spec(
+                "steps:\n  - type: expect_region_not_uniform\n    x: 0\n    y: 0\n"
+            )
+
 
 # ── _win_key_encodings / _encode_win_chord (#3639) ──────────────────────────
 
@@ -406,6 +444,7 @@ class FakeWinCalls:
         closes_after_n_polls: int | None = None,
         session_ok: bool = True,
         session_reason: str = "",
+        frontmost_script: list[tuple[bool, int]] | None = None,
     ) -> None:
         self.launch_fails = launch_fails
         self.window_never_appears = window_never_appears
@@ -423,9 +462,11 @@ class FakeWinCalls:
         self.moved: list[tuple[int, int, int, int, int]] = []
         self.clicks: list[tuple[int, int, int, str]] = []
         self.keys: list[tuple[int, str]] = []
+        self.typed: list[tuple[int, str]] = []
         self.killed: list[int] = []
         self._next_pid = 1000
         self._hwnd = 5555
+        self._frontmost_script = list(frontmost_script or [(True, 5555)])
 
     def session_available(self) -> tuple[bool, str]:
         return self._session_ok, self._session_reason
@@ -467,6 +508,14 @@ class FakeWinCalls:
 
     def send_key(self, hwnd: int, key: str) -> None:
         self.keys.append((hwnd, key))
+
+    def type_text(self, hwnd: int, text: str) -> None:
+        self.typed.append((hwnd, text))
+
+    def is_frontmost(self, hwnd: int) -> tuple[bool, int]:
+        if len(self._frontmost_script) > 1:
+            return self._frontmost_script.pop(0)
+        return self._frontmost_script[0]
 
     def uia_elements(self, hwnd: int) -> list[dict]:
         if len(self._uia_script) > 1:
@@ -615,6 +664,141 @@ class TestNativeRunnerActions:
         capture_entry = results[1]
         assert capture_entry["status"] == "pass"
         assert base64.b64decode(capture_entry["capture_b64"]) == b"one-frame"
+
+    def test_type_text_step_forwards_to_calls(self) -> None:
+        # #3650
+        calls = FakeWinCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0), _step("type_text", 1, text="hello world"),
+        ]))
+        assert results[1]["status"] == "pass"
+        assert calls.typed == [(calls._hwnd, "hello world")]
+
+
+class TestNativeRunnerExpectFile:
+    """#3650 — delegates to :func:`coord.native_fs_wait.wait_for_file`; see
+    ``tests/test_native_fs_wait.py`` for that function's own coverage."""
+
+    def test_passes_once_file_exists(self, tmp_path) -> None:
+        target = tmp_path / "probe.txt"
+        target.write_text("ready")
+        calls = FakeWinCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=1000),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_when_file_never_appears(self, tmp_path) -> None:
+        target = tmp_path / "never.txt"
+        calls = FakeWinCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=100),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "did not appear" in results[1]["message"]
+
+
+class TestNativeRunnerExpectFrontmost:
+    def test_passes_when_frontmost(self) -> None:
+        calls = FakeWinCalls(frontmost_script=[(True, 5555)])
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_frontmost", 1)]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_when_another_hwnd_is_foreground(self) -> None:
+        calls = FakeWinCalls(frontmost_script=[(False, 9999)])
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_frontmost", 1)]))
+        assert results[1]["status"] == "fail"
+        assert "9999" in results[1]["message"]
+
+
+def _bmp_bytes(rows: list[list[tuple[int, int, int]]]) -> bytes:
+    """A minimal 24-bit, bottom-up, uncompressed BMP — the exact shape
+    :func:`coord.win_native_driver._bitmap_to_bmp_bytes` writes. See
+    ``tests/test_native_pixels.py``'s own encoder for the full explanation;
+    duplicated narrowly here so this test module doesn't reach into another
+    module's test-only helpers."""
+    import struct
+
+    height = len(rows)
+    width = len(rows[0])
+    row_bytes = ((width * 3 + 3) // 4) * 4
+    body = bytearray()
+    for row in reversed(rows):
+        line = bytearray(row_bytes)
+        for i, (r, g, b) in enumerate(row):
+            line[i * 3:i * 3 + 3] = bytes((b, g, r))
+        body += line
+    info_header = struct.pack(
+        "<IiiHHIIiiII", 40, width, height, 1, 24, 0, len(body), 0, 0, 0, 0,
+    )
+    pixel_offset = 14 + len(info_header)
+    file_header = struct.pack("<2sIHHI", b"BM", pixel_offset + len(body), 0, 0, pixel_offset)
+    return file_header + info_header + bytes(body)
+
+
+class TestNativeRunnerExpectRegionNotUniform:
+    """#3650 — decodes via :func:`coord.native_pixels.decode_bmp`, judged by
+    the one shared :func:`coord.native_pixels.region_not_uniform`."""
+
+    def test_passes_for_a_varied_region(self) -> None:
+        rows = [[(255, 0, 0), (0, 255, 0)], [(0, 0, 255), (10, 10, 10)]]
+        calls = FakeWinCalls(capture_script=[_bmp_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_region_not_uniform", 1, x=0, y=0, width=2, height=2),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_for_a_uniform_region_the_vimcode_1676_black_bar_shape(self) -> None:
+        rows = [[(0, 0, 0)] * 4 for _ in range(4)]
+        calls = FakeWinCalls(capture_script=[_bmp_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_region_not_uniform", 1, x=0, y=0, width=4, height=4),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "uniform" in results[1]["message"]
+
+
+class TestNativeRunnerExpectNoTofu:
+    def test_passes_for_textured_content(self) -> None:
+        rows = [
+            [(255, 0, 0), (0, 255, 0), (0, 0, 255), (10, 10, 10)],
+            [(255, 255, 255), (128, 128, 128), (64, 64, 64), (0, 0, 0)],
+            [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12)],
+        ]
+        calls = FakeWinCalls(capture_script=[_bmp_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_no_tofu", 1, x=0, y=0, width=4, height=3),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_for_a_classic_tofu_box(self) -> None:
+        size = 8
+        rows = [
+            [(0, 0, 0) if (px in (0, size - 1) or py in (0, size - 1)) else (255, 255, 255)
+             for px in range(size)]
+            for py in range(size)
+        ]
+        calls = FakeWinCalls(capture_script=[_bmp_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_no_tofu", 1, x=0, y=0, width=size, height=size),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "tofu" in results[1]["message"]
 
 
 class TestNativeRunnerExpectMenu:
@@ -1094,6 +1278,62 @@ class TestSendKeyRealSequence:
         calls = _make_win32_calls(user32, kernel32=None)
         with pytest.raises(WinNativeRuntimeError, match="SendInput"):
             calls.send_key(1, "a")
+
+
+class TestTypeTextRealSequence:
+    """#3650 — :meth:`Win32Calls.type_text` against the same fake
+    ``user32`` as :class:`TestSendKeyRealSequence`."""
+
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_UNICODE = 0x0004
+
+    def test_posts_one_down_up_pair_per_character(self) -> None:
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        calls.type_text(1, "ab")
+        assert len(user32.calls) == 2
+        a_code, b_code = ord("a"), ord("b")
+        assert user32.calls[0] == [
+            (0, a_code, self.KEYEVENTF_UNICODE),
+            (0, a_code, self.KEYEVENTF_UNICODE | self.KEYEVENTF_KEYUP),
+        ]
+        assert user32.calls[1] == [
+            (0, b_code, self.KEYEVENTF_UNICODE),
+            (0, b_code, self.KEYEVENTF_UNICODE | self.KEYEVENTF_KEYUP),
+        ]
+
+    def test_empty_text_sends_nothing(self) -> None:
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        calls.type_text(1, "")
+        assert user32.calls == []
+
+    def test_short_count_raises_rather_than_a_silent_ok(self) -> None:
+        user32 = _FakeUser32SendInput(sent_count=0)
+        calls = _make_win32_calls(user32, kernel32=None)
+        with pytest.raises(WinNativeRuntimeError, match="SendInput"):
+            calls.type_text(1, "a")
+
+
+class _FakeUser32Foreground:
+    def __init__(self, foreground_hwnd: int) -> None:
+        self._foreground_hwnd = foreground_hwnd
+
+    def GetForegroundWindow(self) -> int:
+        return self._foreground_hwnd
+
+
+class TestIsFrontmost:
+    """#3650 — :meth:`Win32Calls.is_frontmost`, the vimcode#1824 "app never
+    becomes frontmost" class of bug."""
+
+    def test_true_when_hwnd_is_the_foreground_window(self) -> None:
+        calls = _make_win32_calls(_FakeUser32Foreground(5555), kernel32=None)
+        assert calls.is_frontmost(5555) == (True, 5555)
+
+    def test_false_when_another_hwnd_is_foreground(self) -> None:
+        calls = _make_win32_calls(_FakeUser32Foreground(9999), kernel32=None)
+        assert calls.is_frontmost(5555) == (False, 9999)
 
 
 class _FakeKernel32ProcessTree:

@@ -154,6 +154,44 @@ steps:
                 "steps:\n  - type: expect_hit\n    x: 0\n    y: 0\n    ht: HTCLOSE\n"
             )
 
+    def test_type_text_expect_file_frontmost_dock_region_tofu_parse(self) -> None:
+        # #3650
+        spec = parse_native_spec(
+            "steps:\n"
+            "  - type: type_text\n"
+            "    text: hello\n"
+            "  - type: expect_file\n"
+            "    path: /tmp/probe.txt\n"
+            "    contains: hi\n"
+            "  - type: expect_frontmost\n"
+            "  - type: expect_dock_icon\n"
+            "  - type: expect_region_not_uniform\n"
+            "    x: 1\n    y: 2\n    width: 3\n    height: 4\n"
+            "    tolerance: 10\n"
+            "  - type: expect_no_tofu\n"
+            "    x: 5\n    y: 6\n    width: 7\n    height: 8\n"
+        )
+        kinds = [s.kind for s in spec.steps]
+        assert kinds == [
+            "type_text", "expect_file", "expect_frontmost", "expect_dock_icon",
+            "expect_region_not_uniform", "expect_no_tofu",
+        ]
+        type_text, expect_file, _frontmost, _dock, region, tofu = spec.steps
+        assert type_text.text == "hello"
+        assert (expect_file.path, expect_file.contains) == ("/tmp/probe.txt", "hi")
+        assert (region.x, region.y, region.width, region.height, region.tolerance) == (1, 2, 3, 4, 10)
+        assert (tofu.x, tofu.y, tofu.width, tofu.height) == (5, 6, 7, 8)
+
+    def test_type_text_requires_text(self) -> None:
+        with pytest.raises(MacNativeSpecError, match="text"):
+            parse_native_spec("steps:\n  - type: type_text\n")
+
+    def test_expect_region_not_uniform_requires_geometry(self) -> None:
+        with pytest.raises(MacNativeSpecError, match="width"):
+            parse_native_spec(
+                "steps:\n  - type: expect_region_not_uniform\n    x: 0\n    y: 0\n"
+            )
+
 
 # ── _mac_key_encodings / _encode_mac_chord (#3639) ──────────────────────────
 
@@ -319,6 +357,8 @@ class FakeMacCalls:
         ax_trust_reason: str = "",
         frontmost: bool = True,
         frontmost_pid: int | None = None,
+        dock_icon_ok: bool = True,
+        dock_icon_reason: str = "",
     ) -> None:
         self.launch_fails = launch_fails
         self.window_never_appears = window_never_appears
@@ -338,11 +378,14 @@ class FakeMacCalls:
         # the real incident's iTerm2 pid) rather than just a bare bool.
         self._frontmost = frontmost
         self._frontmost_pid = frontmost_pid if frontmost_pid is not None else 424242
+        self._dock_icon_ok = dock_icon_ok
+        self._dock_icon_reason = dock_icon_reason
 
         self.launched: list[tuple[str, str]] = []
         self.moved: list[tuple[int, int, int, int, int, int]] = []
         self.clicks: list[tuple[int, int, int, int, str]] = []
         self.keys: list[tuple[int, str]] = []
+        self.typed: list[tuple[int, str]] = []
         self.killed: list[int] = []
         self.frontmost_checks: list[int] = []
         self._next_pid = 1000
@@ -388,6 +431,12 @@ class FakeMacCalls:
 
     def send_key(self, pid: int, key: str) -> None:
         self.keys.append((pid, key))
+
+    def type_text(self, pid: int, text: str) -> None:
+        self.typed.append((pid, text))
+
+    def has_dock_icon(self, pid: int) -> tuple[bool, str]:
+        return self._dock_icon_ok, self._dock_icon_reason
 
     def ax_elements(self, pid: int) -> list[dict]:
         if len(self._ax_script) > 1:
@@ -558,6 +607,169 @@ class TestNativeRunnerActions:
         capture_entry = results[1]
         assert capture_entry["status"] == "pass"
         assert base64.b64decode(capture_entry["capture_b64"]) == b"one-frame"
+
+    def test_type_text_step_forwards_to_calls(self) -> None:
+        # #3650
+        calls = FakeMacCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0), _step("type_text", 1, text="hello world"),
+        ]))
+        assert results[1]["status"] == "pass"
+        assert calls.typed == [(calls._next_pid, "hello world")]
+
+    def test_type_text_refuses_when_not_frontmost(self) -> None:
+        # #3650/#3566: same refusal path every other action step already
+        # has — never a blind retry into whatever window is in front.
+        calls = FakeMacCalls(frontmost=False, frontmost_pid=9999)
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0), _step("type_text", 1, text="hi"),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "not frontmost" in results[1]["message"]
+        assert calls.typed == []
+
+
+class TestNativeRunnerExpectFile:
+    """#3650 — delegates to :func:`coord.native_fs_wait.wait_for_file`; see
+    ``tests/test_native_fs_wait.py`` for that function's own coverage."""
+
+    def test_passes_once_file_exists(self, tmp_path) -> None:
+        target = tmp_path / "probe.txt"
+        target.write_text("ready")
+        calls = FakeMacCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=1000),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_when_file_never_appears(self, tmp_path) -> None:
+        target = tmp_path / "never.txt"
+        calls = FakeMacCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=100),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "did not appear" in results[1]["message"]
+
+
+class TestNativeRunnerExpectFrontmost:
+    def test_passes_when_frontmost(self) -> None:
+        calls = FakeMacCalls(frontmost=True)
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_frontmost", 1)]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_when_another_pid_is_frontmost(self) -> None:
+        calls = FakeMacCalls(frontmost=False, frontmost_pid=424242)
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_frontmost", 1)]))
+        assert results[1]["status"] == "fail"
+        assert "424242" in results[1]["message"]
+
+
+class TestNativeRunnerExpectDockIcon:
+    def test_passes_when_dock_icon_present(self) -> None:
+        calls = FakeMacCalls(dock_icon_ok=True)
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_dock_icon", 1)]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_when_no_dock_icon_the_vimcode_1824_shape(self) -> None:
+        calls = FakeMacCalls(dock_icon_ok=False, dock_icon_reason="ApplicationType is Background")
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_dock_icon", 1)]))
+        assert results[1]["status"] == "fail"
+        assert "Background" in results[1]["message"]
+
+
+def _png_bytes(rows: list[list[tuple[int, int, int]]]) -> bytes:
+    """A minimal 8-bit RGB PNG — see ``tests/test_native_pixels.py``'s own
+    encoder for the full explanation; duplicated narrowly here so this test
+    module doesn't reach into another module's test-only helpers."""
+    import struct
+    import zlib
+
+    height = len(rows)
+    width = len(rows[0])
+    raw = bytearray()
+    for row in rows:
+        raw.append(0)
+        for (r, g, b) in row:
+            raw += bytes((r, g, b))
+    compressed = zlib.compress(bytes(raw))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
+
+
+class TestNativeRunnerExpectRegionNotUniform:
+    """#3650 — decodes via :func:`coord.native_pixels.decode_png`, judged by
+    the one shared :func:`coord.native_pixels.region_not_uniform`."""
+
+    def test_passes_for_a_varied_region(self) -> None:
+        rows = [[(255, 0, 0), (0, 255, 0)], [(0, 0, 255), (10, 10, 10)]]
+        calls = FakeMacCalls(capture_script=[_png_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_region_not_uniform", 1, x=0, y=0, width=2, height=2),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_for_a_uniform_region_the_vimcode_1676_black_bar_shape(self) -> None:
+        rows = [[(0, 0, 0)] * 4 for _ in range(4)]
+        calls = FakeMacCalls(capture_script=[_png_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_region_not_uniform", 1, x=0, y=0, width=4, height=4),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "uniform" in results[1]["message"]
+
+
+class TestNativeRunnerExpectNoTofu:
+    def test_passes_for_textured_content(self) -> None:
+        rows = [
+            [(255, 0, 0), (0, 255, 0), (0, 0, 255), (10, 10, 10)],
+            [(255, 255, 255), (128, 128, 128), (64, 64, 64), (0, 0, 0)],
+            [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12)],
+        ]
+        calls = FakeMacCalls(capture_script=[_png_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_no_tofu", 1, x=0, y=0, width=4, height=3),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_for_a_classic_tofu_box(self) -> None:
+        size = 8
+        rows = [
+            [(0, 0, 0) if (px in (0, size - 1) or py in (0, size - 1)) else (255, 255, 255)
+             for px in range(size)]
+            for py in range(size)
+        ]
+        calls = FakeMacCalls(capture_script=[_png_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_no_tofu", 1, x=0, y=0, width=size, height=size),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "tofu" in results[1]["message"]
 
 
 class TestNativeRunnerFrontmostRefusal:
@@ -977,6 +1189,73 @@ class TestSendKeyRealSequence:
         calls.send_key(1, "backspace")
         backspace_vkey = quartz.posted[0]["vkey"]
         assert delete_vkey != backspace_vkey
+
+
+class TestMacOSCallsTypeText:
+    """#3650 — one Unicode-string keyboard down/up pair per character,
+    posted via ``CGEventPostToPid`` (same pid-addressed path as
+    :meth:`MacOSCalls.send_key`/:meth:`send_click`, #3566)."""
+
+    def test_posts_one_down_up_pair_per_character(self) -> None:
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.type_text(1, "ab")
+        assert len(quartz.posted) == 4
+        assert [e["unicode"] for e in quartz.posted] == ["a", "a", "b", "b"]
+        assert [e["down"] for e in quartz.posted] == [True, False, True, False]
+
+    def test_handles_unicode_characters(self) -> None:
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.type_text(1, "日")
+        assert [e["unicode"] for e in quartz.posted] == ["日", "日"]
+
+    def test_empty_text_posts_nothing(self) -> None:
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        calls.type_text(1, "")
+        assert quartz.posted == []
+
+
+class TestMacOSCallsHasDockIcon:
+    """#3650 — ``lsappinfo``'s own ``ApplicationType`` field."""
+
+    def _make_calls(self) -> MacOSCalls:
+        return object.__new__(MacOSCalls)
+
+    def test_foreground_app_has_dock_icon(self, monkeypatch) -> None:
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["lsappinfo", "find"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="ASN:1-2-3\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='"ApplicationType"="Foreground"\n', stderr="",
+            )
+
+        monkeypatch.setattr("coord.mac_native_driver.subprocess.run", fake_run)
+        has_icon, reason = self._make_calls().has_dock_icon(1234)
+        assert (has_icon, reason) == (True, "")
+
+    def test_background_app_has_no_dock_icon(self, monkeypatch) -> None:
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["lsappinfo", "find"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="ASN:1-2-3\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='"ApplicationType"="Background"\n', stderr="",
+            )
+
+        monkeypatch.setattr("coord.mac_native_driver.subprocess.run", fake_run)
+        has_icon, reason = self._make_calls().has_dock_icon(1234)
+        assert has_icon is False
+        assert "Background" in reason
+
+    def test_unknown_pid_has_no_dock_icon(self, monkeypatch) -> None:
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("coord.mac_native_driver.subprocess.run", fake_run)
+        has_icon, reason = self._make_calls().has_dock_icon(999999)
+        assert has_icon is False
+        assert "no running application" in reason
 
 
 class TestImportQuartz:

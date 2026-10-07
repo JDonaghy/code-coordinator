@@ -229,6 +229,32 @@ sibling of ``tui-pty``'s smoke spec):
   "Close actually closes the window" check (quadraui#1228) — per #2096, a
   click is confirmed closed by *observing the window gone afterward*, never
   by the mere fact that the click was sent without an exception.
+- ``type_text: {text}`` (#3650) — types *text* through real OS input (one
+  ``SendInput``/``KEYEVENTF_UNICODE`` down/up pair per character — the same
+  real-input call ``key:`` already uses for an unmapped character) — never
+  by injecting into the app's own in-memory buffer, or a vimcode#1825-class
+  "keystrokes went to the launching terminal instead of the app" bug would
+  stay invisible to this driver too.
+- ``expect_file: {path, timeout_ms, contains}`` (#3650) — *path* must exist
+  within *timeout_ms* (default 5000), optionally containing the substring
+  *contains*. Delegates entirely to :mod:`coord.native_fs_wait` — the one
+  shared implementation every Tier-2 native driver calls through (#2096
+  "one question, one answer"), since a filesystem check has no Win32
+  -specific behaviour to add.
+- ``expect_frontmost: {}`` (#3650) — the launched hwnd must be the real
+  Win32 foreground window right now (``GetForegroundWindow``) — the
+  vimcode#1824 "app never becomes frontmost" class of bug.
+- ``expect_region_not_uniform: {x, y, width, height, tolerance}`` (#3650) —
+  the named pixel rectangle of a ``PrintWindow`` capture must NOT be a
+  single colour (± *tolerance*, default 24, per channel) — vimcode#1676's
+  uniform black-bar minimap and #1828's blank panel are exactly this.
+  Decodes via :func:`coord.native_pixels.decode_bmp`, judged by the one
+  shared :func:`coord.native_pixels.region_not_uniform`.
+- ``expect_no_tofu: {x, y, width, height}`` (#3650) — the named pixel
+  rectangle must NOT look like a missing-glyph "tofu" placeholder box
+  (:func:`coord.native_pixels.looks_like_tofu` — see that function's own
+  docstring for the heuristic's scope and documented false-positive risk;
+  it is deliberately coarse).
 
 **Terminal-hosted mode** (added 2026-09-30, vimcode#1634-#1636: three bugs
 that all pass under a raw ConPTY — ``tui-pty``'s own tier — yet reproduce
@@ -295,6 +321,8 @@ import ctypes.wintypes as _wintypes
 import yaml
 
 from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
+from coord.native_fs_wait import wait_for_file
+from coord.native_pixels import NativePixelError, decode_bmp, looks_like_tofu, region_not_uniform
 
 #: `SendInput`'s `INPUT`/`KEYBDINPUT` structs, module-level (#3639 review
 #: nit — these used to be rebuilt on every `send_key` call). Defining them
@@ -406,6 +434,15 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "expect_idle_stable": (),
     "expect_menu_latency": ("x", "y"),
     "expect_panel_switch": ("x", "y", "role", "name"),
+    # #3650: real OS input (SendInput), never injected into the app's own
+    # buffer — see :mod:`coord.native_fs_wait`/:mod:`coord.native_pixels` for
+    # why `expect_file`/`expect_region_not_uniform`/`expect_no_tofu` are
+    # shared, not win-native-specific, logic.
+    "type_text": ("text",),
+    "expect_file": ("path",),
+    "expect_frontmost": (),
+    "expect_region_not_uniform": ("x", "y", "width", "height"),
+    "expect_no_tofu": ("x", "y", "width", "height"),
 }
 
 _VALID_BUTTONS = ("left", "right", "middle")
@@ -451,6 +488,12 @@ class NativeStep:
     name: str = ""
     items: tuple[str, ...] = ()
     exact: bool = False
+    text: str = ""
+    path: str = ""
+    contains: str = ""
+    width: int = 0
+    height: int = 0
+    tolerance: int = 24
 
     @property
     def step_id(self) -> str:
@@ -578,6 +621,12 @@ def parse_native_spec(yaml_text: str) -> NativeSpec:
             name=str(entry.get("name", "") or ""),
             items=tuple(str(i) for i in items_raw) if isinstance(items_raw, list) else (),
             exact=bool(entry.get("exact", False)),
+            text=str(entry.get("text", "") or ""),
+            path=str(entry.get("path", "") or ""),
+            contains=str(entry.get("contains", "") or ""),
+            width=_int_default(entry.get("width"), 0),
+            height=_int_default(entry.get("height"), 0),
+            tolerance=_int_default(entry.get("tolerance"), 24),
         ))
 
     return NativeSpec(
@@ -641,6 +690,23 @@ class WinCalls(Protocol):
     def send_click(self, hwnd: int, x: int, y: int, button: str) -> None: ...
 
     def send_key(self, hwnd: int, key: str) -> None: ...
+
+    def type_text(self, hwnd: int, text: str) -> None:
+        """Type *text* through real OS input (``SendInput`` with
+        ``KEYEVENTF_UNICODE``, one down/up pair per character) — never by
+        injecting into the app's own in-memory input buffer, or a
+        vimcode#1825-class "keystrokes went to the launching terminal
+        instead of the app" bug would stay invisible to this driver too
+        (#3650)."""
+        ...
+
+    def is_frontmost(self, hwnd: int) -> tuple[bool, int]:
+        """``(True, hwnd)`` when *hwnd* is the real foreground window right
+        now (``GetForegroundWindow``); ``(False, actual_foreground_hwnd)``
+        otherwise — the vimcode#1824 "app never becomes frontmost" class of
+        bug (#3650). Never raises — a probe failure here reads as "not
+        confirmed frontmost", never a crash."""
+        ...
 
     def uia_elements(self, hwnd: int) -> list[dict]:
         """Every element in the window's UI Automation tree right now, each
@@ -764,13 +830,21 @@ class NativeRunner:
             "expect_idle_stable": self._do_expect_idle_stable,
             "expect_menu_latency": self._do_expect_menu_latency,
             "expect_panel_switch": self._do_expect_panel_switch,
+            "type_text": self._do_type_text,
+            "expect_file": self._do_expect_file,
+            "expect_frontmost": self._do_expect_frontmost,
+            "expect_region_not_uniform": self._do_expect_region_not_uniform,
+            "expect_no_tofu": self._do_expect_no_tofu,
         }
         entry: dict = {"id": step.step_id, "status": "pass", "message": ""}
         try:
             extra = handlers[step.kind](step)
             if extra:
                 entry.update(extra)
-        except (WinNativeSpecError, WinNativeRuntimeError, UnsupportedKey, AssertionError) as e:
+        except (
+            WinNativeSpecError, WinNativeRuntimeError, UnsupportedKey,
+            AssertionError, NativePixelError,
+        ) as e:
             entry["status"] = "fail"
             entry["message"] = str(e)
             self._attach_capture_if_possible(entry)
@@ -819,6 +893,11 @@ class NativeRunner:
 
     def _do_click(self, step: NativeStep) -> None:
         self._calls.send_click(self._require_hwnd(), step.x, step.y, step.button or "left")
+
+    def _do_type_text(self, step: NativeStep) -> None:
+        """#3650: real OS input (``SendInput``/``KEYEVENTF_UNICODE``) —
+        never injected into the app's own buffer."""
+        self._calls.type_text(self._require_hwnd(), step.text)
 
     def _do_wait(self, step: NativeStep) -> None:
         time.sleep(step.ms / 1000)
@@ -963,6 +1042,53 @@ class NativeRunner:
                     f"within {step.timeout_ms}ms"
                 )
             time.sleep(0.02)
+
+    def _do_expect_file(self, step: NativeStep) -> None:
+        """#3650: delegates to the one shared filesystem check — see
+        :mod:`coord.native_fs_wait`'s own docstring (#2096 "one question,
+        one answer")."""
+        ok, reason = wait_for_file(step.path, step.timeout_ms or 5000, step.contains or None)
+        if not ok:
+            raise AssertionError(reason)
+
+    def _do_expect_frontmost(self, step: NativeStep) -> None:
+        """#3650: the vimcode#1824 "app never becomes frontmost" class of
+        bug — confirmed by actually asking :meth:`WinCalls.is_frontmost`
+        right now, never by the mere absence of an exception from an
+        earlier ``launch`` step (#2096)."""
+        hwnd = self._require_hwnd()
+        is_front, actual_hwnd = self._calls.is_frontmost(hwnd)
+        if not is_front:
+            raise AssertionError(
+                f"hwnd={hwnd} is not the foreground window right now "
+                f"(GetForegroundWindow reports hwnd={actual_hwnd})"
+            )
+
+    def _do_expect_region_not_uniform(self, step: NativeStep) -> dict:
+        """#3650: decodes this driver's own ``PrintWindow`` BMP, then judges
+        the region through the ONE shared implementation
+        (:func:`coord.native_pixels.region_not_uniform`) — see that
+        module's docstring for why the judgment itself is not
+        win-native-specific logic."""
+        hwnd = self._require_hwnd()
+        image = decode_bmp(self._calls.capture(hwnd))
+        is_not_uniform, message = region_not_uniform(
+            image, step.x, step.y, step.width, step.height, tolerance=step.tolerance,
+        )
+        if not is_not_uniform:
+            raise AssertionError(message)
+        return {"message": message}
+
+    def _do_expect_no_tofu(self, step: NativeStep) -> dict:
+        """#3650: see :func:`coord.native_pixels.looks_like_tofu`'s own
+        docstring for the heuristic's scope and documented false-negative
+        risk."""
+        hwnd = self._require_hwnd()
+        image = decode_bmp(self._calls.capture(hwnd))
+        is_tofu, message = looks_like_tofu(image, step.x, step.y, step.width, step.height)
+        if is_tofu:
+            raise AssertionError(message)
+        return {"message": message}
 
     # -- teardown --
 
@@ -2543,6 +2669,35 @@ class Win32Calls:
                 key_up = _one(enc.vk, 0, _KEYEVENTF_KEYUP)
 
             _send(*mod_downs, key_down, key_up, *mod_ups)
+
+    def type_text(self, hwnd: int, text: str) -> None:
+        """#3650: one ``KEYEVENTF_UNICODE`` down/up pair per character,
+        via ``SendInput`` — the same real-input call (and the same
+        "delivered < sent means blocked" check) :meth:`send_key` already
+        uses for its own ``unicode_char`` branch."""
+        self._user32.SetForegroundWindow(hwnd)
+        self._declare_send_input_signature()
+        for ch in text:
+            code = ord(ch)
+            key_down = _INPUT(type=_INPUT_KEYBOARD, ki=_KEYBDINPUT(0, code, _KEYEVENTF_UNICODE, 0, 0))
+            key_up = _INPUT(
+                type=_INPUT_KEYBOARD,
+                ki=_KEYBDINPUT(0, code, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP, 0, 0),
+            )
+            arr = (_INPUT * 2)(key_down, key_up)
+            sent = self._user32.SendInput(2, arr, ctypes.sizeof(_INPUT))
+            if sent != 2:
+                raise WinNativeRuntimeError(
+                    f"SendInput delivered only {sent} of 2 input event(s) for "
+                    f"character {ch!r} — blocked by UIPI or the input desktop "
+                    f"belongs to another session/thread"
+                )
+
+    def is_frontmost(self, hwnd: int) -> tuple[bool, int]:
+        """#3650: ``GetForegroundWindow`` — the real Win32 notion of "which
+        top-level window currently has keyboard focus"."""
+        foreground = self._user32.GetForegroundWindow()
+        return foreground == hwnd, foreground
 
     # -- UI Automation --
 

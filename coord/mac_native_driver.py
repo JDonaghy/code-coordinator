@@ -78,6 +78,37 @@ per-OS fork.
   *timeout_ms*. Per #2096, a click is confirmed closed by *observing the
   window gone afterward*, never by the mere absence of an exception from an
   earlier click step.
+- ``type_text: {text}`` (#3650) — types *text* through real OS input (one
+  ``CGEventKeyboardSetUnicodeString`` keyboard event per character, posted
+  via ``CGEventPostToPid`` — the same pid-addressed path ``key``/``click``
+  already use, gated by the same frontmost-before-input check, #3566) —
+  never by injecting into the app's own in-memory buffer, or a
+  vimcode#1825-class "keystrokes went to the launching terminal instead of
+  the app" bug would stay invisible to this driver too.
+- ``expect_file: {path, timeout_ms, contains}`` (#3650) — *path* must exist
+  within *timeout_ms* (default 5000), optionally containing the substring
+  *contains*. Delegates entirely to :mod:`coord.native_fs_wait` — the one
+  shared implementation every Tier-2 native driver calls through (#2096
+  "one question, one answer"), since a filesystem check has no macOS
+  -specific behaviour to add.
+- ``expect_frontmost: {}`` (#3650) — the launched pid must be frontmost
+  right now (:meth:`MacCalls.is_frontmost`, the same check #3566 already
+  gates every ``key``/``click`` step with) — the vimcode#1824 "app never
+  becomes frontmost" class of bug.
+- ``expect_dock_icon: {}`` (#3650) — the launched pid must have a real
+  Dock/app-switcher presence (``lsappinfo``'s ``ApplicationType ==
+  "Foreground"``) — the vimcode#1824 "no Dock icon" class of bug.
+- ``expect_region_not_uniform: {x, y, width, height, tolerance}`` (#3650) —
+  the named pixel rectangle of a ``screencapture`` PNG must NOT be a single
+  colour (± *tolerance*, default 24, per channel) — vimcode#1676's uniform
+  black-bar minimap and #1828's blank panel are exactly this. Decodes via
+  :func:`coord.native_pixels.decode_png`, judged by the one shared
+  :func:`coord.native_pixels.region_not_uniform`.
+- ``expect_no_tofu: {x, y, width, height}`` (#3650) — the named pixel
+  rectangle must NOT look like a missing-glyph "tofu" placeholder box
+  (:func:`coord.native_pixels.looks_like_tofu` — see that function's own
+  docstring for the heuristic's scope and documented false-positive risk;
+  it is deliberately coarse).
 
 **Safety: kill only the PID this driver itself launched.** :meth:`MacCalls.kill`
 takes a ``pid: int`` — the exact process id :meth:`MacCalls.launch` returned
@@ -154,6 +185,8 @@ from typing import Any, Protocol
 import yaml
 
 from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
+from coord.native_fs_wait import wait_for_file
+from coord.native_pixels import NativePixelError, decode_png, looks_like_tofu, region_not_uniform
 from coord.shell_exec_wrap import wrap_launch_command
 
 
@@ -185,6 +218,16 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "expect_a11y": ("role", "name"),
     "expect_a11y_within": ("role", "name"),
     "expect_closed": (),
+    # #3650: real OS input (CGEvent), never injected into the app's own
+    # buffer — see :mod:`coord.native_fs_wait`/:mod:`coord.native_pixels` for
+    # why `expect_file`/`expect_region_not_uniform`/`expect_no_tofu` are
+    # shared, not mac-native-specific, logic.
+    "type_text": ("text",),
+    "expect_file": ("path",),
+    "expect_frontmost": (),
+    "expect_dock_icon": (),
+    "expect_region_not_uniform": ("x", "y", "width", "height"),
+    "expect_no_tofu": ("x", "y", "width", "height"),
 }
 
 _VALID_BUTTONS = ("left", "right", "middle")
@@ -208,6 +251,12 @@ class NativeStep:
     timeout_ms: int = 5000
     role: str = ""
     name: str = ""
+    text: str = ""
+    path: str = ""
+    contains: str = ""
+    width: int = 0
+    height: int = 0
+    tolerance: int = 24
 
     @property
     def step_id(self) -> str:
@@ -291,6 +340,12 @@ def parse_native_spec(yaml_text: str) -> NativeSpec:
             timeout_ms=_int_default(entry.get("timeout_ms"), 5000),
             role=str(entry.get("role", "") or ""),
             name=str(entry.get("name", "") or ""),
+            text=str(entry.get("text", "") or ""),
+            path=str(entry.get("path", "") or ""),
+            contains=str(entry.get("contains", "") or ""),
+            width=_int_default(entry.get("width"), 0),
+            height=_int_default(entry.get("height"), 0),
+            tolerance=_int_default(entry.get("tolerance"), 24),
         ))
 
     return NativeSpec(
@@ -344,6 +399,25 @@ class MacCalls(Protocol):
     def send_click(self, pid: int, window_id: int, x: int, y: int, button: str) -> None: ...
 
     def send_key(self, pid: int, key: str) -> None: ...
+
+    def type_text(self, pid: int, text: str) -> None:
+        """Type *text* through real OS input (``CGEventPostToPid`` with a
+        Unicode-string keyboard event per character) — never by injecting
+        into the app's own in-memory input buffer, or a vimcode#1825-class
+        "keystrokes went to the launching terminal instead of the app" bug
+        would stay invisible to this driver too (#3650). Checked for
+        frontmost focus by the SAME :meth:`NativeRunner._require_frontmost`
+        gate every ``key``/``click`` step already goes through — this
+        method itself is never called except after that check passes."""
+        ...
+
+    def has_dock_icon(self, pid: int) -> tuple[bool, str]:
+        """``(True, "")`` when *pid* has a real Dock/app-switcher presence
+        (``lsappinfo``'s own ``ApplicationType`` reports ``"Foreground"``);
+        ``(False, reason)`` otherwise — the vimcode#1824 "no Dock icon"
+        class of bug (#3650). Never raises — a probe failure here reads as
+        "no confirmed Dock icon", never a crash."""
+        ...
 
     def ax_elements(self, pid: int) -> list[dict]:
         """Every element in the app's Accessibility tree right now, each as
@@ -481,13 +555,22 @@ class NativeRunner:
             "expect_a11y": self._do_expect_a11y,
             "expect_a11y_within": self._do_expect_a11y_within,
             "expect_closed": self._do_expect_closed,
+            "type_text": self._do_type_text,
+            "expect_file": self._do_expect_file,
+            "expect_frontmost": self._do_expect_frontmost,
+            "expect_dock_icon": self._do_expect_dock_icon,
+            "expect_region_not_uniform": self._do_expect_region_not_uniform,
+            "expect_no_tofu": self._do_expect_no_tofu,
         }
         entry: dict = {"id": step.step_id, "status": "pass", "message": ""}
         try:
             extra = handlers[step.kind](step)
             if extra:
                 entry.update(extra)
-        except (MacNativeSpecError, MacNativeRuntimeError, UnsupportedKey, AssertionError) as e:
+        except (
+            MacNativeSpecError, MacNativeRuntimeError, UnsupportedKey,
+            AssertionError, NativePixelError,
+        ) as e:
             entry["status"] = "fail"
             entry["message"] = str(e)
             self._attach_capture_if_possible(entry)
@@ -553,6 +636,13 @@ class NativeRunner:
         self._require_frontmost(pid)
         self._calls.send_click(pid, window_id, step.x, step.y, step.button or "left")
 
+    def _do_type_text(self, step: NativeStep) -> None:
+        """#3650: same frontmost-before-input gate (#3566) as every other
+        action step — see :meth:`_require_frontmost`."""
+        pid, _ = self._require_window()
+        self._require_frontmost(pid)
+        self._calls.type_text(pid, step.text)
+
     def _do_wait(self, step: NativeStep) -> None:
         time.sleep(step.ms / 1000)
 
@@ -604,6 +694,62 @@ class NativeRunner:
                     f"expect_closed — it did not actually close"
                 )
             time.sleep(0.02)
+
+    def _do_expect_file(self, step: NativeStep) -> None:
+        """#3650: delegates to the one shared filesystem check — see
+        :mod:`coord.native_fs_wait`'s own docstring (#2096 "one question,
+        one answer")."""
+        ok, reason = wait_for_file(step.path, step.timeout_ms or 5000, step.contains or None)
+        if not ok:
+            raise AssertionError(reason)
+
+    def _do_expect_frontmost(self, step: NativeStep) -> None:
+        """#3650: the vimcode#1824 "app never becomes frontmost" class of
+        bug — confirmed by actually asking :meth:`MacCalls.is_frontmost`
+        right now, never by the mere absence of an exception from an
+        earlier ``launch`` step (#2096)."""
+        pid, _ = self._require_window()
+        is_front, front_pid = self._calls.is_frontmost(pid)
+        if not is_front:
+            raise AssertionError(
+                f"pid={pid} is not frontmost right now (actual frontmost "
+                f"pid={front_pid})"
+            )
+
+    def _do_expect_dock_icon(self, step: NativeStep) -> None:
+        """#3650: the vimcode#1824 "no Dock icon" class of bug."""
+        pid, _ = self._require_window()
+        has_icon, reason = self._calls.has_dock_icon(pid)
+        if not has_icon:
+            raise AssertionError(
+                reason or f"pid={pid} has no Dock/app-switcher presence"
+            )
+
+    def _do_expect_region_not_uniform(self, step: NativeStep) -> dict:
+        """#3650: decodes this driver's own ``screencapture`` PNG, then
+        judges the region through the ONE shared implementation
+        (:func:`coord.native_pixels.region_not_uniform`) — see that
+        module's docstring for why the judgment itself is not
+        mac-native-specific logic."""
+        _, window_id = self._require_window()
+        image = decode_png(self._calls.capture(window_id))
+        is_not_uniform, message = region_not_uniform(
+            image, step.x, step.y, step.width, step.height, tolerance=step.tolerance,
+        )
+        if not is_not_uniform:
+            raise AssertionError(message)
+        return {"message": message}
+
+    def _do_expect_no_tofu(self, step: NativeStep) -> dict:
+        """#3650: see :func:`coord.native_pixels.looks_like_tofu`'s own
+        docstring for the heuristic's scope and documented false-negative
+        risk."""
+        _, window_id = self._require_window()
+        image = decode_png(self._calls.capture(window_id))
+        is_tofu, message = looks_like_tofu(image, step.x, step.y, step.width, step.height)
+        if is_tofu:
+            raise AssertionError(message)
+        return {"message": message}
 
     # -- teardown --
 
@@ -995,6 +1141,50 @@ class MacOSCalls:
                 quartz.CGEventSetFlags(up, flags)
             quartz.CGEventPostToPid(pid, down)
             quartz.CGEventPostToPid(pid, up)
+
+    def type_text(self, pid: int, text: str) -> None:
+        """#3650: one Unicode-string keyboard down/up pair per character
+        (``CGEventKeyboardSetUnicodeString``, ``vkey=0``, no modifier
+        flags — the same literal-insertion idiom :func:`_encode_mac_chord`
+        already uses for a character with no named vkey) posted via
+        ``CGEventPostToPid`` — the same pid-addressed, never-global-HID-tap
+        call :meth:`send_key`/:meth:`send_click` use (#3566), so even a
+        frontmost-check race lands on the intended process."""
+        quartz = self._quartz
+        for ch in text:
+            down = quartz.CGEventCreateKeyboardEvent(None, 0, True)
+            up = quartz.CGEventCreateKeyboardEvent(None, 0, False)
+            quartz.CGEventKeyboardSetUnicodeString(down, 1, ch)
+            quartz.CGEventKeyboardSetUnicodeString(up, 1, ch)
+            quartz.CGEventPostToPid(pid, down)
+            quartz.CGEventPostToPid(pid, up)
+
+    # -- Dock presence (#3650) --
+
+    def has_dock_icon(self, pid: int) -> tuple[bool, str]:
+        """``lsappinfo info -only ApplicationType`` for *pid*'s own ASN —
+        a Dock/app-switcher-visible app reports ``"Foreground"``; a
+        background/UIElement-style app (or one `lsappinfo` can't find at
+        all — e.g. already exited) reports anything else, which reads as
+        "no confirmed Dock icon" rather than crashing the step."""
+        try:
+            asn_proc = subprocess.run(
+                ["lsappinfo", "find", f"pid={pid}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            asn = asn_proc.stdout.strip()
+            if not asn:
+                return False, f"lsappinfo found no running application for pid={pid}"
+            info_proc = subprocess.run(
+                ["lsappinfo", "info", "-only", "ApplicationType", asn],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"lsappinfo probe failed: {e}"
+        output = info_proc.stdout
+        if "Foreground" in output:
+            return True, ""
+        return False, f"pid={pid}'s ApplicationType is not Foreground: {output.strip() or '(empty)'}"
 
     # -- Accessibility --
 

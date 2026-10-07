@@ -104,6 +104,32 @@ and ``mac-native`` rely on (#966/#3241), not a new one.
   *timeout_ms*. Per #2096, a click is confirmed closed by *observing the
   window gone afterward*, never by the mere absence of an exception from an
   earlier click step.
+- ``type_text: {text}`` (#3650) — types *text* through real X11 input
+  (``xdotool type``), the same event path ``key``/``click`` already use —
+  never by injecting into the app's own in-memory buffer, or a
+  vimcode#1825-class "keystrokes went to the launching terminal instead of
+  the app" bug would stay invisible to this driver too.
+- ``expect_file: {path, timeout_ms, contains}`` (#3650) — *path* must exist
+  within *timeout_ms* (default 5000), optionally containing the substring
+  *contains*. Delegates entirely to :mod:`coord.native_fs_wait` — the one
+  shared implementation every Tier-2 native driver calls through (#2096
+  "one question, one answer"), since a filesystem check has no GTK/X11-
+  specific behaviour to add.
+- ``expect_frontmost: {}`` (#3650) — the launched window must be the
+  desktop's real active/foreground window right now (``_NET_ACTIVE_WINDOW``
+  via ``xdotool getactivewindow``) — the vimcode#1824 "app never becomes
+  frontmost" class of bug.
+- ``expect_region_not_uniform: {x, y, width, height, tolerance}`` (#3650) —
+  the named pixel rectangle of an ``xwd`` capture must NOT be a single
+  colour (± *tolerance*, default 24, per channel) — vimcode#1676's uniform
+  black-bar minimap and #1828's blank panel are exactly this. Decodes via
+  :func:`coord.native_pixels.decode_xwd`, judged by the one shared
+  :func:`coord.native_pixels.region_not_uniform`.
+- ``expect_no_tofu: {x, y, width, height}`` (#3650) — the named pixel
+  rectangle must NOT look like a missing-glyph "tofu" placeholder box
+  (:func:`coord.native_pixels.looks_like_tofu` — see that function's own
+  docstring for the heuristic's scope and documented false-positive risk;
+  it is deliberately coarse).
 
 **Safety: kill only the PID this driver itself launched.** :meth:`GtkCalls.kill`
 takes a ``pid: int`` — the exact process id :meth:`GtkCalls.launch` returned
@@ -144,6 +170,8 @@ from typing import Any, Protocol
 import yaml
 
 from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
+from coord.native_fs_wait import wait_for_file
+from coord.native_pixels import NativePixelError, decode_xwd, looks_like_tofu, region_not_uniform
 
 
 class GtkNativeSpecError(Exception):
@@ -176,6 +204,15 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "expect_a11y": ("role", "name"),
     "expect_a11y_within": ("role", "name"),
     "expect_closed": (),
+    # #3650: real OS input (`xdotool type`), never injected into the app's
+    # own buffer — see :mod:`coord.native_fs_wait`/:mod:`coord.native_pixels`
+    # for why `expect_file`/`expect_region_not_uniform`/`expect_no_tofu` are
+    # shared, not gtk-native-specific, logic.
+    "type_text": ("text",),
+    "expect_file": ("path",),
+    "expect_frontmost": (),
+    "expect_region_not_uniform": ("x", "y", "width", "height"),
+    "expect_no_tofu": ("x", "y", "width", "height"),
 }
 
 _VALID_BUTTONS = ("left", "right", "middle")
@@ -199,6 +236,12 @@ class NativeStep:
     timeout_ms: int = 5000
     role: str = ""
     name: str = ""
+    text: str = ""
+    path: str = ""
+    contains: str = ""
+    width: int = 0
+    height: int = 0
+    tolerance: int = 24
 
     @property
     def step_id(self) -> str:
@@ -282,6 +325,12 @@ def parse_native_spec(yaml_text: str) -> NativeSpec:
             timeout_ms=_int_default(entry.get("timeout_ms"), 5000),
             role=str(entry.get("role", "") or ""),
             name=str(entry.get("name", "") or ""),
+            text=str(entry.get("text", "") or ""),
+            path=str(entry.get("path", "") or ""),
+            contains=str(entry.get("contains", "") or ""),
+            width=_int_default(entry.get("width"), 0),
+            height=_int_default(entry.get("height"), 0),
+            tolerance=_int_default(entry.get("tolerance"), 24),
         ))
 
     return NativeSpec(
@@ -342,6 +391,24 @@ class GtkCalls(Protocol):
     def send_click(self, window_id: int, x: int, y: int, button: str) -> None: ...
 
     def send_key(self, window_id: int, key: str) -> None: ...
+
+    def type_text(self, window_id: int, text: str) -> None:
+        """Type *text* through real OS input (``xdotool type``) at
+        *window_id* — never by injecting into the app's own in-memory input
+        buffer, or a vimcode#1825-class "keystrokes went to the launching
+        terminal instead of the app" bug would stay invisible to this
+        driver too (#3650)."""
+        ...
+
+    def is_frontmost(self, window_id: int) -> tuple[bool, int]:
+        """``(True, window_id)`` when *window_id* is the desktop's real
+        active/foreground window right now; ``(False, actual_active_id)``
+        otherwise — the ``_NET_ACTIVE_WINDOW`` root-window property, the
+        same thing a real window manager itself uses to decide which window
+        receives keyboard focus (#3650, the vimcode#1824 "app never becomes
+        frontmost" class of bug). Never raises — a probe failure here reads
+        as "not confirmed frontmost", never a crash."""
+        ...
 
     def ax_elements(self, pid: int) -> list[dict]:
         """Every element in the app's AT-SPI accessibility tree right now,
@@ -459,13 +526,21 @@ class NativeRunner:
             "expect_a11y": self._do_expect_a11y,
             "expect_a11y_within": self._do_expect_a11y_within,
             "expect_closed": self._do_expect_closed,
+            "type_text": self._do_type_text,
+            "expect_file": self._do_expect_file,
+            "expect_frontmost": self._do_expect_frontmost,
+            "expect_region_not_uniform": self._do_expect_region_not_uniform,
+            "expect_no_tofu": self._do_expect_no_tofu,
         }
         entry: dict = {"id": step.step_id, "status": "pass", "message": ""}
         try:
             extra = handlers[step.kind](step)
             if extra:
                 entry.update(extra)
-        except (GtkNativeSpecError, GtkNativeRuntimeError, UnsupportedKey, AssertionError) as e:
+        except (
+            GtkNativeSpecError, GtkNativeRuntimeError, UnsupportedKey,
+            AssertionError, NativePixelError,
+        ) as e:
             entry["status"] = "fail"
             entry["message"] = str(e)
             self._attach_capture_if_possible(entry)
@@ -512,6 +587,12 @@ class NativeRunner:
     def _do_click(self, step: NativeStep) -> None:
         _, window_id = self._require_window()
         self._calls.send_click(window_id, step.x, step.y, step.button or "left")
+
+    def _do_type_text(self, step: NativeStep) -> None:
+        """#3650: real OS input (``xdotool type``) at the launched window —
+        never injected into the app's own buffer."""
+        _, window_id = self._require_window()
+        self._calls.type_text(window_id, step.text)
 
     def _do_wait(self, step: NativeStep) -> None:
         time.sleep(step.ms / 1000)
@@ -564,6 +645,53 @@ class NativeRunner:
                     f"expect_closed — it did not actually close"
                 )
             time.sleep(0.02)
+
+    def _do_expect_file(self, step: NativeStep) -> None:
+        """#3650: delegates to the one shared filesystem check — see
+        :mod:`coord.native_fs_wait`'s own docstring (#2096 "one question,
+        one answer")."""
+        ok, reason = wait_for_file(step.path, step.timeout_ms or 5000, step.contains or None)
+        if not ok:
+            raise AssertionError(reason)
+
+    def _do_expect_frontmost(self, step: NativeStep) -> None:
+        """#3650: the vimcode#1824 "app never becomes frontmost" class of
+        bug — confirmed by actually asking the window manager's own
+        ``_NET_ACTIVE_WINDOW``, never by the mere absence of an exception
+        from an earlier ``launch``/``click`` step (#2096)."""
+        _, window_id = self._require_window()
+        is_front, active_id = self._calls.is_frontmost(window_id)
+        if not is_front:
+            raise AssertionError(
+                f"window_id={window_id} is not the active window right now "
+                f"(_NET_ACTIVE_WINDOW reports window_id={active_id})"
+            )
+
+    def _do_expect_region_not_uniform(self, step: NativeStep) -> dict:
+        """#3650: decodes this driver's own ``xwd`` capture format, then
+        judges the region through the ONE shared implementation
+        (:func:`coord.native_pixels.region_not_uniform`) — see that
+        module's docstring for why the judgment itself is not
+        gtk-native-specific logic."""
+        _, window_id = self._require_window()
+        image = decode_xwd(self._calls.capture(window_id))
+        is_not_uniform, message = region_not_uniform(
+            image, step.x, step.y, step.width, step.height, tolerance=step.tolerance,
+        )
+        if not is_not_uniform:
+            raise AssertionError(message)
+        return {"message": message}
+
+    def _do_expect_no_tofu(self, step: NativeStep) -> dict:
+        """#3650: see :func:`coord.native_pixels.looks_like_tofu`'s own
+        docstring for the heuristic's scope and documented false-negative
+        risk."""
+        _, window_id = self._require_window()
+        image = decode_xwd(self._calls.capture(window_id))
+        is_tofu, message = looks_like_tofu(image, step.x, step.y, step.width, step.height)
+        if is_tofu:
+            raise AssertionError(message)
+        return {"message": message}
 
     # -- teardown --
 
@@ -863,6 +991,41 @@ class LinuxGtkCalls:
                 f"args={xdotool_args}: "
                 f"{proc.stderr.strip() if proc.stderr else '(no stderr)'}"
             )
+
+    def type_text(self, window_id: int, text: str) -> None:
+        """#3650: ``xdotool type`` — real X11 input, the same event path
+        :meth:`send_key` already uses, not an in-process injection into the
+        app's own buffer. ``--`` ends ``xdotool``'s own option parsing
+        before *text*, so a string that itself starts with ``-`` (e.g.
+        ``-rf``) is typed literally rather than misread as a flag."""
+        proc = subprocess.run(
+            ["xdotool", "type", "--window", str(window_id), "--", text],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode != 0:
+            raise GtkNativeRuntimeError(
+                f"xdotool type failed for window_id={window_id}: "
+                f"{proc.stderr.strip() if proc.stderr else '(no stderr)'}"
+            )
+
+    def is_frontmost(self, window_id: int) -> tuple[bool, int]:
+        """#3650: ``_NET_ACTIVE_WINDOW`` via ``xdotool getactivewindow`` —
+        the same root-window property a real window manager itself
+        maintains for "which window has keyboard focus right now". Never
+        raises: a failed probe (no WM running, no such property) reads as
+        "not confirmed frontmost" (``active_id=-1``), matching every other
+        driver's own ``is_frontmost`` contract."""
+        proc = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            return False, -1
+        try:
+            active_id = int(proc.stdout.strip())
+        except ValueError:
+            return False, -1
+        return active_id == window_id, active_id
 
     # -- AT-SPI --
 

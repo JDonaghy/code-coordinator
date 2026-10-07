@@ -163,6 +163,31 @@ steps:
         with pytest.raises(TuiPtySpecError, match="not valid YAML"):
             parse_smoke_spec("steps: [")
 
+    def test_type_text_and_expect_file_parse(self) -> None:
+        # #3650
+        spec = parse_smoke_spec(
+            "steps:\n"
+            "  - type: type_text\n"
+            "    text: 'hello world'\n"
+            "  - type: expect_file\n"
+            "    path: /tmp/probe.txt\n"
+            "    timeout_ms: 2000\n"
+            "    contains: 'hello'\n"
+        )
+        type_text, expect_file = spec.steps
+        assert type_text.text == "hello world"
+        assert expect_file.path == "/tmp/probe.txt"
+        assert expect_file.timeout_ms == 2000
+        assert expect_file.contains == "hello"
+
+    def test_type_text_requires_text(self) -> None:
+        with pytest.raises(TuiPtySpecError, match="missing required field"):
+            parse_smoke_spec("steps:\n  - type: type_text\n")
+
+    def test_expect_file_requires_path(self) -> None:
+        with pytest.raises(TuiPtySpecError, match="missing required field"):
+            parse_smoke_spec("steps:\n  - type: expect_file\n")
+
     def test_non_mapping_top_level_raises(self) -> None:
         with pytest.raises(TuiPtySpecError, match="mapping"):
             parse_smoke_spec("- just\n- a\n- list\n")
@@ -790,6 +815,65 @@ class TestSmokeRunnerActions:
         assert results[1]["status"] == "pass"
         assert child.resizes == [(120, 40)]
         assert (runner._cols, runner._rows) == (120, 40)
+
+    def test_type_text_step_writes_the_literal_utf8_bytes(self) -> None:
+        # #3650: unlike `key:`, `type_text:` never goes through the
+        # terminal-byte-encoding grammar — it's the literal string, as-is.
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("type_text", 1, text="hello, world! 日本語"),
+        ]))
+        assert results[1]["status"] == "pass"
+        assert "hello, world! 日本語".encode("utf-8") in child.writes
+
+    def test_type_text_before_launch_fails(self) -> None:
+        runner = SmokeRunner(lambda cols, rows: FakePtyChild())
+        results = runner.run(_spec([_step("type_text", 0, text="x")]))
+        assert results[0]["status"] == "fail"
+        assert "no child process" in results[0]["message"]
+
+
+class TestSmokeRunnerExpectFile:
+    """#3650 — delegates to :func:`coord.native_fs_wait.wait_for_file`; see
+    ``tests/test_native_fs_wait.py`` for that function's own coverage. These
+    tests only confirm the step is wired up (field plumbing + pass/fail
+    translation), not re-test the filesystem-polling logic itself."""
+
+    def test_passes_once_file_exists(self, tmp_path) -> None:
+        target = tmp_path / "probe.txt"
+        target.write_text("ready")
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=1000),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_with_reason_when_file_never_appears(self, tmp_path) -> None:
+        target = tmp_path / "never.txt"
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=100),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "did not appear" in results[1]["message"]
+
+    def test_fails_when_content_does_not_contain_expected_substring(self, tmp_path) -> None:
+        target = tmp_path / "probe.txt"
+        target.write_text("wrong content")
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=100, contains="right"),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "right" in results[1]["message"]
 
 
 class TestSmokeRunnerWaitIdle:
