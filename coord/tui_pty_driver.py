@@ -78,6 +78,23 @@ is threaded through as the driver's ``entrypoint:``). Steps:
   screen repeatedly rather than sampling once, so a slow-but-eventual paint
   still passes and a truly-never-appears one genuinely fails at the
   deadline (vimcode#1635's right-click-menu-latency regression check).
+- ``type_text: {text}`` (#3650) — writes *text* straight to the pty's own
+  stdin fd (:meth:`PtyChild.write`), the SAME real-OS path every other
+  action step already uses — never into the app's in-memory input buffer.
+  Unlike ``key:`` (which goes through the terminal-byte-encoding grammar,
+  :mod:`coord.key_spec`), this sends the literal UTF-8 bytes of *text*
+  as-is: the workhorse for "type a filename/search string/command line",
+  where a spec author wants exactly these characters delivered, not a named
+  key or chord.
+- ``expect_file: {path, timeout_ms, contains}`` (#3650) — *path* must exist
+  within *timeout_ms* (default 5000), optionally containing the substring
+  *contains*. The one new step with no terminal-specific behaviour at all —
+  see :mod:`coord.native_fs_wait`, the single shared implementation every
+  Tier-2 native driver calls through (#2096 "one question, one answer").
+  *path* may use ``$VAR``/``~`` (or the PowerShell ``$env:VAR`` spelling);
+  it's resolved against the pty child's filesystem, not this process's own
+  — the common case is both run on the same host, so that distinction only
+  matters for a remotely-bridged child, which this driver does not have.
 
 **The ``ESC[6n`` cursor-position query lesson (vimcode's own ConPTY tests,
 folded in before this issue was dispatched).** ratatui's ``Terminal::new()``
@@ -123,6 +140,7 @@ from typing import Callable, Protocol
 import yaml
 
 from coord.key_spec import KeyChord, KeySpecError, UnsupportedKey, parse_key_spec
+from coord.native_fs_wait import wait_for_file
 from coord.shell_exec_wrap import wrap_launch_command as _wrap_launch_command
 
 
@@ -151,6 +169,15 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "expect_screen": (),
     "expect_silent": (),
     "expect_within": ("text",),
+    # #3650: typed through the real pty itself (`SmokeRunner._do_type_text`
+    # writes straight to the child's stdin fd) — never injected into the
+    # app's own in-memory buffer, or a vimcode#1825-class "keystrokes went
+    # to the launching terminal instead" bug would stay invisible here too.
+    "type_text": ("text",),
+    # #3650: a pure filesystem check — see `coord.native_fs_wait`'s own
+    # docstring for why this is the one shared implementation every driver
+    # calls, not a tui-pty-specific one.
+    "expect_file": ("path",),
 }
 
 _VALID_BUTTONS = ("left", "middle", "right", "wheel-up", "wheel-down")
@@ -185,6 +212,8 @@ class SmokeStep:
     attr: dict | None = None
     cols: int = 0
     rows: int = 0
+    path: str = ""
+    contains: str = ""
 
     @property
     def step_id(self) -> str:
@@ -332,6 +361,8 @@ def parse_smoke_spec(yaml_text: str) -> SmokeSpec:
             attr=attr,
             cols=_int_default(entry.get("cols"), 0),
             rows=_int_default(entry.get("rows"), 0),
+            path=str(entry.get("path", "") or ""),
+            contains=str(entry.get("contains", "") or ""),
         ))
 
     return SmokeSpec(
@@ -1059,6 +1090,8 @@ class SmokeRunner:
             "expect_screen": self._do_expect_screen,
             "expect_silent": self._do_expect_silent,
             "expect_within": self._do_expect_within,
+            "type_text": self._do_type_text,
+            "expect_file": self._do_expect_file,
         }
         try:
             handlers[step.kind](step)
@@ -1107,6 +1140,13 @@ class SmokeRunner:
 
     def _do_click(self, step: SmokeStep) -> None:
         self._require_child().write(encode_click(step.row, step.col, step.button))
+
+    def _do_type_text(self, step: SmokeStep) -> None:
+        """#3650: the literal bytes of *step.text*, written straight to the
+        pty child's stdin — the same :meth:`PtyChild.write` every other
+        action step already goes through, i.e. real OS input, never an
+        in-process injection into the app's own buffer."""
+        self._require_child().write(step.text.encode("utf-8"))
 
     def _do_drag(self, step: SmokeStep) -> None:
         self._require_child().write(
@@ -1209,6 +1249,18 @@ class SmokeRunner:
                     f"screen was:\n{screen_text}"
                 )
             time.sleep(0.02)
+
+    def _do_expect_file(self, step: SmokeStep) -> None:
+        """#3650: delegates to :func:`coord.native_fs_wait.wait_for_file` —
+        the one shared filesystem check every Tier-2 native driver's own
+        ``expect_file`` step calls through (#2096 "one question, one
+        answer"); this driver has no OS-specific behaviour to add on top of
+        it."""
+        ok, reason = wait_for_file(
+            step.path, step.timeout_ms or 5000, step.contains or None,
+        )
+        if not ok:
+            raise AssertionError(reason)
 
     # -- background threads --
 

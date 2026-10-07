@@ -152,6 +152,43 @@ steps:
                 "steps:\n  - type: expect_hit\n    x: 0\n    y: 0\n    ht: HTCLOSE\n"
             )
 
+    def test_type_text_expect_file_frontmost_region_tofu_parse(self) -> None:
+        # #3650
+        spec = parse_native_spec(
+            "steps:\n"
+            "  - type: type_text\n"
+            "    text: hello\n"
+            "  - type: expect_file\n"
+            "    path: /tmp/probe.txt\n"
+            "    contains: hi\n"
+            "  - type: expect_frontmost\n"
+            "  - type: expect_region_not_uniform\n"
+            "    x: 1\n    y: 2\n    width: 3\n    height: 4\n"
+            "    tolerance: 10\n"
+            "  - type: expect_no_tofu\n"
+            "    x: 5\n    y: 6\n    width: 7\n    height: 8\n"
+        )
+        kinds = [s.kind for s in spec.steps]
+        assert kinds == [
+            "type_text", "expect_file", "expect_frontmost",
+            "expect_region_not_uniform", "expect_no_tofu",
+        ]
+        type_text, expect_file, _frontmost, region, tofu = spec.steps
+        assert type_text.text == "hello"
+        assert (expect_file.path, expect_file.contains) == ("/tmp/probe.txt", "hi")
+        assert (region.x, region.y, region.width, region.height, region.tolerance) == (1, 2, 3, 4, 10)
+        assert (tofu.x, tofu.y, tofu.width, tofu.height) == (5, 6, 7, 8)
+
+    def test_type_text_requires_text(self) -> None:
+        with pytest.raises(GtkNativeSpecError, match="text"):
+            parse_native_spec("steps:\n  - type: type_text\n")
+
+    def test_expect_region_not_uniform_requires_geometry(self) -> None:
+        with pytest.raises(GtkNativeSpecError, match="width"):
+            parse_native_spec(
+                "steps:\n  - type: expect_region_not_uniform\n    x: 0\n    y: 0\n"
+            )
+
 
 # ── _xdotool_arg_for_chord / _xdotool_args_for_key ──────────────────────────
 
@@ -278,6 +315,7 @@ class FakeGtkCalls:
         closes_after_n_polls: int | None = None,
         session_ok: bool = True,
         session_reason: str = "",
+        frontmost_script: list[tuple[bool, int]] | None = None,
     ) -> None:
         self.launch_fails = launch_fails
         self.window_never_appears = window_never_appears
@@ -292,9 +330,11 @@ class FakeGtkCalls:
         self.moved: list[tuple[int, int, int, int, int]] = []
         self.clicks: list[tuple[int, int, int, str]] = []
         self.keys: list[tuple[int, str]] = []
+        self.typed: list[tuple[int, str]] = []
         self.killed: list[int] = []
         self._next_pid = 1000
         self._window_id = 5555
+        self._frontmost_script = list(frontmost_script or [(True, 5555)])
 
     def session_available(self) -> tuple[bool, str]:
         return self._session_ok, self._session_reason
@@ -325,6 +365,14 @@ class FakeGtkCalls:
 
     def send_key(self, window_id: int, key: str) -> None:
         self.keys.append((window_id, key))
+
+    def type_text(self, window_id: int, text: str) -> None:
+        self.typed.append((window_id, text))
+
+    def is_frontmost(self, window_id: int) -> tuple[bool, int]:
+        if len(self._frontmost_script) > 1:
+            return self._frontmost_script.pop(0)
+        return self._frontmost_script[0]
 
     def ax_elements(self, pid: int) -> list[dict]:
         if len(self._ax_script) > 1:
@@ -448,6 +496,145 @@ class TestNativeRunnerActions:
         capture_entry = results[1]
         assert capture_entry["status"] == "pass"
         assert base64.b64decode(capture_entry["capture_b64"]) == b"one-frame"
+
+    def test_type_text_step_forwards_to_calls(self) -> None:
+        # #3650
+        calls = FakeGtkCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0), _step("type_text", 1, text="hello world"),
+        ]))
+        assert results[1]["status"] == "pass"
+        assert calls.typed == [(calls._window_id, "hello world")]
+
+
+class TestNativeRunnerExpectFile:
+    """#3650 — delegates to :func:`coord.native_fs_wait.wait_for_file`; see
+    ``tests/test_native_fs_wait.py`` for that function's own coverage."""
+
+    def test_passes_once_file_exists(self, tmp_path) -> None:
+        target = tmp_path / "probe.txt"
+        target.write_text("ready")
+        calls = FakeGtkCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=1000),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_when_file_never_appears(self, tmp_path) -> None:
+        target = tmp_path / "never.txt"
+        calls = FakeGtkCalls()
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=100),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "did not appear" in results[1]["message"]
+
+
+class TestNativeRunnerExpectFrontmost:
+    """#3650 — the vimcode#1824 "app never becomes frontmost" class of bug."""
+
+    def test_passes_when_frontmost(self) -> None:
+        calls = FakeGtkCalls(frontmost_script=[(True, 5555)])
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_frontmost", 1)]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_when_another_window_is_active(self) -> None:
+        calls = FakeGtkCalls(frontmost_script=[(False, 999)])
+        runner = _runner(calls)
+        results = runner.run(_spec([_step("launch", 0), _step("expect_frontmost", 1)]))
+        assert results[1]["status"] == "fail"
+        assert "999" in results[1]["message"]
+
+
+def _xwd_bytes(rows: list[list[tuple[int, int, int]]]) -> bytes:
+    """A minimal ZPixmap/32bpp/true-color XWD dump — see
+    ``tests/test_native_pixels.py``'s own encoder for the full field-by-field
+    explanation; duplicated narrowly here so this test module doesn't reach
+    into another module's test-only helpers."""
+    import struct
+
+    height = len(rows)
+    width = len(rows[0])
+    window_name = b"test\x00"
+    header_size = 25 * 4 + len(window_name)
+    bytes_per_line = width * 4
+    header = struct.pack(
+        ">25I", header_size, 7, 2, 24, width, height, 0, 1, 32, 1, 32, 32,
+        bytes_per_line, 4, 0xFF0000, 0x00FF00, 0x0000FF, 8, 0, 0, width,
+        height, 0, 0, 0,
+    )
+    body = bytearray()
+    for row in rows:
+        for (r, g, b) in row:
+            body += struct.pack(">I", (r << 16) | (g << 8) | b)
+    return header + window_name + bytes(body)
+
+
+class TestNativeRunnerExpectRegionNotUniform:
+    """#3650 — decodes via :func:`coord.native_pixels.decode_xwd`, judged by
+    the one shared :func:`coord.native_pixels.region_not_uniform`."""
+
+    def test_passes_for_a_varied_region(self) -> None:
+        rows = [[(255, 0, 0), (0, 255, 0)], [(0, 0, 255), (10, 10, 10)]]
+        calls = FakeGtkCalls(capture_script=[_xwd_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_region_not_uniform", 1, x=0, y=0, width=2, height=2),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_for_a_uniform_region_the_vimcode_1676_black_bar_shape(self) -> None:
+        rows = [[(0, 0, 0)] * 4 for _ in range(4)]
+        calls = FakeGtkCalls(capture_script=[_xwd_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_region_not_uniform", 1, x=0, y=0, width=4, height=4),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "uniform" in results[1]["message"]
+
+
+class TestNativeRunnerExpectNoTofu:
+    """#3650 — see :func:`coord.native_pixels.looks_like_tofu`'s own
+    docstring for the heuristic's scope."""
+
+    def test_passes_for_textured_content(self) -> None:
+        rows = [
+            [(255, 0, 0), (0, 255, 0), (0, 0, 255), (10, 10, 10)],
+            [(255, 255, 255), (128, 128, 128), (64, 64, 64), (0, 0, 0)],
+            [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12)],
+        ]
+        calls = FakeGtkCalls(capture_script=[_xwd_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_no_tofu", 1, x=0, y=0, width=4, height=3),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_fails_for_a_classic_tofu_box(self) -> None:
+        size = 8
+        rows = [
+            [(0, 0, 0) if (px in (0, size - 1) or py in (0, size - 1)) else (255, 255, 255)
+             for px in range(size)]
+            for py in range(size)
+        ]
+        calls = FakeGtkCalls(capture_script=[_xwd_bytes(rows)])
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_no_tofu", 1, x=0, y=0, width=size, height=size),
+        ]))
+        assert results[1]["status"] == "fail"
+        assert "tofu" in results[1]["message"]
 
 
 class TestNativeRunnerExpectA11y:
@@ -646,6 +833,70 @@ class TestLinuxGtkCallsSessionAvailable:
         monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
         available, reason = LinuxGtkCalls().session_available()
         assert (available, reason) == (True, "")
+
+
+class TestLinuxGtkCallsTypeTextAndFrontmost:
+    """#3650 — real ``xdotool type``/``xdotool getactivewindow`` calls."""
+
+    def _linux_with_display(self, monkeypatch) -> None:
+        monkeypatch.setattr("coord.gtk_native_driver._is_linux", lambda: True)
+        monkeypatch.setenv("DISPLAY", ":99")
+
+    def test_type_text_shells_out_with_double_dash_guard(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+        calls_made: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls_made.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        LinuxGtkCalls().type_text(5555, "-rf hello")
+
+        assert calls_made == [
+            ["xdotool", "type", "--window", "5555", "--", "-rf hello"]
+        ]
+
+    def test_type_text_raises_on_nonzero_exit(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No such window")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        with pytest.raises(GtkNativeRuntimeError, match="No such window"):
+            LinuxGtkCalls().type_text(5555, "hi")
+
+    def test_is_frontmost_true_when_active_window_matches(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+
+        def fake_run(cmd, **kwargs):
+            assert cmd == ["xdotool", "getactivewindow"]
+            return subprocess.CompletedProcess(cmd, 0, stdout="5555\n", stderr="")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        is_front, active_id = LinuxGtkCalls().is_frontmost(5555)
+        assert (is_front, active_id) == (True, 5555)
+
+    def test_is_frontmost_false_when_another_window_is_active(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="9999\n", stderr="")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        is_front, active_id = LinuxGtkCalls().is_frontmost(5555)
+        assert (is_front, active_id) == (False, 9999)
+
+    def test_is_frontmost_never_raises_on_probe_failure(self, monkeypatch) -> None:
+        self._linux_with_display(monkeypatch)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no active window")
+
+        monkeypatch.setattr("coord.gtk_native_driver.subprocess.run", fake_run)
+        is_front, active_id = LinuxGtkCalls().is_frontmost(5555)
+        assert (is_front, active_id) == (False, -1)
 
 
 class TestLinuxGtkCallsFindTopWindow:
