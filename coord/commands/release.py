@@ -4843,9 +4843,13 @@ def _render_gate_verdict(verdict: "Any") -> str:
     required=True,
     help=(
         "JSON file with this run's OBSERVED lane/bugbash/nightly results: "
-        '{"lanes": [{"lane", "sha", "passed", "detail"?, "checked_at"?}, ...], '
+        '{"lanes": [{"lane", "sha", "passed", "detail"?, "checked_at"?, '
+        '"unavailable"?}, ...], '
         '"bugbash": [{"sha", "new_findings", "verified"?, "ran_at"?, "detail"?}, ...], '
-        '"nightly": [{"artifact", "sha", "passed", "detail"?, "checked_at"?}, ...]}. '
+        '"nightly": [{"artifact", "sha", "passed", "detail"?, "checked_at"?, '
+        '"unavailable"?}, ...]}. '
+        '("unavailable": true marks an ENVIRONMENT condition — a locked or '
+        "absent GUI session, a missing display — not an app bug, #3510.) "
         "No production Tier-2/bugbash/nightly store is wired yet (tracked "
         "follow-up, out of #3488's and #3652's file scope) — this is the "
         "seam until one is."

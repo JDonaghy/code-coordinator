@@ -317,6 +317,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg"],
             nightly_results=[],
         )
@@ -333,6 +334,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg"],
             nightly_results=[
                 NightlyArtifactResult(artifact="macos-dmg", sha="oldsha", passed=True),
@@ -347,6 +349,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg"],
             nightly_results=[
                 NightlyArtifactResult(
@@ -364,6 +367,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg", "windows-installer"],
             nightly_results=[
                 NightlyArtifactResult(artifact="macos-dmg", sha="deadbeef", passed=True),
@@ -381,6 +385,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg", "windows-installer"],
             nightly_results=[
                 NightlyArtifactResult(artifact="macos-dmg", sha="deadbeef", passed=True),
@@ -395,6 +400,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg"],
             nightly_results=[
                 NightlyArtifactResult(
@@ -419,6 +425,7 @@ class TestEvaluateReleaseGateNightly:
             lane_results=[LaneResult(lane="tui-pty", sha="deadbeef", passed=True)],
             bugbash_required=True,
             bugbash_runs=[BugbashRunRecord(sha="deadbeef", new_findings=0, ran_at=1.0)],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg"],
             nightly_results=[
                 NightlyArtifactResult(artifact="macos-dmg", sha="deadbeef", passed=True),
@@ -435,6 +442,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg"],
             nightly_results=[
                 NightlyArtifactResult(
@@ -455,6 +463,7 @@ class TestEvaluateReleaseGateNightly:
             repo="vimcode",
             release_sha="deadbeef",
             required_lanes=[],
+            nightly_required=True,
             required_nightly_artifacts=["macos-dmg"],
             nightly_results=[
                 NightlyArtifactResult(
@@ -491,6 +500,25 @@ class TestEvaluateReleaseGateNightly:
             required_lanes=[],
             required_nightly_artifacts=[],
         )
+        assert verdict.gate_passed is True
+
+    def test_nightly_steps_are_gated_on_nightly_required_like_bugbash(self) -> None:
+        """#3652 review round 2: `nightly_required=False` means NO nightly
+        steps, symmetrically with `bugbash_required=False` — not "steps
+        anyway, because artifacts happened to be named". Asserted on a
+        would-FAIL artifact (no result recorded at all), so the test can
+        only pass because the step was genuinely skipped, never because
+        the step was added and happened to be green."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=["tui-pty"],
+            lane_results=[LaneResult(lane="tui-pty", sha="deadbeef", passed=True)],
+            nightly_required=False,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[],
+        )
+        assert not any(s.name.startswith("nightly:") for s in verdict.steps)
         assert verdict.gate_passed is True
 
 

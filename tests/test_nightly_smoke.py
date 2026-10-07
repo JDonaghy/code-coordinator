@@ -13,9 +13,11 @@ Four things are under test, matching the module docstring's four
    #2096-disciplined verdict core (never classifies an unobserved result;
    a clean green and an expected-red known bug never alert).
 4. :func:`process_nightly_step` — files/updates/closes exactly one issue
-   per (spec, step), via an EXACT key match (never
+   per (platform, spec, step), via an EXACT key match (never
    `coord.bugbash.dedupe_finding`'s fuzzy title-similarity scoring, which
-   would fold two different steps of the same spec into one issue).
+   would fold two different steps of the same spec into one issue), and
+   attaches the step's own captures to the repeat-failure comment as well
+   as to the filed issue (#3652 Wanted #2).
 """
 
 from __future__ import annotations
@@ -207,7 +209,9 @@ class TestParseKnownBugRef:
 # ── classify_step / classify_nightly_run ─────────────────────────────────
 
 
-def _obs(*, passed: bool, checked_at: float | None = 100.0, **kwargs) -> NightlyStepObservation:
+def _obs(
+    *, passed: bool, checked_at: float | None = 100.0, **kwargs,
+) -> NightlyStepObservation:
     defaults = dict(
         repo="vimcode", spec="install.yaml", step="launch", sha="deadbeef",
     )
@@ -282,6 +286,31 @@ class TestFindingFromStep:
         with pytest.raises(ValueError, match="RED_NEEDS_FILING"):
             finding_from_step(verdict)
 
+    def test_title_key_is_platform_qualified(self) -> None:
+        """Round-2 review: the dedupe key in the title names the platform,
+        so the same step on two hosts is two keys."""
+        obs = _obs(spec="install.yaml", step="launch", passed=False)
+        verdict = classify_step(obs, None)
+        mac = finding_from_step(verdict, platform="mac-native")
+        gtk = finding_from_step(verdict, platform="gtk-native")
+        assert "[nightly:mac-native|install.yaml|launch]" in mac.title
+        assert "[nightly:gtk-native|install.yaml|launch]" in gtk.title
+
+    def test_a_component_containing_the_key_separator_is_rejected(self) -> None:
+        """A key that is not injective silently folds two distinct findings
+        into one issue — the exact defect the key exists to prevent — so a
+        component carrying the key's own structural characters must raise
+        rather than produce an ambiguous key (#2096)."""
+        verdict = classify_step(_obs(spec="a|b", step="launch", passed=False), None)
+        with pytest.raises(ValueError, match="structural characters"):
+            finding_from_step(verdict, platform="mac-native")
+
+    def test_a_component_containing_a_closing_bracket_is_rejected(self) -> None:
+        obs = _obs(spec="install.yaml", step="la]unch", passed=False)
+        verdict = classify_step(obs, None)
+        with pytest.raises(ValueError, match="structural characters"):
+            finding_from_step(verdict, platform="mac-native")
+
 
 # ── process_nightly_step ──────────────────────────────────────────────────
 
@@ -316,6 +345,13 @@ def _lane() -> BugbashLane:
     )
 
 
+def _gtk_lane() -> BugbashLane:
+    return BugbashLane(
+        platform="gtk-native", driver_kind="gtk-native", machine="deb-gtk",
+        capability="gtk",
+    )
+
+
 class TestProcessNightlyStep:
     def test_clean_green_never_calls_runner(self) -> None:
         verdict = classify_step(_obs(passed=True), None)
@@ -346,7 +382,7 @@ class TestProcessNightlyStep:
         """#3652 Wanted #2: 'repeated failures update the same issue rather
         than filing new ones' — literal behaviour, not merely dedup."""
         verdict = classify_step(_obs(passed=False, detail="crashed again"), None)
-        finding = finding_from_step(verdict)
+        finding = finding_from_step(verdict, platform=_lane().platform)
         open_issues = [{"number": 77, "title": finding.title}]
         runner = FakeRunner()
         outcome = process_nightly_step(
@@ -358,6 +394,81 @@ class TestProcessNightlyStep:
         assert len(runner.calls) == 1  # never re-filed, only commented
         assert runner.calls[0][:3] == ["issue", "comment", "vimcode"]
         assert runner.calls[0][3] == "77"
+
+    def test_repeat_failure_comment_carries_the_steps_captures(self) -> None:
+        """BLOCKING #3652 review round 2: the repeat-failure comment used
+        to render a bare `finding.evidence`, which `finding_from_step`
+        deliberately leaves EMPTY whenever `captures` is populated — so the
+        comment said "Evidence:" and then nothing at all, exactly when
+        evidence existed. #3652 Wanted #2 requires the step's evidence
+        (screenshot, file listing, timings) attached to the issue the
+        repeated failure UPDATES, not only to the one it files.
+
+        This is the case the round-1 test could not see: it built its
+        observation with no `evidence=`, so `obs.evidence == ()` and only
+        the still-working branch was ever exercised.
+        """
+        verdict = classify_step(
+            _obs(
+                passed=False, detail="crashed again",
+                evidence=("shot.png", "timings.txt"),
+            ),
+            None,
+        )
+        finding = finding_from_step(verdict, platform=_lane().platform)
+        open_issues = [{"number": 77, "title": finding.title}]
+        runner = FakeRunner()
+        outcome = process_nightly_step(
+            verdict, open_issues=open_issues, closed_issues=[], lane=_lane(),
+            runner=runner, dry_run=False,
+        )
+        assert outcome.action == "commented"
+        body = runner.calls[0][runner.calls[0].index("--body") + 1]
+        assert "shot.png" in body
+        assert "timings.txt" in body
+        # ...and the "Evidence:" heading is never left dangling with
+        # nothing under it.
+        assert not body.rstrip().endswith("Evidence:")
+
+    def test_repeat_failure_comment_says_so_when_nothing_was_captured(self) -> None:
+        """The other branch of the same render: with no captures at all the
+        comment must say so explicitly rather than go silent, since the
+        sentence above it points the reader at evidence."""
+        verdict = classify_step(_obs(passed=False, detail="crashed again"), None)
+        finding = finding_from_step(verdict, platform=_lane().platform)
+        runner = FakeRunner()
+        process_nightly_step(
+            verdict, open_issues=[{"number": 77, "title": finding.title}],
+            closed_issues=[], lane=_lane(), runner=runner, dry_run=False,
+        )
+        body = runner.calls[0][runner.calls[0].index("--body") + 1]
+        assert "no evidence captured" in body
+
+    def test_alerting_step_that_files_nothing_is_not_reported_as_quiet(self) -> None:
+        """#2096 + #3652 review round 2: an open-issue match whose dict
+        carries no `"number"` reaches `file_finding` with a DUPLICATE
+        verdict, which short-circuits with `filed=False`. That is an
+        alerting red step that got no issue, no comment and no close — it
+        must NOT report the same `action="none"` a clean green returns, or
+        a caller can never tell a dropped alert from routine quiet."""
+        verdict = classify_step(_obs(passed=False, detail="crashed"), None)
+        finding = finding_from_step(verdict, platform=_lane().platform)
+        runner = FakeRunner()
+        outcome = process_nightly_step(
+            verdict, open_issues=[{"title": finding.title}], closed_issues=[],
+            lane=_lane(), runner=runner, dry_run=False,
+        )
+        assert outcome.action == "not-filed"
+        assert outcome.dropped is True
+        assert outcome.issue_number is None
+        assert runner.calls == []
+        # A clean green must stay distinguishable from the above.
+        green = process_nightly_step(
+            classify_step(_obs(passed=True), None),
+            open_issues=[], closed_issues=[], dry_run=False,
+        )
+        assert green.action == "none"
+        assert green.dropped is False
 
     def test_two_distinct_steps_of_the_same_spec_get_two_distinct_issues(self) -> None:
         """BLOCKING #3652 review finding: `coord.bugbash.dedupe_finding`'s
@@ -394,7 +505,11 @@ class TestProcessNightlyStep:
         # Step B is classified/filed against a corpus that now includes
         # step A's freshly-filed issue — exactly what a real nightly run's
         # second step would see if it fetched open issues once up front.
-        finding_a = finding_from_step(launch)
+        # The platform is passed EXPLICITLY (round-2 review nit): the real
+        # filing above goes through `lane=_lane()`, so a default here would
+        # only line up by the coincidence that `_lane().platform` happens
+        # to equal `finding_from_step`'s own default.
+        finding_a = finding_from_step(launch, platform=_lane().platform)
         open_issues_after_a = [{"number": 500, "title": finding_a.title}]
         outcome_b = process_nightly_step(
             uninstall, open_issues=open_issues_after_a, closed_issues=[],
@@ -407,8 +522,9 @@ class TestProcessNightlyStep:
     def test_regression_against_a_closed_issue_reopens_via_the_same_key(self) -> None:
         """The REGRESSION path (closed-issue exact-key match) through
         `process_nightly_step` — never exercised before this round."""
-        verdict = classify_step(_obs(spec="install.yaml", step="launch", passed=False), None)
-        finding = finding_from_step(verdict)
+        obs = _obs(spec="install.yaml", step="launch", passed=False)
+        verdict = classify_step(obs, None)
+        finding = finding_from_step(verdict, platform=_lane().platform)
         closed_issues = [{"number": 42, "title": finding.title}]
         runner = FakeRunner(next_issue_number=900)
         outcome = process_nightly_step(
@@ -453,7 +569,9 @@ class TestProcessNightlyStep:
     def test_alerting_step_without_runner_raises(self) -> None:
         verdict = classify_step(_obs(passed=False), None)
         with pytest.raises(ValueError, match="needs a runner"):
-            process_nightly_step(verdict, open_issues=[], closed_issues=[], dry_run=False)
+            process_nightly_step(
+                verdict, open_issues=[], closed_issues=[], dry_run=False,
+            )
 
     def test_malformed_known_bug_ref_raises_mid_flight(self) -> None:
         """#3652 review test gap: a malformed `known_bug` ref reaching
@@ -470,21 +588,78 @@ class TestProcessNightlyStep:
 
     def test_default_platform_comes_from_the_lane_not_a_constant(self) -> None:
         """#3652 review: a caller passing `lane=<some-platform lane>` with
-        no explicit `platform=` must get an issue tagged for THAT lane's
-        platform, not a careless constant default that would dedupe a
-        macOS failure and a GTK-Linux failure of the identical step into
-        one issue."""
+        no explicit `platform=` must get an issue TAGGED for THAT lane's
+        platform, not for a constant default that disagrees with the lane
+        actually doing the run.
+
+        Scope note (round-2 review): this asserts the display tag only.
+        The separate cross-platform DEDUPE guarantee is proven by
+        `test_the_same_step_failing_on_two_platforms_gets_two_issues`.
+        """
         verdict = classify_step(_obs(passed=False, detail="crashed"), None)
         runner = FakeRunner(next_issue_number=700)
-        gtk_lane = BugbashLane(
-            platform="gtk-native", driver_kind="gtk-native", machine="deb-gtk",
-            capability="gtk",
-        )
         outcome = process_nightly_step(
-            verdict, open_issues=[], closed_issues=[], lane=gtk_lane,
+            verdict, open_issues=[], closed_issues=[], lane=_gtk_lane(),
             runner=runner, dry_run=False,
         )
         assert outcome.action == "filed"
         create_call = runner.calls[0]
         title_idx = create_call.index("--title") + 1
         assert "[bugbash:gtk-native]" in create_call[title_idx]
+
+    def test_the_same_step_failing_on_two_platforms_gets_two_issues(self) -> None:
+        """BLOCKING #3652 review round 2: the exact-key matcher's key must
+        be PLATFORM-qualified. #3652 Wanted #1 routes one spec across
+        macmini / dell64 / a GTK Linux box, and
+        `coord.bugbash._best_match`'s own documented rationale is that an
+        identically-titled finding on two different platforms is two
+        different bugs, not one. With a `(spec, step)`-only key the
+        GTK-Linux failure of `install.yaml::launch` found the already-open
+        `[bugbash:mac-native]` issue for the same step and posted "failed
+        again" on a macOS bug — the round-1 defect's shape, across hosts
+        instead of across steps.
+        """
+        verdict = classify_step(
+            _obs(spec="install.yaml", step="launch", passed=False, detail="no window"),
+            None,
+        )
+        mac_lane = BugbashLane(
+            platform="mac-native", driver_kind="mac-native", machine="macmini",
+            capability="macos",
+        )
+        runner = FakeRunner(next_issue_number=800)
+
+        mac_outcome = process_nightly_step(
+            verdict, open_issues=[], closed_issues=[], lane=mac_lane,
+            runner=runner, dry_run=False,
+        )
+        assert mac_outcome.action == "filed"
+        assert mac_outcome.issue_number == 800
+
+        # The GTK run of the SAME step, against a corpus that already holds
+        # the macOS issue.
+        mac_finding = finding_from_step(verdict, platform=mac_lane.platform)
+        gtk_outcome = process_nightly_step(
+            verdict,
+            open_issues=[{"number": 800, "title": mac_finding.title}],
+            closed_issues=[], lane=_gtk_lane(), runner=runner, dry_run=False,
+        )
+        assert gtk_outcome.action == "filed"
+        assert gtk_outcome.issue_number == 801
+        assert gtk_outcome.issue_number != mac_outcome.issue_number
+        # Nothing was ever commented onto the macOS bug.
+        assert not any(call[:2] == ["issue", "comment"] for call in runner.calls)
+
+    def test_a_platforms_own_repeat_failure_folds_into_its_own_issue(self) -> None:
+        """The other half of the platform-qualified key: qualifying by
+        platform must not break #3652 Wanted #2's "repeated failures update
+        the same issue" WITHIN one platform."""
+        verdict = classify_step(_obs(passed=False, detail="no window"), None)
+        gtk_finding = finding_from_step(verdict, platform=_gtk_lane().platform)
+        runner = FakeRunner()
+        outcome = process_nightly_step(
+            verdict, open_issues=[{"number": 801, "title": gtk_finding.title}],
+            closed_issues=[], lane=_gtk_lane(), runner=runner, dry_run=False,
+        )
+        assert outcome.action == "commented"
+        assert outcome.issue_number == 801
