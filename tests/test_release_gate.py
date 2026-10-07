@@ -30,6 +30,7 @@ from coord.release_gate import (
     BugbashRunRecord,
     GateOverride,
     LaneResult,
+    NightlyArtifactResult,
     apply_override,
     bugbash_run_record_from_report,
     evaluate_release_gate,
@@ -294,6 +295,139 @@ class TestEvaluateReleaseGateBugbash:
         assert step.passed is True
 
 
+class TestEvaluateReleaseGateNightly:
+    """#3652: the real-platform nightly smoke runner's own per-repo gate —
+    deliberately graded by the exact same #2096 discipline as
+    `TestEvaluateReleaseGateLanes` (see `_nightly_artifact_step`'s
+    docstring: "one question, one answer")."""
+
+    def test_no_required_artifacts_is_never_evaluated(self) -> None:
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=["tui-pty"],
+            lane_results=[LaneResult(lane="tui-pty", sha="deadbeef", passed=True)],
+            required_nightly_artifacts=[],
+        )
+        assert not any(s.name.startswith("nightly:") for s in verdict.steps)
+        assert verdict.gate_passed is True
+
+    def test_missing_artifact_result_fails(self) -> None:
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[],
+        )
+        [step] = verdict.steps
+        assert step.name == "nightly:macos-dmg"
+        assert step.passed is False
+        assert "no nightly real-platform smoke result recorded" in step.detail
+
+    def test_stale_sha_result_fails(self) -> None:
+        """A nightly result recorded at some OTHER commit must never be
+        silently accepted — too stale to certify THIS release (#2096,
+        mirrors `_lane_step`'s identical rule)."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[
+                NightlyArtifactResult(artifact="macos-dmg", sha="oldsha", passed=True),
+            ],
+        )
+        [step] = verdict.steps
+        assert step.passed is False
+        assert "too stale to certify this release" in step.detail
+
+    def test_failing_artifact_at_release_sha_fails(self) -> None:
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[
+                NightlyArtifactResult(
+                    artifact="macos-dmg", sha="deadbeef", passed=False,
+                    detail="menu bar missing",
+                ),
+            ],
+        )
+        [step] = verdict.steps
+        assert step.passed is False
+        assert "menu bar missing" in step.detail
+
+    def test_all_artifacts_passing_at_release_sha_passes(self) -> None:
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg", "windows-installer"],
+            nightly_results=[
+                NightlyArtifactResult(artifact="macos-dmg", sha="deadbeef", passed=True),
+                NightlyArtifactResult(artifact="windows-installer", sha="deadbeef", passed=True),
+            ],
+        )
+        assert verdict.gate_passed is True
+        assert len(verdict.steps) == 2
+
+    def test_one_of_several_artifacts_missing_fails_the_whole_gate(self) -> None:
+        """'Green across ALL shipped artifacts' (#3652 Wanted #4) — one
+        missing/failing artifact must fail the gate even when every OTHER
+        required artifact passed."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg", "windows-installer"],
+            nightly_results=[
+                NightlyArtifactResult(artifact="macos-dmg", sha="deadbeef", passed=True),
+            ],
+        )
+        assert verdict.gate_passed is False
+        failing_names = {s.name for s in verdict.failing_steps}
+        assert failing_names == {"nightly:windows-installer"}
+
+    def test_picks_the_most_recently_checked_result_at_the_release_sha(self) -> None:
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[
+                NightlyArtifactResult(
+                    artifact="macos-dmg", sha="deadbeef", passed=False, checked_at=1.0,
+                ),
+                NightlyArtifactResult(
+                    artifact="macos-dmg", sha="deadbeef", passed=True, checked_at=2.0,
+                ),
+            ],
+        )
+        [step] = verdict.steps
+        assert step.passed is True
+
+    def test_lanes_bugbash_and_nightly_steps_all_compose(self) -> None:
+        """The three step kinds are independent and all required at once —
+        one gate, not three disagreeing ones (#2096 "one question, one
+        answer")."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=["tui-pty"],
+            lane_results=[LaneResult(lane="tui-pty", sha="deadbeef", passed=True)],
+            bugbash_required=True,
+            bugbash_runs=[BugbashRunRecord(sha="deadbeef", new_findings=0, ran_at=1.0)],
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[
+                NightlyArtifactResult(artifact="macos-dmg", sha="deadbeef", passed=True),
+            ],
+        )
+        assert {s.name for s in verdict.steps} == {"lane:tui-pty", "bugbash", "nightly:macos-dmg"}
+        assert verdict.gate_passed is True
+
+
 class TestBugbashRunRecordFromReport:
     """#3517: `bugbash_run_record_from_report` is the ONE place that maps a
     real `coord.bugbash.BugbashReport` onto this module's own
@@ -498,11 +632,79 @@ class TestParseReleaseGateConfig:
         with pytest.raises(ConfigError, match="mapping"):
             parse_mapping(_mapping(["not", "a", "mapping"]))
 
+    # ── #3652: nightly real-platform smoke gate ─────────────────────────
+
+    def test_nightly_defaults_to_off(self) -> None:
+        cfg = parse_mapping(_mapping({"vimcode": {"lanes": ["tui-pty"]}}))
+        entry = cfg.release_gate.for_repo("vimcode")
+        assert entry.nightly_required is False
+        assert entry.nightly_artifacts == []
+
+    def test_nightly_required_with_artifacts_parses(self) -> None:
+        cfg = parse_mapping(_mapping({
+            "vimcode": {
+                "lanes": ["tui-pty"], "nightly": "required",
+                "nightly_artifacts": ["macos-dmg", "windows-installer"],
+            },
+        }))
+        entry = cfg.release_gate.for_repo("vimcode")
+        assert entry.nightly_required is True
+        assert entry.nightly_artifacts == ["macos-dmg", "windows-installer"]
+
+    def test_nightly_required_with_no_artifacts_rejected(self) -> None:
+        """#2096: `nightly: required` with nothing named could never
+        observe a failure — the exact vacuous-pass trap `lanes` already
+        guards against."""
+        with pytest.raises(ConfigError, match="nightly_artifacts must be"):
+            parse_mapping(_mapping({
+                "vimcode": {"lanes": ["tui-pty"], "nightly": "required"},
+            }))
+
+    def test_nightly_artifacts_without_required_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="nightly: required is not"):
+            parse_mapping(_mapping({
+                "vimcode": {
+                    "lanes": ["tui-pty"], "nightly_artifacts": ["macos-dmg"],
+                },
+            }))
+
+    def test_invalid_nightly_value_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="nightly"):
+            parse_mapping(_mapping({
+                "vimcode": {"lanes": ["tui-pty"], "nightly": "sometimes"},
+            }))
+
+    def test_empty_lanes_allowed_when_nightly_required(self) -> None:
+        """A lanes-less, nightly-only gate can still fail (see
+        `TestEvaluateReleaseGateNightly`'s own missing-artifact test) — a
+        repo that only wants to gate on the nightly runner must not be
+        forced to also name a Tier-2 lane it doesn't care about."""
+        cfg = parse_mapping(_mapping({
+            "vimcode": {
+                "lanes": [], "nightly": "required", "nightly_artifacts": ["macos-dmg"],
+            },
+        }))
+        entry = cfg.release_gate.for_repo("vimcode")
+        assert entry.lanes == []
+        assert entry.nightly_required is True
+
+    def test_empty_lanes_no_bugbash_no_nightly_still_rejected(self) -> None:
+        """Unchanged #2096 guard: a gate with none of the three
+        observable sources is still a vacuous pass."""
+        with pytest.raises(ConfigError, match="lanes must be non-empty"):
+            parse_mapping(_mapping({"vimcode": {"lanes": []}}))
+
 
 # ── `coord release gate` CLI ────────────────────────────────────────────────
 
 
-def _config_with_gate(*, lanes: list[str], bugbash_required: bool) -> Config:
+def _config_with_gate(
+    *,
+    lanes: list[str],
+    bugbash_required: bool,
+    nightly_required: bool = False,
+    nightly_artifacts: list[str] | None = None,
+) -> Config:
     return Config(
         repos=[Repo(name="vimcode", github="acme/vimcode")],
         machines=[Machine(name="m1", host="m1.example.ts.net", repos=["vimcode"])],
@@ -510,6 +712,8 @@ def _config_with_gate(*, lanes: list[str], bugbash_required: bool) -> Config:
             repos={
                 "vimcode": ReleaseGateRepoConfig(
                     lanes=lanes, bugbash_required=bugbash_required,
+                    nightly_required=nightly_required,
+                    nightly_artifacts=nightly_artifacts or [],
                 ),
             }
         ),
@@ -648,6 +852,83 @@ class TestReleaseGateCli:
         )
         assert result.exit_code == 0, result.output
         assert "RESULT: PASS" in result.output
+
+    def test_nightly_failing_artifact_names_the_step_and_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """#3652: `--from-json`'s `"nightly"` array wires into the same
+        gate CLI as `"lanes"`/`"bugbash"`."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(
+                lanes=["tui-pty"], bugbash_required=False,
+                nightly_required=True, nightly_artifacts=["macos-dmg"],
+            ),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "lanes": [{"lane": "tui-pty", "sha": "deadbeef", "passed": True}],
+            "nightly": [{"artifact": "macos-dmg", "sha": "deadbeef", "passed": False,
+                         "detail": "install flow crashed"}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 1, result.output
+        assert "nightly:macos-dmg" in result.output
+        assert "install flow crashed" in result.output
+        assert "RESULT: FAIL" in result.output
+
+    def test_nightly_passing_artifact_at_sha_passes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(
+                lanes=[], bugbash_required=False,
+                nightly_required=True, nightly_artifacts=["macos-dmg"],
+            ),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "nightly": [{"artifact": "macos-dmg", "sha": "deadbeef", "passed": True}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 0, result.output
+        assert "RESULT: PASS" in result.output
+
+    @pytest.mark.parametrize("bad_value", ["false", "0", 0])
+    def test_truthy_non_bool_nightly_passed_is_rejected_not_coerced(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_value: object,
+    ) -> None:
+        """Same #2096 trap as lanes[].passed, extended to nightly[].passed."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(
+                lanes=[], bugbash_required=False,
+                nightly_required=True, nightly_artifacts=["macos-dmg"],
+            ),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "nightly": [{"artifact": "macos-dmg", "sha": "deadbeef", "passed": bad_value}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 2, result.output
+        assert "malformed" in result.output
 
     def test_empty_override_reason_rejected_before_anything_else_runs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,

@@ -4719,11 +4719,12 @@ def _require_bool(value: Any, *, field_name: str) -> bool:
 
 def _load_release_gate_observations(
     payload: dict,
-) -> tuple[list, list]:
+) -> tuple[list, list, list]:
     """Parse ``--from-json``'s payload into
     (:class:`~coord.release_gate.LaneResult`, :class:`~coord.release_gate.
-    BugbashRunRecord`) lists. Raises ``KeyError``/``TypeError``/``ValueError``
-    on a malformed entry — the caller turns that into a clean CLI error."""
+    BugbashRunRecord`, :class:`~coord.release_gate.NightlyArtifactResult`)
+    lists. Raises ``KeyError``/``TypeError``/``ValueError`` on a malformed
+    entry — the caller turns that into a clean CLI error."""
     from coord import release_gate as rg  # noqa: PLC0415
 
     lane_results = [
@@ -4754,7 +4755,17 @@ def _load_release_gate_observations(
         )
         for entry in payload.get("bugbash", []) or []
     ]
-    return lane_results, bugbash_runs
+    nightly_results = [
+        rg.NightlyArtifactResult(
+            artifact=entry["artifact"],
+            sha=entry["sha"],
+            passed=_require_bool(entry["passed"], field_name="nightly[].passed"),
+            detail=entry.get("detail", ""),
+            checked_at=entry.get("checked_at"),
+        )
+        for entry in payload.get("nightly", []) or []
+    ]
+    return lane_results, bugbash_runs, nightly_results
 
 
 def _gate_verdict_to_dict(verdict: "Any") -> dict[str, Any]:
@@ -4808,9 +4819,11 @@ def _render_gate_verdict(verdict: "Any") -> str:
     help=(
         "#3488: the opt-in cross-platform release gate. Refuses (naming the "
         "failing lane/step) unless every Tier-2 smoke lane configured for "
-        "REPO passed at --sha, and (when release_gate.<repo>.bugbash: "
+        "REPO passed at --sha, (when release_gate.<repo>.bugbash: "
         "required) the most recent `coord bugbash` run at or after --sha "
-        "found nothing new."
+        "found nothing new, and (when release_gate.<repo>.nightly: "
+        "required, #3652) the most recent real-platform nightly smoke run "
+        "passed AT --sha for every artifact in nightly_artifacts."
     ),
 )
 @_CONFIG_OPTION
@@ -4822,11 +4835,13 @@ def _render_gate_verdict(verdict: "Any") -> str:
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
     help=(
-        "JSON file with this run's OBSERVED lane/bugbash results: "
+        "JSON file with this run's OBSERVED lane/bugbash/nightly results: "
         '{"lanes": [{"lane", "sha", "passed", "detail"?, "checked_at"?}, ...], '
-        '"bugbash": [{"sha", "new_findings", "verified"?, "ran_at"?, "detail"?}, ...]}. '
-        "No production Tier-2/bugbash store is wired yet (tracked follow-up, "
-        "out of #3488's file scope) — this is the seam until one is."
+        '"bugbash": [{"sha", "new_findings", "verified"?, "ran_at"?, "detail"?}, ...], '
+        '"nightly": [{"artifact", "sha", "passed", "detail"?, "checked_at"?}, ...]}. '
+        "No production Tier-2/bugbash/nightly store is wired yet (tracked "
+        "follow-up, out of #3488's and #3652's file scope) — this is the "
+        "seam until one is."
     ),
 )
 @click.option(
@@ -4896,7 +4911,9 @@ def release_gate_cmd(
         sys.exit(2)
 
     try:
-        lane_results, bugbash_runs = _load_release_gate_observations(payload)
+        lane_results, bugbash_runs, nightly_results = _load_release_gate_observations(
+            payload,
+        )
     except (KeyError, TypeError, ValueError) as exc:
         click.echo(f"error: malformed {from_json_path}: {exc}", err=True)
         sys.exit(2)
@@ -4908,6 +4925,8 @@ def release_gate_cmd(
         lane_results=lane_results,
         bugbash_required=gate_cfg.bugbash_required,
         bugbash_runs=bugbash_runs,
+        required_nightly_artifacts=gate_cfg.nightly_artifacts,
+        nightly_results=nightly_results,
         sha_is_at_or_after=_sha_ancestry_comparator(repo_path_opt),
     )
     if override_reason:

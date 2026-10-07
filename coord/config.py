@@ -1812,19 +1812,31 @@ class ReleaseGateRepoConfig:
     ``coord bugbash`` run reachable from that SHA to have ended with zero
     new findings.
 
-    Nothing here runs the lanes or the bugbash loop itself — this is only
-    the declaration the gate evaluates against observed results (see
-    :mod:`coord.release_gate`). An empty ``lanes`` list is rejected at parse
-    time (see :func:`_parse_release_gate`) UNLESS ``bugbash_required`` is
-    set — a repo that opts in with no lanes and no bugbash requirement has
-    declared a gate that can never observe anything to fail on, which is
-    exactly the "gate that cannot fail" trap (#2096); a lanes-less,
-    bugbash-only gate can still fail on a red/unverified bugbash run, so
-    that combination is allowed.
+    ``nightly_artifacts``/``nightly_required`` (#3652, from the YAML's
+    ``nightly: required|off`` plus ``nightly_artifacts: [...]``) additionally
+    requires the most recent **real-platform** nightly smoke run
+    (:mod:`coord.nightly_smoke` — a built-or-downloaded real artifact run on
+    real capable hardware, distinct from the synthetic Tier-2 lanes above)
+    to show a PASSING result AT THE RELEASE SHA for every named shipped
+    artifact. Same #2096 discipline as ``lanes``: see
+    :func:`coord.release_gate._nightly_artifact_step`.
+
+    Nothing here runs the lanes, the bugbash loop, or the nightly runner
+    itself — this is only the declaration the gate evaluates against
+    observed results (see :mod:`coord.release_gate`). An empty ``lanes``
+    list is rejected at parse time (see :func:`_parse_release_gate`) UNLESS
+    ``bugbash_required`` or ``nightly_required`` is set — a repo that opts
+    in with no lanes and no bugbash/nightly requirement has declared a gate
+    that can never observe anything to fail on, which is exactly the "gate
+    that cannot fail" trap (#2096); a lanes-less gate that still requires
+    bugbash and/or nightly can fail on those, so that combination is
+    allowed.
     """
 
     lanes: list[str] = field(default_factory=list)
     bugbash_required: bool = False
+    nightly_required: bool = False
+    nightly_artifacts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -5238,7 +5250,7 @@ def _parse_release_gate(raw: Any, repo_names: set[str]) -> ReleaseGateConfig:
         if not isinstance(entry, dict):
             raise ConfigError(f"release_gate[{repo_name!r}] must be a mapping")
 
-        known = {"lanes", "bugbash"}
+        known = {"lanes", "bugbash", "nightly", "nightly_artifacts"}
         unknown = sorted(set(entry) - known)
         if unknown:
             raise ConfigError(
@@ -5261,24 +5273,62 @@ def _parse_release_gate(raw: Any, repo_names: set[str]) -> ReleaseGateConfig:
                 f"{_RELEASE_GATE_BUGBASH_VALUES!r}, got {bugbash_raw!r}"
             )
 
-        if not lanes_raw and bugbash_raw != "required":
-            # #2096: a gate declared over zero lanes AND no bugbash
+        # #3652: `nightly: required|off` mirrors `bugbash` exactly — the
+        # real-platform nightly smoke runner's own per-repo gate.
+        nightly_raw = entry.get("nightly", "off")
+        if nightly_raw not in _RELEASE_GATE_BUGBASH_VALUES:
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].nightly must be one of "
+                f"{_RELEASE_GATE_BUGBASH_VALUES!r}, got {nightly_raw!r}"
+            )
+        nightly_required = nightly_raw == "required"
+
+        nightly_artifacts_raw = entry.get("nightly_artifacts", []) or []
+        if not isinstance(nightly_artifacts_raw, list) or not all(
+            isinstance(x, str) and x for x in nightly_artifacts_raw
+        ):
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].nightly_artifacts must be a list "
+                "of non-empty strings"
+            )
+        if nightly_required and not nightly_artifacts_raw:
+            # #2096: `nightly: required` with no named artifacts could never
+            # observe anything either — same vacuous-pass trap as the
+            # lanes/bugbash check below, called out separately because it's
+            # easy to set `nightly: required` and forget the artifact list.
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].nightly_artifacts must be "
+                "non-empty when nightly: required is set — a nightly gate "
+                "with no named artifacts can never observe a failure"
+            )
+        if nightly_artifacts_raw and not nightly_required:
+            raise ConfigError(
+                f"release_gate[{repo_name!r}].nightly_artifacts is set but "
+                "nightly: required is not — either set nightly: required or "
+                "remove nightly_artifacts"
+            )
+
+        if not lanes_raw and bugbash_raw != "required" and not nightly_required:
+            # #2096: a gate declared over zero lanes AND no bugbash/nightly
             # requirement can never observe a failure — it would always
             # report a vacuous pass. Reject it at parse time rather than
             # let an operator believe a repo is gated when it cannot
-            # actually fail on anything. A lanes-less, bugbash-only gate
-            # (`bugbash: required`) is fine — `evaluate_release_gate` can
-            # still fail it on a red/unverified bugbash run — so that
+            # actually fail on anything. A lanes-less gate that still
+            # requires bugbash and/or nightly is fine — `evaluate_release_
+            # gate` can still fail it on a red/unverified run — so that
             # combination is allowed through.
             raise ConfigError(
                 f"release_gate[{repo_name!r}].lanes must be non-empty unless "
-                "bugbash: required is set — a repo opted into the release "
-                "gate must be able to observe at least one failure"
+                "bugbash: required and/or nightly: required is set — a repo "
+                "opted into the release gate must be able to observe at "
+                "least one failure"
             )
 
         repos[repo_name] = ReleaseGateRepoConfig(
             lanes=list(lanes_raw),
             bugbash_required=(bugbash_raw == "required"),
+            nightly_required=nightly_required,
+            nightly_artifacts=list(nightly_artifacts_raw),
         )
 
     return ReleaseGateConfig(repos=repos)
