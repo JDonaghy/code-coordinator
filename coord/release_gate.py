@@ -526,7 +526,8 @@ def evaluate_release_gate(
     """Evaluate the #3488 release gate for *repo* at *release_sha*.
 
     One :class:`GateStepResult` per required lane (named ``lane:<lane>``),
-    plus one more named ``"bugbash"`` when *bugbash_required*, plus one more
+    plus one more named ``"bugbash"`` when *bugbash_required*, plus — when
+    *nightly_required*, mirroring *bugbash_required* exactly — one more
     per *required_nightly_artifacts* entry (named ``nightly:<artifact>``,
     #3652 — the real-platform nightly smoke runner's own per-repo gate:
     "the latest nightly for this SHA is green across all shipped
@@ -565,8 +566,16 @@ def evaluate_release_gate(
     steps = [_lane_step(lane, release_sha, lane_results) for lane in required_lanes]
     if bugbash_required:
         steps.append(_bugbash_step(release_sha, bugbash_runs, sha_is_at_or_after))
-    steps.extend(
-        _nightly_artifact_step(artifact, release_sha, nightly_results)
-        for artifact in required_nightly_artifacts
-    )
+    # #3652 review: nightly steps are gated on `nightly_required` exactly
+    # as bugbash is on `bugbash_required` — adding them whenever
+    # `required_nightly_artifacts` was non-empty was only ever harmless by
+    # accident (it is strictly stricter, and `_parse_release_gate` refuses
+    # artifacts-without-required), but the asymmetry would have let a
+    # future caller reasonably assume `nightly_required=False` means "no
+    # nightly steps" and get the opposite.
+    if nightly_required:
+        steps.extend(
+            _nightly_artifact_step(artifact, release_sha, nightly_results)
+            for artifact in required_nightly_artifacts
+        )
     return ReleaseGateVerdict(repo=repo, release_sha=release_sha, steps=tuple(steps))
