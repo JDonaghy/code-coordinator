@@ -20,6 +20,7 @@ from coord.health.checks import (
     claude_binary,
     disk,
     graph,
+    gui_lane_preflight,
     index_lock,
     local_machine_identity,
     plan_usage,
@@ -1269,3 +1270,173 @@ def test_local_machine_identity_unresolved_with_matching_checkout_is_warn(
     assert result.severity is Severity.WARN
     assert "vimcode" in result.detail
     assert result.values["overlapping_repos"] == ["vimcode"]
+
+
+# ── gui_lane_preflight (#3651) ───────────────────────────────────────────────
+
+
+class _FakeCalls:
+    """A fake `MacCalls`/`WinCalls`/`GtkCalls` — only the two methods
+    `gui_lane_preflight` ever calls."""
+
+    def __init__(self, session: tuple[bool, str], trust: tuple[bool, str] = (True, "")) -> None:
+        self._session = session
+        self._trust = trust
+
+    def session_available(self):
+        return self._session
+
+    def ax_trust_available(self):
+        return self._trust
+
+
+def _ctx_for_machine(tmp_path, machine, monkeypatch) -> HealthContext:
+    monkeypatch.setattr("coord.config.resolve_local_machine", lambda cfg: machine)
+    return make_ctx(tmp_path, config=SimpleNamespace(machines=[machine]))
+
+
+def test_gui_lane_preflight_no_config_is_silent(tmp_path) -> None:
+    ctx = make_ctx(tmp_path, config=None)
+    assert gui_lane_preflight.probe_gui_lane_preflight(ctx) is None
+
+
+def test_gui_lane_preflight_non_gui_host_is_silent(tmp_path, monkeypatch) -> None:
+    """A machine with no GUI capability at all gets no result — never a
+    fabricated "clean" for a capability it never claimed."""
+    m = _machine("elitebook", "elitebook.ts.net", capabilities=["python", "rust"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+
+    assert gui_lane_preflight.probe_gui_lane_preflight(ctx) is None
+
+
+def test_gui_lane_preflight_mac_ready_is_ok(tmp_path, monkeypatch) -> None:
+    m = _machine("macmini", "macmini.ts.net", capabilities=["macos"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_mac_calls_factory",
+        lambda: _FakeCalls(session=(True, ""), trust=(True, "")),
+    )
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.OK
+    assert result.subject == "mac-native"
+
+
+def test_gui_lane_preflight_mac_locked_screen_is_crit_with_fix(tmp_path, monkeypatch) -> None:
+    m = _machine("macmini", "macmini.ts.net", capabilities=["macos"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_mac_calls_factory",
+        lambda: _FakeCalls(session=(False, "the screen is locked (CGSSessionScreenIsLocked)")),
+    )
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.CRIT
+    assert result.headroom.startswith("INFRA:")
+    assert "caffeinate" in result.detail
+
+
+def test_gui_lane_preflight_mac_headless_names_dummy_hdmi_fix(tmp_path, monkeypatch) -> None:
+    m = _machine("macmini", "macmini.ts.net", capabilities=["macos"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_mac_calls_factory",
+        lambda: _FakeCalls(
+            session=(False, "CGSessionCopyCurrentDictionary returned no session — no GUI session is active"),
+        ),
+    )
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.CRIT
+    assert "dummy HDMI" in result.detail
+
+
+def test_gui_lane_preflight_mac_ax_not_trusted_is_crit_with_fix(tmp_path, monkeypatch) -> None:
+    m = _machine("macmini", "macmini.ts.net", capabilities=["macos"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_mac_calls_factory",
+        lambda: _FakeCalls(session=(True, ""), trust=(False, "AXIsProcessTrusted() is False")),
+    )
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.CRIT
+    assert "Accessibility" in result.detail
+    assert "#3566" in result.detail
+
+
+def test_gui_lane_preflight_windows_locked_is_crit_with_fix(tmp_path, monkeypatch) -> None:
+    m = _machine("dell64", "dell64.ts.net", capabilities=["windows"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_win_calls_factory",
+        lambda: _FakeCalls(session=(False, "LogonUI.exe is running in session 1 — the desktop is locked")),
+    )
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.CRIT
+    assert result.subject == "win-native"
+    assert "auto-logon" in result.detail
+
+
+def test_gui_lane_preflight_gtk_missing_display_is_crit_with_fix(tmp_path, monkeypatch) -> None:
+    m = _machine("fleethost", "fleethost.ts.net", capabilities=["gtk"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_gtk_calls_factory",
+        lambda: _FakeCalls(session=(False, "neither $DISPLAY nor $WAYLAND_DISPLAY is set")),
+    )
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.CRIT
+    assert result.subject == "gtk-native"
+    assert "Xvfb" in result.detail
+
+
+def test_gui_lane_preflight_construction_failure_is_crit_not_a_crash(
+    tmp_path, monkeypatch
+) -> None:
+    """A driver whose real `*Calls()` constructor raises (wrong platform,
+    missing pyobjc/comtypes dependency, ...) must still produce a CRIT
+    result, never propagate the exception out of the probe (#2096: a gate
+    must be able to fail, not crash the whole health run instead)."""
+    m = _machine("macmini", "macmini.ts.net", capabilities=["macos"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+
+    def _raise():
+        raise RuntimeError("MacOSCalls requires macOS")
+
+    monkeypatch.setattr(gui_lane_preflight, "_mac_calls_factory", _raise)
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.CRIT
+    assert "MacOSCalls requires macOS" in result.headroom
+
+
+def test_gui_lane_preflight_multiple_capabilities_each_get_a_result(
+    tmp_path, monkeypatch
+) -> None:
+    """A machine declaring more than one GUI capability (unusual, but not
+    disallowed) gets one result per lane, not just the first."""
+    m = _machine("multigpu", "multigpu.ts.net", capabilities=["macos", "gtk"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_mac_calls_factory",
+        lambda: _FakeCalls(session=(True, "")),
+    )
+    monkeypatch.setattr(
+        gui_lane_preflight, "_gtk_calls_factory",
+        lambda: _FakeCalls(session=(True, "")),
+    )
+
+    results = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert {r.subject for r in results} == {"mac-native", "gtk-native"}
+    assert all(r.severity is Severity.OK for r in results)

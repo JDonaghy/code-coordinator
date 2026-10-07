@@ -834,3 +834,112 @@ def test_doctor_is_silent_about_an_enabled_unit(valid_config_path, monkeypatch) 
     result = _run_doctor(valid_config_path, monkeypatch, statuses)
     assert result.exit_code == 0, result.output
     assert "unit enablement" not in result.output
+
+
+# ── gui_lane_preflight (#3651) ───────────────────────────────────────────────
+#
+# `coord doctor` projects the machine's own `gui_lane_preflight` H-1 result
+# (coord/health/checks/gui_lane_preflight.py) out of
+# `/health["health"]["results"]` — see `_gui_lane_preflight_lines` in
+# coord/commands/status.py. Reuses `_health_with_unit_drift`'s generic
+# `h["health"] = {"results": ...}` wiring (it's check-id-agnostic despite the
+# name) rather than a near-duplicate helper.
+
+
+def test_doctor_reports_a_locked_gui_host_as_crit_with_the_fix(
+    valid_config_path, monkeypatch
+) -> None:
+    """The acceptance criteria's core case: a GUI-capable host whose screen
+    is locked is reported CRIT, distinctly labeled, with the exact fix."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    m = cfg.machines[0]
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_unit_drift(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m,
+                unit_results=[{
+                    "check_id": "gui_lane_preflight",
+                    "subject": "mac-native",
+                    "severity": "crit",
+                    "headroom": "INFRA: the screen is locked (CGSSessionScreenIsLocked)",
+                    "detail": (
+                        "the screen is locked — unlock it, then keep it "
+                        "unlocked for the run window with `caffeinate -d`"
+                    ),
+                }],
+            ),
+        ),
+        *[
+            MachineStatus(
+                machine=other, state=ONLINE,
+                health=_health({"git": _ok_probe(), "gh": _ok_probe()}, other),
+            )
+            for other in cfg.machines[1:]
+        ],
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1, result.output
+    assert "GUI lane pre-flight mac-native" in result.output
+    assert "INFRA:" in result.output
+    assert "fix:" in result.output
+    assert "caffeinate" in result.output
+
+
+def test_doctor_reports_a_ready_gui_host_with_an_explicit_ok_line(
+    valid_config_path, monkeypatch
+) -> None:
+    """Unlike unit_drift/unit_enablement (silent when clean), a ready GUI
+    lane prints an explicit ✓ line — "can the GUI lane run tonight?" needs a
+    positive one-command answer, not silence that could equally mean
+    "nothing to check"."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    m = cfg.machines[0]
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_unit_drift(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m,
+                unit_results=[{
+                    "check_id": "gui_lane_preflight",
+                    "subject": "mac-native",
+                    "severity": "ok",
+                    "headroom": "ready — display/session unlocked, permission present",
+                }],
+            ),
+        ),
+        *[
+            MachineStatus(
+                machine=other, state=ONLINE,
+                health=_health({"git": _ok_probe(), "gh": _ok_probe()}, other),
+            )
+            for other in cfg.machines[1:]
+        ],
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0, result.output
+    assert "✓ GUI lane pre-flight mac-native: ready" in result.output
+
+
+def test_doctor_is_silent_about_gui_lane_preflight_for_a_non_gui_host(
+    valid_config_path, monkeypatch
+) -> None:
+    """A host with no `gui_lane_preflight` entry at all (no GUI capability
+    declared, or an agent predating #3651) prints nothing for it."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0, result.output
+    assert "GUI lane pre-flight" not in result.output
