@@ -11,10 +11,13 @@ making that happen on its own, every night:
    downloading the most recent release's published artifact. Pure: the
    actual git-build/HTTP-download I/O is a caller's job.
 2. **Which host runs it** (:func:`pick_nightly_host`) — reuses
-   :func:`coord.smoke.pick_smoke_machine` rather than growing a second
+   :func:`coord.smoke.rank_smoke_machines` rather than growing a second
    capability-matching implementation (#2096 "one question, one answer":
    "which machine can run this" must have exactly one answerer, shared
-   with the Test-stage's own smoke dispatch).
+   with the Test-stage's own smoke dispatch), and walks the full ranked
+   list cross-referenced against each candidate's live ``/health`` probe
+   (:func:`coord.smoke._capability_probe_reasons`) rather than trusting a
+   single head pick (#1678).
 3. **What a result MEANS** (:func:`classify_step`) — the one place that
    turns a real, timestamped observation into one of four verdicts: a
    clean green needs nobody's attention (no LLM dispatch, no filed issue —
@@ -27,11 +30,13 @@ making that happen on its own, every night:
    None``) — #2096 "unconfirmed success is a defect": a verdict must come
    from something OBSERVED, never a default.
 4. **What to do about it** (:func:`process_nightly_step`) — files or
-   updates exactly one issue per ``(spec, step)`` by routing through the
-   SAME dedupe/file machinery every other coord-filed bug uses
-   (:func:`coord.bugbash.dedupe_finding`/:func:`coord.bugbash.
-   file_finding`), rather than a second, independent dedupe
-   implementation that could silently disagree with bugbash's (#2096).
+   updates exactly one issue per ``(spec, step)`` by filing through the
+   SAME path every other coord-filed bug uses (:func:`coord.bugbash.
+   file_finding`), but with an EXACT ``(spec, step)``-keyed dedupe
+   decision of its own (:func:`_dedupe_nightly_finding`) rather than
+   :func:`coord.bugbash.dedupe_finding`'s fuzzy title-similarity scoring —
+   that scorer is right for human-prose bugbash titles but wrong for these
+   machine-generated ones, which already carry an unambiguous key.
 
 What this module deliberately does NOT do (tracked as follow-up, out of
 this first slice's scope): drive an actual cron/scheduler trigger, run a
@@ -50,15 +55,22 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Sequence
 
+import httpx
+
 from coord.bugbash import (
     BugbashLane,
     CoordRunner,
+    DedupeResult,
     DedupeVerdict,
     Finding,
-    dedupe_finding,
     file_finding,
+    finding_target_repo,
 )
-from coord.smoke import SmokeMachineChoice, pick_smoke_machine
+from coord.smoke import (
+    SmokeMachineChoice,
+    _capability_probe_reasons,
+    rank_smoke_machines,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import-cycle-avoidance only
     from coord.config import Config
@@ -127,12 +139,17 @@ def resolve_artifact_plan(
 
 
 def pick_nightly_host(
-    required_caps: list[str], repo_name: str, board: "Board", config: "Config",
+    required_caps: list[str],
+    repo_name: str,
+    board: "Board",
+    config: "Config",
+    *,
+    http_client: "httpx.Client | None" = None,
 ) -> SmokeMachineChoice | None:
     """Route a nightly real-platform run to a capable host (#3652 Wanted
     #1 "route it to a capable host").
 
-    Deliberately a thin wrapper over :func:`coord.smoke.pick_smoke_machine`
+    Reuses :func:`coord.smoke.rank_smoke_machines` for capability matching
     rather than a second capability-matching implementation — #2096 "one
     question, one answer": whether a given machine can run a given
     capability set must have exactly one answerer in this codebase, shared
@@ -142,19 +159,52 @@ def pick_nightly_host(
     leg to prefer, so an empty worker-machine sentinel is passed with
     ``prefer_worker=False`` — every capable machine is ranked purely on
     idle/busy status, nothing is artificially favored.
+
+    Unlike a bare head-pick, this walks the FULL ranked candidate list and
+    cross-references each one's live ``/health`` probe (:func:`coord.smoke.
+    _capability_probe_reasons`) before accepting it — exactly what
+    :func:`coord.smoke.dispatch_smoke` does for every other smoke dispatch,
+    and for the same reason (#1678): on 2026-08-01 the router picked the
+    same unhealthy machine every 30s forever while two other machines
+    declared the identical capability and were never tried. A nightly
+    real-platform runner is the single most probe-sensitive caller there
+    is — CLAUDE.md records a `browser` capability that has read UNMET
+    since that incident — so it must never settle for a single unverified
+    pick. A candidate whose probe disagrees with its declared capabilities
+    is skipped, not fatal: the next capable candidate is tried, same as
+    the Test stage's own routing.
     """
-    return pick_smoke_machine(
+    candidates = rank_smoke_machines(
         required_caps, repo_name, "", board, config, prefer_worker=False,
     )
+    for choice in candidates:
+        if required_caps:
+            unmet = _capability_probe_reasons(
+                choice.machine, required_caps, http_client=http_client,
+            )
+            if unmet:
+                continue
+        return choice
+    return None
 
 
 # ── known-bug references ("<repo>#<N>") ───────────────────────────────────
 
-_KNOWN_BUG_RE = re.compile(r"^\s*([^\s#]+)#(\d+)\s*$")
+# #3652 review: the repo group deliberately excludes `/` as well as
+# whitespace/`#` — `coord issue comment|close REPO ...` resolves REPO
+# against the LOCAL name under `repos:` in coordinator.yml
+# (`coord/commands/issues.py`), never a GitHub `owner/repo` slug. Allowing
+# `/` here let `owner/repo#12` parse "successfully" into a repo name that
+# then fails at `coord issue` call time with a confusing runtime error,
+# even though the parser itself looked happy. Rejecting it here, at parse
+# time, with the example in the message, is cheaper than that trip.
+_KNOWN_BUG_RE = re.compile(r"^\s*([^\s#/]+)#(\d+)\s*$")
 
 
 def parse_known_bug_ref(ref: str) -> tuple[str, int]:
-    """Parse a ``known_bug: <repo>#<N>`` smoke-spec step reference.
+    """Parse a ``known_bug: <repo>#<N>`` smoke-spec step reference, where
+    ``<repo>`` is the LOCAL name under ``repos:`` in coordinator.yml (never
+    a GitHub ``owner/repo`` slug — see :data:`_KNOWN_BUG_RE`'s comment).
 
     Raises :class:`ValueError` on anything else — a malformed reference
     must never silently resolve to "no known bug" (which would turn an
@@ -165,8 +215,9 @@ def parse_known_bug_ref(ref: str) -> tuple[str, int]:
     match = _KNOWN_BUG_RE.match(ref)
     if match is None:
         raise ValueError(
-            f"known_bug ref {ref!r} is not '<repo>#<number>' "
-            "(e.g. 'vimcode#1583')"
+            f"known_bug ref {ref!r} is not '<repo>#<number>' using the "
+            "LOCAL repo name from coordinator.yml's 'repos:' (e.g. "
+            "'vimcode#1583' — not a GitHub 'owner/repo#1583' slug)"
         )
     return match.group(1), int(match.group(2))
 
@@ -181,12 +232,20 @@ class NightlyStepObservation:
     path, file listing, timing numbers — #3652 Wanted #2) attached to
     whatever issue this step's result causes to be filed/updated.
 
-    ``checked_at`` is mandatory in spirit even though the type allows
-    ``None`` for construction convenience in tests — :func:`classify_step`
-    refuses to classify an observation with no timestamp at all (#2096:
+    ``checked_at`` is mandatory in spirit — :func:`classify_step` refuses
+    to classify an observation with no timestamp at all (#2096:
     "unconfirmed success is a defect" applies just as much to an
     unconfirmed-when-observed result as to an unconfirmed-whether-observed
-    one).
+    one) — and is enforced at construction time, not merely by that later
+    runtime check: it has no default, so a caller that forgets it gets a
+    ``TypeError`` immediately rather than a plausible-looking observation
+    that only fails much later, inside :func:`classify_step`. The type
+    stays ``float | None`` (an explicit ``checked_at=None`` is how a test
+    deliberately builds the unobserved case :func:`classify_step` must
+    reject) — only the convenience DEFAULT is gone. Tests get the same
+    ergonomics back via a factory (``_obs`` in
+    ``tests/test_nightly_smoke.py``) rather than a type-level escape hatch
+    every production caller also inherits.
     """
 
     repo: str
@@ -194,9 +253,9 @@ class NightlyStepObservation:
     step: str
     sha: str
     passed: bool
+    checked_at: float | None
     detail: str = ""
     evidence: tuple[str, ...] = ()
-    checked_at: float | None = None
 
 
 class StepVerdictKind(str, Enum):
@@ -297,14 +356,83 @@ def classify_nightly_run(
 # ── acting on a verdict: file, update, or close — never a second dedupe ──
 
 
+def _nightly_key(spec: str, step: str) -> str:
+    """The exact, unambiguous key embedded in every nightly finding's title
+    (#3652 review) so "exactly one issue per (spec, step)" is a literal
+    guarantee rather than a hope.
+
+    :func:`coord.bugbash.dedupe_finding`'s ``_best_match`` scores Jaccard
+    word-set similarity of the tag-stripped title — right for human-prose
+    bugbash titles, but wrong here: splitting ``install.yaml::launch`` into
+    bare words makes it score 0.80 against ``install.yaml::uninstall``,
+    comfortably above ``DEFAULT_DEDUPE_THRESHOLD``, so two genuinely
+    different steps of the same spec collapse into one issue. This key is
+    matched as a literal substring (:func:`_find_by_nightly_key`), never
+    scored for overlap, so one (spec, step) matches only itself.
+    """
+    return f"[nightly:{spec}::{step}]"
+
+
+def _find_by_nightly_key(key: str, issues: Sequence[dict]) -> dict | None:
+    """The first issue in *issues* whose title carries *key* verbatim, or
+    ``None``. Order-preserving, first match wins — callers pass in
+    open/closed issue lists already ordered however their fetch returned
+    them; this makes no further assumption about freshness."""
+    for issue in issues:
+        if key in str(issue.get("title", "")):
+            return issue
+    return None
+
+
+def _dedupe_nightly_finding(
+    finding: Finding,
+    key: str,
+    open_issues: Sequence[dict],
+    closed_issues: Sequence[dict],
+) -> DedupeResult:
+    """The nightly runner's OWN "is this the same finding?" decision —
+    exact-key lookup, not :func:`coord.bugbash.dedupe_finding`'s fuzzy
+    title-similarity scoring (see :func:`_nightly_key`'s docstring for why
+    that scorer is the wrong tool for a machine-generated, already-unique
+    key). Open issues are checked first, same precedence
+    :func:`coord.bugbash.dedupe_finding` uses: an OPEN match is the
+    actionable answer regardless of some unrelated closed issue also
+    carrying the key.
+    """
+    open_match = _find_by_nightly_key(key, open_issues)
+    if open_match is not None:
+        return DedupeResult(
+            verdict=DedupeVerdict.DUPLICATE,
+            matched_number=open_match.get("number"),
+            matched_title=open_match.get("title"),
+            score=1.0,
+        )
+    closed_match = _find_by_nightly_key(key, closed_issues)
+    if closed_match is not None:
+        return DedupeResult(
+            verdict=DedupeVerdict.REGRESSION,
+            matched_number=closed_match.get("number"),
+            matched_title=closed_match.get("title"),
+            score=1.0,
+        )
+    return DedupeResult(verdict=DedupeVerdict.NEW)
+
+
 def finding_from_step(verdict: StepVerdict, *, platform: str = "nightly-smoke") -> Finding:
     """Build a :class:`coord.bugbash.Finding` for a
-    :attr:`StepVerdictKind.RED_NEEDS_FILING` step, so it is dedup'd and
-    filed through the EXACT SAME path every other coord-filed bug uses
-    (:func:`coord.bugbash.dedupe_finding`/:func:`coord.bugbash.
-    file_finding`) — #2096 "one question, one answer": the nightly runner
-    must never grow a second, independently-drifting title-similarity
-    dedupe or issue-filing implementation.
+    :attr:`StepVerdictKind.RED_NEEDS_FILING` step, so it is filed through
+    the EXACT SAME path every other coord-filed bug uses
+    (:func:`coord.bugbash.file_finding`) — #2096 "one question, one
+    answer": the nightly runner must never grow a second, independently
+    drifting issue-filing implementation. The title carries
+    :func:`_nightly_key`'s exact ``(spec, step)`` key — reused for the
+    runner's OWN dedupe decision (:func:`_dedupe_nightly_finding`), not
+    :func:`coord.bugbash.dedupe_finding`'s fuzzy scoring. The resulting
+    issue title still reads like a bugbash finding
+    (``compose_finding_issue_title`` prefixes ``[bugbash:<platform>]``)
+    because filing genuinely does reuse bugbash's own path — that's a
+    deliberate trade of a slightly odd-looking title for not maintaining a
+    second filer.
     """
     if verdict.kind is not StepVerdictKind.RED_NEEDS_FILING:
         raise ValueError(
@@ -312,8 +440,14 @@ def finding_from_step(verdict: StepVerdict, *, platform: str = "nightly-smoke") 
             "only RED_NEEDS_FILING steps are findings"
         )
     obs = verdict.observation
-    title = f"nightly smoke: {obs.spec}::{obs.step} failing on {platform}"
-    evidence = "\n".join(obs.evidence) if obs.evidence else "no evidence captured"
+    key = _nightly_key(obs.spec, obs.step)
+    title = f"{key} nightly smoke: {obs.spec}::{obs.step} failing on {platform}"
+    # #3652 review: `captures` already carries `obs.evidence` verbatim, and
+    # `_evidence_with_acceptance` renders it again as a "Captures: ..." line
+    # — setting `evidence` to the SAME joined tuple would print it a third
+    # time. `evidence` is left to describe "was anything captured at all";
+    # the captures themselves are `captures`'s job alone.
+    evidence = "" if obs.evidence else "no evidence captured"
     return Finding(
         title=title,
         platform=platform,
@@ -343,12 +477,12 @@ class NightlyStepOutcome:
 def process_nightly_step(
     verdict: StepVerdict,
     *,
-    open_issues: Sequence[dict] = (),
-    closed_issues: Sequence[dict] = (),
+    open_issues: Sequence[dict],
+    closed_issues: Sequence[dict],
     lane: BugbashLane | None = None,
     runner: CoordRunner | None = None,
     dry_run: bool = True,
-    platform: str = "nightly-smoke",
+    platform: str | None = None,
 ) -> NightlyStepOutcome:
     """Act on one classified step (#3652 Wanted #2/#3).
 
@@ -356,18 +490,31 @@ def process_nightly_step(
       expected-red known bug) never calls *runner* at all — ``action=
       "none"``. This is the literal mechanism behind "no LLM on a green
       run": there is no code path from a clean pass to any dispatch.
-    - :attr:`StepVerdictKind.RED_NEEDS_FILING` is deduped
-      (:func:`coord.bugbash.dedupe_finding`) against *open_issues*/
-      *closed_issues*. A brand-new or regression finding is filed through
-      :func:`coord.bugbash.file_finding` (the SAME path every bugbash
-      finding takes). A match against an already-OPEN issue is never
-      re-filed — instead a fresh-evidence comment is posted to that SAME
-      issue, so "repeated failures update the same issue rather than
-      filing new ones" (#3652 Wanted #2) is literal behaviour, not merely
-      "doesn't duplicate".
+    - :attr:`StepVerdictKind.RED_NEEDS_FILING` is deduped by EXACT
+      ``(spec, step)`` key (:func:`_dedupe_nightly_finding`), against
+      *open_issues*/*closed_issues* — both required, never defaulted, so a
+      caller can never silently feed an empty corpus and have every
+      finding read as brand new. A brand-new or regression finding is
+      filed through :func:`coord.bugbash.file_finding` (the SAME path
+      every bugbash finding takes). A match against an already-OPEN issue
+      is never re-filed — instead a fresh-evidence comment is posted to
+      that SAME issue, so "repeated failures update the same issue rather
+      than filing new ones" (#3652 Wanted #2) is literal behaviour, not
+      merely "doesn't duplicate" — and a DIFFERENT step of the same spec
+      is never folded into it, because the key is exact, not scored.
     - :attr:`StepVerdictKind.GREEN_KNOWN_BUG_FIXED` posts a comment
       recording the clean pass and closes the parked issue — the
       bidirectional half of the known-bug gate (#3652 Wanted #3).
+
+    *platform* defaults to *lane*'s own ``platform`` (its documented
+    "display/dedupe label") when a lane is given, else the literal string
+    ``"nightly-smoke"`` — never an independent default that could disagree
+    with the lane actually doing the run. Passing *platform* explicitly
+    always wins. This matters beyond labelling: with a careless constant
+    default, the identical step failing on macOS and on GTK Linux would
+    dedupe into ONE issue, directly contradicting `_best_match`'s own
+    documented rationale that an identically-titled finding on two
+    different platforms is two different bugs, not one.
 
     ``dry_run=True`` (the default) never calls *runner* — same "a dry run
     files/comments/closes nothing" guarantee :func:`coord.bugbash.
@@ -378,6 +525,9 @@ def process_nightly_step(
         return NightlyStepOutcome(verdict=verdict, action="none")
 
     obs = verdict.observation
+    effective_platform = platform if platform is not None else (
+        lane.platform if lane is not None else "nightly-smoke"
+    )
 
     if verdict.kind is StepVerdictKind.GREEN_KNOWN_BUG_FIXED:
         if not verdict.known_bug:
@@ -403,8 +553,10 @@ def process_nightly_step(
         return NightlyStepOutcome(verdict=verdict, action="closed", issue_number=number)
 
     # StepVerdictKind.RED_NEEDS_FILING
-    finding = finding_from_step(verdict, platform=platform)
-    dedupe = dedupe_finding(finding, list(open_issues), list(closed_issues))
+    finding = finding_from_step(verdict, platform=effective_platform)
+    key = _nightly_key(obs.spec, obs.step)
+    dedupe = _dedupe_nightly_finding(finding, key, open_issues, closed_issues)
+    target_repo = finding_target_repo(finding)
 
     if dedupe.verdict is DedupeVerdict.DUPLICATE and dedupe.matched_number is not None:
         if dry_run:
@@ -415,7 +567,7 @@ def process_nightly_step(
         if runner is None:
             raise ValueError("process_nightly_step needs a runner to comment on an issue")
         runner([
-            "issue", "comment", finding.repo, str(dedupe.matched_number),
+            "issue", "comment", target_repo, str(dedupe.matched_number),
             "--body",
             (
                 f"Nightly real-platform smoke ({obs.spec}::{obs.step}) failed "
@@ -432,4 +584,11 @@ def process_nightly_step(
     if runner is None:
         raise ValueError("process_nightly_step needs a runner to file an issue")
     result = file_finding(finding, dedupe, lane, runner, dry_run=False)
-    return NightlyStepOutcome(verdict=verdict, action="filed", issue_number=result.issue_number)
+    # #3652 review: derive the outcome from what `file_finding` actually
+    # OBSERVED, never from "no exception was raised" — `file_finding`
+    # short-circuits with `filed=False` for a DUPLICATE verdict (reachable
+    # here whenever `dedupe.matched_number` was `None`, e.g. an issue dict
+    # with no `"number"` key), and reporting `action="filed"` with a real
+    # `issue_number=None` in that case would be a fabricated success.
+    action = "filed" if result.filed and result.issue_number is not None else "none"
+    return NightlyStepOutcome(verdict=verdict, action=action, issue_number=result.issue_number)

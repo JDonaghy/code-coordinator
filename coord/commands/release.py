@@ -4762,6 +4762,13 @@ def _load_release_gate_observations(
             passed=_require_bool(entry["passed"], field_name="nightly[].passed"),
             detail=entry.get("detail", ""),
             checked_at=entry.get("checked_at"),
+            # #3652 review: parity with lanes[].unavailable — a locked/
+            # absent GUI session or missing display, as reported by the
+            # native driver's own session precheck, never coerced from a
+            # truthy non-bool.
+            unavailable=_require_bool(
+                entry.get("unavailable", False), field_name="nightly[].unavailable",
+            ),
         )
         for entry in payload.get("nightly", []) or []
     ]
@@ -4925,6 +4932,7 @@ def release_gate_cmd(
         lane_results=lane_results,
         bugbash_required=gate_cfg.bugbash_required,
         bugbash_runs=bugbash_runs,
+        nightly_required=gate_cfg.nightly_required,
         required_nightly_artifacts=gate_cfg.nightly_artifacts,
         nightly_results=nightly_results,
         sha_is_at_or_after=_sha_ancestry_comparator(repo_path_opt),

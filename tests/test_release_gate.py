@@ -427,6 +427,72 @@ class TestEvaluateReleaseGateNightly:
         assert {s.name for s in verdict.steps} == {"lane:tui-pty", "bugbash", "nightly:macos-dmg"}
         assert verdict.gate_passed is True
 
+    def test_unavailable_nightly_blocks_but_is_labeled_unavailable_not_failed(self) -> None:
+        """#3510 parity (#3652 review): a locked/absent GUI session on the
+        nightly real-platform host must be distinguishable from a genuine
+        app bug, exactly like `_lane_step` already is."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[
+                NightlyArtifactResult(
+                    artifact="macos-dmg", sha="deadbeef", passed=False,
+                    unavailable=True, detail="desktop is locked",
+                ),
+            ],
+        )
+        [step] = verdict.steps
+        assert step.passed is False
+        assert step.unavailable is True
+        assert "desktop is locked" in step.detail
+        [unavailable_step] = verdict.unavailable_steps
+        assert unavailable_step.name == "nightly:macos-dmg"
+
+    def test_unavailable_nightly_default_detail_tells_operator_to_unlock(self) -> None:
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=[
+                NightlyArtifactResult(
+                    artifact="macos-dmg", sha="deadbeef", passed=False, unavailable=True,
+                ),
+            ],
+        )
+        [step] = verdict.steps
+        assert step.unavailable is True
+        assert "unlock" in step.detail
+
+    def test_nightly_required_with_no_artifacts_raises(self) -> None:
+        """#3652 review: `nightly_required=True` with an empty
+        `required_nightly_artifacts` must never silently evaluate to a
+        vacuous pass (zero nightly steps added) — this is the gap a
+        hand-built `ReleaseGateRepoConfig` (not run through the YAML
+        parser's own cross-check) could otherwise slip through."""
+        with pytest.raises(ValueError, match="vacuous"):
+            evaluate_release_gate(
+                repo="vimcode",
+                release_sha="deadbeef",
+                required_lanes=["tui-pty"],
+                lane_results=[LaneResult(lane="tui-pty", sha="deadbeef", passed=True)],
+                nightly_required=True,
+                required_nightly_artifacts=[],
+            )
+
+    def test_nightly_required_false_never_raises_regardless_of_artifacts(self) -> None:
+        """The default (`nightly_required=False`) must stay exactly as
+        permissive as every pre-#3652-review caller relied on."""
+        verdict = evaluate_release_gate(
+            repo="vimcode",
+            release_sha="deadbeef",
+            required_lanes=[],
+            required_nightly_artifacts=[],
+        )
+        assert verdict.gate_passed is True
+
 
 class TestBugbashRunRecordFromReport:
     """#3517: `bugbash_run_record_from_report` is the ONE place that maps a
@@ -669,7 +735,7 @@ class TestParseReleaseGateConfig:
             }))
 
     def test_invalid_nightly_value_rejected(self) -> None:
-        with pytest.raises(ConfigError, match="nightly"):
+        with pytest.raises(ConfigError, match="nightly must be one of"):
             parse_mapping(_mapping({
                 "vimcode": {"lanes": ["tui-pty"], "nightly": "sometimes"},
             }))
@@ -929,6 +995,34 @@ class TestReleaseGateCli:
         )
         assert result.exit_code == 2, result.output
         assert "malformed" in result.output
+
+    def test_nightly_unavailable_field_parses_and_renders_distinctly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """#3652 review: `--from-json`'s `"nightly"` array accepts
+        `"unavailable"` the same way `"lanes"` already does (#3510
+        parity)."""
+        from coord.cli import main
+
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(
+                lanes=[], bugbash_required=False,
+                nightly_required=True, nightly_artifacts=["macos-dmg"],
+            ),
+        )
+        observed = _write_json(tmp_path / "observed.json", {
+            "nightly": [{"artifact": "macos-dmg", "sha": "deadbeef", "passed": False,
+                         "unavailable": True, "detail": "desktop is locked"}],
+        })
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--from-json", str(observed), "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 1, result.output
+        assert "UNAVAILABLE" in result.output
+        assert "desktop is locked" in result.output
 
     def test_empty_override_reason_rejected_before_anything_else_runs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
