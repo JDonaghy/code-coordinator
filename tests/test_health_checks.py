@@ -1276,23 +1276,32 @@ def test_local_machine_identity_unresolved_with_matching_checkout_is_warn(
 
 
 class _FakeCalls:
-    """A fake `MacCalls`/`WinCalls`/`GtkCalls` — only the two methods
-    `gui_lane_preflight` ever calls."""
+    """A fake `MacCalls`/`WinCalls`/`GtkCalls` — only the one method
+    `gui_lane_preflight` calls on it (`session_available`). The AX-trust
+    half of the `macos` lane is deliberately NOT asked through this fake —
+    see `_ax_trust_probe` and its own monkeypatch seam below for why
+    (#3651 review round 1: asking `AXIsProcessTrusted()` through
+    `MacOSCalls` in-process would be the wrong process identity)."""
 
-    def __init__(self, session: tuple[bool, str], trust: tuple[bool, str] = (True, "")) -> None:
+    def __init__(self, session: tuple[bool, str]) -> None:
         self._session = session
-        self._trust = trust
 
     def session_available(self):
         return self._session
-
-    def ax_trust_available(self):
-        return self._trust
 
 
 def _ctx_for_machine(tmp_path, machine, monkeypatch) -> HealthContext:
     monkeypatch.setattr("coord.config.resolve_local_machine", lambda cfg: machine)
     return make_ctx(tmp_path, config=SimpleNamespace(machines=[machine]))
+
+
+def _patch_ax_trust(monkeypatch, trusted: bool, reason: str = "") -> None:
+    """Patch `gui_lane_preflight._ax_trust_probe` — the seam that calls
+    `coord.prereqs._probe_macos_accessibility_trust` (the SAME subprocess
+    probe `/health`'s `macos-accessibility-trust` prereq already uses)
+    rather than `MacOSCalls.ax_trust_available()` in-process (#3651 review
+    round 1)."""
+    monkeypatch.setattr(gui_lane_preflight, "_ax_trust_probe", lambda: (trusted, reason))
 
 
 def test_gui_lane_preflight_no_config_is_silent(tmp_path) -> None:
@@ -1314,13 +1323,15 @@ def test_gui_lane_preflight_mac_ready_is_ok(tmp_path, monkeypatch) -> None:
     ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
     monkeypatch.setattr(
         gui_lane_preflight, "_mac_calls_factory",
-        lambda: _FakeCalls(session=(True, ""), trust=(True, "")),
+        lambda: _FakeCalls(session=(True, "")),
     )
+    _patch_ax_trust(monkeypatch, trusted=True)
 
     (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
 
     assert result.severity is Severity.OK
     assert result.subject == "mac-native"
+    assert result.threshold
 
 
 def test_gui_lane_preflight_mac_locked_screen_is_crit_with_fix(tmp_path, monkeypatch) -> None:
@@ -1359,14 +1370,64 @@ def test_gui_lane_preflight_mac_ax_not_trusted_is_crit_with_fix(tmp_path, monkey
     ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
     monkeypatch.setattr(
         gui_lane_preflight, "_mac_calls_factory",
-        lambda: _FakeCalls(session=(True, ""), trust=(False, "AXIsProcessTrusted() is False")),
+        lambda: _FakeCalls(session=(True, "")),
     )
+    _patch_ax_trust(monkeypatch, trusted=False, reason="AXIsProcessTrusted() is False")
 
     (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
 
     assert result.severity is Severity.CRIT
     assert "Accessibility" in result.detail
     assert "#3566" in result.detail
+
+
+def test_gui_lane_preflight_mac_ax_trust_asked_via_shared_prereqs_seam(
+    tmp_path, monkeypatch
+) -> None:
+    """#3651 review round 1 blocking finding: the AX half must be asked via
+    the same subprocess-based seam `/health`'s `macos-accessibility-trust`
+    prereq already uses (`coord.prereqs._probe_macos_accessibility_trust`),
+    never `MacOSCalls.ax_trust_available()` in-process — in-process asks the
+    long-lived agent's own identity, not a dispatched worker's (#3566)."""
+    import coord.prereqs as prereqs
+
+    calls: list[tuple[object, float]] = []
+
+    def _fake_probe(prereq, timeout):
+        calls.append((prereq, timeout))
+        return prereqs.ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=True,
+            version="trusted", min_version=None, meets_floor=None,
+            what_breaks=prereq.what_breaks,
+        )
+
+    monkeypatch.setattr(prereqs, "_probe_macos_accessibility_trust", _fake_probe)
+
+    trusted, reason = gui_lane_preflight._ax_trust_probe()
+
+    assert trusted is True
+    assert reason == ""
+    assert len(calls) == 1
+    (prereq, _timeout) = calls[0]
+    assert prereq.tool == "macos-accessibility-trust"
+
+
+def test_gui_lane_preflight_mac_ax_trust_denied_names_the_fix(tmp_path, monkeypatch) -> None:
+    import coord.prereqs as prereqs
+
+    def _fake_probe(prereq, timeout):
+        return prereqs.ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=None, meets_floor=None,
+            what_breaks="AXIsProcessTrusted() is False for this process identity",
+        )
+
+    monkeypatch.setattr(prereqs, "_probe_macos_accessibility_trust", _fake_probe)
+
+    trusted, reason = gui_lane_preflight._ax_trust_probe()
+
+    assert trusted is False
+    assert "AXIsProcessTrusted" in reason
 
 
 def test_gui_lane_preflight_windows_locked_is_crit_with_fix(tmp_path, monkeypatch) -> None:
@@ -1435,8 +1496,43 @@ def test_gui_lane_preflight_multiple_capabilities_each_get_a_result(
         gui_lane_preflight, "_gtk_calls_factory",
         lambda: _FakeCalls(session=(True, "")),
     )
+    _patch_ax_trust(monkeypatch, trusted=True)
 
     results = gui_lane_preflight.probe_gui_lane_preflight(ctx)
 
     assert {r.subject for r in results} == {"mac-native", "gtk-native"}
     assert all(r.severity is Severity.OK for r in results)
+
+
+def test_gui_lane_preflight_calls_factory_names_match_lane_capability_extras() -> None:
+    """#3651 review round 1 non-blocking finding: `_CALLS_FACTORY_NAME`'s
+    keys and `coord.acceptance_drivers.LANE_CAPABILITY_EXTRAS`'s keys answer
+    the same question ("which capabilities are GUI lanes?") independently —
+    this pins them to agreeing, so a GUI lane capability added to one and
+    not the other fails loudly instead of silently vanishing from the
+    readiness report."""
+    from coord.acceptance_drivers import LANE_CAPABILITY_EXTRAS
+
+    assert set(gui_lane_preflight._CALLS_FACTORY_NAME) == set(LANE_CAPABILITY_EXTRAS)
+
+
+def test_gui_lane_preflight_gtk_unrecognized_reason_echoes_rather_than_fabricates(
+    tmp_path, monkeypatch
+) -> None:
+    """#3651 review round 1 non-blocking finding: a `gtk-native`
+    `session_available()` failure whose reason doesn't match the one known
+    `$DISPLAY`/`$WAYLAND_DISPLAY` fix must fall through to the generic
+    echo-the-reason default, not be told to restart Xvfb for an unrelated
+    problem."""
+    m = _machine("fleethost", "fleethost.ts.net", capabilities=["gtk"])
+    ctx = _ctx_for_machine(tmp_path, m, monkeypatch)
+    monkeypatch.setattr(
+        gui_lane_preflight, "_gtk_calls_factory",
+        lambda: _FakeCalls(session=(False, "some unrelated GTK init failure")),
+    )
+
+    (result,) = gui_lane_preflight.probe_gui_lane_preflight(ctx)
+
+    assert result.severity is Severity.CRIT
+    assert "Xvfb" not in result.detail
+    assert "some unrelated GTK init failure" in result.detail

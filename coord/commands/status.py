@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1437,7 +1438,9 @@ def _unit_enablement_lines(health: dict) -> list[tuple[bool, str]]:
     return out
 
 
-def _gui_lane_preflight_lines(health: dict) -> list[tuple[bool, str]]:
+def _gui_lane_preflight_lines(
+    health: dict, capabilities: "Iterable[str] | None" = None,
+) -> list[tuple[bool, str]]:
     """Render a machine's ``gui_lane_preflight`` H-1 results (``coord/health/
     checks/gui_lane_preflight.py``, #3651) as ``coord doctor`` lines.
 
@@ -1449,28 +1452,44 @@ def _gui_lane_preflight_lines(health: dict) -> list[tuple[bool, str]]:
     an operator asking "is this ready" wants an explicit yes, not silence
     that could equally mean "nothing to check" or "didn't look yet".
 
-    A CRIT result's ``detail`` already carries the exact remedy the probe
-    named (#3651's "report as INFRA, with the fix named") — printed verbatim
-    as a second ``fix:`` line, the same convention ``_unit_drift_lines`` uses.
+    A CRIT (or WARN) result's ``detail`` already carries the exact remedy the
+    probe named (#3651's "report as INFRA, with the fix named") — printed
+    verbatim as a second ``fix:`` line, the same convention
+    ``_unit_drift_lines`` uses.
 
-    A host with no GUI capability declared has no ``gui_lane_preflight``
-    entries here at all (the probe itself returns ``None`` — see its own
-    docstring), so this renders nothing for it — never a false "clean" for a
-    capability the host never claimed. An agent predating #3651 is
-    indistinguishable from that case, which is the correct fail-soft default.
+    *capabilities*, when given (the call site passes the machine's own
+    ``m.capabilities``), closes a silence gap found in #3651 review round 1:
+    the probe itself returns ``None`` — producing NO ``gui_lane_preflight``
+    entries at all — whenever ``ctx.config`` is unset, whenever
+    ``resolve_local_machine`` can't resolve this host, or on any agent
+    predating #3651. All three leave a genuinely GUI-capable host silent
+    here, which is exactly the "didn't look yet" case this renderer exists
+    to rule out. Cross-checking declared capabilities (via
+    ``coord.acceptance_drivers.LANE_CAPABILITY_EXTRAS``) against the lanes
+    actually present turns that silence into an explicit ``?`` line instead.
+    Omitting *capabilities* (as every existing caller/test that predates this
+    cross-check does) just skips that extra check — the per-result rendering
+    below is unaffected.
 
     Pure function — no I/O — so it's testable without a live fleet.
     """
     out: list[tuple[bool, str]] = []
     results = ((health.get("health") or {}).get("results") or [])
+    seen_lanes: set[str] = set()
     for r in results:
         if r.get("check_id") != "gui_lane_preflight":
             continue
         severity = r.get("severity")
         subject = r.get("subject") or "?"
+        seen_lanes.add(subject)
         headroom = r.get("headroom", "")
         if severity == "crit":
             out.append((True, f"  ✗ CRIT GUI lane pre-flight {subject}: {headroom}"))
+            detail = r.get("detail")
+            if detail:
+                out.append((True, f"        fix: {detail}"))
+        elif severity == "warn":
+            out.append((True, f"  ⚠ GUI lane pre-flight {subject}: {headroom}"))
             detail = r.get("detail")
             if detail:
                 out.append((True, f"        fix: {detail}"))
@@ -1478,6 +1497,19 @@ def _gui_lane_preflight_lines(health: dict) -> list[tuple[bool, str]]:
             out.append((False, f"  ✓ GUI lane pre-flight {subject}: {headroom}"))
         elif severity == "unknown":
             out.append((False, f"  ? GUI lane pre-flight {subject}: {headroom}"))
+
+    if capabilities:
+        from coord.acceptance_drivers import LANE_CAPABILITY_EXTRAS
+
+        for cap in sorted(capabilities):
+            lane = LANE_CAPABILITY_EXTRAS.get(cap)
+            if lane and lane not in seen_lanes:
+                out.append((
+                    False,
+                    f"  ? GUI lane pre-flight {lane}: no pre-flight result "
+                    "from this host (config-free agent, unresolved "
+                    "local-machine identity, or an agent predating #3651)",
+                ))
     return out
 
 
@@ -1826,7 +1858,7 @@ def doctor(
         # mac-native/win-native/gtk-native driver already runs before any
         # spec step, surfaced here BEFORE dispatch rather than discovered
         # after a worker/smoke leg was already spent on a dead host.
-        for is_problem, line in _gui_lane_preflight_lines(health):
+        for is_problem, line in _gui_lane_preflight_lines(health, m.capabilities):
             click.echo(line)
             if is_problem:
                 any_problem = True
