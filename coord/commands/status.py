@@ -1437,6 +1437,50 @@ def _unit_enablement_lines(health: dict) -> list[tuple[bool, str]]:
     return out
 
 
+def _gui_lane_preflight_lines(health: dict) -> list[tuple[bool, str]]:
+    """Render a machine's ``gui_lane_preflight`` H-1 results (``coord/health/
+    checks/gui_lane_preflight.py``, #3651) as ``coord doctor`` lines.
+
+    Answers "can the GUI lane run tonight?" for this host in one command —
+    unlike ``_unit_drift_lines``/``_unit_enablement_lines`` above (which stay
+    silent when clean, #1628's own convention), this ALWAYS prints one line
+    per GUI lane this host declares a capability for, ready or not, mirroring
+    the tool_versions ✓/✗-per-probe loop a few lines below in ``doctor()`` —
+    an operator asking "is this ready" wants an explicit yes, not silence
+    that could equally mean "nothing to check" or "didn't look yet".
+
+    A CRIT result's ``detail`` already carries the exact remedy the probe
+    named (#3651's "report as INFRA, with the fix named") — printed verbatim
+    as a second ``fix:`` line, the same convention ``_unit_drift_lines`` uses.
+
+    A host with no GUI capability declared has no ``gui_lane_preflight``
+    entries here at all (the probe itself returns ``None`` — see its own
+    docstring), so this renders nothing for it — never a false "clean" for a
+    capability the host never claimed. An agent predating #3651 is
+    indistinguishable from that case, which is the correct fail-soft default.
+
+    Pure function — no I/O — so it's testable without a live fleet.
+    """
+    out: list[tuple[bool, str]] = []
+    results = ((health.get("health") or {}).get("results") or [])
+    for r in results:
+        if r.get("check_id") != "gui_lane_preflight":
+            continue
+        severity = r.get("severity")
+        subject = r.get("subject") or "?"
+        headroom = r.get("headroom", "")
+        if severity == "crit":
+            out.append((True, f"  ✗ CRIT GUI lane pre-flight {subject}: {headroom}"))
+            detail = r.get("detail")
+            if detail:
+                out.append((True, f"        fix: {detail}"))
+        elif severity == "ok":
+            out.append((False, f"  ✓ GUI lane pre-flight {subject}: {headroom}"))
+        elif severity == "unknown":
+            out.append((False, f"  ? GUI lane pre-flight {subject}: {headroom}"))
+    return out
+
+
 def _dispatch_blocker_lines_for_config_free(machine, cfg) -> list[tuple[bool, str]]:
     """Real dispatch blockers on a **config-free** agent's machine (#1801).
 
@@ -1773,6 +1817,16 @@ def doctor(
         # the manifest says this host should run and that isn't actually
         # `systemctl --user enable`d.
         for is_problem, line in _unit_enablement_lines(health):
+            click.echo(line)
+            if is_problem:
+                any_problem = True
+
+        # #3651: "can the GUI lane run tonight?" for every GUI-capable
+        # host — the display/session/AX-or-UIA precheck the real
+        # mac-native/win-native/gtk-native driver already runs before any
+        # spec step, surfaced here BEFORE dispatch rather than discovered
+        # after a worker/smoke leg was already spent on a dead host.
+        for is_problem, line in _gui_lane_preflight_lines(health):
             click.echo(line)
             if is_problem:
                 any_problem = True
