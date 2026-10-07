@@ -33,7 +33,12 @@ _PS_ENV_RE = re.compile(r"\$env:([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def wait_for_file(
-    path: str, timeout_ms: int, contains: str | None = None, *, poll_interval_s: float = 0.05,
+    path: str,
+    timeout_ms: int,
+    contains: str | None = None,
+    *,
+    poll_interval_s: float = 0.05,
+    env_overrides: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Poll for *path* to exist within *timeout_ms* milliseconds, optionally
     requiring its content to contain the substring *contains*.
@@ -47,6 +52,15 @@ def wait_for_file(
     resolves against *this* process's own environment rather than requiring
     the spec to hardcode an absolute path that may differ run to run.
 
+    *env_overrides*, when given, is consulted BEFORE this process's own
+    environment for any ``$NAME``/``$env:NAME`` token matching one of its
+    keys — win-native's own #3637 isolates the launched app's own
+    ``%APPDATA%`` (via ``env=`` on the child process only, never this
+    process), so an ``expect_file: {path: '$env:APPDATA\\...'}`` step must
+    resolve against the directory the app itself was actually given, not
+    this process's unrelated ambient profile. ``%TEMP%``/anything else
+    resolves against the ambient environment exactly as before.
+
     Returns ``(True, "")`` the instant the file (and, when given, its
     content) matches; ``(False, reason)`` once *timeout_ms* elapses without
     ever matching — reason names exactly what was still missing (the file
@@ -55,13 +69,13 @@ def wait_for_file(
     actually there, which is usually enough to tell a timing miss from a
     genuinely wrong write.
 
-    Never raises for an ordinary "not there yet"/"wrong content" outcome —
-    only for *path* resolving to something unreadable as a regular file
-    despite existing (e.g. a directory), which is squarely a malformed-spec
-    condition the caller should surface as a failing step, not silently poll
-    forever against.
+    Never raises. An ordinary "not there yet"/"wrong content" outcome and
+    *path* resolving to something unreadable as a regular file despite
+    existing (e.g. a directory) both come back as an ordinary ``(False,
+    reason)`` failing-step result — the latter deliberately does not poll
+    forever waiting for a directory to become a file.
     """
-    resolved = _resolve_path(path)
+    resolved = _resolve_path(path, env_overrides)
     deadline = time.monotonic() + timeout_ms / 1000
     last_reason = f"{resolved!r} did not appear within {timeout_ms}ms"
     while True:
@@ -91,10 +105,19 @@ def wait_for_file(
         time.sleep(poll_interval_s)
 
 
-def _resolve_path(path: str) -> str:
+def _resolve_path(path: str, env_overrides: dict[str, str] | None = None) -> str:
     """Expand ``~``, POSIX ``$VAR``/``${VAR}`` and the PowerShell
-    ``$env:VAR`` spelling against THIS process's own environment. A spec
-    author on any platform can write the natural-looking form for that
-    platform's temp dir and have it resolve the same way here."""
+    ``$env:VAR`` spelling against THIS process's own environment — except
+    for a name present in *env_overrides*, which wins instead (see
+    :func:`wait_for_file`'s own docstring for why this matters for
+    win-native's isolated ``%APPDATA%``). A spec author on any platform
+    can write the natural-looking form for that platform's temp dir and
+    have it resolve the same way here."""
     rewritten = _PS_ENV_RE.sub(r"$\1", path)
+    if env_overrides:
+        def _substitute_override(match: re.Match) -> str:
+            name = match.group(1)
+            return env_overrides.get(name, match.group(0))
+
+        rewritten = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", _substitute_override, rewritten)
     return os.path.expanduser(os.path.expandvars(rewritten))

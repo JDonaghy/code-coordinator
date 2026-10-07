@@ -234,16 +234,23 @@ sibling of ``tui-pty``'s smoke spec):
   real-input call ``key:`` already uses for an unmapped character) — never
   by injecting into the app's own in-memory buffer, or a vimcode#1825-class
   "keystrokes went to the launching terminal instead of the app" bug would
-  stay invisible to this driver too.
+  stay invisible to this driver too. Like ``key:``, this calls
+  ``SetForegroundWindow`` on the launched hwnd first — so a spec asserting
+  ``expect_frontmost`` should order it BEFORE any ``type_text``/``key``
+  step, not after: a later ``expect_frontmost`` would then pass because
+  this driver forced the window to the front, not because the app did.
 - ``expect_file: {path, timeout_ms, contains}`` (#3650) — *path* must exist
   within *timeout_ms* (default 5000), optionally containing the substring
   *contains*. Delegates entirely to :mod:`coord.native_fs_wait` — the one
   shared implementation every Tier-2 native driver calls through (#2096
   "one question, one answer"), since a filesystem check has no Win32
   -specific behaviour to add.
-- ``expect_frontmost: {}`` (#3650) — the launched hwnd must be the real
-  Win32 foreground window right now (``GetForegroundWindow``) — the
-  vimcode#1824 "app never becomes frontmost" class of bug.
+- ``expect_frontmost: {}`` (#3650) — the launched app's window must be
+  the real Win32 foreground window right now, compared at the OWNING
+  -PID level (``GetForegroundWindow`` -> ``GetWindowThreadProcessId``),
+  not raw hwnd identity — a popup/dialog/second top-level window of the
+  SAME app in front still counts, matching the mac driver's own pid-level
+  semantics. The vimcode#1824 "app never becomes frontmost" class of bug.
 - ``expect_region_not_uniform: {x, y, width, height, tolerance}`` (#3650) —
   the named pixel rectangle of a ``PrintWindow`` capture must NOT be a
   single colour (± *tolerance*, default 24, per channel) — vimcode#1676's
@@ -309,6 +316,7 @@ import ntpath
 import os
 import re
 import shutil
+import struct
 import subprocess
 import time
 import uuid
@@ -701,11 +709,15 @@ class WinCalls(Protocol):
         ...
 
     def is_frontmost(self, hwnd: int) -> tuple[bool, int]:
-        """``(True, hwnd)`` when *hwnd* is the real foreground window right
-        now (``GetForegroundWindow``); ``(False, actual_foreground_hwnd)``
-        otherwise — the vimcode#1824 "app never becomes frontmost" class of
-        bug (#3650). Never raises — a probe failure here reads as "not
-        confirmed frontmost", never a crash."""
+        """``(True, actual_foreground_hwnd)`` when the process OWNING
+        *hwnd* also owns the real foreground window right now
+        (``GetForegroundWindow`` -> ``GetWindowThreadProcessId``, compared
+        against *hwnd*'s own owning pid — not hwnd identity, so a
+        popup/dialog/second top-level window of the same app still
+        counts); ``(False, actual_foreground_hwnd)`` otherwise — the
+        vimcode#1824 "app never becomes frontmost" class of bug (#3650).
+        Never raises — a probe failure here reads as "not confirmed
+        frontmost", never a crash."""
         ...
 
     def uia_elements(self, hwnd: int) -> list[dict]:
@@ -1046,8 +1058,20 @@ class NativeRunner:
     def _do_expect_file(self, step: NativeStep) -> None:
         """#3650: delegates to the one shared filesystem check — see
         :mod:`coord.native_fs_wait`'s own docstring (#2096 "one question,
-        one answer")."""
-        ok, reason = wait_for_file(step.path, step.timeout_ms or 5000, step.contains or None)
+        one answer").
+
+        Review finding: ``getattr``-based, same reasoning as
+        :attr:`WinNativeSession.staging_warning` — only a real
+        :class:`Win32Calls` actually sets ``launched_appdata_dir`` on
+        itself (and only non-``None`` when launch staging isolated
+        ``%APPDATA%``, #3637); a scripted test fake simply has none, and
+        this step's own ``$env:APPDATA`` resolution then falls back to
+        the ambient environment exactly as it did before this fix."""
+        appdata_dir = getattr(self._calls, "launched_appdata_dir", None)
+        env_overrides = {"APPDATA": appdata_dir} if appdata_dir is not None else None
+        ok, reason = wait_for_file(
+            step.path, step.timeout_ms, step.contains or None, env_overrides=env_overrides,
+        )
         if not ok:
             raise AssertionError(reason)
 
@@ -2062,6 +2086,17 @@ class Win32Calls:
         #: real instance agree on the starting value.
         self.staging_warning: str | None = None
 
+        #: #3650 review (non-blocking): the per-session ``%APPDATA%`` this
+        #: launch isolated the child into (#3637), when staging engaged —
+        #: ``None`` otherwise (no isolation, ambient ``%APPDATA%`` applies).
+        #: Read by :meth:`NativeRunner._do_expect_file` so an
+        #: ``expect_file: {path: '$env:APPDATA\\...'}`` step resolves
+        #: against the directory the launched app itself was given, not
+        #: this process's own ambient profile — see :meth:`launch`'s own
+        #: comment on why `appdata_dir` isn't otherwise visible outside
+        #: the method that computes it.
+        self.launched_appdata_dir: str | None = None
+
     # -- process lifecycle --
 
     def launch(self, command: str, cwd: str) -> int:
@@ -2093,6 +2128,7 @@ class Win32Calls:
         if self is not None:
             if staged_dir is not None:
                 self._staged_session_dirs[proc.pid] = staged_dir
+            self.launched_appdata_dir = appdata_dir
             job = self._assign_kill_on_close_job(proc.pid)
             if job is not None:
                 self._job_handles[proc.pid] = job
@@ -2115,6 +2151,7 @@ class Win32Calls:
         )
         if staged_dir is not None:
             self._staged_session_dirs[proc.pid] = staged_dir
+        self.launched_appdata_dir = appdata_dir
         job = self._assign_kill_on_close_job(proc.pid)
         if job is not None:
             self._job_handles[proc.pid] = job
@@ -2671,14 +2708,26 @@ class Win32Calls:
             _send(*mod_downs, key_down, key_up, *mod_ups)
 
     def type_text(self, hwnd: int, text: str) -> None:
-        """#3650: one ``KEYEVENTF_UNICODE`` down/up pair per character,
-        via ``SendInput`` — the same real-input call (and the same
+        """#3650: one ``KEYEVENTF_UNICODE`` down/up pair per UTF-16 CODE
+        UNIT, via ``SendInput`` — the same real-input call (and the same
         "delivered < sent means blocked" check) :meth:`send_key` already
-        uses for its own ``unicode_char`` branch."""
+        uses for its own ``unicode_char`` branch.
+
+        Deliberately iterates UTF-16 code units, not Python characters:
+        ``wScan``/``KEYEVENTF_UNICODE`` is a 16-bit field, so a non-BMP
+        character (any emoji — exactly the kind of glyph an
+        ``expect_no_tofu`` step would want typed) needs a *surrogate
+        pair* — two code units, two SendInput events — same as Windows'
+        own Unicode keyboard input is itself defined. Encoding to
+        ``utf-16-le`` produces that surrogate pair automatically; iterating
+        ``ord(ch)`` over the Python string instead would silently truncate
+        a code point above 0xFFFF to its low 16 bits (``ctypes`` wraps
+        rather than raising) and type the wrong character."""
         self._user32.SetForegroundWindow(hwnd)
         self._declare_send_input_signature()
-        for ch in text:
-            code = ord(ch)
+        encoded = text.encode("utf-16-le")
+        code_units = struct.unpack(f"<{len(encoded) // 2}H", encoded)
+        for code in code_units:
             key_down = _INPUT(type=_INPUT_KEYBOARD, ki=_KEYBDINPUT(0, code, _KEYEVENTF_UNICODE, 0, 0))
             key_up = _INPUT(
                 type=_INPUT_KEYBOARD,
@@ -2689,15 +2738,35 @@ class Win32Calls:
             if sent != 2:
                 raise WinNativeRuntimeError(
                     f"SendInput delivered only {sent} of 2 input event(s) for "
-                    f"character {ch!r} — blocked by UIPI or the input desktop "
-                    f"belongs to another session/thread"
+                    f"UTF-16 code unit {code:#06x} — blocked by UIPI or the "
+                    f"input desktop belongs to another session/thread"
                 )
+
+    def _owning_pid(self, hwnd: int) -> int:
+        """``GetWindowThreadProcessId``'s pid output for *hwnd* (0 for an
+        invalid/null hwnd) — shared by :meth:`is_frontmost` below and
+        :meth:`find_top_window`'s own enum callback."""
+        ctypes = self._ctypes
+        if not hwnd:
+            return 0
+        owner_pid = ctypes.wintypes.DWORD()
+        self._user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        return owner_pid.value
 
     def is_frontmost(self, hwnd: int) -> tuple[bool, int]:
         """#3650: ``GetForegroundWindow`` — the real Win32 notion of "which
-        top-level window currently has keyboard focus"."""
+        top-level window currently has keyboard focus" — compared at the
+        OWNING-PID level, not hwnd identity: ``GetWindowThreadProcessId``
+        on both the foreground window and *hwnd* itself, per the issue's
+        own "owning pid" wording and the mac driver's own pid-level
+        semantics. A popup/dialog/second top-level window belonging to the
+        SAME app being in front still counts as frontmost — an hwnd-
+        equality check would false-FAIL on exactly that (safe, since it
+        fails closed, but noisier than specified) shape."""
         foreground = self._user32.GetForegroundWindow()
-        return foreground == hwnd, foreground
+        foreground_pid = self._owning_pid(foreground)
+        hwnd_pid = self._owning_pid(hwnd)
+        return foreground_pid != 0 and foreground_pid == hwnd_pid, foreground
 
     # -- UI Automation --
 

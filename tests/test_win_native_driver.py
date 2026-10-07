@@ -702,6 +702,57 @@ class TestNativeRunnerExpectFile:
         assert results[1]["status"] == "fail"
         assert "did not appear" in results[1]["message"]
 
+    def test_env_appdata_resolves_against_the_isolated_launch_dir_not_ambient(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Regression (#3650 review): #3637 isolates a launched app's own
+        ``%APPDATA%`` via ``env=`` on the CHILD process alone — an
+        ``expect_file: {path: '$env:APPDATA\\...'}`` step (the issue's own
+        "install an extension -> check the file" use case) must resolve
+        against THAT directory, not this test process's ambient one."""
+        ambient_dir = tmp_path / "ambient"
+        isolated_dir = tmp_path / "isolated"
+        ambient_dir.mkdir()
+        isolated_dir.mkdir()
+        (isolated_dir / "settings.json").write_text("{}")
+        monkeypatch.setenv("APPDATA", str(ambient_dir))
+
+        calls = FakeWinCalls()
+        calls.launched_appdata_dir = str(isolated_dir)
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step(
+                "expect_file", 1,
+                path="$env:APPDATA/settings.json", timeout_ms=500,
+            ),
+        ]))
+        assert results[1]["status"] == "pass"
+
+    def test_env_appdata_falls_back_to_ambient_when_launch_did_not_isolate(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """No staging engaged (non-UNC `cwd`, the common same-host case) —
+        `launched_appdata_dir` stays `None`, same as a scripted test fake
+        that never sets it at all — so resolution falls back to the
+        ambient environment exactly as before this fix."""
+        ambient_dir = tmp_path / "ambient"
+        ambient_dir.mkdir()
+        (ambient_dir / "settings.json").write_text("{}")
+        monkeypatch.setenv("APPDATA", str(ambient_dir))
+
+        calls = FakeWinCalls()
+        assert getattr(calls, "launched_appdata_dir", None) is None
+        runner = _runner(calls)
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step(
+                "expect_file", 1,
+                path="$env:APPDATA/settings.json", timeout_ms=500,
+            ),
+        ]))
+        assert results[1]["status"] == "pass"
+
 
 class TestNativeRunnerExpectFrontmost:
     def test_passes_when_frontmost(self) -> None:
@@ -1179,6 +1230,7 @@ def _make_win32_calls(user32, kernel32) -> Win32Calls:
     calls._staged_session_dirs = {}  # #3617 — normally set by `__init__`
     calls._job_handles = {}  # #3634 — normally set by `__init__`
     calls.staging_warning = None  # #3617 — normally set by `__init__`
+    calls.launched_appdata_dir = None  # #3650 — normally set by `__init__`
     return calls
 
 
@@ -1314,25 +1366,82 @@ class TestTypeTextRealSequence:
         with pytest.raises(WinNativeRuntimeError, match="SendInput"):
             calls.type_text(1, "a")
 
+    def test_non_bmp_character_sends_a_surrogate_pair_not_a_truncated_code(self) -> None:
+        """Regression: iterating ``ord(ch)`` over a non-BMP character (any
+        emoji, exactly an ``expect_no_tofu`` use case) overflowed the
+        16-bit ``wScan`` field — `ctypes` wraps silently rather than
+        raising, so the previous code would have typed the WRONG, truncated
+        character instead of the two-code-unit surrogate pair Windows'
+        own Unicode keyboard input expects."""
+        user32 = _FakeUser32SendInput()
+        calls = _make_win32_calls(user32, kernel32=None)
+        emoji = "\U0001F600"  # U+1F600 GRINNING FACE — above the BMP
+        calls.type_text(1, emoji)
+        high_unit, low_unit = struct.unpack("<2H", emoji.encode("utf-16-le"))
+        assert len(user32.calls) == 2
+        assert user32.calls[0] == [
+            (0, high_unit, self.KEYEVENTF_UNICODE),
+            (0, high_unit, self.KEYEVENTF_UNICODE | self.KEYEVENTF_KEYUP),
+        ]
+        assert user32.calls[1] == [
+            (0, low_unit, self.KEYEVENTF_UNICODE),
+            (0, low_unit, self.KEYEVENTF_UNICODE | self.KEYEVENTF_KEYUP),
+        ]
+        # Both surrogate halves fit in 16 bits — the bug this guards
+        # against was a silent wraparound of a value that does NOT fit.
+        assert high_unit <= 0xFFFF and low_unit <= 0xFFFF
+        assert ord(emoji) > 0xFFFF
+
 
 class _FakeUser32Foreground:
-    def __init__(self, foreground_hwnd: int) -> None:
+    """*hwnd_pids* maps a fake ``hwnd`` to its owning pid — defaulting an
+    unlisted hwnd's pid to the hwnd value itself, so most tests can just
+    pick distinct hwnd numbers and get distinct "pids" for free, while a
+    test that wants two different hwnds to be the SAME app's two windows
+    (a popup/dialog in front of its own main window) can say so by giving
+    them equal entries in *hwnd_pids*."""
+
+    def __init__(self, foreground_hwnd: int, hwnd_pids: dict[int, int] | None = None) -> None:
         self._foreground_hwnd = foreground_hwnd
+        self._hwnd_pids = hwnd_pids or {}
 
     def GetForegroundWindow(self) -> int:
         return self._foreground_hwnd
 
+    def GetWindowThreadProcessId(self, hwnd, owner_pid_ref) -> None:
+        owner_pid_ref._obj.value = self._hwnd_pids.get(hwnd, hwnd)
+
 
 class TestIsFrontmost:
     """#3650 — :meth:`Win32Calls.is_frontmost`, the vimcode#1824 "app never
-    becomes frontmost" class of bug."""
+    becomes frontmost" class of bug. Compares OWNING PID, not hwnd
+    identity (review finding): a popup/dialog/second top-level window of
+    the SAME app in front must still read as frontmost."""
 
     def test_true_when_hwnd_is_the_foreground_window(self) -> None:
         calls = _make_win32_calls(_FakeUser32Foreground(5555), kernel32=None)
         assert calls.is_frontmost(5555) == (True, 5555)
 
-    def test_false_when_another_hwnd_is_foreground(self) -> None:
+    def test_false_when_another_apps_hwnd_is_foreground(self) -> None:
         calls = _make_win32_calls(_FakeUser32Foreground(9999), kernel32=None)
+        assert calls.is_frontmost(5555) == (False, 9999)
+
+    def test_true_when_a_different_hwnd_of_the_same_pid_is_foreground(self) -> None:
+        """Regression: a popup/dialog belonging to the same app (same
+        owning pid, different hwnd from the one `find_top_window` latched
+        onto) must still count as frontmost — the whole point of comparing
+        pids instead of raw hwnd equality."""
+        calls = _make_win32_calls(
+            _FakeUser32Foreground(7777, hwnd_pids={7777: 42, 5555: 42}), kernel32=None,
+        )
+        assert calls.is_frontmost(5555) == (True, 7777)
+
+    def test_false_when_a_different_pids_hwnd_is_foreground_even_with_overlapping_numbers(
+        self,
+    ) -> None:
+        calls = _make_win32_calls(
+            _FakeUser32Foreground(9999, hwnd_pids={9999: 99, 5555: 42}), kernel32=None,
+        )
         assert calls.is_frontmost(5555) == (False, 9999)
 
 

@@ -75,13 +75,34 @@ def _encode_bmp_rgb(rows: list[list[tuple[int, int, int]]]) -> bytes:
     return file_header + info_header + bytes(body)
 
 
-def _encode_xwd_rgb(rows: list[list[tuple[int, int, int]]]) -> bytes:
-    """A minimal ZPixmap, 32bpp, true-color XWD dump."""
+def _encode_xwd_rgb(
+    rows: list[list[tuple[int, int, int]]],
+    *,
+    ncolors: int = 0,
+    byte_order: int = 1,
+    bits_per_pixel: int = 32,
+) -> bytes:
+    """A ZPixmap, 24 or 32bpp, true-color XWD dump — matching the *real*
+    on-disk shape ``xwd`` itself writes: a ``colormap`` of ``ncolors``
+    12-byte ``XWDColor`` entries sits between the header and the pixel
+    data (``XWDFile.h:96-99``), which the two hand-rolled test-only
+    encoders in this repo originally omitted (hardcoding ``ncolors=0``) —
+    exactly the gap that let a wrong :func:`coord.native_pixels.decode_xwd`
+    offset go uncaught. Defaults match a headless Xvfb's actual TrueColor
+    dump has no colormap entries, but every caller below exercises
+    ``ncolors > 0`` too.
+
+    ``byte_order``/``bits_per_pixel`` are parameterized so tests can cover
+    the ``"<I"`` (LSBFirst, the branch that actually runs on real x86
+    hardware) and 24bpp (``padded = raw_word + b"\\x00"``) decode paths,
+    not just the MSBFirst/32bpp shape the original fixture hardcoded.
+    """
     height = len(rows)
     width = len(rows[0])
     window_name = b"test\x00"
     header_size = 25 * 4 + len(window_name)
-    bytes_per_line = width * 4
+    bytes_pp = bits_per_pixel // 8
+    bytes_per_line = width * bytes_pp
     header = struct.pack(
         ">25I",
         header_size,  # header_size
@@ -91,29 +112,32 @@ def _encode_xwd_rgb(rows: list[list[tuple[int, int, int]]]) -> bytes:
         width,        # pixmap_width
         height,       # pixmap_height
         0,            # xoffset
-        1,            # byte_order (MSBFirst)
+        byte_order,
         32,           # bitmap_unit
         1,            # bitmap_bit_order
         32,           # bitmap_pad
-        32,           # bits_per_pixel
+        bits_per_pixel,
         bytes_per_line,
         4,            # visual_class (TrueColor)
         0xFF0000,     # red_mask
         0x00FF00,     # green_mask
         0x0000FF,     # blue_mask
         8,            # bits_per_rgb
-        0,            # colormap_entries
-        0,            # ncolors
+        ncolors,      # colormap_entries
+        ncolors,      # ncolors
         width,        # window_width
         height,       # window_height
         0, 0, 0,      # window_x, window_y, window_bdrwidth
     )
+    colormap = b"\x00" * (12 * ncolors)  # sz_XWDColor == 12, content irrelevant here
+    fmt = ">I" if byte_order == 1 else "<I"
     body = bytearray()
     for row in rows:
         for (r, g, b) in row:
             value = (r << 16) | (g << 8) | b
-            body += struct.pack(">I", value)
-    return header + window_name + bytes(body)
+            packed = struct.pack(fmt, value)
+            body += packed if bytes_pp == 4 else (packed[1:] if byte_order == 1 else packed[:3])
+    return header + window_name + colormap + bytes(body)
 
 
 _SAMPLE_ROWS = [
@@ -195,6 +219,46 @@ def test_decode_xwd_rejects_non_zpixmap():
     struct.pack_into(">I", data, 2 * 4, 1)  # pixmap_format <- XYPixmap == 1
     with pytest.raises(NativePixelError, match="ZPixmap"):
         decode_xwd(bytes(data))
+
+
+def test_decode_xwd_skips_colormap_between_header_and_pixel_data():
+    """Regression for the real bug this issue's review caught: a real
+    ``xwd`` dump (e.g. ``ncolors=256`` on a typical TrueColor X11 display)
+    carries a colormap of ``ncolors`` 12-byte ``XWDColor`` entries between
+    the header and the pixel data (``XWDFile.h:96-99``) — decoding must
+    skip past it, not start reading pixels right after the header."""
+    data = _encode_xwd_rgb(_SAMPLE_ROWS, ncolors=256)
+    image = decode_xwd(data)
+    assert image.width == 4 and image.height == 3
+    for y, row in enumerate(_SAMPLE_ROWS):
+        for x, pixel in enumerate(row):
+            assert image.get(x, y) == pixel
+
+
+def test_decode_xwd_round_trip_lsbfirst_byte_order():
+    """Real x86 hosts write ``byte_order=0`` (LSBFirst) — the ``"<I"``
+    decode branch — not the MSBFirst shape the original fixture hardcoded."""
+    data = _encode_xwd_rgb(_SAMPLE_ROWS, ncolors=4, byte_order=0)
+    image = decode_xwd(data)
+    assert image.width == 4 and image.height == 3
+    for y, row in enumerate(_SAMPLE_ROWS):
+        for x, pixel in enumerate(row):
+            assert image.get(x, y) == pixel
+
+
+def test_decode_xwd_round_trip_24bpp():
+    """The 24bpp decode path (``padded = raw_word + b"\\x00"``/
+    ``b"\\x00" + raw_word``) is distinct from the 32bpp one and needs its
+    own coverage, for both byte orders."""
+    for byte_order in (0, 1):
+        data = _encode_xwd_rgb(
+            _SAMPLE_ROWS, ncolors=16, byte_order=byte_order, bits_per_pixel=24,
+        )
+        image = decode_xwd(data)
+        assert image.width == 4 and image.height == 3
+        for y, row in enumerate(_SAMPLE_ROWS):
+            for x, pixel in enumerate(row):
+                assert image.get(x, y) == pixel
 
 
 # ── region_not_uniform ──────────────────────────────────────────────────────
