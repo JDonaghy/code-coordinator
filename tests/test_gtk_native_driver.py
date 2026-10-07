@@ -553,7 +553,9 @@ class TestNativeRunnerExpectFrontmost:
 
 
 def _xwd_bytes(rows: list[list[tuple[int, int, int]]]) -> bytes:
-    """A minimal ZPixmap/32bpp/true-color XWD dump — see
+    """A ZPixmap/32bpp/true-color XWD dump, with a non-empty colormap
+    (``ncolors=4``) sitting between the header and the pixel data exactly
+    as real ``xwd`` output does (``XWDFile.h:96-99``) — see
     ``tests/test_native_pixels.py``'s own encoder for the full field-by-field
     explanation; duplicated narrowly here so this test module doesn't reach
     into another module's test-only helpers."""
@@ -564,16 +566,18 @@ def _xwd_bytes(rows: list[list[tuple[int, int, int]]]) -> bytes:
     window_name = b"test\x00"
     header_size = 25 * 4 + len(window_name)
     bytes_per_line = width * 4
+    ncolors = 4
     header = struct.pack(
         ">25I", header_size, 7, 2, 24, width, height, 0, 1, 32, 1, 32, 32,
-        bytes_per_line, 4, 0xFF0000, 0x00FF00, 0x0000FF, 8, 0, 0, width,
-        height, 0, 0, 0,
+        bytes_per_line, 4, 0xFF0000, 0x00FF00, 0x0000FF, 8, ncolors, ncolors,
+        width, height, 0, 0, 0,
     )
+    colormap = b"\x00" * (12 * ncolors)  # sz_XWDColor == 12; content irrelevant here
     body = bytearray()
     for row in rows:
         for (r, g, b) in row:
             body += struct.pack(">I", (r << 16) | (g << 8) | b)
-    return header + window_name + bytes(body)
+    return header + window_name + colormap + bytes(body)
 
 
 class TestNativeRunnerExpectRegionNotUniform:

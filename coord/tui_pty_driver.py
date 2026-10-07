@@ -92,9 +92,11 @@ is threaded through as the driver's ``entrypoint:``). Steps:
   see :mod:`coord.native_fs_wait`, the single shared implementation every
   Tier-2 native driver calls through (#2096 "one question, one answer").
   *path* may use ``$VAR``/``~`` (or the PowerShell ``$env:VAR`` spelling);
-  it's resolved against the pty child's filesystem, not this process's own
-  — the common case is both run on the same host, so that distinction only
-  matters for a remotely-bridged child, which this driver does not have.
+  it's resolved in THIS process, against this process's own environment —
+  not the pty child's. The common case is both run on the same host (this
+  driver has no remotely-bridged child), so the two environments are
+  usually identical in practice, but a spec relying on a variable this
+  process doesn't itself have set will not see it.
 
 **The ``ESC[6n`` cursor-position query lesson (vimcode's own ConPTY tests,
 folded in before this issue was dispatched).** ratatui's ``Terminal::new()``
@@ -1257,7 +1259,7 @@ class SmokeRunner:
         answer"); this driver has no OS-specific behaviour to add on top of
         it."""
         ok, reason = wait_for_file(
-            step.path, step.timeout_ms or 5000, step.contains or None,
+            step.path, step.timeout_ms, step.contains or None,
         )
         if not ok:
             raise AssertionError(reason)

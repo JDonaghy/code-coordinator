@@ -104,11 +104,22 @@ per-OS fork.
   black-bar minimap and #1828's blank panel are exactly this. Decodes via
   :func:`coord.native_pixels.decode_png`, judged by the one shared
   :func:`coord.native_pixels.region_not_uniform`.
+
+  **Retina caveat:** ``screencapture -x`` (with ``-o``, used here to drop
+  the window's own drop shadow — see :meth:`MacOSCalls.capture`) still
+  emits DEVICE pixels, not logical/points coordinates — on any Retina
+  display (backing scale factor 2x being by far the common case), the
+  captured image is 2x the window's own logical width/height that
+  ``click``/``move_window``'s ``x``/``y`` are expressed in. A spec author
+  targeting a specific logical-coordinate region on a Retina host must
+  scale ``x``/``y``/``width``/``height`` by the display's own backing
+  scale factor first; this driver does not normalize that for you.
 - ``expect_no_tofu: {x, y, width, height}`` (#3650) — the named pixel
   rectangle must NOT look like a missing-glyph "tofu" placeholder box
   (:func:`coord.native_pixels.looks_like_tofu` — see that function's own
   docstring for the heuristic's scope and documented false-positive risk;
-  it is deliberately coarse).
+  it is deliberately coarse). Same Retina caveat as
+  ``expect_region_not_uniform`` above.
 
 **Safety: kill only the PID this driver itself launched.** :meth:`MacCalls.kill`
 takes a ``pid: int`` — the exact process id :meth:`MacCalls.launch` returned
@@ -699,7 +710,7 @@ class NativeRunner:
         """#3650: delegates to the one shared filesystem check — see
         :mod:`coord.native_fs_wait`'s own docstring (#2096 "one question,
         one answer")."""
-        ok, reason = wait_for_file(step.path, step.timeout_ms or 5000, step.contains or None)
+        ok, reason = wait_for_file(step.path, step.timeout_ms, step.contains or None)
         if not ok:
             raise AssertionError(reason)
 
@@ -1149,13 +1160,24 @@ class MacOSCalls:
         already uses for a character with no named vkey) posted via
         ``CGEventPostToPid`` — the same pid-addressed, never-global-HID-tap
         call :meth:`send_key`/:meth:`send_click` use (#3566), so even a
-        frontmost-check race lands on the intended process."""
+        frontmost-check race lands on the intended process.
+
+        ``CGEventKeyboardSetUnicodeString``'s length argument is a UTF-16
+        CODE-UNIT count, not a Python character count — a non-BMP
+        character (any emoji; exactly the kind of glyph an
+        ``expect_no_tofu`` step would want typed) encodes as a *surrogate
+        pair*, two UTF-16 code units. Passing a hardcoded ``1`` would tell
+        Core Graphics to read only the first of those two units, cutting
+        the character off. ``len(ch.encode("utf-16-le")) // 2`` gives the
+        real count (1 for BMP, 2 for a surrogate pair) while still handing
+        the whole Python string to pyobjc's own ``UniChar *`` marshalling."""
         quartz = self._quartz
         for ch in text:
+            length = len(ch.encode("utf-16-le")) // 2
             down = quartz.CGEventCreateKeyboardEvent(None, 0, True)
             up = quartz.CGEventCreateKeyboardEvent(None, 0, False)
-            quartz.CGEventKeyboardSetUnicodeString(down, 1, ch)
-            quartz.CGEventKeyboardSetUnicodeString(up, 1, ch)
+            quartz.CGEventKeyboardSetUnicodeString(down, length, ch)
+            quartz.CGEventKeyboardSetUnicodeString(up, length, ch)
             quartz.CGEventPostToPid(pid, down)
             quartz.CGEventPostToPid(pid, up)
 
@@ -1221,7 +1243,12 @@ class MacOSCalls:
             tmp_path = tmp.name
         try:
             proc = subprocess.run(
-                ["screencapture", "-x", "-l", str(window_id), tmp_path],
+                # `-o`: omit the window's drop shadow, so the captured
+                # image's (0,0) is the window's own top-left content
+                # corner — the same origin `click`/`move_window`/
+                # `expect_region_not_uniform`/`expect_no_tofu` coordinates
+                # already use, rather than shifted by the shadow margin.
+                ["screencapture", "-x", "-o", "-l", str(window_id), tmp_path],
                 capture_output=True, text=True, timeout=10,
             )
             if proc.returncode != 0 or not os.path.exists(tmp_path):

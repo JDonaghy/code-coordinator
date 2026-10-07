@@ -91,7 +91,16 @@ def decode_png(data: bytes) -> PixelImage:
     palette-based, interlaced, >8-bit depth, truncated/corrupt chunks) —
     exactly the shapes macOS's own ``screencapture -x`` never produces, so a
     raise here means the capture itself is unexpectedly not a plain
-    screenshot, not that this decoder needs to grow a new case."""
+    screenshot, not that this decoder needs to grow a new case.
+
+    Pure-Python, one :func:`struct.unpack`-equivalent slice per pixel —
+    a full 1920x1080 capture is ~2M pixels, on the order of a second of
+    wall time, not milliseconds. Callers that only need a small region
+    (every current caller does — ``expect_region_not_uniform``/
+    ``expect_no_tofu`` both take an explicit rectangle) should prefer
+    capturing just that rectangle at the OS layer where the platform
+    supports it, rather than decoding a whole-window capture only to
+    crop it afterwards."""
     if not data.startswith(_PNG_SIGNATURE):
         raise NativePixelError("not a PNG — missing the 8-byte PNG signature")
 
@@ -196,10 +205,7 @@ def _png_line_to_rgb(line: bytes, width: int, channels: int) -> tuple[tuple[int,
     pixels = []
     for x in range(width):
         base = x * channels
-        if channels == 1:  # grayscale
-            g = line[base]
-            pixels.append((g, g, g))
-        elif channels == 2:  # grayscale + alpha
+        if channels in (1, 2):  # grayscale, or grayscale + alpha (alpha ignored)
             g = line[base]
             pixels.append((g, g, g))
         elif channels == 3:  # RGB
@@ -270,7 +276,10 @@ def decode_xwd(data: bytes) -> PixelImage:
     X11 display — including a headless Xvfb session — produces; nothing in
     this fleet runs an 8-bit palette/StaticGray display). Raises
     :class:`NativePixelError` for anything else (wrong/truncated header,
-    ``XYPixmap``, any other bit depth)."""
+    ``XYPixmap``, any other bit depth).
+
+    Same wall-time note as :func:`decode_png`: a per-pixel Python loop over a
+    full 1920x1080/32bpp dump is on the order of a second, not milliseconds."""
     if len(data) < _XWD_HEADER_FIELDS * 4:
         raise NativePixelError("not an XWD dump — truncated file header")
     header = struct.unpack_from(f">{_XWD_HEADER_FIELDS}I", data, 0)
@@ -285,7 +294,7 @@ def decode_xwd(data: bytes) -> PixelImage:
         pixmap_height, _xoffset, byte_order, _bitmap_unit, _bitmap_bit_order,
         _bitmap_pad, bits_per_pixel, bytes_per_line, _visual_class,
         red_mask, green_mask, blue_mask, _bits_per_rgb, _colormap_entries,
-        _ncolors, _window_width, _window_height, _window_x, _window_y,
+        ncolors, _window_width, _window_height, _window_x, _window_y,
         _window_bdrwidth,
     ) = header
 
@@ -300,7 +309,11 @@ def decode_xwd(data: bytes) -> PixelImage:
     if header_size < _XWD_HEADER_FIELDS * 4:
         raise NativePixelError(f"implausible XWD header_size {header_size}")
 
-    pixel_offset = header_size  # the window-name string (NUL-terminated) fills the rest of header_size
+    # Per XWDFile.h: the XWDColor colormap (sz_XWDColor == 12 bytes each)
+    # sits at offset header_size, ncolors entries long; the window-name
+    # string (NUL-terminated) fills the rest of header_size itself, and the
+    # pixel data only starts after the colormap.
+    pixel_offset = header_size + ncolors * 12
     bytes_pp = bits_per_pixel // 8
     needed = pixel_offset + bytes_per_line * pixmap_height
     if len(data) < needed:
@@ -366,8 +379,11 @@ def region_not_uniform(
 
     Raises :class:`NativePixelError` (via :meth:`PixelImage.crop`) when the
     region doesn't fit inside the captured image at all — a malformed-spec
-    condition (coordinates from the wrong window size), not a "fail"
-    verdict to report as if the pixels were examined.
+    condition (coordinates from the wrong window size). Every driver's own
+    ``_run_step`` catches this alongside ``AssertionError`` and records it
+    as an ordinary ``status: "fail"`` step result, same as any other
+    failure — the distinction that matters is in the *message*, which
+    names a bad region rather than claiming the pixels were examined.
     """
     pixels = image.crop(x, y, width, height)
     base = pixels[0]

@@ -105,10 +105,14 @@ and ``mac-native`` rely on (#966/#3241), not a new one.
   window gone afterward*, never by the mere absence of an exception from an
   earlier click step.
 - ``type_text: {text}`` (#3650) — types *text* through real X11 input
-  (``xdotool type``), the same event path ``key``/``click`` already use —
-  never by injecting into the app's own in-memory buffer, or a
-  vimcode#1825-class "keystrokes went to the launching terminal instead of
-  the app" bug would stay invisible to this driver too.
+  (``xdotool type --window <id>``), the same event path ``key``/``click``
+  already use — never by injecting into the app's own in-memory buffer.
+  Caveat: ``--window`` addresses the ``XSendEvent`` at a specific window
+  rather than going through the real X input-focus path, so (unlike the
+  mac/win drivers) a vimcode#1825-class "keystrokes went to the launching
+  terminal instead of the app" bug is not visible to THIS call alone — pair
+  it with a preceding ``expect_frontmost`` to actually close that gap (see
+  :meth:`LinuxGtkCalls.type_text`'s own docstring).
 - ``expect_file: {path, timeout_ms, contains}`` (#3650) — *path* must exist
   within *timeout_ms* (default 5000), optionally containing the substring
   *contains*. Delegates entirely to :mod:`coord.native_fs_wait` — the one
@@ -650,7 +654,7 @@ class NativeRunner:
         """#3650: delegates to the one shared filesystem check — see
         :mod:`coord.native_fs_wait`'s own docstring (#2096 "one question,
         one answer")."""
-        ok, reason = wait_for_file(step.path, step.timeout_ms or 5000, step.contains or None)
+        ok, reason = wait_for_file(step.path, step.timeout_ms, step.contains or None)
         if not ok:
             raise AssertionError(reason)
 
@@ -997,7 +1001,19 @@ class LinuxGtkCalls:
         :meth:`send_key` already uses, not an in-process injection into the
         app's own buffer. ``--`` ends ``xdotool``'s own option parsing
         before *text*, so a string that itself starts with ``-`` (e.g.
-        ``-rf``) is typed literally rather than misread as a flag."""
+        ``-rf``) is typed literally rather than misread as a flag.
+
+        Review caveat (non-blocking, consistent with the pre-existing
+        :meth:`send_key`): ``--window <id>`` addresses the keystrokes at
+        *window_id* via ``XSendEvent``, which bypasses the real X
+        input-focus path entirely — so a vimcode#1825-class "keystrokes
+        went to the launching terminal instead of the app" bug is NOT
+        visible to this call by construction, unlike the mac/win drivers'
+        focus-respecting equivalents. A spec author who wants that gap
+        actually closed should pair a ``type_text`` step with a preceding
+        ``expect_frontmost`` (confirming the window itself, not just this
+        driver's own targeted delivery, has real X input focus) rather
+        than relying on ``type_text`` alone to prove it."""
         proc = subprocess.run(
             ["xdotool", "type", "--window", str(window_id), "--", text],
             capture_output=True, text=True, timeout=30,

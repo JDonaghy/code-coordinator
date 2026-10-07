@@ -657,6 +657,26 @@ class TestNativeRunnerExpectFile:
         assert results[1]["status"] == "fail"
         assert "did not appear" in results[1]["message"]
 
+    def test_explicit_zero_timeout_is_honored_not_defaulted_to_5000(self, tmp_path) -> None:
+        """Regression: `step.timeout_ms or 5000` used to silently turn an
+        explicit "check once, right now" ``timeout_ms: 0`` into a 5-second
+        wait (`_int_default` already supplies the 5000 default for an
+        *absent* field — the `or` only mattered for this literal-zero
+        case). A missing file with ``timeout_ms: 0`` must fail fast."""
+        import time
+
+        target = tmp_path / "never.txt"
+        calls = FakeMacCalls()
+        runner = _runner(calls)
+        start = time.monotonic()
+        results = runner.run(_spec([
+            _step("launch", 0),
+            _step("expect_file", 1, path=str(target), timeout_ms=0),
+        ]))
+        elapsed = time.monotonic() - start
+        assert results[1]["status"] == "fail"
+        assert elapsed < 2.0
+
 
 class TestNativeRunnerExpectFrontmost:
     def test_passes_when_frontmost(self) -> None:
@@ -1025,8 +1045,9 @@ class _FakeQuartz:
     def CGEventCreateKeyboardEvent(self, _source, vkey, key_down):
         return {"vkey": vkey, "down": key_down, "flags": 0, "unicode": None}
 
-    def CGEventKeyboardSetUnicodeString(self, event, _length, chars) -> None:
+    def CGEventKeyboardSetUnicodeString(self, event, length, chars) -> None:
         event["unicode"] = chars
+        event["length"] = length
 
     def CGEventSetFlags(self, event, flags) -> None:
         event["flags"] = flags
@@ -1209,6 +1230,20 @@ class TestMacOSCallsTypeText:
         calls = _make_mac_calls(quartz)
         calls.type_text(1, "日")
         assert [e["unicode"] for e in quartz.posted] == ["日", "日"]
+        assert [e["length"] for e in quartz.posted] == [1, 1]
+
+    def test_non_bmp_character_passes_the_real_utf16_length_not_a_hardcoded_one(self) -> None:
+        """Regression: a non-BMP character (any emoji — exactly an
+        ``expect_no_tofu`` use case) encodes as a UTF-16 *surrogate pair*
+        (2 code units). A hardcoded ``length=1`` would tell
+        ``CGEventKeyboardSetUnicodeString`` to read only the first of
+        those two units, silently cutting the character off."""
+        quartz = _FakeQuartz()
+        calls = _make_mac_calls(quartz)
+        emoji = "\U0001F600"  # U+1F600 GRINNING FACE — above the BMP
+        calls.type_text(1, emoji)
+        assert [e["unicode"] for e in quartz.posted] == [emoji, emoji]
+        assert [e["length"] for e in quartz.posted] == [2, 2]
 
     def test_empty_text_posts_nothing(self) -> None:
         quartz = _FakeQuartz()
