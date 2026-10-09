@@ -327,6 +327,18 @@ SQLITE_CONNECT_ALLOWLIST: dict[str, Classification] = {
         "HTTP by SqliteStore/TestClient, same shape as the rest of this "
         "bucket. 2 A: PRAGMA journal_mode=WAL + the WAL checkpoint tick.",
     ),
+    "test_board_nightly_status.py": Classification(
+        2, (BUCKET_C,),
+        "#3661: a detail_db fixture plus one inline variant "
+        "(test_a_repo_with_no_release_gate_nightly_entry_contributes_nothing) "
+        "that both seed a file DB `build_app(SqliteStore(detail_db), ...)` "
+        "then reads back by path over a real TestClient GET /board, the same "
+        "SqliteStore-opens-by-path shape as test_board_read_path.py below. "
+        "The autouse coord_db connection is :memory: and invisible to a "
+        "SqliteStore opened against a different path, so neither it nor "
+        "scratch_database() (which also yields a connection, not a path) "
+        "fits here.",
+    ),
     "test_board_read_path.py": Classification(
         10, (BUCKET_C,),
         "All file DBs for SqliteStore/TestClient; four are deliberate second "
