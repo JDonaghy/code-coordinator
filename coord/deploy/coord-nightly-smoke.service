@@ -20,10 +20,17 @@
 #      gets its own attempt. See `coord smoke nightly-sweep --help` for the
 #      full per-pair/whole-process distinction.
 #
-# THE ON-DEMAND COMMAND IS UNCHANGED. `coord smoke nightly --repo <R>
-# --artifact <A>` is still exactly what a human runs pre-release for one
-# artifact; this unit exists ONLY to fire the sweep across every configured
-# pair on a schedule nobody has to remember.
+# THE ON-DEMAND COMMAND IS UNCHANGED. `coord smoke nightly --repo REPO
+# --artifact ARTIFACT` is still exactly what a human runs pre-release for
+# one artifact; this unit exists ONLY to fire the sweep across every
+# configured pair on a schedule nobody has to remember.
+#
+# (Deliberately spelled without angle brackets above, unlike
+# deploy/coord-agent.service's real MACHINE_NAME/PORT placeholders:
+# every *.service/*.timer file is scanned by coord/health/checks/
+# unit_drift.py's angle-bracket template-placeholder regex, and a bare
+# single-letter example in brackets would be misread as an unfilled
+# placeholder this unit itself does not have, #1928.)
 #
 # #3661 "LEAVE THE QUEUE ALONE". A nightly run never takes a drive-queue slot
 # and never blocks a merge — it only reports, and only `coord release gate`
