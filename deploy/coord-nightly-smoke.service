@@ -1,0 +1,82 @@
+# coord smoke nightly-sweep — the #3661 scheduled driver for the #3652/#3660
+# real-platform nightly smoke runner.
+#
+# A systemd *user* unit (mirrors coord-notify/coord-drive-queue/
+# coord-release-window), paired with coord-nightly-smoke.timer. Each fire runs
+# `coord smoke nightly-sweep`, which:
+#
+#   1. reads `release_gate.<repo>.nightly_required`/`nightly_artifacts` out of
+#      coordinator.yml for every repo (`coord.nightly_status.
+#      repos_with_nightly_smoke`) — #3661's own "every repo with smoke specs
+#      configured";
+#   2. for each (repo, artifact) pair, runs the EXACT same sequence the
+#      pre-release on-demand `coord smoke nightly` command runs (resolve the
+#      artifact plan, pick a capable+healthy host, preflight its GUI lane,
+#      run the spec, file/update/close issues, persist the result) — never a
+#      second, drifted implementation of "run one nightly spec" (#2096 "one
+#      question, one answer");
+#   3. keeps going if one pair's run crashes outright (an unreadable board, a
+#      GitHub hiccup, a driver exception) — every OTHER configured pair still
+#      gets its own attempt. See `coord smoke nightly-sweep --help` for the
+#      full per-pair/whole-process distinction.
+#
+# THE ON-DEMAND COMMAND IS UNCHANGED. `coord smoke nightly --repo <R>
+# --artifact <A>` is still exactly what a human runs pre-release for one
+# artifact; this unit exists ONLY to fire the sweep across every configured
+# pair on a schedule nobody has to remember.
+#
+# #3661 "LEAVE THE QUEUE ALONE". A nightly run never takes a drive-queue slot
+# and never blocks a merge — it only reports, and only `coord release gate`
+# reads what it persisted as an actual gate. Consequently this unit does NOT
+# wire `OnFailure=coord-failure-notify.service` the way coord-notify.service/
+# coord-drive-queue.service do: `coord smoke nightly-sweep` exits non-zero
+# only for the one defect class that IS this command's own fault (an alerting
+# step that got no issue filed at all), never for an expected app-red or
+# INFRA night — paging a human for either of those would be exactly the
+# false alarm #3661's "it only reports" rule exists to avoid. A genuinely
+# broken sweep (every pair erroring) is visible in `coord status`'s own
+# nightly section reading STALE once the freshness window lapses, and in this
+# unit's own journal regardless.
+#
+# Install ONLY on the daemon host (dellserver in production) — same
+# "which host" reasoning as coord-release-window.service: this unit's own
+# config read is fleet-wide (`coordinator.yml`), so a second copy anywhere
+# else would just duplicate every pair's run for no benefit.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-nightly-smoke.service deploy/coord-nightly-smoke.timer \
+#      ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-nightly-smoke.timer
+#
+# This is a Type=oneshot service fired BY THE TIMER — do not
+# `systemctl --user enable coord-nightly-smoke.service` directly (it has no
+# [Install] section; the timer unit is what you enable).
+#
+# See docs/AGENT_OPERATIONS.md → "Periodic nightly real-platform smoke
+# (coord-nightly-smoke timer, #3661)".
+
+[Unit]
+Description=coord smoke nightly-sweep — scheduled real-platform nightly smoke (#3652/#3660/#3661)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Same #2561 PATH requirement as coord-notify.service/coord-drive-queue.
+# service: `coord smoke nightly-sweep` -> `run_nightly_smoke` ->
+# `process_nightly_step` -> `coord.bugbash.file_finding` ->
+# `subprocess_coord_runner`, which shells `coord <args>` out via
+# `shutil.which("coord")`. With no `Environment=PATH=` that resolves under
+# systemd's bare user-manager PATH instead of the pinned release — byte-
+# identical line to coord-notify.service's (same host, same role family,
+# same reasoning).
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/code-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=%h/.coord-venv/bin/coord smoke nightly-sweep --config %h/.coord/coordinator.yml
+# Generous: one fire can run several repos' real builds/downloads and GUI-
+# lane driver specs back to back, sequentially — unlike coord-notify/
+# coord-drive-queue there is no tighter cadence to stay inside, only the
+# rest of the night before the 02:00 fire comes back around.
+TimeoutStartSec=10800

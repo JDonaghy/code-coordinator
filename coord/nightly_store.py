@@ -150,6 +150,22 @@ class NightlyResultRecord:
     #: graded exactly as it was before this field existed (no completeness
     #: check), because inventing a step count for it would be a guess.
     steps_total: int = 0
+    #: The issue :func:`coord.nightly_smoke.process_nightly_step` filed or
+    #: updated for THIS step, once acting on the already-persisted
+    #: observation above has actually happened — ``None`` until then (a
+    #: clean step, a dry run, or a row whose acting step hasn't completed
+    #: yet/crashed before reporting back). Deliberately NOT part of the
+    #: persist-before-act write `record_nightly_result` makes (#3660 review
+    #: round 2's crash-safety property): the observation itself (``passed``/
+    #: ``detail``/``unavailable``) is known and must survive a crash BEFORE
+    #: the filing call ever runs, but the issue number is only known AFTER
+    #: it returns. :func:`set_nightly_issue_number` anneals it onto the
+    #: already-written row as a separate, best-effort step — #3661's status
+    #: surface (:mod:`coord.nightly_status`) wants "which issue(s)" for a
+    #: red result, and losing this annotation to a crash between acting and
+    #: annealing only costs that one extra link, never the underlying
+    #: pass/fail verdict, which the gate already had durably.
+    issue_number: int | None = None
 
     def to_nightly_artifact_result(self) -> NightlyArtifactResult:
         """The exact shape :func:`coord.release_gate.evaluate_release_gate`
@@ -234,11 +250,60 @@ def read_nightly_results(repo: str) -> list[NightlyResultRecord]:
                     evidence=tuple(row.get("evidence") or ()),
                     run_id=row.get("run_id", ""),
                     steps_total=int(row.get("steps_total", 0) or 0),
+                    issue_number=(
+                        int(row["issue_number"])
+                        if row.get("issue_number") not in (None, "")
+                        else None
+                    ),
                 )
             )
         except (KeyError, TypeError, ValueError):
             continue
     return out
+
+
+def set_nightly_issue_number(
+    *, repo: str, run_id: str, spec: str, step: str, issue_number: int,
+) -> bool:
+    """Anneal *issue_number* onto the already-persisted row(s) matching
+    ``(repo, run_id, spec, step)`` — a best-effort, lock-guarded
+    read-modify-write distinct from :func:`record_nightly_result`'s
+    append (#3661).
+
+    Never invents a row: if nothing matches (a legacy run with no
+    ``run_id``, or a store that was cleared between the observation and
+    this call), this is a no-op that returns ``False`` rather than
+    appending a fabricated record — the caller already has a durable,
+    correctly-graded row from the persist-before-act write; this only ever
+    adds provenance to it, never a substitute for it. Updates every
+    matching row (normally exactly one — one row per ``(spec, step)`` per
+    run) so a retried/duplicated call stays idempotent.
+    """
+    if not run_id:
+        # A legacy/unset run_id groups with every other such row for this
+        # (artifact, sha) — annealing onto ONE of them would be a guess
+        # about which, so this deliberately does nothing rather than
+        # picking at random.
+        return False
+    path = _store_path(repo)
+    lock = FileLock(_lock_path(path))
+    with lock:
+        rows = _load_raw(repo)
+        matched = False
+        for row in rows:
+            if (
+                row.get("run_id") == run_id
+                and row.get("spec") == spec
+                and row.get("step") == step
+            ):
+                row["issue_number"] = issue_number
+                matched = True
+        if not matched:
+            return False
+        tmp = _tmp_path(path)
+        tmp.write_text(json.dumps(rows, indent=2, sort_keys=True))
+        tmp.replace(path)
+        return True
 
 
 def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifactResult]:
@@ -328,46 +393,138 @@ def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifact
     out: list[NightlyArtifactResult] = []
     for (artifact, sha, _run_id), rows in groups.items():
         checked_at = max(r.checked_at for r in rows)
-        unavailable_rows = [r for r in rows if r.unavailable]
-        failing_rows = [r for r in rows if not r.passed and not r.unavailable]
-        steps_total = max(r.steps_total for r in rows)
-        if unavailable_rows:
-            detail = "; ".join(sorted({
-                f"{r.spec}::{r.step}: {r.detail or 'unavailable'}" for r in unavailable_rows
-            }))
-            out.append(NightlyArtifactResult(
-                artifact=artifact, sha=sha, passed=False, unavailable=True,
-                detail=detail, checked_at=checked_at,
-            ))
-        elif failing_rows:
-            detail = "; ".join(sorted({
-                f"{r.spec}::{r.step}: {r.detail or 'failed'}" for r in failing_rows
-            }))
-            out.append(NightlyArtifactResult(
-                artifact=artifact, sha=sha, passed=False, detail=detail,
-                checked_at=checked_at,
-            ))
-        elif steps_total and len(rows) < steps_total:
-            # The run died (an exception out of the filing call, a Ctrl-C,
-            # a kill) before persisting every step it set out to observe.
-            # Reported as "did not finish" — blocking, environment-flavoured
-            # (never an app-bug red), and never a pass (#3660 review round
-            # 2 / #2096 "a gate must be able to fail").
-            out.append(NightlyArtifactResult(
-                artifact=artifact, sha=sha, passed=False, unavailable=True,
-                detail=(
-                    f"nightly run did not finish: only {len(rows)} of "
-                    f"{steps_total} step(s) were observed and recorded — a "
-                    "partial run can never certify this artifact; re-run it"
-                ),
-                checked_at=checked_at,
-            ))
-        else:
-            out.append(NightlyArtifactResult(
-                artifact=artifact, sha=sha, passed=True,
-                detail=f"{len(rows)} step(s) passed", checked_at=checked_at,
-            ))
+        verdict = _classify_group(rows)
+        out.append(NightlyArtifactResult(
+            artifact=artifact, sha=sha, passed=verdict.passed,
+            unavailable=verdict.unavailable, detail=verdict.detail,
+            checked_at=checked_at,
+        ))
     return _ranked(out)
+
+
+@dataclass(frozen=True)
+class _GroupVerdict:
+    """The pass/fail/unavailable judgement for one ``(artifact, sha,
+    run_id)`` group's rows — factored out of
+    :func:`nightly_artifact_results_for_release_gate` so
+    :func:`latest_nightly_runs` (#3661's status surface) grades a group
+    exactly the same way rather than re-deriving the rule (#2096 "one
+    question, one answer": these are two different QUESTIONS — "does this
+    sha pass" vs. "what did the most recent run observe" — but the same
+    sub-question, "given these rows, what's the verdict", must have one
+    answer)."""
+
+    passed: bool
+    unavailable: bool
+    detail: str
+
+
+def _classify_group(rows: list[NightlyResultRecord]) -> _GroupVerdict:
+    unavailable_rows = [r for r in rows if r.unavailable]
+    failing_rows = [r for r in rows if not r.passed and not r.unavailable]
+    steps_total = max(r.steps_total for r in rows)
+    if unavailable_rows:
+        detail = "; ".join(sorted({
+            f"{r.spec}::{r.step}: {r.detail or 'unavailable'}" for r in unavailable_rows
+        }))
+        return _GroupVerdict(passed=False, unavailable=True, detail=detail)
+    if failing_rows:
+        detail = "; ".join(sorted({
+            f"{r.spec}::{r.step}: {r.detail or 'failed'}" for r in failing_rows
+        }))
+        return _GroupVerdict(passed=False, unavailable=False, detail=detail)
+    if steps_total and len(rows) < steps_total:
+        # The run died (an exception out of the filing call, a Ctrl-C, a
+        # kill) before persisting every step it set out to observe.
+        # Reported as "did not finish" — blocking, environment-flavoured
+        # (never an app-bug red), and never a pass (#3660 review round 2 /
+        # #2096 "a gate must be able to fail").
+        return _GroupVerdict(
+            passed=False, unavailable=True,
+            detail=(
+                f"nightly run did not finish: only {len(rows)} of "
+                f"{steps_total} step(s) were observed and recorded — a "
+                "partial run can never certify this artifact; re-run it"
+            ),
+        )
+    return _GroupVerdict(
+        passed=True, unavailable=False, detail=f"{len(rows)} step(s) passed",
+    )
+
+
+@dataclass(frozen=True)
+class NightlyRunSummary:
+    """The most recently OBSERVED nightly run for one ``(repo, artifact)``
+    — #3661's status surface (:mod:`coord.nightly_status`) input.
+
+    Deliberately NOT scoped to a particular ``sha`` (unlike
+    :class:`~coord.release_gate.NightlyArtifactResult`, which
+    :func:`nightly_artifact_results_for_release_gate` answers "does THIS
+    sha have a passing result" for): ``coord status`` and the ``GET
+    /board`` status-bar segment want "what did the fleet last actually
+    observe for this artifact, whatever sha it ran at, and how long ago" —
+    a different question, answered by :func:`latest_nightly_runs` below,
+    which reuses the SAME per-group judgement (:func:`_classify_group`)
+    rather than re-deriving it.
+    """
+
+    repo: str
+    artifact: str
+    sha: str
+    passed: bool
+    unavailable: bool
+    detail: str
+    checked_at: float
+    host: str
+    #: Every distinct, non-``None`` issue number any row in the winning
+    #: group carries (annealed by :func:`set_nightly_issue_number`) —
+    #: sorted ascending, deduped. Empty when nothing was ever filed/known
+    #: (a clean pass, or a filing call whose annealing never landed).
+    issue_numbers: tuple[int, ...] = field(default_factory=tuple)
+    #: How many of the group's rows are real (non-unavailable) failures —
+    #: the "count" half of "red with the count and issue links" (#3661).
+    failing_step_count: int = 0
+
+
+def latest_nightly_runs(repo: str) -> dict[str, NightlyRunSummary]:
+    """The single most recently-observed run per artifact for *repo*,
+    across every sha this repo has ever been nightly-smoked at.
+
+    One flat scan, grouped by ``(artifact, sha, run_id)`` exactly like
+    :func:`nightly_artifact_results_for_release_gate`, but picking the
+    group with the LATEST ``checked_at`` per artifact rather than the
+    group matching a caller-given sha — the release gate asks "is THIS sha
+    good", this asks "what's the latest thing the fleet observed, and how
+    long ago" (#3661's staleness question). An artifact with no rows at
+    all is simply absent from the returned mapping — the caller (
+    :mod:`coord.nightly_status`) decides what "never ran" means, this
+    module only reports what it found.
+    """
+    groups: dict[tuple[str, str, str], list[NightlyResultRecord]] = {}
+    for record in read_nightly_results(repo):
+        groups.setdefault((record.artifact, record.sha, record.run_id), []).append(record)
+
+    best: dict[str, NightlyRunSummary] = {}
+    for (artifact, sha, _run_id), rows in groups.items():
+        checked_at = max(r.checked_at for r in rows)
+        existing = best.get(artifact)
+        if existing is not None and existing.checked_at >= checked_at:
+            continue
+        verdict = _classify_group(rows)
+        newest_row = max(rows, key=lambda r: r.checked_at)
+        issue_numbers = tuple(sorted({
+            r.issue_number for r in rows if r.issue_number is not None
+        }))
+        failing_step_count = sum(
+            1 for r in rows if not r.passed and not r.unavailable
+        )
+        best[artifact] = NightlyRunSummary(
+            repo=repo, artifact=artifact, sha=sha, passed=verdict.passed,
+            unavailable=verdict.unavailable, detail=verdict.detail,
+            checked_at=checked_at, host=newest_row.host,
+            issue_numbers=issue_numbers, failing_step_count=failing_step_count,
+        )
+    return best
 
 
 def _ranked(results: list[NightlyArtifactResult]) -> list[NightlyArtifactResult]:

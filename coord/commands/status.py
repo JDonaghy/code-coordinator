@@ -511,11 +511,21 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         board_payload = fetch_board_payload(svc)
         board = board_from_payload(board_payload)
         fleet_health_block = board_payload.get("fleet_health")
+        # #3661: same single-round-trip reuse as `fleet_health` immediately
+        # above — the daemon already computed this from ITS nightly store
+        # (the one the nightly timer/on-demand runs actually write to); a
+        # thin client re-reading `coord.nightly_store` locally would read
+        # whatever (likely nothing) happens to be on THIS box instead.
+        nightly_status_payload = board_payload.get("nightly_status") or []
     else:
         from coord.health.aggregate import local_fleet_health_block
+        from coord.nightly_status import nightly_statuses_for_config
 
         board = read_board()
         fleet_health_block = local_fleet_health_block([m.name for m in cfg.machines])
+        nightly_status_payload = [
+            s.to_dict() for s in nightly_statuses_for_config(cfg)
+        ]
     if not no_reconcile and agent_completed:
         # #749: write_board() routes to the daemon's /board upsert when a
         # board service is configured, so a thin client's reconciliation now
@@ -1162,6 +1172,30 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 click.echo(f"  [{alarm.severity.upper()}] {alarm.summary}")
     except Exception:  # noqa: BLE001 — never let this break `coord status`
         pass
+
+    # #3661: the latest nightly real-platform smoke verdict per repo —
+    # repo-level (like the dependency graph above), not per-machine, so
+    # skipped under `--machine` for the same reason that graph is. Renders
+    # `nightly_status_payload`, resolved above alongside `fleet_health_block`
+    # from the SAME source (the daemon's `/board` on a thin client, a local
+    # read in host mode) — never re-derived here, so this command and the
+    # status-bar segment `GET /board` thin clients render can never
+    # silently disagree about one repo's nightly verdict (#2096 "one
+    # question, one answer").
+    if not machine_filter:
+        try:
+            from coord.nightly_status import NightlyRepoStatus, render_nightly_status_line
+
+            if nightly_status_payload:
+                click.echo("")
+                click.echo("nightly real-platform smoke (coord smoke nightly):")
+                for raw in nightly_status_payload:
+                    if isinstance(raw, dict):
+                        click.echo(
+                            render_nightly_status_line(NightlyRepoStatus.from_dict(raw))
+                        )
+        except Exception:  # noqa: BLE001 — never let this break `coord status`
+            pass
 
     # #1631 (H-4): the always-visible fleet-health footer. Printed
     # unconditionally, every run — including the all-OK case ("OK states its

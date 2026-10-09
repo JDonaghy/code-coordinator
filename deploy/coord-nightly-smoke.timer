@@ -1,0 +1,51 @@
+# coord smoke nightly-sweep — fires coord-nightly-smoke.service (Type=oneshot)
+# once a night. See that unit's header for the full rationale (#3652/#3660/
+# #3661).
+#
+# 02:00 America/Chicago — deliberately NOT the same instant as
+# coord-release-window.timer's 10:00 (#2866/#2587) or coord-drive-queue.timer's
+# 3-minute cadence: a nightly real-platform smoke run drives a real build or
+# download plus a real GUI-lane driver run, the heaviest single thing this
+# fleet does on a schedule, and it has nothing to do with whether a release is
+# due tonight. Named with an explicit zone (not a bare local wall-clock time)
+# for the same reason coord-release-window.timer is — `systemd.time(7)`'s
+# `OnCalendar=` resolves a zone-qualified spec against that zone's own clock,
+# so a DST transition cannot drift the fire time by an hour twice a year.
+#
+# RandomizedDelaySec spreads this off the exact top of the hour so it does not
+# contend with coord-db-backup/coord-backup/coord-dr-verify, several of which
+# also fire on round hours.
+#
+# Persistent=true: a host asleep or rebooted through 02:00 still catches up on
+# the next boot, rather than silently skipping a whole night's run — #3661's
+# own "stale (no run within N hours)" status is exactly the signal that would
+# otherwise go unexplained.
+#
+# #3661 "leave the queue alone": this timer firing (or not) never touches the
+# drive queue, never blocks a merge, and the service below never fails this
+# UNIT for a per-repo app-red/INFRA result (`coord smoke nightly-sweep`'s own
+# exit-code contract) — only `coord release gate` reads what it persisted as
+# an actual gate.
+#
+# Install (daemon host only — same host as coord-release-window.timer):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-nightly-smoke.service deploy/coord-nightly-smoke.timer \
+#      ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-nightly-smoke.timer
+#
+# See docs/AGENT_OPERATIONS.md → "Periodic nightly real-platform smoke
+# (coord-nightly-smoke timer, #3661)".
+
+[Unit]
+Description=Nightly real-platform smoke sweep, every repo with nightly_required set (#3652/#3660/#3661)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 America/Chicago
+RandomizedDelaySec=15min
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
