@@ -47,6 +47,20 @@ a single ``unavailable=True`` row from a locked host on run 1 kept the
 gate red even after a clean run 2, because there was nothing in the stored
 data to tell the two runs apart.
 
+**#3660 review round 2: a group must be known to be a COMPLETE run before
+it may certify anything.** Per-run grouping alone made a *truncated* run
+dangerous: :func:`coord.nightly_runner.run_nightly_smoke` persists one row
+per step, so a 2-step run whose second step died mid-flight (a
+``RuntimeError`` out of the filing call, a Ctrl-C, a kill) left a group
+holding only its *passing* first row, which reduced to ``passed=True,
+"1 step(s) passed"`` with a fresh ``checked_at`` and outranked the complete
+red run at the same SHA. Every row therefore carries ``steps_total`` — the
+step count the run knew before its loop started — and
+:func:`nightly_artifact_results_for_release_gate` refuses to report
+``passed=True`` for a group holding fewer rows than that (#2096: "a gate
+must be able to fail"; an unfinished run is reported as
+``unavailable`` — "the run did not finish, re-run it" — never as a pass).
+
 A :class:`coord.filelock.FileLock` guards the read-modify-write cycle: more
 than one ``coord smoke nightly`` run (different repos, different hosts, a
 cron timer racing a human's on-demand invocation) can be in flight at once,
@@ -124,6 +138,18 @@ class NightlyResultRecord:
     #: ``run_id=""`` row for the same ``(artifact, sha)``, which is exactly
     #: the (already-shipped) pre-fix behaviour for that legacy data.
     run_id: str = ""
+    #: How many steps the run that produced this row was going to persist
+    #: in total — known to :func:`coord.nightly_runner.run_nightly_smoke`
+    #: from ``len(observations)`` BEFORE its act/persist loop starts, and
+    #: stamped identically onto every row of that run. The completeness
+    #: marker :func:`nightly_artifact_results_for_release_gate` needs to
+    #: tell "every step of this run passed" apart from "the only step this
+    #: run managed to persist before dying passed" (#3660 review round 2).
+    #: ``0`` means "unstated" — a legacy row written before this field
+    #: existed, or a writer that genuinely doesn't know; such a group is
+    #: graded exactly as it was before this field existed (no completeness
+    #: check), because inventing a step count for it would be a guess.
+    steps_total: int = 0
 
     def to_nightly_artifact_result(self) -> NightlyArtifactResult:
         """The exact shape :func:`coord.release_gate.evaluate_release_gate`
@@ -165,6 +191,14 @@ def record_nightly_result(record: NightlyResultRecord) -> None:
     so a reader never observes a lock's own empty/placeholder bytes), and
     written via a temp-file-then-``rename`` swap so a reader never observes
     a partially-written file.
+
+    Deliberately ONE write per observation, not one batched write per run
+    (#3660 review round 2): the whole point of persisting before acting is
+    that an observation already taken survives whatever the acting step
+    does next, and a batched end-of-run write would hand that back — a run
+    killed mid-loop would persist nothing at all. The cost is N
+    read-modify-write cycles for an N-step spec, on a file holding one
+    small row per step, written once a night.
     """
     path = _store_path(record.repo)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +233,7 @@ def read_nightly_results(repo: str) -> list[NightlyResultRecord]:
                     host=row.get("host", ""),
                     evidence=tuple(row.get("evidence") or ()),
                     run_id=row.get("run_id", ""),
+                    steps_total=int(row.get("steps_total", 0) or 0),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -233,7 +268,20 @@ def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifact
       an app bug, named in ``detail``;
     - else any step failed -> ``passed=False``, ``detail`` names the
       failing step(s);
-    - else (every step in the group passed) -> ``passed=True``.
+    - else the group holds FEWER rows than its own ``steps_total`` says
+      the run had -> ``unavailable=True, passed=False`` — "the run did not
+      finish", an environment/interruption condition rather than an app
+      bug, and emphatically not a pass (#3660 review round 2, #2096 "a
+      gate must be able to fail"). This is the case a mid-run crash
+      produces: the runner persists each observation BEFORE acting on it,
+      so a step whose filing call raised still leaves its real (red) row
+      behind — but a run killed before a later step was ever OBSERVED
+      leaves only earlier rows, and "some steps passed" must never be read
+      as "all steps passed". A group whose rows all say ``steps_total=0``
+      (legacy data, or a writer that doesn't know) is graded without this
+      check — the pre-#3660-round-2 behaviour, since there is nothing to
+      compare against and guessing a count would be worse;
+    - else (every step of a complete run passed) -> ``passed=True``.
 
     ``checked_at`` is the group's LATEST step timestamp — so a run that
     hasn't finished all its steps yet is never mistaken, by a caller
@@ -253,6 +301,25 @@ def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifact
     A legacy row with no ``run_id`` (persisted before this fix) groups with
     every other such row for the same ``(artifact, sha)`` — the same
     (imperfect, but no worse than before) behaviour that data always had.
+
+    Two final, deliberate rules about picking BETWEEN a SHA's groups
+    (#3660 review round 2's non-blocking items — both about a run that
+    never observed anything outranking one that did):
+
+    - a group that reports ``unavailable`` (a locked host, or an
+      unfinished run) is dropped entirely when some OTHER group at the
+      same ``(artifact, sha)`` is a complete pass. The SHA is the same
+      artifact, bit for bit, so a completed passing observation of it
+      stays true; a never-ran tick tonight must not flip a genuinely
+      verified artifact to "unlock the host and re-run". When no complete
+      pass exists at that SHA, the ``unavailable`` entry survives
+      untouched and still blocks the gate.
+    - entries are returned newest-``checked_at``-first, and among equal
+      timestamps the NOT-passing one first — so
+      ``_nightly_artifact_step``'s ``max(..., key=checked_at)`` (which
+      keeps the FIRST maximal element it sees) resolves a tie
+      conservatively and deterministically, rather than by whichever row
+      happened to be written to the file first.
     """
     groups: dict[tuple[str, str, str], list[NightlyResultRecord]] = {}
     for record in read_nightly_results(repo):
@@ -263,6 +330,7 @@ def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifact
         checked_at = max(r.checked_at for r in rows)
         unavailable_rows = [r for r in rows if r.unavailable]
         failing_rows = [r for r in rows if not r.passed and not r.unavailable]
+        steps_total = max(r.steps_total for r in rows)
         if unavailable_rows:
             detail = "; ".join(sorted({
                 f"{r.spec}::{r.step}: {r.detail or 'unavailable'}" for r in unavailable_rows
@@ -279,9 +347,41 @@ def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifact
                 artifact=artifact, sha=sha, passed=False, detail=detail,
                 checked_at=checked_at,
             ))
+        elif steps_total and len(rows) < steps_total:
+            # The run died (an exception out of the filing call, a Ctrl-C,
+            # a kill) before persisting every step it set out to observe.
+            # Reported as "did not finish" — blocking, environment-flavoured
+            # (never an app-bug red), and never a pass (#3660 review round
+            # 2 / #2096 "a gate must be able to fail").
+            out.append(NightlyArtifactResult(
+                artifact=artifact, sha=sha, passed=False, unavailable=True,
+                detail=(
+                    f"nightly run did not finish: only {len(rows)} of "
+                    f"{steps_total} step(s) were observed and recorded — a "
+                    "partial run can never certify this artifact; re-run it"
+                ),
+                checked_at=checked_at,
+            ))
         else:
             out.append(NightlyArtifactResult(
                 artifact=artifact, sha=sha, passed=True,
                 detail=f"{len(rows)} step(s) passed", checked_at=checked_at,
             ))
-    return out
+    return _ranked(out)
+
+
+def _ranked(results: list[NightlyArtifactResult]) -> list[NightlyArtifactResult]:
+    """Apply the two between-group rules documented at the end of
+    :func:`nightly_artifact_results_for_release_gate`: an ``unavailable``
+    (never-ran / unfinished) entry is dropped where a COMPLETE PASS for
+    the same ``(artifact, sha)`` exists, and the surviving entries are
+    ordered newest-first with not-passing ahead of passing on a tie — the
+    order :func:`coord.release_gate._nightly_artifact_step`'s ``max(...,
+    key=checked_at)`` resolves ties by."""
+    passing_keys = {(r.artifact, r.sha) for r in results if r.passed}
+    kept = [
+        r for r in results
+        if not (r.unavailable and (r.artifact, r.sha) in passing_keys)
+    ]
+    kept.sort(key=lambda r: (-(r.checked_at or 0.0), r.passed))
+    return kept

@@ -163,6 +163,75 @@ class TestNightlyArtifactResultsForReleaseGate:
         assert verdict.gate_passed is False
 
 
+class TestAnIncompleteRunNeverCertifies:
+    """#3660 review round 2: per-run grouping made a TRUNCATED run
+    dangerous — a 2-step run that died after persisting only its passing
+    first row reduced to `passed=True, "1 step(s) passed"` with a fresh
+    timestamp and outranked the complete red run at the same SHA. A group
+    must be known to be a COMPLETE run before it may certify anything.
+    """
+
+    def test_a_partial_group_is_not_a_pass(self) -> None:
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=100.0, run_id="run-1", steps_total=2,
+        ))
+        results = nightly_artifact_results_for_release_gate("vimcode")
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert results[0].unavailable is True
+        assert "did not finish" in results[0].detail
+        assert "1 of 2" in results[0].detail
+
+    def test_a_complete_group_is_a_pass(self) -> None:
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=100.0, run_id="run-1", steps_total=2,
+        ))
+        record_nightly_result(_record(
+            step="uninstall", passed=True, checked_at=101.0, run_id="run-1", steps_total=2,
+        ))
+        results = nightly_artifact_results_for_release_gate("vimcode")
+        assert len(results) == 1
+        assert results[0].passed is True
+
+    def test_a_truncated_run_never_supersedes_an_earlier_red_at_the_same_sha(self) -> None:
+        """The exact round-2 scenario, graded through the REAL release
+        gate: a complete red run, then a later run whose second (red) step
+        never got persisted because something raised mid-loop."""
+        from coord.release_gate import evaluate_release_gate
+
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=100.0, run_id="red-run", steps_total=2,
+        ))
+        record_nightly_result(_record(
+            step="uninstall", passed=False, detail="crashed",
+            checked_at=101.0, run_id="red-run", steps_total=2,
+        ))
+        # A LATER run at the same SHA, interrupted after step 1 of 2.
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=900.0,
+            run_id="truncated-run", steps_total=2,
+        ))
+        verdict = evaluate_release_gate(
+            repo="vimcode", release_sha="deadbeef",
+            required_lanes=[], nightly_required=True,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
+        )
+        assert verdict.gate_passed is False
+
+    def test_legacy_rows_without_steps_total_keep_their_old_grading(self) -> None:
+        """`steps_total=0` means "unstated" — a row written before the
+        field existed. Guessing a step count for it would be worse than
+        grading it exactly as it was graded before."""
+        record_nightly_result(_record(step="launch", passed=True, run_id="legacy"))
+        results = nightly_artifact_results_for_release_gate("vimcode")
+        assert results[0].passed is True
+
+    def test_steps_total_round_trips(self) -> None:
+        record_nightly_result(_record(steps_total=3))
+        assert read_nightly_results("vimcode")[0].steps_total == 3
+
+
 class TestRunIdSeparatesRuns:
     """#3660 review round 1: every run at one (artifact, sha) must produce
     its OWN group/result, so a later clean run can clear an earlier
@@ -171,17 +240,33 @@ class TestRunIdSeparatesRuns:
 
     def test_two_runs_at_the_same_sha_are_two_separate_results(self) -> None:
         record_nightly_result(_record(
-            step="launch", passed=False, unavailable=True,
-            detail="screen locked", checked_at=100.0, run_id="run-1",
+            step="launch", passed=False, detail="crashed",
+            checked_at=100.0, run_id="run-1", steps_total=1,
         ))
         record_nightly_result(_record(
-            step="launch", passed=True, checked_at=200.0, run_id="run-2",
+            step="launch", passed=True, checked_at=200.0, run_id="run-2", steps_total=1,
         ))
         results = nightly_artifact_results_for_release_gate("vimcode")
         assert len(results) == 2
         by_checked_at = {r.checked_at: r for r in results}
-        assert by_checked_at[100.0].unavailable is True
+        assert by_checked_at[100.0].passed is False
         assert by_checked_at[200.0].passed is True
+
+    def test_an_earlier_unavailable_run_is_dropped_once_a_run_passes(self) -> None:
+        """Same per-run grouping, plus #3660 review round 2's "a never-ran
+        observation must not outrank a completed passing one at the same
+        SHA" rule: the earlier `unavailable` entry isn't just outranked,
+        it's dropped — it says nothing about the artifact's bits."""
+        record_nightly_result(_record(
+            step="launch", passed=False, unavailable=True,
+            detail="screen locked", checked_at=100.0, run_id="run-1", steps_total=1,
+        ))
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=200.0, run_id="run-2", steps_total=1,
+        ))
+        results = nightly_artifact_results_for_release_gate("vimcode")
+        assert len(results) == 1
+        assert results[0].passed is True
 
     def test_a_later_clean_run_clears_an_earlier_poisoned_one_at_the_gate(self) -> None:
         """The whole point: `_nightly_artifact_step`'s own
@@ -203,6 +288,68 @@ class TestRunIdSeparatesRuns:
             nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
         )
         assert verdict.gate_passed is True
+
+    def test_an_unavailable_tick_never_outranks_a_complete_pass_at_one_sha(self) -> None:
+        """#3660 review round 2 (non-blocking): a laptop that happens to be
+        locked TONIGHT must not flip an artifact that was already fully
+        observed as passing at this very SHA — a never-ran observation
+        carries no information about the artifact's bits."""
+        from coord.release_gate import evaluate_release_gate
+
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=100.0, run_id="run-1", steps_total=1,
+        ))
+        record_nightly_result(_record(
+            step="(preflight)", passed=False, unavailable=True, detail="screen locked",
+            checked_at=999.0, run_id="run-2", steps_total=1,
+        ))
+        verdict = evaluate_release_gate(
+            repo="vimcode", release_sha="deadbeef",
+            required_lanes=[], nightly_required=True,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
+        )
+        assert verdict.gate_passed is True
+
+    def test_an_unavailable_tick_still_blocks_when_nothing_ever_passed(self) -> None:
+        """The flip side of the rule above: with no complete pass at that
+        SHA the unavailable entry survives and still fails the gate."""
+        from coord.release_gate import evaluate_release_gate
+
+        record_nightly_result(_record(
+            step="(preflight)", passed=False, unavailable=True, detail="screen locked",
+            checked_at=100.0, run_id="run-1", steps_total=1,
+        ))
+        verdict = evaluate_release_gate(
+            repo="vimcode", release_sha="deadbeef",
+            required_lanes=[], nightly_required=True,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
+        )
+        assert verdict.gate_passed is False
+        step = next(s for s in verdict.steps if s.name == "nightly:macos-dmg")
+        assert step.unavailable is True
+
+    def test_a_tie_in_checked_at_resolves_to_the_not_passing_group(self) -> None:
+        """#3660 review round 2 nit: two groups at one SHA with the SAME
+        timestamp used to resolve by file order (i.e. whichever run was
+        written first). Resolve it conservatively and deterministically."""
+        from coord.release_gate import evaluate_release_gate
+
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=100.0, run_id="run-1", steps_total=1,
+        ))
+        record_nightly_result(_record(
+            step="launch", passed=False, detail="crashed",
+            checked_at=100.0, run_id="run-2", steps_total=1,
+        ))
+        verdict = evaluate_release_gate(
+            repo="vimcode", release_sha="deadbeef",
+            required_lanes=[], nightly_required=True,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
+        )
+        assert verdict.gate_passed is False
 
     def test_legacy_rows_with_no_run_id_still_group_together(self) -> None:
         """A row persisted before `run_id` existed defaults to `""` — it

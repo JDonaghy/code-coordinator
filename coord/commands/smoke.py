@@ -21,6 +21,7 @@ from coord.commands._common import _CONFIG_OPTION, _load_config
 
 if TYPE_CHECKING:  # pragma: no cover - import-cycle-avoidance only
     from coord.nightly_runner import NightlyRunReport
+    from coord.nightly_smoke import NightlyStepOutcome
 
 # #2096 "one question, one answer": `coord.commands.bugbash.
 # _fetch_recently_closed_issues` already does exactly this fetch (same `gh`
@@ -41,7 +42,18 @@ def smoke_group() -> None:
         "resolve the artifact plan, pick a capable+healthy host, preflight "
         "its GUI lane (#3651), run the spec, file/update/close issues for "
         "what it observed, and persist the result so `coord release gate` "
-        "can read it without --from-json."
+        "can read it without --from-json.\n\n"
+        "Exit codes: 0 = ran, every step observed clean; "
+        "1 = an alerting step got no issue, no comment and no close (a "
+        "defect in this command's own acting step); "
+        "2 = nothing ran — an INFRA-blocked plan, or a step the driver "
+        "itself reported 'unavailable' (a locked/absent GUI session, #3510) "
+        "— unblock the host and re-run; "
+        "3 = ran and OBSERVED app-red step(s), each accounted for by a "
+        "filed/updated issue. 2 and 3 are deliberately distinct from 0 and "
+        "from each other: #3566 — a lane that never ran must not read like "
+        "a clean pass, and neither must a lane that ran and found the app "
+        "broken."
     ),
 )
 @_CONFIG_OPTION
@@ -115,13 +127,19 @@ def smoke_nightly_cmd(
     else:
         click.echo(_render_report(report))
 
-    if report.infra_blocked:
-        sys.exit(2)
+    # See the command's own --help for the full exit-code contract. Order
+    # matters: `any_dropped` is a defect in THIS command (an alerting step
+    # that silently got no issue) and outranks the environment/app verdicts.
     if report.any_dropped:
         sys.exit(1)
+    if report.infra_blocked or report.any_unavailable:
+        sys.exit(2)
+    if report.any_app_red:
+        sys.exit(3)
 
 
 def _report_to_dict(report: "NightlyRunReport") -> dict:
+    unavailable = set(report.unavailable_steps)
     return {
         "repo": report.plan.repo,
         "artifact": report.plan.artifact,
@@ -135,6 +153,13 @@ def _report_to_dict(report: "NightlyRunReport") -> dict:
         "infra_reason": report.plan.infra_reason,
         "ran": report.ran,
         "sha": report.sha,
+        # #3566 / #3660 review round 2: a step that never ran must be
+        # distinguishable from a clean pass in machine-readable output too,
+        # not just in the store and the release gate.
+        "unavailable_steps": list(report.unavailable_steps),
+        "any_unavailable": report.any_unavailable,
+        "any_app_red": report.any_app_red,
+        "lane_fallback": report.lane_fallback,
         "outcomes": [
             {
                 "spec": o.verdict.observation.spec,
@@ -143,10 +168,21 @@ def _report_to_dict(report: "NightlyRunReport") -> dict:
                 "action": o.action,
                 "issue_number": o.issue_number,
                 "dropped": o.dropped,
+                "unavailable": _step_key(o) in unavailable,
             }
             for o in report.outcomes
         ],
     }
+
+
+def _step_key(outcome: "NightlyStepOutcome") -> str:
+    """The ``"<spec>::<step>"`` key :attr:`coord.nightly_runner.
+    NightlyRunReport.unavailable_steps` holds — delegated to the runner's
+    own single formatter rather than re-spelled here, so the writer and
+    this reader can never drift (#2096 "one question, one answer")."""
+    from coord.nightly_runner import step_key  # noqa: PLC0415
+
+    return step_key(outcome)
 
 
 def _render_report(report: "NightlyRunReport") -> str:
@@ -155,12 +191,30 @@ def _render_report(report: "NightlyRunReport") -> str:
         lines.append("  (nothing ran)")
         return "\n".join(lines)
     lines.append(f"  sha: {report.sha}")
+    if report.lane_fallback:
+        # Never silent (#3660 review round 2): for a route carrying
+        # `label:`/`platforms:` the fallback lane's bare driver_kind label
+        # is the #3615 per-platform dedupe collision.
+        lines.append(f"  LANE FALLBACK: {report.lane_fallback}")
+    unavailable = set(report.unavailable_steps)
     for o in report.outcomes:
         obs = o.verdict.observation
-        marker = "DROPPED" if o.dropped else o.action
+        if _step_key(o) in unavailable:
+            # #3566: "never ran" must not render identically to a clean
+            # pass — the old `-> none` was indistinguishable from a green.
+            marker = "UNAVAILABLE (never ran — infra, not an app bug)"
+        elif o.dropped:
+            marker = "DROPPED"
+        else:
+            marker = o.action
         lines.append(
             f"  {obs.spec}::{obs.step} — {o.verdict.kind.value} -> "
             f"{marker}" + (f" (#{o.issue_number})" if o.issue_number else "")
+        )
+    if report.any_unavailable:
+        lines.append(
+            f"  {len(unavailable)} step(s) never ran (unavailable) — "
+            "nothing was observed for them; unblock the host and re-run"
         )
     if not report.outcomes:
         lines.append("  every step observed clean, no known-bug flips — nothing to act on")
