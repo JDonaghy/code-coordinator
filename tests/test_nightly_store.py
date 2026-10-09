@@ -411,6 +411,34 @@ class TestIssueNumberAnnealing:
         assert len(rows) == 1
         assert rows[0].issue_number is None
 
+    def test_a_lock_failure_is_swallowed_not_raised(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3661 review round 1: the docstring claims best-effort — prove
+        it. A lock/IO failure during the read-modify-write must return
+        ``False``, never propagate (the caller, mid-nightly-run, must not
+        abort over losing one status-surface annotation)."""
+        import coord.nightly_store as nightly_store
+
+        record_nightly_result(_record(run_id="run-1", spec="install.yaml", step="launch"))
+
+        class _ExplodingLock:
+            def __init__(self, path: Path) -> None:
+                pass
+
+            def __enter__(self) -> "_ExplodingLock":
+                raise OSError("disk full")
+
+            def __exit__(self, *exc: object) -> None:
+                pass
+
+        monkeypatch.setattr(nightly_store, "FileLock", _ExplodingLock)
+        changed = set_nightly_issue_number(
+            repo="vimcode", run_id="run-1", spec="install.yaml", step="launch",
+            issue_number=99,
+        )
+        assert changed is False
+
     def test_a_blank_run_id_is_never_annealed(self) -> None:
         """Legacy rows with no run_id group with every other such row — an
         anneal call would be a guess about which one to annotate, so it

@@ -127,6 +127,32 @@ class TestSmokeNightlySweepCli:
         assert "no acceptance driver configured" in result.output
         assert "natal-chart" in result.output
 
+    def test_one_pairs_unexpected_crash_does_not_abort_the_other(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3661 review round 1: the one type that already worked
+        (`NightlyRunnerError`) is not the only thing `run_nightly_smoke` can
+        raise unwrapped — a `resolve_sha` git/network hiccup, a live host
+        probe in `_resolve_bugbash_lane`, or `subprocess_coord_runner`
+        raising on a non-zero `coord` exit while filing all surface as some
+        OTHER exception type. The sweep must catch those too, or repo A's
+        hiccup silently drops every repo that sorts after it."""
+        from coord.cli import main
+
+        config = _config_two_pairs()
+        _patch_github(monkeypatch, config)
+
+        def _fake_run(*, repo, artifact, **kwargs):
+            if repo == "vimcode":
+                raise RuntimeError("git fetch timed out")
+            return NightlyRunReport(plan=_plan(repo=repo, artifact=artifact), ran=True, sha="deadbeef")
+
+        monkeypatch.setattr("coord.nightly_runner.run_nightly_smoke", _fake_run)
+        result = CliRunner().invoke(main, ["smoke", "nightly-sweep"])
+        assert result.exit_code == 0, result.output
+        assert "git fetch timed out" in result.output
+        assert "natal-chart" in result.output
+
     def test_a_dropped_finding_in_any_pair_exits_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Mirrors the single-repo command's own exit-code contract
         (`any_dropped` outranks everything else) — a defect in THIS

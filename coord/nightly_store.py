@@ -74,7 +74,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from coord.filelock import FileLock
+from coord.filelock import FileLock, LockBusy
 from coord.release_gate import NightlyArtifactResult
 
 
@@ -278,6 +278,17 @@ def set_nightly_issue_number(
     adds provenance to it, never a substitute for it. Updates every
     matching row (normally exactly one — one row per ``(spec, step)`` per
     run) so a retried/duplicated call stays idempotent.
+
+    Genuinely best-effort end to end (#3661 review): a lock timeout, an
+    ``OSError`` from the read-modify-write, or a corrupt-JSON ``ValueError``
+    is swallowed and reported as ``False`` rather than raised. The caller
+    (:func:`coord.nightly_runner.run_nightly_smoke`) relies on this never
+    propagating — the row this anneals onto was already durably written by
+    :func:`record_nightly_result` before this function is ever called, so a
+    failure here can only cost one status-surface link, never the run's own
+    verdict. :func:`record_nightly_result` is, by contrast, NOT best-effort
+    (a failure there must propagate — the whole point of persist-before-act
+    is that the write itself cannot silently fail).
     """
     if not run_id:
         # A legacy/unset run_id groups with every other such row for this
@@ -286,24 +297,32 @@ def set_nightly_issue_number(
         # picking at random.
         return False
     path = _store_path(repo)
-    lock = FileLock(_lock_path(path))
-    with lock:
-        rows = _load_raw(repo)
-        matched = False
-        for row in rows:
-            if (
-                row.get("run_id") == run_id
-                and row.get("spec") == spec
-                and row.get("step") == step
-            ):
-                row["issue_number"] = issue_number
-                matched = True
-        if not matched:
-            return False
-        tmp = _tmp_path(path)
-        tmp.write_text(json.dumps(rows, indent=2, sort_keys=True))
-        tmp.replace(path)
-        return True
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(_lock_path(path))
+        with lock:
+            rows = _load_raw(repo)
+            matched = False
+            for row in rows:
+                if (
+                    row.get("run_id") == run_id
+                    and row.get("spec") == spec
+                    and row.get("step") == step
+                ):
+                    row["issue_number"] = issue_number
+                    matched = True
+            if not matched:
+                return False
+            tmp = _tmp_path(path)
+            tmp.write_text(json.dumps(rows, indent=2, sort_keys=True))
+            tmp.replace(path)
+            return True
+    except (OSError, ValueError, LockBusy):
+        # Best-effort per this function's own docstring/#3661 review: a
+        # lock timeout, a disk/permission error, or a JSON encode failure
+        # must not abort the nightly run that's still mid-loop in the
+        # caller — only this one issue-number annotation is lost.
+        return False
 
 
 def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifactResult]:

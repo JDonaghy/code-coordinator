@@ -104,6 +104,18 @@ def test_dr_verify_timer_is_registered_on_the_daemon_host() -> None:
     assert "coord-dr-verify.service" not in all_manifest_units()
 
 
+def test_nightly_smoke_timer_is_registered_on_the_daemon_host() -> None:
+    """#3661 review nit: `test_dr_verify_timer_is_registered_on_the_daemon_host`
+    above is the named precedent for exactly this assertion — without it,
+    `coord-nightly-smoke.timer`'s presence in `ROLE_UNITS[ROLE_DAEMON]` is
+    only generically covered by `test_doc_table_matches_manifest`'s
+    doc-table cross-check, not asserted as intentional on its own."""
+    assert "coord-nightly-smoke.timer" in units_for_role(ROLE_DAEMON)
+    assert "coord-nightly-smoke.timer" not in units_for_role(ROLE_WORKER)
+    # Same "the timer, never the oneshot it fires" shape as DR-verify.
+    assert "coord-nightly-smoke.service" not in all_manifest_units()
+
+
 def test_doc_table_roles_match_manifest() -> None:
     doc_roles = _doc_table_units()
     for name, role_text in doc_roles.items():
