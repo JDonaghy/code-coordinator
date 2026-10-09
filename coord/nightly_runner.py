@@ -92,7 +92,11 @@ from coord.nightly_smoke import (
     process_nightly_step,
     resolve_artifact_plan,
 )
-from coord.nightly_store import NightlyResultRecord, record_nightly_result
+from coord.nightly_store import (
+    NightlyResultRecord,
+    record_nightly_result,
+    set_nightly_issue_number,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import-cycle-avoidance only
     import httpx
@@ -1002,6 +1006,20 @@ def run_nightly_smoke(
                 lane=lane, runner=runner or subprocess_coord_runner, dry_run=dry_run,
                 platform=lane.platform,
             )
+            # #3661: anneal the filed/updated issue number onto the row
+            # `record_nightly_result` already wrote above, best-effort —
+            # the status surface (`coord.nightly_status`) wants "which
+            # issue(s)" for a red result. Never required for correctness:
+            # the row's own pass/fail/unavailable verdict was already
+            # durable before this acting step ever ran (#3660 review round
+            # 2's crash-safety property is untouched by this), so losing
+            # this annotation to a crash here only costs one status-surface
+            # link, never the gate's own verdict.
+            if outcome.issue_number is not None:
+                set_nightly_issue_number(
+                    repo=repo, run_id=effective_run_id, spec=obs.spec,
+                    step=obs.step, issue_number=outcome.issue_number,
+                )
         outcomes.append(outcome)
 
     return NightlyRunReport(

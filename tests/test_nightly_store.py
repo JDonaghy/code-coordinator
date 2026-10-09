@@ -11,9 +11,11 @@ import pytest
 
 from coord.nightly_store import (
     NightlyResultRecord,
+    latest_nightly_runs,
     nightly_artifact_results_for_release_gate,
     read_nightly_results,
     record_nightly_result,
+    set_nightly_issue_number,
 )
 
 
@@ -360,3 +362,118 @@ class TestRunIdSeparatesRuns:
         results = nightly_artifact_results_for_release_gate("vimcode")
         assert len(results) == 1
         assert results[0].passed is True
+
+
+class TestIssueNumberAnnealing:
+    """#3661: `set_nightly_issue_number` anneals the filed/updated issue
+    number onto an already-persisted row, best-effort and append-only in
+    spirit (it never adds a new row)."""
+
+    def test_round_trips_issue_number_when_set_at_persist_time(self) -> None:
+        record_nightly_result(_record(issue_number=42))
+        rows = read_nightly_results("vimcode")
+        assert rows[0].issue_number == 42
+
+    def test_defaults_to_none(self) -> None:
+        record_nightly_result(_record())
+        rows = read_nightly_results("vimcode")
+        assert rows[0].issue_number is None
+
+    def test_anneals_onto_the_matching_row(self) -> None:
+        record_nightly_result(_record(run_id="run-1", spec="install.yaml", step="launch"))
+        changed = set_nightly_issue_number(
+            repo="vimcode", run_id="run-1", spec="install.yaml", step="launch",
+            issue_number=99,
+        )
+        assert changed is True
+        rows = read_nightly_results("vimcode")
+        assert rows[0].issue_number == 99
+
+    def test_does_not_touch_a_non_matching_row(self) -> None:
+        record_nightly_result(_record(run_id="run-1", spec="install.yaml", step="launch"))
+        record_nightly_result(_record(run_id="run-1", spec="install.yaml", step="uninstall"))
+        set_nightly_issue_number(
+            repo="vimcode", run_id="run-1", spec="install.yaml", step="launch",
+            issue_number=99,
+        )
+        rows = {r.step: r for r in read_nightly_results("vimcode")}
+        assert rows["launch"].issue_number == 99
+        assert rows["uninstall"].issue_number is None
+
+    def test_no_match_is_a_no_op_that_returns_false(self) -> None:
+        record_nightly_result(_record(run_id="run-1"))
+        changed = set_nightly_issue_number(
+            repo="vimcode", run_id="run-2", spec="install.yaml", step="launch",
+            issue_number=99,
+        )
+        assert changed is False
+        rows = read_nightly_results("vimcode")
+        assert len(rows) == 1
+        assert rows[0].issue_number is None
+
+    def test_a_blank_run_id_is_never_annealed(self) -> None:
+        """Legacy rows with no run_id group with every other such row — an
+        anneal call would be a guess about which one to annotate, so it
+        must do nothing rather than pick at random."""
+        record_nightly_result(_record())
+        changed = set_nightly_issue_number(
+            repo="vimcode", run_id="", spec="install.yaml", step="launch",
+            issue_number=99,
+        )
+        assert changed is False
+
+
+class TestLatestNightlyRuns:
+    """#3661: `latest_nightly_runs` answers "what's the most recently
+    observed run per artifact", independent of any particular sha — the
+    status surface's own question, distinct from the release gate's
+    sha-pinned one."""
+
+    def test_empty_store_reads_as_empty_mapping(self) -> None:
+        assert latest_nightly_runs("vimcode") == {}
+
+    def test_picks_the_most_recently_checked_run_for_the_artifact(self) -> None:
+        record_nightly_result(_record(
+            step="launch", passed=False, detail="crashed",
+            checked_at=100.0, run_id="run-1", steps_total=1,
+        ))
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=200.0, run_id="run-2", steps_total=1,
+        ))
+        latest = latest_nightly_runs("vimcode")
+        assert latest["macos-dmg"].passed is True
+        assert latest["macos-dmg"].checked_at == 200.0
+
+    def test_reports_unavailable_and_host(self) -> None:
+        record_nightly_result(_record(
+            step="(preflight)", passed=False, unavailable=True,
+            detail="screen locked", checked_at=100.0, run_id="run-1",
+            steps_total=1, host="elitebook",
+        ))
+        summary = latest_nightly_runs("vimcode")["macos-dmg"]
+        assert summary.unavailable is True
+        assert summary.host == "elitebook"
+
+    def test_collects_distinct_issue_numbers_across_the_group(self) -> None:
+        record_nightly_result(_record(
+            step="launch", passed=False, run_id="run-1", steps_total=2,
+            checked_at=100.0, issue_number=11,
+        ))
+        record_nightly_result(_record(
+            step="uninstall", passed=False, run_id="run-1", steps_total=2,
+            checked_at=101.0, issue_number=12,
+        ))
+        summary = latest_nightly_runs("vimcode")["macos-dmg"]
+        assert summary.issue_numbers == (11, 12)
+        assert summary.failing_step_count == 2
+
+    def test_different_artifacts_are_tracked_independently(self) -> None:
+        record_nightly_result(_record(
+            artifact="macos-dmg", passed=True, checked_at=100.0, run_id="run-1",
+        ))
+        record_nightly_result(_record(
+            artifact="win-exe", passed=False, checked_at=100.0, run_id="run-2",
+        ))
+        latest = latest_nightly_runs("vimcode")
+        assert latest["macos-dmg"].passed is True
+        assert latest["win-exe"].passed is False

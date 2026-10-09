@@ -80,10 +80,7 @@ def smoke_nightly_cmd(
 ) -> None:
     import json as _json  # noqa: PLC0415
 
-    from coord import github_ops  # noqa: PLC0415
-    from coord.board_service import read_board  # noqa: PLC0415
-    from coord.bugbash import subprocess_coord_runner  # noqa: PLC0415
-    from coord.nightly_runner import NightlyRunnerError, run_nightly_smoke  # noqa: PLC0415
+    from coord.nightly_runner import NightlyRunnerError  # noqa: PLC0415
 
     config = _load_config(config_path)
     repo_cfg = config.repo(repo)
@@ -92,32 +89,17 @@ def smoke_nightly_cmd(
         sys.exit(2)
 
     try:
-        board = read_board()
-    except Exception as exc:  # noqa: BLE001 — an unreadable board is a deferral, not a crash
-        click.echo(f"error: could not read the board: {exc}", err=True)
-        sys.exit(2)
-
-    open_issues: list[dict] = []
-    closed_issues: list[dict] = []
-    if not dry_run:
-        try:
-            open_issues = github_ops.get_open_issues(repo_cfg.github)
-        except Exception as exc:  # noqa: BLE001 — #3660 review: a GitHub hiccup here
-            # must exit 2 like every other failure mode, never a bare
-            # traceback (unlike `_fetch_closed_issues`'s own best-effort
-            # fail-open `[]`, open issues are the dedupe decision's
-            # PRIMARY input — fetching nothing and proceeding would file a
-            # duplicate issue for every already-open finding instead).
-            click.echo(f"error: could not fetch open issues for {repo!r}: {exc}", err=True)
-            sys.exit(2)
-        closed_issues = _fetch_closed_issues(repo_cfg.github)
-
-    try:
-        report = run_nightly_smoke(
-            repo=repo, artifact=artifact, spec=spec, config=config, board=board,
-            dry_run=dry_run, runner=subprocess_coord_runner,
-            open_issues=open_issues, closed_issues=closed_issues,
+        report = _run_one_nightly_smoke(
+            config=config, repo=repo, artifact=artifact, spec=spec, dry_run=dry_run,
         )
+    except _NightlyBoardReadError as exc:
+        click.echo(f"error: could not read the board: {exc.__cause__}", err=True)
+        sys.exit(2)
+    except _NightlyIssueFetchError as exc:
+        click.echo(
+            f"error: could not fetch open issues for {repo!r}: {exc.__cause__}", err=True,
+        )
+        sys.exit(2)
     except NightlyRunnerError as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
@@ -136,6 +118,146 @@ def smoke_nightly_cmd(
         sys.exit(2)
     if report.any_app_red:
         sys.exit(3)
+
+
+class _NightlyBoardReadError(Exception):
+    """Wraps an unreadable board so :func:`_run_one_nightly_smoke`'s callers
+    (the single-repo command and the #3661 sweep) can each decide how to
+    report it — a single-repo run exits 2; the sweep logs it and moves on
+    to the next repo rather than abandoning the whole night's run."""
+
+
+class _NightlyIssueFetchError(Exception):
+    """Wraps a failed open-issues fetch — see :class:`_NightlyBoardReadError`
+    for why this is a distinct exception type rather than letting the raw
+    ``httpx``/``gh`` exception propagate."""
+
+
+def _run_one_nightly_smoke(
+    *, config, repo: str, artifact: str, spec: str, dry_run: bool,
+):
+    """The #3660 command's actual body, factored out so #3661's
+    ``coord smoke nightly-sweep`` runs the EXACT same board-read +
+    open/closed-issue-fetch + :func:`run_nightly_smoke` sequence per repo
+    that the on-demand single-repo command runs — never a second,
+    slightly-different implementation of "run one nightly spec" (#2096
+    "one question, one answer"). Callers must have already resolved
+    *repo*'s :class:`~coord.config.RepoConfig` (``config.repo(repo)``).
+    """
+    from coord import github_ops  # noqa: PLC0415
+    from coord.board_service import read_board  # noqa: PLC0415
+    from coord.bugbash import subprocess_coord_runner  # noqa: PLC0415
+    from coord.nightly_runner import run_nightly_smoke  # noqa: PLC0415
+
+    repo_cfg = config.repo(repo)
+
+    try:
+        board = read_board()
+    except Exception as exc:  # noqa: BLE001 — an unreadable board is a deferral, not a crash
+        raise _NightlyBoardReadError() from exc
+
+    open_issues: list[dict] = []
+    closed_issues: list[dict] = []
+    if not dry_run:
+        try:
+            open_issues = github_ops.get_open_issues(repo_cfg.github)
+        except Exception as exc:  # noqa: BLE001 — #3660 review: a GitHub hiccup here
+            # must exit 2 like every other failure mode, never a bare
+            # traceback (unlike `_fetch_closed_issues`'s own best-effort
+            # fail-open `[]`, open issues are the dedupe decision's
+            # PRIMARY input — fetching nothing and proceeding would file a
+            # duplicate issue for every already-open finding instead).
+            raise _NightlyIssueFetchError() from exc
+        closed_issues = _fetch_closed_issues(repo_cfg.github)
+
+    return run_nightly_smoke(
+        repo=repo, artifact=artifact, spec=spec, config=config, board=board,
+        dry_run=dry_run, runner=subprocess_coord_runner,
+        open_issues=open_issues, closed_issues=closed_issues,
+    )
+
+
+@smoke_group.command(
+    "nightly-sweep",
+    help=(
+        "Run the #3660 `coord smoke nightly` command once for every "
+        "(repo, artifact) pair #3661's nightly timer exists to cover — "
+        "every repo with `release_gate.<repo>.nightly_required: true` in "
+        "coordinator.yml, crossed with each of that repo's own "
+        "`nightly_artifacts`. This is the ExecStart of "
+        "`coord-nightly-smoke.timer` (deploy/), never a replacement for "
+        "the pre-release on-demand `coord smoke nightly` call itself.\n\n"
+        "One repo's crash (an unreadable board, a GitHub hiccup, a driver "
+        "exception) is reported and does NOT abort the sweep — every "
+        "other configured pair still gets its own run. Exit code is 0 "
+        "unless NOTHING could even be attempted (no repo in coordinator.yml "
+        "has nightly_required set) or at least one pair hit exactly the "
+        "kind of defect `coord smoke nightly` itself exits 1 for (an "
+        "alerting step that got no issue filed) — a per-pair app-red/INFRA "
+        "result, like the single-repo command, never fails THIS process; "
+        "it is reported and persisted for `coord status`/`coord release "
+        "gate` to grade, which is the whole point of #3661's \"leave the "
+        "queue alone\" rule."
+    ),
+)
+@_CONFIG_OPTION
+@click.option("--dry-run", is_flag=True, help="Print each pair's plan; run/file/persist nothing.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the full sweep as one JSON report.")
+def smoke_nightly_sweep_cmd(config_path: Path, dry_run: bool, as_json: bool) -> None:
+    import json as _json  # noqa: PLC0415
+
+    from coord.nightly_runner import NightlyRunnerError  # noqa: PLC0415
+    from coord.nightly_status import repos_with_nightly_smoke  # noqa: PLC0415
+
+    config = _load_config(config_path)
+    pairs = repos_with_nightly_smoke(config)
+    if not pairs:
+        click.echo(
+            "no repo in coordinator.yml has release_gate.<repo>.nightly_required "
+            "set — nothing to sweep"
+        )
+        sys.exit(1)
+
+    results: list[dict] = []
+    any_dropped = False
+    for repo, artifact in pairs:
+        entry: dict = {"repo": repo, "artifact": artifact}
+        try:
+            report = _run_one_nightly_smoke(
+                config=config, repo=repo, artifact=artifact, spec="", dry_run=dry_run,
+            )
+        except _NightlyBoardReadError as exc:
+            entry["error"] = f"could not read the board: {exc.__cause__}"
+        except _NightlyIssueFetchError as exc:
+            entry["error"] = f"could not fetch open issues: {exc.__cause__}"
+        except NightlyRunnerError as exc:
+            entry["error"] = str(exc)
+        else:
+            entry.update(_report_to_dict(report))
+            if report.any_dropped:
+                any_dropped = True
+        results.append(entry)
+        if not as_json:
+            click.echo(f"== {repo} :: {artifact} ==")
+            if "error" in entry:
+                click.echo(f"  error: {entry['error']}")
+            else:
+                click.echo(_render_report(report))
+
+    if as_json:
+        click.echo(_json.dumps({"results": results}, indent=2, sort_keys=True))
+
+    # #3661: a per-pair app-red/INFRA/crash result is reported above and in
+    # the persisted store — never this process's own failure, since a
+    # nightly sweep must "only report, and gate `coord release`" (the
+    # issue's own "leave the queue alone" rule), not alarm an operator via
+    # systemd's `OnFailure=`/unit-failed machinery for an expected red
+    # night. The one thing that DOES fail this process is the same thing
+    # that fails the single-repo command for the identical reason: an
+    # alerting step that got no issue filed at all (a defect in the
+    # filing/acting step itself, not in the app or the environment).
+    if any_dropped:
+        sys.exit(1)
 
 
 def _report_to_dict(report: "NightlyRunReport") -> dict:

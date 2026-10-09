@@ -50,12 +50,20 @@ UNIT_GLOBS = ("*.service", "*.timer")
 # considered "does this need it" rather than an accident, not that this test
 # assume the answer. Auditing them is follow-up work, not something to fold in
 # here silently.
+#
+# `coord-nightly-smoke.service` (#3661) joined deliberately, not by
+# accident: `coord smoke nightly-sweep` -> `run_nightly_smoke` ->
+# `process_nightly_step` -> `coord.bugbash.file_finding` ->
+# `subprocess_coord_runner` shells `coord <args>` out via
+# `shutil.which("coord")`, the identical resolution hazard #2561 found in
+# coord-notify.service/coord-drive-queue.service.
 _COORD_ARGV_SPAWNING_UNITS = frozenset(
     {
         "coord-notify.service",
         "coord-drive-queue.service",
         "coord-serve.service",
         "coord-agent.service",
+        "coord-nightly-smoke.service",
     }
 )
 

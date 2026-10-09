@@ -6222,6 +6222,19 @@ def _board_digest_projection(result: dict) -> dict:
     if isinstance(concurrency, dict):
         projection["concurrency"] = _board_digest_concurrency(concurrency)
 
+    # #3661: `nightly_status[*].age_hours` is the same self-moving-clock
+    # shape as `fleet_health.refreshed_at`/`concurrency.
+    # occupancy_observed_at` above — it ticks on every request even when
+    # the underlying nightly result hasn't changed at all, so it must not
+    # decide whether the ETag/version bumps either.
+    nightly_status = projection.get("nightly_status")
+    if isinstance(nightly_status, list):
+        projection["nightly_status"] = [
+            {k: v for k, v in row.items() if k != "age_hours"}
+            if isinstance(row, dict) else row
+            for row in nightly_status
+        ]
+
     return projection
 
 
@@ -6780,6 +6793,25 @@ def build_app(
                 projection["approved_submissions"] = _approved_submissions(_cfg)
             except Exception:  # noqa: BLE001 — advisory panel, never fatal
                 projection["approved_submissions"] = []
+            # #3661: the latest nightly real-platform smoke verdict per
+            # repo+artifact — the status-bar segment thin clients (coord-tui,
+            # `coord status`) render. Same fail-open, sibling-key posture as
+            # `approved_submissions` immediately above: reads one small flat
+            # JSON file per repo opted into `release_gate.<repo>.
+            # nightly_required` (no subprocess, no network), computed fresh
+            # per request rather than off a tick-refreshed snapshot because
+            # it is that cheap — and a missing/corrupt store degrades to "no
+            # rows" inside `nightly_statuses_for_config` itself, never a 503
+            # here.
+            try:
+                from coord.nightly_status import (  # noqa: PLC0415
+                    nightly_statuses_for_config,
+                )
+                projection["nightly_status"] = [
+                    s.to_dict() for s in nightly_statuses_for_config(_cfg)
+                ]
+            except Exception:  # noqa: BLE001 — advisory panel, never fatal
+                projection["nightly_status"] = []
             try:
                 from coord import merge_queue as _mq  # noqa: PLC0415
                 from coord.state import build_board as _build_board  # noqa: PLC0415

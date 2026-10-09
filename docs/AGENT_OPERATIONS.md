@@ -1135,6 +1135,88 @@ record can't be read back immediately after, it exits non-zero with a
 `unconfirmed success` is a bug (epic #2096), and this is exactly the tool
 that exists to give operators a durable, trustworthy paper trail.
 
+## Periodic nightly real-platform smoke (`coord-nightly-smoke` timer, #3661)
+
+#3652 shipped the decision core (what a real observation MEANS) and #3660
+gave it a real on-demand run (`coord smoke nightly --repo <R> --artifact <A>`)
+a human can fire pre-release for one artifact. Neither made it run on its
+own: #3661 is the systemd user timer that does, plus the sweep command that
+fans it out across every configured repo+artifact.
+
+**`coord smoke nightly-sweep`** reads `release_gate.<repo>.nightly_required`/
+`nightly_artifacts` out of `coordinator.yml` (`coord.nightly_status.
+repos_with_nightly_smoke`) and, for every `(repo, artifact)` pair that names,
+runs the EXACT same sequence the on-demand single-repo command runs — never a
+second, drifted implementation (#2096 "one question, one answer"). One pair
+crashing outright (an unreadable board, a GitHub hiccup, a driver exception)
+is reported and does not abort the sweep; every other pair still gets its own
+attempt.
+
+**The on-demand command is unchanged.** `coord smoke nightly --repo <R>
+--artifact <A>` is still exactly what a human runs pre-release for one
+artifact — this timer exists only to fire the identical per-pair run across
+every configured pair on a schedule nobody has to remember.
+
+**Surfacing: `coord status` and `GET /board`.** The latest persisted result
+per repo+artifact (`coord.nightly_store.latest_nightly_runs`) is classified
+into exactly one of four states (`coord.nightly_status.
+classify_nightly_status`) and rendered both in `coord status`'s own "nightly
+real-platform smoke" section and in the `nightly_status` key of `GET
+/board`'s payload (the status-bar segment a thin client renders):
+
+- **green** — the latest observed run, whatever sha, passed clean.
+- **red** — a real app failure, with the failing step count and every issue
+  number `coord.nightly_store.set_nightly_issue_number` managed to anneal
+  onto that run.
+- **infra** — the latest run never actually exercised the app (a locked/
+  absent GUI session, a pre-flight block, an interrupted run) — named with
+  the host and the reason.
+- **stale** — nothing has landed within the freshness window (default 36h,
+  `coord.nightly_status.DEFAULT_STALE_AFTER_HOURS`), including "never run at
+  all". Checked first, ahead of every other state — a green from three
+  nights ago is not evidence anything works tonight.
+
+**Leave the queue alone (#3661's own rule).** A nightly run never takes a
+drive-queue slot and never blocks a merge — it only reports, and only `coord
+release gate` reads what it persisted as an actual release gate (unchanged
+from #3652/#3660: `release_gate.<repo>.nightly_required` plus
+`nightly_artifacts`). `coord-nightly-smoke.service` deliberately does NOT
+wire `OnFailure=coord-failure-notify.service` the way `coord-notify.service`/
+`coord-drive-queue.service` do — `coord smoke nightly-sweep` only exits
+non-zero for a defect in its own filing step, never for an expected app-red
+or INFRA night, so paging a human on every non-green night would be exactly
+the false alarm this rule exists to avoid. A genuinely broken sweep (every
+pair erroring, night after night) surfaces on its own once the staleness
+window lapses — `coord status`/`coord doctor` both read STALE, and the
+operator does not need the pager to find out.
+
+Install (daemon host only — same host as `coord-release-window.timer`):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/coord-nightly-smoke.service deploy/coord-nightly-smoke.timer \
+   ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now coord-nightly-smoke.timer
+```
+
+Verify / logs:
+
+```bash
+systemctl --user list-timers coord-nightly-smoke.timer
+journalctl --user -u coord-nightly-smoke.service -f
+```
+
+Registered in `coord/deploy_manifest.py`'s `ROLE_UNITS[ROLE_DAEMON]`, so a
+host that has declared itself `ROLE_DAEMON` (`~/.coord/role` or
+`COORD_ROLE`) gets this timer checked by the SAME `unit_enablement`/
+`unit_drift` machinery every other daemon-only timer gets — `coord doctor`
+reports it exactly like a disabled `coord-release-propagate.timer` would:
+installed-but-disabled is a WARN from `unit_enablement`, and a declared
+daemon host that never installed it at all is a WARN from that same check's
+#3128 half.
+
 ## Fleet watchdog (`coord-fleet-watchdog`, #2580)
 
 The 2026-08-22 outage (#2569 root cause, #2570 blast radius, #2572
@@ -1337,6 +1419,7 @@ two in sync; `tests/test_deploy_manifest.py` cross-checks it.
 | `coord-db-backup.timer` | daemon host | **below** |
 | `coord-backup.timer` | daemon host | `deploy/coord-backup.service` header (#3118) |
 | `coord-dr-verify.timer` | daemon host | `deploy/coord-dr-verify.service` header (#3119) |
+| `coord-nightly-smoke.timer` | daemon host | see "Periodic nightly real-platform smoke" below (#3661) |
 
 Workers (precision, elitebook) run `coord-agent` **only**.
 

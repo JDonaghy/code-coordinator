@@ -81,6 +81,7 @@ ROLE_UNITS: dict[str, tuple[str, ...]] = {
         "coord-db-backup.timer",
         "coord-backup.timer",
         "coord-dr-verify.timer",
+        "coord-nightly-smoke.timer",
     ),
 }
 
