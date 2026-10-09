@@ -4830,7 +4830,7 @@ def bash_deny_pattern_matches(pattern: str, command: str) -> bool:
         return False
     inner = pattern[5:-1]
     command = command.strip()
-    if pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+    if pattern in _WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS_SET:
         return fnmatch.fnmatchcase(command.lower(), inner.lower())
     return fnmatch.fnmatchcase(command, inner)
 
@@ -4867,14 +4867,29 @@ def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | N
 # this module's deny lists use, because the hazard here is a command that
 # MENTIONS these tokens anywhere in a longer pipeline/subshell
 # (``powershell.exe -NoProfile -Command 'Get-Process | ... | Stop-Process
-# ...'``), not one whose single verb+flag starts the string. Written here in
-# lowercase canonical form, but matched CASE-INSENSITIVELY by
-# :func:`bash_deny_pattern_matches` (the one function that actually enforces
-# them — see its docstring) — unlike every other pattern in this module,
-# which targets a case-sensitive POSIX shell, these target PowerShell/
-# ``cmd.exe``, where ``Stop-Process``, ``stop-process``, and ``STOP-PROCESS``
-# invoke the identical cmdlet, and a worker's own commands in the wild
-# (including the dell64 repro above) are PascalCase, not lowercase.
+# ...'``), not one whose single verb+flag starts the string.
+#
+# **Case (#3663 review round 2).** Unlike every other pattern in this
+# module, which targets a case-sensitive POSIX shell, these target
+# PowerShell/``cmd.exe``, where ``Stop-Process``, ``stop-process``, and
+# ``STOP-PROCESS`` invoke the identical cmdlet — and a worker's own commands
+# in the wild (including the dell64 repro above) are PascalCase, not
+# lowercase. Round 1 of this fix shipped only the lowercase form and relied
+# on :func:`bash_deny_pattern_matches` to normalize case before matching;
+# that normalizer has zero production callers — ``--disallowedTools`` and
+# the FORBIDDEN-COMMANDS prompt text both consume these pattern *strings*
+# verbatim, byte-for-byte, through the Claude CLI's own matcher, which this
+# module cannot reach into — so the lowercase-only patterns silently failed
+# to catch the issue's own PascalCase acceptance commands even though the
+# repo's test suite (which asserted through the normalizer) reported green.
+# Fixed by making the pattern BYTES case-proof instead of relying on any
+# matcher to normalize them: each fragment below is listed three times
+# (lowercase, PascalCase/canonical cmdlet casing, UPPERCASE) rather than as
+# a ``[Gg]et-...``-style bracket character class, because this module has
+# no confirmed evidence the Claude CLI's own glob matcher supports bracket
+# classes. This does not claim to be exhaustive — see "Porosity" below —
+# only that these three concrete, real-world-observed casings are each
+# matched byte-for-byte regardless of which layer is asking.
 #
 # Porosity (not closed by this pattern set — the briefing note
 # (`WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE` in coord/dispatch.py) is doing
@@ -4894,43 +4909,81 @@ def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | N
 WINDOWS_IMAGE_NAME_KILL_PATTERNS: tuple[str, ...] = (
     # PowerShell: Stop-Process fed from a Get-Process pipeline — kills
     # every process matching whatever the pipeline selected, not one PID.
+    # Three cased spellings (lowercase / PascalCase / UPPERCASE) because
+    # PowerShell's own shell is case-insensitive, but the two surfaces that
+    # consume these BYTES verbatim (--disallowedTools, the FORBIDDEN
+    # COMMANDS prompt text) are not.
     "*get-process*stop-process*",
+    "*Get-Process*Stop-Process*",
+    "*GET-PROCESS*STOP-PROCESS*",
     # PowerShell: Stop-Process invoked directly by name (also an
     # image-name kill, even with no upstream Get-Process pipeline).
     "*stop-process*-name*",
+    "*Stop-Process*-Name*",
+    "*STOP-PROCESS*-NAME*",
     "*stop-process*-processname*",
+    "*Stop-Process*-ProcessName*",
+    "*STOP-PROCESS*-PROCESSNAME*",
     # taskkill /IM <image> kills every process with that executable name;
-    # taskkill /PID <pid> targets one process and stays allowed.
+    # taskkill /PID <pid> targets one process and stays allowed. cmd.exe is
+    # case-insensitive too, so the same three-spelling treatment applies.
     "*taskkill*/im*",
-    # pkill/killall reaching a Windows .exe via WSL/Cygwin/MSYS interop.
+    "*taskkill*/IM*",
+    "*TASKKILL*/IM*",
+    # pkill/killall reaching a Windows .exe via WSL/Cygwin/MSYS interop —
+    # these run inside the WORKER's own POSIX shell (bash), which IS
+    # case-sensitive, so (unlike the PowerShell/cmd.exe patterns above) a
+    # single lowercase spelling is the canonical and only form that
+    # matters here.
     "*pkill*.exe*",
     "*killall*.exe*",
-    # WMIC's SQL-ish "kill every process with this name" form.
+    # WMIC's SQL-ish "kill every process with this name" form — also
+    # cmd.exe, also case-insensitive.
     "*wmic*process*where*name=*",
+    "*WMIC*PROCESS*WHERE*NAME=*",
 )
 
 #: ``Bash(...)``-wrapped form of :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`,
 #: for the exact same soft-prompt (:func:`build_deny_prompt`) and
 #: ``--disallowedTools`` wiring every other deny list in this module gets.
 #:
-#: **Single source of truth, verified at the actual enforcement surface.**
-#: There is exactly one matcher in this module —
-#: :func:`bash_deny_pattern_matches` (and :func:`find_denying_bash_pattern`,
-#: a thin fold over it) — and it is what ``--disallowedTools``,
-#: :func:`build_deny_prompt`'s FORBIDDEN COMMANDS text, and
-#: ``tests/test_worker_safety.py``'s acceptance tests all key off of. There
-#: used to be a second helper (``is_windows_image_name_kill``) that
+#: **What is actually true about "the enforcement surface" (#3663 review
+#: round 2).** ``--disallowedTools`` (:func:`worker_disallowed_tools`) and
+#: :func:`build_deny_prompt`'s FORBIDDEN COMMANDS text both consume THIS
+#: LIST'S STRINGS verbatim, byte-for-byte — the Claude CLI's own permission
+#: matcher is what actually enforces them, a surface this module cannot
+#: call into or normalize. Neither of those two call sites goes through
+#: :func:`bash_deny_pattern_matches`/:func:`find_denying_bash_pattern` at
+#: all, so this module's own matcher backs only the test suite's model of
+#: what the CLI does, not the CLI itself. (A prior version of this
+#: docstring claimed otherwise — that the matcher "is what
+#: --disallowedTools... key[s] off of" — which was false; the correction
+#: is this paragraph.) That is precisely why the pattern strings
+#: themselves must be case-proof on their own (see the cased duplicates in
+#: :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`) rather than relying on any
+#: matcher, including this module's, to normalize case for them.
+#:
+#: There used to be a second helper (``is_windows_image_name_kill``) that
 #: lowercased its input before matching; it had no production caller, and
-#: its tests passed while the patterns above — matched case-sensitively, as
-#: every other pattern in this module is — silently failed to catch the
+#: its tests passed while these patterns — matched case-sensitively
+#: wherever the CLI itself evaluates them — silently failed to catch the
 #: issue's own PascalCase acceptance commands. It has been removed rather
-#: than fixed in place, so "what does the hook refuse" has exactly one
-#: answer, checked by exercising this exact list through
-#: :func:`find_denying_bash_pattern` (see
-#: ``TestWindowsImageNameKillGuard`` in ``tests/test_worker_safety.py``).
+#: than fixed in place. ``tests/test_worker_safety.py``'s
+#: ``TestWindowsImageNameKillGuard`` exercises this exact list through
+#: :func:`find_denying_bash_pattern`, which is still useful as a model of
+#: the CLI's documented glob semantics — it just isn't the thing that
+#: makes the guard work in production; the pattern bytes are.
 WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS: list[str] = [
     f"Bash({pattern})" for pattern in WINDOWS_IMAGE_NAME_KILL_PATTERNS
 ]
+
+#: Membership-test form of :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`
+#: for :func:`bash_deny_pattern_matches` — a ``frozenset`` reads as "is this
+#: pattern one of the Windows ones" at the call site, rather than a linear
+#: scan that happens to be irrelevant at this list's size.
+_WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS_SET = frozenset(
+    WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS
+)
 
 
 def is_shared_windows_desktop(capabilities: list[str]) -> bool:
