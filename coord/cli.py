@@ -156,6 +156,7 @@ from coord.commands.machine import machine_group
 from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
 from coord.commands.release import release_group, release_preflight
+from coord.commands.smoke import smoke_group
 # #2220: `coord repo add` / `coord repo doctor` — onboarding a repo, and
 # verifying it actually happened across all five layers.
 from coord.commands.repo import repo_group
@@ -515,6 +516,7 @@ main.add_command(release_preflight)
 # the flat command above), grouped so the pre-tag and post-release halves of
 # the release story are discoverable together.
 main.add_command(release_group)
+main.add_command(smoke_group)
 # #2220: repo onboarding + its verifier.
 main.add_command(repo_group)
 # #2915: the machine-side analogue — machine onboarding + its verifier.

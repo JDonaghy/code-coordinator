@@ -4840,7 +4840,7 @@ def _render_gate_verdict(verdict: "Any") -> str:
 @click.option(
     "--from-json", "from_json_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
+    default=None,
     help=(
         "JSON file with this run's OBSERVED lane/bugbash/nightly results: "
         '{"lanes": [{"lane", "sha", "passed", "detail"?, "checked_at"?, '
@@ -4850,9 +4850,13 @@ def _render_gate_verdict(verdict: "Any") -> str:
         '"unavailable"?}, ...]}. '
         '("unavailable": true marks an ENVIRONMENT condition — a locked or '
         "absent GUI session, a missing display — not an app bug, #3510.) "
-        "No production Tier-2/bugbash/nightly store is wired yet (tracked "
-        "follow-up, out of #3488's and #3652's file scope) — this is the "
-        "seam until one is."
+        "Omit this flag to read the nightly step from the persisted "
+        "nightly-smoke results store instead (#3660, `coord smoke nightly` "
+        "writes it, coord.nightly_store reads it) — lanes/bugbash still "
+        "have no production store (tracked follow-up, out of #3488's and "
+        "#3652's file scope), so omitting --from-json when a repo's gate "
+        "requires either reports 'no result recorded' for those steps, "
+        "exactly as an empty --from-json would."
     ),
 )
 @click.option(
@@ -4912,22 +4916,41 @@ def release_gate_cmd(
         )
         sys.exit(2)
 
-    try:
-        payload = _json.loads(from_json_path.read_text())
-    except (OSError, ValueError) as exc:
-        click.echo(f"error: could not read {from_json_path}: {exc}", err=True)
-        sys.exit(2)
-    if not isinstance(payload, dict):
-        click.echo(f"error: {from_json_path} must contain a JSON object", err=True)
-        sys.exit(2)
+    if from_json_path is not None:
+        try:
+            payload = _json.loads(from_json_path.read_text())
+        except (OSError, ValueError) as exc:
+            click.echo(f"error: could not read {from_json_path}: {exc}", err=True)
+            sys.exit(2)
+        if not isinstance(payload, dict):
+            click.echo(f"error: {from_json_path} must contain a JSON object", err=True)
+            sys.exit(2)
 
-    try:
-        lane_results, bugbash_runs, nightly_results = _load_release_gate_observations(
-            payload,
+        try:
+            lane_results, bugbash_runs, nightly_results = _load_release_gate_observations(
+                payload,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            click.echo(f"error: malformed {from_json_path}: {exc}", err=True)
+            sys.exit(2)
+    else:
+        # #3660: no --from-json — lanes/bugbash have no production store
+        # yet (tracked follow-up), so they stay empty and
+        # `evaluate_release_gate` reports "no result recorded" for any of
+        # those steps this repo's gate requires (#2096: a gate must be able
+        # to fail, never default to a silent pass on missing data). The
+        # nightly step DOES have a store now (#3660, `coord smoke nightly`
+        # writes it) — read it through the SAME `NightlyArtifactResult`
+        # seam `_load_release_gate_observations` already builds from
+        # `--from-json`'s own "nightly" array, so the two paths can never
+        # disagree about what a nightly row means (#2096 "one question,
+        # one answer").
+        from coord.nightly_store import (  # noqa: PLC0415
+            nightly_artifact_results_for_release_gate,
         )
-    except (KeyError, TypeError, ValueError) as exc:
-        click.echo(f"error: malformed {from_json_path}: {exc}", err=True)
-        sys.exit(2)
+
+        lane_results, bugbash_runs = [], []
+        nightly_results = nightly_artifact_results_for_release_gate(repo)
 
     verdict = rg.evaluate_release_gate(
         repo=repo,

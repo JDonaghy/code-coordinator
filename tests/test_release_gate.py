@@ -1269,6 +1269,110 @@ class TestReleaseGateCli:
         assert f'"by": "{getpass.getuser()}"' in result.output
 
 
+class TestReleaseGateCliNightlyStoreSeam:
+    """#3660 acceptance: `coord release gate --repo vimcode` reads the
+    nightly step through `coord.nightly_store`, with no `--from-json` at
+    all."""
+
+    def test_reads_nightly_result_from_store_with_no_from_json(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from coord.cli import main
+        from coord.nightly_store import NightlyResultRecord, record_nightly_result
+
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(
+                lanes=[], bugbash_required=False,
+                nightly_required=True, nightly_artifacts=["macos-dmg"],
+            ),
+        )
+        record_nightly_result(NightlyResultRecord(
+            repo="vimcode", artifact="macos-dmg", sha="deadbeef", passed=True,
+            checked_at=100.0, spec="install.yaml", step="launch",
+        ))
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 0, result.output
+        assert "RESULT: PASS" in result.output
+
+    def test_failing_nightly_result_from_store_fails_with_no_from_json(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from coord.cli import main
+        from coord.nightly_store import NightlyResultRecord, record_nightly_result
+
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(
+                lanes=[], bugbash_required=False,
+                nightly_required=True, nightly_artifacts=["macos-dmg"],
+            ),
+        )
+        record_nightly_result(NightlyResultRecord(
+            repo="vimcode", artifact="macos-dmg", sha="deadbeef", passed=False,
+            checked_at=100.0, spec="install.yaml", step="launch",
+            detail="window never appeared",
+        ))
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 1, result.output
+        assert "nightly:macos-dmg" in result.output
+        assert "RESULT: FAIL" in result.output
+
+    def test_no_from_json_and_no_store_history_fails_never_a_vacuous_pass(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """#2096: omitting --from-json with nothing ever recorded must
+        still fail the gate, never silently pass."""
+        from coord.cli import main
+
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(
+                lanes=[], bugbash_required=False,
+                nightly_required=True, nightly_artifacts=["macos-dmg"],
+            ),
+        )
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 1, result.output
+        assert "no nightly real-platform smoke result recorded" in result.output
+
+    def test_omitting_from_json_with_lanes_required_fails_those_steps(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Lanes/bugbash have no production store yet (tracked follow-up)
+        — omitting --from-json must report 'no result recorded' for them,
+        exactly like an empty --from-json would, never a silent pass."""
+        from coord.cli import main
+
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        monkeypatch.setattr(
+            "coord.commands._common._load_config",
+            lambda path: _config_with_gate(lanes=["tui-pty"], bugbash_required=False),
+        )
+        result = CliRunner().invoke(
+            main,
+            ["release", "gate", "vimcode", "--sha", "deadbeef",
+             "--config", str(tmp_path / "coordinator.yml")],
+        )
+        assert result.exit_code == 1, result.output
+        assert "no Tier-2 smoke result recorded" in result.output
+
+
 class TestReleaseGateShaAncestry:
     """The bugbash "at or after" rule resolved for real, via `git merge-base
     --is-ancestor`, against a throwaway local repo — no network."""
