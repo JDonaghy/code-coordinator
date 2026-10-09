@@ -52,11 +52,15 @@ parameter with a real default).
    ``plan.driver_kind`` — #2096 "one question, one answer": a route that
    sets ``label:``/``platforms:`` must get the SAME per-route dedupe label
    a real ``coord bugbash`` lane would (#3615/#3581).
-4. Every step observed is persisted to :mod:`coord.nightly_store`,
-   regardless of outcome, tagged with a per-run ``run_id`` — so ``coord
-   release gate`` can read a repo's nightly artifacts without
-   ``--from-json`` (#3660 acceptance), and a later clean re-run can clear
-   an earlier red/unavailable one at the same SHA (#3660 review round 1).
+4. Every step observed is persisted to :mod:`coord.nightly_store` BEFORE
+   it is acted on, regardless of outcome, tagged with a per-run ``run_id``
+   and the run's own ``steps_total`` — so ``coord release gate`` can read a
+   repo's nightly artifacts without ``--from-json`` (#3660 acceptance), a
+   later clean re-run can clear an earlier red/unavailable one at the same
+   SHA (#3660 review round 1), and a run INTERRUPTED part-way through (the
+   filing call raising, a Ctrl-C) can neither lose the red it already
+   observed nor have its surviving partial rows read as a pass (#3660
+   review round 2).
 """
 
 from __future__ import annotations
@@ -71,6 +75,7 @@ from typing import TYPE_CHECKING, Callable, Sequence
 from coord.acceptance_drivers import DriverResult, run_driver
 from coord.bugbash import (
     GUI_LANE_DRIVER_KINDS,
+    LANE_DRIVER_KINDS,
     BugbashLane,
     CoordRunner,
     discover_lanes,
@@ -81,6 +86,7 @@ from coord.nightly_smoke import (
     NightlyStepObservation,
     NightlyStepOutcome,
     StepVerdict,
+    StepVerdictKind,
     classify_step,
     pick_nightly_host,
     process_nightly_step,
@@ -644,7 +650,7 @@ def _default_download_artifact(
 def _resolve_bugbash_lane(
     config: "Config", repo: str, driver_cfg: "AcceptanceDriverConfig",
     machine_name: str, *, http_client: "httpx.Client | None" = None,
-) -> BugbashLane:
+) -> tuple[BugbashLane, str]:
     """The :class:`~coord.bugbash.BugbashLane` a nightly red step should
     file/comment/close through — resolved via :func:`coord.bugbash.
     discover_lanes`, the SAME lane discovery ``coord bugbash`` itself uses,
@@ -656,39 +662,84 @@ def _resolve_bugbash_lane(
     e.g. vimcode's ``win-gui``/``win-terminal`` routes — both ``kind:
     win-native`` — folding two distinct platform findings into one issue).
 
-    Matched by ``(machine, driver_kind, capability, setup, run)`` — the
-    first three narrow to the right machine/driver; ``setup``/``run`` (the
+    Matched on the ROUTE — ``(driver_kind, capability, setup, run)`` —
+    and NOT on the machine (#3660 review round 2). ``setup``/``run`` (the
     route's own provisioning/launch strings, carried onto
     :attr:`~coord.bugbash.BugbashLane.setup`/:attr:`~coord.bugbash.
-    BugbashLane.launch_command`) disambiguate two sibling routes that
-    share a kind AND a machine — exactly the ``win-gui``/``win-terminal``
-    case, which ``discover_lanes`` itself has no OTHER way to tell apart
-    from a resolved :class:`BugbashLane` alone (it does not echo back
-    which ``routes:`` entry produced each lane).
+    BugbashLane.launch_command`) are what disambiguate two sibling routes
+    sharing a kind — exactly the ``win-gui``/``win-terminal`` case, which
+    ``discover_lanes`` has no OTHER way to tell apart from a resolved
+    :class:`BugbashLane` alone (it does not echo back which ``routes:``
+    entry produced each lane). The machine is then overwritten with
+    *machine_name* — the host :func:`pick_nightly_host` actually chose —
+    rather than used as a match key, because the two machine pickers are
+    deliberately different questions and routinely disagree:
+    ``discover_lanes`` takes the FIRST configured machine claiming the
+    capability (:func:`coord.bugbash._pick_lane_machine`, no pause/cordon
+    filter), while :func:`pick_nightly_host` ranks idle-first and filters
+    cordoned/paused hosts. Keying the match on ``lane.machine ==
+    machine_name`` meant that any such disagreement — a capability claimed
+    by two machines where the first-configured one is busy or cordoned —
+    silently fell through to the hand-built lane, i.e. back to the exact
+    colliding ``platform=driver_kind`` label this function exists to
+    prevent.
 
-    Falls back to a hand-built lane (today's pre-fix shape) when
-    ``discover_lanes`` resolves nothing for this exact pairing — most
-    commonly because *driver_cfg*'s kind isn't one of :data:`coord.bugbash.
+    Returns ``(lane, fallback_reason)``. *fallback_reason* is ``""`` on a
+    real route match, and otherwise NAMES why a hand-built lane
+    (``platform=driver_kind``, no ``setup``/``launch_command``) was used —
+    surfaced in :class:`NightlyRunReport`/``coord smoke nightly``'s own
+    output rather than happening silently. The common, benign case is a
+    *driver_cfg* whose kind isn't one of :data:`coord.bugbash.
     LANE_DRIVER_KINDS` at all (e.g. ``cli-pytest``, which has no bugbash
-    lane concept to begin with) — never a crash on the first nightly repo
-    that isn't ALSO a ``coord bugbash`` target.
+    lane concept to begin with) — hence a usable fallback rather than a
+    crash on the first nightly repo that isn't ALSO a ``coord bugbash``
+    target.
     """
-    for lane in discover_lanes(config, repo, http_client=http_client):
+    import dataclasses
+
+    lanes = list(discover_lanes(config, repo, http_client=http_client))
+    for lane in lanes:
         if (
-            lane.machine == machine_name
-            and lane.driver_kind == driver_cfg.kind
+            lane.driver_kind == driver_cfg.kind
             and lane.capability == driver_cfg.capability
             and lane.setup == driver_cfg.setup
             and lane.launch_command == driver_cfg.run
         ):
-            return lane
+            if lane.machine == machine_name:
+                return lane, ""
+            return dataclasses.replace(lane, machine=machine_name), ""
+    reason = (
+        f"no coord-bugbash lane matches this route (kind={driver_cfg.kind!r}, "
+        f"capability={driver_cfg.capability!r}) — using a hand-built lane "
+        f"labelled {driver_cfg.kind!r}"
+        + (
+            "; it is not one of coord.bugbash's lane driver kinds, which is "
+            "expected for a non-GUI driver"
+            if driver_cfg.kind not in LANE_DRIVER_KINDS
+            else f"; discover_lanes offered {sorted(x.platform for x in lanes)!r}"
+        )
+    )
     return BugbashLane(
         platform=driver_cfg.kind, driver_kind=driver_cfg.kind,
         machine=machine_name, capability=driver_cfg.capability,
-    )
+    ), reason
 
 
 # ── the full orchestration ─────────────────────────────────────────────────
+
+
+def observation_key(obs: NightlyStepObservation) -> str:
+    """``"<spec>::<step>"`` — the ONE formatter for the key
+    :attr:`NightlyRunReport.unavailable_steps` holds, so the runner that
+    writes it, the report property that reads it, and ``coord smoke
+    nightly``'s renderer can never disagree about its shape (#2096 "one
+    question, one answer")."""
+    return f"{obs.spec}::{obs.step}"
+
+
+def step_key(outcome: NightlyStepOutcome) -> str:
+    """:func:`observation_key` for the observation behind *outcome*."""
+    return observation_key(outcome.verdict.observation)
 
 
 @dataclass(frozen=True)
@@ -702,6 +753,23 @@ class NightlyRunReport:
     ran: bool
     sha: str = ""
     outcomes: tuple[NightlyStepOutcome, ...] = ()
+    #: ``"<spec>::<step>"`` for every step the DRIVER itself reported as
+    #: ``"unavailable"`` (#3510 — a locked/absent GUI session, a missing
+    #: display). Such a step deliberately takes no filing action at all
+    #: (:func:`run_nightly_smoke`'s loop), so without this channel it was
+    #: indistinguishable, in this report and in ``coord smoke nightly``'s
+    #: output and exit code, from a clean green — the exact #3566 defect
+    #: ("a lane that never ran read identically to a clean pass") that
+    #: :func:`coord.bugbash.run_bugbash` answers with its own
+    #: ``lanes_unavailable``.
+    unavailable_steps: tuple[str, ...] = ()
+    #: Non-empty when the acting :class:`~coord.bugbash.BugbashLane` could
+    #: not be resolved through :func:`coord.bugbash.discover_lanes` and a
+    #: hand-built one was used instead — see :func:`_resolve_bugbash_lane`.
+    #: Reported rather than silent (#3660 review round 2) because for a
+    #: route carrying ``label:``/``platforms:`` the fallback's bare
+    #: ``driver_kind`` platform label is the #3615 dedupe collision.
+    lane_fallback: str = ""
 
     @property
     def infra_blocked(self) -> bool:
@@ -712,6 +780,35 @@ class NightlyRunReport:
         """#2096: an alerting red step that got no issue, no comment, and
         no close — never silently folded into "nothing to report"."""
         return any(o.dropped for o in self.outcomes)
+
+    @property
+    def any_unavailable(self) -> bool:
+        """Whether any step never actually ran (driver-reported
+        ``unavailable``, #3510) — "nothing was observed here" rather than
+        "everything observed was fine"."""
+        return bool(self.unavailable_steps)
+
+    @property
+    def any_app_red(self) -> bool:
+        """Whether the run OBSERVED a genuine app failure needing a bug
+        (:attr:`~coord.nightly_smoke.StepVerdictKind.RED_NEEDS_FILING`) —
+        true even when every such step was successfully filed/commented,
+        which is precisely the state ``coord smoke nightly``'s exit code
+        must not fold into success.
+
+        An ``unavailable`` step is deliberately NOT an app red, even though
+        :func:`~coord.nightly_smoke.classify_step` (which has no notion of
+        the driver's ``unavailable`` status) labels its verdict
+        ``RED_NEEDS_FILING``: #3510's rule is that a locked/absent session
+        is an environment condition, and :func:`run_nightly_smoke` already
+        keeps such a step away from every filing decision for that reason.
+        """
+        unavailable = set(self.unavailable_steps)
+        return any(
+            o.verdict.kind is StepVerdictKind.RED_NEEDS_FILING
+            and step_key(o) not in unavailable
+            for o in self.outcomes
+        )
 
 
 def run_nightly_smoke(
@@ -800,14 +897,41 @@ def run_nightly_smoke(
     sha = resolve_sha(repo_cfg.github, _git_ref_for_plan(plan))
 
     effective_workdir = workdir or _default_workdir(repo)
-    obtained = (obtain_artifact_fn or obtain_artifact)(
-        plan, config=config, workdir=effective_workdir,
-    )
+    # #3660 review: every real failure mode of these two I/O-heavy steps
+    # must reach the operator as the `exit 2` every other one produces, not
+    # as a bare traceback — `git clone`/`build_command` raise
+    # `subprocess.CalledProcessError`, `fetch_release_assets` raises
+    # `httpx` errors, and `run_driver` raises `DriverError` for a timeout,
+    # an unsupported kind, or a failing `setup:`. The CLI catches only
+    # `NightlyRunnerError`, so they are translated here (at the one seam
+    # that knows WHICH step was in flight) rather than by widening the
+    # CLI's except clause to bare `Exception`.
+    try:
+        obtained = (obtain_artifact_fn or obtain_artifact)(
+            plan, config=config, workdir=effective_workdir,
+        )
+    except NightlyRunnerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — re-raised, never swallowed
+        raise NightlyRunnerError(
+            f"could not obtain {artifact!r} for {repo!r} "
+            f"({plan.source} {plan.ref!r}) in {effective_workdir}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
-    observations = run_nightly_spec(
-        plan, config=config, cwd=obtained.cwd, sha=sha, now=now,
-        run_driver_fn=run_driver_fn,
-    )
+    try:
+        observations = run_nightly_spec(
+            plan, config=config, cwd=obtained.cwd, sha=sha, now=now,
+            run_driver_fn=run_driver_fn,
+        )
+    except NightlyRunnerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — re-raised, never swallowed
+        raise NightlyRunnerError(
+            f"could not run {repo!r}'s nightly spec "
+            f"({plan.driver_kind} driver, spec={plan.spec or '(driver entrypoint)'}): "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
     spec_path_for_known_bugs = _read_spec_text(obtained.cwd, observations)
     known_bugs_raw = known_bugs_from_spec_text(spec_path_for_known_bugs) if spec_path_for_known_bugs else {}
@@ -823,13 +947,35 @@ def run_nightly_smoke(
     # silently defaulting to `lane=None` and this crashing on the first
     # genuinely new finding a real run ever produces.
     driver_cfg = _resolve_driver_cfg(config, repo, spec)
-    lane = _resolve_bugbash_lane(
+    lane, lane_fallback = _resolve_bugbash_lane(
         config, repo, driver_cfg, plan.host.machine.name, http_client=http_client,
     )
 
     checked_at = time.time() if now is None else now
+    steps_total = len(observations)
     outcomes: list[NightlyStepOutcome] = []
+    unavailable_steps: list[str] = []
     for obs, unavailable in observations:
+        # PERSIST BEFORE ACTING (#3660 review round 2). The row records
+        # what the DRIVER observed, which is already true regardless of
+        # whether the acting step below succeeds — and acting first was a
+        # false-green: `process_nightly_step` -> `file_finding` ->
+        # `subprocess_coord_runner` RAISES on any non-zero `coord` exit (as
+        # does a `coord issue create` whose output doesn't parse), nothing
+        # here catches it, and a 2-step run whose second step was a new red
+        # then left the store holding only its first, PASSING row. Grouped
+        # per run, that reduced to "1 step(s) passed" with a fresh
+        # timestamp and outranked the complete red run at the same SHA.
+        # `steps_total` is the second half of the fix: it is known HERE,
+        # before the loop, so the store can refuse to grade a group holding
+        # fewer rows than the run promised (see coord.nightly_store).
+        record_nightly_result(NightlyResultRecord(
+            repo=repo, artifact=artifact, sha=sha, passed=obs.passed,
+            checked_at=checked_at, detail=obs.detail, unavailable=unavailable,
+            spec=obs.spec, step=obs.step, host=plan.host.machine.name,
+            evidence=obs.evidence, run_id=effective_run_id,
+            steps_total=steps_total,
+        ))
         verdict: StepVerdict = classify_step(obs, known_bugs_raw.get(obs.step))
         if unavailable:
             # #3510, mirroring coord.bugbash's own "#3510: an unavailable
@@ -844,6 +990,12 @@ def run_nightly_smoke(
             # plain `RED_NEEDS_FILING` red and filed/commented an app-repo
             # bug for a locked host).
             outcome = NightlyStepOutcome(verdict=verdict, action="none")
+            # ...but it must not read like a clean green in the runner's
+            # own output/exit code either (#3566: "a lane that never ran
+            # read identically to a clean pass"), which is why the report
+            # carries it as a named, separate channel — `coord.bugbash`
+            # reports `lanes_unavailable` for exactly this reason.
+            unavailable_steps.append(observation_key(obs))
         else:
             outcome = process_nightly_step(
                 verdict, open_issues=open_issues, closed_issues=closed_issues,
@@ -851,14 +1003,11 @@ def run_nightly_smoke(
                 platform=lane.platform,
             )
         outcomes.append(outcome)
-        record_nightly_result(NightlyResultRecord(
-            repo=repo, artifact=artifact, sha=sha, passed=obs.passed,
-            checked_at=checked_at, detail=obs.detail, unavailable=unavailable,
-            spec=obs.spec, step=obs.step, host=plan.host.machine.name,
-            evidence=obs.evidence, run_id=effective_run_id,
-        ))
 
-    return NightlyRunReport(plan=plan, ran=True, sha=sha, outcomes=tuple(outcomes))
+    return NightlyRunReport(
+        plan=plan, ran=True, sha=sha, outcomes=tuple(outcomes),
+        unavailable_steps=tuple(unavailable_steps), lane_fallback=lane_fallback,
+    )
 
 
 def _persist_infra_unavailable(
@@ -882,6 +1031,14 @@ def _persist_infra_unavailable(
     and a dry-run-adjacent INFRA short-circuit failing loudly on a
     SEPARATE, best-effort bookkeeping step would be a worse failure mode
     than just not persisting.
+
+    This record can never DOWNGRADE an already-verified artifact: a
+    never-ran ``unavailable`` row is dropped at read time when a complete
+    passing run exists for the same ``(artifact, sha)``
+    (:func:`coord.nightly_store.nightly_artifact_results_for_release_gate`,
+    #3660 review round 2) — so a laptop that happens to be locked tonight
+    does not flip a PASSing ``nightly:<artifact>`` for a SHA that was
+    already fully observed, while still blocking a SHA that wasn't.
     """
     repo_cfg = config.repo(repo)
     if repo_cfg is None:  # pragma: no cover - plan_nightly_run already proved this exists
@@ -897,6 +1054,11 @@ def _persist_infra_unavailable(
         checked_at=checked_at, detail=plan.infra_reason, unavailable=True,
         spec=plan.spec, step="(preflight)", host=plan.machine_name or "",
         evidence=(), run_id=run_id,
+        # A one-row run, and it IS complete: the pre-flight verdict is the
+        # whole of what this tick observed. Stating 1 (rather than leaving
+        # the "unstated" 0) keeps the store's completeness check meaningful
+        # for this group too (#3660 review round 2).
+        steps_total=1,
     ))
 
 

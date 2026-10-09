@@ -513,6 +513,45 @@ class TestRunNightlySmokeGreenRedKnownBug:
         assert results[0].unavailable is True
         assert results[0].passed is False
 
+    def test_unavailable_step_is_named_in_the_report_not_silently_quiet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3566 / #3660 review round 2: a step that never ran must not be
+        indistinguishable from a clean green in the runner's own report —
+        `coord.bugbash` reports `lanes_unavailable` for exactly this
+        reason."""
+        report, _runner = _run(
+            tmp_path, monkeypatch,
+            tests=[
+                {"id": "launch", "status": "pass"},
+                {"id": "menu", "status": "unavailable", "message": "screen locked"},
+            ],
+        )
+        assert report.any_unavailable is True
+        assert report.unavailable_steps == ("tests/smoke-spec/install.yaml::menu",)
+        assert report.any_app_red is False
+
+    def test_a_fully_green_run_reports_nothing_unavailable_and_no_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        report, _runner = _run(
+            tmp_path, monkeypatch, tests=[{"id": "launch", "status": "pass"}],
+        )
+        assert report.any_unavailable is False
+        assert report.any_app_red is False
+        assert report.any_dropped is False
+        assert report.lane_fallback  # cli-pytest has no bugbash lane
+
+    def test_a_red_run_reports_an_app_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        report, _runner = _run(
+            tmp_path, monkeypatch,
+            tests=[{"id": "launch", "status": "fail", "message": "crashed"}],
+        )
+        assert report.any_app_red is True
+        assert report.any_unavailable is False
+
     def test_wrong_host_refuses_loudly(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -526,6 +565,196 @@ class TestRunNightlySmokeGreenRedKnownBug:
                 dry_run=False,
                 local_machine_name_fn=lambda cfg: "some-other-machine",
             )
+
+
+class TestAnInterruptedRunNeverCertifies:
+    """#3660 review round 2: the loop used to ACT first and PERSIST second,
+    so a 2-step run whose second step was a brand-new red lost that red
+    entirely when `file_finding` raised (`subprocess_coord_runner` raises
+    on any non-zero `coord` exit, and nothing here catches it) — leaving a
+    per-run group holding only the first, PASSING row, which reduced to
+    "1 step(s) passed" with a fresh timestamp and reported
+    `nightly:macos-dmg PASS` for an artifact whose red step WAS observed.
+    """
+
+    def test_a_runner_that_raises_on_issue_create_leaves_the_gate_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from coord.nightly_store import nightly_artifact_results_for_release_gate
+        from coord.release_gate import evaluate_release_gate
+
+        class _RaisingRunner:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            def __call__(self, args) -> str:
+                args = list(args)
+                self.calls.append(args)
+                if args[:2] == ["issue", "create"]:
+                    raise RuntimeError("coord issue create exited 1")
+                return ""
+
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        _write_spec(tmp_path)
+        runner = _RaisingRunner()
+        tests = [
+            {"id": "launch", "status": "pass"},
+            {"id": "menu", "status": "fail", "message": "crashed"},
+        ]
+        with pytest.raises(RuntimeError, match="issue create"):
+            run_nightly_smoke(
+                repo="vimcode", artifact="macos-dmg", spec="", config=_config(),
+                board=Board(), dry_run=False,
+                resolve_ref_sha_fn=lambda slug, ref: "deadbeef",
+                local_machine_name_fn=lambda cfg: "m1",
+                obtain_artifact_fn=lambda plan, *, config, workdir: ObtainedArtifact(
+                    cwd=str(tmp_path),
+                ),
+                run_driver_fn=lambda kind, run_command, cwd, **kw: DriverResult(
+                    exit_code=1, tests=tests,
+                ),
+                runner=runner, open_issues=[], closed_issues=[], now=1000.0,
+            )
+
+        # (a) the red observation was persisted BEFORE the filing attempt.
+        rows = read_nightly_results("vimcode")
+        by_step = {r.step: r for r in rows}
+        assert by_step["menu"].passed is False
+        assert by_step["launch"].passed is True
+
+        # ...and the gate is not passing at that SHA.
+        verdict = evaluate_release_gate(
+            repo="vimcode", release_sha="deadbeef",
+            required_lanes=[], nightly_required=True,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
+        )
+        assert verdict.gate_passed is False
+
+    def test_every_persisted_row_states_the_runs_total_step_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """(b) the completeness marker the store needs to refuse to grade a
+        group that holds fewer rows than the run promised — known from
+        `len(observations)` before the act/persist loop starts."""
+        report, _runner = _run(
+            tmp_path, monkeypatch,
+            tests=[
+                {"id": "launch", "status": "pass"},
+                {"id": "uninstall", "status": "pass"},
+            ],
+        )
+        assert report.ran is True
+        rows = read_nightly_results("vimcode")
+        assert len(rows) == 2
+        assert {r.steps_total for r in rows} == {2}
+        assert len({r.run_id for r in rows}) == 1
+
+    def test_a_run_killed_before_its_last_step_cannot_pass_the_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A kill/Ctrl-C between two steps (simulated by making the SECOND
+        `record_nightly_result` raise, as an interrupt would) leaves the
+        store holding only the first, passing row — which must read as
+        "the run did not finish", never as a pass."""
+        from coord.nightly_store import nightly_artifact_results_for_release_gate
+        from coord.release_gate import evaluate_release_gate
+
+        import coord.nightly_store as nightly_store
+
+        real_record = nightly_store.record_nightly_result
+        seen: list[str] = []
+
+        def _record_then_die(record) -> None:
+            if seen:
+                raise KeyboardInterrupt("operator hit Ctrl-C")
+            seen.append(record.step)
+            real_record(record)
+
+        monkeypatch.setattr(nightly_runner, "record_nightly_result", _record_then_die)
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        _write_spec(tmp_path)
+        with pytest.raises(KeyboardInterrupt):
+            run_nightly_smoke(
+                repo="vimcode", artifact="macos-dmg", spec="", config=_config(),
+                board=Board(), dry_run=False,
+                resolve_ref_sha_fn=lambda slug, ref: "deadbeef",
+                local_machine_name_fn=lambda cfg: "m1",
+                obtain_artifact_fn=lambda plan, *, config, workdir: ObtainedArtifact(
+                    cwd=str(tmp_path),
+                ),
+                run_driver_fn=lambda kind, run_command, cwd, **kw: DriverResult(
+                    exit_code=0,
+                    tests=[
+                        {"id": "launch", "status": "pass"},
+                        {"id": "menu", "status": "pass"},
+                    ],
+                ),
+                runner=_FakeRunner(), open_issues=[], closed_issues=[], now=1000.0,
+            )
+
+        results = nightly_artifact_results_for_release_gate("vimcode")
+        assert len(results) == 1
+        assert results[0].passed is False
+        assert "did not finish" in results[0].detail
+        verdict = evaluate_release_gate(
+            repo="vimcode", release_sha="deadbeef",
+            required_lanes=[], nightly_required=True,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
+        )
+        assert verdict.gate_passed is False
+
+
+class TestIoFailuresBecomeRunnerErrors:
+    """#3660 review: `git clone`/`build_command` raise
+    `subprocess.CalledProcessError`, `fetch_release_assets` raises `httpx`
+    errors, and `run_driver` raises `DriverError` — the CLI catches only
+    `NightlyRunnerError`, so an operator got a bare traceback instead of
+    the `exit 2` every other failure mode produces."""
+
+    def _call(self, tmp_path: Path, **overrides):
+        kwargs = dict(
+            repo="vimcode", artifact="macos-dmg", spec="", config=_config(),
+            board=Board(), dry_run=False,
+            resolve_ref_sha_fn=lambda slug, ref: "deadbeef",
+            local_machine_name_fn=lambda cfg: "m1",
+            obtain_artifact_fn=lambda plan, *, config, workdir: ObtainedArtifact(
+                cwd=str(tmp_path),
+            ),
+            run_driver_fn=lambda kind, run_command, cwd, **kw: DriverResult(
+                exit_code=0, tests=[{"id": "launch", "status": "pass"}],
+            ),
+            runner=_FakeRunner(), now=1000.0,
+        )
+        kwargs.update(overrides)
+        return run_nightly_smoke(**kwargs)
+
+    def test_a_failing_build_becomes_a_runner_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        _write_spec(tmp_path)
+
+        def _boom(plan, *, config, workdir):
+            raise subprocess.CalledProcessError(128, ["git", "clone"])
+
+        with pytest.raises(NightlyRunnerError, match="could not obtain"):
+            self._call(tmp_path, obtain_artifact_fn=_boom)
+
+    def test_a_driver_error_becomes_a_runner_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from coord.acceptance_drivers import DriverError
+
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        _write_spec(tmp_path)
+
+        def _boom(kind, run_command, cwd, **kw):
+            raise DriverError("timed out after 900s")
+
+        with pytest.raises(NightlyRunnerError, match="could not run"):
+            self._call(tmp_path, run_driver_fn=_boom)
 
 
 # ── _git_ref_for_plan: DOWNLOAD plans need the real `v`-prefixed tag ───────
@@ -665,26 +894,66 @@ class TestResolveBugbashLane:
         )
         client = _FakeHealthClient({})
 
-        gui_lane = _resolve_bugbash_lane(
+        gui_lane, gui_fallback = _resolve_bugbash_lane(
             config, "vimcode", gui_route, "dell64", http_client=client,
         )
+        assert gui_fallback == ""
         assert gui_lane.platform == "win-native:gui"
         assert gui_lane.setup == "cargo xwin build --bin vimcode"
         assert gui_lane.launch_command == "vimcode.exe"
 
-        terminal_lane = _resolve_bugbash_lane(
+        terminal_lane, terminal_fallback = _resolve_bugbash_lane(
             config, "vimcode", terminal_route, "dell64", http_client=client,
         )
+        assert terminal_fallback == ""
         assert terminal_lane.platform == "win-native:terminal"
         assert terminal_lane.launch_command == "vimcode-term.exe"
+
+    def test_a_host_other_than_discover_lanes_own_pick_still_matches_the_route(
+        self,
+    ) -> None:
+        """#3660 review round 2: the match must be keyed on the ROUTE, not
+        on the machine. `discover_lanes` picks the FIRST configured machine
+        claiming the capability (no pause/cordon filter), while
+        `pick_nightly_host` ranks idle-first and filters cordoned/paused
+        hosts — so the two routinely disagree, and keying on
+        `lane.machine == machine_name` silently fell through to the
+        hand-built lane whose bare `driver_kind` platform label IS the
+        #3615 dedupe collision."""
+        gui_route = AcceptanceDriverConfig(
+            kind="win-native", capability="windows", label="gui",
+            setup="cargo xwin build", run="vimcode.exe",
+        )
+        config = Config(
+            repos=[Repo(name="vimcode", github="acme/vimcode")],
+            # `_pick_lane_machine` will choose `dell64` (first configured);
+            # the nightly host picker chose the OTHER windows box.
+            machines=[
+                _machine("dell64", caps=["windows"]),
+                _machine("spare64", caps=["windows"]),
+            ],
+            acceptance=AcceptanceConfig(drivers={
+                "vimcode": AcceptanceDriverConfig(routes=[gui_route]),
+            }),
+        )
+        lane, fallback = _resolve_bugbash_lane(
+            config, "vimcode", gui_route, "spare64", http_client=_FakeHealthClient({}),
+        )
+        assert fallback == ""  # no silent fallback
+        assert lane.platform == "win-native:gui"  # not the bare "win-native"
+        assert lane.machine == "spare64"  # the host that actually ran it
+        assert lane.launch_command == "vimcode.exe"
 
     def test_falls_back_to_a_hand_built_lane_for_a_non_bugbash_driver_kind(self) -> None:
         """`cli-pytest` isn't one of `coord.bugbash.LANE_DRIVER_KINDS` —
         `discover_lanes` resolves nothing for it, so this must still
-        return a usable lane rather than crashing."""
+        return a usable lane rather than crashing — and must SAY it fell
+        back (#3660 review round 2) rather than doing it silently."""
         config = _config(kind="cli-pytest", capability="python")
         driver_cfg = config.acceptance.drivers["vimcode"]
-        lane = _resolve_bugbash_lane(config, "vimcode", driver_cfg, "m1")
+        lane, fallback = _resolve_bugbash_lane(config, "vimcode", driver_cfg, "m1")
         assert lane.platform == "cli-pytest"
         assert lane.driver_kind == "cli-pytest"
         assert lane.machine == "m1"
+        assert "hand-built lane" in fallback
+        assert "cli-pytest" in fallback

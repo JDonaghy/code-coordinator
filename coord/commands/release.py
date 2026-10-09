@@ -4850,6 +4850,10 @@ def _render_gate_verdict(verdict: "Any") -> str:
         '"unavailable"?}, ...]}. '
         '("unavailable": true marks an ENVIRONMENT condition — a locked or '
         "absent GUI session, a missing display — not an app bug, #3510.) "
+        "The two inputs are strictly EITHER/OR: when this flag is given, "
+        "the persisted nightly-smoke store is not consulted at all, so a "
+        "file listing only lanes reports 'no nightly result recorded' even "
+        "if the store holds one. "
         "Omit this flag to read the nightly step from the persisted "
         "nightly-smoke results store instead (#3660, `coord smoke nightly` "
         "writes it, coord.nightly_store reads it) — lanes/bugbash still "
@@ -4880,7 +4884,7 @@ def release_gate_cmd(
     config_path: Path,
     repo: str,
     release_sha: str,
-    from_json_path: Path,
+    from_json_path: Path | None,
     repo_path_opt: str | None,
     override_reason: str | None,
     as_json: bool,

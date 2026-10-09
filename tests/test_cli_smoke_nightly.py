@@ -46,6 +46,13 @@ def _coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
 
 
+def _patch_github(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("coord.commands.smoke._load_config", lambda path: _config())
+    monkeypatch.setattr("coord.board_service.read_board", lambda: Board())
+    monkeypatch.setattr("coord.github_ops.get_open_issues", lambda slug: [])
+    monkeypatch.setattr("coord.commands.smoke._fetch_closed_issues", lambda slug: [])
+
+
 def _config() -> Config:
     return Config(
         repos=[Repo(name="vimcode", github="acme/vimcode")],
@@ -147,15 +154,31 @@ class TestSmokeNightlyCli:
         assert "nightly smoke plan" in result.output
         assert captured["dry_run"] is True
 
-    def test_successful_run_exits_0_and_lists_outcomes(
-        self, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_clean_run_exits_0(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from coord.cli import main
 
-        monkeypatch.setattr("coord.commands.smoke._load_config", lambda path: _config())
-        monkeypatch.setattr("coord.board_service.read_board", lambda: Board())
-        monkeypatch.setattr("coord.github_ops.get_open_issues", lambda slug: [])
-        monkeypatch.setattr("coord.commands.smoke._fetch_closed_issues", lambda slug: [])
+        _patch_github(monkeypatch)
+        report = NightlyRunReport(
+            plan=_plan(), ran=True, sha="deadbeef",
+            outcomes=(_outcome(action="none"),),
+        )
+        monkeypatch.setattr(
+            "coord.nightly_runner.run_nightly_smoke", lambda **kwargs: report,
+        )
+        result = CliRunner().invoke(
+            main, ["smoke", "nightly", "--repo", "vimcode", "--artifact", "macos-dmg"],
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_observed_app_red_exits_3_and_lists_outcomes(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3660 review: "nightly ran clean" and "nightly ran and the app
+        is broken" must not share an exit code just because every red step
+        was successfully filed."""
+        from coord.cli import main
+
+        _patch_github(monkeypatch)
         report = NightlyRunReport(
             plan=_plan(), ran=True, sha="deadbeef",
             outcomes=(_outcome(action="filed"),),
@@ -166,9 +189,61 @@ class TestSmokeNightlyCli:
         result = CliRunner().invoke(
             main, ["smoke", "nightly", "--repo", "vimcode", "--artifact", "macos-dmg"],
         )
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 3, result.output
         assert "filed" in result.output
         assert "#99" in result.output
+
+    def test_an_unavailable_step_exits_2_and_never_reads_like_a_pass(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3566 / #3660 review round 2: a step the driver reported
+        `unavailable` (a locked/absent GUI session) printed `-> none`,
+        identical to a clean green, and exited 0."""
+        from coord.cli import main
+
+        _patch_github(monkeypatch)
+        report = NightlyRunReport(
+            plan=_plan(), ran=True, sha="deadbeef",
+            outcomes=(_outcome(action="none", step="menu"),),
+            unavailable_steps=("tests/smoke-spec/install.yaml::menu",),
+        )
+        monkeypatch.setattr(
+            "coord.nightly_runner.run_nightly_smoke", lambda **kwargs: report,
+        )
+        result = CliRunner().invoke(
+            main, ["smoke", "nightly", "--repo", "vimcode", "--artifact", "macos-dmg"],
+        )
+        assert result.exit_code == 2, result.output
+        assert "UNAVAILABLE" in result.output
+        assert "never ran" in result.output
+
+    def test_unavailable_and_lane_fallback_show_up_in_json(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import json
+
+        from coord.cli import main
+
+        _patch_github(monkeypatch)
+        report = NightlyRunReport(
+            plan=_plan(), ran=True, sha="deadbeef",
+            outcomes=(_outcome(action="none", step="menu"),),
+            unavailable_steps=("tests/smoke-spec/install.yaml::menu",),
+            lane_fallback="no coord-bugbash lane matches this route",
+        )
+        monkeypatch.setattr(
+            "coord.nightly_runner.run_nightly_smoke", lambda **kwargs: report,
+        )
+        result = CliRunner().invoke(
+            main,
+            ["smoke", "nightly", "--repo", "vimcode", "--artifact", "macos-dmg", "--json"],
+        )
+        assert result.exit_code == 2
+        payload = json.loads(result.output)
+        assert payload["any_unavailable"] is True
+        assert payload["unavailable_steps"] == ["tests/smoke-spec/install.yaml::menu"]
+        assert payload["outcomes"][0]["unavailable"] is True
+        assert "no coord-bugbash lane" in payload["lane_fallback"]
 
     def test_dropped_outcome_exits_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from coord.cli import main
