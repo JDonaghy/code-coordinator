@@ -1229,6 +1229,7 @@ def _make_win32_calls(user32, kernel32) -> Win32Calls:
     calls._kernel32 = kernel32
     calls._staged_session_dirs = {}  # #3617 — normally set by `__init__`
     calls._job_handles = {}  # #3634 — normally set by `__init__`
+    calls._pre_existing_wt_pids = {}  # #3663 — normally set by `__init__`
     calls.staging_warning = None  # #3617 — normally set by `__init__`
     calls.launched_appdata_dir = None  # #3650 — normally set by `__init__`
     return calls
@@ -2609,6 +2610,112 @@ class TestWin32CallsLocalStaging:
 
         assert 0xABCD in closed
         assert 4242 not in calls._job_handles
+
+
+class TestWindowsTerminalPreExistingHostProtection:
+    """#3663: ``launch_in_terminal(terminal_app="windows-terminal")`` runs
+    ``wt.exe``, which hands off to an ALREADY-RUNNING
+    ``WindowsTerminal.exe`` via COM instead of spawning a fresh one,
+    whenever one is already open — every window in every tab/pane across
+    every session on the box lives in that one shared process. These
+    tests build a fake process tree where a pre-existing
+    ``WindowsTerminal.exe`` pid LOOKS like an ordinary descendant of the
+    just-launched pid (the exact shape a COM hand-off, a reparent, or a
+    future process-tree-walk bug could produce) and confirm `kill`/
+    `find_top_window` protect it anyway, via the explicit pid set recorded
+    at launch time — not merely because today's tree topology happens to
+    keep it out of the walk."""
+
+    @staticmethod
+    def _patch_popen(monkeypatch, pid: int) -> None:
+        class _FakeProc:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+        monkeypatch.setattr(
+            "coord.win_native_driver.subprocess.Popen",
+            lambda *_args, **_kwargs: _FakeProc(pid),
+        )
+
+    def test_launch_in_terminal_records_pre_existing_wt_pids(self, monkeypatch) -> None:
+        launcher_pid, pre_existing_wt_pid = 10, 20
+        kernel32 = _FakeKernel32ProcessTree([
+            (pre_existing_wt_pid, 1, b"WindowsTerminal.exe"),
+        ])
+        calls = _make_win32_calls(_FakeUser32(), kernel32)
+        self._patch_popen(monkeypatch, launcher_pid)
+
+        pid = calls.launch_in_terminal("vimcode.exe", "/cwd", "windows-terminal")
+
+        assert pid == launcher_pid
+        assert calls._pre_existing_wt_pids[launcher_pid] == {pre_existing_wt_pid}
+
+    def test_non_windows_terminal_launch_records_no_protected_pids(self, monkeypatch) -> None:
+        kernel32 = _FakeKernel32ProcessTree([(10, 1, b"vimcode.exe")])
+        calls = _make_win32_calls(_FakeUser32(), kernel32)
+        self._patch_popen(monkeypatch, 10)
+
+        pid = calls.launch_in_terminal("vimcode.exe", "/cwd", "conhost")
+
+        assert pid not in calls._pre_existing_wt_pids
+
+    def test_kill_never_terminates_a_pre_existing_windows_terminal_host(
+        self, monkeypatch,
+    ) -> None:
+        launcher_pid, pre_existing_wt_pid, real_descendant_pid = 10, 20, 30
+        terminated: list[int] = []
+
+        class _TrackingKernel32(_FakeKernel32ProcessTree):
+            def OpenProcess(self, _access, _inherit, pid):
+                return pid  # any non-zero/-1 "handle"
+
+            def TerminateProcess(self, handle, _exit_code) -> None:
+                terminated.append(handle)
+
+        kernel32 = _TrackingKernel32([
+            (1, 0, b"System"),
+            # Pre-existing WindowsTerminal.exe — already running BEFORE
+            # `launch_in_terminal` is ever called, but its listed parent
+            # happens to be the pid about to be launched, simulating a
+            # reparent/COM-hand-off-shaped false positive in the live
+            # descendant-process walk `kill` would otherwise trust blindly.
+            (pre_existing_wt_pid, launcher_pid, b"WindowsTerminal.exe"),
+            (real_descendant_pid, launcher_pid, b"cmd.exe"),
+        ])
+        calls = _make_win32_calls(_FakeUser32(), kernel32)
+        self._patch_popen(monkeypatch, launcher_pid)
+
+        returned_pid = calls.launch_in_terminal("vimcode.exe", "/cwd", "windows-terminal")
+        assert returned_pid == launcher_pid
+        assert calls._pre_existing_wt_pids[launcher_pid] == {pre_existing_wt_pid}
+
+        calls.kill(launcher_pid)
+
+        assert pre_existing_wt_pid not in terminated
+        assert set(terminated) == {launcher_pid, real_descendant_pid}
+        # The recorded set is consumed (popped) by `kill`, same discipline
+        # as `_staged_session_dirs`/`_job_handles`.
+        assert launcher_pid not in calls._pre_existing_wt_pids
+
+    def test_find_top_window_ignores_a_pre_existing_windows_terminal_host(
+        self, monkeypatch,
+    ) -> None:
+        launcher_pid, pre_existing_wt_pid = 10, 20
+        kernel32 = _FakeKernel32ProcessTree([
+            (pre_existing_wt_pid, launcher_pid, b"WindowsTerminal.exe"),
+        ])
+        # The ONLY visible window on the whole desktop belongs to the
+        # pre-existing host — if it weren't excluded, `find_top_window`
+        # would wrongly treat the operator's own window as the one this
+        # driver just launched.
+        user32 = _FakeUser32Windows({42: (pre_existing_wt_pid, True)})
+        calls = _make_win32_calls(user32, kernel32)
+        self._patch_popen(monkeypatch, launcher_pid)
+
+        calls.launch_in_terminal("vimcode.exe", "/cwd", "windows-terminal")
+
+        with pytest.raises(WinNativeRuntimeError, match="no visible top-level window"):
+            calls.find_top_window(launcher_pid, timeout_s=0.05)
 
 
 class TestLaunchRealPlanStagingEndToEnd:

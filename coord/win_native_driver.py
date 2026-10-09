@@ -51,6 +51,23 @@ operator's own work, not just this driver's child. See
 ``test_no_image_name_kill_path_exists_in_the_module`` — a source-level
 regression guard, not just a behavioral one.
 
+**Safety: a PID-based kill still is not enough for ``windows-terminal``
+(#3663).** Even with the by-PID discipline above, ``launch_in_terminal``'s
+``wt.exe {command}`` hands off to an ALREADY-RUNNING ``WindowsTerminal.exe``
+via COM instead of spawning a fresh one, whenever one is already open —
+every window of every tab/pane across every session on the box lives in
+that SAME single process. If this driver's own ``wt.exe`` call is the one
+that starts the first ``WindowsTerminal.exe`` instance, that process is a
+genuine (if indirect) descendant of the pid `launch_in_terminal` returned —
+so a later `kill()` call's own descendant-process walk would, by the
+ordinary rules, be entitled to terminate it. :meth:`Win32Calls.
+launch_in_terminal` therefore snapshots every ``WindowsTerminal.exe`` pid
+already running the instant it is called (before spawning anything) and
+:meth:`Win32Calls.kill`/:meth:`Win32Calls.find_top_window` both subtract
+that recorded set unconditionally — a pre-existing host is a process this
+driver never launched, and must never be torn down (or mistaken for the
+window being waited on) no matter what the live process-tree walk returns.
+
 **UNC ``cwd`` (#3543).** A WSL-hosted agent's repo worktree translates
 (``coord.win_native_bridge.translate_to_windows_path``) to a UNC path
 (``\\wsl.localhost\\Ubuntu-24.04\\...``) — the normal case for dell64, this
@@ -2065,6 +2082,20 @@ class Win32Calls:
         #: `kill` pops and closes this FIRST, before its own
         #: `_descendant_pids` walk/`TerminateProcess` backstop.
         self._job_handles: dict[int, int] = {}
+        #: #3663: pid -> the set of ``WindowsTerminal.exe`` pids that were
+        #: ALREADY RUNNING, before `launch_in_terminal` ever spawned
+        #: anything, the moment a ``terminal_app="windows-terminal"``
+        #: launch started (empty for every other launch). ``wt.exe`` hands
+        #: off to an already-running ``WindowsTerminal.exe`` via COM rather
+        #: than spawning a fresh one — when that happens, the shared host
+        #: process predates this launch and must never be torn down by
+        #: this driver's own teardown, no matter what the live
+        #: `_descendant_pids` walk says at `kill` time (a future process-
+        #: tree change — Windows reparenting, or the walk itself drifting —
+        #: must not silently make that possible again). See `kill` and
+        #: `find_top_window`, which both subtract this set from whatever
+        #: pids they'd otherwise treat as "ours".
+        self._pre_existing_wt_pids: dict[int, frozenset[int]] = {}
         #: #3617 review: non-``None`` after `_stage_if_needed` skipped
         #: staging for a UNC `cwd` (as opposed to the common, unremarkable
         #: case of a same-host, already-local `cwd` where staging never
@@ -2142,13 +2173,27 @@ class Win32Calls:
         create_new_console = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         if terminal_app == "windows-terminal":
             full_command = f"wt.exe {command}"
+            # #3663: snapshot BEFORE spawning — `wt.exe` hands off to an
+            # already-running `WindowsTerminal.exe` via COM rather than
+            # spawning a fresh one, so any such process already exists at
+            # this exact point or not at all. Recording it now (keyed by
+            # the pid about to be returned) lets `kill`/`find_top_window`
+            # refuse to ever touch it, regardless of whether it later
+            # shows up in this pid's own descendant-process walk.
+            pre_existing_wt_pids = frozenset(
+                pid for pid, _ppid, name in self._snapshot_processes()
+                if name.lower() == "windowsterminal.exe"
+            )
         else:
             full_command = command
+            pre_existing_wt_pids = frozenset()
         full_command, popen_cwd = _popen_command_and_cwd(full_command, cwd)
         proc = subprocess.Popen(
             full_command, shell=True, cwd=popen_cwd, creationflags=create_new_console,
             env=_isolated_env(appdata_dir), **_NO_HANDLE_INHERITANCE,
         )
+        if terminal_app == "windows-terminal":
+            self._pre_existing_wt_pids[proc.pid] = pre_existing_wt_pids
         if staged_dir is not None:
             self._staged_session_dirs[proc.pid] = staged_dir
         self.launched_appdata_dir = appdata_dir
@@ -2223,12 +2268,27 @@ class Win32Calls:
         # anywhere in this class.
         PROCESS_TERMINATE = 0x0001
         staged_dir = self._staged_session_dirs.pop(pid, None)
+        # #3663: whatever `WindowsTerminal.exe` process(es) already
+        # existed BEFORE this *pid*'s own `launch_in_terminal` call —
+        # never terminated below, no matter what the live
+        # `_descendant_pids` walk returns. `wt.exe` hands off to an
+        # already-running host via COM rather than spawning a fresh one,
+        # so a pre-existing host is a process this driver never launched
+        # and must never tear down, even if some future process-tree
+        # quirk (reparenting, pid reuse) made the walk below mistake it
+        # for one of *pid*'s own descendants.
+        protected_wt_pids = self._pre_existing_wt_pids.pop(pid, frozenset())
         # #3634: close OUR last handle to *pid*'s KILL_ON_JOB_CLOSE Job
         # Object FIRST, if one was successfully assigned at launch time —
         # this alone tears down the WHOLE descendant tree (including a
         # `cmd.exe /c` grandchild, #3542) regardless of whether this
         # process can still see/walk it. See
-        # `_assign_kill_on_close_job`'s docstring.
+        # `_assign_kill_on_close_job`'s docstring. Not a hazard for
+        # *protected_wt_pids*: `AssignProcessToJobObject` was only ever
+        # called on *pid* itself at launch time (see
+        # `_assign_kill_on_close_job`), and a pre-existing external
+        # process reached via COM hand-off — rather than spawned as a
+        # child of *pid* after assignment — never joins that job.
         job = self._job_handles.pop(pid, None)
         if job is not None:
             self._kernel32.CloseHandle(job)
@@ -2241,7 +2301,9 @@ class Win32Calls:
         # Redundant with the Job Object close above whenever that
         # succeeded, but it's the ONLY teardown on a host/fake where job
         # assignment was unavailable, so it always runs regardless.
-        targets = self._descendant_pids(pid)
+        #
+        # #3663: *protected_wt_pids* subtracted unconditionally — see above.
+        targets = self._descendant_pids(pid) - protected_wt_pids
         for target in targets:
             handle = self._kernel32.OpenProcess(PROCESS_TERMINATE, False, target)
             if handle:
@@ -2573,8 +2635,16 @@ class Win32Calls:
                 return False
             return True
 
+        # #3663: never treat a pre-existing `WindowsTerminal.exe` host
+        # (recorded by `launch_in_terminal` BEFORE this *pid* ever existed)
+        # as a candidate — it's reached via COM hand-off, not spawned as
+        # our descendant, but excluding it here too means a window this
+        # driver never launched (quite possibly the operator's own) can
+        # never be mistaken for the one we're waiting on, regardless of
+        # what the live `_descendant_pids` walk returns.
+        protected_wt_pids = self._pre_existing_wt_pids.get(pid, frozenset())
         while time.monotonic() < deadline:
-            candidate_pids = self._descendant_pids(pid)
+            candidate_pids = self._descendant_pids(pid) - protected_wt_pids
             found.clear()
             self._user32.EnumWindows(_enum_proc, 0)
             if found:

@@ -4814,6 +4814,110 @@ def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | N
     return None
 
 
+# #3663: a dell64 worker running a vimcode#1833 manual Windows Terminal
+# repro "cleaned up" between attempts with
+#   Get-Process | Where-Object {$_.ProcessName -match "vcd|WindowsTerminal"} \
+#     | Stop-Process -Force -ErrorAction SilentlyContinue
+# — run roughly 40 times, with `taskkill /IM .../F` and a couple of
+# `OpenConsole` matches alongside it. Windows Terminal (and OpenConsole)
+# hosts every window of every tab/pane of EVERY session on the box in a
+# SINGLE process, so killing it by image/executable name takes down every
+# terminal window on the shared desktop, including the user's own
+# interactive session — dell64 is a desk machine the user actually uses,
+# not a headless box. Killing a PID this worker itself launched is always
+# fine; only the forms below, which cannot distinguish "a process I
+# launched" from "every process with this name", are refused.
+#
+# Written as bare glob FRAGMENTS (no anchoring, no ``Bash(...)`` wrapper)
+# rather than the verb-first ``Bash(git push --force *)`` shape the rest of
+# this module's deny lists use, because the hazard here is a command that
+# MENTIONS these tokens anywhere in a longer pipeline/subshell
+# (``powershell.exe -NoProfile -Command 'Get-Process | ... | Stop-Process
+# ...'``), not one whose single verb+flag starts the string. Matched
+# CASE-INSENSITIVELY (see :func:`is_windows_image_name_kill`) — unlike
+# every other pattern in this module, which targets a case-sensitive POSIX
+# shell, these target PowerShell/``cmd.exe``, where ``Stop-Process``,
+# ``stop-process``, and ``STOP-PROCESS`` invoke the identical cmdlet.
+WINDOWS_IMAGE_NAME_KILL_PATTERNS: tuple[str, ...] = (
+    # PowerShell: Stop-Process fed from a Get-Process pipeline — kills
+    # every process matching whatever the pipeline selected, not one PID.
+    "*get-process*stop-process*",
+    # PowerShell: Stop-Process invoked directly by name (also an
+    # image-name kill, even with no upstream Get-Process pipeline).
+    "*stop-process*-name*",
+    "*stop-process*-processname*",
+    # taskkill /IM <image> kills every process with that executable name;
+    # taskkill /PID <pid> targets one process and stays allowed.
+    "*taskkill*/im*",
+    # pkill/killall reaching a Windows .exe via WSL/Cygwin/MSYS interop.
+    "*pkill*.exe*",
+    "*killall*.exe*",
+    # WMIC's SQL-ish "kill every process with this name" form.
+    "*wmic*process*where*name=*",
+)
+
+#: ``Bash(...)``-wrapped form of :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`,
+#: for the exact same soft-prompt (:func:`build_deny_prompt`) and
+#: ``--disallowedTools`` wiring every other deny list in this module gets.
+#: Single source of truth with :func:`is_windows_image_name_kill`: both
+#: derive from the same pattern tuple, so the "what does the hook refuse"
+#: question has exactly one answer regardless of which layer asks it.
+WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS: list[str] = [
+    f"Bash({pattern})" for pattern in WINDOWS_IMAGE_NAME_KILL_PATTERNS
+]
+
+
+def is_windows_image_name_kill(command: str) -> bool:
+    """Whether *command* kills a Windows process by image/executable name
+    rather than by PID (#3663).
+
+    Matched case-insensitively (see :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`'s
+    docstring for why) via the same whole-string glob semantics
+    :func:`bash_deny_pattern_matches` uses elsewhere in this module —
+    ``*`` matches any run of characters, including none and including
+    across argv token boundaries, so a pattern like
+    ``*get-process*stop-process*`` matches as long as both substrings
+    appear anywhere, in order, regardless of what sits between or around
+    them (a ``Where-Object`` filter, quoting, a ``powershell.exe
+    -NoProfile -Command`` wrapper, ...).
+
+    ``Stop-Process -Id 1234`` and ``taskkill /PID 1234`` — killing a PID
+    this worker itself launched — are never matched by any pattern here.
+    """
+    lowered = command.strip().lower()
+    return any(
+        fnmatch.fnmatchcase(lowered, pattern)
+        for pattern in WINDOWS_IMAGE_NAME_KILL_PATTERNS
+    )
+
+
+def deny_commands_for_machine(
+    base_deny_commands: list[str], machine_capabilities: list[str],
+) -> list[str]:
+    """*base_deny_commands* (the repo's own ``worker_permissions.deny``,
+    usually :data:`coord.config.DEFAULT_DENY_COMMANDS`) plus
+    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` when *machine_capabilities*
+    declares ``"windows"`` (#3663) — a shared desktop like dell64 where an
+    image-name kill can take down the operator's own Windows Terminal
+    window, not just this worker's own.
+
+    **Single source of truth** (epic #2096's "one question, one answer"):
+    :meth:`coord.dispatch.dispatch` calls this ONE function to decide what
+    a given dispatch's ``deny_commands`` are — there is no second,
+    independently-maintained copy of "does this machine need the Windows
+    guard" anywhere else. A machine without ``"windows"`` gets
+    *base_deny_commands* back unchanged (a plain repo with no
+    `worker_permissions.deny` override still sees byte-identical behavior
+    to before this function existed).
+    """
+    deny = list(base_deny_commands)
+    if "windows" in machine_capabilities:
+        for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+            if pattern not in deny:
+                deny.append(pattern)
+    return deny
+
+
 # #1315: sealed-oracle path prefix that only an independent authoring type
 # (``"mock-author"``/a future ``"test-author"``) may ever write to
 # (docs/ORACLE_LOOP.md sealing v1). ``coord.dispatch.dispatch`` already
@@ -5217,6 +5321,16 @@ def worker_disallowed_tools(spec: AssignmentSpec, allowed_tools: str) -> list[st
     4. #2461 ``REVIEW_DENY_COMMANDS`` — only for ``spec.type ==
        "review"``, wiring the mutating-command deny list into the
        CLI-enforced flag and not just the soft prompt reminder.
+    5. #3663 ``WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`` — whichever of
+       those patterns are already present in ``spec.deny_commands`` (set
+       by :func:`deny_commands_for_machine` at dispatch time, when the
+       target machine declares the ``windows`` capability), promoted from
+       the soft prompt reminder every spec type already gets via
+       ``build_deny_prompt(spec.deny_commands)`` to the same CLI-enforced
+       flag — a prompt rule alone was proven insufficient (the dell64
+       worker this guard exists for ran the forbidden command ~40 times
+       with that exact FORBIDDEN COMMANDS section already in its system
+       prompt).
 
     Args:
         spec: The assignment being dispatched.
@@ -5259,6 +5373,13 @@ def worker_disallowed_tools(spec: AssignmentSpec, allowed_tools: str) -> list[st
         for pattern in REVIEW_DENY_COMMANDS:
             if pattern not in disallowed_tools:
                 disallowed_tools.append(pattern)
+    # #3663: hard-enforce the Windows image-name-kill guard too, for any
+    # spec type — it's only ever present in spec.deny_commands when
+    # deny_commands_for_machine added it for a `windows`-capable target,
+    # so this is a no-op for every other dispatch.
+    for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+        if pattern in spec.deny_commands and pattern not in disallowed_tools:
+            disallowed_tools.append(pattern)
     return disallowed_tools
 
 
