@@ -4800,18 +4800,31 @@ def bash_deny_pattern_matches(pattern: str, command: str) -> bool:
     (e.g. an ``Edit(...)``/``Write(...)`` path rule) — those constrain a
     different tool and never match a shell command string.
 
-    **Case sensitivity (#3663).** Matching is case-sensitive by default,
-    mirroring the POSIX shells almost every pattern in this module targets.
-    The one exception is :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`:
-    those patterns target PowerShell/``cmd.exe``, case-insensitive shells
-    where ``Stop-Process``, ``stop-process``, and ``STOP-PROCESS`` invoke
-    the identical cmdlet, so a *pattern* that is a member of that list is
-    matched case-insensitively instead. This is the ONLY place that
-    carve-out is implemented — :func:`find_denying_bash_pattern` and every
-    caller of it (including the FORBIDDEN-COMMANDS prompt text and
-    ``--disallowedTools``) inherit it automatically, so there is no second
-    copy of "is this command an image-name kill" with its own, possibly
-    different, matching semantics anywhere else in this module.
+    **Case sensitivity (#3663, corrected in review round 2).** Matching is
+    case-sensitive by default, mirroring the POSIX shells almost every
+    pattern in this module targets. A *pattern* that is a member of
+    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` gets an extra lowering
+    step here, as a convenience for this module's own tests (PowerShell/
+    ``cmd.exe`` are case-insensitive shells, so ``Stop-Process``,
+    ``stop-process`` and ``STOP-PROCESS`` really are the identical cmdlet
+    invocation, and this lets a test assert that equivalence directly
+    instead of hand-maintaining every cased spelling).
+
+    **That lowering is local to this function and is NOT what makes the
+    Windows guard case-proof in production.** ``--disallowedTools``
+    (:func:`worker_disallowed_tools`) and the FORBIDDEN-COMMANDS prompt
+    text (:func:`build_deny_prompt`) both consume the raw
+    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` pattern *strings*
+    verbatim — neither calls this function, so neither can inherit
+    anything it does. The Claude CLI's own permission matcher is the
+    actual enforcement surface for both, and this module has no way to
+    make that matcher case-insensitive from here. Case-robustness for
+    those two surfaces comes entirely from
+    :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS` shipping explicit cased
+    duplicates of each fragment (lowercase, PascalCase, UPPERCASE) — see
+    that tuple's comment. Round 1 of this fix claimed the opposite (that
+    this lowering "inherited automatically" into those two surfaces);
+    that was false and is corrected here.
     """
     if not (pattern.startswith("Bash(") and pattern.endswith(")")):
         return False
