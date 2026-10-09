@@ -4817,6 +4817,62 @@ def test_dispatch_pending_smoke_liveness_refusal_still_fills_empty_verdict(
     assert load_assignment_test_state(row.assignment_id) == "skipped"
 
 
+# ── #3658: `dispatch_smoke`'s DIRECT-call path (no `issue_liveness_fetcher`
+# wired at all — the shape `coord.reconcile`'s per-item loop used before it
+# was routed through `dispatch_pending_smoke`, and any other future direct
+# caller) must refuse against an already-closed issue / already-merged
+# branch exactly like `dispatch_pending_smoke`'s own opt-in pre-check does.
+# These pin `_gate_already_terminal_work`, the unconditional backstop added
+# inside `_dispatch_smoke_legs` itself so this can never again depend on a
+# caller remembering to thread a fetcher through. ──
+
+
+def test_dispatch_smoke_direct_call_refuses_when_issue_already_closed(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    from coord.state import _record_dispatched_assignment_local, load_assignment_test_state
+
+    monkeypatch.setattr(
+        "coord.github_ops.work_is_terminal", lambda *a, **k: True,
+    )
+
+    row = replace(_completed(), assignment_id="direct-closed-1")
+    _record_dispatched_assignment_local(assignment=row, repo_github="acme/api")
+    client = _FakeClient({"id": "x"})
+
+    result = dispatch_smoke(
+        row, Board(completed=[row]), gtk_and_server_config,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["docs/README.md"],
+    )
+
+    assert result is None
+    assert client.calls == [], (
+        "a terminal issue/branch must never reach the candidate-walking "
+        "POST /assign step (#3658)"
+    )
+    assert load_assignment_test_state(row.assignment_id) == "skipped"
+
+
+def test_dispatch_smoke_direct_call_dispatches_when_not_terminal(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """Control for the test above: the #3658 backstop (`coord.github_ops.
+    work_is_terminal` returning False, the autouse `_non_terminal_work`
+    default) must not change ordinary direct-call dispatch at all."""
+    client = _FakeClient({"id": "x"})
+
+    result = dispatch_smoke(
+        _completed(), Board(), gtk_and_server_config,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["docs/README.md"],
+    )
+
+    assert result is not None
+    assert result.type == "smoke"
+    assert len(client.calls) == 1
+
+
 def test_dispatch_pending_smoke_skips_row_verdicted_after_the_scan_snapshot(
     gtk_and_server_config: Config, monkeypatch,
 ) -> None:

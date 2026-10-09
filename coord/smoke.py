@@ -2486,6 +2486,98 @@ def _gate_zero_commit_branch(completed: Assignment, config: Config) -> bool:
     return True
 
 
+def _gate_already_terminal_work(completed: Assignment, config: Config) -> bool:
+    """#3658: refuse to dispatch — or re-dispatch — a Test leg for a work
+    row whose issue has already closed or whose branch has already merged
+    on GitHub.
+
+    This calls :func:`coord.github_ops.work_is_terminal` — the SAME #522
+    chokepoint :func:`coord.review.dispatch_review` /
+    :func:`coord.review.dispatch_scoped_review` already gate every review
+    dispatch on, live and unconditionally — from :func:`_dispatch_smoke_legs`
+    itself, the ONE function every smoke dispatch path funnels through
+    (:func:`dispatch_smoke`'s direct call AND :func:`dispatch_pending_smoke`'s
+    bulk scan both reach every leg here). Before this, the Test stage's
+    equivalent liveness check (#3375/#3376) existed only as
+    `dispatch_pending_smoke`'s own OPTIONAL `issue_liveness_fetcher`
+    parameter — wired by its two production callers
+    (`coord.reconcile.reconcile`, `coord.notify._dispatch_board_pending_
+    smoke`) but invisible to `dispatch_smoke`'s direct-call path and to any
+    future caller that reaches this function without threading that
+    parameter through. #3658: exactly that gap let a review leg AND a smoke
+    leg dispatch against quadraui#1353 after its PR had already merged and
+    the issue had already closed, holding the repo's only drive slot.
+
+    Live and unconditional, matching `dispatch_review`'s own posture for the
+    identical question — not opt-in like `issue_liveness_fetcher` — so a
+    caller that reaches this function always gets the check, with no
+    parameter to forget to wire. Runs as a backstop ALONGSIDE (not instead
+    of) `dispatch_pending_smoke`'s own pre-check: the two can disagree on
+    phrasing but never on verdict, since both ultimately answer "is this
+    issue closed / has this branch merged" from a live GitHub read.
+
+    On a hit, records a `skipped` Test verdict — UNLESS the row already
+    carries a real terminal verdict (`passed`/`failed`/`blocked`), which is
+    left untouched (see `dispatch_pending_smoke`'s own #3416 comment for why
+    overwriting a real verdict with `skipped` would destroy evidence a suite
+    was ever run, or launder a gate-blocking `failed` into a
+    gate-satisfying `skipped`). Returns ``True`` so the caller stops before
+    any candidate machine is ever walked.
+    """
+    from coord.models import trust_issue_closed_for  # noqa: PLC0415
+
+    repo = config.repo(completed.repo_name)
+    if repo is None:
+        return False
+    if not github_ops.work_is_terminal(
+        repo.github,
+        completed.issue_number,
+        completed.branch,
+        trust_issue_closed=trust_issue_closed_for(completed.type),
+    ):
+        return False
+
+    reason = (
+        f"Test stage refused: issue #{completed.issue_number} is already "
+        f"closed, or branch {completed.branch!r}'s PR has already merged "
+        "on GitHub — dispatching now cannot matter (#3658, mirrors #522)."
+    )
+    logger.info(
+        "_dispatch_smoke_legs: %s#%s row %s — %s", completed.repo_name,
+        completed.issue_number, completed.assignment_id, reason,
+    )
+    if completed.assignment_id is None:
+        return True
+    try:
+        from coord.state import (  # noqa: PLC0415
+            load_assignment_test_state,
+            record_test_verdict,
+        )
+
+        current_state = load_assignment_test_state(completed.assignment_id)
+        if current_state is None:
+            record_test_verdict(
+                assignment_id=completed.assignment_id,
+                test_state="skipped",
+                test_reason=reason,
+            )
+            completed.test_state = "skipped"
+        else:
+            logger.info(
+                "_dispatch_smoke_legs: %s#%s row %s already carries a "
+                "terminal test_state=%r — the #3658 liveness refusal is "
+                "logged only and leaves it untouched.",
+                completed.repo_name, completed.issue_number,
+                completed.assignment_id, current_state,
+            )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "_dispatch_smoke_legs: failed to record the #3658 liveness "
+            "Test verdict for %s", completed.assignment_id,
+        )
+    return True
+
+
 def _dispatch_smoke_legs(
     completed: Assignment,
     board: Board,
@@ -2519,6 +2611,14 @@ def _dispatch_smoke_legs(
         return []
 
     if _gate_zero_commit_branch(completed, config):
+        return []
+
+    # #3658: the SAME terminal-work check `dispatch_review`/`dispatch_scoped_
+    # review` already apply unconditionally, now applied here too — see
+    # `_gate_already_terminal_work`'s docstring for why this cannot be left
+    # to an opt-in parameter the way `dispatch_pending_smoke`'s own #3375
+    # pre-check is.
+    if _gate_already_terminal_work(completed, config):
         return []
 
     # #1819: a row that a LATER work-like row superseded on the same branch is
