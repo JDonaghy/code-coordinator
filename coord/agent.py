@@ -953,7 +953,12 @@ class AssignmentSpec:
     system_prompt: str | None = None
     # PR number being reviewed (only set for type="review").
     review_target: str | None = None
-    # Command patterns the worker must not run (prompt-level enforcement).
+    # Command patterns the worker must not run. Soft-enforced via the
+    # FORBIDDEN COMMANDS prompt text (`build_deny_prompt`) for every entry,
+    # and ALSO CLI-enforced via `--disallowedTools` for the `review`-type
+    # subset (`REVIEW_DENY_COMMANDS`, #2461) and the Windows image-name-kill
+    # subset (`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`, #3663) — see
+    # `worker_disallowed_tools`.
     deny_commands: list[str] = field(default_factory=list)
     # Claude model tier alias (e.g. "haiku", "sonnet", "opus"). When None,
     # the worker command omits --model so claude -p picks its default.
@@ -4794,11 +4799,27 @@ def bash_deny_pattern_matches(pattern: str, command: str) -> bool:
     Returns ``False`` for a *pattern* that isn't a ``Bash(...)`` rule at all
     (e.g. an ``Edit(...)``/``Write(...)`` path rule) — those constrain a
     different tool and never match a shell command string.
+
+    **Case sensitivity (#3663).** Matching is case-sensitive by default,
+    mirroring the POSIX shells almost every pattern in this module targets.
+    The one exception is :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`:
+    those patterns target PowerShell/``cmd.exe``, case-insensitive shells
+    where ``Stop-Process``, ``stop-process``, and ``STOP-PROCESS`` invoke
+    the identical cmdlet, so a *pattern* that is a member of that list is
+    matched case-insensitively instead. This is the ONLY place that
+    carve-out is implemented — :func:`find_denying_bash_pattern` and every
+    caller of it (including the FORBIDDEN-COMMANDS prompt text and
+    ``--disallowedTools``) inherit it automatically, so there is no second
+    copy of "is this command an image-name kill" with its own, possibly
+    different, matching semantics anywhere else in this module.
     """
     if not (pattern.startswith("Bash(") and pattern.endswith(")")):
         return False
     inner = pattern[5:-1]
-    return fnmatch.fnmatchcase(command.strip(), inner)
+    command = command.strip()
+    if pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+        return fnmatch.fnmatchcase(command.lower(), inner.lower())
+    return fnmatch.fnmatchcase(command, inner)
 
 
 def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | None:
@@ -4833,11 +4854,30 @@ def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | N
 # this module's deny lists use, because the hazard here is a command that
 # MENTIONS these tokens anywhere in a longer pipeline/subshell
 # (``powershell.exe -NoProfile -Command 'Get-Process | ... | Stop-Process
-# ...'``), not one whose single verb+flag starts the string. Matched
-# CASE-INSENSITIVELY (see :func:`is_windows_image_name_kill`) — unlike
-# every other pattern in this module, which targets a case-sensitive POSIX
-# shell, these target PowerShell/``cmd.exe``, where ``Stop-Process``,
-# ``stop-process``, and ``STOP-PROCESS`` invoke the identical cmdlet.
+# ...'``), not one whose single verb+flag starts the string. Written here in
+# lowercase canonical form, but matched CASE-INSENSITIVELY by
+# :func:`bash_deny_pattern_matches` (the one function that actually enforces
+# them — see its docstring) — unlike every other pattern in this module,
+# which targets a case-sensitive POSIX shell, these target PowerShell/
+# ``cmd.exe``, where ``Stop-Process``, ``stop-process``, and ``STOP-PROCESS``
+# invoke the identical cmdlet, and a worker's own commands in the wild
+# (including the dell64 repro above) are PascalCase, not lowercase.
+#
+# Porosity (not closed by this pattern set — the briefing note
+# (`WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE` in coord/dispatch.py) is doing
+# real work here, not just belt-and-suspenders): a split across two tool
+# calls (`$p = Get-Process ...` then `$p | Stop-Process` in a later
+# command), `Stop-Process -InputObject (Get-Process WindowsTerminal)`
+# (stop-before-get, so neither substring-order pattern below fires),
+# `(Get-Process wt).Kill()`/`Get-Process wt | %{$_.Kill()}`, and
+# `taskkill /F /FI "IMAGENAME eq WindowsTerminal.exe"` (the `/FI` filter
+# form rather than `/IM`) all still escape it.
+#
+# False-positive risk: `*get-process*stop-process*` / `*stop-process*
+# -name*` also catch a worker `grep`/`rg`-ing for those identifiers, or
+# writing a fixture/heredoc containing them (e.g. a worker editing this
+# very guard). That fails closed, which is the right direction, but is
+# worth recognizing if a refusal looks surprising.
 WINDOWS_IMAGE_NAME_KILL_PATTERNS: tuple[str, ...] = (
     # PowerShell: Stop-Process fed from a Get-Process pipeline — kills
     # every process matching whatever the pipeline selected, not one PID.
@@ -4859,36 +4899,55 @@ WINDOWS_IMAGE_NAME_KILL_PATTERNS: tuple[str, ...] = (
 #: ``Bash(...)``-wrapped form of :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`,
 #: for the exact same soft-prompt (:func:`build_deny_prompt`) and
 #: ``--disallowedTools`` wiring every other deny list in this module gets.
-#: Single source of truth with :func:`is_windows_image_name_kill`: both
-#: derive from the same pattern tuple, so the "what does the hook refuse"
-#: question has exactly one answer regardless of which layer asks it.
+#:
+#: **Single source of truth, verified at the actual enforcement surface.**
+#: There is exactly one matcher in this module —
+#: :func:`bash_deny_pattern_matches` (and :func:`find_denying_bash_pattern`,
+#: a thin fold over it) — and it is what ``--disallowedTools``,
+#: :func:`build_deny_prompt`'s FORBIDDEN COMMANDS text, and
+#: ``tests/test_worker_safety.py``'s acceptance tests all key off of. There
+#: used to be a second helper (``is_windows_image_name_kill``) that
+#: lowercased its input before matching; it had no production caller, and
+#: its tests passed while the patterns above — matched case-sensitively, as
+#: every other pattern in this module is — silently failed to catch the
+#: issue's own PascalCase acceptance commands. It has been removed rather
+#: than fixed in place, so "what does the hook refuse" has exactly one
+#: answer, checked by exercising this exact list through
+#: :func:`find_denying_bash_pattern` (see
+#: ``TestWindowsImageNameKillGuard`` in ``tests/test_worker_safety.py``).
 WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS: list[str] = [
     f"Bash({pattern})" for pattern in WINDOWS_IMAGE_NAME_KILL_PATTERNS
 ]
 
 
-def is_windows_image_name_kill(command: str) -> bool:
-    """Whether *command* kills a Windows process by image/executable name
-    rather than by PID (#3663).
+def is_shared_windows_desktop(capabilities: list[str]) -> bool:
+    """Whether a machine declaring *capabilities* needs the #3663
+    shared-desktop treatment — the Windows image-name-kill guard
+    (:func:`deny_commands_for_machine`) and the matching briefing note
+    (``WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE`` in :mod:`coord.dispatch`).
 
-    Matched case-insensitively (see :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`'s
-    docstring for why) via the same whole-string glob semantics
-    :func:`bash_deny_pattern_matches` uses elsewhere in this module —
-    ``*`` matches any run of characters, including none and including
-    across argv token boundaries, so a pattern like
-    ``*get-process*stop-process*`` matches as long as both substrings
-    appear anywhere, in order, regardless of what sits between or around
-    them (a ``Where-Object`` filter, quoting, a ``powershell.exe
-    -NoProfile -Command`` wrapper, ...).
+    **Single predicate, both call sites.** :meth:`coord.dispatch.dispatch`
+    and this module both used to ask ``"windows" in capabilities``
+    independently; one shared predicate here means the deny-list decision
+    and the briefing-note decision can never silently diverge.
 
-    ``Stop-Process -Id 1234`` and ``taskkill /PID 1234`` — killing a PID
-    this worker itself launched — are never matched by any pattern here.
+    Keyed on bare ``"windows"`` rather than
+    ``coord.config.native_execution_capability("windows")`` (i.e.
+    ``"windows-native"``) deliberately, even though
+    :class:`coord.config.SmokeTestsConfig`'s docstring is explicit that
+    bare ``"windows"`` means only "can build/cross-compile for Windows",
+    not "is a native Windows host" — dell64 declared it while its coord
+    agent ran inside WSL. The over-application this causes (a cross-compile-
+    only Linux box gets a Windows-shaped deny list it will never trip, and
+    in principle could get a briefing paragraph describing a desktop it
+    isn't) is harmless for the deny side. It is not fully harmless for the
+    briefing side, whose prose asserts a human sits at the machine — that
+    mismatch is real and unresolved here; a dedicated "a human uses this
+    desktop" capability, rather than overloading either ``windows`` or
+    ``windows-native``, is the follow-up this predicate's single call site
+    makes easy to land later without touching either caller again.
     """
-    lowered = command.strip().lower()
-    return any(
-        fnmatch.fnmatchcase(lowered, pattern)
-        for pattern in WINDOWS_IMAGE_NAME_KILL_PATTERNS
-    )
+    return "windows" in capabilities
 
 
 def deny_commands_for_machine(
@@ -4896,22 +4955,23 @@ def deny_commands_for_machine(
 ) -> list[str]:
     """*base_deny_commands* (the repo's own ``worker_permissions.deny``,
     usually :data:`coord.config.DEFAULT_DENY_COMMANDS`) plus
-    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` when *machine_capabilities*
-    declares ``"windows"`` (#3663) — a shared desktop like dell64 where an
-    image-name kill can take down the operator's own Windows Terminal
-    window, not just this worker's own.
+    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` when
+    :func:`is_shared_windows_desktop` says *machine_capabilities* needs it
+    (#3663) — a shared desktop like dell64 where an image-name kill can
+    take down the operator's own Windows Terminal window, not just this
+    worker's own.
 
     **Single source of truth** (epic #2096's "one question, one answer"):
     :meth:`coord.dispatch.dispatch` calls this ONE function to decide what
     a given dispatch's ``deny_commands`` are — there is no second,
     independently-maintained copy of "does this machine need the Windows
-    guard" anywhere else. A machine without ``"windows"`` gets
+    guard" anywhere else. A machine that doesn't need it gets
     *base_deny_commands* back unchanged (a plain repo with no
     `worker_permissions.deny` override still sees byte-identical behavior
     to before this function existed).
     """
     deny = list(base_deny_commands)
-    if "windows" in machine_capabilities:
+    if is_shared_windows_desktop(machine_capabilities):
         for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
             if pattern not in deny:
                 deny.append(pattern)

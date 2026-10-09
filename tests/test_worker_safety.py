@@ -15,7 +15,7 @@ from coord.agent import (
     default_worker_command,
     deny_commands_for_machine,
     find_denying_bash_pattern,
-    is_windows_image_name_kill,
+    is_shared_windows_desktop,
     worker_disallowed_tools,
 )
 from coord.config import DEFAULT_DENY_COMMANDS, load
@@ -368,7 +368,7 @@ class TestDispatchDenyCommands:
             assert WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE in payload["briefing"]
 
     def test_dispatch_to_a_non_windows_machine_has_no_shared_desktop_note(self) -> None:
-        """Positive control: the note/guard must not leak onto a dispatch
+        """Negative control: the note/guard must not leak onto a dispatch
         the issue has nothing to do with."""
         from unittest.mock import MagicMock, patch
 
@@ -635,9 +635,22 @@ class TestBashDenyPatternMatcher:
 
 
 # ── #3663: Windows image-name kill guard ─────────────────────────────────────
+#
+# These tests go through `find_denying_bash_pattern` /
+# `bash_deny_pattern_matches` against the EXACT patterns shipped to
+# production (`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`) — the same real
+# enforcement-surface matcher `TestPipDenyEvasion` above uses, and the one
+# `--disallowedTools`/`build_deny_prompt` actually key off of. A prior
+# version of this guard was proven correct against a second, dead helper
+# (`is_windows_image_name_kill`) that lowercased its input before matching
+# — its tests passed while the shipped, case-sensitively-matched patterns
+# silently failed to catch the issue's own PascalCase acceptance commands.
+# That helper has been removed; asserting through the real matcher is what
+# makes "this deny list actually catches that evasion" a checked fact
+# again.
 
 
-class TestIsWindowsImageNameKill:
+class TestWindowsImageNameKillGuard:
     """#3663: a dell64 worker ran
     ``Get-Process | Where-Object {...} | Stop-Process -Force
     -ErrorAction SilentlyContinue`` ~40 times to "clean up" between manual
@@ -651,48 +664,60 @@ class TestIsWindowsImageNameKill:
         "-Force -ErrorAction SilentlyContinue'"
     )
 
+    def _is_denied(self, command: str) -> bool:
+        return find_denying_bash_pattern(
+            command, WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS
+        ) is not None
+
     def test_refuses_the_exact_dell64_repro_command(self) -> None:
-        assert is_windows_image_name_kill(self.REAL_WORLD_REPRO_KILL)
+        assert self._is_denied(self.REAL_WORLD_REPRO_KILL)
 
     def test_refuses_taskkill_by_image_name(self) -> None:
-        assert is_windows_image_name_kill("taskkill /IM WindowsTerminal.exe /F")
+        assert self._is_denied("taskkill /IM WindowsTerminal.exe /F")
 
     def test_refuses_taskkill_by_image_name_lowercase(self) -> None:
-        assert is_windows_image_name_kill("taskkill /im openconsole.exe /f")
+        assert self._is_denied("taskkill /im openconsole.exe /f")
 
     def test_refuses_stop_process_by_name_without_a_get_process_pipeline(self) -> None:
-        assert is_windows_image_name_kill("Stop-Process -Name WindowsTerminal -Force")
+        assert self._is_denied("Stop-Process -Name WindowsTerminal -Force")
 
     def test_refuses_pkill_against_a_windows_exe(self) -> None:
-        assert is_windows_image_name_kill("pkill -f WindowsTerminal.exe")
+        assert self._is_denied("pkill -f WindowsTerminal.exe")
 
     def test_refuses_killall_against_a_windows_exe(self) -> None:
-        assert is_windows_image_name_kill("killall WindowsTerminal.exe")
+        assert self._is_denied("killall WindowsTerminal.exe")
 
     def test_refuses_wmic_process_kill_by_name(self) -> None:
-        assert is_windows_image_name_kill(
+        assert self._is_denied(
             "wmic process where name='WindowsTerminal.exe' delete"
         )
 
     def test_case_insensitive_unlike_the_posix_deny_patterns(self) -> None:
         """PowerShell/cmd.exe are case-insensitive shells — a differently
         cased invocation of the exact same cmdlet must still be refused."""
-        assert is_windows_image_name_kill(
-            "get-process | stop-process -force"
-        )
-        assert is_windows_image_name_kill(
-            "GET-PROCESS | STOP-PROCESS -FORCE"
-        )
+        assert self._is_denied("get-process | stop-process -force")
+        assert self._is_denied("GET-PROCESS | STOP-PROCESS -FORCE")
 
     def test_allows_stop_process_by_pid(self) -> None:
         """Killing a PID the worker itself launched must stay allowed."""
-        assert not is_windows_image_name_kill("Stop-Process -Id 1234")
+        assert not self._is_denied("Stop-Process -Id 1234")
 
     def test_allows_taskkill_by_pid(self) -> None:
-        assert not is_windows_image_name_kill("taskkill /PID 1234")
+        assert not self._is_denied("taskkill /PID 1234")
 
     def test_allows_an_unrelated_command(self) -> None:
-        assert not is_windows_image_name_kill("cargo build --release")
+        assert not self._is_denied("cargo build --release")
+
+    def test_bash_deny_pattern_matches_is_case_insensitive_for_these_patterns_only(
+        self,
+    ) -> None:
+        """The case-insensitive carve-out in `bash_deny_pattern_matches` is
+        scoped to the Windows patterns specifically — it must not leak into
+        ordinary POSIX pattern matching."""
+        assert bash_deny_pattern_matches(
+            "Bash(*stop-process*-name*)", "Stop-Process -Name WindowsTerminal"
+        )
+        assert not bash_deny_pattern_matches("Bash(rm -rf *)", "RM -RF /tmp/x")
 
 
 class TestDenyCommandsForMachine:
@@ -706,6 +731,25 @@ class TestDenyCommandsForMachine:
         assert "Bash(gh *)" in result
         for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
             assert pattern in result
+
+    def test_non_windows_machine_is_unaffected(self) -> None:
+        result = deny_commands_for_machine(["Bash(gh *)"], ["linux"])
+        assert result == ["Bash(gh *)"]
+
+
+class TestIsSharedWindowsDesktop:
+    """#3663: the predicate `deny_commands_for_machine` and
+    `coord.dispatch.dispatch`'s briefing-note decision now both call,
+    rather than each keeping its own `"windows" in capabilities` check."""
+
+    def test_true_for_windows_capability(self) -> None:
+        assert is_shared_windows_desktop(["windows"])
+
+    def test_false_without_windows_capability(self) -> None:
+        assert not is_shared_windows_desktop(["linux", "rust"])
+
+    def test_false_for_empty_capabilities(self) -> None:
+        assert not is_shared_windows_desktop([])
 
     def test_non_windows_machine_is_unaffected(self) -> None:
         assert deny_commands_for_machine(["Bash(gh *)"], ["gtk"]) == ["Bash(gh *)"]

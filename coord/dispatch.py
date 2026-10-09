@@ -1215,16 +1215,22 @@ def dispatch(
     ):
         briefing_text = briefing_text + capability_routing.briefing_note(machine.name)
 
-    # #3663: dell64 (and any other `windows`-capable machine) is a shared
-    # desktop the user actually sits at — appended for every assignment
-    # type, not just `work`, since the hazard this guards against (a
-    # worker improvising process cleanup with a shell command) isn't
-    # confined to one leg shape. The mechanical guard
+    # #3663: dell64 (and any other machine `is_shared_windows_desktop` says
+    # needs it) is a shared desktop the user actually sits at — appended
+    # for every assignment type, not just `work`, since the hazard this
+    # guards against (a worker improvising process cleanup with a shell
+    # command) isn't confined to one leg shape. The mechanical guard
     # (`deny_commands_for_machine`, above) is the thing that actually
     # stops it; this is the advisory half, same relationship every other
     # `files_forbidden`/`deny_commands` pairing in this module has between
-    # its CLI-enforced and prompt-level halves.
-    if "windows" in machine.capabilities:
+    # its CLI-enforced and prompt-level halves. Routed through the same
+    # `coord.agent.is_shared_windows_desktop` predicate `deny_commands_for_
+    # machine` uses, rather than a second, independently-maintained
+    # `"windows" in machine.capabilities` check — see that predicate's
+    # docstring for why bare `"windows"` is still what it checks today.
+    from coord.agent import is_shared_windows_desktop  # noqa: PLC0415
+
+    if is_shared_windows_desktop(machine.capabilities):
         briefing_text = briefing_text + WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"

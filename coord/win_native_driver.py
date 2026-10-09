@@ -52,21 +52,30 @@ operator's own work, not just this driver's child. See
 regression guard, not just a behavioral one.
 
 **Safety: a PID-based kill still is not enough for ``windows-terminal``
-(#3663).** Even with the by-PID discipline above, ``launch_in_terminal``'s
-``wt.exe {command}`` hands off to an ALREADY-RUNNING ``WindowsTerminal.exe``
-via COM instead of spawning a fresh one, whenever one is already open —
-every window of every tab/pane across every session on the box lives in
-that SAME single process. If this driver's own ``wt.exe`` call is the one
-that starts the first ``WindowsTerminal.exe`` instance, that process is a
-genuine (if indirect) descendant of the pid `launch_in_terminal` returned —
-so a later `kill()` call's own descendant-process walk would, by the
-ordinary rules, be entitled to terminate it. :meth:`Win32Calls.
-launch_in_terminal` therefore snapshots every ``WindowsTerminal.exe`` pid
-already running the instant it is called (before spawning anything) and
-:meth:`Win32Calls.kill`/:meth:`Win32Calls.find_top_window` both subtract
-that recorded set unconditionally — a pre-existing host is a process this
-driver never launched, and must never be torn down (or mistaken for the
-window being waited on) no matter what the live process-tree walk returns.
+(#3663) — and what is fixed below only covers HALF the hazard.** Even with
+the by-PID discipline above, ``launch_in_terminal``'s ``wt.exe {command}``
+hands off to an ALREADY-RUNNING ``WindowsTerminal.exe`` via COM instead of
+spawning a fresh one, whenever one is already open — every window of every
+tab/pane across every session on the box lives in that SAME single
+process. :meth:`Win32Calls.launch_in_terminal` snapshots every
+``WindowsTerminal.exe`` pid already running the instant it is called
+(before spawning anything), and :meth:`Win32Calls.kill`/:meth:`Win32Calls.
+find_top_window` both subtract that recorded set unconditionally — so a
+PRE-EXISTING host (the case the issue's own acceptance criterion names) is
+never torn down (or mistaken for the window being waited on) no matter
+what the live process-tree walk returns.
+
+That snapshot is necessarily EMPTY, and therefore protects nothing, in the
+other case: if this driver's own ``wt.exe`` call is the one that starts
+the FIRST ``WindowsTerminal.exe`` instance on the box, that process is a
+genuine (if indirect) descendant of the pid ``launch_in_terminal``
+returned, sits inside its ``KILL_ON_JOB_CLOSE`` job (see below), and any
+window the user opens afterwards joins that same process — so it dies at
+teardown along with it. This is still open; fixing it needs either
+``wt.exe -w new`` (forces a fresh window rather than a COM hand-off, so the
+job never contains a process the user might later share) or closing only
+the driver's own hwnd (``WM_CLOSE``) instead of tearing down the process
+tree. Tracked as a follow-up, not fixed here.
 
 **UNC ``cwd`` (#3543).** A WSL-hosted agent's repo worktree translates
 (``coord.win_native_bridge.translate_to_windows_path``) to a UNC path
@@ -2274,9 +2283,16 @@ class Win32Calls:
         # `_descendant_pids` walk returns. `wt.exe` hands off to an
         # already-running host via COM rather than spawning a fresh one,
         # so a pre-existing host is a process this driver never launched
-        # and must never tear down, even if some future process-tree
-        # quirk (reparenting, pid reuse) made the walk below mistake it
-        # for one of *pid*'s own descendants.
+        # and must never tear down, even if a future process-tree quirk
+        # (reparenting) made the walk below mistake it for one of *pid*'s
+        # own descendants.
+        #
+        # Residual risk (not a reason FOR this protection, but a cost OF
+        # it): if a pid recorded here exits and Windows later reuses that
+        # exact number for a genuine descendant of *pid*, this subtracts
+        # it and that descendant leaks instead of being torn down. Fails
+        # safe (a leaked process, not a killed one the user didn't launch)
+        # rather than closed, so left as-is.
         protected_wt_pids = self._pre_existing_wt_pids.pop(pid, frozenset())
         # #3634: close OUR last handle to *pid*'s KILL_ON_JOB_CLOSE Job
         # Object FIRST, if one was successfully assigned at launch time —
@@ -2642,6 +2658,18 @@ class Win32Calls:
         # driver never launched (quite possibly the operator's own) can
         # never be mistaken for the one we're waiting on, regardless of
         # what the live `_descendant_pids` walk returns.
+        #
+        # Known gap this leaves (correctness over cleanup, deliberately):
+        # in the common case where a WT host already exists, `wt.exe`
+        # hands off and exits, so the new tab/pane ends up a child of that
+        # now-protected host rather than of *pid*. This loop then never
+        # finds a visible window to return, and `kill`'s descendant walk
+        # (above) never reaches that tab/pane's process either — this
+        # lane has no teardown path at all for its own window in that
+        # case, only for the "driver's own fresh host" case. Leaking is
+        # better than killing the operator's shared terminal, so the
+        # direction here is right, but "close only this lane's own
+        # window/tab" (the issue's own ask) is unimplemented.
         protected_wt_pids = self._pre_existing_wt_pids.get(pid, frozenset())
         while time.monotonic() < deadline:
             candidate_pids = self._descendant_pids(pid) - protected_wt_pids
