@@ -42,17 +42,30 @@ parameter with a real default).
    module docstring deferred to), and acted on
    (:func:`coord.nightly_smoke.process_nightly_step` — files/updates one
    issue per red step, alerts on a known-bug step going green, touches
-   nothing on a clean pass).
+   nothing on a clean pass) — EXCEPT a step the driver itself reported
+   ``"unavailable"`` (#3510), which is never classified into a filing
+   decision at all (:func:`run_nightly_smoke`'s loop — mirrors
+   :mod:`coord.bugbash`'s own "#3510: an unavailable lane is not a bug
+   finding", which skips the lane rather than filing anything from it).
+   The lane acted through is resolved via :func:`coord.bugbash.
+   discover_lanes` (:func:`_resolve_bugbash_lane`), not hand-built from
+   ``plan.driver_kind`` — #2096 "one question, one answer": a route that
+   sets ``label:``/``platforms:`` must get the SAME per-route dedupe label
+   a real ``coord bugbash`` lane would (#3615/#3581).
 4. Every step observed is persisted to :mod:`coord.nightly_store`,
-   regardless of outcome — so ``coord release gate`` can read a repo's
-   nightly artifacts without ``--from-json`` (#3660 acceptance).
+   regardless of outcome, tagged with a per-run ``run_id`` — so ``coord
+   release gate`` can read a repo's nightly artifacts without
+   ``--from-json`` (#3660 acceptance), and a later clean re-run can clear
+   an earlier red/unavailable one at the same SHA (#3660 review round 1).
 """
 
 from __future__ import annotations
 
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Sequence
 
 from coord.acceptance_drivers import DriverResult, run_driver
@@ -60,6 +73,7 @@ from coord.bugbash import (
     GUI_LANE_DRIVER_KINDS,
     BugbashLane,
     CoordRunner,
+    discover_lanes,
     subprocess_coord_runner,
 )
 from coord.nightly_smoke import (
@@ -359,20 +373,25 @@ def observations_from_driver_result(
     is where that distinction is actually persisted.
 
     A driver result with NO tests at all (the run command crashed before
-    producing any; see :class:`coord.acceptance_drivers.DriverResult`'s own
-    ``ok`` caveat) yields ONE observation naming the whole spec as the
-    "step" — #2096 "a gate must be able to fail": a crash that produced
-    zero structured output must never read as "zero steps, therefore
-    nothing failed."
+    producing any, or ran and exited 0 without ever emitting a parseable
+    report; see :class:`coord.acceptance_drivers.DriverResult`'s own ``ok``
+    caveat) yields ONE FAILING observation naming the whole spec as the
+    "step" — #2096 "a gate must be able to fail": a run that produced zero
+    structured output must never read as "zero steps, therefore nothing
+    failed," REGARDLESS of ``exit_code`` (#3660 review round 1: the
+    previous ``passed=result.ok`` let a ``run:`` wrapper that exits 0
+    without writing a report, or a native spec whose ``steps:`` is empty,
+    certify the artifact with zero steps ever verified).
     """
     if not result.tests:
         return [(
             NightlyStepObservation(
-                repo=repo, spec=spec, step="(spec)", sha=sha, passed=result.ok,
+                repo=repo, spec=spec, step="(spec)", sha=sha, passed=False,
                 checked_at=checked_at,
                 detail=(
-                    "driver produced no structured test results "
-                    f"(exit_code={result.exit_code})"
+                    "driver produced no structured test results at all "
+                    f"(exit_code={result.exit_code}) — a run with zero "
+                    "observed steps can never certify this artifact"
                 ),
                 evidence=((result.raw_output[-2000:],) if result.raw_output else ()),
             ),
@@ -426,12 +445,39 @@ def run_nightly_spec(
 # ── obtaining the artifact (build, or download) ────────────────────────────
 
 
+def _git_ref_for_plan(plan: "NightlyRunPlan") -> str:
+    """The actual branch/tag name to ``git ls-remote``/``git clone`` for
+    *plan*, on GitHub.
+
+    A BUILD plan's ``ref`` is a branch name — used verbatim. A DOWNLOAD
+    plan's ``ref`` is deliberately the BARE version
+    :func:`coord.tui_release.fetch_latest_release_tag` returns (see that
+    function's own docstring: "coord-tui's newest published release, as a
+    bare version (no ``v``)") — the real git tag on GitHub carries a ``v``
+    prefix, which :func:`coord.tui_release.fetch_release_assets` already
+    adds back itself before querying the Releases API. ``git ls-remote``/
+    ``git clone`` have no such normalization of their own, so without this
+    they look for a tag that doesn't exist and the run dies on "could not
+    resolve ... to a commit sha" (#3660 review round 1).
+    """
+    from coord.nightly_smoke import ArtifactSource
+
+    if plan.source == ArtifactSource.DOWNLOAD.value and not plan.ref.startswith("v"):
+        return f"v{plan.ref}"
+    return plan.ref
+
+
 def _default_resolve_ref_sha(github_slug: str, ref: str, *, timeout: float = 15.0) -> str:
-    """The commit *ref* (a branch OR a tag name) resolves to on
-    ``github.com/<github_slug>``, via a plain ``git ls-remote`` — no GitHub
-    API token needed, and no local checkout required, so this works
-    identically whether the artifact plan says BUILD (branch) or DOWNLOAD
-    (release tag).
+    """The commit *ref* resolves to on ``github.com/<github_slug>``, via a
+    plain ``git ls-remote`` — no GitHub API token needed, and no local
+    checkout required.
+
+    *ref* must already be the REAL git ref name — a branch for a BUILD
+    plan, or a ``v``-prefixed tag for a DOWNLOAD plan (see
+    :func:`_git_ref_for_plan`, which every production caller applies
+    before calling this; #3660 review round 1 — this function used to
+    receive the plan's bare, un-prefixed version string for a DOWNLOAD
+    plan and could never resolve it).
 
     Raises :class:`NightlyRunnerError` when *ref* doesn't resolve at all —
     #2096 "a gate must be able to fail": persisting a result against a
@@ -500,10 +546,50 @@ def obtain_artifact(
     return fn(plan, config=config, workdir=workdir)
 
 
-def _git_clone_ref(github_slug: str, ref: str, workdir: str, *, timeout: float = 600.0) -> None:
+def _github_clone_url(github_slug: str) -> str:
+    return f"https://github.com/{github_slug}.git"
+
+
+def _git_clone_ref(remote_url: str, ref: str, workdir: str, *, timeout: float = 600.0) -> None:
+    """Make *workdir* a checkout of *remote_url* at *ref*.
+
+    A fresh ``git clone --depth 1 --branch <ref>`` the first time; a
+    ``fetch``+``checkout``+``clean`` of the SAME checkout on every
+    subsequent call for the same *workdir* (#3660 review round 1: a bare
+    ``git clone`` refuses a non-empty destination, and
+    :func:`_default_workdir` deliberately returns the SAME path every
+    night for a given repo so an operator never has to configure a fresh
+    one — before this, a second-ever nightly run for any repo died on
+    exactly that). Detecting "already a checkout of this repo" by the
+    presence of ``workdir/.git`` is enough here: *workdir* is this
+    module's own private, per-repo scratch directory
+    (``<coord-dir>/nightly_workdirs/<repo>`` — never shared with, or
+    pointed at, anything else), so finding a ``.git`` there always means
+    "a previous run of THIS function left it," never some unrelated
+    checkout this function should refuse to touch.
+
+    Takes the remote URL directly (production builds it via
+    :func:`_github_clone_url`) rather than a bare GitHub slug — so a test
+    can exercise the real ``git`` reuse logic above against a local
+    ``file://`` remote, with no network and no GitHub dependency.
+    """
+    git_dir = Path(workdir) / ".git"
+    if git_dir.is_dir():
+        subprocess.run(
+            ["git", "fetch", "--depth", "1", "origin", ref],
+            cwd=workdir, check=True, timeout=timeout,
+        )
+        subprocess.run(
+            ["git", "checkout", "--force", "FETCH_HEAD"],
+            cwd=workdir, check=True, timeout=timeout,
+        )
+        subprocess.run(
+            ["git", "clean", "-fdx"], cwd=workdir, check=True, timeout=timeout,
+        )
+        return
+    Path(workdir).mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "clone", "--branch", ref, "--depth", "1",
-         f"https://github.com/{github_slug}.git", workdir],
+        ["git", "clone", "--branch", ref, "--depth", "1", remote_url, workdir],
         check=True, timeout=timeout,
     )
 
@@ -514,7 +600,7 @@ def _default_build_artifact(
     repo_cfg = config.repo(plan.repo)
     if repo_cfg is None:
         raise NightlyRunnerError(f"repo {plan.repo!r} is not declared in coordinator.yml")
-    _git_clone_ref(repo_cfg.github, plan.ref, workdir)
+    _git_clone_ref(_github_clone_url(repo_cfg.github), _git_ref_for_plan(plan), workdir)
     if repo_cfg.build_command:
         subprocess.run(repo_cfg.build_command, shell=True, cwd=workdir, check=True)
     return ObtainedArtifact(cwd=workdir)
@@ -531,7 +617,11 @@ def _default_download_artifact(
     # The spec/harness files this run drives live in the repo itself, never
     # in a release asset — clone at the release tag so the harness matches
     # exactly what shipped, same as the BUILD path does for its branch.
-    _git_clone_ref(repo_cfg.github, plan.ref, workdir)
+    # `_git_ref_for_plan` adds back the `v` prefix `plan.ref` deliberately
+    # lacks (see that function's docstring) — `git clone`/`git fetch` need
+    # the real tag name, unlike `fetch_release_assets` just below, which
+    # adds the prefix itself and wants the bare version.
+    _git_clone_ref(_github_clone_url(repo_cfg.github), _git_ref_for_plan(plan), workdir)
     assets = fetch_release_assets(plan.ref, repo=repo_cfg.github)
     matches = [a for a in assets if plan.artifact in a.name]
     if not matches:
@@ -540,8 +630,62 @@ def _default_download_artifact(
             f"release {plan.ref!r} of {repo_cfg.github!r} has no asset "
             f"matching {plan.artifact!r} (have: {have})"
         )
-    binary_path = download_asset(matches[0].download_url, workdir)
+    # `download_asset` is `coord.tui_release.download_asset(url, dest_dir:
+    # Path)` — it immediately calls `dest_dir.mkdir(...)`, so passing the
+    # bare `workdir` str here raised `AttributeError` on every download run
+    # (#3660 review round 1).
+    binary_path = download_asset(matches[0].download_url, Path(workdir))
     return ObtainedArtifact(cwd=workdir, binary_path=str(binary_path))
+
+
+# ── resolving the acting BugbashLane through the one real answerer ────────
+
+
+def _resolve_bugbash_lane(
+    config: "Config", repo: str, driver_cfg: "AcceptanceDriverConfig",
+    machine_name: str, *, http_client: "httpx.Client | None" = None,
+) -> BugbashLane:
+    """The :class:`~coord.bugbash.BugbashLane` a nightly red step should
+    file/comment/close through — resolved via :func:`coord.bugbash.
+    discover_lanes`, the SAME lane discovery ``coord bugbash`` itself uses,
+    rather than hand-built from ``plan.driver_kind`` (#3660 review round 1:
+    hand-building re-opened #3615's dedupe collision — a route that sets
+    ``label:``/``platforms:`` on its :class:`~coord.config.
+    AcceptanceDriverConfig` got a lane whose ``platform`` was just the bare
+    ``driver_kind``, identical to every sibling route sharing that kind,
+    e.g. vimcode's ``win-gui``/``win-terminal`` routes — both ``kind:
+    win-native`` — folding two distinct platform findings into one issue).
+
+    Matched by ``(machine, driver_kind, capability, setup, run)`` — the
+    first three narrow to the right machine/driver; ``setup``/``run`` (the
+    route's own provisioning/launch strings, carried onto
+    :attr:`~coord.bugbash.BugbashLane.setup`/:attr:`~coord.bugbash.
+    BugbashLane.launch_command`) disambiguate two sibling routes that
+    share a kind AND a machine — exactly the ``win-gui``/``win-terminal``
+    case, which ``discover_lanes`` itself has no OTHER way to tell apart
+    from a resolved :class:`BugbashLane` alone (it does not echo back
+    which ``routes:`` entry produced each lane).
+
+    Falls back to a hand-built lane (today's pre-fix shape) when
+    ``discover_lanes`` resolves nothing for this exact pairing — most
+    commonly because *driver_cfg*'s kind isn't one of :data:`coord.bugbash.
+    LANE_DRIVER_KINDS` at all (e.g. ``cli-pytest``, which has no bugbash
+    lane concept to begin with) — never a crash on the first nightly repo
+    that isn't ALSO a ``coord bugbash`` target.
+    """
+    for lane in discover_lanes(config, repo, http_client=http_client):
+        if (
+            lane.machine == machine_name
+            and lane.driver_kind == driver_cfg.kind
+            and lane.capability == driver_cfg.capability
+            and lane.setup == driver_cfg.setup
+            and lane.launch_command == driver_cfg.run
+        ):
+            return lane
+    return BugbashLane(
+        platform=driver_cfg.kind, driver_kind=driver_cfg.kind,
+        machine=machine_name, capability=driver_cfg.capability,
+    )
 
 
 # ── the full orchestration ─────────────────────────────────────────────────
@@ -584,6 +728,7 @@ def run_nightly_smoke(
     closed_issues: Sequence[dict] = (),
     runner: CoordRunner | None = None,
     now: float | None = None,
+    run_id: str | None = None,
 ) -> NightlyRunReport:
     """The whole #3660 pipeline: plan, (maybe) obtain + run + classify +
     act + persist.
@@ -599,16 +744,33 @@ def run_nightly_smoke(
     all, since there is nothing to classify yet.
 
     An INFRA-blocked plan (no qualifying host, or a GUI-lane pre-flight
-    failure) never runs, never files, never persists either — #3652's own
-    rule ("a host that's locked/asleep/missing trust is an INFRA result,
-    never an app red") extended to mean INFRA genuinely means "we didn't
-    look", not "we looked and it was fine" or "we looked and it failed".
+    failure) never runs or files anything — #3652's own rule ("a host
+    that's locked/asleep/missing trust is an INFRA result, never an app
+    red") extended to mean it never runs the spec or acts on a fabricated
+    result. It DOES persist one ``unavailable=True`` record (#3660 review,
+    non-blocking item 2) so ``coord release gate`` reports the distinct
+    "unavailable at ... unlock the host and re-run" verdict instead of "no
+    nightly result recorded at all" for a host that genuinely was checked
+    and found locked.
+
+    *run_id* (default: a fresh :func:`uuid.uuid4` hex string) tags every
+    :class:`~coord.nightly_store.NightlyResultRecord` this call persists —
+    the grouping key that lets a later clean run clear an earlier
+    red/unavailable one at the same ``(artifact, sha)`` (#3660 review
+    round 1, :mod:`coord.nightly_store`). Injectable so a test can assert
+    on a deterministic value; production leaves it to generate its own.
     """
     plan = plan_nightly_run(
         repo=repo, artifact=artifact, spec=spec, config=config, board=board,
         http_client=http_client, fetch_latest_release_tag_fn=fetch_latest_release_tag_fn,
     )
+    effective_run_id = run_id or uuid.uuid4().hex
     if dry_run or plan.infra_blocked:
+        if not dry_run and plan.infra_blocked:
+            _persist_infra_unavailable(
+                plan, repo=repo, artifact=artifact, config=config,
+                resolve_ref_sha_fn=resolve_ref_sha_fn, now=now, run_id=effective_run_id,
+            )
         return NightlyRunReport(plan=plan, ran=False)
 
     assert plan.host is not None  # infra_blocked is False -> a host was chosen
@@ -635,7 +797,7 @@ def run_nightly_smoke(
     repo_cfg = config.repo(repo)
     if repo_cfg is None:  # pragma: no cover - plan_nightly_run already proved this exists
         raise NightlyRunnerError(f"repo {repo!r} is not declared in coordinator.yml")
-    sha = resolve_sha(repo_cfg.github, plan.ref)
+    sha = resolve_sha(repo_cfg.github, _git_ref_for_plan(plan))
 
     effective_workdir = workdir or _default_workdir(repo)
     obtained = (obtain_artifact_fn or obtain_artifact)(
@@ -661,29 +823,81 @@ def run_nightly_smoke(
     # silently defaulting to `lane=None` and this crashing on the first
     # genuinely new finding a real run ever produces.
     driver_cfg = _resolve_driver_cfg(config, repo, spec)
-    lane = BugbashLane(
-        platform=plan.driver_kind, driver_kind=plan.driver_kind,
-        machine=plan.host.machine.name, capability=driver_cfg.capability,
+    lane = _resolve_bugbash_lane(
+        config, repo, driver_cfg, plan.host.machine.name, http_client=http_client,
     )
 
     checked_at = time.time() if now is None else now
     outcomes: list[NightlyStepOutcome] = []
     for obs, unavailable in observations:
         verdict: StepVerdict = classify_step(obs, known_bugs_raw.get(obs.step))
-        outcome = process_nightly_step(
-            verdict, open_issues=open_issues, closed_issues=closed_issues,
-            lane=lane, runner=runner or subprocess_coord_runner, dry_run=dry_run,
-            platform=plan.driver_kind,
-        )
+        if unavailable:
+            # #3510, mirroring coord.bugbash's own "#3510: an unavailable
+            # lane is not a bug finding" (`run_bugbash` skips the lane for
+            # the round rather than running the checklist against it or
+            # filing anything from it): a driver-reported `unavailable`
+            # step is an environment condition — a locked/absent GUI
+            # session or missing display — never an app bug. It is still
+            # recorded below (so the store/gate can report it distinctly,
+            # #3510), but it never reaches `process_nightly_step` at all
+            # (#3660 review round 1 — before this fix it classified as a
+            # plain `RED_NEEDS_FILING` red and filed/commented an app-repo
+            # bug for a locked host).
+            outcome = NightlyStepOutcome(verdict=verdict, action="none")
+        else:
+            outcome = process_nightly_step(
+                verdict, open_issues=open_issues, closed_issues=closed_issues,
+                lane=lane, runner=runner or subprocess_coord_runner, dry_run=dry_run,
+                platform=lane.platform,
+            )
         outcomes.append(outcome)
         record_nightly_result(NightlyResultRecord(
             repo=repo, artifact=artifact, sha=sha, passed=obs.passed,
             checked_at=checked_at, detail=obs.detail, unavailable=unavailable,
             spec=obs.spec, step=obs.step, host=plan.host.machine.name,
-            evidence=obs.evidence,
+            evidence=obs.evidence, run_id=effective_run_id,
         ))
 
     return NightlyRunReport(plan=plan, ran=True, sha=sha, outcomes=tuple(outcomes))
+
+
+def _persist_infra_unavailable(
+    plan: NightlyRunPlan, *, repo: str, artifact: str, config: "Config",
+    resolve_ref_sha_fn: Callable[[str, str], str] | None, now: float | None, run_id: str,
+) -> None:
+    """Persist ONE ``unavailable=True`` record for an INFRA-blocked *plan*
+    (#3660 review, non-blocking item 2).
+
+    Before this, the pre-flight-blocked path persisted nothing at all —
+    ``coord release gate`` then read "no nightly real-platform smoke
+    result recorded," indistinguishable from a repo nobody has ever run,
+    rather than the distinctly-labelled "unavailable at ... unlock the
+    host and re-run" verdict that exists for exactly this case
+    (:func:`coord.release_gate._nightly_artifact_step`).
+
+    Best-effort: when the sha can't even be resolved (no network, or a
+    genuinely bad ref), there is nothing meaningful to persist against —
+    this silently does nothing rather than raising, since the plan's own
+    ``render()``/``infra_reason`` already told the operator what's wrong,
+    and a dry-run-adjacent INFRA short-circuit failing loudly on a
+    SEPARATE, best-effort bookkeeping step would be a worse failure mode
+    than just not persisting.
+    """
+    repo_cfg = config.repo(repo)
+    if repo_cfg is None:  # pragma: no cover - plan_nightly_run already proved this exists
+        return
+    resolve_sha = resolve_ref_sha_fn or _default_resolve_ref_sha
+    try:
+        sha = resolve_sha(repo_cfg.github, _git_ref_for_plan(plan))
+    except NightlyRunnerError:
+        return
+    checked_at = time.time() if now is None else now
+    record_nightly_result(NightlyResultRecord(
+        repo=repo, artifact=artifact, sha=sha, passed=False,
+        checked_at=checked_at, detail=plan.infra_reason, unavailable=True,
+        spec=plan.spec, step="(preflight)", host=plan.machine_name or "",
+        evidence=(), run_id=run_id,
+    ))
 
 
 def _default_local_machine_name(config: "Config") -> str | None:

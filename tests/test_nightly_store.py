@@ -42,6 +42,19 @@ class TestRecordAndReadRoundTrip:
         assert rows[0].detail == "ok"
         assert rows[0].evidence == ("shot.png",)
 
+    def test_round_trips_run_id(self) -> None:
+        record_nightly_result(_record(run_id="run-123"))
+        rows = read_nightly_results("vimcode")
+        assert rows[0].run_id == "run-123"
+
+    def test_missing_run_id_reads_back_as_empty_string(self) -> None:
+        """A row written before `run_id` existed (or a caller that never
+        set it) must still read back rather than being dropped as
+        malformed."""
+        record_nightly_result(_record())
+        rows = read_nightly_results("vimcode")
+        assert rows[0].run_id == ""
+
     def test_is_append_only_across_multiple_calls(self) -> None:
         record_nightly_result(_record(step="launch"))
         record_nightly_result(_record(step="uninstall", passed=False))
@@ -53,6 +66,16 @@ class TestRecordAndReadRoundTrip:
         record_nightly_result(_record(repo="natal-chart"))
         assert len(read_nightly_results("vimcode")) == 1
         assert len(read_nightly_results("natal-chart")) == 1
+
+    def test_repo_name_with_a_dot_does_not_collide_with_its_prefix(self) -> None:
+        """#3660 review nit: `Path.with_suffix` replaces the LAST suffix of
+        the repo name itself — a repo literally named `a.b` used to lock
+        at `a.lock`, colliding with a repo named `a`. Appending (never
+        replacing) is collision-free."""
+        record_nightly_result(_record(repo="a.b"))
+        record_nightly_result(_record(repo="a"))
+        assert len(read_nightly_results("a.b")) == 1
+        assert len(read_nightly_results("a")) == 1
 
     def test_corrupt_store_reads_as_empty_not_a_crash(self, tmp_path: Path) -> None:
         from coord.platform_paths import default_coord_dir
@@ -138,3 +161,55 @@ class TestNightlyArtifactResultsForReleaseGate:
             nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
         )
         assert verdict.gate_passed is False
+
+
+class TestRunIdSeparatesRuns:
+    """#3660 review round 1: every run at one (artifact, sha) must produce
+    its OWN group/result, so a later clean run can clear an earlier
+    red/unavailable one — the docstring's claim before this fix, but not
+    what the code (grouping on (artifact, sha) alone) actually did."""
+
+    def test_two_runs_at_the_same_sha_are_two_separate_results(self) -> None:
+        record_nightly_result(_record(
+            step="launch", passed=False, unavailable=True,
+            detail="screen locked", checked_at=100.0, run_id="run-1",
+        ))
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=200.0, run_id="run-2",
+        ))
+        results = nightly_artifact_results_for_release_gate("vimcode")
+        assert len(results) == 2
+        by_checked_at = {r.checked_at: r for r in results}
+        assert by_checked_at[100.0].unavailable is True
+        assert by_checked_at[200.0].passed is True
+
+    def test_a_later_clean_run_clears_an_earlier_poisoned_one_at_the_gate(self) -> None:
+        """The whole point: `_nightly_artifact_step`'s own
+        most-recently-checked-wins logic (already tested, untouched) must
+        actually have two entries to pick between."""
+        from coord.release_gate import evaluate_release_gate
+
+        record_nightly_result(_record(
+            step="launch", passed=False, unavailable=True,
+            detail="screen locked", checked_at=100.0, run_id="run-1",
+        ))
+        record_nightly_result(_record(
+            step="launch", passed=True, checked_at=200.0, run_id="run-2",
+        ))
+        verdict = evaluate_release_gate(
+            repo="vimcode", release_sha="deadbeef",
+            required_lanes=[], nightly_required=True,
+            required_nightly_artifacts=["macos-dmg"],
+            nightly_results=nightly_artifact_results_for_release_gate("vimcode"),
+        )
+        assert verdict.gate_passed is True
+
+    def test_legacy_rows_with_no_run_id_still_group_together(self) -> None:
+        """A row persisted before `run_id` existed defaults to `""` — it
+        must still group (imperfectly, but no worse than before this fix)
+        with other such legacy rows for the same (artifact, sha)."""
+        record_nightly_result(_record(step="launch", passed=True, checked_at=100.0))
+        record_nightly_result(_record(step="uninstall", passed=True, checked_at=200.0))
+        results = nightly_artifact_results_for_release_gate("vimcode")
+        assert len(results) == 1
+        assert results[0].passed is True

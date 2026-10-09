@@ -22,28 +22,11 @@ from coord.commands._common import _CONFIG_OPTION, _load_config
 if TYPE_CHECKING:  # pragma: no cover - import-cycle-avoidance only
     from coord.nightly_runner import NightlyRunReport
 
-NIGHTLY_CLOSED_ISSUES_LIMIT = 200
-
-
-def _fetch_closed_issues(slug: str, *, limit: int = NIGHTLY_CLOSED_ISSUES_LIMIT) -> list[dict]:
-    """Best-effort fetch of recently closed issues, for the SAME
-    open/closed/REGRESSION dedupe decision :func:`coord.nightly_smoke.
-    process_nightly_step` already makes — fails open (``[]``) on any
-    GitHub hiccup, the same posture :func:`coord.commands.bugbash.
-    _fetch_recently_closed_issues` already takes for the identical call,
-    rather than aborting a whole nightly run over a transient fetch error.
-    """
-    from coord import github_ops  # noqa: PLC0415
-
-    try:
-        return github_ops._gh_json(
-            "issue", "list", "--repo", slug, "--state", "closed",
-            "--json", "number,title,body,labels",
-            "--limit", str(limit),
-            default=[], caller="commands.smoke._fetch_closed_issues",
-        )
-    except Exception:  # noqa: BLE001
-        return []
+# #2096 "one question, one answer": `coord.commands.bugbash.
+# _fetch_recently_closed_issues` already does exactly this fetch (same `gh`
+# args, same 200 limit, same fail-open posture) for its own regression
+# dedupe — re-exported here rather than forked a third time (#3660 review).
+from coord.commands.bugbash import _fetch_recently_closed_issues as _fetch_closed_issues
 
 
 @click.group("smoke", help="Real-platform smoke runs (#3660).")
@@ -105,7 +88,16 @@ def smoke_nightly_cmd(
     open_issues: list[dict] = []
     closed_issues: list[dict] = []
     if not dry_run:
-        open_issues = github_ops.get_open_issues(repo_cfg.github)
+        try:
+            open_issues = github_ops.get_open_issues(repo_cfg.github)
+        except Exception as exc:  # noqa: BLE001 — #3660 review: a GitHub hiccup here
+            # must exit 2 like every other failure mode, never a bare
+            # traceback (unlike `_fetch_closed_issues`'s own best-effort
+            # fail-open `[]`, open issues are the dedupe decision's
+            # PRIMARY input — fetching nothing and proceeding would file a
+            # duplicate issue for every already-open finding instead).
+            click.echo(f"error: could not fetch open issues for {repo!r}: {exc}", err=True)
+            sys.exit(2)
         closed_issues = _fetch_closed_issues(repo_cfg.github)
 
     try:
