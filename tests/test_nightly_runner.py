@@ -18,16 +18,23 @@ the persisted nightly-results store round-tripping through
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
+import coord.nightly_runner as nightly_runner
 from coord.acceptance_drivers import DriverResult
 from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config, SmokeTestsConfig
 from coord.models import Board, Machine, Repo
 from coord.nightly_runner import (
     NightlyRunnerError,
+    NightlyRunPlan,
     ObtainedArtifact,
+    _default_download_artifact,
+    _git_clone_ref,
+    _git_ref_for_plan,
+    _resolve_bugbash_lane,
     gui_lane_preflight_blockers,
     known_bugs_from_spec_text,
     observations_from_driver_result,
@@ -288,6 +295,21 @@ class TestObservationsFromDriverResult:
         assert obs.passed is False
         assert unavailable is False
 
+    def test_no_tests_at_all_fails_even_with_exit_code_zero(self) -> None:
+        """#3660 review round 1: `passed=result.ok` let a `run:` wrapper
+        that exits 0 without ever emitting a parseable report (or a native
+        spec whose `steps:` is empty) certify the artifact with zero steps
+        ever observed. "No structured results at all" must fail
+        irrespective of exit code."""
+        result = DriverResult(exit_code=0, tests=[])
+        out = observations_from_driver_result(
+            result, repo="vimcode", spec="install.yaml", sha="deadbeef", checked_at=1.0,
+        )
+        assert len(out) == 1
+        obs, unavailable = out[0]
+        assert obs.passed is False
+        assert unavailable is False
+
 
 # ── run_nightly_smoke: the end-to-end acceptance scenarios ─────────────────
 
@@ -345,7 +367,7 @@ class TestRunNightlySmokeDryRunAndInfra:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """#3660 acceptance: a host that fails pre-flight is INFRA, not an
-        app red — never files an issue, never records a result."""
+        app red — never runs the spec, never files an issue."""
         monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
         config = _config(kind="mac-native", capability="macos", caps=["macos"])
         client = _FakeHealthClient({"m1.tail": _gui_lane_health(crit=True)})
@@ -353,10 +375,45 @@ class TestRunNightlySmokeDryRunAndInfra:
         report = run_nightly_smoke(
             repo="vimcode", artifact="macos-dmg", spec="", config=config, board=Board(),
             dry_run=False, http_client=client, runner=runner,
+            resolve_ref_sha_fn=lambda slug, ref: "deadbeef",
         )
         assert report.ran is False
         assert report.infra_blocked is True
         assert runner.calls == []
+
+    def test_infra_blocked_host_persists_a_distinct_unavailable_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3660 review non-blocking item 2: an INFRA-blocked plan must
+        record a distinct "unavailable" verdict, not silently persist
+        nothing at all (which the release gate can't tell apart from a
+        repo nobody has ever run)."""
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        config = _config(kind="mac-native", capability="macos", caps=["macos"])
+        client = _FakeHealthClient({"m1.tail": _gui_lane_health(crit=True)})
+        report = run_nightly_smoke(
+            repo="vimcode", artifact="macos-dmg", spec="", config=config, board=Board(),
+            dry_run=False, http_client=client, runner=_FakeRunner(),
+            resolve_ref_sha_fn=lambda slug, ref: "deadbeef",
+        )
+        assert report.ran is False
+        results = read_nightly_results("vimcode")
+        assert len(results) == 1
+        assert results[0].unavailable is True
+        assert results[0].passed is False
+        assert "locked" in results[0].detail
+
+    def test_dry_run_never_persists_even_when_infra_blocked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COORD_DIR", str(tmp_path / "coord_dir"))
+        config = _config(kind="mac-native", capability="macos", caps=["macos"])
+        client = _FakeHealthClient({"m1.tail": _gui_lane_health(crit=True)})
+        report = run_nightly_smoke(
+            repo="vimcode", artifact="macos-dmg", spec="", config=config, board=Board(),
+            dry_run=True, http_client=client,
+        )
+        assert report.ran is False
         assert read_nightly_results("vimcode") == []
 
 
@@ -436,6 +493,26 @@ class TestRunNightlySmokeGreenRedKnownBug:
         assert len(closes) == 1
         assert closes[0][3] == "42"
 
+    def test_unavailable_step_files_nothing_and_is_recorded_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3660 review round 1: a driver-reported `unavailable` step
+        (#3510 — a locked/absent GUI session, not an app bug) must never
+        be classified into a filing decision, mirroring
+        `coord.bugbash`'s own "an unavailable lane is not a bug finding."
+        """
+        report, runner = _run(
+            tmp_path, monkeypatch,
+            tests=[{"id": "launch", "status": "unavailable", "message": "screen locked"}],
+        )
+        assert report.ran is True
+        assert report.outcomes[0].action == "none"
+        assert runner.calls == []  # never files, comments, or closes
+        results = read_nightly_results("vimcode")
+        assert len(results) == 1
+        assert results[0].unavailable is True
+        assert results[0].passed is False
+
     def test_wrong_host_refuses_loudly(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -449,3 +526,165 @@ class TestRunNightlySmokeGreenRedKnownBug:
                 dry_run=False,
                 local_machine_name_fn=lambda cfg: "some-other-machine",
             )
+
+
+# ── _git_ref_for_plan: DOWNLOAD plans need the real `v`-prefixed tag ───────
+
+
+def _plan(*, source: str, ref: str, driver_kind: str = "mac-native") -> NightlyRunPlan:
+    return NightlyRunPlan(
+        repo="vimcode", artifact="macos-dmg", spec="", driver_kind=driver_kind,
+        source=source, ref=ref, detail="", host=None, host_rationale="",
+        infra_blocked=False, infra_reason="",
+    )
+
+
+class TestGitRefForPlan:
+    def test_download_plan_gets_a_v_prefix(self) -> None:
+        """#3660 review round 1: `fetch_latest_release_tag` deliberately
+        returns a BARE version — `git ls-remote`/`git clone` need the real
+        tag name."""
+        assert _git_ref_for_plan(_plan(source="download", ref="0.15.0")) == "v0.15.0"
+
+    def test_download_plan_already_v_prefixed_is_left_alone(self) -> None:
+        assert _git_ref_for_plan(_plan(source="download", ref="v0.15.0")) == "v0.15.0"
+
+    def test_build_plan_branch_name_is_never_prefixed(self) -> None:
+        assert _git_ref_for_plan(_plan(source="build", ref="integration")) == "integration"
+
+
+# ── _git_clone_ref: reuse an existing checkout rather than re-cloning ──────
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def _local_repo_with_two_tagged_commits(tmp_path: Path) -> Path:
+    src = tmp_path / "src.git"
+    src.mkdir()
+    _git(src, "init", "-q")
+    _git(src, "config", "user.email", "t@example.com")
+    _git(src, "config", "user.name", "t")
+    (src / "f.txt").write_text("v1")
+    _git(src, "add", ".")
+    _git(src, "commit", "-q", "-m", "v1")
+    _git(src, "tag", "v1.0.0")
+    (src / "f.txt").write_text("v2")
+    _git(src, "add", ".")
+    _git(src, "commit", "-q", "-m", "v2")
+    _git(src, "tag", "v2.0.0")
+    return src
+
+
+class TestGitCloneRefReuse:
+    def test_second_call_reuses_the_checkout_instead_of_failing(
+        self, tmp_path: Path,
+    ) -> None:
+        """#3660 review round 1: a bare `git clone` refuses a non-empty
+        destination, and `_default_workdir` deliberately returns the SAME
+        path every night for a given repo — so a repeat nightly run must
+        not require the caller to clean the workdir by hand."""
+        src = _local_repo_with_two_tagged_commits(tmp_path)
+        workdir = tmp_path / "work"
+        remote_url = f"file://{src}"
+
+        _git_clone_ref(remote_url, "v1.0.0", str(workdir))
+        assert (workdir / "f.txt").read_text() == "v1"
+
+        # The second call, at a DIFFERENT ref, must succeed (not raise
+        # CalledProcessError("destination path already exists")) and leave
+        # the checkout actually updated.
+        _git_clone_ref(remote_url, "v2.0.0", str(workdir))
+        assert (workdir / "f.txt").read_text() == "v2"
+
+
+# ── _default_download_artifact: Path, not str, into download_asset ────────
+
+
+class TestDefaultDownloadArtifact:
+    def test_passes_a_path_to_download_asset_not_a_str(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3660 review round 1: `coord.tui_release.download_asset(url,
+        dest_dir: Path)` immediately calls `dest_dir.mkdir(...)` — passing
+        a bare `str` raised `AttributeError` on every download run."""
+        import coord.tui_release as tui_release
+
+        monkeypatch.setattr(nightly_runner, "_git_clone_ref", lambda *a, **k: None)
+        monkeypatch.setattr(
+            tui_release, "fetch_release_assets",
+            lambda version, *, repo: [
+                tui_release.ReleaseAsset(name="macos-dmg", download_url="https://x/macos-dmg"),
+            ],
+        )
+        seen: dict = {}
+
+        def _fake_download(url, dest_dir, **kw):
+            seen["dest_dir_type"] = type(dest_dir)
+            assert isinstance(dest_dir, Path)
+            return dest_dir / "macos-dmg"
+
+        monkeypatch.setattr(tui_release, "download_asset", _fake_download)
+
+        config = Config(
+            repos=[Repo(name="vimcode", github="acme/vimcode", develop_branch=None)],
+            machines=[_machine("m1", caps=["python"])],
+        )
+        workdir = tmp_path / "work"
+        plan = _plan(source="download", ref="0.15.0")
+        obtained = _default_download_artifact(plan, config=config, workdir=str(workdir))
+        assert issubclass(seen["dest_dir_type"], Path)
+        assert obtained.binary_path == str(workdir / "macos-dmg")
+
+
+# ── _resolve_bugbash_lane: resolved via discover_lanes, not hand-built ─────
+
+
+class TestResolveBugbashLane:
+    def test_disambiguates_sibling_routes_sharing_a_kind(self) -> None:
+        """#3660 review round 1 — the exact #3615 case: two routes with the
+        SAME `kind` but different `label:` must resolve to distinct
+        per-route platform labels (and carry their own setup/launch
+        command), not the bare driver_kind both would share if hand-built.
+        """
+        gui_route = AcceptanceDriverConfig(
+            kind="win-native", capability="windows", label="gui",
+            setup="cargo xwin build --bin vimcode", run="vimcode.exe",
+        )
+        terminal_route = AcceptanceDriverConfig(
+            kind="win-native", capability="windows", label="terminal",
+            run="vimcode-term.exe",
+        )
+        config = Config(
+            repos=[Repo(name="vimcode", github="acme/vimcode")],
+            machines=[_machine("dell64", caps=["windows"])],
+            acceptance=AcceptanceConfig(drivers={
+                "vimcode": AcceptanceDriverConfig(routes=[gui_route, terminal_route]),
+            }),
+        )
+        client = _FakeHealthClient({})
+
+        gui_lane = _resolve_bugbash_lane(
+            config, "vimcode", gui_route, "dell64", http_client=client,
+        )
+        assert gui_lane.platform == "win-native:gui"
+        assert gui_lane.setup == "cargo xwin build --bin vimcode"
+        assert gui_lane.launch_command == "vimcode.exe"
+
+        terminal_lane = _resolve_bugbash_lane(
+            config, "vimcode", terminal_route, "dell64", http_client=client,
+        )
+        assert terminal_lane.platform == "win-native:terminal"
+        assert terminal_lane.launch_command == "vimcode-term.exe"
+
+    def test_falls_back_to_a_hand_built_lane_for_a_non_bugbash_driver_kind(self) -> None:
+        """`cli-pytest` isn't one of `coord.bugbash.LANE_DRIVER_KINDS` —
+        `discover_lanes` resolves nothing for it, so this must still
+        return a usable lane rather than crashing."""
+        config = _config(kind="cli-pytest", capability="python")
+        driver_cfg = config.acceptance.drivers["vimcode"]
+        lane = _resolve_bugbash_lane(config, "vimcode", driver_cfg, "m1")
+        assert lane.platform == "cli-pytest"
+        assert lane.driver_kind == "cli-pytest"
+        assert lane.machine == "m1"

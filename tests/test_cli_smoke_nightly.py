@@ -104,6 +104,28 @@ class TestSmokeNightlyCli:
         assert "INFRA BLOCKED" in result.output
         assert "screen is locked" in result.output
 
+    def test_open_issues_fetch_failure_exits_2_not_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3660 review non-blocking item: a GitHub hiccup fetching open
+        issues (the dedupe decision's primary input) must exit 2 like
+        every other failure mode, never an unguarded traceback."""
+        from coord.cli import main
+
+        monkeypatch.setattr("coord.commands.smoke._load_config", lambda path: _config())
+        monkeypatch.setattr("coord.board_service.read_board", lambda: Board())
+
+        def _boom(slug: str) -> list[dict]:
+            raise RuntimeError("gh: connection reset")
+
+        monkeypatch.setattr("coord.github_ops.get_open_issues", _boom)
+        monkeypatch.setattr("coord.commands.smoke._fetch_closed_issues", lambda slug: [])
+        result = CliRunner().invoke(
+            main, ["smoke", "nightly", "--repo", "vimcode", "--artifact", "macos-dmg"],
+        )
+        assert result.exit_code == 2
+        assert "could not fetch open issues" in result.output
+
     def test_dry_run_prints_plan_and_exits_0(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from coord.cli import main
 

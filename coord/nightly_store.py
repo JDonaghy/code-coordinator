@@ -30,6 +30,23 @@ hands every row through unfiltered and lets that existing, already-tested
 logic decide, so the two reading paths can never silently disagree about
 what "the latest nightly result" means — #2096 "one question, one answer").
 
+**#3660 review round 1: a re-run must be able to CLEAR a poisoned
+``(artifact, sha)``.** Every :class:`NightlyResultRecord` carries a
+``run_id`` — one fresh value per :func:`coord.nightly_runner.
+run_nightly_smoke` invocation, shared by every step THAT run persists.
+:func:`nightly_artifact_results_for_release_gate` groups by
+``(artifact, sha, run_id)``, not just ``(artifact, sha)`` — so two runs at
+the same unmoved release SHA (an operator re-running after unlocking a
+host, or simply two nightly ticks against a release that hasn't cut yet)
+produce TWO separate :class:`~coord.release_gate.NightlyArtifactResult`
+entries, each carrying its own run's ``checked_at``, and
+``_nightly_artifact_step``'s already-tested "most recently checked wins"
+logic genuinely has something to pick between. Before ``run_id`` existed,
+every row at a given ``(artifact, sha)`` collapsed into ONE group forever —
+a single ``unavailable=True`` row from a locked host on run 1 kept the
+gate red even after a clean run 2, because there was nothing in the stored
+data to tell the two runs apart.
+
 A :class:`coord.filelock.FileLock` guards the read-modify-write cycle: more
 than one ``coord smoke nightly`` run (different repos, different hosts, a
 cron timer racing a human's on-demand invocation) can be in flight at once,
@@ -55,6 +72,21 @@ def _store_dir() -> Path:
 
 def _store_path(repo: str) -> Path:
     return _store_dir() / f"{repo}.json"
+
+
+def _lock_path(store_path: Path) -> Path:
+    """The lock file for *store_path*, next to it — never derived with
+    ``Path.with_suffix`` (#3660 review nit): that replaces the LAST suffix
+    of the *repo name* itself, so a repo literally named ``a.b`` would
+    collide with a repo named ``a`` (both lock at ``a.lock``). Appending
+    (never replacing) is collision-free for every repo name."""
+    return store_path.parent / (store_path.name + ".lock")
+
+
+def _tmp_path(store_path: Path) -> Path:
+    """Same append-not-replace reasoning as :func:`_lock_path`, for the
+    temp-file-then-``rename`` swap's scratch file."""
+    return store_path.parent / (store_path.name + ".tmp")
 
 
 @dataclass(frozen=True)
@@ -83,6 +115,15 @@ class NightlyResultRecord:
     step: str = ""
     host: str = ""
     evidence: tuple[str, ...] = field(default_factory=tuple)
+    #: One fresh value per :func:`coord.nightly_runner.run_nightly_smoke`
+    #: invocation, shared by every step that run persists — the grouping
+    #: key :func:`nightly_artifact_results_for_release_gate` needs to tell
+    #: "two runs at the same (artifact, sha)" apart (#3660 review round 1).
+    #: Defaults to ``""`` (never required) so a row persisted before this
+    #: field existed still reads back — it just groups with any OTHER
+    #: ``run_id=""`` row for the same ``(artifact, sha)``, which is exactly
+    #: the (already-shipped) pre-fix behaviour for that legacy data.
+    run_id: str = ""
 
     def to_nightly_artifact_result(self) -> NightlyArtifactResult:
         """The exact shape :func:`coord.release_gate.evaluate_release_gate`
@@ -127,11 +168,11 @@ def record_nightly_result(record: NightlyResultRecord) -> None:
     """
     path = _store_path(record.repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock = FileLock(path.with_suffix(".lock"))
+    lock = FileLock(_lock_path(path))
     with lock:
         rows = _load_raw(record.repo)
         rows.append(asdict(record))
-        tmp = path.with_suffix(".tmp")
+        tmp = _tmp_path(path)
         tmp.write_text(json.dumps(rows, indent=2, sort_keys=True))
         tmp.replace(path)
 
@@ -157,6 +198,7 @@ def read_nightly_results(repo: str) -> list[NightlyResultRecord]:
                     step=row.get("step", ""),
                     host=row.get("host", ""),
                     evidence=tuple(row.get("evidence") or ()),
+                    run_id=row.get("run_id", ""),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -200,17 +242,24 @@ def nightly_artifact_results_for_release_gate(repo: str) -> list[NightlyArtifact
 
     Multiple runs of the same ``(artifact, sha)`` (a re-run after a fix, or
     simply two nightly ticks against an unmoved release SHA) each produce
-    their OWN group/result here — ``_nightly_artifact_step``'s own
+    their OWN group/result here — grouped by ``(artifact, sha, run_id)``,
+    not just ``(artifact, sha)`` (#3660 review round 1: without ``run_id``
+    every run at one SHA collapsed into a single group forever, so one
+    ``unavailable``/failing row from an earlier run could never be cleared
+    by a later clean one). ``_nightly_artifact_step``'s own
     most-recently-checked-wins logic (already tested, untouched) is what
-    picks among them, exactly as it already does for the ``--from-json``
-    seam's possibly-multiple entries for one lane/artifact.
+    picks among the resulting entries, exactly as it already does for the
+    ``--from-json`` seam's possibly-multiple entries for one lane/artifact.
+    A legacy row with no ``run_id`` (persisted before this fix) groups with
+    every other such row for the same ``(artifact, sha)`` — the same
+    (imperfect, but no worse than before) behaviour that data always had.
     """
-    groups: dict[tuple[str, str], list[NightlyResultRecord]] = {}
+    groups: dict[tuple[str, str, str], list[NightlyResultRecord]] = {}
     for record in read_nightly_results(repo):
-        groups.setdefault((record.artifact, record.sha), []).append(record)
+        groups.setdefault((record.artifact, record.sha, record.run_id), []).append(record)
 
     out: list[NightlyArtifactResult] = []
-    for (artifact, sha), rows in groups.items():
+    for (artifact, sha, _run_id), rows in groups.items():
         checked_at = max(r.checked_at for r in rows)
         unavailable_rows = [r for r in rows if r.unavailable]
         failing_rows = [r for r in rows if not r.passed and not r.unavailable]
