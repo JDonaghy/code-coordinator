@@ -469,6 +469,29 @@ class TestRunNightlySmokeGreenRedKnownBug:
         assert len(comments) == 1
         assert comments[0][3] == "7"
 
+    def test_a_crash_annealing_the_issue_number_does_not_abort_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#3661 review round 1: `set_nightly_issue_number` is documented
+        best-effort but was being called unguarded — a lock timeout/OSError
+        there must cost only the status-surface annotation, never the
+        run's own verdict or its remaining steps."""
+
+        def _boom(**kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(nightly_runner, "set_nightly_issue_number", _boom)
+        report, runner = _run(
+            tmp_path, monkeypatch,
+            tests=[{"id": "launch", "status": "fail", "message": "window never appeared"}],
+        )
+        assert report.ran is True
+        assert report.outcomes[0].action == "filed"
+        assert report.outcomes[0].issue_number is not None
+        results = read_nightly_results("vimcode")
+        assert len(results) == 1
+        assert results[0].passed is False
+
     def test_known_bug_step_still_red_is_silent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

@@ -254,11 +254,14 @@ def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
     """#3293 unit-level check on ``_board_digest_projection`` itself: the
     named culprits (``audit_recent_count``, ``issues[*].synced_at``,
     ``fleet_health``'s clocks + self-referential ``fleet_board_latency``
-    check, and — per #3428's review — ``concurrency.occupancy_observed_at``)
-    are stripped from the digest input, while every other field —
-    including the REST of ``fleet_health``/``concurrency`` (severities,
-    results, other checks, occupied counts, ceilings) — passes through
-    untouched, so a real state change still bumps the ETag.
+    check, ``concurrency.occupancy_observed_at`` per #3428's review, and —
+    per #3661's review — ``nightly_status[*].age_hours`` plus a STALE row's
+    ``detail`` string, which bakes that same age into its text) are
+    stripped from the digest input, while every other field — including
+    the REST of ``fleet_health``/``concurrency`` (severities, results,
+    other checks, occupied counts, ceilings) and a non-stale
+    ``nightly_status`` row's ``detail`` — passes through untouched, so a
+    real state change still bumps the ETag.
     """
     from coord.serve_app import _board_digest_projection
 
@@ -305,6 +308,18 @@ def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
             "occupancy_state": "observed",
             "occupancy_observed_at": 1000.0,
         },
+        "nightly_status": [
+            {
+                "repo": "vimcode", "artifact": "macos-dmg", "state": "stale",
+                "detail": "last run 40.1h ago (host m1), older than the 36h "
+                          "freshness window — all green",
+                "host": "m1", "age_hours": 40.1,
+            },
+            {
+                "repo": "natal-chart", "artifact": "win-exe", "state": "green",
+                "detail": "all green", "host": "m2", "age_hours": 1.2,
+            },
+        ],
     }
 
     projection = _board_digest_projection(result)
@@ -319,6 +334,10 @@ def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
     assert masked_latency_check["check_id"] == "fleet_board_latency"
     assert "headroom" not in masked_latency_check and "values" not in masked_latency_check
     assert "occupancy_observed_at" not in projection["concurrency"]
+    stale_row = next(r for r in projection["nightly_status"] if r["repo"] == "vimcode")
+    green_row = next(r for r in projection["nightly_status"] if r["repo"] == "natal-chart")
+    assert "age_hours" not in stale_row and "age_hours" not in green_row
+    assert "detail" not in stale_row  # STALE's detail bakes in the clock too
 
     # ...but real state signal is untouched: severities, other fields on the
     # issue rows, and a DIFFERENT fleet check's headroom/values all survive,
@@ -334,6 +353,7 @@ def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
     assert projection["concurrency"]["repo_occupied"] == {"api": 2}
     assert projection["concurrency"]["max_parallel"] == result["concurrency"]["max_parallel"]
     assert projection["concurrency"]["occupancy_state"] == "observed"
+    assert green_row["detail"] == "all green"  # non-stale detail is real content
 
     # And the original `result` passed in is never mutated — it's still the
     # dict that gets serialized as the wire body, culprits and all.
@@ -341,6 +361,7 @@ def test_board_digest_projection_masks_only_the_named_volatile_fields() -> None:
     assert result["issues"][0]["synced_at"] == 111.0
     assert result["fleet_health"]["refreshed_at"] == 1000.0
     assert result["concurrency"]["occupancy_observed_at"] == 1000.0
+    assert result["nightly_status"][0]["detail"].startswith("last run")
 
 
 def test_board_version_stable_across_audit_and_health_tick_noise(

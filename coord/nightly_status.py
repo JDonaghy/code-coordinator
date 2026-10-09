@@ -246,7 +246,10 @@ def nightly_statuses_for_config(
 def render_nightly_status_line(status: NightlyRepoStatus) -> str:
     """One ``coord status`` line for *status* — the generic-checklist
     ``✓``/``⚠``/``✗`` convention every other doctor/status renderer in this
-    codebase uses (`_unit_drift_lines`, `_gui_lane_preflight_lines`, ...).
+    codebase uses (`_unit_drift_lines`, `_gui_lane_preflight_lines`, ...),
+    plus a fourth marker, ``?``, for :data:`STATE_STALE` — a verdict that
+    convention has no symbol for (#2096: there is always a verdict, even
+    "nothing recorded/too old to trust", and it still needs its own glyph).
     """
     label = f"{status.repo} ({status.artifact})"
     if status.state == STATE_GREEN:

@@ -6227,10 +6227,26 @@ def _board_digest_projection(result: dict) -> dict:
     # occupancy_observed_at` above — it ticks on every request even when
     # the underlying nightly result hasn't changed at all, so it must not
     # decide whether the ETag/version bumps either.
+    #
+    # `detail` needs the same treatment, but only for a STALE row:
+    # `classify_nightly_status`'s STALE branch (coord/nightly_status.py)
+    # bakes the clock straight into the string — "last run {age_hours:.1f}h
+    # ago ... older than the {stale_after_hours:.0f}h freshness window —
+    # ...". At one decimal place that text changes roughly every 6
+    # minutes, and STALE is the long-lived state after a broken sweep (a
+    # repo nobody could run against for days), so leaving it in would
+    # re-digest the whole /board projection on that cadence for exactly the
+    # rows most likely to sit untouched for a long time — the #3293 churn
+    # this mask exists to prevent. GREEN/RED/INFRA `detail` carries the
+    # step's own real-content text (unaffected by the clock) and stays in
+    # the digest, where a genuine state change should still bump the ETag.
     nightly_status = projection.get("nightly_status")
     if isinstance(nightly_status, list):
         projection["nightly_status"] = [
-            {k: v for k, v in row.items() if k != "age_hours"}
+            {
+                k: v for k, v in row.items()
+                if k != "age_hours" and not (k == "detail" and row.get("state") == "stale")
+            }
             if isinstance(row, dict) else row
             for row in nightly_status
         ]

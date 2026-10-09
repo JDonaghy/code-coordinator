@@ -232,6 +232,23 @@ def smoke_nightly_sweep_cmd(config_path: Path, dry_run: bool, as_json: bool) -> 
             entry["error"] = f"could not fetch open issues: {exc.__cause__}"
         except NightlyRunnerError as exc:
             entry["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 — #3661 review: this loop's whole
+            # reason to exist is "one pair's crash does not abort the sweep"
+            # (the command's own --help, the deploy/coord-nightly-smoke.service
+            # header, docs/AGENT_OPERATIONS.md). The narrower catches above
+            # only covered the board-read and open-issues-fetch seams;
+            # everything else `run_nightly_smoke` can raise unwrapped —
+            # `resolve_sha`'s git/network call, `_resolve_bugbash_lane`'s
+            # live host probes, and most of all `subprocess_coord_runner`
+            # raising on any non-zero `coord` exit while filing — must land
+            # here too, or repos B..Z never get their own attempt for a
+            # problem local to repo A. Reported exactly like the board-read/
+            # issue-fetch/`NightlyRunnerError` cases above: this pair simply
+            # could not be attempted, which is not an `any_dropped` finding
+            # (nothing was observed to drop) and must not fail the process —
+            # that is the whole "leave the queue alone" point of this
+            # command (see its own --help).
+            entry["error"] = f"unexpected error: {exc}"
         else:
             entry.update(_report_to_dict(report))
             if report.any_dropped:

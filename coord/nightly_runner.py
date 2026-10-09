@@ -1014,12 +1014,22 @@ def run_nightly_smoke(
             # durable before this acting step ever ran (#3660 review round
             # 2's crash-safety property is untouched by this), so losing
             # this annotation to a crash here only costs one status-surface
-            # link, never the gate's own verdict.
+            # link, never the gate's own verdict — and must never abort the
+            # remaining steps of this run so THEIR observations go
+            # unpersisted (#3661 review round 1). `set_nightly_issue_number`
+            # already swallows its own lock/IO/JSON failures and returns
+            # ``False``; the ``except`` below is a second line of defense
+            # against anything else going wrong at this call site, so
+            # "best-effort" is actually true here, not just documented.
             if outcome.issue_number is not None:
-                set_nightly_issue_number(
-                    repo=repo, run_id=effective_run_id, spec=obs.spec,
-                    step=obs.step, issue_number=outcome.issue_number,
-                )
+                try:
+                    set_nightly_issue_number(
+                        repo=repo, run_id=effective_run_id, spec=obs.spec,
+                        step=obs.step, issue_number=outcome.issue_number,
+                    )
+                except Exception:  # noqa: BLE001 — see comment above: this
+                    # annotation is never allowed to abort a live run.
+                    pass
         outcomes.append(outcome)
 
     return NightlyRunReport(
