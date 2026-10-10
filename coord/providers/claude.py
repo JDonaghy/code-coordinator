@@ -124,6 +124,7 @@ class ClaudeProvider(Provider):
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
             _claude_md_system_prompt_suffix,
+            _workflow_leg_system_prompt_suffix,
             build_deny_prompt,
             worker_disallowed_tools,
         )
@@ -247,6 +248,15 @@ class ClaudeProvider(Provider):
                 # auto-discovery, so this is the only mechanism that
                 # delivers it. See _claude_md_system_prompt_suffix.
                 _sp += _claude_md_system_prompt_suffix(spec.repo_path)
+                # #3681: keep in sync with default_worker_command's identical
+                # `if spec.workflow:` branch — opted-in workflow legs only;
+                # every other leg (the overwhelming majority) sees none of
+                # this. ``_workflow_leg_system_prompt_suffix`` itself embeds
+                # ``REVIEWER_SYSTEM_PROMPT`` verbatim, so this stays byte-
+                # identical with what a dispatched Review leg receives no
+                # matter which builder produced the argv.
+                if spec.workflow:
+                    _sp += _workflow_leg_system_prompt_suffix()
                 # #2169: keep in sync with default_worker_command's identical
                 # branch — Monitor is the sanctioned bounded-poll tool for a
                 # backgrounded long-running command. #2301: this grant is for

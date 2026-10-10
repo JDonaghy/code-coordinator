@@ -20,17 +20,22 @@ from coord.agent import (
     HOST_SLEEP_EXIT,
     NO_FIRST_OUTPUT_EXIT,
     RUNTIME_CEILING_EXIT,
+    AssignmentSpec,
     _log_has_output,
     _log_has_result,
+    _log_last_event_is_result,
     _maybe_bash_wrap,
     _wait_for_proc_or_result,
+    _workflow_leg_system_prompt_suffix,
     _PTY_RESULT_LINE_MARKER,
     _RESULT_LINE_MARKER,
     format_host_sleep_reason,
     format_runtime_ceiling_reason,
     is_host_sleep_reason,
     is_runtime_ceiling_reason,
+    worker_disallowed_tools,
 )
+from coord.review import REVIEWER_SYSTEM_PROMPT
 
 
 # ── _log_has_result ──────────────────────────────────────────────────────────
@@ -406,6 +411,172 @@ def test_result_detected_mid_wait_only_kills_after_grace(tmp_path: Path) -> None
     # The SIGTERM should not have fired on the first iteration where result
     # wasn't yet detected.
     assert calls, "expected SIGTERM to fire eventually"
+
+
+def test_workflow_leg_first_of_two_result_events_does_not_reap(tmp_path: Path) -> None:
+    """#3681: a workflow leg's FIRST `result` event is the outer turn's
+    placeholder ("the workflow is running in background"), immediately
+    followed by more stream output as the workflow's agents keep working.
+    With `workflow=True` and a `_log_last_event_is_result`-style
+    `log_has_result`, that placeholder must never arm the grace-period
+    kill — only a result event that stays the LAST line of the log through
+    a full poll (the workflow's real, final result) may.
+    """
+    log_path = str(tmp_path / "log")
+    Path(log_path).write_text("")
+    proc = _FakeProc(exit_after_calls=None, exit_after_kill=True)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    clock = _fake_clock()
+
+    real_wait = proc.wait
+
+    def wait_advances(timeout: float | None = None) -> int:
+        clock.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    state = {"calls": 0}
+
+    def tick(path: str) -> bool:
+        state["calls"] += 1
+        if state["calls"] == 2:
+            # The outer turn's placeholder result — the workflow is still
+            # running in the background.
+            Path(path).write_text(
+                '{"type":"assistant","message":{}}\n'
+                '{"type":"result","subtype":"success","is_error":false}\n'
+            )
+        elif state["calls"] == 3:
+            # More output appears after it — the workflow is still working,
+            # so that earlier result line was NOT the final one.
+            with open(path, "a") as f:
+                f.write('{"type":"assistant","message":{}}\n')
+        elif state["calls"] >= 4:
+            # The workflow's real, final result — stays the last line from
+            # here on.
+            with open(path, "a") as f:
+                f.write('{"type":"result","subtype":"success","is_error":false}\n')
+        return _log_last_event_is_result(path)
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=0.5,
+        grace_after_result=1.0,
+        max_wait=10.0,
+        killpg=record,
+        log_has_result=tick,
+        clock=clock,
+        workflow=True,
+    )
+    assert code == 0
+    assert calls, "expected the process group to eventually be killed"
+    text = Path(log_path).read_text()
+    # The re-arm must have fired for the placeholder result before the real
+    # final one ever armed the grace-period kill.
+    assert "workflow still running after result event" in text
+
+
+def test_non_workflow_leg_ignores_log_has_result_flapping(tmp_path: Path) -> None:
+    """The one-way latch is untouched for ordinary (non-workflow) legs: even
+    if `log_has_result` flips back to False after returning True once (which
+    a plain `claude -p` leg's own `_log_has_result` never does, but this
+    guards the `workflow=False` code path explicitly), the grace period must
+    still be armed by the first True and never re-armed."""
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=None, exit_after_kill=True)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    clock = _fake_clock()
+
+    real_wait = proc.wait
+
+    def wait_advances(timeout: float | None = None) -> int:
+        clock.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+    state = {"calls": 0}
+
+    def flapping_has_result(_path: str) -> bool:
+        state["calls"] += 1
+        # True on the 2nd call, False again on the 3rd — a flap that would
+        # re-arm a workflow leg but must be ignored for workflow=False.
+        return state["calls"] == 2
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=0.5,
+        grace_after_result=1.0,
+        max_wait=10.0,
+        killpg=record,
+        log_has_result=flapping_has_result,
+        clock=clock,
+        workflow=False,
+    )
+    assert code == 0
+    assert calls, "expected SIGTERM to still fire despite the flap"
+    text = Path(log_path).read_text()
+    assert "workflow still running after result event" not in text
+
+
+# ── workflow opt-in: --disallowedTools (#3681) ───────────────────────────────
+
+def _make_spec(*, workflow: bool) -> AssignmentSpec:
+    return AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="do the thing",
+        workflow=workflow,
+    )
+
+
+def test_disallowed_tools_un_disallows_workflow_and_task_only_for_opted_in_leg() -> None:
+    """#3681 item 1/5: `Workflow` (and `Task`, for its subagents) must be
+    absent from --disallowedTools only when the leg opted in via
+    `spec.workflow=True` — every other #3420 UNUSABLE_TOOL_SCHEMAS entry
+    stays disallowed either way, and a non-opted-in leg keeps Workflow/Task
+    disallowed exactly as before."""
+    opted_in = worker_disallowed_tools(
+        _make_spec(workflow=True), allowed_tools="Read,Edit,Write,Bash"
+    )
+    not_opted_in = worker_disallowed_tools(
+        _make_spec(workflow=False), allowed_tools="Read,Edit,Write,Bash"
+    )
+
+    assert "Workflow" not in opted_in
+    assert "Task" not in opted_in
+    assert "Workflow" in not_opted_in
+    assert "Task" in not_opted_in
+
+    # Every other #3420 schema stays disallowed regardless of the opt-in.
+    for pattern in ("Skill", "ScheduleWakeup", "ReportFindings", "ListAgents"):
+        assert pattern in opted_in
+        assert pattern in not_opted_in
+
+
+# ── in-workflow review system prompt (#3681 item 5) ──────────────────────────
+
+def test_workflow_system_prompt_suffix_embeds_the_real_reviewer_prompt_verbatim() -> None:
+    """#3681 item 5 / #2096: the workflow-leg system-prompt suffix must tell
+    the worker to grade its own in-workflow review step with coord's real
+    `REVIEWER_SYSTEM_PROMPT` — the SAME text a dispatched Review leg's
+    system prompt is built from (`coord.agent.default_worker_command`'s
+    `elif spec.type == "review"` branch) — never a second, hand-written
+    description of what a reviewer checks."""
+    suffix = _workflow_leg_system_prompt_suffix()
+
+    assert REVIEWER_SYSTEM_PROMPT in suffix
+    # Not merely similar text: byte-for-byte containment of the exact same
+    # module-level string a Review leg's own system prompt is built from.
+    start = suffix.index(REVIEWER_SYSTEM_PROMPT)
+    assert suffix[start : start + len(REVIEWER_SYSTEM_PROMPT)] == REVIEWER_SYSTEM_PROMPT
 
 
 # ── _log_has_output ──────────────────────────────────────────────────────────

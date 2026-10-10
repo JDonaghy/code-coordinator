@@ -1318,6 +1318,18 @@ def dispatch(
     # kwarg.
     if proposal.issue_labels:
         payload["issue_labels"] = list(proposal.issue_labels)
+    # #3681: the `coord:workflow` opt-in label — only for `type="work"`
+    # dispatches, mirroring `provider_issue_labels`'s identical
+    # `type == "work"` gate above (a label meant for the eventual work leg
+    # must not leak into a review/smoke/plan proposal). Only sent when
+    # True — never False — same "don't 400 an older agent on an unknown
+    # kwarg" discipline as every other optional field in this block; an
+    # agent predating `AssignmentSpec.workflow` simply runs the leg as a
+    # normal (non-workflow) Work leg.
+    from coord.agent import WORKFLOW_LEG_LABEL  # noqa: PLC0415
+
+    if proposal.type == "work" and WORKFLOW_LEG_LABEL in (proposal.issue_labels or []):
+        payload["workflow"] = True
     # #2131: per-leg spend ceiling, resolved here (CLI/daemon lane) and
     # carried on the wire so a config-free agent is covered too. Sent ONLY
     # when the operator has actually configured one — with no `budget:` block

@@ -2508,7 +2508,7 @@ class TestUatStateAndReasonColumns:
 # `review_claims` / #3333's `smoke_claims` bumps above. Closes the race where
 # the live review-completion path and the orphan sweep both see
 # `review_posted_at IS NULL` and both post the identical GitHub comment.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (23, 99)
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (24, 100)
 
 
 class TestMigrateAddColumnsVersionGuard:

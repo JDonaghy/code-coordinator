@@ -1146,7 +1146,16 @@ def retry_on_locked(
 # isn't permanently stranded — a successful post leaves the claim in place
 # forever, which is harmless since `review_posted_at` being set already
 # excludes the row from both callers' candidate queries.
-_DB_SCHEMA_VERSION = 23
+#
+# #3681: bumped 23 -> 24 for the new `assignments.mode` column appended to
+# `_MIGRATE_ADD_COLUMNS` below — `"single"` or `"workflow"`, set once at
+# dispatch time from whether the dispatched issue carried the
+# `coord.agent.WORKFLOW_LEG_LABEL` label (`coord.state._record_dispatched_
+# local`). Lets `coord gates`/cost reporting compare review-round and
+# request-changes rates between workflow and single legs over a sample of
+# issues BEFORE anyone considers relaxing Test/Review for workflow legs —
+# a separate, later decision this column only supplies the data for.
+_DB_SCHEMA_VERSION = 24
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1321,7 +1330,11 @@ _SCHEMA_SQL = """
             -- (including every row predating this column, and every normal
             -- dispatch that was never rerouted). See
             -- coord.models.Assignment.model_reason.
-            model_reason TEXT
+            model_reason TEXT,
+            -- #3681: "single" or "workflow", set once at dispatch time from
+            -- whether the issue carried `coord.agent.WORKFLOW_LEG_LABEL`.
+            -- NULL for every row predating this column.
+            mode TEXT
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -2673,6 +2686,9 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # #1649 review: see the CREATE TABLE comment above — NULL for every row
     # predating this column and for every dispatch that wasn't rerouted.
     "ALTER TABLE assignments ADD COLUMN model_reason TEXT",
+    # #3681: "single" or "workflow" — see the CREATE TABLE comment above.
+    # NULL for every row predating this migration.
+    "ALTER TABLE assignments ADD COLUMN mode TEXT",
 ]
 
 
