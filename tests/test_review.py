@@ -504,6 +504,23 @@ def test_briefing_always_instructs_reviewer_on_issue_resolution_marker() -> None
     assert "investigation" in briefing
 
 
+def test_briefing_and_system_prompt_never_require_a_pending_upstream_draft() -> None:
+    """#3676: cross-repo gaps are filed by the coordinator from a worker's
+    `BLOCKED_ON_UPSTREAM` marker. Neither the reviewer system prompt nor the
+    per-review briefing may push the reviewer to demand a `PENDING_*` prose
+    draft of the upstream issue — both must carry the rule saying so."""
+    from coord.review import REVIEWER_SYSTEM_PROMPT, UPSTREAM_GAP_REVIEW_RULE
+
+    briefing = build_review_briefing(**_briefing_kwargs())
+    for text in (briefing, REVIEWER_SYSTEM_PROMPT):
+        assert UPSTREAM_GAP_REVIEW_RULE in text
+        assert "BLOCKED_ON_UPSTREAM" in text
+    assert "never request changes because a `PENDING_*`" in UPSTREAM_GAP_REVIEW_RULE
+    # The old example told the worker the gap had to be FILED by the time of
+    # review ("not just drafted in a docs file") — the push toward drafts.
+    assert "not just drafted in a docs file" not in briefing
+
+
 def test_briefing_flags_workers_own_partial_claim() -> None:
     """#3502: when the worker's own completion summary already carries
     `ISSUE_RESOLUTION: partial`, the reviewer must see it called out

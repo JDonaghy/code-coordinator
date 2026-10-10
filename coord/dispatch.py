@@ -304,6 +304,34 @@ Process -Id <pid>`, `taskkill /PID <pid>`), or close your own window \
 that hosts it.
 """
 
+# #3676: appended to every `type="work"` briefing — the worker half of the
+# structured cross-repo gap marker. `coord.upstream_gaps` is the coordinator
+# half (parse, file through the issue-tracker seam, link, block the queue row
+# `after=` it). The example deliberately uses `<placeholders>`: the parser
+# rejects them, so a log that echoes this briefing never files a fake gap.
+UPSTREAM_GAP_BRIEFING_NOTE = """
+
+## Cross-repo gaps — `BLOCKED_ON_UPSTREAM` (#3676)
+
+If this issue can't be fully done because ANOTHER repo (e.g. a library this \
+repo consumes) is missing a capability, don't work around it and don't draft \
+the upstream issue as prose in a tracking doc (`docs/PENDING_*.md` or \
+similar) — that draft is not required and no reviewer should ask for it. Put \
+this marker in your FINAL message instead, one per gap, with a short body on \
+the lines directly below it (a blank line ends the body):
+
+    BLOCKED_ON_UPSTREAM: <repo>: <one-line upstream issue title>
+    <2-6 lines: what is missing upstream, the API/behaviour you need, and \
+where this repo would call it>
+
+`<repo>` is the upstream repo's coordinator name or its `owner/name` GitHub \
+slug. The coordinator files the upstream issue for you, links it to this \
+one, and holds this issue's drive-queue row until it lands — you never need \
+the issue number. Still commit and push whatever is genuinely done; if the \
+gap leaves this issue unresolved, also declare `ISSUE_RESOLUTION: partial — \
+blocked on upstream (BLOCKED_ON_UPSTREAM above)`.
+"""
+
 # #3132: the addendum appended to a ``type="epic-decompose"`` dispatch's
 # briefing — see ``epic_decompose_briefing`` below. Kept as a module-level
 # constant (not inlined in the function) so a test can assert against the
@@ -1171,6 +1199,19 @@ def dispatch(
                 + "\n".join(focus_lines)
                 + "\n"
             )
+
+        # #3676: blocking findings a reviewer already raised on SIBLING
+        # issues (same epic/milestone) — recorded onto this issue by
+        # `coord.briefing_lessons.record_sibling_lessons` when the sibling's
+        # request-changes verdict landed, so this worker doesn't pay a fix
+        # round to rediscover the same rule. Fail-soft, "" when none.
+        from coord.briefing_lessons import sibling_lessons_block  # noqa: PLC0415
+
+        briefing_text = (
+            briefing_text
+            + sibling_lessons_block(proposal.repo_name, proposal.issue_number)
+            + UPSTREAM_GAP_BRIEFING_NOTE
+        )
     elif proposal.type == EPIC_DECOMPOSE_TYPE and proposal.issue_number:
         # #3132 review: an epic-decompose worker gets a real worktree + branch
         # and implements the first slice (see WRITE_CAPABLE_SPEC_TYPES'
