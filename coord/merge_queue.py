@@ -3484,16 +3484,31 @@ def evaluate_smoke_verdict(
         # this classification already asserts — item 3's streak bound is
         # what covers a chronically-moving red base instead.
         test_confirmation = getattr(a, "test_confirmation", None)
-        # "baseline_red" mirrors `coord.confirm_test.TEST_CONFIRMATION_
-        # BASELINE_RED` — kept as a literal (not an import) to avoid a
-        # module-level import of `coord.confirm_test`, which imports
-        # `coord.revalidate`, which imports THIS module. Pinned against
-        # drift by `tests/test_merge_queue.py::TestStaleSmokeVerdictReporting::
-        # test_literal_matches_the_canonical_confirm_test_constant`.
+        # "baseline_red" / "ci_and_worker" mirror `coord.confirm_test.
+        # TEST_CONFIRMATION_BASELINE_RED` / `TEST_CONFIRMATION_CI_AND_WORKER`
+        # — kept as literals (not an import) to avoid a module-level import
+        # of `coord.confirm_test`, which imports `coord.revalidate`, which
+        # imports THIS module. Pinned against drift by
+        # `tests/test_merge_queue.py::TestStaleSmokeVerdictReporting::
+        # test_literal_matches_the_canonical_confirm_test_constant` (and its
+        # `ci_and_worker` sibling).
         is_baseline_red_skip = (
             test_state == "skipped" and test_confirmation == "baseline_red"
         )
-        if test_state == "skipped" and not is_baseline_red_skip:
+        # #3673 review round 1: a `skipped` verdict recorded by
+        # `coord.smoke._gate_covered_by_ci_and_worker_run` is NOT the #1732
+        # structural claim either — it is pinned to the exact `test_head_sha`
+        # the worker's self-recorded `passed` and GitHub CI both covered, so
+        # — exactly like a genuine `passed` verdict — it must decay the
+        # moment the branch (or, since the worker's own run never merges
+        # with the base, the base underneath it) moves past that SHA.
+        # Routed through the IDENTICAL #1479 staleness block `passed` uses
+        # just below, rather than a second copy of that logic, so the two
+        # can never drift apart on what "stale" means.
+        is_ci_worker_skip = (
+            test_state == "skipped" and test_confirmation == "ci_and_worker"
+        )
+        if test_state == "skipped" and not is_baseline_red_skip and not is_ci_worker_skip:
             return SmokeVerdictStatus(
                 ok=True, kind=SMOKE_OK, assignment_id=getattr(a, "assignment_id", None)
             )
@@ -3521,11 +3536,15 @@ def evaluate_smoke_verdict(
         base_move_spare_reason: str | None = None
         test_base_sha = getattr(a, "test_base_sha", None)
         test_head_sha = getattr(a, "test_head_sha", None)
-        if test_state == "passed":
+        if test_state == "passed" or is_ci_worker_skip:
             # Merge base moved: the tested combination (this branch + that
             # base) no longer exists, even if the branch's own diff is
             # unchanged. #3386: skipped entirely for a `baseline_red` skip —
-            # see the comment above.
+            # see the comment above. #3673 review round 1: a `ci_and_worker`
+            # skip runs through this SAME block as `passed` — it is the
+            # identical "tested at this SHA" claim, just recorded via a
+            # different code path (see the comment at `is_ci_worker_skip`'s
+            # definition above).
             if (
                 test_base_sha is not None
                 and current_base_sha is None

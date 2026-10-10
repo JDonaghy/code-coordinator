@@ -274,7 +274,9 @@ def _resolve_default_provider(config: Config) -> "Provider":
     return resolve_default_provider(config.providers, config.models)
 
 
-def call_claude(system: str, user: str, *, provider: "Provider | None" = None) -> str:
+def call_claude(
+    system: str, user: str, *, provider: "Provider | None" = None, timeout: float = 300,
+) -> str:
     """Run the configured provider in one-shot mode and return the text response.
 
     Builds the subprocess argv via ``provider.oneshot_command()`` so that
@@ -292,6 +294,12 @@ def call_claude(system: str, user: str, *, provider: "Provider | None" = None) -
         provider: Provider whose ``oneshot_command()`` is called to build
             the argv.  ``None`` falls back to
             :class:`~coord.providers.claude.ClaudeProvider`.
+        timeout: Seconds to wait for the subprocess before raising
+            ``subprocess.TimeoutExpired``.  Defaults to 300s (brain
+            planning's own historical budget); a caller with a tighter,
+            best-effort bound (e.g. #3673's plain-runner failure
+            summariser) should pass a smaller value explicitly rather than
+            inheriting one sized for a different call shape.
 
     Returns:
         The text response string.
@@ -309,7 +317,7 @@ def call_claude(system: str, user: str, *, provider: "Provider | None" = None) -
         input=user,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(
