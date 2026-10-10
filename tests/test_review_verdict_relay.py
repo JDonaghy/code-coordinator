@@ -595,6 +595,54 @@ def test_post_review_claim_release_endpoint_missing_field_returns_400(
     assert resp.status_code == 400
 
 
+def test_post_review_claim_honours_client_stamp_and_release_own(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    """#3668: /review-claim stores the client-minted `claimed_at`, so a
+    client whose claim call failed can release exactly its own row via
+    /review-claim-release-own — and a release carrying any other stamp
+    (a different dispatcher's attempt) leaves the claim held."""
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        won = cli.post(
+            "/review-claim",
+            json={"of_assignment_id": "work-own", "claimed_at": 1234.5},
+        )
+        assert won.json()["claimed"] is True
+
+        foreign = cli.post(
+            "/review-claim-release-own",
+            json={"of_assignment_id": "work-own", "claimed_at": 999.0},
+        )
+        assert foreign.status_code == 200 and foreign.json()["released"] is False
+        still_held = cli.post("/review-claim", json={"of_assignment_id": "work-own"})
+        assert still_held.json()["claimed"] is False
+
+        own = cli.post(
+            "/review-claim-release-own",
+            json={"of_assignment_id": "work-own", "claimed_at": 1234.5},
+        )
+        assert own.status_code == 200 and own.json()["released"] is True
+        reclaimed = cli.post("/review-claim", json={"of_assignment_id": "work-own"})
+    assert reclaimed.json()["claimed"] is True
+
+
+def test_post_review_claim_release_own_missing_stamp_returns_400(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/review-claim-release-own", json={"of_assignment_id": "work-x"}
+        )
+        bad = cli.post(
+            "/review-claim-release-own",
+            json={"of_assignment_id": "work-x", "claimed_at": "soon"},
+        )
+    assert resp.status_code == 400
+    assert bad.status_code == 400
+
+
 # ── #2468: atomic review-POSTING claim — daemon routing + endpoints ─────────
 
 

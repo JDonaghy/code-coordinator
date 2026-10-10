@@ -3292,3 +3292,120 @@ def test_sweep_finalize_failure_falls_back_to_mark_terminal(monkeypatch, sweep_c
     assert len(healed) == 1
     assert "finalize failed" in healed[0].action
     assert marked == ["w1"]
+
+
+# ── #3668: latest review is for a superseded work leg ───────────────────────
+
+
+def _superseded_board(*, fix_test_state: str | None = "passed") -> Board:
+    """vimcode#1877 topology: leg w1 reviewed (request-changes) by rv1, fix
+    leg w2 completed afterwards on the same branch with no review of its own."""
+    fix = _assign(
+        aid="w2", typ="work", status="done", dispatched_at=300.0,
+        review_of="w1",
+    )
+    fix.test_state = fix_test_state
+    return Board(completed=[
+        _assign(
+            aid="w1", typ="work", status="done", review_state="done",
+            verdict="request-changes", dispatched_at=100.0,
+        ),
+        _assign(
+            aid="rv1", typ="review", status="done", verdict="request-changes",
+            dispatched_at=200.0, review_of="w1",
+        ),
+        fix,
+    ])
+
+
+def test_diagnose_review_flags_latest_review_of_superseded_leg(
+    monkeypatch, config, coord_db
+) -> None:
+    """#3668 acceptance: the latest review (rv1, request-changes, findings
+    present — every per-shape check would call it healthy) judged w1, but
+    the newest done leg w2 passed Test and has no review of its own. That
+    must read as unhealthy, not "review stage looks healthy"."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(
+        "coord.state.load_assignment_review_findings",
+        lambda aid: ("request-changes", "## Blocking\n- x"),
+    )
+
+    res = diagnose.diagnose_stage(
+        _superseded_board(), config, "api", 42, "review", dry_run=True,
+    )
+
+    assert res.recovered is False
+    assert res.needs_reset is True
+    assert not any("looks healthy" in f for f in res.findings)
+    assert any(
+        "superseded work leg w1" in f and "w2" in f for f in res.findings
+    )
+
+
+def test_diagnose_review_superseded_leg_awaiting_test_is_not_wedged(
+    monkeypatch, config, coord_db
+) -> None:
+    """While the newest leg's Test verdict is still out, holding its review
+    is correct (Test precedes Review) — reported, but not unhealthy."""
+    _stub(monkeypatch, session="dead")
+
+    res = diagnose.diagnose_stage(
+        _superseded_board(fix_test_state="running"), config, "api", 42,
+        "review", dry_run=True,
+    )
+
+    assert res.recovered is True
+    assert res.needs_reset is False
+    assert any("superseded work leg w1" in f for f in res.findings)
+
+
+def test_diagnose_review_of_newest_leg_still_healthy(
+    monkeypatch, config, coord_db
+) -> None:
+    """No false positive: once the newest leg has its own review, the stage
+    is judged on that review as before."""
+    _stub(monkeypatch, session="dead")
+    board = _superseded_board()
+    board.completed.append(_assign(
+        aid="rv2", typ="review", status="done", verdict="approve",
+        dispatched_at=400.0, review_of="w2",
+    ))
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", dry_run=True)
+
+    assert res.recovered is True
+    assert not any("superseded" in f for f in res.findings)
+    assert any("healthy" in f for f in res.findings)
+
+
+def test_reset_superseded_review_targets_newest_leg_and_keeps_history(
+    monkeypatch, config, coord_db
+) -> None:
+    """`--reset` on the superseded shape makes the NEWEST leg re-dispatchable
+    (claim released, review_state → pending in the DB) and keeps the older
+    leg's request-changes review — that is the history the fix answered."""
+    from coord import state
+
+    _stub(monkeypatch, session="dead")
+    board = _superseded_board()
+    for a in board.completed:
+        _record(a)
+    coord_db.execute(
+        "UPDATE assignments SET review_state='dispatched' WHERE assignment_id='w2'"
+    )
+    coord_db.commit()
+    assert state.claim_review_dispatch("w2") is True  # leaked claim on the head
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    assert res.recovered is True
+    assert res.needs_reset is False
+    assert state.has_review_claim("w2") is False
+    rows = dict(coord_db.execute(
+        "SELECT assignment_id, review_state FROM assignments"
+    ).fetchall())
+    assert rows["w2"] == "pending"
+    assert rows["w1"] == "done"
+    assert "rv1" in rows  # older leg's review row kept

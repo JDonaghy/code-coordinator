@@ -971,6 +971,35 @@ class TestIsLockContentionError:
     def test_false_for_non_operational_exception(self) -> None:
         assert not is_lock_contention_error(RuntimeError("database is locked"))
 
+    @pytest.mark.parametrize(
+        ("exc_type", "message", "code"),
+        [
+            (sqlite3.DatabaseError, "another row available", 100),
+            (sqlite3.OperationalError, "another row available", None),
+            (sqlite3.DatabaseError, "no more rows available", 101),
+            (sqlite3.InterfaceError, "not an error", 0),
+            # Clobbered code, real-looking message (seen in the #3668 repro).
+            (sqlite3.DatabaseError, "cannot commit transaction - SQL statements in progress", 100),
+        ],
+    )
+    def test_true_for_misattributed_success_code(self, exc_type, message, code) -> None:
+        """#3668: on the shared process-wide connection another thread's
+        statement can overwrite the per-connection error slot between this
+        thread's failing call and Python's read of it, so a lock collision
+        surfaces carrying a SQLite *success* code — e.g. the
+        `sqlite3.DatabaseError: another row available` behind the
+        vimcode#1877 `/review-claim` 503. Never a real failure of the
+        statement that raised it, so it is retried like contention."""
+        exc = exc_type(message)
+        if code is not None:
+            exc.sqlite_errorcode = code
+        assert is_lock_contention_error(exc)
+
+    def test_false_for_real_non_contention_database_error(self) -> None:
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        exc.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+        assert not is_lock_contention_error(exc)
+
     def test_real_contention_between_two_connections_is_detected(
         self, tmp_path
     ) -> None:

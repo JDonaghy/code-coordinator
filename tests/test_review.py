@@ -8624,3 +8624,380 @@ def test_dispatch_review_leaves_pending_when_all_candidates_5xx(
     assert len(client.calls) == 2, (
         f"expected 2 POST attempts (one per candidate), got {len(client.calls)}"
     )
+
+
+# ── #3668: newest-head review dispatch + claim release on a failed claim ────
+
+
+def _test_first_config() -> Config:
+    """Test-before-Review gate ON (the production default order) with the
+    auto-loop enabled, so a fix leg is only review-eligible once its own
+    Test verdict lands."""
+    return Config(
+        repos=[],
+        machines=[],
+        reviews=ReviewsConfig(max_auto_dispatch_per_pass=5, flood_threshold=12),
+        pipeline=PipelineConfig(
+            default_gates=["test", "review", "merge"], auto_loop=True,
+        ),
+    )
+
+
+def _drive_to_request_changes_and_fix(fake_dispatch) -> tuple[Board, Assignment, Assignment]:
+    """work → test-pass → review (request-changes) → fix work leg done.
+
+    Returns ``(board, first_leg, fix_leg)`` with the fix leg completed but
+    its Test verdict not yet recorded. The request-changes verdict goes
+    through the real ``propagate_review_verdict`` bookkeeping; the fix leg
+    has exactly the shape ``coord.auto_loop._dispatch_fix`` gives it
+    (same branch, ``review_of_assignment_id`` → the leg it fixes)."""
+    from coord.auto_loop import propagate_review_verdict
+
+    cfg = _test_first_config()
+    work = Assignment(
+        machine_name="laptop", repo_name="vimcode", issue_number=1877,
+        issue_title="t", assignment_id="103d0253cb07", status="done",
+        branch="issue-1877-x", type="work", review_state=None,
+        test_state="passed", dispatched_at=100.0, finished_at=110.0,
+    )
+    board = Board(completed=[work])
+
+    first = dispatch_pending_reviews(board, cfg)
+    assert [r.review_of_assignment_id for r in first] == ["103d0253cb07"]
+    review = board.active.pop()
+    review.status = "done"
+    review.review_verdict = "request-changes"
+    review.dispatched_at = 120.0
+    board.completed.append(review)
+    propagate_review_verdict(review, board, cfg, refresh_merge_queue=False)
+    assert work.review_state == "done"
+    assert work.review_verdict == "request-changes"
+
+    fix = Assignment(
+        machine_name="laptop", repo_name="vimcode", issue_number=1877,
+        issue_title="[fix-1] t", assignment_id="61af6f3e3e39", status="done",
+        branch="issue-1877-x", type="work", review_state=None,
+        review_of_assignment_id="103d0253cb07", review_iteration=1,
+        dispatched_at=130.0, finished_at=140.0,
+    )
+    board.completed.append(fix)
+    return board, work, fix
+
+
+def test_fix_leg_gets_its_own_review_after_its_test_passes(fake_dispatch) -> None:
+    """#3668 acceptance: work → test-pass → request-changes → fix work →
+    test-pass dispatches a SECOND review, for the fix leg. The older leg's
+    request-changes review must not satisfy the gate for the newest head."""
+    board, _work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
+    cfg = _test_first_config()
+
+    # Fix leg's Test not in yet — correctly held.
+    assert dispatch_pending_reviews(board, cfg) == []
+
+    fix.test_state = "passed"
+    second = dispatch_pending_reviews(board, cfg)
+
+    assert fake_dispatch == ["103d0253cb07", "61af6f3e3e39"]
+    assert [r.review_of_assignment_id for r in second] == ["61af6f3e3e39"]
+    assert fix.review_state == "dispatched"
+
+
+def test_fix_leg_stuck_at_stale_dispatched_is_healed_and_reviewed(fake_dispatch) -> None:
+    """#3668 (vimcode#1877): the newest leg read ``review_state="dispatched"``
+    while no review of it existed anywhere — the bulk pass filtered it out on
+    every tick and never even asked for a claim (2h12m stall). The newest
+    head must be handed back to ``pending`` and dispatched."""
+    board, _work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
+    fix.test_state = "passed"
+    fix.review_state = "dispatched"  # stale — nothing was dispatched for it
+
+    second = dispatch_pending_reviews(board, _test_first_config())
+
+    assert fake_dispatch == ["103d0253cb07", "61af6f3e3e39"]
+    assert [r.review_of_assignment_id for r in second] == ["61af6f3e3e39"]
+    assert fix.review_state == "dispatched"
+    assert any(
+        r.type == "review" and r.review_of_assignment_id == "61af6f3e3e39"
+        for r in board.active
+    )
+
+
+def test_stale_dispatched_heal_leaves_superseded_leg_alone(fake_dispatch) -> None:
+    """Only the NEWEST done leg is healed — an older leg left at
+    ``dispatched`` is superseded, and reviewing it is the wrong target."""
+    from coord.review import heal_unreviewed_newest_work_legs
+
+    board, work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
+    work.review_state = "dispatched"
+    work.review_verdict = None
+    # Drop the older leg's review so only "is it the newest?" decides.
+    board.completed = [a for a in board.completed if a.type != "review"]
+    fix.review_state = "dispatched"
+
+    healed = heal_unreviewed_newest_work_legs(board)
+
+    assert healed == ["61af6f3e3e39"]
+    assert work.review_state == "dispatched"
+    assert fix.review_state == "pending"
+
+
+def test_stale_dispatched_heal_respects_scoped_review_of_newest_head(fake_dispatch) -> None:
+    """A #3161 scoped re-review dispatched after the fix leg finished carries
+    the OLDER leg's id but did review the newest head — no heal, no second
+    (full) review on top of it."""
+    from coord.review import heal_unreviewed_newest_work_legs
+
+    board, _work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
+    fix.test_state = "passed"
+    fix.review_state = "dispatched"
+    board.active.append(Assignment(
+        machine_name="server", repo_name="vimcode", issue_number=1877,
+        issue_title="[scoped-review] t", assignment_id="scoped1",
+        status="running", type="review",
+        review_of_assignment_id="103d0253cb07", review_scoped=True,
+        dispatched_at=150.0,
+    ))
+
+    assert heal_unreviewed_newest_work_legs(board) == []
+    assert dispatch_pending_reviews(board, _test_first_config()) == []
+    assert fix.review_state == "dispatched"
+    assert fake_dispatch == ["103d0253cb07"]
+
+
+def test_stale_dispatched_heal_respects_recorded_verdict(fake_dispatch, coord_db) -> None:
+    """#3670 is not regressed: a leg whose verdict is already recorded in the
+    DB is never handed back for a second review."""
+    from coord.review import heal_unreviewed_newest_work_legs
+    from coord.state import record_dispatched_assignment, record_work_review_verdict
+
+    board, _work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
+    fix.review_state = "dispatched"
+    record_dispatched_assignment(assignment=fix, repo_github="acme/vimcode")
+    record_work_review_verdict(fix.assignment_id, "approve")
+
+    assert heal_unreviewed_newest_work_legs(board) == []
+    assert fix.review_state == "dispatched"
+
+
+def test_stale_dispatched_heal_waits_out_grace_and_live_claim(
+    fake_dispatch, coord_db,
+) -> None:
+    """No heal while the evidence could still be a dispatch in progress: a
+    leg that only just finished, or one whose review-dispatch claim is held
+    (a `dispatch_review` in flight right now)."""
+    from coord.review import heal_unreviewed_newest_work_legs
+    from coord.state import claim_review_dispatch
+
+    board, _work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
+    fix.review_state = "dispatched"
+
+    assert heal_unreviewed_newest_work_legs(board, now=fix.finished_at + 5.0) == []
+    fix.finished_at = None
+    assert heal_unreviewed_newest_work_legs(board) == []
+    fix.finished_at = 140.0
+
+    assert claim_review_dispatch(fix.assignment_id) is True
+    assert heal_unreviewed_newest_work_legs(board) == []
+    assert fix.review_state == "dispatched"
+
+
+class _FakeDaemon:
+    """Stands in for the `coord serve` daemon behind `post_record`, writing
+    the (shared, in-memory) test DB exactly as the real endpoints would."""
+
+    url = "http://daemon:7435"
+    token = "t"
+
+    def __init__(self) -> None:
+        self.fail_next_claim_after_commit = False
+        self.calls: list[str] = []
+
+    def post_record(self, svc, path, payload, **kw):
+        import httpx
+
+        from coord import state
+
+        self.calls.append(path)
+        aid = payload["of_assignment_id"]
+        if path == "/review-claim":
+            claimed = state._claim_review_dispatch_local(
+                aid, claimed_at=payload.get("claimed_at")
+            )
+            if self.fail_next_claim_after_commit:
+                # The vimcode#1877 shape: the row landed, the response is a 503.
+                self.fail_next_claim_after_commit = False
+                request = httpx.Request("POST", f"{self.url}{path}")
+                response = httpx.Response(503, request=request)
+                raise httpx.HTTPStatusError(
+                    "503 review-claim write failed: another row available",
+                    request=request, response=response,
+                )
+            return {"ok": True, "claimed": claimed}
+        if path == "/review-claim-release-own":
+            released = state._release_own_review_claim_local(
+                aid, float(payload["claimed_at"])
+            )
+            return {"ok": True, "released": bool(released)}
+        if path == "/review-claim-release":
+            state._release_review_dispatch_claim_local(aid)
+            return {"ok": True}
+        raise AssertionError(f"unexpected daemon path {path}")
+
+
+@pytest.fixture
+def fake_daemon(monkeypatch):
+    import coord.client as cc
+
+    daemon = _FakeDaemon()
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: daemon)
+    monkeypatch.setattr(cc, "post_record", daemon.post_record)
+    return daemon
+
+
+def test_review_claim_503_leaves_claim_released_so_retry_dispatches(
+    fake_daemon, coord_db,
+) -> None:
+    """#3668 acceptance: a 503 from POST /review-claim — even one where the
+    daemon's row had already landed — must not leave the claim held. An
+    immediate retry wins the claim instead of denying with "lost the atomic
+    dispatch-claim race"."""
+    import httpx
+
+    from coord.state import claim_review_dispatch, has_review_claim
+
+    fake_daemon.fail_next_claim_after_commit = True
+    with pytest.raises(httpx.HTTPStatusError):
+        claim_review_dispatch("61af6f3e3e39")
+
+    assert "/review-claim-release-own" in fake_daemon.calls
+    assert has_review_claim("61af6f3e3e39") is False
+
+    assert claim_review_dispatch("61af6f3e3e39") is True
+    assert has_review_claim("61af6f3e3e39") is True
+
+
+def test_review_claim_503_retry_dispatches_review(
+    two_machine_config: Config, fake_daemon, coord_db, monkeypatch,
+) -> None:
+    """#3668 acceptance, end to end through `dispatch_review`: the first
+    attempt dies on the 503, the immediate retry dispatches a review."""
+    import httpx
+
+    from coord import state
+
+    # Only the claim seam is under test here — keep every other write local.
+    real_route = state._route_write
+
+    def _route(svc, endpoint, payload, **kw):
+        if endpoint.startswith("/review-claim"):
+            return real_route(svc, endpoint, payload, **kw)
+        return None
+
+    monkeypatch.setattr(state, "_route_write", _route)
+
+    completed = _completed_assignment(machine="laptop")
+
+    def _pr_lookup(repo_github, **kw):
+        return {"number": 1, "url": "https://github.com/acme/api/pull/1", "existed": True}
+
+    kwargs = dict(
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    fake_daemon.fail_next_claim_after_commit = True
+    with pytest.raises(httpx.HTTPStatusError):
+        dispatch_review(
+            completed, Board(), two_machine_config,
+            http_client=_FakeHTTPClient({"id": "unused"}), **kwargs,
+        )
+
+    retried = dispatch_review(
+        completed, Board(), two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-after-503"}), **kwargs,
+    )
+    assert retried is not None
+    assert retried.review_of_assignment_id == completed.assignment_id
+
+
+def test_failed_claim_never_releases_another_dispatchers_claim(
+    fake_daemon, coord_db,
+) -> None:
+    """The release on failure is scoped to THIS attempt's own stamp — a claim
+    a different dispatcher legitimately holds survives a failed attempt."""
+    import httpx
+
+    from coord.state import claim_review_dispatch, has_review_claim
+
+    assert claim_review_dispatch("w-held") is True  # the other dispatcher
+
+    fake_daemon.fail_next_claim_after_commit = True
+    with pytest.raises(httpx.HTTPStatusError):
+        claim_review_dispatch("w-held")  # loses the insert, then 503s
+
+    assert has_review_claim("w-held") is True
+    assert claim_review_dispatch("w-held") is False
+
+
+def test_local_claim_commit_failure_undoes_row_even_when_rowcount_misread(
+    coord_db, monkeypatch,
+) -> None:
+    """#3668: the local claim write's undo-on-commit-failure used to be gated
+    on `cursor.rowcount` — the per-connection `sqlite3_changes()` value a
+    concurrent thread on the shared connection can overwrite. With a
+    rowcount misread as 0 and a failing commit, the just-inserted row was
+    left pending and leaked. Now the undo is unconditional (scoped to this
+    attempt's own stamp) and ownership is read back, not taken from
+    rowcount."""
+    import sqlite3
+
+    from coord import sql, state
+
+    if sql.detect_dialect(coord_db) != sql.DIALECT_SQLITE:
+        pytest.skip("shared-connection rowcount race is SQLite-only")
+
+    real_insert = sql.insert_ignore
+
+    class _MisreadCursor:
+        rowcount = 0
+
+    def _insert(conn, table, columns, params):
+        real_insert(conn, table, columns, params)
+        return _MisreadCursor()
+
+    monkeypatch.setattr(sql, "insert_ignore", _insert)
+
+    # rowcount misread alone: ownership comes from the read-back.
+    assert state.claim_review_dispatch("w-misread") is True
+    state.release_review_dispatch_claim("w-misread")
+
+    class _CommitFails:
+        """Proxy whose commit raises the misattributed error once, then works."""
+
+        def __init__(self, conn) -> None:
+            self._conn = conn
+            self.failed = False
+
+        def commit(self):
+            if not self.failed:
+                self.failed = True
+                raise sqlite3.DatabaseError("another row available")
+            return self._conn.commit()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    proxy = _CommitFails(coord_db)
+    monkeypatch.setattr(state, "get_connection", lambda: proxy)
+    monkeypatch.setattr(sql, "detect_dialect", lambda conn: sql.DIALECT_SQLITE)
+
+    # The misattributed error is retried (#3668), and the retry re-claims
+    # cleanly instead of reading its own abandoned row as "someone else's".
+    assert state.claim_review_dispatch("w-commit") is True
+    assert proxy.failed is True
+    rows = coord_db.execute(
+        "SELECT COUNT(*) FROM review_claims WHERE of_assignment_id='w-commit'"
+    ).fetchone()[0]
+    assert rows == 1
