@@ -2269,6 +2269,80 @@ def _capture_completion_summary(transition: Transition, entry: dict) -> None:
         )
 
 
+# #3676: the final message sits at the very end of a worker log; this much
+# tail always covers a `result` event plus the last assistant turn.
+_UPSTREAM_GAP_LOG_TAIL_BYTES = 262_144
+
+
+def _worker_log_text(transition: Transition, entry: dict) -> str:
+    """The tail of a worker's log — local file first, else the agent's
+    ``/logs/<id>`` endpoint (same fallback order as the other ``_capture_*``
+    helpers). "" when neither is reachable."""
+    log_path = entry.get("log_path")
+    if log_path:
+        p = Path(log_path)
+        try:
+            if p.exists():
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    size = p.stat().st_size
+                    if size > _UPSTREAM_GAP_LOG_TAIL_BYTES:
+                        f.seek(size - _UPSTREAM_GAP_LOG_TAIL_BYTES)
+                        f.readline()  # skip the partial first line
+                    return f.read()
+        except OSError as exc:
+            log.debug("_worker_log_text: local read failed for %s: %s",
+                      transition.assignment_id, exc)
+    host = _agent_host(transition.machine_name)
+    if not host:
+        return ""
+    import httpx  # noqa: PLC0415
+
+    try:
+        resp = httpx.get(f"http://{host}:7433/logs/{transition.assignment_id}", timeout=15.0)
+        resp.raise_for_status()
+        return resp.text or ""
+    except httpx.HTTPError as exc:
+        log.debug("_worker_log_text: agent fetch failed for %s: %s",
+                  transition.assignment_id, exc)
+        return ""
+
+
+def _capture_upstream_gaps(transition: Transition, entry: dict, record: dict) -> None:
+    """#3676: act on ``BLOCKED_ON_UPSTREAM`` markers in a work-like leg's
+    final message — see :mod:`coord.upstream_gaps`. Every terminal event
+    counts (a leg blocked upstream often ends with zero commits, i.e. an
+    advisory rather than a completion). Silent on failure."""
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+    from coord.upstream_gaps import (  # noqa: PLC0415
+        UPSTREAM_GAP_MARKER,
+        final_message_from_log_text,
+        process_upstream_gaps,
+    )
+
+    if (record.get("type") or "work") not in WORK_LIKE_TYPES or not transition.issue_number:
+        return
+    try:
+        text = _worker_log_text(transition, entry)
+        if UPSTREAM_GAP_MARKER not in text:
+            return
+        final_message = final_message_from_log_text(text)
+        if UPSTREAM_GAP_MARKER not in final_message:
+            return
+        from coord.config import load as _load_config  # noqa: PLC0415
+
+        process_upstream_gaps(
+            final_message,
+            config=_load_config(),
+            repo_name=transition.repo_name,
+            issue_number=transition.issue_number,
+            assignment_id=transition.assignment_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "_capture_upstream_gaps: failed for %s: %s", transition.assignment_id, exc,
+        )
+
+
 def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
     """#252: parse the worker's SMOKE_TESTS block and persist it on the row.
 
@@ -4000,6 +4074,10 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     # #874: capture the worker's ### Summary prose block at the same moment
     # so the board has a durable, queryable summary field.  Best-effort.
     _capture_completion_summary(transition, entry)
+    # #3676: file any `BLOCKED_ON_UPSTREAM` cross-repo gap the worker named
+    # in its final message, link it, and block the queue row on it.
+    # Idempotent (a replayed transition files nothing new) and best-effort.
+    _capture_upstream_gaps(transition, entry, record)
     # #315: persist the worker's claude session ID so chat-continue can
     # pass --resume to the next worker.  Best-effort; silent on failure.
     _capture_claude_session_id(transition, entry)

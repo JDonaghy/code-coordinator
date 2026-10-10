@@ -1449,6 +1449,7 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
     # a duplicate call for a review the issue already has a context entry
     # for — adding another one was the second half of the #650 incident.
     if record.verdict == VERDICT_REQUEST_CHANGES and findings_written:
+        blocking = ""
         try:
             from coord.review import extract_blocking_section  # noqa: PLC0415
             from coord.state import _add_issue_context_entry_local  # noqa: PLC0415
@@ -1482,6 +1483,18 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
                     )
         except Exception:  # noqa: BLE001 — best-effort
             pass
+        # #3676: the same blocking findings are a lesson for every sibling
+        # in this issue's epic/milestone that hasn't been dispatched yet —
+        # port-style epics repeated the identical blocking findings child
+        # after child, one paid fix round each. Separate try: a lessons
+        # failure must never cost the issue's own context entry above.
+        if blocking:
+            try:
+                from coord.briefing_lessons import record_sibling_lessons  # noqa: PLC0415
+
+                record_sibling_lessons(record.repo_name, record.issue_number, blocking)
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
     # #3148: an `approve` is the durable counterpart of the request-changes
     # write above — until now the carry-forward ledger was write-only for
     # request-changes, so an approve left NO trace in it. A re-review

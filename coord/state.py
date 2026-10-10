@@ -8625,6 +8625,13 @@ def _list_issue_numbers_with_assignments_local(repo_name: str) -> set[int]:
 ISSUE_CONTEXT_MAX_ENTRIES = 12
 ISSUE_CONTEXT_MAX_CHARS = 2500
 
+# #3676: the `issue_context.source` of a blocking review finding carried over
+# from a SIBLING issue (same epic/milestone) by
+# `coord.briefing_lessons.record_sibling_lessons`. Kept out of the per-issue
+# digest (`render_issue_context`) and rendered as its own "Lessons from
+# siblings" briefing section instead.
+SIBLING_LESSON_SOURCE = "sibling-lesson"
+
 # #3113: `source="review"` entries are exempt from the char cap below (a
 # reviewer's full `## Blocking findings` section must never be truncated
 # mid-word — that's the whole point of the exemption). Left fully open-ended,
@@ -10138,9 +10145,18 @@ def render_issue_context(
 ) -> str:
     """Render an issue's curated context digest (routes the list read to the
     daemon when set).  Returns "" when empty.  This is what the briefing
-    read-path prepends and what ``coord fix-briefing`` includes."""
+    read-path prepends and what ``coord fix-briefing`` includes.
+
+    #3676: ``SIBLING_LESSON_SOURCE`` entries are left out — they are lessons
+    carried over from OTHER issues in the same epic/milestone, rendered as
+    their own "Lessons from siblings" section by
+    :func:`coord.briefing_lessons.sibling_lessons_block`, and must not eat
+    this digest's per-issue entry budget."""
     return render_issue_context_entries(
-        list_issue_context(repo_name, issue_number),
+        [
+            e for e in list_issue_context(repo_name, issue_number)
+            if e.get("source") != SIBLING_LESSON_SOURCE
+        ],
         max_entries=max_entries,
         max_chars=max_chars,
     )

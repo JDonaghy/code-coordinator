@@ -1040,6 +1040,29 @@ def parse_test_verdict_from_log(log_path: str | Path) -> TestVerdictFindings | N
         return _parse_test_verdict_from_lines(text.splitlines(), stream_json=False)
 
 
+# #3676: cross-repo gaps are the coordinator's to file. A worker that hits a
+# capability missing from another repo emits a `BLOCKED_ON_UPSTREAM: <repo>:
+# <title>` marker in its final message (`coord.upstream_gaps`), and the
+# coordinator files, links and blocks on the upstream issue itself. Reviewers
+# had come to REQUIRE a prose draft of that issue in a `PENDING_*` tracking
+# doc instead (vimcode#1869's blocking finding was the draft's absence) —
+# a paid fix round of prose per gap plus a later manual filing. Shared by the
+# reviewer system prompt and the per-review briefing so the two can't drift.
+UPSTREAM_GAP_REVIEW_RULE = (
+    "Cross-repo gaps (#3676): never request changes because a "
+    "`PENDING_*` tracking doc (e.g. `docs/PENDING_QUADRAUI_ISSUES.md`) or "
+    "any other prose draft of an upstream issue is missing or un-updated — "
+    "such drafts are NOT required, whatever older repo docs say. A gap in "
+    "another repo is reported with a `BLOCKED_ON_UPSTREAM: <repo>: <title>` "
+    "marker in the worker's final message, and the coordinator files that "
+    "upstream issue, links it, and blocks this issue's queue row on it. "
+    "Judge whether the gap is real and the diff's handling of it is honest "
+    "(e.g. `ISSUE_RESOLUTION: partial`, not `resolved`, when the gap leaves "
+    "the issue unfixed) — a drafted or marker-reported gap never makes the "
+    "issue `resolved` on its own."
+)
+
+
 REVIEWER_SYSTEM_PROMPT = """\
 You are an independent code reviewer dispatched by the coordinator. \
 Your job is to find problems — do NOT rubber-stamp.
@@ -1118,8 +1141,8 @@ it. Do not stop as soon as your review prose feels finished; write the \
 `END_REVIEW` line and then stop. Before you end your session, re-read your \
 final message and confirm its last line is `END_REVIEW`.
 
-If the diff is clean, approve — but be thorough first.\
-"""
+If the diff is clean, approve — but be thorough first.
+""" + UPSTREAM_GAP_REVIEW_RULE
 
 
 # ── Machine selection ───────────────────────────────────────────────────────
@@ -2727,8 +2750,8 @@ def build_review_briefing(
         "cause is in another repo and only a dependent half of the fix "
         "landed here). Add `— <what remains>` after the value, e.g. "
         "`ISSUE_RESOLUTION: partial — root cause is a quadraui gap, "
-        "quadraui#NNN now FILED (not just drafted in a docs file — an "
-        "actual GitHub issue) and must land before this can close`."
+        "blocked on upstream (BLOCKED_ON_UPSTREAM marker) and must land "
+        "before this can close`."
     )
     lines.append(
         "- `investigation` — this PR is investigation-only (no production "
@@ -2737,13 +2760,17 @@ def build_review_briefing(
         "as `partial`."
     )
     lines.append(
-        "A drafted-but-unfiled upstream issue (e.g. a bullet in a design "
-        "doc, a TODO comment) is NOT \"filed\" — only a real GitHub issue "
-        "number counts. If the worker's own completion summary above "
-        "already flagged `partial`/`investigation`, your own line can "
-        "only confirm it or make it MORE cautious, never silently revert "
-        "it to `resolved` without saying why that worker claim was wrong."
+        "If the worker's own completion summary above already flagged "
+        "`partial`/`investigation`, your own line can only confirm it or "
+        "make it MORE cautious, never silently revert it to `resolved` "
+        "without saying why that worker claim was wrong."
     )
+    # #3676: cross-repo gaps are filed by the coordinator from the worker's
+    # `BLOCKED_ON_UPSTREAM` marker — a reviewer must never demand a
+    # `PENDING_*` prose draft (vimcode#1869's blocking finding was exactly
+    # that draft's absence, costing a fix round of prose per gap).
+    lines.append("")
+    lines.append(UPSTREAM_GAP_REVIEW_RULE)
     # #1456: the coordinator's #476 gate (an advisory-only request-changes must
     # not burn another fix round) counts bullets under the body's section
     # headings, and since #1456 it fails CLOSED — an unparseable body keeps the

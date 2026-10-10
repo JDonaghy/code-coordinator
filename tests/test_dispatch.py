@@ -21,6 +21,7 @@ from coord.config import (
 )
 from coord.dispatch import (
     EPIC_DECOMPOSE_CONTRACT,
+    UPSTREAM_GAP_BRIEFING_NOTE,
     CapabilityRouting,
     DispatchRefused,
     dispatch,
@@ -139,6 +140,22 @@ class TestDispatch:
         assert "Fix the auth module" in briefing  # original briefing preserved below
 
     @patch("coord.dispatch.httpx.post")
+    def test_work_briefing_carries_the_upstream_gap_marker_contract(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """#3676: every work worker is told about BLOCKED_ON_UPSTREAM (and
+        that no PENDING_* draft is wanted); a non-work leg is not."""
+        mock_post.return_value = MagicMock(json=MagicMock(return_value={"ok": True}))
+        dispatch(proposal, config)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert briefing.endswith(UPSTREAM_GAP_BRIEFING_NOTE)
+        assert "BLOCKED_ON_UPSTREAM: <repo>:" in briefing
+        assert "PENDING_" in briefing
+
+        dispatch(dataclasses_replace(proposal, type="review"), config)
+        assert "BLOCKED_ON_UPSTREAM" not in mock_post.call_args.kwargs["json"]["briefing"]
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_no_context_when_none(
         self, mock_post: MagicMock, config: Config, proposal: Proposal, coord_db,
     ) -> None:
@@ -147,7 +164,7 @@ class TestDispatch:
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
         dispatch(proposal, config)
-        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE
 
     @patch("coord.dispatch.httpx.post")
     def test_payload_includes_repo_specific_review_focus(
@@ -207,7 +224,7 @@ class TestDispatch:
         )
         dispatch(proposal, cfg)
         briefing = mock_post.call_args.kwargs["json"]["briefing"]
-        assert briefing == "Fix the auth module"
+        assert briefing == "Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE
         assert "What the reviewer will grade you against" not in briefing
         assert "Repo-specific focus" not in briefing
 
@@ -616,7 +633,8 @@ class TestDispatch:
         assert "## 🔒 Oracle-loop acceptance contract" in briefing
         assert "tests/acceptance/ms-1/contract.md" in briefing
         assert "coord acceptance run --repo api --issue 10" in briefing
-        assert briefing.rstrip().endswith("Fix the auth module")  # original briefing last
+        # original briefing last, before only the always-on #3676 note
+        assert briefing.endswith("Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE)
 
     @patch("coord.dispatch.httpx.post")
     @patch("coord.github_ops.get_repo_file")
@@ -812,7 +830,7 @@ class TestDispatch:
         dispatch(proposal, cfg)
         briefing = mock_post.call_args.kwargs["json"]["briefing"]
         assert "Oracle-loop acceptance contract" not in briefing
-        assert briefing == "Fix the auth module"
+        assert briefing == "Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE
 
     def test_unknown_machine_raises(self, config: Config) -> None:
         bad = Proposal(
@@ -905,7 +923,7 @@ class TestOverlapFenceWiring:
 
         # Byte-identical to the pre-#1720 no-context case: no empty section,
         # no noise.
-        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE
         mock_compare.assert_not_called()
 
     @patch("coord.github_ops.get_compare_files")
@@ -921,7 +939,7 @@ class TestOverlapFenceWiring:
 
         dispatch(proposal, config)
 
-        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE
         mock_compare.assert_not_called()
 
     @patch("coord.github_ops.get_compare_files")
@@ -939,7 +957,7 @@ class TestOverlapFenceWiring:
         result = dispatch(proposal, config)
 
         assert result["ok"] is True  # never blocks the dispatch
-        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE
 
     @patch("coord.github_ops.get_compare_files")
     @patch("coord.dispatch.httpx.post")
@@ -994,7 +1012,7 @@ class TestOverlapFenceWiring:
 
         dispatch(proposal, config)
 
-        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module" + UPSTREAM_GAP_BRIEFING_NOTE
         mock_compare.assert_not_called()
 
 
