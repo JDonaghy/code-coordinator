@@ -3461,6 +3461,36 @@ def dispatch_review(
             "the worker may not have pushed yet"
         )
 
+    # #3670: ONE review per leg — once a work assignment has a recorded
+    # terminal verdict (approve OR request-changes), it must never be
+    # reviewed again. `has_active_followup` just below only guards against
+    # a review *currently in flight*; once that review finishes, its claim
+    # releases and nothing stopped a LATER, independent dispatch call from
+    # re-reviewing the same leg — the coord#3663 incident: an approved work
+    # leg got a SECOND, contradicting review, and the second verdict won.
+    #
+    # Fast in-memory check first (the common case: *completed* came from a
+    # board that already observed `propagate_review_verdict`'s write), then
+    # the authoritative DB read (`has_recorded_review_verdict`) for the case
+    # where *completed*'s own snapshot is stale but the verdict already
+    # landed durably — see that function's docstring for why the claim
+    # table alone cannot close this gap.
+    if completed.review_verdict is not None:
+        return _deny(
+            f"assignment {completed.assignment_id} already has a recorded "
+            f"review verdict {completed.review_verdict!r} — refusing a "
+            "second review (#3670)"
+        )
+
+    from coord.state import has_recorded_review_verdict  # noqa: PLC0415
+
+    if has_recorded_review_verdict(completed.assignment_id):
+        return _deny(
+            f"assignment {completed.assignment_id} already has a recorded "
+            "review verdict in the database — refusing a second review "
+            "(#3670, stale board snapshot)"
+        )
+
     # Dedupe: don't fire a second review if one's already in flight for this
     # completed work assignment. This in-memory check is a fast path only —
     # `board` is a snapshot that can already be stale by the time we reach

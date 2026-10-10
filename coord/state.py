@@ -1445,6 +1445,90 @@ def record_test_verdict(
     )
 
 
+def _reclassify_infra_test_failure(
+    conn,
+    assignment_id: str,
+    test_reason: str | None,
+    smoke_test: str | None,
+    smoke_test_reason: str | None,
+) -> "tuple[str | None, str | None, str | None, str | None]":
+    """#3670: reclassify a ``test_state="failed"`` write whose *test_reason*
+    actually describes an infrastructure outage, not a test result.
+
+    Uses :func:`coord.failure_class.classify_failure` — the exact same
+    environmental-vs-work classifier the work/review stages already trust
+    for the identical question (#1590) — so this is never a second,
+    independently-tuned copy of that vocabulary (the repo-wide "one
+    question, one answer" rule). coord#3663/#3670: a Test leg whose
+    worktree was deleted out from under it mid-run (no exit status ever
+    produced) was recorded as a plain ``"failed"``, which then spent a
+    real ``coord fix`` round on code that was never actually tested.
+
+    Bounded by the SAME :data:`coord.smoke.ENVIRONMENTAL_SMOKE_RETRY_BUDGET`
+    :func:`coord.reconcile.propagate_smoke_terminal_failure` already
+    enforces for every other environmental Test-stage death (#3315) — never
+    a second, unbounded retry path. The tally is read back out of the row's
+    OWN current ``test_reason`` (the one field that survives from leg to
+    leg), exactly mirroring that function's non-fan-out branch, so the two
+    call sites can never silently diverge on how many consecutive
+    environmental deaths a row has actually seen.
+
+    Returns the ``(test_state, test_reason, smoke_test, smoke_test_reason)``
+    tuple the caller should actually write — unchanged (``"failed"``,
+    original *test_reason*, ...) when *test_reason* carries no
+    environmental signal at all, including a genuine test failure's own
+    summary or no reason whatsoever.
+    """
+    from coord.failure_class import classify_failure  # noqa: PLC0415
+    from coord.smoke import (  # noqa: PLC0415
+        ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
+        TEST_STATE_BLOCKED,
+        environmental_smoke_legs,
+        environmental_smoke_tally,
+    )
+
+    classification = classify_failure(failure_reason=test_reason)
+    if not classification.is_environmental:
+        return "failed", test_reason, smoke_test, smoke_test_reason
+
+    row = sql.execute(
+        conn, "SELECT test_reason FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    previous_reason = row["test_reason"] if row is not None else None
+    env_legs = environmental_smoke_legs(previous_reason) + 1
+    cause = classification.reason
+    original = test_reason or "<no reason recorded>"
+
+    if env_legs >= ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
+        return (
+            TEST_STATE_BLOCKED,
+            (
+                f"{environmental_smoke_tally(env_legs)}: the Test-stage "
+                f"environmental retry budget "
+                f"({ENVIRONMENTAL_SMOKE_RETRY_BUDGET}) is exhausted after "
+                f"{env_legs} consecutive environmental deaths — {cause}. "
+                f"Originally reported: {original} (#3670)"
+            ),
+            None,
+            None,
+        )
+    return (
+        None,
+        (
+            f"{environmental_smoke_tally(env_legs)}: Test-stage failure "
+            f"reclassified as infrastructure, not a test result ({cause}) "
+            "— cleared for automatic re-dispatch, not recorded as a work "
+            f"failure (#3670); {ENVIRONMENTAL_SMOKE_RETRY_BUDGET - env_legs} "
+            f"of the {ENVIRONMENTAL_SMOKE_RETRY_BUDGET}-leg retry budget "
+            f"left before the row parks instead. Originally reported: "
+            f"{original}"
+        ),
+        None,
+        None,
+    )
+
+
 def _record_test_verdict_local(
     *,
     assignment_id: str,
@@ -1487,6 +1571,28 @@ def _record_test_verdict_local(
     "confirmed"/"unconfirmed" sitting on the row looking like it describes
     the new write.
     """
+    conn = get_connection()
+
+    # #3670: before a `test_state="failed"` write lands, ask whether
+    # `test_reason` actually describes an INFRASTRUCTURE outage (a
+    # Test-stage worktree deleted mid-run, a runner killed before it could
+    # report, no exit status ever produced — or any of the other
+    # `coord.failure_class.classify_failure` environmental signals) rather
+    # than a genuine test result. This is the single choke point EVERY
+    # `test_state="failed"` write passes through — a worker's own
+    # self-report, a human's `coord test --fail`, or
+    # `coord.reconcile.propagate_smoke_terminal_failure`'s agent-reap-derived
+    # path — so it catches the shape regardless of which caller produced
+    # it. A reason that does not match passes straight through unchanged
+    # (including a genuine test failure's own summary, or no reason at
+    # all) — this never reclassifies a real failure.
+    if test_state == "failed":
+        test_state, test_reason, smoke_test, smoke_test_reason = (
+            _reclassify_infra_test_failure(
+                conn, assignment_id, test_reason, smoke_test, smoke_test_reason,
+            )
+        )
+
     if smoke_test is None:
         # Derive the legacy mirror from the canonical verdict.
         if test_state == "passed":
@@ -1495,8 +1601,6 @@ def _record_test_verdict_local(
             smoke_test, smoke_test_reason = "fail", test_reason
         # "skipped" (and any unknown state) leaves smoke_test NULL — the same
         # choice `coord test --skipped` makes.
-
-    conn = get_connection()
 
     def _write() -> None:
         # #3386 review: fetched INSIDE `_write` (not just in the post-write
@@ -2777,6 +2881,51 @@ def review_claim_age_secs(of_assignment_id: str) -> float | None:
     if row is None or row[0] is None:
         return None
     return time.time() - row[0]
+
+
+def has_recorded_review_verdict(assignment_id: str) -> bool:
+    """True when *assignment_id* (a WORK row) already carries a terminal
+    ``review_verdict`` in the local DB (#3670).
+
+    The DB-level counterpart to the in-memory ``completed.review_verdict is
+    not None`` fast path :func:`coord.review.dispatch_review` checks right
+    before it: :func:`record_work_review_verdict` stamps this column on the
+    WORK row the INSTANT a review reaches ANY verdict (approve or
+    request-changes, via ``coord.auto_loop.propagate_review_verdict``) —
+    durable immediately, independent of whether/when the caller's own
+    whole-board ``save_board()`` lands (#1565).
+
+    That makes a direct DB read of this column the authoritative answer to
+    "has this work leg already been reviewed", closing a gap
+    :func:`claim_review_dispatch` alone cannot: that claim is released the
+    moment the review assignment reaches a terminal ``status`` write
+    (:func:`release_review_claim_if_row_is_review`), which happens
+    independently of — and can race ahead of — this column being stamped.
+    Once the claim is gone, nothing else stopped a LATER, unrelated
+    ``dispatch_review`` call (passing its own board snapshot, possibly one
+    that never observed the approval) from re-claiming and re-dispatching a
+    review for a leg a prior review had already resolved — the coord#3670
+    incident: an approved work leg reviewed a second time, with the second,
+    contradicting verdict winning.
+
+    Local-DB read only, same documented caveat as :func:`has_review_claim`:
+    correct on the daemon host (where the local DB is canonical), undercounts
+    on a thin client reading its own stale local copy — acceptable here
+    because this is a backstop behind the in-memory check at the call site,
+    not the sole guard.
+    """
+    if not assignment_id:
+        return False
+    conn = get_connection()
+    row = sql.execute(
+        conn,
+        "SELECT review_verdict FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    verdict = row["review_verdict"] if hasattr(row, "keys") else row[0]
+    return verdict is not None
 
 
 def release_review_dispatch_claim(of_assignment_id: str) -> None:

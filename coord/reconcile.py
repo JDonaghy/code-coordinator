@@ -938,6 +938,7 @@ def _environmental_cause_phrase(classification: "FailureClassification") -> str:
     """
     from coord.failure_class import (  # noqa: PLC0415
         KIND_API_ERROR,
+        KIND_INFRA,
         KIND_NETWORK,
         KIND_USAGE_LIMIT,
     )
@@ -953,6 +954,11 @@ def _environmental_cause_phrase(classification: "FailureClassification") -> str:
         return "a sustained provider API error"
     if classification.kind == KIND_NETWORK:
         return "a sustained network/transport failure"
+    if classification.kind == KIND_INFRA:
+        # #3670: the Test-stage runner/worktree infrastructure itself kept
+        # failing — a worktree repeatedly vanishing mid-run, a runner
+        # repeatedly killed before it could report — never the code.
+        return "a sustained Test-stage infrastructure failure"
     return "a sustained environmental failure"  # pragma: no cover — defensive
 
 
