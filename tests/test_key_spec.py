@@ -144,13 +144,6 @@ class TestPunctuation:
         assert parse_key_spec(" ") == parse_key_spec("space")
         assert parse_key_spec(" ").chords[0] == _chord([], "space", False)
 
-    def test_two_or_more_bare_spaces_still_raises(self):
-        # The single-space exception is narrow: it does not mean "strip
-        # whitespace". Two+ spaces are still ambiguous with the chord
-        # separator and still raise, same as before #3666.
-        with pytest.raises(KeySpecError, match="empty key spec"):
-            parse_key_spec("  ")
-
     def test_modifier_plus_literal_plus_sign_is_malformed(self):
         # "ctrl++"  splits into ["ctrl", "", ""] — ambiguous, not supported.
         with pytest.raises(KeySpecError):
@@ -179,13 +172,20 @@ class TestChords:
 
 
 class TestSpaceDeliveredAsRealBytes:
-    """#3666 acceptance: a `key: ' '` step must actually deliver a space,
-    not just parse without raising. ``parse_key_spec(" ") ==
-    parse_key_spec("space")`` (asserted above) already guarantees every
-    driver's encoder — being a pure function of the parsed
-    :class:`KeyChord` — treats the two identically; this exercises the
-    one driver this repo can run end-to-end without a real OS/terminal
-    dependency, confirming the actual terminal byte is 0x20."""
+    """#3666: a `key: ' '` must actually deliver a space, not just parse
+    without raising. ``parse_key_spec(" ") == parse_key_spec("space")``
+    (asserted above) already guarantees every driver's encoder — being a
+    pure function of the parsed :class:`KeyChord` — treats the two
+    identically; this confirms the tui-pty encoder's actual terminal byte
+    is 0x20 for both spellings.
+
+    This exercises :func:`coord.tui_pty_driver.encode_key` directly, one
+    layer above the ``SmokeRunner``/YAML spec-step path that actually
+    broke in the field (23 vimcode ``tui.yaml`` steps) — the full,
+    spec-driven, end-to-end regression test for that path lives in
+    ``tests/test_tui_pty_driver.py`` (``TestSmokeRunnerActions``), which is
+    also where the Test stage routes for a ``coord/tui_pty_driver.py``
+    diff."""
 
     def test_tui_pty_encodes_bare_space_as_0x20(self):
         from coord.tui_pty_driver import encode_key
@@ -207,6 +207,15 @@ class TestErrors:
     def test_whitespace_only_raises(self):
         with pytest.raises(KeySpecError):
             parse_key_spec("   ")
+
+    def test_two_or_more_bare_spaces_still_raises(self):
+        # The single-space exception (#3666) is narrow: it does not mean
+        # "strip whitespace". Two+ spaces are still ambiguous with the
+        # chord separator and still raise, same as before #3666 — the
+        # same shape as test_whitespace_only_raises above, just pinned
+        # down to the exact boundary of the new carve-out.
+        with pytest.raises(KeySpecError, match="empty key spec"):
+            parse_key_spec("  ")
 
     def test_non_string_raises(self):
         with pytest.raises(KeySpecError):

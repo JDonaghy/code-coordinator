@@ -52,7 +52,7 @@ so strip it": any OTHER spec made of two or more spaces (``"  "``) is still
 ambiguous with the chord separator and still raises, same as an empty
 string.
 
-A bare ``+`` (the character itself, not a separator) is the one special
+A bare ``+`` (the character itself, not a separator) is the other special
 case: ``"+"`` parses as the literal plus-sign key with no modifiers, since
 splitting it on ``+`` would otherwise produce two empty tokens.
 
@@ -203,17 +203,21 @@ def parse_key_spec(spec: str) -> KeyEvent:
     chord sequence — into a driver-neutral :class:`KeyEvent`.
 
     Raises :class:`KeySpecError` for anything that doesn't parse under the
-    grammar at all: not a string, empty/whitespace-only, an unrecognized
-    modifier name, or a base that is neither a recognized named key nor a
-    single character. Never returns a partially-parsed event.
+    grammar at all: not a string, empty, made of two or more space
+    characters, an unrecognized modifier name, or a base that is neither a
+    recognized named key nor a single character. Note this is NOT "any
+    whitespace-only string" — a lone tab (``"\\t"``) is not a space
+    character, splits into the single token ``"\\t"``, and parses as a
+    literal-character chord rather than raising.
 
     The one exception: a spec that is exactly a single space (``" "``)
-    means the ``space`` key (#3666) — see the module docstring. Any other
-    run of spaces (``""``, ``"  "``, ...) still raises."""
+    means the ``space`` key (#3666) — see the module docstring. The empty
+    string, and any run of two or more spaces (``""``, ``"  "``, ...),
+    still raise."""
     if not isinstance(spec, str):
         raise KeySpecError(f"key spec must be a string, got {spec!r}")
     if spec == " ":
-        return KeyEvent(chords=(KeyChord(modifiers=frozenset(), base="space", is_char=False),))
+        return KeyEvent(chords=(_parse_chord("space"),))
     tokens = [tok for tok in spec.split(" ") if tok]
     if not tokens:
         raise KeySpecError(f"empty key spec {spec!r}")

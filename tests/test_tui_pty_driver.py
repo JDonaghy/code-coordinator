@@ -755,6 +755,29 @@ class TestSmokeRunnerActions:
         runner.run(_spec([_step("launch", 0), _step("key", 1, key="enter")]))
         assert b"\r" in child.writes
 
+    def test_key_step_bare_space_delivers_a_real_0x20_byte(self) -> None:
+        # #3666: a lone `key: ' '` (23 of these in vimcode's tui.yaml) must
+        # deliver an actual 0x20 byte through the FULL YAML -> SmokeStep ->
+        # SmokeRunner path, not just a direct `encode_key(" ")` call — this
+        # is the exact layer that broke in the field, and the one
+        # `coord/tui_pty_driver.py:355`'s `key=str(entry.get("key", "") or
+        # "")`/`:291`'s `entry.get(f) in (None, "")` truthiness coercion runs
+        # through, which `tests/test_key_spec.py` cannot see at all. Built
+        # from YAML (via `parse_smoke_spec`) rather than a hand-built
+        # `SmokeStep` so the parser's own coercion of a quoted single space
+        # is pinned down too.
+        spec = parse_smoke_spec(
+            "steps:\n"
+            "  - type: launch\n"
+            "  - type: key\n"
+            "    key: ' '\n"
+        )
+        child = FakePtyChild()
+        runner = SmokeRunner(lambda cols, rows: child)
+        results = runner.run(spec)
+        assert [r["status"] for r in results] == ["pass", "pass"]
+        assert b" " in child.writes
+
     def test_click_step_writes_sgr_sequence(self) -> None:
         child = FakePtyChild()
         runner = SmokeRunner(lambda cols, rows: child)
