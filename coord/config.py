@@ -797,16 +797,24 @@ class PrereviewGateRepoConfig:
     issue_ref_pattern: str = r"#\d+"
     history_phrases: tuple[str, ...] = (
         "previously",
+        # "used to" (below) already matches "used to be" as a substring —
+        # a separate "used to be" entry here would be dead weight (#3674
+        # review round 1 nit).
         "used to",
         "before this change",
         "no longer",
         "formerly",
         "old behavior",
         "old behaviour",
-        "used to be",
         "in the past",
         "originally",
     )
+    # #3674 review round 1 (nit): `#` below is unconditionally a "comment"
+    # marker, but for a Rust repo (quadraui, this feature's own motivating
+    # case) a `#`-prefixed line is usually an attribute/macro
+    # (`#[derive(Debug)]`, `#![no_std]`), not a comment — override this
+    # per repo if that ever produces a real false positive.
+    comment_prefixes: tuple[str, ...] = ("//", "#", "/*", "*", "<!--", "--")
     changelog_path: str | None = None
     smoke_spec_paths: tuple[str, ...] = ()
     semver_command: str | None = None
@@ -4194,6 +4202,13 @@ def _parse_prereview_gate(raw: Any) -> PrereviewGateConfig:
                     f"prereview_gate[{repo_name!r}].history_phrases must be a list of strings"
                 )
             cfg.history_phrases = tuple(value)
+        if "comment_prefixes" in entry:
+            value = entry["comment_prefixes"]
+            if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].comment_prefixes must be a list of strings"
+                )
+            cfg.comment_prefixes = tuple(value)
         if "changelog_path" in entry:
             value = entry["changelog_path"]
             if value is not None and not isinstance(value, str):

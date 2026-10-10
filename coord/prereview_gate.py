@@ -32,11 +32,13 @@ judgment call — so a reviewer should never have to re-derive them by hand.
 calls, before it ever spends an HTTP POST on a candidate reviewer machine:
 a non-empty :class:`GateResult.findings` means the leg is bounced straight
 back to the worker (see ``coord.review._record_prereview_gate_verdict``,
-which reuses the exact same terminal-write seam
-``_record_mechanical_review_verdict`` (#3180) already established) — the
-reviewer never sees these findings at all, which is the whole point: a
-check a script can run with zero tolerance should never cost a paid review
-round just to be re-confirmed.
+which shares its actual terminal-write seam,
+``coord.review._record_terminal_mechanical_verdict``, with the #3180
+``_record_mechanical_review_verdict`` path — #3674 review round 1: these
+used to be two independently-maintained copies of the same write, now one)
+— the reviewer never sees these findings at all, which is the whole point:
+a check a script can run with zero tolerance should never cost a paid
+review round just to be re-confirmed.
 
 Every check here is a pure function over diff text (plus, for semver/
 features, an injectable command runner) — no network, no ``gh`` shell-out,
@@ -47,12 +49,15 @@ whether a repo opts in (an unconfigured/disabled repo's
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
 from coord.config import PrereviewGateRepoConfig
+
+log = logging.getLogger(__name__)
 
 # ── diff parsing helpers ─────────────────────────────────────────────────────
 #
@@ -143,22 +148,35 @@ def _diff_has_removed_or_modified_line(diff_text: str, file_path: str) -> bool:
 
 DEFAULT_HISTORY_PHRASES: tuple[str, ...] = (
     "previously",
+    # "used to" (below) already matches "used to be" as a substring — a
+    # separate "used to be" entry here would be dead weight (#3674 review
+    # round 1 nit).
     "used to",
     "before this change",
     "no longer",
     "formerly",
     "old behavior",
     "old behaviour",
-    "used to be",
     "in the past",
     "originally",
 )
 
+#: #3674 review round 1 (nit): `#` is included unconditionally here even
+#: though for quadraui (Rust, the repo this feature is explicitly built
+#: for) a `#`-prefixed line is usually an attribute/macro
+#: (`#[derive(Debug)]`, `#![no_std]`), not a comment — a real, if
+#: low-probability, false-positive source if such a line's text ever
+#: contains `#\d+` or a history-phrase substring. Unlike that risk,
+#: `comment_prefixes` IS now configurable per repo (mirrors
+#: `issue_ref_pattern`/`history_phrases`) via
+#: `PrereviewGateRepoConfig.comment_prefixes` — a Rust-heavy repo that hits
+#: a real false positive can override this default instead of living with
+#: it.
 _COMMENT_PREFIXES: tuple[str, ...] = ("//", "#", "/*", "*", "<!--", "--")
 
 
-def _is_comment_line(stripped: str) -> bool:
-    return any(stripped.startswith(p) for p in _COMMENT_PREFIXES)
+def _is_comment_line(stripped: str, comment_prefixes: tuple[str, ...]) -> bool:
+    return any(stripped.startswith(p) for p in comment_prefixes)
 
 
 def find_comment_lint_violations(
@@ -166,6 +184,7 @@ def find_comment_lint_violations(
     *,
     issue_ref_pattern: str = r"#\d+",
     history_phrases: tuple[str, ...] = DEFAULT_HISTORY_PHRASES,
+    comment_prefixes: tuple[str, ...] = _COMMENT_PREFIXES,
 ) -> list[str]:
     """Zero-tolerance check: does any ADDED comment line reference an issue
     number or narrate the diff's own history ("previously", "used to", ...)?
@@ -181,7 +200,7 @@ def find_comment_lint_violations(
     violations: list[str] = []
     for file_path, lineno, content in _iter_diff_added_lines(diff_text):
         stripped = content.strip()
-        if not stripped or not _is_comment_line(stripped):
+        if not stripped or not _is_comment_line(stripped, comment_prefixes):
             continue
         lower = stripped.lower()
         hit_issue_ref = issue_ref_re.search(stripped) is not None
@@ -207,7 +226,11 @@ def find_changelog_violations(
 ) -> list[str]:
     """When *diff_text* adds/changes a ``pub`` item, *changelog_path* must be
     part of the same diff. Returns ``[]`` when *changelog_path* is unset
-    (check disabled) or the diff touches no ``pub`` item at all."""
+    (check disabled) or the diff touches no ``pub`` item at all.
+
+    #3674 review round 1 (nit): *changelog_path* matches by EXACT string
+    only (see :func:`find_smoke_spec_violations`'s docstring for the same
+    note) — deliberate for a single, explicit path, not a directory."""
     if not changelog_path or not diff_text:
         return []
     if changelog_path in _diff_touched_files(diff_text):
@@ -235,7 +258,13 @@ def find_smoke_spec_violations(
     """A sealed smoke-spec file may only be ADDED to — any ``-`` line inside
     one of *smoke_spec_paths* (a deleted/rewritten step) is a violation.
     A wholly new file under one of these paths is fine (nothing to remove
-    from); only an existing file's hunk losing a line trips this."""
+    from); only an existing file's hunk losing a line trips this.
+
+    #3674 review round 1 (nit): *smoke_spec_paths* matches by EXACT string
+    only, no prefix/directory support — deliberate for a short, explicit
+    per-repo list; unlike `additive_only_entrypoints`/sealed-path elsewhere
+    in `coord/review.py`, this never needs to match "everything under a
+    directory"."""
     if not smoke_spec_paths or not diff_text:
         return []
     violations: list[str] = []
@@ -254,16 +283,62 @@ def find_smoke_spec_violations(
 
 CommandRunner = Callable[[str, "str | None"], tuple[bool, str]]
 
+# #3674 review round 1 (blocking): the one other `shell=True` subprocess
+# pattern in this codebase (`coord/acceptance_drivers.py`'s `_run_setup`/
+# `_run_generic`) always passes an explicit `timeout=` and catches
+# `subprocess.TimeoutExpired`/`OSError` around the call — a hung
+# `cargo semver-checks`/`cargo check` or a nonexistent `cwd` must never hang
+# or crash this gate the same way. 600s mirrors that module's own default
+# acceptance-driver timeout order of magnitude; there's no per-repo override
+# yet since no repo has opted into `semver_command`/`feature_matrix` in
+# production.
+_DEFAULT_COMMAND_TIMEOUT_SECONDS = 600
+
 
 def _default_command_runner(command: str, cwd: str | None) -> tuple[bool, str]:
     """Real ``subprocess`` runner — the default when a repo configures a
     *semver_command*/*feature_matrix* but the caller injects no stub.
     Exercised in production only when a repo actually opts in; every test in
-    this repo injects a fake runner instead."""
-    result = subprocess.run(
-        command, shell=True, cwd=cwd, capture_output=True, text=True, check=False,
-    )
+    this repo injects a fake runner instead.
+
+    Never raises: a timeout or a ``cwd`` that doesn't exist (or any other
+    failure to even start the subprocess) is reported as an ordinary
+    ``(False, <reason>)`` finding, exactly like a non-zero exit — the only
+    thing a caller can rely on this function doing is returning, not
+    raising (#3674 review round 1: the previous version had neither a
+    timeout nor an except clause).
+    """
+    try:
+        result = subprocess.run(
+            command, shell=True, cwd=cwd, capture_output=True, text=True,
+            check=False, timeout=_DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"command timed out after {_DEFAULT_COMMAND_TIMEOUT_SECONDS}s: "
+            f"{command!r} (cwd={cwd!r})"
+        )
+    except OSError as e:
+        # Covers a nonexistent/unreadable `cwd` (FileNotFoundError is an
+        # OSError subclass) and a shell that fails to even start.
+        return False, f"command failed to start: {command!r} (cwd={cwd!r}): {e}"
     return result.returncode == 0, (result.stdout + result.stderr)
+
+
+def _default_head_sha_fetcher(repo_path: str) -> str | None:
+    """Best-effort ``git rev-parse HEAD`` in *repo_path*, via the same
+    timeout-/exception-safe :func:`_default_command_runner` — used to
+    VERIFY a local checkout actually holds the leg's own commit before
+    trusting it for a semver/feature-matrix ``subprocess.run`` (see
+    :func:`run_prereview_gate`'s docstring). Returns ``None`` on ANY
+    failure (missing path, not a git repo, git not installed, timeout,
+    ...) — never raises; the caller treats ``None`` exactly like a
+    mismatch: "cannot verify, skip the local-execution checks"."""
+    ok, output = _default_command_runner("git rev-parse HEAD", repo_path)
+    if not ok:
+        return None
+    stripped = output.strip()
+    return stripped.splitlines()[-1] if stripped else None
 
 
 def find_semver_violations(
@@ -336,14 +411,35 @@ def run_prereview_gate(
     diff_text: str | None,
     repo_config: PrereviewGateRepoConfig,
     repo_path: str | None = None,
+    expected_head_sha: str | None = None,
     semver_runner: CommandRunner | None = None,
     feature_matrix_runner: CommandRunner | None = None,
+    head_sha_fetcher: Callable[[str], "str | None"] | None = None,
 ) -> GateResult:
     """Run every check *repo_config* enables against *diff_text*.
 
     A disabled repo (``repo_config.enabled`` is ``False``, the default for
     any repo that never configures a ``prereview_gate:`` block) is a no-op:
     returns ``GateResult(passed=True)`` without inspecting the diff at all.
+
+    #3674 review round 1 (blocking): *semver_command*/*feature_matrix* are
+    the only two checks that ever shell out against *repo_path* — every
+    other check here is a pure function over *diff_text*. Running a real
+    command against *repo_path* is only sound when *repo_path* is actually
+    known to hold the leg's own commit; nothing upstream of this function
+    fetches or checks out that branch there first, so *repo_path* could just
+    as easily be some unrelated directory sitting on a completely different
+    machine/branch/commit. Rather than trust it blindly, this function
+    VERIFIES it first: when *expected_head_sha* is given (the caller's own
+    independently-fetched branch HEAD, e.g. ``dispatch_review``'s
+    ``review_head_sha``), *repo_path*'s own ``git rev-parse HEAD`` (via
+    *head_sha_fetcher*, defaulting to a real ``git`` shell-out) must match
+    it exactly before either command-based check is allowed to run. A
+    missing *repo_path*, a missing *expected_head_sha*, a fetch failure, or
+    a mismatch all resolve the same way: the semver/feature-matrix checks
+    are SKIPPED (not failed — there's nothing to blame the diff for when
+    this gate itself couldn't verify where it was standing) and a warning
+    is logged so an operator can see the check never actually ran.
     """
     if not repo_config.enabled or not diff_text:
         return GateResult(passed=True)
@@ -355,6 +451,7 @@ def run_prereview_gate(
                 diff_text,
                 issue_ref_pattern=repo_config.issue_ref_pattern,
                 history_phrases=repo_config.history_phrases,
+                comment_prefixes=repo_config.comment_prefixes,
             )
         )
     if repo_config.changelog_path:
@@ -365,7 +462,49 @@ def run_prereview_gate(
         findings.extend(
             find_smoke_spec_violations(diff_text, repo_config.smoke_spec_paths)
         )
-    if repo_config.semver_command:
+
+    wants_local_checks = bool(repo_config.semver_command or repo_config.feature_matrix)
+    local_checks_verified = False
+    if wants_local_checks:
+        if not repo_path:
+            log.warning(
+                "prereview_gate: semver_command/feature_matrix configured but "
+                "no repo_path is available for this leg — skipping both "
+                "checks rather than running them against an unverified "
+                "working directory"
+            )
+        elif not expected_head_sha:
+            log.warning(
+                "prereview_gate: semver_command/feature_matrix configured "
+                "but no expected_head_sha was supplied to verify repo_path "
+                "%r against — skipping both checks",
+                repo_path,
+            )
+        else:
+            fetch_head = head_sha_fetcher or _default_head_sha_fetcher
+            try:
+                local_sha = fetch_head(repo_path)
+            except Exception as e:  # noqa: BLE001 — a verification probe must
+                # never itself crash the gate; treat any failure as "can't
+                # verify, skip" exactly like a returned None/mismatch.
+                log.warning(
+                    "prereview_gate: HEAD verification for repo_path %r "
+                    "raised %r — skipping semver/feature-matrix checks",
+                    repo_path, e,
+                )
+                local_sha = None
+            if local_sha == expected_head_sha:
+                local_checks_verified = True
+            else:
+                log.warning(
+                    "prereview_gate: repo_path %r HEAD (%r) does not match "
+                    "this leg's own head (%r) — skipping semver/"
+                    "feature-matrix checks rather than running them against "
+                    "an unverified checkout",
+                    repo_path, local_sha, expected_head_sha,
+                )
+
+    if repo_config.semver_command and local_checks_verified:
         findings.extend(
             find_semver_violations(
                 semver_command=repo_config.semver_command,
@@ -373,7 +512,7 @@ def run_prereview_gate(
                 runner=semver_runner,
             )
         )
-    if repo_config.feature_matrix:
+    if repo_config.feature_matrix and local_checks_verified:
         findings.extend(
             find_feature_matrix_violations(
                 features=repo_config.feature_matrix,

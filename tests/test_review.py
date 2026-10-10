@@ -2904,6 +2904,113 @@ def test_dispatch_review_prereview_gate_runs_before_sealed_path_short_circuit(
     assert "prereview mechanical gate" in (result.verdict_source_reason or "")
 
 
+# ── #3674 review round 1 (blocking): semver/feature-matrix wiring through
+# the real dispatch_review call path — repo_path must be the WORKER
+# machine's own checkout, verified against its own head before ANY command
+# is allowed to run, and a gate crash must never abort the whole batch ──────
+
+
+def test_dispatch_review_prereview_gate_passes_worker_machine_repo_path_and_head_sha(
+    two_machine_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The previous wiring passed `candidates[0][0].repo_path(...)` — the
+    top-ranked REVIEWER candidate (here `server`, `/srv/api`), never the
+    worker's own checkout (here `laptop`, `/work/api`). Assert the call
+    into `run_prereview_gate` now receives the WORKER machine's repo_path
+    and the independently-fetched `review_head_sha`, so the gate itself can
+    verify it before trusting it for a real `subprocess.run`."""
+    import coord.review as review_mod
+    from coord.config import PrereviewGateRepoConfig
+
+    cfg = replace(
+        two_machine_config,
+        prereview_gate=PrereviewGateConfig(
+            repos={"api": PrereviewGateRepoConfig(enabled=True, semver_command="true")}
+        ),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    captured: dict = {}
+
+    def fake_gate(**kwargs):
+        captured.update(kwargs)
+        return review_mod.GateResult(passed=True)
+
+    monkeypatch.setattr(review_mod, "run_prereview_gate", fake_gate)
+
+    dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: "diff --git a/x b/x\n+fn ok() {}\n",
+        branch_sha_fetcher=lambda repo_github, branch: "deadbeef",
+    )
+
+    assert captured["repo_path"] == "/work/api"
+    assert captured["expected_head_sha"] == "deadbeef"
+
+
+def test_dispatch_review_prereview_gate_crash_fails_open_to_normal_dispatch(
+    two_machine_config: Config, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A gate that raises (a bug, an unexpected edge case in a repo-
+    configured command) must NOT abort the whole `dispatch_pending_reviews`
+    batch — `dispatch_review`'s own #3113 outer except releases the claim
+    and RE-RAISES past an uncaught exception here, which would otherwise
+    cost every OTHER eligible row in the same bulk pass. Fail open: treat
+    the crash like "gate found nothing" and continue to a real review
+    dispatch."""
+    import logging
+
+    import coord.review as review_mod
+    from coord.config import PrereviewGateRepoConfig
+
+    cfg = replace(
+        two_machine_config,
+        prereview_gate=PrereviewGateConfig(
+            repos={"api": PrereviewGateRepoConfig(enabled=True, semver_command="true")}
+        ),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    def boom(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(review_mod, "run_prereview_gate", boom)
+
+    with caplog.at_level(logging.ERROR, logger="coord.review"):
+        result = dispatch_review(
+            completed, board, cfg,
+            http_client=client,
+            pr_lookup=lambda repo_github, **kw: {
+                "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+            },
+            claude_md_reader=lambda p: None,
+            issue_body_fetcher=lambda repo, num: "",
+            now=123.0,
+            remote_branch_checker=lambda repo, branch: True,
+            diff_fetcher=lambda repo, num, **kw: "diff --git a/x b/x\n+fn ok() {}\n",
+        )
+
+    assert len(client.calls) == 1
+    assert result is not None
+    assert result.status == "running"
+    assert result.verdict_source is None
+    assert any("prereview mechanical gate crashed" in rec.message for rec in caplog.records)
+
+
 # ── #3509: Tier-2 lane-kind smoke-spec entrypoints — additive-only, not
 # sealed ───────────────────────────────────────────────────────────────────
 
