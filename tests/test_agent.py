@@ -1379,6 +1379,93 @@ def test_clean_worktrees_skips_symlinks(tmp_path: Path) -> None:
     assert (target / "precious.txt").read_text() == "do not delete"
 
 
+# ── #3670: _free_branch_in_worktrees must never evict a LIVE worktree ───────
+
+
+def test_free_branch_in_worktrees_never_evicts_a_running_assignment(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """coord#3670: before this guard, evicting a conflicting worktree for a
+    sibling dispatch on the SAME branch (`_setup_worktree`'s #460 proactive
+    evict) had NO liveness check at all — it force-removed ANY worktree
+    holding the branch, including one with a live ``pytest`` subprocess
+    mid-run. A still-RUNNING assignment's worktree must survive even though
+    it holds the branch a new dispatch wants to evict."""
+    from coord.agent import AgentAssignment, _free_branch_in_worktrees
+
+    repo = _init_repo(tmp_path / "repo")
+    live_id = "live-test-leg"
+    live_wt = tmp_path / "worktrees" / live_id
+    live_wt.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1-fix", str(live_wt)],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+
+    # No live tmux session (this is a headless smoke/Test leg, not an
+    # interactive one) — liveness must come from the assignments snapshot.
+    monkeypatch.setattr(
+        AgentServer, "_tmux_session_alive", staticmethod(lambda aid: False)
+    )
+
+    running = AgentAssignment(
+        id=live_id,
+        spec=_spec(repo, branch="issue-1-fix"),
+        status=RUNNING,
+    )
+    _free_branch_in_worktrees(
+        repo, "issue-1-fix", str(tmp_path / "worktrees" / "new-leg"),
+        assignments={live_id: running},
+    )
+
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(live_wt) in listing
+    assert live_wt.exists()
+
+
+def test_free_branch_in_worktrees_still_evicts_a_genuinely_stale_worktree(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The flip side: a worktree whose assignment is terminal (or unknown —
+    the crashed-worker case the eviction exists for) must still be evicted,
+    so the #460 fix/retry/PR-worker dispatch collision this function exists
+    to prevent is not silently reintroduced by the #3670 liveness guard."""
+    from coord.agent import AgentAssignment, _free_branch_in_worktrees
+
+    repo = _init_repo(tmp_path / "repo")
+    stale_id = "crashed-prior-leg"
+    stale_wt = tmp_path / "worktrees" / stale_id
+    stale_wt.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1-fix", str(stale_wt)],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+
+    monkeypatch.setattr(
+        AgentServer, "_tmux_session_alive", staticmethod(lambda aid: False)
+    )
+
+    done = AgentAssignment(
+        id=stale_id,
+        spec=_spec(repo, branch="issue-1-fix"),
+        status=DONE,
+    )
+    _free_branch_in_worktrees(
+        repo, "issue-1-fix", str(tmp_path / "worktrees" / "new-leg"),
+        assignments={stale_id: done},
+    )
+
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(stale_wt) not in listing
+    assert not stale_wt.exists()
+
+
 def test_clean_worktrees_stashes_orphaned_worktree_with_no_assignment_record(
     tmp_path: Path,
 ) -> None:

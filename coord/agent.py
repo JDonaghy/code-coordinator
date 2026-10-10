@@ -2766,12 +2766,45 @@ def _safe_remove_worktree(
     return removed
 
 
+def _worktree_assignment_is_live(
+    assignment_id: str, assignments: "dict[str, AgentAssignment] | None"
+) -> bool:
+    """True when *assignment_id*'s worktree is still genuinely in use (#3670).
+
+    The single "is this worktree still live" answer shared by
+    :meth:`AgentServer.clean_worktrees` and :func:`_free_branch_in_worktrees`
+    — the same two signals, asked the same way, so the two callers can never
+    disagree about what "live" means:
+
+    - the in-memory :class:`AgentAssignment` status (``RUNNING``/``PENDING``,
+      keyed by *assignments* — a ``dict(self._assignments)`` snapshot).
+    - the ``coord-<assignment_id>`` tmux session liveness probe
+      (:meth:`AgentServer._tmux_session_alive`), since an interactive pane
+      can outlive its assignment record.
+
+    Before this existed, :func:`_free_branch_in_worktrees` force-removed ANY
+    worktree holding the branch it wanted to evict with NO liveness check at
+    all — its docstring assumed "a stale prior-assignment worktree (e.g. a
+    crashed worker)" without ever confirming that assumption. A still-running
+    headless smoke/Test leg sharing a branch with a freshly-dispatched
+    sibling (a retry, or a fix round reusing the same branch by design) had
+    its worktree deleted out from under its live ``pytest`` subprocess
+    mid-run (coord#3670) — the Test verdict that produced was then recorded
+    as a plain ``failed``, not the infra outage it actually was.
+    """
+    a = (assignments or {}).get(assignment_id)
+    if a is not None and a.status in (RUNNING, PENDING):
+        return True
+    return AgentServer._tmux_session_alive(assignment_id)
+
+
 def _free_branch_in_worktrees(
     repo_path: Path,
     branch_name: str,
     exclude_path: str,
     *,
     log_path: str | None = None,
+    assignments: "dict[str, AgentAssignment] | None" = None,
 ) -> None:
     """Remove any worktree that has *branch_name* checked out, except *exclude_path*.
 
@@ -2781,6 +2814,19 @@ def _free_branch_in_worktrees(
     that a stale prior-assignment worktree (e.g. a crashed worker whose
     ``_cleanup_worktree`` never ran) does not block the next dispatch on the
     same branch.
+
+    *assignments* (#3670) is an optional ``dict[str, AgentAssignment]``
+    snapshot (keyed by assignment id — the worktree directory's basename)
+    used by :func:`_worktree_assignment_is_live` to refuse removing a
+    worktree whose assignment is still ``RUNNING``/``PENDING``, or whose
+    ``coord-<id>`` tmux session is still alive. ``None`` (the default, used
+    by the interactive-launcher call site which has no `AgentServer`
+    assignments table to snapshot) falls back to the tmux check alone —
+    still strictly safer than the old no-check-at-all behaviour. A
+    worktree the liveness check protects is logged and left in place: the
+    caller's `worktree add` surfaces the resulting collision exactly like
+    any other removal failure below, which is accurate — the branch
+    genuinely is still held by a live worker.
 
     Silently tolerates git errors — if the list or removal fails, the
     subsequent ``worktree add`` will still surface a clear error.
@@ -2839,6 +2885,25 @@ def _free_branch_in_worktrees(
                     f"default branch non-destructively (#1694), and raise "
                     f"naming it if that is not safe (#1693) — either way it "
                     f"will NOT delete it.\n",
+                )
+            continue
+        # #3670: never evict a worktree whose assignment is still live —
+        # the liveness check `clean_worktrees` already trusts for the exact
+        # same question (RUNNING/PENDING status, or a live tmux session).
+        # A worktree directory is always named after its assignment id
+        # (`AgentServer._setup_worktree`/`setup_interactive_worktree` both
+        # place it at `<state_dir>/worktrees/<assignment_id>/`), so the
+        # basename IS the lookup key.
+        wt_assignment_id = Path(wt_path).name
+        if _worktree_assignment_is_live(wt_assignment_id, assignments):
+            if log_path:
+                _append_log_line(
+                    log_path,
+                    f"# worktree-free: NOT removing {wt_path!r} — assignment "
+                    f"{wt_assignment_id!r} is still live (RUNNING/PENDING or "
+                    f"an active tmux session), even though it holds branch "
+                    f"{branch_name!r} (#3670). The `worktree add` below will "
+                    f"surface the resulting collision instead.\n",
                 )
             continue
         # Found a conflicting worktree — force-remove it.
@@ -8819,9 +8884,16 @@ class AgentServer:
         # assignment's worktree was not yet cleaned up (e.g. crash before
         # _cleanup_worktree ran, or clean_worktrees held back by the 300 s
         # recent-skip).  The call is a no-op when no conflicting worktree exists.
+        # #3670: pass a snapshot of `self._assignments` so the eviction can
+        # refuse to remove a worktree whose assignment is still RUNNING/
+        # PENDING — see `_worktree_assignment_is_live`'s docstring for the
+        # incident this closes.
+        with self._lock:
+            _live_assignments = dict(self._assignments)
         _free_branch_in_worktrees(
             repo_path, branch_name, str(worktree_path),
             log_path=assignment.log_path,
+            assignments=_live_assignments,
         )
 
         if origin_has_branch:

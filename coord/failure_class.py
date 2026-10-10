@@ -92,6 +92,12 @@ WORK = "work"
 KIND_USAGE_LIMIT = "usage_limit"
 KIND_API_ERROR = "api_error"
 KIND_NETWORK = "network"
+#: #3670: the test-runner/worktree infrastructure itself failed (a
+#: worktree deleted out from under a live run, a runner killed before it
+#: could report, no exit status ever produced) — the coordinator's own
+#: diagnosis of a lost Test-stage leg, never a verdict about the code
+#: under test.
+KIND_INFRA = "infra"
 KIND_WORK = "work"
 
 #: HTTP statuses from the Claude API that mean "the provider, not the work".
@@ -237,10 +243,39 @@ _NETWORK_RE = re.compile(
     r")\b"
 )
 
+# Coordinator-authored infra-outage signatures (#3670): the Test-stage
+# worktree/runner disappearing out from under a live run is something the
+# COORDINATOR notices and writes up (it is the one observing that no exit
+# status ever arrived, or that the worktree it dispatched into is simply
+# gone) — never a worker's test-output prose, so — like the API/network
+# tokens above — safe to scan unconditionally in `failure_reason`/
+# `terminal_reason`. Anchored on the specific infra shapes coord#3670 named
+# (a deleted worktree, a runner killed mid-run, no exit status produced,
+# the explicit "not a test result" self-diagnosis) rather than loose single
+# words like "worktree" or "killed" alone, which a genuine failing test's
+# own summary could legitimately contain (e.g. a test asserting a worktree
+# cleanup path).
+_INFRA_RE = re.compile(
+    r"("
+    r"worktree\s+\S+\s+was\s+deleted\s+out\s+from\s+under"
+    r"|deleted\s+out\s+from\s+under\s+the\s+running\s+\S+\s*(?:suite|run)?"
+    r"|no\s+exit\s+status\s+(?:was\s+)?produced"
+    r"|runner\s+(?:was\s+)?killed\s+before\s+it\s+could\s+report"
+    r"|infra\s+issue,?\s+not\s+a\s+test\s+result"
+    r")",
+    re.IGNORECASE,
+)
+
 # How much worker-authored terminal prose to consider. An error `result` is a
 # one-liner plus a JSON blob; anything past this is a transcript that should
 # not have been passed here in the first place.
 _RESULT_TEXT_LIMIT = 4000
+
+
+def _environmental_infra(text: str) -> str | None:
+    """The matched infra-outage signature, if *text* carries one."""
+    m = _INFRA_RE.search(text)
+    return m.group(1) if m else None
 
 
 def _scan_api_status(text: str) -> int | None:
@@ -340,6 +375,11 @@ def classify_failure(
        (always scanned — coordinator-authored summaries) or in ``result_text``
        (scanned **only** when ``is_error`` is truthy — see the module
        docstring).
+    5. An anchored infra-outage signature (#3670: a Test-stage worktree
+       deleted mid-run, a runner killed before it could report, no exit
+       status produced) in ``failure_reason`` / ``terminal_reason`` — same
+       "coordinator-authored, always scanned" treatment as the wire tokens
+       above, via :func:`_environmental_infra`.
 
     Anything that matches none of those is :data:`WORK`, including the case
     where no evidence was supplied at all. ``is_error=True`` on its own is not
@@ -422,6 +462,19 @@ def classify_failure(
                     "not a defect in the work"
                 ),
                 signal=token,
+            )
+
+        infra = _environmental_infra(text)
+        if infra is not None:
+            return FailureClassification(
+                failure_class=ENVIRONMENTAL,
+                kind=KIND_INFRA,
+                reason=(
+                    "environmental (infra): the test-runner/worktree "
+                    "infrastructure failed before producing a verdict — "
+                    "not a defect in the work (#3670)"
+                ),
+                signal=infra,
             )
 
     detail = next((t for t in (failure_reason, terminal_reason) if t), None)
