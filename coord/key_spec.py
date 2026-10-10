@@ -41,10 +41,16 @@ binding). Each chord is::
   - or **any single printable character**, including punctuation (``:``,
     ``@``, ``<``, ``$``, ``.``, `````, ``\\``, ``[``, ``]``) — case is
     preserved (``key: M`` is Shift+m; ``key: shift+m`` means the same
-    thing spelled explicitly). A literal space character is the one
-    exception: chords are whitespace-separated, so a bare space must be
-    spelled ``space``, not ``" "`` — the string ``" "`` parses as zero
-    tokens and raises :class:`KeySpecError`.
+    thing spelled explicitly).
+
+A literal single space (``" "``, exactly one space character and nothing
+else) is special-cased to mean the ``space`` key, same as spelling it out —
+#3666: a lot of existing ``key:`` specs (vimcode's ``tui.yaml`` alone has 23)
+predate this grammar and were written as ``key: ' '``, and that corpus isn't
+this repo's to migrate. This is narrower than "whitespace is a separator,
+so strip it": any OTHER spec made of two or more spaces (``"  "``) is still
+ambiguous with the chord separator and still raises, same as an empty
+string.
 
 A bare ``+`` (the character itself, not a separator) is the one special
 case: ``"+"`` parses as the literal plus-sign key with no modifiers, since
@@ -199,9 +205,15 @@ def parse_key_spec(spec: str) -> KeyEvent:
     Raises :class:`KeySpecError` for anything that doesn't parse under the
     grammar at all: not a string, empty/whitespace-only, an unrecognized
     modifier name, or a base that is neither a recognized named key nor a
-    single character. Never returns a partially-parsed event."""
+    single character. Never returns a partially-parsed event.
+
+    The one exception: a spec that is exactly a single space (``" "``)
+    means the ``space`` key (#3666) — see the module docstring. Any other
+    run of spaces (``""``, ``"  "``, ...) still raises."""
     if not isinstance(spec, str):
         raise KeySpecError(f"key spec must be a string, got {spec!r}")
+    if spec == " ":
+        return KeyEvent(chords=(KeyChord(modifiers=frozenset(), base="space", is_char=False),))
     tokens = [tok for tok in spec.split(" ") if tok]
     if not tokens:
         raise KeySpecError(f"empty key spec {spec!r}")
