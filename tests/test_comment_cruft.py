@@ -313,3 +313,9 @@ def test_normalize_ignores_layout_but_not_operator_splits():
     assert cc.normalize("const K: &[&str] = &[\n];") == cc.normalize("const K: &[&str] = &[];")
     assert cc.normalize("a >> b") != cc.normalize("a > > b")
     assert cc.normalize("ab") != cc.normalize("a b")
+
+
+def test_rewrite_strips_indentation_the_model_adds():
+    src = "fn f() {\n    // #12 thing\n    g();\n}\n"
+    reply = json.dumps({"blocks": [{"id": 0, "action": "replace", "lines": ["    // Thing."]}]})
+    assert cc.rewrite_source(src, lambda p: (reply, 0.0)).new_src == "fn f() {\n    // Thing.\n    g();\n}\n"

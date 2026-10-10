@@ -489,6 +489,10 @@ Keep every present-tense fact a reader needs: invariants, the reason the code is
 way, non-obvious constraints, warnings, pointers to other code. Never invent facts. Keep the \
 original wording and line breaks where they are already fine: make the smallest edit that \
 removes the history, and reflow only the lines you change.
+Deleting is rare. Most history comments also say something true about the code as it is: \
+why it accepts two values, what a test or scenario proves, what an invariant protects, what a \
+section contains. Keep that part, restated in the present tense, and drop only the story. \
+Delete a block only when nothing in it would help someone reading the current code.
 A reference may stay only when it marks a workaround that must be removed when that issue \
 closes; then write it as `// TODO(#N): <what to remove>`.
 
@@ -499,7 +503,7 @@ still describe the item: replace rather than delete unless the whole block is hi
 You get numbered comment blocks, each shown with nearby code for context. For every block \
 answer one of:
   {"id": N, "action": "keep"}
-  {"id": N, "action": "delete"}            (nothing present-tense is left)
+  {"id": N, "action": "delete"}            (every sentence is pure history)
   {"id": N, "action": "replace", "lines": ["// ...", "// ..."]}
 Replacement lines start with the block's own prefix (`// `, or `/// ` / `//! ` for DOC \
 blocks), carry no indentation and are no longer than the block's longest original line. A block marked TRAILING sits after code on the same line: replace it with \
@@ -607,6 +611,8 @@ def rewrite_source(src: str, answer_fn, chunk: int = 40, docs: bool = False) -> 
             if action == "keep":
                 continue
             new = [] if action == "delete" else ans.get("lines")
+            if isinstance(new, list):  # the model often indents despite being told not to
+                new = [t.strip() if isinstance(t, str) else t for t in new]
             if not isinstance(new, list) or not all(isinstance(t, str) and valid_line(t.rstrip(), b.prefix) for t in new):
                 res.rejected.append(f"line {b.comments[0].line + 1}: invalid replacement")
                 continue
