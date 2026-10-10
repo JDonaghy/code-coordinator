@@ -434,6 +434,224 @@ def native_unverified_for_verdict(
     )
 
 
+# ── #3673: plain-runner policy ───────────────────────────────────────────────
+#
+# A Test-stage leg used to be a full `claude -p` session whose only real job
+# was "pull the branch, run one command, report the exit code" — 568 legs /
+# $210 / 144h over one week, 40% of fleet slot time, median 24-26min, with 54
+# of 95 local transcripts busy-polling a backgrounded build in a `sleep` loop
+# (#3673's own measurement). None of that needed an LLM: the verdict is
+# already fully determined by the command's exit code. `coord.agent`'s
+# `execute_plain_runner_smoke` is the actual executor (it runs on the agent,
+# where the subprocess runs); this module only decides WHETHER a given leg
+# qualifies for that path, same as everything else here decides routing/
+# command selection without itself touching a subprocess or a `claude -p`
+# argv.
+
+
+def smoke_needs_judgement(
+    required_caps: list[str], native_execution_capabilities: Iterable[str],
+) -> bool:
+    """True when this leg's required capabilities include one needing
+    genuine judgement rather than a bare exit code (#3673) — GUI and
+    real-host drivers, where "the suite exited 0" and "the feature actually
+    works" can diverge (a headless GTK test harness exiting clean while the
+    popup never rendered, a PTY driver racing its own teardown).
+
+    Deliberately reuses `smoke_cfg.native_execution_capabilities` (#3455) —
+    the SAME list that already marks "this capability needs a genuinely
+    native host, not just a bare declaration" — as the one source of truth
+    for "this also needs more than an exit code" rather than inventing a
+    second, parallel capability list that could silently drift from it
+    (#2096, "one question, one answer"): every capability #3455 already
+    distrusts a bare machine declaration for is, by the same reasoning,
+    exactly the kind of GUI/real-host surface #3673 says needs a human-
+    judgement (LLM) pass rather than a plain runner.
+
+    Pure and order-independent — returns `False` (plain runner applies) for
+    every repo/diff that predates #3455, i.e. every config with the default
+    `native_execution_capabilities: ["windows"]` and a diff that never
+    touches a `windows`-requiring rule.
+    """
+    return bool(set(required_caps) & set(native_execution_capabilities))
+
+
+@dataclass(frozen=True)
+class PlainRunnerVerdict:
+    """The Test-stage verdict a plain runner derives from a subprocess exit
+    code alone (#3673) — no `claude -p` session involved. See
+    `coord.agent.run_plain_runner_command` for the executor.
+    """
+
+    passed: bool
+    exit_code: int
+    log_tail: str
+
+
+# #3673 item 2: "skip re-smoke when it adds nothing" — a work leg that
+# self-recorded its own passing `coord test` verdict (#2217: the worker ran
+# the suite itself as its last step and wrote the verdict straight onto its
+# OWN row) is already the strongest form of evidence this board has
+# (`coord.notify`'s own comment on the identical mechanism). When GitHub CI
+# has ALSO gone green for that exact commit, the suite has now run twice
+# against the identical SHA by two independent means (the worker's own
+# session, and CI) — a THIRD run (a smoke leg) adds no new information, just
+# the 24-26 minute median cost #3673 measured. 169 of 568 Test legs over one
+# week were exactly this: redundant re-runs of a commit already proven twice.
+SKIP_REASON_COVERED_BY_CI_AND_WORKER = "skipped (covered by CI + worker run)"
+
+
+def _ci_green_for_sha(
+    repo_github: str | None, branch: str, head_sha: str, config: Config,
+) -> bool:
+    """True iff *branch*'s open PR on GitHub reports every check green AND
+    its live head SHA still matches *head_sha* (#3673).
+
+    Reuses `coord.ci_store.build_ci_store` — the SAME CiStore construction
+    `coord.gate_snapshot`/`coord.serve_app` use for the merge gate's own CI
+    read — rather than inventing a second GitHub-CI reader (#2096, "one
+    question, one answer"), and `coord.github_ops.get_branch_sha` — the SAME
+    primitive the #1479 staleness check already reads the live branch head
+    through — for the SHA pin.
+
+    Fails CLOSED (returns `False`) on anything inconclusive: no `repo_github`
+    configured, no open PR for *branch*, a CI backend that isn't available,
+    no checks reported yet, any check still failed/in-flight, or a live SHA
+    lookup that disagrees with *head_sha* (the branch moved since the
+    worker's self-record — #1479's own staleness reasoning). A live Test
+    dispatch is cheap to still run; a wrongly-skipped one is not recoverable
+    after the fact, so every ambiguous case dispatches rather than skips.
+    """
+    if not repo_github:
+        return False
+    from coord.ci_store import build_ci_store, failed_checks, in_flight_checks  # noqa: PLC0415
+    from coord.github_ops import find_pr_for_branch, get_branch_sha  # noqa: PLC0415
+
+    pr = find_pr_for_branch(repo_github, branch)
+    if not pr or not pr.get("number"):
+        return False
+    store = build_ci_store(
+        config.ci_store.type, host=config.ci_store.host, token_env=config.ci_store.token_env,
+    )
+    if not store.is_available:
+        return False
+    checks = store.list_checks_for_pr(repo_github, int(pr["number"]))
+    if not checks or failed_checks(checks) or in_flight_checks(checks):
+        return False
+    current_sha = get_branch_sha(repo_github, branch)
+    return current_sha is not None and current_sha == head_sha
+
+
+def _gate_covered_by_ci_and_worker_run(
+    completed: Assignment, config: Config,
+    *, ci_green: Callable[[str | None, str, str, Config], bool] = _ci_green_for_sha,
+) -> bool:
+    """#3673 item 2: refuse to dispatch — and record a structural `skipped`
+    verdict instead — when *completed* already self-recorded a `passed`
+    `coord test` verdict for the exact commit GitHub CI has ALSO gone green
+    on.
+
+    Narrow by design: only fires when `completed.test_state == "passed"`
+    (never `failed`/`blocked`/`running` — those still need a real Test leg)
+    AND `completed.test_head_sha` is set AND still matches the branch's live
+    HEAD (a later push invalidates this exactly like the #1479 staleness
+    check does for any other `passed` verdict — `_ci_green_for_sha` re-reads
+    the live SHA itself, so a push between the worker's self-record and this
+    call is caught, not assumed stale) AND CI is independently green for
+    that identical commit.
+
+    Writes `test_state="skipped"`, `test_reason=SKIP_REASON_COVERED_BY_CI_
+    AND_WORKER` — never `"passed"` (that already stands); `"skipped"` is the
+    TEST STAGE's own statement that no further leg was needed, which
+    `coord.merge_queue.has_smoke_verdict`'s #1732 structural-skip path
+    already accepts unconditionally (it is not a `baseline_red` skip, so no
+    other merge-gate special-case applies to it either).
+
+    Returns `True` (caller must stop, nothing more to dispatch) only once the
+    skip verdict has been recorded — `False` otherwise, including every
+    inconclusive case `_ci_green_for_sha` fails closed on.
+    """
+    if completed.test_state != "passed":
+        return False
+    head_sha = completed.test_head_sha
+    if not head_sha or not completed.branch:
+        return False
+    repo = config.repo(completed.repo_name)
+    if repo is None:
+        return False
+    if not ci_green(repo.github, completed.branch, head_sha, config):
+        return False
+
+    reason = SKIP_REASON_COVERED_BY_CI_AND_WORKER
+    logger.info(
+        "dispatch_smoke: %s#%s — %s (head %s)",
+        completed.repo_name, completed.issue_number, reason, head_sha[:12],
+    )
+    if completed.assignment_id:
+        try:
+            from coord.state import record_test_verdict  # noqa: PLC0415
+
+            record_test_verdict(
+                assignment_id=completed.assignment_id,
+                test_state="skipped",
+                test_reason=reason,
+            )
+        except Exception:  # noqa: BLE001 — reporting must never break dispatch
+            logger.exception(
+                "dispatch_smoke: failed to record the #3673 CI+worker skip "
+                "verdict for %s", completed.assignment_id,
+            )
+            return True
+    completed.test_state = "skipped"
+    completed.test_reason = reason
+    return True
+
+
+# ── #3673 item 4: per-machine cargo-heavy concurrency cap ───────────────────
+#
+# Smoke/work legs are the "cargo-heavy" ones — they build and run a real
+# suite, unlike a plan/review/chat leg that only reads. #3673 measured the
+# macmini hitting load ~30 on 8 cores with four concurrent cargo-heavy
+# sessions. Reuses `coord.reconcile._machine_capacity` — the SAME per-machine
+# capacity resolution (`machines[].max_workers` override, else `concurrency.
+# max_workers`) every other dispatch-capacity question in this codebase
+# already answers through (#2096, "one question, one answer") — rather than
+# inventing a second, competing concurrency knob just for smoke routing.
+_CARGO_HEAVY_TYPES: frozenset[str] = frozenset(WORK_LIKE_TYPES) | {"smoke"}
+
+
+def cargo_heavy_legs_in_flight(board: Board, machine_name: str) -> int:
+    """How many cargo-heavy (build/test) legs are already `pending`/`running`
+    on *machine_name* — the count `machine_over_cargo_heavy_cap` compares
+    against that machine's capacity.
+    """
+    return sum(
+        1 for a in board.active
+        if a.machine_name == machine_name
+        and a.status in ("pending", "running")
+        and a.type in _CARGO_HEAVY_TYPES
+    )
+
+
+def machine_over_cargo_heavy_cap(machine: Machine, board: Board, config: Config) -> bool:
+    """True when *machine* already carries as many cargo-heavy legs as its
+    effective capacity (`coord.reconcile._machine_capacity`) allows — i.e. a
+    NEW smoke leg must not be routed here this round.
+
+    A non-positive capacity (misconfiguration) fails OPEN — returns `False`
+    — rather than silently excluding every machine from Test-stage routing
+    forever; `coord.reconcile`'s own capacity check already treats a
+    configured capacity as the operator's intent, this is purely an
+    additional routing filter on top of it.
+    """
+    from coord.reconcile import _machine_capacity  # noqa: PLC0415 — avoid an import cycle
+
+    cap = _machine_capacity(machine, config)
+    if cap <= 0:
+        return False
+    return cargo_heavy_legs_in_flight(board, machine.name) >= cap
+
+
 # ── Partitioning (#3177) ─────────────────────────────────────────────────────
 #
 # `match_rules` above returns ONE union — every capability any matched rule
@@ -900,6 +1118,7 @@ class SmokeMachineChoice:
 
 def _capability_matched_machines(
     required_caps: list[str], repo_name: str, config: Config,
+    board: Board | None = None,
 ) -> list[Machine]:
     """Every machine that can build *repo_name* and declares every one of
     *required_caps* — capability/repo matching only, no pause/quiet-hours or
@@ -909,11 +1128,17 @@ def _capability_matched_machines(
     empty ranking can tell "nothing is capable" apart from "something is
     capable but every candidate is paused or in quiet hours" (#2636) without
     re-deriving the capability filter a second time.
+
+    *board* (#3673, optional) also excludes a machine already at its
+    cargo-heavy concurrency cap (:func:`machine_over_cargo_heavy_cap`) —
+    `None` (the default, and every call site predating #3673) performs no
+    such filtering, matching this function's exact pre-#3673 behaviour.
     """
     return [
         m for m in config.machines
         if m.can_work_on(repo_name)
         and all(cap in m.capabilities for cap in required_caps)
+        and (board is None or not machine_over_cargo_heavy_cap(m, board, config))
     ]
 
 
@@ -1003,7 +1228,7 @@ def rank_smoke_machines(
     specific wall-clock moment instead of depending on whatever instant the
     suite happens to run at.
     """
-    candidates = _capability_matched_machines(required_caps, repo_name, config)
+    candidates = _capability_matched_machines(required_caps, repo_name, config, board)
     if not candidates:
         return []
 
@@ -2241,6 +2466,9 @@ def _walk_candidates_and_dispatch(
     smoke_model_wire: str,
     http_client: httpx.Client | None,
     native_execution_capabilities: Iterable[str] = (),
+    smoke_command: str | None = None,
+    smoke_needs_judgement: bool = False,
+    smoke_timeout_s: float | None = None,
 ) -> tuple[tuple[SmokeMachineChoice, str, dict] | None, list[SmokeAttempt]]:
     """Walk *candidates* best-first, probing then POSTing ``/assign`` — the
     #1672 full-candidate-list walk every smoke dispatch does. Returns the
@@ -2255,6 +2483,20 @@ def _walk_candidates_and_dispatch(
     whether THIS candidate declares native execution for every required
     capability in *native_execution_capabilities*
     (:func:`unverified_native_capabilities`).
+
+    *smoke_command*/*smoke_needs_judgement* (#3673) ride along on the
+    dispatch payload as `plain_runner`/`smoke_command`/`smoke_needs_
+    judgement` — `coord.agent.AgentServer._spawn` reads them to decide
+    whether to run *smoke_command* directly as a subprocess (no `claude -p`
+    session) instead of the briefing-driven chat the SMOKE_SYSTEM_PROMPT
+    above describes. `plain_runner` is unconditionally `True` on every
+    dispatch this function makes — #3673's "make the Test stage a plain
+    runner by default" policy — with `smoke_needs_judgement` as the one
+    opt-out (GUI/real-host-driver specs, :func:`smoke_needs_judgement`); the
+    briefing text is sent either way so a plain-runner-ineligible agent (one
+    whose `default_worker_command` predates #3673, or any OTHER assignment
+    type reusing this wire shape) still gets a fully-formed `claude -p`
+    session exactly as before.
 
     Factored out of what used to be a single dispatch path so the #3182
     fan-out path (:func:`_dispatch_smoke_fanout`) cannot silently drift from
@@ -2351,6 +2593,11 @@ def _walk_candidates_and_dispatch(
             # consults `branch` as the integration base.
             "branch": repo.default_branch or "main",
             "model": smoke_model_wire,
+            # #3673: plain-runner wiring — see this function's own docstring.
+            "plain_runner": True,
+            "smoke_command": smoke_command,
+            "smoke_needs_judgement": smoke_needs_judgement,
+            "smoke_timeout_s": float(smoke_timeout_s) if smoke_timeout_s else None,
         }
 
         url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"
@@ -2608,6 +2855,17 @@ def _dispatch_smoke_legs(
         # --stage test --reset`) once the fleet is fixed. `dispatch_pending_
         # smoke` already skips rows with a verdict; this covers the callers
         # that hand us a row directly (reconcile).
+        return []
+
+    # #3673 item 2: a work leg that already self-recorded a `passed` verdict
+    # on its own row AND whose exact commit GitHub CI has ALSO gone green on
+    # needs no Test-stage leg of its own — see `_gate_covered_by_ci_and_
+    # worker_run`'s docstring. Checked before the zero-commit/terminal-work
+    # gates below: both of those exist to explain why a leg CAN'T run; this
+    # one explains why a leg isn't NEEDED, which takes priority when both
+    # could apply (there is no "the branch has 0 commits" state once a
+    # worker self-recorded a real passing run against it).
+    if _gate_covered_by_ci_and_worker_run(completed, config):
         return []
 
     if _gate_zero_commit_branch(completed, config):
@@ -2934,6 +3192,11 @@ def _dispatch_smoke_single_leg(
         smoke_model_wire=smoke_model_wire,
         http_client=http_client,
         native_execution_capabilities=smoke_cfg.native_execution_capabilities,
+        smoke_command=smoke_command,
+        smoke_needs_judgement=smoke_needs_judgement(
+            required_caps, smoke_cfg.native_execution_capabilities,
+        ),
+        smoke_timeout_s=smoke_cfg.timeout_seconds,
     )
 
     if dispatched is None:
@@ -3279,6 +3542,11 @@ def _dispatch_smoke_fanout(
                 smoke_model_wire=smoke_model_wire,
                 http_client=http_client,
                 native_execution_capabilities=smoke_cfg.native_execution_capabilities,
+                smoke_command=smoke_command,
+                smoke_needs_judgement=smoke_needs_judgement(
+                    caps, smoke_cfg.native_execution_capabilities,
+                ),
+                smoke_timeout_s=smoke_cfg.timeout_seconds,
             )
 
             if result is None:

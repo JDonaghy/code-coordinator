@@ -1041,6 +1041,46 @@ class AssignmentSpec:
     # the wire the same way `cost_ceiling_usd` is, for the same config-free-
     # agent reason (docs/EPHEMERAL_WORKERS.md).
     runtime_ceiling_s: float | None = None
+    # #3673: "make the Test stage a plain runner by default" — when True AND
+    # ``type == "smoke"`` AND ``smoke_needs_judgement`` is False AND
+    # ``smoke_command`` is set, ``_spawn`` runs ``smoke_command`` directly as
+    # a subprocess (:func:`run_plain_runner_command`) instead of spawning a
+    # ``claude -p`` session, and derives the Test-stage verdict from its exit
+    # code alone — an LLM session is spawned only to SUMMARISE a failure
+    # (:func:`AgentServer._spawn_plain_runner_failure_summary`), never to
+    # decide pass/fail. Defaults to ``False`` — the same "unrecognized kwarg
+    # 400s a config-free/older agent" discipline every other optional field
+    # above follows — so only ``coord.smoke``'s own smoke dispatch (which
+    # sets this ``True`` unconditionally for every leg it builds, #3673's
+    # actual default-on policy) opts a leg into this path; every other
+    # assignment type, and any caller that predates this field, is
+    # completely unaffected.
+    plain_runner: bool = False
+    # #3673: the resolved shell command a plain-runner leg executes
+    # (``coord.smoke.resolve_smoke_command``'s result, carried structurally
+    # instead of only embedded in the ``claude -p`` briefing prose) — the
+    # plain-runner path has no LLM to parse the briefing and extract it.
+    # ``None`` when ``plain_runner`` is False, or for every spec predating
+    # this field.
+    smoke_command: str | None = None
+    # #3673: the hard subprocess timeout (seconds) for ``smoke_command`` —
+    # ``smoke_tests.timeout_seconds``, carried structurally because the
+    # plain-runner path has no `claude -p` session to read it out of the
+    # briefing prose and apply it itself the way `SMOKE_SYSTEM_PROMPT` step 2
+    # asks a worker to. Deliberately a DIFFERENT field from
+    # ``runtime_ceiling_s`` (the generic whole-assignment watchdog, several
+    # hours by default) rather than overloading it: a plain-runner leg IS
+    # just this one subprocess call, but a judgement-needing smoke leg is
+    # still a full `claude -p` session that legitimately needs the much
+    # longer generic ceiling, and the two must not collide.
+    smoke_timeout_s: float | None = None
+    # #3673: True when this leg's required capabilities need genuine
+    # judgement rather than a bare exit code (GUI/real-host drivers — see
+    # ``coord.smoke.smoke_needs_judgement``). ``_spawn`` falls through to
+    # the ordinary ``claude -p`` chat path whenever this is True, even if
+    # ``plain_runner`` is also True — the opt-out, not a second on/off
+    # switch of its own.
+    smoke_needs_judgement: bool = False
 
 
 class _GitError(RuntimeError):
@@ -5991,6 +6031,172 @@ def _user_message_line(text: str) -> bytes:
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
+# ── #3673: plain-runner smoke executor ──────────────────────────────────────
+#
+# A Test-stage leg's whole job is "pull the branch, run the smoke command,
+# report the exit code" — none of that needs an LLM. This section is the
+# PLAIN runner: it executes the command as a bare subprocess (no `claude -p`
+# session) and derives the verdict from the exit code alone. An LLM session
+# is spawned only to SUMMARISE a failure for a human-readable report — never
+# to decide pass/fail — via `AgentServer._spawn_plain_runner_failure_summary`.
+# `coord.smoke.smoke_needs_judgement` is the opt-out for GUI/real-host-driver
+# specs that genuinely need more than an exit code.
+
+#: How much of a plain-runner command's combined stdout+stderr survives into
+#: the leg's log (and, on failure, the summary request) — generous enough to
+#: carry a real stack trace/test-failure block, bounded so a runaway command
+#: can't blow up the log file.
+PLAIN_RUNNER_LOG_TAIL_CHARS = 8000
+
+
+def _tail_text(text: str, limit: int = PLAIN_RUNNER_LOG_TAIL_CHARS) -> str:
+    """The last *limit* characters of *text*, with a marker when truncated."""
+    if len(text) <= limit:
+        return text
+    return f"...[truncated, {len(text) - limit} earlier chars omitted]...\n{text[-limit:]}"
+
+
+@dataclass(frozen=True)
+class PlainRunnerVerdict:
+    """The Test-stage verdict a plain runner derives from a subprocess exit
+    code alone (#3673) — mirrors :class:`coord.smoke.PlainRunnerVerdict`
+    (duplicated, not imported: `coord.smoke` is coordinator-side dispatch
+    policy, this module is where the subprocess the verdict describes
+    actually runs — the two sides of the same question, in two different
+    processes on two different machines, never need to share a Python
+    import for that to be true).
+    """
+
+    passed: bool
+    exit_code: int
+    log_tail: str
+    #: True for the one exit/marker combination `SMOKE_SYSTEM_PROMPT` step 4
+    #: treats specially — the suite re-ran its own failures against the
+    #: merge-base and found every one of them fails there too, i.e. a
+    #: statement about the MACHINE/base, not the branch. Mirrors the
+    #: claude-driven path's `SMOKE: baseline-red` marker exactly so
+    #: downstream verdict parsing (`coord.notify._record_smoke_verdict`)
+    #: reads the plain-runner's log identically to a worker-printed one.
+    baseline_red: bool = False
+
+
+def run_plain_runner_command(
+    command: str,
+    cwd: str,
+    *,
+    timeout: float,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> PlainRunnerVerdict:
+    """Execute *command* as a bare subprocess in *cwd* and derive a
+    :class:`PlainRunnerVerdict` from its exit code alone (#3673) — no
+    `claude -p` session is spawned here, ever; this function cannot call one.
+
+    *run* is injectable (defaults to :func:`subprocess.run`) purely for
+    tests — production always uses the real default.
+
+    Exit-code mapping mirrors `SMOKE_SYSTEM_PROMPT`'s steps 3-5 exactly, so a
+    plain-runner leg's log reads the same way a worker-printed one would:
+      * ``0`` → passed.
+      * :data:`coord.revalidate.RUNNER_BASELINE_RED_EXIT` AND the combined
+        output contains :data:`coord.revalidate.BASELINE_RED_OUTPUT_MARKER`
+        → ``baseline_red=True``, not a plain failure (the suite already
+        re-ran its own failures against the merge-base and found them red
+        there too — a statement about the machine/base, not the branch).
+      * any other non-zero exit → failed.
+    A timeout is reported as a failure with exit_code ``-1`` — a smoke
+    command that cannot finish within its own configured budget never
+    passes by default (fail-closed, matching every other inconclusive case
+    in this stage).
+    """
+    from coord.revalidate import (  # noqa: PLC0415 — avoid a module-load-time cycle
+        BASELINE_RED_OUTPUT_MARKER,
+        RUNNER_BASELINE_RED_EXIT,
+    )
+
+    try:
+        result = run(
+            command, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        combined = (exc.stdout or "") + (exc.stderr or "")
+        tail = _tail_text(
+            f"timed out after {timeout:.0f}s\n{combined}" if combined else f"timed out after {timeout:.0f}s"
+        )
+        return PlainRunnerVerdict(passed=False, exit_code=-1, log_tail=tail)
+
+    combined = (result.stdout or "") + (result.stderr or "")
+    tail = _tail_text(combined)
+    if result.returncode == 0:
+        return PlainRunnerVerdict(passed=True, exit_code=0, log_tail=tail)
+    baseline_red = (
+        result.returncode == RUNNER_BASELINE_RED_EXIT
+        and BASELINE_RED_OUTPUT_MARKER in combined
+    )
+    return PlainRunnerVerdict(
+        passed=False, exit_code=result.returncode, log_tail=tail, baseline_red=baseline_red,
+    )
+
+
+def execute_plain_runner_smoke(
+    spec: AssignmentSpec,
+    cwd: str,
+    *,
+    timeout: float,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    spawn_failure_summary: Callable[[AssignmentSpec, PlainRunnerVerdict], None] | None = None,
+) -> PlainRunnerVerdict:
+    """The full #3673 plain-runner decision for one smoke leg: run
+    ``spec.smoke_command`` directly (:func:`run_plain_runner_command`, no
+    LLM involved) and, ONLY when the verdict is a genuine failure (not a
+    pass, and not a `baseline_red` — that is a statement about the machine,
+    not a code defect, so it gets no failure summary either), call
+    *spawn_failure_summary* to produce a human-readable explanation.
+
+    This is the seam the acceptance test drives directly: pass a fake *run*
+    that returns a failing/passing `CompletedProcess` and a recording
+    *spawn_failure_summary*, and assert it was invoked exactly once per
+    failure and never on a pass — with no `claude`/`subprocess.Popen` of a
+    `claude -p` argv anywhere in this call graph for the verdict itself.
+
+    Raises nothing — a missing ``smoke_command`` is reported as a failed
+    verdict (exit_code ``-1``) rather than an exception, so a caller that
+    accidentally reaches this path for an unconfigured leg still gets a
+    reportable Test-stage outcome instead of an agent-crashing exception.
+    """
+    if not spec.smoke_command:
+        verdict = PlainRunnerVerdict(
+            passed=False, exit_code=-1,
+            log_tail="#3673 plain-runner: no smoke_command on this assignment spec",
+        )
+    else:
+        verdict = run_plain_runner_command(spec.smoke_command, cwd, timeout=timeout, run=run)
+
+    if not verdict.passed and not verdict.baseline_red and spawn_failure_summary is not None:
+        spawn_failure_summary(spec, verdict)
+    return verdict
+
+
+def plain_runner_smoke_marker_lines(spec: AssignmentSpec, verdict: PlainRunnerVerdict) -> str:
+    """The exact `SMOKE:` marker text a plain-runner leg's log carries
+    (#3673) — byte-for-byte the same vocabulary `SMOKE_SYSTEM_PROMPT` asks a
+    `claude -p` smoke worker to print, so `coord.notify._record_smoke_verdict`
+    parses a plain-runner leg's log identically to a worker-printed one; no
+    downstream verdict-parsing code needs to know which path produced it.
+    """
+    header = (
+        f"# plain-runner (#3673): executing `{spec.smoke_command}` — no claude -p "
+        "session spawned for the verdict itself\n"
+    )
+    body = verdict.log_tail.rstrip("\n")
+    if verdict.baseline_red:
+        marker = f"SMOKE: baseline-red exit={verdict.exit_code}"
+    elif verdict.passed:
+        marker = "SMOKE: pass"
+    else:
+        marker = f"SMOKE: fail exit={verdict.exit_code}"
+    return f"{header}{body}\n{marker}\n"
+
+
 # #425: assignment types that **mutate** the repo or external state.  The
 # safety gate in :meth:`AgentServer.assign` refuses to start these on any
 # provider whose ``capabilities().enforces_deny_list`` is False — i.e. a
@@ -9551,6 +9757,127 @@ class AgentServer:
             assignment.finished_at = time.time()
         self._persist()
 
+    def _run_plain_runner_smoke(self, assignment: AgentAssignment, repo_path: Path) -> None:
+        """#3673: entry point for a plain-runner smoke leg — never spawns
+        `claude -p` for the verdict itself (see :func:`execute_plain_runner_
+        smoke`). Runs on a background thread for the same reason `_spawn_
+        pty` does: this is reached synchronously from the async HTTP
+        `/assign` handler, and the smoke command itself can block for
+        minutes — doing that inline here would freeze the event loop.
+        """
+        with self._lock:
+            assignment.status = RUNNING
+            assignment.started_at = time.time()
+        self._persist()
+        thread = threading.Thread(
+            target=self._run_plain_runner_smoke_blocking,
+            args=(assignment, repo_path),
+            daemon=True,
+            name=f"agent-plain-runner-{assignment.id}",
+        )
+        with self._lock:
+            self._threads[assignment.id] = thread
+        thread.start()
+
+    def _run_plain_runner_smoke_blocking(
+        self, assignment: AgentAssignment, repo_path: Path,
+    ) -> None:
+        """The actual (blocking) plain-runner execution — runs on the
+        background thread started by :meth:`_run_plain_runner_smoke`.
+
+        Writes the SAME ``SMOKE:`` marker vocabulary a `claude -p` smoke
+        worker would print (:func:`plain_runner_smoke_marker_lines`) into
+        the assignment's log, so `coord.notify._record_smoke_verdict` reads
+        a plain-runner leg's log exactly like a worker-printed one — no
+        downstream verdict-parsing change needed for this path to exist.
+        """
+        spec = assignment.spec
+        timeout = (
+            spec.smoke_timeout_s
+            if spec.smoke_timeout_s and spec.smoke_timeout_s > 0
+            else 600.0
+        )
+        try:
+            verdict = execute_plain_runner_smoke(
+                spec, str(repo_path), timeout=timeout,
+                spawn_failure_summary=lambda s, v: self._spawn_plain_runner_failure_summary(
+                    assignment, s, v,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — must still reach a terminal state
+            _log.exception(
+                "plain-runner smoke %s: execute_plain_runner_smoke raised", assignment.id,
+            )
+            self._fail(assignment, f"plain-runner smoke crashed: {exc}")
+            return
+
+        try:
+            with open(assignment.log_path, "a", encoding="utf-8") as fh:
+                fh.write(
+                    f"# agent={self.machine_name} repo={spec.repo_name} "
+                    f"issue=#{spec.issue_number} plain-runner (#3673), "
+                    f"timeout={timeout:.0f}s\n"
+                )
+                fh.write(plain_runner_smoke_marker_lines(spec, verdict))
+        except OSError:
+            _log.exception(
+                "plain-runner smoke %s: failed to write verdict to log %s",
+                assignment.id, assignment.log_path,
+            )
+
+        with self._lock:
+            assignment.status = DONE
+            assignment.exit_code = verdict.exit_code
+            assignment.finished_at = time.time()
+        self._persist()
+
+    def _spawn_plain_runner_failure_summary(
+        self, assignment: AgentAssignment, spec: AssignmentSpec, verdict: PlainRunnerVerdict,
+    ) -> None:
+        """#3673: the ONLY place a plain-runner leg spawns `claude -p` — a
+        short, bounded one-shot session whose sole job is to read the
+        failing command's output and write a human-readable summary, never
+        to re-decide pass/fail (the exit code already settled that before
+        this is ever called — see :func:`execute_plain_runner_smoke`).
+
+        Best-effort and bounded: a summary that fails, times out, or crashes
+        appends nothing beyond the raw log tail already written by
+        :meth:`_run_plain_runner_smoke_blocking` — never escalates a
+        summarisation problem into the Test-stage verdict itself, and never
+        blocks the leg beyond its own short timeout.
+        """
+        prompt = (
+            "A Test-stage smoke command just failed. Read the command and its "
+            "output below and write a SHORT (2-4 sentence) plain-English "
+            "summary of why it failed — no fix, no code changes, just the "
+            "diagnosis a human reviewing this leg would want up front.\n\n"
+            f"Command: {spec.smoke_command}\n"
+            f"Exit code: {verdict.exit_code}\n\n"
+            f"Output:\n{verdict.log_tail}"
+        )
+        try:
+            result = subprocess.run(
+                [DEFAULT_WORKER_BINARY, "-p", "--output-format", "text"],
+                input=prompt, capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _log.exception(
+                "plain-runner smoke %s: failure-summary claude -p call failed",
+                assignment.id,
+            )
+            return
+        summary = (result.stdout or "").strip()
+        if not summary:
+            return
+        try:
+            with open(assignment.log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n# plain-runner failure summary (#3673):\n{summary}\n")
+        except OSError:
+            _log.exception(
+                "plain-runner smoke %s: failed to append failure summary to log",
+                assignment.id,
+            )
+
     def _spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
         # #324/#425/#1796: provider-layer routing.
         #
@@ -9569,6 +9896,20 @@ class AgentServer:
         # but unresolvable provider), which `assign()` now refuses before
         # `_spawn` is ever reached.
         spec = assignment.spec
+
+        # #3673: the plain-runner path — a smoke leg this policy applies to
+        # never spawns `claude -p` for its verdict at all, so it must be
+        # checked before any provider resolution/argv-building below, which
+        # exists purely to build THAT spawn.
+        if (
+            spec.type == "smoke"
+            and spec.plain_runner
+            and not spec.smoke_needs_judgement
+            and spec.smoke_command
+        ):
+            self._run_plain_runner_smoke(assignment, repo_path)
+            return
+
         provider_obj = self._resolve_provider(spec)
         if provider_obj is not None:
             # Deferred import keeps the cycle latent at module load time.
