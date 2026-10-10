@@ -3409,3 +3409,42 @@ def test_reset_superseded_review_targets_newest_leg_and_keeps_history(
     assert rows["w2"] == "pending"
     assert rows["w1"] == "done"
     assert "rv1" in rows  # older leg's review row kept
+
+
+def test_diagnose_review_superseded_leg_names_the_guard_holding_it(
+    monkeypatch, config, coord_db
+) -> None:
+    """#3668 review round 1: for a pending, test-passed newest head the
+    finding names WHICH automatic-dispatch guard is declining it (here a
+    live work leg left on the same issue) — the bulk pass's own predicate,
+    so the operator is not left guessing why nothing was ever claimed."""
+    _stub(monkeypatch, session="dead")
+    board = _superseded_board()
+    board.active.append(_assign(aid="w9", typ="work", status="pending", dispatched_at=50.0))
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", dry_run=True)
+
+    assert res.recovered is False
+    assert any(
+        "not dispatching w2" in f and "w9" in f and "#459" in f
+        for f in res.findings
+    ), res.findings
+
+
+def test_diagnose_review_superseded_leg_with_no_guard_points_at_journal(
+    monkeypatch, config, coord_db
+) -> None:
+    """No guard declines the newest head: say so, and point at the journal
+    line the bulk pass now logs per failing row (the daemon's drain claims
+    locally, so POST /review-claim is the wrong place to look)."""
+    _stub(monkeypatch, session="dead")
+
+    res = diagnose.diagnose_stage(
+        _superseded_board(), config, "api", 42, "review", dry_run=True,
+    )
+
+    assert any(
+        "passes every automatic review-dispatch gate" in f
+        and "bulk review dispatch (#3668)" in f
+        for f in res.findings
+    ), res.findings

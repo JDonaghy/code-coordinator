@@ -1023,6 +1023,25 @@ def _flag_superseded_review(board, config, latest, res: DiagnoseResult) -> bool:
         )
         res.recovered = True
         return True
+    # #3668 review round 1: name the guard actually holding the newest head
+    # back — the bulk pass's own eligibility predicate, not a re-derivation.
+    # vimcode#1877 sat at "[awaiting review]" with nothing saying which one.
+    from coord.review import newest_head_review_dispatch_blockers  # noqa: PLC0415
+
+    blockers = newest_head_review_dispatch_blockers(board, config, newest)
+    if blockers:
+        res.findings.append(
+            f"the automatic review pass is not dispatching {newest.assignment_id}: "
+            + "; ".join(blockers)
+        )
+    else:
+        res.findings.append(
+            f"{newest.assignment_id} passes every automatic review-dispatch "
+            "gate, yet no review exists — if this persists across passes, look "
+            "for 'bulk review dispatch (#3668)' / dispatch_review errors in the "
+            "coord-serve journal (the daemon's own drain claims in its local "
+            "DB, so it never shows up as POST /review-claim)"
+        )
     res.findings.append(
         f"nothing has dispatched a review for {newest.assignment_id} — re-run "
         "with --reset to make it re-dispatchable (releases any review-dispatch "

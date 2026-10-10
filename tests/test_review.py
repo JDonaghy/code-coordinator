@@ -8667,15 +8667,53 @@ def _drive_to_request_changes_and_fix(fake_dispatch) -> tuple[Board, Assignment,
     return board, work, fix
 
 
-def test_fix_leg_gets_its_own_review_after_its_test_passes(fake_dispatch) -> None:
+def _poison_row_ahead(board: Board, monkeypatch) -> Assignment:
+    """Put an unrelated eligible row AHEAD of everything on *board* whose
+    review dispatch raises on every attempt (a gh/PR lookup that keeps
+    failing) — ordinary fleet noise on a shared board."""
+    import coord.review as review_mod
+
+    poison = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=7,
+        issue_title="unrelated", assignment_id="poison7", status="done",
+        branch="issue-7-x", type="work", review_state=None,
+        test_state="passed", dispatched_at=50.0, finished_at=60.0,
+    )
+    board.completed.insert(0, poison)
+    inner = review_mod.dispatch_review
+
+    def _dispatch(completed, board, config, **kw):
+        if completed.assignment_id == "poison7":
+            raise RuntimeError("gh pr list: HTTP 502")
+        return inner(completed, board, config, **kw)
+
+    monkeypatch.setattr(review_mod, "dispatch_review", _dispatch)
+    return poison
+
+
+def test_fix_leg_gets_its_own_review_after_its_test_passes(
+    fake_dispatch, monkeypatch,
+) -> None:
     """#3668 acceptance: work → test-pass → request-changes → fix work →
-    test-pass dispatches a SECOND review, for the fix leg. The older leg's
-    request-changes review must not satisfy the gate for the newest head."""
+    test-pass dispatches a SECOND review, for the fix leg — on a realistic
+    shared board, where another repo's eligible row sits ahead of the fix
+    leg and its dispatch raises on every pass.
+
+    Review round 1: on a clean board this flow already worked before #3668
+    (the bulk pass picks up a pending, test-passed fix leg), so a clean-board
+    version of this test proved nothing. What stalled the newest head at
+    "[awaiting review]" — pending, test passed, no review row, no claim — is
+    a pass that never reached it: one row's dispatch raising aborted the
+    WHOLE bulk pass, every caller swallowed the exception, and the next tick
+    rebuilt the same eligibility list in the same order and died on the same
+    row. Fails on origin/main; passes once each row is isolated."""
     board, _work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
     cfg = _test_first_config()
+    poison = _poison_row_ahead(board, monkeypatch)
 
     # Fix leg's Test not in yet — correctly held.
     assert dispatch_pending_reviews(board, cfg) == []
+    assert fix.review_state is None
 
     fix.test_state = "passed"
     second = dispatch_pending_reviews(board, cfg)
@@ -8683,6 +8721,58 @@ def test_fix_leg_gets_its_own_review_after_its_test_passes(fake_dispatch) -> Non
     assert fake_dispatch == ["103d0253cb07", "61af6f3e3e39"]
     assert [r.review_of_assignment_id for r in second] == ["61af6f3e3e39"]
     assert fix.review_state == "dispatched"
+    # The failing row is left eligible for the next pass, not dropped.
+    assert poison.review_state is None
+
+
+def test_bulk_review_pass_isolates_a_row_whose_dispatch_raises(
+    fake_dispatch, monkeypatch, caplog,
+) -> None:
+    """#3668: a raising row is logged and skipped; every other eligible row
+    on the board — before AND after it — still gets its review, and the
+    failure is retried on the next pass rather than silently dropped."""
+    import logging
+
+    board = Board(completed=_pending_work(3))
+    poison = _poison_row_ahead(board, monkeypatch)
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    with caplog.at_level(logging.ERROR, logger="coord.review"):
+        out = dispatch_pending_reviews(board, cfg)
+
+    assert sorted(r.review_of_assignment_id for r in out) == ["w1", "w2", "w3"]
+    assert poison.review_state is None
+    assert any(
+        "poison7" in rec.getMessage() and "#3668" in rec.getMessage()
+        for rec in caplog.records
+    )
+    # Next pass: the poisoned row is attempted again (and only it).
+    assert dispatch_pending_reviews(board, cfg) == []
+    assert fake_dispatch == ["w1", "w2", "w3"]
+
+
+def test_bulk_review_eligibility_blockers_match_the_bulk_filter(fake_dispatch) -> None:
+    """#3668: the predicate diagnose reports from IS the bulk filter — a
+    pending, test-passed leg blocked only by a live work leg on the same
+    issue names that leg, and is dispatched once the leg is gone."""
+    from coord.review import bulk_review_eligibility_blockers
+
+    board, _work, fix = _drive_to_request_changes_and_fix(fake_dispatch)
+    fix.test_state = "passed"
+    board.active.append(Assignment(
+        machine_name="laptop", repo_name="vimcode", issue_number=1877,
+        issue_title="t", assignment_id="ghost1", status="pending",
+        type="work", branch="issue-1877-x",
+    ))
+
+    blockers = bulk_review_eligibility_blockers(fix, board, gate_test=True)
+    assert len(blockers) == 1 and "ghost1" in blockers[0]
+    assert dispatch_pending_reviews(board, _test_first_config()) == []
+
+    board.active = [a for a in board.active if a.assignment_id != "ghost1"]
+    assert bulk_review_eligibility_blockers(fix, board, gate_test=True) == []
+    second = dispatch_pending_reviews(board, _test_first_config())
+    assert [r.review_of_assignment_id for r in second] == ["61af6f3e3e39"]
 
 
 def test_fix_leg_stuck_at_stale_dispatched_is_healed_and_reviewed(fake_dispatch) -> None:
