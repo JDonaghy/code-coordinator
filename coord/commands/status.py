@@ -1472,6 +1472,63 @@ def _unit_enablement_lines(health: dict) -> list[tuple[bool, str]]:
     return out
 
 
+def _graph_refresh_lines(
+    health: dict, now: float | None = None,
+) -> list[tuple[bool, str]]:
+    """Render a machine's ``graph_refresh`` block (the agent's periodic
+    fast-forward of its base checkouts plus graph rebuild) as ``coord
+    doctor`` lines: the outcome, the HEAD it left, and which commit the graph
+    was last built from and how long ago.
+
+    A checkout left untouched because someone owns its state (dirty, parked
+    on another branch, diverged, mid-rebase) prints a ``⚠`` line that does
+    not fail doctor — an operator's own working checkout would otherwise
+    fail it forever. A refused fetch/fast-forward or a failed rebuild is a
+    problem. An agent without the block renders nothing — never a false
+    "clean".
+
+    Pure function — no I/O — so it's testable without a live fleet.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.graph_health import REFRESH_FAILED, REFRESH_LEFT_UNTOUCHED  # noqa: PLC0415
+    from coord.health.units import human_hours  # noqa: PLC0415
+
+    block = health.get("graph_refresh")
+    if not isinstance(block, dict):
+        return []
+    now = _time.time() if now is None else now
+    out: list[tuple[bool, str]] = []
+    for c in block.get("checkouts") or []:
+        if not isinstance(c, dict):
+            continue
+        repo = c.get("repo") or c.get("repo_path") or "?"
+        outcome = c.get("outcome") or "?"
+        head = (c.get("head_after") or c.get("head_before") or "")[:8] or "?"
+        built = (c.get("graph_built_sha") or "")[:8] or "none"
+        refreshed_at = c.get("graph_refreshed_at")
+        age = (
+            f"{human_hours(max(0.0, now - refreshed_at))} ago"
+            if isinstance(refreshed_at, (int, float)) else "never"
+        )
+        summary = f"graph refresh {repo}: {outcome} @ {head}, graph {built} refreshed {age}"
+        detail = c.get("detail") or ""
+        graph_detail = c.get("graph_detail") or ""
+        if outcome in REFRESH_FAILED:
+            out.append((True, f"  ✗ {summary}"))
+            if detail:
+                out.append((True, f"        {detail}"))
+        elif c.get("graph_rebuild_ok") is False:
+            out.append((True, f"  ✗ {summary}"))
+            out.append((True, f"        {graph_detail or 'graph rebuild failed'}"))
+        elif outcome in REFRESH_LEFT_UNTOUCHED:
+            out.append((False, f"  ⚠ {summary} — left untouched: {detail}"))
+        else:
+            suffix = f" ({graph_detail})" if graph_detail and graph_detail != "graph current" else ""
+            out.append((False, f"  ✓ {summary}{suffix}"))
+    return out
+
+
 def _gui_lane_preflight_lines(
     health: dict, capabilities: "Iterable[str] | None" = None,
 ) -> list[tuple[bool, str]]:
@@ -1883,6 +1940,13 @@ def doctor(
         # the manifest says this host should run and that isn't actually
         # `systemctl --user enable`d.
         for is_problem, line in _unit_enablement_lines(health):
+            click.echo(line)
+            if is_problem:
+                any_problem = True
+
+        # Is each base checkout (and so the graph every worktree borrows)
+        # being kept current with origin, and if not, what is blocking it?
+        for is_problem, line in _graph_refresh_lines(health):
             click.echo(line)
             if is_problem:
                 any_problem = True
@@ -2580,13 +2644,14 @@ def _diagnose_graph_health(config_path: Path) -> None:
     whether worktrees on this box get a linked graph at all.
 
     #2211: also reports HEAD vs ``origin/<default_branch>``, alongside the
-    existing graph-vs-HEAD comparison.  The base checkout is fetched but
-    never pulled by design (worktrees always branch from a fresh
-    ``origin/<default>``, so a stale base never breaks dispatch) — which
-    means a graph can match HEAD exactly while HEAD itself sits arbitrarily
-    far behind the remote, and the graph-vs-HEAD check alone reports a clean
-    ``✓ in sync`` for it. This never fetches or pulls; it only reads whatever
-    ``origin/<default_branch>`` the last fetch left behind.
+    existing graph-vs-HEAD comparison.  The agent fast-forwards a base
+    checkout only when it is clean and on its integration branch (worktrees
+    always branch from a fresh ``origin/<default>``, so a stale base never
+    breaks dispatch) — so a parked or dirty checkout's graph can match HEAD
+    exactly while HEAD itself sits arbitrarily far behind the remote, and
+    the graph-vs-HEAD check alone reports a clean ``✓ in sync`` for it. This
+    never fetches or pulls; it only reads whatever ``origin/<default_branch>``
+    the last fetch left behind.
 
     Local-machine only, same scope as ``--orphan-worktrees``: it inspects the
     checkouts named in ``coordinator.yml`` that actually exist here.

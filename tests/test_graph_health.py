@@ -23,6 +23,7 @@ import pytest
 
 from coord.graph_health import (
     GraphStatus,
+    fast_forward_base_checkout,
     graph_status,
     hooks_file_present,
     hooks_path_status,
@@ -656,3 +657,153 @@ def test_every_graphify_hook_in_this_repo_has_a_versioned_shim() -> None:
         assert os.access(versioned / required, os.X_OK), (
             f".githooks/{required} is not executable — git will ignore it"
         )
+
+
+# ── fast_forward_base_checkout: keeping the base checkout itself current ─────
+#
+# Real git throughout: a bare origin, the base checkout cloned from it, and a
+# second clone that pushes new commits, so "behind origin" is a genuine state
+# rather than a stubbed answer.
+
+
+def _ff_commit(repo: Path, name: str, content: str = "x\n") -> str:
+    (repo / name).write_text(content)
+    _git("add", name, cwd=repo)
+    _git("commit", "-q", "-m", f"add {name}", cwd=repo)
+    return _head(repo)
+
+
+def _clean_base_behind_origin(
+    tmp_path: Path, n: int, *, branch: str = "main"
+) -> tuple[Path, Path]:
+    """``(base, pusher)``: *base* is a clean clone on *branch*, and *pusher*
+    has pushed *n* further commits to origin/*branch* since."""
+    origin = tmp_path / "origin.git"
+    _git("init", "-q", "--bare", "-b", branch, str(origin), cwd=tmp_path)
+    seed = tmp_path / "seed"
+    _git("init", "-q", "-b", branch, str(seed), cwd=tmp_path)
+    _ff_commit(seed, "README", "init\n")
+    _git("remote", "add", "origin", str(origin), cwd=seed)
+    _git("push", "-q", "origin", branch, cwd=seed)
+    base = tmp_path / "base"
+    _git("clone", "-q", "-b", branch, str(origin), str(base), cwd=tmp_path)
+    for i in range(n):
+        _ff_commit(seed, f"f{i}.txt")
+    if n:
+        _git("push", "-q", "origin", branch, cwd=seed)
+    return base, seed
+
+
+def test_ff_clean_base_behind_origin_is_fast_forwarded(tmp_path: Path) -> None:
+    base, pusher = _clean_base_behind_origin(tmp_path, 2)
+    before = _head(base)
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "fast_forwarded", res.detail
+    assert res.refreshed
+    assert res.head_before == before
+    assert res.head_after == _head(pusher) == _head(base)
+    assert "2 commits" in res.detail
+
+
+def test_ff_already_current_is_up_to_date(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 0)
+    before = _head(base)
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "up_to_date"
+    assert not res.refreshed
+    assert _head(base) == before
+
+
+def test_ff_dirty_tracked_file_is_left_untouched(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 2)
+    before = _head(base)
+    (base / "README").write_text("local edit\n")
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "skipped_dirty"
+    assert "README" in res.detail
+    assert _head(base) == before
+    assert (base / "README").read_text() == "local edit\n"
+
+
+def test_ff_untracked_file_does_not_block(tmp_path: Path) -> None:
+    base, pusher = _clean_base_behind_origin(tmp_path, 1)
+    (base / ".pytest.out").write_text("junk\n")
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "fast_forwarded", res.detail
+    assert _head(base) == _head(pusher)
+    assert (base / ".pytest.out").read_text() == "junk\n"
+
+
+def test_ff_off_branch_is_left_untouched(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 2)
+    _git("checkout", "-q", "-b", "feature", cwd=base)
+    before = _head(base)
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "skipped_off_branch"
+    assert "feature" in res.detail
+    assert _head(base) == before
+    branch = _git("symbolic-ref", "--short", "HEAD", cwd=base).stdout.strip()
+    assert branch == "feature"
+
+
+def test_ff_detached_head_is_left_untouched(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 1)
+    _git("checkout", "-q", "--detach", cwd=base)
+    before = _head(base)
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "skipped_off_branch"
+    assert _head(base) == before
+
+
+def test_ff_local_unpushed_commit_is_diverged_and_untouched(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 2)
+    local = _ff_commit(base, "local.txt")
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "skipped_diverged"
+    assert _head(base) == local
+
+
+def test_ff_linked_worktree_is_skipped(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 1)
+    wt = tmp_path / "wt"
+    _git("worktree", "add", "-q", "-b", "main-wt", str(wt), cwd=base)
+    before = _head(wt)
+    res = fast_forward_base_checkout(wt, ("main", "main-wt"))
+    assert res.outcome == "skipped_linked_worktree"
+    assert _head(wt) == before
+
+
+def test_ff_index_lock_is_in_progress_and_untouched(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 1)
+    before = _head(base)
+    (base / ".git" / "index.lock").write_text("")
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "skipped_in_progress"
+    assert "index.lock" in res.detail
+    assert _head(base) == before
+
+
+def test_ff_develop_integration_branch_is_fast_forwarded(tmp_path: Path) -> None:
+    base, pusher = _clean_base_behind_origin(tmp_path, 3, branch="develop")
+    res = fast_forward_base_checkout(base, ("main", "develop"))
+    assert res.outcome == "fast_forwarded", res.detail
+    assert res.branch == "develop"
+    assert _head(base) == _head(pusher)
+
+
+def test_ff_no_origin_remote(tmp_path: Path) -> None:
+    repo = tmp_path / "lonely"
+    _git("init", "-q", "-b", "main", str(repo), cwd=tmp_path)
+    _ff_commit(repo, "README")
+    res = fast_forward_base_checkout(repo, ("main",))
+    assert res.outcome == "no_origin"
+
+
+def test_ff_fetch_failure_is_reported_and_untouched(tmp_path: Path) -> None:
+    base, _ = _clean_base_behind_origin(tmp_path, 1)
+    before = _head(base)
+    shutil.rmtree(tmp_path / "origin.git")
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "fetch_failed"
+    assert res.detail
+    assert _head(base) == before

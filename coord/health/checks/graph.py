@@ -25,8 +25,9 @@ hooks-working checkout from WARN to CRIT at ``graph_stale_crit_hours``;
 hooks-disabled skips straight to CRIT because time cannot fix it.
 
 **graph == HEAD is not the whole story (#2211).** ``status.stale`` only
-compares the graph to this checkout's OWN HEAD. The base checkout is fetched
-but never pulled (see ``coord.graph_health``'s module docstring), so HEAD can
+compares the graph to this checkout's OWN HEAD. The agent only fast-forwards
+a base checkout that is clean and on its integration branch (see
+``coord.graph_health``'s module docstring), so a parked or dirty one's HEAD can
 sit arbitrarily far behind ``origin/<default_branch>`` while the graph
 matches it exactly — a confidently-correct-looking graph of stale code. This
 module reports that as its own WARN (``status.origin_behind``), independent
@@ -83,11 +84,12 @@ def fix_graph(ctx: HealthContext, result: CheckResult) -> FixOutcome:
     checkout itself is caught up with ``origin/<default_branch>``.
 
     A stale/absent graph on a checkout that is itself behind origin is
-    exactly the "not automatic" case the probe already refuses to name a
-    bare command for (see the ``origin_behind`` branch above): rebuilding
-    would just produce a confidently-current-looking graph of code that is
-    still stale relative to origin. That half stays human-only — a
-    ``git pull`` under live workers is not this check's decision to make.
+    the case the probe deliberately does not name a bare rebuild for (see
+    the ``origin_behind`` branch above): rebuilding would just produce a
+    confidently-current-looking graph of code that is still stale relative
+    to origin. Catching HEAD up is the agent's guarded fast-forward
+    (:func:`coord.graph_health.fast_forward_base_checkout`), never this
+    fixer's.
 
     Re-derives the verdict fresh via :func:`coord.graph_health.graph_status`
     rather than trusting *result*, which may predate the last commit/rebuild
@@ -121,7 +123,8 @@ def fix_graph(ctx: HealthContext, result: CheckResult) -> FixOutcome:
         return FixOutcome(
             check_id="graph", subject=name, status="no_action",
             message=f"{path} is itself behind origin/{default_branch} — "
-            "graphify update would only rebuild from stale HEAD; not automatic",
+            "graphify update would only rebuild from stale HEAD; the agent "
+            "fast-forwards it when clean and on its integration branch",
         )
     if fresh.present and not fresh.stale:
         return FixOutcome(
@@ -277,9 +280,9 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
 
         # #2211: graph == HEAD only proves the graph matches this checkout's
         # OWN HEAD — it says nothing about whether HEAD itself is behind
-        # origin. The base checkout is fetched but never pulled by design
-        # (see coord.graph_health module docstring), so this must be judged
-        # independently of `status.stale`, not folded into it.
+        # origin. The agent only fast-forwards a clean, on-branch base
+        # checkout (see coord.graph_health module docstring), so this must be
+        # judged independently of `status.stale`, not folded into it.
         origin_suffix = (
             ""
             if not status.origin_behind
@@ -320,13 +323,15 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
         detail = ""
         if not status.stale and status.origin_behind:
             # Not a graph problem — `graphify update` would rebuild from the
-            # same stale HEAD. Naming a `git pull` here deliberately, but not
-            # running one: automatic pulls are unsafe for a base checkout
-            # (see coord.graph_health module docstring — deliberately-parked
-            # branches, stale .git/index.lock, etc).
+            # same stale HEAD. The agent's periodic fast-forward catches a
+            # clean, on-branch base checkout up by itself; one still behind
+            # here was refused for a reason (parked branch, local changes,
+            # index.lock, ...) that `coord doctor`'s graph refresh line names.
             detail = (
-                f"fix: review, then pull {checkout.path} to catch it up to "
-                f"origin/{status.default_branch} (not automatic)"
+                f"the agent fast-forwards {checkout.path} to "
+                f"origin/{status.default_branch} when it is clean and on its "
+                f"integration branch; otherwise review and pull it by hand "
+                f"(`coord doctor` names what blocked it)"
             )
         elif severity is not Severity.OK:
             detail = f"fix: graphify update {checkout.path}"
