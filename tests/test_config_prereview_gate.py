@@ -66,6 +66,9 @@ prereview_gate:
     history_phrases:
       - "used to"
       - "previously"
+    comment_prefixes:
+      - "//"
+      - "/*"
     changelog_path: "CHANGELOG.md"
     smoke_spec_paths:
       - "tests/smoke/lane1.rs"
@@ -81,6 +84,7 @@ prereview_gate:
     assert repo_cfg.enabled is True
     assert repo_cfg.comment_lint is True
     assert repo_cfg.history_phrases == ("used to", "previously")
+    assert repo_cfg.comment_prefixes == ("//", "/*")
     assert repo_cfg.changelog_path == "CHANGELOG.md"
     assert repo_cfg.smoke_spec_paths == ("tests/smoke/lane1.rs",)
     assert repo_cfg.semver_command == "cargo semver-checks check-release"
@@ -98,6 +102,20 @@ prereview_gate:
 """
     )
     with pytest.raises(ConfigError, match="must be a mapping"):
+        load(p)
+
+
+def test_prereview_gate_rejects_bad_comment_prefixes(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+prereview_gate:
+  quadraui:
+    comment_prefixes: "not-a-list"
+"""
+    )
+    with pytest.raises(ConfigError, match="comment_prefixes"):
         load(p)
 
 
