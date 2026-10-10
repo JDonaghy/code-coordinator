@@ -14,6 +14,7 @@ import pytest
 from coord.config import (
     Config,
     PipelineConfig,
+    PrereviewGateConfig,
     ProviderDef,
     ProvidersConfig,
     ReviewsConfig,
@@ -941,6 +942,22 @@ def test_briefing_flags_tamper_when_diff_touches_sealed_path() -> None:
     assert "SEALED ORACLE TAMPER DETECTED" in briefing
     assert "tests/acceptance/" in briefing
     assert "request-changes is mandatory" in briefing
+
+
+def test_briefing_tells_reviewer_prereview_gate_findings_are_nits() -> None:
+    """#3674: the reviewer briefing must instruct that findings the
+    pre-review mechanical gate covers — and CLAUDE.md Code Style rules
+    generally — are nits, never `## Blocking findings`."""
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=1, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=None,
+    )
+    assert "#3674" in briefing
+    assert "never" in briefing and "Blocking findings" in briefing
+    assert "Code Style" in briefing
 
 
 def test_diff_touched_sealed_paths_matches_diff_git_header() -> None:
@@ -2728,6 +2745,163 @@ def test_dispatch_review_unaffected_when_no_mechanical_violation(
     assert result.status == "running"
     assert result.verdict_source is None
     assert completed.review_state != "done"
+
+
+# ── #3674: pre-review mechanical gate — runs BEFORE review dispatch, a gate
+# failure bounces back to the worker without ever spending a review leg ─────
+
+
+def test_dispatch_review_prereview_gate_blocks_review_dispatch(
+    two_machine_config: Config,
+) -> None:
+    """#3674 acceptance: a repo-configured gate finding (here, the
+    added-lines comment lint) must record request-changes WITHOUT a review
+    leg ever being dispatched — the same proof shape as the #3180 tests
+    above: no HTTP POST to any agent, not just a string assertion on a
+    prompt nobody ever sent."""
+    from coord.config import PrereviewGateRepoConfig
+    from coord.issue_store import _read_verdict_source_local  # noqa: PLC0415
+    from coord.state import load_assignment_review_verdict  # noqa: PLC0415
+
+    cfg = replace(
+        two_machine_config,
+        prereview_gate=PrereviewGateConfig(
+            repos={"api": PrereviewGateRepoConfig(enabled=True)}
+        ),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "should-never-be-used"})
+    diff = (
+        "diff --git a/coord/foo.py b/coord/foo.py\n"
+        "--- a/coord/foo.py\n"
+        "+++ b/coord/foo.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " def f(): pass\n"
+        "+# see #999 for why this works this way\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    # The actual proof no review leg was spent: zero HTTP calls.
+    assert client.calls == []
+
+    assert result is not None
+    assert result.type == "review"
+    assert result.status == "done"
+    assert result.review_verdict == "request-changes"
+    assert result.verdict_source == "mechanical"
+    assert "prereview mechanical gate" in (result.verdict_source_reason or "")
+    assert "PRE-REVIEW MECHANICAL GATE FAILED" in result.briefing
+    assert "#999" in result.briefing
+
+    review_state, review_verdict = load_assignment_review_verdict(result.assignment_id)
+    assert review_verdict == "request-changes"
+    source, reason = _read_verdict_source_local(result.assignment_id)
+    assert source == "mechanical"
+    assert reason and "prereview mechanical gate" in reason
+
+    assert completed.review_state == "done"
+    assert completed.review_verdict == "request-changes"
+
+
+def test_dispatch_review_prereview_gate_disabled_dispatches_normally(
+    two_machine_config: Config,
+) -> None:
+    """A repo with no `prereview_gate:` entry (the default) must behave
+    exactly as before — a real review leg is dispatched even for a diff
+    that WOULD trip the gate's checks if it were enabled."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "review-id-1"})
+    diff = (
+        "diff --git a/coord/foo.py b/coord/foo.py\n"
+        "--- a/coord/foo.py\n"
+        "+++ b/coord/foo.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " def f(): pass\n"
+        "+# see #999 for why this works this way\n"
+    )
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert len(client.calls) == 1
+    assert result is not None
+    assert result.status == "running"
+    assert result.verdict_source is None
+
+
+def test_dispatch_review_prereview_gate_runs_before_sealed_path_short_circuit(
+    two_machine_config: Config,
+) -> None:
+    """#3674: the gate's OWN finding must win — and be the one recorded —
+    even when the diff would ALSO trip the #3180 sealed-path check, proving
+    the gate runs first (both are "before a review leg" short-circuits; the
+    gate's verdict_source_reason, not the sealed-path one, must be what's
+    recorded when both would fire)."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig, PrereviewGateRepoConfig
+
+    cfg = replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+        }),
+        prereview_gate=PrereviewGateConfig(
+            repos={"api": PrereviewGateRepoConfig(enabled=True)}
+        ),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    board.completed.append(completed)
+    client = _FakeHTTPClient({"id": "should-never-be-used"})
+    diff = (
+        "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+        "--- a/tests/acceptance/ms01/foo.rs\n"
+        "+++ b/tests/acceptance/ms01/foo.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+// previously this test asserted something else\n"
+    )
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        diff_fetcher=lambda repo, num, **kw: diff,
+    )
+
+    assert client.calls == []
+    assert result is not None
+    assert "prereview mechanical gate" in (result.verdict_source_reason or "")
 
 
 # ── #3509: Tier-2 lane-kind smoke-spec entrypoints — additive-only, not
