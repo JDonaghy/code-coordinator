@@ -807,3 +807,69 @@ def test_ff_fetch_failure_is_reported_and_untouched(tmp_path: Path) -> None:
     assert res.outcome == "fetch_failed"
     assert res.detail
     assert _head(base) == before
+
+
+def test_ff_merge_gets_its_own_generous_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import coord.graph_health as gh
+
+    base, _ = _clean_base_behind_origin(tmp_path, 1)
+    seen: dict[str, float] = {}
+    real = gh._git_run
+
+    def _spy(repo_path, *args, timeout=10.0):
+        if args and args[0] == "merge":
+            seen["merge"] = timeout
+        return real(repo_path, *args, timeout=timeout)
+
+    monkeypatch.setattr(gh, "_git_run", _spy)
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "fast_forwarded", res.detail
+    assert seen["merge"] >= 300.0
+
+
+def test_ff_merge_timeout_is_reported_and_names_left_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import coord.graph_health as gh
+
+    base, _ = _clean_base_behind_origin(tmp_path, 1)
+    before = _head(base)
+    real = gh._git_run
+
+    def _killed_mid_merge(repo_path, *args, timeout=10.0):
+        if args and args[0] == "merge":
+            # What a SIGKILLed checkout leaves behind.
+            (base / ".git" / "index.lock").write_text("")
+            return -1, "", f"git {' '.join(args)} timed out after {timeout:.0f}s"
+        return real(repo_path, *args, timeout=timeout)
+
+    monkeypatch.setattr(gh, "_git_run", _killed_mid_merge)
+    res = fast_forward_base_checkout(base, ("main",), merge_timeout=7.0)
+    assert res.outcome == "ff_failed"
+    assert not res.refreshed
+    assert "timed out after 7s" in res.detail
+    assert "index.lock" in res.detail
+    assert "delete it" in res.detail
+    assert res.head_after == before
+
+
+def test_ff_merge_timeout_without_lock_does_not_mention_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import coord.graph_health as gh
+
+    base, _ = _clean_base_behind_origin(tmp_path, 1)
+    real = gh._git_run
+
+    def _timed_out(repo_path, *args, timeout=10.0):
+        if args and args[0] == "merge":
+            return -1, "", f"git {' '.join(args)} timed out after {timeout:.0f}s"
+        return real(repo_path, *args, timeout=timeout)
+
+    monkeypatch.setattr(gh, "_git_run", _timed_out)
+    res = fast_forward_base_checkout(base, ("main",))
+    assert res.outcome == "ff_failed"
+    assert "timed out" in res.detail
+    assert "index.lock" not in res.detail

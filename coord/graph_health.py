@@ -837,12 +837,22 @@ def is_linked_worktree(repo_path: Path) -> bool | None:
     return _resolve_git_path(repo_path, git_dir) != _resolve_git_path(repo_path, common_dir)
 
 
+def _git_index_lock(repo_path: Path) -> Path | None:
+    """The checkout's ``index.lock`` when one exists, else ``None``."""
+    git_dir_raw = _git_out(repo_path, "rev-parse", "--git-dir")
+    if not git_dir_raw:
+        return None
+    lock = _resolve_git_path(repo_path, git_dir_raw) / "index.lock"
+    return lock if lock.exists() else None
+
+
 def fast_forward_base_checkout(
     repo_path: Path,
     home_branches: tuple[str, ...],
     *,
     fetch: bool = True,
     fetch_timeout: float = 60.0,
+    merge_timeout: float = 300.0,
 ) -> BaseRefreshResult:
     """Fast-forward the base checkout at *repo_path* to its ``origin`` branch
     when — and only when — that cannot lose or disturb anything.
@@ -868,6 +878,14 @@ def fast_forward_base_checkout(
 
     Only then ``git merge --ff-only origin/<branch>`` runs. No ``--force``,
     ``reset``, ``stash`` or ``checkout`` is ever used. Never raises.
+
+    The merge is the one step that writes the index and working tree, so it
+    gets *merge_timeout* — a budget sized for a large jump on a slow
+    filesystem, not the short one the read-only probes use. Killing git
+    mid-checkout would leave ``index.lock`` behind, which every later refresh
+    reads as ``skipped_in_progress`` and every manual git command refuses on.
+    If that happens anyway, the ``ff_failed`` detail names the lock and the
+    manual remedy.
     """
     path_str = str(repo_path)
 
@@ -955,12 +973,22 @@ def fast_forward_base_checkout(
             origin_sha=origin_sha,
         )
 
-    rc, _, err = _git_run(repo_path, "merge", "--ff-only", "--quiet", origin_sha)
+    rc, _, err = _git_run(
+        repo_path, "merge", "--ff-only", "--quiet", origin_sha, timeout=merge_timeout
+    )
     if rc != 0:
+        detail = err or f"git merge --ff-only exited {rc}"
+        lock = _git_index_lock(repo_path)
+        if lock is not None:
+            detail += (
+                f"; {lock} was left behind — confirm no git process is running "
+                f"in this checkout, then delete it and run `git status` to "
+                f"check the working tree"
+            )
         return _result(
             REFRESH_FF_FAILED, branch=branch, head_before=head_before,
             head_after=_head_sha(repo_path), origin_sha=origin_sha,
-            detail=err or f"git merge --ff-only exited {rc}",
+            detail=detail,
         )
     head_after = _head_sha(repo_path)
     n = _commits_ahead(repo_path, head_before, head_after) if head_before and head_after else None
