@@ -4696,8 +4696,11 @@ def heal_unreviewed_newest_work_legs(
     ``review_state`` is ``None``/``"pending"``, so a leg left at
     ``"dispatched"`` with nothing actually dispatched for it (a racing
     whole-board save, a dispatch whose review row never landed) is skipped
-    by every pass, forever — vimcode#1877 sat 2h12m at "[awaiting review]"
-    with zero ``/review-claim`` calls because the auto-loop never asked.
+    by every pass, forever ("[review dispatched]" with no review anywhere).
+    This is the sibling of the vimcode#1877 stall, not that stall itself:
+    #1877's leg read "[awaiting review]" (``pending``), which the bulk pass
+    DOES consider — that shape is closed by isolating per-row dispatch
+    failures in :func:`dispatch_pending_reviews` (#3668 review round 1).
 
     Deliberately narrow — every condition below is evidence nothing will
     review this head on its own:
@@ -4772,6 +4775,120 @@ def heal_unreviewed_newest_work_legs(
     return healed
 
 
+def bulk_review_eligibility_blockers(
+    c: Assignment, board: Board, *, gate_test: bool
+) -> list[str]:
+    """Why :func:`dispatch_pending_reviews`'s bulk pass will NOT consider
+    *c* for a review — empty when it is eligible (#3668).
+
+    This IS the bulk pass's eligibility filter (it calls this, never a copy
+    of it), so ``coord diagnose --stage review`` reports exactly the
+    condition that is holding a pending newest head back — the vimcode#1877
+    stall left a test-passed fix leg at "[awaiting review]" for 2h12m and
+    nothing anywhere said which guard was declining it.
+    """
+    from coord.claim import has_active_work_followup  # noqa: PLC0415
+    from coord.models import effective_issue_number  # noqa: PLC0415
+
+    reasons: list[str] = []
+    if c.review_state not in (None, "pending"):
+        reasons.append(f"review_state={c.review_state!r} (only None/'pending' is eligible)")
+    if c.type not in WORK_LIKE_TYPES:
+        reasons.append(f"type={c.type!r} is not reviewable work")
+    # #1534: only a genuinely SUCCESSFUL completion is review-eligible.
+    # `dispatch_review` has always refused a non-`done` row internally, but
+    # the bulk loop used to feed it every `failed`/`advisory` row on the
+    # board on every pass (they carry `review_state=None`), which made this
+    # loop's own eligibility list read as "review is pending for these" when
+    # it was not — and made the surge/flood counters count rows that could
+    # never dispatch.
+    if c.status != "done":
+        reasons.append(f"status={c.status!r} (only 'done' work is reviewed)")
+    # #555: NEVER auto-dispatch a headless `claude -p` review for an
+    # *interactive* (`provider_name="claude-pty"`) work completion. The
+    # interactive Work→Review handoff is human-attended; the explicit `coord
+    # review <id>` escape hatch (→ dispatch_review) still works.
+    if c.provider_name == "claude-pty":
+        reasons.append(
+            "interactive work (provider claude-pty) — review is human-attended "
+            "(#555); request one with coord review"
+        )
+    if gate_test and c.test_state not in ("passed", "skipped"):
+        reasons.append(
+            f"Test precedes Review and test_state={c.test_state or 'none'!r} "
+            "is not passed/skipped"
+        )
+    # #1553: effective issue, not raw — the same key has_active_work_followup
+    # itself matches on.
+    if c.type in WORK_LIKE_TYPES and has_active_work_followup(
+        board, repo_name=c.repo_name, issue_number=effective_issue_number(c)
+    ):
+        live = [
+            a.assignment_id or "?"
+            for a in board.active
+            if a.type in ("work", "conflict-fix")
+            and a.status != "failed"
+            and a.repo_name == c.repo_name
+            and effective_issue_number(a) == effective_issue_number(c)
+        ]
+        reasons.append(
+            "a work/conflict-fix leg is live on the same issue (#459): "
+            + ", ".join(live)
+        )
+    return reasons
+
+
+def newest_head_review_dispatch_blockers(
+    board: Board, config: Config, leg: Assignment
+) -> list[str]:
+    """Every reason the automatic review pass is not dispatching a review of
+    *leg* — the bulk eligibility filter
+    (:func:`bulk_review_eligibility_blockers`) plus the pass-wide gates in
+    front of it (reviews disabled, the review-iteration cap, the 2026-06-08
+    flood guard). Empty means the next pass should dispatch it (#3668).
+    """
+    import os  # noqa: PLC0415
+
+    reasons: list[str] = []
+    reviews = getattr(config, "reviews", None)
+    if reviews is not None and (not reviews.enabled or not reviews.auto_dispatch):
+        reasons.append(
+            f"automatic review dispatch is off (reviews.enabled={reviews.enabled!r}, "
+            f"reviews.auto_dispatch={reviews.auto_dispatch!r})"
+        )
+    gate_test = (
+        getattr(config, "pipeline", None) is not None
+        and config.pipeline.test_precedes_review()
+    )
+    reasons.extend(bulk_review_eligibility_blockers(leg, board, gate_test=gate_test))
+    pipeline = getattr(config, "pipeline", None)
+    if pipeline is not None and (leg.review_iteration or 0) >= pipeline.max_review_iterations:
+        reasons.append(
+            f"review_iteration={leg.review_iteration or 0} >= "
+            f"max_review_iterations={pipeline.max_review_iterations} (#1612 cap)"
+        )
+    if reviews is not None and not reasons:
+        threshold = reviews.flood_threshold
+        override = (
+            reviews.allow_review_flood
+            or os.environ.get("COORD_ALLOW_REVIEW_FLOOD") == "1"
+        )
+        if threshold and not override:
+            eligible = sum(
+                1
+                for c in board.completed
+                if not bulk_review_eligibility_blockers(c, board, gate_test=gate_test)
+            )
+            if eligible > threshold:
+                reasons.append(
+                    f"review flood guard: {eligible} rows are pending review "
+                    f"(> reviews.flood_threshold={threshold}), so the bulk pass "
+                    "dispatches nothing — clear the stale backlog or set "
+                    "reviews.allow_review_flood"
+                )
+    return reasons
+
+
 def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, now=None):
     """Bounded bulk review dispatch — the flood guard (incident 2026-06-08).
 
@@ -4812,9 +4929,6 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
     """
     import logging
     import os
-
-    from coord.claim import has_active_work_followup
-    from coord.models import effective_issue_number
 
     logger = logging.getLogger("coord.review")
 
@@ -4951,35 +5065,13 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
             _post_max_iterations_notice(c, config)
             c.review_state = "cap_hit"
 
+    # #3668: the predicate lives in `bulk_review_eligibility_blockers` so
+    # `coord diagnose --stage review` can name WHICH condition is holding a
+    # pending, test-passed newest head back instead of guessing.
     eligible = [
         c
         for c in board.completed
-        if c.review_state in (None, "pending")
-        and c.type in WORK_LIKE_TYPES
-        # #1534: only a genuinely SUCCESSFUL completion is review-eligible.
-        # `dispatch_review` has always refused a non-`done` row internally,
-        # but the bulk loop used to feed it every `failed`/`advisory` row on
-        # the board on every pass (they carry `review_state=None`), which
-        # made this loop's own eligibility list read as "review is pending
-        # for these" when it was not — and made the surge/flood counters
-        # below count rows that could never dispatch. Stating the invariant
-        # here keeps the loop and the chokepoint agreeing.
-        and c.status == "done"
-        # #555: NEVER auto-dispatch a headless `claude -p` review for an
-        # *interactive* (`provider_name="claude-pty"`) work completion. The
-        # interactive Work→Review handoff is human-attended (TUI confirm →
-        # interactive review); a metered headless review must not silently
-        # follow it. This guard lives only in the automatic bulk path — the
-        # explicit `coord review <id>` escape hatch (→ dispatch_review) still
-        # lets a human deliberately request a headless review if they want one.
-        and c.provider_name != "claude-pty"
-        and (not gate_test or c.test_state in ("passed", "skipped"))
-        # #1553: effective issue, not raw — see the matching comment on the
-        # ``dispatch_review`` call site above; both must key on the same
-        # thing has_active_work_followup itself keys on internally.
-        and not has_active_work_followup(
-            board, repo_name=c.repo_name, issue_number=effective_issue_number(c)
-        )
+        if not bulk_review_eligibility_blockers(c, board, gate_test=gate_test)
     ]
     if not eligible:
         return []
@@ -5018,14 +5110,37 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         # `maybe_scoped_review_for_completed_fix`'s docstring for why the
         # race exists at all.
         review = None
-        if completed.review_of_assignment_id is not None:
-            review = maybe_scoped_review_for_completed_fix(
-                completed, board, config, now=now, terminal_cache=terminal_cache,
+        # #3668: one row's dispatch raising (a gh/PR lookup failure, a
+        # transport error, a bad repo config — `dispatch_review` re-raises
+        # after releasing its claim, by design) used to abort this whole
+        # pass. Every caller swallows the exception, so the pass simply
+        # ended there — and because `eligible` is rebuilt in the same board
+        # order every tick, the same poisoned row aborted every later pass
+        # too, starving every eligible row behind it forever. That is a
+        # pending, test-passed fix leg sitting at "[awaiting review]"
+        # indefinitely with no review row and no held claim (vimcode#1877).
+        # Isolate each row: log it loudly, leave it "pending" for the next
+        # pass, and carry on with the rest.
+        try:
+            if completed.review_of_assignment_id is not None:
+                review = maybe_scoped_review_for_completed_fix(
+                    completed, board, config, now=now,
+                    terminal_cache=terminal_cache,
+                )
+            if review is None:
+                review = dispatch_review(
+                    completed, board, config, now=now,
+                    terminal_cache=terminal_cache,
+                )
+        except Exception:  # noqa: BLE001 — isolate; see comment above
+            logger.exception(
+                "bulk review dispatch (#3668): dispatching a review for %s "
+                "(%s #%s) raised — leaving it pending for the next pass and "
+                "continuing with the remaining eligible rows",
+                completed.assignment_id, completed.repo_name,
+                completed.issue_number,
             )
-        if review is None:
-            review = dispatch_review(
-                completed, board, config, now=now, terminal_cache=terminal_cache
-            )
+            continue
         if review is not None:
             # #3180: a mechanical short-circuit (coordinator-doc/sealed-path
             # violation) already finalized `review` AND propagated the
