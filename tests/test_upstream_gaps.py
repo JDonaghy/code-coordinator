@@ -434,6 +434,105 @@ class TestNotifyHook:
         assert tracker.created == []
 
 
+class TestWorkerLogText:
+    """Review of #3676: `_worker_log_text` must stay a thin wrapper around
+    the shared `_fetch_raw_log_text_by_id` primitive for the remote-fetch
+    branch — not a second, independently-hardcoded-port implementation of
+    it — while keeping its own seek-based tail-read for the local-file
+    branch, where it earns its keep against huge logs."""
+
+    def _transition(self):
+        from coord.notify import Transition
+
+        return Transition(assignment_id="aid-9", machine_name="laptop",
+                          repo_name="vimcode", issue_number=42,
+                          event="completion", exit_code=0)
+
+    def test_local_file_under_tail_threshold_returns_full_text(self, tmp_path) -> None:
+        from coord.notify import _worker_log_text
+
+        p = tmp_path / "worker.log"
+        p.write_text("line one\nline two\n")
+        text = _worker_log_text(self._transition(), {"log_path": str(p)})
+        assert text == "line one\nline two\n"
+
+    def test_local_file_over_tail_threshold_returns_only_the_tail(self, tmp_path) -> None:
+        from coord.notify import _UPSTREAM_GAP_LOG_TAIL_BYTES, _worker_log_text
+
+        p = tmp_path / "worker.log"
+        filler = "x" * (_UPSTREAM_GAP_LOG_TAIL_BYTES + 1000)
+        marker = "THE-ACTUAL-TAIL-CONTENT\n"
+        p.write_text(filler + "\n" + marker)
+        text = _worker_log_text(self._transition(), {"log_path": str(p)})
+        assert marker in text
+        assert "x" * 100 not in text  # none of the filler survived the seek
+        assert len(text) < len(filler)
+
+    def test_missing_log_path_falls_back_to_shared_remote_primitive(self) -> None:
+        """No local log_path at all -> remote fetch must go through
+        `_fetch_raw_log_text_by_id` (so it inherits AGENT_PORT, not a
+        hardcoded literal)."""
+        from coord.notify import _worker_log_text
+
+        with (
+            patch("coord.notify._agent_host", return_value="laptop.ts.net"),
+            patch("coord.notify._fetch_raw_log_text_by_id",
+                  return_value="remote log text") as fetch,
+        ):
+            text = _worker_log_text(self._transition(), {})
+        assert text == "remote log text"
+        fetch.assert_called_once_with("aid-9", None, "laptop.ts.net")
+
+    def test_remote_fetch_uses_agent_port_constant_not_a_literal(self) -> None:
+        """A change to AGENT_PORT must flow through to the remote-fetch URL
+        this helper ultimately issues (via the shared primitive) — pinning
+        down the exact split-brain bug this review round fixed."""
+        from coord.notify import _worker_log_text
+
+        class _Resp:
+            text = "remote log text"
+
+            def raise_for_status(self) -> None:
+                return None
+
+        captured_urls: list[str] = []
+
+        def _fake_get(url, timeout=None):
+            captured_urls.append(url)
+            return _Resp()
+
+        with (
+            patch("coord.notify._agent_host", return_value="laptop.ts.net"),
+            patch("coord.notify.AGENT_PORT", 19999),
+            patch("httpx.get", side_effect=_fake_get),
+        ):
+            text = _worker_log_text(self._transition(), {})
+        assert text == "remote log text"
+        assert len(captured_urls) == 1
+        assert ":19999/logs/aid-9" in captured_urls[0]
+        assert ":7433" not in captured_urls[0]
+
+    def test_unreadable_local_file_falls_back_to_remote(self, tmp_path) -> None:
+        from coord.notify import _worker_log_text
+
+        missing = tmp_path / "does-not-exist.log"
+        with (
+            patch("coord.notify._agent_host", return_value="laptop.ts.net"),
+            patch("coord.notify._fetch_raw_log_text_by_id",
+                  return_value="remote log text") as fetch,
+        ):
+            text = _worker_log_text(self._transition(), {"log_path": str(missing)})
+        assert text == "remote log text"
+        fetch.assert_called_once_with("aid-9", None, "laptop.ts.net")
+
+    def test_no_host_resolves_to_empty_string(self) -> None:
+        from coord.notify import _worker_log_text
+
+        with patch("coord.notify._agent_host", return_value=None):
+            text = _worker_log_text(self._transition(), {})
+        assert text == ""
+
+
 def test_upstream_gap_dataclass_key_matches_gap_key() -> None:
     gap = UpstreamGap(repo="quadraui", title="X")
     assert gap.key == gap_key("quadraui", "X")

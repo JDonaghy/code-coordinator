@@ -1142,7 +1142,7 @@ it. Do not stop as soon as your review prose feels finished; write the \
 final message and confirm its last line is `END_REVIEW`.
 
 If the diff is clean, approve — but be thorough first.
-""" + UPSTREAM_GAP_REVIEW_RULE
+""" + "\n" + UPSTREAM_GAP_REVIEW_RULE
 
 
 # ── Machine selection ───────────────────────────────────────────────────────

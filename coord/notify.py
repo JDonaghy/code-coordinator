@@ -2276,8 +2276,15 @@ _UPSTREAM_GAP_LOG_TAIL_BYTES = 262_144
 
 def _worker_log_text(transition: Transition, entry: dict) -> str:
     """The tail of a worker's log — local file first, else the agent's
-    ``/logs/<id>`` endpoint (same fallback order as the other ``_capture_*``
-    helpers). "" when neither is reachable."""
+    ``/logs/<id>`` endpoint via the shared :func:`_fetch_raw_log_text_by_id`
+    primitive (same fallback order, same ``AGENT_PORT``, as the other
+    ``_capture_*`` helpers). "" when neither is reachable.
+
+    The seek-based tail-read below only applies to the local-file branch,
+    where it avoids loading a huge log fully into memory; the remote-fetch
+    branch is delegated to the shared primitive rather than reimplemented
+    here.
+    """
     log_path = entry.get("log_path")
     if log_path:
         p = Path(log_path)
@@ -2293,18 +2300,8 @@ def _worker_log_text(transition: Transition, entry: dict) -> str:
             log.debug("_worker_log_text: local read failed for %s: %s",
                       transition.assignment_id, exc)
     host = _agent_host(transition.machine_name)
-    if not host:
-        return ""
-    import httpx  # noqa: PLC0415
-
-    try:
-        resp = httpx.get(f"http://{host}:7433/logs/{transition.assignment_id}", timeout=15.0)
-        resp.raise_for_status()
-        return resp.text or ""
-    except httpx.HTTPError as exc:
-        log.debug("_worker_log_text: agent fetch failed for %s: %s",
-                  transition.assignment_id, exc)
-        return ""
+    text = _fetch_raw_log_text_by_id(transition.assignment_id, None, host)
+    return text or ""
 
 
 def _capture_upstream_gaps(transition: Transition, entry: dict, record: dict) -> None:
