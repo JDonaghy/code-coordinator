@@ -4132,6 +4132,7 @@ def openapi_spec() -> dict:
                                 "type": "object",
                                 "properties": {
                                     "of_assignment_id": {"type": "string"},
+                                    "claimed_at": {"type": "number"},
                                 },
                                 "required": ["of_assignment_id"],
                             }
@@ -4174,6 +4175,37 @@ def openapi_spec() -> dict:
                         "content": {"application/json": {"schema": ok_response}},
                     },
                     "400": {"description": "Missing of_assignment_id"},
+                },
+            }
+        },
+        "/review-claim-release-own": {
+            "post": {
+                "summary": (
+                    "Release only the claim row a failed /review-claim attempt "
+                    "wrote, identified by its client-minted claimed_at stamp "
+                    "(#3668) — a claim held by another dispatcher is untouched"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "of_assignment_id": {"type": "string"},
+                                    "claimed_at": {"type": "number"},
+                                },
+                                "required": ["of_assignment_id", "claimed_at"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — `released` is true iff the row was this attempt's",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing/invalid field"},
                 },
             }
         },
@@ -8494,7 +8526,16 @@ def build_app(
         if body is None:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         try:
-            claimed = state._claim_review_dispatch_local(body["of_assignment_id"])
+            # #3668: the client mints the claim's stamp so that, if this
+            # request fails (a 503 below, or a timeout after the row already
+            # committed), it can release exactly the row it wrote through
+            # /review-claim-release-own. Absent on a pre-#3668 client — the
+            # local write then mints its own, exactly as before.
+            claimed_at = body.get("claimed_at")
+            claimed = state._claim_review_dispatch_local(
+                body["of_assignment_id"],
+                claimed_at=float(claimed_at) if claimed_at is not None else None,
+            )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001
@@ -8521,6 +8562,34 @@ def build_app(
                 status_code=503,
             )
         return JSONResponse({"ok": True})
+
+    async def post_review_claim_release_own(request: Request) -> Response:
+        # #3668: release ONLY the claim row a failed /review-claim attempt
+        # itself wrote, identified by the `claimed_at` stamp that attempt
+        # minted — never a claim another dispatcher holds. See
+        # coord.state._release_own_review_claim.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            released = state._release_own_review_claim_local(
+                body["of_assignment_id"], float(body["claimed_at"])
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except (TypeError, ValueError) as e:
+            return JSONResponse(
+                {"error": "claimed_at must be a number", "detail": str(e)},
+                status_code=400,
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "review-claim-release-own write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True, "released": bool(released)})
 
     async def post_review_post_claim(request: Request) -> Response:
         # #2468: atomic review-POSTING claim on the daemon's canonical DB —
@@ -12174,6 +12243,9 @@ def build_app(
         Route("/review-findings", post_review_findings, methods=["POST"]),
         Route("/review-claim", post_review_claim, methods=["POST"]),
         Route("/review-claim-release", post_review_claim_release, methods=["POST"]),
+        Route(
+            "/review-claim-release-own", post_review_claim_release_own, methods=["POST"]
+        ),
         Route("/review-post-claim", post_review_post_claim, methods=["POST"]),
         Route(
             "/review-post-claim-release", post_review_post_claim_release,

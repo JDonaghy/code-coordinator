@@ -4587,6 +4587,164 @@ def dispatch_review(
         raise
 
 
+def newest_done_work_leg(
+    board: Board, repo_name: str, issue_number: int
+) -> Assignment | None:
+    """The newest ``status="done"`` work-like leg for ``(repo_name,
+    issue_number)`` — the leg whose head the Review gate must judge (#3668).
+
+    Keyed on :func:`coord.models.effective_issue_number` (#1553), ordered by
+    ``dispatched_at`` with the assignment id as a stable tie-break, matching
+    :func:`coord.claim.superseding_work_row`.
+    """
+    from coord.models import effective_issue_number  # noqa: PLC0415
+
+    legs = [
+        a
+        for a in list(board.active) + list(board.completed)
+        if a.type in WORK_LIKE_TYPES
+        and a.status == "done"
+        and a.repo_name == repo_name
+        and effective_issue_number(a) == issue_number
+    ]
+    if not legs:
+        return None
+    return max(legs, key=lambda a: (a.dispatched_at or 0.0, a.assignment_id or ""))
+
+
+def superseded_review_gap(
+    board: Board, repo_name: str, issue_number: int
+) -> tuple[Assignment, Assignment] | None:
+    """``(newest_leg, latest_review)`` when the issue's latest review judged
+    an OLDER work leg than the newest done one, and that newest leg has no
+    review of its own (#3668) — else ``None``.
+
+    That is the vimcode#1877 shape: a request-changes review of leg A, a fix
+    leg B completed and passed Test, and nothing ever reviewed B — yet
+    every reader that looked at "the latest review" (``coord diagnose
+    --stage review``) saw a perfectly healthy terminal review and stopped
+    there. A review of a superseded leg says nothing about the newest head.
+    """
+    newest = newest_done_work_leg(board, repo_name, issue_number)
+    if newest is None or not newest.assignment_id:
+        return None
+    reviews = [
+        a
+        for a in list(board.active) + list(board.completed)
+        if a.type == "review"
+        and a.repo_name == repo_name
+        and a.issue_number == newest.issue_number
+    ]
+    if not reviews:
+        return None
+    if any(r.review_of_assignment_id == newest.assignment_id for r in reviews):
+        return None
+    latest = max(reviews, key=lambda a: (a.dispatched_at or 0.0, a.assignment_id or ""))
+    # A review dispatched after the newest leg finished already saw its head
+    # (the #3161 scoped re-review deliberately carries the OLDER leg's id),
+    # so it is not a gap.
+    head_ready_at = newest.finished_at or newest.dispatched_at or 0.0
+    if (latest.dispatched_at or 0.0) >= head_ready_at:
+        return None
+    return newest, latest
+
+
+# #3668: how long a newest done leg must have been finished before a stale
+# `review_state="dispatched"` with no review row is trusted as stale rather
+# than as a dispatch still being persisted. Mirrors `coord.diagnose`'s
+# `_REVIEW_CLAIM_LEAK_GRACE_SECS` — it has to outlast a worst-case
+# multi-candidate `dispatch_review` (several 60s `/assign` POSTs).
+_NEWEST_HEAD_HEAL_GRACE_SECS = 600.0
+
+
+def heal_unreviewed_newest_work_legs(
+    board: Board, *, logger=None, now: float | None = None
+) -> list[str]:
+    """Reset a stale ``review_state="dispatched"`` back to ``"pending"`` on
+    the newest done work leg of an issue when no review of that leg exists
+    (#3668). Returns the healed assignment ids; mutates *board* in memory
+    (the caller persists it, as with every other write here).
+
+    ``dispatch_pending_reviews`` only ever considers rows whose
+    ``review_state`` is ``None``/``"pending"``, so a leg left at
+    ``"dispatched"`` with nothing actually dispatched for it (a racing
+    whole-board save, a dispatch whose review row never landed) is skipped
+    by every pass, forever — vimcode#1877 sat 2h12m at "[awaiting review]"
+    with zero ``/review-claim`` calls because the auto-loop never asked.
+
+    Deliberately narrow — every condition below is evidence nothing will
+    review this head on its own:
+
+    * the row is the issue's **newest** done work-like leg (an older leg is
+      superseded; reviewing it is the wrong target);
+    * no ``type="review"`` row anywhere carries its id;
+    * no review for the issue is in flight right now, and none was
+      dispatched after this leg finished (a #3161 scoped re-review covers
+      the newest head while carrying the OLDER leg's id — don't double it);
+    * no terminal verdict is recorded for it (in memory or in the DB, #3670
+      — one review per leg);
+    * it finished at least :data:`_NEWEST_HEAD_HEAL_GRACE_SECS` ago (a row
+      with no ``finished_at`` is never healed — no evidence it is stale);
+    * no review-dispatch claim is held for it — a held claim means a
+      ``dispatch_review`` is in flight right now (or a leaked claim, which
+      ``coord diagnose --stage review --reset`` releases; re-pending the row
+      would only make every pass deny on the claim).
+    """
+    from coord.models import effective_issue_number  # noqa: PLC0415
+    from coord.state import has_recorded_review_verdict, has_review_claim  # noqa: PLC0415
+
+    log_ = logger or log
+    now_ = time.time() if now is None else now
+    healed: list[str] = []
+    pool = list(board.active) + list(board.completed)
+    active_ids = {id(a) for a in board.active}
+    for c in board.completed:
+        if (
+            c.review_state != "dispatched"
+            or c.type not in WORK_LIKE_TYPES
+            or c.status != "done"
+            or not c.assignment_id
+            or c.review_verdict is not None
+        ):
+            continue
+        if c.finished_at is None or now_ - c.finished_at < _NEWEST_HEAD_HEAL_GRACE_SECS:
+            continue
+        if newest_done_work_leg(board, c.repo_name, effective_issue_number(c)) is not c:
+            continue
+        if any(
+            r.type == "review" and r.review_of_assignment_id == c.assignment_id
+            for r in pool
+        ):
+            continue
+        head_ready_at = c.finished_at or c.dispatched_at or 0.0
+        if any(
+            r.type == "review"
+            and r.repo_name == c.repo_name
+            and r.issue_number == c.issue_number
+            and (
+                id(r) in active_ids
+                or r.status in ("running", "pending")
+                or (r.dispatched_at or 0.0) >= head_ready_at
+            )
+            for r in pool
+        ):
+            continue
+        if has_recorded_review_verdict(c.assignment_id):
+            continue
+        if has_review_claim(c.assignment_id):
+            continue
+        log_.warning(
+            "newest-head review gap (#3668): %s (%s #%s) is the newest done "
+            "work leg and reads review_state='dispatched', but no review of "
+            "it exists or is in flight — resetting to 'pending' so it is "
+            "dispatched instead of waiting forever.",
+            c.assignment_id, c.repo_name, c.issue_number,
+        )
+        c.review_state = "pending"
+        healed.append(c.assignment_id)
+    return healed
+
+
 def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, now=None):
     """Bounded bulk review dispatch — the flood guard (incident 2026-06-08).
 
@@ -4728,6 +4886,12 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         c.review_state = "done"
         c.review_verdict = prior_verdict
         record_work_review_verdict(c.assignment_id, prior_verdict)
+
+    # #3668: newest-head backstop — a newest done work leg whose
+    # `review_state` claims a review is in flight, while no review of THAT
+    # leg exists anywhere, is invisible to the eligibility filter below
+    # forever. Hand it back to "pending" so this pass can dispatch it.
+    heal_unreviewed_newest_work_legs(board, logger=logger, now=now)
 
     # #1612 step 2: enforce max_review_iterations here too, not just in
     # run_for_fix_transition. A fix row whose test verdict isn't in yet gets
