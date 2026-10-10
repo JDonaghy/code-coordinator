@@ -139,13 +139,35 @@ else
   die "re-run this script once the Command Line Tools install finishes"
 fi
 
-# ── 1. macOS server hygiene (sudo) ──────────────────────────────────────────
+# ── 1. macOS server hygiene ─────────────────────────────────────────────────
 step "1. macOS server hygiene"
 
+# Reading power state needs NO privileges, so this ALWAYS runs and always
+# reports the truth — even without --with-sudo. That split matters: on
+# 2026-09-06 a first-provisioned mini went to idle sleep mid-leg, dropped off
+# the tailnet, and killed a running worker. The leg was redispatched and the
+# work survived only because the branch had already been pushed. The script
+# had "skipped (pass --with-sudo)" and said nothing about sleep at all, so
+# nothing connected the dispatch failure to a power setting.
+#
+# A fleet machine that naps is worse than one you cannot ssh to: the ssh gap
+# announces itself the first time you try, the sleep gap only shows up as a
+# worker dying with no explanation.
+pm_get() { pmset -g 2>/dev/null | awk -v k="$1" '$1 == k { print $2; exit }'; }
+
+SLEEP_NOW=$(pm_get sleep)
+DISKSLEEP_NOW=$(pm_get disksleep)
+POWERNAP_NOW=$(pm_get powernap)
+AUTORESTART_NOW=$(pm_get autorestart)
+WOMP_NOW=$(pm_get womp)
+echo "  current: sleep=${SLEEP_NOW:-?} disksleep=${DISKSLEEP_NOW:-?} powernap=${POWERNAP_NOW:-?} autorestart=${AUTORESTART_NOW:-?} womp=${WOMP_NOW:-?}"
+
 if [[ "$DO_SUDO" == "1" ]]; then
-  # Remote Login is OFF by default and is currently refusing connections on
-  # this box. Without it: install/repair over ssh, `coord machine doctor
-  # --ssh`, and release propagation all have no channel to the machine.
+  # Remote Login is OFF by default. Without it: install/repair over ssh,
+  # `coord machine doctor --ssh`, and every recovery path have no channel to
+  # the machine. Note `coord release propagate` does NOT use ssh (it is an
+  # HTTP POST /update to the agent) — which is exactly why ssh is the channel
+  # you need when propagation is what stranded the agent.
   if sudo systemsetup -setremotelogin on 2>/dev/null; then
     ok "Remote Login (sshd) enabled"
   else
@@ -154,15 +176,55 @@ if [[ "$DO_SUDO" == "1" ]]; then
        Full Disk Access, or flip the switch at Settings > General > Sharing >
        Remote Login."
   fi
-  # It is a server now.
-  if sudo pmset -a sleep 0 disablesleep 1 2>/dev/null; then
-    ok "sleep disabled"
+
+  # It is a server now. `sleep 0` alone is not enough — disksleep and
+  # powernap both produce the same symptom from the fleet's side (a machine
+  # that stops answering mid-leg), and autorestart is what brings it back
+  # after a power cut rather than leaving it dark until someone notices.
+  if sudo pmset -a sleep 0 disablesleep 1 disksleep 0 powernap 0 womp 1 autorestart 1 2>/dev/null; then
+    ok "power: sleep/disksleep/powernap off, wake-on-net + autorestart on"
   else
-    warn "could not apply pmset sleep settings"
+    warn "could not apply pmset settings — run by hand:
+       sudo pmset -a sleep 0 disablesleep 1 disksleep 0 powernap 0 womp 1 autorestart 1"
   fi
 else
-  skip "skipped (pass --with-sudo to enable Remote Login + disable sleep)"
+  skip "skipped (pass --with-sudo to enable Remote Login + harden power)"
   RESIDUE+=("Remote Login is off — ssh to this box is refused until you enable it.")
+  # Name the specific defect, not just the skipped step. `sleep` is the one
+  # that silently eats a dispatch.
+  if [[ "${SLEEP_NOW:-1}" != "0" ]]; then
+    RESIDUE+=("*** THIS MACHINE WILL SLEEP (pmset sleep=${SLEEP_NOW:-?}) ***
+       It will drop off the tailnet while idle and KILL any running worker —
+       the leg fails with no explanation that points at power. Fix before
+       taking any dispatch:
+         sudo pmset -a sleep 0 disablesleep 1 disksleep 0 powernap 0 womp 1 autorestart 1")
+  else
+    RESIDUE+=("Power settings not hardened (sleep is already 0, but disksleep=${DISKSLEEP_NOW:-?}
+       powernap=${POWERNAP_NOW:-?} autorestart=${AUTORESTART_NOW:-?}). Same command as above.")
+  fi
+fi
+
+# Auto-login: LaunchAgents start at LOGIN, not boot (see step 12). Without it
+# the agent does not come back after a reboot — and from the coordinator that
+# is indistinguishable from the machine being switched off. Best-effort read;
+# an unreadable pref is reported as unknown, never as a defect.
+# Distinguish "definitely off" from "could not tell": read the whole domain
+# first. If THAT fails we have no basis for an opinion and say so — a check
+# that cries wolf on a healthy machine is how a real defect gets ignored.
+if ! defaults read /Library/Preferences/com.apple.loginwindow >/dev/null 2>&1; then
+  skip "auto-login state unknown (loginwindow prefs unreadable) — verify by hand"
+elif AUTOLOGIN=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null) \
+     && [[ -n "$AUTOLOGIN" ]]; then
+  ok "auto-login enabled for '$AUTOLOGIN' — the agent returns after a reboot"
+else
+  # Domain readable + key absent = genuinely off. /etc/kcpassword is the
+  # companion marker; its absence corroborates.
+  warn "auto-login is OFF. LaunchAgents start at LOGIN, not boot, so coord-agent
+       will NOT come back after a reboot — an OS update is enough to do it, and
+       from the coordinator that is indistinguishable from the machine being
+       switched off. Enable it: System Settings > Users & Groups > Automatic
+       login. Until then, treat every reboot as attended."
+  RESIDUE+=("auto-login is OFF — coord-agent does not survive a reboot unattended.")
 fi
 
 # ── 2. Homebrew packages ────────────────────────────────────────────────────
