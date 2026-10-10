@@ -938,6 +938,45 @@ class TestFormatUsageIssueDrill:
         assert "n/a" in out
         assert "unknown model" in out.lower()
 
+    def test_turns_and_context_footprint_columns(self) -> None:
+        """#3672: `coord usage --issue N` must surface the worker-reported
+        turn count and a context-footprint proxy per leg — the two numbers
+        the cost analysis found drove the 300+-turn-leg cost cliff."""
+        from coord.config import PricingConfig
+
+        rows = [{
+            "issue_number": 11, "repo_name": "r1", "type": "work", "model": "sonnet",
+            "is_interactive": False, "status": "done", "cost_usd": 1.2,
+            "input_tokens": 1_000, "output_tokens": 2_000,
+            "cache_read_tokens": 70_000_000, "cache_creation_tokens": 500_000,
+            "num_turns": 291,
+            "dispatched_at": 1_000.0, "finished_at": 1_500.0,
+        }]
+        out = format_usage_issue_drill(rows, 11, PricingConfig())
+        row_line = next(line for line in out.splitlines() if "work" in line)
+        assert "291" in row_line
+        # Context footprint = input + cache_creation + cache_read tokens,
+        # compacted the same way the out/cache columns already are.
+        from coord.usage import _fmt_tokens_compact
+        expected_ctx = _fmt_tokens_compact(1_000 + 500_000 + 70_000_000)
+        assert expected_ctx in row_line
+
+    def test_num_turns_absent_renders_a_dash_not_zero(self) -> None:
+        """A row predating `num_turns` (or one that never carried it) must
+        render as `—`, not a misleading `0` turns."""
+        from coord.config import PricingConfig
+
+        rows = [{
+            "issue_number": 13, "repo_name": "r1", "type": "work", "model": "sonnet",
+            "is_interactive": False, "status": "done", "cost_usd": 0.1,
+            "input_tokens": 10, "output_tokens": 20,
+            "cache_read_tokens": 30, "cache_creation_tokens": 0,
+            "dispatched_at": 1_000.0, "finished_at": 1_010.0,
+        }]
+        out = format_usage_issue_drill(rows, 13, PricingConfig())
+        row_line = next(line for line in out.splitlines() if "work" in line)
+        assert "—" in row_line
+
     def test_running_leg_has_no_dollar_signs(self) -> None:
         from coord.config import PricingConfig
 

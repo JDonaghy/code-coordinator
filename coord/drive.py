@@ -2512,6 +2512,85 @@ def _decide_epic_decompose_followup(
     return _epic_decompose_batch(state, snapshot)
 
 
+# ── #3672: turn-ceiling continuation, not a failure ─────────────────────────
+#
+# A work-shaped leg (`coord.agent.WORKER_SYSTEM_PROMPT`'s ONE-SHOT section)
+# is told that if it's approaching `coord.agent.WORK_TURN_CEILING` turns with
+# real work still outstanding, it should commit + push what's genuinely done
+# and hand off cleanly instead of rushing (or silently claiming) completion:
+# it ends its own `### Summary` block (the existing #874 convention —
+# `coord.progress.parse_completion_summary_from_log`/`completion_summary`)
+# with a line starting `coord.agent.WORKER_CONTINUATION_MARKER`
+# ("CONTINUATION:"). That is a *resume* signal, not a failed attempt, so
+# `decide()` must not spend `counters.fix_rounds` or `counters.work_retries`
+# routing it back through the Test/Review failure machinery — see the
+# `decide()` call site below, inserted BEFORE that machinery runs at all.
+#
+# Both strings below are read off `coord.agent` rather than redefined here
+# so there is exactly one place each is spelled (the worker is actually
+# told these values; a copy here could silently drift from what the prompt
+# says). `coord.agent` is a heavy, subprocess-adjacent module, so the import
+# is deferred into the two functions that need it rather than hoisted to
+# module scope — matching this module's own deferred-import convention
+# elsewhere (`from coord import machine_fault` is the one exception,
+# already a module-level dependency before this change).
+_CONTINUATION_RE = re.compile(
+    r"^[ \t>*_`-]*CONTINUATION:[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE
+)
+
+
+def parse_continuation_marker(text: str | None) -> str | None:
+    """Extract the handoff reason off a `CONTINUATION:` marker line in *text*.
+
+    Returns ``None`` when *text* is falsy or carries no marker line. Picks
+    the LAST match (mirrors `coord.models`' identical "last occurrence wins"
+    convention for `ISSUE_RESOLUTION:`) in case a worker's transcript
+    discusses the marker before actually emitting it for real. The reason
+    may be empty (a bare `CONTINUATION:` with nothing after it) — that still
+    counts as "the marker is present", just with an empty handoff string.
+    """
+    if not text:
+        return None
+    matches = list(_CONTINUATION_RE.finditer(text))
+    if not matches:
+        return None
+    return matches[-1].group(1).strip()
+
+
+def is_turn_ceiling_continuation(
+    *, num_turns: int | None, completion_text: str | None
+) -> bool:
+    """True iff a `done` work leg checkpointed at the turn ceiling rather
+    than genuinely finishing (#3672).
+
+    Both signals must hold:
+
+    1. The worker's own completion summary carries a `CONTINUATION:`
+       marker (:func:`parse_continuation_marker` is not ``None``) — the
+       EXPLICIT, authoritative self-report. A worker is told never to emit
+       this marker on a leg that actually finished (see
+       `coord.agent.WORKER_SYSTEM_PROMPT`), so its mere presence already
+       means "not done".
+    2. ``num_turns`` is at or past `coord.agent.WORK_TURN_CEILING` — a
+       sanity floor so a worker that pastes the literal word
+       "CONTINUATION:" into unrelated prose on a short, ordinary leg (a
+       discussion of this very feature, for instance) cannot mistakenly
+       flip a normal few-turn `done` row into a continuation. ``None``
+       (never measured) fails this floor, matching
+       `coord.machine_fault.is_instant_zero_cost_failure`'s identical
+       "unmeasured is not zero" treatment of the same field.
+
+    A long-but-genuinely-finished leg (no marker at all) returns ``False``
+    regardless of how many turns it took — this function only answers "did
+    the worker say it stopped short", never "this leg ran a lot of turns".
+    """
+    from coord.agent import WORK_TURN_CEILING  # noqa: PLC0415
+
+    if num_turns is None or num_turns < WORK_TURN_CEILING:
+        return False
+    return parse_continuation_marker(completion_text) is not None
+
+
 def decide(
     state: IssueState,
     opts: DriveOptions,
@@ -2997,6 +3076,47 @@ def decide(
             "(0-commit advisory).\n"
             f"   inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}"
+        )
+
+    # ---- #3672: turn-ceiling continuation, not a failure -------------------
+    #
+    # Positioned HERE — after `work_status == "done"` is established and a
+    # real branch with commits is confirmed present, but BEFORE the
+    # Test/Review/Merge machinery below (and its `counters.fix_rounds`/
+    # `counters.work_retries` budgets) ever runs. A continuation never
+    # reaches that machinery at all, so it structurally cannot spend either
+    # budget — this is a fresh `coord assign` for the same issue, the exact
+    # same call `refused_policy`'s stale-row bypass above already makes to
+    # treat an old terminal row as not blocking a new dispatch.
+    if state.work_status == "done" and is_turn_ceiling_continuation(
+        num_turns=state.work_num_turns,
+        completion_text=state.work_completion_summary,
+    ):
+        handoff = parse_continuation_marker(state.work_completion_summary) or (
+            "(worker emitted the marker with no handoff text)"
+        )
+        dispatch = _dispatch_work_stage(
+            state, opts, counters, machine, oracle, gate_checker, verifier
+        )
+        return replace(
+            dispatch,
+            warnings=warnings + (
+                f"{state.work_aid} hit the turn ceiling ({state.work_num_turns} "
+                "turns) and checkpointed with commits pushed — continuing in "
+                "a fresh leg instead of dispatching Test/Review (#3672)",
+            ),
+            audit_event=(
+                "turn_ceiling_continuation",
+                (
+                    f"pre-review: {state.work_aid} checkpointed at the turn "
+                    f"ceiling — dispatching a fresh leg to continue (#3672, "
+                    f"not a fix round): {handoff}"
+                ),
+                {
+                    "continued_assignment_id": state.work_aid,
+                    "num_turns": state.work_num_turns,
+                },
+            ),
         )
 
     # #3246/#3275: an epic-decompose leg's step 2 (queue the first batch of

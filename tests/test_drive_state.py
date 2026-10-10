@@ -98,6 +98,29 @@ def test_project_reads_the_work_row_and_repo_config():
     assert state.repo_test_command == "pytest -q"
 
 
+def test_project_reads_work_completion_summary_from_the_work_row():
+    """#3672: `decide()`'s turn-ceiling continuation check reads
+    `work_completion_summary` for a `CONTINUATION:` marker — this is the
+    projection that threads the board's `completion_summary` column onto
+    `IssueState`."""
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="w1",
+                completion_summary="CONTINUATION: tests pass, docs remain.",
+            )
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_completion_summary == "CONTINUATION: tests pass, docs remain."
+
+
+def test_project_defaults_work_completion_summary_none_when_absent():
+    payload = {"assignments": [row(assignment_id="w1")]}
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_completion_summary is None
+
+
 def test_project_reads_the_acceptance_trust_gate_verdict_from_the_work_row():
     """#2199: `coord acceptance record --issue N --sha <sha>` writes
     `acceptance_state`/`acceptance_reason`/`acceptance_sha` onto the

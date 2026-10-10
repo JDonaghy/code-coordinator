@@ -69,6 +69,8 @@ from coord.drive import (
     _remote_matches_repo,
     coord_argv,
     decide,
+    is_turn_ceiling_continuation,
+    parse_continuation_marker,
     preflight,
     resolve_oracle_decision,
 )
@@ -2512,6 +2514,124 @@ def done_work(**kw) -> IssueState:
     base = dict(work_aid="w1", work_status="done", work_branch="issue-1392-x")
     base.update(kw)
     return state(**base)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #3672: turn-ceiling continuation is a resume, not a failure
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_parse_continuation_marker_extracts_handoff_text():
+    summary = (
+        "Implemented most of the parser.\n\n"
+        "CONTINUATION: tests pass; still need to wire the CLI flag."
+    )
+    assert (
+        parse_continuation_marker(summary)
+        == "tests pass; still need to wire the CLI flag."
+    )
+
+
+def test_parse_continuation_marker_returns_none_without_a_marker():
+    assert parse_continuation_marker("Finished everything, all tests pass.") is None
+    assert parse_continuation_marker(None) is None
+    assert parse_continuation_marker("") is None
+
+
+def test_parse_continuation_marker_picks_the_last_occurrence():
+    summary = (
+        "CONTINUATION: first draft, incomplete.\n"
+        "Actually finished the rest.\n"
+        "CONTINUATION: final handoff — just the docs remain."
+    )
+    assert (
+        parse_continuation_marker(summary) == "final handoff — just the docs remain."
+    )
+
+
+def test_is_turn_ceiling_continuation_requires_marker_and_turn_floor():
+    """Both the explicit self-report AND the turn floor must hold (#3672) —
+    neither alone is enough: a short leg that merely pastes the marker word
+    into unrelated prose must not be mistaken for a real checkpoint, and a
+    long-but-genuinely-finished leg (no marker) must not be mistaken for an
+    incomplete one just because it ran a lot of turns."""
+    marker_text = "CONTINUATION: ran out of room, tests still need fixtures."
+
+    # Both signals present -> continuation.
+    assert is_turn_ceiling_continuation(num_turns=160, completion_text=marker_text)
+    # At the exact floor -> still continuation (">=", not ">").
+    assert is_turn_ceiling_continuation(num_turns=150, completion_text=marker_text)
+
+    # Marker present, but turns below the ceiling -> not a continuation.
+    assert not is_turn_ceiling_continuation(num_turns=5, completion_text=marker_text)
+
+    # Turns at/past the ceiling, but no marker -> a genuinely long finish,
+    # not a continuation.
+    assert not is_turn_ceiling_continuation(
+        num_turns=300, completion_text="Finished everything, all tests pass."
+    )
+    assert not is_turn_ceiling_continuation(num_turns=300, completion_text=None)
+
+    # num_turns=None ("never measured") must not be read as "turns is huge".
+    assert not is_turn_ceiling_continuation(num_turns=None, completion_text=marker_text)
+
+
+def test_decide_treats_turn_ceiling_continuation_as_a_resume_not_a_fix_round():
+    """A `done` work row that checkpointed at the turn ceiling with commits
+    pushed dispatches a fresh leg (the same `coord assign` the
+    `refused_policy`-stale bypass already makes) instead of falling into the
+    Test/Review machinery — and, critically, never touches `fix_rounds` or
+    `work_retries`: those are ONLY spent inside the Test-failed/Review
+    request-changes branches, which this never reaches."""
+    counters = DriveCounters()
+    s = done_work(
+        work_num_turns=160,
+        work_completion_summary=(
+            "### Summary\n"
+            "Committed and pushed the parser rewrite.\n\n"
+            "CONTINUATION: tests pass; still need to wire the CLI flag."
+        ),
+    )
+    action = step(s, counters=counters)
+
+    assert action.kind == RUN
+    assert action.command[0] == "assign"
+    assert action.audit_event is not None
+    event_type, summary, details = action.audit_event
+    assert event_type == "turn_ceiling_continuation"
+    assert "w1" in summary
+    assert details["continued_assignment_id"] == "w1"
+    assert details["num_turns"] == 160
+    assert any("turn ceiling" in w for w in action.warnings)
+
+    # The whole point (#3672): this must not spend either retry budget.
+    assert counters.fix_rounds == 0
+    assert counters.work_retries == 0
+
+
+def test_decide_does_not_treat_an_ordinary_done_leg_as_a_continuation():
+    """No `CONTINUATION:` marker at all -> falls through unchanged to the
+    ordinary Test-gate machinery (a bare WAIT, matching
+    ``test_non_oracle_drive_never_touches_the_trust_gate`` above) regardless
+    of how many turns the leg took."""
+    s = done_work(work_num_turns=300, work_test_state="", work_completion_summary=None)
+    action = step(s)
+    assert action.kind == WAIT
+    assert action.command == ()
+
+
+def test_decide_does_not_treat_a_short_leg_mentioning_the_marker_as_continuation():
+    """A leg that merely discusses the marker in passing (well under the
+    turn ceiling) must not be misread as a real checkpoint — the turn floor
+    in `is_turn_ceiling_continuation` exists exactly for this."""
+    s = done_work(
+        work_num_turns=5,
+        work_test_state="",
+        work_completion_summary="CONTINUATION: this is just an example in my commit message.",
+    )
+    action = step(s)
+    assert action.kind == WAIT
+    assert action.command == ()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

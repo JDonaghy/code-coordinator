@@ -2278,6 +2278,77 @@ def test_default_worker_command_uses_setting_sources_user_for_plan_type() -> Non
     assert "--bare" not in argv
 
 
+def test_default_worker_command_work_type_carries_autocompact() -> None:
+    """#3672: a work-shaped leg's launch command carries the lower
+    `--autocompact` threshold — the "force earlier auto-compaction" half of
+    the fix for 200+-turn legs that never compact at all."""
+    from coord.agent import WORK_AUTOCOMPACT_TOKENS
+
+    spec = AssignmentSpec(
+        repo_name="api", repo_path="/tmp/repo", issue_number=1,
+        issue_title="t", briefing="b",  # default type is "work"
+    )
+    argv = default_worker_command(spec)
+    assert "--autocompact" in argv
+    idx = argv.index("--autocompact")
+    assert argv[idx + 1] == WORK_AUTOCOMPACT_TOKENS
+
+
+@pytest.mark.parametrize(
+    "spec_type", ["plan", "refinement", "test-chat", "new-issue-chat",
+                  "milestone-chat", "smoke", "review"]
+)
+def test_default_worker_command_non_work_types_omit_autocompact(spec_type: str) -> None:
+    """Scoped to work-shaped legs only (#3672) — a short-lived chat/smoke/
+    review leg's argv must be byte-for-byte unchanged."""
+    spec = AssignmentSpec(
+        repo_name="api", repo_path="/tmp/repo", issue_number=1,
+        issue_title="t", briefing="b", type=spec_type,
+    )
+    argv = default_worker_command(spec)
+    assert "--autocompact" not in argv
+
+
+def test_default_worker_command_work_type_system_prompt_carries_turn_ceiling() -> None:
+    """The launch command's own `--system-prompt` is what actually teaches
+    the worker the ceiling/continuation-marker contract #3672 relies on —
+    assert the text itself carries the real ceiling value, not a copy that
+    could silently drift from `coord.agent.WORK_TURN_CEILING`."""
+    from coord.agent import WORK_TURN_CEILING, WORKER_CONTINUATION_MARKER
+
+    spec = AssignmentSpec(
+        repo_name="api", repo_path="/tmp/repo", issue_number=1,
+        issue_title="t", briefing="b",
+    )
+    argv = default_worker_command(spec)
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert str(WORK_TURN_CEILING) in system_prompt
+    assert WORKER_CONTINUATION_MARKER in system_prompt
+
+
+def test_worker_subprocess_env_raises_bash_timeout_defaults() -> None:
+    """#3672: quadraui#1321's 5 longest waits were exactly 120s each, on
+    `cargo test --features ... --lib` — the CLI's own *default* Bash-tool
+    timeout, not this harness's documented 600s ceiling. Raise the default
+    to match."""
+    from coord.agent import WORKER_BASH_TIMEOUT_MS, _worker_subprocess_env
+
+    env = _worker_subprocess_env()
+    assert env["BASH_DEFAULT_TIMEOUT_MS"] == WORKER_BASH_TIMEOUT_MS
+    assert env["BASH_MAX_TIMEOUT_MS"] == WORKER_BASH_TIMEOUT_MS
+
+
+def test_worker_subprocess_env_respects_an_already_set_bash_timeout() -> None:
+    """An operator who already set either env var in their own shell keeps
+    their value — this only fills the gap for a fleet that never set
+    either."""
+    from coord.agent import _worker_subprocess_env
+
+    env = _worker_subprocess_env(base_env={"BASH_DEFAULT_TIMEOUT_MS": "30000"})
+    assert env["BASH_DEFAULT_TIMEOUT_MS"] == "30000"
+    assert env["BASH_MAX_TIMEOUT_MS"] == "600000"
+
+
 def test_default_worker_command_passes_strict_mcp_config() -> None:
     """#2820: a worker must not load the operator's personal user-scope MCP
     servers (Google Drive/Calendar/Gmail) — no worker can ever use them, and

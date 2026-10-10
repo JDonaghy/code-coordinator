@@ -23,6 +23,7 @@ from coord.usage_rollup import (
     IssueKey,
     TimeWindow,
     aggregate,
+    leg_context_footprint,
     leg_cost,
     leg_duration,
     leg_in_window,
@@ -556,6 +557,24 @@ def test_duration_clamps_negative_to_zero() -> None:
     duration, is_open = leg_duration(row)
     assert duration == 0.0
     assert is_open is False
+
+
+# ── #3672: context-footprint proxy ──────────────────────────────────────────
+
+
+def test_context_footprint_sums_input_cache_creation_and_cache_read() -> None:
+    """Excludes output_tokens (generated text, not context pressure)."""
+    row = dict(
+        input_tokens=1_000,
+        output_tokens=99_999,  # must NOT contribute
+        cache_creation_tokens=500,
+        cache_read_tokens=70_000_000,
+    )
+    assert leg_context_footprint(row) == 1_000 + 500 + 70_000_000
+
+
+def test_context_footprint_missing_columns_default_to_zero() -> None:
+    assert leg_context_footprint({}) == 0
 
 
 # ── Window predicate: dispatched-or-finished, boundary ──────────────────────

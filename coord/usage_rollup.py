@@ -286,6 +286,33 @@ def leg_cost(row: dict, pricing: PricingConfig) -> tuple[float, float, bool]:
     return 0.0, est, False
 
 
+def leg_context_footprint(row: dict) -> int:
+    """Best-effort "how big did this leg's context get" proxy (#3672).
+
+    Returns ``input_tokens + cache_creation_tokens + cache_read_tokens`` —
+    every token column that reflects context sent/cached across the leg,
+    deliberately excluding ``output_tokens`` (generated text, not context
+    pressure). This is a **proxy, not a true peak**: the board only stores
+    ONE post-hoc token total per leg (sourced from claude's own terminal
+    ``result`` event, or summed turn-by-turn when that event never arrived
+    — see ``coord.worker_events.WorkerSummary``'s docstring), not a
+    per-turn series, so there is no persisted "biggest single turn" to read
+    here. For a leg whose context only ever grows (the common #3672 shape:
+    zero `compact_boundary` events observed in any local log), this total
+    is dominated by the final, largest turn, so it tracks the leg's actual
+    peak context reasonably well in practice — but a leg that DID compact
+    partway through would make this an overestimate of the peak at any
+    single moment. Tracking a true per-turn peak would need a new persisted
+    column (and per-turn instrumentation in ``coord.worker_events``) —
+    tracked as a follow-up, not implemented here.
+    """
+    return (
+        _to_int(row.get("input_tokens"))
+        + _to_int(row.get("cache_creation_tokens"))
+        + _to_int(row.get("cache_read_tokens"))
+    )
+
+
 def leg_duration(row: dict) -> tuple[float, bool]:
     """Compute ``(duration_secs, is_open)`` for one leg.
 

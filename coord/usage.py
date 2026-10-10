@@ -772,8 +772,21 @@ def format_usage_issue_drill(rows: list[dict], issue_number: int, pricing) -> st
     filtering already applied by the caller); *pricing* is a
     :class:`~coord.config.PricingConfig`. Rows are rendered oldest-first by
     ``dispatched_at`` (falling back to ``finished_at``).
+
+    #3672: the ``turns``/``ctx(~)`` columns surface the two numbers the
+    7-day cost analysis found drove the 300+-turn-leg cost cliff (31% of
+    work spend at a $10.36 mean, vs. $1.07 under 100 turns) — ``turns`` is
+    the exact worker-reported ``num_turns``; ``ctx(~)`` is
+    :func:`coord.usage_rollup.leg_context_footprint`'s best-effort proxy
+    (see its own docstring for why it's a proxy, not a persisted true
+    peak).
     """
-    from coord.usage_rollup import leg_cost, leg_duration, parse_timestamp
+    from coord.usage_rollup import (
+        leg_context_footprint,
+        leg_cost,
+        leg_duration,
+        parse_timestamp,
+    )
 
     if not rows:
         return f"No usage data for issue #{issue_number}."
@@ -800,7 +813,7 @@ def format_usage_issue_drill(rows: list[dict], issue_number: int, pricing) -> st
     ]
     lines.append(
         f"{'stage':<9}{'model':<11}{'int':<5}{'cost':<11}{'est(~)':<11}"
-        f"{'out':<7}{'cache':<8}{'time':<10}status"
+        f"{'out':<7}{'cache':<8}{'turns':>6}  {'ctx(~)':<8}{'time':<10}status"
     )
     for row in ordered:
         captured, est, unknown_model = leg_cost(row, pricing)
@@ -817,12 +830,16 @@ def format_usage_issue_drill(rows: list[dict], issue_number: int, pricing) -> st
             est_col = "—"
         out_col = _fmt_tokens_compact(int(row.get("output_tokens") or 0))
         cache_col = _fmt_tokens_compact(int(row.get("cache_read_tokens") or 0))
+        turns = row.get("num_turns")
+        turns_col = str(int(turns)) if turns else "—"
+        ctx_col = _fmt_tokens_compact(leg_context_footprint(row))
         time_col = _fmt_duration_hms(duration, is_open=is_open)
         status = str(row.get("status") or "")
         note = "  *unknown model" if unknown_model else ""
         lines.append(
             f"{stage:<9}{model:<11}{interactive:<5}{cost_col:<11}{est_col:<11}"
-            f"{out_col:<7}{cache_col:<8}{time_col:<10}{status}{note}"
+            f"{out_col:<7}{cache_col:<8}{turns_col:>6}  {ctx_col:<8}{time_col:<10}"
+            f"{status}{note}"
         )
     return "\n".join(lines)
 
