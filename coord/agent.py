@@ -953,7 +953,12 @@ class AssignmentSpec:
     system_prompt: str | None = None
     # PR number being reviewed (only set for type="review").
     review_target: str | None = None
-    # Command patterns the worker must not run (prompt-level enforcement).
+    # Command patterns the worker must not run. Soft-enforced via the
+    # FORBIDDEN COMMANDS prompt text (`build_deny_prompt`) for every entry,
+    # and ALSO CLI-enforced via `--disallowedTools` for the `review`-type
+    # subset (`REVIEW_DENY_COMMANDS`, #2461) and the Windows image-name-kill
+    # subset (`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`, #3663) — see
+    # `worker_disallowed_tools`.
     deny_commands: list[str] = field(default_factory=list)
     # Claude model tier alias (e.g. "haiku", "sonnet", "opus"). When None,
     # the worker command omits --model so claude -p picks its default.
@@ -4794,11 +4799,40 @@ def bash_deny_pattern_matches(pattern: str, command: str) -> bool:
     Returns ``False`` for a *pattern* that isn't a ``Bash(...)`` rule at all
     (e.g. an ``Edit(...)``/``Write(...)`` path rule) — those constrain a
     different tool and never match a shell command string.
+
+    **Case sensitivity (#3663, corrected in review round 2).** Matching is
+    case-sensitive by default, mirroring the POSIX shells almost every
+    pattern in this module targets. A *pattern* that is a member of
+    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` gets an extra lowering
+    step here, as a convenience for this module's own tests (PowerShell/
+    ``cmd.exe`` are case-insensitive shells, so ``Stop-Process``,
+    ``stop-process`` and ``STOP-PROCESS`` really are the identical cmdlet
+    invocation, and this lets a test assert that equivalence directly
+    instead of hand-maintaining every cased spelling).
+
+    **That lowering is local to this function and is NOT what makes the
+    Windows guard case-proof in production.** ``--disallowedTools``
+    (:func:`worker_disallowed_tools`) and the FORBIDDEN-COMMANDS prompt
+    text (:func:`build_deny_prompt`) both consume the raw
+    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` pattern *strings*
+    verbatim — neither calls this function, so neither can inherit
+    anything it does. The Claude CLI's own permission matcher is the
+    actual enforcement surface for both, and this module has no way to
+    make that matcher case-insensitive from here. Case-robustness for
+    those two surfaces comes entirely from
+    :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS` shipping explicit cased
+    duplicates of each fragment (lowercase, PascalCase, UPPERCASE) — see
+    that tuple's comment. Round 1 of this fix claimed the opposite (that
+    this lowering "inherited automatically" into those two surfaces);
+    that was false and is corrected here.
     """
     if not (pattern.startswith("Bash(") and pattern.endswith(")")):
         return False
     inner = pattern[5:-1]
-    return fnmatch.fnmatchcase(command.strip(), inner)
+    command = command.strip()
+    if pattern in _WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS_SET:
+        return fnmatch.fnmatchcase(command.lower(), inner.lower())
+    return fnmatch.fnmatchcase(command, inner)
 
 
 def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | None:
@@ -4812,6 +4846,202 @@ def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | N
         if bash_deny_pattern_matches(pattern, command):
             return pattern
     return None
+
+
+# #3663: a dell64 worker running a vimcode#1833 manual Windows Terminal
+# repro "cleaned up" between attempts with
+#   Get-Process | Where-Object {$_.ProcessName -match "vcd|WindowsTerminal"} \
+#     | Stop-Process -Force -ErrorAction SilentlyContinue
+# — run roughly 40 times, with `taskkill /IM .../F` and a couple of
+# `OpenConsole` matches alongside it. Windows Terminal (and OpenConsole)
+# hosts every window of every tab/pane of EVERY session on the box in a
+# SINGLE process, so killing it by image/executable name takes down every
+# terminal window on the shared desktop, including the user's own
+# interactive session — dell64 is a desk machine the user actually uses,
+# not a headless box. Killing a PID this worker itself launched is always
+# fine; only the forms below, which cannot distinguish "a process I
+# launched" from "every process with this name", are refused.
+#
+# Written as bare glob FRAGMENTS (no anchoring, no ``Bash(...)`` wrapper)
+# rather than the verb-first ``Bash(git push --force *)`` shape the rest of
+# this module's deny lists use, because the hazard here is a command that
+# MENTIONS these tokens anywhere in a longer pipeline/subshell
+# (``powershell.exe -NoProfile -Command 'Get-Process | ... | Stop-Process
+# ...'``), not one whose single verb+flag starts the string.
+#
+# **Case (#3663 review round 2).** Unlike every other pattern in this
+# module, which targets a case-sensitive POSIX shell, these target
+# PowerShell/``cmd.exe``, where ``Stop-Process``, ``stop-process``, and
+# ``STOP-PROCESS`` invoke the identical cmdlet — and a worker's own commands
+# in the wild (including the dell64 repro above) are PascalCase, not
+# lowercase. Round 1 of this fix shipped only the lowercase form and relied
+# on :func:`bash_deny_pattern_matches` to normalize case before matching;
+# that normalizer has zero production callers — ``--disallowedTools`` and
+# the FORBIDDEN-COMMANDS prompt text both consume these pattern *strings*
+# verbatim, byte-for-byte, through the Claude CLI's own matcher, which this
+# module cannot reach into — so the lowercase-only patterns silently failed
+# to catch the issue's own PascalCase acceptance commands even though the
+# repo's test suite (which asserted through the normalizer) reported green.
+# Fixed by making the pattern BYTES case-proof instead of relying on any
+# matcher to normalize them: each fragment below is listed three times
+# (lowercase, PascalCase/canonical cmdlet casing, UPPERCASE) rather than as
+# a ``[Gg]et-...``-style bracket character class, because this module has
+# no confirmed evidence the Claude CLI's own glob matcher supports bracket
+# classes. This does not claim to be exhaustive — see "Porosity" below —
+# only that these three concrete, real-world-observed casings are each
+# matched byte-for-byte regardless of which layer is asking.
+#
+# Porosity (not closed by this pattern set — the briefing note
+# (`WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE` in coord/dispatch.py) is doing
+# real work here, not just belt-and-suspenders): a split across two tool
+# calls (`$p = Get-Process ...` then `$p | Stop-Process` in a later
+# command), `Stop-Process -InputObject (Get-Process WindowsTerminal)`
+# (stop-before-get, so neither substring-order pattern below fires),
+# `(Get-Process wt).Kill()`/`Get-Process wt | %{$_.Kill()}`, and
+# `taskkill /F /FI "IMAGENAME eq WindowsTerminal.exe"` (the `/FI` filter
+# form rather than `/IM`) all still escape it.
+#
+# False-positive risk: `*get-process*stop-process*` / `*stop-process*
+# -name*` also catch a worker `grep`/`rg`-ing for those identifiers, or
+# writing a fixture/heredoc containing them (e.g. a worker editing this
+# very guard). That fails closed, which is the right direction, but is
+# worth recognizing if a refusal looks surprising.
+WINDOWS_IMAGE_NAME_KILL_PATTERNS: tuple[str, ...] = (
+    # PowerShell: Stop-Process fed from a Get-Process pipeline — kills
+    # every process matching whatever the pipeline selected, not one PID.
+    # Three cased spellings (lowercase / PascalCase / UPPERCASE) because
+    # PowerShell's own shell is case-insensitive, but the two surfaces that
+    # consume these BYTES verbatim (--disallowedTools, the FORBIDDEN
+    # COMMANDS prompt text) are not.
+    "*get-process*stop-process*",
+    "*Get-Process*Stop-Process*",
+    "*GET-PROCESS*STOP-PROCESS*",
+    # PowerShell: Stop-Process invoked directly by name (also an
+    # image-name kill, even with no upstream Get-Process pipeline).
+    "*stop-process*-name*",
+    "*Stop-Process*-Name*",
+    "*STOP-PROCESS*-NAME*",
+    "*stop-process*-processname*",
+    "*Stop-Process*-ProcessName*",
+    "*STOP-PROCESS*-PROCESSNAME*",
+    # taskkill /IM <image> kills every process with that executable name;
+    # taskkill /PID <pid> targets one process and stays allowed. cmd.exe is
+    # case-insensitive too, so the same three-spelling treatment applies.
+    "*taskkill*/im*",
+    "*taskkill*/IM*",
+    "*TASKKILL*/IM*",
+    # pkill/killall reaching a Windows .exe via WSL/Cygwin/MSYS interop —
+    # these run inside the WORKER's own POSIX shell (bash), which IS
+    # case-sensitive, so (unlike the PowerShell/cmd.exe patterns above) a
+    # single lowercase spelling is the canonical and only form that
+    # matters here.
+    "*pkill*.exe*",
+    "*killall*.exe*",
+    # WMIC's SQL-ish "kill every process with this name" form — also
+    # cmd.exe, also case-insensitive.
+    "*wmic*process*where*name=*",
+    "*WMIC*PROCESS*WHERE*NAME=*",
+)
+
+#: ``Bash(...)``-wrapped form of :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`,
+#: for the exact same soft-prompt (:func:`build_deny_prompt`) and
+#: ``--disallowedTools`` wiring every other deny list in this module gets.
+#:
+#: **What is actually true about "the enforcement surface" (#3663 review
+#: round 2).** ``--disallowedTools`` (:func:`worker_disallowed_tools`) and
+#: :func:`build_deny_prompt`'s FORBIDDEN COMMANDS text both consume THIS
+#: LIST'S STRINGS verbatim, byte-for-byte — the Claude CLI's own permission
+#: matcher is what actually enforces them, a surface this module cannot
+#: call into or normalize. Neither of those two call sites goes through
+#: :func:`bash_deny_pattern_matches`/:func:`find_denying_bash_pattern` at
+#: all, so this module's own matcher backs only the test suite's model of
+#: what the CLI does, not the CLI itself. (A prior version of this
+#: docstring claimed otherwise — that the matcher "is what
+#: --disallowedTools... key[s] off of" — which was false; the correction
+#: is this paragraph.) That is precisely why the pattern strings
+#: themselves must be case-proof on their own (see the cased duplicates in
+#: :data:`WINDOWS_IMAGE_NAME_KILL_PATTERNS`) rather than relying on any
+#: matcher, including this module's, to normalize case for them.
+#:
+#: There used to be a second helper (``is_windows_image_name_kill``) that
+#: lowercased its input before matching; it had no production caller, and
+#: its tests passed while these patterns — matched case-sensitively
+#: wherever the CLI itself evaluates them — silently failed to catch the
+#: issue's own PascalCase acceptance commands. It has been removed rather
+#: than fixed in place. ``tests/test_worker_safety.py``'s
+#: ``TestWindowsImageNameKillGuard`` exercises this exact list through
+#: :func:`find_denying_bash_pattern`, which is still useful as a model of
+#: the CLI's documented glob semantics — it just isn't the thing that
+#: makes the guard work in production; the pattern bytes are.
+WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS: list[str] = [
+    f"Bash({pattern})" for pattern in WINDOWS_IMAGE_NAME_KILL_PATTERNS
+]
+
+#: Membership-test form of :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`
+#: for :func:`bash_deny_pattern_matches` — a ``frozenset`` reads as "is this
+#: pattern one of the Windows ones" at the call site, rather than a linear
+#: scan that happens to be irrelevant at this list's size.
+_WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS_SET = frozenset(
+    WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS
+)
+
+
+def is_shared_windows_desktop(capabilities: list[str]) -> bool:
+    """Whether a machine declaring *capabilities* needs the #3663
+    shared-desktop treatment — the Windows image-name-kill guard
+    (:func:`deny_commands_for_machine`) and the matching briefing note
+    (``WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE`` in :mod:`coord.dispatch`).
+
+    **Single predicate, both call sites.** :meth:`coord.dispatch.dispatch`
+    and this module both used to ask ``"windows" in capabilities``
+    independently; one shared predicate here means the deny-list decision
+    and the briefing-note decision can never silently diverge.
+
+    Keyed on bare ``"windows"`` rather than
+    ``coord.config.native_execution_capability("windows")`` (i.e.
+    ``"windows-native"``) deliberately, even though
+    :class:`coord.config.SmokeTestsConfig`'s docstring is explicit that
+    bare ``"windows"`` means only "can build/cross-compile for Windows",
+    not "is a native Windows host" — dell64 declared it while its coord
+    agent ran inside WSL. The over-application this causes (a cross-compile-
+    only Linux box gets a Windows-shaped deny list it will never trip, and
+    in principle could get a briefing paragraph describing a desktop it
+    isn't) is harmless for the deny side. It is not fully harmless for the
+    briefing side, whose prose asserts a human sits at the machine — that
+    mismatch is real and unresolved here; a dedicated "a human uses this
+    desktop" capability, rather than overloading either ``windows`` or
+    ``windows-native``, is the follow-up this predicate's single call site
+    makes easy to land later without touching either caller again.
+    """
+    return "windows" in capabilities
+
+
+def deny_commands_for_machine(
+    base_deny_commands: list[str], machine_capabilities: list[str],
+) -> list[str]:
+    """*base_deny_commands* (the repo's own ``worker_permissions.deny``,
+    usually :data:`coord.config.DEFAULT_DENY_COMMANDS`) plus
+    :data:`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS` when
+    :func:`is_shared_windows_desktop` says *machine_capabilities* needs it
+    (#3663) — a shared desktop like dell64 where an image-name kill can
+    take down the operator's own Windows Terminal window, not just this
+    worker's own.
+
+    **Single source of truth** (epic #2096's "one question, one answer"):
+    :meth:`coord.dispatch.dispatch` calls this ONE function to decide what
+    a given dispatch's ``deny_commands`` are — there is no second,
+    independently-maintained copy of "does this machine need the Windows
+    guard" anywhere else. A machine that doesn't need it gets
+    *base_deny_commands* back unchanged (a plain repo with no
+    `worker_permissions.deny` override still sees byte-identical behavior
+    to before this function existed).
+    """
+    deny = list(base_deny_commands)
+    if is_shared_windows_desktop(machine_capabilities):
+        for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+            if pattern not in deny:
+                deny.append(pattern)
+    return deny
 
 
 # #1315: sealed-oracle path prefix that only an independent authoring type
@@ -5217,6 +5447,16 @@ def worker_disallowed_tools(spec: AssignmentSpec, allowed_tools: str) -> list[st
     4. #2461 ``REVIEW_DENY_COMMANDS`` — only for ``spec.type ==
        "review"``, wiring the mutating-command deny list into the
        CLI-enforced flag and not just the soft prompt reminder.
+    5. #3663 ``WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`` — whichever of
+       those patterns are already present in ``spec.deny_commands`` (set
+       by :func:`deny_commands_for_machine` at dispatch time, when the
+       target machine declares the ``windows`` capability), promoted from
+       the soft prompt reminder every spec type already gets via
+       ``build_deny_prompt(spec.deny_commands)`` to the same CLI-enforced
+       flag — a prompt rule alone was proven insufficient (the dell64
+       worker this guard exists for ran the forbidden command ~40 times
+       with that exact FORBIDDEN COMMANDS section already in its system
+       prompt).
 
     Args:
         spec: The assignment being dispatched.
@@ -5259,6 +5499,13 @@ def worker_disallowed_tools(spec: AssignmentSpec, allowed_tools: str) -> list[st
         for pattern in REVIEW_DENY_COMMANDS:
             if pattern not in disallowed_tools:
                 disallowed_tools.append(pattern)
+    # #3663: hard-enforce the Windows image-name-kill guard too, for any
+    # spec type — it's only ever present in spec.deny_commands when
+    # deny_commands_for_machine added it for a `windows`-capable target,
+    # so this is a no-op for every other dispatch.
+    for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+        if pattern in spec.deny_commands and pattern not in disallowed_tools:
+            disallowed_tools.append(pattern)
     return disallowed_tools
 
 

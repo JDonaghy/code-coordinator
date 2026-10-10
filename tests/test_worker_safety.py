@@ -8,11 +8,15 @@ import pytest
 
 from coord.agent import (
     AssignmentSpec,
+    WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS,
     WORKER_SYSTEM_PROMPT,
     bash_deny_pattern_matches,
     build_deny_prompt,
     default_worker_command,
+    deny_commands_for_machine,
     find_denying_bash_pattern,
+    is_shared_windows_desktop,
+    worker_disallowed_tools,
 )
 from coord.config import DEFAULT_DENY_COMMANDS, load
 from coord.models import WorkerPermissionsConfig
@@ -311,6 +315,101 @@ class TestDispatchDenyCommands:
             payload = mock_post.call_args.kwargs["json"]
             assert payload["deny_commands"] == DEFAULT_DENY_COMMANDS
 
+    def test_dispatch_to_a_windows_machine_adds_the_image_name_kill_guard(self) -> None:
+        """#3663: a `windows`-capable machine (dell64) gets the extra
+        guard added on top of whatever the repo's own `worker_permissions`
+        already specify — AND the shared-desktop briefing note."""
+        from unittest.mock import MagicMock, patch
+
+        from coord.config import Config
+        from coord.dispatch import WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE, dispatch
+        from coord.models import Machine, Proposal, Repo
+
+        repo = Repo(
+            name="vimcode",
+            github="acme/vimcode",
+            worker_permissions=WorkerPermissionsConfig(
+                deny=["Bash(git push --force *)"]
+            ),
+        )
+        cfg = Config(
+            repos=[repo],
+            machines=[
+                Machine(
+                    name="dell64",
+                    host="dell64.tailnet",
+                    repos=["vimcode"],
+                    repo_paths={"vimcode": "/home/user/src/vimcode"},
+                    capabilities=["windows"],
+                ),
+            ],
+        )
+        proposal = Proposal(
+            id=1,
+            machine_name="dell64",
+            repo_name="vimcode",
+            issue_number=10,
+            issue_title="Fix the terminal repro",
+            rationale="best fit",
+            briefing="Reproduce the Windows Terminal bug",
+        )
+
+        with patch("coord.dispatch.httpx.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"ok": True}
+            mock_post.return_value = mock_resp
+
+            dispatch(proposal, cfg)
+
+            payload = mock_post.call_args.kwargs["json"]
+            assert "Bash(git push --force *)" in payload["deny_commands"]
+            for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+                assert pattern in payload["deny_commands"]
+            assert WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE in payload["briefing"]
+
+    def test_dispatch_to_a_non_windows_machine_has_no_shared_desktop_note(self) -> None:
+        """Negative control: the note/guard must not leak onto a dispatch
+        the issue has nothing to do with."""
+        from unittest.mock import MagicMock, patch
+
+        from coord.config import Config
+        from coord.dispatch import WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE, dispatch
+        from coord.models import Machine, Proposal, Repo
+
+        repo = Repo(name="api", github="acme/api")
+        cfg = Config(
+            repos=[repo],
+            machines=[
+                Machine(
+                    name="laptop",
+                    host="laptop.tailnet",
+                    repos=["api"],
+                    repo_paths={"api": "/home/user/src/api"},
+                ),
+            ],
+        )
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Fix auth",
+            rationale="best fit",
+            briefing="Fix the auth module",
+        )
+
+        with patch("coord.dispatch.httpx.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"ok": True}
+            mock_post.return_value = mock_resp
+
+            dispatch(proposal, cfg)
+
+            payload = mock_post.call_args.kwargs["json"]
+            for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+                assert pattern not in payload["deny_commands"]
+            assert WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE not in payload["briefing"]
+
 
 # ── WorkerPermissionsConfig dataclass ────────────────────────────────────────
 
@@ -533,3 +632,162 @@ class TestBashDenyPatternMatcher:
     def test_find_denying_bash_pattern_returns_the_matching_pattern(self) -> None:
         pattern = find_denying_bash_pattern("gh issue list", DEFAULT_DENY_COMMANDS)
         assert pattern == "Bash(gh *)"
+
+
+# ── #3663: Windows image-name kill guard ─────────────────────────────────────
+#
+# These tests go through `find_denying_bash_pattern` /
+# `bash_deny_pattern_matches` against the EXACT patterns shipped to
+# production (`WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`) — the same real
+# enforcement-surface matcher `TestPipDenyEvasion` above uses, and the one
+# `--disallowedTools`/`build_deny_prompt` actually key off of. A prior
+# version of this guard was proven correct against a second, dead helper
+# (`is_windows_image_name_kill`) that lowercased its input before matching
+# — its tests passed while the shipped, case-sensitively-matched patterns
+# silently failed to catch the issue's own PascalCase acceptance commands.
+# That helper has been removed; asserting through the real matcher is what
+# makes "this deny list actually catches that evasion" a checked fact
+# again.
+
+
+class TestWindowsImageNameKillGuard:
+    """#3663: a dell64 worker ran
+    ``Get-Process | Where-Object {...} | Stop-Process -Force
+    -ErrorAction SilentlyContinue`` ~40 times to "clean up" between manual
+    repro attempts — Windows Terminal hosts every window on the box in one
+    process, so this killed the user's own terminal too. These are the
+    acceptance examples from the issue itself."""
+
+    REAL_WORLD_REPRO_KILL = (
+        "powershell.exe -NoProfile -Command 'Get-Process | Where-Object "
+        '{$_.ProcessName -match "vcd|WindowsTerminal"} | Stop-Process '
+        "-Force -ErrorAction SilentlyContinue'"
+    )
+
+    def _is_denied(self, command: str) -> bool:
+        return find_denying_bash_pattern(
+            command, WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS
+        ) is not None
+
+    def test_refuses_the_exact_dell64_repro_command(self) -> None:
+        assert self._is_denied(self.REAL_WORLD_REPRO_KILL)
+
+    def test_refuses_taskkill_by_image_name(self) -> None:
+        assert self._is_denied("taskkill /IM WindowsTerminal.exe /F")
+
+    def test_refuses_taskkill_by_image_name_lowercase(self) -> None:
+        assert self._is_denied("taskkill /im openconsole.exe /f")
+
+    def test_refuses_stop_process_by_name_without_a_get_process_pipeline(self) -> None:
+        assert self._is_denied("Stop-Process -Name WindowsTerminal -Force")
+
+    def test_refuses_pkill_against_a_windows_exe(self) -> None:
+        assert self._is_denied("pkill -f WindowsTerminal.exe")
+
+    def test_refuses_killall_against_a_windows_exe(self) -> None:
+        assert self._is_denied("killall WindowsTerminal.exe")
+
+    def test_refuses_wmic_process_kill_by_name(self) -> None:
+        assert self._is_denied(
+            "wmic process where name='WindowsTerminal.exe' delete"
+        )
+
+    def test_case_insensitive_unlike_the_posix_deny_patterns(self) -> None:
+        """PowerShell/cmd.exe are case-insensitive shells — a differently
+        cased invocation of the exact same cmdlet must still be refused."""
+        assert self._is_denied("get-process | stop-process -force")
+        assert self._is_denied("GET-PROCESS | STOP-PROCESS -FORCE")
+
+    def test_allows_stop_process_by_pid(self) -> None:
+        """Killing a PID the worker itself launched must stay allowed."""
+        assert not self._is_denied("Stop-Process -Id 1234")
+
+    def test_allows_taskkill_by_pid(self) -> None:
+        assert not self._is_denied("taskkill /PID 1234")
+
+    def test_allows_an_unrelated_command(self) -> None:
+        assert not self._is_denied("cargo build --release")
+
+    def test_bash_deny_pattern_matches_is_case_insensitive_for_these_patterns_only(
+        self,
+    ) -> None:
+        """The case-insensitive carve-out in `bash_deny_pattern_matches` is
+        scoped to the Windows patterns specifically — it must not leak into
+        ordinary POSIX pattern matching."""
+        assert bash_deny_pattern_matches(
+            "Bash(*stop-process*-name*)", "Stop-Process -Name WindowsTerminal"
+        )
+        assert not bash_deny_pattern_matches("Bash(rm -rf *)", "RM -RF /tmp/x")
+
+
+class TestDenyCommandsForMachine:
+    """#3663: :func:`deny_commands_for_machine` is the SINGLE function that
+    decides whether a dispatch's deny list gets the Windows guard — no
+    second, independently-maintained copy of "is this machine windows-
+    capable" anywhere else."""
+
+    def test_windows_capable_machine_gets_the_guard_added(self) -> None:
+        result = deny_commands_for_machine(["Bash(gh *)"], ["windows"])
+        assert "Bash(gh *)" in result
+        for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+            assert pattern in result
+
+    def test_non_windows_machine_is_unaffected(self) -> None:
+        result = deny_commands_for_machine(["Bash(gh *)"], ["linux"])
+        assert result == ["Bash(gh *)"]
+
+
+class TestIsSharedWindowsDesktop:
+    """#3663: the predicate `deny_commands_for_machine` and
+    `coord.dispatch.dispatch`'s briefing-note decision now both call,
+    rather than each keeping its own `"windows" in capabilities` check."""
+
+    def test_true_for_windows_capability(self) -> None:
+        assert is_shared_windows_desktop(["windows"])
+
+    def test_false_without_windows_capability(self) -> None:
+        assert not is_shared_windows_desktop(["linux", "rust"])
+
+    def test_false_for_empty_capabilities(self) -> None:
+        assert not is_shared_windows_desktop([])
+
+    def test_non_windows_machine_is_unaffected(self) -> None:
+        assert deny_commands_for_machine(["Bash(gh *)"], ["gtk"]) == ["Bash(gh *)"]
+
+    def test_empty_base_list_on_a_windows_machine_still_gets_the_guard(self) -> None:
+        """An operator's explicit `deny: []` (opt out of every REPO-level
+        restriction) must not opt out of this machine-level safety guard."""
+        result = deny_commands_for_machine([], ["windows"])
+        assert result == WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS
+
+    def test_no_duplicate_entries_when_base_list_already_has_them(self) -> None:
+        base = list(WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS)
+        result = deny_commands_for_machine(base, ["windows"])
+        assert result == base
+
+
+class TestWindowsImageNameKillHardEnforced:
+    """#3663: unlike a worker's ordinary `deny_commands` (soft system-
+    prompt reminder only), the Windows guard must also land in
+    `--disallowedTools` — a prompt rule alone was proven insufficient."""
+
+    def test_disallowed_tools_includes_the_guard_when_present_in_deny_commands(
+        self,
+    ) -> None:
+        spec = AssignmentSpec(
+            repo_name="api", repo_path="/tmp/repo", issue_number=1,
+            issue_title="t", briefing="do the thing",
+            deny_commands=deny_commands_for_machine([], ["windows"]),
+        )
+        disallowed = worker_disallowed_tools(spec, allowed_tools="Read,Edit,Write,Bash")
+        for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+            assert pattern in disallowed
+
+    def test_disallowed_tools_omits_the_guard_for_a_non_windows_dispatch(self) -> None:
+        spec = AssignmentSpec(
+            repo_name="api", repo_path="/tmp/repo", issue_number=1,
+            issue_title="t", briefing="do the thing", deny_commands=[],
+        )
+        disallowed = worker_disallowed_tools(spec, allowed_tools="Read,Edit,Write,Bash")
+        for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
+            assert pattern not in disallowed

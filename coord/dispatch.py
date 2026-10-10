@@ -277,6 +277,33 @@ def enforce_epic_dispatch_guard(
     )
 
 
+# #3663: appended to EVERY assignment's briefing when the target machine
+# declares the `windows` capability (dell64 today) — a module-level
+# constant for the same testability reason as EPIC_DECOMPOSE_CONTRACT
+# below: a test can assert against this exact text without re-deriving it.
+# The mechanical guard is `deny_commands_for_machine`
+# (`coord.agent.WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS`); this is its
+# prompt-level half, same split every CLI-enforced deny list in this
+# fleet has from its own soft reminder.
+WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE = """
+
+## This machine is a shared desktop (#3663)
+
+This is a shared desktop, not a headless box — the user sits at it and runs \
+their own Windows Terminal / explorer.exe sessions while you work. \
+`WindowsTerminal.exe`, `OpenConsole.exe`, and `explorer.exe` each host every \
+window of every tab/pane/session on the box in a SINGLE process — killing \
+one of those by image/executable name (`Get-Process | Stop-Process`, \
+`taskkill /IM`, `pkill`/`killall` against a `.exe`, `wmic process where \
+name=... delete`) takes down every window with that name, including the \
+user's own, not just something you started.
+
+Never kill by process name. Kill only a PID you yourself launched (`Stop-\
+Process -Id <pid>`, `taskkill /PID <pid>`), or close your own window \
+(send it WM_CLOSE / close its own tab) instead of terminating the process \
+that hosts it.
+"""
+
 # #3132: the addendum appended to a ``type="epic-decompose"`` dispatch's
 # briefing — see ``epic_decompose_briefing`` below. Kept as a module-level
 # constant (not inlined in the function) so a test can assert against the
@@ -932,6 +959,17 @@ def dispatch(
     deny_commands: list[str] = []
     if repo is not None and repo.worker_permissions is not None:
         deny_commands = repo.worker_permissions.deny
+    # #3663: a `windows`-capable machine (dell64) is a shared desktop the
+    # user actually sits at — an image-name process kill (`Stop-Process`
+    # fed from `Get-Process`, `taskkill /IM`, ...) takes down every window
+    # of that name on the box, not just this worker's own. Applied
+    # regardless of whether *repo* configured its own `worker_permissions`
+    # (even a `deny: []` repo still gets this one) — see
+    # `deny_commands_for_machine`'s docstring for the single-source-of-
+    # truth rationale.
+    from coord.agent import deny_commands_for_machine  # noqa: PLC0415
+
+    deny_commands = deny_commands_for_machine(deny_commands, machine.capabilities)
 
     # Resolve coordinator-only files (workers must not read or modify these).
     # #2966: coordinator_only_files was set by zero repos fleet-wide, so this
@@ -1176,6 +1214,24 @@ def dispatch(
         and capability_routing.unmet_capabilities
     ):
         briefing_text = briefing_text + capability_routing.briefing_note(machine.name)
+
+    # #3663: dell64 (and any other machine `is_shared_windows_desktop` says
+    # needs it) is a shared desktop the user actually sits at — appended
+    # for every assignment type, not just `work`, since the hazard this
+    # guards against (a worker improvising process cleanup with a shell
+    # command) isn't confined to one leg shape. The mechanical guard
+    # (`deny_commands_for_machine`, above) is the thing that actually
+    # stops it; this is the advisory half, same relationship every other
+    # `files_forbidden`/`deny_commands` pairing in this module has between
+    # its CLI-enforced and prompt-level halves. Routed through the same
+    # `coord.agent.is_shared_windows_desktop` predicate `deny_commands_for_
+    # machine` uses, rather than a second, independently-maintained
+    # `"windows" in machine.capabilities` check — see that predicate's
+    # docstring for why bare `"windows"` is still what it checks today.
+    from coord.agent import is_shared_windows_desktop  # noqa: PLC0415
+
+    if is_shared_windows_desktop(machine.capabilities):
+        briefing_text = briefing_text + WINDOWS_SHARED_DESKTOP_BRIEFING_NOTE
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
