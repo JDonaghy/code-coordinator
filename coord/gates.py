@@ -125,6 +125,13 @@ class AssignmentGateRow:
     # "overridden". See coord.models.Assignment.verdict_source.
     verdict_source: str | None
     verdict_source_reason: str | None
+    # #3686 (remainder of #3681): "single" or "workflow" — see
+    # coord.models.Assignment.mode. Normalized here (never left `None`) so
+    # every `coord gates` row — including ones predating the `mode` column —
+    # reads identically to the "every pre-#3681 leg ran single-agent" rule
+    # coord.state.load_assignment_mode's docstring already documents, rather
+    # than leaving a third place to apply that same normalization.
+    mode: str
 
 
 @dataclass
@@ -199,6 +206,7 @@ def _row_from_assignment(a: "Assignment") -> AssignmentGateRow:
         review_of_assignment_id=a.review_of_assignment_id,
         verdict_source=a.verdict_source,
         verdict_source_reason=a.verdict_source_reason,
+        mode=a.mode or "single",
     )
 
 
@@ -977,6 +985,12 @@ def format_gate_report(report: GateReport) -> str:
             f"branch={row.branch or '-'}  machine={row.machine_name or '-'}"
             + (f"  provider={row.provider_name}" if row.provider_name else "")
             + (f"  interactive={row.is_interactive}" if row.is_interactive is not None else "")
+            # #3686 (remainder of #3681): only printed for a Work leg — every
+            # other type ("review"/"test"/"fix"/...) always records "single"
+            # trivially (mode is gated on `type == "work"` at dispatch time,
+            # see coord.state._record_dispatched_local), so showing it there
+            # would just be noise.
+            + (f"  mode={row.mode}" if row.type == "work" else "")
             # #1730: legible two-number reality — only printed when the row's
             # attribution differs from the issue it's booked to, so an
             # ordinary row (no `for_issue_number`, or one equal to
