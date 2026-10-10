@@ -53,6 +53,7 @@ import httpx
 from coord import github_ops
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
+from coord.prereview_gate import GateResult, run_prereview_gate
 from coord.models import (
     CLOSES_ISSUE_TYPES,
     SEALED_PATH_AUTHOR_TYPES,
@@ -2309,6 +2310,21 @@ def build_review_briefing(
         lines.append("- Did the worker stay within the assigned file scope?")
         lines.append("- Any security issues (injection, auth bypass, credential exposure)?")
 
+    lines.append("")
+    lines.append(
+        "- NOTE (#3674): a pre-review mechanical gate already ran against "
+        "this diff before you were dispatched and found nothing — stray "
+        "issue-number/history comments, a missing CHANGELOG entry, a semver "
+        "break, a non-additive smoke-spec edit, and a feature-gating "
+        "regression are all checked with zero tolerance by script, not by "
+        "you. Do NOT re-derive those by hand and do NOT put a finding about "
+        "them under `## Blocking findings` — if you still notice one (the "
+        "gate is per-repo configured and may not cover everything here), "
+        "file it under `## Nits` instead. The same goes for CLAUDE.md's "
+        "*Code Style* rules generally: style is a nit, never a blocking "
+        "finding."
+    )
+
     lines.extend(repo_focus_lines(reviews_cfg, repo_name))
     lines.extend(
         shared_scenario_focus_lines(
@@ -3286,6 +3302,111 @@ def _record_mechanical_review_verdict(
     return review_assignment
 
 
+def _record_prereview_gate_verdict(
+    completed: Assignment,
+    board: Board,
+    config: Config,
+    *,
+    repo,
+    pr: dict | None,
+    candidates: list[tuple[Machine, bool]],
+    findings: list[str],
+    now: float | None,
+) -> Assignment:
+    """(#3674) Record a request-changes verdict for a pre-review mechanical
+    gate failure, WITHOUT ever dispatching a reviewer session — the sibling
+    of :func:`_record_mechanical_review_verdict` (#3180), reusing the exact
+    same terminal-write seam (``coord.issue_store.post_result`` +
+    ``coord.auto_loop.propagate_review_verdict``) so this and every other
+    mechanically-recorded verdict answer "was a review leg spent?" through
+    one code path, never two independently-maintained ones (#2096 "one
+    question, one answer").
+
+    Unlike the #3180 checks (sealed-path/coordinator-doc tampering, always a
+    structural violation of this repo's own rules), a gate finding here is a
+    deterministic rule a script already caught with zero tolerance — see
+    ``coord/prereview_gate.py``'s module docstring for the check list. The
+    reviewer never sees these findings at all: they are never posted to a
+    review briefing, because no review briefing is ever built for this leg.
+    """
+    from coord.auto_loop import propagate_review_verdict  # noqa: PLC0415
+    from coord.issue_store import ResultRecord, post_result  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment  # noqa: PLC0415
+
+    reason = "prereview mechanical gate: " + "; ".join(findings)
+    body_lines = [
+        "## \U0001f6a8 PRE-REVIEW MECHANICAL GATE FAILED",
+        "",
+        (
+            "This diff tripped one or more zero-tolerance, script-checked "
+            "rules BEFORE a reviewer was ever dispatched (#3674) — fix these "
+            "and push again; a fresh review will be dispatched once the "
+            "gate passes."
+        ),
+        "",
+    ]
+    body_lines.extend(f"- {finding}" for finding in findings)
+    body = "\n".join(body_lines)
+    attributed_machine = candidates[0][0].name
+    review_assignment_id = uuid.uuid4().hex[:12]
+    dispatched_at = now if now is not None else time.time()
+
+    review_assignment = Assignment(
+        machine_name=attributed_machine,
+        repo_name=completed.repo_name,
+        issue_number=completed.issue_number,
+        issue_title=f"[review] {completed.issue_title}",
+        files_allowed=[],
+        files_forbidden=[],
+        briefing=body,
+        assignment_id=review_assignment_id,
+        status="running",
+        branch=completed.branch,
+        pr_url=pr.get("url") if pr else None,
+        dispatched_at=dispatched_at,
+        type="review",
+        review_target=str(pr["number"]) if pr else completed.branch,
+        review_of_assignment_id=completed.assignment_id,
+        for_issue_number=completed.for_issue_number,
+    )
+    board.completed.append(review_assignment)
+    record_dispatched_assignment(assignment=review_assignment, repo_github=repo.github)
+
+    outcome = post_result(ResultRecord(
+        assignment_id=review_assignment_id,
+        machine_name=attributed_machine,
+        repo_name=completed.repo_name,
+        repo_github=repo.github,
+        issue_number=completed.issue_number,
+        status="done",
+        verdict="request-changes",
+        summary=(
+            "Pre-review mechanical gate failed before dispatch (#3674) — no "
+            "review leg was spent; see the findings below for the rules "
+            "violated."
+        ),
+        branch=completed.branch,
+        findings_body=body,
+        verdict_source="mechanical",
+        verdict_source_reason=reason,
+    ))
+    log.warning(
+        "[review] %s: pre-review mechanical gate failed (%s) — recording "
+        "request-changes mechanically, no review leg dispatched "
+        "(findings posted=%s)",
+        completed.assignment_id, reason, outcome.posted,
+    )
+
+    review_assignment.status = "done"
+    review_assignment.review_verdict = "request-changes"
+    review_assignment.verdict_source = "mechanical"
+    review_assignment.verdict_source_reason = reason
+
+    propagate_review_verdict(review_assignment, board, config, refresh_merge_queue=False)
+
+    return review_assignment
+
+
 def dispatch_review(
     completed: Assignment,
     board: Board,
@@ -4085,6 +4206,34 @@ def dispatch_review(
             )
         except Exception:  # noqa: BLE001 — fail-open: advisory, never blocking
             oracle_contract_note_text = None
+
+        # #3674: the pre-review mechanical gate runs FIRST, ahead of the
+        # #3180 sealed-path/coordinator-doc check below — both are "mechanical,
+        # before a review leg is spent" short-circuits, but this one's checks
+        # (added-lines comment lint, CHANGELOG, smoke-spec additive-only,
+        # semver, feature matrix) are configured per repo via
+        # `config.prereview_gate`, disabled (a no-op) for any repo that never
+        # sets one. Same UNTRUNCATED `full_diff_text` as the #3180 check, for
+        # the same reason.
+        _gate_repo_path = (
+            candidates[0][0].repo_path(completed.repo_name) if candidates else None
+        )
+        _gate_result: GateResult = run_prereview_gate(
+            diff_text=full_diff_text,
+            repo_config=config.prereview_gate.for_repo(completed.repo_name),
+            repo_path=_gate_repo_path,
+        )
+        if not _gate_result.passed:
+            gate_review = _record_prereview_gate_verdict(
+                completed, board, config,
+                repo=repo,
+                pr=pr,
+                candidates=candidates,
+                findings=_gate_result.findings,
+                now=now,
+            )
+            _claim_held = False  # released by the terminal write above (#3113)
+            return gate_review
 
         # #3180: short-circuit BEFORE spending a review leg. `build_review_
         # briefing` below would compute this exact same check purely to

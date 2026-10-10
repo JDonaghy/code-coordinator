@@ -774,6 +774,59 @@ class AcceptanceConfig:
         return repo_name in self.drivers
 
 
+@dataclass
+class PrereviewGateRepoConfig:
+    """One entry under ``prereview_gate.<repo_name>`` (#3674) — the
+    deterministic, script-checkable rules run against a completed work
+    leg's diff BEFORE a review is ever dispatched. Disabled by default
+    (``enabled=False``): an absent or unconfigured repo's
+    :func:`coord.prereview_gate.run_prereview_gate` call is a no-op,
+    identical to today's behaviour.
+
+    Each check below is independently opt-in — setting ``enabled: true``
+    alone turns on only ``comment_lint`` (the one check with no further
+    configuration needed); ``changelog_path``/``smoke_spec_paths``/
+    ``semver_command``/``feature_matrix`` must each be set explicitly to
+    turn on their own check, since each needs a repo-specific value this
+    class cannot default sanely (a CHANGELOG path that doesn't exist, a
+    semver command for a non-Rust repo, ...).
+    """
+
+    enabled: bool = False
+    comment_lint: bool = True
+    issue_ref_pattern: str = r"#\d+"
+    history_phrases: tuple[str, ...] = (
+        "previously",
+        "used to",
+        "before this change",
+        "no longer",
+        "formerly",
+        "old behavior",
+        "old behaviour",
+        "used to be",
+        "in the past",
+        "originally",
+    )
+    changelog_path: str | None = None
+    smoke_spec_paths: tuple[str, ...] = ()
+    semver_command: str | None = None
+    feature_matrix: tuple[str, ...] = ()
+    feature_matrix_command_template: str = "cargo check --no-default-features --features {feature}"
+
+
+@dataclass
+class PrereviewGateConfig:
+    """``prereview_gate:`` — repo name -> :class:`PrereviewGateRepoConfig`."""
+
+    repos: dict[str, PrereviewGateRepoConfig] = field(default_factory=dict)
+
+    def for_repo(self, repo_name: str) -> PrereviewGateRepoConfig:
+        """*repo_name*'s gate config, or an all-disabled default when it
+        has none configured — mirrors :meth:`AcceptanceConfig.has_driver`'s
+        "absent means opted out, never a broken config" posture."""
+        return self.repos.get(repo_name, PrereviewGateRepoConfig())
+
+
 # #1430: plan-worker ESTIMATE -> escalation rung (see ModelsConfig.model_for_estimate).
 _ESTIMATE_RUNG: dict[str, int] = {"trivial": 0, "small": 0, "medium": 1, "large": 2}
 
@@ -2869,6 +2922,10 @@ class Config:
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     smoke_tests: SmokeTestsConfig = field(default_factory=SmokeTestsConfig)
     acceptance: AcceptanceConfig = field(default_factory=AcceptanceConfig)
+    # #3674 — absent block == no repo has a gate configured == every repo's
+    # dispatch_review call skips straight to the #3180 mechanical check,
+    # today's behaviour untouched.
+    prereview_gate: PrereviewGateConfig = field(default_factory=PrereviewGateConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -3150,6 +3207,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     concurrency = _parse_concurrency(raw.get("concurrency"))
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
     acceptance = _parse_acceptance(raw.get("acceptance"))
+    prereview_gate = _parse_prereview_gate(raw.get("prereview_gate"))
     models = _parse_models(raw.get("models"), set(providers.definitions))
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
@@ -3177,6 +3235,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         concurrency=concurrency,
         smoke_tests=smoke_tests,
         acceptance=acceptance,
+        prereview_gate=prereview_gate,
         models=models,
         pipeline=pipeline,
         dispatch=dispatch,
@@ -4090,6 +4149,90 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
         )
     cfg.capability_rules = rules
     return cfg
+
+
+def _parse_prereview_gate(raw: Any) -> PrereviewGateConfig:
+    """Parse the ``prereview_gate:`` block (#3674).
+
+    ``prereview_gate.<repo_name>`` maps a local repo name (as declared under
+    ``repos:``) to its :class:`PrereviewGateRepoConfig`. Absent entirely ->
+    no repo has a gate configured, matching today's behaviour (every
+    ``dispatch_review`` call's gate check is a no-op).
+    """
+    if raw is None:
+        return PrereviewGateConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'prereview_gate' must be a mapping")
+
+    repos: dict[str, PrereviewGateRepoConfig] = {}
+    for repo_name, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(f"prereview_gate[{repo_name!r}] must be a mapping")
+
+        cfg = PrereviewGateRepoConfig()
+        if "enabled" in entry:
+            value = entry["enabled"]
+            if not isinstance(value, bool):
+                raise ConfigError(f"prereview_gate[{repo_name!r}].enabled must be a boolean")
+            cfg.enabled = value
+        if "comment_lint" in entry:
+            value = entry["comment_lint"]
+            if not isinstance(value, bool):
+                raise ConfigError(f"prereview_gate[{repo_name!r}].comment_lint must be a boolean")
+            cfg.comment_lint = value
+        if "issue_ref_pattern" in entry:
+            value = entry["issue_ref_pattern"]
+            if not isinstance(value, str) or not value:
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].issue_ref_pattern must be a non-empty string"
+                )
+            cfg.issue_ref_pattern = value
+        if "history_phrases" in entry:
+            value = entry["history_phrases"]
+            if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].history_phrases must be a list of strings"
+                )
+            cfg.history_phrases = tuple(value)
+        if "changelog_path" in entry:
+            value = entry["changelog_path"]
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].changelog_path must be a string"
+                )
+            cfg.changelog_path = value
+        if "smoke_spec_paths" in entry:
+            value = entry["smoke_spec_paths"]
+            if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].smoke_spec_paths must be a list of strings"
+                )
+            cfg.smoke_spec_paths = tuple(value)
+        if "semver_command" in entry:
+            value = entry["semver_command"]
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].semver_command must be a string"
+                )
+            cfg.semver_command = value
+        if "feature_matrix" in entry:
+            value = entry["feature_matrix"]
+            if not isinstance(value, list) or not all(isinstance(f, str) for f in value):
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].feature_matrix must be a list of strings"
+                )
+            cfg.feature_matrix = tuple(value)
+        if "feature_matrix_command_template" in entry:
+            value = entry["feature_matrix_command_template"]
+            if not isinstance(value, str) or "{feature}" not in value:
+                raise ConfigError(
+                    f"prereview_gate[{repo_name!r}].feature_matrix_command_template must be "
+                    "a string containing '{feature}'"
+                )
+            cfg.feature_matrix_command_template = value
+        repos[repo_name] = cfg
+
+    return PrereviewGateConfig(repos=repos)
 
 
 def _parse_acceptance(raw: Any) -> AcceptanceConfig:
