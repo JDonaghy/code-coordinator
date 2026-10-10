@@ -15,9 +15,11 @@ the file. This tool removes them as cheaply as possible, in four steps:
     verify   prove a diff is comment-only: every changed file must lex to
              the same token stream with plain `//` comments removed
 
-Only plain `//` comments are touched. Doc comments (`///`, `//!`) can carry
-doctests and are part of the public docs, and `/* */` blocks are rare enough
-to leave to a human; `verify` fails if any of them change.
+By default only plain `//` comments are touched, and `verify` fails if a doc
+comment changes. With `--docs`, `///` / `//!` doc comments are handled too:
+fenced code inside them (doctests) is never edited and `verify --docs` still
+requires it byte-identical, and a doc block is never emptied (that would
+trip `missing_docs`). `/* */` blocks are rare enough to leave to a human.
 
 A reference that marks a workaround to remove when an issue closes is kept,
 written as `TODO(#N): ...`; that form is not flagged.
@@ -194,10 +196,22 @@ def lex(src: str) -> list[Seg]:
 SEP = object()
 
 
-def normalize(src: str) -> list[object]:
+def _line_starts(src: str) -> list[int]:
+    return [0] + [m.end() for m in re.finditer("\n", src)]
+
+
+def normalize(src: str, docs: bool = False) -> list[object]:
     """Token stream with plain `//` comments and whitespace runs collapsed
-    into one separator. Literals, doc and block comments stay verbatim."""
+    into one separator. Literals, doc and block comments stay verbatim.
+
+    With `docs`, doc-comment prose is dropped too, but fenced code inside a
+    doc comment (doctests) stays verbatim."""
     out: list[object] = []
+    frozen: set[int] = set()
+    starts: list[int] = []
+    if docs:
+        frozen = {c.line for c in line_comments(src, docs=True) if c.frozen}
+        starts = _line_starts(src)
 
     def sep() -> None:
         if out and out[-1] is not SEP:
@@ -205,7 +219,9 @@ def normalize(src: str) -> list[object]:
 
     for seg in lex(src):
         text = src[seg.start : seg.end]
-        if seg.kind == "line":
+        if seg.kind == "line" or (
+            docs and seg.kind == "doc" and bisect.bisect_right(starts, seg.start) - 1 not in frozen
+        ):
             sep()
         elif seg.kind == "code":
             for part in re.split(r"(\s+)", text):
@@ -234,10 +250,16 @@ class Comment:
     col: int  # column of the `//`
     text: str  # full comment text from `//` to end of line
     own_line: bool  # nothing but whitespace before it
+    prefix: str = "//"  # `//`, or `///` / `//!` for a doc comment
+    frozen: bool = False  # a doc-comment fence line or inside one: never edited
 
     @property
     def body(self) -> str:
-        return self.text[2:]
+        return self.text[len(self.prefix) :]
+
+    @property
+    def is_doc(self) -> bool:
+        return self.prefix != "//"
 
 
 @dataclass
@@ -249,22 +271,48 @@ class Block:
         return self.comments[0].own_line
 
     @property
+    def prefix(self) -> str:
+        return self.comments[0].prefix
+
+    @property
     def flagged(self) -> bool:
-        return any(is_flagged(c.body) for c in self.comments)
+        return any(not c.frozen and is_flagged(c.body) for c in self.comments)
 
 
-def line_comments(src: str) -> list[Comment]:
-    starts = [0]
-    for m in re.finditer("\n", src):
-        starts.append(m.end())
+FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+
+
+def _prefix(text: str) -> str:
+    if text.startswith("//!"):
+        return "//!"
+    if text.startswith("///") and not text.startswith("////"):
+        return "///"
+    return "//"
+
+
+def line_comments(src: str, docs: bool = False) -> list[Comment]:
+    """Plain `//` comments, plus `///` / `//!` doc comments when `docs`."""
+    starts = _line_starts(src)
     out = []
     for seg in lex(src):
-        if seg.kind != "line":
+        if not (seg.kind == "line" or (docs and seg.kind == "doc")):
             continue
         ln = bisect.bisect_right(starts, seg.start) - 1
         col = seg.start - starts[ln]
         own = src[starts[ln] : seg.start].strip() == ""
-        out.append(Comment(ln, col, src[seg.start : seg.end], own))
+        text = src[seg.start : seg.end]
+        out.append(Comment(ln, col, text, own, _prefix(text)))
+    in_fence, prev = False, None
+    for c in out:
+        if not c.is_doc:
+            continue
+        if prev is None or c.line != prev.line + 1 or c.prefix != prev.prefix:
+            in_fence = False
+        if FENCE_RE.match(c.body):
+            c.frozen, in_fence = True, not in_fence
+        else:
+            c.frozen = in_fence
+        prev = c
     return out
 
 
@@ -278,11 +326,62 @@ def blocks(comments: list[Comment]) -> list[Block]:
             and last.own_line
             and c.line == last.line + 1
             and c.col == last.col
+            and c.prefix == last.prefix
+            and c.frozen == last.frozen
         ):
             out[-1].comments.append(c)
         else:
             out.append(Block([c]))
     return out
+
+
+def _doc_runs(comments: list[Comment]) -> list[list[Comment]]:
+    """Maximal runs of own-line doc comments attached to one item."""
+    runs: list[list[Comment]] = []
+    for c in comments:
+        if not (c.is_doc and c.own_line):
+            continue
+        last = runs[-1][-1] if runs else None
+        if last is not None and c.line == last.line + 1 and c.prefix == last.prefix and c.col == last.col:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    return runs
+
+
+def settle_doc_edits(comments: list[Comment], edits: dict[int, list[str] | None]) -> None:
+    """Turn the edits that touch a doc-comment run into one edit of the whole
+    run, in place: tidy the blank doc lines a deletion leaves behind, and
+    drop the edits outright if they would leave the item with no docs at all
+    (that would trip `missing_docs` and lose the item's description)."""
+    for run in _doc_runs(comments):
+        if not any(c.line in edits for c in run):
+            continue
+        prefix = run[0].prefix
+
+        def blank(t: str) -> bool:
+            return t[len(prefix) :].strip() == ""
+
+        new: list[tuple[str, bool]] = []
+        for c in run:
+            if c.line in edits:
+                new += [(t, False) for t in edits[c.line] or []]
+            else:
+                new.append((c.text, c.frozen))
+        if all(blank(t) for t, _ in new):
+            for c in run:
+                edits.pop(c.line, None)
+            continue
+        tidy: list[tuple[str, bool]] = []
+        for t, frozen in new:
+            if not frozen and blank(t) and (not tidy or (blank(tidy[-1][0]) and not tidy[-1][1])):
+                continue
+            tidy.append((t, frozen))
+        while tidy and not tidy[-1][1] and blank(tidy[-1][0]):
+            tidy.pop()
+        edits[run[0].line] = [t for t, _ in tidy]
+        for c in run[1:]:
+            edits[c.line] = []
 
 
 def apply_edits(src: str, comments_by_line: dict[int, Comment], edits: dict[int, list[str] | None]) -> str:
@@ -364,26 +463,30 @@ def strip_body(body: str) -> str | None:
     return new
 
 
-def strip_file(src: str) -> tuple[str, int]:
-    comments = line_comments(src)
+def strip_file(src: str, docs: bool = False) -> tuple[str, int]:
+    comments = line_comments(src, docs)
     by_line = {c.line: c for c in comments}
     edits: dict[int, list[str] | None] = {}
     for c in comments:
+        if c.frozen:
+            continue
         new = strip_body(c.body)
         if new is None:
             edits[c.line] = []
         elif new != c.body:
-            edits[c.line] = ["//" + new.rstrip()]
+            edits[c.line] = [c.prefix + new.rstrip()]
+    changed = len(edits)
+    settle_doc_edits(comments, edits)
     if not edits:
         return src, 0
-    return apply_edits(src, by_line, edits), len(edits)
+    return apply_edits(src, by_line, edits), changed
 
 
 # ---------------------------------------------------------------------------
 # Model rewrite
 
 SYSTEM_PROMPT = """\
-You clean up `//` comments in Rust source. Policy: a comment describes the code as it is now.
+You clean up comments in Rust source. Policy: a comment describes the code as it is now.
 
 Remove history: issue or PR numbers (#123, repo#123), what the code used to do, what a review \
 or reviewer found, which fix introduced something, how a bug was discovered.
@@ -394,13 +497,17 @@ removes the history, and reflow only the lines you change.
 A reference may stay only when it marks a workaround that must be removed when that issue \
 closes; then write it as `// TODO(#N): <what to remove>`.
 
+Blocks marked DOC are `///` or `//!` doc comments, rendered as Markdown API documentation. \
+Their replacement lines keep the same prefix, keep intra-doc links such as [`Foo`] intact, and \
+still describe the item: replace rather than delete unless the whole block is history.
+
 You get numbered comment blocks, each shown with nearby code for context. For every block \
 answer one of:
   {"id": N, "action": "keep"}
   {"id": N, "action": "delete"}            (nothing present-tense is left)
   {"id": N, "action": "replace", "lines": ["// ...", "// ..."]}
-Replacement lines start with `// ` (never `///` or `//!`), carry no indentation and are no \
-longer than the block's longest original line. A block marked TRAILING sits after code on the same line: replace it with \
+Replacement lines start with the block's own prefix (`// `, or `/// ` / `//! ` for DOC \
+blocks), carry no indentation and are no longer than the block's longest original line. A block marked TRAILING sits after code on the same line: replace it with \
 exactly one line or delete it.
 
 Reply with only a JSON object: {"blocks": [ ... ]}"""
@@ -424,7 +531,7 @@ def build_prompt(src: str, flagged: list[Block], before: int = 3, after: int = 8
     for n, b in enumerate(flagged):
         first, last = b.comments[0].line, b.comments[-1].line
         lo, hi = max(0, first - before), min(len(lines), last + 1 + after)
-        tag = "" if b.own_line else " TRAILING"
+        tag = ("" if b.own_line else " TRAILING") + (f" DOC({b.prefix})" if b.prefix != "//" else "")
         ctx = []
         for i in range(lo, hi):
             marker = ">" if first <= i <= last else " "
@@ -466,22 +573,32 @@ def parse_answer(text: str) -> list[dict]:
     return json.loads(m.group(0))["blocks"]
 
 
-_VALID_LINE = re.compile(r"^//(?![/!])[^\n]*$")
+def valid_line(text: str, prefix: str) -> bool:
+    """A replacement line is one comment of exactly the block's kind."""
+    return "\n" not in text and _prefix(text) == prefix and text.startswith(prefix)
 
 
-def rewrite_source(src: str, answer_fn, chunk: int = 40) -> RewriteResult:
+def rewrite_source(src: str, answer_fn, chunk: int = 40, docs: bool = False) -> RewriteResult:
     """Rewrite flagged blocks in `src`. `answer_fn(prompt) -> (reply, cost)`."""
     res = RewriteResult(path="")
-    comments = line_comments(src)
+    comments = line_comments(src, docs)
     by_line = {c.line: c for c in comments}
     flagged = [b for b in blocks(comments) if b.flagged]
     res.blocks = len(flagged)
     edits: dict[int, list[str] | None] = {}
     for start in range(0, len(flagged), chunk):
         group = flagged[start : start + chunk]
-        reply, cost = answer_fn(build_prompt(src, group))
-        res.cost_usd += cost
-        for ans in parse_answer(reply):
+        prompt = build_prompt(src, group)
+        for attempt in (1, 2):  # a malformed JSON reply is usually a one-off
+            reply, cost = answer_fn(prompt)
+            res.cost_usd += cost
+            try:
+                answers = parse_answer(reply)
+                break
+            except (ValueError, KeyError) as e:
+                if attempt == 2:
+                    raise RuntimeError(f"unparseable model reply: {e}") from e
+        for ans in answers:
             try:
                 b = group[int(ans["id"])]
             except (KeyError, ValueError, IndexError, TypeError):
@@ -491,7 +608,7 @@ def rewrite_source(src: str, answer_fn, chunk: int = 40) -> RewriteResult:
             if action == "keep":
                 continue
             new = [] if action == "delete" else ans.get("lines")
-            if not isinstance(new, list) or not all(isinstance(t, str) and _VALID_LINE.match(t.rstrip()) for t in new):
+            if not isinstance(new, list) or not all(isinstance(t, str) and valid_line(t.rstrip(), b.prefix) for t in new):
                 res.rejected.append(f"line {b.comments[0].line + 1}: invalid replacement")
                 continue
             if not b.own_line and len(new) > 1:
@@ -510,9 +627,10 @@ def rewrite_source(src: str, answer_fn, chunk: int = 40) -> RewriteResult:
             edits[lines[0]] = new
             for ln in lines[1:]:
                 edits[ln] = []
+    settle_doc_edits(comments, edits)
     if edits:
         out = apply_edits(src, by_line, edits)
-        if normalize(out) != normalize(src):  # cannot happen if apply_edits is right; cheap guard
+        if normalize(out, docs) != normalize(src, docs):  # cannot happen if apply_edits is right; cheap guard
             raise RuntimeError("rewrite changed non-comment tokens")
         res.new_src = out
     return res
@@ -544,9 +662,9 @@ def cmd_scan(a) -> int:
     listing = []
     for f in rust_files(repo, a.paths, a.exclude):
         src = (repo / f).read_text(errors="replace")
-        cs = line_comments(src)
+        cs = line_comments(src, a.docs)
         for c in cs:
-            if is_flagged(c.body):
+            if not c.frozen and is_flagged(c.body):
                 counts[group_of(f, a.depth)] += 1
                 chars += len(c.text)
                 if a.list:
@@ -573,9 +691,9 @@ def cmd_strip(a) -> int:
     for f in rust_files(repo, a.paths, a.exclude):
         p = repo / f
         src = p.read_text()
-        new, n = strip_file(src)
+        new, n = strip_file(src, a.docs)
         if n:
-            if normalize(new) != normalize(src):
+            if normalize(new, a.docs) != normalize(src, a.docs):
                 print(f"BUG: strip changed code in {f}; left untouched", file=sys.stderr)
                 continue
             p.write_text(new)
@@ -590,7 +708,7 @@ def cmd_rewrite(a) -> int:
     todo = []
     for f in rust_files(repo, a.paths, a.exclude):
         src = (repo / f).read_text()
-        if any(b.flagged for b in blocks(line_comments(src))):
+        if any(b.flagged for b in blocks(line_comments(src, a.docs))):
             todo.append(f)
     if a.limit:
         todo = todo[: a.limit]
@@ -599,7 +717,7 @@ def cmd_rewrite(a) -> int:
     def work(f: str) -> RewriteResult:
         p = repo / f
         try:
-            r = rewrite_source(p.read_text(), lambda prompt: call_model(prompt, a.model))
+            r = rewrite_source(p.read_text(), lambda prompt: call_model(prompt, a.model), docs=a.docs)
         except Exception as e:  # noqa: BLE001 -- report and keep going
             r = RewriteResult(path=f, error=str(e))
         r.path = f
@@ -643,7 +761,7 @@ def cmd_verify(a) -> int:
         ).stdout
         new = (repo / path).read_text()
         checked += 1
-        if normalize(old) != normalize(new):
+        if normalize(old, a.docs) != normalize(new, a.docs):
             print(f"FAIL {path}: non-comment tokens changed")
             bad += 1
     print(f"verify: {checked} files compared, {bad} failures")
@@ -659,6 +777,10 @@ def main(argv: list[str] | None = None) -> int:
         if paths:
             p.add_argument("paths", nargs="*", help="limit to these paths (git pathspecs)")
         p.add_argument("--exclude", action="append", default=list(DEFAULT_EXCLUDES), help="glob to skip")
+        p.add_argument(
+            "--docs", action="store_true",
+            help="also handle `///` / `//!` doc comments (fenced doctest code is never touched)",
+        )
 
     p = sub.add_parser("scan")
     common(p)

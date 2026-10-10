@@ -233,3 +233,66 @@ def test_rewrite_applies_replace_delete_and_trailing():
 def test_rewrite_rejects_invalid_answers(answer):
     res = cc.rewrite_source(SRC, fake([answer]))
     assert res.rejected and res.new_src is None
+
+
+# --- doc comments (--docs) -------------------------------------------------
+
+DOC_SRC = (
+    "/// Draws the frame (#12).\n"
+    "///\n"
+    "/// see #34\n"
+    "///\n"
+    "/// ```\n"
+    "/// let x = 1; // (#56)\n"
+    "/// ```\n"
+    "pub fn draw() {}\n"
+)
+
+
+def test_doc_comments_untouched_without_docs_flag():
+    assert cc.strip_file(DOC_SRC) == (DOC_SRC, 0)
+
+
+def test_doc_strip_skips_fences_and_tidies_blank_doc_lines():
+    out, _ = cc.strip_file(DOC_SRC, docs=True)
+    assert out == (
+        "/// Draws the frame.\n"
+        "///\n"
+        "/// ```\n"
+        "/// let x = 1; // (#56)\n"
+        "/// ```\n"
+        "pub fn draw() {}\n"
+    )
+    assert cc.normalize(out, docs=True) == cc.normalize(DOC_SRC, docs=True)
+
+
+def test_doc_block_is_never_emptied():
+    src = "//! #12\nfn f() {}\n"
+    assert cc.strip_file(src, docs=True) == (src, 0)
+
+
+def test_verify_docs_still_pins_doctest_code():
+    changed = DOC_SRC.replace("let x = 1;", "let x = 2;")
+    assert cc.normalize(changed, docs=True) != cc.normalize(DOC_SRC, docs=True)
+    prose = DOC_SRC.replace("Draws the frame", "Paints the frame")
+    assert cc.normalize(prose, docs=True) == cc.normalize(DOC_SRC, docs=True)
+    assert cc.normalize(prose) != cc.normalize(DOC_SRC)
+
+
+def test_doc_rewrite_requires_the_blocks_own_prefix():
+    src = "/// Frame drawer; used to flicker.\npub fn draw() {}\n"
+
+    def answer(lines):
+        return lambda prompt: (json.dumps({"blocks": [{"id": 0, "action": "replace", "lines": lines}]}), 0.0)
+
+    assert "DOC(///)" in cc.build_prompt(src, [b for b in cc.blocks(cc.line_comments(src, True)) if b.flagged])
+    bad = cc.rewrite_source(src, answer(["// Frame drawer."]), docs=True)
+    assert bad.rejected and bad.new_src is None
+    good = cc.rewrite_source(src, answer(["/// Frame drawer."]), docs=True)
+    assert good.new_src == "/// Frame drawer.\npub fn draw() {}\n"
+
+
+def test_rewrite_retries_one_malformed_reply():
+    replies = iter(["{not json", json.dumps({"blocks": [{"id": 0, "action": "delete"}]})])
+    res = cc.rewrite_source("fn f() {\n    // #12 thing\n    g();\n}\n", lambda p: (next(replies), 0.0))
+    assert res.new_src == "fn f() {\n    g();\n}\n"
