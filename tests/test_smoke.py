@@ -4471,6 +4471,67 @@ def test_dispatch_pending_smoke_calls_dispatch_smoke_for_eligible_rows(
     assert result == [sentinel]
 
 
+def test_infra_reclassified_row_is_actually_picked_up_by_the_dispatcher(
+    gtk_and_server_config: Config, monkeypatch, coord_db,
+) -> None:
+    """#3670 review: "cleared for automatic re-dispatch" must be confirmed
+    by an OBSERVATION of the dispatcher (#2096's "a gate must be able to
+    fail" rule, in reverse — a clear must be able to actually redispatch),
+    never just inferred from the `test_state` column reading `None`.
+
+    Chains the real write path end to end: `record_test_verdict` reclassifies
+    a `test_state="failed"` write carrying an infra signature down to
+    `test_state=None` (`coord.state._reclassify_infra_test_failure`), and
+    THIS test confirms `dispatch_pending_smoke` actually treats the
+    resulting row as eligible and calls through to the dispatcher — not a
+    second, independent assertion on the DB column that could silently
+    diverge from what the dispatcher itself checks.
+    """
+    from unittest.mock import patch as _patch
+
+    from coord.models import Assignment  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        load_assignment_test_reason,
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    work = Assignment(
+        assignment_id="abc123", machine_name="server", repo_name="api",
+        issue_number=287, issue_title="GTK key routing fix", type="work",
+        status="done", branch="issue-1-fix", dispatched_at=0.0, finished_at=1.0,
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    record_test_verdict(
+        assignment_id="abc123",
+        test_state="failed",
+        test_reason="runner was killed before it could report",
+    )
+    # The reclassify already landed (covered on its own in
+    # tests/test_state.py) — re-read it off the DB so this test's board
+    # snapshot reflects exactly what a real reconcile tick would see.
+    assert load_assignment_test_state("abc123") is None
+    eligible = replace(
+        _completed(),
+        test_state=None,
+        test_reason=load_assignment_test_reason("abc123"),
+    )
+    board = Board(completed=[eligible])
+    sentinel = object()
+    with _patch(
+        "coord.smoke._dispatch_smoke_legs", return_value=[sentinel],
+    ) as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert mock_dispatch.called
+    assert mock_dispatch.call_args[0][0] is eligible
+    assert result == [sentinel]
+
+
 # ── #3309: dispatch_pending_smoke skips on verdict PRESENCE, the merge gate
 # blocks on FRESHNESS — a rebase (moved base) makes a recorded `passed`
 # verdict #1479-stale, and without a re-dispatch here nothing ever produces a

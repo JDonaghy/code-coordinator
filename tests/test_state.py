@@ -3083,6 +3083,178 @@ class TestRecordTestVerdictInfraReclassification:
         assert rows[0]["assignment_id"] == "aid-1"
         assert rows[0]["type"] == "work"
 
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            # KIND_NETWORK — a genuine test asserting on a named transport
+            # token, or a parametrised pytest id carrying one.
+            "pytest: 2 failed — AssertionError: Connection error raised "
+            "unexpectedly by retry()",
+            "FAILED test_named_transport_tokens[ECONNRESET] - "
+            "AssertionError: expected retry, got raise",
+            "fetch failed: AssertionError in test_http_client_retries",
+            # KIND_API_ERROR — a worker legitimately reporting the status
+            # its own test expected vs. got.
+            "AssertionError: expected an api_error response body, got a "
+            "plain 200",
+            "FAILED test_provider_error_mapping - AssertionError: expected "
+            "rate_limit_error, got overloaded_error",
+        ],
+    )
+    def test_non_infra_environmental_signals_are_not_reclassified(
+        self, coord_db, reason,
+    ) -> None:
+        """#3670 review (blocking): the reclassifier must gate on
+        `KIND_INFRA` specifically, never the broader `is_environmental` —
+        `test_reason` here is frequently the WORKER's own `SMOKE: fail ...`
+        summary (`coord.notify`'s `test_reason=f"headless smoke:
+        {verdict.reason}"`), so a genuine failing suite whose summary
+        happens to contain a network/API wire token must still land
+        `test_state="failed"` and stay reachable from `coord fix` — never
+        silently erased into an unbounded retry loop."""
+        self._seed_assignment(coord_db)
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="failed", test_reason=reason,
+        )
+
+        row = coord_db.execute(
+            "SELECT test_state, test_reason, smoke_test FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_state"] == "failed"
+        assert row["smoke_test"] == "fail"
+        assert row["test_reason"] == reason
+
+    def test_stale_smoke_test_mirror_is_cleared_on_infra_reclassification(
+        self, coord_db,
+    ) -> None:
+        """#3670 review (nit): a row that already carries `smoke_test='fail'`
+        from an EARLIER genuine failure must not keep it once this leg's
+        own failure is reclassified away from `"failed"` — `coord fix`
+        gates on `smoke_test == "fail"`, so a stale mirror left in place
+        would still drive the very fix round this reclassification exists
+        to avoid."""
+        self._seed_assignment(coord_db)
+
+        # A genuine failure first — stamps the legacy mirror.
+        record_test_verdict(
+            assignment_id="aid-1", test_state="failed",
+            test_reason="FAILED test_widget.py::test_x - AssertionError",
+        )
+        row = coord_db.execute(
+            "SELECT smoke_test FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["smoke_test"] == "fail"
+
+        # A later leg dies with an infra signature — must clear BOTH the
+        # canonical test_state and the legacy smoke_test mirror.
+        record_test_verdict(
+            assignment_id="aid-1", test_state="failed",
+            test_reason="no exit status was produced",
+        )
+        row = coord_db.execute(
+            "SELECT test_state, smoke_test FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_state"] is None
+        assert row["smoke_test"] is None
+
+    def test_fanout_parent_manifest_survives_an_infra_clear(self, coord_db) -> None:
+        """#3670 review (blocking): the #3182 fan-out PARENT's own write
+        (`coord.smoke.finalize_smoke_fanout` stamping the `[[smoke-fanout:
+        ...]]` manifest in front of the aggregate verdict) must not be
+        replaced wholesale by an infra clear — `_parse_fanout_manifest`/
+        `finalize_smoke_fanout` need that manifest to find every sibling
+        leg on a LATER re-stamp of this same round."""
+        from coord.smoke import _encode_fanout_manifest, _parse_fanout_manifest
+
+        self._seed_assignment(coord_db)
+        manifest = _encode_fanout_manifest(
+            [
+                ("leg-macos", ("macos",), "make smoke"),
+                ("leg-gtk", ("gtk", "windows"), "make smoke"),
+            ]
+        )
+        record_test_verdict(
+            assignment_id="aid-1",
+            test_state="failed",
+            test_reason=(
+                f"{manifest}\nTest stage failed (#3182): capability set "
+                "[macos] failed — runner was killed before it could report."
+            ),
+        )
+
+        row = coord_db.execute(
+            "SELECT test_state, test_reason FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_state"] is None
+        legs = _parse_fanout_manifest(row["test_reason"])
+        assert legs is not None
+        assert {leg_id for leg_id, _caps, _cmd in legs} == {"leg-macos", "leg-gtk"}
+
+    def test_fanout_parent_infra_clear_releases_every_leg_smoke_claim(
+        self, coord_db,
+    ) -> None:
+        """#3670 review (blocking): any writer that clears a fan-out
+        parent's `test_state`/`test_reason` must also release the
+        per-partition `smoke_claims` it names (mirrors
+        `reset_work_test_state`, #3333) — otherwise `claim_smoke_dispatch`
+        refuses the very next dispatch attempt for that partition even
+        though the row now reads as "cleared for automatic re-dispatch"."""
+        from coord.smoke import _encode_fanout_manifest
+
+        self._seed_assignment(coord_db)
+        manifest = _encode_fanout_manifest(
+            [
+                ("leg-macos", ("macos",), "make smoke"),
+                ("leg-gtk", ("gtk", "windows"), "make smoke"),
+            ]
+        )
+        assert state.claim_smoke_dispatch("aid-1", "macos") is True
+        assert state.claim_smoke_dispatch("aid-1", "gtk+windows") is True
+
+        record_test_verdict(
+            assignment_id="aid-1",
+            test_state="failed",
+            test_reason=(
+                f"{manifest}\nTest stage failed (#3182): capability set "
+                "[macos] failed — runner was killed before it could report."
+            ),
+        )
+
+        # Both partitions reclaimable — a fresh fan-out dispatch for this
+        # round is never blocked by a claim the infra clear just orphaned.
+        assert state.claim_smoke_dispatch("aid-1", "macos") is True
+        assert state.claim_smoke_dispatch("aid-1", "gtk+windows") is True
+
+    def test_mute_leg_tally_carries_forward_across_an_infra_clear(
+        self, coord_db,
+    ) -> None:
+        """#3670 review: an infra clear must carry the #2272 mute-leg tally
+        forward exactly like every OTHER environmental clear
+        (`coord.reconcile.propagate_smoke_terminal_failure`'s single-leg
+        branch) — dropping it would silently hand the row a fresh mute-leg
+        budget every time an infra death interleaves with a mute leg."""
+        from coord.smoke import mute_smoke_tally
+
+        self._seed_assignment(coord_db)
+        record_test_verdict(
+            assignment_id="aid-1", test_state="running",
+            test_reason=f"{mute_smoke_tally(1)} — Test stage running.",
+        )
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="failed",
+            test_reason="no exit status was produced",
+        )
+
+        row = coord_db.execute(
+            "SELECT test_reason FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert mute_smoke_tally(1) in row["test_reason"]
+
 
 class TestRecordTestVerdictBaselineRedStreak:
     """#3386 (item 3 of #3378): `_record_test_verdict_local` is the single

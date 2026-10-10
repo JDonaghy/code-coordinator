@@ -2767,20 +2767,36 @@ def _safe_remove_worktree(
 
 
 def _worktree_assignment_is_live(
-    assignment_id: str, assignments: "dict[str, AgentAssignment] | None"
+    assignment_id: str,
+    assignments: "dict[str, AgentAssignment] | None",
+    protect_set: "set[str] | None" = None,
 ) -> bool:
     """True when *assignment_id*'s worktree is still genuinely in use (#3670).
 
     The single "is this worktree still live" answer shared by
     :meth:`AgentServer.clean_worktrees` and :func:`_free_branch_in_worktrees`
-    — the same two signals, asked the same way, so the two callers can never
-    disagree about what "live" means:
+    — the same three signals, asked the same way, so the two callers can
+    never disagree about what "live" means (#3670 review: ``clean_worktrees``
+    used to inline its own copy of the first two checks rather than call
+    this helper, which is exactly the "two independent implementations of
+    the same question" split-brain #2085 warns about — it now calls through
+    here too):
 
     - the in-memory :class:`AgentAssignment` status (``RUNNING``/``PENDING``,
-      keyed by *assignments* — a ``dict(self._assignments)`` snapshot).
+      keyed by *assignments* — a ``dict(self._assignments)`` snapshot) —
+      checked first, since it is a plain dict lookup.
+    - *protect_set* (#1295): an optional coordinator-supplied snapshot of
+      every board-non-terminal assignment id, for a caller (``clean_worktrees``)
+      that has one — the agent may have restarted and lost its in-memory
+      ``_assignments`` record for a worker whose interactive session is
+      still up, so the board's own view is a second, independent signal.
+      ``None`` (the default — every caller without a board snapshot, e.g.
+      :func:`_free_branch_in_worktrees`'s interactive-launcher call site)
+      simply skips this check rather than treating it as "not protected".
     - the ``coord-<assignment_id>`` tmux session liveness probe
       (:meth:`AgentServer._tmux_session_alive`), since an interactive pane
-      can outlive its assignment record.
+      can outlive its assignment record — checked last, since it is the one
+      signal that shells out.
 
     Before this existed, :func:`_free_branch_in_worktrees` force-removed ANY
     worktree holding the branch it wanted to evict with NO liveness check at
@@ -2794,6 +2810,8 @@ def _worktree_assignment_is_live(
     """
     a = (assignments or {}).get(assignment_id)
     if a is not None and a.status in (RUNNING, PENDING):
+        return True
+    if protect_set and assignment_id in protect_set:
         return True
     return AgentServer._tmux_session_alive(assignment_id)
 
@@ -7729,31 +7747,19 @@ class AgentServer:
             assignment_id = entry.name
             a = assignments.get(assignment_id)
 
-            # #1295: coordinator-supplied second-tier guard.  Any
-            # assignment id the board considers non-terminal is off-limits
-            # regardless of what the local assignments dict says — the
-            # agent may have restarted and lost its in-memory record for a
-            # worker whose interactive session is still up.
-            if assignment_id in protect_set:
-                kept += 1
-                continue
-
-            # #1295: agent-local live-session guard.  If a tmux session
-            # named `coord-<assignment_id>` exists on this host, someone
-            # is (still) interactively using this worktree — an operator
-            # in a Test/Review/Merge/Work pane whose session outlived the
-            # dispatch subprocess.  The tmux probe is ground truth and
-            # cheap; consult it BEFORE any other decision so a stale
-            # `finished_at`/absent record can't sweep out a live pane.
-            # Failures inside `_tmux_session_alive` (tmux not installed,
-            # server not running, subprocess/OS errors) collapse to
-            # False so the check never raises out of this loop.
-            if self._tmux_session_alive(assignment_id):
-                kept += 1
-                continue
-
-            # Never touch worktrees for running/pending assignments.
-            if a is not None and a.status in (RUNNING, PENDING):
+            # #3670 review: one shared "is this worktree still live"
+            # question (`_worktree_assignment_is_live`), also asked by
+            # `_free_branch_in_worktrees` — checks, in cheapest-first
+            # order: the in-memory RUNNING/PENDING status, the
+            # coordinator-supplied `protect_set` (#1295 second-tier guard —
+            # the agent may have restarted and lost its in-memory record
+            # for a worker whose interactive session is still up), and
+            # finally the `coord-<assignment_id>` tmux session probe (#1295
+            # agent-local live-session guard — an operator's pane can
+            # outlive its assignment record; `_tmux_session_alive` failures
+            # collapse to False so the check never raises out of this
+            # loop).
+            if _worktree_assignment_is_live(assignment_id, assignments, protect_set):
                 kept += 1
                 continue
 

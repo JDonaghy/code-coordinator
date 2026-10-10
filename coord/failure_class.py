@@ -255,11 +255,25 @@ _NETWORK_RE = re.compile(
 # words like "worktree" or "killed" alone, which a genuine failing test's
 # own summary could legitimately contain (e.g. a test asserting a worktree
 # cleanup path).
+#
+# #3670 review: the ONE phrasing a production writer actually emits today is
+# the canned verdict `coord.smoke.SMOKE_SYSTEM_PROMPT`/`build_smoke_briefing`
+# (search "never returned an exit status") instructs a Test-stage worker to
+# print verbatim when it genuinely cannot obtain an exit status before
+# running out of room: `` SMOKE: fail <the smoke command never returned an
+# exit status within this session> ``. `coord.notify._record_smoke_verdict`'s
+# `fail`-verdict branch ("headless smoke: {verdict.reason}") carries that
+# text straight into `failure_reason`/`test_reason` verbatim — so
+# `never\s+returned\s+an\s+exit\s+status` is the pattern that actually fires
+# in the field; the other phrasings below are kept for a human operator
+# typing a `coord test --fail`/`coord diagnose` reason in the same register,
+# but none of them is (yet) machine-emitted.
 _INFRA_RE = re.compile(
     r"("
     r"worktree\s+\S+\s+was\s+deleted\s+out\s+from\s+under"
     r"|deleted\s+out\s+from\s+under\s+the\s+running\s+\S+\s*(?:suite|run)?"
     r"|no\s+exit\s+status\s+(?:was\s+)?produced"
+    r"|never\s+returned\s+an\s+exit\s+status"
     r"|runner\s+(?:was\s+)?killed\s+before\s+it\s+could\s+report"
     r"|infra\s+issue,?\s+not\s+a\s+test\s+result"
     r")",

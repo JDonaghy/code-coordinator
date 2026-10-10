@@ -1379,6 +1379,50 @@ def test_clean_worktrees_skips_symlinks(tmp_path: Path) -> None:
     assert (target / "precious.txt").read_text() == "do not delete"
 
 
+# ── #3670 review: _worktree_assignment_is_live is the ONE shared answer ─────
+
+
+def test_worktree_assignment_is_live_checks_status_then_protect_then_tmux(
+    monkeypatch,
+) -> None:
+    """#3670 review: `clean_worktrees` used to inline its own copy of the
+    protect-set and tmux checks instead of calling
+    `_worktree_assignment_is_live` — two independent implementations of the
+    same question that could silently disagree (#2085). Now both
+    `clean_worktrees` and `_free_branch_in_worktrees` go through this one
+    function, with all three signals it actually understands: in-memory
+    RUNNING/PENDING status, the coordinator-supplied `protect_set`, and the
+    tmux session probe."""
+    from coord.agent import AgentAssignment, _worktree_assignment_is_live
+
+    tmux_calls: list[str] = []
+    monkeypatch.setattr(
+        AgentServer, "_tmux_session_alive",
+        staticmethod(lambda aid: tmux_calls.append(aid) or False),
+    )
+
+    # No assignment record, no protect_set entry, no tmux session: not live.
+    assert _worktree_assignment_is_live("ghost", None) is False
+
+    # In-memory RUNNING status alone is enough — and is checked first, so a
+    # cheap dict lookup never falls through to a tmux probe. `_spec` never
+    # touches the filesystem, so an arbitrary path is fine here.
+    tmux_calls.clear()
+    running = AgentAssignment(
+        id="r1", spec=_spec(Path("/nonexistent/repo"), branch="b"), status=RUNNING,
+    )
+    assert _worktree_assignment_is_live("r1", {"r1": running}) is True
+    assert tmux_calls == []
+
+    # protect_set alone (no assignment record at all) is enough.
+    assert _worktree_assignment_is_live("p1", None, {"p1"}) is True
+
+    # Neither status nor protect_set — falls through to the tmux probe.
+    tmux_calls.clear()
+    assert _worktree_assignment_is_live("t1", None, {"other"}) is False
+    assert tmux_calls == ["t1"]
+
+
 # ── #3670: _free_branch_in_worktrees must never evict a LIVE worktree ───────
 
 
