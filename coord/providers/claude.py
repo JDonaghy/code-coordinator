@@ -120,6 +120,7 @@ class ClaudeProvider(Provider):
             REFINEMENT_SYSTEM_PROMPT,
             REVIEW_DENY_COMMANDS,
             TEST_CHAT_SYSTEM_PROMPT,
+            WORK_AUTOCOMPACT_TOKENS,
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
             _claude_md_system_prompt_suffix,
@@ -141,6 +142,11 @@ class ClaudeProvider(Provider):
             effective_model = spec.model
         else:
             effective_model = self._model
+
+        # #3672: set only by the catch-all `else` branch below — keep in
+        # sync with default_worker_command's identical `autocompact_tokens`
+        # local.
+        autocompact_tokens: str | None = None
 
         # Compute system_prompt / allowed_tools from spec.type when not
         # provided — direct transcription of default_worker_command's logic.
@@ -246,6 +252,9 @@ class ClaudeProvider(Provider):
                 # backgrounded long-running command. #2301: this grant is for
                 # work-shaped legs only — smoke has its own branch above.
                 _at = "Read,Edit,Write,Bash,Monitor"
+                # #3672: keep in sync with default_worker_command's identical
+                # branch — force earlier auto-compaction for work-shaped legs.
+                autocompact_tokens = WORK_AUTOCOMPACT_TOKENS
 
             if system_prompt is None:
                 system_prompt = _sp
@@ -287,6 +296,8 @@ class ClaudeProvider(Provider):
         ]
         if effective_model:
             argv.extend(["--model", effective_model])
+        if autocompact_tokens:
+            argv.extend(["--autocompact", autocompact_tokens])
         # #3420 / #1315 / #1642 / #2461: NOT transcribed from
         # default_worker_command like the branches above — both builders call
         # the one shared `worker_disallowed_tools`, so a new deny layer lands

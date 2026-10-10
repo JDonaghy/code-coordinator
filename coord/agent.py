@@ -1839,6 +1839,17 @@ def _worker_subprocess_env(
     if assignment_id is not None:
         env["COORD_ASSIGNMENT_ID"] = assignment_id
 
+    # #3672: raise claude -p's own *default* Bash-tool timeout (120s out of
+    # the box) to match the 600s *ceiling* this harness already documents to
+    # every worker — quadraui#1321's 5 longest waits were exactly 120s each,
+    # on `cargo test --features ... --lib`, because the worker never passed
+    # an explicit `timeout` and the CLI's built-in default killed/retried it
+    # first. `setdefault` so an operator who has already set either in their
+    # own shell env keeps their value; this only fills the gap for a fleet
+    # that never set either.
+    env.setdefault("BASH_DEFAULT_TIMEOUT_MS", WORKER_BASH_TIMEOUT_MS)
+    env.setdefault("BASH_MAX_TIMEOUT_MS", WORKER_BASH_TIMEOUT_MS)
+
     # #3371 Part A: adopt this host's long-lived, SUBSCRIPTION-backed
     # `claude setup-token` credential when the operator has minted one.
     # This is the only place a headless worker's environment is built, so
@@ -3797,7 +3808,52 @@ class AgentAssignment:
         return d
 
 
-WORKER_SYSTEM_PROMPT = """\
+# #3672: a 7-day cost analysis found 65% of fleet spend is cache-read
+# tokens, driven by work legs that run 200-450 turns with ZERO
+# `compact_boundary` events (no auto-compaction ever fired) — context grows
+# ~20K -> 425K tokens over a leg, so cost grows roughly quadratically with
+# turn count (300+-turn legs were 31% of all work spend at a $10.36 mean,
+# vs. $1.07 under 100 turns). Two independent levers:
+#
+# `WORK_TURN_CEILING` is the turn count at which `WORKER_SYSTEM_PROMPT`
+# (below) tells a work-shaped worker to stop expanding scope and checkpoint
+# instead — commit + push what's done and hand off with a `CONTINUATION:`
+# marker rather than claim completion. This is advisory (there is no CLI
+# flag that forcibly truncates a `claude -p` session at a turn count), so
+# the number only has to be "early enough to matter" — it is read by
+# `coord.drive.is_turn_ceiling_continuation` too, which is why it lives
+# here rather than inline in the prompt string: both call sites import this
+# one constant instead of agreeing on a magic number independently.
+WORK_TURN_CEILING = 150
+
+# `--autocompact <tokens>` (100k-1M, or "auto") forces claude's OWN
+# auto-compaction to trigger earlier than its default — the direct fix for
+# "zero compact_boundary events in any local log" above. Scoped to
+# work-shaped legs only (`default_worker_command`'s catch-all `else`
+# branch) since those are the only legs the cost analysis found running
+# long enough for this to matter; chat/review/smoke legs are short-lived
+# and unaffected either way.
+WORK_AUTOCOMPACT_TOKENS = "100000"
+
+# `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` (claude -p env vars, not
+# CLI flags) — see `_worker_subprocess_env`. #3672: quadraui#1321's 5
+# longest waits were exactly 120s each, on `cargo test --features ...
+# --lib` — the CLI's own *default* Bash-tool timeout (120s) when a worker
+# forgets to pass an explicit `timeout`, not this harness's documented
+# 600000ms *ceiling*. Raising the default to match the ceiling means a
+# worker that never thought to ask for more no longer retries/polls a
+# cargo build that was always going to take longer than 120s.
+WORKER_BASH_TIMEOUT_MS = "600000"
+
+# #3672: the marker a work-shaped worker emits (inside its own `### Summary`
+# block — the existing #874 `completion_summary` convention, see
+# `coord.progress.parse_completion_summary_from_log`) when it stops at the
+# turn ceiling with a clean checkpoint instead of claiming the issue is
+# fully done. `coord.drive.parse_continuation_marker` extracts the handoff
+# text that follows it on the same line.
+WORKER_CONTINUATION_MARKER = "CONTINUATION:"
+
+WORKER_SYSTEM_PROMPT = f"""\
 You are a Claude Code worker executing an assignment from the coordinator.
 
 Rules:
@@ -3848,6 +3904,20 @@ better than a perfect uncommitted diff, which is worth nothing.
 - Your final message is the LAST thing you will ever say. Never end it with \
 "I'll continue", "waiting for X", or "will follow up" — finish or report \
 the blocker.
+- This leg is bounded at roughly {WORK_TURN_CEILING} turns (#3672). That is \
+not a hard cutoff you'll be killed at — it's a point past which continuing \
+to expand scope gets expensive (cache-read cost grows with context size, \
+and context only grows across turns). If you're approaching it with real \
+work left, don't rush or skip verification to "finish" in time: commit and \
+push whatever is genuinely done, then end your final message with a \
+"### Summary" heading containing a line starting \
+`{WORKER_CONTINUATION_MARKER}` and a one-sentence handoff of what remains, \
+e.g. `{WORKER_CONTINUATION_MARKER} tests pass; still need to wire the new \
+flag into the CLI parser.` The coordinator reads that as a checkpoint and \
+dispatches a fresh leg to continue — it is a resume, not a failure, and \
+does not spend a fix round. Do NOT emit this marker on a leg that is \
+actually finished — only when you are stopping with real work still \
+outstanding.
 
 Before writing any code, verify the feature or fix isn't already implemented. \
 Grep for relevant function names, check existing modules, and read related files. \
@@ -3886,6 +3956,13 @@ worker's own partial run (#2169). Find the test file(s)/module(s) whose \
 name or path mirrors what you changed (e.g. `tests/test_<module>.py` for \
 `coord/<module>.py`, the crate-local `#[cfg(test)]` block for a Rust file) \
 and run just those — confirm they pass before declaring done.
+- For a Rust crate, scope even further than the module: run \
+`cargo test -p <crate> <filter>` (a narrow package + name filter), not a \
+whole-feature `cargo test --features ... --lib` sweep. The latter is what \
+timed out at exactly 120s repeatedly in quadraui#1321 — this Bash tool's \
+default timeout is now raised, but a whole-crate `--lib` run still burns \
+several minutes and several retries for signal a one-test `-p`/filter run \
+gives you in seconds.
 - Exception: if this assignment IS an oracle-loop acceptance round (you \
 were told to run `coord acceptance run --issue N`), keep running that \
 sealed slice as many times as it takes to go green. It is the loop's \
@@ -5611,7 +5688,15 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     one-shot ``claude -p`` session, and ``Monitor`` ends the turn to await a
     notification that can never arrive in time to resume it, which silently
     kills a backgrounded smoke suite mid-run and leaves no verdict printed.
+
+    #3672: ``autocompact_tokens`` is set (to :data:`WORK_AUTOCOMPACT_TOKENS`)
+    only by the catch-all ``else`` branch below (work/fix/conflict-fix/
+    test-author — the same "work-shaped" set :func:`coord.review.
+    read_repo_claude_md`'s docstring names) and threaded into ``--autocompact``
+    at the bottom. Every other branch leaves it ``None``, so a plan/chat/
+    smoke/review leg's argv is byte-for-byte unchanged.
     """
+    autocompact_tokens: str | None = None
     if spec.type == "plan":
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
         # `--setting-sources user` (below) drops CLAUDE.md auto-discovery; a
@@ -5780,6 +5865,13 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # the dedicated `elif spec.type == "smoke"` branch above, which
         # deliberately withholds it instead.
         allowed_tools = "Read,Edit,Write,Bash,Monitor"
+        # #3672: force earlier auto-compaction for work-shaped legs — see
+        # `WORK_AUTOCOMPACT_TOKENS`'s docstring. These are exactly the legs
+        # the cost analysis found running 200-450 turns with zero
+        # `compact_boundary` events; the lower threshold here is what makes
+        # at least one fire before context reaches the 425K-token range
+        # that analysis measured.
+        autocompact_tokens = WORK_AUTOCOMPACT_TOKENS
 
     # NOTE: briefing is NOT passed as a positional arg — it is written to
     # stdin as the first stream-json user message by ``_spawn``.
@@ -5877,6 +5969,8 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     ]
     if spec.model:
         argv.extend(["--model", spec.model])
+    if autocompact_tokens:
+        argv.extend(["--autocompact", autocompact_tokens])
     # #3420 / #1315 / #1642 / #2461: all four --disallowedTools layers live
     # in worker_disallowed_tools, shared with ClaudeProvider.build_command so
     # the two argv builders cannot drift apart (see that function's docstring).

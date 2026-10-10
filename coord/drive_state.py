@@ -154,6 +154,15 @@ class IssueState:
     # `_die()` — an explicit, auditable human claim, never inferred.
     work_premise_rechecked_at: float | None = None
     work_premise_rechecked_reason: str = ""
+    # #3672: the work row's self-reported ``### Summary`` block (the #874
+    # convention — see ``coord.progress.parse_completion_summary_from_log``),
+    # when one was captured. ``decide()``'s ``is_turn_ceiling_continuation``
+    # scans this for the ``CONTINUATION:`` marker
+    # (``coord.agent.WORKER_CONTINUATION_MARKER``) a worker emits when it
+    # checkpoints at the turn ceiling instead of claiming the issue is
+    # fully done — ``""``/``None`` (the overwhelming majority: no marker,
+    # or no summary captured at all) never matches.
+    work_completion_summary: str | None = None
 
     review_aid: str = ""
     review_status: str = ""
@@ -550,6 +559,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_finished_at=work_finished_at,
         work_premise_rechecked_at=work_premise_rechecked_at,
         work_premise_rechecked_reason=g(work, "premise_rechecked_reason"),
+        work_completion_summary=g(work, "completion_summary", None),
         review_aid=g(review, "assignment_id"),
         review_status=g(review, "status"),
         review_verdict=g(review, "review_verdict"),
