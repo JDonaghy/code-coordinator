@@ -1464,31 +1464,66 @@ def _reclassify_infra_test_failure(
     produced) was recorded as a plain ``"failed"``, which then spent a
     real ``coord fix`` round on code that was never actually tested.
 
+    #3670 review: gates on :data:`coord.failure_class.KIND_INFRA`
+    specifically — never the broader ``classification.is_environmental``.
+    ``test_reason`` here is frequently a WORKER's own ``SMOKE: fail ...``
+    summary (``coord.notify``'s ``test_reason=f"headless smoke:
+    {verdict.reason}"``), not coordinator-authored prose, so a genuine
+    failing suite whose summary happens to contain a wire token
+    (``Connection error``, ``ECONNRESET``, ``api_error``, even a
+    parametrised pytest id like ``test_named_transport_tokens[ECONNRESET]``)
+    would otherwise be read as ``KIND_USAGE_LIMIT``/``KIND_API_ERROR``/
+    ``KIND_NETWORK`` and have its ``failed`` verdict silently erased
+    forever — the exact worker-prose trap
+    :func:`coord.failure_class.classify_failure`'s own module docstring
+    warns against. The infra sub-kind alone is the coordinator's OWN
+    diagnosis of a lost Test-stage leg (a worktree deleted mid-run, a
+    runner killed before it could report), never a worker's test-output
+    prose, so it alone is safe to scan unconditionally here.
+
     Bounded by the SAME :data:`coord.smoke.ENVIRONMENTAL_SMOKE_RETRY_BUDGET`
     :func:`coord.reconcile.propagate_smoke_terminal_failure` already
     enforces for every other environmental Test-stage death (#3315) — never
     a second, unbounded retry path. The tally is read back out of the row's
     OWN current ``test_reason`` (the one field that survives from leg to
-    leg), exactly mirroring that function's non-fan-out branch, so the two
-    call sites can never silently diverge on how many consecutive
-    environmental deaths a row has actually seen.
+    leg), exactly mirroring that function's non-fan-out branch, including
+    carrying the #2272 mute-leg tally forward (:func:`coord.smoke.
+    mute_smoke_legs`/``mute_smoke_tally``) so a row that alternates "mute
+    leg" / "infra death" keeps counting against both budgets instead of
+    resetting one every time the other fires.
+
+    #3670 review: when *test_reason* is the #3182 fan-out PARENT's own
+    write (:func:`coord.smoke.finalize_smoke_fanout` stamping the aggregate
+    verdict, carrying the ``[[smoke-fanout:...]]`` manifest at the front),
+    the manifest is preserved — never replaced wholesale — so
+    :func:`coord.smoke._parse_fanout_manifest`/``finalize_smoke_fanout``
+    can still find every sibling leg on a LATER re-stamp, and every named
+    leg's :func:`claim_smoke_dispatch` claim is released right here
+    (mirroring :func:`reset_work_test_state`, #3333) so the row this clears
+    "for automatic re-dispatch" can actually BE re-dispatched instead of
+    every claimed partition refusing the next attempt and the row stranding
+    permanently.
 
     Returns the ``(test_state, test_reason, smoke_test, smoke_test_reason)``
     tuple the caller should actually write — unchanged (``"failed"``,
-    original *test_reason*, ...) when *test_reason* carries no
-    environmental signal at all, including a genuine test failure's own
-    summary or no reason whatsoever.
+    original *test_reason*, ...) when *test_reason* carries no infra
+    signal at all, including a genuine test failure's own summary, a
+    usage-limit/API/network signal, or no reason whatsoever.
     """
-    from coord.failure_class import classify_failure  # noqa: PLC0415
+    from coord.failure_class import KIND_INFRA, classify_failure  # noqa: PLC0415
     from coord.smoke import (  # noqa: PLC0415
         ENVIRONMENTAL_SMOKE_RETRY_BUDGET,
         TEST_STATE_BLOCKED,
+        _encode_fanout_manifest,
+        _parse_fanout_manifest,
         environmental_smoke_legs,
         environmental_smoke_tally,
+        mute_smoke_legs,
+        mute_smoke_tally,
     )
 
     classification = classify_failure(failure_reason=test_reason)
-    if not classification.is_environmental:
+    if classification.kind != KIND_INFRA:
         return "failed", test_reason, smoke_test, smoke_test_reason
 
     row = sql.execute(
@@ -1496,19 +1531,56 @@ def _reclassify_infra_test_failure(
         (assignment_id,),
     ).fetchone()
     previous_reason = row["test_reason"] if row is not None else None
-    env_legs = environmental_smoke_legs(previous_reason) + 1
     cause = classification.reason
     original = test_reason or "<no reason recorded>"
+
+    # #3670 review: log loudly whenever a `"failed"` write actually gets
+    # rewritten here — including the case where the caller was a HUMAN's
+    # explicit `coord test --fail <id> --reason "..."` (this function has
+    # no way to tell that caller apart from any other, and the surrounding
+    # code elsewhere goes out of its way not to clobber a human override).
+    # A silent rewrite of an operator's own stated verdict is exactly the
+    # kind of surprise that should be visible in the logs even though it
+    # is never blocked.
+    _log.warning(
+        "record_test_verdict: reclassifying assignment %s's failed verdict "
+        "as infrastructure (#3670) — original reason: %r",
+        assignment_id, original,
+    )
+
+    # The manifest in the NEW test_reason (not the row's old one) is what
+    # finalize_smoke_fanout just stamped — present only when this write is
+    # the fan-out parent's aggregate verdict. Re-encoded (rather than
+    # textually sliced) so the preserved prefix is always exactly what
+    # `_parse_fanout_manifest` will read back, regardless of how the raw
+    # text is formatted.
+    manifest = _parse_fanout_manifest(test_reason) or []
+    manifest_prefix = f"{_encode_fanout_manifest(manifest)}\n" if manifest else ""
+    for _leg_id, caps, _cmd in manifest:
+        try:
+            _release_smoke_dispatch_claim_local(assignment_id, "+".join(sorted(caps)))
+        except Exception:  # noqa: BLE001 — best-effort; never block the write
+            pass
+
+    carried = mute_smoke_legs(previous_reason)
+    mute_prefix = f"{mute_smoke_tally(carried)} — " if carried else ""
+
+    env_legs = environmental_smoke_legs(previous_reason) + 1
 
     if env_legs >= ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
         return (
             TEST_STATE_BLOCKED,
             (
+                f"{manifest_prefix}{mute_prefix}"
                 f"{environmental_smoke_tally(env_legs)}: the Test-stage "
                 f"environmental retry budget "
                 f"({ENVIRONMENTAL_SMOKE_RETRY_BUDGET}) is exhausted after "
                 f"{env_legs} consecutive environmental deaths — {cause}. "
-                f"Originally reported: {original} (#3670)"
+                f"Originally reported: {original} (#3670). Recover with "
+                "`coord diagnose <repo> <issue> --stage test --reset` once "
+                "the infrastructure is healthy again, or record the "
+                f"verdict by hand with `coord test --passed|--fail "
+                f"{assignment_id}`."
             ),
             None,
             None,
@@ -1516,6 +1588,7 @@ def _reclassify_infra_test_failure(
     return (
         None,
         (
+            f"{manifest_prefix}{mute_prefix}"
             f"{environmental_smoke_tally(env_legs)}: Test-stage failure "
             f"reclassified as infrastructure, not a test result ({cause}) "
             "— cleared for automatic re-dispatch, not recorded as a work "
@@ -1586,21 +1659,34 @@ def _record_test_verdict_local(
     # it. A reason that does not match passes straight through unchanged
     # (including a genuine test failure's own summary, or no reason at
     # all) — this never reclassifies a real failure.
+    reclassified_away_from_failed = False
     if test_state == "failed":
         test_state, test_reason, smoke_test, smoke_test_reason = (
             _reclassify_infra_test_failure(
                 conn, assignment_id, test_reason, smoke_test, smoke_test_reason,
             )
         )
+        reclassified_away_from_failed = test_state != "failed"
 
+    force_clear_smoke_mirror = False
     if smoke_test is None:
         # Derive the legacy mirror from the canonical verdict.
         if test_state == "passed":
             smoke_test, smoke_test_reason = "pass", None
         elif test_state == "failed":
             smoke_test, smoke_test_reason = "fail", test_reason
-        # "skipped" (and any unknown state) leaves smoke_test NULL — the same
-        # choice `coord test --skipped` makes.
+        elif reclassified_away_from_failed:
+            # #3670 review (nit): the infra reclassifier above just moved
+            # `test_state` off `"failed"` — if a PRIOR genuine failure on
+            # this same row already wrote `smoke_test='fail'`, that stale
+            # mirror must be cleared too, or `coord fix` (which gates on
+            # `smoke_test == "fail"`, see the write below) still drives a
+            # fix round on a row that no longer carries a failed verdict —
+            # exactly the fix round this whole reclassify exists to avoid.
+            force_clear_smoke_mirror = True
+        # "skipped" (and any other unknown, non-reclassified state) leaves
+        # smoke_test NULL untouched — the same choice `coord test
+        # --skipped` makes.
 
     def _write() -> None:
         # #3386 review: fetched INSIDE `_write` (not just in the post-write
@@ -1627,6 +1713,14 @@ def _record_test_verdict_local(
                 "UPDATE assignments SET smoke_test=?, smoke_test_reason=? "
                 "WHERE assignment_id=?",
                 (smoke_test, smoke_test_reason, assignment_id),
+            )
+        elif force_clear_smoke_mirror:
+            # #3670 review (nit): explicit NULL, not just "don't touch" —
+            # see the comment above where this flag is set.
+            sql.execute(conn,
+                "UPDATE assignments SET smoke_test=NULL, smoke_test_reason=NULL "
+                "WHERE assignment_id=?",
+                (assignment_id,),
             )
 
         # #3386 (item 3 of #3378): keep the per-repo consecutive
@@ -2909,10 +3003,19 @@ def has_recorded_review_verdict(assignment_id: str) -> bool:
     contradicting verdict winning.
 
     Local-DB read only, same documented caveat as :func:`has_review_claim`:
-    correct on the daemon host (where the local DB is canonical), undercounts
-    on a thin client reading its own stale local copy — acceptable here
-    because this is a backstop behind the in-memory check at the call site,
-    not the sole guard.
+    correct on the daemon host (where the local DB is canonical). On a thin
+    client reading its own stale local copy, this can go wrong in EITHER
+    direction, not just undercounting: a verdict recorded on the canonical
+    DB after this client's last sync is invisible here (the #3670 case this
+    function exists for), but the reverse also happens —
+    :func:`reset_work_review_state` clears ``review_verdict`` on the
+    canonical DB to make a leg re-reviewable, and a thin client still
+    holding its OWN stale, pre-reset local row would then wrongly deny a
+    legitimate post-reset re-review, citing the stale snapshot as if it
+    were current (#3670 review). Acceptable here because this is a
+    backstop behind the in-memory check at the call site, not the sole
+    guard — the daemon host, where this read is actually authoritative, is
+    unaffected either way.
     """
     if not assignment_id:
         return False

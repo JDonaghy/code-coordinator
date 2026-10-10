@@ -4041,17 +4041,30 @@ def test_dispatch_review_skipped_when_db_has_recorded_verdict_despite_stale_boar
     assert "#3670" in (completed.review_dispatch_reason or "")
 
 
-def test_dispatch_review_two_racing_dispatchers_both_denied_for_already_reviewed_leg(
+def test_dispatch_review_two_sequential_dispatchers_both_denied_for_already_reviewed_leg(
     two_machine_config: Config, coord_db,
 ) -> None:
-    """Two independent dispatchers (e.g. `coord notify`'s driver and the
-    drive-queue tick) racing `dispatch_review` for a leg a review has
-    ALREADY approved must both lose — not just one of them winning a claim
-    the other loses, but BOTH denied outright, because there is nothing
-    left to dispatch a review for. Before #3670 the claim table alone could
-    not express this: once the first review's terminal write released its
-    claim, a later unrelated call could win a fresh claim and dispatch a
-    genuinely second, contradicting review."""
+    """#3670 review: NOT a race test — both calls below run sequentially,
+    single-threaded, against a verdict that already exists before either
+    runs, so both necessarily take the identical `has_recorded_review_verdict`
+    branch. What it DOES cover: two independent dispatchers (e.g. `coord
+    notify`'s driver and the drive-queue tick) that each, independently,
+    read "no review in flight" and call `dispatch_review` for a leg a
+    review has ALREADY approved must both lose — not just one of them
+    winning a claim the other loses, but BOTH denied outright, because
+    there is nothing left to dispatch a review for. Before #3670 the claim
+    table alone could not express this: once the first review's terminal
+    write released its claim, a later unrelated call could win a fresh
+    claim and dispatch a genuinely second, contradicting review.
+
+    The genuine RACE acceptance item — two dispatchers racing
+    `claim_review_dispatch` for the SAME leg with NO verdict recorded yet,
+    where exactly one must win the atomic claim — is covered by the
+    pre-existing #3113 test(s) against `claim_review_dispatch` directly in
+    `tests/test_state.py` (the claim table's own atomicity, which this
+    module's dispatch guard sits on top of); this test's job is the
+    DIFFERENT, #3670-specific shape: a verdict that already landed before
+    either call started."""
     from coord import state
 
     completed_for_dispatcher_1 = _completed_assignment(machine="laptop")

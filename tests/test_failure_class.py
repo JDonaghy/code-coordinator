@@ -305,6 +305,19 @@ class TestClassifyInfra:
             "runner killed before it could report",
             "runner was killed before it could report",
             "infra issue, not a test result",
+            # #3670 review: the ONE phrasing a production writer actually
+            # emits today — coord.smoke's own briefing instructs a
+            # Test-stage worker, verbatim, to print `SMOKE: fail <the smoke
+            # command never returned an exit status within this session>`
+            # when it genuinely cannot obtain a real exit status, and
+            # coord.notify._record_smoke_verdict's fail-verdict branch
+            # carries that text straight into `test_reason` as
+            # "headless smoke: <the smoke command never returned an exit "
+            # "status within this session>". Before this case was added,
+            # NOTHING in `_INFRA_RE` matched it, so this exact incident
+            # shape recorded a plain `failed` and spent a real fix round.
+            "headless smoke: <the smoke command never returned an exit "
+            "status within this session>",
         ],
     )
     def test_infra_signatures_classify_environmental(self, reason: str) -> None:
