@@ -4046,11 +4046,16 @@ or
 unknown>
 
 Omit the line entirely (it defaults to `resolved`, today's behaviour) \
-when this PR genuinely fixes the issue. A drafted-but-unfiled upstream \
-issue — a bullet in a design doc, a TODO comment, a line in a tracking \
-markdown file — is NOT "filed"; only a real GitHub issue number counts, \
-so don't write `partial — see quadraui issue` unless that issue actually \
-exists and you name its number. This is read by the coordinator's merge \
+when this PR genuinely fixes the issue. If what remains is a capability \
+missing from ANOTHER repo, don't draft that upstream issue as prose (a \
+bullet in a design doc, a TODO comment, a `PENDING_*` tracking markdown \
+file) and don't try to file it yourself: emit the \
+`BLOCKED_ON_UPSTREAM: <repo>: <title>` marker your briefing describes \
+(#3676) — the coordinator files the issue and holds this one on it — and \
+write `ISSUE_RESOLUTION: partial — blocked on upstream \
+(BLOCKED_ON_UPSTREAM above)`; you never need its number. Any OTHER \
+issue you cite in a `partial` line must be a real, existing one named by \
+number. This is read by the coordinator's merge \
 gate (not posted to GitHub by you — never run `gh` commands): a `partial`/ \
 `investigation` here keeps the issue OPEN after your PR merges, with a \
 comment on the issue quoting what remains, instead of auto-closing work \

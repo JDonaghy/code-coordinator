@@ -26,6 +26,10 @@ and the coordinator (:func:`process_upstream_gaps`, called from
    (the existing drive-queue ``after=`` mechanism, cross-repo keys and all —
    an open, unqueued upstream issue defers the dependent with "waiting on
    quadraui#N (open, not queued)", and its landing satisfies the edge).
+   The row is usually ``running`` at this point (the work leg just ended
+   mid-drive), and the tick reads ``after=`` only for ``waiting`` rows, so an
+   in-flight row is taken out of flight first — its drive stopped and the
+   row returned to ``waiting`` with the edge (see :func:`_block_queue_row`).
 
 Parsing is tolerant (:func:`parse_upstream_markers`): several markers per
 message, markdown decoration around the marker (bold, backticks, list
@@ -316,18 +320,67 @@ def _upstream_issue_body(
     )
 
 
-def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str) -> tuple[bool, str]:
-    """Add ``after=upstream_key`` to the downstream drive-queue row.
+def _enqueue_kwargs(entry, after: list[str]) -> dict:
+    """The operator-declared fields of *entry*, carried through unchanged with
+    a new ``after=`` list — :func:`coord.state.enqueue_drive_queue` replaces
+    them all on every call (same discipline as ``coord.commands.drive_queue.
+    _apply_reversed_overlap_after``)."""
+    return dict(
+        machine=entry.machine or None,
+        after=after,
+        hold_after=entry.hold_after,
+        hold_reason=entry.hold_reason,
+        resume_when=entry.resume_when,
+        hold_scope=entry.hold_scope,
+        max_fix_rounds=entry.max_fix_rounds,
+        no_acceptance=entry.no_acceptance,
+        plan_destructive=entry.plan_destructive,
+    )
 
-    Every other operator-declared field is carried through unchanged
-    (:func:`coord.state.enqueue_drive_queue` replaces them all on every
-    call — same discipline as ``coord.commands.drive_queue.
-    _apply_reversed_overlap_after``). Returns ``(applied, note)``; an issue
-    with no queue row is left unqueued (nothing to block), and an edge that
-    would close a cycle is refused rather than written.
+
+def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str) -> tuple[bool, str]:
+    """Hold the downstream drive-queue row ``after=upstream_key``.
+
+    Returns ``(applied, note)``. An issue with no queue row is left unqueued
+    (nothing to block), and an edge that would close a cycle is refused
+    rather than written. What "hold" takes depends on the row's state,
+    because the tick only reads ``after=`` for a ``waiting`` row
+    (``_resolve_prereqs`` is called from the waiting walk alone;
+    ``_reconcile_running`` never looks at it):
+
+    * ``waiting`` — the edge alone is enough; written in place.
+    * ``running`` (the usual case: this runs as the work leg ends, mid-drive)
+      and every other not-yet-landed state (``parked``/``blocked``/
+      ``failed``) — an edge on such a row would be dead data: the drive goes
+      on to Test → Review → Merge with the partial change, and a merge moves
+      the row to ``done`` without the edge ever being read (review of #3676).
+      So the row is taken out of flight: removed through
+      :func:`coord.state.dequeue_drive_queue` — the #3282 seam that also
+      kills the live ``coord drive --tmux`` session on the daemon host, the
+      one place a drive session can be reached from — and re-added at the
+      SAME queue position as a fresh ``waiting`` row carrying the edge. The
+      tick then defers it "waiting on <upstream> (open, not queued)" and
+      relaunches it when the upstream issue lands, attempts reset (being
+      blocked upstream is not this issue's failed attempt).
+    * ``done``/``merged-partial`` — already landed; there is nothing left to
+      hold, so nothing is written.
+
+    An edge already present is a no-op in every state — which is also what
+    keeps a replayed transition from stopping a drive that was relaunched
+    after the upstream issue landed (the requeued row still carries it).
     """
-    from coord.drive_queue import QueueEntry, QueueError, validate_enqueue  # noqa: PLC0415
-    from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
+    from coord.drive_queue import (  # noqa: PLC0415
+        STATE_DONE_LIKE,
+        STATE_WAITING,
+        QueueEntry,
+        QueueError,
+        validate_enqueue,
+    )
+    from coord.state import (  # noqa: PLC0415
+        dequeue_drive_queue,
+        enqueue_drive_queue,
+        list_drive_queue,
+    )
 
     entries = [QueueEntry.from_row(r) for r in list_drive_queue()]
     entry = next(
@@ -338,26 +391,53 @@ def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str)
         return False, "not in the drive queue — nothing to block"
     if upstream_key in entry.after:
         return True, f"already after {upstream_key}"
+    if entry.state in STATE_DONE_LIKE:
+        return False, (
+            f"queue row already {entry.state} — landed before the gap was "
+            f"read, nothing left to hold after {upstream_key}"
+        )
     new_after = [*entry.after, upstream_key]
     try:
         validate_enqueue(entries, downstream_repo, issue_number, new_after)
     except QueueError as exc:
         return False, f"after={upstream_key} refused: {exc}"
-    enqueue_drive_queue(
-        entry.repo,
-        entry.issue,
-        machine=entry.machine or None,
-        after=new_after,
-        position=None,
-        hold_after=entry.hold_after,
-        hold_reason=entry.hold_reason,
-        resume_when=entry.resume_when,
-        hold_scope=entry.hold_scope,
-        max_fix_rounds=entry.max_fix_rounds,
-        no_acceptance=entry.no_acceptance,
-        plan_destructive=entry.plan_destructive,
+
+    if entry.state == STATE_WAITING:
+        enqueue_drive_queue(entry.repo, entry.issue, position=None,
+                            **_enqueue_kwargs(entry, new_after))
+        return True, f"queue row now after {upstream_key}"
+
+    removal = dequeue_drive_queue(entry.repo, entry.issue)
+    if not removal.get("removed"):
+        return False, (
+            f"queue row ({entry.state}) vanished before it could be held "
+            f"after {upstream_key}"
+        )
+    try:
+        enqueue_drive_queue(entry.repo, entry.issue, position=entry.position,
+                            **_enqueue_kwargs(entry, new_after))
+    except Exception:
+        # Never leave the issue dropped from the queue: put the row back as
+        # it was declared (still out of flight), then surface the failure.
+        try:
+            enqueue_drive_queue(entry.repo, entry.issue, position=entry.position,
+                                **_enqueue_kwargs(entry, list(entry.after)))
+        except Exception:  # noqa: BLE001 — the original error is the one to report
+            log.warning("upstream gap: could not restore queue row %s", entry.key)
+        raise
+    note = (
+        f"in-flight queue row ({entry.state}) taken out of flight and "
+        f"returned to waiting after {upstream_key}"
     )
-    return True, f"queue row now after {upstream_key}"
+    session = removal.get("driver_session")
+    if session and removal.get("driver_ok", True):
+        note += f"; stopped driver session {session}"
+    elif session:
+        note += (
+            f"; driver session {session} could NOT be confirmed stopped "
+            f"({removal.get('driver_detail') or 'unknown'}) — kill it by hand"
+        )
+    return True, note
 
 
 def _file_one(

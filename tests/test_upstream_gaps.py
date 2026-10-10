@@ -262,6 +262,133 @@ class TestProcessUpstreamGaps:
         assert tracker.created == []
 
 
+def _row(issue: int, repo: str = "vimcode") -> dict:
+    return next(r for r in state.list_drive_queue(repo) if r["issue_number"] == issue)
+
+
+def _after(row: dict) -> list[str]:
+    after = row["after_json"]
+    return after if isinstance(after, list) else json.loads(after)
+
+
+class TestInFlightRow:
+    """Review of #3676: the gap is read as the work leg ends, i.e. mid-drive,
+    when the row is `running` — and the tick reads `after=` only for
+    `waiting` rows. The row must be taken out of flight (drive stopped, row
+    back to `waiting` with the edge), not just annotated."""
+
+    @pytest.fixture
+    def stopped(self):
+        calls: list[tuple[str, int]] = []
+
+        def fake_stop(repo, issue, **_kw):
+            calls.append((repo, issue))
+            return True, f"coord-drive-{repo}-{issue}", None
+
+        with patch("coord.drive.stop_live_driver_session", side_effect=fake_stop):
+            yield calls
+
+    def _launch(self, issue: int = 42) -> None:
+        state.update_drive_queue_entry(
+            "vimcode", issue, state="running", attempts=1,
+            session_name=f"coord-drive-vimcode-{issue}", launched_at=1000.0,
+            launch_host="daemon", last_reason="launched",
+        )
+
+    def test_running_row_is_stopped_and_returned_to_waiting(
+        self, tracker, config, stopped,
+    ) -> None:
+        from coord.drive_queue import STATE_WAITING, QueueEntry
+
+        state.enqueue_drive_queue("vimcode", 41)
+        state.enqueue_drive_queue("vimcode", 42, machine="laptop", after=["vimcode#40"],
+                                  max_fix_rounds=3)
+        state.enqueue_drive_queue("vimcode", 43)
+        self._launch(42)
+        position_before = _row(42)["position"]
+
+        outcomes = process_upstream_gaps(
+            FINAL_MESSAGE, config=config, repo_name="vimcode", issue_number=42,
+            assignment_id="aid-1",
+        )
+
+        assert [o.status for o in outcomes] == ["filed"]
+        assert outcomes[0].queued_after is True
+        assert any("returned to waiting" in n for n in outcomes[0].notes)
+        # The live driver was stopped through the dequeue seam (#3282) …
+        assert stopped == [("vimcode", 42)]
+        # … and the row is back in the walk, at its old slot, carrying the
+        # edge and every operator-declared field, with a fresh run state.
+        row = _row(42)
+        assert row["state"] == STATE_WAITING
+        assert _after(row) == ["vimcode#40", "quadraui#501"]
+        assert row["position"] == position_before
+        assert row["machine"] == "laptop"
+        assert row["max_fix_rounds"] == 3
+        assert not row["session_name"]
+        assert int(row["attempts"] or 0) == 0
+        # A `waiting` row is what the tick's walk feeds to `_resolve_prereqs`;
+        # the upstream issue is queued nowhere and open in the cache, so it
+        # defers "waiting on quadraui#501 (open, not queued)".
+        assert QueueEntry.from_row(row).state == STATE_WAITING
+        assert state.get_cached_issue_state("quadraui", 501) == "open"
+        # The other queue rows were untouched.
+        assert [r["issue_number"] for r in state.list_drive_queue("vimcode")] == [41, 42, 43]
+
+    def test_replay_does_not_stop_a_relaunched_drive(
+        self, tracker, config, stopped,
+    ) -> None:
+        state.enqueue_drive_queue("vimcode", 42)
+        self._launch(42)
+        process_upstream_gaps(FINAL_MESSAGE, config=config,
+                              repo_name="vimcode", issue_number=42)
+        assert stopped == [("vimcode", 42)]
+        # Upstream lands; the tick relaunches the row. A replayed transition
+        # of the ORIGINAL work leg must leave the new drive alone.
+        self._launch(42)
+        again = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                      repo_name="vimcode", issue_number=42)
+        assert [o.status for o in again] == ["already-filed"]
+        assert stopped == [("vimcode", 42)]
+        assert _row(42)["state"] == "running"
+        assert len(tracker.created) == 1
+
+    def test_blocked_row_is_returned_to_waiting(self, tracker, config, stopped) -> None:
+        state.enqueue_drive_queue("vimcode", 42)
+        state.update_drive_queue_entry("vimcode", 42, state="blocked",
+                                       last_reason="DEAD END: nothing to do")
+        process_upstream_gaps(FINAL_MESSAGE, config=config,
+                              repo_name="vimcode", issue_number=42)
+        row = _row(42)
+        assert row["state"] == "waiting"
+        assert _after(row) == ["quadraui#501"]
+
+    def test_landed_row_is_left_alone(self, tracker, config, stopped) -> None:
+        state.enqueue_drive_queue("vimcode", 42)
+        state.update_drive_queue_entry("vimcode", 42, state="done")
+        outcomes = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                         repo_name="vimcode", issue_number=42)
+        assert outcomes[0].status == "filed"
+        assert outcomes[0].queued_after is False
+        assert stopped == []
+        row = _row(42)
+        assert row["state"] == "done"
+        assert _after(row) == []
+
+    def test_multiple_gaps_on_a_running_row_stop_it_once(
+        self, tracker, config, stopped,
+    ) -> None:
+        state.enqueue_drive_queue("vimcode", 42)
+        self._launch(42)
+        text = ("BLOCKED_ON_UPSTREAM: quadraui: Gap one\n\n"
+                "BLOCKED_ON_UPSTREAM: quadraui: Gap two\n")
+        process_upstream_gaps(text, config=config, repo_name="vimcode", issue_number=42)
+        assert stopped == [("vimcode", 42)]
+        row = _row(42)
+        assert row["state"] == "waiting"
+        assert _after(row) == ["quadraui#501", "quadraui#502"]
+
+
 class TestNotifyHook:
     """The coordinator half runs when a work-like leg's transition is posted."""
 
@@ -310,3 +437,20 @@ class TestNotifyHook:
 def test_upstream_gap_dataclass_key_matches_gap_key() -> None:
     gap = UpstreamGap(repo="quadraui", title="X")
     assert gap.key == gap_key("quadraui", "X")
+
+
+def test_worker_system_prompt_agrees_with_the_briefing_marker_contract() -> None:
+    """Review of #3676: the work-leg system prompt used to forbid exactly the
+    `partial — blocked on upstream` form the briefing note prescribes (it
+    demanded a real upstream issue number), so every work leg got
+    conflicting instructions."""
+    from coord.agent import WORKER_SYSTEM_PROMPT
+
+    assert "drafted-but-unfiled" not in WORKER_SYSTEM_PROMPT
+    assert "only a real GitHub issue number counts" not in WORKER_SYSTEM_PROMPT
+    assert "BLOCKED_ON_UPSTREAM: <repo>: <title>" in WORKER_SYSTEM_PROMPT
+    partial = "partial — blocked on upstream (BLOCKED_ON_UPSTREAM above)"
+    assert partial in WORKER_SYSTEM_PROMPT
+    assert partial in " ".join(UPSTREAM_GAP_BRIEFING_NOTE.split())
+    # The prompt's own example of the marker never parses as a real gap.
+    assert parse_upstream_markers(WORKER_SYSTEM_PROMPT) == []
