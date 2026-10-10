@@ -13,6 +13,7 @@ from starlette.testclient import TestClient
 
 from coord.config import Config
 from coord.dashboard.server import build_app, dist_has_bundle
+from coord.dispatch import UPSTREAM_GAP_BRIEFING_NOTE
 from coord.models import Assignment, Board, Machine, Proposal, Repo
 from coord.state import save_board
 
@@ -1447,7 +1448,8 @@ class TestBriefingOverride:
         assert r.status_code == 200
         call_args = mock_post.call_args
         payload = call_args.kwargs.get("json") or call_args[1].get("json")
-        assert payload["briefing"] == "edited briefing"
+        # #3676: every work dispatch appends the BLOCKED_ON_UPSTREAM marker note.
+        assert payload["briefing"] == "edited briefing" + UPSTREAM_GAP_BRIEFING_NOTE
 
 
 class TestChatAPI:
