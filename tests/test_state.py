@@ -1630,6 +1630,37 @@ class TestRecordDispatchedMode:
 
         assert load_assignment_mode(assignment_id) == "workflow"
 
+    def test_opted_in_work_leg_surfaces_workflow_on_board(self, coord_db) -> None:
+        """#3686 (remainder of #3681): the `mode` column must reach the
+        actual board row (`coord.state.build_board`, via
+        `coord._board_mapping.row_to_assignment`) -- not just
+        `load_assignment_mode`'s own single-row read -- since that's the
+        path the `/board` JSON payload and the TUI/dashboard go through."""
+        from coord.agent import WORKFLOW_LEG_LABEL
+        from coord.state import build_board, record_dispatched
+
+        proposal = Proposal(
+            id=13,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=3686,
+            issue_title="Run this as a workflow too",
+            rationale="test",
+            briefing="run it as a workflow",
+            type="work",
+            issue_labels=[WORKFLOW_LEG_LABEL],
+        )
+        assignment_id = "aid-3686-workflow-board"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/myrepo",
+        )
+
+        board = build_board()
+        row = next(a for a in board.active if a.assignment_id == assignment_id)
+        assert row.mode == "workflow"
+
     def test_normal_work_leg_records_single(self, coord_db) -> None:
         from coord.state import load_assignment_mode, record_dispatched
 

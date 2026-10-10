@@ -1386,6 +1386,19 @@ class Assignment:
     # column is the ONLY thing that can bypass the `_die()` there.
     premise_rechecked_at: float | None = None
     premise_rechecked_reason: str | None = None
+    # #3681/#3686: "single" or "workflow" — whether this Work leg ran as a
+    # plain single-agent `claude -p` session or an opted-in (`coord:workflow`
+    # issue label) Claude Code workflow (implement -> adversarial review ->
+    # fix, several agent turns). Set once, at dispatch time, by
+    # `coord.state._record_dispatched_local` from
+    # `coord.agent.WORKFLOW_LEG_LABEL`; never updated afterwards. `None` for
+    # a row predating the `mode` column (#3681) — every caller must read
+    # that identically to `"single"` (every pre-#3681 leg ran single-agent),
+    # never leave it unhandled, since this is the field `coord gates`/cost
+    # reporting needs to compare review-round and request-changes rates
+    # between workflow and single legs before anyone relaxes Test/Review for
+    # workflow legs.
+    mode: str | None = None
 
 
 def effective_issue_number(assignment: "Assignment | dict") -> int:

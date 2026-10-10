@@ -197,6 +197,13 @@ def row_to_assignment(row: object) -> Assignment:
         # asserted against.
         premise_rechecked_at=d.get("premise_rechecked_at"),
         premise_rechecked_reason=d.get("premise_rechecked_reason"),
+        # #3681/#3686: "single" or "workflow"; None for rows predating the
+        # `mode` column — see coord.models.Assignment.mode. Deliberately NOT
+        # normalized to "single" here: that's a per-caller display/compare
+        # concern (coord.gates, coord.state.load_assignment_mode), and
+        # collapsing None here would make this the second place that
+        # decision lives.
+        mode=d.get("mode"),
     )
 
 

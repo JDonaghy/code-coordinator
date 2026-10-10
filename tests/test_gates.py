@@ -48,6 +48,7 @@ def _work(
     review_verdict: str | None = None,
     required_gates: list[str] | None = None,
     dispatched_at: float | None = 1.0,
+    mode: str | None = None,
 ) -> Assignment:
     return Assignment(
         machine_name="precision",
@@ -69,6 +70,7 @@ def _work(
         review_verdict=review_verdict,
         required_gates=required_gates or [],
         dispatched_at=dispatched_at,
+        mode=mode,
     )
 
 
@@ -183,6 +185,38 @@ class TestRows:
         board = Board(active=[], completed=[work])
         report = build_gate_report(board, config, "api", 42)
         assert report.rows[0].test_toolchain is None
+
+    def test_row_dump_surfaces_workflow_mode(self, config: Config) -> None:
+        """#3686 (remainder of #3681): an opted-in (`coord:workflow`) Work
+        leg's row reports `mode="workflow"`, both in the dataclass and in
+        the JSON `coord gates --json` shape — not just stored, but actually
+        readable off the board."""
+        work = _work(mode="workflow")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+        assert report.rows[0].mode == "workflow"
+        assert report_to_dict(report)["rows"][0]["mode"] == "workflow"
+        assert "mode=workflow" in format_gate_report(report)
+
+    def test_row_dump_normal_leg_reports_single_mode(self, config: Config) -> None:
+        """A normal (non-opted-in) Work leg's row reports `mode="single"` —
+        the #3681 default — in both the dataclass and the JSON shape."""
+        work = _work(mode="single")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+        assert report.rows[0].mode == "single"
+        assert report_to_dict(report)["rows"][0]["mode"] == "single"
+        assert "mode=single" in format_gate_report(report)
+
+    def test_row_dump_pre_3681_row_normalizes_to_single(self, config: Config) -> None:
+        """A row predating the `mode` column (Assignment.mode is None) must
+        still read as "single" off the gate report — never left as the raw
+        None, which would be a third place this normalization could drift
+        from coord.state.load_assignment_mode's documented default."""
+        work = _work(mode=None)
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+        assert report.rows[0].mode == "single"
 
     def test_rows_scoped_to_repo_and_issue(self, config: Config) -> None:
         matching = _work(aid="w1", issue=42)
