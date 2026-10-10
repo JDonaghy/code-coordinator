@@ -296,3 +296,20 @@ def test_rewrite_retries_one_malformed_reply():
     replies = iter(["{not json", json.dumps({"blocks": [{"id": 0, "action": "delete"}]})])
     res = cc.rewrite_source("fn f() {\n    // #12 thing\n    g();\n}\n", lambda p: (next(replies), 0.0))
     assert res.new_src == "fn f() {\n    g();\n}\n"
+
+
+def test_doc_replacement_may_not_carry_a_fence_line():
+    assert not cc.valid_line("//! ```", "//!")
+    assert not cc.valid_line("/// ~~~rust", "///")
+    assert cc.valid_line("/// Uses `x`.", "///")
+
+
+def test_deleting_the_last_comment_in_a_block_drops_the_blank_before_the_brace():
+    src = "fn f() {\n    a();\n\n    // #12\n}\n"
+    assert cc.strip_file(src)[0] == "fn f() {\n    a();\n}\n"
+
+
+def test_normalize_ignores_layout_but_not_operator_splits():
+    assert cc.normalize("const K: &[&str] = &[\n];") == cc.normalize("const K: &[&str] = &[];")
+    assert cc.normalize("a >> b") != cc.normalize("a > > b")
+    assert cc.normalize("ab") != cc.normalize("a b")

@@ -193,50 +193,43 @@ def lex(src: str) -> list[Seg]:
     return segs
 
 
-SEP = object()
+# Rust tokens, maximal munch: identifiers, numbers, multi-char operators,
+# then any single other character. Comparing token lists rather than text
+# makes `verify` blind to pure layout (rustfmt joining `&[\n]` into `&[]`)
+# while `>>` vs `> >` still counts as a change.
+_TOKEN_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*|\d[\w.]*"
+    r"|>>=|<<=|\.\.=|\.\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||\+=|-=|\*=|/=|%=|\^=|&=|\|=|<<|>>|\.\."
+    r"|\S"
+)
 
 
 def _line_starts(src: str) -> list[int]:
     return [0] + [m.end() for m in re.finditer("\n", src)]
 
 
-def normalize(src: str, docs: bool = False) -> list[object]:
-    """Token stream with plain `//` comments and whitespace runs collapsed
-    into one separator. Literals, doc and block comments stay verbatim.
+def normalize(src: str, docs: bool = False) -> list[str]:
+    """The file's token stream with plain `//` comments and all layout
+    removed. Literals, doc and block comments stay as verbatim atoms.
 
     With `docs`, doc-comment prose is dropped too, but fenced code inside a
     doc comment (doctests) stays verbatim."""
-    out: list[object] = []
+    out: list[str] = []
     frozen: set[int] = set()
     starts: list[int] = []
     if docs:
         frozen = {c.line for c in line_comments(src, docs=True) if c.frozen}
         starts = _line_starts(src)
-
-    def sep() -> None:
-        if out and out[-1] is not SEP:
-            out.append(SEP)
-
     for seg in lex(src):
         text = src[seg.start : seg.end]
         if seg.kind == "line" or (
             docs and seg.kind == "doc" and bisect.bisect_right(starts, seg.start) - 1 not in frozen
         ):
-            sep()
-        elif seg.kind == "code":
-            for part in re.split(r"(\s+)", text):
-                if not part:
-                    continue
-                if part.isspace():
-                    sep()
-                else:
-                    out.append(part)
+            continue
+        if seg.kind == "code":
+            out += _TOKEN_RE.findall(text)
         else:
             out.append(text)
-    while out and out[-1] is SEP:
-        out.pop()
-    while out and out[0] is SEP:
-        out.pop(0)
     return out
 
 
@@ -418,20 +411,22 @@ def _tidy_blank_lines(lines: list[str], sites: list[int]) -> list[str]:
     """Undo the blank-line damage a deletion can do (rustfmt would reject it):
     a doubled blank line, or a blank line left just inside `{` or before `}`."""
     drop: set[int] = set()
+
+    def blank(j: int) -> bool:
+        return 0 <= j < len(lines) and lines[j].strip() == ""
+
+    def opens(j: int) -> bool:
+        return j < 0 or lines[j].rstrip().endswith(("{", "(", "["))
+
+    def closes(j: int) -> bool:
+        return j >= len(lines) or lines[j].strip().startswith(("}", ")", "]"))
+
     for k in sites:
         before, after = k - 1, k
-        if not (0 <= after < len(lines)):
-            continue
-        blank_after = lines[after].strip() == ""
-        if not blank_after:
-            continue
-        if before < 0:
+        if blank(after) and (blank(before) or opens(before) or closes(after + 1)):
             drop.add(after)
-            continue
-        prev = lines[before].rstrip()
-        nxt = next((lines[j] for j in range(after + 1, len(lines)) if j not in drop), "")
-        if prev.strip() == "" or prev.endswith(("{", "(", "[")) or nxt.strip().startswith(("}", ")", "]")):
-            drop.add(after)
+        elif blank(before) and not blank(after) and (opens(before - 1) or closes(after)):
+            drop.add(before)
     return [ln for j, ln in enumerate(lines) if j not in drop]
 
 
@@ -574,8 +569,12 @@ def parse_answer(text: str) -> list[dict]:
 
 
 def valid_line(text: str, prefix: str) -> bool:
-    """A replacement line is one comment of exactly the block's kind."""
-    return "\n" not in text and _prefix(text) == prefix and text.startswith(prefix)
+    """A replacement line is one comment of exactly the block's kind. It may
+    not open or close a doc-comment fence: the model sometimes echoes the
+    fence that follows the block, which would shift every doctest line."""
+    if "\n" in text or _prefix(text) != prefix or not text.startswith(prefix):
+        return False
+    return prefix == "//" or not FENCE_RE.match(text[len(prefix) :])
 
 
 def rewrite_source(src: str, answer_fn, chunk: int = 40, docs: bool = False) -> RewriteResult:
@@ -734,7 +733,8 @@ def cmd_rewrite(a) -> int:
                 failed += 1
                 print(f"  FAIL {r.path}: {r.error}", flush=True)
                 continue
-            note = f" ({len(r.rejected)} answers rejected)" if r.rejected else ""
+            reasons = Counter(re.sub(r"^line \d+: ", "", x) for x in r.rejected)
+            note = f" (rejected: {dict(reasons)})" if r.rejected else ""
             print(f"  {r.path}: {r.changed}/{r.blocks} blocks changed, {r.deleted} deleted, ${r.cost_usd:.3f}{note}", flush=True)
     print(f"rewrite: done, {failed} failed, total ${total_cost:.2f}")
     return 1 if failed else 0
