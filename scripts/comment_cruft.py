@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""Find and remove fix-history cruft from Rust `//` comments.
+
+Agent-written fixes accumulate comments that narrate history rather than
+describe the code: `// #1630 review: ...`, `(#1005)`, "this used to ...",
+"pre-#1434". Every one of them is re-read by every later worker that opens
+the file. This tool removes them as cheaply as possible, in four steps:
+
+    scan     count flagged comment lines per directory (no tokens)
+    strip    mechanical rewrite: drop leading issue tags and parenthetical
+             issue refs, delete comments that were nothing but a ref (no tokens)
+    rewrite  send each file's remaining flagged comment blocks to a small
+             model (`claude -p --model haiku`, no tools, minimal system
+             prompt) and apply its keep / delete / replace answers
+    verify   prove a diff is comment-only: every changed file must lex to
+             the same token stream with plain `//` comments removed
+
+Only plain `//` comments are touched. Doc comments (`///`, `//!`) can carry
+doctests and are part of the public docs, and `/* */` blocks are rare enough
+to leave to a human; `verify` fails if any of them change.
+
+A reference that marks a workaround to remove when an issue closes is kept,
+written as `TODO(#N): ...`; that form is not flagged.
+
+Paths under a `tests/acceptance*` directory or named `acceptance.rs` are
+skipped by default: they are sealed suites in the fleet repos.
+
+Usage:
+    scripts/comment_cruft.py scan    REPO [--depth 2] [--list] [--json]
+    scripts/comment_cruft.py strip   REPO [PATH ...]
+    scripts/comment_cruft.py rewrite REPO [PATH ...] [--jobs 4] [--limit N] [--dry-run]
+    scripts/comment_cruft.py verify  REPO --base REF [--allow GLOB ...]
+
+`strip` and `rewrite` edit the working tree in place; run them on a clean
+branch and finish with `verify --base <branch point>` and `cargo check`.
+"""
+from __future__ import annotations
+
+import argparse
+import bisect
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Patterns
+
+# An issue reference: `#123` or `repo#123`. Two to five digits so `#1` in
+# prose and six-digit hex colours (`#282828`) don't match; the lookbehind
+# keeps HTML entities (`&#123;`) out.
+REF = r"(?<![&\w])(?:[A-Za-z][\w.-]*)?#\d{2,5}\b"
+REF_LIST = rf"{REF}(?:\s*(?:[,/;&–-]|and)\s*{REF})*"
+REF_RE = re.compile(REF)
+
+# `TODO(#123)` / `FIXME(repo#123)`: the sanctioned load-bearing form.
+EXEMPT_RE = re.compile(r"\b(?:TODO|FIXME|HACK|XXX)\((?:[A-Za-z][\w.-]*)?#\d+\)")
+
+HISTORY_RE = re.compile(
+    r"\bused to\b|\bno longer\b|\bpreviously\b|\boriginally\b|\bpre-#|\bbefore #|\bafter #"
+    r"|\bthis pr\b|\bthe reviewer\b|\badversarial\b|\breview(?:er)? (?:found|flagged|finding|note)"
+    r"|\bthe old (?:code|path|behaviou?r)\b|\bwas (?:broken|fixed)\b|\bthe fix for\b",
+    re.IGNORECASE,
+)
+
+# `#1630 review: text` / `#12, #34: text` / `#99 (follow-up) — text` at the
+# start of a comment body.
+LEADING_TAG_RE = re.compile(
+    rf"^(\s*){REF_LIST}"
+    r"(?:\s+(?:review|follow-?up|fix|regression|bug))?"
+    r"(?:\s*\([^)]*\))?\s*[:—–-]\s+"
+)
+# ` (#1005)`, ` (see #883)`, ` (quadraui#12, #13 review)`.
+PAREN_REF_RE = re.compile(
+    rf"\s*\((?:(?:see|cf\.?|per|from|via|issue|fixed in|regression)\s+)?{REF_LIST}(?:\s+review)?\)"
+)
+# A body that says nothing but which issue it came from.
+REF_ONLY_RE = re.compile(rf"^\s*(?:(?:see|cf\.?|per|issue|regression(?: test)? for)\s+)?{REF_LIST}\s*[.:]?\s*$", re.I)
+# A body left with no words after stripping (`//`, `// —`, `// :`).
+EMPTY_BODY_RE = re.compile(r"^[\s:—–\-.,;]*$")
+BANNER_TAIL_RE = re.compile(r"\s([─═━=\-])\1{2,}\s*$")
+
+# rustfmt's default `max_width`; a replacement may not push a line past it.
+MAX_WIDTH = 100
+
+DEFAULT_EXCLUDES = ["*/tests/acceptance*/*", "tests/acceptance*/*", "*acceptance.rs", "target/*", "*/target/*"]
+
+
+def is_flagged(body: str) -> bool:
+    body = EXEMPT_RE.sub("", body)
+    return bool(REF_RE.search(body) or HISTORY_RE.search(body))
+
+
+# ---------------------------------------------------------------------------
+# Rust lexer: just enough to tell comments from code from literals.
+
+
+@dataclass
+class Seg:
+    kind: str  # code | str | line | doc | block
+    start: int
+    end: int
+
+
+_IDENT = re.compile(r"[A-Za-z0-9_]")
+_RAW_START = re.compile(r'(?:b|c)?r(#*)"')
+_STR_START = re.compile(r'(?:b|c)?"')
+
+
+def lex(src: str) -> list[Seg]:
+    segs: list[Seg] = []
+    n = len(src)
+    i = 0
+    code_start = 0
+
+    def flush(upto: int) -> None:
+        if upto > code_start:
+            segs.append(Seg("code", code_start, upto))
+
+    while i < n:
+        c = src[i]
+        prev_ident = i > 0 and bool(_IDENT.match(src[i - 1]))
+        if c == "/" and src.startswith("//", i):
+            flush(i)
+            j = src.find("\n", i)
+            j = n if j == -1 else j
+            third, fourth = src[i + 2 : i + 3], src[i + 3 : i + 4]
+            kind = "doc" if third == "!" or (third == "/" and fourth != "/") else "line"
+            segs.append(Seg(kind, i, j))
+            i = code_start = j
+            continue
+        if c == "/" and src.startswith("/*", i):
+            flush(i)
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif src.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            segs.append(Seg("block", i, j))
+            i = code_start = j
+            continue
+        if not prev_ident and c in "bcr":
+            m = _RAW_START.match(src, i)
+            if m:
+                flush(i)
+                close = '"' + m.group(1)
+                j = src.find(close, m.end())
+                j = n if j == -1 else j + len(close)
+                segs.append(Seg("str", i, j))
+                i = code_start = j
+                continue
+        if c == '"' or (not prev_ident and c in "bc" and src.startswith('"', i + 1)):
+            m = _STR_START.match(src, i)
+            if m:
+                flush(i)
+                j = m.end()
+                while j < n and src[j] != '"':
+                    j += 2 if src[j] == "\\" else 1
+                j = min(j + 1, n)
+                segs.append(Seg("str", i, j))
+                i = code_start = j
+                continue
+        if c == "'" or (not prev_ident and c == "b" and src.startswith("'", i + 1)):
+            q = i if c == "'" else i + 1
+            if src.startswith("\\", q + 1):
+                j = q + 1
+                while j < n and src[j] != "'":
+                    j += 2 if src[j] == "\\" else 1
+                end = min(j + 1, n)
+            elif q + 2 < n and src[q + 2] == "'":
+                end = q + 3
+            else:
+                end = None  # a lifetime or label
+            if end is not None:
+                flush(i)
+                segs.append(Seg("str", i, end))
+                i = code_start = end
+                continue
+        i += 1
+    flush(n)
+    return segs
+
+
+SEP = object()
+
+
+def normalize(src: str) -> list[object]:
+    """Token stream with plain `//` comments and whitespace runs collapsed
+    into one separator. Literals, doc and block comments stay verbatim."""
+    out: list[object] = []
+
+    def sep() -> None:
+        if out and out[-1] is not SEP:
+            out.append(SEP)
+
+    for seg in lex(src):
+        text = src[seg.start : seg.end]
+        if seg.kind == "line":
+            sep()
+        elif seg.kind == "code":
+            for part in re.split(r"(\s+)", text):
+                if not part:
+                    continue
+                if part.isspace():
+                    sep()
+                else:
+                    out.append(part)
+        else:
+            out.append(text)
+    while out and out[-1] is SEP:
+        out.pop()
+    while out and out[0] is SEP:
+        out.pop(0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-file comment model
+
+
+@dataclass
+class Comment:
+    line: int  # 0-based line index
+    col: int  # column of the `//`
+    text: str  # full comment text from `//` to end of line
+    own_line: bool  # nothing but whitespace before it
+
+    @property
+    def body(self) -> str:
+        return self.text[2:]
+
+
+@dataclass
+class Block:
+    comments: list[Comment]
+
+    @property
+    def own_line(self) -> bool:
+        return self.comments[0].own_line
+
+    @property
+    def flagged(self) -> bool:
+        return any(is_flagged(c.body) for c in self.comments)
+
+
+def line_comments(src: str) -> list[Comment]:
+    starts = [0]
+    for m in re.finditer("\n", src):
+        starts.append(m.end())
+    out = []
+    for seg in lex(src):
+        if seg.kind != "line":
+            continue
+        ln = bisect.bisect_right(starts, seg.start) - 1
+        col = seg.start - starts[ln]
+        own = src[starts[ln] : seg.start].strip() == ""
+        out.append(Comment(ln, col, src[seg.start : seg.end], own))
+    return out
+
+
+def blocks(comments: list[Comment]) -> list[Block]:
+    out: list[Block] = []
+    for c in comments:
+        last = out[-1].comments[-1] if out else None
+        if (
+            last is not None
+            and c.own_line
+            and last.own_line
+            and c.line == last.line + 1
+            and c.col == last.col
+        ):
+            out[-1].comments.append(c)
+        else:
+            out.append(Block([c]))
+    return out
+
+
+def apply_edits(src: str, comments_by_line: dict[int, Comment], edits: dict[int, list[str] | None]) -> str:
+    """Apply per-line comment edits.
+
+    `edits[line]` is the list of replacement comment texts (each starting
+    `//`) for the comment on that line; `[]` deletes the comment (and the
+    whole line if it held nothing else). Trailing comments accept at most one
+    replacement text.
+    """
+    lines = src.split("\n")
+    out: list[str] = []
+    deleted_at: list[int] = []  # indices in `out` where a whole line vanished
+    for i, line in enumerate(lines):
+        if i not in edits:
+            out.append(line)
+            continue
+        c = comments_by_line[i]
+        new = edits[i] or []
+        prefix = line[: c.col]
+        if c.own_line:
+            if not new:
+                deleted_at.append(len(out))
+            for t in new:
+                out.append(prefix + t)
+        else:
+            if len(new) > 1:
+                raise ValueError(f"line {i + 1}: trailing comment replaced by {len(new)} lines")
+            out.append(prefix + new[0] if new else prefix.rstrip())
+    return "\n".join(_tidy_blank_lines(out, deleted_at))
+
+
+def _tidy_blank_lines(lines: list[str], sites: list[int]) -> list[str]:
+    """Undo the blank-line damage a deletion can do (rustfmt would reject it):
+    a doubled blank line, or a blank line left just inside `{` or before `}`."""
+    drop: set[int] = set()
+    for k in sites:
+        before, after = k - 1, k
+        if not (0 <= after < len(lines)):
+            continue
+        blank_after = lines[after].strip() == ""
+        if not blank_after:
+            continue
+        if before < 0:
+            drop.add(after)
+            continue
+        prev = lines[before].rstrip()
+        nxt = next((lines[j] for j in range(after + 1, len(lines)) if j not in drop), "")
+        if prev.strip() == "" or prev.endswith(("{", "(", "[")) or nxt.strip().startswith(("}", ")", "]")):
+            drop.add(after)
+    return [ln for j, ln in enumerate(lines) if j not in drop]
+
+
+# ---------------------------------------------------------------------------
+# Mechanical strip
+
+
+def strip_body(body: str) -> str | None:
+    """Return the cleaned comment body, `None` to delete the comment, or the
+    body unchanged."""
+    exempt = EXEMPT_RE.findall(body)
+    if exempt:
+        return body
+    if REF_ONLY_RE.match(body):
+        return None
+    new = body
+    m = LEADING_TAG_RE.match(new)
+    if m:
+        rest = new[m.end() :]
+        if rest[:1].islower():
+            rest = rest[0].upper() + rest[1:]
+        new = m.group(1) + rest
+    new = PAREN_REF_RE.sub("", new)
+    if new != body and EMPTY_BODY_RE.match(new):
+        return None
+    rule = BANNER_TAIL_RE.search(new)
+    if rule and len(new) < len(body):  # keep `// ── Title ──────` banners their original width
+        new += rule.group(1)[0] * (len(body) - len(new))
+    return new
+
+
+def strip_file(src: str) -> tuple[str, int]:
+    comments = line_comments(src)
+    by_line = {c.line: c for c in comments}
+    edits: dict[int, list[str] | None] = {}
+    for c in comments:
+        new = strip_body(c.body)
+        if new is None:
+            edits[c.line] = []
+        elif new != c.body:
+            edits[c.line] = ["//" + new.rstrip()]
+    if not edits:
+        return src, 0
+    return apply_edits(src, by_line, edits), len(edits)
+
+
+# ---------------------------------------------------------------------------
+# Model rewrite
+
+SYSTEM_PROMPT = """\
+You clean up `//` comments in Rust source. Policy: a comment describes the code as it is now.
+
+Remove history: issue or PR numbers (#123, repo#123), what the code used to do, what a review \
+or reviewer found, which fix introduced something, how a bug was discovered.
+Keep every present-tense fact a reader needs: invariants, the reason the code is shaped this \
+way, non-obvious constraints, warnings, pointers to other code. Never invent facts. Keep the \
+original wording and line breaks where they are already fine: make the smallest edit that \
+removes the history, and reflow only the lines you change.
+A reference may stay only when it marks a workaround that must be removed when that issue \
+closes; then write it as `// TODO(#N): <what to remove>`.
+
+You get numbered comment blocks, each shown with nearby code for context. For every block \
+answer one of:
+  {"id": N, "action": "keep"}
+  {"id": N, "action": "delete"}            (nothing present-tense is left)
+  {"id": N, "action": "replace", "lines": ["// ...", "// ..."]}
+Replacement lines start with `// ` (never `///` or `//!`), carry no indentation and are no \
+longer than the block's longest original line. A block marked TRAILING sits after code on the same line: replace it with \
+exactly one line or delete it.
+
+Reply with only a JSON object: {"blocks": [ ... ]}"""
+
+
+@dataclass
+class RewriteResult:
+    path: str
+    blocks: int = 0
+    changed: int = 0
+    deleted: int = 0
+    cost_usd: float = 0.0
+    error: str = ""
+    new_src: str | None = None
+    rejected: list[str] = field(default_factory=list)
+
+
+def build_prompt(src: str, flagged: list[Block], before: int = 3, after: int = 8) -> str:
+    lines = src.split("\n")
+    parts = []
+    for n, b in enumerate(flagged):
+        first, last = b.comments[0].line, b.comments[-1].line
+        lo, hi = max(0, first - before), min(len(lines), last + 1 + after)
+        tag = "" if b.own_line else " TRAILING"
+        ctx = []
+        for i in range(lo, hi):
+            marker = ">" if first <= i <= last else " "
+            ctx.append(f"{marker} {lines[i]}")
+        parts.append(f"### block {n}{tag}\n" + "\n".join(ctx))
+    return (
+        "Lines marked `>` hold the comment block; the rest is context and must not be echoed.\n\n"
+        + "\n\n".join(parts)
+    )
+
+
+def call_model(prompt: str, model: str) -> tuple[str, float]:
+    cmd = [
+        "claude", "-p",
+        "--model", model,
+        "--output-format", "json",
+        "--system-prompt", SYSTEM_PROMPT,
+        "--tools", "",
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+    ]
+    # Thinking roughly tripled the cost in trials and bought nothing for this edit.
+    env = {**os.environ, "MAX_THINKING_TOKENS": "0"}
+    with tempfile.TemporaryDirectory() as cwd:  # no CLAUDE.md to auto-load
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=cwd, env=env, timeout=600)
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:300]}")
+    env = json.loads(proc.stdout)
+    if env.get("is_error"):
+        raise RuntimeError(f"claude -p error: {str(env.get('result'))[:300]}")
+    return env.get("result", ""), float(env.get("total_cost_usd") or 0.0)
+
+
+def parse_answer(text: str) -> list[dict]:
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise ValueError("no JSON object in model reply")
+    return json.loads(m.group(0))["blocks"]
+
+
+_VALID_LINE = re.compile(r"^//(?![/!])[^\n]*$")
+
+
+def rewrite_source(src: str, answer_fn, chunk: int = 40) -> RewriteResult:
+    """Rewrite flagged blocks in `src`. `answer_fn(prompt) -> (reply, cost)`."""
+    res = RewriteResult(path="")
+    comments = line_comments(src)
+    by_line = {c.line: c for c in comments}
+    flagged = [b for b in blocks(comments) if b.flagged]
+    res.blocks = len(flagged)
+    edits: dict[int, list[str] | None] = {}
+    for start in range(0, len(flagged), chunk):
+        group = flagged[start : start + chunk]
+        reply, cost = answer_fn(build_prompt(src, group))
+        res.cost_usd += cost
+        for ans in parse_answer(reply):
+            try:
+                b = group[int(ans["id"])]
+            except (KeyError, ValueError, IndexError, TypeError):
+                res.rejected.append(f"bad id {ans.get('id')!r}")
+                continue
+            action = ans.get("action")
+            if action == "keep":
+                continue
+            new = [] if action == "delete" else ans.get("lines")
+            if not isinstance(new, list) or not all(isinstance(t, str) and _VALID_LINE.match(t.rstrip()) for t in new):
+                res.rejected.append(f"line {b.comments[0].line + 1}: invalid replacement")
+                continue
+            if not b.own_line and len(new) > 1:
+                res.rejected.append(f"line {b.comments[0].line + 1}: multi-line trailing replacement")
+                continue
+            new = [t.rstrip() for t in new]
+            width = max(MAX_WIDTH - b.comments[0].col, max(len(c.text.rstrip()) for c in b.comments))
+            if any(len(t) > width for t in new):
+                res.rejected.append(f"line {b.comments[0].line + 1}: replacement wider than {width}")
+                continue
+            if new == [c.text.rstrip() for c in b.comments]:
+                continue
+            res.changed += 1
+            res.deleted += not new
+            lines = [c.line for c in b.comments]
+            edits[lines[0]] = new
+            for ln in lines[1:]:
+                edits[ln] = []
+    if edits:
+        out = apply_edits(src, by_line, edits)
+        if normalize(out) != normalize(src):  # cannot happen if apply_edits is right; cheap guard
+            raise RuntimeError("rewrite changed non-comment tokens")
+        res.new_src = out
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Repo helpers
+
+
+def rust_files(repo: Path, paths: list[str], excludes: list[str]) -> list[str]:
+    args = ["git", "-C", str(repo), "ls-files", "--", *(paths or ["."])]
+    files = subprocess.run(args, capture_output=True, text=True, check=True).stdout.split("\n")
+    return [
+        f for f in files
+        if f.endswith(".rs") and not any(fnmatch.fnmatch(f, g) for g in excludes)
+    ]
+
+
+def group_of(path: str, depth: int) -> str:
+    parts = path.split("/")[:-1]
+    return "/".join(parts[:depth]) or "."
+
+
+def cmd_scan(a) -> int:
+    repo = Path(a.repo)
+    counts: Counter[str] = Counter()
+    blocks_n: Counter[str] = Counter()
+    chars = 0
+    listing = []
+    for f in rust_files(repo, a.paths, a.exclude):
+        src = (repo / f).read_text(errors="replace")
+        cs = line_comments(src)
+        for c in cs:
+            if is_flagged(c.body):
+                counts[group_of(f, a.depth)] += 1
+                chars += len(c.text)
+                if a.list:
+                    listing.append(f"{f}:{c.line + 1}: {c.text.strip()}")
+        blocks_n[group_of(f, a.depth)] += sum(b.flagged for b in blocks(cs))
+    total = sum(counts.values())
+    if a.json:
+        print(json.dumps({"groups": dict(counts), "blocks": dict(blocks_n), "total": total, "approx_tokens": chars // 4}, indent=2))
+        return 0
+    if a.list:
+        print("\n".join(listing))
+        return 0
+    w = max([len(g) for g in counts] + [5])
+    print(f"{'group':<{w}}  lines  blocks")
+    for g, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"{g:<{w}}  {n:5}  {blocks_n[g]:6}")
+    print(f"\ntotal flagged lines: {total} (~{chars // 4} tokens), blocks: {sum(blocks_n.values())}")
+    return 0
+
+
+def cmd_strip(a) -> int:
+    repo = Path(a.repo)
+    files = edits = 0
+    for f in rust_files(repo, a.paths, a.exclude):
+        p = repo / f
+        src = p.read_text()
+        new, n = strip_file(src)
+        if n:
+            if normalize(new) != normalize(src):
+                print(f"BUG: strip changed code in {f}; left untouched", file=sys.stderr)
+                continue
+            p.write_text(new)
+            files += 1
+            edits += n
+    print(f"strip: {edits} comment lines edited in {files} files")
+    return 0
+
+
+def cmd_rewrite(a) -> int:
+    repo = Path(a.repo)
+    todo = []
+    for f in rust_files(repo, a.paths, a.exclude):
+        src = (repo / f).read_text()
+        if any(b.flagged for b in blocks(line_comments(src))):
+            todo.append(f)
+    if a.limit:
+        todo = todo[: a.limit]
+    print(f"rewrite: {len(todo)} files with flagged blocks (model={a.model}, jobs={a.jobs})", flush=True)
+
+    def work(f: str) -> RewriteResult:
+        p = repo / f
+        try:
+            r = rewrite_source(p.read_text(), lambda prompt: call_model(prompt, a.model))
+        except Exception as e:  # noqa: BLE001 -- report and keep going
+            r = RewriteResult(path=f, error=str(e))
+        r.path = f
+        if r.new_src is not None and not a.dry_run:
+            p.write_text(r.new_src)
+        return r
+
+    total_cost = 0.0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        for r in ex.map(work, todo):
+            total_cost += r.cost_usd
+            if r.error:
+                failed += 1
+                print(f"  FAIL {r.path}: {r.error}", flush=True)
+                continue
+            note = f" ({len(r.rejected)} answers rejected)" if r.rejected else ""
+            print(f"  {r.path}: {r.changed}/{r.blocks} blocks changed, {r.deleted} deleted, ${r.cost_usd:.3f}{note}", flush=True)
+    print(f"rewrite: done, {failed} failed, total ${total_cost:.2f}")
+    return 1 if failed else 0
+
+
+def cmd_verify(a) -> int:
+    repo = Path(a.repo)
+    diff = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--name-status", "--no-renames", a.base],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    bad = 0
+    checked = 0
+    for row in diff:
+        status, path = row.split("\t", 1)
+        if any(fnmatch.fnmatch(path, g) for g in a.allow):
+            continue
+        if status != "M" or not path.endswith(".rs"):
+            print(f"FAIL {path}: status {status}; only modified .rs files are allowed")
+            bad += 1
+            continue
+        old = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{a.base}:{path}"], capture_output=True, text=True, check=True
+        ).stdout
+        new = (repo / path).read_text()
+        checked += 1
+        if normalize(old) != normalize(new):
+            print(f"FAIL {path}: non-comment tokens changed")
+            bad += 1
+    print(f"verify: {checked} files compared, {bad} failures")
+    return 1 if bad else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p, paths=True):
+        p.add_argument("repo")
+        if paths:
+            p.add_argument("paths", nargs="*", help="limit to these paths (git pathspecs)")
+        p.add_argument("--exclude", action="append", default=list(DEFAULT_EXCLUDES), help="glob to skip")
+
+    p = sub.add_parser("scan")
+    common(p)
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--list", action="store_true", help="print every flagged line")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_scan)
+
+    p = sub.add_parser("strip")
+    common(p)
+    p.set_defaults(fn=cmd_strip)
+
+    p = sub.add_parser("rewrite")
+    common(p)
+    p.add_argument("--model", default="haiku")
+    p.add_argument("--jobs", type=int, default=4)
+    p.add_argument("--limit", type=int, default=0, help="only the first N files")
+    p.add_argument("--dry-run", action="store_true", help="call the model but don't write files")
+    p.set_defaults(fn=cmd_rewrite)
+
+    p = sub.add_parser("verify")
+    common(p, paths=False)
+    p.add_argument("--base", required=True)
+    p.add_argument("--allow", action="append", default=[], help="glob of non-.rs paths allowed to change")
+    p.set_defaults(fn=cmd_verify)
+
+    a = ap.parse_args(argv)
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
