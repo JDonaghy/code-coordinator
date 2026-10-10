@@ -1214,6 +1214,16 @@ def _is_linked_worktree(repo_path: Path) -> bool:
     return _abs(git_dir) != _abs(common_dir)
 
 
+def _resolved_path_str(raw: str | Path) -> str:
+    """*raw* with ``~`` expanded and symlinks resolved, for comparing a
+    config checkout path against an assignment's ``repo_path``."""
+    p = Path(raw).expanduser()
+    try:
+        return str(p.resolve())
+    except OSError:
+        return str(p)
+
+
 def _graphify_update(repo_path: Path, *, timeout: float = 600.0) -> tuple[bool, str]:
     """Run ``graphify update .`` in *repo_path* (#1729, H-6's self-heal).
 
@@ -6543,6 +6553,22 @@ class AgentServer:
         self._graph_heal_last_skip_at: float | None = None
         self._graph_heal_passes: int = 0
 
+        # Base-checkout refresh: a graph that matches HEAD still describes
+        # stale code when HEAD is behind origin, and every worktree borrows
+        # the base checkout's graph. `_refresh_base_checkouts` fast-forwards
+        # clean, on-branch base checkouts on its own (slower) interval and
+        # rebuilds their graph. `_graph_refresh_results` holds the latest
+        # outcome per checkout path for /health's `graph_refresh` block;
+        # `_graph_refresh_pending` maps a path whose HEAD moved but whose
+        # graph is not rebuilt yet (deferred while the machine is busy) to
+        # the time it moved.
+        self._graph_refresh_interval: float = float(
+            os.environ.get("COORD_AGENT_GRAPH_REFRESH_INTERVAL", "1800")
+        )
+        self._graph_refresh_last_run_at: float | None = None
+        self._graph_refresh_results: dict[str, dict] = {}
+        self._graph_refresh_pending: dict[str, float] = {}
+
         # Skills self-heal (#319 follow-up): `coord install-skills` was a
         # real fix (coord/skills/*/SKILL.md) for a real problem, but was a
         # 100%-manual step nothing in provisioning ever ran — so a skill
@@ -7007,6 +7033,15 @@ class AgentServer:
                 "skipped_active": self._graph_heal_skipped_active,
                 "last_skip_at": self._graph_heal_last_skip_at,
             },
+            # Per base checkout: the last fast-forward attempt (or why it was
+            # refused — dirty, off-branch, diverged, ...) and the commit and
+            # time the graph was last built/verified against. Rendered by
+            # `coord doctor`; absent on an agent that predates it.
+            "graph_refresh": {
+                "interval_s": self._graph_refresh_interval,
+                "last_run_at": self._graph_refresh_last_run_at,
+                "checkouts": [dict(v) for v in self._graph_refresh_results.values()],
+            },
             # Same idea as `graph_self_heal` above, for the bundled
             # `coord/skills/*/SKILL.md` sync: `coord install-skills` existed
             # as a real fix but was a 100%-manual step nothing in
@@ -7101,6 +7136,14 @@ class AgentServer:
 
             ctx = build_context(self._health_config, allow_network=False, now=now)
             _mark("build_context")
+            try:
+                # Before the checks run, so this same report's `graph` results
+                # already describe the fast-forwarded HEAD and rebuilt graph.
+                # Own try/except for the same reason as the graph pass below.
+                self._refresh_base_checkouts(ctx)
+            except Exception as exc:  # noqa: BLE001 — refresh is best-effort
+                _log.warning("base checkout refresh pass failed: %s", exc)
+            _mark("refresh_base_checkouts")
             report = run_all(ctx, scopes=("machine", "checkout"))
             _mark("run_checks")
             check_durations_ms = report.check_durations_ms
@@ -7174,6 +7217,150 @@ class AgentServer:
 
         self._local_health_cache = (now, payload)
         return payload
+
+    def _refresh_base_checkouts(self, ctx: Any) -> None:
+        """Keep each base checkout's HEAD, and so its graph, current with
+        origin.
+
+        Rides the cached local-health tick but on its own interval
+        (``COORD_AGENT_GRAPH_REFRESH_INTERVAL``, default 1800s), because the
+        fetch is network I/O. Per configured checkout in *ctx*:
+
+        * :func:`coord.graph_health.fast_forward_base_checkout` fetches and
+          fast-forwards the integration branch only when the checkout is
+          clean, on that branch, not mid-operation and not diverged; any
+          other state is left untouched and its outcome recorded.
+        * A repo with an assignment still in setup (PENDING — worktree
+          creation fetches and runs ``git worktree add`` in the same base
+          repo) is skipped this round rather than raced.
+        * After a fast-forward, ``graphify update .`` runs — but only while
+          no assignment is RUNNING, the same idle rule the stale-graph heal
+          follows. A busy machine records the rebuild as deferred and every
+          later tick retries until it is idle; the deferral is not
+          interval-gated.
+        * A rebuild failure is recorded in ``_graph_rebuild_failed`` for the
+          new HEAD, so the stale-graph pass surfaces it as WARN and does not
+          retry it.
+
+        Runs before the health checks, so the same report already reflects
+        the new HEAD. Never raises out to /health (the caller wraps it).
+        """
+        from coord.graph_health import fast_forward_base_checkout  # noqa: PLC0415
+
+        now = time.time()
+        with self._lock:
+            last = self._graph_refresh_last_run_at
+            due = last is None or (now - last) >= self._graph_refresh_interval
+            if due:
+                self._graph_refresh_last_run_at = now
+            busy = any(a.status == RUNNING for a in self._assignments.values())
+            setting_up = {
+                _resolved_path_str(a.spec.repo_path)
+                for a in self._assignments.values()
+                if a.status == PENDING and a.spec.repo_path
+            }
+
+        for checkout in ctx.checkouts:
+            path_str = str(checkout.path)
+            if due and _resolved_path_str(path_str) not in setting_up:
+                with self._lock:
+                    if path_str in self._graph_rebuild_in_progress:
+                        continue
+                    self._graph_rebuild_in_progress.add(path_str)
+                try:
+                    result = fast_forward_base_checkout(
+                        checkout.path, checkout.home_branches
+                    )
+                finally:
+                    with self._lock:
+                        self._graph_rebuild_in_progress.discard(path_str)
+                entry = {"repo": checkout.name, **result.to_dict()}
+                previous = self._graph_refresh_results.get(path_str) or {}
+                for key in ("graph_detail", "graph_rebuild_ok"):
+                    if key in previous:
+                        entry[key] = previous[key]
+                if result.refreshed:
+                    self._graph_refresh_pending[path_str] = result.at
+                    self._graph_rebuild_failed.pop(path_str, None)
+                    entry.pop("graph_detail", None)
+                    entry.pop("graph_rebuild_ok", None)
+                self._graph_refresh_results[path_str] = entry
+
+            entry = self._graph_refresh_results.get(path_str)
+            if entry is None:
+                continue
+            if path_str in self._graph_refresh_pending:
+                self._rebuild_refreshed_graph(checkout, entry, busy=busy)
+            self._stamp_graph_refresh_entry(checkout, entry)
+
+    def _rebuild_refreshed_graph(self, checkout: Any, entry: dict, *, busy: bool) -> None:
+        """Rebuild the graph of a checkout whose HEAD the refresh pass moved.
+
+        Clears the pending mark once the graph is current — rebuilt here,
+        rebuilt by the stale-graph pass meanwhile, or absent (building an
+        absent graph is the stale-graph pass's job). Leaves it pending while
+        *busy*. A failed rebuild clears it too: the failure is recorded once
+        for this HEAD instead of being retried every tick.
+        """
+        from coord.graph_health import graph_status  # noqa: PLC0415
+
+        path_str = str(checkout.path)
+        moved_at = self._graph_refresh_pending.get(path_str, 0.0)
+        before = graph_status(checkout.path, checkout.default_branch)
+        if not before.present:
+            self._graph_refresh_pending.pop(path_str, None)
+            entry["graph_detail"] = "no graph here yet — the graph self-heal builds it"
+            return
+        if before.in_sync or (before.verified_at is not None and before.verified_at >= moved_at):
+            self._graph_refresh_pending.pop(path_str, None)
+            entry.setdefault("graph_detail", "graph current")
+            return
+        if busy:
+            entry["graph_detail"] = "rebuild deferred: machine busy"
+            return
+
+        with self._lock:
+            if path_str in self._graph_rebuild_in_progress:
+                return
+            self._graph_rebuild_in_progress.add(path_str)
+        try:
+            ok, detail = _graphify_update(checkout.path)
+        finally:
+            with self._lock:
+                self._graph_rebuild_in_progress.discard(path_str)
+        self._graph_refresh_pending.pop(path_str, None)
+
+        if not ok:
+            if before.head_sha:
+                self._graph_rebuild_failed[path_str] = (before.head_sha, detail)
+            entry["graph_rebuild_ok"] = False
+            entry["graph_detail"] = f"rebuild failed: {detail}"
+            return
+        after = graph_status(checkout.path, checkout.default_branch)
+        if after.present and not after.stale:
+            self._graph_rebuild_failed.pop(path_str, None)
+            entry["graph_rebuild_ok"] = True
+            entry["graph_detail"] = "graph rebuilt"
+        else:
+            entry["graph_rebuild_ok"] = False
+            entry["graph_detail"] = (
+                "graphify update exited 0 but the graph is still stale "
+                f"(built from {after.built_sha or '?'}, HEAD {(after.head_sha or '?')[:8]})"
+            )
+
+    @staticmethod
+    def _stamp_graph_refresh_entry(checkout: Any, entry: dict) -> None:
+        """Record which commit the checkout's graph was last built from and
+        when graphify last verified it, for `coord doctor`."""
+        from coord.graph_health import graph_status  # noqa: PLC0415
+
+        st = graph_status(checkout.path, checkout.default_branch)
+        entry["graph_built_sha"] = st.built_sha
+        refreshed_at = st.verified_at
+        if refreshed_at is None and st.age_seconds is not None:
+            refreshed_at = time.time() - st.age_seconds
+        entry["graph_refreshed_at"] = refreshed_at
+        entry["graph_current"] = bool(st.present and not st.stale)
 
     def _self_heal_stale_graphs(self, ctx: Any, report: Any) -> None:
         """React to the ``graph`` check's STATE verdict instead of chasing

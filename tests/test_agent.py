@@ -338,6 +338,7 @@ def test_local_health_timing_breakdown_covers_every_phase(tmp_path: Path) -> Non
     timing = local_health["timing_ms"]
     expected_phases = {
         "build_context",
+        "refresh_base_checkouts",
         "run_checks",
         "self_heal_graphs",
         "self_heal_skills",

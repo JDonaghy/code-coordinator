@@ -1048,3 +1048,119 @@ def test_gui_lane_preflight_lines_renders_an_unknown_result() -> None:
         not is_problem and "gtk-native" in line and "boom" in line
         for is_problem, line in lines
     )
+
+
+# ── graph refresh: the agent's base-checkout fast-forward + graph rebuild ────
+#
+# `coord doctor` projects /health's `graph_refresh` block — see
+# `_graph_refresh_lines` in coord/commands/status.py. Driven through the real
+# `doctor` command, matching this file's convention.
+
+
+def _health_with_graph_refresh(tool_versions: dict, machine, *, checkouts: list[dict]) -> dict:
+    import time
+
+    h = _health(tool_versions, machine)
+    h["graph_refresh"] = {
+        "interval_s": 1800.0, "last_run_at": time.time(), "checkouts": checkouts,
+    }
+    return h
+
+
+def _refresh_entry(**overrides) -> dict:
+    import time
+
+    entry = {
+        "repo": "quadraui", "repo_path": "/src/quadraui", "outcome": "fast_forwarded",
+        "branch": "develop", "head_before": "a" * 40, "head_after": "b" * 40,
+        "origin_sha": "b" * 40, "detail": "fast-forwarded 32 commits to origin/develop",
+        "at": time.time(), "graph_built_sha": "bbbbbbbb",
+        "graph_refreshed_at": time.time() - 2 * 3600, "graph_current": True,
+        "graph_rebuild_ok": True, "graph_detail": "graph rebuilt",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _doctor_with_refresh(valid_config_path, monkeypatch, checkouts: list[dict]):
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    m = cfg.machines[0]
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_graph_refresh(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m, checkouts=checkouts,
+            ),
+        ),
+        *[
+            MachineStatus(
+                machine=other, state=ONLINE,
+                health=_health({"git": _ok_probe(), "gh": _ok_probe()}, other),
+            )
+            for other in cfg.machines[1:]
+        ],
+    ]
+    return _run_doctor(valid_config_path, monkeypatch, statuses)
+
+
+def test_doctor_shows_graph_refresh_sha_and_age(valid_config_path, monkeypatch) -> None:
+    result = _doctor_with_refresh(valid_config_path, monkeypatch, [_refresh_entry()])
+    assert result.exit_code == 0, result.output
+    assert (
+        "✓ graph refresh quadraui: fast_forwarded @ bbbbbbbb, "
+        "graph bbbbbbbb refreshed 2.0h ago" in result.output
+    )
+
+
+def test_doctor_reports_an_untouched_dirty_checkout_without_failing(
+    valid_config_path, monkeypatch,
+) -> None:
+    entry = _refresh_entry(
+        outcome="skipped_dirty", head_after="a" * 40, graph_built_sha="aaaaaaaa",
+        detail="uncommitted changes to tracked files: src/lib.rs",
+        graph_detail=None, graph_rebuild_ok=None,
+    )
+    result = _doctor_with_refresh(valid_config_path, monkeypatch, [entry])
+    assert result.exit_code == 0, result.output
+    assert "⚠ graph refresh quadraui: skipped_dirty" in result.output
+    assert "left untouched: uncommitted changes to tracked files: src/lib.rs" in result.output
+
+
+def test_doctor_fails_on_a_refused_fast_forward(valid_config_path, monkeypatch) -> None:
+    entry = _refresh_entry(
+        outcome="ff_failed", detail="fatal: Not possible to fast-forward, aborting.",
+        graph_detail=None, graph_rebuild_ok=None,
+    )
+    result = _doctor_with_refresh(valid_config_path, monkeypatch, [entry])
+    assert result.exit_code == 1, result.output
+    assert "✗ graph refresh quadraui: ff_failed" in result.output
+    assert "Not possible to fast-forward" in result.output
+
+
+def test_doctor_fails_on_a_failed_graph_rebuild(valid_config_path, monkeypatch) -> None:
+    entry = _refresh_entry(
+        graph_rebuild_ok=False, graph_current=False,
+        graph_detail="rebuild failed: graphify refused",
+    )
+    result = _doctor_with_refresh(valid_config_path, monkeypatch, [entry])
+    assert result.exit_code == 1, result.output
+    assert "rebuild failed: graphify refused" in result.output
+
+
+def test_doctor_is_silent_about_graph_refresh_for_an_older_agent(
+    valid_config_path, monkeypatch,
+) -> None:
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert "graph refresh" not in result.output

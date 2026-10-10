@@ -46,6 +46,13 @@ records the commit it was built from::
 :func:`graph_status` compares that to HEAD.  ``coord diagnose --graph``
 surfaces it, so drift shows up in a routine health check instead of being
 discovered by a confused agent mid-task.
+
+**3. HEAD itself drifts behind origin.**  A graph can match HEAD exactly and
+still describe stale code when the base checkout is never pulled.
+:func:`fast_forward_base_checkout` is the agent's periodic remedy: it
+fast-forwards a base checkout's integration branch only when the checkout is
+clean, on that branch, not mid-operation and not diverged. A dirty, parked or
+diverged checkout is left exactly as it is and the reason is reported.
 """
 
 from __future__ import annotations
@@ -86,8 +93,9 @@ class GraphStatus:
     head_sha: str | None = None
     in_sync: bool = False
     # HEAD vs origin/<default_branch> — the axis graph<->HEAD alone cannot see
-    # (#2211).  The base checkout is fetched but never pulled by design (see
-    # module docstring), so HEAD can sit arbitrarily far behind origin while
+    # (#2211).  The base checkout is only fast-forwarded when it is clean and
+    # on its integration branch (see module docstring), so HEAD can sit
+    # arbitrarily far behind origin while
     # graph == HEAD reports a clean bill of health.  ``default_branch`` is the
     # branch name the comparison used; ``origin_sha`` / ``commits_behind_origin``
     # are ``None`` when it could not be determined (no remote, ref never
@@ -658,7 +666,7 @@ def format_status_lines(st: GraphStatus) -> list[str]:
 
     # #2211: graph == HEAD only proves the graph matches the checkout's own
     # HEAD — it says nothing about whether that HEAD itself is stale relative
-    # to origin (the base checkout is fetched but never pulled, by design;
+    # to origin (a dirty or parked base checkout is never fast-forwarded;
     # see module docstring).  Shared by both "graph matches HEAD" branches
     # below so a genuinely-current-but-unpushed-tracking checkout doesn't
     # report a false ✓.
@@ -668,7 +676,9 @@ def format_status_lines(st: GraphStatus) -> list[str]:
         origin_note = (
             f" — HEAD is {n} commit{'' if n == 1 else 's'} behind "
             f"origin/{st.default_branch}; the graph describes stale code "
-            f"(fix: review + pull — not automatic, see #2211)"
+            f"(the agent fast-forwards a clean base checkout on its integration "
+            f"branch; a dirty or off-branch one is left alone — check "
+            f"`coord doctor`'s graph refresh line)"
         )
 
     if st.unknown_reason:
@@ -698,3 +708,295 @@ def format_status_lines(st: GraphStatus) -> list[str]:
     if st.age_seconds is not None:
         lines.append(f"    graph.json age: {st.age_seconds / 3600.0:.1f}h")
     return lines
+
+
+# ── Keeping the base checkout itself current ────────────────────────────────
+#
+# A graph that matches HEAD exactly still describes stale code when HEAD is
+# behind origin, and worktrees borrow the base checkout's graph, so every
+# worker on the machine navigates by it. The agent therefore fast-forwards
+# each base checkout's integration branch on a timer — but only when that is
+# provably a pure ref move nobody could object to. Every guard below fails
+# closed and leaves the checkout exactly as it was; the outcome is reported
+# instead, so a parked or dirty checkout is visible rather than silently stale.
+
+REFRESH_FAST_FORWARDED = "fast_forwarded"
+REFRESH_UP_TO_DATE = "up_to_date"
+REFRESH_SKIPPED_LINKED_WORKTREE = "skipped_linked_worktree"
+REFRESH_SKIPPED_OFF_BRANCH = "skipped_off_branch"
+REFRESH_SKIPPED_IN_PROGRESS = "skipped_in_progress"
+REFRESH_SKIPPED_DIRTY = "skipped_dirty"
+REFRESH_SKIPPED_DIVERGED = "skipped_diverged"
+REFRESH_NO_ORIGIN = "no_origin"
+REFRESH_FETCH_FAILED = "fetch_failed"
+REFRESH_FF_FAILED = "ff_failed"
+
+# Outcomes where the checkout was deliberately left alone because a human
+# (or an in-flight git operation) owns its state. Reported, not failures.
+REFRESH_LEFT_UNTOUCHED: frozenset[str] = frozenset({
+    REFRESH_SKIPPED_LINKED_WORKTREE,
+    REFRESH_SKIPPED_OFF_BRANCH,
+    REFRESH_SKIPPED_IN_PROGRESS,
+    REFRESH_SKIPPED_DIRTY,
+    REFRESH_SKIPPED_DIVERGED,
+    REFRESH_NO_ORIGIN,
+})
+
+# Outcomes where the refresh was attempted and git refused or errored.
+REFRESH_FAILED: frozenset[str] = frozenset({REFRESH_FETCH_FAILED, REFRESH_FF_FAILED})
+
+# Files in the git dir whose presence means a multi-step git operation is
+# mid-flight in this checkout; moving HEAD underneath one corrupts it.
+_IN_PROGRESS_MARKERS: tuple[str, ...] = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "rebase-merge",
+    "rebase-apply",
+    "index.lock",
+)
+
+
+@dataclass
+class BaseRefreshResult:
+    """Outcome of one :func:`fast_forward_base_checkout` call."""
+
+    repo_path: str
+    outcome: str
+    branch: str | None = None
+    head_before: str | None = None
+    head_after: str | None = None
+    origin_sha: str | None = None
+    detail: str = ""
+    at: float = field(default_factory=time.time)
+
+    @property
+    def refreshed(self) -> bool:
+        return self.outcome == REFRESH_FAST_FORWARDED
+
+    def to_dict(self) -> dict:
+        return {
+            "repo_path": self.repo_path,
+            "outcome": self.outcome,
+            "branch": self.branch,
+            "head_before": self.head_before,
+            "head_after": self.head_after,
+            "origin_sha": self.origin_sha,
+            "detail": self.detail,
+            "at": self.at,
+        }
+
+
+def _git_run(
+    repo_path: Path, *args: str, timeout: float = 10.0
+) -> tuple[int, str, str]:
+    """``(returncode, stdout, stderr)`` for ``git <args>`` in *repo_path*.
+
+    Unlike :func:`_git_out` this keeps the failure detail, so a refused
+    fast-forward can say why. A git that cannot be started or times out is
+    reported as returncode ``-1`` with the reason in stderr — never raised.
+    """
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return -1, "", f"git {' '.join(args)} timed out after {timeout:.0f}s"
+    except (subprocess.SubprocessError, OSError) as exc:
+        return -1, "", f"git {' '.join(args)} failed to start: {exc}"
+    return r.returncode, r.stdout.rstrip(), r.stderr.strip()
+
+
+def _resolve_git_path(repo_path: Path, raw: str) -> Path:
+    p = Path(raw)
+    if not p.is_absolute():
+        p = repo_path / p
+    try:
+        return p.resolve()
+    except OSError:
+        return p
+
+
+def is_linked_worktree(repo_path: Path) -> bool | None:
+    """True for a linked ``git worktree``, False for the checkout that owns
+    its ``.git`` directory, ``None`` when git cannot say.
+
+    Same predicate as ``.githooks/_lib.sh``'s ``gfy_is_linked_worktree``: a
+    linked worktree's ``--git-dir`` is a subdirectory of ``--git-common-dir``,
+    while a base checkout's two are the same path.
+    """
+    git_dir = _git_out(repo_path, "rev-parse", "--git-dir")
+    common_dir = _git_out(repo_path, "rev-parse", "--git-common-dir")
+    if not git_dir or not common_dir:
+        return None
+    return _resolve_git_path(repo_path, git_dir) != _resolve_git_path(repo_path, common_dir)
+
+
+def _git_index_lock(repo_path: Path) -> Path | None:
+    """The checkout's ``index.lock`` when one exists, else ``None``."""
+    git_dir_raw = _git_out(repo_path, "rev-parse", "--git-dir")
+    if not git_dir_raw:
+        return None
+    lock = _resolve_git_path(repo_path, git_dir_raw) / "index.lock"
+    return lock if lock.exists() else None
+
+
+def fast_forward_base_checkout(
+    repo_path: Path,
+    home_branches: tuple[str, ...],
+    *,
+    fetch: bool = True,
+    fetch_timeout: float = 60.0,
+    merge_timeout: float = 300.0,
+) -> BaseRefreshResult:
+    """Fast-forward the base checkout at *repo_path* to its ``origin`` branch
+    when — and only when — that cannot lose or disturb anything.
+
+    *home_branches* are the repo's integration branches (its configured
+    ``default_branch``, plus ``develop_branch`` when set). The checkout must
+    currently be on one of them; that branch is the one fetched and
+    fast-forwarded. Guards, in order, each of which leaves the checkout
+    untouched and names itself in the returned ``outcome``:
+
+    * a linked worktree is never a base checkout (``skipped_linked_worktree``);
+    * detached HEAD or a branch outside *home_branches* means someone parked
+      it there on purpose (``skipped_off_branch``);
+    * a merge, rebase, cherry-pick, revert, bisect or ``index.lock`` in the
+      git dir means an operation is mid-flight (``skipped_in_progress``);
+    * any modified or staged **tracked** file (``skipped_dirty``). Untracked
+      files are deliberately allowed: ``git merge --ff-only`` itself refuses
+      to overwrite an untracked file, so they cannot be clobbered, and base
+      checkouts routinely carry untracked test output;
+    * no ``origin`` remote (``no_origin``);
+    * the fetch fails or times out (``fetch_failed``);
+    * local commits not on origin (``skipped_diverged``) — never reset.
+
+    Only then ``git merge --ff-only origin/<branch>`` runs. No ``--force``,
+    ``reset``, ``stash`` or ``checkout`` is ever used. Never raises.
+
+    The merge is the one step that writes the index and working tree, so it
+    gets *merge_timeout* — a budget sized for a large jump on a slow
+    filesystem, not the short one the read-only probes use. Killing git
+    mid-checkout would leave ``index.lock`` behind, which every later refresh
+    reads as ``skipped_in_progress`` and every manual git command refuses on.
+    If that happens anyway, the ``ff_failed`` detail names the lock and the
+    manual remedy.
+    """
+    path_str = str(repo_path)
+
+    def _result(outcome: str, **kw) -> BaseRefreshResult:
+        return BaseRefreshResult(repo_path=path_str, outcome=outcome, **kw)
+
+    linked = is_linked_worktree(repo_path)
+    if linked is None:
+        return _result(REFRESH_FF_FAILED, detail="git cannot read this checkout")
+    if linked:
+        return _result(
+            REFRESH_SKIPPED_LINKED_WORKTREE,
+            detail="linked worktree — only base checkouts are refreshed",
+        )
+
+    head_before = _head_sha(repo_path)
+    rc, ref, _ = _git_run(repo_path, "symbolic-ref", "--quiet", "HEAD")
+    branch = ref[len("refs/heads/"):] if rc == 0 and ref.startswith("refs/heads/") else None
+    if branch is None:
+        return _result(
+            REFRESH_SKIPPED_OFF_BRANCH, head_before=head_before, head_after=head_before,
+            detail=f"detached HEAD — integration branch is {'/'.join(home_branches)}",
+        )
+    if branch not in home_branches:
+        return _result(
+            REFRESH_SKIPPED_OFF_BRANCH, branch=branch,
+            head_before=head_before, head_after=head_before,
+            detail=f"on {branch!r}, not {'/'.join(home_branches)}",
+        )
+
+    def _untouched(outcome: str, detail: str, **kw) -> BaseRefreshResult:
+        return _result(
+            outcome, branch=branch, head_before=head_before, head_after=head_before,
+            detail=detail, **kw,
+        )
+
+    git_dir_raw = _git_out(repo_path, "rev-parse", "--git-dir")
+    if git_dir_raw:
+        git_dir = _resolve_git_path(repo_path, git_dir_raw)
+        busy = [m for m in _IN_PROGRESS_MARKERS if (git_dir / m).exists()]
+        if busy:
+            return _untouched(
+                REFRESH_SKIPPED_IN_PROGRESS,
+                f"git operation in progress ({', '.join(busy)})",
+            )
+
+    rc, porcelain, err = _git_run(
+        repo_path, "status", "--porcelain", "--untracked-files=no"
+    )
+    if rc != 0:
+        return _untouched(REFRESH_SKIPPED_DIRTY, f"git status failed: {err}")
+    if porcelain:
+        changed = [line[3:] for line in porcelain.splitlines() if line.strip()]
+        shown = ", ".join(changed[:3])
+        more = f" (+{len(changed) - 3} more)" if len(changed) > 3 else ""
+        return _untouched(
+            REFRESH_SKIPPED_DIRTY, f"uncommitted changes to tracked files: {shown}{more}"
+        )
+
+    if _git_out(repo_path, "remote", "get-url", "origin") is None:
+        return _untouched(REFRESH_NO_ORIGIN, "no origin remote")
+
+    if fetch:
+        rc, _, err = _git_run(
+            repo_path, "fetch", "--quiet", "origin", branch, timeout=fetch_timeout
+        )
+        if rc != 0:
+            return _untouched(REFRESH_FETCH_FAILED, err or f"git fetch exited {rc}")
+
+    origin_sha = _git_out(repo_path, "rev-parse", f"refs/remotes/origin/{branch}")
+    if not origin_sha:
+        return _untouched(REFRESH_FETCH_FAILED, f"origin/{branch} not found after fetch")
+    if head_before and head_before == origin_sha:
+        return _untouched(
+            REFRESH_UP_TO_DATE, f"at origin/{branch}", origin_sha=origin_sha
+        )
+
+    rc, _, _ = _git_run(repo_path, "merge-base", "--is-ancestor", "HEAD", origin_sha)
+    if rc != 0:
+        ahead = _commits_ahead(repo_path, origin_sha, "HEAD")
+        return _untouched(
+            REFRESH_SKIPPED_DIVERGED,
+            f"{ahead if ahead is not None else 'some'} local commit(s) not on "
+            f"origin/{branch} — fast-forward impossible, left as is",
+            origin_sha=origin_sha,
+        )
+
+    rc, _, err = _git_run(
+        repo_path, "merge", "--ff-only", "--quiet", origin_sha, timeout=merge_timeout
+    )
+    if rc != 0:
+        detail = err or f"git merge --ff-only exited {rc}"
+        lock = _git_index_lock(repo_path)
+        if lock is not None:
+            detail += (
+                f"; {lock} was left behind — confirm no git process is running "
+                f"in this checkout, then delete it and run `git status` to "
+                f"check the working tree"
+            )
+        return _result(
+            REFRESH_FF_FAILED, branch=branch, head_before=head_before,
+            head_after=_head_sha(repo_path), origin_sha=origin_sha,
+            detail=detail,
+        )
+    head_after = _head_sha(repo_path)
+    n = _commits_ahead(repo_path, head_before, head_after) if head_before and head_after else None
+    return _result(
+        REFRESH_FAST_FORWARDED, branch=branch, head_before=head_before,
+        head_after=head_after, origin_sha=origin_sha,
+        detail=(
+            f"fast-forwarded {n} commit{'' if n == 1 else 's'} to origin/{branch}"
+            if n is not None else f"fast-forwarded to origin/{branch}"
+        ),
+    )
