@@ -1064,10 +1064,22 @@ def _record_dispatched_local(
     # is never branch=NULL.  Mirrors agent.py:1021 exactly:
     #   branch_name = existing_branch or f"issue-{issue_number}-{_slugify(issue_title)}"
     # where proposal.target_branch maps to existing_branch.
-    from coord.agent import _slugify  # noqa: PLC0415
+    from coord.agent import WORKFLOW_LEG_LABEL, _slugify  # noqa: PLC0415
 
     branch = proposal.target_branch or (
         f"issue-{proposal.issue_number}-{_slugify(proposal.issue_title)}"
+    )
+
+    # #3681: "workflow" only for a `type="work"` dispatch whose issue carries
+    # the opt-in `coord:workflow` label (mirrors coord.dispatch's own
+    # `proposal.type == "work"` gating for the wire-payload `workflow` flag)
+    # — every other proposal type (test, review, fix, ...) and every
+    # unlabeled work issue records "single". See
+    # `coord.agent.AssignmentSpec.workflow`.
+    mode = (
+        "workflow"
+        if proposal.type == "work" and WORKFLOW_LEG_LABEL in (proposal.issue_labels or [])
+        else "single"
     )
 
     conn = get_connection()
@@ -1077,8 +1089,8 @@ def _record_dispatched_local(
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, required_gates,
             provider_name, branch, driven_by, dispatched_by_assignment_id,
-            model_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            model_reason, mode
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO NOTHING""",
         (
             assignment_id,
@@ -1098,6 +1110,7 @@ def _record_dispatched_local(
             proposal.driven_by,
             proposal.dispatched_by_assignment_id,
             model_reason,
+            mode,
         ),
     )
     conn.commit()
@@ -4612,6 +4625,44 @@ def load_assignment_test_state(assignment_id: str) -> str | None:
     if row is None:
         return None
     return row["test_state"] if hasattr(row, "keys") else row[0]
+
+
+def load_assignment_mode(assignment_id: str) -> str | None:
+    """#3681: the ``mode`` (``"single"`` or ``"workflow"``) a Work leg's row
+    was dispatched with.
+
+    Set once, at dispatch time, by `_record_dispatched_local` — never
+    updated afterwards. ``None`` for a row predating this column, or an
+    assignment id this board has never heard of; callers should treat that
+    the same as ``"single"`` (every pre-#3681 leg ran single-agent).
+
+    Same daemon-first, local-fallback routing as
+    :func:`load_assignment_test_state`.
+    """
+    if not assignment_id:
+        return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_assignment  # noqa: PLC0415
+
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return row.get("mode")
+            return None
+        except Exception:  # noqa: BLE001 — degraded fallback, never blocking
+            return None
+    try:
+        conn = get_connection()
+        row = sql.execute(conn,
+            "SELECT mode FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    return row["mode"] if hasattr(row, "keys") else row[0]
 
 
 def load_assignment_test_confirmation(assignment_id: str) -> str | None:

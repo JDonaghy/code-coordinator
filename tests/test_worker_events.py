@@ -404,6 +404,44 @@ class TestParseLog:
         assert summary.terminal_reason is None
         assert summary.api_error_status is None
 
+    def test_workflow_leg_two_result_events_last_one_wins(self, tmp_path: Path) -> None:
+        """#3681: a Work leg run as a Claude Code workflow (implement -> review
+        -> fix) emits TWO `result` events from a single `claude -p` process —
+        one when the first agent in the workflow finishes, one when the whole
+        workflow finishes. Every consumer of "the result" (completion
+        summaries, the `done` record) must reflect the LAST one, never the
+        first, since the first is not the leg's actual outcome."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    _assistant_text_event("Implementing the fix..."),
+                    _result_event(
+                        result="Implementation agent done, handing off to reviewer.",
+                        stop_reason="end_turn",
+                        num_turns=4,
+                        duration_ms=90000,
+                        total_cost_usd=0.05,
+                    ),
+                    _assistant_text_event("Reviewing and addressing feedback..."),
+                    _result_event(
+                        result="Workflow complete: implemented, reviewed, and pushed.",
+                        stop_reason="end_turn",
+                        num_turns=11,
+                        duration_ms=310000,
+                        total_cost_usd=0.41,
+                    ),
+                ]
+            )
+        )
+        summary = parse_log(p)
+        assert summary.result_text == "Workflow complete: implemented, reviewed, and pushed."
+        assert summary.stop_reason == "end_turn"
+        assert summary.num_turns == 11
+        assert summary.duration_ms == 310000
+        assert summary.total_cost_usd == pytest.approx(0.41)
+
     def test_rate_limit_event_allowed_does_not_set_flag(self, tmp_path: Path) -> None:
         """#1466: `status: "allowed"` is the healthy, common case — Claude
         Code emits it on essentially every run — and must never set

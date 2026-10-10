@@ -7,6 +7,7 @@ tests can drive it directly without standing up a real server.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import logging
 import os
@@ -325,6 +326,12 @@ def _format_truncation_reason(stop_reason: str, provider_name: str | None) -> st
 _REAP_POLL_INTERVAL = 5.0        # seconds between proc.wait timeout attempts
 _REAP_GRACE_AFTER_RESULT = 30.0  # grace period after result line before SIGTERM
 _REAP_MAX_WAIT = 2 * 60 * 60.0   # absolute max wait (2 hours) — last-resort safety net
+# #3681: a workflow leg (implement → adversarial review → fix, all run as one
+# `claude -p` workflow) is several ordinary legs chained end to end, so the
+# single-leg `_REAP_MAX_WAIT` safety net is too tight — it would fire on a
+# workflow that is still legitimately working. Generous multiple (8 hours);
+# only ever consulted for legs that opted in via ``AssignmentSpec.workflow``.
+_REAP_MAX_WAIT_WORKFLOW = 8 * 60 * 60.0
 _RESULT_LINE_MARKER = b'"type":"result"'
 # PTY workers (ClaudePtyProvider) never emit stream-json, so the pump thread
 # stamps this sentinel after the subprocess exits.  MUST stay byte-equal to
@@ -601,6 +608,72 @@ def _log_has_result(log_path: str) -> bool:
         return False
 
 
+def _log_last_event_is_result(
+    log_path: str, *, marker: bytes = _RESULT_LINE_MARKER
+) -> bool:
+    """Workflow-aware counterpart to :func:`_log_has_result` (#3681).
+
+    `claude -p` running a **workflow** (multiple agents: implement → review
+    → fix) emits a `result` event when the *outer* turn ends — the one that
+    says "the workflow is running in background" — and only emits the real,
+    final `result` once the workflow (and every subagent it spawned)
+    actually finishes. `_log_has_result` latches on the FIRST matching line
+    it finds anywhere in the log, so used naively it would treat that
+    placeholder as completion and let the reap thread's grace-period
+    teardown kill the still-running workflow out from under itself.
+
+    This variant instead asks "is the **last** event in the log a result
+    event (or the PTY exit sentinel)?" — true only while nothing has been
+    appended since. `_wait_for_proc_or_result`'s `workflow=True` branch
+    re-arms (clears) `result_seen_at` the moment this flips back to False,
+    so a result line with more stream output after it is never treated as
+    final — only a result line that stays the last line of the log for the
+    whole grace window is.
+
+    `#`-comment lines — the spawn header and the reap thread's own
+    bookkeeping lines it appends to this same file while polling (e.g.
+    `"# reap: worker emitted result; awaiting clean exit"`) — are never
+    real worker output, so they are skipped rather than treated as
+    "something new was appended" (except the PTY sentinel itself, which IS
+    a legitimate completion signal despite the `#` prefix).
+
+    ``marker`` lets `_reap` reuse this one implementation for a
+    non-default-provider result marker too (mirroring how `_log_has_result`
+    is reused/wrapped there) rather than hand-rolling a second "is this line
+    a result line" check — only the default marker gets the extra per-line
+    JSON validation `_log_has_result` also applies, since a provider with a
+    different marker isn't necessarily emitting JSON lines at all.
+    """
+    try:
+        last_match = False
+        with open(log_path, "rb") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(b"#"):
+                    if line.startswith(_PTY_RESULT_LINE_MARKER):
+                        last_match = True
+                    continue
+                if marker not in raw:
+                    last_match = False
+                    continue
+                if marker == _RESULT_LINE_MARKER:
+                    try:
+                        event = json.loads(raw)
+                    except (ValueError, TypeError):
+                        last_match = False
+                        continue
+                    last_match = (
+                        isinstance(event, dict) and event.get("type") == "result"
+                    )
+                else:
+                    last_match = True
+        return last_match
+    except OSError:
+        return False
+
+
 def _log_has_output(log_path: str) -> bool:
     """Return True once the worker has produced any output beyond the spawn header.
 
@@ -680,6 +753,7 @@ def _wait_for_proc_or_result(
     log_has_output: Callable[[str], bool] = _log_has_output,
     clock: Callable[[], float] = time.monotonic,
     wall_clock: Callable[[], float] = time.time,
+    workflow: bool = False,
 ) -> int:
     """Wait for `proc` to exit; force-kill its process group if it hangs after
     the worker emitted its final result event.
@@ -741,6 +815,30 @@ def _wait_for_proc_or_result(
       well before, the runtime ceiling above: a leg that slept through a
       multi-hour suspend should never be trusted to resume cleanly, whatever
       its eventual wall-clock age would have been.
+
+    Workflow legs (#3681): ``claude -p`` running a **workflow** (multiple
+    agents — implement, then adversarial review, then fix — chained inside
+    one invocation) emits a `result` event when the *outer* turn ends, before
+    the workflow it kicked off in the background has actually finished; the
+    real, final `result` only appears once the workflow (and every subagent
+    it spawned) completes. With the default ``workflow=False`` behavior above
+    — a one-way latch on ``log_has_result`` — that placeholder would be
+    mistaken for completion and the grace-period teardown below would kill
+    the still-running workflow out from under itself.
+
+    When ``workflow=True``, ``log_has_result`` is expected to be a
+    workflow-aware callable (built from :func:`_log_last_event_is_result`)
+    that answers "is the **last** line of the log right now a result event?"
+    rather than "has a result event ever appeared?". The completion gate
+    below then RE-ARMS: if ``log_has_result`` ever reports ``False`` again
+    after having reported ``True`` (because the workflow appended more
+    output), ``result_seen_at`` is cleared back to ``None`` so the grace
+    period restarts from scratch on the next real completion. A result line
+    only triggers the grace-period teardown once it has stayed the last line
+    of the log for the whole grace window — exactly the semantics needed to
+    survive the placeholder result without disabling the safety net
+    entirely. The default ``workflow=False`` path is untouched: the latch
+    never resets, byte-identical to pre-#3681 behavior.
 
     The keyword-only parameters exist for tests to inject short timeouts and
     mock kill/clock/cost/wall-clock behavior.
@@ -827,11 +925,28 @@ def _wait_for_proc_or_result(
                 return NO_FIRST_OUTPUT_EXIT
 
         # Detect logical completion: worker emitted its final result event.
-        if result_seen_at is None and log_has_result(log_path):
+        #
+        # #3681: for a workflow leg, `log_has_result` answers "is the last
+        # line of the log a result event right now?" (see
+        # `_log_last_event_is_result`), so it can flip back to False after
+        # having been True — the outer turn's placeholder result, followed
+        # by more workflow/subagent output. Re-arm by clearing
+        # `result_seen_at` in that case so the grace period never fires off
+        # a result line that turned out not to be final. Non-workflow legs
+        # keep the one-way latch: once set, never cleared.
+        has_result_now = log_has_result(log_path)
+        if result_seen_at is None and has_result_now:
             result_seen_at = clock()
             _append_log_line(
                 log_path,
                 "# reap: worker emitted result; awaiting clean exit\n",
+            )
+        elif workflow and result_seen_at is not None and not has_result_now:
+            result_seen_at = None
+            _append_log_line(
+                log_path,
+                "# reap: workflow still running after result event; "
+                "resuming wait\n",
             )
 
         # #2638: wall-clock runtime ceiling — measured from `wall_start`, NOT
@@ -926,6 +1041,14 @@ def _wait_for_proc_or_result(
             except subprocess.TimeoutExpired:
                 pass
             return 137  # SIGKILL convention
+
+
+# #3681: the GitHub issue label that opts a ``type="work"`` dispatch into
+# ``AssignmentSpec.workflow=True`` — see that field's docstring below.
+# ``coord/dispatch.py`` checks ``proposal.issue_labels`` for exactly this
+# string, gated to ``type="work"`` the same way the existing #2188
+# ``issue_labels`` precedent (``provider_issue_labels``) already is.
+WORKFLOW_LEG_LABEL = "coord:workflow"
 
 
 @dataclass
@@ -1081,6 +1204,31 @@ class AssignmentSpec:
     # ``plain_runner`` is also True — the opt-out, not a second on/off
     # switch of its own.
     smoke_needs_judgement: bool = False
+    # #3681: opts a ``type="work"`` leg into running as a Claude Code
+    # *workflow* — multiple agents (implement → adversarial review → fix)
+    # chained inside one `claude -p` invocation instead of coord dispatching
+    # separate Work/Review legs. When True: `Workflow` (and `Task`, for
+    # subagents) are no longer added to `--disallowedTools`
+    # (`worker_disallowed_tools`); `WORKER_SYSTEM_PROMPT` gets an extra
+    # section telling the worker to run the task as a workflow, wait for it,
+    # and commit+push before its own final message; and the reap thread's
+    # `log_has_result` check becomes workflow-aware (`workflow=True` into
+    # `_wait_for_proc_or_result`, built from `_log_last_event_is_result`) so
+    # the workflow's own placeholder "running in background" result event
+    # never trips the grace-period teardown early. Defaults to ``False`` —
+    # the same "unrecognized kwarg 400s a config-free/older agent" discipline
+    # every other optional field above follows — so only a dispatch that
+    # explicitly opted an issue in (the `coord:workflow` label; see
+    # `coord/dispatch.py`) ever sets this, and every other leg, including
+    # Review/smoke/new-issue-chat, is completely unaffected.
+    #
+    # #3681 item 6: this leg's `mode` ("single" vs "workflow") is also
+    # recorded on the board row (`coord/state.py`) so review rounds, the
+    # request-changes rate, and cost can be compared between the two leg
+    # kinds over a sample of issues before anyone considers relaxing Test or
+    # Review for workflow legs — a decision this field intentionally does
+    # NOT make on its own.
+    workflow: bool = False
 
 
 class _GitError(RuntimeError):
@@ -5577,6 +5725,52 @@ def _claude_md_system_prompt_suffix(repo_path: str) -> str:
     return "\n\n## Project rules (from CLAUDE.md)\n\n" + claude_md.strip() + "\n"
 
 
+def _workflow_leg_system_prompt_suffix() -> str:
+    """Return the system-prompt suffix for an opted-in workflow leg (#3681).
+
+    Only appended when ``spec.workflow`` is True — every other leg (the
+    overwhelming majority) is completely unaffected. Tells the worker to run
+    its assignment as a Claude Code *workflow* (multiple agents: implement
+    then adversarial-review then fix, chained inside this one ``claude -p``
+    invocation) instead of just editing and stopping, to wait for the
+    workflow to actually finish before writing its own final message, and
+    that the ONE-SHOT / commit-and-push-before-final-message rules above
+    still apply in full once the workflow completes.
+
+    Item 5 of #3681: the workflow's own in-workflow review step must grade
+    against coord's real reviewer rules, not lenses the worker invents on
+    the spot — on #3676 a hand-run workflow used generic review lenses and
+    missed the exact #2096 duplication pattern (a duplicated helper plus a
+    hardcoded port) that coord's own external Review leg caught immediately
+    after. So this text is built from ``REVIEWER_SYSTEM_PROMPT`` itself — the
+    SAME source :func:`coord.review.default_worker_command`'s review branch
+    hands a dispatched Review leg (see the ``elif spec.type == "review"``
+    branch above) — never a second, hand-copied description of what a
+    reviewer checks (#2096: one question, one answer).
+    """
+    from coord.review import REVIEWER_SYSTEM_PROMPT  # noqa: PLC0415
+
+    return (
+        "\n\n## Running this assignment as a workflow (#3681)\n\n"
+        "This leg has been opted in to running as a Claude Code *workflow*: "
+        "multiple agents chained inside this one session — implement, then "
+        "an adversarial review step, then fix — rather than a single pass. "
+        "Start the workflow for your assignment and let it run to "
+        "completion; do not treat the workflow's own first progress update "
+        "as your final answer, and do not write your own final message "
+        "until the workflow itself has actually finished. The ONE-SHOT "
+        "rules above still apply in full: once the workflow completes, "
+        "`git add`/`git commit`/`git push origin HEAD` still happen BEFORE "
+        "your final message, exactly as they would for a non-workflow leg.\n\n"
+        "The workflow's own final review step must grade your diff with "
+        "coord's real reviewer rules — not lenses you write yourself. Use "
+        "exactly the following as that review step's system prompt/lens "
+        "(this is the identical text coord's own dispatched Review leg "
+        "receives for this repo, byte for byte):\n\n"
+        "-----\n" + REVIEWER_SYSTEM_PROMPT + "\n-----\n"
+    )
+
+
 # #3420: every `claude -p` leg loads the full JSON schema for all built-in
 # tools regardless of `--allowedTools`, which is a *permission* filter, not a
 # tool-surface one — a leg with `Read,Bash` in `--allowedTools` still pays
@@ -5654,7 +5848,10 @@ def worker_disallowed_tools(spec: AssignmentSpec, allowed_tools: str) -> list[st
     Layers, in argv order (each skips entries an earlier layer already
     added, so the result is de-duplicated but order-stable):
 
-    1. #3420 ``UNUSABLE_TOOL_SCHEMAS`` — unconditional, every spec type.
+    1. #3420 ``UNUSABLE_TOOL_SCHEMAS`` — unconditional, every spec type,
+       EXCEPT ``Workflow`` (and ``Task``, needed for the workflow's own
+       subagents) are omitted when ``spec.workflow`` is True (#3681) — the
+       whole point of a workflow leg is running ``Workflow``.
     2. #1315 sealed-oracle write guard, from ``spec.files_forbidden``.
     3. #1642 base-checkout write guard — only when *allowed_tools*
        actually grants ``Edit``; for the Read/Bash-only chat types the
@@ -5693,7 +5890,15 @@ def worker_disallowed_tools(spec: AssignmentSpec, allowed_tools: str) -> list[st
     # Workflow/Skill/Task/etc. schemas as a work leg and benefit identically.
     # This is FIRST so the guards below, which each append to this same
     # list, keep working unchanged.
-    disallowed_tools = list(UNUSABLE_TOOL_SCHEMAS)
+    if spec.workflow:
+        # #3681: a workflow leg's whole point is running `Workflow` (and its
+        # subagents via `Task`) — un-disallow just those two, leaving every
+        # other #3420 schema (and every other leg type's behavior) unchanged.
+        disallowed_tools = [
+            t for t in UNUSABLE_TOOL_SCHEMAS if t not in ("Workflow", "Task")
+        ]
+    else:
+        disallowed_tools = list(UNUSABLE_TOOL_SCHEMAS)
     # #1315: structural sealing enforcement — see _sealed_write_guard_tools.
     for pattern in _sealed_write_guard_tools(spec.files_forbidden):
         if pattern not in disallowed_tools:
@@ -5904,6 +6109,14 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # and needs the target repo's conventions. See
         # _claude_md_system_prompt_suffix.
         system_prompt += _claude_md_system_prompt_suffix(spec.repo_path)
+        # #3681: opted-in workflow legs only — see
+        # _workflow_leg_system_prompt_suffix for why this is appended here
+        # rather than baked into WORKER_SYSTEM_PROMPT itself (it must embed
+        # REVIEWER_SYSTEM_PROMPT, which only exists per dispatch, and every
+        # non-workflow leg — the overwhelming majority — must see none of
+        # this text).
+        if spec.workflow:
+            system_prompt += _workflow_leg_system_prompt_suffix()
         # #2169: `Monitor` is the sanctioned way to poll a backgrounded
         # long-running command in bounded steps (see the ONE-SHOT section of
         # WORKER_SYSTEM_PROMPT) instead of a foreground loop that blocks
@@ -10806,6 +11019,26 @@ class AgentServer:
         else:
             _log_has_result_fn = _log_has_result
 
+        # #3681: a workflow leg's result line is a one-way latch's enemy —
+        # the placeholder "workflow is running in background" result must
+        # never trip the grace-period teardown. Build the workflow-aware
+        # variant from the SAME marker resolved above (reusing
+        # `_log_last_event_is_result` rather than a second hand-rolled
+        # check) and only pass it (plus `workflow=True` and the larger
+        # workflow max-wait) into the wait loop when this leg actually opted
+        # in — every other leg's call below is untouched.
+        _is_workflow_leg = bool(
+            _reap_start is not None and getattr(_reap_start.spec, "workflow", False)
+        )
+        _workflow_marker = (
+            _reap_provider.result_marker().encode()
+            if _reap_provider is not None
+            else _RESULT_LINE_MARKER
+        )
+        _log_last_event_is_result_fn = functools.partial(
+            _log_last_event_is_result, marker=_workflow_marker
+        )
+
         # #2131: arm the per-leg spend ceiling when the coordinator sent one.
         # The meter is built here (not inside the wait loop) so the same
         # instance survives the whole run and can be re-read afterwards for
@@ -10845,10 +11078,14 @@ class AgentServer:
         exit_code = _wait_for_proc_or_result(
             proc, log_path,
             first_output_timeout=self.first_output_timeout,
-            log_has_result=_log_has_result_fn,
+            log_has_result=(
+                _log_last_event_is_result_fn if _is_workflow_leg else _log_has_result_fn
+            ),
             cost_ceiling_usd=_cost_ceiling,
             read_cost_usd=_cost_meter.read if _cost_meter is not None else None,
             runtime_ceiling_s=_runtime_ceiling,
+            workflow=_is_workflow_leg,
+            max_wait=_REAP_MAX_WAIT_WORKFLOW if _is_workflow_leg else _REAP_MAX_WAIT,
         )
         log_fh.close()
 

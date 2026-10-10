@@ -1600,6 +1600,88 @@ class TestRecordDispatchedBranch:
         )
 
 
+class TestRecordDispatchedMode:
+    """#3681: _record_dispatched_local must record `mode` ("single" vs
+    "workflow") on the dispatched row, derived from whether the issue
+    carried the `coord.agent.WORKFLOW_LEG_LABEL` opt-in label — and
+    `coord.state.load_assignment_mode` must read it back."""
+
+    def test_opted_in_work_leg_records_workflow(self, coord_db) -> None:
+        from coord.agent import WORKFLOW_LEG_LABEL
+        from coord.state import load_assignment_mode, record_dispatched
+
+        proposal = Proposal(
+            id=10,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=3681,
+            issue_title="Run this as a workflow",
+            rationale="test",
+            briefing="run it as a workflow",
+            type="work",
+            issue_labels=[WORKFLOW_LEG_LABEL],
+        )
+        assignment_id = "aid-3681-workflow"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/myrepo",
+        )
+
+        assert load_assignment_mode(assignment_id) == "workflow"
+
+    def test_normal_work_leg_records_single(self, coord_db) -> None:
+        from coord.state import load_assignment_mode, record_dispatched
+
+        proposal = Proposal(
+            id=11,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=3682,
+            issue_title="A perfectly ordinary work leg",
+            rationale="test",
+            briefing="fix it",
+            type="work",
+        )
+        assignment_id = "aid-3682-single"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/myrepo",
+        )
+
+        assert load_assignment_mode(assignment_id) == "single"
+
+    def test_label_on_non_work_proposal_does_not_opt_in(self, coord_db) -> None:
+        """The `coord:workflow` label only opts in a `type="work"` dispatch
+        (mirrors `coord.dispatch`'s own `proposal.type == "work"` gate for
+        the wire-payload flag) — a review/test/fix leg carrying the same
+        label (e.g. because it shares the underlying GitHub issue) must
+        still record "single"."""
+        from coord.agent import WORKFLOW_LEG_LABEL
+        from coord.state import load_assignment_mode, record_dispatched
+
+        proposal = Proposal(
+            id=12,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=3683,
+            issue_title="A review leg on a workflow issue",
+            rationale="test",
+            briefing="review it",
+            type="review",
+            issue_labels=[WORKFLOW_LEG_LABEL],
+        )
+        assignment_id = "aid-3683-review"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/myrepo",
+        )
+
+        assert load_assignment_mode(assignment_id) == "single"
+
+
 class TestThinClientLocalBoardGuard:
     """#659: save_board/load_board/build_board warn (or raise) on thin clients.
 
