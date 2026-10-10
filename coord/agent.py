@@ -6114,6 +6114,11 @@ def run_plain_runner_command(
     )
 
     try:
+        # #3673 review round 1 (nit): `shell=True` is not a new injection
+        # surface — `command` is `spec.smoke_command`, sourced from this
+        # repo's OPERATOR-authored `coordinator.yml` (`ci_command`/
+        # `default_command`/`test_command`), never from the branch/PR
+        # content a worker or a smoke runner is actually testing.
         result = run(
             command, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout,
         )
@@ -6158,10 +6163,18 @@ def execute_plain_runner_smoke(
     failure and never on a pass — with no `claude`/`subprocess.Popen` of a
     `claude -p` argv anywhere in this call graph for the verdict itself.
 
-    Raises nothing — a missing ``smoke_command`` is reported as a failed
-    verdict (exit_code ``-1``) rather than an exception, so a caller that
-    accidentally reaches this path for an unconfigured leg still gets a
-    reportable Test-stage outcome instead of an agent-crashing exception.
+    A missing ``smoke_command`` is reported as a failed verdict (exit_code
+    ``-1``) rather than an exception, so a caller that accidentally reaches
+    this path for an unconfigured leg still gets a reportable Test-stage
+    outcome instead of an agent-crashing exception. #3673 review round 1
+    (nit): that is NOT a blanket "raises nothing" guarantee —
+    :func:`run_plain_runner_command` only catches ``subprocess.
+    TimeoutExpired`` around its own ``run()`` call; any OTHER
+    ``subprocess.run`` exception (e.g. a bad *cwd*) still propagates out of
+    this function. The current caller
+    (:meth:`AgentServer._run_plain_runner_smoke_blocking`) already wraps the
+    whole call in a broad ``except Exception``, so this is harmless today —
+    just don't rely on this function's own signature to make that promise.
     """
     if not spec.smoke_command:
         verdict = PlainRunnerVerdict(
@@ -9845,28 +9858,44 @@ class AgentServer:
         :meth:`_run_plain_runner_smoke_blocking` — never escalates a
         summarisation problem into the Test-stage verdict itself, and never
         blocks the leg beyond its own short timeout.
+
+        #3673 review round 1: routes through :func:`coord.brain.call_claude`
+        — the SAME provider-routing seam (:meth:`_resolve_provider_best_effort`
+        -> ``provider.oneshot_command()``) brain planning and the liveness
+        auditor already use for an unattended one-shot prompt/response call
+        — rather than a second, independent ``[DEFAULT_WORKER_BINARY, "-p",
+        ...]`` invocation that bypasses both the injectable
+        :attr:`worker_command` seam and the provider layer entirely. A
+        fleet machine configured with a non-default worker binary or a
+        different provider now gets a failure summary from the SAME
+        backend its real Test-stage leg would have used, rather than
+        silently producing none.
         """
+        system_prompt = (
+            "You summarise failing Test-stage smoke commands for a human "
+            "reviewing a CI-style run. Read the command and its output and "
+            "write a SHORT (2-4 sentence) plain-English summary of why it "
+            "failed — no fix, no code changes, just the diagnosis a human "
+            "would want up front."
+        )
         prompt = (
-            "A Test-stage smoke command just failed. Read the command and its "
-            "output below and write a SHORT (2-4 sentence) plain-English "
-            "summary of why it failed — no fix, no code changes, just the "
-            "diagnosis a human reviewing this leg would want up front.\n\n"
             f"Command: {spec.smoke_command}\n"
             f"Exit code: {verdict.exit_code}\n\n"
             f"Output:\n{verdict.log_tail}"
         )
+        provider_obj = self._resolve_provider_best_effort(spec)
         try:
-            result = subprocess.run(
-                [DEFAULT_WORKER_BINARY, "-p", "--output-format", "text"],
-                input=prompt, capture_output=True, text=True, timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            from coord.brain import call_claude  # noqa: PLC0415 — avoid a module-load-time cycle
+
+            summary = call_claude(
+                system_prompt, prompt, provider=provider_obj, timeout=120,  # type: ignore[arg-type]
+            ).strip()
+        except Exception:  # noqa: BLE001 — best-effort, must never break the leg
             _log.exception(
-                "plain-runner smoke %s: failure-summary claude -p call failed",
+                "plain-runner smoke %s: failure-summary call_claude call failed",
                 assignment.id,
             )
             return
-        summary = (result.stdout or "").strip()
         if not summary:
             return
         try:

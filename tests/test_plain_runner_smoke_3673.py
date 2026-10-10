@@ -247,16 +247,30 @@ def test_agent_plain_runner_leg_failure_spawns_a_claude_summariser(
     summariser_calls: list = []
     real_run = subprocess.run
 
+    # #3673 review round 1: the summariser now routes through
+    # `coord.brain.call_claude` -> `provider.oneshot_command()` (the SAME
+    # provider-routing seam brain planning uses) rather than a hardcoded
+    # `[DEFAULT_WORKER_BINARY, "-p", "--output-format", "text"]` argv — see
+    # `AgentServer._spawn_plain_runner_failure_summary`. With no provider
+    # configured on this spec, that still resolves to `ClaudeProvider()`,
+    # whose `oneshot_command()` still names `DEFAULT_WORKER_BINARY` as
+    # argv[0] (no-config parity), just with `--output-format json` instead
+    # of the old hardcoded `text` — `call_claude` falls back to raw stdout
+    # when that isn't valid JSON, so a plain-text fake response still works.
     def fake_run(cmd, *args, **kwargs):
         if isinstance(cmd, list) and cmd and cmd[0] == agent_mod.DEFAULT_WORKER_BINARY:
             summariser_calls.append(cmd)
-
-            class _Result:
-                stdout = "it failed because the assertion didn't hold"
-                stderr = ""
-            return _Result()
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout="it failed because the assertion didn't hold", stderr="",
+            )
         return real_run(cmd, *args, **kwargs)
 
+    # `coord.brain` imports `subprocess` as its own module-level name, but
+    # it is the SAME stdlib module object `coord.agent` imports — patching
+    # either module's `subprocess.run` attribute patches the one underlying
+    # module, so this single patch still covers the call now made from
+    # `coord.brain.call_claude` instead of directly from `coord.agent`.
     monkeypatch.setattr(agent_mod.subprocess, "run", fake_run)
 
     spec = _spec(

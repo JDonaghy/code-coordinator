@@ -104,6 +104,7 @@ from coord.config import (
     SmokeTestsConfig,
     native_execution_capability,
 )
+from coord.confirm_test import TEST_CONFIRMATION_CI_AND_WORKER
 from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
 # #3315 review: the shared environmental-retry-budget knob — see
 # `ENVIRONMENTAL_SMOKE_RETRY_BUDGET` below for why this lives in
@@ -546,10 +547,10 @@ def _gate_covered_by_ci_and_worker_run(
     completed: Assignment, config: Config,
     *, ci_green: Callable[[str | None, str, str, Config], bool] = _ci_green_for_sha,
 ) -> bool:
-    """#3673 item 2: refuse to dispatch — and record a structural `skipped`
-    verdict instead — when *completed* already self-recorded a `passed`
-    `coord test` verdict for the exact commit GitHub CI has ALSO gone green
-    on.
+    """#3673 item 2: refuse to dispatch — and record a `skipped` verdict
+    carrying `test_confirmation=TEST_CONFIRMATION_CI_AND_WORKER` instead —
+    when *completed* already self-recorded a `passed` `coord test` verdict
+    for the exact commit GitHub CI has ALSO gone green on.
 
     Narrow by design: only fires when `completed.test_state == "passed"`
     (never `failed`/`blocked`/`running` — those still need a real Test leg)
@@ -564,12 +565,31 @@ def _gate_covered_by_ci_and_worker_run(
     AND_WORKER` — never `"passed"` (that already stands); `"skipped"` is the
     TEST STAGE's own statement that no further leg was needed, which
     `coord.merge_queue.has_smoke_verdict`'s #1732 structural-skip path
-    already accepts unconditionally (it is not a `baseline_red` skip, so no
-    other merge-gate special-case applies to it either).
+    already accepts.
+
+    #3673 review round 1: UNLIKE the #1732 structural skip, this one is a
+    claim pinned to exactly one `test_head_sha` ("tested at exactly this
+    commit, confirmed by CI") — it decays the moment the branch moves past
+    that SHA, the same way a `passed` verdict does. Recording it as a plain
+    `skipped` row with no provenance would be indistinguishable from the
+    permanent structural skip on every later read (`coord.merge_queue.
+    evaluate_smoke_verdict` short-circuits ANY non-`baseline_red` `skipped`
+    row to `SMOKE_OK` before any staleness check runs), which would let a
+    bounce/fix round's *later*, never-tested commit ride on a stale CI run
+    forever. `test_confirmation=TEST_CONFIRMATION_CI_AND_WORKER` gives this
+    skip its own escape valve — mirroring `baseline_red`'s — so
+    `evaluate_smoke_verdict` can and does run the full #1479 base/branch
+    re-check against the live branch head for it, exactly as it already does
+    for `passed`.
 
     Returns `True` (caller must stop, nothing more to dispatch) only once the
-    skip verdict has been recorded — `False` otherwise, including every
-    inconclusive case `_ci_green_for_sha` fails closed on.
+    skip verdict has actually been PERSISTED — `False` otherwise, including
+    every inconclusive case `_ci_green_for_sha` fails closed on, and the
+    (should-never-happen) case where *completed* carries no `assignment_id`
+    to persist against: an in-memory-only mutation here would read as
+    success to this call site while leaving every OTHER reader of the board
+    none the wiser, so a missing `assignment_id` is treated as "could not
+    record" rather than "nothing more to do."
     """
     if completed.test_state != "passed":
         return False
@@ -587,23 +607,33 @@ def _gate_covered_by_ci_and_worker_run(
         "dispatch_smoke: %s#%s — %s (head %s)",
         completed.repo_name, completed.issue_number, reason, head_sha[:12],
     )
-    if completed.assignment_id:
-        try:
-            from coord.state import record_test_verdict  # noqa: PLC0415
+    if not completed.assignment_id:
+        logger.error(
+            "dispatch_smoke: completed work assignment for %s#%s has no "
+            "assignment_id — cannot persist the #3673 CI+worker skip "
+            "verdict; falling through to a real Test-stage dispatch instead "
+            "of claiming an unrecorded skip",
+            completed.repo_name, completed.issue_number,
+        )
+        return False
+    try:
+        from coord.state import record_test_verdict  # noqa: PLC0415
 
-            record_test_verdict(
-                assignment_id=completed.assignment_id,
-                test_state="skipped",
-                test_reason=reason,
-            )
-        except Exception:  # noqa: BLE001 — reporting must never break dispatch
-            logger.exception(
-                "dispatch_smoke: failed to record the #3673 CI+worker skip "
-                "verdict for %s", completed.assignment_id,
-            )
-            return True
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state="skipped",
+            test_reason=reason,
+            test_confirmation=TEST_CONFIRMATION_CI_AND_WORKER,
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "dispatch_smoke: failed to record the #3673 CI+worker skip "
+            "verdict for %s", completed.assignment_id,
+        )
+        return True
     completed.test_state = "skipped"
     completed.test_reason = reason
+    completed.test_confirmation = TEST_CONFIRMATION_CI_AND_WORKER
     return True
 
 
@@ -2497,6 +2527,18 @@ def _walk_candidates_and_dispatch(
     whose `default_worker_command` predates #3673, or any OTHER assignment
     type reusing this wire shape) still gets a fully-formed `claude -p`
     session exactly as before.
+
+    #3673 review round 1 (non-blocking, rollout-order dependency):
+    `AssignmentSpec(**body)` (`coord.agent_app`'s `/assign` route) 400s on
+    an unrecognized kwarg — every existing field on this payload already
+    follows that discipline. Unlike an OPT-IN field, `plain_runner` rides
+    on EVERY Test-stage dispatch this function makes, not a subset, so
+    EVERY agent in the fleet must already recognize it (i.e. be deployed
+    with #3673's `AssignmentSpec.plain_runner`/`smoke_command`/
+    `smoke_needs_judgement`/`smoke_timeout_s` fields) at or before the
+    coordinator that runs this code — an agent still on a pre-#3673 build
+    receiving this payload refuses the whole dispatch with a 400, not just
+    falls back to the old briefing-driven chat for that one leg.
 
     Factored out of what used to be a single dispatch path so the #3182
     fan-out path (:func:`_dispatch_smoke_fanout`) cannot silently drift from

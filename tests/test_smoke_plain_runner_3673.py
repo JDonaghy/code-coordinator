@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from coord import merge_queue as mq
+from coord.confirm_test import TEST_CONFIRMATION_CI_AND_WORKER
 from coord.config import Config
 from coord.models import Assignment, Board, Machine, Repo
 from coord.smoke import (
@@ -172,6 +173,26 @@ def test_gate_fires_and_records_skip_when_test_state_passed_and_ci_green() -> No
     assert fired is True
     assert completed.test_state == "skipped"
     assert completed.test_reason == SKIP_REASON_COVERED_BY_CI_AND_WORKER
+    # #3673 review round 1: this skip must carry its OWN `test_confirmation`
+    # — not the bare `skipped` the #1732 structural skip uses — so the
+    # merge gate can tell "tested at exactly this SHA" apart from "nothing
+    # here could ever be tested" and re-check staleness accordingly.
+    assert completed.test_confirmation == TEST_CONFIRMATION_CI_AND_WORKER
+
+
+def test_gate_does_not_fire_without_an_assignment_id() -> None:
+    """#3673 review round 1 (non-blocking finding): a completed work row
+    with no `assignment_id` can never have its skip PERSISTED — the gate
+    must refuse rather than claim an unrecorded success."""
+    config = Config(repos=[_repo()], machines=[])
+    completed = _self_recorded_work(assignment_id=None)
+
+    fired = _gate_covered_by_ci_and_worker_run(
+        completed, config, ci_green=lambda *a: True,
+    )
+
+    assert fired is False
+    assert completed.test_state == "passed"  # untouched
 
 
 def test_gate_does_not_fire_when_ci_is_not_green() -> None:
@@ -223,23 +244,85 @@ def test_gate_asks_ci_green_with_the_recorded_head_sha() -> None:
     assert seen == [("acme/api", "issue-1-fix", "pinned-sha")]
 
 
-# ── Merge-gate acceptance: the #3673 skip reads as an ordinary structural
-#    skip (#1732), same as every other `coord.merge_queue` "skipped" already
-#    does — no separate code path, no special-casing. ──────────────────────
+# ── Merge-gate acceptance: the #3673 skip is pinned to the SHA it was
+#    recorded against — UNLIKE the #1732 structural skip, it must still be
+#    able to go stale when the branch moves past that SHA (review round 1
+#    blocking finding). ──────────────────────────────────────────────────
 
 
-def test_merge_gate_accepts_the_ci_and_worker_skip_verdict() -> None:
+def test_merge_gate_accepts_the_ci_and_worker_skip_verdict_at_the_same_sha() -> None:
     work = Assignment(
         machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
         assignment_id="w1", type="work", status="done",
         branch="worker/w1",
         test_state="skipped",
         test_reason=SKIP_REASON_COVERED_BY_CI_AND_WORKER,
+        test_confirmation=TEST_CONFIRMATION_CI_AND_WORKER,
+        test_head_sha="sha-current",
     )
     board = Board(active=[], completed=[work])
     entry = _q("w1", target="main")
+    # Simulate `process()` having already backfilled the live branch head —
+    # unchanged since the skip was recorded.
+    entry.branch_head_sha = "sha-current"
 
     verdict = mq.evaluate_smoke_verdict(entry, board)
 
     assert verdict.ok is True
     assert verdict.kind == mq.SMOKE_OK
+
+
+def test_merge_gate_rejects_the_ci_and_worker_skip_once_branch_moved_past_recorded_sha() -> None:
+    """The review round 1 blocking finding: a bounce/fix round that pushes
+    new commits to the SAME branch after this skip was recorded must not
+    read as covered forever — the branch's current head was never tested by
+    anyone (not CI, not the worker, not a Test leg) at the new SHA."""
+    work = Assignment(
+        machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done",
+        branch="worker/w1",
+        test_state="skipped",
+        test_reason=SKIP_REASON_COVERED_BY_CI_AND_WORKER,
+        test_confirmation=TEST_CONFIRMATION_CI_AND_WORKER,
+        test_head_sha="sha-old",
+    )
+    board = Board(active=[], completed=[work])
+    entry = _q("w1", target="main")
+    entry.branch_head_sha = "sha-new"  # a fix round pushed new commits
+
+    verdict = mq.evaluate_smoke_verdict(entry, board)
+
+    assert verdict.ok is False
+    assert verdict.kind == mq.SMOKE_STALE
+
+
+def test_merge_gate_treats_an_ordinary_structural_skip_as_permanently_ok() -> None:
+    """Contrast case: a plain #1732 structural skip (no `test_confirmation`
+    at all) still short-circuits to `SMOKE_OK` unconditionally, even once
+    the branch has moved on — it is not a claim about any particular SHA."""
+    work = Assignment(
+        machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done",
+        branch="worker/w1",
+        test_state="skipped",
+        test_reason="contract/fixture-only, nothing to smoke-test",
+        test_head_sha="sha-old",
+    )
+    board = Board(active=[], completed=[work])
+    entry = _q("w1", target="main")
+    entry.branch_head_sha = "sha-new"
+
+    verdict = mq.evaluate_smoke_verdict(entry, board)
+
+    assert verdict.ok is True
+    assert verdict.kind == mq.SMOKE_OK
+
+
+def test_ci_and_worker_literal_matches_the_canonical_confirm_test_constant() -> None:
+    """`evaluate_smoke_verdict` compares `test_confirmation` against the
+    literal `"ci_and_worker"` rather than importing `coord.confirm_test.
+    TEST_CONFIRMATION_CI_AND_WORKER` (that would be a circular import:
+    `coord.confirm_test` -> `coord.revalidate` -> `coord.merge_queue`). Pin
+    the literal against the canonical constant so the two can never
+    silently drift apart (#2096)."""
+    assert TEST_CONFIRMATION_CI_AND_WORKER == "ci_and_worker"

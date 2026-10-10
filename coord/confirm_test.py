@@ -327,8 +327,23 @@ INCONCLUSIVE_KINDS = frozenset({
 #   by `coord.notify._record_smoke_verdict`'s PASS branches regardless of
 #   what the worker's own `SMOKE:` marker text says — see `coord.smoke.
 #   native_unverified_for_verdict`.
+# * ``TEST_CONFIRMATION_CI_AND_WORKER`` (#3673 item 2, review round 1) — a
+#   Test-stage leg was deliberately NOT dispatched because the work leg
+#   already self-recorded a `passed` `coord test` at this exact
+#   `test_head_sha` AND GitHub CI independently went green for that same
+#   commit (`coord.smoke._gate_covered_by_ci_and_worker_run`). Recorded as
+#   `test_state="skipped"` so the merge gate's existing `skipped`-is-
+#   accepted convention applies, but — UNLIKE the `#1732` structural skip
+#   ("contract/fixture-only, nothing to smoke-test", which makes no claim
+#   about any particular commit and so can never go stale) — this skip is a
+#   claim pinned to ONE SHA ("tested at exactly this commit, by two
+#   independent means"). `coord.merge_queue.evaluate_smoke_verdict` must
+#   treat this exactly like a `passed` verdict for staleness purposes (full
+#   #1479 base/branch re-check against the live branch head), not like the
+#   permanent structural skip — see that function's own handling, mirroring
+#   `TEST_CONFIRMATION_BASELINE_RED`'s escape valve.
 #
-# ``None`` (the column default) is a sixth, implicit state: no confirmation
+# ``None`` (the column default) is a seventh, implicit state: no confirmation
 # question was ever asked about this write at all — a headless smoke
 # FAILURE, a human `coord test --passed` write that has not yet been reaped
 # by a notify pass, a mute-leg park, ``TEST_STATE_BLOCKED``, ... None of
@@ -340,6 +355,7 @@ TEST_CONFIRMATION_UNCONFIRMED = "unconfirmed"
 TEST_CONFIRMATION_REFUTED = "refuted"
 TEST_CONFIRMATION_BASELINE_RED = "baseline_red"
 TEST_CONFIRMATION_NATIVE_UNVERIFIED = "native_unverified"
+TEST_CONFIRMATION_CI_AND_WORKER = "ci_and_worker"
 
 #: Every value `test_confirmation` may hold — for validation / display sites
 #: that want to assert exhaustiveness rather than silently falling through.
@@ -349,6 +365,7 @@ TEST_CONFIRMATION_VALUES = frozenset({
     TEST_CONFIRMATION_REFUTED,
     TEST_CONFIRMATION_BASELINE_RED,
     TEST_CONFIRMATION_NATIVE_UNVERIFIED,
+    TEST_CONFIRMATION_CI_AND_WORKER,
 })
 
 #: #3378: the canonical prefix a ``test_reason`` carries when a ``skipped``
@@ -1478,6 +1495,7 @@ __all__ = [
     "REFUTING_KINDS",
     "STALE_WORKTREE_MAX_AGE_HOURS",
     "TEST_CONFIRMATION_BASELINE_RED",
+    "TEST_CONFIRMATION_CI_AND_WORKER",
     "TEST_CONFIRMATION_CONFIRMED",
     "TEST_CONFIRMATION_NATIVE_UNVERIFIED",
     "TEST_CONFIRMATION_REFUTED",
