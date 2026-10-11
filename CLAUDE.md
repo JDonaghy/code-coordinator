@@ -138,7 +138,9 @@ in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-r
   headless auto-loop holds review dispatch until there is a `passed`/`skipped` verdict.
 - **Adversarial reviews are rule-enforcing, not rubber-stamping.** A fresh `claude -p`
   session on a *different* machine reviews your diff against this file, with **zero shared
-  context with you** — so your diff and final message must stand on their own.
+  context with you** — so your diff and final message must stand on their own. Put the
+  *why* of a fix in the commit message and final message, not in code comments: comments
+  describe the code as it is, with no issue numbers or "used to" history.
 
 ## Rules for workers
 
