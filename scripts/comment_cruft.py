@@ -437,8 +437,7 @@ def _tidy_blank_lines(lines: list[str], sites: list[int]) -> list[str]:
 def strip_body(body: str) -> str | None:
     """Return the cleaned comment body, `None` to delete the comment, or the
     body unchanged."""
-    exempt = EXEMPT_RE.findall(body)
-    if exempt:
+    if EXEMPT_RE.search(body) or _SAFETY_RE.search(body):
         return body
     if REF_ONLY_RE.match(body):
         return None
@@ -572,6 +571,15 @@ def parse_answer(text: str) -> list[dict]:
     return json.loads(m.group(0))["blocks"]
 
 
+_SAFETY_RE = re.compile(r"\bSAFETY\b")
+
+
+def _safety_count(texts) -> int:
+    """`// SAFETY:` notes justify `unsafe` blocks; a rewrite may reword one
+    but never drop it."""
+    return sum(len(_SAFETY_RE.findall(t)) for t in texts)
+
+
 def valid_line(text: str, prefix: str) -> bool:
     """A replacement line is one comment of exactly the block's kind. It may
     not open or close a doc-comment fence: the model sometimes echoes the
@@ -625,6 +633,9 @@ def rewrite_source(src: str, answer_fn, chunk: int = 40, docs: bool = False) -> 
                 res.rejected.append(f"line {b.comments[0].line + 1}: replacement wider than {width}")
                 continue
             if new == [c.text.rstrip() for c in b.comments]:
+                continue
+            if _safety_count(new) < _safety_count(c.text for c in b.comments):
+                res.rejected.append(f"line {b.comments[0].line + 1}: dropped a SAFETY note")
                 continue
             res.changed += 1
             res.deleted += not new

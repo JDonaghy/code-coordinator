@@ -319,3 +319,11 @@ def test_rewrite_strips_indentation_the_model_adds():
     src = "fn f() {\n    // #12 thing\n    g();\n}\n"
     reply = json.dumps({"blocks": [{"id": 0, "action": "replace", "lines": ["    // Thing."]}]})
     assert cc.rewrite_source(src, lambda p: (reply, 0.0)).new_src == "fn f() {\n    // Thing.\n    g();\n}\n"
+
+
+def test_rewrite_never_drops_a_safety_note():
+    src = "fn f() {\n    // SAFETY: ptr is valid (#12).\n    unsafe { g() };\n}\n"
+    reply = json.dumps({"blocks": [{"id": 0, "action": "delete"}]})
+    res = cc.rewrite_source(src, lambda p: (reply, 0.0))
+    assert res.new_src is None and "dropped a SAFETY note" in res.rejected[0]
+    assert cc.strip_body(" SAFETY: ptr is valid (#12).") == " SAFETY: ptr is valid (#12)."
