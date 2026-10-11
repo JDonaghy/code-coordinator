@@ -332,3 +332,8 @@ def test_rewrite_never_drops_a_safety_note():
 def test_doc_only_file_keeps_its_final_newline():
     src = "//! Module.\n//!\n//! see #12\n"
     assert cc.strip_file(src, docs=True)[0] == "//! Module.\n"
+
+
+def test_paren_ref_at_start_of_a_continuation_line_is_left_alone():
+    body = "   (quadraui#666), same posture for `folder_dialogs`"
+    assert cc.strip_body(body) == body

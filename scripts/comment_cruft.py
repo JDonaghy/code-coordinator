@@ -79,9 +79,12 @@ LEADING_TAG_RE = re.compile(
     r"(?:\s+(?:review|follow-?up|fix|regression|bug))?"
     r"(?:\s*\([^)]*\))?\s*[:—–-]\s+"
 )
-# ` (#1005)`, ` (see #883)`, ` (quadraui#12, #13 review)`.
+# ` (#1005)`, ` (see #883)`, ` (quadraui#12, #13 review)` -- only after other
+# text on the line: at the start of a continuation line it carries the
+# indentation and is followed by the sentence's punctuation (`(#666), same
+# posture`), so removing it there wrecks the line; the model pass handles it.
 PAREN_REF_RE = re.compile(
-    rf"\s*\((?:(?:see|cf\.?|per|from|via|issue|fixed in|regression)\s+)?{REF_LIST}(?:\s+review)?\)"
+    rf"(?<=\S)\s*\((?:(?:see|cf\.?|per|from|via|issue|fixed in|regression)\s+)?{REF_LIST}(?:\s+review)?\)"
 )
 # A body that says nothing but which issue it came from.
 REF_ONLY_RE = re.compile(rf"^\s*(?:(?:see|cf\.?|per|issue|regression(?: test)? for)\s+)?{REF_LIST}\s*[.:]?\s*$", re.I)
