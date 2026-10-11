@@ -4382,6 +4382,137 @@ class TestConfirmedPassVerdictConfirmationField:
         )
 
 
+class TestPlainRunnerPassIsConfirmedNotUnconfirmed3693:
+    """#3693: a #3673 plain-runner leg's `SMOKE: pass` is the agent's own
+    direct observation of the exit code, not a `claude -p` session's
+    self-report — so it must never be stamped `UNCONFIRMED` (that text
+    claims "this verdict rests on the worker's own report", which is false
+    here: there is no worker self-report to rest on at all).
+    """
+
+    def _transition(self):
+        from coord.notify import Transition, EVENT_COMPLETION  # noqa: PLC0415
+
+        return Transition(
+            assignment_id="work-1",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+
+    def test_plain_runner_pass_records_confirmed_with_no_unconfirmed_text(
+        self,
+    ) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        entry = {
+            "branch": "issue-42-fix-thing",
+            "spec": {"plain_runner": True},
+        }
+
+        with patch(
+            "coord.notify._run_pass_confirmation",
+        ) as mock_confirm:
+            state, reason, confirmation = _confirmed_pass_verdict(
+                self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
+            )
+
+        assert state == "passed"
+        assert confirmation == ct.TEST_CONFIRMATION_CONFIRMED, (
+            "a plain-runner exit code is a direct observation, not a "
+            f"self-report — it must never be recorded UNCONFIRMED, got "
+            f"{confirmation!r}"
+        )
+        assert "UNCONFIRMED" not in reason, (
+            f"the plain-runner outcome must not read like 'nobody checked' "
+            f"— got {reason!r}"
+        )
+        mock_confirm.assert_not_called(), (
+            "there is no worker self-report to confirm for a plain-runner "
+            "leg — the #2464 re-run must be skipped entirely, not merely "
+            "overridden after running"
+        )
+
+    def test_entry_missing_spec_is_not_treated_as_plain_runner(self) -> None:
+        """An entry predating #3673 (no `spec` key at all) must fall back
+        to exactly today's (pre-#3693) behaviour — "can't tell" reads as
+        "not a plain-runner leg", never a crash."""
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        entry = {"branch": "issue-42-fix-thing"}
+
+        with patch("coord.notify._run_pass_confirmation", return_value=None):
+            state, reason, confirmation = _confirmed_pass_verdict(
+                self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
+            )
+
+        assert state == "passed"
+        assert confirmation == ct.TEST_CONFIRMATION_UNCONFIRMED
+        assert "UNCONFIRMED" in reason
+
+
+class TestUnconfirmedReasonNamesConfirmingHost3693:
+    """#3693: when a real `claude -p` leg's pass genuinely cannot be
+    confirmed, the reason must name the HOST THAT TRIED the re-run — never
+    the ambiguous "this machine", which a human reading only the board row
+    cannot tell apart from the Test-stage machine the leg ran on (the
+    quadraui#1494/#1495 misread: a healthy `macmini` leg read UNCONFIRMED
+    and was mistaken for a `macmini` fault, when the real story was that
+    `dellserver` — the confirming host — couldn't build the repo at all).
+    """
+
+    def _transition(self):
+        from coord.notify import Transition, EVENT_COMPLETION  # noqa: PLC0415
+
+        return Transition(
+            assignment_id="work-1",
+            machine_name="macmini",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+
+    def test_unconfirmed_reason_names_the_confirming_host_not_this_machine(
+        self,
+    ) -> None:
+        from coord import confirm_test as ct  # noqa: PLC0415
+        from coord.notify import _confirmed_pass_verdict  # noqa: PLC0415
+
+        entry = {"branch": "issue-42-fix-thing"}
+
+        with (
+            patch("coord.notify._run_pass_confirmation", return_value=None),
+            patch(
+                "coord.notify._confirming_host_label",
+                return_value="dellserver",
+            ),
+        ):
+            state, reason, confirmation = _confirmed_pass_verdict(
+                self._transition(), entry, "work-1", claim_reason="SMOKE: pass",
+            )
+
+        assert state == "passed"
+        assert confirmation == ct.TEST_CONFIRMATION_UNCONFIRMED, (
+            "an LLM-leg pass with no confirmation available must still "
+            f"record unconfirmed — got {confirmation!r}"
+        )
+        assert "UNCONFIRMED" in reason
+        assert "dellserver" in reason, (
+            "the reason must name the confirming host so it can't be "
+            f"misread as a fault in the Test-stage machine — got {reason!r}"
+        )
+        assert "on this machine" not in reason, (
+            "the ambiguous 'this machine' phrasing conflates the "
+            "confirming host with the Test-stage machine (quadraui#1494/"
+            f"#1495) — got {reason!r}"
+        )
+
+
 class TestNativeUnverifiedDowngrade3455:
     """#3455 review: the whole prior fix was advisory-only — it never
     changed the recorded verdict, only the briefing text the worker was

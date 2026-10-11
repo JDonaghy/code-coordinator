@@ -2710,6 +2710,71 @@ def _downgrade_for_native_unverified(
     )
 
 
+def _is_plain_runner_leg(entry: dict) -> bool:
+    """#3693: is this completed Test-stage leg a #3673 plain-runner leg —
+    the repo's smoke/test command run directly as a subprocess, verdict
+    read straight off the exit code — rather than a `claude -p` session
+    that *reports* its own verdict?
+
+    The single question "is this a plain-runner leg" must have exactly one
+    answer across this codebase (#2085 split-brain): this reads the same
+    ``entry["spec"]["plain_runner"]`` field `coord.brain` already reads
+    (`spec = entry.get("spec", {})`), never a second, independently-
+    maintained signal such as sniffing the log text for the "plain-runner
+    (#3673)" marker string that `coord.agent.plain_runner_smoke_marker_lines`
+    also happens to print.
+
+    ``entry["spec"]`` is ``dataclasses.asdict(AssignmentSpec)``
+    (`AgentAssignment.to_status_dict`) and so always carries
+    ``plain_runner`` as a plain ``bool`` once populated — but defends with
+    ``.get(..., {})``/``.get(..., False)`` anyway for entries predating
+    #3673 (no ``spec`` at all) or any other shape this never anticipated;
+    "can't tell" must read as "not a plain-runner leg" (the pre-#3693
+    behaviour), never crash the reap pass over it.
+    """
+    spec = entry.get("spec") or {}
+    return bool(spec.get("plain_runner", False))
+
+
+def _confirming_host_label() -> str:
+    """#3693: the name of *this* host — the one attempting the #2464
+    out-of-band re-run right now — for use in a "could not confirm" reason.
+
+    Before this, that reason said "on this machine", which is ambiguous
+    between the confirming host (this process, e.g. `dellserver`) and the
+    Test-stage machine the leg actually ran on (`transition.machine_name`,
+    e.g. `macmini`) — a human reading only the board row has no way to
+    tell which is meant, and conflating them caused a real misread
+    (quadraui#1494/#1495, 2026-10-11: a healthy `macmini` Test leg read
+    `UNCONFIRMED` and was mistaken for a `macmini` failure, when the actual
+    story was "dellserver, which can't build quadraui, couldn't re-run
+    it"). This always names *this* process's own host, never the leg's.
+
+    Prefers the configured `coordinator.yml` machine name — the same name
+    every other machine-name string on the board already uses — via the
+    shared :func:`coord.config.resolve_local_machine` (#3440), the one
+    "which configured machine is this host" resolver every other locality
+    check in this codebase uses (#2085: never a private hostname
+    comparison of its own). Falls back to the bare OS hostname when config
+    can't be loaded or this host isn't a configured machine — still names
+    *something* concrete over the ambiguous "this machine", and this is a
+    best-effort label for a log/reason string, never allowed to raise and
+    abandon the transition over it.
+    """
+    try:
+        from coord.config import load as _load_config  # noqa: PLC0415
+        from coord.config import resolve_local_machine  # noqa: PLC0415
+
+        local_machine = resolve_local_machine(_load_config())
+        if local_machine is not None:
+            return local_machine.name
+    except Exception:  # noqa: BLE001
+        pass
+    import socket  # noqa: PLC0415
+
+    return socket.gethostname().split(".")[0].lower()
+
+
 def _confirmed_pass_verdict_core(
     transition: Transition, entry: dict, parent_id: str, *, claim_reason: str,
 ) -> tuple[str, str, str]:
@@ -2727,8 +2792,19 @@ def _confirmed_pass_verdict_core(
     observation by re-running the repo's own build/test command out-of-band and
     reading the real exit code (:mod:`coord.confirm_test`).
 
-    Four outcomes, and note that only ONE of them is a downgrade:
+    Five outcomes, and note that only ONE of them is a downgrade:
 
+    * **plain-runner (#3693)** — this leg is a #3673 plain-runner leg
+      (:func:`_is_plain_runner_leg`): the repo's own command ran as a bare
+      subprocess and the verdict IS the exit code the agent observed
+      directly, not a `claude -p` session's self-report. The #2464
+      confirmation this function otherwise applies exists to turn a
+      self-report into an observation — there is no self-report here to
+      second-guess, so `_run_pass_confirmation` is skipped entirely and
+      this records ``passed``, ``TEST_CONFIRMATION_CONFIRMED`` directly.
+      Recording ``TEST_CONFIRMATION_UNCONFIRMED`` here (the pre-#3693
+      behaviour) was the defect this outcome fixes: it told the merge gate
+      "nobody checked" about a verdict the agent itself just checked.
     * **refuted** — a command ran to completion and returned nonzero. The claim
       was wrong; record ``failed``. This is the arm #2464 exists for.
 
@@ -2758,7 +2834,10 @@ def _confirmed_pass_verdict_core(
     #3357: the THIRD element of the returned tuple is the machine-readable
     counterpart to that same story — one of
     :data:`~coord.confirm_test.TEST_CONFIRMATION_VALUES`
-    (``"confirmed"`` / ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``),
+    (``"confirmed"`` / ``"unconfirmed"`` / ``"refuted"`` / ``"baseline_red"``,
+    and ``"confirmed"`` again for the plain-runner outcome above — it is a
+    real, direct observation, not a distinct shape of truth #3357's
+    consumers need to tell apart from an independently re-run confirmation),
     recorded alongside ``test_state`` so a caller (the merge gate, `coord
     gates`, the dashboard) can finally tell "passed, independently confirmed"
     from "passed, because nobody could check" WITHOUT parsing the English
@@ -2785,14 +2864,29 @@ def _confirmed_pass_verdict_core(
         write_confirmation_output,
     )
 
+    # #3693: a plain-runner (#3673) leg's "pass" IS the agent's own direct
+    # observation of the exit code — there is no `claude -p` self-report to
+    # confirm, so skip `_run_pass_confirmation` (and the #2975 budget/
+    # timeout machinery it spends) entirely rather than asking a question
+    # that has already been answered.
+    if _is_plain_runner_leg(entry):
+        return (
+            "passed",
+            f"{claim_reason} — the plain-runner (#3673) exit code is a "
+            "direct observation of the run, not a worker self-report, so "
+            "no #2464 confirmation re-run is needed here.",
+            TEST_CONFIRMATION_CONFIRMED,
+        )
+
     result = _run_pass_confirmation(transition, entry)
 
     if result is None:
+        host = _confirming_host_label()
         return (
             "passed",
-            f"{claim_reason} — UNCONFIRMED: no independent re-run was possible "
-            "on this machine, so this verdict rests on the worker's own report "
-            "(#2464).",
+            f"{claim_reason} — UNCONFIRMED: no independent re-run was "
+            f"possible on {host}, so this verdict rests on the worker's "
+            "own report (#2464).",
             TEST_CONFIRMATION_UNCONFIRMED,
         )
 
