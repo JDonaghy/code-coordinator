@@ -791,3 +791,12 @@ class TestWindowsImageNameKillHardEnforced:
         disallowed = worker_disallowed_tools(spec, allowed_tools="Read,Edit,Write,Bash")
         for pattern in WINDOWS_IMAGE_NAME_KILL_DENY_COMMANDS:
             assert pattern not in disallowed
+
+
+def test_worker_prompt_forbids_history_comments():
+    """Fix-round workers narrated history into comments (`// #1630 review: ...`)
+    that every later leg re-reads; the prompt must send it to the commit message."""
+    from coord.agent import WORKER_SYSTEM_PROMPT
+
+    assert "describe the code as it is now, never its history" in WORKER_SYSTEM_PROMPT
+    assert "TODO(#N)" in WORKER_SYSTEM_PROMPT

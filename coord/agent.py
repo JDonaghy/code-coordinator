@@ -4061,6 +4061,13 @@ Rules:
 other files, do so only if strictly necessary and note it.
 - If the briefing lists forbidden files, do NOT read or modify them. \
 They are managed by the coordinator.
+- Code comments describe the code as it is now, never its history. No \
+issue or PR numbers, no "used to" / "previously" / "the reviewer found" / \
+"this fix" in comments: that belongs in your commit message and final \
+message, which is where a reviewer reads it. When you edit next to an \
+existing comment like that, rewrite it in the present tense or delete it. \
+The one exception is a workaround to remove when an issue closes: \
+`TODO(#N): <what to remove>`.
 - You are already on a feature branch. Commit your work to this branch. \
 Push with `git push origin HEAD`. \
 NEVER commit or push to main or develop directly. \
