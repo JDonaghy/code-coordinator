@@ -3010,6 +3010,81 @@ def test_dispatch_smoke_a_cordoned_fleet_still_recovers_after_the_cordon_lifts(
     assert completed.test_state == "running"
 
 
+def test_dispatch_smoke_a_machine_at_its_cargo_heavy_cap_leaves_the_row_waiting(
+    repo: Repo, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#3692: the only capability-matched machine is not paused and not
+    missing — it is merely at its #3673 cargo-heavy concurrency cap right
+    now. That is a load snapshot, not an operator decision, and clears
+    itself the moment the in-flight leg finishes — same self-clearing
+    shape as a release cordon (#3599) — so it must NOT durably block the
+    row, the reason must name the busy machine, and a later call once the
+    machine is back under its cap must dispatch to it."""
+    desktop = Machine(
+        name="desktop-a",
+        host="desktop-a.tail",
+        capabilities=["python", "gtk"],
+        repos=["api"],
+        repo_paths={"api": "/a/api"},
+        max_workers=1,
+    )
+    cfg = Config(
+        repos=[repo],
+        machines=[desktop],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+        ),
+    )
+    completed = _completed(machine="server")
+    busy_leg = Assignment(
+        machine_name="desktop-a",
+        repo_name="api",
+        issue_number=99,
+        issue_title="other in-flight work",
+        briefing="Worker briefing",
+        assignment_id="busy-leg",
+        status="running",
+        branch="other-branch",
+        dispatched_at=0.0,
+        type="work",
+    )
+    board = Board(completed=[completed], active=[busy_leg])
+
+    with caplog.at_level("WARNING", logger="coord.smoke"):
+        result = dispatch_smoke(
+            completed, board, cfg,
+            http_client=_MultiHostClient(),
+            diff_lookup=lambda r, b: _GTK_DIFF,
+        )
+
+    assert result is None
+    assert completed.test_state != "blocked", (
+        "a machine that is merely busy at its cargo-heavy cap must leave "
+        "the row re-dispatchable, not durably block it"
+    )
+    # Transient dead ends are logged, not written to the board — the
+    # message must name the busy machine, not read as a generic
+    # capability miss.
+    logged = "\n".join(r.message for r in caplog.records)
+    assert "desktop-a" in logged
+    assert "cargo-heavy concurrency cap" in logged
+    assert "no configured machine declares capability" not in logged
+
+    # Once the in-flight leg clears, the machine is back under its cap and
+    # the very next call dispatches to it.
+    board.active.remove(busy_leg)
+    second = dispatch_smoke(
+        completed, board, cfg,
+        http_client=_MultiHostClient(),
+        diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert second is not None, (
+        "the row must dispatch once the machine is back under its cap"
+    )
+    assert completed.test_state == "running"
+
+
 def test_dispatch_smoke_a_mixed_pause_and_cordon_fleet_still_durably_blocks(
     three_gtk_config: Config,
 ) -> None:
