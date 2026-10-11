@@ -2172,6 +2172,7 @@ def _report_unroutable_smoke(
     *,
     paused_capable: list[str] | None = None,
     cordon_only_capable: list[str] | None = None,
+    busy_capable: list[str] | None = None,
 ) -> None:
     """Report — once — that the Test stage has no machine it can run on.
 
@@ -2223,6 +2224,14 @@ def _report_unroutable_smoke(
       --reset`, converting the TTL-bounded cordon wait into an unbounded
       one — exactly the #3599 failure this carve-out closes. Logged once
       and left re-dispatchable, same as transient-connectivity.
+    * **Transient-busy** (#3692 — see *busy_capable*): every capable,
+      unpaused candidate was filtered SOLELY by the #3673 cargo-heavy
+      concurrency cap — it is merely busy, not missing. The cap is a
+      snapshot of in-flight legs, not an operator decision, and clears
+      itself the moment one of those legs finishes; durably blocking here
+      would wedge the row on a `coord diagnose --reset` for what the very
+      next tick would have resolved for free. Logged once and left
+      re-dispatchable, same as transient-cordon.
 
     *paused_capable* (#2636): machine names that matched capability but were
     filtered out of `rank_smoke_machines`'s ranking by `paused_set` — an
@@ -2243,6 +2252,15 @@ def _report_unroutable_smoke(
     durable branch still applies — lifting the cordon alone would not make
     the row dispatchable, so a human still needs to look at the
     non-cordoned ones.
+
+    *busy_capable* (#3692): machine names that matched capability, are NOT
+    in `paused_set`, yet were still filtered out of `rank_smoke_machines`'s
+    ranking because `machine_over_cargo_heavy_cap` says they are at their
+    #3673 cargo-heavy concurrency cap. Disjoint from *paused_capable* by
+    construction (the busy check only runs over machines already excluded
+    from pause) — when non-empty it is treated as transient, same as a
+    cordon-only dead end, since a load snapshot that will shift on its own
+    is not grounds to demand a manual `coord diagnose --reset`.
 
     Never raises: a board-write failure must not take the caller down.
     """
@@ -2276,6 +2294,13 @@ def _report_unroutable_smoke(
             f"capability [{caps}] for repo {completed.repo_name!r} is "
             f"paused or inside its quiet-hours window right now: "
             f"{', '.join(paused_capable)}{cordon_note}. (#2636)"
+        )
+    elif busy_capable:
+        message = (
+            f"Test stage cannot be routed: every machine that declares "
+            f"capability [{caps}] for repo {completed.repo_name!r} is at its "
+            f"cargo-heavy concurrency cap right now: "
+            f"{', '.join(busy_capable)}. (#3673)"
         )
     elif attempts:
         message = (
@@ -2320,6 +2345,15 @@ def _report_unroutable_smoke(
             "mechanism, not an operator pause — leaving the row "
             "re-dispatchable; it retries once the cordon lifts or expires "
             "(#3599).",
+        )
+        return
+
+    if busy_capable and not paused_capable:
+        _log_once(
+            logging.WARNING,
+            f"{message} The cargo-heavy cap is a snapshot of in-flight work, "
+            "not an operator decision — leaving the row re-dispatchable; it "
+            "retries once a slot frees up (#3692).",
         )
         return
 
@@ -3173,6 +3207,7 @@ def _dispatch_smoke_single_leg(
     # pause, a quiet-hours window, or (#3599) a release cordon.
     paused_capable: list[str] = []
     cordon_only_capable: list[str] = []
+    busy_capable: list[str] = []
     if not candidates:
         capable = _capability_matched_machines(
             required_caps, completed.repo_name, config
@@ -3199,6 +3234,23 @@ def _dispatch_smoke_single_leg(
                 cordon_only_capable = sorted(
                     name for name in paused_capable if name not in non_cordon_paused
                 )
+            # #3692: a capable, unpaused machine can still be missing from
+            # `candidates` because the board-aware `_capability_matched_
+            # machines` call inside `rank_smoke_machines` filtered it out
+            # for sitting at its #3673 cargo-heavy concurrency cap — not
+            # because it lacks the capability. That is self-clearing (the
+            # cap frees up the moment one of its in-flight legs finishes),
+            # same shape as a release cordon, so it must name the busy
+            # machine and leave the row re-dispatchable rather than falling
+            # through to the durable "no configured machine declares
+            # capability" message — reusing `machine_over_cargo_heavy_cap`
+            # (#2096: one question, one answer) rather than re-deriving the
+            # cap check here.
+            busy_capable = sorted(
+                m.name for m in capable
+                if m.name not in paused
+                and machine_over_cargo_heavy_cap(m, board, config)
+            )
 
     # #2168: pin the Test stage's model to avoid the agent falling through to
     # the machine's ambient `claude -p` default (Opus). Mirrors the review
@@ -3248,7 +3300,7 @@ def _dispatch_smoke_single_leg(
         # can show it, exactly once — never the silent 30 s spin of #1678.
         _report_unroutable_smoke(
             completed, required_caps, attempts, paused_capable=paused_capable,
-            cordon_only_capable=cordon_only_capable,
+            cordon_only_capable=cordon_only_capable, busy_capable=busy_capable,
         )
         return None
 
