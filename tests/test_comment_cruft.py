@@ -327,3 +327,8 @@ def test_rewrite_never_drops_a_safety_note():
     res = cc.rewrite_source(src, lambda p: (reply, 0.0))
     assert res.new_src is None and "dropped a SAFETY note" in res.rejected[0]
     assert cc.strip_body(" SAFETY: ptr is valid (#12).") == " SAFETY: ptr is valid (#12)."
+
+
+def test_doc_only_file_keeps_its_final_newline():
+    src = "//! Module.\n//!\n//! see #12\n"
+    assert cc.strip_file(src, docs=True)[0] == "//! Module.\n"

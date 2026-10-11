@@ -404,7 +404,9 @@ def apply_edits(src: str, comments_by_line: dict[int, Comment], edits: dict[int,
             if len(new) > 1:
                 raise ValueError(f"line {i + 1}: trailing comment replaced by {len(new)} lines")
             out.append(prefix + new[0] if new else prefix.rstrip())
-    return "\n".join(_tidy_blank_lines(out, deleted_at))
+    eof = out[-1:] == [""]  # the file's final newline, not a blank line to tidy
+    tidied = _tidy_blank_lines(out[:-1] if eof else out, deleted_at)
+    return "\n".join(tidied + ([""] if eof else []))
 
 
 def _tidy_blank_lines(lines: list[str], sites: list[int]) -> list[str]:
