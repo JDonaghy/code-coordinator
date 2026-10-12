@@ -2005,6 +2005,122 @@ def test_a_test_routing_dead_end_self_clear_also_resets_the_assignments_test_sta
     assert audit_row["issue"] == 3600
 
 
+def _seed_test_routing_dead_end(cli, seed, coord_db, issue: int = 3601) -> None:
+    """A `blocked` queue row carrying a Test-stage routing dead-end reason,
+    past #3695's re-check grace window, with the matching work assignment
+    parked on a stale `blocked` `test_state` — the exact pre-tick state the
+    self-clear acts on."""
+    seed(issues={issue: "open"})
+    cli("add", REPO, str(issue))
+    state._update_drive_queue_entry_local(
+        REPO, issue, state="blocked", last_reason=_TEST_ROUTING_REASON, attempts=2,
+    )
+    _backdate_reason(coord_db, issue, 3600)
+    coord_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, machine_name, "
+        " type, status, test_state, test_reason, dispatched_at) "
+        "VALUES (?, ?, ?, ?, 'dellserver', 'work', 'dispatched', 'blocked', ?, ?)",
+        (
+            f"a-claude-coordinator-{issue}-work",
+            REPO,
+            issue,
+            f"issue {issue}",
+            "stale Test-stage routing dead end",
+            50.0,
+        ),
+    )
+    coord_db.commit()
+
+
+@pytest.mark.parametrize(
+    "fake_reset, observed",
+    [
+        # The write blew up outright (locked db, migration drift, ...).
+        pytest.param(
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("database is locked")),
+            "raised RuntimeError",
+            id="reset-raises",
+        ),
+        # The write ran but matched nothing — e.g. the assignment row this
+        # dead end came from is not a `work`-like type any more.
+        pytest.param(lambda *a, **k: 0, "matched no work assignment row", id="reset-no-rows"),
+        # The nastiest shape: the call reports rows updated, yet a re-read
+        # still finds `test_state` set. Only a post-write OBSERVATION catches
+        # this one — the return value alone says "success".
+        pytest.param(lambda *a, **k: 1, "STILL set on re-read", id="reset-silent-noop"),
+    ],
+)
+def test_an_unconfirmed_test_state_reset_never_reports_a_self_clear(
+    cli, seed, launches, coord_db, monkeypatch, fake_reset, observed,
+):
+    """#3695 review round 2 (epic #2096 — "report success only from a
+    post-action observation"). The self-clear's queue-row write and its
+    `test_routing_recovered` audit row used to fire unconditionally: the
+    reset's return value was discarded and any exception swallowed by a bare
+    `except: pass`. A reset that raised, matched no row, or silently failed
+    to persist therefore left the assignment's `test_state` reading `blocked`
+    — poisoning `build_gate_report`/`dispatch_pending_smoke` exactly as
+    before — while the audit log and `last_reason` both claimed the dead end
+    had self-cleared, and a fresh Work leg was launched straight into the
+    unchanged gate.
+
+    Now the reset is observed (bound return value + a
+    `test_reset_candidates` re-read, mirroring
+    `coord.diagnose._reset_test_stage`): an unconfirmed clear records NO
+    `test_routing_recovered` row, puts the entry BACK to `blocked` with its
+    original `(#1672)`/`(#2019)` cause intact, and launches nothing."""
+    import coord.state as state_mod
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    _seed_test_routing_dead_end(cli, seed, coord_db)
+    key = f"{REPO}#3601"
+    monkeypatch.setattr(
+        drive_queue_cmd,
+        "_fetch_live_test_routing_clear",
+        lambda entries, config_path: (
+            {key: True},
+            {key: "a capability-matched machine is now free and healthy"},
+        ),
+    )
+    monkeypatch.setattr(state_mod, "reset_work_test_state", fake_reset)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+
+    recovered = coord_db.execute(
+        "SELECT count(*) AS n FROM audit_log "
+        "WHERE event_type = 'test_routing_recovered'"
+    ).fetchone()
+    assert recovered["n"] == 0, (
+        "a reset that was never observed to land must NOT be audited as a "
+        "self-clear (#2096)"
+    )
+    unconfirmed = coord_db.execute(
+        "SELECT event_type, repo, issue, summary, details_json FROM audit_log "
+        "WHERE event_type = 'test_routing_recovery_unconfirmed'"
+    ).fetchone()
+    assert unconfirmed is not None, (
+        "the failed self-clear still has to be visible to an operator"
+    )
+    assert unconfirmed["repo"] == REPO and unconfirmed["issue"] == 3601
+    assert observed in (unconfirmed["details_json"] or "")
+
+    entry = queued(3601)
+    assert entry["state"] == "blocked", (
+        "leaving it `waiting` launches a Work leg into a Test gate still "
+        "reading `blocked`"
+    )
+    assert entry["attempts"] == 2  # pre-tick budget, nothing progressed
+    assert observed in entry["last_reason"]
+    # The original cause — and the markers every later tick classifies on —
+    # survive the honest note layered on top of it.
+    assert "(#1672)" in entry["last_reason"]
+    assert "(#2019)" in entry["last_reason"]
+    assert launches == [], launches
+    assert "not confirmed" in result.output
+
+
 def test_a_dependent_is_released_when_its_prereq_is_wrongly_stuck_running(
     cli, seed, launches, monkeypatch,
 ):

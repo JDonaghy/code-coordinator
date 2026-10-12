@@ -8473,3 +8473,39 @@ def test_a_test_routing_dead_end_past_max_resumes_reports_oscillating_not_waitin
     )
     assert plan_again.reconciles == ()
     assert plan_again.launch is None
+
+
+def test_an_unconfirmed_test_state_reset_reason_keeps_the_dead_end_markers():
+    """#3695 review round 2: when the self-clear's second half — clearing the
+    assignment's own `test_state` — is not observed to land, the shell puts
+    the row back to `blocked` carrying this text. Like the oscillating note
+    above it must LAYER on the original cause: strip `(#1672)`/`(#2019)` and
+    the next tick stops recognising the row as a Test-routing dead end (so it
+    never retries the self-clear) and stops treating it as permanent at all.
+    It must also say what was actually observed, so the audit trail and
+    `status` never read as a recovery."""
+    from coord.drive_queue import (
+        is_permanent_block_reason,
+        is_test_stage_routing_dead_end_reason,
+        test_routing_recovery_unconfirmed_reason,
+    )
+
+    observed = "the reset raised OperationalError: database is locked"
+    reason = test_routing_recovery_unconfirmed_reason(_TEST_ROUTING_REASON, observed)
+
+    assert is_test_stage_routing_dead_end_reason(reason)
+    assert is_permanent_block_reason(reason)
+    assert "#1672" in reason and "#2019" in reason
+    assert _TEST_ROUTING_REASON.split(" — ")[0] in reason
+    assert observed in reason
+    assert "NOT confirmed" in reason
+
+    # Re-composing over an already-noted reason replaces the note instead of
+    # growing the string forever (the `_strip_test_routing_probe_note` half
+    # of the convention).
+    again = test_routing_recovery_unconfirmed_reason(reason, observed)
+    assert again == reason
+
+    # With no original cause to layer onto, the note stands alone rather
+    # than emitting a dangling separator.
+    assert not test_routing_recovery_unconfirmed_reason("", observed).startswith(" —")

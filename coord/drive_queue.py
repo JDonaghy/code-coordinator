@@ -5912,6 +5912,42 @@ def _with_test_routing_probe_note(original: str | None, note: str) -> str:
     return f"{base}{_TEST_ROUTING_PROBE_NOTE_SEP}{note}" if base else note
 
 
+def test_routing_recovery_unconfirmed_reason(
+    previous_reason: str | None, detail: str
+) -> str:
+    """The ``last_reason`` to put back on a row whose Test-stage routing
+    recheck read clear but whose follow-up ``test_state`` reset could NOT be
+    confirmed — *detail* says what was observed instead (the reset raised,
+    matched no assignment row, or the re-read still found a `test_state`
+    set).
+
+    A `test_routing_recovered` reconcile is only half the self-clear: the
+    queue row goes back to `waiting`, but the parent work assignment's own
+    `test_state`/`test_reason` have to be cleared too (that write lives in
+    the shell, outside the plan, because `update_drive_queue_entry` can
+    reach no table but the queue's own). When that second half is not
+    observed to have landed, the row must go back to `blocked` carrying
+    THIS text rather than keep the recovered wording — reporting a recovery
+    nobody observed is the #2096 defect, and a row left `waiting` on a
+    still-poisoned Test gate just dead-ends again with its audit trail
+    claiming it healed.
+
+    *previous_reason* is the row's PRE-tick cause, so the `(#1672)`/
+    `(#2019)` markers `is_test_stage_routing_dead_end_reason` and
+    `is_permanent_block_reason` classify on survive: the finding is layered
+    via :func:`_with_test_routing_probe_note`, never written in place of the
+    cause.
+    """
+    note = (
+        "read CLEAR, but clearing this issue's own Test-stage state was "
+        f"NOT confirmed ({detail}) — staying "
+        "blocked rather than reporting a self-clear that did not happen "
+        "(#2096). Run `coord diagnose <repo> <issue> --stage test --reset` "
+        "to clear it by hand, or look at why that write is failing"
+    )
+    return _with_test_routing_probe_note(previous_reason, note)
+
+
 def _strip_blocked_gate_probe_note(text: str | None) -> str:
     """*text* with any :data:`_BLOCKED_GATE_PROBE_NOTE_SEP`-delimited note a
     previous tick appended (via :func:`_with_blocked_gate_probe_note`)

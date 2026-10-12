@@ -111,6 +111,7 @@ from coord.drive_queue import (
     resolve_max_parallel,
     resolve_max_parallel_per_repo,
     resolve_repo_ceilings,
+    test_routing_recovery_unconfirmed_reason,
     unreachable_wait_alert,
     validate_apply_gate,
     validate_enqueue,
@@ -7780,8 +7781,27 @@ def drive_queue_tick(
         # .reset_work_test_state` is the exact call `coord diagnose --stage
         # test --reset` itself makes (see `_reset_test_stage`) — this is
         # that same reset, fired automatically instead of by a human.
+        #
+        # #3695 review round 2: the reset is OBSERVED, never assumed. Its
+        # return value (rows updated) is bound and a fresh
+        # `test_reset_candidates` re-read confirms nothing is still set —
+        # exactly what `coord.diagnose._reset_test_stage` does around the
+        # same call, and what epic #2096 requires of any success report. An
+        # unconfirmed clear takes the honest path instead: no
+        # `test_routing_recovered` audit row, a warning plus its own
+        # business-tier `test_routing_recovery_unconfirmed` row, and the queue
+        # row put BACK to `blocked` (pre-tick attempts restored, the bumped
+        # `resumes` kept so repeated failures still reach #2230's ceiling
+        # and escalate). Leaving it `waiting` would launch a fresh Work leg
+        # straight into the same poisoned gate — `build_gate_report` and
+        # `dispatch_pending_smoke` both read that stale `blocked`
+        # `test_state` — while the audit log claimed it had healed.
+        unconfirmed_test_recovery: set[str] = set()
         from coord.audit import record_audit  # noqa: PLC0415
-        from coord.state import reset_work_test_state  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            reset_work_test_state,
+            test_reset_candidates,
+        )
 
         for item in plan.reconciles:
             if item.outcome != "test_routing_recovered":
@@ -7790,27 +7810,91 @@ def drive_queue_tick(
             if parsed is None:
                 continue
             repo_name, issue_number = parsed
+            updated = 0
+            unconfirmed: str | None = None
             try:
-                reset_work_test_state(repo_name, issue_number)
-            except Exception:  # noqa: BLE001 — never let a best-effort
-                # reset turn an already-applied, already-successful tick
-                # into a reported CLI failure; the queue row itself already
-                # moved to `waiting` via `_apply_writes` above, so the next
-                # dispatch attempt still has a path forward even if this
-                # particular reset failed.
-                pass
+                updated = reset_work_test_state(repo_name, issue_number)
+                if not updated:
+                    unconfirmed = (
+                        "the reset matched no work assignment row for this "
+                        "issue"
+                    )
+                else:
+                    still_set = [
+                        f"{aid} ({typ}): {ts}"
+                        for aid, typ, ts in test_reset_candidates(
+                            repo_name, issue_number
+                        )
+                        if ts
+                    ]
+                    if still_set:
+                        unconfirmed = (
+                            f"the reset reported {updated} row(s) updated, but "
+                            f"test_state is STILL set on re-read for: "
+                            f"{', '.join(still_set)}"
+                        )
+            except Exception as exc:  # noqa: BLE001 — never let a failed
+                # reset turn an already-applied tick into a reported CLI
+                # failure; it is reported through the row and the audit log
+                # (below) instead, which is what an operator actually reads.
+                unconfirmed = (
+                    f"the reset raised {type(exc).__name__}: {exc}"
+                    if str(exc)
+                    else f"the reset raised {type(exc).__name__}"
+                )
+            if unconfirmed is None:
+                record_audit(
+                    tier="business",
+                    category="test",
+                    event_type="test_routing_recovered",
+                    actor="drive-queue-tick",
+                    summary=(
+                        f"Test-stage routing dead end self-cleared: "
+                        f"{repo_name}#{issue_number}"
+                    ),
+                    repo=repo_name,
+                    issue=issue_number,
+                    details={"reason": item.reason, "assignments_reset": updated},
+                )
+                continue
+            unconfirmed_test_recovery.add(item.key)
+            entry = by_key.get(item.key)
+            reason = test_routing_recovery_unconfirmed_reason(
+                entry.last_reason if entry else None, unconfirmed
+            )
+            log.warning(
+                "test-routing self-clear (#3695) NOT confirmed for %s: %s",
+                item.key,
+                unconfirmed,
+            )
+            update_drive_queue_entry(
+                repo_name,
+                issue_number,
+                state=STATE_BLOCKED,
+                attempts=entry.attempts if entry else 0,
+                last_reason=reason,
+            )
             record_audit(
+                # Business tier, same as the recovery it replaces: an
+                # `operational` row is DROPPED outright under
+                # `audit.level: business` (see `record_audit`), and the
+                # failed half of a self-clear is exactly the row an
+                # operator needs to still be there.
                 tier="business",
                 category="test",
-                event_type="test_routing_recovered",
+                event_type="test_routing_recovery_unconfirmed",
                 actor="drive-queue-tick",
                 summary=(
-                    f"Test-stage routing dead end self-cleared: "
-                    f"{repo_name}#{issue_number}"
+                    f"Test-stage routing self-clear NOT confirmed, staying "
+                    f"blocked: {repo_name}#{issue_number}"
                 ),
                 repo=repo_name,
                 issue=issue_number,
-                details={"reason": item.reason},
+                details={"observed": unconfirmed, "assignments_reset": updated},
+            )
+            click.echo(
+                f"self-clear not confirmed for {item.key}: {unconfirmed} "
+                "— left blocked (#3695)"
             )
 
         if plan.alert is not None:
@@ -7852,6 +7936,17 @@ def drive_queue_tick(
 
         target = plan.launch
         if target is None:
+            return
+        if target.key in unconfirmed_test_recovery:
+            # The only reason this row was launchable at all is the
+            # `test_routing_recovered` reconcile above, whose second half —
+            # clearing the assignment's own `test_state` — was NOT observed
+            # to land. The row is back to `blocked`; spending a Work leg on
+            # a gate still reading `blocked` would just dead-end again.
+            click.echo(
+                f"no launch for {target.key}: its Test-stage self-clear was "
+                "not confirmed this tick (#3695)"
+            )
             return
 
         # #2972: pass this entry's own board facts so a relaunch's
