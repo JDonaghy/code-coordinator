@@ -2757,6 +2757,229 @@ def test_native_execution_capabilities_rejects_non_string_entries(tmp_path: Path
         load(p)
 
 
+# ── smoke_tests.command_stages (#3696) ──────────────────────────────────────
+
+
+def test_command_stages_absent_defaults_to_empty(tmp_path: Path) -> None:
+    """A repo that hasn't opted into stage decomposition behaves exactly as
+    before #3696 — `command_stages` is empty, so `resolve_stage_command`
+    always returns `None` and nothing changes."""
+    cfg = load(
+        _write_smoke_config(
+            tmp_path,
+            "    - files: ['src/win/']\n      requires: [windows]\n",
+        )
+    )
+    assert cfg.smoke_tests.command_stages == ()
+
+
+def test_command_stages_round_trips(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: build-gtk\n"
+        "      command: cargo build --features gtk\n"
+        "      requires: [gtk]\n"
+        "    - name: build-win\n"
+        "      command: cargo build --features win\n"
+        "      requires: [windows]\n"
+    )
+    cfg = load(p)
+    stages = cfg.smoke_tests.command_stages
+    assert [s.name for s in stages] == ["build-gtk", "build-win"]
+    assert stages[0].command == "cargo build --features gtk"
+    assert stages[0].requires == ("gtk",)
+    assert stages[1].requires == ("windows",)
+
+
+def test_command_stages_requires_optional_defaults_to_empty_tuple(
+    tmp_path: Path,
+) -> None:
+    """A stage with no `requires` (e.g. a shared lint step) is valid and
+    lands on the first partition in every fan-out (#3696)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: lint\n"
+        "      command: make lint\n"
+    )
+    cfg = load(p)
+    assert cfg.smoke_tests.command_stages[0].requires == ()
+
+
+def test_command_stages_rejects_non_list(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages: lint\n"
+    )
+    with pytest.raises(
+        ConfigError, match="smoke_tests.command_stages must be a list"
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_non_mapping_entry(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - lint\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[0\] must be a mapping",
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_missing_name(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - command: make lint\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[0\]\.name must be a non-empty string",
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_empty_name(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: ''\n      command: make lint\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[0\]\.name must be a non-empty string",
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_duplicate_name(tmp_path: Path) -> None:
+    """Index in the error message points at the SECOND occurrence, where the
+    duplicate was detected."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: build\n      command: make build\n"
+        "    - name: build\n      command: make build-again\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[1\]\.name 'build' is duplicated",
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_missing_command(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: lint\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[0\]\.command must be a non-empty string",
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_empty_command(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: lint\n      command: '   '\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[0\]\.command must be a non-empty string",
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_non_list_requires(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: build-win\n      command: make build\n      requires: windows\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[0\]\.requires must be a list of strings",
+    ):
+        load(p)
+
+
+def test_command_stages_rejects_non_string_requires_entries(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: quadraui\n    github: acme/quadraui\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [quadraui]\n"
+        "smoke_tests:\n"
+        "  command_stages:\n"
+        "    - name: build-win\n      command: make build\n      requires: [42]\n"
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"smoke_tests\.command_stages\[0\]\.requires must be a list of strings",
+    ):
+        load(p)
+
+
 def test_native_execution_capability_naming_helper() -> None:
     """Single source of truth for the `<cap>-native` convention — mirrors
     `provider_capability`'s `provider:<type>` (#1711)."""

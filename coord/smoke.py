@@ -35,6 +35,12 @@ Public entry points:
   the Test-stage command, provenance included. A matched rule's own
   `command` (#3056) outranks the repo/fleet-wide sources — see
   `resolve_rule_command` for the multiple-matching-rules tiebreak.
+- `partition_command_stages(stages, partitions)` / `resolve_stage_command(
+  smoke_cfg, partition, partitions)` (#3696) — pure: when a repo declares
+  `smoke_tests.command_stages`, assigns every stage to exactly one #3182
+  fan-out partition (by capability superset) so each partition's leg runs
+  only its own stages instead of the repo's whole command — see
+  `_dispatch_smoke_fanout`.
 - `rank_smoke_machines(required_caps, repo, worker_machine, board, config)` —
   every capability-matched machine, best first (#1672).
 - `pick_smoke_machine(required_caps, worker_machine, board, config)` — picks
@@ -101,6 +107,7 @@ from coord import github_ops
 from coord.config import (
     Config,
     SmokeRule,
+    SmokeStage,
     SmokeTestsConfig,
     native_execution_capability,
 )
@@ -885,6 +892,47 @@ def partition_capability_requirements(
     return partitions, unroutable
 
 
+def partition_command_stages(
+    stages: Sequence[SmokeStage],
+    partitions: Sequence[SmokePartition],
+) -> dict[tuple[str, ...], list[SmokeStage]]:
+    """Assign every declared `command_stages` entry to exactly one fan-out
+    partition (#3696).
+
+    Each partition's own capability tuple is checked, in `partitions`
+    order, for the first one whose capabilities are a superset of the
+    stage's own `requires` — so a `[gtk+windows]` partition claims a stage
+    that `requires=["windows"]` before a later `[macos]` partition is even
+    considered. A stage with empty `requires` is capability-agnostic and
+    always matches the first partition, by the same superset rule (every
+    set is a superset of the empty set) — e.g. a shared lint/build step
+    that does not vary per platform.
+
+    Falls back to `partitions[0]` for a stage no partition's capabilities
+    cover, so a misconfigured `requires` (one naming a capability no
+    partition has) still runs it exactly once rather than silently
+    dropping it — "no gap" is guaranteed by construction, never by the
+    operator getting the config right.
+
+    Returns one list of `SmokeStage`, in declaration order, per partition
+    — keyed by `partition.capabilities` (unique per partition within one
+    fan-out, built by `partition_capability_requirements`). A partition
+    that claims no stage at all is simply absent from the returned dict.
+    """
+    assignments: dict[tuple[str, ...], list[SmokeStage]] = {}
+    if not partitions:
+        return assignments
+    for stage in stages:
+        requires = set(stage.requires)
+        target = partitions[0]
+        for partition in partitions:
+            if requires <= set(partition.capabilities):
+                target = partition
+                break
+        assignments.setdefault(target.capabilities, []).append(stage)
+    return assignments
+
+
 # ── Capability-partition fan-out (#3182) ─────────────────────────────────────
 #
 # `partition_capability_requirements` above is the ROUTING half: the fewest
@@ -1611,12 +1659,20 @@ class SmokeCommand:
     where CI only compiles) while still being *narrower* than the whole CI
     workflow. ``briefing_note`` says this explicitly so a transcript reader
     can tell a rule-command green from a repo-command green.
+
+    ``from_stages`` (#3696) is True when this command was assembled from the
+    subset of ``smoke_tests.command_stages`` that `partition_command_stages`
+    assigned to one #3182 fan-out partition — see `resolve_stage_command`.
+    Also never ``ci_equivalent``: it is a slice of the repo-wide command,
+    not CI's own declared command, even when that slice happens to cover
+    everything CI runs for this partition's capabilities.
     """
 
     command: str | None
     source: str
     ci_equivalent: bool
     from_rule: bool = False
+    from_stages: bool = False
 
     def briefing_note(self) -> str:
         """One line for the smoke agent's briefing naming the command's origin."""
@@ -1630,6 +1686,15 @@ class SmokeCommand:
                 "CI's own leg for these files, while still being NARROWER "
                 "than the whole CI workflow. Passing here does not by "
                 "itself prove CI is green."
+            )
+        if self.from_stages:
+            return (
+                f"- Suite: `{self.source}` — this is the subset of "
+                "`smoke_tests.command_stages` (#3696) this capability "
+                "partition owns, not the repo's whole Test-stage command. "
+                "Other partitions in this fan-out cover the remaining "
+                "stages; this leg's PASS does not by itself prove the "
+                "stages another partition owns are green."
             )
         if self.ci_equivalent:
             return (
@@ -1683,6 +1748,44 @@ def resolve_rule_command(
                 from_rule=True,
             )
     return None
+
+
+def resolve_stage_command(
+    smoke_cfg: SmokeTestsConfig,
+    partition: SmokePartition,
+    partitions: Sequence[SmokePartition],
+) -> SmokeCommand | None:
+    """Return *partition*'s own command out of `smoke_tests.command_stages`
+    (#3696), or `None` when the repo hasn't declared any — the pre-#3696
+    behaviour, where this partition's leg falls all the way through to
+    `resolve_smoke_command`'s repo/rule precedence unchanged.
+
+    Only `_dispatch_smoke_fanout` calls this: `command_stages` is specifically
+    a per-*partition* decomposition, and only a #3182 fan-out leg has a
+    partition (with other partitions alongside it) to decompose against. The
+    single-leg dispatch path has exactly one implicit "partition" covering
+    every capability, so splitting stages there would buy nothing — it is
+    unaffected, by construction, since it never calls this function.
+
+    Stages this partition owns are joined with `&&` in `command_stages`
+    declaration order, so an earlier stage failing stops the later ones from
+    running — the same fail-fast shape as a single hand-written multi-step
+    command.
+    """
+    if not smoke_cfg.command_stages:
+        return None
+    assignments = partition_command_stages(smoke_cfg.command_stages, partitions)
+    stages = assignments.get(partition.capabilities, [])
+    if not stages:
+        return None
+    command = " && ".join(stage.command for stage in stages)
+    names = ", ".join(stage.name for stage in stages)
+    return SmokeCommand(
+        command,
+        f"smoke_tests.command_stages ({names})",
+        False,
+        from_stages=True,
+    )
 
 
 def resolve_smoke_command(
@@ -3630,15 +3733,26 @@ def _dispatch_smoke_fanout(
     for partition in partitions:
         caps = list(partition.capabilities)
 
-        # #3298: scope resolution to the files that put THIS partition on the
-        # board — never the full diff's `touched` — so a rule-scoped command
-        # is attributed to the one leg it was written for. `partition.files`
-        # is never empty for a partition this function actually returned
-        # (see `SmokePartition`'s docstring); the `or touched` is a defensive
-        # fallback, not a path this should ever take.
-        resolved = resolve_smoke_command(
-            repo, smoke_cfg, touched_files=list(partition.files) or touched,
-        )
+        # #3696: `command_stages` decomposes the repo's whole command into
+        # capability-tagged steps, so a partition's own command is built by
+        # claiming only ITS stages — checked first because it is strictly
+        # more specific than anything `resolve_smoke_command` below can see
+        # (that function has no notion of "this partition" at all, only
+        # which files were touched). A repo with no `command_stages`
+        # declared gets `None` here every time and falls straight through
+        # to the pre-#3696 behaviour, unchanged.
+        resolved = resolve_stage_command(smoke_cfg, partition, partitions)
+        if resolved is None:
+            # #3298: scope resolution to the files that put THIS partition
+            # on the board — never the full diff's `touched` — so a
+            # rule-scoped command is attributed to the one leg it was
+            # written for. `partition.files` is never empty for a partition
+            # this function actually returned (see `SmokePartition`'s
+            # docstring); the `or touched` is a defensive fallback, not a
+            # path this should ever take.
+            resolved = resolve_smoke_command(
+                repo, smoke_cfg, touched_files=list(partition.files) or touched,
+            )
         smoke_command = resolved.command
         if smoke_command is None:
             # Skip this partition — `_report_unconfigured_smoke_command`
@@ -4320,3 +4434,63 @@ def dispatch_pending_smoke(
         dispatched.extend(_dispatch_smoke_legs(completed, board, config, now=now))
 
     return dispatched
+
+
+def cancel_stale_smoke_legs(
+    board: Board,
+    config: Config,
+    *,
+    repo_name: str,
+    branch: str,
+) -> list[Assignment]:
+    """#3696: a new fix/conflict-fix round about to push fresh commits onto
+    *branch* replaces the head any in-flight Test-stage leg for that branch
+    is currently running against. Cancel every such leg (``type="smoke"``,
+    still ``"running"`` or ``"pending"``) rather than let it burn a machine
+    for 10-20+ minutes producing a verdict on a commit nobody will trust —
+    the macmini overload (#3696) this exists for.
+
+    Best-effort and never raises, mirroring :func:`coord.network.cancel_assignment`
+    itself: a machine missing from config, or unreachable, is logged and
+    skipped rather than blocking the fix dispatch that called this. Returns
+    every matching leg this attempted to cancel (regardless of whether the
+    cancel itself succeeded), so a caller can log/count them.
+
+    Scoped to ``(repo_name, branch)`` only — not to any one work row's
+    ``review_of_assignment_id`` — because the whole point is that EVERY
+    leg still testing this branch is now stale, no matter which prior work
+    row originally queued it.
+    """
+    from coord.network import cancel_assignment  # noqa: PLC0415
+
+    stale = [
+        a
+        for a in board.active
+        if a.type == "smoke"
+        and a.repo_name == repo_name
+        and a.branch == branch
+        and a.status in ("running", "pending")
+    ]
+    for leg in stale:
+        machine = next((m for m in config.machines if m.name == leg.machine_name), None)
+        if machine is None:
+            logger.warning(
+                "cancel_stale_smoke_legs: machine %r not in config — "
+                "cannot cancel leg %s for %s/%s",
+                leg.machine_name, leg.assignment_id, repo_name, branch,
+            )
+            continue
+        result = cancel_assignment(machine, leg.assignment_id)
+        if not result.ok:
+            logger.warning(
+                "cancel_stale_smoke_legs: cancel failed for leg %s on %s "
+                "(%s/%s): %s",
+                leg.assignment_id, machine.name, repo_name, branch, result.error,
+            )
+        else:
+            logger.info(
+                "cancel_stale_smoke_legs: cancelled superseded leg %s on "
+                "%s for %s/%s",
+                leg.assignment_id, machine.name, repo_name, branch,
+            )
+    return stale

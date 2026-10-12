@@ -2315,3 +2315,67 @@ class TestAlreadyUpstreamMergeTreeMechanism:
             assert result.stdout.strip() != main_tree
         else:
             assert "CONFLICT" in result.stderr or "CONFLICT" in result.stdout
+
+
+# ── #3696: a dispatched conflict-fix cancels stale Test-stage legs ─────────
+
+
+class TestDispatchConflictFixCancelsStaleSmokeLegs:
+    """The rebase/force-push a conflict-fix performs replaces whatever head
+    ``entry.branch`` currently points at — any Test-stage leg still
+    ``running``/``pending`` against that branch was testing the commit this
+    dispatch is about to replace. ``dispatch_conflict_fix`` must cancel it."""
+
+    def _stale_smoke_leg(self, *, status: str = "running") -> Assignment:
+        return Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="Test: Fix the thing",
+            briefing="Smoke briefing.",
+            assignment_id="smoke-3696", status=status,
+            branch="issue-1-fix", dispatched_at=0.0, type="smoke",
+        )
+
+    def test_successful_dispatch_cancels_running_smoke_leg_on_same_branch(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        from coord.network import CancelResult
+
+        cancelled: list[tuple[str, str]] = []
+
+        def _fake_cancel(machine, assignment_id, **kwargs):
+            cancelled.append((machine.name, assignment_id))
+            return CancelResult(ok=True, status="cancelled")
+
+        board = Board(active=[self._stale_smoke_leg()])
+        client = _FakeHTTPClient({"id": "fix-id-3696"})
+        with patch("coord.network.cancel_assignment", side_effect=_fake_cancel):
+            result = dispatch_conflict_fix(
+                _entry(), board, two_machine_config,
+                http_client=client, prefer_machine="laptop",
+            )
+
+        assert result is not None
+        assert cancelled == [("server", "smoke-3696")]
+
+    def test_dispatch_leaves_unrelated_branch_smoke_legs_alone(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        unrelated_leg = self._stale_smoke_leg()
+        unrelated_leg.branch = "issue-999-other"
+        board = Board(active=[unrelated_leg])
+        client = _FakeHTTPClient({"id": "fix-id-3696b"})
+
+        cancelled: list[str] = []
+        with patch(
+            "coord.network.cancel_assignment",
+            side_effect=lambda machine, assignment_id, **kwargs: cancelled.append(
+                assignment_id
+            ),
+        ):
+            result = dispatch_conflict_fix(
+                _entry(), board, two_machine_config,
+                http_client=client, prefer_machine="laptop",
+            )
+
+        assert result is not None
+        assert cancelled == []

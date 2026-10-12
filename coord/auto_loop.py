@@ -1687,6 +1687,17 @@ def _dispatch_fix(
             work.assignment_id, fix_assignment.assignment_id, exc,
         )
         return None
+
+    # #3696: this fix round is about to push fresh commits onto
+    # `work.branch` — any Test-stage leg still running/queued against the
+    # head it replaces is testing a commit that's about to stop existing.
+    # Cancel it rather than let it finish and either waste a machine-hour
+    # or (worse) fold a stale PASS into the new head's verdict.
+    if work.branch:
+        from coord.smoke import cancel_stale_smoke_legs  # noqa: PLC0415
+
+        cancel_stale_smoke_legs(board, config, repo_name=work.repo_name, branch=work.branch)
+
     return fix_assignment
 
 

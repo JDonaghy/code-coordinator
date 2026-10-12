@@ -3270,6 +3270,108 @@ class TestDispatchFixDbContention:
                 )
 
 
+# ── #3696: a fresh fix round cancels stale Test-stage legs on the old head ──
+
+
+class TestDispatchFixCancelsStaleSmokeLegs:
+    """A dispatched fix round pushes new commits onto `work.branch` — any
+    Test-stage leg still `running`/`pending` against that branch was
+    testing the head this fix is about to replace. `_dispatch_fix` must
+    cancel it rather than let it finish and either burn a machine for
+    nothing or fold a stale verdict into the new head's outcome."""
+
+    def _work(self, machine: str = "laptop") -> Assignment:
+        return Assignment(
+            machine_name=machine,
+            repo_name="api",
+            issue_number=5,
+            issue_title="Fix thing",
+            briefing="Original briefing.",
+            assignment_id="work-3696",
+            status="done",
+            branch="issue-5-fix-thing",
+            dispatched_at=0.0,
+            finished_at=1.0,
+            type="work",
+        )
+
+    def _stale_smoke_leg(self, *, status: str = "running") -> Assignment:
+        return Assignment(
+            machine_name="server",
+            repo_name="api",
+            issue_number=5,
+            issue_title="Test: Fix thing",
+            briefing="Smoke briefing.",
+            assignment_id="smoke-3696",
+            status=status,
+            branch="issue-5-fix-thing",
+            dispatched_at=0.0,
+            type="smoke",
+        )
+
+    def test_successful_fix_dispatch_cancels_running_smoke_leg_on_same_branch(
+        self,
+    ) -> None:
+        cfg = _two_machine_config()
+        work = self._work(machine="laptop")
+        stale_leg = self._stale_smoke_leg()
+        board = Board(completed=[work], active=[stale_leg])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-3696-a"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        from coord.network import CancelResult
+
+        cancelled: list[tuple[str, str]] = []
+
+        def _fake_cancel(machine, assignment_id, **kwargs):
+            cancelled.append((machine.name, assignment_id))
+            return CancelResult(ok=True, status="cancelled")
+
+        with (
+            patch("coord.auto_loop.record_dispatched_assignment"),
+            patch("coord.network.cancel_assignment", side_effect=_fake_cancel),
+        ):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, cfg, iteration=1,
+                http_client=mock_http,
+                status_fetcher=_reachable_status_fetcher,
+            )
+
+        assert result is not None
+        assert cancelled == [("server", "smoke-3696")]
+
+    def test_fix_dispatch_leaves_unrelated_branch_smoke_legs_alone(self) -> None:
+        cfg = _two_machine_config()
+        work = self._work(machine="laptop")
+        unrelated_leg = self._stale_smoke_leg()
+        unrelated_leg.branch = "issue-999-other"
+        board = Board(completed=[work], active=[unrelated_leg])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-3696-b"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        cancelled: list[str] = []
+
+        with (
+            patch("coord.auto_loop.record_dispatched_assignment"),
+            patch(
+                "coord.network.cancel_assignment",
+                side_effect=lambda machine, assignment_id, **kwargs: cancelled.append(
+                    assignment_id
+                ),
+            ),
+        ):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, cfg, iteration=1,
+                http_client=mock_http,
+                status_fetcher=_reachable_status_fetcher,
+            )
+
+        assert result is not None
+        assert cancelled == []
+
+
 # ── #1176: test-author bounce gets a type="test-author" fix, not "work" ─────
 
 
