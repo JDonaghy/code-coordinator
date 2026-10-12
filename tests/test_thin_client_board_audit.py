@@ -268,6 +268,20 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         ("_run_auto_revalidate_checks_stale", "load_board"),
         ("drive_queue_diagnose", "build_board"),
         ("_fetch_live_running_merge_gate", "load_board"),
+        # #3695-guarded: `_fetch_live_test_routing_clear` is the fifth member
+        # of the `_fetch_live_*` family above, identical guard, identical
+        # place — it re-checks, live THIS tick, whether a Test-stage routing
+        # dead-end (a machine merely busy, briefly unhealthy, or
+        # paused/cordoned at dispatch time) has since cleared, so
+        # `_reconcile_blocked` can auto-clear the row to `waiting` instead of
+        # leaving it blocked forever. The
+        # `if resolve_board_service() is not None: return {}, {}` early return
+        # sits ABOVE the `from coord.state import load_board` import, so a
+        # thin client returns before the local read is even imported; only the
+        # daemon host (#1870) reaches it. Read-only: load_board only, no
+        # save_board, wrapped in the same fail-soft `except Exception` that
+        # degrades to the pre-#3695 "stay blocked" behaviour.
+        ("_fetch_live_test_routing_clear", "load_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
