@@ -5470,12 +5470,23 @@ def _xlsx_cell(value: Any, meta: Mapping[str, Any] | None = None) -> Any:
 _XLSX_FIXED_STAMP = datetime(1980, 1, 1, 0, 0, 0)
 
 
+_XLSX_FIXED_STAMP_ISO = "1980-01-01T00:00:00Z"
+
+# ISO 8601 datetime pattern used by openpyxl in docProps/core.xml.
+_ISO_DATETIME_RE = re.compile(
+    rb"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
+)
+
+
 def _zero_xlsx_zip_timestamps(data: bytes) -> bytes:
     """Rewrite every zip entry's `date_time` in a saved `.xlsx` to the fixed
-    stamp, leaving contents untouched. `openpyxl` has no option to pin this
-    itself, so it has to be done as a post-processing pass over the bytes
-    it produced (#3500)."""
+    stamp, and normalise timestamps embedded in ``docProps/core.xml``.
+
+    openpyxl ignores a pinned ``wb.properties.modified`` and writes
+    ``datetime.now()`` at save time, so the zip-entry rewrite alone is not
+    sufficient — the XML content itself must be normalised too (#3500)."""
     stamp = _XLSX_FIXED_STAMP.timetuple()[:6]
+    fixed_iso = _XLSX_FIXED_STAMP_ISO.encode()
     src = io.BytesIO(data)
     dst = io.BytesIO()
     with (
@@ -5484,6 +5495,8 @@ def _zero_xlsx_zip_timestamps(data: bytes) -> bytes:
     ):
         for item in zin.infolist():
             payload = zin.read(item.filename)
+            if item.filename == "docProps/core.xml":
+                payload = _ISO_DATETIME_RE.sub(fixed_iso, payload)
             info = zipfile.ZipInfo(item.filename, date_time=stamp)
             info.compress_type = item.compress_type
             info.external_attr = item.external_attr
