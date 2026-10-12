@@ -1370,6 +1370,123 @@ def rank_smoke_machines(
     return ranked
 
 
+# #3695: the exact bracketed capability list `_report_unroutable_smoke`
+# embeds in every DURABLE routing-dead-end message it writes
+# (``f"capability [{caps}] for repo ..."`` — see its own body above), and
+# the one distinct substring that marks the OTHER durable shape, "no
+# configured machine declares this capability at all" — a `coordinator.yml`
+# config gap, not fleet state, so it is excluded on sight rather than
+# re-checked tick after tick for a capability that was never going to
+# appear on its own.
+_CAPABILITY_BRACKET_RE = re.compile(r"capability \[([^\]]*)\]")
+_NO_CONFIGURED_MACHINE_MARKER = "no configured machine declares capability"
+
+
+def required_caps_from_test_reason(reason: str | None) -> list[str] | None:
+    """Recover the capability list behind a Test-stage routing dead end.
+
+    #3695: `coord.dead_end`'s ``test_stage_blocked`` shape interpolates the
+    parent row's own ``test_reason`` — the exact string
+    :func:`_report_unroutable_smoke` wrote when it first recorded
+    ``TEST_STATE_BLOCKED`` — into the `DeadEnd.reason` that eventually lands
+    in a drive-queue entry's ``last_reason``. Every one of that function's
+    DURABLE messages (paused/quiet-hours, every candidate refused, or no
+    configured machine at all) embeds the same
+    ``f"capability [{caps}] for repo ..."`` fragment, so this is read back
+    off of *reason* rather than re-deriving or re-storing the list anywhere
+    new — #2096/#2085 "one question, one answer" applies to data, not just
+    functions: there is exactly one place this list is written, and this is
+    its one reader.
+
+    Returns ``None`` — "nothing to re-check" — for two different reasons
+    that both need to leave the row alone:
+
+    * *reason* does not look like one of :func:`_report_unroutable_smoke`'s
+      own messages at all (no bracketed capability list found) — some
+      other `(#2019)` dead-end shape entirely (guard refusal, fix-round
+      ceiling, an `after=` prerequisite, ...), none of which this issue
+      touches.
+    * *reason* carries :data:`_NO_CONFIGURED_MACHINE_MARKER` — "no
+      configured machine declares capability [...] AND can build repo
+      ...". That is a `coordinator.yml` gap, not transient fleet state: no
+      amount of waiting makes an undeclared capability appear, so treating
+      it as permanent (scenario (c) in the issue) is correct, not a bug.
+
+    An empty list (as opposed to ``None``) means the dead end legitimately
+    required no capability at all (``caps`` reads
+    ``"(none — any capable machine)"`` — see the ``caps = ", ".join(...)``
+    line above) — still worth a re-check, since "no capable machine" in
+    that case can only mean every machine was paused/cordoned/refused the
+    repo itself, which is exactly the fleet-state class this issue targets.
+    """
+    if not reason:
+        return None
+    if _NO_CONFIGURED_MACHINE_MARKER in reason:
+        return None
+    match = _CAPABILITY_BRACKET_RE.search(reason)
+    if match is None:
+        return None
+    raw = match.group(1)
+    if raw == "(none — any capable machine)":
+        return []
+    return [cap.strip() for cap in raw.split(",") if cap.strip()]
+
+
+def test_stage_routable_now(
+    required_caps: list[str],
+    repo_name: str,
+    board: Board,
+    config: Config,
+    *,
+    payload: dict | None = None,
+) -> bool:
+    """#3695: is the Test stage routable RIGHT NOW — cheaply?
+
+    Answers the SAME two questions dispatch-time :func:`rank_smoke_machines`
+    already answers for a live dispatch, reused rather than re-derived
+    (#2096/#2085 "one question, one answer"):
+
+    1. Is there at least one capability-matched, unpaused, uncordoned,
+       under-cap machine for *repo_name*? — :func:`rank_smoke_machines`
+       itself, which composes :func:`_capability_matched_machines` and
+       ``coord.machine_pause.paused_set`` exactly as dispatch does.
+    2. Does its cached/last ``/health`` agree it is actually there? —
+       ``coord.drive_state._unreachable_machine_names(payload)``, the SAME
+       already-polled ``fleet_health.machine_health`` reading
+       ``eligible_hosts_for_repo``/``pick_machine_choice`` already use for
+       an identical reason, stated explicitly in their own docstrings: a
+       live per-candidate ``/health`` GET on every tick does not scale.
+       Deliberately NOT :func:`_capability_probe_reasons` — that makes a
+       live HTTP call per machine and exists for dispatch time, where
+       paying for one fresh probe per actual assignment is the point; a
+       `blocked`-row re-check runs once per tick per blocked row and must
+       stay cheap, per the issue's own "cheaply, config/board-first"
+       requirement.
+
+    *payload* is the board daemon's own ``/board`` response body (or
+    ``None`` when no live fleet-health snapshot is available, e.g. in a
+    unit test that only cares about capability/pause routing) — when
+    ``None`` the health cross-check is simply skipped, matching
+    `rank_smoke_machines`'s own graceful behaviour when a caller has
+    nothing but config and board.
+
+    Returns ``False`` the moment either question comes back empty-handed —
+    this must be a genuinely reachable branch, not a default that always
+    clears (#2096 "a gate must be able to fail"): a *required_caps* nothing
+    currently declares, or every declared candidate still paused/cordoned/
+    over-cap/unreachable, both return ``False`` unchanged.
+    """
+    candidates = rank_smoke_machines(required_caps, repo_name, None, board, config)
+    if not candidates:
+        return False
+    if payload is not None:
+        from coord.drive_state import _unreachable_machine_names  # noqa: PLC0415
+
+        unreachable = _unreachable_machine_names(payload)
+        candidates = [c for c in candidates if c.machine.name not in unreachable]
+    return bool(candidates)
+
+
 def pick_smoke_machine(
     required_caps: list[str],
     repo_name: str,
