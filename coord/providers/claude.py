@@ -120,6 +120,7 @@ class ClaudeProvider(Provider):
             REFINEMENT_SYSTEM_PROMPT,
             REVIEW_DENY_COMMANDS,
             TEST_CHAT_SYSTEM_PROMPT,
+            FIX_AUTOCOMPACT_TOKENS,
             WORK_AUTOCOMPACT_TOKENS,
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
@@ -264,7 +265,13 @@ class ClaudeProvider(Provider):
                 _at = "Read,Edit,Write,Bash,Monitor"
                 # #3672: keep in sync with default_worker_command's identical
                 # branch — force earlier auto-compaction for work-shaped legs.
-                autocompact_tokens = WORK_AUTOCOMPACT_TOKENS
+                # #3697: fix/conflict-fix legs carry the review findings as
+                # their first user message — compacting that away destroys the
+                # roadmap. Use FIX_AUTOCOMPACT_TOKENS (None = disabled).
+                if spec.type in ("fix", "conflict-fix"):
+                    autocompact_tokens = FIX_AUTOCOMPACT_TOKENS
+                else:
+                    autocompact_tokens = WORK_AUTOCOMPACT_TOKENS
 
             if system_prompt is None:
                 system_prompt = _sp
