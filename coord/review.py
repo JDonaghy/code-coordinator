@@ -1132,6 +1132,14 @@ you raised nothing blocking. Put blocking findings ONLY under \
 `## Blocking findings` — anything you would still merge over belongs in one of \
 the other two sections.
 
+A finding is blocking ONLY when the code is wrong, unsafe, or violates a \
+project rule that affects runtime behavior. Process-only issues — commit \
+message wording, comment phrasing, PR description, documentation formatting, \
+test-naming conventions — are NEVER blocking. Put them under \
+`## Non-blocking concerns` or `## Nits`. Each fix+review round costs real \
+wall-clock time and money; do not burn a round on something that does not \
+change what the code does.
+
 `END_REVIEW` is a HARD REQUIREMENT, not a formatting flourish: the coordinator \
 only records a verdict when it sees that exact line, so a review that is \
 otherwise complete and correct but stops one line early is discarded in its \
