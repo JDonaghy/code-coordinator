@@ -4033,6 +4033,16 @@ WORK_TURN_CEILING = 150
 # and unaffected either way.
 WORK_AUTOCOMPACT_TOKENS = "100000"
 
+# #3697: fix/conflict-fix legs carry the review findings as their first
+# user message (not the system prompt), so auto-compaction summarizes away
+# the precise surgical instructions the worker needs. At 100k the
+# compaction fires within ~15 turns and the worker loses file names, line
+# numbers, and reasoning — then over-explores to rediscover what it had.
+# Disable autocompact for fix legs entirely: they should be short and
+# targeted; if they're long enough to need compaction, the briefing loss
+# makes them worse, not better.
+FIX_AUTOCOMPACT_TOKENS: str | None = None
+
 # `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` (claude -p env vars, not
 # CLI flags) — see `_worker_subprocess_env`. #3672: quadraui#1321's 5
 # longest waits were exactly 120s each, on `cargo test --features ...
@@ -6155,7 +6165,15 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # `compact_boundary` events; the lower threshold here is what makes
         # at least one fire before context reaches the 425K-token range
         # that analysis measured.
-        autocompact_tokens = WORK_AUTOCOMPACT_TOKENS
+        #
+        # #3697: fix/conflict-fix legs carry the review findings as their
+        # first user message — compacting that away destroys the roadmap and
+        # causes massive over-exploration. Use FIX_AUTOCOMPACT_TOKENS (None
+        # by default = disabled) for these legs instead.
+        if spec.type in ("fix", "conflict-fix"):
+            autocompact_tokens = FIX_AUTOCOMPACT_TOKENS
+        else:
+            autocompact_tokens = WORK_AUTOCOMPACT_TOKENS
 
     # NOTE: briefing is NOT passed as a positional arg — it is written to
     # stdin as the first stream-json user message by ``_spawn``.
