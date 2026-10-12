@@ -2092,4 +2092,16 @@ def dispatch_conflict_fix(
         },
     )
 
+    # #3696: the rebase/force-push this conflict-fix is about to perform
+    # replaces whatever head `entry.branch` currently points at — any
+    # Test-stage leg still running/queued against that branch is about to
+    # be testing a commit that's going away. Cancel it rather than let it
+    # burn a machine producing a verdict nobody will trust.
+    if entry.branch:
+        from coord.smoke import cancel_stale_smoke_legs  # noqa: PLC0415
+
+        cancel_stale_smoke_legs(
+            board, config, repo_name=entry.repo_name, branch=entry.branch,
+        )
+
     return fix_assignment

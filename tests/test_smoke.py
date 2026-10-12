@@ -10,6 +10,7 @@ import pytest
 from coord.config import (
     Config,
     SmokeRule,
+    SmokeStage,
     SmokeTestsConfig,
     load,
     native_execution_capability,
@@ -25,6 +26,7 @@ from coord.smoke import (
     SmokePartition,
     UnroutableCapability,
     build_smoke_briefing,
+    cancel_stale_smoke_legs,
     dispatch_pending_smoke,
     dispatch_smoke,
     environmental_smoke_legs,
@@ -34,10 +36,12 @@ from coord.smoke import (
     mute_smoke_legs,
     mute_smoke_tally,
     partition_capability_requirements,
+    partition_command_stages,
     pick_smoke_machine,
     required_capabilities,
     resolve_rule_command,
     resolve_smoke_command,
+    resolve_stage_command,
     smoke_leg_capabilities,
     smoke_leg_issue_title,
     unverified_native_capabilities,
@@ -3896,6 +3900,170 @@ def test_partition_command_does_not_leak_into_a_sibling_partition() -> None:
     assert resolved_macos.command == "pytest macos_suite"
 
 
+# ── Stage-decomposed commands (#3696) ───────────────────────────────────────
+
+
+_GTK_WINDOWS_PARTITION = SmokePartition(capabilities=("gtk", "windows"), files=())
+_MACOS_PARTITION = SmokePartition(capabilities=("macos",), files=())
+_STAGE_PARTITIONS = [_GTK_WINDOWS_PARTITION, _MACOS_PARTITION]
+
+
+def test_partition_command_stages_assigns_each_stage_to_exactly_one_partition() -> None:
+    """#3696 acceptance: every declared stage lands in exactly one
+    partition's list — no gap, no duplicate — when each stage's `requires`
+    is covered by exactly one of the fan-out's partitions."""
+    stages = [
+        SmokeStage(name="build-gtk", command="cargo build --features gtk", requires=["gtk"]),
+        SmokeStage(name="build-win", command="cargo build --features win", requires=["windows"]),
+        SmokeStage(name="build-macos", command="cargo build --features macos", requires=["macos"]),
+    ]
+    assignments = partition_command_stages(stages, _STAGE_PARTITIONS)
+
+    all_assigned = [s for group in assignments.values() for s in group]
+    assert sorted(s.name for s in all_assigned) == ["build-gtk", "build-macos", "build-win"]
+    assert len(all_assigned) == len(stages)
+
+    gtk_windows_names = {s.name for s in assignments[_GTK_WINDOWS_PARTITION.capabilities]}
+    macos_names = {s.name for s in assignments[_MACOS_PARTITION.capabilities]}
+    assert gtk_windows_names == {"build-gtk", "build-win"}
+    assert macos_names == {"build-macos"}
+    # No stage name appears in more than one partition's list.
+    assert gtk_windows_names.isdisjoint(macos_names)
+
+
+def test_partition_command_stages_capability_agnostic_stage_goes_to_first_partition() -> None:
+    """A stage with empty `requires` (e.g. a shared lint step) always lands
+    on `partitions[0]` — every capability set is a superset of the empty
+    set, so the first-match-wins rule picks the first partition."""
+    stages = [SmokeStage(name="lint", command="make lint", requires=[])]
+    assignments = partition_command_stages(stages, _STAGE_PARTITIONS)
+    assert assignments == {_GTK_WINDOWS_PARTITION.capabilities: stages}
+
+
+def test_partition_command_stages_falls_back_to_first_partition_when_unrouted() -> None:
+    """#3696 "no gap" guarantee: a stage whose `requires` names a capability
+    NO partition has still gets assigned — to `partitions[0]` — rather than
+    silently vanishing from every leg's command."""
+    stages = [
+        SmokeStage(name="android", command="./gradlew test", requires=["android"]),
+    ]
+    assignments = partition_command_stages(stages, _STAGE_PARTITIONS)
+    assert assignments == {_GTK_WINDOWS_PARTITION.capabilities: stages}
+
+
+def test_partition_command_stages_empty_partitions_assigns_nothing() -> None:
+    stages = [SmokeStage(name="lint", command="make lint")]
+    assert partition_command_stages(stages, []) == {}
+
+
+def test_resolve_stage_command_returns_none_when_repo_declares_no_stages() -> None:
+    """Pre-#3696 behaviour: a repo that hasn't opted into `command_stages`
+    gets `None` here every time, so `_dispatch_smoke_fanout` falls straight
+    through to `resolve_smoke_command` unchanged."""
+    smoke_cfg = SmokeTestsConfig()
+    resolved = resolve_stage_command(smoke_cfg, _GTK_WINDOWS_PARTITION, _STAGE_PARTITIONS)
+    assert resolved is None
+
+
+def test_resolve_stage_command_returns_none_when_partition_owns_no_stage() -> None:
+    smoke_cfg = SmokeTestsConfig(
+        command_stages=(
+            SmokeStage(name="build-macos", command="cargo build --features macos", requires=("macos",)),
+        ),
+    )
+    resolved = resolve_stage_command(smoke_cfg, _GTK_WINDOWS_PARTITION, _STAGE_PARTITIONS)
+    assert resolved is None
+
+
+def test_resolve_stage_command_joins_owned_stages_with_and_and() -> None:
+    smoke_cfg = SmokeTestsConfig(
+        command_stages=(
+            SmokeStage(name="build-gtk", command="cargo build --features gtk", requires=("gtk",)),
+            SmokeStage(name="test-gtk", command="cargo test --features gtk", requires=("gtk",)),
+            SmokeStage(name="build-macos", command="cargo build --features macos", requires=("macos",)),
+        ),
+    )
+    resolved = resolve_stage_command(smoke_cfg, _GTK_WINDOWS_PARTITION, _STAGE_PARTITIONS)
+    assert resolved is not None
+    assert resolved.command == "cargo build --features gtk && cargo test --features gtk"
+    assert resolved.from_stages is True
+    assert resolved.ci_equivalent is False
+    assert "command_stages" in resolved.source
+
+    resolved_macos = resolve_stage_command(smoke_cfg, _MACOS_PARTITION, _STAGE_PARTITIONS)
+    assert resolved_macos is not None
+    assert resolved_macos.command == "cargo build --features macos"
+
+
+def test_dispatch_smoke_fanout_scopes_stage_command_to_its_own_partition(
+    repo: Repo,
+) -> None:
+    """#3696 acceptance: with `command_stages` declared, each partition's
+    leg command contains only ITS OWN stages — never a stage another
+    partition owns — so a macmini `[macos]` leg no longer runs the
+    cross-target Windows build the `[gtk+windows]` leg already covers."""
+    from coord.smoke import _dispatch_smoke_legs
+
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("dell64", "dell64.tail", caps=["gtk", "windows"], path="/d/api"),
+            _machine("macmini", "macmini.tail", caps=["macos"], path="/m/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[
+                SmokeRule(files=["quadraui/src/gtk/"], requires=["gtk"]),
+                SmokeRule(files=["quadraui/src/win/"], requires=["windows"]),
+                SmokeRule(files=["quadraui/src/macos/"], requires=["macos"]),
+            ],
+            command_stages=(
+                SmokeStage(name="build-gtk", command="cargo build --features gtk", requires=("gtk",)),
+                SmokeStage(name="build-win", command="cargo build --features win", requires=("windows",)),
+                SmokeStage(name="build-macos", command="cargo build --features macos", requires=("macos",)),
+            ),
+        ),
+    )
+    completed = _completed()
+    diff = [
+        "quadraui/src/gtk/a.rs",
+        "quadraui/src/win/b.rs",
+        "quadraui/src/macos/c.rs",
+    ]
+    board = Board()
+    client = _MultiHostClient(assign={
+        "dell64.tail": {"id": "dell64-leg"},
+        "macmini.tail": {"id": "macmini-leg"},
+    })
+    legs = _dispatch_smoke_legs(
+        completed, board, cfg, http_client=client, diff_lookup=lambda r, b: diff,
+    )
+
+    assert len(legs) == 2
+    by_machine = {a.machine_name: a for a in legs}
+
+    dell64_briefing = by_machine["dell64"].briefing
+    macmini_briefing = by_machine["macmini"].briefing
+
+    # Every declared stage's command appears in EXACTLY ONE leg's briefing —
+    # no gap, no duplicate.
+    for stage_command in (
+        "cargo build --features gtk",
+        "cargo build --features win",
+        "cargo build --features macos",
+    ):
+        appears_in = [
+            b for b in (dell64_briefing, macmini_briefing) if stage_command in b
+        ]
+        assert len(appears_in) == 1, (
+            f"{stage_command!r} must appear in exactly one leg, found in {len(appears_in)}"
+        )
+
+    assert "cargo build --features macos" not in dell64_briefing
+    assert "cargo build --features gtk" not in macmini_briefing
+    assert "cargo build --features win" not in macmini_briefing
+
+
 def test_dispatch_smoke_fanout_reports_unconfigured_command_naming_the_partition() -> None:
     """#3298: a partition whose OWN files resolve to no smoke command at all
     (no matching rule `command`, and the repo declares no
@@ -6115,3 +6283,165 @@ def test_stage_routable_now_skips_the_health_cross_check_when_no_payload(
         test_stage_routable_now(["gtk"], "api", Board(), three_gtk_config, payload=None)
         is True
     )
+
+
+# ── cancel_stale_smoke_legs (#3696) ─────────────────────────────────────────
+
+
+def _smoke_leg(
+    *,
+    machine: str = "server",
+    repo: str = "api",
+    branch: str = "issue-287-fix",
+    status: str = "running",
+    assignment_id: str = "smoke1",
+) -> Assignment:
+    return Assignment(
+        machine_name=machine,
+        repo_name=repo,
+        issue_number=287,
+        issue_title="Test: GTK key routing fix",
+        briefing="Smoke briefing",
+        assignment_id=assignment_id,
+        status=status,
+        branch=branch,
+        dispatched_at=0.0,
+        type="smoke",
+    )
+
+
+def test_cancel_stale_smoke_legs_cancels_matching_running_leg(
+    monkeypatch, gtk_and_server_config: Config,
+) -> None:
+    from coord.network import CancelResult
+
+    seen: list[tuple[str, str]] = []
+
+    def _fake_cancel(machine, assignment_id, **kwargs):
+        seen.append((machine.name, assignment_id))
+        return CancelResult(ok=True, status="cancelled")
+
+    monkeypatch.setattr("coord.network.cancel_assignment", _fake_cancel)
+
+    leg = _smoke_leg()
+    board = Board(active=[leg])
+
+    cancelled = cancel_stale_smoke_legs(
+        board, gtk_and_server_config, repo_name="api", branch="issue-287-fix",
+    )
+
+    assert cancelled == [leg]
+    assert seen == [("server", "smoke1")]
+
+
+def test_cancel_stale_smoke_legs_cancels_pending_leg_too(
+    monkeypatch, gtk_and_server_config: Config,
+) -> None:
+    from coord.network import CancelResult
+
+    monkeypatch.setattr(
+        "coord.network.cancel_assignment",
+        lambda machine, assignment_id, **kwargs: CancelResult(ok=True, status="cancelled"),
+    )
+
+    leg = _smoke_leg(status="pending")
+    board = Board(active=[leg])
+
+    cancelled = cancel_stale_smoke_legs(
+        board, gtk_and_server_config, repo_name="api", branch="issue-287-fix",
+    )
+
+    assert cancelled == [leg]
+
+
+def test_cancel_stale_smoke_legs_ignores_other_branches_and_repos(
+    monkeypatch, gtk_and_server_config: Config,
+) -> None:
+    called = []
+    monkeypatch.setattr(
+        "coord.network.cancel_assignment",
+        lambda machine, assignment_id, **kwargs: called.append(assignment_id),
+    )
+
+    other_branch = _smoke_leg(branch="issue-999-fix", assignment_id="smoke-other-branch")
+    other_repo = _smoke_leg(repo="other-repo", assignment_id="smoke-other-repo")
+    board = Board(active=[other_branch, other_repo])
+
+    cancelled = cancel_stale_smoke_legs(
+        board, gtk_and_server_config, repo_name="api", branch="issue-287-fix",
+    )
+
+    assert cancelled == []
+    assert called == []
+
+
+def test_cancel_stale_smoke_legs_ignores_non_smoke_and_finished_legs(
+    monkeypatch, gtk_and_server_config: Config,
+) -> None:
+    """A `type="work"` row and an already-`"done"` smoke leg on the exact
+    same branch must not be touched — only in-flight (`running`/`pending`)
+    `type="smoke"` legs are superseded by a new fix round."""
+    called = []
+    monkeypatch.setattr(
+        "coord.network.cancel_assignment",
+        lambda machine, assignment_id, **kwargs: called.append(assignment_id),
+    )
+
+    work_row = _completed(branch="issue-287-fix")
+    done_smoke = _smoke_leg(status="done", assignment_id="smoke-done")
+    board = Board(active=[work_row, done_smoke])
+
+    cancelled = cancel_stale_smoke_legs(
+        board, gtk_and_server_config, repo_name="api", branch="issue-287-fix",
+    )
+
+    assert cancelled == []
+    assert called == []
+
+
+def test_cancel_stale_smoke_legs_skips_machine_missing_from_config(
+    monkeypatch, gtk_and_server_config: Config,
+) -> None:
+    """A leg's machine no longer in `config.machines` must be skipped —
+    best-effort, never raising — rather than block the fix dispatch that
+    called this."""
+    called = []
+    monkeypatch.setattr(
+        "coord.network.cancel_assignment",
+        lambda machine, assignment_id, **kwargs: called.append(assignment_id),
+    )
+
+    leg = _smoke_leg(machine="decommissioned-box")
+    board = Board(active=[leg])
+
+    cancelled = cancel_stale_smoke_legs(
+        board, gtk_and_server_config, repo_name="api", branch="issue-287-fix",
+    )
+
+    assert cancelled == [leg]
+    assert called == []
+
+
+def test_cancel_stale_smoke_legs_tolerates_cancel_failure(
+    monkeypatch, gtk_and_server_config: Config,
+) -> None:
+    """A failed agent-side cancel (machine unreachable, dirty worktree,
+    etc.) is logged, not raised — the leg is still reported as
+    attempted-cancel so the caller can count/log it."""
+    from coord.network import CancelResult
+
+    monkeypatch.setattr(
+        "coord.network.cancel_assignment",
+        lambda machine, assignment_id, **kwargs: CancelResult(
+            ok=False, error="connection refused",
+        ),
+    )
+
+    leg = _smoke_leg()
+    board = Board(active=[leg])
+
+    cancelled = cancel_stale_smoke_legs(
+        board, gtk_and_server_config, repo_name="api", branch="issue-287-fix",
+    )
+
+    assert cancelled == [leg]

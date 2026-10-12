@@ -354,6 +354,30 @@ class SmokeRule:
     platforms: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class SmokeStage:
+    """One named step of a repo's full Test-stage command (#3696).
+
+    A plain-runner `default_command`/`ci_command`/`test_command` is one
+    opaque shell string the Test stage runs verbatim. A #3182 fan-out leg
+    still runs that whole string on every partition's machine — e.g.
+    quadraui's `[macos]` leg ran all 8 stages of the plain-runner command,
+    including Windows cross-builds the `[gtk+windows]` leg already covers,
+    costing duplicated machine-hours on the one `macos` box. Declaring
+    `command_stages` instead decomposes the command into stages tagged with
+    the capabilities each one needs; `coord.smoke.partition_command_stages`
+    assigns every stage to exactly one fan-out partition (the first whose
+    own capabilities are a superset of `requires`), and each partition's
+    leg runs only its own stages' commands joined together. A stage with no
+    `requires` (the default) is capability-agnostic and lands on the first
+    partition in declaration order.
+    """
+
+    name: str
+    command: str
+    requires: tuple[str, ...] = ()
+
+
 @dataclass
 class SmokeTestsConfig:
     """Smoke-test orchestration. Off by default — opt-in per project.
@@ -382,6 +406,16 @@ class SmokeTestsConfig:
     `["windows"]`, the one capability the incident this exists for actually
     involved; add more here (e.g. a future `"macos"` cross-build path)
     without any code change.
+
+    `command_stages` (#3696) is an optional decomposition of the repo's full
+    Test-stage command into named, capability-tagged steps — see
+    `SmokeStage`. Empty (the default) means "behaves exactly as before this
+    field existed": every #3182 fan-out leg runs the one repo-wide command
+    from `default_command`/`repos[].ci_command`/`repos[].test_command` (or a
+    matched rule's `command` override) in full, regardless of its own
+    partition's capabilities. When set, `coord.smoke.partition_command_stages`
+    takes over per-partition command construction instead — see that
+    function and `coord.smoke._dispatch_smoke_fanout`.
     """
 
     auto_queue: bool = False
@@ -389,6 +423,7 @@ class SmokeTestsConfig:
     timeout_seconds: int = 600
     capability_rules: list[SmokeRule] = field(default_factory=list)
     native_execution_capabilities: list[str] = field(default_factory=lambda: ["windows"])
+    command_stages: tuple[SmokeStage, ...] = ()
 
 
 @dataclass
@@ -4156,6 +4191,41 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
             SmokeRule(files=files, requires=requires, command=command, platforms=platforms)
         )
     cfg.capability_rules = rules
+
+    stages_raw = raw.get("command_stages", []) or []
+    if not isinstance(stages_raw, list):
+        raise ConfigError("smoke_tests.command_stages must be a list")
+    stages: list[SmokeStage] = []
+    seen_names: set[str] = set()
+    for i, entry in enumerate(stages_raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"smoke_tests.command_stages[{i}] must be a mapping")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(
+                f"smoke_tests.command_stages[{i}].name must be a non-empty string"
+            )
+        if name in seen_names:
+            raise ConfigError(
+                f"smoke_tests.command_stages[{i}].name {name!r} is duplicated"
+            )
+        seen_names.add(name)
+        stage_command = entry.get("command")
+        if not isinstance(stage_command, str) or not stage_command.strip():
+            raise ConfigError(
+                f"smoke_tests.command_stages[{i}].command must be a non-empty string"
+            )
+        stage_requires = entry.get("requires", []) or []
+        if not isinstance(stage_requires, list) or not all(
+            isinstance(r, str) for r in stage_requires
+        ):
+            raise ConfigError(
+                f"smoke_tests.command_stages[{i}].requires must be a list of strings"
+            )
+        stages.append(
+            SmokeStage(name=name, command=stage_command, requires=tuple(stage_requires))
+        )
+    cfg.command_stages = tuple(stages)
     return cfg
 
 
