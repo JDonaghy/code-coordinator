@@ -96,6 +96,7 @@ from coord.drive_queue import (
     is_merge_gate_block_reason,
     is_permanent_block_reason,
     is_pre_dispatch_block_reason,
+    is_test_stage_routing_dead_end_reason,
     is_unsatisfiable_prereq_reason,
     merge_gate_remedy_command,
     merge_plan_inspect_command,
@@ -5502,6 +5503,128 @@ def _fetch_live_blocked_gate(
     return overrides, reasons, unreadable
 
 
+def _fetch_live_test_routing_clear(
+    entries: list, config_path: Path | None
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """``({entry_key: now_routable}, {entry_key: human_reason})`` for every
+    ``blocked`` entry whose dead end is a Test-stage ROUTING cause (#3695) —
+    a sibling of :func:`_fetch_live_blocked_gate` for the one `(#2019)` shape
+    that function's own `is_permanent_block_reason` filter deliberately
+    excludes: fleet state (a machine merely busy, briefly unhealthy, or
+    paused/cordoned at dispatch time), not a deterministic cause.
+
+    THE GAP THIS CLOSES. `coord.dead_end`'s ``test_stage_blocked`` shape
+    (#1672/#2019) is classified permanent by `is_permanent_block_reason`,
+    so `_reconcile_blocked` never looks at it again — the row sits
+    `blocked` forever until an operator runs `coord diagnose <repo> <N>
+    --stage test --reset`, 27 times since August per the issue. Most of
+    those causes self-clear within minutes on their own; nothing was ever
+    asking again.
+
+    THE CHEAP RE-CHECK, reused rather than re-derived (#2096/#2085 "one
+    question, one answer"): :func:`coord.smoke.required_caps_from_test_reason`
+    recovers the capability list :func:`coord.smoke._report_unroutable_smoke`
+    originally embedded in the dead end's reason text, then :func:`coord.
+    smoke.test_stage_routable_now` asks the SAME two questions dispatch-time
+    `rank_smoke_machines` already answers — a capability-matched, unpaused,
+    uncordoned, under-cap machine, cross-checked against the board daemon's
+    own cached ``fleet_health`` reading — never a fresh per-candidate
+    ``/health`` probe (that is dispatch-time's job, not a once-per-tick
+    blocked-row re-check's).
+
+    NOT EVERY BLOCKED ENTRY QUALIFIES. `required_caps_from_test_reason`
+    returns ``None`` — and this function then skips the entry, leaving it
+    absent from both returned dicts — for every other `(#2019)` shape (a
+    guard refusal, a fix-round ceiling, an `after=` prerequisite,
+    `test_stage_human_attended`, the #2272 mute-smoke-legs sibling) and for
+    the "no machine declares this capability at all" config-gap case
+    (scenario (c) in the issue): no amount of re-checking fixes an
+    undeclared capability, so treating it as permanent is correct, not a
+    bug — `coord.drive_queue.is_test_stage_routing_dead_end_reason` applies
+    the identical exclusion on the pure side before ever consulting these
+    dicts, so this function's own skip is belt-and-suspenders, not the only
+    guard.
+
+    Same fail-open-per-entry, fail-closed-overall contract as
+    `_fetch_live_blocked_gate`: any exception while loading config/board, or
+    while fetching the board-daemon payload, leaves BOTH dicts empty for
+    every target — `_reconcile_blocked_test_routing` then does nothing for
+    any of them (no live opinion means no auto-clear), exactly as a thin
+    client with no board-service of its own already does nothing here.
+    """
+    targets = [
+        e for e in entries
+        if e.state == STATE_BLOCKED
+        and is_test_stage_routing_dead_end_reason(getattr(e, "last_reason", "") or "")
+    ]
+    if not targets:
+        return {}, {}
+
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return {}, {}
+
+    try:
+        from coord import smoke as _smoke  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.state import load_board as _load_board  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        board = _load_board()
+    except Exception as exc:  # noqa: BLE001 — see the fail-soft note above
+        log.warning(
+            "test-routing sweep (#3695): could not build board/config for "
+            "this tick's %d qualifying blocked entr%s — every one is left "
+            "to the pure side's own cheap board-only fallback: %r",
+            len(targets), "y" if len(targets) == 1 else "ies", exc,
+        )
+        return {}, {}
+
+    try:
+        payload = _fetch_board_payload()
+    except Exception as exc:  # noqa: BLE001 — health cross-check is best-effort
+        log.warning(
+            "test-routing sweep (#3695): could not fetch the board payload "
+            "for the fleet-health cross-check — continuing with "
+            "capability/pause/cordon routing only, no health reading: %r",
+            exc,
+        )
+        payload = None
+
+    clear: dict[str, bool] = {}
+    reasons: dict[str, str] = {}
+    for e in targets:
+        reason = getattr(e, "last_reason", "") or ""
+        required_caps = _smoke.required_caps_from_test_reason(reason)
+        if required_caps is None:
+            continue
+        parsed = parse_key(e.key)
+        if parsed is None:
+            log.warning(
+                "test-routing sweep (#3695): %s — key does not parse as "
+                "repo#issue, skipping", e.key,
+            )
+            continue
+        repo_name, _issue_num = parsed
+        try:
+            routable = _smoke.test_stage_routable_now(
+                required_caps, repo_name, board, cfg, payload=payload
+            )
+        except Exception as exc:  # noqa: BLE001 — leave this one entry alone
+            log.warning(
+                "test-routing sweep (#3695): %s — test_stage_routable_now "
+                "raised: %r", e.key, exc,
+            )
+            continue
+        clear[e.key] = routable
+        if routable:
+            reasons[e.key] = (
+                "a capability-matched machine is now free and healthy"
+            )
+    return clear, reasons
+
+
 def _fetch_live_running_merge_gate(
     entries: list, exit_reasons: Mapping[str, str], config_path: Path | None
 ) -> tuple[dict[str, bool], dict[str, str]]:
@@ -7210,6 +7333,16 @@ def drive_queue_tick(
             _fetch_live_blocked_gate(entries, config_path)
         )
 
+        # #3695: the sibling re-check for the ONE `(#2019)` dead-end shape
+        # `is_permanent_block_reason` deliberately excludes above — a
+        # Test-stage ROUTING dead end whose cause is fleet state (a machine
+        # merely busy, briefly unhealthy, or paused/cordoned), not anything
+        # deterministic. See `_fetch_live_test_routing_clear`'s docstring
+        # for the gap this closes (27 hand `--reset`s since August).
+        live_test_routing_clear, live_test_routing_reason = (
+            _fetch_live_test_routing_clear(entries, config_path)
+        )
+
         # #3577: the same live re-derivation, for `running` entries whose
         # OWN exit this tick already named a merge-gate block — see
         # `_fetch_live_running_merge_gate`'s docstring for the gap this
@@ -7303,6 +7436,8 @@ def drive_queue_tick(
             fix_round_config_default=_pipeline_max_fix_rounds_default(config_path),
             live_running_merge_gate=live_running_merge_gate,
             live_running_merge_gate_reason=live_running_merge_gate_reason,
+            live_test_routing_clear=live_test_routing_clear,
+            live_test_routing_reason=live_test_routing_reason,
         )
 
         if roll_pending is not None:

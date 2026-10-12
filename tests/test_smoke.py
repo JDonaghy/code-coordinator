@@ -5996,3 +5996,122 @@ def test_smoke_leg_issue_title_round_trips_through_smoke_leg_capabilities() -> N
     # An ordinary, untagged single-leg row is never mistaken for a leg.
     assert smoke_leg_capabilities("[smoke] Fix cross-platform bug") is None
     assert smoke_leg_capabilities(None) is None
+
+
+# ── #3695: re-checking a Test-stage routing dead end every tick ────────────
+#
+# `required_caps_from_test_reason` recovers the capability list a `(#1672)`
+# "no capability-matched machine" reason embedded, EXCEPT when the reason's
+# own cause is "no configured machine declares this capability at all" — a
+# config gap, never self-clearing, which must read as `None` so the drive-
+# queue sweep never mistakes it for a re-checkable fleet-state cause.
+# `test_stage_routable_now` is the cheap per-tick recheck itself: it REUSES
+# `rank_smoke_machines` rather than re-deriving routing logic, then crosses
+# the result against the board daemon's cached `/health` payload.
+
+
+def test_required_caps_from_test_reason_returns_none_for_no_reason() -> None:
+    from coord.smoke import required_caps_from_test_reason
+
+    assert required_caps_from_test_reason(None) is None
+    assert required_caps_from_test_reason("") is None
+
+
+def test_required_caps_from_test_reason_returns_none_for_no_configured_machine() -> None:
+    """The #3695 scenario-(c) shape: a config gap, not fleet state — this is
+    the ONE case `is_test_stage_routing_dead_end_reason` cannot itself tell
+    apart from a self-clearing fleet-state cause, so the split is pinned
+    here instead."""
+    from coord.smoke import required_caps_from_test_reason
+
+    reason = (
+        "Test stage cannot be routed: no configured machine declares "
+        "capability [gtk] AND can build repo 'api' — the Test stage cannot "
+        "run for this completion until a capable machine is added."
+    )
+    assert required_caps_from_test_reason(reason) is None
+
+
+def test_required_caps_from_test_reason_returns_none_with_no_bracket() -> None:
+    from coord.smoke import required_caps_from_test_reason
+
+    assert required_caps_from_test_reason("no capability bracket in this text") is None
+
+
+def test_required_caps_from_test_reason_returns_empty_list_for_any_capable_machine() -> None:
+    from coord.smoke import required_caps_from_test_reason
+
+    reason = "capability [(none — any capable machine)] for repo 'api' is paused"
+    assert required_caps_from_test_reason(reason) == []
+
+
+def test_required_caps_from_test_reason_parses_a_real_bracketed_list() -> None:
+    from coord.smoke import required_caps_from_test_reason
+
+    reason = (
+        "Test stage cannot be routed: every machine that declares capability "
+        "[gtk, windows] for repo 'api' is paused or inside its quiet-hours "
+        "window right now: desktop-a. (#2636)"
+    )
+    assert required_caps_from_test_reason(reason) == ["gtk", "windows"]
+
+
+def test_stage_routable_now_is_true_when_a_capable_machine_is_free(
+    three_gtk_config: Config,
+) -> None:
+    from coord.smoke import test_stage_routable_now
+
+    assert test_stage_routable_now(["gtk"], "api", Board(), three_gtk_config) is True
+
+
+def test_stage_routable_now_is_false_when_no_machine_declares_the_capability(
+    three_gtk_config: Config,
+) -> None:
+    """Reuses `rank_smoke_machines` — no candidates at all means not
+    routable, the same as a busy/paused/cordoned fleet would report."""
+    from coord.smoke import test_stage_routable_now
+
+    assert test_stage_routable_now(["cuda"], "api", Board(), three_gtk_config) is False
+
+
+def test_stage_routable_now_is_false_when_the_only_candidate_is_unreachable(
+    three_gtk_config: Config,
+) -> None:
+    """`rank_smoke_machines` alone would say "routable" here — the health
+    cross-check against the board daemon's cached payload is what catches a
+    machine that is capability-matched but not actually reachable right
+    now."""
+    from coord.config import Config as _Config
+
+    single = _Config(
+        repos=three_gtk_config.repos,
+        machines=[m for m in three_gtk_config.machines if m.name == "desktop-a"],
+        smoke_tests=three_gtk_config.smoke_tests,
+    )
+    payload = {
+        "fleet_health": {
+            "machine_health": [
+                {"machine": "desktop-a", "state": "timeout", "stale": False},
+            ],
+        },
+    }
+    from coord.smoke import test_stage_routable_now
+
+    assert (
+        test_stage_routable_now(["gtk"], "api", Board(), single, payload=payload)
+        is False
+    )
+
+
+def test_stage_routable_now_skips_the_health_cross_check_when_no_payload(
+    three_gtk_config: Config,
+) -> None:
+    """`payload=None` (the shell's own fail-soft fallback when the board
+    daemon fetch itself errors) must not block an otherwise-routable
+    reading — only degrade to capability/pause/cordon routing alone."""
+    from coord.smoke import test_stage_routable_now
+
+    assert (
+        test_stage_routable_now(["gtk"], "api", Board(), three_gtk_config, payload=None)
+        is True
+    )
