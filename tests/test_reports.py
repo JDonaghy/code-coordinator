@@ -3972,27 +3972,18 @@ class TestXlsxSerializer:
         assert result_to_xlsx(result) == result_to_xlsx(result.to_dict())
 
     def test_output_is_byte_identical_even_as_the_save_clock_advances(
-        self, monkeypatch
+        self,
     ) -> None:
-        """#3500: `zipfile.ZipFile.writestr` stamps every entry's
-        `date_time` with `time.localtime(time.time())` *at save*, at
-        one-second resolution — so two saves of the identical report
-        straddling a second boundary used to produce different bytes,
-        exactly the flake observed on PR #2785's CI run. Advance the clock
-        `zipfile` reads from by several seconds between the two calls and
-        assert the output doesn't move."""
+        """#3500: openpyxl writes wall-clock timestamps into both zip entry
+        metadata and ``docProps/core.xml`` at save time.
+        ``_zero_xlsx_zip_timestamps`` normalises both, so two saves of the
+        identical report separated by real wall-clock time must produce
+        byte-identical output without any monkeypatching."""
         pytest.importorskip("openpyxl")
         result = _export_fixture_result()
 
-        base_wall = time.time()
-        clock = {"offset": 0.0}
-        monkeypatch.setattr(
-            "zipfile.time.time", lambda: base_wall + clock["offset"]
-        )
-
         first = result_to_xlsx(result)
-        clock["offset"] += 5.0  # advance the save clock by 5s, well past
-        # the 1s resolution that caused the flake.
+        time.sleep(2)
         second = result_to_xlsx(result)
 
         assert first == second
