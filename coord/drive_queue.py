@@ -5877,6 +5877,40 @@ def _blocked_gate_reading(
 # growing it forever.
 _BLOCKED_GATE_PROBE_NOTE_SEP = " — this tick's merge-gate probe: "
 
+# #3695: the Test-stage routing sibling of `_BLOCKED_GATE_PROBE_NOTE_SEP`,
+# used by `_reconcile_blocked_test_routing`'s oscillating branch for the
+# identical reason `_with_blocked_gate_probe_note` exists: a review of this
+# issue's first cut found that branch's `reason` text replaced
+# `entry.last_reason` wholesale, stripping the `(#1672)`/`(#2019)` markers
+# `is_test_stage_routing_dead_end_reason`/`is_permanent_block_reason` need to
+# keep recognising the row — so the VERY NEXT tick, this module no longer
+# saw it as a Test-routing dead end OR as permanent at all, and handed it to
+# `_reconcile_blocked`'s unrelated merge-gate path instead. A dedicated
+# separator (rather than reusing `_BLOCKED_GATE_PROBE_NOTE_SEP`) keeps the
+# two probe notes from ever colliding if a row somehow carried both.
+_TEST_ROUTING_PROBE_NOTE_SEP = " — this tick's Test-stage routing recheck: "
+
+
+def _strip_test_routing_probe_note(text: str | None) -> str:
+    """*text* with any :data:`_TEST_ROUTING_PROBE_NOTE_SEP`-delimited note a
+    previous tick appended (via :func:`_with_test_routing_probe_note`)
+    removed, leaving only the entry's original `(#1672)`/`(#2019)` dead-end
+    cause intact."""
+    base, _sep, _note = (text or "").partition(_TEST_ROUTING_PROBE_NOTE_SEP)
+    return base.rstrip()
+
+
+def _with_test_routing_probe_note(original: str | None, note: str) -> str:
+    """*original* (an entry's ``last_reason``) with *note* — this tick's
+    Test-stage routing recheck finding — appended, after first stripping any
+    note an earlier tick appended the same way. The original `(#1672)`/
+    `(#2019)` markers are NEVER discarded, mirroring
+    :func:`_with_blocked_gate_probe_note` — see :data:`_TEST_ROUTING_PROBE_NOTE_SEP`
+    for the incident this avoids.
+    """
+    base = _strip_test_routing_probe_note(original)
+    return f"{base}{_TEST_ROUTING_PROBE_NOTE_SEP}{note}" if base else note
+
 
 def _strip_blocked_gate_probe_note(text: str | None) -> str:
     """*text* with any :data:`_BLOCKED_GATE_PROBE_NOTE_SEP`-delimited note a
@@ -6052,7 +6086,15 @@ def _reconcile_blocked_test_routing(
         "a capability-matched machine is now free and healthy"
     )
     if entry.resumes >= MAX_BLOCKED_RESUMES:
-        reason = (
+        # #3695 review: this write must NEVER replace `entry.last_reason`
+        # wholesale — doing so strips the `(#1672)`/`(#2019)` markers
+        # `is_test_stage_routing_dead_end_reason`/`is_permanent_block_reason`
+        # both need to keep classifying this row correctly on every LATER
+        # tick. `_with_test_routing_probe_note` layers this tick's finding on
+        # top of the original cause instead (same convention as
+        # `_with_blocked_gate_probe_note`) — see
+        # :data:`_TEST_ROUTING_PROBE_NOTE_SEP` for the incident this avoids.
+        probe_note = (
             f"{entry.key}'s Test-stage routing reads clear again "
             f"({live_reason}), but this entry has already been auto-resumed "
             f"{entry.resumes} time(s) and dead-ended on the routing block "
@@ -6060,6 +6102,12 @@ def _reconcile_blocked_test_routing(
             "#3695); look at what keeps re-blocking it, not just this tick's "
             "fleet reading"
         )
+        reason = _with_test_routing_probe_note(entry.last_reason, probe_note)
+        if reason == entry.last_reason:
+            # Nothing new to report — same finding as an earlier tick
+            # already recorded; skip the write rather than re-stamping an
+            # identical string forever.
+            return None
         return Reconcile(
             entry.key,
             "oscillating",
