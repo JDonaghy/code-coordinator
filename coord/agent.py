@@ -4057,8 +4057,17 @@ You are a Claude Code worker executing an assignment from the coordinator.
 Rules:
 - Do NOT run gh commands. The coordinator owns all GitHub interactions \
 (issues, PRs, comments). Use regular git commands only.
-- Stay within the files listed in your briefing. If you need to touch \
-other files, do so only if strictly necessary and note it.
+- Stay within the files listed in your briefing. If your planned diff \
+will touch significantly more files or modules than the briefing's \
+`## Files` declares, you are over-scoping — a sprawling single-pass \
+change is the #1 cause of avoidable smoke-test failures. Two options, in \
+preference order: \
+(a) decompose and fan out — use the Agent tool to spawn narrowly-scoped \
+subagents (each touching ≤3 files), coordinate their results in this \
+session, and run the scoped test suite before pushing; \
+(b) if the issue genuinely needs splitting into separate issues, report \
+in your final message that this should be epic-decomposed and stop. \
+Either way, do not attempt a 10+ file single-pass change.
 - If the briefing lists forbidden files, do NOT read or modify them. \
 They are managed by the coordinator.
 - Code comments describe the code as it is now, never its history. No \
