@@ -8409,8 +8409,22 @@ def test_a_test_routing_dead_end_inside_its_grace_window_is_not_resumed_yet():
 def test_a_test_routing_dead_end_past_max_resumes_reports_oscillating_not_waiting():
     """#2230's churn bound applies here too: an entry that has already
     resumed `MAX_BLOCKED_RESUMES` times must stop auto-resuming and instead
-    report an `oscillating` note, staying blocked."""
-    from coord.drive_queue import MAX_BLOCKED_RESUMES
+    report an `oscillating` note, staying blocked.
+
+    #3695 review finding 2: the oscillating write must layer this tick's
+    finding on TOP of the entry's original `(#1672)`/`(#2019)` cause,
+    never replace it outright — a wholesale replacement would strip both
+    markers and make the row fall out of `is_test_stage_routing_dead_end_
+    reason` AND `is_permanent_block_reason` on the very next tick, handing
+    it to the unrelated merge-gate `_reconcile_blocked` path and bypassing
+    this oscillation ceiling entirely. Also pin the idempotent no-op: a
+    second tick that would produce the exact same note must not re-stamp
+    an identical string forever."""
+    from coord.drive_queue import (
+        MAX_BLOCKED_RESUMES,
+        is_permanent_block_reason,
+        is_test_stage_routing_dead_end_reason,
+    )
 
     entries = [
         _blocked_entry(
@@ -8431,3 +8445,31 @@ def test_a_test_routing_dead_end_past_max_resumes_reports_oscillating_not_waitin
     assert reconcile.updates.get("state") != STATE_WAITING
     assert str(MAX_BLOCKED_RESUMES) in reconcile.reason
     assert plan.launch is None
+
+    noted_reason = reconcile.updates["last_reason"]
+    # The original cause's markers must survive the note being appended —
+    # otherwise the row falls out of BOTH classifications on the next tick.
+    assert is_test_stage_routing_dead_end_reason(noted_reason)
+    assert is_permanent_block_reason(noted_reason)
+    assert "#1672" in noted_reason
+    assert "#2019" in noted_reason
+
+    # A second tick that sees the SAME already-noted reason, with nothing
+    # new to say, must be a no-op rather than re-stamping an identical
+    # string forever (the `reason == entry.last_reason` short-circuit).
+    entries_again = [
+        _blocked_entry(
+            3600,
+            position=3,
+            last_reason=noted_reason,
+            resumes=MAX_BLOCKED_RESUMES,
+        )
+    ]
+    plan_again = plan_tick(
+        entries_again,
+        board(),
+        capacity=1,
+        live_test_routing_clear={entry_key(REPO, 3600): True},
+    )
+    assert plan_again.reconciles == ()
+    assert plan_again.launch is None

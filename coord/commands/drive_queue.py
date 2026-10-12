@@ -7765,6 +7765,54 @@ def drive_queue_tick(
                 command=merge_plan_inspect_command(parsed[0]),
             )
 
+        # #3695 review finding 1: `_apply_writes(plan)` above only ever
+        # touches `_DRIVE_QUEUE_UPDATABLE` columns on the DRIVE QUEUE row
+        # itself (`update_drive_queue_entry`) — it has no way to reach the
+        # parent work assignment's own `test_state`/`test_reason` columns.
+        # A `test_routing_recovered` reconcile flips the queue row back to
+        # `waiting`, but if the assignment's `test_state` is left at its
+        # stale `blocked` reading, `dispatch_pending_smoke` keeps skipping
+        # the row (it never considers a row whose `test_state` already
+        # reads `blocked`) and `coord.dead_end.detect_dead_end` immediately
+        # re-observes the same stale state and re-raises the dead end on
+        # its very next look — the self-clear this issue exists to add
+        # would silently do nothing in production. `coord.state
+        # .reset_work_test_state` is the exact call `coord diagnose --stage
+        # test --reset` itself makes (see `_reset_test_stage`) — this is
+        # that same reset, fired automatically instead of by a human.
+        from coord.audit import record_audit  # noqa: PLC0415
+        from coord.state import reset_work_test_state  # noqa: PLC0415
+
+        for item in plan.reconciles:
+            if item.outcome != "test_routing_recovered":
+                continue
+            parsed = parse_key(item.key)
+            if parsed is None:
+                continue
+            repo_name, issue_number = parsed
+            try:
+                reset_work_test_state(repo_name, issue_number)
+            except Exception:  # noqa: BLE001 — never let a best-effort
+                # reset turn an already-applied, already-successful tick
+                # into a reported CLI failure; the queue row itself already
+                # moved to `waiting` via `_apply_writes` above, so the next
+                # dispatch attempt still has a path forward even if this
+                # particular reset failed.
+                pass
+            record_audit(
+                tier="business",
+                category="test",
+                event_type="test_routing_recovered",
+                actor="drive-queue-tick",
+                summary=(
+                    f"Test-stage routing dead end self-cleared: "
+                    f"{repo_name}#{issue_number}"
+                ),
+                repo=repo_name,
+                issue=issue_number,
+                details={"reason": item.reason},
+            )
+
         if plan.alert is not None:
             _escalate(
                 QUEUE_ALERT_REPO,
