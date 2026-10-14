@@ -18,6 +18,7 @@ in `docs/`.*
   (Azure), where the off-site backup and its credentials live, and — honestly — which parts are
   still manual. Epic #3117.
 - [`DRIVE_QUEUE.md`](DRIVE_QUEUE.md) — the durable, board-backed driver (`coord drive-queue`, #1750). **Read the top section before queuing more than ~2 issues on one repo.**
+- [`EPIC_AUTHORING.md`](EPIC_AUTHORING.md) — filing an epic so its children actually link. The `## Sub-issues` grammar is exact and **every way of getting it wrong is silent**; an epic with no milestone cannot appear in the Plans panel at all.
 
 ## The core loop
 
