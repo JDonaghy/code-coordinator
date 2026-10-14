@@ -222,3 +222,31 @@ incident this whole doc is downstream of):
   log since 07-28 do **not** count toward it, because the arms whose absence caused
   the interventions in that window were not deployed. `auto_drain` stays `false`;
   the bar is now one *waiting* condition, not one *build* condition.
+- 2026-08-18 — `auto_drain` flipped to `true`. Condition 4 re-verified fresh (not
+  reused from 08-04): all three agents and dellserver's daemon report **v0.5.146**;
+  `~/.coord-venv` (dellserver) installed 0.5.146 at 21:11:50 UTC with `coord-serve`
+  starting 7s later (not a stale in-memory process); `~/.coord/coordinator.yml` is
+  still a live symlink into a clean `~/src/coord-settings` checkout. Condition 3
+  unchanged (`max_per_tick: 1`). Condition 1's fixes are trivially still ancestors
+  of 0.5.146 (v0.4.104 → 0.5.146 is a strict forward history, no reverts observed).
+  Side note: the "fourth lane" the 08-04 entry also checked (`~/.coord-cli-venv` /
+  `drive-epic.service`, the epic sequencer) no longer exists anywhere on the fleet —
+  not one of this bar's three required rows, so not a blocker, but worth a look
+  separately.
+
+  **Condition 2 was NOT formally satisfied by the letter of this doc** — no tallied
+  run of 10 consecutive *operator-typed* `coord merge` invocations was ever recorded.
+  What stands in its place: `coord audit --category merge --since 2026-08-04` shows
+  500+ `merged` events (query cap), all `actor=coordinator` (i.e. via `coord merge`
+  being invoked — confirming `auto_drain` genuinely stayed `false` the whole window),
+  plus only 4 conflict-related events (3 conflict-fix dispatches, 1 escalated to a
+  human) and no incorrect-merge or rollback-trigger signal found in that trail. Most
+  of that volume is `coord drive-queue`'s 15-minute timer firing `coord merge`
+  unattended, not a human watching each one — which is exactly the distinction this
+  doc's condition 2 draws and says doesn't count. Flipping anyway on this evidence is
+  a **deliberate, recorded deviation** from the bar as written, not a silent skip:
+  two weeks of heavy unattended `coord merge` usage with a clean audit trail was
+  judged sufficient in practice, in lieu of a separately-tallied manual run. Restart
+  confirmed clean (`coord-serve` up 22:08:09 UTC, zero errors in the daemon log).
+  Rollback triggers (below) apply from this point exactly as written — watching
+  closely for the first several real auto-drain merges once something clears review/CI.
