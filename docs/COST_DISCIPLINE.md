@@ -41,6 +41,15 @@ Minimize direct code work in the coordinator — instead, write a good briefing 
 - **Catch platform violations at review time.** The adversarial reviewer should check for
   platform-specific code in shared/cross-platform paths. Catching after merge costs an entire
   round-trip.
+- **One backend per issue for multi-backend repos (quadraui, vimcode).** A cross-backend
+  feature becomes a **seam issue** (shared trait methods + one headless backend, typically TUI)
+  plus **one issue per backend** (GTK, macOS, Windows). The seam issue touches only
+  `backend.rs`, `testing/`, the TUI painter, and `todo!()`-style stubs in the other backends
+  — never real painters for GTK/macOS/win. Each backend issue is verified only on its own
+  host. Filing a single issue that spans all backends triggers the full smoke fanout matrix,
+  balloons scope past 6 files, and has burned 3+ fix rounds without landing (quadraui#1539,
+  2026-10-14; quadraui#1476, 2026-10-10). **Check the target repo's CLAUDE.md before filing**
+  — quadraui's encodes this rule.
 
 ## Operator sessions: dispatch, don't do
 
