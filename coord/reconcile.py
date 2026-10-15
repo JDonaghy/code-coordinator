@@ -940,9 +940,14 @@ def _environmental_cause_phrase(classification: "FailureClassification") -> str:
         KIND_API_ERROR,
         KIND_INFRA,
         KIND_NETWORK,
+        KIND_SILENT,
         KIND_USAGE_LIMIT,
     )
 
+    if classification.kind == KIND_SILENT:
+        # #3705: a Test-stage worker that died reporting nothing at all —
+        # not a provider signal, just no diagnostic to hand anyone.
+        return "a Test-stage worker repeatedly dying with no reason recorded (#1605)"
     if classification.kind == KIND_USAGE_LIMIT:
         return "an exhausted account usage limit"
     if classification.kind == KIND_API_ERROR:
@@ -1036,6 +1041,19 @@ def propagate_smoke_terminal_failure(
       ``test_state="failed"`` exactly like a normal non-zero-exit smoke
       completion already does (`coord/notify.py`'s completion handler), so
       the existing bounded `coord fix` loop picks it up from there.
+    * **silent** (#3705: *failure_reason* itself is empty — no usage-limit,
+      API, network, or infra token to classify, because there is no text at
+      all) — this is the #1605 class the module docstring above describes,
+      and it is treated like **environmental**, not **work**: there is
+      nothing for a `coord fix` worker to act on, so dispatching one only
+      adds a full Work→Test→Review cycle onto a row whose original Work may
+      already be approved, for zero actionable content. Reclassified via
+      :func:`coord.failure_class.silent_test_death` and folded into the same
+      bounded clear-and-retry-then-park machinery as a genuine environmental
+      death, sharing its budget and tally. Deliberately distinct from
+      **work**'s "no RECOGNIZED signal" case, which still has real
+      diagnostic text worth a fix worker's time and keeps its current
+      ``test_state="failed"`` handling unchanged.
 
     *environmental* (#2275) overrides that classification when the CALLER
     already knows the answer.  Default ``None`` means "classify from
@@ -1134,6 +1152,28 @@ def propagate_smoke_terminal_failure(
     if environmental is None:
         is_environmental = classification.is_environmental
         cause = classification.reason
+        if not is_environmental and not (failure_reason or "").strip():
+            # #3705: `classify_failure` correctly calls this WORK — its own
+            # "no evidence at all defaults to WORK" rule — but that rule is
+            # about an UNRECOGNIZED signal, not an ABSENT one. There is a
+            # real difference between "the worker's own terminal text didn't
+            # match any environmental pattern" (real diagnostic content, a
+            # genuine work failure worth a fix worker's time) and "there is
+            # no `failure_reason` text at all" (a dead agent, a killed
+            # process group — the #1605 class this function exists for,
+            # with nothing for a fix worker to act on). Only this caller can
+            # tell the two apart, since only it sees whether
+            # *failure_reason* itself was ever populated. Treat the latter
+            # like an environmental death: bounded clear-and-retry of the
+            # Test stage, parking (never a blind `coord fix`) once the
+            # shared #3315 budget is exhausted — instead of ever recording
+            # a `test_state="failed"` work verdict with a synthetic
+            # placeholder reason and no actual failure behind it.
+            from coord.failure_class import silent_test_death  # noqa: PLC0415
+
+            classification = silent_test_death()
+            is_environmental = True
+            cause = classification.reason
     else:
         is_environmental = bool(environmental)
         cause = failure_reason or classification.reason

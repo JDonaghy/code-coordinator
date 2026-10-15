@@ -32,6 +32,7 @@ from coord.failure_class import (
     KIND_API_ERROR,
     KIND_INFRA,
     KIND_NETWORK,
+    KIND_SILENT,
     KIND_USAGE_LIMIT,
     KIND_WORK,
     WORK,
@@ -45,6 +46,7 @@ from coord.failure_class import (
     parse_reset_at,
     plan_usage_limit_resume,
     probe_environment_liveness,
+    silent_test_death,
 )
 from coord.worker_events import UsageLimitKill, format_usage_limit_reason
 
@@ -822,3 +824,21 @@ def test_classification_is_frozen() -> None:
     with pytest.raises(Exception):
         c.failure_class = WORK  # type: ignore[misc]
     assert isinstance(c, FailureClassification)
+
+
+def test_silent_test_death_is_environmental_and_distinct_from_plain_work() -> None:
+    """#3705: a Test-stage worker that died reporting literally nothing (no
+    `failure_reason` at all) classifies ENVIRONMENTAL via
+    :func:`silent_test_death`, with its own `KIND_SILENT` — distinct from
+    the ordinary `classify_failure(failure_reason=None)` WORK default, which
+    stays unchanged for every other caller (notably the WORK-stage retry
+    logic in `coord/drive.py`, out of scope for this Test-stage-only fix)."""
+    c = silent_test_death()
+    assert c.failure_class == ENVIRONMENTAL
+    assert c.kind == KIND_SILENT
+    assert c.is_environmental
+    assert "1605" in c.reason
+
+    # The ordinary classifier is untouched: no evidence still defaults WORK.
+    assert classify_failure(failure_reason=None).failure_class == WORK
+    assert classify_failure(failure_reason=None).kind == KIND_WORK

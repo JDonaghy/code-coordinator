@@ -2847,15 +2847,24 @@ class TestSmokeCompletionVerdict:
     def test_fanout_leg_crash_folds_into_the_parent_via_event_failure(
         self, coord_db, tmp_path,
     ) -> None:
-        """#3182 review (non-blocking): the `EVENT_FAILURE` branch in
-        `post_transition` mirrors the `EVENT_COMPLETION` one above — a
-        capability-partition leg whose WORKER died (#1605: killed process,
+        """#3182 review (non-blocking), updated for #3705: the `EVENT_FAILURE`
+        branch in `post_transition` mirrors the `EVENT_COMPLETION` one above —
+        a capability-partition leg whose WORKER died (#1605: killed process,
         terminal API error, anything short of the worker printing its own
         `SMOKE:` verdict) resolves onto its OWN row via
         `propagate_smoke_terminal_failure`, never straight onto the shared
-        parent, then folds through `finalize_smoke_fanout` exactly like a
-        leg that reports a real `SMOKE: fail`. Before this test, only the
-        EVENT_COMPLETION half of that symmetry had coverage."""
+        parent. `coord.notify`'s `_failure_reason` is built only from a fixed
+        set of coordinator-authored structured fields (usage-limit, API
+        error, etc.) — a worker's own free-text `entry["error"]` never feeds
+        it, by design (`classify_failure`'s vocabulary is deliberately
+        restricted to named wire tokens, never arbitrary worker prose). So a
+        crash whose only diagnostic text lives in `entry["error"]` reaches
+        `propagate_smoke_terminal_failure` with an empty `failure_reason` —
+        the #1605 "no reason recorded" class — and is cleared for a bounded
+        automatic retry of the partition, never recorded as a work failure
+        with a synthetic placeholder, which is exactly what used to trigger a
+        full blind Work→Test→Review smoke-fix cycle for zero actionable
+        content."""
         from coord.notify import (  # noqa: PLC0415
             EVENT_COMPLETION,
             EVENT_FAILURE,
@@ -2864,6 +2873,7 @@ class TestSmokeCompletionVerdict:
         )
         from coord.state import (  # noqa: PLC0415
             get_connection,
+            load_assignment_test_reason,
             load_assignment_test_state,
             record_test_verdict,
         )
@@ -2936,22 +2946,28 @@ class TestSmokeCompletionVerdict:
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             post_transition(failure, failure_record, failure_entry)
 
-        # The leg's OWN row carries the terminal verdict — never a straight
-        # write onto the shared parent (#1797's shape).
-        assert load_assignment_test_state("leg-win2") == "failed"
+        # The leg's OWN row is cleared for a fresh re-dispatch — never
+        # recorded "failed" — because `_failure_reason` carried no text at
+        # all for this crash (#3705's silent #1605 class).
+        assert load_assignment_test_state("leg-win2") is None, (
+            "a crashed leg with no classifiable failure reason must clear "
+            "for automatic retry, never fail the leg outright — got "
+            f"{load_assignment_test_state('leg-win2')!r}"
+        )
+        assert "#1605" in (load_assignment_test_reason("leg-win2") or "")
 
         conn = get_connection()
         row = conn.execute(
             "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
             ("work-fanout2",),
         ).fetchone()
-        assert row["test_state"] == "failed", (
-            "a crashed leg must fail the aggregate exactly like a real "
-            f"SMOKE: fail verdict would — got {row['test_state']!r}"
+        assert row["test_state"] == "running", (
+            "a silent #1605 leg death must hold the fan-out's aggregate at "
+            "'running' — not everyone has reported in yet — rather than "
+            f"fold a synthetic failure into it — got {row['test_state']!r}"
         )
-        assert "[windows] failed" in (row["test_reason"] or ""), (
-            "the reason must name the FAILING capability set — got "
-            f"{row['test_reason']!r}"
+        assert "environmental" in (row["test_reason"] or "").lower(), (
+            f"expected the #3315 environmental tally — got {row['test_reason']!r}"
         )
 
     def test_operator_cancelled_leg_does_not_fail_the_parent_while_sibling_runs(
@@ -3045,13 +3061,17 @@ class TestSmokeCompletionVerdict:
             f"folded in as a verdict; got {row['test_state']!r}"
         )
 
-    def test_operator_cancelled_leg_fails_the_parent_when_no_sibling_survives(
+    def test_operator_cancelled_leg_clears_for_retry_when_no_sibling_survives(
         self, coord_db,
     ) -> None:
         """The guard only protects a LIVE/passed sibling. When every other
         leg is already a non-verdict terminal row too (nothing left to
         protect), an operator cancellation falls through to the ordinary
-        classification unchanged."""
+        classification — which, post-#3705, carries no `failure_reason` text
+        either (a `coord stop` leaves nothing for `classify_failure` to scan)
+        and so is cleared for a bounded automatic retry of the partition
+        exactly like the sibling-protection branch already does, rather than
+        recorded as a work failure with nothing actionable behind it."""
         from coord.notify import EVENT_FAILURE, Transition, post_transition  # noqa: PLC0415
         from coord.state import (  # noqa: PLC0415
             get_connection,
@@ -3097,13 +3117,21 @@ class TestSmokeCompletionVerdict:
         ):
             post_transition(cancel, cancel_record, cancel_entry)
 
-        assert load_assignment_test_state("leg-macos-solo") == "failed"
+        # No structured or free-text reason survives a `coord stop` cancel,
+        # so the fall-through classification treats this exactly like any
+        # other silent #1605 death: clear the leg for a bounded automatic
+        # retry rather than fail it outright with nothing actionable.
+        assert load_assignment_test_state("leg-macos-solo") is None
         conn = get_connection()
         row = conn.execute(
-            "SELECT test_state FROM assignments WHERE assignment_id=?",
+            "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
             ("work-cancel-solo",),
         ).fetchone()
-        assert row["test_state"] == "failed"
+        assert row["test_state"] == "running", (
+            "the fan-out aggregate must stay 'running' while the solo leg "
+            f"is retried — got {row['test_state']!r}"
+        )
+        assert "environmental" in (row["test_reason"] or "").lower()
 
     def test_interactive_smoke_mode_not_auto_certified(
         self, coord_db
