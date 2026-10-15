@@ -98,6 +98,11 @@ KIND_NETWORK = "network"
 #: diagnosis of a lost Test-stage leg, never a verdict about the code
 #: under test.
 KIND_INFRA = "infra"
+#: #3705: a Test-stage worker died with literally no `failure_reason` to
+#: classify — not "classified as work because the text didn't match any
+#: environmental pattern" (that case has real diagnostic text and stays
+#: `KIND_WORK`), but zero evidence at all. See :func:`silent_test_death`.
+KIND_SILENT = "silent"
 KIND_WORK = "work"
 
 #: HTTP statuses from the Claude API that mean "the provider, not the work".
@@ -350,6 +355,40 @@ def _usage_limit(reset_at_raw: str | None, signal: str) -> FailureClassification
         ),
         signal=signal,
         reset_at_raw=reset_at_raw,
+    )
+
+
+def silent_test_death() -> FailureClassification:
+    """#3705: classification for a Test-stage worker that died reporting
+    literally nothing — no usage-limit/API/network/infra signal and no
+    ``failure_reason`` text at all for :func:`classify_failure` to have
+    scanned in the first place (a dead agent, a killed process group, a
+    terminal API error with the summary itself lost — the #1605 class).
+
+    Deliberately **not** a branch inside :func:`classify_failure`: that
+    function's "everything else is WORK, including no evidence" rule is
+    correct for a failure that has *some* terminal text which simply didn't
+    match an environmental pattern (that IS a real, if unrecognized, work
+    failure with diagnostic content worth handing a fix worker). This is
+    the narrower case of *zero* content — nothing to classify, let alone
+    hand to a fix worker — which only
+    :func:`coord.reconcile.propagate_smoke_terminal_failure` can tell apart
+    from the ordinary case (it alone sees whether ``failure_reason`` itself
+    was ever populated). Classified ``ENVIRONMENTAL`` so it gets the same
+    bounded clear-and-retry-then-park treatment as a usage limit or network
+    drop — a silent death is no more evidence of a code defect than either
+    of those, and parking (never a blind ``coord fix``) is the correct
+    escalation once the shared retry budget is exhausted.
+    """
+    return FailureClassification(
+        failure_class=ENVIRONMENTAL,
+        kind=KIND_SILENT,
+        reason=(
+            "environmental (silent #1605 death): the Test-stage worker "
+            "died without recording any reason — no usage-limit, API, "
+            "network, or infra signal, and no terminal output at all"
+        ),
+        signal=None,
     )
 
 

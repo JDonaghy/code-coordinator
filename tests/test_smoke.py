@@ -1574,6 +1574,81 @@ def test_environmental_death_adds_no_tally_when_there_is_none(coord_db) -> None:
     assert mute_smoke_legs(row["test_reason"]) == 0
 
 
+def test_silent_test_death_with_no_failure_reason_clears_for_retry_not_fail(
+    coord_db,
+) -> None:
+    """#3705: a Test-stage worker that died reporting literally nothing (no
+    `failure_reason` at all — a dead agent, a killed process group) must be
+    cleared for automatic re-dispatch exactly like an environmental death,
+    never recorded as `test_state="failed"` with a synthetic placeholder
+    reason. Recording it as `"failed"` is what drove the auto-loop to
+    dispatch a full blind Work→Test→Review smoke-fix cycle with nothing
+    actionable in the briefing."""
+    from coord.models import Assignment  # noqa: PLC0415
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+    )
+
+    work = Assignment(
+        assignment_id="w-silent", machine_name="laptop", repo_name="api",
+        issue_number=9, issue_title="X", type="work", status="done",
+        branch="issue-9",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-silent",
+        failure_reason=None,
+    )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-silent",),
+    ).fetchone()
+    assert row["test_state"] is None, (
+        "a silent #1605 death with no failure_reason must clear the row for "
+        f"automatic re-dispatch, never fail it — got {row['test_state']!r}"
+    )
+    assert "#1605" in (row["test_reason"] or "")
+
+
+def test_work_failure_with_a_real_unrecognized_reason_still_fails(
+    coord_db,
+) -> None:
+    """Regression guard for #3705: a Test-stage death that DOES carry real
+    (if unrecognized) diagnostic text is a genuine work failure and must
+    still record `test_state="failed"` with that text — the #3705 fix only
+    changes the behavior for a truly EMPTY `failure_reason`, never for one
+    `classify_failure` merely failed to recognize as environmental."""
+    from coord.models import Assignment  # noqa: PLC0415
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+    )
+
+    work = Assignment(
+        assignment_id="w-real-fail", machine_name="laptop", repo_name="api",
+        issue_number=10, issue_title="X", type="work", status="done",
+        branch="issue-10",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-real-fail",
+        failure_reason="AssertionError: expected 3 got 4",
+    )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-real-fail",),
+    ).fetchone()
+    assert row["test_state"] == "failed"
+    assert row["test_reason"] == "AssertionError: expected 3 got 4"
+
+
 # ── #3315: environmental Test-stage retries — the rate-limit budget ────────
 
 
