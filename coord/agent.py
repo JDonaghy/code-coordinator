@@ -2137,6 +2137,18 @@ def _sanitize_branch(branch: str) -> str:
 # worktree.  The captured group is the conflicting worktree's path.
 _WT_COLLISION_RE = re.compile(r"already used by worktree at '([^']+)'")
 
+# #3704: the *other* shape git raises for a branch-name collision — "fatal: a
+# branch named '<branch>' already exists".  `git worktree add -b <branch> ...`
+# raises this whenever the branch ref exists at all, whether or not it is
+# currently checked out anywhere — unlike `_WT_COLLISION_RE` above, which only
+# fires when something has it checked out.  A retried smoke-fix/test-fix
+# dispatch picks the same deterministic branch name as its failed predecessor;
+# if that predecessor's worktree was torn down without the branch itself being
+# deleted (`git worktree remove` never deletes the branch), the retry hits
+# this exact message and — before this fix — crashed instead of recovering.
+# The captured group is the branch name, not a path.
+_WT_BRANCH_EXISTS_RE = re.compile(r"a branch named '([^']+)' already exists")
+
 # Build-intermediate file suffixes that are never useful stash artifacts.
 # Cargo produces dozens of *.rcgu.o incremental-codegen objects per build
 # (e.g. `tui_selection-<hash>.<unit>.rcgu.o`) — Path.suffix on these returns
@@ -2763,6 +2775,29 @@ def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
     if current:
         worktrees.append(current)
     return worktrees
+
+
+def _worktree_path_for_branch(repo_path: Path, branch_name: str) -> str | None:
+    """Path of the worktree currently holding *branch_name*, or ``None`` (#3704).
+
+    Git's "a branch named '<branch>' already exists" error (matched by
+    :data:`_WT_BRANCH_EXISTS_RE`) names the *branch*, not a worktree path —
+    unlike :data:`_WT_COLLISION_RE`'s "already used by worktree at '<path>'",
+    which hands :func:`_git_worktree_add` the path directly. This resolves the
+    same thing by scanning ``git worktree list --porcelain`` for an entry
+    whose branch matches. ``None`` means the branch ref exists but nothing has
+    it checked out anywhere — the common case for a retried dispatch whose
+    prior attempt's worktree was already cleaned up without the branch itself
+    being deleted.
+    """
+    try:
+        output = _git(repo_path, "worktree", "list", "--porcelain")
+    except _GitError:
+        return None
+    for wt in _parse_worktree_porcelain(output):
+        if wt.get("branch", "") == branch_name:
+            return wt.get("worktree")
+    return None
 
 
 def _is_same_path(candidate: str, resolved_target: Path) -> bool:
@@ -3443,15 +3478,83 @@ def _git_worktree_add(
     *default_branch* is deliberately optional and the remedy is skipped
     without it: the helper has to know where to put the base, and a caller
     that cannot say keeps #1693's behaviour unchanged (refuse and re-raise).
+
+    #3704: git raises a *second* message shape for a branch-name collision —
+    "a branch named '<branch>' already exists" — whenever the ``-b <branch>``
+    form is used and the branch ref exists at all, checked out anywhere or
+    not.  A retried smoke-fix/test-fix dispatch deterministically picks the
+    same branch name as its failed predecessor, so if that predecessor's
+    worktree was already torn down (leaving a stale branch ref behind — ``git
+    worktree remove`` never deletes the branch), the retry hits this exact
+    message.  It is resolved the same way: look up where the branch is
+    checked out (if anywhere) via :func:`_worktree_path_for_branch` and fall
+    into the identical main-checkout-restore / linked-worktree-evict logic
+    below.  Nothing checked out anywhere is the common case — the stale ref
+    is just deleted and the add is retried once.
     """
+    # #3704: set only when the failure was "a branch named '<branch>' already
+    # exists" — the ``-b`` form's signal that it wants a brand-new branch at
+    # this name, never that it wants to reuse the existing one.  Whatever
+    # clears the collision below (restoring the base checkout, evicting a
+    # linked worktree) only moves things *off* the branch; it never deletes
+    # the ref, so without this the retry would hit the identical error again.
+    pending_branch_delete: str | None = None
+
+    def _delete_pending_branch() -> None:
+        """Delete *pending_branch_delete*, if set, once its checkout is clear.
+
+        Best-effort: a failure here just means the retry below hits the same
+        "already exists" error and surfaces it as a real ``_GitError`` —
+        exactly like every other irrecoverable case in this function.
+        """
+        if pending_branch_delete is None:
+            return
+        try:
+            _git(repo_path, "branch", "-D", pending_branch_delete)
+        except _GitError:
+            pass
+
     try:
         _git(repo_path, "worktree", "add", *add_args)
         return
     except _GitError as exc:
         m = _WT_COLLISION_RE.search(str(exc))
-        if not m:
-            raise  # unrelated error — propagate unchanged
-        conflicting_path = m.group(1)
+        if m:
+            conflicting_path = m.group(1)
+        else:
+            m = _WT_BRANCH_EXISTS_RE.search(str(exc))
+            if not m:
+                raise  # unrelated error — propagate unchanged
+            branch_name = m.group(1)
+            conflicting_path = _worktree_path_for_branch(repo_path, branch_name)
+            if conflicting_path is None:
+                # #3704: the branch ref exists but nothing has it checked out
+                # — e.g. a prior attempt's worktree was already cleaned up
+                # without deleting the branch itself.  Safe to delete the
+                # stale ref outright and retry once.
+                if log_path:
+                    _append_log_line(
+                        log_path,
+                        f"# worktree-add: branch {branch_name!r} already "
+                        f"exists but is not checked out in any worktree "
+                        f"(#3704) — deleting the stale ref and retrying\n",
+                    )
+                try:
+                    _git(repo_path, "branch", "-D", branch_name)
+                except _GitError as delete_exc:
+                    raise _GitError(
+                        f"cannot create a worktree for branch "
+                        f"{branch_name!r}: it already exists and could not "
+                        f"be deleted ({delete_exc})"
+                    ) from exc
+                # One retry only — raises if it fails again.
+                _git(repo_path, "worktree", "add", *add_args)
+                return
+            # Checked out somewhere — fall into the main-checkout-restore /
+            # linked-worktree-evict logic below, which clears the *checkout*.
+            # The branch ref itself still needs deleting once that's done,
+            # since the whole point of `-b` is a fresh branch (#3704).
+            pending_branch_delete = branch_name
         original = exc
 
     # #1693: refuse before removing.  The base checkout is not a recoverable
@@ -3485,6 +3588,12 @@ def _git_worktree_add(
                             f"collision (#1694). Nothing was deleted. "
                             f"Retrying the add once.\n",
                         )
+                    # #3704: if the original error was "branch already
+                    # exists" (not the older "already used by worktree"),
+                    # the branch ref itself is still there even though the
+                    # base checkout just moved off it — delete it now that
+                    # nothing has it checked out.
+                    _delete_pending_branch()
                     # One retry only — raises if it fails again.
                     _git(repo_path, "worktree", "add", *add_args)
                     return
@@ -3519,6 +3628,10 @@ def _git_worktree_add(
         # to be removable here.  Anything else is refused and the retry below
         # raises the real error.
     )
+    # #3704: as above — a "branch already exists" origin means the branch
+    # ref outlives the worktree that just got evicted, and needs its own
+    # deletion before the retry can succeed.
+    _delete_pending_branch()
     # One retry only — raises if it fails again.
     _git(repo_path, "worktree", "add", *add_args)
 
