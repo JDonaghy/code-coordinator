@@ -308,6 +308,90 @@ def test_the_collision_retry_for_a_real_linked_worktree_still_works(
     assert _current_branch(base) == "main", "the base was moved for no reason"
 
 
+# ── #3704: git's *other* collision message — "a branch named '<branch>' ──────
+# already exists" — raised by the plain ``-b`` form whenever the branch ref
+# exists at all, checked out anywhere or not.  A retried smoke-fix/test-fix
+# dispatch picks the same branch name as its failed predecessor, so if that
+# predecessor's worktree was already torn down (which never deletes the
+# branch), the retry hits this exact message instead of "already used by
+# worktree at ...".  All three sub-cases below funnel into the identical
+# recovery machinery above; the branch ref is deleted once nothing has it
+# checked out, since `-b` always means "I want a fresh branch here".
+
+
+def test_branch_exists_but_checked_out_nowhere_is_freed_and_retried(
+    repo_with_remote: Path, tmp_path: Path
+) -> None:
+    """The common case: a prior attempt's worktree was cleaned up, but `git
+    worktree remove` never deletes the branch it held — so the stale ref is
+    all that is left to collide with the retry."""
+    base = repo_with_remote
+    stale = tmp_path / "stale"
+    _run(base, "worktree", "add", "-b", "issue-3704-stale", str(stale))
+    _run(base, "worktree", "remove", str(stale))
+    assert _run(base, "branch", "--list", "issue-3704-stale"), "branch should linger"
+
+    log = tmp_path / "worker.log"
+    log.write_text("")
+    new_wt = tmp_path / "new-wt"
+    _git_worktree_add(
+        base,
+        ["-b", "issue-3704-stale", str(new_wt)],
+        log_path=str(log),
+    )
+
+    assert new_wt.exists(), "the worktree add did not succeed after the remedy"
+    assert _current_branch(new_wt) == "issue-3704-stale"
+    assert "not checked out in any worktree" in log.read_text()
+
+
+def test_branch_exists_in_a_linked_worktree_is_evicted_and_retried(
+    repo_with_remote: Path, tmp_path: Path
+) -> None:
+    """The branch is live in a linked worktree — evict it, same as #460/#1693,
+    then delete the now-unchecked-out ref so the `-b` retry can recreate it."""
+    base = repo_with_remote
+    linked = tmp_path / "linked"
+    _run(base, "worktree", "add", "-b", "issue-3704-linked", str(linked))
+
+    new_wt = tmp_path / "new-wt"
+    _git_worktree_add(
+        base,
+        ["-b", "issue-3704-linked", str(new_wt)],
+    )
+
+    assert new_wt.exists(), "the worktree add did not succeed after the remedy"
+    assert not linked.exists(), "the stale linked worktree should have been evicted"
+    assert _current_branch(new_wt) == "issue-3704-linked"
+
+
+def test_branch_exists_in_the_base_checkout_is_restored_and_retried(
+    repo_with_remote: Path, tmp_path: Path
+) -> None:
+    """The branch is checked out in the *base* checkout itself — move the base
+    off it non-destructively (#1694), then delete the ref it leaves behind so
+    the `-b` retry can recreate it fresh."""
+    base = repo_with_remote
+    _park(base, "issue-3704-parked")
+    log = tmp_path / "worker.log"
+    log.write_text("")
+
+    new_wt = tmp_path / "new-wt"
+    _git_worktree_add(
+        base,
+        ["-b", "issue-3704-parked", str(new_wt)],
+        log_path=str(log),
+        default_branch="main",
+    )
+
+    assert new_wt.exists(), "the worktree add did not succeed after the remedy"
+    assert _current_branch(base) == "main", "base was not moved to the default branch"
+    assert _current_branch(new_wt) == "issue-3704-parked"
+    text = log.read_text()
+    assert "base checkout was parked on 'issue-3704-parked'" in text, text
+    assert "moved it to main" in text, text
+
+
 # ── The helper's own contract ───────────────────────────────────────────────
 
 
