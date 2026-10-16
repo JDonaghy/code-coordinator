@@ -1057,6 +1057,17 @@ def propagate_smoke_terminal_failure(
       diagnostic text worth a fix worker's time and keeps its current
       ``test_state="failed"`` handling unchanged.
 
+    *exit_code* (#3705) is the deciding evidence for that **silent** branch,
+    and every automatic caller must forward it: the dying worker's own
+    process exit status, when the agent recorded one. A non-zero exit means
+    the worker ran and returned an error — real evidence of a work failure,
+    even with no reason text — so only ``exit_code in {0, None}`` reclassifies
+    as silent. *operator_cancelled* overrides this, since a `coord stop`
+    kills the process group and its exit status reflects the operator's
+    signal rather than the code under test. Leaving *exit_code* unset means
+    "no exit status is known", which is itself the #1605 shape, so a caller
+    that CAN see one and omits it would reclassify genuine failures as silent.
+
     *environmental* (#2275) overrides that classification when the CALLER
     already knows the answer.  Default ``None`` means "classify from
     *failure_reason*", i.e. every pre-#2275 caller is unchanged.  Pass
@@ -1157,7 +1168,7 @@ def propagate_smoke_terminal_failure(
         if (
             not is_environmental
             and not (failure_reason or "").strip()
-            and not exit_code
+            and (operator_cancelled or exit_code in (0, None))
         ):
             # #3705: `classify_failure` correctly calls this WORK — its own
             # "no evidence at all defaults to WORK" rule — but that rule is
@@ -1171,13 +1182,21 @@ def propagate_smoke_terminal_failure(
             # tell the two apart, since only it sees whether
             # *failure_reason* itself was ever populated.
             #
-            # The additional `not exit_code` guard keeps a non-zero exit
-            # code (e.g. exit_code=1: the `claude -p` process actually ran
-            # and returned an error) as a genuine WORK failure even when the
+            # The additional *exit_code* guard keeps a non-zero exit code
+            # (e.g. exit_code=1: the `claude -p` process actually ran and
+            # returned an error) as a genuine WORK failure even when the
             # agent captured no classified reason text — a non-zero exit IS
             # a signal, just one without a human-readable reason string.
             # Only `exit_code in {0, None}` qualifies as truly silent.
-            # Treat the latter like an environmental death: bounded
+            #
+            # *operator_cancelled* overrides that guard: a `coord stop` kills
+            # the worker's process group, so its exit status reports the
+            # OPERATOR'S signal, not a verdict on the code under test. Every
+            # cancellation is therefore silent by construction, whatever exit
+            # code the kill happened to leave behind — the same reasoning as
+            # the sibling-protection branch above, applied to a solo leg that
+            # has no live sibling left to protect.
+            # Treat all of the above like an environmental death: bounded
             # clear-and-retry of the Test stage, parking (never a blind
             # `coord fix`) once the shared #3315 budget is exhausted —
             # instead of ever recording a `test_state="failed"` work verdict

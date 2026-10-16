@@ -4587,6 +4587,51 @@ def load_assignment_test_reason(assignment_id: str) -> str | None:
     return row["test_reason"] if hasattr(row, "keys") else row[0]
 
 
+def load_assignment_exit_code(assignment_id: str) -> int | None:
+    """#3705: the recorded process ``exit_code`` for one assignment.
+
+    The single-row read that lets a caller holding only an
+    :class:`coord.models.Assignment` (whose projection carries no
+    ``exit_code``) answer "did this worker actually run and return an error?"
+    — the deciding evidence
+    :func:`coord.reconcile.propagate_smoke_terminal_failure` needs to tell a
+    genuine work failure from a silent #1605 death.
+
+    Same daemon-first, local-fallback routing as
+    :func:`load_assignment_test_reason`. Returns ``None`` when the row is
+    absent, the column is NULL (the agent recorded no exit status), or a
+    remote read failed — all three mean "no exit status I can see", which is
+    itself the silent shape, so callers must treat it as absence of evidence
+    rather than as a successful exit.
+    """
+    if not assignment_id:
+        return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_assignment  # noqa: PLC0415
+
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                code = row.get("exit_code")
+                return int(code) if code is not None else None
+            return None
+        except Exception:  # noqa: BLE001 — degraded fallback, never blocking
+            return None
+    try:
+        conn = get_connection()
+        row = sql.execute(conn,
+            "SELECT exit_code FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    code = row["exit_code"] if hasattr(row, "keys") else row[0]
+    return int(code) if code is not None else None
+
+
 def load_assignment_test_state(assignment_id: str) -> str | None:
     """#2244: the current ``test_state`` for one assignment.
 

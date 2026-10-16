@@ -1712,10 +1712,9 @@ def test_stuck_test_state_with_terminal_smoke_child_is_recovered(monkeypatch, co
     calls: list[dict] = []
     monkeypatch.setattr(
         "coord.reconcile.propagate_smoke_terminal_failure",
-        lambda *, parent_assignment_id, failure_reason: calls.append(
-            {"parent_assignment_id": parent_assignment_id, "failure_reason": failure_reason}
-        ),
+        lambda **kw: calls.append(kw),
     )
+    monkeypatch.setattr("coord.state.load_assignment_exit_code", lambda aid: None)
     work = _assign(aid="w1", typ="work", status="done")
     work.test_state = "running"
     smoke = _assign(
@@ -1728,10 +1727,73 @@ def test_stuck_test_state_with_terminal_smoke_child_is_recovered(monkeypatch, co
 
     assert any("test_state='running'" in f and "s1" in f for f in res.findings)
     assert calls == [
-        {"parent_assignment_id": "w1", "failure_reason": "api_error: aborted_streaming"}
+        {
+            "parent_assignment_id": "w1",
+            "failure_reason": "api_error: aborted_streaming",
+            "operator_cancelled": False,
+            "exit_code": None,
+        }
     ]
     assert any("resolved stuck test_state" in a for a in res.actions_taken)
     assert res.recovered is True
+
+
+def test_stuck_test_state_forwards_the_smoke_child_exit_code(monkeypatch, config) -> None:
+    """#3705: a smoke child that ran and exited non-zero is a genuine work
+    failure even with no reason text recorded, so the repair must forward the
+    child's own exit status — the board projection does not carry it, and
+    omitting it would reclassify the failure as a silent #1605 death and earn
+    it a bounded Test-stage retry instead."""
+    _stub(monkeypatch, session="dead")
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "coord.reconcile.propagate_smoke_terminal_failure",
+        lambda **kw: calls.append(kw),
+    )
+    monkeypatch.setattr(
+        "coord.state.load_assignment_exit_code",
+        lambda aid: 1 if aid == "s1" else None,
+    )
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "running"
+    smoke = _assign(aid="s1", typ="smoke", status="failed", review_of="w1")
+    board = Board(completed=[work, smoke])
+
+    diagnose.diagnose_stage(board, config, "api", 42, "test")
+
+    assert calls and calls[0]["exit_code"] == 1, (
+        "the smoke child's recorded exit status must reach "
+        f"propagate_smoke_terminal_failure — got {calls!r}"
+    )
+    assert calls[0]["operator_cancelled"] is False
+
+
+def test_stuck_test_state_marks_a_cancelled_smoke_child_operator_cancelled(
+    monkeypatch, config
+) -> None:
+    """#3705/#3333: an operator `coord stop` leaves the smoke row `cancelled`
+    and its exit status is the kill signal, not a verdict on the code under
+    test — so the repair must flag the cancellation and keep the clear-and-retry
+    treatment rather than letting the signal's exit code read as a work
+    failure."""
+    _stub(monkeypatch, session="dead")
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "coord.reconcile.propagate_smoke_terminal_failure",
+        lambda **kw: calls.append(kw),
+    )
+    monkeypatch.setattr("coord.state.load_assignment_exit_code", lambda aid: -15)
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "running"
+    smoke = _assign(aid="s1", typ="smoke", status="cancelled", review_of="w1")
+    board = Board(completed=[work, smoke])
+
+    diagnose.diagnose_stage(board, config, "api", 42, "test")
+
+    assert calls and calls[0]["operator_cancelled"] is True, (
+        f"a cancelled smoke child must be reported as operator-cancelled — got {calls!r}"
+    )
+    assert calls[0]["exit_code"] == -15
 
 
 def test_stuck_test_state_dry_run_reports_without_writing(monkeypatch, config) -> None:
