@@ -606,7 +606,12 @@ def _latest_review_verdict(pool, branch_work_ids: set | frozenset) -> str | None
 
 
 def has_approved_review(
-    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+    entry: "QueuedMerge",
+    board,
+    gh_ops: "GhOps | None" = None,
+    *,
+    ancillary_files: list[str] | None = None,
+    ancillary_gh_ops: "GhOps | None" = None,
 ) -> bool:
     """True when a completed review with ``review_verdict='approve'`` exists
     on *board* for the work assignment behind *entry*.
@@ -636,12 +641,32 @@ def has_approved_review(
     UNLESS *gh_ops* is supplied, in which case a null ``branch_patch_id`` is
     computed on demand (#1506) rather than treated as an unrecoverable
     mismatch; see :func:`_backfill_branch_patch_id`.
+
+    #3707: *ancillary_files* (the repo's configured
+    ``Repo.ancillary_files``, e.g. ``["CHANGELOG.md", "README.md"]``) and
+    *ancillary_gh_ops* are a second, independent escape hatch — a SHA
+    mismatch whose entire delta is confined to those paths also still
+    covers the current head, regardless of patch-id. Deliberately a
+    separate argument from *gh_ops*: that one also drives
+    :func:`_backfill_branch_patch_id`'s on-demand network fetch, and a
+    caller must opt into *that* I/O independently of this one.
     """
-    return scan_approved_reviews(entry, board, gh_ops).approved
+    return scan_approved_reviews(
+        entry,
+        board,
+        gh_ops,
+        ancillary_files=ancillary_files,
+        ancillary_gh_ops=ancillary_gh_ops,
+    ).approved
 
 
 def scan_approved_reviews(
-    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+    entry: "QueuedMerge",
+    board,
+    gh_ops: "GhOps | None" = None,
+    *,
+    ancillary_files: list[str] | None = None,
+    ancillary_gh_ops: "GhOps | None" = None,
 ) -> ApprovalScan:
     """Walk *board* for an approving review covering *entry*'s work chain.
 
@@ -718,6 +743,17 @@ def scan_approved_reviews(
                 if current_patch_id is not None and review_patch_id == current_patch_id:
                     # content-identical rebase — approval still covers it
                     return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
+            if current_sha is not None and _review_delta_is_ancillary_only(
+                ancillary_gh_ops,
+                getattr(entry, "repo_github", None),
+                ancillary_files,
+                review_sha,
+                current_sha,
+            ):
+                # #3707: the rebase delta is confined to ancillary paths
+                # (CHANGELOG.md/README.md, per repo config) — approval
+                # still covers it, same as a content-identical patch-id.
+                return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
             if current_sha is None:
                 # Refused because we don't KNOW the head, not because we
                 # checked and it moved. Same (closed) gate verdict, but a
@@ -739,7 +775,12 @@ def scan_approved_reviews(
 
 
 def find_scoped_review_candidate(
-    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+    entry: "QueuedMerge",
+    board,
+    gh_ops: "GhOps | None" = None,
+    *,
+    ancillary_files: list[str] | None = None,
+    ancillary_gh_ops: "GhOps | None" = None,
 ) -> Assignment | None:
     """Return the previously-approved review whose approval was voided
     ONLY by a content-changing rebase (#1476), or ``None``.
@@ -764,9 +805,14 @@ def find_scoped_review_candidate(
     - Its patch-id still matches the current one (content-identical
       rebase — :func:`has_approved_review` already carries this forward,
       there is no delta to scope a review around).
+    - The delta since that review is confined to *ancillary_files* (#3707)
+      — :func:`has_approved_review` already carries THAT forward too, via
+      the same :func:`_review_delta_is_ancillary_only` check, so there is
+      nothing left to scope a review around either.
     - Either patch-id is missing (fail closed, same posture as
       ``has_approved_review``: an unconfirmable diff gets a full review,
-      never a guessed-at scoped one).
+      never a guessed-at scoped one) — unless the ancillary-only check
+      above already proved there's no real delta to review.
     """
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
     branch_work_ids = _chain_work_ids(entry, pool)
@@ -798,10 +844,18 @@ def find_scoped_review_candidate(
         if review_sha is None or review_sha == current_sha:
             continue  # not stale, or SHA tracking unavailable — not this path
         review_patch_id = getattr(a, "review_patch_id", None)
+        if review_patch_id == current_patch_id and review_patch_id is not None:
+            continue  # content-identical — has_approved_review already covers it
+        if _review_delta_is_ancillary_only(
+            ancillary_gh_ops,
+            getattr(entry, "repo_github", None),
+            ancillary_files,
+            review_sha,
+            current_sha,
+        ):
+            continue  # #3707: ancillary-only delta — has_approved_review already covers it
         if review_patch_id is None:
             continue  # fail closed — cannot confirm scope, full review
-        if review_patch_id == current_patch_id:
-            continue  # content-identical — has_approved_review already covers it
         return a  # approval voided ONLY by a content-changing rebase
     return None
 
@@ -2174,6 +2228,55 @@ def _base_move_spared(
     if _base_move_disjoint_from_branch(base_files, branch_files):
         return True, "base move and branch touch disjoint files (#1847)"
     return False, None
+
+
+def _files_are_ancillary(
+    files: list[str] | None, ancillary_files: list[str] | None
+) -> bool:
+    """True when *files* — an already-fetched compare file list — is
+    non-empty and every entry is one of the repo's configured
+    *ancillary_files* (#3707, e.g. ``CHANGELOG.md``/``README.md``).
+
+    Fails closed to ``False`` when *ancillary_files* is unset/empty (the
+    feature is off), *files* is ``None`` (an unreadable compare), or *files*
+    is empty — a patch-id mismatch only happens when content changed, so an
+    empty touched-file list means the compare itself couldn't be trusted,
+    not that nothing changed.
+    """
+    if not ancillary_files or not files:
+        return False
+    allowed = set(ancillary_files)
+    return all(f in allowed for f in files)
+
+
+def _review_delta_is_ancillary_only(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    ancillary_files: list[str] | None,
+    review_sha: str | None,
+    current_sha: str | None,
+) -> bool:
+    """True when every file that changed between *review_sha* (the SHA an
+    existing ``approve``d review covered) and *current_sha* (the branch's
+    current head) is in the repo's configured ``ancillary_files`` list
+    (#3707) — e.g. a conflict-fix rebase whose only churn is CHANGELOG.md/
+    README.md entries, which a scoped re-review always rubber-stamps.
+
+    Mirrors :func:`_base_move_is_inert`/:func:`_branch_is_inert`: fails
+    closed to ``False`` whenever *ancillary_files* is unset, *gh_ops*/
+    *repo_github*/either SHA is missing, the compare call raises, or it
+    can't prove the delta is ancillary-only. Deliberately takes its own
+    *gh_ops*-shaped argument rather than reusing whatever ``gh_ops`` a
+    caller passes to :func:`_backfill_branch_patch_id` — callers that want
+    this check active must opt in explicitly, so a caller that only wants
+    patch-id backfill (or neither) sees no behavior change.
+    """
+    if not ancillary_files:
+        return False
+    return _files_are_ancillary(
+        _fetch_compare_files(gh_ops, repo_github, review_sha, current_sha),
+        ancillary_files,
+    )
 
 
 # #1851: the reason string prefix `_entry_gate_status` returns for a CI-stale

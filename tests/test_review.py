@@ -4946,6 +4946,83 @@ def test_dispatch_scoped_reviews_for_queue_skips_when_already_approved(
     assert dispatched == []
 
 
+def test_dispatch_scoped_reviews_for_queue_skips_when_delta_is_ancillary_only(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """#3707: a rebase delta confined to a repo-configured ancillary file
+    (e.g. CHANGELOG.md) preserves the prior approval, so there is nothing
+    left for the scoped-review path to dispatch."""
+    from coord import merge_queue as mq
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.get_compare_files",
+        lambda repo, base, head: ["CHANGELOG.md"],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    board = Board(completed=[work, prior])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, cfg,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-5"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert dispatched == []
+
+
+def test_dispatch_scoped_reviews_for_queue_dispatches_when_delta_has_non_ancillary_file(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """A mixed delta (ancillary + real file) is not exempt — the scoped
+    review still fires, same as before #3707."""
+    from coord import merge_queue as mq
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.get_compare_files",
+        lambda repo, base, head: ["CHANGELOG.md", "src/main.py"],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, cfg,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-6"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+
+
 def test_dispatch_scoped_reviews_for_queue_dedupes_already_handled_entry(
     two_machine_config: Config,
 ) -> None:
@@ -5490,6 +5567,89 @@ def test_maybe_scoped_review_dispatches_when_queue_entry_eligible(
     assert result is not None
     assert result.review_scoped is True
     assert result.review_scope_base_sha == prior.review_head_sha
+
+
+def test_maybe_scoped_review_skips_when_delta_is_ancillary_only(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """#3707: same ancillary-only exemption as the queue-scan entry point —
+    `maybe_scoped_review_for_completed_fix` must not dispatch when the live
+    compare shows only a repo-configured ancillary file changed."""
+    from coord import merge_queue as mq
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.get_compare_files",
+        lambda repo, base, head: ["CHANGELOG.md"],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])
+
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, cfg,
+        http_client=_FakeHTTPClient({"id": "scoped-mb2"}),
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+    )
+    assert result is None
+
+
+def test_maybe_scoped_review_dispatches_when_delta_has_non_ancillary_file(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """A mixed delta (ancillary + real file) is not exempt — the scoped
+    review still fires, same as before #3707."""
+    from coord import merge_queue as mq
+
+    cfg = replace(
+        two_machine_config,
+        repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.get_compare_files",
+        lambda repo, base, head: ["CHANGELOG.md", "src/main.py"],
+    )
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+    mq.save_queue([_scoped_entry()])
+
+    client = _FakeHTTPClient({"id": "scoped-mb3"})
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, cfg,
+        http_client=client,
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+    )
+    assert result is not None
+    assert result.review_scoped is True
 
 
 def test_maybe_scoped_review_returns_none_without_branch(

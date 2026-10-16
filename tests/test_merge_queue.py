@@ -3795,6 +3795,79 @@ class TestReviewGate:
         entry = _q("orig", branch="worker/orig")
         assert mq.has_approved_review(entry, board) is True
 
+    # ── #3707: ancillary-only rebase delta preserves approval ──────────────
+
+    def test_has_approved_review_ancillary_only_delta_survives_rebase(self) -> None:
+        """#3707: a rebase whose entire file delta is a repo-configured
+        ancillary file (e.g. CHANGELOG.md) must not void the approval,
+        even though the patch-id genuinely changed."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"  # conflict resolution changed content
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+                assert (repo, base, head) == ("acme/api", "abc123", "def456")
+                return ["CHANGELOG.md"]
+
+        assert mq.has_approved_review(
+            entry, board, ancillary_files=["CHANGELOG.md", "README.md"],
+            ancillary_gh_ops=_Gh(),
+        ) is True
+
+    def test_has_approved_review_non_ancillary_file_still_voids(self) -> None:
+        """A delta that touches even one non-ancillary file must still void
+        the approval — the exemption is all-or-nothing, not a free pass."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+                return ["CHANGELOG.md", "src/main.py"]
+
+        assert mq.has_approved_review(
+            entry, board, ancillary_files=["CHANGELOG.md"], ancillary_gh_ops=_Gh(),
+        ) is False
+
+    def test_has_approved_review_ancillary_files_unset_keeps_prior_behaviour(self) -> None:
+        """Without ancillary_files configured, a genuine patch-id mismatch
+        still voids the approval exactly as before #3707 — the new kwargs
+        are opt-in."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+                return ["CHANGELOG.md"]
+
+        # ancillary_gh_ops supplied but ancillary_files is not — stays stale.
+        assert mq.has_approved_review(
+            entry, board, ancillary_gh_ops=_Gh(),
+        ) is False
+
     # ── #292 Defect 3: skip-and-proceed instead of group-halt ────────────
 
     def test_process_review_gated_entry_does_not_block_approved_sibling(self) -> None:
@@ -4029,6 +4102,42 @@ class TestScopedReviewCandidate:
         board = self._board(completed=[work, review])
         entry = self._voided_entry()
         assert mq.find_scoped_review_candidate(entry, board) is None
+
+    # ── #3707: ancillary-only rebase delta ──────────────────────────────────
+
+    def test_returns_none_when_delta_is_ancillary_only(self) -> None:
+        """#3707: has_approved_review already covers an ancillary-only
+        delta, so there is nothing left to scope a review around."""
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+
+        class _Gh:
+            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+                return ["CHANGELOG.md"]
+
+        found = mq.find_scoped_review_candidate(
+            entry, board, ancillary_files=["CHANGELOG.md"], ancillary_gh_ops=_Gh(),
+        )
+        assert found is None
+
+    def test_finds_candidate_when_delta_includes_non_ancillary_file(self) -> None:
+        """A mixed delta (ancillary + real file) is not exempt — the
+        existing scoped-review path still applies unchanged."""
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+
+        class _Gh:
+            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+                return ["CHANGELOG.md", "src/main.py"]
+
+        found = mq.find_scoped_review_candidate(
+            entry, board, ancillary_files=["CHANGELOG.md"], ancillary_gh_ops=_Gh(),
+        )
+        assert found is review
 
     # ── only_conflict_fix_since_review ──────────────────────────────────────
 

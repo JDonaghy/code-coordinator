@@ -759,7 +759,13 @@ def build_gate_report(
     review_reason: str | None = None
     review_verdict_unparseable = False
     if review_required:
-        review_scan = mq.scan_approved_reviews(entry, board, gh_ops)
+        review_scan = mq.scan_approved_reviews(
+            entry,
+            board,
+            gh_ops,
+            ancillary_files=getattr(repo_cfg, "ancillary_files", None),
+            ancillary_gh_ops=gh_ops,
+        )
         review_ok = review_scan.approved
         if not review_ok:
             # #2704: `unknown_head` means the branch head could not be

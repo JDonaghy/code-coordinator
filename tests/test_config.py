@@ -673,6 +673,66 @@ def test_artifact_paths_non_string_element(tmp_path: Path) -> None:
         load(p)
 
 
+# ── ancillary_files (#3707) ──────────────────────────────────────────────────
+
+
+def test_ancillary_files_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    ancillary_files:\n"
+        "      - CHANGELOG.md\n"
+        "      - README.md\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").ancillary_files == ["CHANGELOG.md", "README.md"]
+
+
+def test_ancillary_files_default_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").ancillary_files == []
+
+
+def test_ancillary_files_not_a_list(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    ancillary_files: CHANGELOG.md\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="ancillary_files must be a list"):
+        load(p)
+
+
+def test_ancillary_files_non_string_element(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    ancillary_files:\n"
+        "      - 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="ancillary_files\\[0\\] must be a string"):
+        load(p)
+
+
 # ── requires (#3351) ─────────────────────────────────────────────────────────
 
 

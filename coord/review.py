@@ -5877,10 +5877,23 @@ def dispatch_scoped_reviews_for_queue(
             except Exception:  # noqa: BLE001
                 pass
 
-        if mq.has_approved_review(entry, board):
-            continue  # not stale, or a content-identical rebase covers it (#1475)
+        repo_cfg = config.repo(entry.repo_name)
+        ancillary_files = getattr(repo_cfg, "ancillary_files", None) if repo_cfg else None
 
-        prior_review = mq.find_scoped_review_candidate(entry, board)
+        if mq.has_approved_review(
+            entry,
+            board,
+            ancillary_files=ancillary_files,
+            ancillary_gh_ops=github_ops,
+        ):
+            continue  # not stale, or a content-identical/ancillary-only rebase covers it (#1475/#3707)
+
+        prior_review = mq.find_scoped_review_candidate(
+            entry,
+            board,
+            ancillary_files=ancillary_files,
+            ancillary_gh_ops=github_ops,
+        )
         if prior_review is None:
             continue  # no scoped candidate — needs a full review, not this path
 
@@ -6139,10 +6152,21 @@ def maybe_scoped_review_for_completed_fix(
         if entry.branch_patch_id is None:
             return None
 
-        if mq.has_approved_review(entry, board):
-            return None  # nothing stale to scope a review around
+        ancillary_files = getattr(repo, "ancillary_files", None)
+        if mq.has_approved_review(
+            entry,
+            board,
+            ancillary_files=ancillary_files,
+            ancillary_gh_ops=github_ops,
+        ):
+            return None  # nothing stale to scope a review around — or an ancillary-only delta (#3707)
 
-        prior_review = mq.find_scoped_review_candidate(entry, board)
+        prior_review = mq.find_scoped_review_candidate(
+            entry,
+            board,
+            ancillary_files=ancillary_files,
+            ancillary_gh_ops=github_ops,
+        )
         if prior_review is None:
             return None
         if not mq.only_bounded_fix_since_review(entry, board, prior_review):
