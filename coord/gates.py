@@ -763,7 +763,7 @@ def build_gate_report(
             entry,
             board,
             gh_ops,
-            ancillary_files=getattr(repo_cfg, "ancillary_files", None),
+            ancillary_files=repo_cfg.ancillary_files,
             ancillary_gh_ops=gh_ops,
         )
         review_ok = review_scan.approved

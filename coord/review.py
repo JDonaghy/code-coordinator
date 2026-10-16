@@ -5878,7 +5878,7 @@ def dispatch_scoped_reviews_for_queue(
                 pass
 
         repo_cfg = config.repo(entry.repo_name)
-        ancillary_files = getattr(repo_cfg, "ancillary_files", None) if repo_cfg else None
+        ancillary_files = repo_cfg.ancillary_files if repo_cfg else None
 
         if mq.has_approved_review(
             entry,
@@ -6152,7 +6152,7 @@ def maybe_scoped_review_for_completed_fix(
         if entry.branch_patch_id is None:
             return None
 
-        ancillary_files = getattr(repo, "ancillary_files", None)
+        ancillary_files = repo.ancillary_files
         if mq.has_approved_review(
             entry,
             board,

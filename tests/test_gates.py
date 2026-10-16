@@ -153,6 +153,20 @@ class FakeGh:
         self.compare_calls.append((repo, base, head))
         return self.compare_files
 
+    def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+        """Synthesize unified-diff text for ``self.compare_files``, one block
+        per path whose content line embeds *head* — so two calls with
+        different *head* values (e.g. the review's recorded SHA vs. the
+        branch's current SHA) produce diff blocks that differ for exactly
+        those paths, matching what `_review_delta_is_ancillary_only`
+        (#3707) expects from a real `gh api compare` diff."""
+        self.compare_calls.append((repo, base, head))
+        if self.compare_files is None:
+            return None
+        return "".join(
+            f"diff --git a/{path} b/{path}\n-old\n+{head}\n" for path in self.compare_files
+        )
+
 
 # ── raw column dump ─────────────────────────────────────────────────────────
 

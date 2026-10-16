@@ -110,14 +110,14 @@ class Repo:
     # semantics per (repo, branch) pair.  Files under 100 bytes or ending
     # in `.d` are excluded (dependency files, not binaries).
     artifact_paths: list[str] = field(default_factory=list)
-    # #3707: filenames (relative to the repo root, e.g. "CHANGELOG.md",
+    # Filenames (relative to the repo root, e.g. "CHANGELOG.md",
     # "README.md") whose conflict resolution is always mechanical — the
     # scoped-review voiding in `coord.merge_queue.scan_approved_reviews`/
     # `find_scoped_review_candidate` is skipped when a rebase's entire
     # file delta is confined to this list, since the re-review it would
     # otherwise trigger always just confirms "both sides' additions are
-    # present".  Unset/empty keeps the pre-#3707 behaviour (every
-    # content-changing rebase voids the approval).
+    # present".  Unset/empty means every content-changing rebase voids
+    # the approval.
     ancillary_files: list[str] = field(default_factory=list)
     # #323: optional provider override for workers dispatched to this repo.
     # When set, overrides providers.default from coordinator.yml.  The value

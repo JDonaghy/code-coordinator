@@ -4959,8 +4959,8 @@ def test_dispatch_scoped_reviews_for_queue_skips_when_delta_is_ancillary_only(
         repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
     )
     monkeypatch.setattr(
-        "coord.github_ops.get_compare_files",
-        lambda repo, base, head: ["CHANGELOG.md"],
+        "coord.github_ops.get_compare_diff",
+        lambda repo, base, head: f"diff --git a/CHANGELOG.md b/CHANGELOG.md\n@@ -1 +1 @@\n-old\n+{head}\n",
     )
 
     work = Assignment(
@@ -4968,7 +4968,12 @@ def test_dispatch_scoped_reviews_for_queue_skips_when_delta_is_ancillary_only(
         assignment_id="w1", type="work", status="done", branch="issue-1-fix",
     )
     prior = _scoped_prior_review()
-    board = Board(completed=[work, prior])
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
     entry = _scoped_entry(state=mq.PENDING)
     entry.branch_head_sha = "newsha"
     entry.branch_patch_id = "patchid-new"
@@ -4994,8 +4999,11 @@ def test_dispatch_scoped_reviews_for_queue_dispatches_when_delta_has_non_ancilla
         repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
     )
     monkeypatch.setattr(
-        "coord.github_ops.get_compare_files",
-        lambda repo, base, head: ["CHANGELOG.md", "src/main.py"],
+        "coord.github_ops.get_compare_diff",
+        lambda repo, base, head: (
+            f"diff --git a/CHANGELOG.md b/CHANGELOG.md\n@@ -1 +1 @@\n-old\n+{head}\n"
+            f"diff --git a/src/main.py b/src/main.py\n@@ -1 +1 @@\n-old\n+{head}\n"
+        ),
     )
 
     work = Assignment(
@@ -5582,8 +5590,8 @@ def test_maybe_scoped_review_skips_when_delta_is_ancillary_only(
         repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
     )
     monkeypatch.setattr(
-        "coord.github_ops.get_compare_files",
-        lambda repo, base, head: ["CHANGELOG.md"],
+        "coord.github_ops.get_compare_diff",
+        lambda repo, base, head: f"diff --git a/CHANGELOG.md b/CHANGELOG.md\n@@ -1 +1 @@\n-old\n+{head}\n",
     )
 
     work = Assignment(
@@ -5622,8 +5630,11 @@ def test_maybe_scoped_review_dispatches_when_delta_has_non_ancillary_file(
         repos=[replace(two_machine_config.repos[0], ancillary_files=["CHANGELOG.md"])],
     )
     monkeypatch.setattr(
-        "coord.github_ops.get_compare_files",
-        lambda repo, base, head: ["CHANGELOG.md", "src/main.py"],
+        "coord.github_ops.get_compare_diff",
+        lambda repo, base, head: (
+            f"diff --git a/CHANGELOG.md b/CHANGELOG.md\n@@ -1 +1 @@\n-old\n+{head}\n"
+            f"diff --git a/src/main.py b/src/main.py\n@@ -1 +1 @@\n-old\n+{head}\n"
+        ),
     )
 
     work = Assignment(
