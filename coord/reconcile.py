@@ -590,6 +590,7 @@ def reconcile_completed_assignments(
             propagate_smoke_terminal_failure(
                 parent_assignment_id=a.review_of_assignment_id,
                 failure_reason=_failure_reason,
+                exit_code=entry.get("exit_code"),
             )
 
         # #666 Gap A: best-effort cost/token capture from the agent completed
@@ -974,6 +975,7 @@ def propagate_smoke_terminal_failure(
     environmental: bool | None = None,
     fanout_parent_id: str | None = None,
     operator_cancelled: bool = False,
+    exit_code: int | None = None,
 ) -> None:
     """#1605: resolve a work row's ``test_state`` when its Test-stage
     (``type="smoke"``) child dies without ever reporting pass/fail.
@@ -1152,7 +1154,11 @@ def propagate_smoke_terminal_failure(
     if environmental is None:
         is_environmental = classification.is_environmental
         cause = classification.reason
-        if not is_environmental and not (failure_reason or "").strip():
+        if (
+            not is_environmental
+            and not (failure_reason or "").strip()
+            and not exit_code
+        ):
             # #3705: `classify_failure` correctly calls this WORK — its own
             # "no evidence at all defaults to WORK" rule — but that rule is
             # about an UNRECOGNIZED signal, not an ABSENT one. There is a
@@ -1163,12 +1169,20 @@ def propagate_smoke_terminal_failure(
             # process group — the #1605 class this function exists for,
             # with nothing for a fix worker to act on). Only this caller can
             # tell the two apart, since only it sees whether
-            # *failure_reason* itself was ever populated. Treat the latter
-            # like an environmental death: bounded clear-and-retry of the
-            # Test stage, parking (never a blind `coord fix`) once the
-            # shared #3315 budget is exhausted — instead of ever recording
-            # a `test_state="failed"` work verdict with a synthetic
-            # placeholder reason and no actual failure behind it.
+            # *failure_reason* itself was ever populated.
+            #
+            # The additional `not exit_code` guard keeps a non-zero exit
+            # code (e.g. exit_code=1: the `claude -p` process actually ran
+            # and returned an error) as a genuine WORK failure even when the
+            # agent captured no classified reason text — a non-zero exit IS
+            # a signal, just one without a human-readable reason string.
+            # Only `exit_code in {0, None}` qualifies as truly silent.
+            # Treat the latter like an environmental death: bounded
+            # clear-and-retry of the Test stage, parking (never a blind
+            # `coord fix`) once the shared #3315 budget is exhausted —
+            # instead of ever recording a `test_state="failed"` work verdict
+            # with a synthetic placeholder reason and no actual failure
+            # behind it.
             from coord.failure_class import silent_test_death  # noqa: PLC0415
 
             classification = silent_test_death()
