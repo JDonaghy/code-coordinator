@@ -3582,9 +3582,9 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 )
         artifact_paths: list[str] = list(artifact_paths_raw)
 
-        # #3707: ancillary_files — filenames whose conflict resolution is
-        # always mechanical (e.g. CHANGELOG.md, README.md), so a rebase
-        # delta confined to them skips the scoped re-review.
+        # ancillary_files — filenames whose conflict resolution is always
+        # mechanical (e.g. CHANGELOG.md, README.md), so a rebase delta
+        # confined to them skips the scoped re-review.
         ancillary_files_raw = entry.get("ancillary_files", []) or []
         if not isinstance(ancillary_files_raw, list):
             raise ConfigError(f"repos[{i}].ancillary_files must be a list of strings")

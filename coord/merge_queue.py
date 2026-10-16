@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -605,6 +606,56 @@ def _latest_review_verdict(pool, branch_work_ids: set | frozenset) -> str | None
     return winner
 
 
+def _resolve_ancillary_config(
+    entry: "QueuedMerge",
+    gh_ops: "GhOps | None",
+    config,
+    ancillary_files: list[str] | None,
+    ancillary_gh_ops: "GhOps | None",
+) -> tuple[list[str] | None, "GhOps | None"]:
+    """Resolve *ancillary_files*/*ancillary_gh_ops* from *config* (#3707)
+    for a caller that passed the live ``Config`` but not the two resolved
+    values directly.
+
+    Every one of this module's "is this approved?" surfaces
+    (:func:`has_approved_review`, :func:`scan_approved_reviews`,
+    :func:`find_scoped_review_candidate`) must answer the #3707
+    ancillary-rebase question identically to every other — a caller that
+    resolved ``config.repo(entry.repo_name).ancillary_files`` and threaded
+    *gh_ops* as *ancillary_gh_ops* itself at only SOME call sites, while
+    others kept calling with neither, is exactly the #2096 split-brain this
+    helper exists to prevent: one surface (e.g. `coord/review.py`'s dispatch
+    gate) treating a rebase as still-approved while another (this module's
+    OWN merge gate) still sees it as stale, permanently wedging the queue
+    row with no automated recovery.
+
+    *ancillary_files*/*ancillary_gh_ops* passed explicitly always win —
+    *config* is purely a convenience for a caller that doesn't already have
+    the resolved values on hand, never a second source of truth that could
+    disagree with them. ``config is None`` (a caller not yet updated to
+    thread it) leaves both arguments exactly as given, i.e. today's
+    pre-#3707-split-brain-fix behaviour.
+    """
+    if config is not None:
+        if ancillary_files is None:
+            # Fail closed, not loud: *config* here is sometimes a minimal
+            # test double or a caller-specific partial stand-in that models
+            # only the subset of ``Config`` its own gate check needs (no
+            # ``.repo()`` at all) — that is a "no ancillary-exemption data
+            # available" situation, identical in effect to ``config is
+            # None``, never a crash this question didn't exist to answer
+            # before #3707.
+            try:
+                repo_cfg = config.repo(getattr(entry, "repo_name", None))
+            except Exception:  # noqa: BLE001 — see docstring: fail closed
+                repo_cfg = None
+            if repo_cfg is not None:
+                ancillary_files = list(getattr(repo_cfg, "ancillary_files", None) or [])
+        if ancillary_gh_ops is None:
+            ancillary_gh_ops = gh_ops
+    return ancillary_files, ancillary_gh_ops
+
+
 def has_approved_review(
     entry: "QueuedMerge",
     board,
@@ -612,6 +663,7 @@ def has_approved_review(
     *,
     ancillary_files: list[str] | None = None,
     ancillary_gh_ops: "GhOps | None" = None,
+    config=None,
 ) -> bool:
     """True when a completed review with ``review_verdict='approve'`` exists
     on *board* for the work assignment behind *entry*.
@@ -650,7 +702,18 @@ def has_approved_review(
     separate argument from *gh_ops*: that one also drives
     :func:`_backfill_branch_patch_id`'s on-demand network fetch, and a
     caller must opt into *that* I/O independently of this one.
+
+    *config*, when supplied, resolves *ancillary_files*/*ancillary_gh_ops*
+    automatically via :func:`_resolve_ancillary_config` — pass the live
+    ``Config`` instead of resolving ``config.repo(entry.repo_name)
+    .ancillary_files`` and threading *gh_ops* as *ancillary_gh_ops*
+    yourself, so every call site answers the #3707 question the same way
+    (#2096). Explicit *ancillary_files*/*ancillary_gh_ops* still win if a
+    caller passes both.
     """
+    ancillary_files, ancillary_gh_ops = _resolve_ancillary_config(
+        entry, gh_ops, config, ancillary_files, ancillary_gh_ops
+    )
     return scan_approved_reviews(
         entry,
         board,
@@ -667,13 +730,24 @@ def scan_approved_reviews(
     *,
     ancillary_files: list[str] | None = None,
     ancillary_gh_ops: "GhOps | None" = None,
+    config=None,
 ) -> ApprovalScan:
     """Walk *board* for an approving review covering *entry*'s work chain.
 
     The single implementation behind both :func:`has_approved_review` (the
     merge gate) and :func:`display_error`'s read-only recompute — see
     :class:`ApprovalScan` for why the second one needs more than the bool.
+
+    *config*, when supplied, resolves *ancillary_files*/*ancillary_gh_ops*
+    via :func:`_resolve_ancillary_config` (#3707) for a caller that has the
+    live ``Config`` but not those two values already in hand — every
+    caller of this scan must answer the ancillary-rebase question the same
+    way (#2096), so prefer passing *config* over leaving a call site on the
+    pre-#3707 default of "never exempt".
     """
+    ancillary_files, ancillary_gh_ops = _resolve_ancillary_config(
+        entry, gh_ops, config, ancillary_files, ancillary_gh_ops
+    )
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
 
     branch_work_ids = _chain_work_ids(entry, pool)
@@ -747,6 +821,7 @@ def scan_approved_reviews(
                 ancillary_gh_ops,
                 getattr(entry, "repo_github", None),
                 ancillary_files,
+                getattr(entry, "target_branch", None),
                 review_sha,
                 current_sha,
             ):
@@ -781,9 +856,15 @@ def find_scoped_review_candidate(
     *,
     ancillary_files: list[str] | None = None,
     ancillary_gh_ops: "GhOps | None" = None,
+    config=None,
 ) -> Assignment | None:
     """Return the previously-approved review whose approval was voided
     ONLY by a content-changing rebase (#1476), or ``None``.
+
+    *config*, when supplied, resolves *ancillary_files*/*ancillary_gh_ops*
+    via :func:`_resolve_ancillary_config` (#3707) — see
+    :func:`scan_approved_reviews` for why every "is this approved?" surface
+    should prefer passing *config* over leaving a call site unexempted.
 
     Mirrors :func:`has_approved_review`'s SHA/patch-id staleness walk but
     returns the review :class:`~coord.models.Assignment` itself (not a
@@ -814,6 +895,9 @@ def find_scoped_review_candidate(
       never a guessed-at scoped one) — unless the ancillary-only check
       above already proved there's no real delta to review.
     """
+    ancillary_files, ancillary_gh_ops = _resolve_ancillary_config(
+        entry, gh_ops, config, ancillary_files, ancillary_gh_ops
+    )
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
     branch_work_ids = _chain_work_ids(entry, pool)
     if not branch_work_ids:
@@ -844,12 +928,13 @@ def find_scoped_review_candidate(
         if review_sha is None or review_sha == current_sha:
             continue  # not stale, or SHA tracking unavailable — not this path
         review_patch_id = getattr(a, "review_patch_id", None)
-        if review_patch_id == current_patch_id and review_patch_id is not None:
+        if review_patch_id is not None and review_patch_id == current_patch_id:
             continue  # content-identical — has_approved_review already covers it
         if _review_delta_is_ancillary_only(
             ancillary_gh_ops,
             getattr(entry, "repo_github", None),
             ancillary_files,
+            getattr(entry, "target_branch", None),
             review_sha,
             current_sha,
         ):
@@ -1678,7 +1763,7 @@ def merge_gate_failures(
     """
     failures: list[MergeGateFailure] = []
     if requires_review(a, config):
-        review_scan = scan_approved_reviews(a, board, gh_ops)
+        review_scan = scan_approved_reviews(a, board, gh_ops, config=config)
         if not review_scan.approved:
             # #2704: `unknown_head` means the branch head could not be
             # confirmed at all — never collapse that into "not approved",
@@ -2249,10 +2334,70 @@ def _files_are_ancillary(
     return all(f in allowed for f in files)
 
 
+def _fetch_compare_diff(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    base_sha: str | None,
+    head_sha: str | None,
+) -> str | None:
+    """Fetch the unified diff TEXT for one ``get_compare_diff(base_sha,
+    head_sha)`` compare, failing closed to ``None`` (never raising) exactly
+    like :func:`_fetch_compare_files` — no *gh_ops*/*repo_github* to ask, a
+    missing SHA on either side, the call raising, or it returning ``None``
+    itself.
+
+    Unlike :func:`_fetch_compare_files`, this fetches diff *text* (per-file
+    hunks), not just a file-name list — :func:`_review_delta_is_ancillary_only`
+    needs the text to tell "this file's content didn't change between the
+    two base-relative compares" apart from "this file isn't touched by
+    either compare", which a file-name list alone can't distinguish.
+    """
+    if gh_ops is None or not repo_github or not base_sha or not head_sha:
+        return None
+    try:
+        return gh_ops.get_compare_diff(repo_github, base_sha, head_sha)
+    except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "ancillary-only"
+        return None
+
+
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+
+def _diff_blocks_by_path(diff_text: str | None) -> dict[str, str]:
+    """Split a unified diff *diff_text* into per-file blocks, keyed by the
+    file's path (the header's b-side name, which is also the a-side name for
+    every #3707 ancillary path — none of them are renames).
+
+    Walks line-by-line tracking the current ``diff --git a/... b/...``
+    header, mirroring :func:`coord.review._diff_removed_content_lines`'s
+    header-tracking walk — but accumulates each block's FULL text (not just
+    ``-`` lines for one target path) so two diffs anchored at the same base
+    can be compared block-for-block by :func:`_review_delta_is_ancillary_only`.
+
+    Returns ``{}`` for ``None``/empty input — the empty dict composes safely
+    with the caller's "does this path's block match" lookups, which all
+    treat a missing key as "this diff doesn't touch that path".
+    """
+    if not diff_text:
+        return {}
+    blocks: dict[str, list[str]] = {}
+    current_path: str | None = None
+    for line in diff_text.splitlines():
+        match = _DIFF_GIT_HEADER_RE.match(line)
+        if match:
+            current_path = match.group(2)
+            blocks[current_path] = [line]
+            continue
+        if current_path is not None:
+            blocks[current_path].append(line)
+    return {path: "\n".join(lines) for path, lines in blocks.items()}
+
+
 def _review_delta_is_ancillary_only(
     gh_ops: "GhOps | None",
     repo_github: str | None,
     ancillary_files: list[str] | None,
+    base_branch: str | None,
     review_sha: str | None,
     current_sha: str | None,
 ) -> bool:
@@ -2262,21 +2407,61 @@ def _review_delta_is_ancillary_only(
     (#3707) — e.g. a conflict-fix rebase whose only churn is CHANGELOG.md/
     README.md entries, which a scoped re-review always rubber-stamps.
 
-    Mirrors :func:`_base_move_is_inert`/:func:`_branch_is_inert`: fails
-    closed to ``False`` whenever *ancillary_files* is unset, *gh_ops*/
-    *repo_github*/either SHA is missing, the compare call raises, or it
-    can't prove the delta is ancillary-only. Deliberately takes its own
-    *gh_ops*-shaped argument rather than reusing whatever ``gh_ops`` a
-    caller passes to :func:`_backfill_branch_patch_id` — callers that want
-    this check active must opt in explicitly, so a caller that only wants
-    patch-id backfill (or neither) sees no behavior change.
+    After a conflict-fix rebase, *review_sha* is no longer an ancestor of
+    *current_sha* — the two SHAs belong to different replays of the branch
+    onto different base commits. GitHub's compare endpoint is ALWAYS
+    three-dot (``diff(merge_base(base, head), head)``), so a direct
+    ``review_sha...current_sha`` compare does not answer "what did the
+    rebase itself change" — it answers "what changed since wherever these
+    two histories last agreed", which can include the branch's entire
+    pre-existing diff. Comparing a plain file-NAME list from that compare
+    against *ancillary_files* would also be unsound even if the SHAs were
+    ancestors: a real PR's `base...review_sha` file list already contains
+    every file the WHOLE branch touches, not just what the rebase changed,
+    so the check would fail for any branch with real source changes.
+
+    Instead this fetches two *base_branch*-relative diffs — ``base_branch
+    ...review_sha`` and ``base_branch...current_sha`` — mirroring how
+    :func:`coord.github_ops.get_branch_patch_id` already anchors both of
+    its own patch-id measurements at the same base ref rather than diffing
+    two branch SHAs against each other. Splitting each into per-file blocks
+    (:func:`_diff_blocks_by_path`) and comparing block text path-by-path
+    isolates exactly what the rebase itself changed: a path whose block is
+    byte-identical in both diffs did not change between *review_sha* and
+    *current_sha*; a path whose block differs, or appears in only one diff,
+    did. Only that changed-path set is checked against *ancillary_files*.
+
+    Fails closed to ``False`` whenever *ancillary_files*/*base_branch* is
+    unset, *gh_ops*/*repo_github*/either SHA is missing, either compare call
+    raises or returns ``None``, or the changed-path set can't be shown to be
+    ancillary-only. Deliberately takes its own *gh_ops*-shaped argument
+    rather than reusing whatever ``gh_ops`` a caller passes to
+    :func:`_backfill_branch_patch_id` — callers that want this check active
+    must opt in explicitly, so a caller that only wants patch-id backfill
+    (or neither) sees no behavior change.
     """
-    if not ancillary_files:
+    if not ancillary_files or not base_branch:
         return False
-    return _files_are_ancillary(
-        _fetch_compare_files(gh_ops, repo_github, review_sha, current_sha),
-        ancillary_files,
-    )
+    review_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, review_sha)
+    current_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, current_sha)
+    if review_diff is None or current_diff is None:
+        return False
+    review_blocks = _diff_blocks_by_path(review_diff)
+    current_blocks = _diff_blocks_by_path(current_diff)
+    changed_paths = {
+        path
+        for path in set(review_blocks) | set(current_blocks)
+        if review_blocks.get(path) != current_blocks.get(path)
+    }
+    if not changed_paths:
+        # No path differs between the two base-relative diffs at all — the
+        # rebase changed nothing, which #1475's patch-id check upstream of
+        # this call should already have caught. Fail closed rather than
+        # treat "nothing changed" as "nothing non-ancillary changed": an
+        # empty set here is more likely an unreadable/empty compare than a
+        # genuinely no-op rebase that patch-id somehow missed.
+        return False
+    return _files_are_ancillary(sorted(changed_paths), ancillary_files)
 
 
 # #1851: the reason string prefix `_entry_gate_status` returns for a CI-stale
@@ -4187,7 +4372,16 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
     if entry.error.startswith("review"):
         if not requires_review(entry, config):
             return None
-        scan = scan_approved_reviews(entry, board)
+        # #3707: thread *config* so this agrees with the merge gate about
+        # ancillary-only exemptions when it can — but this function takes
+        # no *gh_ops* (recomputation here is deliberately I/O-free, see
+        # docstring), so `ancillary_gh_ops` still resolves to ``None`` and
+        # the exemption still can't fire network-side. Same pre-existing
+        # posture as the #1475 patch-id escape hatch, which also never
+        # backfills here for the same reason — a display-only staleness,
+        # not a gate disagreement, since it only ever makes this message
+        # MORE conservative than the real gate, never less.
+        scan = scan_approved_reviews(entry, board, config=config)
         if scan.approved:
             return None
         if scan.unknown_head:
@@ -4560,6 +4754,19 @@ class GhOps(Protocol):
         :func:`_base_move_disjoint_from_branch` — the third #1479 escape
         hatch, sparing a verdict when the two diffs simply touch no files in
         common, independent of either being inert on its own.
+        """
+        ...
+
+    def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+        """Return the unified diff TEXT for the three-dot *base*...*head*
+        compare, or None on failure.
+
+        #3707: used by :func:`_review_delta_is_ancillary_only` to fetch the
+        two *base*-relative diffs (one against the prior review's SHA, one
+        against the branch's current head) it splits into per-file blocks
+        and compares, to isolate exactly what a conflict-fix rebase itself
+        changed — see that function's docstring for why a file-NAME compare
+        (:meth:`get_compare_files`) can't answer the same question.
         """
         ...
 
@@ -5917,7 +6124,7 @@ def _entry_gate_status(
         # whose approved review predates #1475) is computed on demand rather
         # than displaying a stale "review not approved" the plan can't fix.
         if requires_review(entry, config):
-            review_scan = scan_approved_reviews(entry, board, gh_ops)
+            review_scan = scan_approved_reviews(entry, board, gh_ops, config=config)
             if not review_scan.approved:
                 # #2704: don't render "not approved" for a branch head this
                 # scan couldn't even read — see `ApprovalScan.unknown_head`.
@@ -6692,7 +6899,7 @@ def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingI
         # approved — the item isn't "approved" yet and should not appear in the
         # staging section (it belongs to the pipeline, not the merge staging).
         if config is not None and board is not None:
-            if requires_review(a, config) and not has_approved_review(a, board, gh_ops):
+            if requires_review(a, config) and not has_approved_review(a, board, gh_ops, config=config):
                 continue
 
         # Gate: smoke.  When the test gate is enabled and no *fresh* verdict
@@ -6730,7 +6937,9 @@ class MergeEvent:
     message: str = ""
 
 
-def _briefing_body(entry: QueuedMerge, board=None, gh_ops: "GhOps | None" = None) -> str:
+def _briefing_body(
+    entry: QueuedMerge, board=None, gh_ops: "GhOps | None" = None, config=None
+) -> str:
     # `Closes #N` makes GitHub auto-close the linked issue when the PR
     # merges — without it the issue stays stranded open and the TUI's
     # lifecycle ledger shows the row as In-flight forever (the brain
@@ -6751,7 +6960,7 @@ def _briefing_body(entry: QueuedMerge, board=None, gh_ops: "GhOps | None" = None
     # the judgment are usually available. *board*/*gh_ops* default to
     # ``None`` (every pre-#3502 test/call site) which reads as "resolved" —
     # unchanged behaviour.
-    resolution = _issue_resolution_for_entry(entry, board, gh_ops)
+    resolution = _issue_resolution_for_entry(entry, board, gh_ops, config=config)
     keyword = (
         "Closes"
         if entry.assignment_type in CLOSES_ISSUE_TYPES and resolution.value == "resolved"
@@ -6786,7 +6995,7 @@ def _work_assignment_for_entry(entry: QueuedMerge, board) -> Assignment | None:
 
 
 def _issue_resolution_for_entry(
-    entry: QueuedMerge, board, gh_ops: "GhOps | None" = None,
+    entry: QueuedMerge, board, gh_ops: "GhOps | None" = None, config=None,
 ) -> IssueResolution:
     """(#3502) The EFFECTIVE `ISSUE_RESOLUTION:` verdict for *entry* — the
     worker's own judgment (its `completion_summary`), folded with the
@@ -6810,6 +7019,11 @@ def _issue_resolution_for_entry(
     does not import `merge_queue.py` at module level, but keeping the
     import local here mirrors every other cross-module deferred import in
     this file).
+
+    *config*, when supplied, is forwarded to :func:`scan_approved_reviews`
+    (#3707) so an ancillary-only rebase still finds its covering approval
+    here too — otherwise this would fall back to "no reviewer claim to
+    read" for exactly the entries the merge gate now treats as approved.
     """
     work = _work_assignment_for_entry(entry, board)
     worker_resolution = parse_issue_resolution(
@@ -6818,7 +7032,7 @@ def _issue_resolution_for_entry(
 
     reviewer_resolution: IssueResolution | None = None
     if board is not None:
-        scan = scan_approved_reviews(entry, board, gh_ops)
+        scan = scan_approved_reviews(entry, board, gh_ops, config=config)
         review_assignment = scan.review_assignment
         if scan.approved and review_assignment is not None:
             from coord.review import fetch_review_findings_from_github  # noqa: PLC0415
@@ -7915,7 +8129,9 @@ def process(
                     # the rate-limited/unreachable condition this reason
                     # exists to report.
                     _review_scan = (
-                        None if board is None else scan_approved_reviews(entry, board, gh_ops)
+                        None
+                        if board is None
+                        else scan_approved_reviews(entry, board, gh_ops, config=config)
                     )
                     if board is None or not _review_scan.approved:
                         # #2704: don't report a confirmed refusal ("not
@@ -8258,7 +8474,7 @@ def process(
                         base=entry.target_branch,
                         head=entry.branch,
                         title=f"#{entry.issue_number}: {entry.issue_title}",
-                        body=_briefing_body(entry, board, gh_ops),
+                        body=_briefing_body(entry, board, gh_ops, config=config),
                     )
                 except Exception as e:  # noqa: BLE001 — surface gh failure as event
                     events.append(MergeEvent(entry, "error", f"create_pr failed: {e}"))
@@ -8366,7 +8582,9 @@ def process(
                 # the `unknown_head` reason below — see the matching dry-run
                 # site above for why a second call here is worth avoiding.
                 _review_scan = (
-                    None if board is None else scan_approved_reviews(entry, board, gh_ops)
+                    None
+                    if board is None
+                    else scan_approved_reviews(entry, board, gh_ops, config=config)
                 )
                 if board is None or not _review_scan.approved:
                     # #2704: don't report a confirmed refusal ("not
@@ -8912,7 +9130,7 @@ def process(
             # — avoiding a second `gh`/GitHub review-findings round trip for
             # every `CLOSES_ISSUE_TYPES` merge).
             issue_resolution = (
-                _issue_resolution_for_entry(entry, board, gh_ops)
+                _issue_resolution_for_entry(entry, board, gh_ops, config=config)
                 if entry.assignment_type in CLOSES_ISSUE_TYPES
                 else IssueResolution()
             )

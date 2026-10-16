@@ -3813,9 +3813,13 @@ class TestReviewGate:
         board = self._board(completed=[work, review])
 
         class _Gh:
-            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
-                assert (repo, base, head) == ("acme/api", "abc123", "def456")
-                return ["CHANGELOG.md"]
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                assert (repo, base) == ("acme/api", "main")
+                if head == "abc123":
+                    return "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+review version\n"
+                if head == "def456":
+                    return "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+current version\n"
+                raise AssertionError(head)
 
         assert mq.has_approved_review(
             entry, board, ancillary_files=["CHANGELOG.md", "README.md"],
@@ -3837,8 +3841,18 @@ class TestReviewGate:
         board = self._board(completed=[work, review])
 
         class _Gh:
-            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
-                return ["CHANGELOG.md", "src/main.py"]
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+review version\n"
+                        "diff --git a/src/main.py b/src/main.py\n-old\n+review version\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+current version\n"
+                        "diff --git a/src/main.py b/src/main.py\n-old\n+changed version\n"
+                    )
+                raise AssertionError(head)
 
         assert mq.has_approved_review(
             entry, board, ancillary_files=["CHANGELOG.md"], ancillary_gh_ops=_Gh(),
@@ -3860,8 +3874,8 @@ class TestReviewGate:
         board = self._board(completed=[work, review])
 
         class _Gh:
-            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
-                return ["CHANGELOG.md"]
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                return "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+changed\n"
 
         # ancillary_gh_ops supplied but ancillary_files is not — stays stale.
         assert mq.has_approved_review(
@@ -4114,8 +4128,12 @@ class TestScopedReviewCandidate:
         entry = self._voided_entry()
 
         class _Gh:
-            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
-                return ["CHANGELOG.md"]
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":  # review_head_sha
+                    return "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+review version\n"
+                if head == "def456":  # current branch_head_sha
+                    return "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+current version\n"
+                raise AssertionError(head)
 
         found = mq.find_scoped_review_candidate(
             entry, board, ancillary_files=["CHANGELOG.md"], ancillary_gh_ops=_Gh(),
@@ -4131,8 +4149,18 @@ class TestScopedReviewCandidate:
         entry = self._voided_entry()
 
         class _Gh:
-            def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
-                return ["CHANGELOG.md", "src/main.py"]
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+review version\n"
+                        "diff --git a/src/main.py b/src/main.py\n-old\n+review version\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/CHANGELOG.md b/CHANGELOG.md\n-old\n+current version\n"
+                        "diff --git a/src/main.py b/src/main.py\n-old\n+changed version\n"
+                    )
+                raise AssertionError(head)
 
         found = mq.find_scoped_review_candidate(
             entry, board, ancillary_files=["CHANGELOG.md"], ancillary_gh_ops=_Gh(),

@@ -5979,6 +5979,7 @@ def _fetch_merge_only_ready(
     entries: list,
     live_ci_gate: Mapping[str, bool],
     live_blocked_gate: Mapping[str, bool],
+    config_path: Path | None = None,
 ) -> dict[str, bool]:
     """``{entry_key: True}`` for #2350's Merge-only fast path: every entry
     THIS tick's live gate re-check just found clear — a `parked` entry with
@@ -6003,9 +6004,11 @@ def _fetch_merge_only_ready(
     else here, so it is not unsafe — just not the zero-I/O read the rest of
     this docstring describes.
 
-    Takes no *config_path*, unlike both siblings: neither board-only read
-    needs a :class:`~coord.config.Config` (no ``ci_store``, no live gate
-    re-derivation), so there is nothing to load here.
+    Takes *config_path* only to resolve #3707's ancillary-rebase exemption
+    inside ``has_approved_review`` consistently with every other merge-gate
+    surface (#2096) — unlike both siblings, neither read otherwise needs a
+    ``ci_store`` or live gate re-derivation, so that's the only reason a
+    :class:`~coord.config.Config` is loaded here at all.
 
     Same fail-open-per-entry, fail-closed-overall contract as its siblings:
     a key ABSENT from the result (no queue row, an unreadable board or
@@ -6028,9 +6031,11 @@ def _fetch_merge_only_ready(
     try:
         from coord import github_ops as _gh_ops  # noqa: PLC0415
         from coord import merge_queue as _mq  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
         from coord.state import load_board as _load_board  # noqa: PLC0415
 
         board = _load_board()
+        cfg = _load_config(config_path)
         queue_by_key = {
             entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
         }
@@ -6044,7 +6049,7 @@ def _fetch_merge_only_ready(
             continue
         try:
             ready[e.key] = _mq.has_approved_review(
-                q, board, _gh_ops
+                q, board, _gh_ops, config=cfg
             ) and _mq.has_passed_test(q, board)
         except Exception:  # noqa: BLE001 — leave this one entry to the ordinary path
             continue
@@ -7361,7 +7366,7 @@ def drive_queue_tick(
         # `plan_tick` can attempt it directly this tick instead of spending
         # a relaunch. See `_fetch_merge_only_ready`'s docstring.
         merge_only_ready = _fetch_merge_only_ready(
-            entries, live_ci_gate, live_blocked_gate
+            entries, live_ci_gate, live_blocked_gate, config_path
         )
 
         # #2602: a live re-check for every `after=` pre-req the cached board

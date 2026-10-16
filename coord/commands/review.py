@@ -1387,7 +1387,7 @@ def review_reaffirm(
         sys.exit(1)
     entry.branch_patch_id = None  # force a fresh backfill below, never trust a stale value
 
-    if mq.has_approved_review(entry, board, github_ops):
+    if mq.has_approved_review(entry, board, github_ops, config=cfg):
         click.echo(
             "nothing to reaffirm — an approved review already covers the "
             "branch's current head (either fresh, or a content-identical "
@@ -1395,7 +1395,7 @@ def review_reaffirm(
         )
         return
 
-    prior_review = mq.find_scoped_review_candidate(entry, board, github_ops)
+    prior_review = mq.find_scoped_review_candidate(entry, board, github_ops, config=cfg)
     if prior_review is None:
         click.echo(
             "error: no reaffirmable approval found — either this branch was "
