@@ -332,6 +332,32 @@ gap leaves this issue unresolved, also declare `ISSUE_RESOLUTION: partial — \
 blocked on upstream (BLOCKED_ON_UPSTREAM above)`.
 """
 
+# #3711: appended to every `type="work"` briefing, alongside
+# UPSTREAM_GAP_BRIEFING_NOTE above — the worker-facing half of the
+# wrong-repo close+refile capability. `coord issue close-wrong-repo`
+# (`coord/commands/issues.py`) is the command half; without this note a
+# worker has no way to discover it (`CLAUDE.md` tells every worker the only
+# `coord` command it runs is `coord acceptance run`), so it would keep
+# reporting a wrong-repo conclusion in its final message and stopping —
+# exactly the quadraui#1554 shape (3 legs, 0 commits) this exists to end.
+WRONG_REPO_BRIEFING_NOTE = """
+
+## Wrong-repo issues — `coord issue close-wrong-repo` (#3711)
+
+If you conclude mid-investigation that this issue's fix belongs in a
+DIFFERENT repo entirely (not just a missing upstream capability — the whole
+issue is mis-targeted), don't just say so in your final message and stop:
+
+    coord issue close-wrong-repo <this-repo> <this-issue> \\
+        --target <other-repo> --title "<title>" --body "<root-cause analysis>"
+
+This closes the current issue with a `coord:event=wrong_repo` marker comment
+and files the replacement in `<other-repo>` in one step, carrying your root-
+cause analysis forward so it isn't lost — closing reads as terminal to the
+drive queue, so it also stops further dispatch against this issue. Still
+commit and push whatever is genuinely done first if you made any progress.
+"""
+
 # #3132: the addendum appended to a ``type="epic-decompose"`` dispatch's
 # briefing — see ``epic_decompose_briefing`` below. Kept as a module-level
 # constant (not inlined in the function) so a test can assert against the
@@ -1211,6 +1237,7 @@ def dispatch(
             briefing_text
             + sibling_lessons_block(proposal.repo_name, proposal.issue_number)
             + UPSTREAM_GAP_BRIEFING_NOTE
+            + WRONG_REPO_BRIEFING_NOTE
         )
     elif proposal.type == EPIC_DECOMPOSE_TYPE and proposal.issue_number:
         # #3132 review: an epic-decompose worker gets a real worktree + branch

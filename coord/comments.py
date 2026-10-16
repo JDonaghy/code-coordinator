@@ -98,6 +98,14 @@ EVENT_STUCK_TEST_STATE_HEALED = "stuck_test_state_healed"
 # landing a second branch) UPDATES this comment in place
 # (`coord.state.upsert_issue_comment`) rather than appending a duplicate.
 EVENT_VERIFICATION = "verification"
+# #3711: `coord issue close-wrong-repo` closes an issue whose fix belongs in
+# a different repo, filing the replacement there and linking the two with
+# this marker on the closing comment. Distinct from every event above: those
+# all narrate pipeline/worker conditions on a SINGLE issue; this one records
+# a cross-repo, cross-issue relationship (closed-here, refiled-there) so a
+# future parser can resolve `target=`/`issue=` back to the new issue without
+# re-scraping comment text.
+EVENT_WRONG_REPO = "wrong_repo"
 
 
 @dataclass

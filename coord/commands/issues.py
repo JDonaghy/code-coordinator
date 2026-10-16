@@ -579,20 +579,19 @@ def issue_create_cmd(
         "filing the replacement there in the same step (#3711). REPO/ISSUE "
         "are the issue being closed; --target is the repo (coordinator.yml "
         "name or owner/repo slug) the fix actually belongs in.\n\n"
-        "A worker that discovers mid-investigation that the root cause "
-        "lives elsewhere previously had no recourse but to say so in its "
-        "final message and stop — the queue kept dispatching fresh workers "
-        "at the same wrong-repo issue in the meantime (quadraui#1554: 3 "
-        "legs, 0 commits, all reporting the same wrong-repo conclusion). "
-        "This closes REPO#ISSUE with a `coord:event=wrong_repo` marker "
-        "comment pointing at the new issue, so the closed GH state alone "
-        "stops further dispatch — closing an issue already reads as "
-        "terminal/landed to the drive queue, no separate queue-side change "
-        "needed.\n\n"
+        "A worker that reaches this conclusion should run this instead of "
+        "just saying so in its final message — closing REPO#ISSUE with a "
+        "`coord:event=wrong_repo` marker comment pointing at the new issue "
+        "is what stops further dispatch against it; a final message alone "
+        "does not.\n\n"
         "--title/--body (or --body-file) seed the new issue — pass along "
         "the root-cause analysis from the investigation so it isn't lost. "
         "--reason is an optional one-line note on *why* it belongs in "
-        "--target, appended to REPO#ISSUE's closing comment.\n\n"
+        "--target, appended to REPO#ISSUE's closing comment. --label and "
+        "--milestone behave exactly as on `coord issue create`. A --body "
+        "without a `## Files` heading is accepted but warned about — "
+        "without it `coord drive-queue add`'s overlap prediction has "
+        "nothing to compare in-flight branches against.\n\n"
         "Auto-queueing the new issue (`coord drive-queue add`) is left to "
         "the operator/coordinator — this only files and links it."
     ),
@@ -616,6 +615,16 @@ def issue_create_cmd(
     help="One-line note on why this belongs in --target (appended to the close comment).",
 )
 @click.option(
+    "--label",
+    "labels",
+    multiple=True,
+    help="Label to apply to the new issue (repeatable).",
+)
+@click.option(
+    "--milestone", default=None,
+    help="Milestone (number or title) to attach the new issue to, resolved against --target.",
+)
+@click.option(
     "--force", is_flag=True, default=False,
     help="Close REPO#ISSUE even if it has open children (#1196).",
 )
@@ -628,6 +637,8 @@ def issue_close_wrong_repo_cmd(
     body: str | None,
     body_file: Path | None,
     reason: str | None,
+    labels: tuple[str, ...],
+    milestone: str | None,
     force: bool,
     config_path: Path,
 ) -> None:
@@ -639,35 +650,110 @@ def issue_close_wrong_repo_cmd(
     if not body:
         click.echo("error: provide --body or --body-file", err=True)
         sys.exit(2)
+    if "## Files" not in body:
+        click.echo(
+            "warning: --body has no `## Files` heading — "
+            "`coord drive-queue add`'s overlap prediction won't have "
+            "anything to compare in-flight branches against for the new issue",
+            err=True,
+        )
 
     cfg = _load_config(config_path)
     source_slug = _resolve_repo_slug(cfg, repo)
+    source_entry = cfg.repo(repo)
+    source_name = source_entry.name if source_entry is not None else repo
     target_slug = _resolve_repo_slug(cfg, target)
     target_entry = cfg.repo(target)
     target_name = target_entry.name if target_entry is not None else target
 
+    # Resolve --milestone *before* creating the issue (#3432) — creating the
+    # issue and then failing to attach it would silently reproduce the bug
+    # this closes (an issue that looks healthy but is unreachable from
+    # `coord.plans.aggregate_repo_plans`, which keys on milestone
+    # membership).
+    milestone_number: int | None = None
+    milestone_title: str | None = None
+    if milestone is not None:
+        from coord.commands.milestone import (  # noqa: PLC0415
+            MilestoneResolutionError,
+            resolve_milestone_ref,
+        )
+
+        try:
+            milestone_number, milestone_title = resolve_milestone_ref(target_slug, milestone)
+        except MilestoneResolutionError as e:
+            click.echo(f"error: {e}", err=True)
+            sys.exit(1)
+
+    # #3711: check for open children *before* filing in --target, not just
+    # at close time. `close_issue` below already refuses on open children,
+    # but by then the replacement issue would already exist — a refusal at
+    # that point followed by a natural `--force` retry would file a SECOND
+    # duplicate issue in --target rather than reusing the first. Checking
+    # here means a blocked close never creates anything in the first place.
+    if not force:
+        from coord.github_ops import has_open_children  # noqa: PLC0415
+
+        if has_open_children(source_slug, issue):
+            click.echo(
+                f"error: refusing to close {source_slug}#{issue}: it has "
+                "open children (#1196) — resolve them first, or re-run "
+                "with --force. Checked before filing in --target so a "
+                "blocked close here never leaves an orphan issue behind.",
+                err=True,
+            )
+            sys.exit(1)
+
+    from coord.comments import EVENT_WRONG_REPO  # noqa: PLC0415
     from coord.state import add_issue_context_entry, close_issue, create_issue  # noqa: PLC0415
 
     try:
-        result = create_issue(target_name, title, body, labels=[], repo_github=target_slug)
+        result = create_issue(
+            target_name, title, body, labels=list(labels), repo_github=target_slug,
+        )
     except Exception as e:  # noqa: BLE001
         click.echo(f"error: filing issue in {target_slug} failed: {e}", err=True)
         sys.exit(1)
     new_number = result["number"]
     click.echo(f"#{new_number} ({target_slug}) created")
 
-    marker = f"<!-- coord:event=wrong_repo target={target_slug} issue={new_number} -->"
+    if milestone_number is not None:
+        from coord.state import assign_issue_milestone  # noqa: PLC0415
+
+        try:
+            assign_issue_milestone(
+                target_name,
+                new_number,
+                milestone_number,
+                milestone_title=milestone_title,
+                repo_github=target_slug,
+            )
+        except Exception as e:  # noqa: BLE001
+            click.echo(
+                f"error: #{new_number} ({target_slug}) created but "
+                f"milestone assign failed: {e}",
+                err=True,
+            )
+            sys.exit(1)
+
+    marker = f"<!-- coord:event={EVENT_WRONG_REPO} target={target_slug} issue={new_number} -->"
     reason_line = f"\n\n{reason}" if reason else ""
     close_comment = (
         f"Closing — this belongs in `{target_slug}`, filed as "
         f"{target_slug}#{new_number}.{reason_line}\n\n{marker}"
     )
     try:
-        close_issue(repo, issue, comment=close_comment, repo_github=source_slug, force=force)
+        close_issue(
+            source_name, issue, comment=close_comment, repo_github=source_slug, force=force,
+        )
     except Exception as e:  # noqa: BLE001
         click.echo(
             f"error: #{new_number} ({target_slug}) created but closing "
-            f"#{issue} ({source_slug}) failed: {e}",
+            f"#{issue} ({source_slug}) failed: {e}\n"
+            f"Do not re-run this command to retry — it would file a "
+            f"second, duplicate issue in {target_slug}. Instead close "
+            f"{source_slug}#{issue} directly (`coord issue close {repo} "
+            f"{issue}`), referencing {target_slug}#{new_number}.",
             err=True,
         )
         sys.exit(1)
@@ -675,18 +761,30 @@ def issue_close_wrong_repo_cmd(
 
     # Pinned context entries link the two issues in both directions without
     # requiring a comment re-scrape — same hygiene as upstream_gaps._file_one.
-    add_issue_context_entry(
-        repo, issue,
-        f"Closed as wrong-repo — filed in {target_slug}#{new_number}.",
-        pinned=True,
-        source="wrong-repo",
-    )
-    add_issue_context_entry(
-        target_name, new_number,
-        f"Filed from {source_slug}#{issue} (closed as wrong-repo).",
-        pinned=True,
-        source="wrong-repo",
-    )
+    # Both writes that actually matter (the new issue, the close) already
+    # landed by this point, so a daemon hiccup here must not surface as a
+    # raw traceback on an otherwise-successful command (model:
+    # coord/upstream_gaps.py's own context-entry writes).
+    try:
+        add_issue_context_entry(
+            source_name, issue,
+            f"Closed as wrong-repo — filed in {target_slug}#{new_number}.",
+            pinned=True,
+            source="wrong-repo",
+        )
+        add_issue_context_entry(
+            target_name, new_number,
+            f"Filed from {source_slug}#{issue} (closed as wrong-repo).",
+            pinned=True,
+            source="wrong-repo",
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(
+            f"warning: {source_slug}#{issue} closed and {target_slug}#"
+            f"{new_number} filed, but recording the cross-link context "
+            f"entry failed: {e}",
+            err=True,
+        )
 
 
 @issue_group.command(
