@@ -191,6 +191,16 @@ class GateSnapshot:
     # lookup that found nothing: same fail-open *caching* convention as
     # `branch_shas` above.
     deployment_urls: dict[tuple[str, str], str | None] = field(default_factory=dict)
+    # #3707: (repo, base, head) -> unified diff text for the ancillary-only
+    # rebase-delta check (`merge_queue._review_delta_is_ancillary_only`).
+    # Keyed on (repo, base_ref_or_sha, head_sha) — the same triple
+    # `github_ops.get_compare_diff` takes.  A key that is absent (never
+    # refreshed) yields None, which `_fetch_compare_diff` already treats as
+    # "can't compare → not ancillary-only" (fail-closed), same convention
+    # as `branch_shas`/`branch_patch_ids` above.
+    compare_diffs: dict[tuple[str, str, str], str | None] = field(
+        default_factory=dict
+    )
     # #1904: repo -> whether the inner CiStore believes this repo declares
     # CI at all — the signal `expects_checks` below needs to tell "no CI
     # configured" apart from "CI exists but never reported for this PR"
@@ -261,6 +271,11 @@ class GateSnapshot:
 
     def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
         return self.branch_commit_timestamps.get((repo, branch))
+
+    # ── github_ops view consumed by the #3707 ancillary-only rebase check ──
+    # (merge_queue._review_delta_is_ancillary_only → _fetch_compare_diff)
+    def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+        return self.compare_diffs.get((repo, base, head))
 
     # ── github_ops view consumed by the #2948 UAT preview-URL lookup ───────
     # (#3216 — merge_queue._resolve_uat_preview_url)
