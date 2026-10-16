@@ -1441,10 +1441,19 @@ def _recover_test(
             from coord.reconcile import (  # noqa: PLC0415
                 propagate_smoke_terminal_failure,
             )
+            from coord.state import load_assignment_exit_code  # noqa: PLC0415
 
+            # #3705: the board projection carries no `exit_code`, so read the
+            # smoke child's recorded exit status directly — without it every
+            # reason-less failure would reclassify as a silent #1605 death and
+            # earn a bounded retry instead of a work failure.  A `cancelled`
+            # row is the operator's own `coord stop`, whose exit status is the
+            # kill signal rather than a verdict on the code under test.
             propagate_smoke_terminal_failure(
                 parent_assignment_id=latest.assignment_id,
                 failure_reason=smoke.failure_reason,
+                operator_cancelled=(smoke.status or "") == "cancelled",
+                exit_code=load_assignment_exit_code(smoke.assignment_id),
             )
             res.actions_taken.append(
                 f"resolved stuck test_state='running' from smoke child "

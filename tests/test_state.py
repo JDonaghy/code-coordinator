@@ -6150,6 +6150,35 @@ class TestMarkNotifiedReleasesLeakedSmokeClaim:
         assert state.claim_smoke_dispatch("w1", "macos") is True
 
 
+class TestLoadAssignmentExitCode:
+    """#3705: `load_assignment_exit_code` is how a caller holding only an
+    `Assignment` (whose projection has no `exit_code`) reaches the dying
+    worker's recorded process exit status — the evidence
+    `propagate_smoke_terminal_failure` uses to tell a genuine work failure
+    from a silent #1605 death."""
+
+    def test_reads_back_a_recorded_non_zero_exit(self, coord_db) -> None:
+        from coord.comments import EVENT_FAILURE
+
+        _seed_smoke_leg_row("leg1", review_of_assignment_id="w1", status="running")
+        state.mark_notified(
+            "leg1", EVENT_FAILURE, branch=None, failure_reason=None, exit_code=1,
+        )
+
+        assert state.load_assignment_exit_code("leg1") == 1
+
+    def test_absent_exit_status_reads_as_none(self, coord_db) -> None:
+        """A row whose agent recorded no exit status at all — the #1605 shape
+        — must read as `None`, never be invented as a zero."""
+        _seed_smoke_leg_row("leg2", review_of_assignment_id="w1", status="running")
+
+        assert state.load_assignment_exit_code("leg2") is None
+
+    def test_unknown_or_empty_id_reads_as_none(self, coord_db) -> None:
+        assert state.load_assignment_exit_code("does-not-exist") is None
+        assert state.load_assignment_exit_code("") is None
+
+
 class TestResetWorkTestStateReleasesSmokeClaims:
     """#3333: `coord diagnose --stage test --reset`'s whole point is forcing
     a fresh Test-stage dispatch — that must not be silently defeated by a

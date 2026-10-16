@@ -4623,17 +4623,26 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 # can protect a still-live/already-passed sibling partition
                 # from a false aggregate failure instead of folding this
                 # leg's cancellation straight into the parent's verdict.
+                # #3705: `exit_code` is the deciding evidence for the
+                # silent-death branch — a leg that actually ran and exited
+                # non-zero is a genuine work failure even with no classified
+                # reason text, while a leg whose process left no exit status
+                # at all is the #1605 class that gets a bounded retry. Same
+                # forwarding as `coord.reconcile`'s own call site, so both
+                # surfaces answer "silent or genuine?" identically.
                 propagate_smoke_terminal_failure(
                     parent_assignment_id=transition.assignment_id,
                     failure_reason=_failure_reason,
                     fanout_parent_id=parent_id,
                     operator_cancelled=entry.get("status") == "cancelled",
+                    exit_code=transition.exit_code,
                 )
                 finalize_smoke_fanout(parent_id)
             else:
                 propagate_smoke_terminal_failure(
                     parent_assignment_id=parent_id,
                     failure_reason=_failure_reason,
+                    exit_code=transition.exit_code,
                 )
     elif transition.event == EVENT_COMPLETION:
         # #2188: a `deliverable:analysis` issue that legitimately ended with
