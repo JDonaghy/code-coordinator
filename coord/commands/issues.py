@@ -573,6 +573,123 @@ def issue_create_cmd(
 
 
 @issue_group.command(
+    "close-wrong-repo",
+    help=(
+        "Close an issue that turns out to belong in a different repo, "
+        "filing the replacement there in the same step (#3711). REPO/ISSUE "
+        "are the issue being closed; --target is the repo (coordinator.yml "
+        "name or owner/repo slug) the fix actually belongs in.\n\n"
+        "A worker that discovers mid-investigation that the root cause "
+        "lives elsewhere previously had no recourse but to say so in its "
+        "final message and stop — the queue kept dispatching fresh workers "
+        "at the same wrong-repo issue in the meantime (quadraui#1554: 3 "
+        "legs, 0 commits, all reporting the same wrong-repo conclusion). "
+        "This closes REPO#ISSUE with a `coord:event=wrong_repo` marker "
+        "comment pointing at the new issue, so the closed GH state alone "
+        "stops further dispatch — closing an issue already reads as "
+        "terminal/landed to the drive queue, no separate queue-side change "
+        "needed.\n\n"
+        "--title/--body (or --body-file) seed the new issue — pass along "
+        "the root-cause analysis from the investigation so it isn't lost. "
+        "--reason is an optional one-line note on *why* it belongs in "
+        "--target, appended to REPO#ISSUE's closing comment.\n\n"
+        "Auto-queueing the new issue (`coord drive-queue add`) is left to "
+        "the operator/coordinator — this only files and links it."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--target", required=True,
+    help="Repo (coordinator.yml name or owner/repo slug) the fix belongs in.",
+)
+@click.option("--title", required=True, help="Title for the new issue in --target.")
+@click.option("--body", default=None, help="Body for the new issue in --target (markdown).")
+@click.option(
+    "--body-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Read the new issue's body from a file. '-' = stdin.",
+)
+@click.option(
+    "--reason", default=None,
+    help="One-line note on why this belongs in --target (appended to the close comment).",
+)
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Close REPO#ISSUE even if it has open children (#1196).",
+)
+@_CONFIG_OPTION
+def issue_close_wrong_repo_cmd(
+    repo: str,
+    issue: int,
+    target: str,
+    title: str,
+    body: str | None,
+    body_file: Path | None,
+    reason: str | None,
+    force: bool,
+    config_path: Path,
+) -> None:
+    if body is not None and body_file is not None:
+        click.echo("error: --body and --body-file are mutually exclusive", err=True)
+        sys.exit(2)
+    if body_file is not None:
+        body = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
+    if not body:
+        click.echo("error: provide --body or --body-file", err=True)
+        sys.exit(2)
+
+    cfg = _load_config(config_path)
+    source_slug = _resolve_repo_slug(cfg, repo)
+    target_slug = _resolve_repo_slug(cfg, target)
+    target_entry = cfg.repo(target)
+    target_name = target_entry.name if target_entry is not None else target
+
+    from coord.state import add_issue_context_entry, close_issue, create_issue  # noqa: PLC0415
+
+    try:
+        result = create_issue(target_name, title, body, labels=[], repo_github=target_slug)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: filing issue in {target_slug} failed: {e}", err=True)
+        sys.exit(1)
+    new_number = result["number"]
+    click.echo(f"#{new_number} ({target_slug}) created")
+
+    marker = f"<!-- coord:event=wrong_repo target={target_slug} issue={new_number} -->"
+    reason_line = f"\n\n{reason}" if reason else ""
+    close_comment = (
+        f"Closing — this belongs in `{target_slug}`, filed as "
+        f"{target_slug}#{new_number}.{reason_line}\n\n{marker}"
+    )
+    try:
+        close_issue(repo, issue, comment=close_comment, repo_github=source_slug, force=force)
+    except Exception as e:  # noqa: BLE001
+        click.echo(
+            f"error: #{new_number} ({target_slug}) created but closing "
+            f"#{issue} ({source_slug}) failed: {e}",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(f"#{issue} ({source_slug}) closed as wrong-repo")
+
+    # Pinned context entries link the two issues in both directions without
+    # requiring a comment re-scrape — same hygiene as upstream_gaps._file_one.
+    add_issue_context_entry(
+        repo, issue,
+        f"Closed as wrong-repo — filed in {target_slug}#{new_number}.",
+        pinned=True,
+        source="wrong-repo",
+    )
+    add_issue_context_entry(
+        target_name, new_number,
+        f"Filed from {source_slug}#{issue} (closed as wrong-repo).",
+        pinned=True,
+        source="wrong-repo",
+    )
+
+
+@issue_group.command(
     "label",
     help=(
         "Add and/or remove arbitrary labels on an existing issue through the "
