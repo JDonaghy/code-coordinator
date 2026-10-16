@@ -129,12 +129,17 @@ def _slice_test_author(
 class FakeGh:
     """Stub gh_ops — returns fixed SHAs/patch-ids, records calls made."""
 
-    def __init__(self, *, branch_sha="branchsha", base_sha="basesha", patch_id="patchid"):
+    def __init__(
+        self, *, branch_sha="branchsha", base_sha="basesha", patch_id="patchid",
+        compare_files: list[str] | None = None,
+    ):
         self.branch_sha = branch_sha
         self.base_sha = base_sha
         self.patch_id = patch_id
+        self.compare_files = compare_files
         self.sha_calls: list[tuple[str, str]] = []
         self.patch_calls: list[tuple[str, str, str]] = []
+        self.compare_calls: list[tuple[str, str, str]] = []
 
     def get_branch_sha(self, repo: str, branch: str) -> str | None:
         self.sha_calls.append((repo, branch))
@@ -143,6 +148,10 @@ class FakeGh:
     def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
         self.patch_calls.append((repo, base, branch))
         return self.patch_id
+
+    def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+        self.compare_calls.append((repo, base, head))
+        return self.compare_files
 
 
 # ── raw column dump ─────────────────────────────────────────────────────────
@@ -582,6 +591,63 @@ class TestDecision:
         assert by_gate["review"].reason == mq.UNKNOWN_BRANCH_HEAD_REASON
         assert by_gate["review"].reason != "review required but not approved"
         assert by_gate["review"].verdict_unparseable is False
+
+    def test_ancillary_only_rebase_delta_reports_merge_ready(self) -> None:
+        """#3707: `build_gate_report` threads the repo's configured
+        `ancillary_files` through to `scan_approved_reviews` — a rebase
+        whose live compare shows only an ancillary-file delta reports
+        the review (and merge) gate READY despite the patch-id mismatch,
+        exactly like `coord merge` would."""
+        repo_cfg = Repo(
+            name="api", github="acme/api", default_branch="main",
+            ancillary_files=["CHANGELOG.md", "README.md"],
+        )
+        config = Config(
+            repos=[repo_cfg],
+            machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+        )
+        work = _work(test_state="passed")
+        review = _review(
+            "w1", verdict="approve",
+            review_head_sha="oldsha", review_patch_id="patchid-old",
+        )
+        board = Board(active=[], completed=[work, review])
+        gh_ops = FakeGh(
+            branch_sha="newsha", patch_id="patchid-new",
+            compare_files=["CHANGELOG.md"],
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh_ops)
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is True
+        assert by_gate["merge"].ok is True
+
+    def test_mixed_rebase_delta_still_blocks_merge(self) -> None:
+        """A rebase delta that touches even one non-ancillary file is not
+        exempt — the review gate stays BLOCKED, same as before #3707."""
+        repo_cfg = Repo(
+            name="api", github="acme/api", default_branch="main",
+            ancillary_files=["CHANGELOG.md"],
+        )
+        config = Config(
+            repos=[repo_cfg],
+            machines=[Machine(name="precision", host="precision.tailnet", repos=["api"])],
+        )
+        work = _work(test_state="passed")
+        review = _review(
+            "w1", verdict="approve",
+            review_head_sha="oldsha", review_patch_id="patchid-old",
+        )
+        board = Board(active=[], completed=[work, review])
+        gh_ops = FakeGh(
+            branch_sha="newsha", patch_id="patchid-new",
+            compare_files=["CHANGELOG.md", "src/main.py"],
+        )
+        report = build_gate_report(board, config, "api", 42, gh_ops=gh_ops)
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is False
+        assert by_gate["merge"].ok is False
 
 
 # ── UAT gate, registry-walked (#3273, S-5 of #3261) ─────────────────────────

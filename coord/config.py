@@ -3327,6 +3327,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "reference_repos",
         "new_issue_guidance",
         "artifact_paths",
+        "ancillary_files",
         "provider",
         "uat_preview",
         "uat_live_preview",
@@ -3581,6 +3582,20 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 )
         artifact_paths: list[str] = list(artifact_paths_raw)
 
+        # #3707: ancillary_files — filenames whose conflict resolution is
+        # always mechanical (e.g. CHANGELOG.md, README.md), so a rebase
+        # delta confined to them skips the scoped re-review.
+        ancillary_files_raw = entry.get("ancillary_files", []) or []
+        if not isinstance(ancillary_files_raw, list):
+            raise ConfigError(f"repos[{i}].ancillary_files must be a list of strings")
+        for j, p in enumerate(ancillary_files_raw):
+            if not isinstance(p, str):
+                raise ConfigError(
+                    f"repos[{i}].ancillary_files[{j}] must be a string, "
+                    f"got {type(p).__name__}"
+                )
+        ancillary_files: list[str] = list(ancillary_files_raw)
+
         # #323: optional per-repo provider override.
         repo_provider = entry.get("provider")
         if repo_provider is not None and not isinstance(repo_provider, str):
@@ -3667,6 +3682,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 reference_repos=reference_repos,
                 new_issue_guidance=new_issue_guidance,
                 artifact_paths=artifact_paths,
+                ancillary_files=ancillary_files,
                 provider=repo_provider,
                 uat_preview=uat_preview,
                 uat_live_preview=uat_live_preview_raw,
