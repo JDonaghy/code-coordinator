@@ -3140,6 +3140,34 @@ class TestRecordTestVerdictInfraReclassification:
         assert row["smoke_test"] == "fail"
         assert "FAILED tests/test_widget.py" in row["test_reason"]
 
+    def test_plain_runner_timeout_is_cleared_for_retest_not_recorded_as_failed(
+        self, coord_db,
+    ) -> None:
+        """#1476 (2026-10-10/11): a #3673 plain-runner Test leg that hit its
+        own wall-clock timeout mid-`cargo test` writes `test_reason=
+        "headless smoke: exit=-1"` (coord.notify._record_smoke_verdict,
+        reading coord.agent.run_plain_runner_command's `exit_code=-1`
+        sentinel) — no `claude -p` session, so it never had the chance to
+        print the #3670 `never returned an exit status` sentence this
+        reclassifier was first written against. Before `_INFRA_RE` learned
+        `exit=-\\d+`, this landed as a plain `failed` and spent two real fix
+        rounds on a worker that had nothing to fix."""
+        self._seed_assignment(coord_db)
+
+        record_test_verdict(
+            assignment_id="aid-1",
+            test_state="failed",
+            test_reason="headless smoke: exit=-1",
+        )
+
+        row = coord_db.execute(
+            "SELECT test_state, test_reason, smoke_test FROM assignments "
+            "WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_state"] is None
+        assert row["smoke_test"] is None
+        assert "reclassified as infrastructure" in row["test_reason"]
+
     def test_infra_failure_tally_increments_across_consecutive_legs(
         self, coord_db,
     ) -> None:

@@ -320,6 +320,21 @@ class TestClassifyInfra:
             # shape recorded a plain `failed` and spent a real fix round.
             "headless smoke: <the smoke command never returned an exit "
             "status within this session>",
+            # #1476 (2026-10-10/11): #3673's plain-runner Test stage has no
+            # `claude -p` session to print the sentence above — it maps a
+            # `subprocess.TimeoutExpired` straight to the sentinel
+            # `exit_code=-1` (coord.agent.run_plain_runner_command) and
+            # `coord.notify._record_smoke_verdict` carries that into
+            # `test_reason` verbatim. Before this case was added, NOTHING in
+            # `_INFRA_RE` matched it either, so the #1476 macOS smoke leg's
+            # wall-clock timeout was recorded as a plain `failed` and spent
+            # two real fix rounds on a worker that had nothing to fix.
+            "headless smoke: exit=-1",
+            # A signal-killed (not timed-out) plain-runner child reaches the
+            # same marker shape with its own negative `returncode` — same
+            # "never ran to completion" kind, mirroring
+            # `coord.confirm_test._classify_failure`'s `returncode < 0` rule.
+            "headless smoke: exit=-9",
         ],
     )
     def test_infra_signatures_classify_environmental(self, reason: str) -> None:
@@ -343,6 +358,11 @@ class TestClassifyInfra:
             # worktree cleanup path must never be reclassified away.
             "test_cleanup_deletes_the_worktree failed: AssertionError",
             "test_process_is_killed_on_timeout failed",
+            # A plain-runner leg that actually ran to completion and failed
+            # reports its real (non-negative) exit status — `exit=-\d+`
+            # must never swallow this.
+            "headless smoke: exit=1",
+            "headless smoke: exit=101",
         ],
     )
     def test_genuine_failures_are_not_misclassified_as_infra(

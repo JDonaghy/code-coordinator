@@ -273,6 +273,26 @@ _NETWORK_RE = re.compile(
 # in the field; the other phrasings below are kept for a human operator
 # typing a `coord test --fail`/`coord diagnose` reason in the same register,
 # but none of them is (yet) machine-emitted.
+#
+# #1476 incident (2026-10-10/11): #3673's plain runner — the Test stage's
+# bare-subprocess path, no `claude -p` session, so it never had the chance to
+# print the `never returned an exit status` sentence above — has its OWN
+# machine-emitted shape that this regex never anticipated.
+# `coord.agent.run_plain_runner_command` maps a `subprocess.TimeoutExpired` to
+# the sentinel `exit_code=-1` (never a real shell exit status, which is
+# always 0-255), and `plain_runner_smoke_marker_lines` prints that verbatim as
+# `SMOKE: fail exit={verdict.exit_code}` — which
+# `coord.notify._record_smoke_verdict` then carries into `test_reason` as
+# `"headless smoke: exit=-1"`. A real signal-kill mid-run (not a timeout)
+# reaches the same marker with `result.returncode` itself negative (e.g.
+# `exit=-9` for SIGKILL), identical in kind: a command that never ran to
+# completion says nothing about the branch, the same #2527 rule
+# `coord.confirm_test._classify_failure` already applies to its own
+# `returncode < 0` case. `exit=-\d+` is safe to match unconditionally here —
+# grepping the repo for this exact `exit={...}` f-string shows it is produced
+# in exactly one place (`coord.agent.plain_runner_smoke_marker_lines`), and a
+# genuine `cargo`/`pytest` failure's own exit status is always >= 0, so this
+# can never swallow a real refutation.
 _INFRA_RE = re.compile(
     r"("
     r"worktree\s+\S+\s+was\s+deleted\s+out\s+from\s+under"
@@ -281,6 +301,7 @@ _INFRA_RE = re.compile(
     r"|never\s+returned\s+an\s+exit\s+status"
     r"|runner\s+(?:was\s+)?killed\s+before\s+it\s+could\s+report"
     r"|infra\s+issue,?\s+not\s+a\s+test\s+result"
+    r"|exit=-\d+"
     r")",
     re.IGNORECASE,
 )
