@@ -3271,28 +3271,94 @@ def test_a_done_smoke_child_with_lagging_test_state_still_just_waits():
     assert action.kind == WAIT
 
 
-def test_a_failed_test_loops_through_coord_fix_on_the_same_branch():
-    """`coord fix` gates on the legacy smoke_test field and dispatches with
-    inherit_branch=True — the same branch, model escalated (#1445)."""
+def test_a_failed_test_retries_once_before_fix_round():
+    """#3714: the first test failure at a given SHA retries the test stage
+    via ``coord diagnose --stage test --reset`` before consuming a fix round."""
     counters = DriveCounters()
-    action = step(
-        done_work(work_test_state="failed", work_test_reason="3 failed"),
-        counters=counters,
-    )
-    assert action.command == ("fix", "w1")
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+    retry = step(s, counters=counters)
+    assert retry.command[0] == "diagnose"
+    assert "--reset" in retry.command
+    assert counters.fix_rounds == 0
+
+    # Second failure at the same SHA proceeds to the fix round.
+    fix = step(s, counters=counters)
+    assert fix.command == ("fix", "w1")
     assert counters.fix_rounds == 1
-    assert "smoke_test" in action.error_message  # the diagnosis if it won't dispatch
-    assert action.on_error == "die"
+    assert "smoke_test" in fix.error_message
+    assert fix.on_error == "die"
+
+
+def test_empty_fix_round_does_not_spend_the_budget():
+    """#3713: if a fix worker pushes 0 commits (SHA unchanged), the fix_rounds
+    increment is undone so an infra death doesn't consume the budget."""
+    sha = "aaa"
+    v = FakeVerifier(head_sha=sha)
+    counters = DriveCounters(
+        test_retry_sha=sha,  # #3714 retry already spent
+        fix_rounds=1,
+        fix_round_dispatched_sha=sha,  # previous fix dispatched at this SHA
+    )
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+
+    # SHA unchanged → #3713 undoes the increment, then re-dispatches.
+    action = step(s, counters=counters, verifier=v)
+    assert action.command == ("fix", "w1")
+    assert counters.fix_rounds == 1  # net: undid 1→0, then dispatched 0→1
+    assert counters.empty_fix_retried_sha == sha
+
+
+def test_empty_fix_round_latch_prevents_infinite_undo():
+    """#3713: the empty_fix_retried_sha latch prevents a second undo at the
+    same SHA, so an infinitely-failing fix worker doesn't loop forever."""
+    sha = "aaa"
+    v = FakeVerifier(head_sha=sha)
+    counters = DriveCounters(
+        test_retry_sha=sha,
+        fix_rounds=1,
+        fix_round_dispatched_sha=sha,
+        empty_fix_retried_sha=sha,  # latch already set for this SHA
+    )
+    opts = DriveOptions(machine="precision", max_fix_rounds=2)
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+
+    # SHA unchanged but latch is set → fix_rounds is NOT undone.
+    action = step(s, opts, counters=counters, verifier=v)
+    assert action.command == ("fix", "w1")
+    assert counters.fix_rounds == 2  # no undo: stayed at 1, then incremented to 2
+
+    # A third attempt at the same SHA hits the ceiling.
+    exhausted = step(s, opts, counters=counters, verifier=v)
+    assert exhausted.is_exit
+    assert "after 2 fix round(s)" in exhausted.message
 
 
 def test_the_test_fix_loop_is_bounded_by_max_fix_rounds():
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_fix_rounds=2)
     s = done_work(work_test_state="failed", work_test_reason="3 failed")
+    v = FakeVerifier(head_sha="aaa")
 
-    assert step(s, opts, counters=counters).command == ("fix", "w1")
-    assert step(s, opts, counters=counters).command == ("fix", "w1")
-    exhausted = step(s, opts, counters=counters)
+    # #3714 retry fires first.
+    retry = step(s, opts, counters=counters, verifier=v)
+    assert retry.command[0] == "diagnose"
+
+    # Second failure at same SHA → fix round 1.
+    assert step(s, opts, counters=counters, verifier=v).command == ("fix", "w1")
+    assert counters.fix_rounds == 1
+
+    # Simulate the fix worker pushing a commit (new SHA).
+    v = FakeVerifier(head_sha="bbb")
+    # #3714 retry fires at the new SHA.
+    retry2 = step(s, opts, counters=counters, verifier=v)
+    assert retry2.command[0] == "diagnose"
+    # Second failure at new SHA → fix round 2.
+    assert step(s, opts, counters=counters, verifier=v).command == ("fix", "w1")
+    assert counters.fix_rounds == 2
+
+    # Third attempt at yet another SHA → ceiling reached.
+    v = FakeVerifier(head_sha="ccc")
+    exhausted = step(s, opts, counters=counters, verifier=v)
     assert exhausted.is_exit
     assert exhausted.exit_code == EXIT_TERMINAL_FAILURE
     assert "after 2 fix round(s)" in exhausted.message
@@ -3688,29 +3754,34 @@ def test_the_review_fix_arm_shares_one_fix_budget_with_the_test_arm():
     """Not a parallel counter (#1692): a failing test and a request-changes
     review are two shapes of one loop, so a drive that bounces between them
     spends ONE budget. Two rounds of mixed kinds exhaust --max-fix-rounds 2."""
-    counters = DriveCounters()
+    sha = "aaa"
+    v = FakeVerifier(head_sha=sha)
+    counters = DriveCounters(test_retry_sha=sha)  # #3714 retry already spent
     opts = DriveOptions(machine="precision", max_fix_rounds=2)
 
     first = step(
         done_work(work_test_state="failed", work_test_reason="3 failed"),
-        opts, counters=counters,
+        opts, counters=counters, verifier=v,
     )
     assert first.command == ("fix", "w1")  # test arm, round 1
 
-    second = step(requested_changes(), opts, counters=counters)
+    # Simulate the fix worker pushing (SHA advances).
+    v2 = FakeVerifier(head_sha="bbb")
+    second = step(requested_changes(), opts, counters=counters, verifier=v2)
     assert second.command == ("fix", "r1")  # review arm, round 2
     assert counters.fix_rounds == 2
 
     # A THIRD round of either kind is over budget.
-    exhausted = step(requested_changes(review_aid="r2"), opts, counters=counters)
+    exhausted = step(requested_changes(review_aid="r2"), opts, counters=counters, verifier=v2)
     assert exhausted.is_exit
     assert exhausted.exit_code == EXIT_TERMINAL_FAILURE
     assert "after 2 fix round(s)" in exhausted.message
     assert "NOT exhausted" in exhausted.message  # says WHICH cap was hit
 
+    # The test arm also stays exhausted (fix_rounds already at ceiling).
     still_exhausted = step(
         done_work(work_test_state="failed", work_test_reason="3 failed"),
-        opts, counters=counters,
+        opts, counters=counters, verifier=v2,
     )
     assert still_exhausted.is_exit
 

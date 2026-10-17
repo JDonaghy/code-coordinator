@@ -558,6 +558,19 @@ class DriveCounters:
     # another round" loop, and a drive that spends three rounds bouncing
     # between them has spent three rounds. Bounded by `opts.max_fix_rounds`.
     fix_rounds: int = 0
+    # #3713: branch SHA when the last fix round was dispatched.  If we
+    # re-enter `_decide_test` and the SHA is unchanged, the fix round
+    # pushed 0 commits (killed or otherwise empty) — undo the increment
+    # so an infra death doesn't spend the budget.
+    fix_round_dispatched_sha: str = ""
+    # #3713: SHA for which we already gave one free empty-fix-round retry.
+    # Prevents infinite undo→redispatch when a fix worker never pushes.
+    empty_fix_retried_sha: str = ""
+    # #3714: one-shot retry latch — the branch SHA for which we already
+    # retried the test stage before dispatching a fix round.  A first
+    # test failure at a given SHA retries the test; only the second
+    # failure at the same SHA proceeds to a fix round.
+    test_retry_sha: str = ""
     merge_attempts: int = 0
     review_dispatches: int = 0
     # #1584: bounded retry for a review WORKER that died (transient API
@@ -3190,7 +3203,7 @@ def decide(
             acceptance_gate, warnings=warnings + acceptance_gate.warnings
         )
 
-    test = _decide_test(state, opts, counters, machine)
+    test = _decide_test(state, opts, counters, machine, verifier=verifier)
     if test is not None:
         return replace(test, warnings=warnings + test.warnings)
 
@@ -3562,6 +3575,7 @@ def _decide_test(
     opts: DriveOptions,
     counters: DriveCounters,
     machine: str,
+    verifier: MergeVerifier | None = None,
 ) -> Action | None:
     """The TEST gate.  ``None`` means "passed/skipped, fall through".
 
@@ -3655,6 +3669,25 @@ def _decide_test(
                 f"   Recover: coord diagnose {state.repo} {state.issue} "
                 "--stage test --reset"
             )
+        # #3713: if we dispatched a fix round and the branch HEAD has not
+        # advanced, the fix worker pushed 0 commits (killed, timed out, or
+        # found nothing to do).  Undo the previous increment so an infra
+        # death doesn't spend the budget — but only once per SHA (the
+        # `empty_fix_retried_sha` latch prevents infinite undo→redispatch).
+        # `branch_head_sha` costs one GitHub API call — only invoked here
+        # (test failed + fix_rounds > 0), not on every poll.
+        current_sha: str | None = None
+        if (
+            counters.fix_rounds > 0
+            and counters.fix_round_dispatched_sha
+            and verifier is not None
+        ):
+            current_sha = verifier.branch_head_sha(state)
+            if current_sha and current_sha == counters.fix_round_dispatched_sha:
+                if counters.empty_fix_retried_sha != current_sha:
+                    counters.fix_rounds -= 1
+                    counters.empty_fix_retried_sha = current_sha
+
         if counters.fix_rounds >= opts.max_fix_rounds:
             return _die(
                 f"test still failing after {counters.fix_rounds} fix round(s) — "
@@ -3665,7 +3698,33 @@ def _decide_test(
                 f"   Continue by hand: coord assign --interactive --fix-of "
                 f"{state.work_aid}"
             )
+
+        # #3714: retry the test once before consuming a fix round.  A
+        # first failure at a given SHA gets one automatic retest; only the
+        # second failure at the same SHA dispatches the fix worker.  This
+        # avoids burning a fix slot on a transient / flaky failure.
+        branch_sha = current_sha or (
+            verifier.branch_head_sha(state) if verifier is not None else None
+        )
+        if branch_sha and counters.test_retry_sha != branch_sha:
+            counters.test_retry_sha = branch_sha
+            return Action(
+                kind=RUN,
+                label="TEST: failed — retrying once before fix round (#3714)",
+                command=(
+                    "diagnose", state.repo, str(state.issue),
+                    "--stage", "test", "--reset",
+                ),
+                error_message=(
+                    f"coord diagnose {state.repo} {state.issue} "
+                    "--stage test --reset failed."
+                ),
+                sleep_after=10.0,
+            )
+
         counters.fix_rounds += 1
+        # Record the branch SHA so #3713 can detect an empty fix round.
+        counters.fix_round_dispatched_sha = branch_sha or ""
         # `coord fix` gates on the assignment's legacy `smoke_test == "fail"`
         # field — which `coord test --fail` mirrors from `test_state` — and
         # dispatches a follow-up worker with `inherit_branch=True`, so the fix
