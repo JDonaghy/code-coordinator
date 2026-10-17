@@ -3289,6 +3289,50 @@ def test_a_failed_test_retries_once_before_fix_round():
     assert fix.on_error == "die"
 
 
+def test_empty_fix_round_does_not_spend_the_budget():
+    """#3713: if a fix worker pushes 0 commits (SHA unchanged), the fix_rounds
+    increment is undone so an infra death doesn't consume the budget."""
+    sha = "aaa"
+    v = FakeVerifier(head_sha=sha)
+    counters = DriveCounters(
+        test_retry_sha=sha,  # #3714 retry already spent
+        fix_rounds=1,
+        fix_round_dispatched_sha=sha,  # previous fix dispatched at this SHA
+    )
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+
+    # SHA unchanged → #3713 undoes the increment, then re-dispatches.
+    action = step(s, counters=counters, verifier=v)
+    assert action.command == ("fix", "w1")
+    assert counters.fix_rounds == 1  # net: undid 1→0, then dispatched 0→1
+    assert counters.empty_fix_retried_sha == sha
+
+
+def test_empty_fix_round_latch_prevents_infinite_undo():
+    """#3713: the empty_fix_retried_sha latch prevents a second undo at the
+    same SHA, so an infinitely-failing fix worker doesn't loop forever."""
+    sha = "aaa"
+    v = FakeVerifier(head_sha=sha)
+    counters = DriveCounters(
+        test_retry_sha=sha,
+        fix_rounds=1,
+        fix_round_dispatched_sha=sha,
+        empty_fix_retried_sha=sha,  # latch already set for this SHA
+    )
+    opts = DriveOptions(machine="precision", max_fix_rounds=2)
+    s = done_work(work_test_state="failed", work_test_reason="3 failed")
+
+    # SHA unchanged but latch is set → fix_rounds is NOT undone.
+    action = step(s, opts, counters=counters, verifier=v)
+    assert action.command == ("fix", "w1")
+    assert counters.fix_rounds == 2  # no undo: stayed at 1, then incremented to 2
+
+    # A third attempt at the same SHA hits the ceiling.
+    exhausted = step(s, opts, counters=counters, verifier=v)
+    assert exhausted.is_exit
+    assert "after 2 fix round(s)" in exhausted.message
+
+
 def test_the_test_fix_loop_is_bounded_by_max_fix_rounds():
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_fix_rounds=2)

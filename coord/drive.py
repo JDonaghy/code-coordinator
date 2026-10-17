@@ -559,9 +559,9 @@ class DriveCounters:
     # between them has spent three rounds. Bounded by `opts.max_fix_rounds`.
     fix_rounds: int = 0
     # #3713: branch SHA when the last fix round was dispatched.  If we
-    # re-enter `_decide_test_failed` and the SHA is unchanged, the fix
-    # round pushed 0 commits (killed or otherwise empty) — undo the
-    # increment so an infra death doesn't spend the budget.
+    # re-enter `_decide_test` and the SHA is unchanged, the fix round
+    # pushed 0 commits (killed or otherwise empty) — undo the increment
+    # so an infra death doesn't spend the budget.
     fix_round_dispatched_sha: str = ""
     # #3713: SHA for which we already gave one free empty-fix-round retry.
     # Prevents infinite undo→redispatch when a fix worker never pushes.
