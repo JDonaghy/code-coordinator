@@ -6425,10 +6425,24 @@ PLAIN_RUNNER_LOG_TAIL_CHARS = 8000
 
 
 def _tail_text(text: str, limit: int = PLAIN_RUNNER_LOG_TAIL_CHARS) -> str:
-    """The last *limit* characters of *text*, with a marker when truncated."""
+    """Keep the first and last portions of *text* when it exceeds *limit*.
+
+    Split 1/4 head + 3/4 tail: biased toward the tail (summary markers,
+    exit status) but enough head to capture the first test failure or
+    compiler error — which is the output that matters most for a fix
+    worker and is otherwise lost when later stages pile on compilation
+    noise (#3715).
+    """
     if len(text) <= limit:
         return text
-    return f"...[truncated, {len(text) - limit} earlier chars omitted]...\n{text[-limit:]}"
+    head_budget = limit // 4
+    tail_budget = limit - head_budget
+    omitted = len(text) - limit
+    return (
+        f"{text[:head_budget]}\n"
+        f"...[truncated, {omitted} chars omitted — first {head_budget} + last {tail_budget} shown]...\n"
+        f"{text[-tail_budget:]}"
+    )
 
 
 @dataclass(frozen=True)
