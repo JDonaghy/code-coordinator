@@ -33,6 +33,20 @@ from coord.commands._common import (
 )
 
 
+# #3649: the macmini incident — uvicorn's default `timeout_graceful_shutdown`
+# is `None`, which means "wait forever" for in-flight requests/background
+# tasks to finish before exiting. The agent's own `/health` run can take
+# tens of seconds under CPU load (the observed log sequence was `Shutting
+# down` -> `Waiting for connections to close` -> `Waiting for background
+# tasks to complete`, then nothing further — no new `Started server
+# process`, port never freed). A bounded ceiling here means a shutdown
+# signal always produces a process exit within this many seconds, so
+# launchd's `KeepAlive`/`ThrottleInterval` actually gets a chance to fire
+# instead of waiting on a process that is still "running" but wedged in
+# shutdown.
+AGENT_GRACEFUL_SHUTDOWN_TIMEOUT_S = 30
+
+
 @click.group(
     invoke_without_command=True,
     help=(
@@ -447,7 +461,16 @@ def _start_agent_server(
         f"listening on http://{bind_host}:{bind_port}"
     )
     try:
-        uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
+        uvicorn.run(
+            app,
+            host=bind_host,
+            port=bind_port,
+            log_level="info",
+            # #3649: bound how long shutdown waits on in-flight
+            # requests/background tasks — see the module-level constant's
+            # docstring for why unbounded is a real outage.
+            timeout_graceful_shutdown=AGENT_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        )
     finally:
         server.shutdown()
 
