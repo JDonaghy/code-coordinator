@@ -6761,7 +6761,15 @@ def _apply_writes(plan: TickPlan) -> None:
         update_drive_queue_entry(parsed[0], parsed[1], **updates)
 
 
-def _escalate(repo: str, issue: int, *, reason: str, gates: str, command: str) -> None:
+def _escalate(
+    repo: str,
+    issue: int,
+    *,
+    reason: str,
+    gates: str,
+    command: str,
+    assignment_id: str | None = None,
+) -> None:
     from coord.state import record_drive_escalation  # noqa: PLC0415
 
     record_drive_escalation(
@@ -6771,6 +6779,7 @@ def _escalate(repo: str, issue: int, *, reason: str, gates: str, command: str) -
         reason=reason,
         gate_readings=gates,
         proposed_command=command,
+        assignment_id=assignment_id,
     )
 
 
@@ -6803,7 +6812,14 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     )
 
 
-def _refusal_park_escalation_command(entry: QueueEntry | None, key: str) -> str:
+def _refusal_park_escalation_command(
+    entry: QueueEntry | None,
+    key: str,
+    reason: str,
+    kind: str,
+    *,
+    config_path: Path | None = None,
+) -> str:
     """The command a #3719 policy-/premise-refusal `parked` escalation
     proposes.
 
@@ -6811,15 +6827,43 @@ def _refusal_park_escalation_command(entry: QueueEntry | None, key: str) -> str:
     #2234) or confirm the premise now holds (premise, #3164) — and neither
     decision is itself expressible as a blind CLI command: retargeting means
     rewriting the GitHub issue title by hand, and `clear-refusal` takes a
-    free-text `--reason` only a human can write. `item.reason` (passed
-    through verbatim as this escalation's own `reason=`) already states
-    which decision is needed and why, so this only has to supply the
-    mechanical half that runs once that decision is made: drop the stale
-    parked row and re-add it clean, exactly like `_requeue_command` — safe
-    here because a parked refusal, unlike a merge-gate block, never reached
-    Work/Test/Review, so there is nothing completed to discard.
+    free-text `--reason` only a human can write. `reason` (passed through
+    verbatim as this escalation's own `reason=`) already states which
+    decision is needed and why, so this only has to supply the mechanical
+    half that runs once that decision is made.
+
+    A parked `refused_premise`/`refused_policy` row IS a completed
+    Work-stage assignment (that is what those statuses mean), so it gets
+    the mechanical half from `_blocked_escalation_command` — the same
+    function every other parked/blocked escalation uses — instead of a
+    bespoke requeue: #2377's open-PR check (never propose a blind requeue
+    when an out-of-band PR already exists for this entry) and #3539's
+    plain-`add` carve-out (a green PR missing only its recorded gates)
+    both apply here exactly as they do for any other parked entry.
+
+    For `kind == "premise"`, `coord drive`'s `decide()` reads the latest
+    work assignment's own `work_status` column directly — independent of
+    the drive-queue row or any PR — so ANY redispatch (the blind requeue
+    OR the #3539 plain `add`) dies on the same refusal again unless
+    `clear-refusal` first records that the premise now holds. Prepend
+    that step whenever the delegated command would actually redispatch
+    (still names `drive-queue add`); the inspect/merge-existing remedies
+    propose no redispatch at all, so they need no such prefix. The policy
+    case has no `clear-refusal` equivalent — #2234's refusal is cleared by
+    retargeting the GitHub issue by hand, which a redispatch neither needs
+    nor can bypass.
     """
-    return _requeue_command(entry, key)
+    tail = _blocked_escalation_command(entry, key, reason, config_path=config_path)
+    if kind != "premise" or "drive-queue add" not in tail:
+        return tail
+    parsed = parse_key(key)
+    if parsed is None:
+        return tail
+    repo, issue = parsed
+    return (
+        f"coord drive-queue clear-refusal {repo} {issue} "
+        f'--reason "<describe why the premise now holds>" && {tail}'
+    )
 
 
 def _blocked_escalation_command(
@@ -7824,16 +7868,33 @@ def drive_queue_tick(
                 continue
             entry = by_key.get(item.key)
             kind = "premise" if is_premise_refusal_reason(item.reason) else "policy"
-            _escalate(
-                parsed[0],
-                parsed[1],
-                reason=item.reason,
-                gates=(
-                    f"queue_state=parked | refusal={kind} | position="
-                    f"{entry.position if entry else '?'}"
-                ),
-                command=_refusal_park_escalation_command(entry, item.key),
-            )
+            # Best-effort, matching `_record_checks_stale_escalation`'s own
+            # posture: the write above (`_apply_writes(plan)`) already
+            # landed, so a failure recording the escalation itself must not
+            # turn an otherwise-successful tick into a reported CLI failure.
+            try:
+                aid, _status, _machine = _latest_work_assignment(
+                    parsed[0], parsed[1]
+                )
+                _escalate(
+                    parsed[0],
+                    parsed[1],
+                    reason=item.reason,
+                    gates=(
+                        f"queue_state=parked | refusal={kind} | position="
+                        f"{entry.position if entry else '?'}"
+                    ),
+                    command=_refusal_park_escalation_command(
+                        entry,
+                        item.key,
+                        item.reason,
+                        kind,
+                        config_path=config_path,
+                    ),
+                    assignment_id=aid or None,
+                )
+            except Exception:  # noqa: BLE001 — observability only, see above
+                pass
 
         # #3695 review finding 1: `_apply_writes(plan)` above only ever
         # touches `_DRIVE_QUEUE_UPDATABLE` columns on the DRIVE QUEUE row
