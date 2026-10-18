@@ -451,6 +451,7 @@ models:
     bug: sonnet
     enhancement: sonnet
     infrastructure: opus
+    ultracode: opus
   # Pin each alias to an exact model id so the coordinator passes the exact
   # version to `claude -p --model <id>` instead of relying on the CLI's
   # latest-by-default. Aliases not listed here fall back to claude -p's pick.
