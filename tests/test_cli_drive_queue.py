@@ -3095,7 +3095,7 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(
 
 
 def test_a_premise_refusal_park_escalates_exactly_once(
-    cli, seed, launches, coord_db
+    cli, seed, launches, coord_db, monkeypatch,
 ):
     """#3719: a premise refusal (#3164) parks the entry, but unlike a
     `merge_ci_pending` park it never clears itself — `plan_tick`'s
@@ -3105,52 +3105,74 @@ def test_a_premise_refusal_park_escalates_exactly_once(
     sat parked and invisible until an operator happened to go looking in
     `coord drive-queue list`. The very tick that first parks it must now
     also write a `drive_escalations` row naming the human decision needed
-    (confirm the premise now holds) and a requeue as the mechanical half
-    to run once that decision is made — and because the pre-pass never
-    re-emits a `Reconcile` for an already-parked entry, a second tick must
-    NOT write a second escalation.
+    (confirm the premise now holds) and, as the mechanical half, a
+    `clear-refusal` ahead of the requeue — `coord drive`'s `decide()` keys
+    off the latest work assignment's own status column, so a bare requeue
+    without first clearing the refusal would just die on it again. Because
+    the pre-pass never re-emits a `Reconcile` for an already-parked entry, a
+    second tick must NOT write a second escalation.
     """
     from coord.audit import record_audit
     from coord.models import PREMISE_REFUSAL_MARKER
+    from coord import state as state_module
 
-    seed(issues={812: "open"})
-    cli("add", REPO, "812")
+    calls = []
+    real_record = state_module.record_drive_escalation
+
+    def _spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(state_module, "record_drive_escalation", _spy)
+
+    seed(issues={4219: "open"})
+    cli("add", REPO, "4219")
     cli("tick")
 
     reason = (
-        f"drive exited for {REPO}#812 (exit_code=1): work 721861c90bf3 "
+        f"drive exited for {REPO}#4219 (exit_code=1): work 721861c90bf3 "
         "refused on the issue's own false premise rather than doing the "
         f"dispatched work — the worker did the CORRECT thing (#3164). "
         f"{PREMISE_REFUSAL_MARKER}"
     )
-    launched_at = queued(812)["launched_at"]
-    _backdate(812, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    launched_at = queued(4219)["launched_at"]
+    _backdate(4219, DRIVE_STARTUP_GRACE_SECONDS + 60)
     record_audit(
         tier="business", category="drive", event_type="drive_exited",
-        actor="drive", summary=reason, repo=REPO, issue=812,
+        actor="drive", summary=reason, repo=REPO, issue=4219,
         ts=launched_at + 5,
     )
     result = cli("tick")
     assert result.exit_code == 0, result.output
 
-    entry = queued(812)
+    entry = queued(4219)
     assert entry["state"] == "parked"
     assert entry["attempts"] == 0
 
-    escalation = state._get_drive_escalation_local(REPO, 812)
+    escalation = state._get_drive_escalation_local(REPO, 4219)
     assert escalation is not None
     proposed = escalation["proposed_command"]
+    assert "coord drive-queue clear-refusal" in proposed
     assert "coord drive-queue remove" in proposed
     assert "coord drive-queue add" in proposed
+    # The clear-refusal must run BEFORE the requeue it precedes, or the
+    # requeue's own redispatch races the still-unset premise-recheck flag.
+    assert proposed.index("clear-refusal") < proposed.index("remove")
+    assert PREMISE_REFUSAL_MARKER in escalation["reason"]
+    assert "refusal=premise" in escalation["gate_readings"]
     first_created_at = escalation["created_at"]
+    assert len(calls) == 1, calls
 
     # A second tick: the entry stays parked, no second escalation write.
     second = cli("tick")
     assert second.exit_code == 0, second.output
-    assert queued(812)["state"] == "parked"
-    still = state._get_drive_escalation_local(REPO, 812)
+    assert queued(4219)["state"] == "parked"
+    still = state._get_drive_escalation_local(REPO, 4219)
     assert still is not None
     assert still["created_at"] == first_created_at
+    # The actual write call count — not just the preserved `created_at` —
+    # is the assertion that would fail if the sweep re-escalated.
+    assert len(calls) == 1, calls
 
 
 def test_exhausted_ci_stale_escalation_proposes_revalidate_not_a_requeue(
@@ -3443,6 +3465,27 @@ def test_a_still_parked_entry_stays_parked_across_a_quiet_tick(
     assert entry["state"] == "parked"
     assert entry["attempts"] == 0
     assert len(launches) == 1, launches  # no second launch attempt
+
+
+def test_a_merge_ci_pending_park_never_escalates(cli, seed, launches, coord_db):
+    """#3719's sweep targets only the two causes a human must decide
+    (policy/premise refusal) — a `merge_ci_pending` park is self-healing
+    (the pre-pass in `plan_tick` resumes it the moment CI reports), so it
+    must never write a `drive_escalations` row, no matter how many quiet
+    ticks it sits through."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _seed_ci_pending_merge_row(coord_db, 1762)
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    assert queued(1762)["state"] == "parked"
+    assert state._get_drive_escalation_local(REPO, 1762) is None
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(1762)["state"] == "parked"
+    assert state._get_drive_escalation_local(REPO, 1762) is None
 
 
 # ── #2158: a park must have an exit that is not the merge it blocks ────────
