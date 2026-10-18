@@ -2778,9 +2778,9 @@ class QueueAlert:
     carried here rather than derived in the shell so the alert's prose and its
     one-key remedy are decided together — a "HELD" alert whose command says
     ``coord drive-queue list`` teaches the operator to ignore the field. Left
-    at its ``QUEUE_ALERT_NO_REMEDY_COMMAND`` default, it also doubles (#3720)
-    as the signal the notifier uses to tell a routine, self-healing alert
-    (nothing names a real fix) apart from one that does.
+    at its ``QUEUE_ALERT_NO_REMEDY_COMMAND`` default, it also doubles as the
+    signal the notifier uses to tell a routine, self-healing alert (nothing
+    names a real fix) apart from one that does.
     """
 
     reason: str
@@ -8476,6 +8476,23 @@ def plan_tick(
     if launch is None and stalled:
         details = [f"{item.key}: {item.reason}" for item in deferrals]
         details += [f"{item.key}: BLOCKED — {item.reason}" for item in blocked]
+        # A tick where every stalled entry is a benign deferral has no
+        # one-key remedy — nothing is wedged, the fleet is just busy, and the
+        # next tick that finds capacity self-heals it — so `command` stays at
+        # `QueueAlert`'s `QUEUE_ALERT_NO_REMEDY_COMMAND` default, which is
+        # also the signal the notifier reads to treat the alert as routine.
+        # The moment even one entry is genuinely `blocked`, though, there IS
+        # a remedy (the same remove+add this module already surfaces for
+        # #2944's guaranteed-false waits), so the alert must carry it
+        # explicitly rather than let it fall through to the "nothing to do
+        # here" sentinel — a gate's failure must still be able to page.
+        command = QUEUE_ALERT_NO_REMEDY_COMMAND
+        if blocked:
+            command = (
+                "coord drive-queue remove <repo> <issue> && "
+                "coord drive-queue add <repo> <issue> — for each BLOCKED "
+                "entry named above"
+            )
         alert = QueueAlert(
             # "considered N" rather than "N waiting": some of those entries are
             # blocked by the time this line is written, and an alert that
@@ -8487,6 +8504,7 @@ def plan_tick(
                 f"{capacity - occupied} free slot(s)"
             ),
             details=tuple(details),
+            command=command,
         )
 
     return TickPlan(

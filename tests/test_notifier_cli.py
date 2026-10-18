@@ -190,6 +190,65 @@ def test_tick_dry_run_delivers_nothing_and_writes_no_ledger(config_path, monkeyp
     assert store.load_state().ledger == {}
 
 
+def test_tick_dry_run_pages_nothing_for_a_routine_queue_alert(config_path, monkeypatch):
+    """The real `halted_drives()` collector runs end to end through `tick
+    --dry-run`: a step-4 "nothing eligible to launch" escalation whose
+    `proposed_command` is still the no-remedy sentinel must not surface as
+    a `drive_halted` event."""
+    import coord.state as state_mod
+    from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_NO_REMEDY_COMMAND, QUEUE_ALERT_REPO
+
+    now = 3_000_000.0
+    monkeypatch.setattr(
+        state_mod, "list_drive_escalations",
+        lambda *a, **kw: [
+            {
+                "repo_name": QUEUE_ALERT_REPO,
+                "issue_number": QUEUE_ALERT_ISSUE,
+                "stage": "drive-queue",
+                "reason": "nothing eligible to launch: considered 2 waiting entries, 0 free slot(s)",
+                "proposed_command": QUEUE_ALERT_NO_REMEDY_COMMAND,
+            }
+        ],
+    )
+    monkeypatch.setattr("coord.notifier.collect.history_rows", lambda: [])
+    monkeypatch.setattr("coord.notifier.collect.issue_label_index", lambda: {})
+    monkeypatch.setattr("time.time", lambda: now)
+
+    result = run("notifier", "tick", "--config", config_path, "--dry-run")
+    assert result.exit_code == 0
+    assert "drive_halted" not in result.output
+
+
+def test_tick_dry_run_pages_a_genuine_queue_hold(config_path, monkeypatch):
+    """The same synthetic queue-alert key, but with a real remedy command
+    (a fleet hold rather than a benign "nothing to do" tick), must surface
+    as a `drive_halted` event through the same `tick --dry-run` path."""
+    import coord.state as state_mod
+    from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
+
+    now = 3_000_000.0
+    monkeypatch.setattr(
+        state_mod, "list_drive_escalations",
+        lambda *a, **kw: [
+            {
+                "repo_name": QUEUE_ALERT_REPO,
+                "issue_number": QUEUE_ALERT_ISSUE,
+                "stage": "drive-queue",
+                "reason": "fleet hold: operator declared",
+                "proposed_command": "coord drive-queue resume",
+            }
+        ],
+    )
+    monkeypatch.setattr("coord.notifier.collect.history_rows", lambda: [])
+    monkeypatch.setattr("coord.notifier.collect.issue_label_index", lambda: {})
+    monkeypatch.setattr("time.time", lambda: now)
+
+    result = run("notifier", "tick", "--config", config_path, "--dry-run")
+    assert result.exit_code == 0
+    assert "drive_halted" in result.output
+
+
 def test_pending_lists_held_events():
     from coord.notifier.models import NotifyEvent
 

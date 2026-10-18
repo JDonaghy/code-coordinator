@@ -272,21 +272,25 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
     exists for: the drive reached a decision it cannot make, exited, and
     nothing will tick that issue again until a human looks.
 
-    #3720: one queue-level row is the exception. `plan_tick`'s step 4 also
-    writes a "nothing eligible to launch" record on an ordinary quiet tick —
+    One queue-level row is the exception: `plan_tick`'s step 4 writes a
+    "nothing eligible to launch" record on an ordinary quiet tick whenever
+    every stalled entry is a benign deferral rather than an actual block —
     self-healing (the next tick that finds something to launch clears it)
     and carrying no real fix, which is exactly why its ``proposed_command``
     is left at ``QUEUE_ALERT_NO_REMEDY_COMMAND`` instead of naming one (see
-    that constant). Paging on it taught the operator to ignore this channel
-    (#3720's evidence); `coord drive-queue status` still shows it on
-    request, this function just stops it from becoming a push.
+    that constant). `coord drive-queue status` still shows it on request;
+    this function just stops it from becoming a push. A queue-level alert
+    that DOES carry a real ``proposed_command`` (because step 4 found at
+    least one genuinely blocked entry) is never a sentinel match here, so it
+    pages like any other halted drive.
     """
+    from coord.drive_queue import (  # noqa: PLC0415
+        QUEUE_ALERT_ISSUE,
+        QUEUE_ALERT_NO_REMEDY_COMMAND,
+        QUEUE_ALERT_REPO,
+    )
+
     try:
-        from coord.drive_queue import (  # noqa: PLC0415
-            QUEUE_ALERT_ISSUE,
-            QUEUE_ALERT_NO_REMEDY_COMMAND,
-            QUEUE_ALERT_REPO,
-        )
         from coord.state import list_drive_escalations  # noqa: PLC0415
 
         records = list_drive_escalations()
@@ -302,11 +306,11 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
             issue = int(record.get("issue_number"))
         except (TypeError, ValueError):
             continue
+        command = str(record.get("proposed_command") or "").strip()
         if (
             repo == QUEUE_ALERT_REPO
             and issue == QUEUE_ALERT_ISSUE
-            and str(record.get("proposed_command") or "").strip()
-            == QUEUE_ALERT_NO_REMEDY_COMMAND
+            and command == QUEUE_ALERT_NO_REMEDY_COMMAND
         ):
             continue
         stage = str(record.get("stage") or "").strip()
@@ -317,6 +321,7 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
                 issue=issue,
                 reason=f"{stage + ': ' if stage else ''}{reason}".strip(),
                 urgent=urgent_key(repo, issue) in urgent,
+                proposed_command=command or None,
             )
         )
     return out

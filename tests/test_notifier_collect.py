@@ -295,11 +295,65 @@ def test_an_unavailable_escalation_table_yields_no_halted_drives(monkeypatch):
     assert collect.halted_drives(notifier_state=NotifierState(), now=NOW) == []
 
 
+def test_unavailable_history_is_an_empty_population(monkeypatch):
+    import coord.usage as usage_mod
+
+    monkeypatch.setattr(
+        usage_mod, "fetch_usage_rows",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("board unreachable")),
+    )
+    assert collect.history_rows() == []
+
+
+def test_unavailable_labels_degrade_to_untiered(monkeypatch):
+    import coord.dao as dao
+
+    class Boom:
+        def list_issues(self):
+            raise RuntimeError("nope")
+
+    monkeypatch.setattr(dao, "SqliteStore", Boom)
+    assert collect.issue_label_index() == {}
+
+
+# ── the step-4 queue alert is a halted drive only when it names a remedy ──
+#
+# `plan_tick`'s step 4 writes one `drive_escalations` row for the whole
+# queue (keyed by `QUEUE_ALERT_REPO`/`QUEUE_ALERT_ISSUE`) whenever nothing
+# launched. Whether that row should page is decided once, at the producer:
+# `command` stays at `QUEUE_ALERT_NO_REMEDY_COMMAND` when every stalled
+# entry is a benign deferral (nothing to fix, self-heals next tick), and
+# carries a real remedy the moment even one entry is genuinely blocked.
+# `halted_drives()` only ever reads that single field back.
+
+
 def test_a_routine_nothing_eligible_queue_alert_is_not_a_halted_drive(monkeypatch):
-    """#3720: the self-healing "nothing eligible to launch" record pages no
-    one — it names no remedy (`proposed_command` left at
-    `QUEUE_ALERT_NO_REMEDY_COMMAND`), unlike a real hold/cordon/drift
-    escalation sharing the same synthetic queue-alert key."""
+    import coord.state as state_mod
+    from coord.drive_queue import (
+        QUEUE_ALERT_ISSUE,
+        QUEUE_ALERT_NO_REMEDY_COMMAND,
+        QUEUE_ALERT_REPO,
+    )
+
+    monkeypatch.setattr(
+        state_mod, "list_drive_escalations",
+        lambda *a, **kw: [
+            {
+                "repo_name": QUEUE_ALERT_REPO,
+                "issue_number": QUEUE_ALERT_ISSUE,
+                "stage": "drive-queue",
+                "reason": "nothing eligible to launch: considered 3 waiting entries, 0 free slot(s)",
+                "proposed_command": QUEUE_ALERT_NO_REMEDY_COMMAND,
+            }
+        ],
+    )
+    assert collect.halted_drives(notifier_state=NotifierState(), now=NOW) == []
+
+
+def test_a_queue_alert_naming_a_blocked_entrys_remedy_becomes_a_halted_drive(monkeypatch):
+    """A step-4 alert produced with at least one genuinely `blocked` entry
+    carries a real remedy command rather than the no-remedy sentinel, so it
+    pages exactly like any other halted drive."""
     import coord.state as state_mod
     from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
 
@@ -310,12 +364,20 @@ def test_a_routine_nothing_eligible_queue_alert_is_not_a_halted_drive(monkeypatc
                 "repo_name": QUEUE_ALERT_REPO,
                 "issue_number": QUEUE_ALERT_ISSUE,
                 "stage": "drive-queue",
-                "reason": "nothing eligible to launch: considered 3 waiting entries, 0 free slot(s)",
-                "proposed_command": "coord drive-queue list",
+                "reason": "nothing eligible to launch: considered 1 waiting entry, 0 free slot(s)",
+                "proposed_command": (
+                    "coord drive-queue remove <repo> <issue> && "
+                    "coord drive-queue add <repo> <issue> — for each BLOCKED "
+                    "entry named above"
+                ),
             }
         ],
     )
-    assert collect.halted_drives(notifier_state=NotifierState(), now=NOW) == []
+    out = collect.halted_drives(notifier_state=NotifierState(), now=NOW)
+    assert len(out) == 1
+    assert out[0].repo == QUEUE_ALERT_REPO
+    assert out[0].issue == QUEUE_ALERT_ISSUE
+    assert out[0].proposed_command and "drive-queue remove" in out[0].proposed_command
 
 
 def test_a_genuine_queue_hold_alert_still_becomes_a_halted_drive(monkeypatch):
@@ -342,24 +404,4 @@ def test_a_genuine_queue_hold_alert_still_becomes_a_halted_drive(monkeypatch):
     assert out[0].repo == QUEUE_ALERT_REPO
     assert out[0].issue == QUEUE_ALERT_ISSUE
     assert "fleet hold" in out[0].reason
-
-
-def test_unavailable_history_is_an_empty_population(monkeypatch):
-    import coord.usage as usage_mod
-
-    monkeypatch.setattr(
-        usage_mod, "fetch_usage_rows",
-        lambda *a, **kw: (_ for _ in ()).throw(OSError("board unreachable")),
-    )
-    assert collect.history_rows() == []
-
-
-def test_unavailable_labels_degrade_to_untiered(monkeypatch):
-    import coord.dao as dao
-
-    class Boom:
-        def list_issues(self):
-            raise RuntimeError("nope")
-
-    monkeypatch.setattr(dao, "SqliteStore", Boom)
-    assert collect.issue_label_index() == {}
+    assert out[0].proposed_command == "coord drive-queue resume"
