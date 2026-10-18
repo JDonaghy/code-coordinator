@@ -295,6 +295,55 @@ def test_an_unavailable_escalation_table_yields_no_halted_drives(monkeypatch):
     assert collect.halted_drives(notifier_state=NotifierState(), now=NOW) == []
 
 
+def test_a_routine_nothing_eligible_queue_alert_is_not_a_halted_drive(monkeypatch):
+    """#3720: the self-healing "nothing eligible to launch" record pages no
+    one — it names no remedy (`proposed_command` left at
+    `QUEUE_ALERT_NO_REMEDY_COMMAND`), unlike a real hold/cordon/drift
+    escalation sharing the same synthetic queue-alert key."""
+    import coord.state as state_mod
+    from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
+
+    monkeypatch.setattr(
+        state_mod, "list_drive_escalations",
+        lambda *a, **kw: [
+            {
+                "repo_name": QUEUE_ALERT_REPO,
+                "issue_number": QUEUE_ALERT_ISSUE,
+                "stage": "drive-queue",
+                "reason": "nothing eligible to launch: considered 3 waiting entries, 0 free slot(s)",
+                "proposed_command": "coord drive-queue list",
+            }
+        ],
+    )
+    assert collect.halted_drives(notifier_state=NotifierState(), now=NOW) == []
+
+
+def test_a_genuine_queue_hold_alert_still_becomes_a_halted_drive(monkeypatch):
+    """A hold/cordon/drift escalation names a real one-key fix, so it keeps
+    producing a `HaltedDrive` even though it shares the same synthetic
+    queue-alert key as the routine "nothing eligible" record."""
+    import coord.state as state_mod
+    from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
+
+    monkeypatch.setattr(
+        state_mod, "list_drive_escalations",
+        lambda *a, **kw: [
+            {
+                "repo_name": QUEUE_ALERT_REPO,
+                "issue_number": QUEUE_ALERT_ISSUE,
+                "stage": "drive-queue",
+                "reason": "fleet hold: operator declared",
+                "proposed_command": "coord drive-queue resume",
+            }
+        ],
+    )
+    out = collect.halted_drives(notifier_state=NotifierState(), now=NOW)
+    assert len(out) == 1
+    assert out[0].repo == QUEUE_ALERT_REPO
+    assert out[0].issue == QUEUE_ALERT_ISSUE
+    assert "fleet hold" in out[0].reason
+
+
 def test_unavailable_history_is_an_empty_population(monkeypatch):
     import coord.usage as usage_mod
 
