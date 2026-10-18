@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import re
 import socket
 import subprocess
 import time
@@ -2306,6 +2307,36 @@ def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
     )
 
 
+#: Shapes an un-filled-in ``--reason`` template takes: an angle-bracketed
+#: prompt (``<describe why the premise now holds>``) or a bare ellipsis
+#: (``"..."``) — the two forms this repo's own remediation strings use.
+_TEMPLATED_REASON_RE = re.compile(r"<[^<>]*>|^[.…\s]+$")
+
+
+def _is_templated_reason(reason: str) -> bool:
+    """True when *reason* is still a copy-pasted placeholder, not an assertion.
+
+    #3339's premise recheck is "a human's explicit, auditable assertion …
+    its mere presence — never inferred, never re-derived" (`coord/drive.py`'s
+    `decide()`), so the one thing `--reason` must never accept is the template
+    text out of a remediation string. Several surfaces print that chain with a
+    placeholder in it — `coord diagnose`'s `refused_premise` finding, the
+    premise park reason, and the `proposed_command` on the #3719 refusal-park
+    escalation, which `coord escalate run` executes blind with no confirmation
+    prompt. Rejecting the placeholder is what makes such a blind run exit
+    non-zero (so nothing is requeued and the escalation is not dismissed)
+    instead of recording a fabricated assertion and dispatching paid work at
+    a premise nobody rechecked.
+
+    The angle-bracket arm over-matches: a genuine reason that quotes a
+    bracketed URL (`PR <https://…> landed`) is rejected too. That is the
+    deliberate direction to err in — the rejection names the offending
+    string and shows a usable example, so the cost is one retyped sentence,
+    whereas the other direction records an assertion nobody made.
+    """
+    return bool(_TEMPLATED_REASON_RE.search(reason))
+
+
 @drive_queue_group.command("clear-refusal")
 @click.argument("repo")
 @click.argument("issue", type=int)
@@ -2338,6 +2369,13 @@ def drive_queue_clear_refusal(
     row that will actually tick. Re-scope the issue FIRST if the remaining
     work has changed — this command only unblocks dispatch, it does not
     touch the issue body.
+
+    `--reason` must be your own words. A still-templated placeholder — the
+    `<...>`/`"..."` text the remediation chains printed by `coord diagnose`,
+    the premise park reason and the #3719 refusal-park escalation all carry
+    — is rejected, so running one of those chains verbatim (including blind,
+    via `coord escalate run`) fails here rather than fabricating the
+    assertion and redispatching paid work at an unverified premise.
     """
     from coord.drive_state import WORK_LIKE  # noqa: PLC0415
     from coord.state import mark_premise_rechecked  # noqa: PLC0415
@@ -2345,6 +2383,16 @@ def drive_queue_clear_refusal(
     reason = reason.strip()
     if not reason:
         raise click.ClickException("--reason must not be empty")
+    if _is_templated_reason(reason):
+        raise click.ClickException(
+            f"--reason is still the placeholder text ({reason!r}) — it must be "
+            "your own assertion of why the premise now holds (e.g. "
+            '--reason "quadraui#971 landed, re-scoped to a pin move"). This '
+            "is recorded as a human's explicit, auditable claim that the "
+            "prerequisite exists now, and `coord drive` dispatches fresh "
+            "paid work off its mere presence, so it is never inferred and "
+            "never filled in from a template."
+        )
 
     aid, status, _machine = _latest_work_assignment(repo, issue)
     if not aid:
@@ -6839,7 +6887,12 @@ def _refusal_park_escalation_command(
     bespoke requeue: #2377's open-PR check (never propose a blind requeue
     when an out-of-band PR already exists for this entry) and #3539's
     plain-`add` carve-out (a green PR missing only its recorded gates)
-    both apply here exactly as they do for any other parked entry.
+    both apply here as they do for any other parked entry. One corner is
+    inherited from #3539's own design rather than chosen here: it reasons
+    from `state.work_aid` being unset, which for a refusal park it is not,
+    so on a premise refusal whose issue has acquired a green out-of-band PR
+    the plain `add` restarts the Work stage over that PR rather than
+    running only the missing stages forward.
 
     For `kind == "premise"`, `coord drive`'s `decide()` reads the latest
     work assignment's own `work_status` column directly — independent of
@@ -6852,6 +6905,18 @@ def _refusal_park_escalation_command(
     case has no `clear-refusal` equivalent — #2234's refusal is cleared by
     retargeting the GitHub issue by hand, which a redispatch neither needs
     nor can bypass.
+
+    The `--reason` this emits is a PLACEHOLDER, and this field is executed
+    blind: `coord escalate run` shells the whole string out with no
+    confirmation prompt, and `coord/reports.py` offers it as the card's
+    "Recommended" option. That is safe only because
+    :func:`_is_templated_reason` makes `clear-refusal` reject the
+    placeholder, so a one-key run fails on the FIRST step — nothing is
+    requeued, no premise assertion is recorded, and `escalate run` reports
+    the failure instead of dismissing the escalation as resolved. Keep the
+    two in step: an edit here that produces a reason `clear-refusal` would
+    accept turns this into a blind command that fabricates the one value
+    #3339 says must never be inferred.
     """
     tail = _blocked_escalation_command(entry, key, reason, config_path=config_path)
     if kind != "premise" or "drive-queue add" not in tail:
@@ -7872,6 +7937,11 @@ def drive_queue_tick(
             # posture: the write above (`_apply_writes(plan)`) already
             # landed, so a failure recording the escalation itself must not
             # turn an otherwise-successful tick into a reported CLI failure.
+            # The stdout line is the floor, and here it is load-bearing: the
+            # sweep fires once per park, so a failure anywhere in this block
+            # (including inside `_refusal_park_escalation_command`, which
+            # reaches `gh` for #2377's open-PR check) loses this entry's ONLY
+            # escalation permanently — it must at least leave a trace.
             try:
                 aid, _status, _machine = _latest_work_assignment(
                     parsed[0], parsed[1]
@@ -7893,8 +7963,11 @@ def drive_queue_tick(
                     ),
                     assignment_id=aid or None,
                 )
-            except Exception:  # noqa: BLE001 — observability only, see above
-                pass
+            except Exception as exc:  # noqa: BLE001 — the stdout line is the floor
+                click.echo(
+                    f"  (could not record the {kind}-refusal park escalation "
+                    f"for {item.key}: {exc})"
+                )
 
         # #3695 review finding 1: `_apply_writes(plan)` above only ever
         # touches `_DRIVE_QUEUE_UPDATABLE` columns on the DRIVE QUEUE row
