@@ -3868,6 +3868,133 @@ class TestDispatchFixReachabilityFallback:
         assert "--machine" in actions[0].detail
 
 
+# ── #3721: needs-redesign escalation instead of churning the same gate ───────
+
+
+class TestNeedsRedesignEscalation:
+    """A mechanical request-changes verdict on a structurally-unfixable gate
+    (sealed-path, breaking public API) must get exactly one bounce before
+    the issue is parked instead of re-dispatched."""
+
+    def test_first_occurrence_dispatches_fix_normally(self, config: Config) -> None:
+        from coord.auto_loop import _dispatch_fix_for_review
+
+        work = _work_assignment(assignment_id="work-3721a")
+        review = _review_assignment(
+            assignment_id="review-3721a", review_of="work-3721a",
+        )
+        review.verdict_source = "mechanical"
+        review.verdict_source_reason = (
+            "sealed path(s) violated: tests/acceptance/foo.py"
+        )
+        board = _board_with(work, review)
+        findings = ReviewFindings(
+            verdict="request-changes", body="## Blocking\n- 1. don't touch it\n"
+        )
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-3721a-2"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = _dispatch_fix_for_review(
+                review, findings, board, config, http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+
+    def test_second_occurrence_escalates_and_skips_dispatch(
+        self, config: Config
+    ) -> None:
+        from coord.auto_loop import _dispatch_fix_for_review
+
+        work = _work_assignment(assignment_id="work-3721b")
+        prior_review = _review_assignment(
+            assignment_id="review-3721b-1", review_of="work-3721b",
+        )
+        prior_review.verdict_source = "mechanical"
+        prior_review.verdict_source_reason = (
+            "sealed path(s) violated: tests/acceptance/bar.py"
+        )
+        review = _review_assignment(
+            assignment_id="review-3721b-2", review_of="work-3721b",
+        )
+        review.verdict_source = "mechanical"
+        review.verdict_source_reason = (
+            "sealed path(s) violated: tests/acceptance/foo.py"
+        )
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[work, prior_review, review],
+        )
+        findings = ReviewFindings(
+            verdict="request-changes", body="## Blocking\n- 1. don't touch it\n"
+        )
+
+        with patch("coord.state.record_drive_escalation") as mock_escalate:
+            actions = _dispatch_fix_for_review(review, findings, board, config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "needs_redesign"
+        assert "sealed-path" in actions[0].detail
+        assert "api#1" in actions[0].detail
+        mock_escalate.assert_called_once()
+        _, kwargs = mock_escalate.call_args
+        assert kwargs["stage"] == "needs-redesign"
+        assert kwargs["assignment_id"] == "work-3721b"
+        # No fix worker dispatched.
+        assert board.active == []
+
+    def test_non_eligible_mechanical_kind_never_escalates(
+        self, config: Config
+    ) -> None:
+        """A repeated coordinator-doc tamper is worker error, not a
+        structural wall — it must keep bouncing through the normal fix
+        loop, not get parked."""
+        from coord.auto_loop import _dispatch_fix_for_review
+
+        work = _work_assignment(assignment_id="work-3721c")
+        prior_review = _review_assignment(
+            assignment_id="review-3721c-1", review_of="work-3721c",
+        )
+        prior_review.verdict_source = "mechanical"
+        prior_review.verdict_source_reason = (
+            "coordinator-owned doc(s) edited: README.md"
+        )
+        review = _review_assignment(
+            assignment_id="review-3721c-2", review_of="work-3721c",
+        )
+        review.verdict_source = "mechanical"
+        review.verdict_source_reason = (
+            "coordinator-owned doc(s) edited: CHANGELOG.md"
+        )
+        board = Board(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            active=[],
+            completed=[work, prior_review, review],
+        )
+        findings = ReviewFindings(
+            verdict="request-changes", body="## Blocking\n- 1. don't touch it\n"
+        )
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-3721c-2"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"), patch(
+            "coord.state.record_drive_escalation"
+        ) as mock_escalate:
+            actions = _dispatch_fix_for_review(
+                review, findings, board, config, http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+        mock_escalate.assert_not_called()
+
+
 # ── #3322: the fix-round counter is monotonic across every dispatch path ─────
 
 

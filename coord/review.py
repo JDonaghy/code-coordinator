@@ -3441,6 +3441,131 @@ def _record_prereview_gate_verdict(
     )
 
 
+# (#3721) Mechanical gate kinds that are structurally unfixable within the
+# SAME work leg: no further diff can satisfy this gate while also satisfying
+# the rule that required it, so re-dispatching another fix round is pure
+# churn, not a chance to improve. Deliberately narrow — every OTHER
+# mechanical kind (``coordinator_doc``, ``lane_entrypoint_weakened``, a
+# generic ``prereview_gate`` finding) is fixable by a diff that simply stops
+# making the forbidden edit, so a repeat there is worker error, not a wall.
+NEEDS_REDESIGN_GATE_KINDS: frozenset[str] = frozenset(
+    {"sealed_path", "breaking_public_api"}
+)
+
+NEEDS_REDESIGN_ALERT_STAGE = "needs-redesign"
+
+_NEEDS_REDESIGN_GATE_DESCRIPTION: dict[str, str] = {
+    "sealed_path": (
+        "sealed-path violation — the fix would require editing a sealed "
+        "path (tests/acceptance/**), which is itself an unconditional "
+        "request-changes under this repo's own rules, so no single diff "
+        "can satisfy both at once"
+    ),
+    "breaking_public_api": (
+        "breaking public-API change flagged by the semver check — cannot "
+        "be resolved by further edits to this same PR; needs a "
+        "non-breaking redesign or the deprecate-first two-PR protocol"
+    ),
+}
+
+
+def mechanical_gate_kind(reason: str | None) -> str:
+    """Classify a mechanical ``verdict_source_reason`` into a stable
+    gate-kind tag (#3721).
+
+    Works off the reason TEXT rather than a persisted field, so it
+    classifies both freshly-recorded and historical ``board.completed``
+    rows identically, with no schema/signature change: every reason string
+    produced by :func:`_record_mechanical_review_verdict` or
+    :func:`_record_prereview_gate_verdict` already starts with one of
+    these stable prefixes.
+    """
+    if not reason:
+        return "other"
+    if reason.startswith("sealed path(s) violated:"):
+        return "sealed_path"
+    if reason.startswith("coordinator-owned doc(s) edited:"):
+        return "coordinator_doc"
+    if reason.startswith("Tier-2 lane smoke-spec entry point weakened:"):
+        return "lane_entrypoint_weakened"
+    if "semver check failed (" in reason:
+        return "breaking_public_api"
+    if reason.startswith("prereview mechanical gate:"):
+        return "prereview_gate"
+    return "other"
+
+
+def needs_redesign_escalation(
+    work: Assignment,
+    review: Assignment,
+    board: Board,
+    *,
+    gate_kind: str,
+) -> str | None:
+    """(#3721) Decide whether *work*'s issue should be parked as
+    needs-redesign instead of dispatching yet another fix round.
+
+    Returns the escalation reason once *gate_kind* is one of
+    :data:`NEEDS_REDESIGN_GATE_KINDS` AND this is at least the SECOND time
+    a mechanical verdict of that same kind has fired for this issue —
+    counted off ``board.completed`` (which reflects the full DB history,
+    not just this process's lifetime), excluding *review* itself so the
+    verdict that triggered this call isn't double-counted as its own
+    predecessor. A worker gets exactly one mechanical bounce on an eligible
+    gate before this escalates, since a lone occurrence could still be a
+    trivial mistake rather than the structural wall the issue describes.
+
+    Returns ``None`` (dispatch the fix as usual) for every other case:
+    *gate_kind* not eligible, or this is its first occurrence. Writes the
+    durable escalation itself (best-effort — a write failure here must not
+    block the caller's own fallback behavior) so the caller only needs to
+    check for a non-``None`` return to skip dispatch.
+    """
+    if gate_kind not in NEEDS_REDESIGN_GATE_KINDS:
+        return None
+    prior = sum(
+        1
+        for a in board.completed
+        if a.type == "review"
+        and a.assignment_id != review.assignment_id
+        and a.repo_name == work.repo_name
+        and a.issue_number == work.issue_number
+        and a.verdict_source == "mechanical"
+        and mechanical_gate_kind(a.verdict_source_reason) == gate_kind
+    )
+    if prior < 1:
+        return None
+    occurrences = prior + 1
+    description = _NEEDS_REDESIGN_GATE_DESCRIPTION.get(gate_kind, gate_kind)
+    reason = (
+        f"needs-redesign (#3721): {work.repo_name}#{work.issue_number} hit "
+        f"the same structurally-unfixable mechanical gate {occurrences} "
+        f"times in a row — {description}. Latest finding: "
+        f"{review.verdict_source_reason}"
+    )
+    try:
+        from coord.state import record_drive_escalation  # noqa: PLC0415
+
+        record_drive_escalation(
+            work.repo_name,
+            work.issue_number,
+            stage=NEEDS_REDESIGN_ALERT_STAGE,
+            reason=reason,
+            gate_readings=f"gate_kind={gate_kind} occurrences={occurrences}",
+            proposed_command=(
+                f"coord drive-queue remove {work.repo_name} {work.issue_number}"
+            ),
+            assignment_id=work.assignment_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — the log line below is the floor
+        log.warning(
+            "auto_loop: failed to record needs-redesign escalation for "
+            "%s#%s: %s",
+            work.repo_name, work.issue_number, exc,
+        )
+    return reason
+
+
 def dispatch_review(
     completed: Assignment,
     board: Board,

@@ -64,6 +64,8 @@ from coord.review import (
     dispatch_review,
     estimate_review_counts,
     maybe_scoped_review_for_completed_fix,
+    mechanical_gate_kind,
+    needs_redesign_escalation,
     parse_review_from_agent,
     parse_review_from_log,
 )
@@ -148,6 +150,11 @@ class LoopAction:
                                  for bookkeeping only (``dispatch_fixes=False``
                                  — the daemon drain, which must never spawn a
                                  fix worker; #476/#477)
+    - ``"needs_redesign"``     — #3721: the SAME structurally-unfixable
+                                 mechanical gate (sealed-path, breaking public
+                                 API) fired twice in a row for this issue; the
+                                 issue was parked with a durable escalation
+                                 instead of dispatching another fix round
     """
     assignment_id: str | None
     detail: str = ""
@@ -1125,6 +1132,30 @@ def _dispatch_fix_for_review(
                 "no fix dispatched"
             ),
         )]
+
+    # #3721: a mechanical request-changes verdict (sealed-path tamper,
+    # breaking-public-API semver check — the only two gate kinds a diff to
+    # THIS work leg can never satisfy without also breaking another
+    # unconditional rule) that fires for the SECOND time in a row on this
+    # issue means another fix round is pure churn, not a chance to improve.
+    # Park it with a durable escalation instead of re-dispatching. Checked
+    # only for mechanical verdicts — a real reviewer's request-changes
+    # always gets its normal fix round, however many times it repeats.
+    if review.verdict_source == "mechanical":
+        gate_kind = mechanical_gate_kind(review.verdict_source_reason)
+        escalation_reason = needs_redesign_escalation(
+            work, review, board, gate_kind=gate_kind,
+        )
+        if escalation_reason is not None:
+            log.warning(
+                "auto_loop: NOT dispatching fix for %s — %s",
+                work.assignment_id, escalation_reason,
+            )
+            return [LoopAction(
+                kind="needs_redesign",
+                assignment_id=review.assignment_id,
+                detail=escalation_reason,
+            )]
 
     # Compute the next iteration number and check the limit.  #3322: read it
     # off the WHOLE branch chain, not off `work` alone — the stalled-pipeline
