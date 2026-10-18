@@ -271,8 +271,22 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
     A ``drive_escalations`` row is exactly the condition this feature
     exists for: the drive reached a decision it cannot make, exited, and
     nothing will tick that issue again until a human looks.
+
+    #3720: one queue-level row is the exception. `plan_tick`'s step 4 also
+    writes a "nothing eligible to launch" record on an ordinary quiet tick —
+    self-healing (the next tick that finds something to launch clears it)
+    and carrying no real fix, which is exactly why its ``proposed_command``
+    is left at ``QUEUE_ALERT_NO_REMEDY_COMMAND`` instead of naming one (see
+    that constant). Paging on it taught the operator to ignore this channel
+    (#3720's evidence); `coord drive-queue status` still shows it on
+    request, this function just stops it from becoming a push.
     """
     try:
+        from coord.drive_queue import (  # noqa: PLC0415
+            QUEUE_ALERT_ISSUE,
+            QUEUE_ALERT_NO_REMEDY_COMMAND,
+            QUEUE_ALERT_REPO,
+        )
         from coord.state import list_drive_escalations  # noqa: PLC0415
 
         records = list_drive_escalations()
@@ -287,6 +301,13 @@ def halted_drives(*, notifier_state: NotifierState, now: float) -> list[HaltedDr
         try:
             issue = int(record.get("issue_number"))
         except (TypeError, ValueError):
+            continue
+        if (
+            repo == QUEUE_ALERT_REPO
+            and issue == QUEUE_ALERT_ISSUE
+            and str(record.get("proposed_command") or "").strip()
+            == QUEUE_ALERT_NO_REMEDY_COMMAND
+        ):
             continue
         stage = str(record.get("stage") or "").strip()
         reason = str(record.get("reason") or "").strip()

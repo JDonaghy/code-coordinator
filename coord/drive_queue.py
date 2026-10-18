@@ -1376,6 +1376,16 @@ QUEUE_ALERT_REPO = "(drive-queue)"
 QUEUE_ALERT_ISSUE = 0
 QUEUE_ALERT_STAGE = "drive-queue"
 
+#: #3720: the sentinel ``QueueAlert.command`` value meaning "no one-key
+#: remedy exists — there is nothing for a human to run." The step-4 "nothing
+#: eligible to launch" alert below is the only `QueueAlert` that omits
+#: ``command``, so it is the only one that carries this value; the notifier
+#: (`coord/notifier/collect.py`'s `halted_drives`) matches on it to tell that
+#: routine, self-healing condition apart from a genuine hold/cordon/drift
+#: escalation (each of which names its own real fix) without a DB schema
+#: change — `coord drive-queue status` still reads the record unchanged.
+QUEUE_ALERT_NO_REMEDY_COMMAND = "coord drive-queue list"
+
 #: #3413: a DISPLAY hint only — production's `coord-drive-queue.timer` fires
 #: every 3 minutes (`OnUnitActiveSec=3min`, `deploy/coord-drive-queue.timer`),
 #: not a value this module reads from the deployed unit (there is no seam to
@@ -2767,12 +2777,15 @@ class QueueAlert:
     ``command`` is the proposed fix written into the escalation record. It is
     carried here rather than derived in the shell so the alert's prose and its
     one-key remedy are decided together — a "HELD" alert whose command says
-    ``coord drive-queue list`` teaches the operator to ignore the field.
+    ``coord drive-queue list`` teaches the operator to ignore the field. Left
+    at its ``QUEUE_ALERT_NO_REMEDY_COMMAND`` default, it also doubles (#3720)
+    as the signal the notifier uses to tell a routine, self-healing alert
+    (nothing names a real fix) apart from one that does.
     """
 
     reason: str
     details: tuple[str, ...] = ()
-    command: str = "coord drive-queue list"
+    command: str = QUEUE_ALERT_NO_REMEDY_COMMAND
 
 
 @dataclass(frozen=True)
