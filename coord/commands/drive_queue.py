@@ -95,7 +95,9 @@ from coord.drive_queue import (
     is_fix_round_ceiling_blocked,
     is_merge_gate_block_reason,
     is_permanent_block_reason,
+    is_policy_refusal_reason,
     is_pre_dispatch_block_reason,
+    is_premise_refusal_reason,
     is_test_stage_routing_dead_end_reason,
     is_unsatisfiable_prereq_reason,
     merge_gate_remedy_command,
@@ -6801,6 +6803,25 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     )
 
 
+def _refusal_park_escalation_command(entry: QueueEntry | None, key: str) -> str:
+    """The command a #3719 policy-/premise-refusal `parked` escalation
+    proposes.
+
+    Both causes need a human DECISION first — retarget the issue (policy,
+    #2234) or confirm the premise now holds (premise, #3164) — and neither
+    decision is itself expressible as a blind CLI command: retargeting means
+    rewriting the GitHub issue title by hand, and `clear-refusal` takes a
+    free-text `--reason` only a human can write. `item.reason` (passed
+    through verbatim as this escalation's own `reason=`) already states
+    which decision is needed and why, so this only has to supply the
+    mechanical half that runs once that decision is made: drop the stale
+    parked row and re-add it clean, exactly like `_requeue_command` — safe
+    here because a parked refusal, unlike a merge-gate block, never reached
+    Work/Test/Review, so there is nothing completed to discard.
+    """
+    return _requeue_command(entry, key)
+
+
 def _blocked_escalation_command(
     entry: QueueEntry | None,
     key: str,
@@ -7769,6 +7790,49 @@ def drive_queue_tick(
                     f"position={entry.position if entry else '?'}"
                 ),
                 command=merge_plan_inspect_command(parsed[0]),
+            )
+
+        # #3719: a `parked` entry whose park reason names a policy (#2234)
+        # or premise (#3164) refusal never resumes on its own — see
+        # `plan_tick`'s pre-pass above (`is_policy_refusal_reason`/
+        # `is_premise_refusal_reason` both just `continue`, leaving the
+        # entry parked rather than falling through to the CI-park auto-
+        # resume) — so without this it sits invisible until an operator
+        # happens to notice it in `coord drive-queue list`. Gate-A
+        # (#2063), throttle-skip (#2977), `merge_ci_pending` (#1891), and
+        # the issue-cache-stale (#2858) parks are deliberately NOT swept
+        # here: all four are documented, by the same pre-pass, to clear
+        # themselves with no human decision needed — exactly the
+        # auto-resolvable half #3719 says must NOT be escalated.
+        #
+        # This fires once: `plan.reconciles` only carries a `"parked"`
+        # entry for *this* key on the single tick `_reconcile_running`
+        # first parks it (a running entry hitting the refusal) — every
+        # later tick the entry stays parked, the pre-pass above `continue`s
+        # without emitting a `Reconcile` for it at all, so there is no
+        # repeat entry here to re-escalate on.
+        for item in plan.reconciles:
+            if item.outcome != "parked":
+                continue
+            if not (
+                is_policy_refusal_reason(item.reason)
+                or is_premise_refusal_reason(item.reason)
+            ):
+                continue
+            parsed = parse_key(item.key)
+            if parsed is None:
+                continue
+            entry = by_key.get(item.key)
+            kind = "premise" if is_premise_refusal_reason(item.reason) else "policy"
+            _escalate(
+                parsed[0],
+                parsed[1],
+                reason=item.reason,
+                gates=(
+                    f"queue_state=parked | refusal={kind} | position="
+                    f"{entry.position if entry else '?'}"
+                ),
+                command=_refusal_park_escalation_command(entry, item.key),
             )
 
         # #3695 review finding 1: `_apply_writes(plan)` above only ever

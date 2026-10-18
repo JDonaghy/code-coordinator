@@ -3094,6 +3094,65 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(
     assert state._get_drive_escalation_local(REPO, 1762) is not None
 
 
+def test_a_premise_refusal_park_escalates_exactly_once(
+    cli, seed, launches, coord_db
+):
+    """#3719: a premise refusal (#3164) parks the entry, but unlike a
+    `merge_ci_pending` park it never clears itself — `plan_tick`'s
+    STATE_PARKED pre-pass just `continue`s on it forever (see
+    `test_a_parked_policy_refusal_does_not_auto_resume_next_tick` in
+    tests/test_drive_queue.py). Before this issue, that meant the entry
+    sat parked and invisible until an operator happened to go looking in
+    `coord drive-queue list`. The very tick that first parks it must now
+    also write a `drive_escalations` row naming the human decision needed
+    (confirm the premise now holds) and a requeue as the mechanical half
+    to run once that decision is made — and because the pre-pass never
+    re-emits a `Reconcile` for an already-parked entry, a second tick must
+    NOT write a second escalation.
+    """
+    from coord.audit import record_audit
+    from coord.models import PREMISE_REFUSAL_MARKER
+
+    seed(issues={812: "open"})
+    cli("add", REPO, "812")
+    cli("tick")
+
+    reason = (
+        f"drive exited for {REPO}#812 (exit_code=1): work 721861c90bf3 "
+        "refused on the issue's own false premise rather than doing the "
+        f"dispatched work — the worker did the CORRECT thing (#3164). "
+        f"{PREMISE_REFUSAL_MARKER}"
+    )
+    launched_at = queued(812)["launched_at"]
+    _backdate(812, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=reason, repo=REPO, issue=812,
+        ts=launched_at + 5,
+    )
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+
+    entry = queued(812)
+    assert entry["state"] == "parked"
+    assert entry["attempts"] == 0
+
+    escalation = state._get_drive_escalation_local(REPO, 812)
+    assert escalation is not None
+    proposed = escalation["proposed_command"]
+    assert "coord drive-queue remove" in proposed
+    assert "coord drive-queue add" in proposed
+    first_created_at = escalation["created_at"]
+
+    # A second tick: the entry stays parked, no second escalation write.
+    second = cli("tick")
+    assert second.exit_code == 0, second.output
+    assert queued(812)["state"] == "parked"
+    still = state._get_drive_escalation_local(REPO, 812)
+    assert still is not None
+    assert still["created_at"] == first_created_at
+
+
 def test_exhausted_ci_stale_escalation_proposes_revalidate_not_a_requeue(
     cli, seed, launches, coord_db, config_file
 ):
