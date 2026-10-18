@@ -124,6 +124,7 @@ class HaltedDrive:
     reason: str = ""
     exit_code: int | None = None
     urgent: bool = False
+    proposed_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -361,20 +362,25 @@ def _parked_event(gate: ParkedGate, snapshot: PipelineSnapshot) -> NotifyEvent:
 
 def _halted_event(drive: HaltedDrive, snapshot: PipelineSnapshot) -> NotifyEvent:
     where = f"{drive.repo}#{drive.issue}"
+    command = (drive.proposed_command or "").strip() or None
+    body = f"The drive reached a terminal state and will not tick again. {drive.reason.strip()}".strip()
+    if command:
+        body = f"{body} Fix: {command}"
     return NotifyEvent(
         subject=f"drive:{where}",
         condition=CONDITION_DRIVE_HALTED,
         title=f"{where} — {CONDITION_LABELS[CONDITION_DRIVE_HALTED]}",
-        body=(
-            f"The drive reached a terminal state and will not tick again. "
-            f"{drive.reason.strip()}".strip()
-        ),
+        body=body,
         created_at=snapshot.now,
         repo=drive.repo,
         issue=drive.issue,
         urgent=drive.urgent,
         link=deep_link(snapshot.web_base_url, drive.repo, drive.issue),
-        detail={"reason": drive.reason, "exit_code": drive.exit_code},
+        detail={
+            "reason": drive.reason,
+            "exit_code": drive.exit_code,
+            "proposed_command": command,
+        },
     )
 
 
