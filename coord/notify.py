@@ -67,6 +67,9 @@ from coord.progress import parse_progress
 from coord.smoke import MUTE_SMOKE_LEG_BUDGET, TEST_STATE_BLOCKED
 from coord.smoke import NO_SMOKE_VERDICT_MARKER as _NO_SMOKE_VERDICT_MARKER
 from coord.smoke import (
+    ABANDONED_BACKGROUND_SMOKE_BUDGET,
+    abandoned_background_smoke_legs,
+    abandoned_background_smoke_tally,
     finalize_smoke_fanout,
     mute_smoke_legs,
     mute_smoke_tally,
@@ -2452,58 +2455,6 @@ def _smoke_worker_verdict(
 #: tally across its own ``running`` stamp for this counter to survive at all.
 #: Re-bound here because this is the name the reap path has always used.
 NO_SMOKE_VERDICT_MARKER = _NO_SMOKE_VERDICT_MARKER
-
-
-#: #3737: the marker for a leg that ended its turn with the smoke command
-#: still running in the background — session terminated, no verdict marker —
-#: rather than a genuinely mute suite. Kept entirely separate from
-#: `NO_SMOKE_VERDICT_MARKER`/`MUTE_SMOKE_LEG_BUDGET` (#2272) so an infra abort
-#: never shares, and prematurely exhausts, the budget meant for a suite that
-#: really won't speak. Mirrors `coord.smoke`'s #3315
-#: `ENVIRONMENTAL_SMOKE_MARKER` shape, but lives here rather than in
-#: `coord.smoke` because the detection it tallies
-#: (`coord.review.detect_abandoned_background_leg`) is read straight off this
-#: module's own verdict-recording path.
-ABANDONED_BACKGROUND_SMOKE_MARKER = "abandoned-background (#3737)"
-
-#: Bounded separately from `MUTE_SMOKE_LEG_BUDGET` — a direct "run it
-#: synchronously" re-dispatch instruction is more likely to self-heal than a
-#: genuinely silent suite, so it gets a little more room, but a cause the
-#: system cannot diagnose must still be a cause the system stops paying for
-#: (#3315's own rationale, applied here to a different cause).
-ABANDONED_BACKGROUND_SMOKE_BUDGET = 3
-
-_ABANDONED_BACKGROUND_TALLY_RE = re.compile(
-    re.escape(ABANDONED_BACKGROUND_SMOKE_MARKER) + r"(?:\s*x\s*(\d+))?",
-    re.IGNORECASE,
-)
-
-
-def abandoned_background_smoke_legs(test_reason: str | None) -> int:
-    """How many consecutive Test-stage legs in a row ended with the #3737
-    abandoned-background hand-off, per the tally `_record_smoke_verdict`
-    leaves at the front of *test_reason*. Mirrors
-    :func:`coord.smoke.mute_smoke_legs`."""
-    if not test_reason:
-        return 0
-    match = _ABANDONED_BACKGROUND_TALLY_RE.search(test_reason)
-    if match is None:
-        return 0
-    raw = match.group(1)
-    if raw is None:
-        return 1
-    try:
-        return max(1, int(raw))
-    except ValueError:  # pragma: no cover - regex already constrains digits
-        return 1
-
-
-def abandoned_background_smoke_tally(count: int) -> str:
-    """Render *count* as the #3737 tally marker. Mirrors
-    :func:`coord.smoke.mute_smoke_tally`."""
-    if count <= 1:
-        return ABANDONED_BACKGROUND_SMOKE_MARKER
-    return f"{ABANDONED_BACKGROUND_SMOKE_MARKER} x{count}"
 
 
 #: #2579: the ``test_state`` written when a #2464 confirmation REFUTES a pass

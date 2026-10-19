@@ -1899,6 +1899,31 @@ def test_blocked_test_state_names_mute_legs_cause(monkeypatch, config) -> None:
     assert not any("#1672" in f for f in res.findings)
 
 
+def test_blocked_test_state_names_abandoned_background_cause(monkeypatch, config) -> None:
+    """#3737 shape: N Test-stage legs in a row ended their turn with the
+    smoke command still backgrounded, never printing a verdict —
+    `abandoned_background_smoke_legs` (the exact function `coord.dead_end`
+    shape 2 checks FIRST, ahead of the #2272 mute-leg one, #2235) finds the
+    tally marker, so this must name THAT cause instead of either sibling —
+    and must not misdiagnose this as an unroutable fleet (#1672)."""
+    from coord.smoke import abandoned_background_smoke_tally
+
+    _stub(monkeypatch, session="dead")
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "blocked"
+    work.test_reason = f"{abandoned_background_smoke_tally(3)}: still backgrounded"
+    board = Board(completed=[work])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test", dry_run=True)
+
+    assert any("#3737" in f and "backgrounded" in f for f in res.findings)
+    assert not any("#1672" in f for f in res.findings)
+    # The mute-leg cause text is distinct ("printing a `SMOKE:` verdict
+    # marker") — must not be the one actually reported here even though
+    # #2272 is named in passing as the OTHER budget.
+    assert not any("verdict marker" in f for f in res.findings)
+
+
 def test_reset_test_reports_which_rows_were_cleared(monkeypatch, config, coord_db) -> None:
     """#3332: the reset report must name which rows it cleared, not just a
     bare count — an operator reading "cleared Test verdict on 3 work

@@ -1059,17 +1059,29 @@ def parse_test_verdict_from_log(log_path: str | Path) -> TestVerdictFindings | N
 # turn/line only" discipline — avoids false-positiving on a worker that
 # merely discusses backgrounding mid-session before going on to print a
 # real verdict later in the same transcript.
+#
+# Plain-text logs have no structured turn boundary to scan exactly, so
+# `detect_abandoned_background_leg` approximates "the final turn" with the
+# last `_ABANDONED_BACKGROUND_TAIL_LINES` non-blank, non-comment lines
+# instead (below) — wide enough to hold a multi-sentence hand-off without
+# reaching back far enough to catch an earlier, unrelated mention of
+# backgrounding. Stream-json logs (the common case) use the real turn
+# boundary via `coord.worker_events.latest_assistant_turn_text`.
+#
+# Deliberately narrow: this matches only the specific "running in the
+# background ... continue/notify/watcher/wait" hand-off shape quadraui#1616
+# actually produced, not every way a worker might phrase "I backgrounded
+# this". A differently-worded hand-off falls through to the #2272 mute-leg
+# accounting instead (an undercount, not a false positive) — acceptable
+# because #2272 still eventually parks the row, just under the wrong cause
+# text. Widen the pattern if a real transcript is seen phrasing this
+# differently, rather than guessing at alternate phrasings up front.
 _ABANDONED_BACKGROUND_RE = re.compile(
     r"\brunning\s+in\s+the\s+background\b[\s\S]{0,200}?"
     r"\b(?:continu\w*|notif\w*|watcher|wait\w*)\b",
     re.IGNORECASE,
 )
 
-#: Plain-text (non stream-json) logs have no structured notion of "the last
-#: assistant turn", so the tail is approximated by its last few non-blank,
-#: non-``#``-comment lines — generous enough to hold a multi-sentence
-#: hand-off without reaching back far enough to catch an earlier, unrelated
-#: mention of backgrounding.
 _ABANDONED_BACKGROUND_TAIL_LINES = 40
 
 

@@ -2333,6 +2333,74 @@ def environmental_smoke_tally_reset(test_reason: str | None) -> str:
     return _ENV_RETRY_TALLY_RE.sub("", test_reason).rstrip()
 
 
+# ── Abandoned-background Test-stage retries (#3737) ─────────────────────────
+#
+# A Test-stage leg that ends its one-shot turn with the smoke command still
+# running in the background — session terminated, no `SMOKE:` marker printed
+# — is an infra abort (the worker backgrounded a long build past its own
+# turn and never came back to report an outcome), not a genuinely mute
+# suite. `coord.notify._record_smoke_verdict` detects the hand-off
+# (`coord.review.detect_abandoned_background_leg`) and clears the leg for an
+# automatic re-dispatch without charging `MUTE_SMOKE_LEG_BUDGET` — but that
+# clear still needs its OWN bounded budget (below), for exactly the #2272/
+# #3315 reason: a cause the system cannot diagnose must still be a cause the
+# system stops paying for. Co-located here with `NO_SMOKE_VERDICT_MARKER`/
+# `ENVIRONMENTAL_SMOKE_MARKER` — not in `coord.notify`, where this used to
+# live — because `_dispatch_smoke_single_leg`'s `running` stamp just below is
+# the SAME writer that has to carry `mute_smoke_legs`/`environmental_smoke_
+# legs` forward across its own re-dispatch, and a marker read by that writer
+# but defined in a different module is exactly how the #2272 defect (the
+# tally erased by the very retry it existed to count) happened in the first
+# place.
+
+#: The marker left in the parent work row's ``test_reason`` when a Test-stage
+#: leg is cleared for re-dispatch because it ended with the smoke command
+#: still backgrounded, rather than because the suite was genuinely mute.
+#: Suffixed with `` xN`` from the second CONSECUTIVE leg on, mirroring
+#: :func:`mute_smoke_tally`.
+ABANDONED_BACKGROUND_SMOKE_MARKER = "abandoned-background (#3737)"
+
+#: Bounded separately from `MUTE_SMOKE_LEG_BUDGET` — a direct "run it
+#: synchronously" re-dispatch instruction is more likely to self-heal than a
+#: genuinely silent suite, so it gets a little more room, but a cause the
+#: system cannot diagnose must still be a cause the system stops paying for
+#: (#3315's own rationale, applied here to a different cause).
+ABANDONED_BACKGROUND_SMOKE_BUDGET = 3
+
+#: Matches the marker with or without its `` xN`` tally — mirrors
+#: :data:`_MUTE_TALLY_RE`.
+_ABANDONED_BACKGROUND_TALLY_RE = re.compile(
+    re.escape(ABANDONED_BACKGROUND_SMOKE_MARKER) + r"(?:\s*x\s*(\d+))?",
+    re.IGNORECASE,
+)
+
+
+def abandoned_background_smoke_legs(test_reason: str | None) -> int:
+    """How many CONSECUTIVE Test-stage legs in a row ended with the #3737
+    abandoned-background hand-off (0 if none) — mirrors
+    :func:`mute_smoke_legs`."""
+    if not test_reason:
+        return 0
+    match = _ABANDONED_BACKGROUND_TALLY_RE.search(test_reason)
+    if match is None:
+        return 0
+    raw = match.group(1)
+    if raw is None:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:  # pragma: no cover — regex only matches digits
+        return 1
+
+
+def abandoned_background_smoke_tally(count: int) -> str:
+    """The marker for *count* consecutive abandoned-background legs — mirrors
+    :func:`mute_smoke_tally`."""
+    if count <= 1:
+        return ABANDONED_BACKGROUND_SMOKE_MARKER
+    return f"{ABANDONED_BACKGROUND_SMOKE_MARKER} x{count}"
+
+
 #: Soft (transient) unroutable reports already logged this process, keyed by
 #: ``(assignment_id, message)``. Transient conditions — a machine that is
 #: merely unreachable right now — are left re-dispatchable so the stage
@@ -3641,6 +3709,16 @@ def _dispatch_smoke_single_leg(
             environmental_smoke_legs(authoritative_reason),
             environmental_smoke_legs(board_reason),
         )
+        # #3737: ...and this stamp must ALSO carry the ABANDONED-BACKGROUND
+        # tally forward, for the identical #2272 reason above — without
+        # re-stating it here, this same "running" write erases it on every
+        # retry and the #3737 budget below (`_record_smoke_verdict`'s
+        # abandoned-background branch) can never be reached: the row would
+        # re-dispatch forever at full leg cost instead of eventually parking.
+        prior_abandoned_legs = max(
+            abandoned_background_smoke_legs(authoritative_reason),
+            abandoned_background_smoke_legs(board_reason),
+        )
         running_reason = "dispatched: Test stage running (#1426)"
         if prior_legs:
             running_reason = (
@@ -3654,6 +3732,13 @@ def _dispatch_smoke_single_leg(
                 f"{running_reason} ({prior_env_legs} of "
                 f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive "
                 "environmental Test-stage death(s) so far, #3315)"
+            )
+        if prior_abandoned_legs:
+            running_reason = (
+                f"{abandoned_background_smoke_tally(prior_abandoned_legs)} — "
+                f"{running_reason} ({prior_abandoned_legs} of "
+                f"{ABANDONED_BACKGROUND_SMOKE_BUDGET} consecutive "
+                "abandoned-background Test-stage leg(s) so far, #3737)"
             )
 
         record_test_verdict(

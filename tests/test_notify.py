@@ -3649,10 +3649,8 @@ class TestAbandonedBackgroundSmokeLeg3737(TestSmokeVerdictFailsClosed):
     def test_single_abandoned_leg_is_cleared_not_counted_as_mute(
         self, coord_db, tmp_path
     ) -> None:
-        from coord.notify import (  # noqa: PLC0415
-            ABANDONED_BACKGROUND_SMOKE_MARKER,
-            NO_SMOKE_VERDICT_MARKER,
-        )
+        from coord.notify import NO_SMOKE_VERDICT_MARKER  # noqa: PLC0415
+        from coord.smoke import ABANDONED_BACKGROUND_SMOKE_MARKER  # noqa: PLC0415
 
         transition, record, entry = self._setup(
             "work-3737a", "smoke-3737a", exit_code=0, log=self._ABANDONED_LOG,
@@ -3736,11 +3734,11 @@ class TestAbandonedBackgroundSmokeLeg3737(TestSmokeVerdictFailsClosed):
         mention of backgrounding) must still exhaust the #2272 budget and
         park exactly as before — this change must never mask a real
         no-verdict as an infra abort."""
-        from coord.notify import (  # noqa: PLC0415
+        from coord.notify import NO_SMOKE_VERDICT_MARKER  # noqa: PLC0415
+        from coord.smoke import (  # noqa: PLC0415
             ABANDONED_BACKGROUND_SMOKE_MARKER,
-            NO_SMOKE_VERDICT_MARKER,
+            MUTE_SMOKE_LEG_BUDGET,
         )
-        from coord.smoke import MUTE_SMOKE_LEG_BUDGET  # noqa: PLC0415
 
         transition, record, entry = self._setup(
             "work-3737d", "smoke-3737d", exit_code=0, log=None,

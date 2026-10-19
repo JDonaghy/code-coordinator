@@ -1501,10 +1501,13 @@ def _reclassify_infra_test_failure(
     a second, unbounded retry path. The tally is read back out of the row's
     OWN current ``test_reason`` (the one field that survives from leg to
     leg), exactly mirroring that function's non-fan-out branch, including
-    carrying the #2272 mute-leg tally forward (:func:`coord.smoke.
-    mute_smoke_legs`/``mute_smoke_tally``) so a row that alternates "mute
-    leg" / "infra death" keeps counting against both budgets instead of
-    resetting one every time the other fires.
+    carrying the #2272 mute-leg tally AND the #3737 abandoned-background
+    tally forward (:func:`coord.smoke.mute_smoke_legs`/``mute_smoke_tally``,
+    :func:`coord.smoke.abandoned_background_smoke_legs`/
+    ``abandoned_background_smoke_tally``) so a row that alternates between
+    any of "mute leg" / "infra death" / "abandoned background" keeps
+    counting against every applicable budget instead of resetting one every
+    time another fires.
 
     #3670 review: when *test_reason* is the #3182 fan-out PARENT's own
     write (:func:`coord.smoke.finalize_smoke_fanout` stamping the aggregate
@@ -1530,6 +1533,8 @@ def _reclassify_infra_test_failure(
         TEST_STATE_BLOCKED,
         _encode_fanout_manifest,
         _parse_fanout_manifest,
+        abandoned_background_smoke_legs,
+        abandoned_background_smoke_tally,
         environmental_smoke_legs,
         environmental_smoke_tally,
         mute_smoke_legs,
@@ -1579,13 +1584,25 @@ def _reclassify_infra_test_failure(
     carried = mute_smoke_legs(previous_reason)
     mute_prefix = f"{mute_smoke_tally(carried)} — " if carried else ""
 
+    # #3737: carry the abandoned-background tally forward too, for the
+    # identical #2272 reason the mute-leg tally is carried above — this
+    # reclassify path is a second writer of `test_reason` on the SAME row a
+    # #3737 budget is accruing against, and without re-stating it here it
+    # would be silently erased the next time an infra death reclassifies in
+    # between two abandoned-background legs.
+    abandoned_carried = abandoned_background_smoke_legs(previous_reason)
+    abandoned_prefix = (
+        f"{abandoned_background_smoke_tally(abandoned_carried)} — "
+        if abandoned_carried else ""
+    )
+
     env_legs = environmental_smoke_legs(previous_reason) + 1
 
     if env_legs >= ENVIRONMENTAL_SMOKE_RETRY_BUDGET:
         return (
             TEST_STATE_BLOCKED,
             (
-                f"{manifest_prefix}{mute_prefix}"
+                f"{manifest_prefix}{mute_prefix}{abandoned_prefix}"
                 f"{environmental_smoke_tally(env_legs)}: the Test-stage "
                 f"environmental retry budget "
                 f"({ENVIRONMENTAL_SMOKE_RETRY_BUDGET}) is exhausted after "
@@ -1602,7 +1619,7 @@ def _reclassify_infra_test_failure(
     return (
         None,
         (
-            f"{manifest_prefix}{mute_prefix}"
+            f"{manifest_prefix}{mute_prefix}{abandoned_prefix}"
             f"{environmental_smoke_tally(env_legs)}: Test-stage failure "
             f"reclassified as infrastructure, not a test result ({cause}) "
             "— cleared for automatic re-dispatch, not recorded as a work "

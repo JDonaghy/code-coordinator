@@ -1363,19 +1363,44 @@ def _recover_test(
     ``coord diagnose --stage test`` is a separate entry point an operator
     runs by hand, and it must not disagree with the driver about whether the
     same row is wedged.
+
+    #3737: ``coord.dead_end`` shape 2 has a THIRD cause for the same
+    ``blocked`` value — N Test-stage legs in a row ended their one-shot turn
+    with the smoke command still running in the background, never printing a
+    verdict marker — checked here too, in the same order, so this entry
+    point never disagrees with the driver about why a row is wedged (#2096
+    "one question, one answer").
     """
     from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
 
     if latest.test_state == TEST_STATE_BLOCKED:
-        from coord.smoke import mute_smoke_legs  # noqa: PLC0415
+        from coord.smoke import (  # noqa: PLC0415
+            abandoned_background_smoke_legs,
+            mute_smoke_legs,
+        )
 
-        # Same predicate `coord.dead_end`'s shape 2 uses to tell #1672
-        # (unroutable fleet) apart from #2272 (mute Test-stage legs) — #2235
-        # exists to keep those two REASONS from blurring together, so this
-        # reuses the identical function rather than re-deriving the split
-        # (#2096 "one question, one answer").
+        # Same predicates `coord.dead_end`'s shape 2 uses to tell #1672
+        # (unroutable fleet) apart from #2272 (mute Test-stage legs) and
+        # #3737 (abandoned-background legs) — #2235 exists to keep those
+        # REASONS from blurring together, so this reuses the identical
+        # functions, in the identical order, rather than re-deriving the
+        # split (#2096 "one question, one answer").
+        abandoned_legs = abandoned_background_smoke_legs(latest.test_reason)
         mute_legs = mute_smoke_legs(latest.test_reason)
-        if mute_legs:
+        if abandoned_legs:
+            cause = (
+                f"{abandoned_legs} Test-stage leg(s) in a row ended their "
+                "turn with the smoke command still running in the "
+                "background instead of to completion, exhausting the "
+                "#3737 retry budget (a separate budget from #2272's mute-"
+                "leg one, so this is not a report of a mute suite). Nothing "
+                "is known to be wrong with the BRANCH or the suite's "
+                "result — the worker backgrounded the smoke command past "
+                "its own turn and never reported an outcome. Re-dispatch "
+                "with an instruction to run the smoke command SYNCHRONOUSLY "
+                "to completion rather than backgrounding it."
+            )
+        elif mute_legs:
             cause = (
                 f"{mute_legs} Test-stage leg(s) in a row finished without "
                 "printing a `SMOKE:` verdict marker, exhausting the retry "
