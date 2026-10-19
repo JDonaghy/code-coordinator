@@ -10,8 +10,9 @@ no real `claude -p`. The end-to-end tests drive the real
 :class:`coord.agent.AgentServer` (reusing the ``_server``/``_spec``/
 ``_init_repo`` fixtures from :mod:`tests.test_agent`) through
 ``server.assign(...)`` and confirm no `claude` binary is ever invoked for a
-plain-runner leg's verdict, while a judgement-needing leg still gets the
-ordinary `claude -p` path unchanged.
+plain-runner leg's verdict — including a judgement-needing leg (#3736:
+`smoke_needs_judgement` no longer routes a `plain_runner` leg to the
+ordinary `claude -p` chat path; see `coord.agent.AgentServer._spawn`).
 """
 
 from __future__ import annotations
@@ -20,8 +21,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import coord.agent as agent_mod
 from coord.agent import (
     DONE,
+    FAILED,
     AssignmentSpec,
     PlainRunnerVerdict,
     execute_plain_runner_smoke,
@@ -290,12 +293,15 @@ def test_agent_plain_runner_leg_failure_spawns_a_claude_summariser(
     server.shutdown()
 
 
-def test_agent_smoke_needing_judgement_falls_through_to_the_claude_path(
+def test_agent_smoke_needing_judgement_also_takes_the_plain_runner_path(
     tmp_path: Path,
 ) -> None:
-    """``smoke_needs_judgement=True`` is the opt-out — even with
-    ``plain_runner=True``, this leg must get the ordinary `claude -p`
-    chat session, not the plain-runner subprocess path (#3673)."""
+    """#3736: ``smoke_needs_judgement=True`` no longer opts a ``plain_runner``
+    leg out of the subprocess path — the ordinary `claude -p` chat session
+    (`SMOKE_SYSTEM_PROMPT`) has no judgement logic beyond polling the same
+    command's exit code, and is bounded by the Bash tool's 600s ceiling that
+    this fix exists to route around. The leg must get a `SMOKE:` verdict
+    from the subprocess, with no `claude` binary ever invoked."""
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path, repo_path=repo,
@@ -308,7 +314,75 @@ def test_agent_smoke_needing_judgement_falls_through_to_the_claude_path(
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
 
+    assert final.status == DONE
+    assert final.exit_code == 0
     log = Path(final.log_path).read_text()
-    assert "claude-path-ran" in log
-    assert "plain-runner (#3673)" not in log
+    assert "SMOKE: pass" in log
+    assert "plain-runner (#3673)" in log
+    assert "claude-path-ran" not in log
+    server.shutdown()
+
+
+def test_agent_plain_runner_smoke_exceeding_the_bash_tool_ceiling_still_verdicts(
+    tmp_path: Path,
+) -> None:
+    """#3736: a smoke command that would run well past the Bash tool's 600s
+    ceiling still yields a recorded ``SMOKE:`` verdict — because it never
+    runs inside a `claude -p` turn that could background-and-abandon it. A
+    short ``smoke_timeout_s`` stands in for "exceeds the ceiling" so the
+    test itself stays fast; what matters is that the command runs to
+    completion (or is reaped by ITS OWN timeout) as a bare subprocess, with
+    no `claude` binary ever invoked and no #2244 no-verdict park."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path, repo_path=repo,
+        argv=[sys.executable, "-c", "print('claude-path-ran')"],
+    )
+    spec = _spec(
+        repo, type="smoke", plain_runner=True, smoke_needs_judgement=True,
+        smoke_command=f"{sys.executable} -c \"import time; time.sleep(0.3)\"",
+        smoke_timeout_s=30,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == DONE
+    assert final.exit_code == 0
+    log = Path(final.log_path).read_text()
+    assert "SMOKE: pass" in log
+    assert "claude-path-ran" not in log
+    server.shutdown()
+
+
+def test_agent_plain_runner_smoke_crash_still_writes_a_smoke_marker(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#3736: if :func:`execute_plain_runner_smoke` itself raises (not a
+    smoke-command failure — an infra crash in the executor), the leg must
+    still get a parseable ``SMOKE: fail`` line in its log, not just a FAILED
+    status with nothing for `coord.progress.parse_smoke_verdict_from_log` to
+    find — the same #2244 no-verdict park this whole fix targets, reachable
+    from a second angle."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path, repo_path=repo,
+        argv=[sys.executable, "-c", "print('claude-path-ran')"],
+    )
+
+    def fake_execute(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(agent_mod, "execute_plain_runner_smoke", fake_execute)
+
+    spec = _spec(
+        repo, type="smoke", plain_runner=True, smoke_command="exit 0",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == FAILED
+    log = Path(final.log_path).read_text()
+    assert "SMOKE: fail" in log
+    assert "boom" in log
+    assert "claude-path-ran" not in log
     server.shutdown()
