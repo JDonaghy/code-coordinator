@@ -263,6 +263,14 @@ class ClaudeProvider(Provider):
                 # backgrounded long-running command. #2301: this grant is for
                 # work-shaped legs only — smoke has its own branch above.
                 _at = "Read,Edit,Write,Bash,Monitor"
+                # #3730: keep in sync with default_worker_command's identical
+                # `if spec.workflow:` branch — being absent from
+                # --disallowedTools is not enough to actually use Workflow/
+                # Task; its per-invocation confirmation dialog auto-denies
+                # with no TTY unless pre-approved via --allowedTools, the
+                # same mechanism `Bash` already relies on above.
+                if spec.workflow:
+                    _at += ",Workflow,Task"
                 # #3672: keep in sync with default_worker_command's identical
                 # branch — force earlier auto-compaction for work-shaped legs.
                 # #3697: fix/conflict-fix legs carry the review findings as

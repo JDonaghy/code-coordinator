@@ -5886,6 +5886,27 @@ def _workflow_leg_system_prompt_suffix() -> str:
     hands a dispatched Review leg (see the ``elif spec.type == "review"``
     branch above) — never a second, hand-copied description of what a
     reviewer checks (#2096: one question, one answer).
+
+    #3730 adds three more guardrails on top of #3681's Workflow/Task
+    un-denial, each a system-prompt-level mitigation rather than a new CLI
+    flag (no documented, stable way to express any of the three as
+    ``--settings``/``--allowedTools`` was found):
+
+    * isolation — the leg already runs inside its own dedicated worktree;
+      a workflow subagent that additionally requests ``isolation:
+      "worktree"``/``"remote"`` would nest a second worktree inside it,
+      risking collision with the leg's own base-checkout guard and the
+      graphify symlink. Subagents must stay in the leg's own working
+      directory instead.
+    * fail-fast — a Workflow invocation that still gets denied (e.g. the
+      confirmation dialog auto-denies despite the --allowedTools grant)
+      must not be retried; retrying was observed to thrash into the
+      fleet's rapid-refill cost breaker. The leg must fall back to
+      performing the assignment directly, as a normal non-workflow leg
+      would.
+    * size — a small, bounded workflow (few agents/phases) keeps cost and
+      token usage predictable; ``WORK_AUTOCOMPACT_TOKENS`` is still the
+      hard backstop regardless.
     """
     from coord.review import REVIEWER_SYSTEM_PROMPT  # noqa: PLC0415
 
@@ -5906,7 +5927,24 @@ def _workflow_leg_system_prompt_suffix() -> str:
         "exactly the following as that review step's system prompt/lens "
         "(this is the identical text coord's own dispatched Review leg "
         "receives for this repo, byte for byte):\n\n"
-        "-----\n" + REVIEWER_SYSTEM_PROMPT + "\n-----\n"
+        "-----\n" + REVIEWER_SYSTEM_PROMPT + "\n-----\n\n"
+        "Three more rules for this workflow specifically (#3730):\n\n"
+        "1. Isolation: this leg already runs inside its own dedicated git "
+        "worktree. Do NOT give any agent in your workflow script "
+        "`isolation: \"worktree\"` or `isolation: \"remote\"` — that would "
+        "nest a second worktree inside the one you're already in, which is "
+        "unsupported here and risks colliding with this leg's own "
+        "base-checkout guard. Leave isolation unset (or `\"none\"`) so every "
+        "subagent shares this leg's own working directory.\n"
+        "2. Fail fast: if starting the workflow (or the Workflow tool call "
+        "itself) is ever denied, do NOT retry it — retrying has thrashed "
+        "other legs into the fleet's cost circuit breaker. Immediately fall "
+        "back to completing this assignment directly yourself, exactly as a "
+        "non-workflow leg would, and say so in your final message.\n"
+        "3. Keep it small: use the fewest agents/phases that can do the "
+        "job (e.g. implement, review, fix — not a long chain). This leg "
+        "still has its own hard context/cost caps regardless, but a small "
+        "workflow keeps you well inside them.\n"
     )
 
 
@@ -6272,6 +6310,16 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # the dedicated `elif spec.type == "smoke"` branch above, which
         # deliberately withholds it instead.
         allowed_tools = "Read,Edit,Write,Bash,Monitor"
+        # #3730: being absent from --disallowedTools (worker_disallowed_tools
+        # above) is not sufficient for Workflow/Task — the Workflow tool's
+        # own confirmation dialog still fires per invocation, and a headless
+        # `-p` leg has no TTY to answer it, so without an explicit
+        # --allowedTools grant it is auto-denied exactly like any other
+        # unconfirmed permission prompt. Granting it here is the same
+        # pre-approval mechanism `Bash` already relies on in this list to
+        # skip its own per-command confirmations.
+        if spec.workflow:
+            allowed_tools += ",Workflow,Task"
         # #3672: force earlier auto-compaction for work-shaped legs — see
         # `WORK_AUTOCOMPACT_TOKENS`'s docstring. These are exactly the legs
         # the cost analysis found running 200-450 turns with zero

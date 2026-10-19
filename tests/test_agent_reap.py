@@ -29,6 +29,7 @@ from coord.agent import (
     _workflow_leg_system_prompt_suffix,
     _PTY_RESULT_LINE_MARKER,
     _RESULT_LINE_MARKER,
+    default_worker_command,
     format_host_sleep_reason,
     format_runtime_ceiling_reason,
     is_host_sleep_reason,
@@ -561,6 +562,29 @@ def test_disallowed_tools_un_disallows_workflow_and_task_only_for_opted_in_leg()
         assert pattern in not_opted_in
 
 
+# ── workflow opt-in: --allowedTools (#3730) ──────────────────────────────────
+
+
+def test_allowed_tools_grants_workflow_and_task_only_for_opted_in_leg() -> None:
+    """#3730 item 2: merely absent from --disallowedTools is not enough to
+    actually use Workflow — its own per-invocation confirmation dialog
+    auto-denies with no TTY unless pre-approved via --allowedTools (the same
+    mechanism `Bash` already relies on in this list). A workflow leg's argv
+    must explicitly grant `Workflow`/`Task`; a non-opted-in leg must not."""
+    opted_in = default_worker_command(_make_spec(workflow=True))
+    not_opted_in = default_worker_command(_make_spec(workflow=False))
+
+    opted_in_allowed = opted_in[opted_in.index("--allowedTools") + 1].split(",")
+    not_opted_in_allowed = not_opted_in[
+        not_opted_in.index("--allowedTools") + 1
+    ].split(",")
+
+    assert "Workflow" in opted_in_allowed
+    assert "Task" in opted_in_allowed
+    assert "Workflow" not in not_opted_in_allowed
+    assert "Task" not in not_opted_in_allowed
+
+
 # ── in-workflow review system prompt (#3681 item 5) ──────────────────────────
 
 def test_workflow_system_prompt_suffix_embeds_the_real_reviewer_prompt_verbatim() -> None:
@@ -577,6 +601,32 @@ def test_workflow_system_prompt_suffix_embeds_the_real_reviewer_prompt_verbatim(
     # module-level string a Review leg's own system prompt is built from.
     start = suffix.index(REVIEWER_SYSTEM_PROMPT)
     assert suffix[start : start + len(REVIEWER_SYSTEM_PROMPT)] == REVIEWER_SYSTEM_PROMPT
+
+
+def test_workflow_system_prompt_suffix_tells_worker_not_to_nest_worktree_isolation() -> None:
+    """#3730 item 3: the leg already runs inside its own dedicated worktree;
+    a workflow subagent must not additionally request `isolation:
+    "worktree"`/`"remote"`, which would nest a second worktree inside it."""
+    suffix = _workflow_leg_system_prompt_suffix()
+    assert 'isolation: "worktree"' in suffix
+    assert 'isolation: "remote"' in suffix
+
+
+def test_workflow_system_prompt_suffix_tells_worker_to_fail_fast_on_denial() -> None:
+    """#3730 item 4: a denied Workflow invocation must not be retried — a
+    real leg thrashed into the fleet's rapid-refill cost breaker doing
+    exactly that — the worker must fall back to a direct, non-workflow
+    completion of the assignment instead."""
+    suffix = _workflow_leg_system_prompt_suffix()
+    assert "do NOT retry it" in suffix
+    assert "fall back to completing this assignment directly" in suffix
+
+
+def test_workflow_system_prompt_suffix_tells_worker_to_keep_workflow_small() -> None:
+    """#3730 item 5: guide the worker toward a small/bounded workflow rather
+    than shipping an unverified workflow-size settings flag."""
+    suffix = _workflow_leg_system_prompt_suffix()
+    assert "Keep it small" in suffix
 
 
 # ── _log_has_output ──────────────────────────────────────────────────────────
