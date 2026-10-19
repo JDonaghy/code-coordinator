@@ -301,6 +301,37 @@ def test_a_mute_exhausted_test_stage_names_its_own_cause() -> None:
     assert "Nothing is known to be wrong with the BRANCH" in found.reason
 
 
+def test_an_abandoned_background_exhausted_test_stage_names_its_own_cause() -> None:
+    """#3737: the abandoned-background retry budget parks the SAME ``blocked``
+    value as #1672's unroutable stage and #2272's mute-leg budget, but it is a
+    THIRD, distinct cause — the worker backgrounded the smoke command past its
+    own turn — and must not be misreported as either of the other two.
+    """
+    from coord.notify import abandoned_background_smoke_tally  # noqa: PLC0415
+
+    found = detect_dead_end(
+        state(
+            work_aid="w3737",
+            work_status="done",
+            work_branch="issue-3737",
+            work_test_state=TEST_STATE_BLOCKED,
+            work_test_reason=(
+                f"{abandoned_background_smoke_tally(3)}: the Test-stage "
+                "worker dc91c2843872 ended its turn with the smoke command "
+                "still running in the background instead of to completion."
+            ),
+            active_count=0,
+        )
+    )
+    assert found is not None
+    assert found.kind == "test_stage_blocked"
+    assert "#3737" in found.reason
+    assert "running in the background" in found.reason
+    # It must NOT misattribute this to the fleet or to a genuinely mute suite.
+    assert "no capability-matched" not in found.reason
+    assert "verdict marker" not in found.reason
+
+
 def test_gates_carry_the_readings_that_proved_the_dead_end() -> None:
     """The escalation record has to answer "how did you conclude that?"
     without the tmux pane, which is gone. ``active=0`` in particular is the

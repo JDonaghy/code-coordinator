@@ -3625,6 +3625,148 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         assert row["test_reason"] == "worker: 5 failed"
 
 
+class TestAbandonedBackgroundSmokeLeg3737(TestSmokeVerdictFailsClosed):
+    """#3737: a Test-stage leg that ends its one-shot turn with the smoke
+    command still running in the background — no `SMOKE:` marker, because
+    the worker never came back to print one — is an infra abort, not a
+    genuine no-verdict, and must not eat the #2272 mute-leg retry budget.
+
+    Reuses ``TestSmokeVerdictFailsClosed``'s ``_setup``/``_reap``/``_row``
+    helpers; only the transcript content (an abandoned hand-off instead of a
+    silent-but-clean one) and the asserted marker/budget differ.
+    """
+
+    #: The quadraui#1616 (2026-10-19) hand-off text verbatim — legs
+    #: dc91c2843872 and 93996e6b56d3 both ended their turn with exactly this,
+    #: no `SMOKE:` marker, and the row parked `test_stage_blocked` though the
+    #: branch was one clippy fix from green.
+    _ABANDONED_LOG = (
+        "Kicked off the smoke suite.\n\n"
+        "Smoke suite is running in the background; I'll continue once the "
+        "background watcher notifies me.\n"
+    )
+
+    def test_single_abandoned_leg_is_cleared_not_counted_as_mute(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord.notify import (  # noqa: PLC0415
+            ABANDONED_BACKGROUND_SMOKE_MARKER,
+            NO_SMOKE_VERDICT_MARKER,
+        )
+
+        transition, record, entry = self._setup(
+            "work-3737a", "smoke-3737a", exit_code=0, log=self._ABANDONED_LOG,
+            tmp_path=tmp_path,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-3737a")
+        assert row["test_state"] is None, (
+            "an abandoned-background leg must clear for an automatic "
+            f"re-dispatch, not park — got {row['test_state']!r}"
+        )
+        reason = row["test_reason"] or ""
+        assert ABANDONED_BACKGROUND_SMOKE_MARKER in reason
+        assert NO_SMOKE_VERDICT_MARKER not in reason, (
+            "must be tallied as its own #3737 cause, not folded into the "
+            "#2272 mute-leg tally it is explicitly meant not to share"
+        )
+
+    def test_two_consecutive_abandoned_legs_do_not_park_the_row(
+        self, coord_db, tmp_path
+    ) -> None:
+        """Acceptance: two legs in a row that both end with a live
+        background task and no `SMOKE:` marker must NOT park the row — the
+        #3737 budget (3) is wider than the #2272 mute-leg one (2) precisely
+        so this case self-heals instead."""
+        transition, record, entry = self._setup(
+            "work-3737b", "smoke-3737b", exit_code=0, log=self._ABANDONED_LOG,
+            tmp_path=tmp_path,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+            assert self._row("work-3737b")["test_state"] is None
+
+            transition2, record2, entry2 = self._setup(
+                "work-3737b", "smoke-3737b2", exit_code=0,
+                log=self._ABANDONED_LOG, tmp_path=tmp_path,
+            )
+            self._reap(transition2, record2, entry2)
+
+        row = self._row("work-3737b")
+        assert row["test_state"] is None, (
+            "two abandoned-background legs must still be cleared for "
+            f"re-dispatch, not parked — got {row['test_state']!r}"
+        )
+
+    def test_exhausted_abandoned_background_budget_parks_the_row(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord.notify import ABANDONED_BACKGROUND_SMOKE_BUDGET  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-3737c", "smoke-3737c", exit_code=0, log=self._ABANDONED_LOG,
+            tmp_path=tmp_path,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+            for lap in range(2, ABANDONED_BACKGROUND_SMOKE_BUDGET + 1):
+                smoke_id = f"smoke-3737c{lap}"
+                t2, r2, e2 = self._setup(
+                    "work-3737c", smoke_id, exit_code=0,
+                    log=self._ABANDONED_LOG, tmp_path=tmp_path,
+                )
+                self._reap(t2, r2, e2)
+
+        row = self._row("work-3737c")
+        reason = row["test_reason"] or ""
+        assert row["test_state"] == "blocked", (
+            "the #3737 budget must still be finite — exhausting it must "
+            f"park the row, got {row['test_state']!r}"
+        )
+        assert "#3737" in reason
+        assert "running in the background" in reason
+        assert "retry budget" in reason
+
+    def test_genuinely_mute_leg_is_unaffected_and_still_exhausts_its_budget(
+        self, coord_db, tmp_path
+    ) -> None:
+        """Regression: a genuinely mute suite (clean exit, no marker, no
+        mention of backgrounding) must still exhaust the #2272 budget and
+        park exactly as before — this change must never mask a real
+        no-verdict as an infra abort."""
+        from coord.notify import (  # noqa: PLC0415
+            ABANDONED_BACKGROUND_SMOKE_MARKER,
+            NO_SMOKE_VERDICT_MARKER,
+        )
+        from coord.smoke import MUTE_SMOKE_LEG_BUDGET  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-3737d", "smoke-3737d", exit_code=0, log=None,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+            for lap in range(2, MUTE_SMOKE_LEG_BUDGET + 1):
+                smoke_id = f"smoke-3737d{lap}"
+                self._record_smoke(smoke_id, parent_id="work-3737d")
+                t2, r2, e2 = self._make_transition_and_entry(
+                    smoke_id, exit_code=0,
+                )
+                r2 = dict(r2)
+                r2["review_of_assignment_id"] = "work-3737d"
+                self._reap(t2, r2, e2)
+
+        row = self._row("work-3737d")
+        reason = row["test_reason"] or ""
+        assert row["test_state"] == "blocked"
+        assert NO_SMOKE_VERDICT_MARKER in reason
+        assert ABANDONED_BACKGROUND_SMOKE_MARKER not in reason, (
+            "a genuinely mute leg must never be misclassified as the #3737 "
+            "abandoned-background case"
+        )
+
+
 class TestMuteLegMechanicalFallback(TestSmokeVerdictFailsClosed):
     """#3415: a MUTE Test-stage leg (no `SMOKE:` marker, clean exit) must
     try the mechanical fallback (`coord.confirm_test.confirm_branch`, no LLM,
