@@ -401,29 +401,6 @@ class TestDispatch:
         assert payload["workflow"] is True
 
     @patch("coord.dispatch.httpx.post")
-    def test_payload_carries_workflow_true_for_ultracode_work_proposal(
-        self, mock_post: MagicMock, config: Config,
-    ) -> None:
-        """#3722: `ultracode` implies the `coord:workflow` opt-in on a
-        `type="work"` proposal, even with no explicit `coord:workflow`
-        label — operators read "ultracode" as "do the most thorough thing",
-        which means running as a workflow, not just picking the opus
-        model."""
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"ok": True}
-        mock_post.return_value = mock_resp
-
-        p = Proposal(
-            id=1, machine_name="laptop", repo_name="api",
-            issue_number=3722, issue_title="run as a workflow via ultracode",
-            rationale="multi-agent leg", type="work",
-            issue_labels=["ultracode"],
-        )
-        dispatch(p, config)
-        payload = mock_post.call_args.kwargs["json"]
-        assert payload["workflow"] is True
-
-    @patch("coord.dispatch.httpx.post")
     def test_payload_omits_workflow_when_label_absent(
         self, mock_post: MagicMock, config: Config, proposal: Proposal,
     ) -> None:
@@ -454,28 +431,6 @@ class TestDispatch:
             issue_number=3681, issue_title="review the workflow change",
             rationale="review", type="review",
             issue_labels=["coord:workflow"],
-        )
-        dispatch(p, config)
-        payload = mock_post.call_args.kwargs["json"]
-        assert "workflow" not in payload
-
-    @patch("coord.dispatch.httpx.post")
-    def test_payload_omits_workflow_for_non_work_proposal_with_ultracode(
-        self, mock_post: MagicMock, config: Config,
-    ) -> None:
-        """#3722: `ultracode`'s workflow implication is gated to
-        `type="work"` the same way `coord:workflow` itself is — a review/
-        smoke/plan proposal carrying `ultracode` (e.g. from the same issue's
-        labels) never gets `workflow=True`."""
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"ok": True}
-        mock_post.return_value = mock_resp
-
-        p = Proposal(
-            id=1, machine_name="laptop", repo_name="api",
-            issue_number=3722, issue_title="review the ultracode change",
-            rationale="review", type="review",
-            issue_labels=["ultracode"],
         )
         dispatch(p, config)
         payload = mock_post.call_args.kwargs["json"]

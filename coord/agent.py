@@ -1050,31 +1050,6 @@ def _wait_for_proc_or_result(
 # ``issue_labels`` precedent (``provider_issue_labels``) already is.
 WORKFLOW_LEG_LABEL = "coord:workflow"
 
-# #3722: the model-selection label (`models.labels.ultracode` in
-# coordinator.yml, resolved independently by `coord.config.ModelsConfig`)
-# that operators expect to *also* mean "run this thoroughly" — i.e. imply
-# `WORKFLOW_LEG_LABEL` — rather than silently staying a single opus leg.
-ULTRACODE_LABEL = "ultracode"
-
-
-def is_workflow_leg(proposal_type: str, issue_labels: list[str] | None) -> bool:
-    """Whether a ``type="work"`` dispatch should run as a multi-agent workflow.
-
-    True when the issue carries ``WORKFLOW_LEG_LABEL`` or ``ULTRACODE_LABEL``
-    (#3722: ``ultracode`` implies the workflow opt-in, not just the opus
-    model). Every non-``"work"`` proposal type (test, review, fix, ...) is
-    never a workflow leg, regardless of labels.
-
-    Single source of truth for this question: ``coord/dispatch.py`` (the
-    wire ``AssignmentSpec.workflow`` payload) and ``coord/state.py`` (the
-    recorded assignment ``mode`` column) both call this instead of
-    re-deriving the condition, so the two surfaces cannot drift apart.
-    """
-    labels = issue_labels or []
-    return proposal_type == "work" and (
-        WORKFLOW_LEG_LABEL in labels or ULTRACODE_LABEL in labels
-    )
-
 
 @dataclass
 class AssignmentSpec:
