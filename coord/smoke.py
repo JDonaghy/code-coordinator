@@ -2775,8 +2775,13 @@ def _walk_candidates_and_dispatch(
     session) instead of the briefing-driven chat the SMOKE_SYSTEM_PROMPT
     above describes. `plain_runner` is unconditionally `True` on every
     dispatch this function makes — #3673's "make the Test stage a plain
-    runner by default" policy — with `smoke_needs_judgement` as the one
-    opt-out (GUI/real-host-driver specs, :func:`smoke_needs_judgement`); the
+    runner by default" policy. `smoke_needs_judgement` still rides along
+    (GUI/real-host-driver specs, :func:`smoke_needs_judgement`) and is still
+    read by this module's own dispatch bookkeeping, but #3736 removed its
+    use in `_spawn` as a second gate: every `plain_runner` leg takes the
+    subprocess path regardless, since `SMOKE_SYSTEM_PROMPT`'s chat path has
+    no judgement logic of its own beyond polling the same command's exit
+    code, and loses the Bash tool's 600s ceiling for nothing in return. The
     briefing text is sent either way so a plain-runner-ineligible agent (one
     whose `default_worker_command` predates #3673, or any OTHER assignment
     type reusing this wire shape) still gets a fully-formed `claude -p`

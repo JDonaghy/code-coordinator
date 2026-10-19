@@ -1165,11 +1165,11 @@ class AssignmentSpec:
     # agent reason (docs/EPHEMERAL_WORKERS.md).
     runtime_ceiling_s: float | None = None
     # #3673: "make the Test stage a plain runner by default" — when True AND
-    # ``type == "smoke"`` AND ``smoke_needs_judgement`` is False AND
-    # ``smoke_command`` is set, ``_spawn`` runs ``smoke_command`` directly as
-    # a subprocess (:func:`run_plain_runner_command`) instead of spawning a
-    # ``claude -p`` session, and derives the Test-stage verdict from its exit
-    # code alone — an LLM session is spawned only to SUMMARISE a failure
+    # ``type == "smoke"`` AND ``smoke_command`` is set, ``_spawn`` runs
+    # ``smoke_command`` directly as a subprocess
+    # (:func:`run_plain_runner_command`) instead of spawning a ``claude -p``
+    # session, and derives the Test-stage verdict from its exit code alone —
+    # an LLM session is spawned only to SUMMARISE a failure
     # (:func:`AgentServer._spawn_plain_runner_failure_summary`), never to
     # decide pass/fail. Defaults to ``False`` — the same "unrecognized kwarg
     # 400s a config-free/older agent" discipline every other optional field
@@ -1178,6 +1178,10 @@ class AssignmentSpec:
     # actual default-on policy) opts a leg into this path; every other
     # assignment type, and any caller that predates this field, is
     # completely unaffected.
+    #
+    # #3736: ``smoke_needs_judgement`` is no longer a second gate on this —
+    # see that field's own docstring below for why every plain-runner leg,
+    # judgement-needing or not, now takes this subprocess path.
     plain_runner: bool = False
     # #3673: the resolved shell command a plain-runner leg executes
     # (``coord.smoke.resolve_smoke_command``'s result, carried structurally
@@ -1199,10 +1203,17 @@ class AssignmentSpec:
     smoke_timeout_s: float | None = None
     # #3673: True when this leg's required capabilities need genuine
     # judgement rather than a bare exit code (GUI/real-host drivers — see
-    # ``coord.smoke.smoke_needs_judgement``). ``_spawn`` falls through to
-    # the ordinary ``claude -p`` chat path whenever this is True, even if
-    # ``plain_runner`` is also True — the opt-out, not a second on/off
-    # switch of its own.
+    # ``coord.smoke.smoke_needs_judgement``). Still carried on the wire and
+    # still read by ``coord.smoke``'s own dispatch bookkeeping, but #3736
+    # removed its use as a SECOND gate in ``_spawn``: it no longer routes a
+    # leg to the ordinary ``claude -p`` chat path on its own.
+    # ``SMOKE_SYSTEM_PROMPT`` (``coord.smoke``) has no actual GUI/real-host
+    # judgement logic beyond polling the same command and reading its exit
+    # code, so a judgement-needing leg gains nothing from that path that the
+    # plain-runner subprocess doesn't already do — while losing the Bash
+    # tool's 600s ceiling, which a long judgement-needing build (e.g. a cold
+    # Windows cross-compile) can exceed and get backgrounded-and-abandoned
+    # into a #2244 no-verdict park (see ``_spawn``'s own comment for detail).
     smoke_needs_judgement: bool = False
     # #3681: opts a ``type="work"`` leg into running as a Claude Code
     # *workflow* — multiple agents (implement → adversarial review → fix)
@@ -6462,8 +6473,10 @@ def _user_message_line(text: str) -> bytes:
 # session) and derives the verdict from the exit code alone. An LLM session
 # is spawned only to SUMMARISE a failure for a human-readable report — never
 # to decide pass/fail — via `AgentServer._spawn_plain_runner_failure_summary`.
-# `coord.smoke.smoke_needs_judgement` is the opt-out for GUI/real-host-driver
-# specs that genuinely need more than an exit code.
+# #3736: every `plain_runner` leg takes this path, including one
+# `coord.smoke.smoke_needs_judgement` flags as GUI/real-host-driver — see
+# `AgentServer._spawn`'s routing comment for why that stopped being a
+# second gate.
 
 #: How much of a plain-runner command's combined stdout+stderr survives into
 #: the leg's log (and, on failure, the summary request) — generous enough to
@@ -10439,6 +10452,25 @@ class AgentServer:
             _log.exception(
                 "plain-runner smoke %s: execute_plain_runner_smoke raised", assignment.id,
             )
+            # #3736: write the SAME `SMOKE:` marker vocabulary the normal
+            # path writes, even on this crash branch — `_fail` alone sets
+            # the assignment FAILED but writes nothing to the log, which
+            # left `coord.progress.parse_smoke_verdict_from_log` (read via
+            # `coord.notify._smoke_worker_verdict`) with no marker to find
+            # and the leg parked as a #2244 no-verdict rather than recorded
+            # as a failure a human can act on. `_SMOKE_VERDICT_RE` is a
+            # line-anchored `^SMOKE:\s*(pass|fail|baseline-red)\b\s*(.*)$`
+            # match, so the free-text reason after `fail` here is read back
+            # as the verdict's `reason` exactly like a `claude -p` worker's
+            # own `SMOKE: fail <reason>` line.
+            try:
+                with open(assignment.log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"\nSMOKE: fail plain-runner smoke crashed: {exc}\n")
+            except OSError:
+                _log.exception(
+                    "plain-runner smoke %s: failed to write crash marker to log %s",
+                    assignment.id, assignment.log_path,
+                )
             self._fail(assignment, f"plain-runner smoke crashed: {exc}")
             return
 
@@ -10544,16 +10576,35 @@ class AgentServer:
         # `_spawn` is ever reached.
         spec = assignment.spec
 
-        # #3673: the plain-runner path — a smoke leg this policy applies to
-        # never spawns `claude -p` for its verdict at all, so it must be
-        # checked before any provider resolution/argv-building below, which
-        # exists purely to build THAT spawn.
-        if (
-            spec.type == "smoke"
-            and spec.plain_runner
-            and not spec.smoke_needs_judgement
-            and spec.smoke_command
-        ):
+        # #3673/#3736: the plain-runner path — a smoke leg this policy
+        # applies to never spawns `claude -p` for its verdict at all, so it
+        # must be checked before any provider resolution/argv-building below,
+        # which exists purely to build THAT spawn.
+        #
+        # #3736: `smoke_needs_judgement` no longer excludes a leg from this
+        # path. It used to (the `and not spec.smoke_needs_judgement` clause
+        # that lived here routed a "judgement-needing" leg — in practice,
+        # every default-config `windows` capability leg, e.g. quadraui's
+        # win-msvc cross-compile smoke — through the ordinary `claude -p`
+        # chat session instead). That session runs `SMOKE_SYSTEM_PROMPT`
+        # (coord/smoke.py), which has no visual/interactive judgement logic
+        # of its own: it polls the SAME command this subprocess path runs and
+        # derives the SAME pass/fail from its exit code, just inside a
+        # `claude -p` turn bounded by the Bash tool's 600s ceiling — long
+        # enough for a cold cross-build that a worker then backgrounds and
+        # abandons when it ends its (one-shot, non-resumable) turn to "wait
+        # for a notification" that never arrives. The result was a #2244
+        # no-verdict park with no `SMOKE:` marker ever written (quadraui#1616)
+        # — exactly the failure mode `run_plain_runner_command`'s own
+        # `subprocess.run(..., timeout=...)` call cannot have, since it never
+        # runs inside a Claude Code tool call at all. This also closes the
+        # #2085 split-brain with `coord.notify._is_plain_runner_leg`, which
+        # already classified every leg here as plain-runner (`plain_runner`
+        # rides the wire unconditionally True, per `coord.smoke.
+        # _walk_candidates_and_dispatch`'s docstring) — that classification
+        # now matches how the leg actually executes, for every leg, with no
+        # change needed on the `coord.notify` side.
+        if spec.type == "smoke" and spec.plain_runner and spec.smoke_command:
             self._run_plain_runner_smoke(assignment, repo_path)
             return
 
