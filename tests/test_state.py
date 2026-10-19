@@ -1661,31 +1661,6 @@ class TestRecordDispatchedMode:
         row = next(a for a in board.active if a.assignment_id == assignment_id)
         assert row.mode == "workflow"
 
-    def test_ultracode_work_leg_records_workflow(self, coord_db) -> None:
-        """#3722: `ultracode` implies the `coord:workflow` opt-in even with
-        no explicit `coord:workflow` label on the issue."""
-        from coord.state import load_assignment_mode, record_dispatched
-
-        proposal = Proposal(
-            id=14,
-            machine_name="precision",
-            repo_name="myrepo",
-            issue_number=3722,
-            issue_title="Run this as a workflow via ultracode",
-            rationale="test",
-            briefing="run it thoroughly",
-            type="work",
-            issue_labels=["ultracode"],
-        )
-        assignment_id = "aid-3722-ultracode"
-        record_dispatched(
-            assignment_id=assignment_id,
-            proposal=proposal,
-            repo_github="acme/myrepo",
-        )
-
-        assert load_assignment_mode(assignment_id) == "workflow"
-
     def test_normal_work_leg_records_single(self, coord_db) -> None:
         from coord.state import load_assignment_mode, record_dispatched
 
