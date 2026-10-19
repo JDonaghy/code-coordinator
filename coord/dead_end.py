@@ -250,10 +250,32 @@ def detect_dead_end(state, *, can_waive_test_gate: bool = False) -> DeadEnd | No
     # symptom-not-cause failure #2235 exists to measure, and it is one
     # `mute_smoke_legs` call away from being avoided.
     if state.work_test_state == TEST_STATE_BLOCKED:
+        from coord.notify import abandoned_background_smoke_legs  # noqa: PLC0415
         from coord.smoke import mute_smoke_legs  # noqa: PLC0415
 
+        # #3737: a THIRD, unrelated cause parks the same value — N Test-stage
+        # legs in a row ended their one-shot turn with the smoke command
+        # still running in the background (no verdict marker, because the
+        # worker never came back to print one). Checked before the plain
+        # mute-leg tally since the two markers never co-occur in the same
+        # `test_reason`, but keeping the order explicit avoids depending on
+        # that.
+        abandoned_legs = abandoned_background_smoke_legs(state.work_test_reason)
         mute_legs = mute_smoke_legs(state.work_test_reason)
-        if mute_legs:
+        if abandoned_legs:
+            cause = (
+                f"{abandoned_legs} Test-stage leg(s) in a row ended their "
+                "turn with the smoke command still running in the "
+                "background instead of to completion, exhausting the "
+                "#3737 retry budget (a separate budget from #2272's mute-"
+                "leg one, so this is not a report of a mute suite). Nothing "
+                "is known to be wrong with the BRANCH or the suite's "
+                "result — the worker backgrounded the smoke command past "
+                "its own turn and never reported an outcome. Re-dispatch "
+                "with an instruction to run the smoke command "
+                "SYNCHRONOUSLY to completion rather than backgrounding it."
+            )
+        elif mute_legs:
             cause = (
                 f"{mute_legs} Test-stage leg(s) in a row finished without "
                 "printing a `SMOKE:` verdict marker, exhausting the retry "

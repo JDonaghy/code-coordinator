@@ -12,7 +12,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from coord.review import TestVerdictFindings, parse_test_verdict_from_log
+from coord.review import (
+    TestVerdictFindings,
+    detect_abandoned_background_leg,
+    parse_test_verdict_from_log,
+)
 
 
 def _write_plain_log(path: Path, content: str) -> Path:
@@ -155,3 +159,66 @@ Looks fine.
 
     def test_nonexistent_file_returns_none(self, tmp_path: Path) -> None:
         assert parse_test_verdict_from_log(tmp_path / "nonexistent.log") is None
+
+
+class TestDetectAbandonedBackgroundLeg:
+    """#3737: the signature of a Test-stage leg that ended its one-shot turn
+    with the smoke command still running in the background — session
+    terminated, no `SMOKE:`/`TEST_VERDICT:` marker printed — rather than an
+    infra abort indistinguishable from a genuinely mute suite."""
+
+    def test_plain_text_quadraui_1616_handoff(self, tmp_path: Path) -> None:
+        log = tmp_path / "smoke.log"
+        _write_plain_log(log, """\
+Kicked off the smoke suite.
+
+Smoke suite is running in the background; I'll continue once the \
+background watcher notifies me.
+""")
+        assert detect_abandoned_background_leg(log) is True
+
+    def test_plain_text_alternate_phrasing(self, tmp_path: Path) -> None:
+        log = tmp_path / "smoke.log"
+        _write_plain_log(log, """\
+Build takes a while, so the suite is still running in the background. \
+I'll pick this up again once notified, will continue when notified.
+""")
+        assert detect_abandoned_background_leg(log) is True
+
+    def test_stream_json_handoff_in_last_turn(self, tmp_path: Path) -> None:
+        log = tmp_path / "smoke.log"
+        _write_stream_json_log(log, [
+            "Kicking off the build now.",
+            "Smoke suite is running in the background; I'll continue once "
+            "the background watcher notifies me.",
+        ])
+        assert detect_abandoned_background_leg(log) is True
+
+    def test_genuinely_mute_suite_is_not_abandoned_background(
+        self, tmp_path: Path,
+    ) -> None:
+        """A real #2244 mute leg — clean exit, no marker, and no mention of
+        backgrounding anywhere — must NOT be misclassified as an infra abort;
+        that would mask a genuine no-verdict."""
+        log = tmp_path / "smoke.log"
+        _write_plain_log(log, "Ran the checklist. Everything looked fine.")
+        assert detect_abandoned_background_leg(log) is False
+
+    def test_a_real_verdict_is_not_abandoned_background(
+        self, tmp_path: Path,
+    ) -> None:
+        """A leg that printed a real verdict is obviously not this case,
+        even if it mentions backgrounding earlier in the session."""
+        log = tmp_path / "smoke.log"
+        _write_plain_log(log, """\
+Kicked off a background job earlier, then waited for it to finish.
+
+TEST_VERDICT: passed
+TEST_REASON:
+All checks passed.
+END_TEST
+""")
+        assert detect_abandoned_background_leg(log) is False
+
+    def test_nonexistent_file_returns_false(self, tmp_path: Path) -> None:
+        assert detect_abandoned_background_leg(tmp_path / "nonexistent.log") is False
