@@ -208,10 +208,24 @@ I'll pick this up again once notified, will continue when notified.
         self, tmp_path: Path,
     ) -> None:
         """A leg that printed a real verdict is obviously not this case,
-        even if it mentions backgrounding earlier in the session."""
+        even if an EARLIER, unrelated mention of backgrounding — matching
+        the actual regex phrase, not just the word "background" — scrolls
+        out of the `_ABANDONED_BACKGROUND_TAIL_LINES` tail window the plain-
+        text path scans. This is the real guard the module docstring
+        describes ("wide enough ... not reaching back far enough to catch
+        an earlier, unrelated mention"); a fixture whose early mention never
+        matches the regex at all would pass trivially regardless of that
+        guard, so this one is built long enough to actually exercise it."""
         log = tmp_path / "smoke.log"
-        _write_plain_log(log, """\
-Kicked off a background job earlier, then waited for it to finish.
+        early_mention = (
+            "Kicking off the build now.\n"
+            "Smoke suite is running in the background; I'll continue once "
+            "the background watcher notifies me.\n"
+        )
+        filler = "\n".join(f"Still working, step {i}." for i in range(50))
+        _write_plain_log(log, f"""\
+{early_mention}
+{filler}
 
 TEST_VERDICT: passed
 TEST_REASON:

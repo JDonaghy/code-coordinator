@@ -1709,6 +1709,46 @@ def test_dispatch_smoke_carries_the_environmental_retry_tally_across_the_running
     assert f"{ENVIRONMENTAL_SMOKE_RETRY_BUDGET} consecutive" in parent.test_reason
 
 
+def test_dispatch_smoke_carries_the_abandoned_background_tally_across_the_running_stamp(
+    gtk_and_server_config: Config,
+) -> None:
+    """The #2272 regression, replayed again for the #3737 abandoned-
+    background budget.
+
+    `test_reason` is the only field that survives from one Test-stage leg to
+    the next. If `dispatch_smoke`'s own "running" stamp does not re-state the
+    #3737 tally, the very next dispatch erases it and
+    `ABANDONED_BACKGROUND_SMOKE_BUDGET` can never fire — the row re-dispatches
+    forever at full leg cost instead of eventually parking, the same #2272/
+    #3315 failure mode replayed for a third cause.
+    """
+    from coord.smoke import (  # noqa: PLC0415
+        ABANDONED_BACKGROUND_SMOKE_BUDGET,
+        abandoned_background_smoke_legs,
+        abandoned_background_smoke_tally,
+    )
+
+    parent = _completed(machine="server")
+    parent.test_reason = (
+        f"{abandoned_background_smoke_tally(2)}: still backgrounded"
+    )
+    board = Board(completed=[parent])
+
+    result = dispatch_smoke(
+        parent, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-run"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is not None
+    assert parent.test_state == "running"
+    assert abandoned_background_smoke_legs(parent.test_reason) == 2, (
+        "the abandoned-background tally must survive the `running` stamp, "
+        f"or the #3737 budget can never fire — got {parent.test_reason!r}"
+    )
+    assert f"{ABANDONED_BACKGROUND_SMOKE_BUDGET} consecutive" in parent.test_reason
+
+
 def test_propagate_smoke_terminal_failure_parks_after_retry_budget_exhausted(
     coord_db,
 ) -> None:

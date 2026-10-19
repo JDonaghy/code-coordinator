@@ -3368,6 +3368,36 @@ class TestRecordTestVerdictInfraReclassification:
         ).fetchone()
         assert mute_smoke_tally(1) in row["test_reason"]
 
+    def test_abandoned_background_tally_carries_forward_across_an_infra_clear(
+        self, coord_db,
+    ) -> None:
+        """#3737 review (blocking): an infra clear must carry the #3737
+        abandoned-background tally forward exactly like the #2272 mute-leg
+        tally above — this reclassify path is a second writer of
+        `test_reason` on the SAME row the #3737 budget accrues against, and
+        without re-stating it here an infra death interleaving with an
+        abandoned-background leg would silently hand the row a fresh
+        budget."""
+        from coord.smoke import abandoned_background_smoke_tally
+
+        self._seed_assignment(coord_db)
+        record_test_verdict(
+            assignment_id="aid-1", test_state="running",
+            test_reason=(
+                f"{abandoned_background_smoke_tally(2)} — Test stage running."
+            ),
+        )
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="failed",
+            test_reason="no exit status was produced",
+        )
+
+        row = coord_db.execute(
+            "SELECT test_reason FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert abandoned_background_smoke_tally(2) in row["test_reason"]
+
 
 class TestRecordTestVerdictBaselineRedStreak:
     """#3386 (item 3 of #3378): `_record_test_verdict_local` is the single

@@ -250,8 +250,10 @@ def detect_dead_end(state, *, can_waive_test_gate: bool = False) -> DeadEnd | No
     # symptom-not-cause failure #2235 exists to measure, and it is one
     # `mute_smoke_legs` call away from being avoided.
     if state.work_test_state == TEST_STATE_BLOCKED:
-        from coord.notify import abandoned_background_smoke_legs  # noqa: PLC0415
-        from coord.smoke import mute_smoke_legs  # noqa: PLC0415
+        from coord.smoke import (  # noqa: PLC0415
+            abandoned_background_smoke_legs,
+            mute_smoke_legs,
+        )
 
         # #3737: a THIRD, unrelated cause parks the same value — N Test-stage
         # legs in a row ended their one-shot turn with the smoke command
