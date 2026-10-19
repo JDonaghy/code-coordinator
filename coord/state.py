@@ -1064,23 +1064,20 @@ def _record_dispatched_local(
     # is never branch=NULL.  Mirrors agent.py:1021 exactly:
     #   branch_name = existing_branch or f"issue-{issue_number}-{_slugify(issue_title)}"
     # where proposal.target_branch maps to existing_branch.
-    from coord.agent import WORKFLOW_LEG_LABEL, _slugify  # noqa: PLC0415
+    from coord.agent import _slugify, is_workflow_leg  # noqa: PLC0415
 
     branch = proposal.target_branch or (
         f"issue-{proposal.issue_number}-{_slugify(proposal.issue_title)}"
     )
 
-    # #3681: "workflow" only for a `type="work"` dispatch whose issue carries
-    # the opt-in `coord:workflow` label (mirrors coord.dispatch's own
-    # `proposal.type == "work"` gating for the wire-payload `workflow` flag)
-    # — every other proposal type (test, review, fix, ...) and every
-    # unlabeled work issue records "single". See
-    # `coord.agent.AssignmentSpec.workflow`.
-    mode = (
-        "workflow"
-        if proposal.type == "work" and WORKFLOW_LEG_LABEL in (proposal.issue_labels or [])
-        else "single"
-    )
+    # #3681/#3722: "workflow" only for a `type="work"` dispatch whose issue
+    # carries the opt-in `coord:workflow` label, or `ultracode` (which
+    # implies it) — `is_workflow_leg` is the single source of truth for this
+    # question, also called by `coord.dispatch`'s wire-payload `workflow`
+    # flag, so the two surfaces cannot drift apart. Every other proposal
+    # type (test, review, fix, ...) and every unlabeled work issue records
+    # "single". See `coord.agent.AssignmentSpec.workflow`.
+    mode = "workflow" if is_workflow_leg(proposal.type, proposal.issue_labels) else "single"
 
     conn = get_connection()
     cur = sql.execute(conn,
