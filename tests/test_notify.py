@@ -3410,6 +3410,14 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         '{"type":"result","subtype":"success","result":"The suite failed."}\n'
     )
 
+    @pytest.fixture(autouse=True)
+    def _isolated_coord_dir(self, tmp_path, monkeypatch):
+        """A `fail` verdict with non-empty preceding context writes it to
+        `COORD_DIR/test_output/<assignment_id>.txt`
+        (`coord.confirm_test.write_test_output_file`) — point `COORD_DIR` at
+        this test's own `tmp_path` rather than a real one."""
+        monkeypatch.setattr("coord.state.COORD_DIR", tmp_path / "coord-dir")
+
     def _reap(self, transition, record, entry) -> None:
         from coord.notify import post_transition  # noqa: PLC0415
 
@@ -3473,14 +3481,18 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         assert row["smoke_test"] == "fail"
         assert "5 failed" in (row["test_reason"] or "")
 
-    def test_plain_runner_failure_threads_log_context_into_test_reason(
+    def test_plain_runner_failure_threads_log_context_into_test_output_file(
         self, coord_db, tmp_path,
     ) -> None:
-        """#3741: a plain-runner (#3673) log has NOTHING but `exit=N` on the
-        `SMOKE: fail` line itself — the failing test name and rerun hint are
-        only in the captured output that precedes it. `test_reason` must
-        carry that, not just `headless smoke: exit=1`, or a fix worker can't
-        tell its own diff from a red base."""
+        """A plain-runner log has NOTHING but `exit=N` on the `SMOKE: fail`
+        line itself — the failing test name and rerun hint are only in the
+        captured output that precedes it. That context must reach a fix
+        worker via `COORD_DIR/test_output/<assignment_id>.txt`
+        (`coord.commands.plan_followup.fix` reads this file ahead of
+        `test_reason`), not via `test_reason` itself — `test_reason` stays a
+        short, coordinator-authored headline because several readers
+        (`coord.state.classify_failure`, `coord.smoke`'s budget tallies)
+        scan it with unanchored regexes that must never see raw log text."""
         plain_runner_log = (
             "FAILED tests/readme_truth.rs::version_matches\n"
             "error: test failed, to rerun pass -p vimcode --test readme_truth\n"
@@ -3497,11 +3509,23 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         assert row["test_state"] == "failed"
         reason = row["test_reason"] or ""
         assert "exit=1" in reason
-        assert "FAILED tests/readme_truth.rs::version_matches" in reason, (
-            "a bare 'headless smoke: exit=1' is exactly the failure mode "
-            f"#3741 reports — got {reason!r}"
+        assert "FAILED tests/readme_truth.rs::version_matches" not in reason, (
+            "raw log text must not land in test_reason — it is scanned "
+            f"unanchored by several readers; got {reason!r}"
         )
-        assert "to rerun pass -p vimcode --test readme_truth" in reason
+
+        from coord.state import COORD_DIR  # noqa: PLC0415
+
+        stored = COORD_DIR / "test_output" / "work-3741.txt"
+        assert stored.exists(), (
+            f"expected the captured context at {stored} for `coord fix` to read"
+        )
+        context = stored.read_text()
+        assert "FAILED tests/readme_truth.rs::version_matches" in context, (
+            "a bare 'headless smoke: exit=1' tells a fix worker nothing — "
+            f"the failing test name must survive into the file; got {context!r}"
+        )
+        assert "to rerun pass -p vimcode --test readme_truth" in context
 
     def test_clean_exit_without_verdict_records_no_verdict(
         self, coord_db, tmp_path

@@ -85,13 +85,6 @@ _ECHOED_SMOKE_RE = re.compile(
 )
 
 
-#: #3741: how much of the log *preceding* the `SMOKE:` marker line to keep as
-#: `SmokeVerdict.context` — mirrors `coord.revalidate._OUTPUT_TAIL_CHARS`'s
-#: reasoning (enough to quote the failing test name + assertion/panic lines
-#: and a rerun hint back to a fix worker, not a whole log dump).
-_SMOKE_CONTEXT_CHARS = 4000
-
-
 @dataclass(frozen=True)
 class SmokeVerdict:
     """#2244: a smoke worker's self-reported verdict line.
@@ -100,13 +93,14 @@ class SmokeVerdict:
     ``"baseline-red"``; ``reason`` is the (possibly empty) trailing text on
     the marker's own line.
 
-    ``context`` (#3741) is a bounded tail of whatever text preceded the
-    marker — the plain-runner (#3673) always writes its captured test output
-    immediately before `SMOKE: fail exit=N`, and a `claude -p` smoke worker
-    usually states the failing test/assertion in the same turn it prints the
-    marker. Without this, a fix briefing built from `reason` alone sees only
-    the marker's own trailing text (often just `exit=1`) and never the actual
-    failure the log already contains.
+    ``context`` is a bounded tail (:func:`coord.revalidate._tail`) of
+    whatever text preceded the marker — a plain-runner writes its captured
+    test output immediately before `SMOKE: fail exit=N`, and a `claude -p`
+    smoke worker usually states the failing test/assertion in the same turn
+    it prints the marker. This is raw worker-authored text, not a short
+    summary: callers must route it to a channel meant for that (e.g.
+    `coord.confirm_test.write_test_output_file`), never append it to a
+    structured field like `test_reason`.
     """
 
     kind: str
@@ -501,6 +495,8 @@ def _extract_smoke_verdict_from_text(text: str) -> "SmokeVerdict | None":
     itself — "I said baseline-red, but re-running shows a real failure")
     means the final line, not the first.
     """
+    from coord.revalidate import _tail  # noqa: PLC0415
+
     matches = list(_SMOKE_VERDICT_RE.finditer(text))
     if not matches:
         return None
@@ -512,12 +508,11 @@ def _extract_smoke_verdict_from_text(text: str) -> "SmokeVerdict | None":
         kind = "pass"
     else:
         kind = "fail"
-    # #3741: whatever preceded the marker line, bounded. `text[:last.start()]`
-    # not `.end()` — the marker line itself (e.g. `SMOKE: fail exit=1`) is
+    # Whatever preceded the marker line, bounded the same way
+    # `coord.revalidate`'s own failure tails are. `text[:last.start()]` not
+    # `.end()` — the marker line itself (e.g. `SMOKE: fail exit=1`) is
     # already captured as `reason` and would just duplicate here.
-    preceding = text[: last.start()].strip()
-    if len(preceding) > _SMOKE_CONTEXT_CHARS:
-        preceding = "…(truncated)…\n" + preceding[-_SMOKE_CONTEXT_CHARS:]
+    preceding = _tail(text[: last.start()])
     return SmokeVerdict(
         kind=kind, reason=last.group(2).strip(), context=preceding,
     )

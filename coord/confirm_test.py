@@ -788,6 +788,41 @@ class ConfirmationResult:
         return self.kind in INCONCLUSIVE_KINDS
 
 
+def write_test_output_file(assignment_id: str, output: str) -> Path | None:
+    """Best-effort persist of *output* to ``COORD_DIR/test_output/<assignment_id>.txt``.
+
+    This is the one dedicated channel for quoting raw worker-/suite-authored
+    text back to a fix worker: ``coord fix`` (:mod:`coord.commands.plan_followup`)
+    prefers reading this file over every other evidence source, and —
+    critically — ``test_reason`` does not: that column is scanned by several
+    unanchored regex readers (:func:`coord.state.classify_failure` on every
+    ``test_state="failed"`` write, the smoke budget tallies in
+    :mod:`coord.smoke`) that must never see raw log prose, only the
+    coordinator's own one-line summaries. Anything longer than a headline
+    belongs here, not in ``test_reason``.
+
+    *assignment_id* is the parent **work** row's id (the one a fix leg is
+    spawned from), not a confirming/smoke transition's id — the same key
+    :func:`coord.commands.plan_followup.fix` reads back by.
+
+    A no-op, returning ``None``, when there is nothing to write or when the
+    write itself fails (a read-only ``COORD_DIR``, a full disk, ...); callers
+    treat this as best-effort and must never let it break verdict recording.
+    """
+    if not output:
+        return None
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    try:
+        test_output_dir = COORD_DIR / "test_output"
+        test_output_dir.mkdir(parents=True, exist_ok=True)
+        stored = test_output_dir / f"{assignment_id}.txt"
+        stored.write_text(output)
+    except OSError:
+        return None
+    return stored
+
+
 def write_confirmation_output(assignment_id: str, result: ConfirmationResult) -> Path | None:
     """Persist a confirmation run's captured output tail for the fix briefing (#2563).
 
@@ -802,29 +837,13 @@ def write_confirmation_output(assignment_id: str, result: ConfirmationResult) ->
     failing test names, no tracebacks, and had to re-derive the diagnosis the
     daemon already held in memory.
 
-    *assignment_id* is the parent **work** row's id (the one the fix leg is
-    spawned from), not the confirming smoke transition's id — same key
-    :func:`coord.commands.plan_followup.fix` reads back by.
-
     A no-op, returning ``None``, when there is nothing to write (``KIND_OK``
     and ``KIND_SETUP`` both carry an empty ``.output`` — the former because
     nothing failed, the latter because no command ever ran) or when the write
-    itself fails (a read-only ``COORD_DIR``, a full disk, ...); this must
-    never break verdict recording, which is why the caller in
-    :mod:`coord.notify` treats it as best-effort.
+    itself fails; see :func:`write_test_output_file`, which does the actual
+    work.
     """
-    if not result.output:
-        return None
-    from coord.state import COORD_DIR  # noqa: PLC0415
-
-    try:
-        test_output_dir = COORD_DIR / "test_output"
-        test_output_dir.mkdir(parents=True, exist_ok=True)
-        stored = test_output_dir / f"{assignment_id}.txt"
-        stored.write_text(result.output)
-    except OSError:
-        return None
-    return stored
+    return write_test_output_file(assignment_id, result.output)
 
 
 def confirmation_enabled(config=None) -> bool:
