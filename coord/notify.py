@@ -3280,14 +3280,30 @@ def _record_smoke_verdict(
         # `test_state`, so a headless smoke FAILURE lands as
         # test_state='failed' AND smoke_test='fail' and stays reachable from
         # `coord fix`.
+        #
+        # #3741: `verdict.reason` alone is often just the marker's own
+        # trailing text (a plain-runner's `SMOKE: fail exit=1` has nothing
+        # else on that line) — useless to a fix worker who can't tell its own
+        # diff from a red base from an exit code. `verdict.context` is the
+        # bounded log tail that preceded the marker, which for the
+        # plain-runner (#3673) IS the captured failing-test output (panic /
+        # assertion lines, `error: test failed, to rerun pass -p <crate>
+        # --test <name>`), and for a `claude -p` smoke worker is usually the
+        # turn where it identified the failure. Append it so the fix
+        # briefing (`coord/commands/plan_followup.py`'s `fix()`) quotes real
+        # output instead of a bare exit code.
+        headline = (
+            f"headless smoke: {verdict.reason}"
+            if verdict.reason
+            else "headless smoke reported SMOKE: fail"
+        )
+        test_reason = (
+            f"{headline}\n\n{verdict.context}" if verdict.context else headline
+        )
         record_test_verdict(
             assignment_id=parent_id,
             test_state="failed",
-            test_reason=(
-                f"headless smoke: {verdict.reason}"
-                if verdict.reason
-                else "headless smoke reported SMOKE: fail"
-            ),
+            test_reason=test_reason,
         )
         return
 

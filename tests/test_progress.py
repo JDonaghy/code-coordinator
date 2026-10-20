@@ -584,6 +584,54 @@ class TestSmokeVerdictParser:
         assert v is not None and v.kind == "fail"
         assert v.reason == "5 failed + 3 errors"
 
+    def test_fail_captures_preceding_output_as_context(
+        self, tmp_path: Path,
+    ) -> None:
+        """#3741: a plain-runner's captured test output precedes its
+        `SMOKE: fail exit=N` marker — that's exactly what a fix briefing
+        needs quoted, not just the marker's own trailing text."""
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(
+                tmp_path,
+                "FAILED tests/readme_truth.rs::version_matches\n"
+                "error: test failed, to rerun pass -p vimcode "
+                "--test readme_truth\n"
+                "SMOKE: fail exit=1\n",
+            )
+        )
+        assert v is not None and v.kind == "fail"
+        assert v.reason == "exit=1"
+        assert "FAILED tests/readme_truth.rs::version_matches" in v.context
+        assert "to rerun pass -p vimcode --test readme_truth" in v.context
+        # The marker line itself is `reason`'s job, not duplicated here.
+        assert "SMOKE: fail" not in v.context
+
+    def test_context_is_truncated_from_the_front_when_oversized(
+        self, tmp_path: Path,
+    ) -> None:
+        """Mirrors `coord.revalidate._tail`'s bias: keep the END of the
+        preceding output (closest to the failure) and mark the cut."""
+        from coord.progress import parse_smoke_verdict_from_log
+        huge = "x" * 5000 + "TAIL-MARKER-END"
+        v = parse_smoke_verdict_from_log(
+            self._log(tmp_path, f"{huge}\nSMOKE: fail exit=1\n")
+        )
+        assert v is not None and v.kind == "fail"
+        assert "…(truncated)…" in v.context
+        assert "TAIL-MARKER-END" in v.context
+        assert len(v.context) < 4100
+
+    def test_pass_has_no_context_requirement(self, tmp_path: Path) -> None:
+        """A pass verdict doesn't need preceding output explained; just
+        confirm populating `.context` for `pass` doesn't break anything."""
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(tmp_path, "9911 passed in 662s\nSMOKE: pass\n")
+        )
+        assert v is not None and v.kind == "pass"
+        assert v.context == "9911 passed in 662s"
+
     def test_parses_baseline_red(self, tmp_path: Path) -> None:
         from coord.progress import parse_smoke_verdict_from_log
         v = parse_smoke_verdict_from_log(

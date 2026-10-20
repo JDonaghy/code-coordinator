@@ -3473,6 +3473,36 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         assert row["smoke_test"] == "fail"
         assert "5 failed" in (row["test_reason"] or "")
 
+    def test_plain_runner_failure_threads_log_context_into_test_reason(
+        self, coord_db, tmp_path,
+    ) -> None:
+        """#3741: a plain-runner (#3673) log has NOTHING but `exit=N` on the
+        `SMOKE: fail` line itself — the failing test name and rerun hint are
+        only in the captured output that precedes it. `test_reason` must
+        carry that, not just `headless smoke: exit=1`, or a fix worker can't
+        tell its own diff from a red base."""
+        plain_runner_log = (
+            "FAILED tests/readme_truth.rs::version_matches\n"
+            "error: test failed, to rerun pass -p vimcode --test readme_truth\n"
+            "SMOKE: fail exit=1\n"
+        )
+        transition, record, entry = self._setup(
+            "work-3741", "smoke-3741", exit_code=1,
+            log=plain_runner_log, tmp_path=tmp_path,
+        )
+        self._reap(transition, record, entry)
+
+        row = self._row("work-3741")
+        assert row is not None
+        assert row["test_state"] == "failed"
+        reason = row["test_reason"] or ""
+        assert "exit=1" in reason
+        assert "FAILED tests/readme_truth.rs::version_matches" in reason, (
+            "a bare 'headless smoke: exit=1' is exactly the failure mode "
+            f"#3741 reports — got {reason!r}"
+        )
+        assert "to rerun pass -p vimcode --test readme_truth" in reason
+
     def test_clean_exit_without_verdict_records_no_verdict(
         self, coord_db, tmp_path
     ) -> None:
