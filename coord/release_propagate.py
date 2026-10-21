@@ -804,7 +804,7 @@ def confirmation_lock_busy(
     assignment already gates a restart (module docstring, "Why the cut is
     not optional").
 
-    A LOCAL probe of *lock_path* — in production
+    A LOCAL, bounded-wait probe of *lock_path* — in production
     :func:`coord.filelock.notify_lock_path`, the same lock
     `coord.notify.run_drain` holds for a confirmation's whole duration (see
     `coord.confirm_test.CONFIRM_PASS_BUDGET_SECONDS`) — not a fleet-wide
@@ -813,25 +813,22 @@ def confirmation_lock_busy(
     notify`'s drain (and so any confirmation) actually runs on, so a network
     probe would answer the identical local question at ten times the cost.
 
-    Bounded wait, not instantaneous (#3747): *timeout* blocks up to
+    Bounded wait, not instantaneous: *timeout* blocks up to
     :data:`DRAIN_TICK_GRACE_SECONDS` before concluding the lock is genuinely
     busy, so a routine drain tick holding the lock for its ~20s board scan
     gets a chance to release before this probe gives up on it — see
     `DRAIN_TICK_GRACE_SECONDS`'s own docstring for the measured numbers. A
-    hold that outlasts the wait still reports Busy; the wait shrinks the race
-    window, it does not remove the gate's ability to fail.
-
-    Tick vs. confirmation (#3747): if the lock is still held once the wait
-    elapses, peek the label `coord.notify.run_drain` writes onto it
-    (`coord.filelock.peek_label`/`FileLock.write_label`). A label of
-    `DRAIN_LABEL_TICK` means the current holder is just the routine drain
-    pass itself, not a #2464 confirmation — not the hazard this gate exists
-    to catch — so it is treated as NOT busy. Any other label (including
-    `DRAIN_LABEL_CONFIRMATION`, or no label at all — e.g. an older `coord
-    notify` build, or the file read racing the write) is conservatively
-    treated as busy, same as before: unlabelled must fail toward blocking,
-    never toward silently waving through the exact #2596 incident this
-    function exists to prevent.
+    hold that outlasts the wait still reports Busy, from WHATEVER is holding
+    it — this function deliberately does not try to tell a routine drain
+    tick apart from a genuine confirmation once the wait has elapsed.
+    `coord.notify.run_drain` holds this same lock for its whole pass,
+    including the non-atomic `dispatch_pending_reviews` read-then-write
+    (`run_drain`'s own "Concurrency" docstring) that the lock exists to
+    serialise — so a hold that is STILL there past the grace period is, by
+    definition, not the quick, nothing-to-interrupt case the wait already
+    covers, and deferring is the only answer that keeps the gate able to
+    fail (epic #2096). The wait shrinks the race window; it does not try to
+    second-guess what is inside it.
 
     Unattributable on purpose (``host=None``, so it blocks the WHOLE fleet,
     not just one host — see :attr:`Busy.host`'s #2067 note): the restart this
@@ -846,20 +843,20 @@ def confirmation_lock_busy(
     (a permissions problem, a read-only home) is a local host problem this
     call must not turn into "block the entire fleet until someone notices" —
     it returns ``[]`` and the existing per-host/board signals still apply.
+
+    *timeout* is a real wall-clock block, so a caller that re-probes this on
+    a poll loop (e.g. `coord.commands.release._drain`'s busy-fetch) pays up
+    to the full grace period on every poll of a genuinely busy lock, roughly
+    doubling that loop's effective cadence — harmless (the loop re-probes
+    repeatedly and the deadline arithmetic is independent of it), but worth
+    knowing if that cadence ever needs to tighten.
     """
-    from coord.filelock import (  # noqa: PLC0415
-        DRAIN_LABEL_TICK,
-        FileLock,
-        LockBusy,
-        peek_label,
-    )
+    from coord.filelock import FileLock, LockBusy  # noqa: PLC0415
 
     lock = FileLock(lock_path)
     try:
         lock.acquire(timeout=timeout)
     except LockBusy:
-        if peek_label(lock_path) == DRAIN_LABEL_TICK:
-            return []
         return [
             Busy(
                 kind="confirmation/notify drain running",
