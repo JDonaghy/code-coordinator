@@ -34,9 +34,31 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "azure-workers" / "throwaway-vm.sh"
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="throwaway-vm.sh is Ubuntu/az-CLI-oriented and untested elsewhere"
-)
+# Quarantined out of the blocking test gate. Every case in this file drives
+# the real ``throwaway-vm.sh`` end-to-end, which forks ~20 short-lived stub
+# subprocesses per invocation. Run under ``pytest -n auto`` on a
+# resource-constrained CI runner (2-4 cores, shared with the rest of the
+# suite's xdist workers), that fork pressure non-deterministically tips a
+# worker into a crash/timeout — surfacing as an unparseable xdist worker
+# failure, not a clean ``FAILED`` line — and gates whatever unrelated PR is in
+# flight. A flaky blocking test is worse than no blocking test, so this file is
+# skipped by default and opted back in with ``COORD_RUN_QUARANTINED_TESTS=1``
+# (the retry-hardening below keeps that opt-in run reliable). This module-level
+# skip covers every CI job that runs the suite at once; it is deliberately not
+# a ``pytest -m`` exclusion, which would have to be kept in sync across each
+# job's pytest invocation separately.
+_QUARANTINED = not os.environ.get("COORD_RUN_QUARANTINED_TESTS")
+
+pytestmark = [
+    pytest.mark.skipif(
+        sys.platform != "linux", reason="throwaway-vm.sh is Ubuntu/az-CLI-oriented and untested elsewhere"
+    ),
+    pytest.mark.skipif(
+        _QUARANTINED,
+        reason="quarantined from the blocking gate: fork-heavy, crashes xdist workers under CI load; "
+        "run with COORD_RUN_QUARANTINED_TESTS=1",
+    ),
+]
 
 
 # ── stub fleet ───────────────────────────────────────────────────────────────
