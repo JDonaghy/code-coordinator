@@ -518,14 +518,29 @@ def test_fix_cargo_targets_evicts_the_same_repo_once_it_goes_idle(
 ) -> None:
     """Same fixture as the protection test above, minus the live assignment
     — proves the protection in that test is doing the work, not some other
-    difference between the two setups."""
+    difference between the two setups.
+
+    Mocks ``shutil.disk_usage`` to report ample free space: without it, the
+    free-space floor (default 10GB, ``COORD_CARGO_FREE_FLOOR_GB``) reads the
+    REAL disk free space of whatever machine runs this test. On a runner
+    with under 10GB free, the tiny 4096-byte fixture cache can never cover
+    the shortfall on its own, ``cargo_floor_unreachable`` fires, tier-3
+    eviction is skipped entirely, and the repo survives — flipping this
+    test's outcome based on the host's disk, not the code under test.
+    """
     import coord.board_service as board_service
+    from coord import cargo_cache
     from coord.health.checks import release_cordon as check_mod
 
     coord_dir = tmp_path / ".coord"
     _write_bytes(coord_dir / "cargo-target" / "repo1" / "blob", 4096)
     _gc_status(coord_dir)
     monkeypatch.setenv("COORD_CARGO_CACHE_CAP_GB", "0.0000000001")
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=1_000_000_000_000, used=0, free=1_000_000_000_000),
+    )
 
     monkeypatch.setattr(check_mod.socket, "gethostname", lambda: "precision")
     config = SimpleNamespace(
