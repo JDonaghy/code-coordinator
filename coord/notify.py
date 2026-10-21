@@ -2487,18 +2487,6 @@ NO_SMOKE_VERDICT_MARKER = _NO_SMOKE_VERDICT_MARKER
 #: misleading one for this issue's own scenario).
 TEST_STATE_CONTESTED = "contested"
 
-#: The :class:`~coord.filelock.FileLock` the *current* :func:`run_drain` pass
-#: holds, or ``None`` between passes / outside one. Published so
-#: :func:`_run_pass_confirmation` — called deep inside the reap loop
-#: ``run_drain`` kicks off — can relabel the very lock it is already running
-#: under for the one step that genuinely holds it a long, externally-visible
-#: time (#3747), without threading the lock object through every intervening
-#: call signature. Safe as a bare module global: each ``coord notify``
-#: invocation (and each ``coord-serve`` tick) is its own process, and
-#: ``run_drain`` itself holds the lock non-reentrantly for the whole pass, so
-#: there is never more than one live value to publish at a time.
-_ACTIVE_DRAIN_LOCK: "FileLock | None" = None
-
 
 def _run_pass_confirmation(transition: Transition, entry: dict):
     """#2464: independently re-run the repo's real build+test for this branch.
@@ -2589,16 +2577,6 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         "confirm the pass claim, within %ss (#2464).",
         transition.assignment_id, transition.repo_name, branch, timeout,
     )
-    # #3747: this is the one step that holds `notify.lock` for a long, real
-    # stretch rather than a routine bookkeeping tick — relabel it so
-    # `coord.release_propagate.confirmation_lock_busy`'s bounded wait knows
-    # this hold is the kind worth deferring a roll for, not a ~20s drain tick
-    # it would otherwise outlast and misclassify as busy about a third of the
-    # time (the race this issue is about).
-    from coord.filelock import DRAIN_LABEL_CONFIRMATION, DRAIN_LABEL_TICK  # noqa: PLC0415
-
-    if _ACTIVE_DRAIN_LOCK is not None:
-        _ACTIVE_DRAIN_LOCK.write_label(DRAIN_LABEL_CONFIRMATION)
     started = time.monotonic()
     result: ConfirmationResult | None = None
     try:
@@ -2614,8 +2592,6 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         )
         return None
     finally:
-        if _ACTIVE_DRAIN_LOCK is not None:
-            _ACTIVE_DRAIN_LOCK.write_label(DRAIN_LABEL_TICK)
         # Charged in `finally` so a raising confirmation still costs its time.
         # It really did hold the drain (and `notify.lock`) for those seconds,
         # and a run that reliably blows up after ten minutes must not be able
@@ -5595,26 +5571,10 @@ def run_drain(
     (non-blocking): if another drain holds it, return ``skipped_locked`` and
     let the next tick retry rather than pinning a threadpool worker.
 
-    **Labelling (#3747).**  As soon as the lock is held, it is labelled
-    ``DRAIN_LABEL_TICK`` — "routine bookkeeping" — and the active
-    :class:`~coord.filelock.FileLock` is published on
-    :data:`_ACTIVE_DRAIN_LOCK` so :func:`_run_pass_confirmation` can flip the
-    label to ``DRAIN_LABEL_CONFIRMATION`` for the one step that actually holds
-    this lock for a long, externally-visible stretch (a #2464 confirmation).
-    ``coord.release_propagate.confirmation_lock_busy`` peeks that label to
-    tell an idle ~20s tick, which a short bounded wait will simply outlast,
-    from a real confirmation worth deferring a roll for.
-
     Every step is independently try/except'd — one failing side effect must
     never sink the rest of the pass, and a drain must never crash the daemon.
     """
-    global _ACTIVE_DRAIN_LOCK
-    from coord.filelock import (  # noqa: PLC0415
-        DRAIN_LABEL_TICK,
-        FileLock,
-        LockBusy,
-        notify_lock_path,
-    )
+    from coord.filelock import FileLock, LockBusy, notify_lock_path  # noqa: PLC0415
 
     lock = FileLock(lock_path if lock_path is not None else notify_lock_path())
     try:
@@ -5622,12 +5582,9 @@ def run_drain(
     except LockBusy:
         log.debug("notify drain: %s held elsewhere — skipping this pass", lock.path)
         return DrainResult(skipped_locked=True)
-    lock.write_label(DRAIN_LABEL_TICK)
-    _ACTIVE_DRAIN_LOCK = lock
     try:
         return _run_drain_locked(config)
     finally:
-        _ACTIVE_DRAIN_LOCK = None
         lock.release()
 
 

@@ -268,43 +268,6 @@ def test_a_sustained_hold_past_the_grace_period_still_defers(tmp_path):
     assert elapsed >= 0.3, "must actually wait out the grace period, not probe instantly"
 
 
-def test_a_lock_labelled_as_a_tick_is_not_busy_even_past_the_grace_period(tmp_path):
-    """#3747's second mechanism: a holder can advertise *what kind* of pass it
-    is running. A hold labelled as a routine tick must not defer a roll even
-    if it outlasts the bounded wait entirely — the label is the authoritative
-    signal once it is present, not just a tie-breaker inside the wait."""
-    from coord.filelock import DRAIN_LABEL_TICK, FileLock
-
-    lock_path = tmp_path / "notify.lock"
-    holder = FileLock(lock_path)
-    holder.acquire(timeout=0.0)
-    holder.write_label(DRAIN_LABEL_TICK)
-    try:
-        busy = rp.confirmation_lock_busy(lock_path, timeout=0.1)
-    finally:
-        holder.release()
-
-    assert busy == []
-
-
-def test_a_lock_labelled_as_a_confirmation_still_defers(tmp_path):
-    """The flip side of the previous test — a holder that has labelled itself
-    as the genuine #2464 confirmation (or left the label stale/absent) must
-    still defer, same as before #3747's label mechanism existed."""
-    from coord.filelock import DRAIN_LABEL_CONFIRMATION, FileLock
-
-    lock_path = tmp_path / "notify.lock"
-    holder = FileLock(lock_path)
-    holder.acquire(timeout=0.0)
-    holder.write_label(DRAIN_LABEL_CONFIRMATION)
-    try:
-        busy = rp.confirmation_lock_busy(lock_path, timeout=0.1)
-    finally:
-        holder.release()
-
-    assert len(busy) == 1
-
-
 def test_queue_key_falls_back_across_row_spellings():
     """`/board` publishes sqlite columns; a rendered row carries `key`. Both
     must resolve — `coord drive-queue resume` needs the real key."""

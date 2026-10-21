@@ -49,14 +49,6 @@ class LockBusy(Exception):
     """Someone else holds the lock."""
 
 
-# Labels for :meth:`FileLock.write_label` / :func:`peek_label` (#3747),
-# shared here rather than defined in each caller so ``coord.notify`` (the
-# writer) and ``coord.release_propagate`` (the reader) compare the same two
-# strings instead of two independently-typed literals drifting apart.
-DRAIN_LABEL_TICK = "tick"
-DRAIN_LABEL_CONFIRMATION = "confirmation"
-
-
 def _lock_exclusive_nonblocking(fd: int) -> None:
     """Try to take an exclusive, non-blocking lock on *fd*.
 
@@ -142,52 +134,12 @@ class FileLock:
             os.close(self._fd)
             self._fd = None
 
-    def write_label(self, label: str) -> None:
-        """Advertise *label* in the lock file's own content, for a caller that
-        cannot acquire the lock (#3747) to read via :func:`peek_label`.
-
-        ``flock`` is advisory and says nothing about who may read or write the
-        underlying bytes — a non-holder peeking the file never blocks on, or
-        disturbs, the lock itself. That makes the file double as a cheap,
-        best-effort side channel: the holder can say *what kind* of pass it is
-        running, so a prober that fails to acquire the lock can tell "routine
-        bookkeeping, safe to ignore" from "something that actually matters"
-        apart, without a second file or a second protocol.
-
-        Requires :meth:`acquire` to have already succeeded. A write failure
-        here is swallowed rather than raised — the label is purely advisory,
-        never load-bearing for the lock's own correctness, so it must never
-        turn into a reason this process fails to do its actual work.
-        """
-        if self._fd is None:
-            return
-        try:
-            os.lseek(self._fd, 0, os.SEEK_SET)
-            os.ftruncate(self._fd, 0)
-            os.write(self._fd, label.encode("utf-8"))
-        except OSError:
-            pass
-
     def __enter__(self) -> FileLock:
         self.acquire(timeout=None)
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.release()
-
-
-def peek_label(path: Path) -> str:
-    """Read whatever label the current (or most recent) holder of *path*
-    wrote via :meth:`FileLock.write_label`, without taking the lock.
-
-    Returns ``""`` for a missing file, an empty file, or any I/O error reading
-    it — a caller that cannot read a label must treat it as unknown rather
-    than raise into a probe that was only checking (#3747).
-    """
-    try:
-        return path.read_text().strip()
-    except OSError:
-        return ""
 
 
 def notify_lock_path() -> Path:
