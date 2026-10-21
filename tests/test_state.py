@@ -5688,6 +5688,25 @@ class TestReviewClaimAgeSecs:
     def test_none_for_empty_id(self, coord_db) -> None:
         assert state.review_claim_age_secs("") is None
 
+    def test_clamps_a_future_claimed_at_to_zero_not_negative(self, coord_db) -> None:
+        """Deterministic regression for the clamp: a claim stamped slightly
+        ahead of ``time.time()`` (clock skew, or jitter from a different
+        host — `_new_review_claim_stamp` explicitly covers two processes on
+        different hosts) must report age 0.0, never negative. Unlike
+        `test_small_positive_age_while_freshly_claimed`, this does not rely
+        on timing — a 5-second-ahead stamp forces the negative-delta branch
+        on every run, so a revert of the clamp fails this deterministically."""
+        from coord.db import get_connection
+
+        assert state.claim_review_dispatch("w1") is True
+        conn = get_connection()
+        conn.execute(
+            "UPDATE review_claims SET claimed_at=? WHERE of_assignment_id=?",
+            (time.time() + 5.0, "w1"),
+        )
+        conn.commit()
+        assert state.review_claim_age_secs("w1") == 0.0
+
     def test_reflects_a_backdated_claim(self, coord_db) -> None:
         from coord.db import get_connection
 
