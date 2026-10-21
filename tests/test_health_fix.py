@@ -477,14 +477,27 @@ def test_fix_cargo_targets_protects_a_repo_with_a_live_assignment(
     cap is tier-3 whole-directory eviction. With a live `running` assignment
     for ``repo1`` on this machine, that eviction must be skipped: the sweep
     stays over cap and the directory survives.
+
+    Mocks ``shutil.disk_usage`` to report ample free space, mirroring its
+    twin (``test_fix_cargo_targets_evicts_the_same_repo_once_it_goes_idle``)
+    so the two tests differ only in the live assignment — otherwise this
+    test's "still over cap" / surviving-blob assertions would also pass
+    vacuously on a runner with under 10GB free (`cargo_floor_unreachable`,
+    `coord/cargo_cache.py`), proving nothing about `protect_repos` either.
     """
     import coord.board_service as board_service
+    from coord import cargo_cache
     from coord.health.checks import release_cordon as check_mod
 
     coord_dir = tmp_path / ".coord"
     _write_bytes(coord_dir / "cargo-target" / "repo1" / "blob", 4096)
     _gc_status(coord_dir)
     monkeypatch.setenv("COORD_CARGO_CACHE_CAP_GB", "0.0000000001")
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=1_000_000_000_000, used=0, free=1_000_000_000_000),
+    )
 
     monkeypatch.setattr(check_mod.socket, "gethostname", lambda: "precision")
     config = SimpleNamespace(
