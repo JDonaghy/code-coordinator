@@ -594,6 +594,46 @@ class TestFixFromRedCi:
 
         assert result.exit_code == 0, result.output
 
+    def test_test_output_file_content_reaches_the_rendered_briefing(
+        self, ci_config: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """`fix()`'s `elif test_output_file.exists()` branch wins over
+        `test_reason` — pin that the file's content, not just its
+        existence, actually lands in the rendered `## Test failure`
+        section a fix worker reads."""
+        work = _work(test_state="failed", test_reason="exit=1")
+        state_mod.save_board(Board(completed=[work]))
+
+        def boom(*a, **k):
+            raise AssertionError("CI must not be consulted when the test gate failed")
+
+        monkeypatch.setattr("coord.ci_store.build_ci_store", boom)
+
+        test_output_dir = coord_dir / "test_output"
+        test_output_dir.mkdir(parents=True, exist_ok=True)
+        (test_output_dir / "work-abc.txt").write_text(
+            "FAILED tests/readme_truth.rs::version_matches\n"
+            "error: test failed, to rerun pass -p vimcode --test readme_truth\n"
+            "SMOKE: fail exit=1\n"
+        )
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            return {"id": "fix-t"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--config", str(ci_config)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "## Test failure" in captured["briefing"]
+        assert "FAILED tests/readme_truth.rs::version_matches" in captured["briefing"]
+        assert "to rerun pass -p vimcode --test readme_truth" in captured["briefing"]
+
     def test_dispatch_refused_by_a_pre_dispatch_guard_exits_distinctly(
         self, ci_config: Path, coord_dir: Path, monkeypatch
     ) -> None:

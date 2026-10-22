@@ -3280,14 +3280,38 @@ def _record_smoke_verdict(
         # `test_state`, so a headless smoke FAILURE lands as
         # test_state='failed' AND smoke_test='fail' and stays reachable from
         # `coord fix`.
+        #
+        # A plain-runner's marker line (`SMOKE: fail exit=1`) carries nothing
+        # but an exit code — useless to a fix worker who can't tell its own
+        # diff from a red base from that alone. `verdict.context` is the
+        # bounded log tail that preceded the marker, which for the
+        # plain-runner is the captured failing-test output (panic/assertion
+        # lines, the `error: test failed, to rerun pass -p <crate> --test
+        # <name>` hint), and for a `claude -p` smoke worker is usually the
+        # turn where it identified the failure.
+        #
+        # That text is raw worker-/suite-authored prose, so it goes to the
+        # dedicated `test_output` file (`coord.confirm_test.
+        # write_test_output_file`), never into `test_reason` itself —
+        # `test_reason` is scanned unanchored by several readers
+        # (`coord.state.classify_failure` on every failed write,
+        # `coord.smoke`'s budget tallies) that must only ever see the
+        # coordinator's own short summary, not a worker's log output which
+        # could coincidentally contain one of their matched phrases.
+        # `plan_followup.fix()` already prefers this file over `test_reason`
+        # when composing the briefing.
+        from coord.confirm_test import write_test_output_file  # noqa: PLC0415
+
+        write_test_output_file(parent_id, verdict.context)
+        headline = (
+            f"headless smoke: {verdict.reason}"
+            if verdict.reason
+            else "headless smoke reported SMOKE: fail"
+        )
         record_test_verdict(
             assignment_id=parent_id,
             test_state="failed",
-            test_reason=(
-                f"headless smoke: {verdict.reason}"
-                if verdict.reason
-                else "headless smoke reported SMOKE: fail"
-            ),
+            test_reason=headline,
         )
         return
 
