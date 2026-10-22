@@ -120,17 +120,46 @@ def _fake_coord_home(tmp_path: Path) -> Path:
     return home
 
 
+def _venv_pythonpath() -> str:
+    """site-packages (for PyYAML) and REPO_ROOT (for `coord`), as the block's
+    `PYBIN` subprocess sees them.
+
+    The real daemon host's ~/.coord-venv/bin/python is a venv interpreter that
+    finds `coord` and its deps in its own site-packages. `_fake_coord_home`
+    fakes that interpreter with a bare symlink to this test process's
+    executable -- but a symlink with no adjacent `pyvenv.cfg` is not a venv, so
+    the subprocess resolves its prefix to the base interpreter and cannot see
+    the test venv's site-packages (notably PyYAML, which `coord.config` imports
+    at module top). Python 3.13 made this prefix resolution stricter, so the
+    bare symlink no longer happens to import `yaml`. Hand the subprocess the
+    exact directories where `yaml` and `coord` live for this interpreter, which
+    stands in for the real venv having them installed."""
+    import coord
+    import yaml
+
+    return os.pathsep.join(
+        str(p)
+        for p in (
+            Path(yaml.__file__).resolve().parent.parent,  # site-packages
+            Path(coord.__file__).resolve().parent.parent,  # REPO_ROOT
+        )
+    )
+
+
 def _run_remote_block(body: str, home: Path, *args: str):
     import subprocess
 
     driver = f"set -euo pipefail\n{body}\n"
+    extra_path = _venv_pythonpath()
+    existing = os.environ.get("PYTHONPATH")
+    pythonpath = f"{extra_path}{os.pathsep}{existing}" if existing else extra_path
     return subprocess.run(
         [POSIX_BASH, "-c", driver, "bash", *args],
         capture_output=True,
         text=True,
         timeout=30,
         cwd=REPO_ROOT,
-        env={**os.environ, "HOME": str(home)},
+        env={**os.environ, "HOME": str(home), "PYTHONPATH": pythonpath},
         check=False,
     )
 
