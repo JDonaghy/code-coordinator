@@ -3102,6 +3102,12 @@ def review_claim_age_secs(of_assignment_id: str) -> float | None:
 
     Same local-DB-only caveat as :func:`has_review_claim` — reads the local
     connection, not the daemon, so it undercounts on a thin client.
+
+    Clamped to ``0.0``: ``_new_review_claim_stamp`` adds a sub-millisecond
+    positive jitter to ``time.time()`` for uniqueness, so a read taken
+    microseconds after the claim can land *before* that jittered stamp and
+    would otherwise go slightly negative — "age since claim" can never be
+    less than zero.
     """
     if not of_assignment_id:
         return None
@@ -3113,7 +3119,7 @@ def review_claim_age_secs(of_assignment_id: str) -> float | None:
     ).fetchone()
     if row is None or row[0] is None:
         return None
-    return time.time() - row[0]
+    return max(0.0, time.time() - row[0])
 
 
 def has_recorded_review_verdict(assignment_id: str) -> bool:

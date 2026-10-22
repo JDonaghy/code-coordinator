@@ -25,6 +25,8 @@ stayed invisible."
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -175,7 +177,11 @@ def test_confirmation_lock_busy_defers_when_something_holds_the_lock(tmp_path):
     holder = FileLock(lock_path)
     holder.acquire(timeout=0.0)
     try:
-        busy = rp.confirmation_lock_busy(lock_path)
+        # Explicit short timeout: the production default is a ~30s bounded
+        # wait (#3747, `DRAIN_TICK_GRACE_SECONDS`) and this hold is never
+        # released, so leaving the default would make this test actually
+        # block for 30 real seconds.
+        busy = rp.confirmation_lock_busy(lock_path, timeout=0.1)
     finally:
         holder.release()
 
@@ -203,6 +209,63 @@ def test_confirmation_lock_busy_is_clear_again_once_the_holder_releases(tmp_path
     holder.release()
 
     assert rp.confirmation_lock_busy(lock_path) == []
+
+
+# ── #3747: a routine drain tick racing the probe must NOT defer ────────────
+#
+# `coord.notify.run_drain` holds this same lock on EVERY pass — measured at
+# ~20s bursts about once every ~65s — so the old instantaneous probe
+# (`timeout=0.0`) landed inside a burst roughly a third of the time and
+# deferred a roll into an otherwise-quiescent fleet, AFTER `propagate` had
+# already cordoned every host. A bounded wait must outlast a routine tick;
+# a hold that outlasts the wait itself must still report Busy, or the gate
+# could never fail (#2096).
+
+
+def test_a_lock_held_transiently_by_a_drain_tick_does_not_defer(tmp_path):
+    """A routine ~20s drain tick that releases well inside the bounded wait
+    must not be mistaken for the #2596 hazard this gate exists to catch."""
+    from coord.filelock import FileLock
+
+    lock_path = tmp_path / "notify.lock"
+    holder = FileLock(lock_path)
+    holder.acquire(timeout=0.0)
+    released = threading.Event()
+
+    def release_after_a_beat():
+        time.sleep(0.2)
+        holder.release()
+        released.set()
+
+    thread = threading.Thread(target=release_after_a_beat)
+    thread.start()
+    try:
+        busy = rp.confirmation_lock_busy(lock_path, timeout=2.0)
+    finally:
+        thread.join()
+
+    assert released.is_set(), "the probe returned before the tick even released"
+    assert busy == []
+
+
+def test_a_sustained_hold_past_the_grace_period_still_defers(tmp_path):
+    """The bounded wait is not infinite — a hold that outlasts it (a real
+    #2464 confirmation, or a wedged process) must still report Busy, or the
+    gate could never fail (#2096)."""
+    from coord.filelock import FileLock
+
+    lock_path = tmp_path / "notify.lock"
+    holder = FileLock(lock_path)
+    holder.acquire(timeout=0.0)
+    try:
+        started = time.monotonic()
+        busy = rp.confirmation_lock_busy(lock_path, timeout=0.3)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.release()
+
+    assert len(busy) == 1
+    assert elapsed >= 0.3, "must actually wait out the grace period, not probe instantly"
 
 
 def test_queue_key_falls_back_across_row_spellings():

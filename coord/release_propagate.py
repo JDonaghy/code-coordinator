@@ -771,7 +771,24 @@ class Busy:
         return f"{base} ({self.detail})" if self.detail else base
 
 
-def confirmation_lock_busy(lock_path: Path) -> list[Busy]:
+#: How long :func:`confirmation_lock_busy` waits for `notify.lock` before
+#: giving up and reporting Busy (#3747). `coord.notify.run_drain`'s own
+#: periodic tick (`coord/serve_app.py::_notify_drain_tick`) holds this same
+#: lock on EVERY pass — a ~1.3GB `coord.db` board scan measured at ~20s
+#: bursts about once every ~65s (~35% duty cycle) — so a single instantaneous
+#: probe (the old `timeout=0.0`) landed inside a burst roughly a third of the
+#: time and deferred a roll into an otherwise-quiescent fleet for no reason,
+#: AFTER `propagate` had already cordoned every host. 30s comfortably outlasts
+#: the measured ~21s burst with margin, so a routine tick releases well
+#: within the wait and a genuine, long-running #2464 confirmation (which can
+#: run for the whole `coord.confirm_test.CONFIRM_PASS_BUDGET_SECONDS`) still
+#: reports Busy once this wait elapses.
+DRAIN_TICK_GRACE_SECONDS = 30.0
+
+
+def confirmation_lock_busy(
+    lock_path: Path, *, timeout: float = DRAIN_TICK_GRACE_SECONDS
+) -> list[Busy]:
     """A #2464 out-of-band test confirmation in flight, as a `Busy` signal
     (#2596).
 
@@ -787,7 +804,7 @@ def confirmation_lock_busy(lock_path: Path) -> list[Busy]:
     assignment already gates a restart (module docstring, "Why the cut is
     not optional").
 
-    A LOCAL, non-blocking probe of *lock_path* — in production
+    A LOCAL, bounded-wait probe of *lock_path* — in production
     :func:`coord.filelock.notify_lock_path`, the same lock
     `coord.notify.run_drain` holds for a confirmation's whole duration (see
     `coord.confirm_test.CONFIRM_PASS_BUDGET_SECONDS`) — not a fleet-wide
@@ -795,6 +812,23 @@ def confirmation_lock_busy(lock_path: Path) -> list[Busy]:
     installs this unit ONLY on the daemon host, the same host `coord
     notify`'s drain (and so any confirmation) actually runs on, so a network
     probe would answer the identical local question at ten times the cost.
+
+    Bounded wait, not instantaneous: *timeout* blocks up to
+    :data:`DRAIN_TICK_GRACE_SECONDS` before concluding the lock is genuinely
+    busy, so a routine drain tick holding the lock for its ~20s board scan
+    gets a chance to release before this probe gives up on it — see
+    `DRAIN_TICK_GRACE_SECONDS`'s own docstring for the measured numbers. A
+    hold that outlasts the wait still reports Busy, from WHATEVER is holding
+    it — this function deliberately does not try to tell a routine drain
+    tick apart from a genuine confirmation once the wait has elapsed.
+    `coord.notify.run_drain` holds this same lock for its whole pass,
+    including the non-atomic `dispatch_pending_reviews` read-then-write
+    (`run_drain`'s own "Concurrency" docstring) that the lock exists to
+    serialise — so a hold that is STILL there past the grace period is, by
+    definition, not the quick, nothing-to-interrupt case the wait already
+    covers, and deferring is the only answer that keeps the gate able to
+    fail (epic #2096). The wait shrinks the race window; it does not try to
+    second-guess what is inside it.
 
     Unattributable on purpose (``host=None``, so it blocks the WHOLE fleet,
     not just one host — see :attr:`Busy.host`'s #2067 note): the restart this
@@ -809,12 +843,19 @@ def confirmation_lock_busy(lock_path: Path) -> list[Busy]:
     (a permissions problem, a read-only home) is a local host problem this
     call must not turn into "block the entire fleet until someone notices" —
     it returns ``[]`` and the existing per-host/board signals still apply.
+
+    *timeout* is a real wall-clock block, so a caller that re-probes this on
+    a poll loop (e.g. `coord.commands.release._drain`'s busy-fetch) pays up
+    to the full grace period on every poll of a genuinely busy lock, roughly
+    doubling that loop's effective cadence — harmless (the loop re-probes
+    repeatedly and the deadline arithmetic is independent of it), but worth
+    knowing if that cadence ever needs to tighten.
     """
     from coord.filelock import FileLock, LockBusy  # noqa: PLC0415
 
     lock = FileLock(lock_path)
     try:
-        lock.acquire(timeout=0.0)
+        lock.acquire(timeout=timeout)
     except LockBusy:
         return [
             Busy(

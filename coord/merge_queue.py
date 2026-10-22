@@ -703,6 +703,15 @@ def has_approved_review(
     :func:`_backfill_branch_patch_id`'s on-demand network fetch, and a
     caller must opt into *that* I/O independently of this one.
 
+    #3749: a third, independent escape hatch shares *ancillary_gh_ops*
+    with the one above rather than *gh_ops* — see
+    :func:`_review_delta_is_context_only`. A SHA mismatch whose base-relative
+    diff changed only in context lines (a rebase, a zero-conflict
+    base-merge) also still covers the current head, for ANY file, not just
+    a configured ancillary set. It activates behind the same opt-in as the
+    #3707 check on purpose: a caller must not be able to enable one
+    base-relative-diff check without the other.
+
     *config*, when supplied, resolves *ancillary_files*/*ancillary_gh_ops*
     automatically via :func:`_resolve_ancillary_config` — pass the live
     ``Config`` instead of resolving ``config.repo(entry.repo_name)
@@ -744,10 +753,24 @@ def scan_approved_reviews(
     caller of this scan must answer the ancillary-rebase question the same
     way (#2096), so prefer passing *config* over leaving a call site on the
     pre-#3707 default of "never exempt".
+
+    #3749: *ancillary_gh_ops* also gates a second, independent
+    base-relative-diff check — see :func:`_review_delta_is_context_only` —
+    that covers a patch-id mismatch produced by context-line churn alone
+    (a rebase, a zero-conflict base-merge), for any file. It deliberately
+    shares *ancillary_gh_ops* rather than the raw *gh_ops* parameter so a
+    caller can never opt into one base-relative-diff check without the
+    other.
     """
     ancillary_files, ancillary_gh_ops = _resolve_ancillary_config(
         entry, gh_ops, config, ancillary_files, ancillary_gh_ops
     )
+    # #3749: shared across every _review_delta_is_ancillary_only/
+    # _review_delta_is_context_only call this scan makes — both check the
+    # exact same (repo, base_branch, sha) compare, and current_sha is the
+    # same across every pool entry too, so a single dict spanning the whole
+    # scan avoids a repeat `gh api compare` round trip per loop iteration.
+    diff_cache: dict[tuple[str, str, str], str | None] = {}
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
 
     branch_work_ids = _chain_work_ids(entry, pool)
@@ -824,10 +847,30 @@ def scan_approved_reviews(
                 getattr(entry, "target_branch", None),
                 review_sha,
                 current_sha,
+                diff_cache,
             ):
                 # #3707: the rebase delta is confined to ancillary paths
                 # (CHANGELOG.md/README.md, per repo config) — approval
                 # still covers it, same as a content-identical patch-id.
+                return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
+            if current_sha is not None and _review_delta_is_context_only(
+                ancillary_gh_ops,
+                getattr(entry, "repo_github", None),
+                getattr(entry, "target_branch", None),
+                review_sha,
+                current_sha,
+                diff_cache,
+            ):
+                # #3749: the patch-id changed only because upstream churn
+                # shifted the diff's context lines (a rebase, a
+                # zero-conflict base-merge) — the reviewed hunks' own
+                # content is byte-identical, so the approval still covers
+                # the current head. No ancillary-files allow-list gates
+                # this (unlike the check above, it's sound for any file),
+                # but it shares that check's *gh_ops* argument on purpose:
+                # both base-relative-diff checks must activate behind the
+                # SAME explicit per-call opt-in, so a caller that only
+                # intends to opt into one never silently gets the other.
                 return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
             if current_sha is None:
                 # Refused because we don't KNOW the head, not because we
@@ -890,6 +933,11 @@ def find_scoped_review_candidate(
       — :func:`has_approved_review` already carries THAT forward too, via
       the same :func:`_review_delta_is_ancillary_only` check, so there is
       nothing left to scope a review around either.
+    - The delta since that review changed only the diff's context lines,
+      not the reviewed hunks' own content (#3749: a rebase, a zero-conflict
+      base-merge) — :func:`has_approved_review` already carries THAT
+      forward too, via the same :func:`_review_delta_is_context_only`
+      check, so there is nothing left to scope a review around either.
     - Either patch-id is missing (fail closed, same posture as
       ``has_approved_review``: an unconfirmable diff gets a full review,
       never a guessed-at scoped one) — unless the ancillary-only check
@@ -898,6 +946,9 @@ def find_scoped_review_candidate(
     ancillary_files, ancillary_gh_ops = _resolve_ancillary_config(
         entry, gh_ops, config, ancillary_files, ancillary_gh_ops
     )
+    # #3749: see the identical cache in `scan_approved_reviews` — shared
+    # across every ancillary-only/context-only compare this walk makes.
+    diff_cache: dict[tuple[str, str, str], str | None] = {}
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
     branch_work_ids = _chain_work_ids(entry, pool)
     if not branch_work_ids:
@@ -937,8 +988,18 @@ def find_scoped_review_candidate(
             getattr(entry, "target_branch", None),
             review_sha,
             current_sha,
+            diff_cache,
         ):
             continue  # #3707: ancillary-only delta — has_approved_review already covers it
+        if _review_delta_is_context_only(
+            ancillary_gh_ops,
+            getattr(entry, "repo_github", None),
+            getattr(entry, "target_branch", None),
+            review_sha,
+            current_sha,
+            diff_cache,
+        ):
+            continue  # #3749: context-only delta — has_approved_review already covers it
         if review_patch_id is None:
             continue  # fail closed — cannot confirm scope, full review
         return a  # approval voided ONLY by a content-changing rebase
@@ -2339,6 +2400,7 @@ def _fetch_compare_diff(
     repo_github: str | None,
     base_sha: str | None,
     head_sha: str | None,
+    cache: dict[tuple[str, str, str], str | None] | None = None,
 ) -> str | None:
     """Fetch the unified diff TEXT for one ``get_compare_diff(base_sha,
     head_sha)`` compare, failing closed to ``None`` (never raising) exactly
@@ -2351,13 +2413,28 @@ def _fetch_compare_diff(
     needs the text to tell "this file's content didn't change between the
     two base-relative compares" apart from "this file isn't touched by
     either compare", which a file-name list alone can't distinguish.
+
+    *cache*, when supplied, is a plain dict keyed by ``(repo_github,
+    base_sha, head_sha)`` that the caller owns and reuses across sibling
+    calls within one scan — :func:`_review_delta_is_ancillary_only` and
+    :func:`_review_delta_is_context_only` fetch the exact same two
+    base-relative compares, so a caller that runs both back-to-back (every
+    "is this approved?" surface does, per #3749) would otherwise make the
+    same ``gh api compare`` round trip twice. ``None`` (the default) keeps
+    this an uncached, standalone fetch.
     """
     if gh_ops is None or not repo_github or not base_sha or not head_sha:
         return None
+    key = (repo_github, base_sha, head_sha)
+    if cache is not None and key in cache:
+        return cache[key]
     try:
-        return gh_ops.get_compare_diff(repo_github, base_sha, head_sha)
+        result = gh_ops.get_compare_diff(repo_github, base_sha, head_sha)
     except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "ancillary-only"
-        return None
+        result = None
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 _DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
@@ -2400,6 +2477,7 @@ def _review_delta_is_ancillary_only(
     base_branch: str | None,
     review_sha: str | None,
     current_sha: str | None,
+    diff_cache: dict[tuple[str, str, str], str | None] | None = None,
 ) -> bool:
     """True when every file that changed between *review_sha* (the SHA an
     existing ``approve``d review covered) and *current_sha* (the branch's
@@ -2439,11 +2517,16 @@ def _review_delta_is_ancillary_only(
     :func:`_backfill_branch_patch_id` — callers that want this check active
     must opt in explicitly, so a caller that only wants patch-id backfill
     (or neither) sees no behavior change.
+
+    *diff_cache*, when supplied, is forwarded to :func:`_fetch_compare_diff`
+    so a caller that also runs :func:`_review_delta_is_context_only` for the
+    same *review_sha*/*current_sha* pair reuses the fetch instead of hitting
+    ``gh api compare`` twice (#3749).
     """
     if not ancillary_files or not base_branch:
         return False
-    review_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, review_sha)
-    current_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, current_sha)
+    review_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, review_sha, diff_cache)
+    current_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, current_sha, diff_cache)
     if review_diff is None or current_diff is None:
         return False
     review_blocks = _diff_blocks_by_path(review_diff)
@@ -2462,6 +2545,141 @@ def _review_delta_is_ancillary_only(
         # genuinely no-op rebase that patch-id somehow missed.
         return False
     return _files_are_ancillary(sorted(changed_paths), ancillary_files)
+
+
+def _content_lines_only(block: str) -> list[str]:
+    """Reduce *block* (one file's unified-diff text) to just its added/
+    removed content lines, in order — dropping the ``diff --git``/``index``/
+    ``---``/``+++``/mode/rename header region, the ``@@`` hunk markers
+    themselves, and unchanged context lines.
+
+    Tracks hunk state rather than prefix-matching every line in the block:
+    everything before the first ``@@`` is header (``diff --git``, ``index``,
+    the ``--- a/X`` / ``+++ b/X`` file markers, ``old mode``/``new mode``,
+    ``rename from``/``rename to``), never real content, however it's
+    spelled; everything at or after the first ``@@`` is hunk body, where a
+    line starting with ``+``/``-`` is real added/removed content REGARDLESS
+    of what follows that first character. A naive ``line.startswith("---")``
+    skip would also swallow a genuinely removed line whose content happens
+    to start with ``--`` (a SQL/Lua/Haskell comment, a YAML/Markdown rule,
+    a shell ``--flag \\`` continuation) — this walk never makes that
+    mistake, because it only treats ``---``/``+++`` as header while still in
+    the header region.
+
+    #3749: a diff's context lines shift whenever the base branch changes
+    nearby — a pure rebase, a zero-conflict merge of an advanced base, an
+    unrelated commit landing a few lines above the reviewed hunk — even
+    though the reviewed hunk's own added/removed content is byte-identical.
+    ``git patch-id`` (:func:`coord.github_ops.compute_patch_id`) hashes
+    those context lines too, so this kind of mechanical churn can still
+    flip the patch-id and void an approval that covers unchanged content.
+    Comparing only the ``+``/``-`` lines is intentionally looser than
+    patch-id, checking only that no hunk INSERTED, REMOVED, or REORDERED a
+    real line — it cannot see hunk *position* (the dropped ``@@`` header
+    means two identical lines deleted at different places in the same file
+    compare equal), so it is not a full statement of "nothing a reviewer
+    cares about changed", only of the narrower thing it actually checks.
+    """
+    out: list[str] = []
+    in_hunk = False
+    for line in block.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue  # file-identity header region — never content
+        if line.startswith(("+", "-")):
+            out.append(line)
+    return out
+
+
+def _review_delta_is_context_only(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    base_branch: str | None,
+    review_sha: str | None,
+    current_sha: str | None,
+    diff_cache: dict[tuple[str, str, str], str | None] | None = None,
+) -> bool:
+    """True when every file that changed between *review_sha* (what an
+    existing ``approve``d review covered) and *current_sha* (the branch's
+    current head) changed ONLY in diff context — the reviewed hunks'
+    actual added/removed lines are byte-identical, and what moved is purely
+    the unchanged lines around them (#3749: a pure rebase, a zero-conflict
+    base-merge, upstream churn landing near but not inside the reviewed
+    diff). :func:`_review_delta_is_ancillary_only`'s patch-id carry-forward
+    (via ``scan_approved_reviews``'s own #1475 comparison) already catches
+    the case where context happens to be untouched too — this is the
+    fallback for when the base moving shifted it, since ``git patch-id``
+    hashes context lines and so cannot tell the two apart.
+
+    Mirrors :func:`_review_delta_is_ancillary_only`'s approach of anchoring
+    both compares at *base_branch* (never diffing *review_sha* against
+    *current_sha* directly — after a rebase neither is an ancestor of the
+    other) and splitting each into per-file blocks via
+    :func:`_diff_blocks_by_path`. Unlike that function, no
+    *ancillary_files* allow-list gates this — a context-only delta is safe
+    to carry forward for ANY file, not just a configured ancillary set.
+    *gh_ops* here is deliberately the caller's resolved ``ancillary_gh_ops``
+    (never a raw, unconditionally-available ``gh_ops``) so this check is
+    gated behind the SAME explicit per-call opt-in as #3707 — every one of
+    this module's "is this approved?" surfaces must activate (or not
+    activate) both base-relative-diff checks together, never just one: the
+    merge gate and `coord/review.py`'s scoped-review dispatch answering
+    this question differently permanently wedges the queue row.
+
+    Fails closed to ``False`` when *base_branch*/*gh_ops*/*repo_github*/
+    either SHA is missing, either compare call raises or returns ``None``,
+    every per-file block compares byte-identical between the two diffs
+    (which includes both diffs being completely empty — mirrors
+    :func:`_review_delta_is_ancillary_only`'s empty-changed-path case:
+    byte-identical base-relative diffs cannot produce two different
+    patch-ids, so reaching this function at all with nothing differing
+    means a patch-id read upstream was wrong, not that this is a genuine
+    no-op the patch-id check somehow missed), a differing block yields no
+    ``+``/``-`` content lines on EITHER side (a binary-file change, an
+    ``old mode``/``new mode`` permission flip, or an empty-file add/delete
+    — the block differs, but there is no positive evidence of what changed,
+    only the absence of an observed hunk, which is not the same thing), or
+    any changed path's content-only lines differ between the two diffs.
+
+    *diff_cache*, when supplied, is forwarded to :func:`_fetch_compare_diff`
+    so a caller that also runs :func:`_review_delta_is_ancillary_only` for
+    the same *review_sha*/*current_sha* pair reuses that fetch instead of
+    hitting ``gh api compare`` twice for the exact same compare.
+    """
+    if not base_branch:
+        # Short-circuit, not a second safety net: `_fetch_compare_diff`
+        # itself fails closed on a missing base, so this only spares the two
+        # calls (and keeps the no-base case readable here).
+        return False
+    review_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, review_sha, diff_cache)
+    current_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, current_sha, diff_cache)
+    if review_diff is None or current_diff is None:
+        return False
+    review_blocks = _diff_blocks_by_path(review_diff)
+    current_blocks = _diff_blocks_by_path(current_diff)
+    any_block_differed = False
+    for path in set(review_blocks) | set(current_blocks):
+        before = review_blocks.get(path, "")
+        after = current_blocks.get(path, "")
+        if before == after:
+            continue  # byte-identical block — not even a context shift
+        any_block_differed = True
+        before_content = _content_lines_only(before)
+        after_content = _content_lines_only(after)
+        if not before_content and not after_content:
+            # The block differs but neither side has a `+`/`-` hunk line to
+            # compare — a binary blob, a mode-only change, or an
+            # empty-file add/delete. Absence of an observed content line
+            # is not evidence the content is unchanged.
+            return False
+        if before_content != after_content:
+            return False
+    # Nothing differed at all: byte-identical base-relative diffs cannot
+    # produce two different patch-ids, so a patch-id read upstream of this
+    # call was wrong rather than this being a genuine no-op. Fail closed.
+    return any_block_differed
 
 
 # #1851: the reason string prefix `_entry_gate_status` returns for a CI-stale
