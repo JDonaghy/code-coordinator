@@ -2624,15 +2624,14 @@ def _review_delta_is_context_only(
     (never a raw, unconditionally-available ``gh_ops``) so this check is
     gated behind the SAME explicit per-call opt-in as #3707 — every one of
     this module's "is this approved?" surfaces must activate (or not
-    activate) both base-relative-diff checks together, never just one,
-    which is exactly what split the merge gate from `coord/review.py`'s
-    scoped-review dispatch before this was fixed.
+    activate) both base-relative-diff checks together, never just one: the
+    merge gate and `coord/review.py`'s scoped-review dispatch answering
+    this question differently permanently wedges the queue row.
 
     Fails closed to ``False`` when *base_branch*/*gh_ops*/*repo_github*/
     either SHA is missing, either compare call raises or returns ``None``,
-    both diffs are completely empty (nothing to compare — never claim a
-    no-op diff against an unreadable one), every per-file block compares
-    byte-identical between the two diffs (mirrors
+    every per-file block compares byte-identical between the two diffs
+    (which includes both diffs being completely empty — mirrors
     :func:`_review_delta_is_ancillary_only`'s empty-changed-path case:
     byte-identical base-relative diffs cannot produce two different
     patch-ids, so reaching this function at all with nothing differing
@@ -2650,6 +2649,9 @@ def _review_delta_is_context_only(
     hitting ``gh api compare`` twice for the exact same compare.
     """
     if not base_branch:
+        # Short-circuit, not a second safety net: `_fetch_compare_diff`
+        # itself fails closed on a missing base, so this only spares the two
+        # calls (and keeps the no-base case readable here).
         return False
     review_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, review_sha, diff_cache)
     current_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, current_sha, diff_cache)
@@ -2657,8 +2659,6 @@ def _review_delta_is_context_only(
         return False
     review_blocks = _diff_blocks_by_path(review_diff)
     current_blocks = _diff_blocks_by_path(current_diff)
-    if not review_blocks and not current_blocks:
-        return False
     any_block_differed = False
     for path in set(review_blocks) | set(current_blocks):
         before = review_blocks.get(path, "")
@@ -2676,9 +2676,10 @@ def _review_delta_is_context_only(
             return False
         if before_content != after_content:
             return False
-    if not any_block_differed:
-        return False
-    return True
+    # Nothing differed at all: byte-identical base-relative diffs cannot
+    # produce two different patch-ids, so a patch-id read upstream of this
+    # call was wrong rather than this being a genuine no-op. Fail closed.
+    return any_block_differed
 
 
 # #1851: the reason string prefix `_entry_gate_status` returns for a CI-stale
