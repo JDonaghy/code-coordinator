@@ -3963,7 +3963,7 @@ class TestReviewGate:
                     )
                 raise AssertionError(head)
 
-        assert mq.has_approved_review(entry, board, _Gh()) is False
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is False
 
     def test_has_approved_review_context_only_delta_via_ancillary_gh_ops_only(
         self,
@@ -4013,13 +4013,70 @@ class TestReviewGate:
             entry, board, ancillary_gh_ops=_Gh(),
         ) is True
 
+    def test_has_approved_review_context_only_delta_with_full_git_headers(
+        self,
+    ) -> None:
+        """#3749: a real rebase's two base-relative compares differ in their
+        file-identity header region too — the pre-image blob hash on the
+        ``index`` line moves with the base, and the `--- a/`/`+++ b/`
+        markers sit right above the hunk. None of that is content a
+        reviewer read, so a delta whose ONLY differences are header lines
+        plus shifted context must still carry the approval forward."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "index 1111111..2222222 100644\n"
+                        "--- a/src/main.py\n"
+                        "+++ b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@ def handler():\n"
+                        " context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " context after\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "index 3333333..4444444 100644\n"
+                        "--- a/src/main.py\n"
+                        "+++ b/src/main.py\n"
+                        "@@ -40,3 +40,3 @@ def handler():\n"
+                        " shifted context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " shifted context after\n"
+                    )
+                raise AssertionError(head)
+
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is True
+
     def test_has_approved_review_removed_line_starting_with_dashes_still_voids(
         self,
     ) -> None:
-        """#3749: a removed/added line whose own content happens to start
-        with `--`/`++` (a SQL/Lua comment, a YAML/Markdown rule, a shell
-        `--flag` continuation) must not be mistaken for a diff header —
-        this is real content churn and must still void the approval."""
+        """#3749: a REMOVED line whose own content starts with `--` (a
+        SQL/Lua/Haskell comment, a YAML document separator, a shell
+        `--flag \\` continuation) renders as `---…` in a unified diff and
+        must not be mistaken for the `--- a/path` file header — it is real
+        content churn and must still void the approval.
+
+        Both blocks also carry an ordinary `-plain`/`+plain` pair so the
+        content-line list is non-empty either way: that keeps this test
+        aimed squarely at the header-vs-content distinction, instead of
+        being answered by the separate "no content lines on either side"
+        fail-closed branch."""
         work = self._work("w1")
         review = self._review("w1", verdict="approve")
         review.review_head_sha = "abc123"
@@ -4036,20 +4093,73 @@ class TestReviewGate:
                 if head == "abc123":
                     return (
                         "diff --git a/query.sql b/query.sql\n"
-                        "@@ -1,2 +1,2 @@\n"
+                        "--- a/query.sql\n"
+                        "+++ b/query.sql\n"
+                        "@@ -1,4 +1,3 @@\n"
                         " select 1;\n"
-                        "-- old comment\n"
+                        "-plain removed\n"
+                        "+plain added\n"
+                        "--- old comment\n"
                     )
                 if head == "def456":
                     return (
                         "diff --git a/query.sql b/query.sql\n"
-                        "@@ -1,2 +1,2 @@\n"
+                        "--- a/query.sql\n"
+                        "+++ b/query.sql\n"
+                        "@@ -1,4 +1,3 @@\n"
                         " select 1;\n"
-                        "-- new comment\n"
+                        "-plain removed\n"
+                        "+plain added\n"
+                        "--- new comment\n"
                     )
                 raise AssertionError(head)
 
-        assert mq.has_approved_review(entry, board, _Gh()) is False
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is False
+
+    def test_has_approved_review_added_line_starting_with_plusses_still_voids(
+        self,
+    ) -> None:
+        """#3749: the `+` mirror of the previous case — an ADDED line whose
+        own content starts with `++` (`++i;`) renders as `+++…` and must not
+        be mistaken for the `+++ b/path` file header."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/loop.c b/loop.c\n"
+                        "--- a/loop.c\n"
+                        "+++ b/loop.c\n"
+                        "@@ -1,4 +1,4 @@\n"
+                        " while (go) {\n"
+                        "-plain removed\n"
+                        "+plain added\n"
+                        "+++i;\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/loop.c b/loop.c\n"
+                        "--- a/loop.c\n"
+                        "+++ b/loop.c\n"
+                        "@@ -1,4 +1,4 @@\n"
+                        " while (go) {\n"
+                        "-plain removed\n"
+                        "+plain added\n"
+                        "+++j;\n"
+                    )
+                raise AssertionError(head)
+
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is False
 
     def test_has_approved_review_binary_mode_change_fails_closed(self) -> None:
         """#3749: a block that differs (before != after) but has no `+`/`-`
@@ -4083,7 +4193,7 @@ class TestReviewGate:
                     )
                 raise AssertionError(head)
 
-        assert mq.has_approved_review(entry, board, _Gh()) is False
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is False
 
     def test_has_approved_review_byte_identical_diffs_fails_closed(self) -> None:
         """#3749: if every per-file block compares byte-identical between
@@ -4113,7 +4223,7 @@ class TestReviewGate:
             def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
                 return identical_diff
 
-        assert mq.has_approved_review(entry, board, _Gh()) is False
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is False
 
     def test_has_approved_review_context_only_missing_base_branch_fails_closed(
         self,
@@ -4137,7 +4247,7 @@ class TestReviewGate:
             def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
                 raise AssertionError("must not be called without a base_branch")
 
-        assert mq.has_approved_review(entry, board, _Gh()) is False
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is False
 
     def test_has_approved_review_context_only_none_compare_fails_closed(self) -> None:
         """#3749: an unreadable compare (`get_compare_diff` returns ``None``
@@ -4158,7 +4268,7 @@ class TestReviewGate:
             def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
                 return None
 
-        assert mq.has_approved_review(entry, board, _Gh()) is False
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is False
 
     # ── #292 Defect 3: skip-and-proceed instead of group-halt ────────────
 
@@ -4511,7 +4621,7 @@ class TestScopedReviewCandidate:
                     )
                 raise AssertionError(head)
 
-        found = mq.find_scoped_review_candidate(entry, board, _Gh())
+        found = mq.find_scoped_review_candidate(entry, board, ancillary_gh_ops=_Gh())
         assert found is review
 
     def test_returns_none_when_delta_is_context_only_via_ancillary_gh_ops_only(
