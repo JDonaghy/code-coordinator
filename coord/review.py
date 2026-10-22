@@ -6102,7 +6102,7 @@ def dispatch_scoped_reviews_for_queue(
             ancillary_files=ancillary_files,
             ancillary_gh_ops=github_ops,
         ):
-            continue  # not stale, or a content-identical/ancillary-only rebase covers it (#1475/#3707)
+            continue  # not stale, or a content-identical/ancillary-only/context-only rebase covers it (#1475/#3707/#3749)
 
         prior_review = mq.find_scoped_review_candidate(
             entry,
@@ -6375,7 +6375,7 @@ def maybe_scoped_review_for_completed_fix(
             ancillary_files=ancillary_files,
             ancillary_gh_ops=github_ops,
         ):
-            return None  # nothing stale to scope a review around — or an ancillary-only delta (#3707)
+            return None  # nothing stale to scope a review around — or an ancillary-only/context-only delta (#3707/#3749)
 
         prior_review = mq.find_scoped_review_candidate(
             entry,
