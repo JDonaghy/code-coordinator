@@ -11703,6 +11703,109 @@ class TestProcessCiFlakyAutoRerun:
         assert "ci_flaky_rerun" not in kinds
 
 
+# ── #3754: rerun budgets are scoped to the commit they were accrued for ─────
+
+class TestProcessCiRerunBudgetScopedToCommit:
+    """A NEW ``branch_head_sha`` (a ci-fix leg's own push, most commonly)
+    must get its own fair #2252 rerun-once chance rather than inherit
+    whatever is left of a DIFFERENT, prior commit's exhausted budget —
+    the repro in #3754 is exactly a ci-fix leg landing at the fix-round
+    ceiling because its fresh push inherited an already-spent streak."""
+
+    def test_new_commit_after_exhausted_budget_gets_its_own_rerun(self) -> None:
+        items = [_q("w1", pr=99)]
+        entry = items[0]
+        # Commit A: budget already exhausted and confirmed real (mirrors
+        # `test_fails_again_spends_the_attempt_identical_to_today` above).
+        entry.branch_head_sha = "sha_a"
+        entry.ci_rerun_budget_sha = "sha_a"
+        entry.ci_infra_reruns = mq.MAX_CI_INFRA_RERUNS
+        entry.ci_flaky_reruns = mq.MAX_CI_FLAKY_RERUNS
+        entry.ci_unreadable_reruns = mq.MAX_CI_UNREADABLE_RERUNS
+        entry.ci_flaky_pending = ""
+
+        gh = FakeGh()
+        ci = TestProcessCiFlakyAutoRerun._Ci(
+            checks=TestProcessCiFlakyAutoRerun._genuine_failure()
+        )
+
+        # Commit A still red -> budget exhausted, plain checks_failed,
+        # no rerun attempted -- unchanged from today's behaviour.
+        events = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_flaky_rerun" not in kinds
+        assert ci.rerun_failed_calls == []
+        assert entry.ci_flaky_reruns == mq.MAX_CI_FLAKY_RERUNS
+
+        # A new commit lands (e.g. a ci-fix leg's own push) and ALSO
+        # fails CI -- it must get its own fresh rerun-once chance rather
+        # than being immediately confirmed as broken from A's exhausted
+        # budget.
+        entry.branch_head_sha = "sha_b"
+        events = process(items, gh, ci_store=ci)
+
+        kinds = [e.kind for e in events]
+        assert "ci_flaky_rerun" in kinds
+        assert "checks_failed" not in kinds
+        assert ci.rerun_failed_calls == [("acme/api", 99)]
+        assert entry.ci_infra_reruns == 0
+        assert entry.ci_flaky_reruns == 1
+        assert entry.ci_unreadable_reruns == 0
+        assert entry.ci_flaky_pending
+        assert entry.ci_rerun_budget_sha == "sha_b"
+
+    def test_same_commit_failing_again_keeps_the_exhausted_budget(self) -> None:
+        """Control: without a NEW sha, the existing exhausted-budget
+        behaviour (today's `checks_failed` on a repeat failure) is
+        unchanged — the reset is scoped to a genuinely new commit, not
+        every tick."""
+        items = [_q("w1", pr=99)]
+        entry = items[0]
+        entry.branch_head_sha = "sha_a"
+        entry.ci_rerun_budget_sha = "sha_a"
+        entry.ci_flaky_reruns = mq.MAX_CI_FLAKY_RERUNS
+        entry.ci_flaky_pending = ""
+
+        gh = FakeGh()
+        ci = TestProcessCiFlakyAutoRerun._Ci(
+            checks=TestProcessCiFlakyAutoRerun._genuine_failure()
+        )
+
+        events = process(items, gh, ci_store=ci)
+
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_flaky_rerun" not in kinds
+        assert ci.rerun_failed_calls == []
+        assert entry.ci_flaky_reruns == mq.MAX_CI_FLAKY_RERUNS
+        assert entry.ci_rerun_budget_sha == "sha_a"
+
+    def test_unknown_branch_head_sha_does_not_reset_the_budget(self) -> None:
+        """An unknown sha (``board=None``, the dry-preview path with no
+        live `gh` fetch) carries no information either way -- leave the
+        existing budget alone rather than reset against ``""``."""
+        items = [_q("w1", pr=99)]
+        entry = items[0]
+        entry.branch_head_sha = None
+        entry.ci_rerun_budget_sha = "sha_a"
+        entry.ci_flaky_reruns = mq.MAX_CI_FLAKY_RERUNS
+        entry.ci_flaky_pending = ""
+
+        gh = FakeGh()
+        ci = TestProcessCiFlakyAutoRerun._Ci(
+            checks=TestProcessCiFlakyAutoRerun._genuine_failure()
+        )
+
+        events = process(items, gh, ci_store=ci)
+
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_flaky_rerun" not in kinds
+        assert entry.ci_flaky_reruns == mq.MAX_CI_FLAKY_RERUNS
+        assert entry.ci_rerun_budget_sha == "sha_a"
+
+
 # ── #778: staging_items() ─────────────────────────────────────────────────────
 
 class TestStagingItems:

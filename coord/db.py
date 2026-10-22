@@ -1155,7 +1155,16 @@ def retry_on_locked(
 # request-changes rates between workflow and single legs over a sample of
 # issues BEFORE anyone considers relaxing Test/Review for workflow legs —
 # a separate, later decision this column only supplies the data for.
-_DB_SCHEMA_VERSION = 24
+#
+# #3754: bumped 24 -> 25 for the new `merge_queue.ci_rerun_budget_sha` column
+# appended to `_MIGRATE_ADD_COLUMNS` below — the `branch_head_sha` that
+# `ci_infra_reruns`/`ci_flaky_reruns`/`ci_unreadable_reruns`/`ci_flaky_pending`
+# were last accrued against, same pairing shape as #3263's `ci_seen_checks_
+# sha`. Lets a new commit landing while CI is still red (a ci-fix leg's own
+# push, most commonly) re-arm those budgets for its own fair rerun-once
+# chance instead of inheriting an already-exhausted count from an unrelated
+# prior commit. See `coord.merge_queue.QueuedMerge.ci_rerun_budget_sha`.
+_DB_SCHEMA_VERSION = 25
 
 
 def _read_schema_version(conn: sqlite3.Connection) -> int:
@@ -1403,7 +1412,8 @@ _SCHEMA_SQL = """
             ci_fix_detail_sha TEXT NOT NULL DEFAULT '',
             ci_fix_detail_json TEXT,
             ci_seen_checks_sha TEXT NOT NULL DEFAULT '',
-            ci_seen_check_names_json TEXT
+            ci_seen_check_names_json TEXT,
+            ci_rerun_budget_sha TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -2640,6 +2650,16 @@ _MIGRATE_ADD_COLUMNS: list[str] = [
     # commit" by `coord.merge_queue._ci_seen_check_names`.
     "ALTER TABLE merge_queue ADD COLUMN ci_seen_checks_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE merge_queue ADD COLUMN ci_seen_check_names_json TEXT",
+    # #3754: the `branch_head_sha` that `ci_infra_reruns`/`ci_flaky_reruns`/
+    # `ci_unreadable_reruns`/`ci_flaky_pending` were last accrued against --
+    # see `coord.merge_queue.QueuedMerge.ci_rerun_budget_sha`'s docstring.
+    # Lets a new commit landing while CI is still red (a ci-fix leg's own
+    # push, most commonly) re-arm those rerun budgets for its own fair
+    # rerun-once chance instead of inheriting an already-exhausted count
+    # from an unrelated prior commit. '' for every row predating this
+    # migration, read identically to "no live CI-failure read yet" by
+    # `coord.merge_queue.MergeQueue.process`.
+    "ALTER TABLE merge_queue ADD COLUMN ci_rerun_budget_sha TEXT NOT NULL DEFAULT ''",
     # #3339: the explicit operator assertion that clears a terminal
     # `refused_premise` row — see `coord.state.mark_premise_rechecked` and
     # `coord drive-queue clear-refusal`. Unlike `refused_policy`, a premise
