@@ -5763,21 +5763,69 @@ def refresh_entry_assignment(
 
 # ── Stale-conflict reconciliation (#1477) ───────────────────────────────────
 
+# A HUMAN_REQUIRED entry's `error` is not always the pristine original
+# conflict message: `coord.reconcile`'s conflict-fix completion hook builds
+# several of its own escalation messages as `f"{existing_error}; ..."`,
+# prefixing a fresh explanation onto whatever was already there rather than
+# replacing it. `classify_conflict` only pattern-matches wording, so a
+# message carrying one of these prefixes can still contain a `_REBASEABLE_
+# SIGNALS` phrase from the ORIGINAL conflict text and classify as
+# "rebaseable" even though the actual latch reason has nothing to do with
+# mergeability (the branch's content already landed elsewhere, a worker was
+# killed by a usage-limit reset, a reword was refused as non-content-
+# preserving, or an escalation attempt itself could not be dispatched).
+# These phrases are the ones `reconcile_conflict_entries` must still
+# recognize and refuse to unpark, even when `classify_conflict` disagrees.
+_NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS = (
+    "not a real conflict",  # usage-limit kill — never was a conflict
+    "nothing to merge",  # already-upstream — content already landed elsewhere
+    "manual reword required",  # reword worker declined a non-content-preserving rewrite
+    "escalation could not be dispatched",  # ordinary conflict-fix escalation itself declined
+)
+
+
+def _is_non_mergeability_human_latch(error: str | None) -> bool:
+    """True when ``error`` carries a known non-mergeability escalation
+    phrase, even though it may also contain conflict wording from a
+    prefixed original message (see ``_NON_MERGEABILITY_HUMAN_REQUIRED_
+    SIGNALS`` above).
+    """
+    if not error:
+        return False
+    text = error.lower()
+    return any(sig in text for sig in _NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS)
+
+
 def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
-    """Re-test every ``CONFLICT`` entry's mergeability and clear stale verdicts.
+    """Re-test stale conflict verdicts (``CONFLICT``, and retry-cap-latched
+    ``HUMAN_REQUIRED``) against live mergeability and clear them when stale.
 
     A ``CONFLICT`` entry caches the ``gh pr merge`` failure message from
     whenever the queue last attempted it, and ``process()`` never looks at it
     again — it only ever iterates ``PENDING`` entries. When a conflict-fix
-    worker (#241) lands a rebase, or a human pushes a fix by hand, the branch
+    worker lands a rebase, or a human pushes a fix by hand, the branch
     becomes clean but the entry sits parked on the old verdict forever,
-    requiring the three-step manual incantation described in #1477
-    (``--drop`` → a bare re-enqueue → ``--only``) to notice.
+    requiring a manual ``--drop`` → re-enqueue → ``--only`` incantation to
+    notice.
 
-    This re-tests GitHub's own mergeability computation for every
-    ``CONFLICT`` entry that has an open PR and, when it now reports clean,
-    returns the entry to ``PENDING`` and clears the stored error so it
-    re-enters the ordinary merge flow on this tick — no manual archaeology.
+    The same staleness bites a ``HUMAN_REQUIRED`` entry escalated after a
+    conflict-fix retry-cap hit: if the branch was rebased or the conflict
+    resolved by hand afterwards (e.g. a develop merge that happened to land
+    after the latch), the cached error is now pure archaeology and nothing
+    else re-checks it — a clean, approved branch stays blocked until a
+    manual ``--override-human-required``. Eligibility here requires BOTH
+    that :func:`classify_conflict` reads the message as ``"rebaseable"``
+    AND that it does not carry one of the ``_NON_MERGEABILITY_HUMAN_
+    REQUIRED_SIGNALS`` phrases — a permission/protection latch
+    (``classify_conflict(...) == "human"``), and any latch whose actual
+    cause was never a mergeability question in the first place (content
+    already upstream, a usage-limit kill, a declined reword, a declined
+    escalation), are left untouched.
+
+    This re-tests GitHub's own mergeability computation for every eligible
+    entry that has an open PR and, when it now reports clean, returns the
+    entry to ``PENDING`` and clears the stored error so it re-enters the
+    ordinary merge flow on this tick — no manual archaeology.
 
     Fail-closed by design: an entry with no PR yet, or whose mergeability
     can't be determined (``gh`` error, or GitHub still computing it — both
@@ -5812,7 +5860,22 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
     events: list[MergeEvent] = []
     changed = False
     for entry in items:
-        if entry.state != CONFLICT or not entry.pr_number:
+        if not entry.pr_number:
+            continue
+        was_human_required = entry.state == HUMAN_REQUIRED
+        if was_human_required:
+            # Only a conflict-fix retry-cap latch is a mergeability
+            # question — a permission/protection latch, or a latch whose
+            # message merely contains leftover conflict wording from a
+            # prefixed original error but was actually caused by something
+            # re-checking `check_pr_mergeable` could never resolve, is left
+            # alone.
+            if (
+                classify_conflict(entry.error) != "rebaseable"
+                or _is_non_mergeability_human_latch(entry.error)
+            ):
+                continue
+        elif entry.state != CONFLICT:
             continue
         try:
             mergeable = gh_ops.check_pr_mergeable(entry.repo_github, entry.pr_number)
@@ -5835,9 +5898,10 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
         entry.state = PENDING
         entry.error = None
         changed = True
+        cleared_kind = "human_required latch" if was_human_required else "conflict"
         events.append(MergeEvent(
             entry, "reopened",
-            f"conflict cleared — PR #{entry.pr_number} ({entry.branch}) is "
+            f"{cleared_kind} cleared — PR #{entry.pr_number} ({entry.branch}) is "
             "mergeable again, returned to pending",
         ))
     if changed:

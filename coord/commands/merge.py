@@ -2114,7 +2114,12 @@ def merge(
         # #1477: re-test any parked CONFLICT entry before resolving
         # --only — a branch repaired since the last tick should be eligible
         # for --only the moment it's clean, not only after a manual --drop.
+        # Keep the events so the --override-human-required check below can
+        # tell "already HUMAN_REQUIRED" apart from "just auto-cleared by this
+        # same reconcile pass" instead of treating the latter as a usage error.
+        _reconciled_assignment_ids = set()
         for _ev in mq.reconcile_conflict_entries(gh_ops):
+            _reconciled_assignment_ids.add(_ev.entry.assignment_id)
             click.echo(
                 f"  {_ev.entry.repo_name} #{_ev.entry.issue_number} "
                 f"({_ev.entry.branch}): {_ev.kind} — {_ev.message}"
@@ -2173,49 +2178,63 @@ def merge(
         # so it gets its own flag, its own validation, and its own audit
         # row, never bundled into --force-merge.
         if override_human_required:
+            _override_already_moot = False
             if only_entry.state != HUMAN_REQUIRED:
-                click.echo(
-                    "error: --override-human-required only applies to a "
-                    f"HUMAN_REQUIRED entry; {only_assignment!r} is in state "
-                    f"{only_entry.state!r}",
-                    err=True,
-                )
-                sys.exit(1)
-            if dry_run:
-                click.echo(
-                    "  --override-human-required: (dry run) would clear "
-                    f"HUMAN_REQUIRED on {only_assignment!r} — "
-                    f"{override_human_required!r}"
-                )
-            else:
-                from coord.audit import record_audit  # noqa: PLC0415
+                if only_entry.assignment_id in _reconciled_assignment_ids:
+                    # The reconcile pass just above this already found the
+                    # PR mergeable again and cleared the latch itself — the
+                    # override the operator asked for is moot, not an error.
+                    _override_already_moot = True
+                    click.echo(
+                        "  --override-human-required: not needed — "
+                        f"{only_assignment!r} was already auto-cleared to "
+                        f"{only_entry.state!r} by the conflict reconcile pass"
+                    )
+                else:
+                    click.echo(
+                        "error: --override-human-required only applies to a "
+                        f"HUMAN_REQUIRED entry; {only_assignment!r} is in state "
+                        f"{only_entry.state!r}",
+                        err=True,
+                    )
+                    sys.exit(1)
+            if not _override_already_moot:
+                if dry_run:
+                    click.echo(
+                        "  --override-human-required: (dry run) would clear "
+                        f"HUMAN_REQUIRED on {only_assignment!r} — "
+                        f"{override_human_required!r}"
+                    )
+                else:
+                    from coord.audit import record_audit  # noqa: PLC0415
 
-                record_audit(
-                    tier="business",
-                    category="merge",
-                    event_type="human_required_override",
-                    actor="user",
-                    summary=(
-                        f"human_required override: {only_entry.repo_name}"
-                        f"#{only_entry.issue_number} ({only_assignment}) — "
-                        f"{override_human_required}"
-                    ),
-                    repo=only_entry.repo_name,
-                    issue=only_entry.issue_number,
-                    assignment_id=only_entry.assignment_id,
-                    details={"reason": override_human_required},
-                )
-                click.echo(
-                    "  --override-human-required: cleared HUMAN_REQUIRED on "
-                    f"{only_assignment!r} — {override_human_required!r} — "
-                    "requeued as PENDING"
-                )
-            # Reset in-memory state either way so the dry-run event stream
-            # below reflects what a real run would do (matching the review/
-            # smoke gate dry-run convention); actual persistence is still
-            # gated on `not dry_run` in the save block further down.
-            only_entry.state = PENDING
-            only_entry.error = None
+                    record_audit(
+                        tier="business",
+                        category="merge",
+                        event_type="human_required_override",
+                        actor="user",
+                        summary=(
+                            f"human_required override: {only_entry.repo_name}"
+                            f"#{only_entry.issue_number} ({only_assignment}) — "
+                            f"{override_human_required}"
+                        ),
+                        repo=only_entry.repo_name,
+                        issue=only_entry.issue_number,
+                        assignment_id=only_entry.assignment_id,
+                        details={"reason": override_human_required},
+                    )
+                    click.echo(
+                        "  --override-human-required: cleared HUMAN_REQUIRED on "
+                        f"{only_assignment!r} — {override_human_required!r} — "
+                        "requeued as PENDING"
+                    )
+                # Reset in-memory state either way so the dry-run event
+                # stream below reflects what a real run would do (matching
+                # the review/smoke gate dry-run convention); actual
+                # persistence is still gated on `not dry_run` in the save
+                # block further down.
+                only_entry.state = PENDING
+                only_entry.error = None
         # #2157: MERGED is the one non-PENDING state that is not a failure.
         # An exit code reports whether the CALLER's postcondition holds, and
         # for `--only <aid>` that postcondition is "aid's branch is on the

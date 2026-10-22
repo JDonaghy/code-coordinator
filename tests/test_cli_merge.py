@@ -1132,6 +1132,49 @@ class TestMergeOverrideHumanRequired:
         ).fetchall()
         assert rows == []
 
+    def test_override_moot_when_reconcile_already_cleared_entry(
+        self, config_file: Path, coord_dir: Path, coord_db,
+    ) -> None:
+        """`--only`'s own stale-conflict reconcile pass (#1477) runs before
+        this validation and can itself unpark a HUMAN_REQUIRED retry-cap
+        latch the moment GitHub reports the PR mergeable again. That is not
+        a usage error — the override the operator asked for is simply no
+        longer needed — so it must not be reported as one, and must not
+        write a spurious `human_required_override` audit row for an
+        override that never actually applied."""
+        entry = mq.QueuedMerge(
+            assignment_id="h1", repo_name="api", repo_github="acme/api",
+            branch="worker/h1", target_branch="main", issue_number=1,
+            issue_title="t", state=mq.HUMAN_REQUIRED, pr_number=900,
+            error="gh pr merge 900 ... --rebase failed: not mergeable",
+        )
+        _seed_queue([entry])
+
+        def fake_merge(repo, number, method="rebase"):
+            return True, "ok"
+
+        with patch("coord.github_ops.check_pr_mergeable", return_value=True), \
+             patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "merge", "--config", str(config_file),
+                    "--only", "h1",
+                    "--override-human-required", "no longer needed",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "not needed" in result.output
+        assert "cleared HUMAN_REQUIRED" not in result.output
+
+        rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='human_required_override'"
+        ).fetchall()
+        assert rows == []
+
     def test_override_dry_run_does_not_persist_or_audit(
         self, config_file: Path, coord_dir: Path, coord_db,
     ) -> None:
