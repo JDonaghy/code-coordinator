@@ -3882,6 +3882,86 @@ class TestReviewGate:
             entry, board, ancillary_gh_ops=_Gh(),
         ) is False
 
+    # ── #3749: context-only rebase/base-merge delta preserves approval ─────
+
+    def test_has_approved_review_context_only_delta_survives_rebase(self) -> None:
+        """#3749: a rebase/zero-conflict base-merge that only shifts the
+        diff's context lines (upstream churned nearby, but the reviewed
+        hunk's own +/- content is byte-identical) must not void the
+        approval, even though the patch-id genuinely changed."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"  # context shift changed the hash
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                assert (repo, base) == ("acme/api", "main")
+                if head == "abc123":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " context after\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -40,3 +40,3 @@\n"
+                        " shifted context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " shifted context after\n"
+                    )
+                raise AssertionError(head)
+
+        assert mq.has_approved_review(entry, board, _Gh()) is True
+
+    def test_has_approved_review_genuine_content_change_still_voids(self) -> None:
+        """A delta whose +/- content itself differs (not just context) must
+        still void the approval — #3749's fallback only carries forward a
+        content-identical rebase, never a real change."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context\n"
+                        "-old line\n"
+                        "+new line\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context\n"
+                        "-old line\n"
+                        "+a genuinely different line\n"
+                    )
+                raise AssertionError(head)
+
+        assert mq.has_approved_review(entry, board, _Gh()) is False
+
     # ── #292 Defect 3: skip-and-proceed instead of group-halt ────────────
 
     def test_process_review_gated_entry_does_not_block_approved_sibling(self) -> None:
@@ -4165,6 +4245,73 @@ class TestScopedReviewCandidate:
         found = mq.find_scoped_review_candidate(
             entry, board, ancillary_files=["CHANGELOG.md"], ancillary_gh_ops=_Gh(),
         )
+        assert found is review
+
+    # ── #3749: context-only rebase/base-merge delta ────────────────────────
+
+    def test_returns_none_when_delta_is_context_only(self) -> None:
+        """#3749: has_approved_review already covers a context-only delta —
+        there is nothing left to scope a review around."""
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":  # review_head_sha
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " context after\n"
+                    )
+                if head == "def456":  # current branch_head_sha
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -40,3 +40,3 @@\n"
+                        " shifted context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " shifted context after\n"
+                    )
+                raise AssertionError(head)
+
+        found = mq.find_scoped_review_candidate(entry, board, _Gh())
+        assert found is None
+
+    def test_finds_candidate_when_content_genuinely_differs(self) -> None:
+        """A delta whose +/- content differs (not just context) is still a
+        scoped-review candidate — the context-only exemption only matches a
+        content-identical rebase."""
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context\n"
+                        "-old line\n"
+                        "+new line\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context\n"
+                        "-old line\n"
+                        "+a genuinely different line\n"
+                    )
+                raise AssertionError(head)
+
+        found = mq.find_scoped_review_candidate(entry, board, _Gh())
         assert found is review
 
     # ── only_conflict_fix_since_review ──────────────────────────────────────
