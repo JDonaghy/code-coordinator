@@ -2508,7 +2508,11 @@ class TestUatStateAndReasonColumns:
 # `review_claims` / #3333's `smoke_claims` bumps above. Closes the race where
 # the live review-completion path and the orphan sweep both see
 # `review_posted_at IS NULL` and both post the identical GitHub comment.
-_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (24, 100)
+# #3754 bumped this to (25, 101): `merge_queue.ci_rerun_budget_sha` — the
+# `branch_head_sha` the CI-flaky/infra/unreadable rerun budgets were last
+# accrued against, so a new commit landing while CI is still red gets its
+# own fair rerun-once chance instead of inheriting an exhausted budget.
+_PINNED_SCHEMA_VERSION_AND_MIGRATION_COUNT = (25, 101)
 
 
 class TestMigrateAddColumnsVersionGuard:

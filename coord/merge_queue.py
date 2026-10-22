@@ -4897,6 +4897,23 @@ class QueuedMerge:
     # is nothing to contradict on the very first read of a fresh SHA.
     ci_seen_checks_sha: str = ""
     ci_seen_check_names_json: str | None = None
+    # #3754: `branch_head_sha` (see the field above) that `ci_infra_reruns`/
+    # `ci_flaky_reruns`/`ci_unreadable_reruns`/`ci_flaky_pending` were last
+    # accrued against. Those four durable fields used to be reset ONLY in
+    # the "genuinely resolved" block below (reached only once CI reads
+    # fully green) — so a NEW commit landing while CI is STILL red (most
+    # commonly a ci-fix leg's own push) inherited whatever was left of the
+    # PRIOR commit's budget instead of getting its own fair rerun-once
+    # chance. That silently turned a single flaky required check into two
+    # consecutive `checks_failed` verdicts back to back, burning the
+    # #2972 fix-round ceiling on a PR nothing was actually wrong with.
+    # Compared against `branch_head_sha` at the top of the `if failed:`
+    # block below: a mismatch re-arms all four fields for the new commit
+    # before any of #2347/#1892/#2252's own budget checks run, mirroring
+    # the `ci_seen_checks_sha` pairing immediately above. '' for every
+    # entry that has never had a live CI-failure read, and for rows
+    # predating this column.
+    ci_rerun_budget_sha: str = ""
 
 
 class GhOps(Protocol):
@@ -5308,6 +5325,9 @@ def load_queue() -> list[QueuedMerge]:
             # ci_fix_detail_json above, for rows predating this migration.
             ci_seen_checks_sha=row["ci_seen_checks_sha"] or "",
             ci_seen_check_names_json=row["ci_seen_check_names_json"],
+            # #3754: same NULL-to-'' decoding as ci_seen_checks_sha above,
+            # for rows predating this migration.
+            ci_rerun_budget_sha=row["ci_rerun_budget_sha"] or "",
         )
         for row in rows
     ]
@@ -5332,8 +5352,9 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         ci_unreadable_reruns, ci_fix_dispatches,
                         ci_fix_head_sha, ci_fix_noop_streak,
                         ci_fix_detail_sha, ci_fix_detail_json,
-                        ci_seen_checks_sha, ci_seen_check_names_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ci_seen_checks_sha, ci_seen_check_names_json,
+                        ci_rerun_budget_sha
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         item.assignment_id, item.repo_name, item.repo_github,
                         item.branch, item.target_branch, item.issue_number,
@@ -5346,6 +5367,7 @@ def save_queue(items: list[QueuedMerge]) -> None:
                         item.ci_fix_head_sha, item.ci_fix_noop_streak,
                         item.ci_fix_detail_sha, item.ci_fix_detail_json,
                         item.ci_seen_checks_sha, item.ci_seen_check_names_json,
+                        item.ci_rerun_budget_sha,
                     ),
                 )
 
@@ -9036,6 +9058,25 @@ def process(
                     summary = ", ".join(
                         f"{c.name} ({c.conclusion})" for c in failed
                     )
+                    # #3754: a NEW commit landing while CI is still red
+                    # (most commonly a ci-fix leg's own push) must get its
+                    # own fair rerun-once chance, not inherit whatever is
+                    # left of a DIFFERENT, prior commit's budget — the
+                    # "genuinely resolved" reset later in this function only
+                    # fires once CI reads fully green, which a still-broken
+                    # (or still-flaky) new commit never reaches. Guarded on
+                    # `branch_head_sha` being known at all: an unknown SHA
+                    # carries no information either way, so leave the
+                    # existing budget alone rather than reset against "".
+                    if (
+                        entry.branch_head_sha
+                        and entry.branch_head_sha != entry.ci_rerun_budget_sha
+                    ):
+                        entry.ci_infra_reruns = 0
+                        entry.ci_flaky_reruns = 0
+                        entry.ci_flaky_pending = ""
+                        entry.ci_unreadable_reruns = 0
+                        entry.ci_rerun_budget_sha = entry.branch_head_sha
                     # #2347: classify a bare check-list FETCH failure
                     # BEFORE #1892's infra classifier gets a chance — a
                     # synthetic unreadable check always carries `run_id ==
@@ -9320,6 +9361,12 @@ def process(
                 # failures the budget was tracking is over. A LATER,
                 # unrelated fetch failure starts its own count from zero.
                 entry.ci_unreadable_reruns = 0
+                # #3754: keep `ci_rerun_budget_sha` in lockstep with the
+                # three counters above — harmless if it's already current
+                # (the `if failed:` guard above is idempotent), but keeps a
+                # later failure on this SAME sha (a flaky green-then-read)
+                # from being misread as stale tracking.
+                entry.ci_rerun_budget_sha = entry.branch_head_sha or ""
                 # #1851: a green CI result can itself be stale relative to the
                 # base — see `_ci_checks_are_stale`'s docstring. Named
                 # distinctly (`checks_stale`) from checks_failed/
