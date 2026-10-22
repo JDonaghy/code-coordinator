@@ -4987,6 +4987,64 @@ def test_dispatch_scoped_reviews_for_queue_skips_when_delta_is_ancillary_only(
     assert dispatched == []
 
 
+def test_dispatch_scoped_reviews_for_queue_skips_when_delta_is_context_only(
+    two_machine_config: Config, monkeypatch,
+) -> None:
+    """#3749: this is the actual production wiring the blocking review
+    finding targeted — `dispatch_scoped_reviews_for_queue` calls
+    `has_approved_review`/`find_scoped_review_candidate` with
+    `ancillary_gh_ops=github_ops` and no positional `gh_ops`, so the
+    context-only check must activate from that channel alone. A rebase
+    whose diff shifted only context lines (the reviewed hunk's own +/-
+    content is byte-identical) must leave nothing for the scoped-review
+    path to dispatch."""
+    from coord import merge_queue as mq
+
+    def _compare_diff(repo: str, base: str, head: str) -> str:
+        if head == "oldsha":
+            return (
+                "diff --git a/f.py b/f.py\n"
+                "@@ -10,3 +10,3 @@\n"
+                " context before\n"
+                "-old\n"
+                "+kept\n"
+                " context after\n"
+            )
+        return (
+            "diff --git a/f.py b/f.py\n"
+            "@@ -40,3 +40,3 @@\n"
+            " shifted context before\n"
+            "-old\n"
+            "+kept\n"
+            " shifted context after\n"
+        )
+
+    monkeypatch.setattr("coord.github_ops.get_compare_diff", _compare_diff)
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-context-only"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert dispatched == []
+
+
 def test_dispatch_scoped_reviews_for_queue_dispatches_when_delta_has_non_ancillary_file(
     two_machine_config: Config, monkeypatch,
 ) -> None:

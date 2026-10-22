@@ -3923,7 +3923,10 @@ class TestReviewGate:
                     )
                 raise AssertionError(head)
 
-        assert mq.has_approved_review(entry, board, _Gh()) is True
+        # #3749: the context-only check shares *ancillary_gh_ops* with the
+        # #3707 ancillary-files check rather than reading the raw *gh_ops*
+        # positional — passing it any other way must not activate it.
+        assert mq.has_approved_review(entry, board, ancillary_gh_ops=_Gh()) is True
 
     def test_has_approved_review_genuine_content_change_still_voids(self) -> None:
         """A delta whose +/- content itself differs (not just context) must
@@ -3959,6 +3962,201 @@ class TestReviewGate:
                         "+a genuinely different line\n"
                     )
                 raise AssertionError(head)
+
+        assert mq.has_approved_review(entry, board, _Gh()) is False
+
+    def test_has_approved_review_context_only_delta_via_ancillary_gh_ops_only(
+        self,
+    ) -> None:
+        """#3749: the context-only check must activate from *ancillary_gh_ops*
+        alone, with no positional *gh_ops* supplied — this is exactly the
+        shape `coord/review.py`'s scoped-review dispatch calls
+        `has_approved_review` with (`ancillary_gh_ops=github_ops`, no
+        positional `gh_ops`). A version of this check gated on the raw
+        *gh_ops* parameter instead would be inert at that call site even
+        though the caller clearly opted in."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " context after\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -40,3 +40,3 @@\n"
+                        " shifted context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " shifted context after\n"
+                    )
+                raise AssertionError(head)
+
+        # No positional gh_ops — only ancillary_gh_ops, matching review.py.
+        assert mq.has_approved_review(
+            entry, board, ancillary_gh_ops=_Gh(),
+        ) is True
+
+    def test_has_approved_review_removed_line_starting_with_dashes_still_voids(
+        self,
+    ) -> None:
+        """#3749: a removed/added line whose own content happens to start
+        with `--`/`++` (a SQL/Lua comment, a YAML/Markdown rule, a shell
+        `--flag` continuation) must not be mistaken for a diff header —
+        this is real content churn and must still void the approval."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/query.sql b/query.sql\n"
+                        "@@ -1,2 +1,2 @@\n"
+                        " select 1;\n"
+                        "-- old comment\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/query.sql b/query.sql\n"
+                        "@@ -1,2 +1,2 @@\n"
+                        " select 1;\n"
+                        "-- new comment\n"
+                    )
+                raise AssertionError(head)
+
+        assert mq.has_approved_review(entry, board, _Gh()) is False
+
+    def test_has_approved_review_binary_mode_change_fails_closed(self) -> None:
+        """#3749: a block that differs (before != after) but has no `+`/`-`
+        content line on either side — a binary file change, a permission
+        (`old mode`/`new mode`) flip, an empty-file add/delete — must fail
+        closed and void the approval. Absence of an observed content line
+        is not evidence the content is unchanged."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/assets/logo.png b/assets/logo.png\n"
+                        "old mode 100644\n"
+                        "new mode 100755\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/assets/logo.png b/assets/logo.png\n"
+                        "Binary files a/assets/logo.png and b/assets/logo.png differ\n"
+                    )
+                raise AssertionError(head)
+
+        assert mq.has_approved_review(entry, board, _Gh()) is False
+
+    def test_has_approved_review_byte_identical_diffs_fails_closed(self) -> None:
+        """#3749: if every per-file block compares byte-identical between
+        the two base-relative diffs, reaching the context-only check at all
+        means the patch-id read upstream was wrong, not that this is a
+        genuine no-op the patch-id check somehow missed — mirrors
+        `_review_delta_is_ancillary_only`'s empty-changed-path posture."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+        identical_diff = (
+            "diff --git a/src/main.py b/src/main.py\n"
+            "@@ -10,3 +10,3 @@\n"
+            " context\n"
+            "-old line\n"
+            "+new line\n"
+        )
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                return identical_diff
+
+        assert mq.has_approved_review(entry, board, _Gh()) is False
+
+    def test_has_approved_review_context_only_missing_base_branch_fails_closed(
+        self,
+    ) -> None:
+        """#3749: no *target_branch* on the entry means there is no base to
+        anchor the compares at — fail closed rather than silently skip the
+        check."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.target_branch = None
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                raise AssertionError("must not be called without a base_branch")
+
+        assert mq.has_approved_review(entry, board, _Gh()) is False
+
+    def test_has_approved_review_context_only_none_compare_fails_closed(self) -> None:
+        """#3749: an unreadable compare (`get_compare_diff` returns ``None``
+        — e.g. a GitHub API error) must fail closed, never be read as "no
+        diff, so nothing changed"."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                return None
 
         assert mq.has_approved_review(entry, board, _Gh()) is False
 
@@ -4279,7 +4477,9 @@ class TestScopedReviewCandidate:
                     )
                 raise AssertionError(head)
 
-        found = mq.find_scoped_review_candidate(entry, board, _Gh())
+        # #3749: shares *ancillary_gh_ops* with the #3707 ancillary-files
+        # check rather than the raw *gh_ops* positional.
+        found = mq.find_scoped_review_candidate(entry, board, ancillary_gh_ops=_Gh())
         assert found is None
 
     def test_finds_candidate_when_content_genuinely_differs(self) -> None:
@@ -4313,6 +4513,45 @@ class TestScopedReviewCandidate:
 
         found = mq.find_scoped_review_candidate(entry, board, _Gh())
         assert found is review
+
+    def test_returns_none_when_delta_is_context_only_via_ancillary_gh_ops_only(
+        self,
+    ) -> None:
+        """#3749: same as `test_returns_none_when_delta_is_context_only`, but
+        with the context-only check wired exactly as `coord/review.py`'s
+        scoped-review dispatch calls it — `ancillary_gh_ops` only, no
+        positional `gh_ops`."""
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+
+        class _Gh:
+            def get_compare_diff(self, repo: str, base: str, head: str) -> str | None:
+                if head == "abc123":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -10,3 +10,3 @@\n"
+                        " context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " context after\n"
+                    )
+                if head == "def456":
+                    return (
+                        "diff --git a/src/main.py b/src/main.py\n"
+                        "@@ -40,3 +40,3 @@\n"
+                        " shifted context before\n"
+                        "-old line\n"
+                        "+new line\n"
+                        " shifted context after\n"
+                    )
+                raise AssertionError(head)
+
+        found = mq.find_scoped_review_candidate(
+            entry, board, ancillary_gh_ops=_Gh(),
+        )
+        assert found is None
 
     # ── only_conflict_fix_since_review ──────────────────────────────────────
 
