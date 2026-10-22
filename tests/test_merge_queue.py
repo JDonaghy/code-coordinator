@@ -7278,14 +7278,16 @@ class TestReconcileConflictEntries:
 
 
 class TestReconcileHumanRequiredConflictLatch:
-    """#3750: a HUMAN_REQUIRED entry escalated by the conflict-fix retry
-    cap still holds the ORIGINAL conflict message on ``entry.error`` (see
-    ``_dispatch_conflict_fixes``'s ``"retry_cap"`` branch in
-    ``coord/commands/merge.py``) — so it must be re-tested against live
-    mergeability exactly like a plain CONFLICT entry, instead of staying
-    latched forever once the branch is actually clean again (quadraui
-    #1586: a develop-merge push resolved the conflict but the latch
-    predated it and nothing ever re-checked)."""
+    """A HUMAN_REQUIRED entry escalated by the conflict-fix retry cap must
+    be re-tested against live mergeability exactly like a plain CONFLICT
+    entry, instead of staying latched forever once the branch is actually
+    clean again. Eligibility requires both a ``"rebaseable"``
+    classification AND the absence of a known non-mergeability escalation
+    phrase (``_NON_MERGEABILITY_HUMAN_REQUIRED_SIGNALS``) — several
+    HUMAN_REQUIRED escalations build their message as
+    ``f"{existing_error}; ..."``, so the original conflict wording can
+    survive into a message whose actual cause was never a mergeability
+    question at all."""
 
     def test_unparks_human_required_conflict_latch_when_now_mergeable(self, coord_db) -> None:
         entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
@@ -7332,6 +7334,104 @@ class TestReconcileHumanRequiredConflictLatch:
         reloaded = load_queue()[0]
         assert reloaded.state == mq.HUMAN_REQUIRED
         assert reloaded.error == "GraphQL: protected branch rules violation"
+
+    def test_leaves_already_upstream_latch_untouched_despite_conflict_wording(
+        self, coord_db,
+    ) -> None:
+        """quadraui #3462: the stale-rebase worker found the branch's
+        content already landed elsewhere — not a conflict at all — but the
+        escalation message is built as ``f"{existing_error}; ..."``, so the
+        ORIGINAL ``"is not mergeable"`` wording survives into it. That
+        prefix must not make the entry eligible for re-probing: GitHub will
+        happily read MERGEABLE for a no-op branch, and unparking here would
+        re-enter the merge flow for a PR the system already determined has
+        nothing to merge."""
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = (
+            "Pull request #100 is not mergeable; stale-rebase worker "
+            "found: no unique commits. Branch content is already present "
+            "on main (landed via another change) — nothing to merge; "
+            "close the issue or `coord drive-queue remove`."
+        )
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert gh.mergeable_calls == []
+        reloaded = load_queue()[0]
+        assert reloaded.state == mq.HUMAN_REQUIRED
+
+    def test_leaves_usage_limit_latch_untouched_despite_conflict_wording(
+        self, coord_db,
+    ) -> None:
+        """A conflict-fix worker killed by the account's usage limit never
+        resolved (or failed to resolve) anything — the original conflict
+        wording surviving in the prefixed message must not make this
+        eligible."""
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = (
+            "Pull request #100 is not mergeable; conflict-fix worker was "
+            "killed by the account's 5-hour usage limit — not a real "
+            "conflict. Wait for the reset, then re-run `coord merge` to "
+            "retry unchanged."
+        )
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert gh.mergeable_calls == []
+        reloaded = load_queue()[0]
+        assert reloaded.state == mq.HUMAN_REQUIRED
+
+    def test_leaves_reword_mismatch_latch_untouched_despite_conflict_wording(
+        self, coord_db,
+    ) -> None:
+        """A reword-commit worker's refusal to push a non-content-
+        preserving rewrite is not a mergeability question either."""
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = (
+            "Pull request #100 is not mergeable; reword-commit worker "
+            "refused to push: a conflict marker appeared mid-rebase. "
+            "Manual reword required."
+        )
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert gh.mergeable_calls == []
+        reloaded = load_queue()[0]
+        assert reloaded.state == mq.HUMAN_REQUIRED
+
+    def test_leaves_declined_escalation_latch_untouched_despite_conflict_wording(
+        self, coord_db,
+    ) -> None:
+        """quadraui #3444: when the ordinary conflict-fix escalation that
+        follows a stale-rebase mismatch itself couldn't be dispatched, the
+        resulting latch is about dispatch capacity, not live
+        mergeability."""
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = (
+            "Pull request #100 is not mergeable; stale-rebase worker "
+            "refused to push: a conflict marker appeared. The rebase was "
+            "not content-preserving against the new base, and the "
+            "ordinary conflict-fix escalation could not be dispatched "
+            "either — manual resolution required."
+        )
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert gh.mergeable_calls == []
+        reloaded = load_queue()[0]
+        assert reloaded.state == mq.HUMAN_REQUIRED
 
 
 class TestReconcileConflictEntriesRebaseRefusalGuard:
