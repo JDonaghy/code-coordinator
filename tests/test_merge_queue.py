@@ -7235,7 +7235,10 @@ class TestReconcileConflictEntries:
         assert load_queue()[0].state == CONFLICT
 
     def test_only_touches_conflict_entries(self, coord_db) -> None:
-        """PENDING/MERGED/HUMAN_REQUIRED entries are never re-tested."""
+        """PENDING/MERGED entries, and a HUMAN_REQUIRED entry with no
+        conflict-shaped error (e.g. a permission/protection latch), are
+        never re-tested. A retry-cap-latched conflict IS re-tested — see
+        ``TestReconcileHumanRequiredConflictLatch`` below (#3750)."""
         pending = _q("p", state=PENDING, pr=200)
         merged = _q("m", state=MERGED, pr=201)
         human = _q("h", state=mq.HUMAN_REQUIRED, pr=202)
@@ -7272,6 +7275,63 @@ class TestReconcileConflictEntries:
         assert [e.entry.assignment_id for e in events] == ["clean"]
         states = {x.assignment_id: x.state for x in load_queue()}
         assert states == {"clean": PENDING, "broken": CONFLICT}
+
+
+class TestReconcileHumanRequiredConflictLatch:
+    """#3750: a HUMAN_REQUIRED entry escalated by the conflict-fix retry
+    cap still holds the ORIGINAL conflict message on ``entry.error`` (see
+    ``_dispatch_conflict_fixes``'s ``"retry_cap"`` branch in
+    ``coord/commands/merge.py``) — so it must be re-tested against live
+    mergeability exactly like a plain CONFLICT entry, instead of staying
+    latched forever once the branch is actually clean again (quadraui
+    #1586: a develop-merge push resolved the conflict but the latch
+    predated it and nothing ever re-checked)."""
+
+    def test_unparks_human_required_conflict_latch_when_now_mergeable(self, coord_db) -> None:
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = "Pull request #100 is not mergeable"
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert len(events) == 1
+        assert events[0].kind == "reopened"
+        assert "human_required latch cleared" in events[0].message
+        reloaded = load_queue()[0]
+        assert reloaded.state == PENDING
+        assert reloaded.error is None
+
+    def test_leaves_human_required_conflict_latch_parked_when_still_conflicting(
+        self, coord_db,
+    ) -> None:
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = "Pull request #100 is not mergeable"
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: False})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        reloaded = load_queue()[0]
+        assert reloaded.state == mq.HUMAN_REQUIRED
+        assert reloaded.error == "Pull request #100 is not mergeable"
+
+    def test_leaves_permission_human_required_latch_untouched(self, coord_db) -> None:
+        """A permission/protection HUMAN_REQUIRED latch is not a
+        mergeability question — it must never be probed at all."""
+        entry = _q("a", state=mq.HUMAN_REQUIRED, pr=100)
+        entry.error = "GraphQL: protected branch rules violation"
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert gh.mergeable_calls == []
+        reloaded = load_queue()[0]
+        assert reloaded.state == mq.HUMAN_REQUIRED
+        assert reloaded.error == "GraphQL: protected branch rules violation"
 
 
 class TestReconcileConflictEntriesRebaseRefusalGuard:

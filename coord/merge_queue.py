@@ -5764,7 +5764,8 @@ def refresh_entry_assignment(
 # ── Stale-conflict reconciliation (#1477) ───────────────────────────────────
 
 def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
-    """Re-test every ``CONFLICT`` entry's mergeability and clear stale verdicts.
+    """Re-test stale conflict verdicts (``CONFLICT``, and retry-cap-latched
+    ``HUMAN_REQUIRED``) against live mergeability and clear them when stale.
 
     A ``CONFLICT`` entry caches the ``gh pr merge`` failure message from
     whenever the queue last attempted it, and ``process()`` never looks at it
@@ -5774,10 +5775,24 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
     requiring the three-step manual incantation described in #1477
     (``--drop`` → a bare re-enqueue → ``--only``) to notice.
 
-    This re-tests GitHub's own mergeability computation for every
-    ``CONFLICT`` entry that has an open PR and, when it now reports clean,
-    returns the entry to ``PENDING`` and clears the stored error so it
-    re-enters the ordinary merge flow on this tick — no manual archaeology.
+    #3750: the same staleness bites a ``HUMAN_REQUIRED`` entry that
+    ``_dispatch_conflict_fixes`` escalated after hitting the conflict-fix
+    retry cap — ``ev.entry.error`` is left holding the ORIGINAL conflict
+    message when that escalation happens (see its ``"retry_cap"`` branch),
+    so :func:`classify_conflict` still reads it correctly. If the branch
+    was rebased or the conflict resolved by hand afterwards (e.g. a develop
+    merge that happened to land after the latch), that message is now pure
+    archaeology, and today nothing ever re-checks it — a clean, approved
+    branch stays blocked until a manual ``--override-human-required``. Only
+    the conflict-caused escalation (``classify_conflict(...) ==
+    "rebaseable"``) is eligible here; a permission/protection-caused
+    ``HUMAN_REQUIRED`` (``"human"``) is not a mergeability question at all
+    and is left untouched.
+
+    This re-tests GitHub's own mergeability computation for every eligible
+    entry that has an open PR and, when it now reports clean, returns the
+    entry to ``PENDING`` and clears the stored error so it re-enters the
+    ordinary merge flow on this tick — no manual archaeology.
 
     Fail-closed by design: an entry with no PR yet, or whose mergeability
     can't be determined (``gh`` error, or GitHub still computing it — both
@@ -5812,7 +5827,17 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
     events: list[MergeEvent] = []
     changed = False
     for entry in items:
-        if entry.state != CONFLICT or not entry.pr_number:
+        if not entry.pr_number:
+            continue
+        was_human_required = entry.state == HUMAN_REQUIRED
+        if was_human_required:
+            # Only a conflict-fix retry-cap latch is a mergeability
+            # question — a permission/protection latch (or any other
+            # HUMAN_REQUIRED cause) isn't something re-checking
+            # `check_pr_mergeable` could ever resolve.
+            if classify_conflict(entry.error) != "rebaseable":
+                continue
+        elif entry.state != CONFLICT:
             continue
         try:
             mergeable = gh_ops.check_pr_mergeable(entry.repo_github, entry.pr_number)
@@ -5835,9 +5860,10 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
         entry.state = PENDING
         entry.error = None
         changed = True
+        _was = "human_required latch" if was_human_required else "conflict"
         events.append(MergeEvent(
             entry, "reopened",
-            f"conflict cleared — PR #{entry.pr_number} ({entry.branch}) is "
+            f"{_was} cleared — PR #{entry.pr_number} ({entry.branch}) is "
             "mergeable again, returned to pending",
         ))
     if changed:
