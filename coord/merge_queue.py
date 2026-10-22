@@ -829,6 +829,21 @@ def scan_approved_reviews(
                 # (CHANGELOG.md/README.md, per repo config) — approval
                 # still covers it, same as a content-identical patch-id.
                 return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
+            if current_sha is not None and _review_delta_is_context_only(
+                gh_ops,
+                getattr(entry, "repo_github", None),
+                getattr(entry, "target_branch", None),
+                review_sha,
+                current_sha,
+            ):
+                # #3749: the patch-id changed only because upstream churn
+                # shifted the diff's context lines (a rebase, a
+                # zero-conflict base-merge) — the reviewed hunks' own
+                # content is byte-identical, so the approval still covers
+                # the current head. Unlike the ancillary-files check above,
+                # this is always on: it is sound for any file, not just a
+                # configured allow-list.
+                return ApprovalScan(approved=True, unknown_head=False, review_assignment=a)
             if current_sha is None:
                 # Refused because we don't KNOW the head, not because we
                 # checked and it moved. Same (closed) gate verdict, but a
@@ -890,6 +905,11 @@ def find_scoped_review_candidate(
       — :func:`has_approved_review` already carries THAT forward too, via
       the same :func:`_review_delta_is_ancillary_only` check, so there is
       nothing left to scope a review around either.
+    - The delta since that review changed only the diff's context lines,
+      not the reviewed hunks' own content (#3749: a rebase, a zero-conflict
+      base-merge) — :func:`has_approved_review` already carries THAT
+      forward too, via the same :func:`_review_delta_is_context_only`
+      check, so there is nothing left to scope a review around either.
     - Either patch-id is missing (fail closed, same posture as
       ``has_approved_review``: an unconfirmable diff gets a full review,
       never a guessed-at scoped one) — unless the ancillary-only check
@@ -939,6 +959,14 @@ def find_scoped_review_candidate(
             current_sha,
         ):
             continue  # #3707: ancillary-only delta — has_approved_review already covers it
+        if _review_delta_is_context_only(
+            gh_ops,
+            getattr(entry, "repo_github", None),
+            getattr(entry, "target_branch", None),
+            review_sha,
+            current_sha,
+        ):
+            continue  # #3749: context-only delta — has_approved_review already covers it
         if review_patch_id is None:
             continue  # fail closed — cannot confirm scope, full review
         return a  # approval voided ONLY by a content-changing rebase
@@ -2462,6 +2490,87 @@ def _review_delta_is_ancillary_only(
         # genuinely no-op rebase that patch-id somehow missed.
         return False
     return _files_are_ancillary(sorted(changed_paths), ancillary_files)
+
+
+_DIFF_NOISE_LINE_RE = re.compile(r"^(\+\+\+|---|diff --git|index )")
+
+
+def _content_lines_only(block: str) -> list[str]:
+    """Reduce *block* (one file's unified-diff text) to just its added/
+    removed content lines, in order — dropping the ``diff --git``/``index``/
+    ``+++``/``---`` headers, ``@@`` hunk markers, and unchanged context
+    lines.
+
+    #3749: a diff's context lines shift whenever the base branch changes
+    nearby — a pure rebase, a zero-conflict merge of an advanced base, an
+    unrelated commit landing a few lines above the reviewed hunk — even
+    though the reviewed hunk's own added/removed content is byte-identical.
+    ``git patch-id`` (:func:`coord.github_ops.compute_patch_id`) hashes
+    those context lines too, so this kind of mechanical churn can still
+    flip the patch-id and void an approval that covers unchanged content.
+    Comparing only the ``+``/``-`` lines is intentionally looser than
+    patch-id, but still sound: inserting, removing, or reordering a real
+    line changes this list, only the surrounding context shifting does not.
+    """
+    out = []
+    for line in block.splitlines():
+        if _DIFF_NOISE_LINE_RE.match(line) or line.startswith("@@"):
+            continue
+        if line.startswith(("+", "-")):
+            out.append(line)
+    return out
+
+
+def _review_delta_is_context_only(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    base_branch: str | None,
+    review_sha: str | None,
+    current_sha: str | None,
+) -> bool:
+    """True when every file that changed between *review_sha* (what an
+    existing ``approve``d review covered) and *current_sha* (the branch's
+    current head) changed ONLY in diff context — the reviewed hunks'
+    actual added/removed lines are byte-identical, and what moved is purely
+    the unchanged lines around them (#3749: a pure rebase, a zero-conflict
+    base-merge, upstream churn landing near but not inside the reviewed
+    diff). :func:`_review_delta_is_ancillary_only`'s patch-id carry-forward
+    (#1475) already catches the case where context happens to be untouched
+    too — this is the fallback for when the base moving shifted it, since
+    ``git patch-id`` hashes context lines and so cannot tell the two apart.
+
+    Mirrors :func:`_review_delta_is_ancillary_only`'s approach of anchoring
+    both compares at *base_branch* (never diffing *review_sha* against
+    *current_sha* directly — after a rebase neither is an ancestor of the
+    other) and splitting each into per-file blocks via
+    :func:`_diff_blocks_by_path`. Unlike that function, no
+    *ancillary_files* allow-list gates this — a context-only delta is safe
+    to carry forward for ANY file, not just a configured ancillary set.
+
+    Fails closed to ``False`` when *base_branch*/*gh_ops*/*repo_github*/
+    either SHA is missing, either compare call raises or returns ``None``,
+    both diffs are empty (nothing to compare — never claim a no-op diff
+    against an unreadable one), or any changed path's content-only lines
+    differ between the two diffs.
+    """
+    if not base_branch:
+        return False
+    review_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, review_sha)
+    current_diff = _fetch_compare_diff(gh_ops, repo_github, base_branch, current_sha)
+    if review_diff is None or current_diff is None:
+        return False
+    review_blocks = _diff_blocks_by_path(review_diff)
+    current_blocks = _diff_blocks_by_path(current_diff)
+    if not review_blocks and not current_blocks:
+        return False
+    for path in set(review_blocks) | set(current_blocks):
+        before = review_blocks.get(path, "")
+        after = current_blocks.get(path, "")
+        if before == after:
+            continue  # byte-identical block — not even a context shift
+        if _content_lines_only(before) != _content_lines_only(after):
+            return False
+    return True
 
 
 # #1851: the reason string prefix `_entry_gate_status` returns for a CI-stale
