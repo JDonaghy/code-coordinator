@@ -404,6 +404,41 @@ def is_fix_round_ceiling_blocked(state: str | None, last_reason: str | None) -> 
     return state == STATE_BLOCKED and is_fix_round_ceiling_reason(last_reason)
 
 
+def fix_round_ceiling_blocked_for_issue(repo_name: str, issue_number: int) -> bool:
+    """#3756: the ONE lookup every dispatcher must use to ask "has THIS
+    (repo, issue)'s drive-queue row already given up on the #2972 fix-round
+    ceiling" — wraps the read (:func:`coord.state.get_drive_queue_entry`) and
+    the predicate (:func:`is_fix_round_ceiling_blocked`) together so no
+    caller re-derives either half.
+
+    #3454 consolidated the two ``dispatch_conflict_fix`` callers onto
+    :func:`is_fix_round_ceiling_blocked`, but that review's "no further
+    relaunch ... from any of this fleet's independent dispatchers" promise
+    did not actually hold fleet-wide: ``coord.auto_loop``'s
+    ``_dispatch_fix_for_review`` — the review-completion path that fires a
+    fix worker on every ``request-changes`` verdict — paces itself purely
+    off ``pipeline.max_review_iterations`` (a SEPARATE counter from this
+    row's own ``pipeline.max_fix_rounds`` budget) and never consulted the
+    drive-queue row at all, so a row that had already gone ``blocked``
+    could still receive an unbounded run of review→fix→review legs,
+    independent of this module's own ceiling (vimcode#2018: ~14 legs/$31
+    overnight). Callers now ask this one function instead of each re-reading
+    the row and re-deriving the predicate — the "one question, one answer"
+    rule this module already applies elsewhere (#2096/#2085).
+
+    A drive-queue row is optional infrastructure (an issue can be worked
+    with no ``coord drive-queue add`` at all), so "no row for this (repo,
+    issue)" reads as "nothing to block on" — ``False``.
+    """
+    from coord.state import get_drive_queue_entry  # noqa: PLC0415
+
+    row = get_drive_queue_entry(repo_name, issue_number)
+    if row is None:
+        return False
+    entry = QueueEntry.from_row(row)
+    return is_fix_round_ceiling_blocked(entry.state, entry.last_reason)
+
+
 def is_permanent_block_reason(text: str | None) -> bool:
     """Whether *text* names a cause of `blocked` that #2230's sweep must
     never re-check — **relaunching the drive session cannot change the
