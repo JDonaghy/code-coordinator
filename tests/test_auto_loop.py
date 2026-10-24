@@ -3995,6 +3995,74 @@ class TestNeedsRedesignEscalation:
         mock_escalate.assert_not_called()
 
 
+# ── #3756: honor the drive-queue's fix-round ceiling block fleet-wide ────────
+
+
+class TestFixRoundCeilingBlockedFleetWide:
+    """The review→fix dispatcher must not re-grant fix rounds past the
+    #2972 ceiling just because its own `max_review_iterations` counter still
+    has budget — once the drive-queue row for this (repo, issue) has given
+    up (`STATE_BLOCKED` with a `(#2972)` reason), every dispatcher must honor
+    that, not just the drive-queue's own relaunch loop (#3454)."""
+
+    def test_blocked_row_skips_dispatch_and_posts_notice(
+        self, config: Config
+    ) -> None:
+        from coord.auto_loop import _dispatch_fix_for_review
+
+        work = _work_assignment(assignment_id="work-3756a")
+        review = _review_assignment(
+            assignment_id="review-3756a", review_of="work-3756a",
+        )
+        board = _board_with(work, review)
+        findings = _request_changes_findings()
+
+        with patch(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            return_value=True,
+        ) as mock_blocked, patch(
+            "coord.github_ops.post_issue_comment"
+        ) as mock_post:
+            actions = _dispatch_fix_for_review(review, findings, board, config)
+
+        mock_blocked.assert_called_once_with("api", 1)
+        assert len(actions) == 1
+        assert actions[0].kind == "fix_round_ceiling_blocked"
+        assert "ceiling" in actions[0].detail
+        # No fix worker dispatched.
+        assert board.active == []
+        mock_post.assert_called_once()
+        posted_body = mock_post.call_args[0][2]
+        assert "fix-round ceiling" in posted_body.lower()
+
+    def test_unblocked_row_dispatches_normally(self, config: Config) -> None:
+        """Sanity check: when the drive-queue has no opinion (no row, or a
+        row that isn't ceiling-blocked), the normal fix dispatch still
+        fires — this guard must not false-positive."""
+        from coord.auto_loop import _dispatch_fix_for_review
+
+        work = _work_assignment(assignment_id="work-3756b")
+        review = _review_assignment(
+            assignment_id="review-3756b", review_of="work-3756b",
+        )
+        board = _board_with(work, review)
+        findings = _request_changes_findings()
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-3756b-1"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            return_value=False,
+        ), patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = _dispatch_fix_for_review(
+                review, findings, board, config, http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+
+
 # ── #3322: the fix-round counter is monotonic across every dispatch path ─────
 
 

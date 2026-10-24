@@ -155,6 +155,13 @@ class LoopAction:
                                  API) fired twice in a row for this issue; the
                                  issue was parked with a durable escalation
                                  instead of dispatching another fix round
+    - ``"fix_round_ceiling_blocked"`` — #3756: this (repo, issue)'s drive-queue
+                                 row already gave up on the #2972 fix-round
+                                 ceiling (``STATE_BLOCKED`` with a permanent
+                                 reason); no fix worker was dispatched even
+                                 though ``max_review_iterations`` had budget
+                                 left, because that counter is a SEPARATE
+                                 budget from the drive-queue's
     """
     assignment_id: str | None
     detail: str = ""
@@ -1133,6 +1140,38 @@ def _dispatch_fix_for_review(
             ),
         )]
 
+    # #3756: the drive-queue's #2972 fix-round ceiling and this function's own
+    # `max_review_iterations` are two INDEPENDENT budgets answering the same
+    # question ("has this issue had enough fix rounds?"). Once a drive-queue
+    # row gives up (`STATE_BLOCKED`, #3454's "no further relaunch... from any
+    # of this fleet's independent dispatchers" promise), this dispatcher must
+    # honor that promise too — otherwise a review that completes after the
+    # row blocked keeps feeding fresh fix legs off the separate iteration
+    # counter, which is exactly how vimcode#2018 churned 14 legs / ~$31
+    # overnight despite the ceiling firing. Checked AFTER the terminal-skip
+    # guard (a merged/closed issue is already handled) and BEFORE the
+    # mechanical-verdict escalation below, so neither branch's own dispatch
+    # path can race past this.
+    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+
+    if fix_round_ceiling_blocked_for_issue(work.repo_name, work.issue_number):
+        log.warning(
+            "auto_loop: NOT dispatching fix for %s — issue #%s's drive-queue "
+            "row already gave up on the fix-round ceiling (#2972/#3454); "
+            "max_review_iterations has separate budget left but this "
+            "dispatcher honors the drive-queue's block too (#3756)",
+            work.assignment_id, work.issue_number,
+        )
+        _post_fix_round_ceiling_blocked_notice(work, config)
+        return [LoopAction(
+            kind="fix_round_ceiling_blocked",
+            assignment_id=review.assignment_id,
+            detail=(
+                f"issue #{work.issue_number}'s drive-queue row is already "
+                "blocked on the fix-round ceiling — no fix dispatched"
+            ),
+        )]
+
     # #3721: a mechanical request-changes verdict (sealed-path tamper,
     # breaking-public-API semver check — the only two gate kinds a diff to
     # THIS work leg can never satisfy without also breaking another
@@ -1780,6 +1819,50 @@ def _post_max_iterations_notice(
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "auto_loop: failed to post max-iterations notice for %s: %s",
+            work.assignment_id, exc,
+        )
+
+
+def _post_fix_round_ceiling_blocked_notice(work: Assignment, config: Config) -> None:
+    """Post a GitHub issue comment when the review→fix dispatcher declines to
+    fire because the drive-queue row for this (repo, issue) already gave up
+    on the #2972 fix-round ceiling (#3756).
+
+    Mirrors :func:`_post_max_iterations_notice`'s shape so operators see a
+    consistent "auto-loop stopped, here's how to intervene" comment whichever
+    of the two independent budgets actually stopped it.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    repo = config.repo(work.repo_name)
+    if repo is None:
+        return
+
+    body = (
+        f"<!-- coord:event=auto_loop_stopped assignment={work.assignment_id} -->\n"
+        f"## ⚠️ Auto-loop stopped — fix-round ceiling already blocked (#3756)\n\n"
+        f"A review on issue **#{work.issue_number}** requested changes, but "
+        f"this issue's drive-queue row had already given up on the #2972 "
+        f"fix-round ceiling and gone `blocked` — so no further fix worker "
+        f"was dispatched, even though `pipeline.max_review_iterations` still "
+        f"had budget left. The two counters are separate; this notice fires "
+        f"when the drive-queue's gives up first.\n\n"
+        f"**Manual intervention required.** Options:\n"
+        f"- Review the diff and the reviewer's latest findings, then dispatch "
+        f"a fix manually with `coord assign`.\n"
+        f"- Run `coord merge --force-merge` to merge the branch as-is "
+        f"(if the review findings are acceptable).\n"
+        f"- `coord drive-queue` the issue again to give it a fresh fix-round "
+        f"budget.\n\n"
+        f"Details:\n"
+        f"- Assignment: `{work.assignment_id}`\n"
+        f"- Branch: `{work.branch or '(unknown)'}`\n"
+    )
+    try:
+        github_ops.post_issue_comment(repo.github, work.issue_number, body)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "auto_loop: failed to post fix-round-ceiling-blocked notice for %s: %s",
             work.assignment_id, exc,
         )
 

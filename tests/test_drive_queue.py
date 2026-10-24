@@ -6275,6 +6275,35 @@ def test_is_fix_round_ceiling_blocked_requires_both_state_and_reason():
     assert not is_fix_round_ceiling_blocked(STATE_BLOCKED, None)
 
 
+def test_fix_round_ceiling_blocked_for_issue_reads_live_row_through_the_predicate():
+    """#3756: `fix_round_ceiling_blocked_for_issue` is the ONE lookup every
+    dispatcher — not just `coord.commands.drive_queue` and `coord.notify`,
+    but now `coord.auto_loop`'s review→fix path too — must call instead of
+    re-deriving "is this (repo, issue) ceiling-blocked" from a row it reads
+    itself. Exercise the real read (`coord.state.get_drive_queue_entry`) and
+    the real `QueueEntry.from_row` + `is_fix_round_ceiling_blocked` wiring,
+    not a mock of the wrapper itself."""
+    from unittest.mock import patch
+
+    from coord.drive_queue import STATE_BLOCKED, STATE_WAITING, fix_round_ceiling_blocked_for_issue
+
+    blocked_row = {
+        "repo_name": REPO,
+        "issue_number": 3756,
+        "state": STATE_BLOCKED,
+        "last_reason": "fix-round ceiling reached across relaunches (#2972): giving up",
+    }
+    with patch("coord.state.get_drive_queue_entry", return_value=blocked_row):
+        assert fix_round_ceiling_blocked_for_issue(REPO, 3756) is True
+
+    waiting_row = dict(blocked_row, state=STATE_WAITING)
+    with patch("coord.state.get_drive_queue_entry", return_value=waiting_row):
+        assert fix_round_ceiling_blocked_for_issue(REPO, 3756) is False
+
+    with patch("coord.state.get_drive_queue_entry", return_value=None):
+        assert fix_round_ceiling_blocked_for_issue(REPO, 3756) is False
+
+
 def test_a_genuinely_dead_drive_without_ci_pending_still_retries_normally():
     """No regression: without `merge_ci_pending`, a dead drive takes the
     EXACT pre-#1891 path — this is byte-for-byte

@@ -1177,15 +1177,16 @@ def _fix_round_ceiling_blocked_for_work(work: "Assignment") -> bool:
     with no ``coord drive-queue add`` at all), so "no row for this (repo,
     issue)" reads as "nothing to block on" — ``False`` — same as it always
     implicitly has for every OTHER stalled-pipeline reason.
-    """
-    from coord.drive_queue import QueueEntry, is_fix_round_ceiling_blocked  # noqa: PLC0415
-    from coord.state import get_drive_queue_entry  # noqa: PLC0415
 
-    row = get_drive_queue_entry(work.repo_name, work.issue_number)
-    if row is None:
-        return False
-    dq_entry = QueueEntry.from_row(row)
-    return is_fix_round_ceiling_blocked(dq_entry.state, dq_entry.last_reason)
+    #3756 widened the lookup itself (not just the predicate) into
+    :func:`coord.drive_queue.fix_round_ceiling_blocked_for_issue` so
+    ``coord.auto_loop``'s review→fix dispatcher — a FOURTH caller this
+    module's two arms didn't cover — asks the exact same question. This
+    wrapper stays for its own call sites' docstring context.
+    """
+    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+
+    return fix_round_ceiling_blocked_for_issue(work.repo_name, work.issue_number)
 
 
 def _drive_terminally_exited_for_work(work: "Assignment") -> bool:
