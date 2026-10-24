@@ -1345,17 +1345,21 @@ def dispatch(
     # kwarg.
     if proposal.issue_labels:
         payload["issue_labels"] = list(proposal.issue_labels)
-    # #3681: the `coord:workflow` opt-in label — only for `type="work"`
-    # dispatches, mirroring `provider_issue_labels`'s identical
-    # `type == "work"` gate above (a label meant for the eventual work leg
-    # must not leak into a review/smoke/plan proposal). Only sent when
-    # True — never False — same "don't 400 an older agent on an unknown
-    # kwarg" discipline as every other optional field in this block; an
-    # agent predating `AssignmentSpec.workflow` simply runs the leg as a
-    # normal (non-workflow) Work leg.
-    from coord.agent import WORKFLOW_LEG_LABEL  # noqa: PLC0415
+    # #3681/#3722: the `coord:workflow` opt-in label — or `ultracode`, which
+    # implies it (operators read "ultracode" as "do the most thorough thing",
+    # not just "pick opus") — only for `type="work"` dispatches, mirroring
+    # `provider_issue_labels`'s identical `type == "work"` gate above (a
+    # label meant for the eventual work leg must not leak into a
+    # review/smoke/plan proposal). Only sent when True — never False — same
+    # "don't 400 an older agent on an unknown kwarg" discipline as every
+    # other optional field in this block; an agent predating
+    # `AssignmentSpec.workflow` simply runs the leg as a normal
+    # (non-workflow) Work leg. `is_workflow_leg` is the single source of
+    # truth for this question — `coord.state`'s recorded `mode` column
+    # calls the same function.
+    from coord.agent import is_workflow_leg  # noqa: PLC0415
 
-    if proposal.type == "work" and WORKFLOW_LEG_LABEL in (proposal.issue_labels or []):
+    if is_workflow_leg(proposal.type, proposal.issue_labels):
         payload["workflow"] = True
     # #2131: per-leg spend ceiling, resolved here (CLI/daemon lane) and
     # carried on the wire so a config-free agent is covered too. Sent ONLY
