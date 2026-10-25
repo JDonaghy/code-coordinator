@@ -1,0 +1,59 @@
+# coord board-doctor sweep — scheduled harness over the stuck rows (#3758).
+#
+# A systemd *user* unit (mirrors coord-notify/coord-drive-queue), paired
+# with coord-board-doctor.timer. Runs `coord drive-queue sweep` on a
+# schedule: walks the drive-queue and merge-queue, classifies each stuck
+# row's cause+tier via #2276 Phase 1 (coord.queue_diagnose), hands it to a
+# C3 action dispatcher or a C4 alert path (both sibling, not-yet-built
+# issues of #3745 — every cause is conservatively alert-tier today), and
+# records the decision with provenance. It takes no board-mutating action
+# itself — see coord/board_doctor.py's module docstring.
+#
+# #3758 requires this ship DRY-RUN BY DEFAULT: the packaged ExecStart below
+# passes `--dry-run`, so even a host that installs and enables this unit
+# gets classification + logging with ZERO dispatch and ZERO convergence-
+# state mutation until an operator deliberately edits this unit (after
+# install) to drop the flag. This is on top of, not instead of,
+# coord.deploy_units's own safety property 1 ("refresh only units this
+# host already runs" — a packaged unit with no installed counterpart is
+# left alone, so this file landing in coord/deploy/ auto-enables nothing,
+# anywhere, by itself).
+#
+# Install ONLY on the box that owns ~/.coord/coord.db (the same host that
+# runs coord-serve/coord-notify/coord-drive-queue) — this reads the daemon
+# host's queues, board and block log directly (coord.board_service.is_remote()
+# guard in `coord drive-queue sweep` refuses to run on a thin client).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-board-doctor.service deploy/coord-board-doctor.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-board-doctor.timer
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-board-doctor.service` directly (it has no
+# [Install] section; the timer unit is what you enable). Observable via
+# `coord doctor`'s timer_active check (coord/health/checks/timer_active.py)
+# once installed, the same way coord-notify.timer is.
+#
+# Prereqs: same as coord-notify (coordinator.yml at ~/.coord/coordinator.yml,
+# a `gh`-authenticated environment — the GhLiveProbe classifier needs `gh`).
+
+[Unit]
+Description=coord board-doctor sweep — classify and log stuck rows (#3758)
+After=network-online.target
+Wants=network-online.target
+# Same escalation wiring as coord-notify.service and coord-drive-queue.service
+# — if this unit itself fails (not a row it looked at; this unit's own
+# process), page and attempt the mechanical fleet repair, same as those.
+OnFailure=coord-failure-notify.service coord-fleet-watchdog.service
+
+[Service]
+Type=oneshot
+# Byte-identical PATH to coord-notify.service / coord-serve.service — same
+# host, same role family, same #2561/#1831/#1117 reasoning (see those
+# units' comments for why each entry is there and why the ordering matters).
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/code-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=%h/.coord-venv/bin/coord drive-queue sweep --dry-run --config %h/.coord/coordinator.yml
+TimeoutStartSec=1800
