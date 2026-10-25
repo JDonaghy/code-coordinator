@@ -78,15 +78,17 @@ _MERGE_QUEUE_STUCK_CAUSE: dict[str, str] = {
 }
 
 #: #3760 Action 1: a drive-queue row whose *live* evidence reads completely
-#: clear (review-approved, every check green, PR mergeable) but whose entry
-#: is sitting in ``blocked`` only because it already gave up on #2972's
-#: fix-round ceiling. ``queue_diagnose.diagnose`` itself must never be
-#: handed the entry's own stated reason to pick a cause — it reads live
-#: evidence only — so these two causes are exactly the ones a ceiling-
-#: blocked-but-otherwise-clear row can carry.
-_LIVE_CLEAR_CAUSES = frozenset(
-    {queue_diagnose.CAUSE_NOTHING_BLOCKING, queue_diagnose.CAUSE_CI_GREEN}
-)
+#: clear — review-approved (``gate_ready``), every check green, and PR
+#: mergeable — but whose entry is sitting in ``blocked`` only because it
+#: already gave up on #2972's fix-round ceiling. Deliberately just
+#: ``CAUSE_NOTHING_BLOCKING``, not ``CAUSE_CI_GREEN`` too:
+#: ``queue_diagnose._rule_ci_green`` fires on green checks alone, and sits
+#: BELOW ``_rule_nothing_blocking`` in rule order, so it is only ever
+#: reached when ``gate_ready``/``mergeable`` were NOT both confirmed true —
+#: i.e. exactly the rows this set must exclude. ``queue_diagnose.diagnose``
+#: itself must never be handed the entry's own stated reason to pick a
+#: cause — it reads live evidence only.
+_LIVE_CLEAR_CAUSES = frozenset({queue_diagnose.CAUSE_NOTHING_BLOCKING})
 
 #: A narrow cause minted by :func:`_reclassify_ceiling_blocked`, never by
 #: `queue_diagnose` itself. Keeping it separate from `_LIVE_CLEAR_CAUSES`
@@ -135,8 +137,8 @@ class Decision:
     key: str
     cause: str
     tier: str
-    #: "auto-dispatch" | "alert" | "would-alert" | "alert-failed" |
-    #: "alert-skipped" | "no-dispatcher" | "converged-noop"
+    #: "auto-dispatch" | "auto-dispatch-noop" | "alert" | "would-alert" |
+    #: "alert-failed" | "alert-skipped" | "no-dispatcher" | "converged-noop"
     action: str
     count: int
     escalated: bool
@@ -254,12 +256,23 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     (:func:`coord.drive_queue.fix_round_ceiling_blocked_for_issue`), to ask
     whether a cause this sweep would otherwise leave at the alert tier is
     actually a ceiling a fresh budget would clear.
+
+    Also requires :data:`coord.queue_diagnose.CONFIDENCE_LOW` be absent —
+    a low-confidence verdict means the live probe that produced it was
+    itself incomplete (``live.probe_errors`` downgraded it), so "the live
+    reads are clear" has not actually been established for that row; this
+    reclassification, and the auto-dispatch it feeds, must not fire on an
+    unconfirmed reading.
     """
     from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
 
     reclassified: list[StuckRow] = []
     for row in rows:
-        if row.queue == "drive-queue" and row.cause in _LIVE_CLEAR_CAUSES:
+        if (
+            row.queue == "drive-queue"
+            and row.cause in _LIVE_CLEAR_CAUSES
+            and row.confidence != queue_diagnose.CONFIDENCE_LOW
+        ):
             repo_name, _, issue_text = row.key.rpartition("#")
             if (
                 repo_name
@@ -270,7 +283,10 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
                     row,
                     cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
                     evidence=row.evidence
-                    + ("drive_queue: blocked on the #2972 fix-round ceiling while live reads clear",),
+                    + (
+                        "drive_queue: blocked on the #2972 fix-round ceiling "
+                        "while live reads clear",
+                    ),
                 )
         reclassified.append(row)
     return reclassified
@@ -341,7 +357,7 @@ def sweep(
     rows: Sequence[StuckRow],
     *,
     tier_of: Callable[[str], str] = default_tier_of,
-    auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
+    auto_dispatchers: Mapping[str, Callable[[StuckRow], bool]] | None = None,
     alert_dispatcher: Callable[[StuckRow], bool | str] | None = None,
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,
@@ -378,7 +394,14 @@ def sweep(
       4. Auto tier: dispatch via ``auto_dispatchers[cause]`` while under
          *convergence_limit*; at/past the limit, fall back to the alert
          path exactly once instead of re-dispatching the same auto action
-         forever — the "stop being re-acted" half of #3758.
+         forever — the "stop being re-acted" half of #3758. An
+         ``auto_dispatchers`` callable returns ``True`` only once its action
+         is CONFIRMED to have done something (mirroring *alert_dispatcher*'s
+         own confirmed-truthy contract); a falsy return — the underlying C3
+         handler's primitive reported a no-op (row already gone, nothing to
+         requeue, …) — is recorded as ``action="auto-dispatch-noop"`` rather
+         than ``"auto-dispatch"``, so the decision log never claims an
+         action happened when the queue was, in fact, left untouched.
 
     *dry_run* classifies and logs but dispatches nothing and writes no
     convergence counter — a second sweep immediately after a dry run sees
@@ -459,9 +482,11 @@ def sweep(
         elif count < convergence_limit:
             dispatcher = auto_dispatchers.get(row.cause)
             if dispatcher is not None:
-                if not dry_run:
-                    dispatcher(row)
-                action = "auto-dispatch"
+                if dry_run:
+                    action = "auto-dispatch"
+                else:
+                    performed = dispatcher(row)
+                    action = "auto-dispatch" if performed else "auto-dispatch-noop"
             else:
                 action = "no-dispatcher"
         else:
@@ -515,7 +540,7 @@ def run_sweep(
     *,
     config,
     tier_of: Callable[[str], str] = default_tier_of,
-    auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
+    auto_dispatchers: Mapping[str, Callable[[StuckRow], bool]] | None = None,
     alert_dispatcher: Callable[[StuckRow], bool | str] | None = None,
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,

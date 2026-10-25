@@ -69,13 +69,11 @@ from coord.board_doctor_permissions import (
     dispatch_sweep_action,
 )
 
-#: cause -> auto-action name. Empty by design; see the module docstring.
-#: A future PR populates this from Phase 0 block-log evidence of a
-#: recurring, safe-to-automate cause — never speculatively. Populate it
-#: only via :func:`_register_auto_action`, never by assigning into this
-#: dict directly, so every entry is also checked against
-#: `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` — the one closed
-#: allow-list this module answers to, not a second copy of it.
+#: cause -> auto-action name. Populated only via :func:`_register_auto_action`
+#: — never by assigning into this dict directly, so every entry is also
+#: checked against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` — the
+#: one closed allow-list this module answers to, not a second copy of it.
+#: See the module docstring for why this names exactly two causes today.
 ALLOWLIST: dict[str, str] = {}
 
 #: cause -> the C3 callable that actually performs the auto-action named in
@@ -84,13 +82,15 @@ ALLOWLIST: dict[str, str] = {}
 #: cause to :data:`coord.board_doctor.TIER_AUTO` on the strength of an
 #: allowlist entry with no real dispatcher behind it — that combination
 #: would silently do nothing while still suppressing the alert tier's own
-#: escalation for the cause. Empty today for the same reason
-#: :data:`ALLOWLIST` is.
-AUTO_DISPATCHERS: dict[str, Callable[[StuckRow], None]] = {}
+#: escalation for the cause. Each handler returns ``True`` only once its
+#: action is CONFIRMED to have done something; a falsy return means the
+#: underlying primitive reported a no-op, and :func:`coord.board_doctor.sweep`
+#: must not log that as a successful auto-dispatch.
+AUTO_DISPATCHERS: dict[str, Callable[[StuckRow], bool]] = {}
 
 
 def _register_auto_action(
-    cause: str, action: str, handler: Callable[[StuckRow], None]
+    cause: str, action: str, handler: Callable[[StuckRow], bool]
 ) -> None:
     """The only way this module may populate :data:`ALLOWLIST` /
     :data:`AUTO_DISPATCHERS` — a future PR wiring a Phase-0-evidenced cause
@@ -109,9 +109,9 @@ def _register_auto_action(
     """
     authorize_sweep_action(action)
 
-    def _gated(row: StuckRow) -> None:
+    def _gated(row: StuckRow) -> bool:
         authorize_sweep_action(action)
-        handler(row)
+        return handler(row)
 
     ALLOWLIST[cause] = action
     AUTO_DISPATCHERS[cause] = _gated
@@ -160,7 +160,7 @@ def _parse_row_key(key: str) -> tuple[str, int] | None:
     return repo_name, int(issue_text)
 
 
-def _requeue_ceiling_blocked_mergeable(row: StuckRow) -> None:
+def _requeue_ceiling_blocked_mergeable(row: StuckRow) -> bool:
     """#3760 Action 1: a ceiling-blocked-but-mergeable row gets a fresh budget.
 
     ``remove``+``add`` (:func:`coord.board_doctor_permissions.
@@ -169,27 +169,61 @@ def _requeue_ceiling_blocked_mergeable(row: StuckRow) -> None:
     the missing gate — it never re-runs Work/Test/Review, and it never
     touches the PR itself (no merge, no force-merge: that stays outside
     `SAFE_TIER_ACTIONS` entirely).
+
+    Returns ``True`` only when `sweep_drive_queue_requeue` confirms
+    ``requeued=True`` — an unparseable row key or a reported no-op (row no
+    longer queued, gate mid-flight refusal aside, since that raises instead)
+    both return ``False`` so :func:`coord.board_doctor.sweep` records
+    ``"auto-dispatch-noop"`` rather than falsely claiming the action fired.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
-        return
+        return False
     repo_name, issue_number = parsed
-    dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
+    result = dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
+    if not result.get("requeued"):
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"warning: board-doctor requeue no-op for {repo_name}#"
+            f"{issue_number}: {result.get('detail')}",
+            err=True,
+        )
+        return False
+    return True
 
 
-def _clear_merged_row(row: StuckRow) -> None:
+def _clear_merged_row(row: StuckRow) -> bool:
     """#3760 Action 4: drop a drive-queue row whose PR already merged.
 
     `queue_diagnose`'s highest-priority rule already fires
     :data:`coord.queue_diagnose.CAUSE_PR_MERGED` straight off live PR state
     — no reclassification needed, unlike Action 1 — so this only has to
     remove the now-stale row.
+
+    Returns ``True`` only when `sweep_drive_queue_remove` confirms
+    ``removed=True``. A row no longer present (or an unparseable key) is a
+    no-op, not a success, so :func:`coord.board_doctor.sweep` records
+    ``"auto-dispatch-noop"`` rather than claiming the action fired; a
+    confirmed remove whose driver session could not be stopped
+    (``driver_ok=False``) still counts as a successful removal here —
+    `sweep_drive_queue_remove` already logged that loudly on its own.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
-        return
+        return False
     repo_name, issue_number = parsed
-    dispatch_sweep_action("drive_queue_remove", repo_name, issue_number)
+    result = dispatch_sweep_action("drive_queue_remove", repo_name, issue_number)
+    if not result.get("removed"):
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"warning: board-doctor remove no-op for {repo_name}#"
+            f"{issue_number} — row was not found in the drive queue",
+            err=True,
+        )
+        return False
+    return True
 
 
 _register_auto_action(

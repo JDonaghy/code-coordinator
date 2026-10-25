@@ -423,11 +423,12 @@ class TestASafeTierActionCompletesFromTheSweepContext:
 
         handled: list[str] = []
 
-        def requeue_handler(row: StuckRow) -> None:
+        def requeue_handler(row: StuckRow) -> bool:
             repo_name, _, number = row.key.rpartition("#")
             result = sweep_drive_queue_requeue(repo_name, int(number))
             assert result["requeued"] is True
             handled.append(row.key)
+            return True
 
         _register_auto_action("probe_only_cause", "drive_queue_requeue", requeue_handler)
 
@@ -613,7 +614,9 @@ class TestThe3760AutoActionsEndToEnd:
         monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
         monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
 
-        _seed_declared_row("acme/widgets", 3763)
+        # No hold_after gate on this row: there is nothing a removal could
+        # prematurely satisfy, so the clear goes through cleanly.
+        state.enqueue_drive_queue("acme/widgets", 3763)
         row = StuckRow(
             queue="drive-queue",
             key="acme/widgets#3763",
@@ -636,6 +639,74 @@ class TestThe3760AutoActionsEndToEnd:
         assert decision.action == "auto-dispatch"
         assert state.get_drive_queue_entry("acme/widgets", 3763) is None
 
+    def test_pr_merged_row_with_an_unresolved_deploy_gate_is_not_cleared(
+        self, monkeypatch
+    ) -> None:
+        # #1757: `_after_satisfied` treats an absent row as satisfied, so
+        # clearing a merged row whose deploy gate is still armed/fired would
+        # silently release every `after=`-dependent row as if a human had
+        # already deployed. The sweep must refuse rather than remove.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        before = _seed_declared_row("acme/widgets", 3765)
+        assert before["hold_state"] == "armed"
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3765",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_PR_MERGED,
+            confidence="high",
+            evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
+        )
+
+        with pytest.raises(SweepPermissionError, match="deploy gate"):
+            sweep(
+                [row],
+                tier_of=policy_tier_of,
+                auto_dispatchers=AUTO_DISPATCHERS,
+                alert_dispatcher=_must_not_alert,
+                sweep_id="sweep-3765-merged-gated",
+            )
+
+        after = state.get_drive_queue_entry("acme/widgets", 3765)
+        assert after is not None
+        assert after == before
+
+    def test_pr_merged_row_with_a_released_deploy_gate_is_cleared(
+        self, monkeypatch
+    ) -> None:
+        # `hold_state == "released"` is the one gated state removal is safe
+        # in: a human already resolved the gate by hand.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        _seed_declared_row("acme/widgets", 3766)
+        assert state.update_drive_queue_entry(
+            "acme/widgets", 3766, hold_state="released"
+        )
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3766",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_PR_MERGED,
+            confidence="high",
+            evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
+        )
+
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3766-merged-released",
+        )
+
+        decision = report.decisions[0]
+        assert decision.tier == TIER_AUTO
+        assert decision.action == "auto-dispatch"
+        assert state.get_drive_queue_entry("acme/widgets", 3766) is None
+
     def test_pr_merged_row_clear_is_idempotent(self, monkeypatch) -> None:
         # A row already removed (by an earlier sweep, or by hand) must not
         # make a second sweep pass over the same cause raise or re-mutate
@@ -643,7 +714,7 @@ class TestThe3760AutoActionsEndToEnd:
         monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
         monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
 
-        _seed_declared_row("acme/widgets", 3764)
+        state.enqueue_drive_queue("acme/widgets", 3764)
         row = StuckRow(
             queue="drive-queue",
             key="acme/widgets#3764",
