@@ -536,6 +536,13 @@ class TestInvestigateCapacityCheck:
             machines=[],
         )
 
+    @pytest.fixture(autouse=True)
+    def _no_drive_sessions(self, monkeypatch) -> None:
+        # `_investigate_in_flight_count` now also checks live `coord drive`
+        # tmux sessions — keep that hermetic here, same convention used
+        # across the repo's other drive-queue tests.
+        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
+
     def test_at_the_cap_the_rest_defer_with_no_escalation(self, monkeypatch) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
         monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
@@ -616,13 +623,15 @@ class TestInvestigateCapacityCheck:
         )
         assert dispatched == ["acme/widgets#40"]
 
-        # Second (hourly) sweep: a brand-new gate, same board/config — the
-        # mocked board stays empty (the fake dispatch never lands an
-        # assignment on it), so it is this sweep's own fresh reservation
-        # that lets the next row through — "still one agent per blocked
-        # item over time, just bounded instantaneously".
+        # Second (hourly) sweep: row 40 has since resolved (no longer part
+        # of the stuck set `collect_rows` would hand `sweep`) and its slot
+        # is free again — a brand-new gate, same board/config, now lets
+        # row 41 through instead of re-dispatching row 40 a second time.
+        # This is the actual acceptance criterion: "the next sweep
+        # dispatches the next one," not the same row forever.
+        rows2 = [_row(f"acme/widgets#{n}", cause) for n in (41, 42)]
         report2 = sweep(
-            rows,
+            rows2,
             tier_of=policy_tier_of,
             auto_dispatchers=AUTO_DISPATCHERS,
             alert_dispatcher=lambda row: False,
@@ -630,10 +639,9 @@ class TestInvestigateCapacityCheck:
         )
 
         actions2 = {d.key: d.action for d in report2.decisions}
-        assert actions2["acme/widgets#40"] == "auto-dispatch"
-        assert actions2["acme/widgets#41"] == "investigate-deferred"
+        assert actions2["acme/widgets#41"] == "auto-dispatch"
         assert actions2["acme/widgets#42"] == "investigate-deferred"
-        assert dispatched == ["acme/widgets#40", "acme/widgets#40"]
+        assert dispatched == ["acme/widgets#40", "acme/widgets#41"]
 
     def test_an_in_flight_leg_counts_toward_the_cap(self, monkeypatch) -> None:
         # #C1's in-flight signal: a running work-like assignment for this

@@ -141,13 +141,20 @@ def default_investigate_capacity(config) -> Callable[[StuckRow], bool]:
     return make_investigate_capacity_check(config)
 
 
-#: Sentinel distinguishing "caller did not pass `capacity_check` at all" (the
-#: default: `run_sweep` builds the real per-repo cap via
-#: :func:`default_investigate_capacity`) from "caller explicitly passed
-#: `capacity_check=None`" (disable capacity-gating entirely — e.g. a test
-#: that wants `sweep`'s other behaviour with no cap in play). A plain
-#: ``None`` default could not tell these two cases apart.
-_CAPACITY_CHECK_UNSET = object()
+class _CapacityCheckUnset:
+    """Sentinel TYPE distinguishing "caller did not pass `capacity_check` at
+    all" (the default: `run_sweep` builds the real per-repo cap via
+    :func:`default_investigate_capacity`) from "caller explicitly passed
+    `capacity_check=None`" (disable capacity-gating entirely — e.g. a test
+    that wants `sweep`'s other behaviour with no cap in play). A plain
+    ``None`` default could not tell these two cases apart. A dedicated
+    class (rather than a bare ``object()``) lets `run_sweep`'s own
+    *capacity_check* parameter name this sentinel's type honestly in its
+    annotation instead of silently accepting a value outside it.
+    """
+
+
+_CAPACITY_CHECK_UNSET = _CapacityCheckUnset()
 
 
 @dataclass(frozen=True)
@@ -566,10 +573,17 @@ def sweep(
     state the prior sweep left it at, added to ``touched`` (so
     *clear_absent_rows* leaves it alone; it is still present, just not
     reached this sweep), and otherwise skipped entirely: no counter
-    movement, no dispatch, no escalation. A row is only ever reached once
-    its own repo has a free slot, so a deferred row this sweep is simply
-    retried, unchanged, next sweep — bounding how many legs one sweep can
-    fan out without ever starving a row outright.
+    movement, no dispatch, no escalation. Peeking ``capacity_check(row)``
+    never itself claims a slot — only a row whose dispatch is actually
+    CONFIRMED this sweep (``action == "auto-dispatch"``) does, via
+    ``capacity_check.confirm_dispatch(row)`` if that method exists (see
+    :class:`coord.board_doctor_policy.InvestigateCapacityGate`). That is
+    what makes "bounding how many legs one sweep can fan out" true
+    without ever starving a row outright: a row that is let through the
+    check but turns out to be a converged-noop, an internal alert-tier
+    fallback, or an in-flight no-op never holds a slot it never used, so
+    the next row in *rows* — not the same row again next sweep — is the
+    one that gets the freed capacity.
     """
     sweep_id = sweep_id or f"sweep-{(now or _utcnow)().strftime('%Y%m%dT%H%M%SZ')}"
     auto_dispatchers = auto_dispatchers or {}
@@ -709,6 +723,19 @@ def sweep(
             if not escalated:
                 escalated, action = _alert_action(row)
 
+        if action == "auto-dispatch" and capacity_check is not None:
+            # #3770: claim this row's capacity slot only now that its
+            # dispatch is CONFIRMED (dry-run's own "would dispatch" counts
+            # as confirmed too, same as the real-run branch above sets
+            # `action="auto-dispatch"` only once `dispatcher(row)` returns
+            # truthy) — never merely because `capacity_check` let the row
+            # through. `confirm_dispatch` is optional on *capacity_check*
+            # (a bare `Callable[[StuckRow], bool]` test double has none) so
+            # this is a no-op rather than an error for those callers.
+            confirm_dispatch = getattr(capacity_check, "confirm_dispatch", None)
+            if confirm_dispatch is not None:
+                confirm_dispatch(row)
+
         decision = Decision(
             queue=row.queue,
             key=row.key,
@@ -761,7 +788,9 @@ def run_sweep(
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,
     escalation_resolver: Callable[[str, str], None] | None = None,
-    capacity_check: Callable[[StuckRow], bool] | None = _CAPACITY_CHECK_UNSET,
+    capacity_check: Callable[[StuckRow], bool] | _CapacityCheckUnset | None = (
+        _CAPACITY_CHECK_UNSET
+    ),
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
