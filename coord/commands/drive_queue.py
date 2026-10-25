@@ -3172,7 +3172,10 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
         return
 
     if not report.decisions:
-        click.echo("nothing stuck: no drive-queue or merge-queue row was observed")
+        click.echo(
+            "nothing stuck: no drive-queue, merge-queue, or baseline-red row "
+            "was observed"
+        )
         return
     for d in report.decisions:
         escalated = " (escalated)" if d.escalated else ""
