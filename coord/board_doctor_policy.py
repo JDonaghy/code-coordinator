@@ -73,18 +73,25 @@ A sweep's `tier_of`/dispatch decisions run row-by-row with no shared view
 of how many fix-it legs the sweep has already launched this pass — so an
 unbounded number of :data:`INVESTIGATE_CAUSES` rows for the same repo
 would otherwise all dispatch in one sweep. :func:`make_investigate_capacity_check`
-builds `coord.board_doctor.sweep`'s optional ``capacity_check`` gate:
-it bounds concurrent investigate-tier legs per repo at that repo's
-existing drive-queue ceiling (:func:`_investigate_repo_capacity` —
-`coordinator.yml` `repos[].max_parallel` / `pipeline.max_parallel_per_repo`,
-never a second knob), counting legs already in flight
-(:func:`_investigate_in_flight_count`, the same running/pending work-like
-assignment signal `sweep_dispatch_fixit_leg`'s own in-flight lock already
-answers) plus whatever the gate has already reserved earlier in the same
-sweep. A row the gate defers is not dispatched, not escalated and does
-not touch the row's convergence counter — it is simply deferred to the
-next sweep, which is why `sweep` checks it before, not after, the
-counter bump.
+builds `coord.board_doctor.sweep`'s optional ``capacity_check`` gate as a
+:class:`InvestigateCapacityGate`: it bounds concurrent investigate-tier
+legs per repo at that repo's existing drive-queue ceiling
+(:func:`_investigate_repo_capacity` — `coordinator.yml`
+`repos[].max_parallel` / `pipeline.max_parallel_per_repo`, never a second
+knob), counting legs already in flight (:func:`_investigate_in_flight_count`
+— the same running/pending work-like assignment plus live `coord drive`
+session signals `sweep_dispatch_fixit_leg`'s own in-flight lock already
+answers) plus whatever the gate has CONFIRMED claimed earlier in the same
+sweep via :meth:`InvestigateCapacityGate.confirm_dispatch`. A row the gate
+defers is not dispatched, not escalated and does not touch the row's
+convergence counter — it is simply deferred to the next sweep, which is
+why `sweep` checks it before, not after, the counter bump. The gate only
+claims a slot once a row's dispatch is confirmed (``action ==
+"auto-dispatch"``), never merely because the row was let through the
+check — so a row that turns out to be a converged-noop, an internal
+alert-tier fallback, or an in-flight no-op never burns a slot, and a
+repo with ``max_parallel=1`` keeps making progress through its rows
+sweep over sweep instead of one never-dispatching row starving the rest.
 
 Why the alert path reuses `drive_escalations`
 ------------------------------------------------
@@ -527,77 +534,124 @@ def _investigate_repo_capacity(repo_name: str, config: "Config") -> int:
 
 
 def _investigate_in_flight_count(repo_name: str, board: "Board") -> int:
-    """How many investigate-tier legs are already running or queued for
-    *repo_name*, counted the SAME way :func:`coord.board_doctor_permissions.
-    sweep_dispatch_fixit_leg`'s own in-flight lock already does — a
-    ``running``/``pending`` work-like assignment — just aggregated across
-    the whole repo (every assignment on *board.active* for *repo_name*)
-    rather than scoped to one issue. Reusing that exact predicate (rather
-    than re-deriving a different "is work in flight" signal) is what keeps
-    this the same question with the same answer as the per-row in-flight
-    lock, not a second, independently-maintained one (#3770).
+    """How many issues in *repo_name* are already occupied by in-flight work,
+    counted the SAME two ways :func:`coord.board_doctor_permissions.
+    sweep_dispatch_fixit_leg`'s own in-flight lock does — a ``running``/
+    ``pending`` work-like assignment, OR a live `coord drive` tmux session
+    (`coord.drive.list_drive_sessions`) — just aggregated across the whole
+    repo (every issue on *board.active* / every session for *repo_name*)
+    rather than scoped to one issue. An issue counted by both signals is
+    only counted once, since the union is taken over issue numbers rather
+    than over raw signal counts.
+
+    This cap is shared with ordinary drive-queue work, not a dedicated
+    investigate-tier budget: any running/pending work-like assignment or
+    live drive session for the repo — fix-it leg or not — eats into the
+    same ``max_parallel`` ceiling checked here.
     """
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
     from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
 
-    return sum(
-        1
+    busy_issues: set[int] = {
+        assignment.issue_number
         for assignment in board.active
         if assignment.repo_name == repo_name
         and assignment.type in WORK_LIKE_TYPES
         and assignment.status in ("running", "pending")
+    }
+    busy_issues.update(
+        session["issue"]
+        for session in list_drive_sessions()
+        if session.get("repo") == repo_name and session.get("issue") is not None
     )
+    return len(busy_issues)
 
 
-def make_investigate_capacity_check(
-    config: "Config",
-) -> Callable[[StuckRow], bool]:
-    """Build a per-sweep "is the investigate tier over its per-repo cap"
-    gate for `coord.board_doctor.sweep`'s new ``capacity_check`` parameter
-    (#3770).
+class InvestigateCapacityGate:
+    """Per-sweep "is the investigate tier over its per-repo cap" gate for
+    `coord.board_doctor.sweep`'s ``capacity_check`` parameter.
 
-    Builds `board = coord.state.build_board()` and a fresh ``claimed``
-    counter ONCE, at construction time — one gate per sweep, never shared
-    across sweeps — then returns a closure that, per row:
+    Built ONCE per sweep (`board = coord.state.build_board()` plus a fresh
+    ``claimed`` counter at construction time), then used in two phases:
 
-    * Returns ``False`` (never defer) immediately for any cause outside
-      :data:`INVESTIGATE_CAUSES` — the per-repo cap bounds the investigate
-      tier only; :data:`ALLOWLIST`'s mechanical fixes (#3760) are untouched.
-    * Returns ``False`` if ``row.key`` does not parse — a row this gate
-      cannot even attribute to a repo cannot be capacity-checked, so it is
-      left to run the normal tier/dispatch path rather than silently stuck.
-    * Returns ``False`` (unlimited) if the repo's resolved cap
-      (:func:`_investigate_repo_capacity`) is non-positive.
-    * Otherwise compares ``in_flight + claimed`` against the cap: at or
-      over it, returns ``True`` (defer) without reserving a slot; under it,
-      reserves one slot in ``claimed`` and returns ``False`` — the
-      reservation is what makes "exactly N dispatch, the rest defer"
-      hold within a single sweep pass, since this gate runs once per row
-      before that row's own dispatcher does.
+    * ``__call__`` is a pure peek — it answers "would this row's repo be
+      at capacity right now" from the repo's resolved cap, the persisted
+      in-flight signal (:func:`_investigate_in_flight_count`) and whatever
+      has already been CONFIRMED claimed this sweep. It never itself
+      reserves a slot, so calling it twice for the same row (or not
+      calling :meth:`confirm_dispatch` afterwards) never changes the
+      answer.
+    * :meth:`confirm_dispatch` is the only thing that claims a slot.
+      `coord.board_doctor.sweep` calls it only after a row's own
+      dispatcher has actually returned a confirmed dispatch (``action ==
+      "auto-dispatch"``) — so a row that turns out to be a
+      converged-noop, an internal alert-tier fallback, or an in-flight
+      no-op (`_investigate`'s three non-dispatch returns, or `sweep`'s own
+      already-escalated default) never holds a slot it never used, and a
+      later row in the same sweep can still get through. This is what
+      keeps "exactly N dispatch, the rest defer" true across repeated
+      sweeps rather than only within the first one — the old single-phase
+      design reserved a slot the instant a row was LET THROUGH, before
+      knowing whether it would actually dispatch, which let one
+      never-dispatching row at the front of `collect_rows`' stable order
+      permanently starve every later row in a ``max_parallel=1`` repo.
     """
-    from coord.state import build_board  # noqa: PLC0415
 
-    board = build_board()
-    claimed: dict[str, int] = {}
+    def __init__(self, config: "Config") -> None:
+        from coord.state import build_board  # noqa: PLC0415
 
-    def _check(row: StuckRow) -> bool:
+        self._config = config
+        self._board = build_board()
+        self._claimed: dict[str, int] = {}
+
+    def __call__(self, row: StuckRow) -> bool:
+        """``True`` means defer: *row*'s repo is at or over its cap.
+
+        * Returns ``False`` (never defer) immediately for any cause outside
+          :data:`INVESTIGATE_CAUSES` — the per-repo cap bounds the
+          investigate tier only; :data:`ALLOWLIST`'s mechanical fixes
+          (#3760) are untouched.
+        * Returns ``False`` if ``row.key`` does not parse — a row this gate
+          cannot even attribute to a repo cannot be capacity-checked, so it
+          is left to run the normal tier/dispatch path rather than silently
+          stuck.
+        * Returns ``False`` (unlimited) if the repo's resolved cap
+          (:func:`_investigate_repo_capacity`) is non-positive.
+        * Otherwise compares ``in_flight + claimed`` against the cap.
+        """
         if row.cause not in INVESTIGATE_CAUSES:
             return False
         parsed = _parse_row_key(row.key)
         if parsed is None:
             return False
         repo_name, _issue_number = parsed
-        cap = _investigate_repo_capacity(repo_name, config)
+        cap = _investigate_repo_capacity(repo_name, self._config)
         if cap <= 0:
             return False
-        in_flight = _investigate_in_flight_count(repo_name, board) + claimed.get(
-            repo_name, 0
-        )
-        if in_flight >= cap:
-            return True
-        claimed[repo_name] = claimed.get(repo_name, 0) + 1
-        return False
+        in_flight = _investigate_in_flight_count(
+            repo_name, self._board
+        ) + self._claimed.get(repo_name, 0)
+        return in_flight >= cap
 
-    return _check
+    def confirm_dispatch(self, row: StuckRow) -> None:
+        """Claim one slot for *row*'s repo after a CONFIRMED dispatch.
+
+        No-op for rows outside :data:`INVESTIGATE_CAUSES` or with an
+        unparseable key — the same rows :meth:`__call__` never defers, so
+        there is nothing to claim.
+        """
+        if row.cause not in INVESTIGATE_CAUSES:
+            return
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return
+        repo_name, _issue_number = parsed
+        self._claimed[repo_name] = self._claimed.get(repo_name, 0) + 1
+
+
+def make_investigate_capacity_check(config: "Config") -> InvestigateCapacityGate:
+    """Build a fresh :class:`InvestigateCapacityGate` for one sweep (#3770)."""
+    return InvestigateCapacityGate(config)
 
 
 def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple[str, str]:
