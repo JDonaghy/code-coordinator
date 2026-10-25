@@ -91,7 +91,9 @@ from typing import TYPE_CHECKING, Any, Callable, TypedDict, cast
 from coord.drive_queue import HOLD_RELEASED
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
+    from coord.config import Config
     from coord.drive_queue import QueueEntry
+    from coord.models import Board
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +138,11 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: re-authorized when it runs, granting nothing neither grants alone; it is
 #: a separate name so a cause may be allow-listed for a faithful requeue
 #: without also being allow-listed for a bare add or a bare remove.
+#: ``"dispatch_fixit_leg"`` (#3768) is the one action here that spawns a
+#: worker rather than mutating a drive-queue row directly — it is still
+#: safe-tier because the leg it spawns runs at ordinary worker tool-scope
+#: (edit/push/git), never `--dangerously-skip-permissions`, and has no path
+#: to either name in :data:`PERMANENTLY_FORBIDDEN`.
 SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
     {
         "merge_approved_green",
@@ -143,6 +150,7 @@ SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
         "drive_queue_remove",
         "drive_queue_requeue",
         "ci_rerun",
+        "dispatch_fixit_leg",
     }
 )
 
@@ -665,6 +673,190 @@ def sweep_drive_queue_requeue(repo_name: str, issue_number: int) -> DriveQueueRe
     )
 
 
+def _fixit_leg_briefing(*, cause: str, evidence: tuple[str, ...]) -> str:
+    """The briefing text handed to the fix-it leg — the sweep's *cause* and
+    *evidence* for why this row is blocked, translated into the same
+    worker-facing shape every other fix dispatch (`coord.ci_fix`,
+    `coord.auto_loop._dispatch_fix_for_review`) uses, so the leg reads this
+    like any other fix round rather than a special case.
+    """
+    lines = [
+        "The board-doctor sweep (#3758) dispatched this fix-it leg "
+        "automatically because this issue's row is stuck.",
+        "",
+        f"Cause: {cause}",
+    ]
+    if evidence:
+        lines.append("Evidence:")
+        lines.extend(f"- {item}" for item in evidence)
+    lines.extend([
+        "",
+        "You will NOT use `--dangerously-skip-permissions`, `gh`, "
+        "`--force-merge`, or `--override-human-required` — this leg runs "
+        "at ordinary worker tool-scope (edit/push/git) only, same as any "
+        "other fix round.",
+    ])
+    return "\n".join(lines)
+
+
+class FixitLegDispatch(TypedDict):
+    """:func:`sweep_dispatch_fixit_leg`'s return shape.
+
+    ``dispatched`` is the one answer to "did a new fix-it leg actually
+    start" — set from `_dispatch_fix`'s own confirmed return value, never
+    from the mere absence of an exception (#2096): a dispatch that cannot
+    be confirmed started reads ``False`` here, same as a lock-blocked or
+    no-work-found no-op. ``detail`` explains a ``False`` result so a caller
+    can tell the three apart without inspecting exceptions.
+    """
+
+    dispatched: bool
+    assignment_id: str | None
+    machine: str | None
+    detail: str
+
+
+def sweep_dispatch_fixit_leg(
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    cause: str,
+    evidence: tuple[str, ...] = (),
+    http_client: Any | None = None,
+) -> FixitLegDispatch:
+    """Daemon-internal "dispatch one autonomous fix-it leg", authorized for
+    the sweep context (#3768).
+
+    Re-dispatches a routed worker/ci-fix leg via `coord.auto_loop.
+    _dispatch_fix` — the same primitive `coord.ci_fix.dispatch_ci_fix` and
+    the headless review-bounce path call, never a bespoke HTTP POST built
+    here — with a fresh fix-round number (`coord.auto_loop.
+    next_fix_iteration`) and a briefing carrying the sweep's *cause* and
+    *evidence* (:func:`_fixit_leg_briefing`). The leg it spawns is scoped to
+    ordinary worker tool-scope (edit/push/git); nothing here can reach
+    `--dangerously-skip-permissions` or either name in
+    :data:`PERMANENTLY_FORBIDDEN`.
+
+    In-flight lock: no-ops, rather than dispatching a second leg, when
+    *repo_name*/*issue_number* already has a ``running`` or ``pending``
+    work-like assignment on *board*, OR a live `coord drive` tmux session
+    (`coord.drive.list_drive_sessions`) — one leg per blocked item per
+    sweep, idempotent if the sweep runs again while a leg is live.
+
+    Returns a :class:`FixitLegDispatch` with ``dispatched=False`` — never
+    raises — for: no originating work-like assignment found for this
+    issue, a leg already in flight, or an underlying `_dispatch_fix` call
+    that declined (no capable machine, unreachable agent, …). Only an
+    observed, confirmed `Assignment` back from `_dispatch_fix` is reported
+    as ``dispatched=True``.
+    """
+    authorize_sweep_action("dispatch_fixit_leg")
+
+    from coord.gates import _select_winning_work_assignment, assignments_for_issue  # noqa: PLC0415
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    work_like = [
+        a
+        for a in assignments_for_issue(board, repo_name, issue_number)
+        if a.type in WORK_LIKE_TYPES
+    ]
+    if not work_like:
+        return FixitLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} has no originating work "
+                "assignment on the board — nothing to dispatch a fix-it "
+                "leg against"
+            ),
+        )
+
+    if any(a.status in ("running", "pending") for a in work_like):
+        return FixitLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} already has a running or "
+                "pending assignment — a fix-it leg is already in flight, "
+                "not dispatching a second one"
+            ),
+        )
+
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+
+    live_sessions = [
+        s
+        for s in list_drive_sessions()
+        if s.get("repo") == repo_name and s.get("issue") == issue_number
+    ]
+    if live_sessions:
+        return FixitLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} has a live `coord drive` "
+                f"session ({live_sessions[0].get('session_name')}) — a "
+                "fix-it leg is already in flight, not dispatching a second "
+                "one"
+            ),
+        )
+
+    work = _select_winning_work_assignment(work_like)
+
+    from coord.auto_loop import _dispatch_fix, next_fix_iteration  # noqa: PLC0415
+
+    iteration = next_fix_iteration(board, work)
+    briefing = _fixit_leg_briefing(cause=cause, evidence=evidence)
+
+    fix = _dispatch_fix(
+        work, briefing, board, config, iteration, http_client=http_client,
+    )
+    if fix is None:
+        return FixitLegDispatch(
+            dispatched=False,
+            assignment_id=None,
+            machine=None,
+            detail=(
+                f"{repo_name}#{issue_number} fix-it leg dispatch could not "
+                "be confirmed started — no capable machine, an unreachable "
+                "agent, or a declined dispatch"
+            ),
+        )
+
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="board_doctor",
+        event_type="fixit_leg_dispatched",
+        actor="daemon",
+        summary=(
+            f"board-doctor dispatched a fix-it leg for {repo_name}#"
+            f"{issue_number} (cause={cause}) -> {fix.machine_name}"
+        ),
+        repo=repo_name,
+        issue=issue_number,
+        assignment_id=fix.assignment_id,
+        machine=fix.machine_name,
+        details={"cause": cause, "evidence": list(evidence)},
+    )
+
+    return FixitLegDispatch(
+        dispatched=True,
+        assignment_id=fix.assignment_id,
+        machine=fix.machine_name,
+        detail=(
+            f"{repo_name}#{issue_number} fix-it leg dispatched to "
+            f"{fix.machine_name} (iteration {iteration})"
+        ),
+    )
+
+
 #: action name -> the daemon-internal handler that actually performs it.
 #: Looked up by :func:`dispatch_sweep_action` only after
 #: :func:`authorize_sweep_action` has already cleared the action — an
@@ -676,6 +868,7 @@ _HANDLERS: dict[str, Callable[..., Any]] = {
     "drive_queue_add": sweep_drive_queue_add,
     "drive_queue_remove": sweep_drive_queue_remove,
     "drive_queue_requeue": sweep_drive_queue_requeue,
+    "dispatch_fixit_leg": sweep_dispatch_fixit_leg,
 }
 
 
