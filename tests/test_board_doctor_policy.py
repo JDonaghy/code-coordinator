@@ -75,17 +75,19 @@ class TestPolicyTierOf:
         # Causes with no safe mechanical fix AND no investigate-tier
         # dispatcher registered (#3769): "nothing actually wrong" states
         # (nothing-blocking, ci-green), a whole-repo condition no single
-        # row can fix (baseline-red), and a genuinely unknown string.
+        # row can fix (baseline-red), and a genuinely unknown, never-
+        # registered string. These must never collide with a real
+        # queue_diagnose.CAUSE_* value — that would make this test
+        # vacuous the moment the real cause gets routed to a tier.
         for cause in (
-            "no_pr",
-            "merge_conflict",
-            "dead_leg",
-            "ci_red",
-            "anything_else",
+            "not-a-real-cause",
+            "also-not-a-real-cause",
             queue_diagnose.CAUSE_NOTHING_BLOCKING,
             queue_diagnose.CAUSE_CI_GREEN,
             CAUSE_BASELINE_RED,
         ):
+            assert cause not in ALLOWLIST
+            assert cause not in INVESTIGATE_CAUSES
             assert policy_tier_of(cause) == TIER_ALERT
 
     def test_registered_3760_causes_are_auto_tier(self) -> None:
@@ -462,6 +464,51 @@ class TestInvestigate:
         escalation = state.get_drive_escalation("acme/widgets", 40)
         assert escalation is not None
 
+    def test_falls_back_to_the_alert_tier_when_the_fix_round_ceiling_blocks_it(
+        self, monkeypatch
+    ) -> None:
+        # #3756/#3454: an issue whose drive-queue row already gave up on the
+        # #2972 fix-round ceiling must not get an unbounded stream of
+        # investigate-dispatched legs on top of that (vimcode#2018's ~14
+        # legs/$31 overnight is exactly the failure mode this guards
+        # against) — `_investigate` must consult the ceiling BEFORE it ever
+        # resolves config or calls `dispatch_sweep_action`.
+        calls: list[tuple[str, int]] = []
+
+        def fake_ceiling_blocked(repo_name: str, issue_number: int) -> bool:
+            calls.append((repo_name, issue_number))
+            return True
+
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            fake_ceiling_blocked,
+        )
+
+        def boom_if_called(path, **kwargs):
+            raise AssertionError(
+                "config must not be resolved once the ceiling check blocks"
+            )
+
+        monkeypatch.setattr(common, "resolve_and_load_config", boom_if_called)
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "dispatch_sweep_action must not run once the ceiling check blocks"
+            )
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        assert _investigate(row) is False
+        assert calls == [("acme/widgets", 40)]
+
+        escalation = state.get_drive_escalation("acme/widgets", 40)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+
     def test_unparseable_key_does_not_raise(self) -> None:
         row = _row("no-hash-separator", queue_diagnose.CAUSE_CI_RED)
 
@@ -498,6 +545,12 @@ class TestInvestigateConvergence:
 
         monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
 
+        escalation_calls: list[StuckRow] = []
+
+        def counting_alert_dispatcher(row: StuckRow):
+            escalation_calls.append(row)
+            return escalation_alert_dispatcher(row)
+
         key = "acme/widgets#40"
         cause = queue_diagnose.CAUSE_CI_RED
         for _ in range(5):
@@ -505,15 +558,18 @@ class TestInvestigateConvergence:
                 [_row(key, cause)],
                 tier_of=policy_tier_of,
                 auto_dispatchers=AUTO_DISPATCHERS,
-                alert_dispatcher=escalation_alert_dispatcher,
+                alert_dispatcher=counting_alert_dispatcher,
                 convergence_limit=CONVERGENCE_LIMIT,
             )
 
         # Sweeps 1-2 dispatch (left alone, no alert); sweep 3 hits the
         # convergence limit and escalates via the alert tier exactly once,
         # bypassing `_investigate` entirely; sweeps 4-5 neither re-dispatch
-        # nor re-alert.
+        # nor re-alert. Counting the alert dispatcher's own calls (not just
+        # the end-state escalation row) pins "exactly once", not merely
+        # "at least once".
         assert len(calls) == CONVERGENCE_LIMIT - 1
+        assert len(escalation_calls) == 1
         row_state = state.board_doctor_row_state("drive-queue", key)
         assert row_state["escalated"] is True
 

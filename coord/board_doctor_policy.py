@@ -110,6 +110,13 @@ from coord.board_doctor_permissions import (
 #: check itself (#3769).
 _FIXIT_LEG_IN_FLIGHT_MARKER = "already in flight"
 
+#: The one `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` action name
+#: the investigate tier dispatches — named once here rather than as a
+#: string literal repeated in :func:`policy_tier_of`,
+#: :func:`_register_investigate_action` and :func:`_investigate`'s own
+#: `dispatch_sweep_action` call.
+_INVESTIGATE_ACTION = "dispatch_fixit_leg"
+
 #: cause -> auto-action name. Populated only via :func:`_register_auto_action`
 #: — never by assigning into this dict directly, so every entry is also
 #: checked against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` — the
@@ -197,7 +204,7 @@ def policy_tier_of(cause: str) -> str:
     if (
         cause in INVESTIGATE_CAUSES
         and cause in AUTO_DISPATCHERS
-        and "dispatch_fixit_leg" in SAFE_TIER_ACTIONS
+        and _INVESTIGATE_ACTION in SAFE_TIER_ACTIONS
     ):
         return TIER_AUTO
     return TIER_ALERT
@@ -354,12 +361,23 @@ def _investigate(row: StuckRow) -> bool:
       …) — falls back to :func:`_alert_fallback` so the row still gets a
       human-visible alert rather than silently going nowhere.
 
+    Before any of that, `coord.drive_queue.fix_round_ceiling_blocked_for_issue`
+    is consulted — the single required check (#3756/#3454) every
+    independent dispatcher in the fleet must honor before relaunching a fix
+    leg for an issue, so an issue whose drive-queue row already gave up on
+    the #2972 fix-round ceiling cannot get an unbounded stream of
+    investigate-dispatched legs on top of that (vimcode#2018's ~14 legs/$31
+    overnight is exactly the failure mode this guards against). A
+    ceiling-blocked row falls straight to :func:`_alert_fallback`, the same
+    as a declined machine pin.
+
     This function's return value answers exactly one question — "was a
     fix-it leg dispatched?" — never "was the alert fallback delivered?".
-    Every fallback branch (unparseable key, unresolvable config, no safe
-    machine to pin) calls :func:`_alert_fallback` only for its side effect
-    and always returns ``False`` regardless of whether the fallback alert
-    itself was confirmed delivered.
+    Every fallback branch (unparseable key, ceiling-blocked issue,
+    unresolvable config, no safe machine to pin) calls
+    :func:`_alert_fallback` only for its side effect and always returns
+    ``False`` regardless of whether the fallback alert itself was confirmed
+    delivered.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
@@ -370,7 +388,19 @@ def _investigate(row: StuckRow) -> bool:
     import click  # noqa: PLC0415
 
     from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
+    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
     from coord.state import build_board  # noqa: PLC0415
+
+    if fix_round_ceiling_blocked_for_issue(repo_name, issue_number):
+        click.echo(
+            f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
+            "— its drive-queue row already gave up on the fix-round ceiling "
+            "(#2972/#3454); falling back to the alert tier instead of "
+            "dispatching another fix-it leg (#3756)",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
 
     try:
         config = resolve_and_load_config(None)
@@ -385,7 +415,7 @@ def _investigate(row: StuckRow) -> bool:
 
     board = build_board()
     result = dispatch_sweep_action(
-        "dispatch_fixit_leg",
+        _INVESTIGATE_ACTION,
         repo_name,
         issue_number,
         board,
@@ -414,10 +444,10 @@ def _register_investigate_action(cause: str) -> None:
     touching :data:`ALLOWLIST`, which stays reserved for mechanical,
     per-cause-reviewed fixes (see the module docstring).
     """
-    authorize_sweep_action("dispatch_fixit_leg")
+    authorize_sweep_action(_INVESTIGATE_ACTION)
 
     def _gated(row: StuckRow) -> bool:
-        authorize_sweep_action("dispatch_fixit_leg")
+        authorize_sweep_action(_INVESTIGATE_ACTION)
         return _investigate(row)
 
     INVESTIGATE_CAUSES.add(cause)
