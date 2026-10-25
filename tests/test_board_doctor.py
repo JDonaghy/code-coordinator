@@ -15,11 +15,13 @@ from __future__ import annotations
 from coord import queue_diagnose, state
 from coord.board_doctor import (
     ALERT_SKIPPED,
+    CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
     _reclassify_ceiling_blocked,
+    baseline_red_rows,
     sweep,
 )
 
@@ -593,6 +595,57 @@ class TestConvergence:
             clear_absent_rows=False,
         )
         assert state.board_doctor_row_state("drive-queue", key)["count"] == 1
+
+
+class TestBaselineRedRows:
+    """#3761: a red base poisons every row for the repo, collapsed to one."""
+
+    def test_one_row_per_blocked_repo_regardless_of_streak_value(self) -> None:
+        rows = baseline_red_rows({"acme/widgets": 3, "acme/gadgets": 9})
+
+        assert {row.key for row in rows} == {"acme/widgets#0", "acme/gadgets#0"}
+        for row in rows:
+            assert row.queue == "baseline-red"
+            assert row.cause == CAUSE_BASELINE_RED
+
+    def test_evidence_carries_the_streak_count_not_the_repo_name(self) -> None:
+        [row] = baseline_red_rows({"acme/widgets": 7})
+
+        assert row.evidence == ("baseline_red_streak=7",)
+
+    def test_empty_mapping_yields_no_rows(self) -> None:
+        assert baseline_red_rows({}) == []
+
+    def test_a_row_never_collides_with_a_real_per_issue_row(self) -> None:
+        # Issue numbers on GitHub start at 1 — the synthetic "#0" row can
+        # never be mistaken for (or clobber) a genuine per-issue row for
+        # the same repo in escalation/convergence bookkeeping.
+        [row] = baseline_red_rows({"acme/widgets": 3})
+        real_row = _row("acme/widgets#1", "merge_conflict")
+
+        assert row.key != real_row.key
+
+
+class TestBaselineRedConvergesLikeAnyOtherAlertRow:
+    """#3761 acceptance (a)+(d): one alert, never a second for the same cause."""
+
+    def test_baseline_red_row_escalates_once_and_a_resweep_stays_quiet(self) -> None:
+        alert = _Recorder()
+        auto = _Recorder()
+        row = baseline_red_rows({"acme/widgets": 3})[0]
+
+        for _ in range(4):
+            sweep(
+                [row],
+                tier_of=_always(TIER_ALERT),
+                auto_dispatchers={CAUSE_BASELINE_RED: auto},
+                alert_dispatcher=alert,
+            )
+
+        # Alert-tier: never routed to an auto-action, no matter how many
+        # sweeps see it — a red base has no safe auto-fix.
+        assert auto.count == 0
+        assert alert.count == 1
 
 
 class TestDryRun:

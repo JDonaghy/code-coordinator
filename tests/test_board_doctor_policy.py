@@ -14,6 +14,7 @@ import pytest
 from coord import queue_diagnose, state
 from coord.board_doctor import (
     ALERT_SKIPPED,
+    CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     TIER_ALERT,
     TIER_AUTO,
@@ -56,7 +57,15 @@ class TestPolicyTierOf:
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:
-        for cause in ("no_pr", "merge_conflict", "dead_leg", "ci_red", "anything_else"):
+        for cause in (
+            "no_pr",
+            "merge_conflict",
+            "dead_leg",
+            "ci_red",
+            "anything_else",
+            queue_diagnose.CAUSE_GATE_BLOCKED,
+            CAUSE_BASELINE_RED,
+        ):
             assert policy_tier_of(cause) == TIER_ALERT
 
     def test_registered_3760_causes_are_auto_tier(self) -> None:
@@ -234,6 +243,43 @@ class TestEscalationAlertDispatcher:
         monkeypatch.setattr(state, "record_drive_escalation", lambda *a, **k: None)
 
         assert escalation_alert_dispatcher(_row("acme/widgets#13", "ci_red")) is False
+
+    def test_gate_blocked_row_gets_a_ready_to_run_override_command(self) -> None:
+        # #3761: a force-merge-needing row surfaces a one-line, ready-to-run
+        # command rather than the generic "coord status" pointer — the
+        # sweep itself never runs it.
+        row = _row("acme/widgets#21", queue_diagnose.CAUSE_GATE_BLOCKED)
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 21)
+        assert escalation is not None
+        assert escalation["proposed_command"] == (
+            "coord merge --only acme/widgets#21 "
+            '--override-human-required "<reason the override is safe>"'
+        )
+        assert "--override-human-required" in escalation["reason"]
+
+    def test_baseline_red_row_keeps_coord_status_with_an_explanatory_reason(self) -> None:
+        # #3761: there is no single per-row command that fixes a red base,
+        # so the fallback command stays, but the reason explains why.
+        row = _row("acme/widgets#0", CAUSE_BASELINE_RED)
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 0)
+        assert escalation is not None
+        assert escalation["proposed_command"] == "coord status"
+        assert "merge base is red" in escalation["reason"]
+
+    def test_an_unrelated_cause_keeps_the_generic_coord_status_default(self) -> None:
+        row = _row("acme/widgets#22", "ci_red")
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 22)
+        assert escalation is not None
+        assert escalation["proposed_command"] == "coord status"
 
 
 class TestDismissResolvedEscalation:

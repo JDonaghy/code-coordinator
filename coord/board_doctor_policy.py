@@ -58,6 +58,7 @@ from typing import Callable
 from coord import queue_diagnose
 from coord.board_doctor import (
     ALERT_SKIPPED,
+    CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     TIER_ALERT,
     TIER_AUTO,
@@ -238,6 +239,48 @@ _register_auto_action(
 )
 
 
+def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple[str, str]:
+    """``(reason_suffix, proposed_command)`` for *row*'s cause (#3761's C4).
+
+    Every alert-only cause gets a one-line, ready-to-run operator command
+    rather than a self-executing fix — the whole point of this tier is that
+    recovery needs a human decision. ``"coord status"`` is the fallback for
+    causes with no single-command remedy; the two causes below each have
+    one:
+
+    * ``queue_diagnose.CAUSE_GATE_BLOCKED`` — the row is stuck behind
+      `coord merge`'s own `human_required` gate (a required check is red,
+      possibly flaky-and-unfixable-by-rerun per #3744). The only way past
+      that gate without a passing check is `coord merge`'s own
+      ``--override-human-required`` flag — surfaced here verbatim, never
+      run by the sweep itself.
+    * :data:`coord.board_doctor.CAUSE_BASELINE_RED` — the repo's base is
+      red (#3386), not this row; there is no per-row command that fixes a
+      broken base, so the suffix says so and the command stays
+      ``coord status`` — the streak clears on its own the next time the
+      base goes green.
+    """
+    if row.cause == queue_diagnose.CAUSE_GATE_BLOCKED:
+        command = (
+            f'coord merge --only {repo_name}#{issue_number} '
+            '--override-human-required "<reason the override is safe>"'
+        )
+        return (
+            " — a required gate is blocking merge; if it is flaky, deflake "
+            "or drop the check (#3744), otherwise force past it with: "
+            f"`{command}`",
+            command,
+        )
+    if row.cause == CAUSE_BASELINE_RED:
+        return (
+            f" — {repo_name}'s merge base is red, so its queues are paused "
+            "until a real green run clears the streak; this is not fixable "
+            "per-row",
+            "coord status",
+        )
+    return ("", "coord status")
+
+
 def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
     """#3745's C4: surface an alert-tier row via `drive_escalations`.
 
@@ -295,10 +338,12 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
             # generic "coord status" pointer.
             return ALERT_SKIPPED
 
+        resolution_suffix, proposed_command = _alert_resolution(row, repo_name, issue_number)
         reason = (
             f"board-doctor: {row.queue} row {row.key} stuck on cause="
             f"{row.cause} (confidence={row.confidence}) — see `coord "
             "drive-queue sweep --json` for the full decision log"
+            f"{resolution_suffix}"
         )
         gate_readings = f"queue={row.queue} | cause={row.cause} | evidence={' | '.join(row.evidence)}"
         record_drive_escalation(
@@ -307,7 +352,7 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
             stage=stage,
             reason=reason,
             gate_readings=gate_readings,
-            proposed_command="coord status",
+            proposed_command=proposed_command,
         )
 
         confirmed = get_drive_escalation(repo_name, issue_number)
