@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
 import re
 import socket
 import subprocess
@@ -3095,8 +3096,21 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
     default=False,
     help="Classify and print, but dispatch nothing and persist no convergence state.",
 )
+@click.option(
+    "--no-investigate",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disarm the C1 investigate tier fleet-wide for this sweep, "
+        "regardless of config (#3771) — rows that would have dispatched a "
+        "fix-it leg fall back to the alert tier instead. The mechanical "
+        "(C2/C3 allowlist) and alert (C4) tiers are unaffected."
+    ),
+)
 @_CONFIG_OPTION
-def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> None:
+def drive_queue_sweep(
+    output_json: bool, dry_run: bool, no_investigate: bool, config_path: Path,
+) -> None:
     """Board-doctor sweep: classify every stuck row, dispatch, record (#3758).
 
     This is the scheduled HARNESS #3745's epic asks for; it decides tier and
@@ -3125,6 +3139,16 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
     shipped disabled by default) as well as by hand; same `is_remote()`
     guard as `drive-queue diagnose`, for the same reason — the queues, the
     block log and `gh` all live on the daemon host.
+
+    The C1 investigate tier (dispatching a fix-it leg rather than just an
+    allowlisted mechanical action) is strictly more powerful than the rest
+    of the sweep, so it is off unless BOTH `--dry-run` is dropped AND the
+    target repo opts in via `repos[].board_doctor.investigate` in
+    `coordinator.yml` (#3771). `--no-investigate` disarms that tier
+    fleet-wide for this invocation regardless of any repo's opt-in, same as
+    setting `board_doctor.investigate: false` at the top of
+    `coordinator.yml` would for every future sweep — the mechanical and
+    alert tiers keep running either way.
     """
     from coord import board_doctor, board_doctor_policy  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
@@ -3138,14 +3162,30 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
         )
 
     config = _load_config(config_path)
-    report = board_doctor.run_sweep(
-        config=config,
-        tier_of=board_doctor_policy.policy_tier_of,
-        auto_dispatchers=board_doctor_policy.AUTO_DISPATCHERS,
-        alert_dispatcher=board_doctor_policy.escalation_alert_dispatcher,
-        dry_run=dry_run,
-        escalation_resolver=board_doctor_policy.dismiss_resolved_escalation,
-    )
+
+    env_var = board_doctor_policy.NO_INVESTIGATE_ENV_VAR
+    previous = os.environ.get(env_var)
+    if no_investigate:
+        os.environ[env_var] = "1"
+    try:
+        report = board_doctor.run_sweep(
+            config=config,
+            tier_of=board_doctor_policy.policy_tier_of,
+            auto_dispatchers=board_doctor_policy.AUTO_DISPATCHERS,
+            alert_dispatcher=board_doctor_policy.escalation_alert_dispatcher,
+            dry_run=dry_run,
+            escalation_resolver=board_doctor_policy.dismiss_resolved_escalation,
+        )
+    finally:
+        # Restore rather than blindly delete: a caller already running with
+        # the kill switch set via the environment (e.g. a wrapper script)
+        # must not have it cleared out from under it by an unrelated
+        # `--no-investigate` sweep invocation in the same process.
+        if no_investigate:
+            if previous is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = previous
 
     if output_json:
         click.echo(

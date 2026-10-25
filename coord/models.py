@@ -49,6 +49,28 @@ class _UatPreviewVars(dict):
 
 
 @dataclass
+class BoardDoctorRepoConfig:
+    """Per-repo board-doctor settings.
+
+    ``investigate`` is this repo's opt-in to the board-doctor investigate
+    tier (C1): dispatching a fix-it leg for a stuck drive-queue/merge-queue
+    row whose cause needs an agent to look at it, rather than a mechanical
+    allowlisted action (C2/C3) or a human-paged alert (C4). `False` (the
+    default) means a stuck row on this repo falls through to the alert tier
+    exactly as it did before the investigate tier existed — opting in is a
+    deliberate, per-repo decision, since the investigate tier is strictly
+    more powerful (it dispatches a worker) than the mechanical tier.
+    `coord.board_doctor_policy._investigate_tier_enabled` is the single
+    function that reads this alongside the fleet-wide kill switch
+    (`Config.board_doctor.investigate`) and the `--no-investigate` CLI
+    override, so there is exactly one place to look to answer "will this
+    repo's stuck row get investigated".
+    """
+
+    investigate: bool = False
+
+
+@dataclass
 class Repo:
     name: str
     github: str
@@ -224,6 +246,9 @@ class Repo:
     # `max_parallel_per_repo`), NOT "never launch" — the global
     # `--max-parallel` still bounds it.
     max_parallel: int | None = None
+    # #3771: this repo's opt-in to the board-doctor investigate tier. See
+    # `BoardDoctorRepoConfig.investigate` for the full rationale.
+    board_doctor: BoardDoctorRepoConfig = field(default_factory=BoardDoctorRepoConfig)
 
     def unresolved_uat_preview_placeholder(
         self,

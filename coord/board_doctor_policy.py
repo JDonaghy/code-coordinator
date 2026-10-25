@@ -109,6 +109,7 @@ operator landing on the alert has the next action right there.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable
 
 from coord import queue_diagnose
@@ -337,6 +338,47 @@ _register_auto_action(
 )
 
 
+NO_INVESTIGATE_ENV_VAR = "COORD_BOARD_DOCTOR_NO_INVESTIGATE"
+"""Process-wide kill switch read by :func:`_investigate_tier_enabled`.
+
+Set (to any truthy string) by ``coord drive-queue sweep --no-investigate``
+so the flag can reach this module without widening the
+``Callable[[StuckRow], bool]`` dispatcher/handler signature (#3771).
+"""
+
+
+def _investigate_tier_enabled(repo_name: str, config: "Config") -> bool:
+    """Decide whether the C1 investigate tier may fire for ``repo_name``.
+
+    Three independent gates, any of which can disarm the tier (#3771):
+
+    1. The :data:`NO_INVESTIGATE_ENV_VAR` process-wide kill switch, set by
+       ``coord drive-queue sweep --no-investigate`` — disarms the tier
+       fleet-wide for the lifetime of that sweep invocation regardless of
+       config.
+    2. ``board_doctor.investigate`` at the top of ``coordinator.yml`` — a
+       fleet-wide config kill switch, re-read from disk on every call
+       (:func:`_investigate` reloads config fresh each time), so flipping
+       it takes effect on the very next sweep with no daemon restart.
+    3. ``repos[].board_doctor.investigate`` — the per-repo opt-in. Even
+       with the fleet-wide switch on, a repo that has not explicitly opted
+       in stays on the mechanical/alert tiers only.
+
+    The investigate tier is strictly more powerful than the mechanical
+    (C2/C3 allowlist) tier — it dispatches a fix-it leg rather than just
+    running a pre-approved action — so it defaults to off at both the
+    fleet level (``board_doctor.investigate`` defaults ``True`` fleet-wide
+    but each repo defaults ``False``) and must be explicitly opted into
+    per repo.
+    """
+    if os.environ.get(NO_INVESTIGATE_ENV_VAR):
+        return False
+    if not config.board_doctor.investigate:
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.investigate)
+
+
 def _alert_fallback(row: StuckRow) -> bool:
     """Replicate `coord.board_doctor.sweep`'s own private ``_alert_action``
     confirmed-dispatch contract for a row :func:`_investigate` is falling
@@ -401,13 +443,20 @@ def _investigate(row: StuckRow) -> bool:
     ceiling-blocked row falls straight to :func:`_alert_fallback`, the same
     as a declined machine pin.
 
+    Finally, :func:`_investigate_tier_enabled` gates the whole tier on the
+    global kill switch (config-level and the ``--no-investigate`` sweep
+    flag) and the per-repo ``repos[].board_doctor.investigate`` opt-in
+    (#3771) — a repo that has not opted in, or a sweep run with the tier
+    disarmed fleet-wide, falls back to the alert tier exactly like a
+    ceiling-blocked or config-load failure does.
+
     This function's return value answers exactly one question — "was a
     fix-it leg dispatched?" — never "was the alert fallback delivered?".
     Every fallback branch (unparseable key, ceiling-blocked issue,
-    unresolvable config, no safe machine to pin) calls
-    :func:`_alert_fallback` only for its side effect and always returns
-    ``False`` regardless of whether the fallback alert itself was confirmed
-    delivered.
+    unresolvable config, tier disarmed/not opted in, no safe machine to
+    pin) calls :func:`_alert_fallback` only for its side effect and always
+    returns ``False`` regardless of whether the fallback alert itself was
+    confirmed delivered.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
@@ -438,6 +487,19 @@ def _investigate(row: StuckRow) -> bool:
         click.echo(
             f"warning: board-doctor could not load config to investigate "
             f"{repo_name}#{issue_number}: {exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    if not _investigate_tier_enabled(repo_name, config):
+        click.echo(
+            f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
+            "— the investigate tier is disarmed for this repo (either the "
+            "fleet-wide board_doctor.investigate kill switch, the "
+            "--no-investigate sweep flag, or this repo has not opted in via "
+            "repos[].board_doctor.investigate); falling back to the alert "
+            "tier instead of dispatching a fix-it leg (#3771)",
             err=True,
         )
         _alert_fallback(row)

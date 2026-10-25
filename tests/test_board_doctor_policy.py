@@ -395,6 +395,7 @@ class TestInvestigate:
         self, monkeypatch
     ) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         monkeypatch.setattr(state, "build_board", lambda: object())
         monkeypatch.setattr(
             board_doctor_policy,
@@ -414,6 +415,7 @@ class TestInvestigate:
 
     def test_leaves_an_in_flight_row_alone(self, monkeypatch) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         monkeypatch.setattr(state, "build_board", lambda: object())
         monkeypatch.setattr(
             board_doctor_policy,
@@ -436,6 +438,7 @@ class TestInvestigate:
         self, monkeypatch
     ) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         monkeypatch.setattr(state, "build_board", lambda: object())
         monkeypatch.setattr(
             board_doctor_policy,
@@ -545,6 +548,7 @@ class TestInvestigateCapacityCheck:
 
     def test_at_the_cap_the_rest_defer_with_no_escalation(self, monkeypatch) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
 
         dispatched: list[str] = []
@@ -593,6 +597,7 @@ class TestInvestigateCapacityCheck:
 
     def test_the_next_sweep_dispatches_the_deferred_row(self, monkeypatch) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
 
         dispatched: list[str] = []
@@ -720,6 +725,7 @@ class TestInvestigateConvergence:
         # reaches CONVERGENCE_LIMIT, and stops being handed to
         # `_investigate` at all after that.
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
         monkeypatch.setattr(state, "build_board", lambda: object())
 
         calls: list[int] = []

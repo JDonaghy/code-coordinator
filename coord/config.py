@@ -26,7 +26,13 @@ from coord.liveness_auditor import (
     DEFAULT_STRIKES as DEFAULT_LIVENESS_STRIKES,
     DEFAULT_TIMEOUT_SECONDS as DEFAULT_LIVENESS_TIMEOUT_SECONDS,
 )
-from coord.models import Machine, QuietHours, Repo, WorkerPermissionsConfig
+from coord.models import (
+    BoardDoctorRepoConfig,
+    Machine,
+    QuietHours,
+    Repo,
+    WorkerPermissionsConfig,
+)
 from coord.platform_paths import default_coord_dir
 from coord.sql import DIALECT_POSTGRES, DIALECT_SQLITE
 from coord.uat_checks import HeaderAssertion, UatCheckConfig, UatChecks
@@ -1397,6 +1403,35 @@ class LivenessAuditorConfig:
     model: str = DEFAULT_LIVENESS_MODEL
     timeout_seconds: float = DEFAULT_LIVENESS_TIMEOUT_SECONDS
     claude_bin: str | None = None
+
+
+@dataclass
+class BoardDoctorConfig:
+    """#3771: fleet-wide tunables for the board-doctor investigate tier (C1).
+
+    This is a SIBLING top-level section to ``pipeline:``, not nested under
+    it — unlike ``LivenessAuditorConfig``. The investigate tier's actual
+    on/off decision is two-part: a repo must opt in via its own
+    ``repos[].board_doctor.investigate`` (``Repo.board_doctor``, default
+    ``False``) AND this fleet-wide switch must be armed. Either one being
+    ``False`` disarms the tier for that repo; a stuck row then falls
+    through to the alert tier (C4) exactly as it did before the investigate
+    tier existed.
+
+    ``investigate`` defaults to ``True`` at the fleet level — the per-repo
+    default of ``False`` is already the safety-by-default gate, so this
+    switch exists purely as an operator kill switch (e.g. during an
+    incident, or while the investigate tier's dispatch budget is being
+    tuned), not as a second "off by default" layer. ``coord drive-queue
+    sweep --no-investigate`` is the equivalent one-shot CLI override for a
+    single sweep, without editing ``coordinator.yml``.
+
+    `coord.board_doctor_policy._investigate_tier_enabled` is the single
+    function that reads both this field and the per-repo opt-in — see its
+    docstring for the full decision, so there is exactly one place to look.
+    """
+
+    investigate: bool = True
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3000,6 +3035,11 @@ class Config:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     # #2179 — absent block == disabled == coord never talks to coord-portal.
     portal: PortalConfig = field(default_factory=PortalConfig)
+    # #3771 — absent block == investigate=True fleet-wide, but every repo's
+    # own board_doctor.investigate still defaults to False, so a repo that
+    # says nothing behaves exactly as it did before the investigate tier
+    # existed (stuck rows fall through to the alert tier).
+    board_doctor: BoardDoctorConfig = field(default_factory=BoardDoctorConfig)
     path: Path | None = None
     # #2783 — non-fatal parse-time warnings (e.g. an unrecognised repos[] key)
     # surfaced to an operator via `coord config` / `coord diagnose`. Never
@@ -3269,6 +3309,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     health = _parse_health(raw.get("health"))
     notifications = _parse_notifications(raw.get("notifications"))
     portal = _parse_portal(raw.get("portal"), {r.name for r in repos})
+    board_doctor = _parse_board_doctor(raw.get("board_doctor"))
 
     return Config(
         repos=repos,
@@ -3298,9 +3339,32 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         health=health,
         notifications=notifications,
         portal=portal,
+        board_doctor=board_doctor,
         path=p,
         warnings=repo_warnings,
     )
+
+
+def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
+    """Parse the top-level ``board_doctor:`` fleet-wide kill switch.
+
+    Absent block == ``investigate=True`` == every repo's own
+    ``board_doctor.investigate`` opt-in is the only gate that matters, i.e.
+    today's behaviour before this fleet-wide switch existed. See
+    :class:`BoardDoctorConfig` for the full rationale.
+    """
+    if raw is None:
+        return BoardDoctorConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"board_doctor must be a mapping, got {type(raw).__name__}")
+
+    cfg = BoardDoctorConfig()
+    if "investigate" in raw:
+        investigate = raw["investigate"]
+        if not isinstance(investigate, bool):
+            raise ConfigError("board_doctor.investigate must be a boolean")
+        cfg.investigate = investigate
+    return cfg
 
 
 # #2783 — every key `_parse_repos` actually reads. Anything in a repos[] entry
@@ -3334,6 +3398,7 @@ _KNOWN_REPO_KEYS = frozenset(
         "uat_checks",
         "requires",
         "max_parallel",
+        "board_doctor",
     }
 )
 
@@ -3665,6 +3730,11 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                     "for this repo) or more"
                 )
 
+        # #3771: board_doctor.investigate — this repo's opt-in to the
+        # investigate tier. Absent/False means today's pre-#3771 behaviour
+        # (a stuck row always falls through to the alert tier).
+        board_doctor_cfg = _parse_board_doctor_repo_config(entry.get("board_doctor"), i)
+
         repos.append(
             Repo(
                 name=name,
@@ -3689,6 +3759,7 @@ def _parse_repos(raw: Any) -> tuple[list[Repo], list[str]]:
                 uat_checks=uat_checks,
                 requires=list(requires),
                 max_parallel=repo_max_parallel,
+                board_doctor=board_doctor_cfg,
             )
         )
     return repos, warnings
@@ -3721,6 +3792,29 @@ def _parse_worker_permissions(raw: Any, repo_index: int) -> WorkerPermissionsCon
         )
 
     return WorkerPermissionsConfig(allow=allow, deny=deny)
+
+
+def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRepoConfig:
+    """Parse the ``board_doctor`` block for a single repo.
+
+    When *raw* is ``None`` (key absent from YAML), ``investigate`` stays at
+    its safety-by-default ``False`` — see :class:`BoardDoctorRepoConfig`.
+    """
+    if raw is None:
+        return BoardDoctorRepoConfig()
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"repos[{repo_index}].board_doctor must be a mapping")
+
+    cfg = BoardDoctorRepoConfig()
+    if "investigate" in raw:
+        investigate = raw["investigate"]
+        if not isinstance(investigate, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.investigate must be a boolean"
+            )
+        cfg.investigate = investigate
+    return cfg
 
 
 # #1862: 24h "HH:MM" — the only shape `quiet_hours.start`/`.end` accept.
