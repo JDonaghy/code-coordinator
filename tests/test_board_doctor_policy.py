@@ -76,20 +76,23 @@ class TestPolicyTierOf:
 
 
 class TestRegisterAutoAction:
-    def test_registers_a_safe_tier_action_in_both_mappings(self) -> None:
+    def test_registers_a_safe_tier_action_in_both_mappings(self, monkeypatch) -> None:
         calls: list[StuckRow] = []
-        try:
-            _register_auto_action("probe_only_cause", "drive_queue_add", calls.append)
+        # Claim both keys through monkeypatch first — they are absent, so
+        # its undo DELETES them — then let the real _register_auto_action
+        # overwrite both. Same teardown as every neighbouring test, with no
+        # hand-rolled finally block.
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "unregistered")
+        monkeypatch.setitem(AUTO_DISPATCHERS, "probe_only_cause", lambda row: None)
 
-            assert ALLOWLIST["probe_only_cause"] == "drive_queue_add"
-            assert policy_tier_of("probe_only_cause") == TIER_AUTO
+        _register_auto_action("probe_only_cause", "drive_queue_add", calls.append)
 
-            row = _row("acme/widgets#1", "probe_only_cause")
-            AUTO_DISPATCHERS["probe_only_cause"](row)
-            assert calls == [row]
-        finally:
-            ALLOWLIST.pop("probe_only_cause", None)
-            AUTO_DISPATCHERS.pop("probe_only_cause", None)
+        assert ALLOWLIST["probe_only_cause"] == "drive_queue_add"
+        assert policy_tier_of("probe_only_cause") == TIER_AUTO
+
+        row = _row("acme/widgets#1", "probe_only_cause")
+        AUTO_DISPATCHERS["probe_only_cause"](row)
+        assert calls == [row]
 
     def test_refuses_to_register_an_action_outside_the_safe_tier(self) -> None:
         with pytest.raises(SweepPermissionError, match="force_merge"):

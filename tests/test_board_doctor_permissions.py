@@ -11,17 +11,67 @@ from __future__ import annotations
 import pytest
 
 from coord import state
+from coord.board_doctor import TIER_AUTO, StuckRow, sweep
 from coord.board_doctor_permissions import (
     PERMANENTLY_FORBIDDEN,
     SAFE_TIER_ACTIONS,
     SweepHandlerNotRegisteredError,
     SweepPermissionError,
+    SweepWriteNotConfirmedError,
     authorize_sweep_action,
     dispatch_sweep_action,
     sweep_drive_queue_add,
     sweep_drive_queue_remove,
+    sweep_drive_queue_requeue,
+)
+from coord.board_doctor_policy import (
+    ALLOWLIST,
+    AUTO_DISPATCHERS,
+    _register_auto_action,
+    policy_tier_of,
 )
 from coord.commands.drive_queue import drive_queue_add, drive_queue_remove
+
+#: Everything an operator declares on `coord drive-queue add` that
+#: `coord.state.enqueue_drive_queue` replaces on every subsequent call —
+#: i.e. everything a sweep write must carry through rather than reset.
+DECLARED_POLICY = {
+    "machine": "precision",
+    "hold_after": True,
+    "hold_reason": "deploy terraform before the dependents run",
+    "resume_when": "test -f /tmp/deployed",
+    "hold_scope": "fleet",
+    "max_fix_rounds": 2,
+    "no_acceptance": True,
+    "plan_destructive": True,
+}
+
+#: The columns of a seeded row that must be byte-identical after a sweep
+#: write, read straight off the raw board row.
+POLICY_COLUMNS = (
+    "machine",
+    "after_json",
+    "hold_after",
+    "hold_reason",
+    "resume_when",
+    "hold_state",
+    "hold_scope",
+    "max_fix_rounds",
+    "no_acceptance",
+    "plan_destructive",
+)
+
+
+def _seed_declared_row(repo: str, issue: int, *, after: list[str] | None = None) -> dict:
+    """Queue a row the way an operator would, with every policy lever set."""
+    state.enqueue_drive_queue(repo, issue, after=list(after or []), **DECLARED_POLICY)
+    row = state.get_drive_queue_entry(repo, issue)
+    assert row is not None
+    return dict(row)
+
+
+def _policy_of(row: dict) -> dict:
+    return {name: row[name] for name in POLICY_COLUMNS}
 
 
 def _must_not_be_called(*args, **kwargs):
@@ -29,6 +79,10 @@ def _must_not_be_called(*args, **kwargs):
         "sweep action must never route through the operator-session Click "
         "command — it must call coord.state's primitives directly"
     )
+
+
+def _must_not_alert(row: StuckRow) -> bool:
+    raise AssertionError(f"auto-tier row {row.key} must not reach the alert tier")
 
 
 class TestSafeTierActionRunsWithoutTheInteractiveLayer:
@@ -114,3 +168,332 @@ class TestOutOfAllowlistActionsAreRejected:
 
         after = state.get_drive_queue_entry("acme/widgets", 55)
         assert after == before
+
+
+class TestOperatorDeclaredPolicySurvivesASweepWrite:
+    """`coord.state.enqueue_drive_queue` is an upsert that REPLACES every
+    policy column on each call, so re-adding an already-queued row is the
+    sweep's sharpest way to silently disarm an operator's deploy gate. These
+    drive the real board row end to end."""
+
+    def test_re_adding_a_queued_row_preserves_every_declared_column(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        state.enqueue_drive_queue("acme/widgets", 10)
+        before = _seed_declared_row("acme/widgets", 20, after=["acme/widgets#10"])
+        assert before["hold_state"] == "armed"
+
+        sweep_drive_queue_add("acme/widgets", 20)
+
+        after = state.get_drive_queue_entry("acme/widgets", 20)
+        assert after is not None
+        assert _policy_of(dict(after)) == _policy_of(before)
+        # Spelled out individually too: an all-at-once dict compare would
+        # pass if the helper silently read the same wrong columns twice.
+        assert after["hold_after"] == before["hold_after"]
+        assert after["hold_reason"] == DECLARED_POLICY["hold_reason"]
+        assert after["resume_when"] == DECLARED_POLICY["resume_when"]
+        assert after["hold_scope"] == "fleet"
+        assert after["max_fix_rounds"] == 2
+        assert after["machine"] == "precision"
+        assert after["plan_destructive"] == before["plan_destructive"]
+        assert after["hold_state"] == "armed"
+
+    def test_a_fresh_row_gets_the_fleet_defaults_not_a_borrowed_policy(
+        self, monkeypatch
+    ) -> None:
+        # The carry-through must come off the row being written, never off
+        # whatever else is queued.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        _seed_declared_row("acme/widgets", 20)
+
+        sweep_drive_queue_add("acme/widgets", 21)
+
+        fresh = state.get_drive_queue_entry("acme/widgets", 21)
+        assert fresh is not None
+        assert not fresh["hold_after"]
+        assert fresh["hold_state"] == ""
+        assert fresh["hold_reason"] == ""
+        assert fresh["resume_when"] == ""
+        assert not fresh["plan_destructive"]
+        assert not fresh["no_acceptance"]
+        assert fresh["max_fix_rounds"] is None
+
+    def test_an_add_contradicting_the_queued_declaration_is_refused(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        state.enqueue_drive_queue("acme/widgets", 10)
+        before = _seed_declared_row("acme/widgets", 20, after=["acme/widgets#10"])
+
+        for kwargs in (
+            {"machine": "beast"},
+            {"after": []},
+            {"after": ["acme/widgets#99"]},
+            {"position": before["position"] + 1},
+        ):
+            with pytest.raises(SweepPermissionError, match="re-declare"):
+                sweep_drive_queue_add("acme/widgets", 20, **kwargs)
+
+        after = state.get_drive_queue_entry("acme/widgets", 20)
+        assert after == before
+
+    def test_an_add_restating_the_queued_declaration_is_allowed(
+        self, monkeypatch
+    ) -> None:
+        # The refusal is about CONTRADICTING the row, not about passing the
+        # arguments at all — a caller echoing the row's own terms is a
+        # faithful in-place refresh.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        state.enqueue_drive_queue("acme/widgets", 10)
+        before = _seed_declared_row("acme/widgets", 20, after=["acme/widgets#10"])
+
+        sweep_drive_queue_add(
+            "acme/widgets",
+            20,
+            machine="precision",
+            after=["acme/widgets#10"],
+            position=before["position"],
+        )
+
+        after = state.get_drive_queue_entry("acme/widgets", 20)
+        assert after is not None
+        assert _policy_of(dict(after)) == _policy_of(before)
+
+    def test_a_cycle_is_refused_before_anything_is_written(self, monkeypatch) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+
+        with pytest.raises(SweepPermissionError, match="refused to enqueue"):
+            sweep_drive_queue_add("acme/widgets", 30, after=["acme/widgets#30"])
+
+        assert state.get_drive_queue_entry("acme/widgets", 30) is None
+
+
+class TestAMidFlightDeployGateIsRefused:
+    """`hold_state`/`hold_probes` are derived by `enqueue_drive_queue` and
+    have no parameter, so a row past ``armed`` cannot be written back
+    faithfully — it must be left alone rather than re-armed."""
+
+    def _seed_fired(self, issue: int, hold_state: str = "fired") -> dict:
+        _seed_declared_row("acme/widgets", issue)
+        assert state.update_drive_queue_entry(
+            "acme/widgets", issue, hold_state=hold_state, hold_probes=3
+        )
+        row = state.get_drive_queue_entry("acme/widgets", issue)
+        assert row is not None
+        return dict(row)
+
+    @pytest.mark.parametrize("hold_state", ["fired", "released"])
+    def test_add_refuses_a_gate_past_armed(self, monkeypatch, hold_state) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        before = self._seed_fired(40, hold_state)
+
+        with pytest.raises(SweepPermissionError, match="deploy gate's run state"):
+            sweep_drive_queue_add("acme/widgets", 40)
+
+        after = state.get_drive_queue_entry("acme/widgets", 40)
+        assert after == before
+        assert after is not None
+        assert after["hold_state"] == hold_state
+
+    def test_requeue_refuses_before_removing_the_row(self, monkeypatch) -> None:
+        # The order matters: a refusal AFTER the remove would leave the
+        # operator's gated row off the queue entirely.
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        before = self._seed_fired(41)
+
+        with pytest.raises(SweepPermissionError, match="deploy gate's run state"):
+            sweep_drive_queue_requeue("acme/widgets", 41)
+
+        after = state.get_drive_queue_entry("acme/widgets", 41)
+        assert after == before
+
+    def test_an_armed_but_unfired_gate_is_still_writable(self, monkeypatch) -> None:
+        # The guard must refuse only what it cannot reproduce: `armed` with
+        # no probes is exactly what a write produces, so it is allowed.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        before = _seed_declared_row("acme/widgets", 42)
+        assert before["hold_state"] == "armed"
+
+        sweep_drive_queue_add("acme/widgets", 42)
+
+        after = state.get_drive_queue_entry("acme/widgets", 42)
+        assert after is not None
+        assert _policy_of(dict(after)) == _policy_of(before)
+
+
+class TestRequeueRoundTripsTheWholeDeclaration:
+    def test_requeue_takes_the_row_down_and_puts_it_back_as_declared(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        state.enqueue_drive_queue("acme/widgets", 10)
+        before = _seed_declared_row("acme/widgets", 50, after=["acme/widgets#10"])
+
+        result = sweep_drive_queue_requeue("acme/widgets", 50)
+
+        assert result["requeued"] is True
+        assert result["removal"] is not None
+        assert result["removal"]["removed"] is True
+        assert "declaration preserved" in result["detail"]
+
+        after = state.get_drive_queue_entry("acme/widgets", 50)
+        assert after is not None
+        assert _policy_of(dict(after)) == _policy_of(before)
+        assert after["position"] == before["position"]
+
+    def test_requeueing_an_unqueued_issue_says_so_instead_of_queueing_it(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        result = sweep_drive_queue_requeue("acme/widgets", 51)
+
+        assert result["requeued"] is False
+        assert result["entry_id"] is None
+        assert result["removal"] is None
+        assert "nothing to requeue" in result["detail"]
+        # A requeue is not a back door to an add.
+        assert state.get_drive_queue_entry("acme/widgets", 51) is None
+
+    def test_dispatch_sweep_action_routes_the_requeue(self, monkeypatch) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        before = _seed_declared_row("acme/widgets", 52)
+
+        result = dispatch_sweep_action("drive_queue_requeue", "acme/widgets", 52)
+
+        assert result["requeued"] is True
+        after = state.get_drive_queue_entry("acme/widgets", 52)
+        assert after is not None
+        assert _policy_of(dict(after)) == _policy_of(before)
+
+
+class TestTheWriteConfirmationCanActuallyFail:
+    """A confirmation that cannot report failure proves nothing (#2096), so
+    these drive the re-read into contradicting the write."""
+
+    def test_a_write_that_does_not_read_back_raises(self, monkeypatch) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(state, "get_drive_queue_entry", lambda *a, **k: None)
+
+        with pytest.raises(SweepWriteNotConfirmedError, match="not there on a re-read"):
+            sweep_drive_queue_add("acme/widgets", 60)
+
+    def test_a_row_that_reads_back_with_a_different_policy_raises(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        real = state.get_drive_queue_entry
+        reads: list[int] = []
+
+        def tampering_read(repo_name, issue_number):
+            row = real(repo_name, issue_number)
+            reads.append(issue_number)
+            if row is not None and len(reads) > 1:
+                row = dict(row)
+                # Exactly the hazard the carry-through exists to prevent,
+                # injected on the confirming read instead of the write.
+                row["hold_after"] = 1
+            return row
+
+        monkeypatch.setattr(state, "get_drive_queue_entry", tampering_read)
+
+        with pytest.raises(SweepWriteNotConfirmedError, match="hold_after"):
+            sweep_drive_queue_add("acme/widgets", 61)
+
+
+class TestASafeTierActionCompletesFromTheSweepContext:
+    def test_sweep_auto_dispatches_a_registered_cause_and_the_write_lands(
+        self, monkeypatch
+    ) -> None:
+        # The whole stack as the daemon runs it: a real cause registered
+        # through _register_auto_action, classified by the real
+        # policy_tier_of, dispatched by the real coord.board_doctor.sweep,
+        # mutating a real board row — with the operator-session Click
+        # commands pinned to explode if anything routes through them.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        # Claim both keys so monkeypatch's undo deletes them on teardown.
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "unregistered")
+        monkeypatch.setitem(AUTO_DISPATCHERS, "probe_only_cause", lambda row: None)
+
+        handled: list[str] = []
+
+        def requeue_handler(row: StuckRow) -> None:
+            repo_name, _, number = row.key.rpartition("#")
+            result = sweep_drive_queue_requeue(repo_name, int(number))
+            assert result["requeued"] is True
+            handled.append(row.key)
+
+        _register_auto_action("probe_only_cause", "drive_queue_requeue", requeue_handler)
+
+        before = _seed_declared_row("acme/widgets", 3759)
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3759",
+            state="stuck",
+            cause="probe_only_cause",
+            confidence="high",
+            evidence=("cause=probe_only_cause",),
+        )
+
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3759-permissions",
+        )
+
+        decision = report.decisions[0]
+        assert decision.tier == TIER_AUTO
+        assert decision.action == "auto-dispatch"
+        assert handled == ["acme/widgets#3759"]
+
+        after = state.get_drive_queue_entry("acme/widgets", 3759)
+        assert after is not None
+        assert _policy_of(dict(after)) == _policy_of(before)
+
+    def test_sweep_surfaces_a_permission_refusal_instead_of_mutating(
+        self, monkeypatch
+    ) -> None:
+        # Same stack, but the row's gate has fired: the handler's refusal
+        # must reach the caller rather than being absorbed into a
+        # success-looking decision, and the board must be untouched.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "unregistered")
+        monkeypatch.setitem(AUTO_DISPATCHERS, "probe_only_cause", lambda row: None)
+
+        def requeue_handler(row: StuckRow) -> None:
+            repo_name, _, number = row.key.rpartition("#")
+            sweep_drive_queue_requeue(repo_name, int(number))
+
+        _register_auto_action("probe_only_cause", "drive_queue_requeue", requeue_handler)
+
+        _seed_declared_row("acme/widgets", 3760)
+        state.update_drive_queue_entry("acme/widgets", 3760, hold_state="fired")
+        before = state.get_drive_queue_entry("acme/widgets", 3760)
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3760",
+            state="stuck",
+            cause="probe_only_cause",
+            confidence="high",
+            evidence=("cause=probe_only_cause",),
+        )
+
+        with pytest.raises(SweepPermissionError, match="deploy gate's run state"):
+            sweep(
+                [row],
+                tier_of=policy_tier_of,
+                auto_dispatchers=AUTO_DISPATCHERS,
+                alert_dispatcher=_must_not_alert,
+                sweep_id="sweep-3759-refusal",
+            )
+
+        assert state.get_drive_queue_entry("acme/widgets", 3760) == before
