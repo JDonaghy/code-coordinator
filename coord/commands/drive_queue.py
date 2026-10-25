@@ -3142,6 +3142,7 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
                 {
                     "sweep_id": report.sweep_id,
                     "dry_run": report.dry_run,
+                    "rows_observed": report.rows_observed,
                     "decisions": [
                         {
                             "queue": d.queue,
@@ -3160,7 +3161,7 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
         return
 
     if not report.decisions:
-        click.echo("nothing stuck: no drive-queue or merge-queue row needed a decision")
+        click.echo("nothing stuck: no drive-queue or merge-queue row was observed")
         return
     for d in report.decisions:
         escalated = " (escalated)" if d.escalated else ""
@@ -3172,7 +3173,7 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
         click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
     else:
         click.echo(
-            f"{len(report.decisions)} row(s) decided — read the log later with "
+            f"{report.rows_observed} row(s) observed and decided — read the log later with "
             "`coord drive-queue sweep --json`"
         )
 

@@ -37,6 +37,13 @@ in `board_meta` via :mod:`coord.state`'s ``record_board_doctor_observation``
 ``baseline_red_streaks`` uses for its own streak counter (#2096: one
 question, one answer; convergence is decided by reading that ONE counter,
 never re-derived from the decision log).
+
+"CONSECUTIVE" is only honest because :func:`sweep` also clears a
+(queue, key)'s counter the moment that row stops appearing in the current
+*rows* — ``coord.state.clear_board_doctor_row``, driven by the
+*clear_absent_rows* parameter (default on). Without it a resolved-then-recurring
+row would resume its stale count instead of starting over, and a row that
+escalated once could never be re-alerted after it later resolves and recurs.
 """
 
 from __future__ import annotations
@@ -110,9 +117,15 @@ class SweepReport:
     sweep_id: str
     dry_run: bool = False
     decisions: list[Decision] = field(default_factory=list)
-
-    def by_action(self, action: str) -> list[Decision]:
-        return [d for d in self.decisions if d.action == action]
+    #: ``len(rows)`` this sweep classified — including rows that needed
+    #: no decision (e.g. a cause with no dispatcher wired yet). Distinct
+    #: from ``len(decisions)``, which is always equal to this today but
+    #: is kept separate so a future CLI reader never has to assume the
+    #: two stay in lockstep. Lets the CLI's empty-case message say what
+    #: was actually observed ("walked N row(s), 0 needed a decision")
+    #: instead of asserting nothing is stuck when rows were simply
+    #: filtered out upstream of :func:`sweep` (#3758).
+    rows_observed: int = 0
 
 
 def merge_queue_rows(entries: Sequence[Any]) -> list[StuckRow]:
@@ -163,6 +176,40 @@ def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[Stuc
     ]
 
 
+def _episode_stuck_row(episode: dict) -> StuckRow | None:
+    """Reconstruct a :class:`StuckRow` from an already-diagnosed episode (#3758).
+
+    :func:`coord.queue_diagnose.run_pass` only re-probes episodes
+    :func:`coord.queue_diagnose.needs_diagnosis` says still need it —
+    deliberately NOT every open episode, since re-probing a cause Phase 1
+    already concluded would waste a `gh` round-trip to re-learn the same
+    answer. That filtering is correct for Phase 1's own job (don't
+    re-diagnose), but it must not make an already-concluded episode
+    invisible to THIS sweep, whose job is exactly the opposite: act on
+    concluded causes. So for episodes :func:`collect_rows` does not hand to
+    `run_pass`, this rebuilds the same :class:`StuckRow` shape directly
+    from the episode's own stored diagnosis fields — no re-probe needed.
+
+    Returns ``None`` for an episode with no concluded, actionable cause
+    yet (empty or still :data:`coord.queue_diagnose.CAUSE_UNKNOWN`) — same
+    as today's effective behavior for those, just reached without a retry.
+    """
+    cause = episode.get("diagnosed_cause") or ""
+    if not cause or cause == queue_diagnose.CAUSE_UNKNOWN:
+        return None
+    key = episode.get("key")
+    if not key:
+        return None
+    return StuckRow(
+        queue="drive-queue",
+        key=str(key),
+        state=str(episode.get("state") or ""),
+        cause=cause,
+        confidence=str(episode.get("diagnosis_confidence") or queue_diagnose.CONFIDENCE_LOW),
+        evidence=tuple(episode.get("diagnosis_evidence") or ()),
+    )
+
+
 def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRow]:
     """The impure production walk over both queues (#3758).
 
@@ -171,6 +218,15 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     same ``block_log`` open-episode read, same ``GhLiveProbe`` construction
     — rather than a second, independently-built read of the same queue
     (#2096). Merge-queue: :func:`merge_queue_rows`, no `gh` needed.
+
+    Every OPEN episode becomes a row, never only the subset
+    :func:`coord.queue_diagnose.needs_diagnosis` would still re-probe:
+    episodes that need fresh diagnosis go through `run_pass` as before;
+    episodes whose cause Phase 1 already concluded are reconstructed
+    directly via :func:`_episode_stuck_row`, so a cause this sweep already
+    knows never becomes permanently invisible just because it is settled
+    (#3758) — that would invert the point of a sweep that is supposed to
+    ACT on settled causes.
 
     Deferred imports, same reason ``drive_queue_diagnose`` defers them: this
     module is imported by the CLI's thin registration layer, and these
@@ -187,6 +243,9 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     episodes = [
         ep for ep in block_log.episodes(block_log.read_events()) if not ep.get("resolved")
     ]
+    fresh_episodes = [ep for ep in episodes if queue_diagnose.needs_diagnosis(ep)]
+    settled_episodes = [ep for ep in episodes if not queue_diagnose.needs_diagnosis(ep)]
+
     entries = entries_from_rows(list_drive_queue())
     fleet_health = local_fleet_health_block([m.name for m in config.machines])
     live_sessions = frozenset(
@@ -201,10 +260,12 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
         live_sessions=live_sessions,
         local_host=_local_host_id(),
     )
+    triggers = {str(ep["key"]): trigger for ep in fresh_episodes if ep.get("key")}
     diagnoses = queue_diagnose.run_pass(
-        entries, episodes, probe=probe, keys=None, triggers=[trigger], limit=None
+        entries, fresh_episodes, probe=probe, keys=None, triggers=triggers, limit=None
     )
     rows = drive_queue_rows(diagnoses)
+    rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     rows.extend(merge_queue_rows(load_merge_queue()))
     return rows
 
@@ -219,6 +280,7 @@ def sweep(
     convergence_limit: int = CONVERGENCE_LIMIT,
     sweep_id: str | None = None,
     now: Callable[[], datetime] | None = None,
+    clear_absent_rows: bool = True,
 ) -> SweepReport:
     """The pure harness core: classify-already-done rows in, decisions out.
 
@@ -247,21 +309,35 @@ def sweep(
     *dry_run* classifies and logs but dispatches nothing and writes no
     convergence counter — a second sweep immediately after a dry run sees
     the SAME state a first sweep would, by construction.
+
+    "CONSECUTIVE sweeps" (the module docstring's convergence contract) is
+    only true if a row that stops appearing also stops counting. *rows* is
+    taken to be the FULL current stuck set *collect_rows* walked (both
+    queues, every open episode) — not a partial view — so after dispatching
+    every row above, any (queue, key) this call's :mod:`coord.state` still
+    has a counter for but that did NOT appear in *rows* has, by definition,
+    resolved or otherwise stopped being stuck: :func:`clear_absent_rows`
+    (default on; *clear_absent_rows=False* opts a caller intentionally
+    driving a partial row set out of it) drops its counter entirely via
+    ``coord.state.clear_board_doctor_row``, so a later recurrence starts
+    fresh at ``count=1, escalated=False`` instead of resuming a stale count
+    or staying permanently escalation-blind.
     """
     sweep_id = sweep_id or f"sweep-{(now or _utcnow)().strftime('%Y%m%dT%H%M%SZ')}"
     auto_dispatchers = auto_dispatchers or {}
-    report = SweepReport(sweep_id=sweep_id, dry_run=dry_run)
+    rows = list(rows)
+    report = SweepReport(sweep_id=sweep_id, dry_run=dry_run, rows_observed=len(rows))
 
     from coord import state  # noqa: PLC0415 — deferred so dry-run callers need no DB.
 
+    touched: set[tuple[str, str]] = set()
+
     for row in rows:
+        touched.add((row.queue, row.key))
         if dry_run:
-            counter = state.board_doctor_row_state(row.queue, row.key)
-            if counter.get("cause") == row.cause:
-                count = counter.get("count", 0) + 1
-                escalated = bool(counter.get("escalated", False))
-            else:
-                count, escalated = 1, False
+            prior = state.board_doctor_row_state(row.queue, row.key) or None
+            updated = state.next_board_doctor_counter(prior, row.cause)
+            count, escalated = updated["count"], updated["escalated"]
         else:
             counter = state.record_board_doctor_observation(row.queue, row.key, row.cause)
             count, escalated = counter["count"], counter["escalated"]
@@ -319,6 +395,11 @@ def sweep(
                     "recorded_at": (now or _utcnow)().isoformat(),
                 }
             )
+
+    if not dry_run and clear_absent_rows:
+        for queue, key in state.board_doctor_tracked_rows():
+            if (queue, key) not in touched:
+                state.clear_board_doctor_row(queue, key)
 
     return report
 

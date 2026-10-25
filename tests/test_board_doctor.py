@@ -147,6 +147,109 @@ class TestConvergence:
         assert row_state["count"] == 1
         assert row_state["escalated"] is False
 
+    def test_row_absent_from_a_later_sweep_clears_its_counter(self) -> None:
+        """A row that drops out of the walk (resolved) is no longer tracked.
+
+        Without clearing, a later recurrence on the SAME cause would silently
+        resume the stale count/escalation instead of starting over.
+        """
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#11"
+        cause = "ci_red"
+
+        for _ in range(3):
+            sweep(
+                [_row(key, cause)],
+                tier_of=_always(TIER_AUTO),
+                auto_dispatchers={cause: dispatch},
+                alert_dispatcher=alert,
+                convergence_limit=3,
+            )
+        assert state.board_doctor_row_state("drive-queue", key)["count"] == 3
+
+        # The row resolves — it no longer appears in the walk at all.
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=3,
+        )
+        assert state.board_doctor_row_state("drive-queue", key) == {}
+
+    def test_resolved_then_recurring_row_restarts_convergence_from_scratch(
+        self,
+    ) -> None:
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#12"
+        cause = "ci_red"
+
+        # Escalate past the limit.
+        for _ in range(4):
+            sweep(
+                [_row(key, cause)],
+                tier_of=_always(TIER_AUTO),
+                auto_dispatchers={cause: dispatch},
+                alert_dispatcher=alert,
+                convergence_limit=3,
+            )
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is True
+
+        # Resolves for one sweep (absent from the walk) ...
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=3,
+        )
+
+        # ... then recurs on the SAME cause. Without the clear-on-absence
+        # mechanism this would resume at count=5/escalated=True and never
+        # alert again; it must instead look exactly like a fresh row.
+        alert.calls.clear()
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            convergence_limit=3,
+        )
+
+        row_state = state.board_doctor_row_state("drive-queue", key)
+        assert row_state["count"] == 1
+        assert row_state["escalated"] is False
+
+    def test_clear_absent_rows_false_leaves_a_partial_walks_counters_alone(
+        self,
+    ) -> None:
+        """A caller intentionally driving a partial row subset opts out."""
+        dispatch = _Recorder()
+        alert = _Recorder()
+        key = "repo#13"
+        cause = "ci_red"
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+        )
+        assert state.board_doctor_row_state("drive-queue", key)["count"] == 1
+
+        # A deliberately empty/partial walk with clear_absent_rows=False must
+        # not treat this row as resolved.
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            clear_absent_rows=False,
+        )
+        assert state.board_doctor_row_state("drive-queue", key)["count"] == 1
+
 
 class TestDryRun:
     def test_dry_run_dispatches_nothing_and_persists_no_counter(self) -> None:
