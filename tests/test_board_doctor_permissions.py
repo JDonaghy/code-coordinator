@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from coord import queue_diagnose, state
+from coord.audit import query_audit_log
 from coord.board_doctor import CAUSE_CEILING_BLOCKED_MERGEABLE, TIER_AUTO, StuckRow, sweep
 from coord.board_doctor_permissions import (
     PERMANENTLY_FORBIDDEN,
@@ -20,6 +21,7 @@ from coord.board_doctor_permissions import (
     SweepWriteNotConfirmedError,
     authorize_sweep_action,
     dispatch_sweep_action,
+    sweep_dispatch_fixit_leg,
     sweep_drive_queue_add,
     sweep_drive_queue_remove,
     sweep_drive_queue_requeue,
@@ -31,6 +33,8 @@ from coord.board_doctor_policy import (
     policy_tier_of,
 )
 from coord.commands.drive_queue import drive_queue_add, drive_queue_remove
+from coord.config import Config
+from coord.models import Assignment, Board, Machine, Repo
 
 #: Everything an operator declares on `coord drive-queue add` that
 #: `coord.state.enqueue_drive_queue` replaces on every subsequent call —
@@ -741,3 +745,204 @@ class TestThe3760AutoActionsEndToEnd:
             sweep_id="sweep-3764-merged-second",
         )
         assert state.get_drive_queue_entry("acme/widgets", 3764) is None
+
+
+# ── #3768: the fix-it leg dispatch primitive + its in-flight lock ──────────
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeHTTPClient:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+        self.calls: list[tuple[str, dict]] = []
+
+    def post(self, url: str, *, json: dict, timeout: float) -> _FakeHTTPResponse:
+        self.calls.append((url, json))
+        return _FakeHTTPResponse(self._payload)
+
+
+def _fixit_repo() -> Repo:
+    return Repo(name="api", github="acme/api", default_branch="main", test_command="pytest")
+
+
+def _fixit_config(repo: Repo) -> Config:
+    return Config(
+        repos=[repo],
+        machines=[
+            Machine(
+                name="laptop", host="laptop.tail",
+                repos=["api"], repo_paths={"api": "/work/api"},
+            ),
+            Machine(
+                name="server", host="server.tail",
+                repos=["api"], repo_paths={"api": "/srv/api"},
+            ),
+        ],
+    )
+
+
+def _fixit_work_assignment(*, aid: str = "w1", status: str = "done") -> Assignment:
+    return Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix the thing",
+        assignment_id=aid,
+        status=status,
+        type="work",
+        branch="issue-1-fix",
+        files_allowed=["src/foo.py"],
+        files_forbidden=["docs/**"],
+        dispatched_at=10.0,
+    )
+
+
+class TestDispatchFixitLeg:
+    """#3768: the daemon-internal "dispatch one autonomous fix-it leg"
+    primitive — authorized through :func:`authorize_sweep_action` like
+    every other handler, with an in-flight lock so a repeated sweep never
+    dispatches a second leg against the same blocked row."""
+
+    @pytest.fixture(autouse=True)
+    def _machines_always_reachable(self, monkeypatch: pytest.MonkeyPatch):
+        from coord.network import StatusResult
+
+        monkeypatch.setattr(
+            "coord.network.fetch_status",
+            lambda machine, timeout=3.0: StatusResult(data={}),
+        )
+
+    def test_dispatches_for_a_stuck_row_with_no_live_assignment(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        client = _FakeHTTPClient({"id": "fixit-1"})
+
+        result = sweep_dispatch_fixit_leg(
+            "api", 1, board, config,
+            cause="ci_rerun_exhausted",
+            evidence=("checks failed 3x",),
+            http_client=client,
+        )
+
+        assert result["dispatched"] is True
+        assert result["assignment_id"] is not None
+        assert result["machine"] is not None
+        dispatched = board.find_by_id(result["assignment_id"])
+        assert dispatched is not None
+        assert dispatched in board.active
+        assert len(client.calls) == 1
+        _, payload = client.calls[0]
+        assert "ci_rerun_exhausted" in payload["briefing"]
+        assert "checks failed 3x" in payload["briefing"]
+        assert "--dangerously-skip-permissions" in payload["briefing"]
+
+        log = query_audit_log(event_type="fixit_leg_dispatched", repo="api", issue=1)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["assignment_id"] == result["assignment_id"]
+
+    def test_noop_when_a_leg_is_already_in_flight_via_a_running_assignment(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        board.active.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="prior-fix", status="running",
+            type="work", review_of_assignment_id="w1",
+        ))
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+
+        result = sweep_dispatch_fixit_leg(
+            "api", 1, board, config, cause="ci_rerun_exhausted", http_client=client,
+        )
+
+        assert result["dispatched"] is False
+        assert result["assignment_id"] is None
+        assert "already" in result["detail"]
+        assert client.calls == []
+
+    def test_noop_when_a_leg_is_already_in_flight_via_a_live_drive_session(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+
+        monkeypatch.setattr(
+            "coord.drive.list_drive_sessions",
+            lambda **kwargs: [
+                {"repo": "api", "issue": 1, "session_name": "drive-api-1", "attached": True},
+            ],
+        )
+
+        result = sweep_dispatch_fixit_leg(
+            "api", 1, board, config, cause="ci_rerun_exhausted", http_client=client,
+        )
+
+        assert result["dispatched"] is False
+        assert result["assignment_id"] is None
+        assert "already" in result["detail"]
+        assert client.calls == []
+
+    def test_noop_when_no_originating_work_assignment_exists(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+
+        result = sweep_dispatch_fixit_leg(
+            "api", 1, board, config, cause="ci_rerun_exhausted", http_client=client,
+        )
+
+        assert result["dispatched"] is False
+        assert result["assignment_id"] is None
+        assert client.calls == []
+
+    def test_unconfirmed_start_is_reported_as_a_noop_not_a_false_success(self) -> None:
+        import httpx
+
+        class _Failing:
+            def post(self, url, *, json, timeout):
+                raise httpx.ConnectError("offline")
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+
+        result = sweep_dispatch_fixit_leg(
+            "api", 1, board, config, cause="ci_rerun_exhausted", http_client=_Failing(),
+        )
+
+        assert result["dispatched"] is False
+        assert result["assignment_id"] is None
+        assert result["machine"] is None
+        assert result["detail"]
+        assert board.active == []
+
+    def test_forbidden_actions_still_raise_even_though_this_one_is_allowed(self) -> None:
+        # dispatch_fixit_leg is genuinely on the safe-tier allow-list...
+        authorize_sweep_action("dispatch_fixit_leg")
+        assert "dispatch_fixit_leg" in SAFE_TIER_ACTIONS
+
+        # ...but neither permanently-forbidden operator escape hatch is
+        # reachable through this module merely because a new safe-tier
+        # action was added next to them.
+        with pytest.raises(SweepPermissionError):
+            authorize_sweep_action("force_merge")
+        with pytest.raises(SweepPermissionError):
+            authorize_sweep_action("override_human_required")
