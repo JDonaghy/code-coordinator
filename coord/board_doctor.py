@@ -48,7 +48,7 @@ escalated once could never be re-alerted after it later resolves and recurs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -76,6 +76,27 @@ _MERGE_QUEUE_STUCK_CAUSE: dict[str, str] = {
     "conflict": queue_diagnose.CAUSE_MERGE_CONFLICT,
     "human_required": queue_diagnose.CAUSE_GATE_BLOCKED,
 }
+
+#: #3760 Action 1: a drive-queue row whose *live* evidence reads completely
+#: clear (review-approved, every check green, PR mergeable) but whose entry
+#: is sitting in ``blocked`` only because it already gave up on #2972's
+#: fix-round ceiling. ``queue_diagnose.diagnose`` itself must never be
+#: handed the entry's own stated reason to pick a cause — it reads live
+#: evidence only — so these two causes are exactly the ones a ceiling-
+#: blocked-but-otherwise-clear row can carry.
+_LIVE_CLEAR_CAUSES = frozenset(
+    {queue_diagnose.CAUSE_NOTHING_BLOCKING, queue_diagnose.CAUSE_CI_GREEN}
+)
+
+#: A narrow cause minted by :func:`_reclassify_ceiling_blocked`, never by
+#: `queue_diagnose` itself. Keeping it separate from `_LIVE_CLEAR_CAUSES`
+#: is the whole point: promoting either of those two causes to auto-tier
+#: directly would hand every "nothing blocking"/"ci green" row — including
+#: ones that are not ceiling-blocked at all — to an auto-dispatcher, which
+#: would permanently cut them off from C4 escalation. Only a row this
+#: reclassifier has independently confirmed IS ceiling-blocked gets
+#: relabelled, so the broad causes stay alert-eligible for everything else.
+CAUSE_CEILING_BLOCKED_MERGEABLE = "ceiling-blocked-mergeable"
 
 
 def default_tier_of(cause: str) -> str:
@@ -222,6 +243,39 @@ def _episode_stuck_row(episode: dict) -> StuckRow | None:
     )
 
 
+def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
+    """Relabel #2972-ceiling-blocked-but-live-clear rows (#3760 Action 1).
+
+    Runs strictly AFTER :func:`queue_diagnose.diagnose` has already picked
+    a cause from live evidence alone — this never feeds the entry's stated
+    reason into that classifier (#2235's invariant); it only reads the
+    drive-queue row's OWN stored state/reason afterward, through the one
+    existing predicate every other caller already uses
+    (:func:`coord.drive_queue.fix_round_ceiling_blocked_for_issue`), to ask
+    whether a cause this sweep would otherwise leave at the alert tier is
+    actually a ceiling a fresh budget would clear.
+    """
+    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+
+    reclassified: list[StuckRow] = []
+    for row in rows:
+        if row.queue == "drive-queue" and row.cause in _LIVE_CLEAR_CAUSES:
+            repo_name, _, issue_text = row.key.rpartition("#")
+            if (
+                repo_name
+                and issue_text.isdigit()
+                and fix_round_ceiling_blocked_for_issue(repo_name, int(issue_text))
+            ):
+                row = replace(
+                    row,
+                    cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
+                    evidence=row.evidence
+                    + ("drive_queue: blocked on the #2972 fix-round ceiling while live reads clear",),
+                )
+        reclassified.append(row)
+    return reclassified
+
+
 def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRow]:
     """The impure production walk over both queues (#3758).
 
@@ -278,6 +332,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     )
     rows = drive_queue_rows(diagnoses)
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
+    rows = _reclassify_ceiling_blocked(rows)
     rows.extend(merge_queue_rows(load_merge_queue()))
     return rows
 

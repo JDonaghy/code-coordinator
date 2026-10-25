@@ -11,8 +11,14 @@ from __future__ import annotations
 
 import pytest
 
-from coord import state
-from coord.board_doctor import ALERT_SKIPPED, TIER_ALERT, TIER_AUTO, StuckRow
+from coord import queue_diagnose, state
+from coord.board_doctor import (
+    ALERT_SKIPPED,
+    CAUSE_CEILING_BLOCKED_MERGEABLE,
+    TIER_ALERT,
+    TIER_AUTO,
+    StuckRow,
+)
 from coord.board_doctor_permissions import SweepPermissionError
 from coord.board_doctor_policy import (
     ALLOWLIST,
@@ -38,14 +44,24 @@ def _row(
 
 
 class TestPolicyTierOf:
-    def test_allowlist_is_empty_by_design(self) -> None:
-        # No cause is pre-approved for auto-action without Phase 0
-        # block-log evidence of it recurring with a known-safe fix.
-        assert ALLOWLIST == {}
+    def test_allowlist_holds_exactly_the_two_3760_entries(self) -> None:
+        # No cause is pre-approved for auto-action without a reviewed,
+        # known-safe fix behind it. #3760 (C3) names exactly two: a
+        # ceiling-blocked-but-mergeable row gets a fresh fix-round budget,
+        # and a row whose PR already merged gets cleared. Every other
+        # cause stays alert-tier.
+        assert ALLOWLIST == {
+            CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
+            queue_diagnose.CAUSE_PR_MERGED: "drive_queue_remove",
+        }
 
-    def test_every_cause_is_alert_tier_today(self) -> None:
+    def test_every_other_cause_is_alert_tier_today(self) -> None:
         for cause in ("no_pr", "merge_conflict", "dead_leg", "ci_red", "anything_else"):
             assert policy_tier_of(cause) == TIER_ALERT
+
+    def test_registered_3760_causes_are_auto_tier(self) -> None:
+        assert policy_tier_of(CAUSE_CEILING_BLOCKED_MERGEABLE) == TIER_AUTO
+        assert policy_tier_of(queue_diagnose.CAUSE_PR_MERGED) == TIER_AUTO
 
     def test_a_future_allowlist_entry_would_be_honored(self, monkeypatch) -> None:
         # Pins the seam itself, not a specific entry: if a cause is ever

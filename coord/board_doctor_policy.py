@@ -7,15 +7,29 @@ logs, but it deliberately does not decide WHICH cause gets auto-acted on
 (C2's job) or WHAT an alert actually does (C4's job) — see that module's
 docstring. This module is where those two decisions live.
 
-Why the allowlist below is EMPTY
----------------------------------
-A cause belongs on the auto-action allowlist only once the Phase 0 block
-log shows it recurring with a known-safe fix — never as a pre-approved
-guess. That log is not yet mined for a recurring, safe-to-automate cause,
-so :data:`ALLOWLIST` ships empty: every cause is alert-tier today. A later
-change populates it from log evidence, via :func:`_register_auto_action`,
-without touching this module's shape or `sweep`'s control flow. A wrong
-auto-action default is worse than an extra, harmless alert.
+Why the allowlist below is NOT empty
+-------------------------------------
+A cause belongs on the auto-action allowlist only once there is a
+known-safe, reviewed-in-advance fix for it — never as a pre-approved
+guess. #3760 (C3) names exactly two such causes, each wired below via
+:func:`_register_auto_action`:
+
+* ``CAUSE_CEILING_BLOCKED_MERGEABLE`` (minted by
+  `coord.board_doctor._reclassify_ceiling_blocked`, never by
+  `queue_diagnose` itself) — a row that already gave up on #2972's
+  fix-round ceiling but reads completely clear live (review-approved,
+  every check green, PR mergeable). ``drive_queue_requeue`` hands it a
+  fresh fix-round budget without touching the PR itself, and without
+  re-running Work/Test/Review.
+* ``queue_diagnose.CAUSE_PR_MERGED`` — the row's PR already merged, so
+  there is nothing left for the queue to track; ``drive_queue_remove``
+  clears it.
+
+Every other cause stays unregistered until it has the same kind of
+reviewed, narrowly-scoped evidence behind it — a wrong auto-action default
+is worse than an extra, harmless alert — so :data:`ALLOWLIST` growing
+beyond these two is a deliberate, one-at-a-time decision, not a bulk
+promotion of a whole existing cause bucket.
 
 :func:`_register_auto_action` also checks every new entry's action name
 against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` (#3745's C2
@@ -41,8 +55,19 @@ from __future__ import annotations
 
 from typing import Callable
 
-from coord.board_doctor import ALERT_SKIPPED, TIER_ALERT, TIER_AUTO, StuckRow
-from coord.board_doctor_permissions import SAFE_TIER_ACTIONS, authorize_sweep_action
+from coord import queue_diagnose
+from coord.board_doctor import (
+    ALERT_SKIPPED,
+    CAUSE_CEILING_BLOCKED_MERGEABLE,
+    TIER_ALERT,
+    TIER_AUTO,
+    StuckRow,
+)
+from coord.board_doctor_permissions import (
+    SAFE_TIER_ACTIONS,
+    authorize_sweep_action,
+    dispatch_sweep_action,
+)
 
 #: cause -> auto-action name. Empty by design; see the module docstring.
 #: A future PR populates this from Phase 0 block-log evidence of a
@@ -118,6 +143,65 @@ def policy_tier_of(cause: str) -> str:
 
 def _board_doctor_stage(queue: str) -> str:
     return f"board-doctor:{queue}"
+
+
+def _parse_row_key(key: str) -> tuple[str, int] | None:
+    """``"repo#issue"`` -> ``(repo, issue)``, or ``None`` if unparseable.
+
+    Same split every C3/C4 reader of ``row.key`` already does
+    (:func:`escalation_alert_dispatcher`, :func:`dismiss_resolved_escalation`)
+    — kept here as one function so a C3 auto-action handler answers the
+    same "what repo/issue is this row" question the same way C4 already
+    does, rather than re-deriving the split a third time.
+    """
+    repo_name, _, issue_text = key.rpartition("#")
+    if not repo_name or not issue_text.isdigit():
+        return None
+    return repo_name, int(issue_text)
+
+
+def _requeue_ceiling_blocked_mergeable(row: StuckRow) -> None:
+    """#3760 Action 1: a ceiling-blocked-but-mergeable row gets a fresh budget.
+
+    ``remove``+``add`` (:func:`coord.board_doctor_permissions.
+    sweep_drive_queue_requeue`) re-stamps ``legs_at_enqueue`` from scratch
+    while preserving the row's declared policy fields, so this resumes only
+    the missing gate — it never re-runs Work/Test/Review, and it never
+    touches the PR itself (no merge, no force-merge: that stays outside
+    `SAFE_TIER_ACTIONS` entirely).
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return
+    repo_name, issue_number = parsed
+    dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
+
+
+def _clear_merged_row(row: StuckRow) -> None:
+    """#3760 Action 4: drop a drive-queue row whose PR already merged.
+
+    `queue_diagnose`'s highest-priority rule already fires
+    :data:`coord.queue_diagnose.CAUSE_PR_MERGED` straight off live PR state
+    — no reclassification needed, unlike Action 1 — so this only has to
+    remove the now-stale row.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return
+    repo_name, issue_number = parsed
+    dispatch_sweep_action("drive_queue_remove", repo_name, issue_number)
+
+
+_register_auto_action(
+    CAUSE_CEILING_BLOCKED_MERGEABLE,
+    "drive_queue_requeue",
+    _requeue_ceiling_blocked_mergeable,
+)
+_register_auto_action(
+    queue_diagnose.CAUSE_PR_MERGED,
+    "drive_queue_remove",
+    _clear_merged_row,
+)
 
 
 def escalation_alert_dispatcher(row: StuckRow) -> bool | str:

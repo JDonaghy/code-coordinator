@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from coord import state
-from coord.board_doctor import TIER_AUTO, StuckRow, sweep
+from coord import queue_diagnose, state
+from coord.board_doctor import CAUSE_CEILING_BLOCKED_MERGEABLE, TIER_AUTO, StuckRow, sweep
 from coord.board_doctor_permissions import (
     PERMANENTLY_FORBIDDEN,
     SAFE_TIER_ACTIONS,
@@ -497,3 +497,176 @@ class TestASafeTierActionCompletesFromTheSweepContext:
             )
 
         assert state.get_drive_queue_entry("acme/widgets", 3760) == before
+
+
+class TestThe3760AutoActionsEndToEnd:
+    """#3760 (C3): the two real registered causes, not a synthetic probe.
+
+    Same "whole stack as the daemon runs it" pattern as
+    `TestASafeTierActionCompletesFromTheSweepContext`, but against the
+    module-level :data:`ALLOWLIST`/:data:`AUTO_DISPATCHERS` entries that
+    `coord.board_doctor_policy` registers at import time — no
+    `_register_auto_action` call of our own.
+    """
+
+    def test_ceiling_blocked_mergeable_gets_a_fresh_budget_with_policy_preserved(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        _seed_declared_row("acme/widgets", 3761)
+        state.update_drive_queue_entry(
+            "acme/widgets",
+            3761,
+            state="blocked",
+            last_reason="giving up after 2 fix rounds (#2972)",
+        )
+        before = state.get_drive_queue_entry("acme/widgets", 3761)
+        assert before is not None
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3761",
+            state="stuck",
+            cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
+            confidence="high",
+            evidence=(f"cause={CAUSE_CEILING_BLOCKED_MERGEABLE}",),
+        )
+
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3761-ceiling",
+        )
+
+        decision = report.decisions[0]
+        assert decision.tier == TIER_AUTO
+        assert decision.action == "auto-dispatch"
+
+        after = state.get_drive_queue_entry("acme/widgets", 3761)
+        assert after is not None
+        # Only the missing gate gets a fresh budget — Work/Test/Review are
+        # not touched, so the operator's own policy declaration survives
+        # byte-for-byte.
+        assert _policy_of(dict(after)) == _policy_of(dict(before))
+        # The ceiling itself is lifted: a fresh row competes for a launch
+        # slot again instead of sitting on the #2972 give-up reason.
+        assert after["state"] == "waiting"
+        assert after["last_reason"] != before["last_reason"]
+
+    def test_ceiling_blocked_mergeable_sweep_is_idempotent(self, monkeypatch) -> None:
+        # The production path never re-dispatches a row it already fixed:
+        # once requeued, `_reclassify_ceiling_blocked` (tests/test_board_doctor.py)
+        # no longer relabels it, because the row is no longer ceiling-blocked
+        # live. This pins the handler half of that guarantee: calling the
+        # real dispatcher again on an already-fresh row is a safe no-op,
+        # not a second destructive remove+re-add of a row that moved on.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        _seed_declared_row("acme/widgets", 3762)
+        state.update_drive_queue_entry(
+            "acme/widgets",
+            3762,
+            state="blocked",
+            last_reason="giving up after 2 fix rounds (#2972)",
+        )
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3762",
+            state="stuck",
+            cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
+            confidence="high",
+            evidence=(f"cause={CAUSE_CEILING_BLOCKED_MERGEABLE}",),
+        )
+
+        sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3762-ceiling-first",
+        )
+        once = state.get_drive_queue_entry("acme/widgets", 3762)
+        assert once is not None
+
+        # A second sweep pass sees the SAME StuckRow (the sweep harness
+        # itself does not re-diagnose; `coord.board_doctor.collect_rows`
+        # would have already dropped this cause by now, since the row no
+        # longer reads ceiling-blocked) — the handler itself must still not
+        # corrupt the row if it somehow runs again.
+        sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3762-ceiling-second",
+        )
+        twice = state.get_drive_queue_entry("acme/widgets", 3762)
+        assert twice is not None
+        assert _policy_of(dict(twice)) == _policy_of(dict(once))
+        assert twice["state"] == "waiting"
+
+    def test_pr_merged_row_is_cleared(self, monkeypatch) -> None:
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        _seed_declared_row("acme/widgets", 3763)
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3763",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_PR_MERGED,
+            confidence="high",
+            evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
+        )
+
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3763-merged",
+        )
+
+        decision = report.decisions[0]
+        assert decision.tier == TIER_AUTO
+        assert decision.action == "auto-dispatch"
+        assert state.get_drive_queue_entry("acme/widgets", 3763) is None
+
+    def test_pr_merged_row_clear_is_idempotent(self, monkeypatch) -> None:
+        # A row already removed (by an earlier sweep, or by hand) must not
+        # make a second sweep pass over the same cause raise or re-mutate
+        # anything that no longer exists.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        _seed_declared_row("acme/widgets", 3764)
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3764",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_PR_MERGED,
+            confidence="high",
+            evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
+        )
+
+        sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3764-merged-first",
+        )
+        assert state.get_drive_queue_entry("acme/widgets", 3764) is None
+
+        sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3764-merged-second",
+        )
+        assert state.get_drive_queue_entry("acme/widgets", 3764) is None
