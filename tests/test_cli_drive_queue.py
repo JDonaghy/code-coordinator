@@ -7964,12 +7964,14 @@ def test_sweep_dry_run_classifies_a_real_stalled_row_and_persists_nothing(
 
     result = cli("sweep", "--dry-run")
     assert result.exit_code == 0, result.output
-    assert f"drive-queue:{REPO}#1762 cause=merge-conflict tier=alert" in result.output
-    # The real policy wires a real alert_dispatcher, so the action label
-    # reflects that a dispatch would happen were this not --dry-run —
-    # "would-alert", not "no-dispatcher" (and never the confirmed-delivery
-    # "alert" label, since nothing was actually dispatched).
-    assert "action=would-alert count=1" in result.output
+    # merge-conflict is #3769's investigate tier, not a direct alert: the
+    # real policy dispatches a fix-it leg before paging a human, so the
+    # tier is "auto" and the action label reflects that an investigate
+    # dispatch would be attempted were this not --dry-run — "auto-dispatch",
+    # not "no-dispatcher" (and never a "would-alert"/"alert" label, since
+    # nothing in the alert tier runs for this cause at all).
+    assert f"drive-queue:{REPO}#1762 cause=merge-conflict tier=auto" in result.output
+    assert "action=auto-dispatch count=1" in result.output
     assert (
         "--dry-run: nothing was dispatched and no convergence state was persisted"
         in result.output
@@ -8003,8 +8005,12 @@ def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
     assert logged[0]["key"] == f"{REPO}#1762"
     assert logged[0]["cause"] == "merge-conflict"
 
-    # #2268's C4: the first sweep's alert actually filed a `drive_escalations`
-    # row — the real "issue filing" surface, not a literal new GitHub issue.
+    # #3769: merge-conflict is investigate-tier now, so the dispatcher is
+    # `_investigate`, not a direct alert. In this test's process there is no
+    # resolvable `--config`/`$COORD_CONFIG` for `_investigate`'s own config
+    # load, so it falls back to `_alert_fallback` — the same
+    # `drive_escalations` write #2268's C4 always made, just reached via the
+    # fallback path instead of a direct alert dispatch.
     escalation = state.get_drive_escalation(REPO, 1762)
     assert escalation is not None
     assert escalation["stage"] == "board-doctor:drive-queue"
@@ -8016,10 +8022,14 @@ def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
     assert "count=2" in second.output
     decisions = state.board_doctor_decisions()
     assert len(decisions) == 2
-    # Already escalated for this same, unresolved cause — #3758's
-    # "escalate exactly once" contract — so no second alert overwrites it.
-    assert decisions[-1]["action"] == "converged-noop"
-    assert "action=converged-noop" in second.output
+    # Still under the convergence limit, so the auto tier's dispatcher
+    # (`_investigate`) runs again on every sweep regardless of the prior
+    # fallback alert — it never "performed" a dispatch (no fix-it leg
+    # started), hence "auto-dispatch-noop", not "converged-noop" (that
+    # label is reserved for a row that is ALREADY escalated under the
+    # alert tier, or past the convergence limit).
+    assert decisions[-1]["action"] == "auto-dispatch-noop"
+    assert "action=auto-dispatch-noop" in second.output
 
 
 def _sweep_json(output: str) -> dict:
@@ -8034,9 +8044,11 @@ def _sweep_json(output: str) -> dict:
 def test_sweep_reports_alert_failed_when_the_escalation_cannot_be_written(
     cli, seed, block_log, gh_world, monkeypatch
 ):
-    """An alert that could not be delivered must say so, and must not
-    record the row as escalated — otherwise #3758's "escalate exactly
-    once" contract suppresses every future attempt for that cause."""
+    """merge-conflict's investigate-tier dispatcher (`_investigate`) falls
+    back to the SAME `_alert_fallback` escalation write as a direct alert
+    would, and that write failing must not record the row as escalated —
+    otherwise #3758's "escalate exactly once" contract suppresses every
+    future attempt for that cause."""
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
@@ -8051,22 +8063,32 @@ def test_sweep_reports_alert_failed_when_the_escalation_cannot_be_written(
 
     failed = cli("sweep")
     assert failed.exit_code == 0, failed.output
-    assert "action=alert-failed count=1" in failed.output
+    # `_investigate` never performs a dispatch in this test's process (no
+    # resolvable config), so it always falls back to `_alert_fallback` —
+    # and here that fallback's own escalation write is the one broken by
+    # the monkeypatch above, so it fails too. Either way `_investigate`
+    # returns False, so the action is "auto-dispatch-noop", not an
+    # "alert-failed" the alert tier never ran for this cause.
+    assert "action=auto-dispatch-noop count=1" in failed.output
     assert "(escalated)" not in failed.output
     assert state.get_drive_escalation(REPO, 1762) is None
     assert state.board_doctor_row_state("drive-queue", f"{REPO}#1762")["escalated"] is False
     logged = state.board_doctor_decisions()
-    assert logged[-1]["action"] == "alert-failed"
+    assert logged[-1]["action"] == "auto-dispatch-noop"
     assert logged[-1]["escalated"] is False
 
-    # The store comes back: the next sweep re-attempts rather than
-    # treating the lost alert as already delivered.
+    # The store comes back: the next sweep's fallback alert gets through
+    # as a side effect of `_investigate`'s own fallback — but the
+    # decision log still reflects the pre-dispatch escalation state and
+    # `_investigate` still returns False (no leg was actually dispatched),
+    # so the logged action/escalated fields don't flip to "alert"/True
+    # just because the fallback alert itself landed this time.
     monkeypatch.setattr(state, "record_drive_escalation", real_record)
     recovered = cli("sweep", "--json")
     assert recovered.exit_code == 0, recovered.output
     payload = _sweep_json(recovered.output)
-    assert [d["action"] for d in payload["decisions"]] == ["alert"]
-    assert payload["decisions"][0]["escalated"] is True
+    assert [d["action"] for d in payload["decisions"]] == ["auto-dispatch-noop"]
+    assert payload["decisions"][0]["escalated"] is False
     assert state.get_drive_escalation(REPO, 1762) is not None
 
 
@@ -8087,7 +8109,11 @@ def test_sweep_json_reports_alert_failed_for_an_undeliverable_alert(
     result = cli("sweep", "--json")
     assert result.exit_code == 0, result.output
     payload = _sweep_json(result.output)
-    assert [d["action"] for d in payload["decisions"]] == ["alert-failed"]
+    # Same investigate-tier fallback as the text-output test above: the
+    # dispatcher never reports "performed", so the action is
+    # "auto-dispatch-noop", not an "alert-failed" that implies the alert
+    # tier ran directly for this cause.
+    assert [d["action"] for d in payload["decisions"]] == ["auto-dispatch-noop"]
     assert payload["decisions"][0]["escalated"] is False
 
 
