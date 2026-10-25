@@ -67,6 +67,25 @@ once, the same as it already does for every :data:`TIER_AUTO` cause —
 this module only decides WHICH causes reach that path as auto-tier, not
 how the path itself behaves.
 
+Why the investigate tier is capped per repo (#3770)
+----------------------------------------------------
+A sweep's `tier_of`/dispatch decisions run row-by-row with no shared view
+of how many fix-it legs the sweep has already launched this pass — so an
+unbounded number of :data:`INVESTIGATE_CAUSES` rows for the same repo
+would otherwise all dispatch in one sweep. :func:`make_investigate_capacity_check`
+builds `coord.board_doctor.sweep`'s optional ``capacity_check`` gate:
+it bounds concurrent investigate-tier legs per repo at that repo's
+existing drive-queue ceiling (:func:`_investigate_repo_capacity` —
+`coordinator.yml` `repos[].max_parallel` / `pipeline.max_parallel_per_repo`,
+never a second knob), counting legs already in flight
+(:func:`_investigate_in_flight_count`, the same running/pending work-like
+assignment signal `sweep_dispatch_fixit_leg`'s own in-flight lock already
+answers) plus whatever the gate has already reserved earlier in the same
+sweep. A row the gate defers is not dispatched, not escalated and does
+not touch the row's convergence counter — it is simply deferred to the
+next sweep, which is why `sweep` checks it before, not after, the
+counter bump.
+
 Why the alert path reuses `drive_escalations`
 ------------------------------------------------
 "Issue filing" is not a literal new-GitHub-issue flow — `gh` is denied to
@@ -83,7 +102,7 @@ operator landing on the alert has the next action right there.
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from coord import queue_diagnose
 from coord.board_doctor import (
@@ -99,6 +118,10 @@ from coord.board_doctor_permissions import (
     authorize_sweep_action,
     dispatch_sweep_action,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from coord.config import Config
+    from coord.models import Board
 
 #: A fix-it-leg dispatch is already in flight for this row — both
 #: `coord.board_doctor_permissions.sweep_dispatch_fixit_leg` detail strings
@@ -467,6 +490,114 @@ for _investigate_cause in (
 ):
     _register_investigate_action(_investigate_cause)
 del _investigate_cause
+
+
+def _investigate_repo_capacity(repo_name: str, config: "Config") -> int:
+    """The investigate tier's per-repo dispatch cap for *repo_name* (#3770).
+
+    Reuses *repo_name*'s existing drive-queue ceiling verbatim — there is
+    no second capacity knob for board-doctor to configure. Mirrors
+    `coord.commands.drive_queue.drive_queue_tick`'s own resolution order
+    exactly: `coord.drive_queue.resolve_max_parallel_per_repo` with no CLI
+    override (board-doctor has no such flag) for the fleet-wide default,
+    then `coord.drive_queue.resolve_repo_max_parallel` for *repo_name*'s own
+    ``repos[].max_parallel`` override, if any.
+
+    ``0`` from either source means "no per-repo ceiling at all"
+    (unlimited) per that resolution's own documented semantics, not "zero
+    capacity" — callers must treat a non-positive return as "never defer".
+    """
+    from coord.drive_queue import (  # noqa: PLC0415 — see module note on deferred imports
+        resolve_max_parallel_per_repo,
+        resolve_repo_max_parallel,
+    )
+
+    fleet = resolve_max_parallel_per_repo(
+        override_value=None,
+        override_source="board-doctor",
+        config_value=config.pipeline.max_parallel_per_repo,
+    )
+    repo = config.repo(repo_name)
+    resolution = resolve_repo_max_parallel(
+        repo_name,
+        repo_override=repo.max_parallel if repo is not None else None,
+        fleet=fleet,
+    )
+    return resolution.value
+
+
+def _investigate_in_flight_count(repo_name: str, board: "Board") -> int:
+    """How many investigate-tier legs are already running or queued for
+    *repo_name*, counted the SAME way :func:`coord.board_doctor_permissions.
+    sweep_dispatch_fixit_leg`'s own in-flight lock already does — a
+    ``running``/``pending`` work-like assignment — just aggregated across
+    the whole repo (every assignment on *board.active* for *repo_name*)
+    rather than scoped to one issue. Reusing that exact predicate (rather
+    than re-deriving a different "is work in flight" signal) is what keeps
+    this the same question with the same answer as the per-row in-flight
+    lock, not a second, independently-maintained one (#3770).
+    """
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    return sum(
+        1
+        for assignment in board.active
+        if assignment.repo_name == repo_name
+        and assignment.type in WORK_LIKE_TYPES
+        and assignment.status in ("running", "pending")
+    )
+
+
+def make_investigate_capacity_check(
+    config: "Config",
+) -> Callable[[StuckRow], bool]:
+    """Build a per-sweep "is the investigate tier over its per-repo cap"
+    gate for `coord.board_doctor.sweep`'s new ``capacity_check`` parameter
+    (#3770).
+
+    Builds `board = coord.state.build_board()` and a fresh ``claimed``
+    counter ONCE, at construction time — one gate per sweep, never shared
+    across sweeps — then returns a closure that, per row:
+
+    * Returns ``False`` (never defer) immediately for any cause outside
+      :data:`INVESTIGATE_CAUSES` — the per-repo cap bounds the investigate
+      tier only; :data:`ALLOWLIST`'s mechanical fixes (#3760) are untouched.
+    * Returns ``False`` if ``row.key`` does not parse — a row this gate
+      cannot even attribute to a repo cannot be capacity-checked, so it is
+      left to run the normal tier/dispatch path rather than silently stuck.
+    * Returns ``False`` (unlimited) if the repo's resolved cap
+      (:func:`_investigate_repo_capacity`) is non-positive.
+    * Otherwise compares ``in_flight + claimed`` against the cap: at or
+      over it, returns ``True`` (defer) without reserving a slot; under it,
+      reserves one slot in ``claimed`` and returns ``False`` — the
+      reservation is what makes "exactly N dispatch, the rest defer"
+      hold within a single sweep pass, since this gate runs once per row
+      before that row's own dispatcher does.
+    """
+    from coord.state import build_board  # noqa: PLC0415
+
+    board = build_board()
+    claimed: dict[str, int] = {}
+
+    def _check(row: StuckRow) -> bool:
+        if row.cause not in INVESTIGATE_CAUSES:
+            return False
+        parsed = _parse_row_key(row.key)
+        if parsed is None:
+            return False
+        repo_name, _issue_number = parsed
+        cap = _investigate_repo_capacity(repo_name, config)
+        if cap <= 0:
+            return False
+        in_flight = _investigate_in_flight_count(repo_name, board) + claimed.get(
+            repo_name, 0
+        )
+        if in_flight >= cap:
+            return True
+        claimed[repo_name] = claimed.get(repo_name, 0) + 1
+        return False
+
+    return _check
 
 
 def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple[str, str]:

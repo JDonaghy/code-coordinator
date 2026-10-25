@@ -126,6 +126,30 @@ def default_tier_of(cause: str) -> str:
     return policy_tier_of(cause)
 
 
+def default_investigate_capacity(config) -> Callable[[StuckRow], bool]:
+    """Default `capacity_check` builder: delegates to the real per-repo cap.
+
+    Mirrors :func:`default_tier_of`'s own rationale exactly: `sweep`/
+    `run_sweep` need a safe default that can never silently diverge from
+    the real policy, which lives in
+    :func:`coord.board_doctor_policy.make_investigate_capacity_check`
+    (#3770). Deferred import for the same reason as `default_tier_of` —
+    no import cycle once this module has finished loading.
+    """
+    from coord.board_doctor_policy import make_investigate_capacity_check  # noqa: PLC0415
+
+    return make_investigate_capacity_check(config)
+
+
+#: Sentinel distinguishing "caller did not pass `capacity_check` at all" (the
+#: default: `run_sweep` builds the real per-repo cap via
+#: :func:`default_investigate_capacity`) from "caller explicitly passed
+#: `capacity_check=None`" (disable capacity-gating entirely — e.g. a test
+#: that wants `sweep`'s other behaviour with no cap in play). A plain
+#: ``None`` default could not tell these two cases apart.
+_CAPACITY_CHECK_UNSET = object()
+
+
 @dataclass(frozen=True)
 class StuckRow:
     """One drive-queue or merge-queue row this sweep looked at."""
@@ -157,7 +181,8 @@ class Decision:
     cause: str
     tier: str
     #: "auto-dispatch" | "auto-dispatch-noop" | "alert" | "would-alert" |
-    #: "alert-failed" | "alert-skipped" | "no-dispatcher" | "converged-noop"
+    #: "alert-failed" | "alert-skipped" | "no-dispatcher" | "converged-noop" |
+    #: "suppressed-baseline-red" | "investigate-deferred"
     action: str
     count: int
     escalated: bool
@@ -460,6 +485,7 @@ def sweep(
     now: Callable[[], datetime] | None = None,
     clear_absent_rows: bool = True,
     escalation_resolver: Callable[[str, str], None] | None = None,
+    capacity_check: Callable[[StuckRow], bool] | None = None,
 ) -> SweepReport:
     """The pure harness core: classify-already-done rows in, decisions out.
 
@@ -532,6 +558,18 @@ def sweep(
     failure interrupt the clear loop — that is the resolver's own
     responsibility to swallow, exactly like *alert_dispatcher* is expected
     to never raise.
+
+    *capacity_check*, if given, is consulted BEFORE the convergence
+    counter is bumped or ``tier_of``/dispatch runs (#3770): a row for
+    which ``capacity_check(row)`` returns ``True`` is deferred — logged
+    with ``action="investigate-deferred"`` at whatever count/escalated
+    state the prior sweep left it at, added to ``touched`` (so
+    *clear_absent_rows* leaves it alone; it is still present, just not
+    reached this sweep), and otherwise skipped entirely: no counter
+    movement, no dispatch, no escalation. A row is only ever reached once
+    its own repo has a free slot, so a deferred row this sweep is simply
+    retried, unchanged, next sweep — bounding how many legs one sweep can
+    fan out without ever starving a row outright.
     """
     sweep_id = sweep_id or f"sweep-{(now or _utcnow)().strftime('%Y%m%dT%H%M%SZ')}"
     auto_dispatchers = auto_dispatchers or {}
@@ -583,6 +621,44 @@ def sweep(
                 cause=row.cause,
                 tier=tier_of(row.cause),
                 action="suppressed-baseline-red",
+                count=int(prior.get("count", 0)),
+                escalated=bool(prior.get("escalated", False)),
+                dry_run=dry_run,
+            )
+            report.decisions.append(decision)
+            if not dry_run:
+                state.record_board_doctor_decision(
+                    {
+                        "sweep_id": sweep_id,
+                        "queue": decision.queue,
+                        "key": decision.key,
+                        "cause": decision.cause,
+                        "tier": decision.tier,
+                        "action": decision.action,
+                        "count": decision.count,
+                        "escalated": decision.escalated,
+                        "confidence": row.confidence,
+                        "evidence": list(row.evidence),
+                        "recorded_at": (now or _utcnow)().isoformat(),
+                    }
+                )
+            continue
+        if capacity_check is not None and capacity_check(row):
+            # #3770: the row's repo has no free investigate-tier slot this
+            # sweep — present (so `clear_absent_rows` leaves its counter
+            # and any live escalation alone) but deliberately neither
+            # counted nor dispatched, same shape as the suppressed branch
+            # above. Reads (never writes) the persisted counter so the
+            # decision log / CLI still shows the row's last known count
+            # instead of a misleading ``count=0``, and a deferred row
+            # carries no escalation side effect of its own.
+            prior = state.board_doctor_row_state(row.queue, row.key) or {}
+            decision = Decision(
+                queue=row.queue,
+                key=row.key,
+                cause=row.cause,
+                tier=tier_of(row.cause),
+                action="investigate-deferred",
                 count=int(prior.get("count", 0)),
                 escalated=bool(prior.get("escalated", False)),
                 dry_run=dry_run,
@@ -685,14 +761,27 @@ def run_sweep(
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,
     escalation_resolver: Callable[[str, str], None] | None = None,
+    capacity_check: Callable[[StuckRow], bool] | None = _CAPACITY_CHECK_UNSET,
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
     The only function the CLI subcommand calls — everything it needs
     (`gh`, the board, the merge queue) is read here, so :func:`sweep` itself
     stays importable and runnable with none of that.
+
+    *capacity_check* defaults to the sentinel :data:`_CAPACITY_CHECK_UNSET`
+    rather than plain ``None`` (#3770): "caller did not pass it at all"
+    resolves to the real per-repo investigate-tier cap via
+    :func:`default_investigate_capacity`, while "caller explicitly passed
+    ``capacity_check=None``" disables capacity-gating entirely — a plain
+    ``None`` default could not tell those two cases apart.
     """
     rows = collect_rows(config=config)
+    resolved_capacity_check = (
+        default_investigate_capacity(config)
+        if capacity_check is _CAPACITY_CHECK_UNSET
+        else capacity_check
+    )
     return sweep(
         rows,
         tier_of=tier_of,
@@ -701,6 +790,7 @@ def run_sweep(
         dry_run=dry_run,
         convergence_limit=convergence_limit,
         escalation_resolver=escalation_resolver,
+        capacity_check=resolved_capacity_check,
     )
 
 

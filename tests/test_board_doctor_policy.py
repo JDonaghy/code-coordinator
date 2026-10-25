@@ -33,8 +33,11 @@ from coord.board_doctor_policy import (
     _register_auto_action,
     dismiss_resolved_escalation,
     escalation_alert_dispatcher,
+    make_investigate_capacity_check,
     policy_tier_of,
 )
+from coord.config import Config
+from coord.models import Assignment, Board, Repo
 
 _IN_FLIGHT_DETAIL = (
     "acme/widgets#40 already has a running or pending assignment — a "
@@ -514,6 +517,185 @@ class TestInvestigate:
 
         assert _investigate(row) is False
         assert state.list_drive_escalations() == []
+
+
+class TestInvestigateCapacityCheck:
+    """#3770: the investigate tier's per-repo cap, read straight from the
+    repo's own `max_parallel` (no second capacity knob), bounds how many
+    fix-it legs one sweep dispatches — the rest defer to the next hourly
+    sweep instead of fanning out unbounded, and a deferred row carries no
+    convergence or escalation side effect of its own.
+    """
+
+    @staticmethod
+    def _config(max_parallel: int) -> Config:
+        return Config(
+            repos=[
+                Repo(name="acme/widgets", github="acme/widgets", max_parallel=max_parallel)
+            ],
+            machines=[],
+        )
+
+    def test_at_the_cap_the_rest_defer_with_no_escalation(self, monkeypatch) -> None:
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
+
+        dispatched: list[str] = []
+
+        def fake_dispatch(action, repo_name, issue_number, board, config, **kwargs):
+            dispatched.append(f"{repo_name}#{issue_number}")
+            return {
+                "dispatched": True,
+                "assignment_id": "asn-1",
+                "machine": "mac1",
+                "detail": "dispatched",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+
+        def alert_must_not_fire(row: StuckRow):
+            raise AssertionError("a deferred row must never reach the alert tier")
+
+        config = self._config(max_parallel=1)
+        capacity_check = make_investigate_capacity_check(config)
+        cause = queue_diagnose.CAUSE_CI_RED
+        rows = [_row(f"acme/widgets#{n}", cause) for n in (40, 41, 42)]
+
+        report = sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=alert_must_not_fire,
+            capacity_check=capacity_check,
+        )
+
+        actions = {d.key: d.action for d in report.decisions}
+        assert actions["acme/widgets#40"] == "auto-dispatch"
+        assert actions["acme/widgets#41"] == "investigate-deferred"
+        assert actions["acme/widgets#42"] == "investigate-deferred"
+        assert dispatched == ["acme/widgets#40"]
+
+        # Deferred rows never had their convergence counter bumped, and no
+        # escalation was ever filed for them.
+        assert state.board_doctor_row_state("drive-queue", "acme/widgets#41") == {}
+        assert state.board_doctor_row_state("drive-queue", "acme/widgets#42") == {}
+        for d in report.decisions:
+            if d.action == "investigate-deferred":
+                assert d.escalated is False
+        assert state.list_drive_escalations() == []
+
+    def test_the_next_sweep_dispatches_the_deferred_row(self, monkeypatch) -> None:
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: Board(active=[]))
+
+        dispatched: list[str] = []
+
+        def fake_dispatch(action, repo_name, issue_number, board, config, **kwargs):
+            dispatched.append(f"{repo_name}#{issue_number}")
+            return {
+                "dispatched": True,
+                "assignment_id": "asn-1",
+                "machine": "mac1",
+                "detail": "dispatched",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+
+        config = self._config(max_parallel=1)
+        cause = queue_diagnose.CAUSE_CI_RED
+        rows = [_row(f"acme/widgets#{n}", cause) for n in (40, 41, 42)]
+
+        # First sweep: one gate, built fresh for this sweep (as a real
+        # hourly sweep does) — only the first row gets through.
+        sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False,
+            capacity_check=make_investigate_capacity_check(config),
+        )
+        assert dispatched == ["acme/widgets#40"]
+
+        # Second (hourly) sweep: a brand-new gate, same board/config — the
+        # mocked board stays empty (the fake dispatch never lands an
+        # assignment on it), so it is this sweep's own fresh reservation
+        # that lets the next row through — "still one agent per blocked
+        # item over time, just bounded instantaneously".
+        report2 = sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False,
+            capacity_check=make_investigate_capacity_check(config),
+        )
+
+        actions2 = {d.key: d.action for d in report2.decisions}
+        assert actions2["acme/widgets#40"] == "auto-dispatch"
+        assert actions2["acme/widgets#41"] == "investigate-deferred"
+        assert actions2["acme/widgets#42"] == "investigate-deferred"
+        assert dispatched == ["acme/widgets#40", "acme/widgets#40"]
+
+    def test_an_in_flight_leg_counts_toward_the_cap(self, monkeypatch) -> None:
+        # #C1's in-flight signal: a running work-like assignment for this
+        # repo (from a prior sweep's dispatch, or the drive loop itself)
+        # already occupies the repo's only slot, so capacity_check defers
+        # the row this sweep even though it never reaches a dispatcher.
+        busy_board = Board(
+            active=[
+                Assignment(
+                    machine_name="mac1",
+                    repo_name="acme/widgets",
+                    issue_number=40,
+                    issue_title="t",
+                    status="running",
+                    type="work",
+                )
+            ]
+        )
+        monkeypatch.setattr(state, "build_board", lambda: busy_board)
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError("an at-capacity repo must not dispatch")
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+
+        config = self._config(max_parallel=1)
+        capacity_check = make_investigate_capacity_check(config)
+        cause = queue_diagnose.CAUSE_CI_RED
+        rows = [_row("acme/widgets#41", cause)]
+
+        report = sweep(
+            rows,
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=lambda row: False,
+            capacity_check=capacity_check,
+        )
+
+        assert report.decisions[0].action == "investigate-deferred"
+
+    def test_a_non_investigate_cause_is_never_capacity_gated(self) -> None:
+        # #3760's C2 allowlist (mechanical fixes) is untouched by the
+        # investigate tier's cap — only INVESTIGATE_CAUSES rows ever reach
+        # the gate's cap-comparison logic at all.
+        config = self._config(max_parallel=1)
+        capacity_check = make_investigate_capacity_check(config)
+        row = _row("acme/widgets#40", CAUSE_CEILING_BLOCKED_MERGEABLE)
+
+        assert capacity_check(row) is False
+
+    def test_zero_max_parallel_means_unlimited_not_zero_capacity(self) -> None:
+        # `max_parallel=0` means "no per-repo ceiling at all" per
+        # `coord.drive_queue`'s own resolution semantics — never "never
+        # dispatch". A gate that got this backwards would silently stall
+        # every investigate-tier row for any repo with no explicit cap.
+        config = self._config(max_parallel=0)
+        capacity_check = make_investigate_capacity_check(config)
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        assert capacity_check(row) is False
 
 
 class TestInvestigateConvergence:
