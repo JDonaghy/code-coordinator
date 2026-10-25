@@ -248,34 +248,59 @@ def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple
     causes with no single-command remedy; the two causes below each have
     one:
 
-    * ``queue_diagnose.CAUSE_GATE_BLOCKED`` — the row is stuck behind
-      `coord merge`'s own `human_required` gate (a required check is red,
-      possibly flaky-and-unfixable-by-rerun per #3744). The only way past
-      that gate without a passing check is `coord merge`'s own
-      ``--override-human-required`` flag — surfaced here verbatim, never
-      run by the sweep itself.
+    * ``queue_diagnose.CAUSE_GATE_BLOCKED`` on a **merge-queue** row — this
+      cause is only ever minted there (`_MERGE_QUEUE_STUCK_CAUSE`) from the
+      queue's own ``human_required`` state (a required check is red,
+      possibly flaky-and-unfixable-by-rerun per #3744), so `coord merge`'s
+      own ``--override-human-required`` flag is always a valid next step —
+      surfaced here verbatim, never run by the sweep itself. On a
+      **drive-queue** row the same cause instead means
+      `queue_diagnose`'s generic ``live.gate_ready is False`` (unapproved
+      review, a different red required check, or a non-mergeable PR) — NOT
+      necessarily a merge-queue ``human_required`` state, so
+      ``coord merge --override-human-required`` would hard-error there;
+      this points at the read-only ``coord drive-queue diagnose`` instead,
+      to re-derive the actual blocker before deciding what to run.
     * :data:`coord.board_doctor.CAUSE_BASELINE_RED` — the repo's base is
       red (#3386), not this row; there is no per-row command that fixes a
-      broken base, so the suffix says so and the command stays
-      ``coord status`` — the streak clears on its own the next time the
-      base goes green.
+      broken base. `baseline_red_merge_blocked` only reclassifies a
+      merge-queue entry's OWN already-skipped smoke verdict once the
+      streak passes the limit (`coord.merge_queue`'s
+      `evaluate_smoke_verdict`) — it does not pause drive-queue dispatch of
+      new work/ci-fix legs against the repo, so the suffix says only what
+      is actually true rather than claiming a pause that doesn't exist;
+      the command stays ``coord status`` — the streak clears on its own
+      the next time the base goes green.
     """
     if row.cause == queue_diagnose.CAUSE_GATE_BLOCKED:
-        command = (
-            f'coord merge --only {repo_name}#{issue_number} '
-            '--override-human-required "<reason the override is safe>"'
-        )
+        if row.queue == "merge-queue":
+            command = (
+                f'coord merge --only {repo_name}#{issue_number} '
+                '--override-human-required "<reason the override is safe>"'
+            )
+            return (
+                " — a required gate is blocking merge; if it is flaky, deflake "
+                "or drop the check (#3744), otherwise force past it with: "
+                f"`{command}`",
+                command,
+            )
+        command = "coord drive-queue diagnose --json"
         return (
-            " — a required gate is blocking merge; if it is flaky, deflake "
-            "or drop the check (#3744), otherwise force past it with: "
-            f"`{command}`",
+            " — the live gate is not ready (unapproved review, a red "
+            "required check, or a non-mergeable PR — not necessarily a "
+            "merge-queue human_required state, so `coord merge "
+            "--override-human-required` may not apply here); re-derive the "
+            f"actual blocker with: `{command}`",
             command,
         )
     if row.cause == CAUSE_BASELINE_RED:
         return (
-            f" — {repo_name}'s merge base is red, so its queues are paused "
-            "until a real green run clears the streak; this is not fixable "
-            "per-row",
+            f" — {repo_name}'s merge base is red; this does not pause "
+            "dispatch of new work/ci-fix legs against it, but any "
+            "merge-queue entry whose own smoke run was skipped as "
+            "baseline-red will be blocked from merging once the streak "
+            "clears the limit — this is not fixable per-row, it clears on "
+            "its own the next time the base goes green",
             "coord status",
         )
     return ("", "coord status")

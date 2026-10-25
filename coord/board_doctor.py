@@ -130,12 +130,21 @@ def default_tier_of(cause: str) -> str:
 class StuckRow:
     """One drive-queue or merge-queue row this sweep looked at."""
 
-    queue: str  # "drive-queue" or "merge-queue"
+    queue: str  # "drive-queue", "merge-queue", or "baseline-red"
     key: str
     state: str
     cause: str
     confidence: str
     evidence: tuple[str, ...] = ()
+    #: #3761: True for a real per-row entry :func:`collect_rows` is folding
+    #: into a repo-wide :func:`baseline_red_rows` alert rather than acting
+    #: on individually. :func:`sweep` must still count it as present (so
+    #: `clear_absent_rows` does not treat the fold as "resolved" and wipe
+    #: its convergence counter / dismiss its live escalation — the row's
+    #: own cause is untouched, only superseded for THIS sweep) while
+    #: skipping its own dispatch/counter update entirely — the collapsed
+    #: baseline-red row is what alerts, once per repo, not this one.
+    suppressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -407,14 +416,34 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     }
     if blocked_streaks:
         # A red base poisons every row for that repo in both queues — they
-        # are not individually stuck, so collapse them all to the single
-        # synthetic row :func:`baseline_red_rows` builds, rather than
-        # sweeping (and risking a C3 auto-action against) each one.
-        rows = [
-            row
-            for row in rows
-            if row.key.rpartition("#")[0] not in blocked_streaks
-        ]
+        # are not individually stuck, so this withdraws them from this
+        # sweep's OWN tier/dispatch decision (no C3 auto-action, no second
+        # C4 alert) in favor of the single synthetic row
+        # :func:`baseline_red_rows` builds. #3761 review: marking them
+        # ``suppressed=True`` rather than dropping them from *rows*
+        # entirely is load-bearing — :func:`sweep`'s ``clear_absent_rows``
+        # walk treats anything missing from *rows* as resolved (wrong
+        # here: the underlying cause is untouched, just superseded for
+        # this sweep) and would wipe their convergence counters and
+        # dismiss any live escalation filed against them, only for them
+        # to reappear un-escalated — and re-page — the moment the base
+        # flaps green. Keeping the row present (just suppressed) keeps it
+        # in `sweep`'s ``touched`` set instead.
+        #
+        # #3761 non-blocking: this also withdraws C3 safe auto-actions
+        # (e.g. a stale `CAUSE_PR_MERGED` row's cleanup) while the streak
+        # holds — deliberate, since any per-row action here would be
+        # against evidence this sweep no longer trusts (the base, not the
+        # row, is why the queue diagnosis is unreliable right now).
+        from coord.board_doctor_policy import _parse_row_key  # noqa: PLC0415
+
+        def _suppress_if_blocked(row: StuckRow) -> StuckRow:
+            parsed = _parse_row_key(row.key)
+            if parsed is not None and parsed[0] in blocked_streaks:
+                return replace(row, suppressed=True)
+            return row
+
+        rows = [_suppress_if_blocked(row) for row in rows]
         rows.extend(baseline_red_rows(blocked_streaks))
     return rows
 
@@ -472,6 +501,14 @@ def sweep(
     *dry_run* classifies and logs but dispatches nothing and writes no
     convergence counter — a second sweep immediately after a dry run sees
     the SAME state a first sweep would, by construction.
+
+    A row with ``suppressed=True`` (:func:`collect_rows`'s baseline-red
+    fold, #3761) is counted as present — it is added to ``touched`` and
+    logged with ``action="suppressed-baseline-red"`` — but skips tier
+    decision, convergence counting, and both dispatch paths entirely: it
+    is withdrawn from THIS sweep's own decision in favor of the single
+    collapsed baseline-red row elsewhere in *rows*, not resolved, so it
+    must not be treated as absent by *clear_absent_rows* below.
 
     "CONSECUTIVE sweeps" (the module docstring's convergence contract) is
     only true if a row that stops appearing also stops counting. *rows* is
@@ -531,6 +568,43 @@ def sweep(
 
     for row in rows:
         touched.add((row.queue, row.key))
+        if row.suppressed:
+            # #3761: present (so `clear_absent_rows` below leaves its
+            # counter and any live escalation alone) but deliberately
+            # neither counted nor dispatched — the collapsed baseline-red
+            # row elsewhere in *rows* is what alerts for this repo. Reads
+            # (never writes) the persisted counter purely so the decision
+            # log / CLI can still show what this row was last known at,
+            # instead of a misleading ``count=0``.
+            prior = state.board_doctor_row_state(row.queue, row.key) or {}
+            decision = Decision(
+                queue=row.queue,
+                key=row.key,
+                cause=row.cause,
+                tier=tier_of(row.cause),
+                action="suppressed-baseline-red",
+                count=int(prior.get("count", 0)),
+                escalated=bool(prior.get("escalated", False)),
+                dry_run=dry_run,
+            )
+            report.decisions.append(decision)
+            if not dry_run:
+                state.record_board_doctor_decision(
+                    {
+                        "sweep_id": sweep_id,
+                        "queue": decision.queue,
+                        "key": decision.key,
+                        "cause": decision.cause,
+                        "tier": decision.tier,
+                        "action": decision.action,
+                        "count": decision.count,
+                        "escalated": decision.escalated,
+                        "confidence": row.confidence,
+                        "evidence": list(row.evidence),
+                        "recorded_at": (now or _utcnow)().isoformat(),
+                    }
+                )
+            continue
         if dry_run:
             prior = state.board_doctor_row_state(row.queue, row.key) or None
             updated = state.next_board_doctor_counter(prior, row.cause)

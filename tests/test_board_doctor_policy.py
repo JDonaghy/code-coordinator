@@ -244,11 +244,15 @@ class TestEscalationAlertDispatcher:
 
         assert escalation_alert_dispatcher(_row("acme/widgets#13", "ci_red")) is False
 
-    def test_gate_blocked_row_gets_a_ready_to_run_override_command(self) -> None:
-        # #3761: a force-merge-needing row surfaces a one-line, ready-to-run
-        # command rather than the generic "coord status" pointer — the
-        # sweep itself never runs it.
-        row = _row("acme/widgets#21", queue_diagnose.CAUSE_GATE_BLOCKED)
+    def test_gate_blocked_merge_queue_row_gets_the_override_command(self) -> None:
+        # #3761: on a merge-queue row this cause is only ever minted from
+        # the queue's own `human_required` state, so the override is
+        # always valid there — surfaced as a one-line, ready-to-run command
+        # rather than the generic "coord status" pointer. The sweep itself
+        # never runs it.
+        row = _row(
+            "acme/widgets#21", queue_diagnose.CAUSE_GATE_BLOCKED, queue="merge-queue"
+        )
 
         assert escalation_alert_dispatcher(row) is True
 
@@ -259,6 +263,24 @@ class TestEscalationAlertDispatcher:
             '--override-human-required "<reason the override is safe>"'
         )
         assert "--override-human-required" in escalation["reason"]
+
+    def test_gate_blocked_drive_queue_row_points_at_diagnose_not_override(self) -> None:
+        # #3761 review: on a drive-queue row this cause means generic
+        # `live.gate_ready is False` (unapproved review, a different red
+        # required check, or a non-mergeable PR) — NOT necessarily a
+        # merge-queue `human_required` state, so `coord merge
+        # --override-human-required` would hard-error there. The surfaced
+        # command must be the read-only diagnose, not the override.
+        row = _row(
+            "acme/widgets#21", queue_diagnose.CAUSE_GATE_BLOCKED, queue="drive-queue"
+        )
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 21)
+        assert escalation is not None
+        assert escalation["proposed_command"] == "coord drive-queue diagnose --json"
+        assert "--override-human-required" not in escalation["proposed_command"]
 
     def test_baseline_red_row_keeps_coord_status_with_an_explanatory_reason(self) -> None:
         # #3761: there is no single per-row command that fixes a red base,
