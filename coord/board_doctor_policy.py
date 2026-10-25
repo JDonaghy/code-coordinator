@@ -25,17 +25,47 @@ guess. #3760 (C3) names exactly two such causes, each wired below via
   there is nothing left for the queue to track; ``drive_queue_remove``
   clears it.
 
-Every other cause stays unregistered until it has the same kind of
-reviewed, narrowly-scoped evidence behind it — a wrong auto-action default
-is worse than an extra, harmless alert — so :data:`ALLOWLIST` growing
-beyond these two is a deliberate, one-at-a-time decision, not a bulk
-promotion of a whole existing cause bucket.
+Every other mechanical cause stays off this allow-list until it has the
+same kind of reviewed, narrowly-scoped evidence behind it — a wrong
+auto-action default is worse than an extra, harmless alert — so
+:data:`ALLOWLIST` growing beyond these two is a deliberate, one-at-a-time
+decision, not a bulk promotion of a whole existing cause bucket.
 
 :func:`_register_auto_action` also checks every new entry's action name
 against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` (#3745's C2
 enforcement boundary) before adding it, and :func:`policy_tier_of` checks
 it again at read time — so this allow-list can never promote a cause to
 auto-tier for an action that module's own closed list does not permit.
+
+Why alert-eligible causes go through the investigate tier (#3769)
+-------------------------------------------------------------------
+A cause with no known-safe mechanical fix still does not have to jump
+straight to paging a human. :data:`INVESTIGATE_CAUSES` names the causes
+that instead get a fix-it leg dispatched against them
+(`coord.board_doctor_permissions.sweep_dispatch_fixit_leg`, #3768's C1) —
+registered into :data:`AUTO_DISPATCHERS` the same way as the mechanical
+two, but kept out of :data:`ALLOWLIST`, which is reserved for fixes that
+touch the queue row itself rather than spawning a worker leg.
+:func:`_investigate` is the one handler behind every entry: it builds the
+board/config the primitive needs, derives ``(repo, issue)`` from the row
+key, and dispatches. The primitive's own in-flight check (a running or
+pending work-like assignment, or a live `coord drive` session) is the
+"only investigate a row the drive loop has given up on" trigger guard —
+reused as-is rather than re-derived here, so there is exactly one place
+that answers "is this issue already being worked." The same call's
+machine-routing decision (`coord.auto_loop._dispatch_fix` ->
+`coord.dispatch.select_fix_machine`) is the "pin to a capable host or
+refuse" guard; when it declines, :func:`_investigate` falls back to
+:func:`escalation_alert_dispatcher` for that row instead of leaving it
+silently unhandled.
+
+`coord.board_doctor.sweep`'s own convergence/escalate-once machinery
+(#3758) is untouched by any of this: a row that keeps re-diagnosing to
+the same investigate-eligible cause for `CONVERGENCE_LIMIT` sweeps stops
+being handed to :func:`_investigate` and falls to the alert tier exactly
+once, the same as it already does for every :data:`TIER_AUTO` cause —
+this module only decides WHICH causes reach that path as auto-tier, not
+how the path itself behaves.
 
 Why the alert path reuses `drive_escalations`
 ------------------------------------------------
@@ -70,6 +100,16 @@ from coord.board_doctor_permissions import (
     dispatch_sweep_action,
 )
 
+#: A fix-it-leg dispatch is already in flight for this row — both
+#: `coord.board_doctor_permissions.sweep_dispatch_fixit_leg` detail strings
+#: for "don't dispatch a second one" (a running/pending work-like
+#: assignment, or a live `coord drive` session) share this substring, so
+#: :func:`_investigate` can tell "leave it alone, the drive loop is
+#: already on it" apart from the two detail strings that mean "nothing is
+#: in flight and the leg still didn't start" without re-deriving either
+#: check itself (#3769).
+_FIXIT_LEG_IN_FLIGHT_MARKER = "already in flight"
+
 #: cause -> auto-action name. Populated only via :func:`_register_auto_action`
 #: — never by assigning into this dict directly, so every entry is also
 #: checked against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` — the
@@ -88,6 +128,17 @@ ALLOWLIST: dict[str, str] = {}
 #: underlying primitive reported a no-op, and :func:`coord.board_doctor.sweep`
 #: must not log that as a successful auto-dispatch.
 AUTO_DISPATCHERS: dict[str, Callable[[StuckRow], bool]] = {}
+
+#: Causes routed to the investigate tier (#3769) rather than either
+#: :data:`ALLOWLIST`'s mechanical fixes or straight to the alert tier.
+#: Populated only via :func:`_register_investigate_action`, kept as its
+#: own set (never folded into :data:`ALLOWLIST`) because these causes have
+#: no known-safe fix for the queue row itself — the module docstring's
+#: "not a bulk promotion" rule for :data:`ALLOWLIST` still applies to
+#: THAT dict; this is a separate decision about a separate action
+#: (``dispatch_fixit_leg``) with its own, already-conservative built-in
+#: no-ops (#3768's in-flight lock and machine-routing refusal).
+INVESTIGATE_CAUSES: set[str] = set()
 
 
 def _register_auto_action(
@@ -119,27 +170,37 @@ def _register_auto_action(
 
 
 def policy_tier_of(cause: str) -> str:
-    """#3745's C2: real (if currently conservative) cause -> tier policy.
+    """#3745's C2 (extended by #3769): cause -> tier policy.
 
-    Returns :data:`coord.board_doctor.TIER_AUTO` only when *cause* is
-    present in BOTH :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS` AND the
-    action :data:`ALLOWLIST` names for it is on `coord
-    .board_doctor_permissions.SAFE_TIER_ACTIONS` — not merely present in
-    both local mappings. That third check is what makes this module's
-    allow-list answer to the sweep's actual permission boundary instead of
-    being a second, independently-maintained copy of it: an entry naming an
-    action outside the safe tier (which :func:`_register_auto_action` will
-    already have refused to create, but a direct-assignment bug could still
-    produce) gets :data:`coord.board_doctor.TIER_ALERT`, the same as a
-    cause with no entry at all. This is the function `coord drive-queue
-    sweep` wires in as `tier_of`.
+    Returns :data:`coord.board_doctor.TIER_AUTO` for a *cause* reaching
+    auto-tier by either of two routes, each gated on the same safe-tier
+    check so neither can promote a cause for an action
+    `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` does not permit:
+
+    * The #3760 mechanical route — *cause* present in BOTH
+      :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS`, and the action
+      :data:`ALLOWLIST` names for it is on ``SAFE_TIER_ACTIONS``.
+    * The #3769 investigate route — *cause* present in BOTH
+      :data:`INVESTIGATE_CAUSES` and :data:`AUTO_DISPATCHERS`, and
+      ``"dispatch_fixit_leg"`` is on ``SAFE_TIER_ACTIONS``.
+
+    Everything else — including an :data:`ALLOWLIST` entry naming an
+    action outside the safe tier, which :func:`_register_auto_action` will
+    already have refused to create but a direct-assignment bug could
+    still produce — gets :data:`coord.board_doctor.TIER_ALERT`, the same
+    as a cause with no entry at all. This is the function `coord
+    drive-queue sweep` wires in as `tier_of`.
     """
     action = ALLOWLIST.get(cause)
-    if action is None or cause not in AUTO_DISPATCHERS:
-        return TIER_ALERT
-    if action not in SAFE_TIER_ACTIONS:
-        return TIER_ALERT
-    return TIER_AUTO
+    if action is not None and cause in AUTO_DISPATCHERS and action in SAFE_TIER_ACTIONS:
+        return TIER_AUTO
+    if (
+        cause in INVESTIGATE_CAUSES
+        and cause in AUTO_DISPATCHERS
+        and "dispatch_fixit_leg" in SAFE_TIER_ACTIONS
+    ):
+        return TIER_AUTO
+    return TIER_ALERT
 
 
 def _board_doctor_stage(queue: str) -> str:
@@ -237,6 +298,145 @@ _register_auto_action(
     "drive_queue_remove",
     _clear_merged_row,
 )
+
+
+def _alert_fallback(row: StuckRow) -> bool:
+    """Replicate `coord.board_doctor.sweep`'s own private ``_alert_action``
+    confirmed-dispatch contract for a row :func:`_investigate` is falling
+    back on (#3769).
+
+    Only `escalation_alert_dispatcher` returning truthy (never
+    :data:`ALERT_SKIPPED`, never an exception) marks the row escalated via
+    `coord.state.mark_board_doctor_escalated` — the same "unconfirmed
+    success is a defect" rule `sweep` itself applies, so a row this helper
+    could not actually get an alert filed for stays un-escalated and the
+    next sweep gets another chance, rather than this module silently
+    assuming its own fallback worked.
+    """
+    outcome = escalation_alert_dispatcher(row)
+    if outcome is ALERT_SKIPPED or not outcome:
+        return False
+    from coord.state import mark_board_doctor_escalated  # noqa: PLC0415
+
+    mark_board_doctor_escalated(row.queue, row.key)
+    return True
+
+
+def _investigate(row: StuckRow) -> bool:
+    """#3769's C1 wiring: dispatch a fix-it leg for an alert-eligible
+    cause instead of paging a human outright.
+
+    Builds the board/config `sweep_dispatch_fixit_leg` needs itself
+    (deferred imports — `coord.board_doctor.sweep` never threads a board
+    through to auto-dispatchers, only *row*) and derives ``(repo, issue)``
+    from ``row.key`` the same way every other handler in this module does.
+    A config that fails to resolve/load is treated as a routing failure,
+    not a crash: it falls back to the alert tier the same as a declined
+    machine pin would, since neither case has anywhere safe left to
+    dispatch a leg.
+
+    `sweep_dispatch_fixit_leg` itself is both the trigger guard ("only
+    investigate a row the drive loop has given up on" — its own in-flight
+    check against a running/pending work-like assignment or a live
+    `coord drive` session) and the machine-routing guard ("pin to a
+    capable host or refuse" — via `coord.auto_loop._dispatch_fix` ->
+    `coord.dispatch.select_fix_machine`), so this function never
+    re-derives either check; it only reads the primitive's own
+    :class:`~coord.board_doctor_permissions.FixitLegDispatch` result,
+    which documents exactly this disambiguation as its intended use:
+
+    * ``dispatched=True`` — a leg started; returns ``True``.
+    * ``dispatched=False`` with :data:`_FIXIT_LEG_IN_FLIGHT_MARKER` in
+      ``detail`` — the drive loop (or a prior fix-it leg) is already on
+      this row; left alone, returns ``False`` with no alert filed.
+    * ``dispatched=False`` otherwise — no originating work assignment, or
+      `_dispatch_fix` declined (no capable machine, unreachable agent,
+      …) — falls back to :func:`_alert_fallback` so the row still gets a
+      human-visible alert rather than silently going nowhere.
+
+    This function's return value answers exactly one question — "was a
+    fix-it leg dispatched?" — never "was the alert fallback delivered?".
+    Every fallback branch (unparseable key, unresolvable config, no safe
+    machine to pin) calls :func:`_alert_fallback` only for its side effect
+    and always returns ``False`` regardless of whether the fallback alert
+    itself was confirmed delivered.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        _alert_fallback(row)
+        return False
+    repo_name, issue_number = parsed
+
+    import click  # noqa: PLC0415
+
+    from coord.commands._common import ConfigError, resolve_and_load_config  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    try:
+        config = resolve_and_load_config(None)
+    except ConfigError as exc:
+        click.echo(
+            f"warning: board-doctor could not load config to investigate "
+            f"{repo_name}#{issue_number}: {exc}",
+            err=True,
+        )
+        _alert_fallback(row)
+        return False
+
+    board = build_board()
+    result = dispatch_sweep_action(
+        "dispatch_fixit_leg",
+        repo_name,
+        issue_number,
+        board,
+        config,
+        cause=row.cause,
+        evidence=row.evidence,
+    )
+    if result.get("dispatched"):
+        return True
+    detail = result.get("detail", "")
+    if _FIXIT_LEG_IN_FLIGHT_MARKER in detail:
+        return False
+    click.echo(
+        f"warning: board-doctor fix-it leg not dispatched for "
+        f"{repo_name}#{issue_number}: {detail}",
+        err=True,
+    )
+    _alert_fallback(row)
+    return False
+
+
+def _register_investigate_action(cause: str) -> None:
+    """The only way this module may populate :data:`INVESTIGATE_CAUSES` /
+    :data:`AUTO_DISPATCHERS` for the investigate tier (#3769) — mirrors
+    :func:`_register_auto_action`'s authorization discipline without
+    touching :data:`ALLOWLIST`, which stays reserved for mechanical,
+    per-cause-reviewed fixes (see the module docstring).
+    """
+    authorize_sweep_action("dispatch_fixit_leg")
+
+    def _gated(row: StuckRow) -> bool:
+        authorize_sweep_action("dispatch_fixit_leg")
+        return _investigate(row)
+
+    INVESTIGATE_CAUSES.add(cause)
+    AUTO_DISPATCHERS[cause] = _gated
+
+
+for _investigate_cause in (
+    queue_diagnose.CAUSE_PR_CLOSED,
+    queue_diagnose.CAUSE_MERGE_CONFLICT,
+    queue_diagnose.CAUSE_DEAD_LEG,
+    queue_diagnose.CAUSE_NO_PR,
+    queue_diagnose.CAUSE_CI_RED,
+    queue_diagnose.CAUSE_CI_PENDING,
+    queue_diagnose.CAUSE_GATE_BLOCKED,
+    queue_diagnose.CAUSE_AGENT_UNREACHABLE,
+    queue_diagnose.CAUSE_UNKNOWN,
+):
+    _register_investigate_action(_investigate_cause)
+del _investigate_cause
 
 
 def _alert_resolution(row: StuckRow, repo_name: str, issue_number: int) -> tuple[str, str]:

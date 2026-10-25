@@ -11,23 +11,38 @@ from __future__ import annotations
 
 import pytest
 
+import coord.board_doctor_policy as board_doctor_policy
+import coord.commands._common as common
 from coord import queue_diagnose, state
 from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CONVERGENCE_LIMIT,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
+    sweep,
 )
 from coord.board_doctor_permissions import SweepPermissionError
 from coord.board_doctor_policy import (
     ALLOWLIST,
     AUTO_DISPATCHERS,
+    INVESTIGATE_CAUSES,
+    _investigate,
     _register_auto_action,
     dismiss_resolved_escalation,
     escalation_alert_dispatcher,
     policy_tier_of,
+)
+
+_IN_FLIGHT_DETAIL = (
+    "acme/widgets#40 already has a running or pending assignment — a "
+    "fix-it leg is already in flight, not dispatching a second one"
+)
+_UNPINNABLE_DETAIL = (
+    "acme/widgets#40 fix-it leg dispatch could not be confirmed started — "
+    "no capable machine, an unreachable agent, or a declined dispatch"
 )
 
 
@@ -57,13 +72,18 @@ class TestPolicyTierOf:
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:
+        # Causes with no safe mechanical fix AND no investigate-tier
+        # dispatcher registered (#3769): "nothing actually wrong" states
+        # (nothing-blocking, ci-green), a whole-repo condition no single
+        # row can fix (baseline-red), and a genuinely unknown string.
         for cause in (
             "no_pr",
             "merge_conflict",
             "dead_leg",
             "ci_red",
             "anything_else",
-            queue_diagnose.CAUSE_GATE_BLOCKED,
+            queue_diagnose.CAUSE_NOTHING_BLOCKING,
+            queue_diagnose.CAUSE_CI_GREEN,
             CAUSE_BASELINE_RED,
         ):
             assert policy_tier_of(cause) == TIER_ALERT
@@ -71,6 +91,28 @@ class TestPolicyTierOf:
     def test_registered_3760_causes_are_auto_tier(self) -> None:
         assert policy_tier_of(CAUSE_CEILING_BLOCKED_MERGEABLE) == TIER_AUTO
         assert policy_tier_of(queue_diagnose.CAUSE_PR_MERGED) == TIER_AUTO
+
+    def test_investigate_eligible_causes_are_auto_tier_via_fixit_leg(self) -> None:
+        # #3769: a cause with no safe mechanical fix still reaches
+        # TIER_AUTO once it is routed to the investigate tier — it lands in
+        # AUTO_DISPATCHERS (what the cause -> TIER_AUTO check actually
+        # reads) but never in ALLOWLIST, which stays reserved for fixes
+        # that touch the queue row itself (#3760).
+        assert INVESTIGATE_CAUSES == {
+            queue_diagnose.CAUSE_PR_CLOSED,
+            queue_diagnose.CAUSE_MERGE_CONFLICT,
+            queue_diagnose.CAUSE_DEAD_LEG,
+            queue_diagnose.CAUSE_NO_PR,
+            queue_diagnose.CAUSE_CI_RED,
+            queue_diagnose.CAUSE_CI_PENDING,
+            queue_diagnose.CAUSE_GATE_BLOCKED,
+            queue_diagnose.CAUSE_AGENT_UNREACHABLE,
+            queue_diagnose.CAUSE_UNKNOWN,
+        }
+        for cause in INVESTIGATE_CAUSES:
+            assert policy_tier_of(cause) == TIER_AUTO
+            assert cause in AUTO_DISPATCHERS
+            assert cause not in ALLOWLIST
 
     def test_a_future_allowlist_entry_would_be_honored(self, monkeypatch) -> None:
         # Pins the seam itself, not a specific entry: if a cause is ever
@@ -337,3 +379,143 @@ class TestDismissResolvedEscalation:
 
     def test_missing_escalation_does_not_raise(self) -> None:
         dismiss_resolved_escalation("drive-queue", "acme/widgets#404")
+
+
+class TestInvestigate:
+    """#3769's C1 wiring: `_investigate` is the one handler behind every
+    entry in :data:`INVESTIGATE_CAUSES`.
+    """
+
+    def test_dispatches_a_fixit_leg_when_the_drive_loop_has_given_up(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: object())
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {
+                "dispatched": True,
+                "assignment_id": "asn-1",
+                "machine": "mac1",
+                "detail": "acme/widgets#40 fix-it leg dispatched to mac1 (iteration 1)",
+            },
+        )
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        assert _investigate(row) is True
+        # A started leg is not an alert-worthy outcome.
+        assert state.list_drive_escalations() == []
+
+    def test_leaves_an_in_flight_row_alone(self, monkeypatch) -> None:
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: object())
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {
+                "dispatched": False,
+                "assignment_id": None,
+                "machine": None,
+                "detail": _IN_FLIGHT_DETAIL,
+            },
+        )
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        assert _investigate(row) is False
+        # The drive loop (or a prior fix-it leg) is already on this row —
+        # left alone, no human-visible alert filed.
+        assert state.list_drive_escalations() == []
+
+    def test_falls_back_to_the_alert_tier_when_no_machine_can_be_pinned(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: object())
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {
+                "dispatched": False,
+                "assignment_id": None,
+                "machine": None,
+                "detail": _UNPINNABLE_DETAIL,
+            },
+        )
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        assert _investigate(row) is False
+        escalation = state.get_drive_escalation("acme/widgets", 40)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+
+    def test_falls_back_to_the_alert_tier_when_config_cannot_be_resolved(
+        self, monkeypatch
+    ) -> None:
+        def boom(path, **kwargs):
+            raise common.ConfigError("no config file found")
+
+        monkeypatch.setattr(common, "resolve_and_load_config", boom)
+        row = _row("acme/widgets#40", queue_diagnose.CAUSE_CI_RED)
+
+        assert _investigate(row) is False
+        escalation = state.get_drive_escalation("acme/widgets", 40)
+        assert escalation is not None
+
+    def test_unparseable_key_does_not_raise(self) -> None:
+        row = _row("no-hash-separator", queue_diagnose.CAUSE_CI_RED)
+
+        assert _investigate(row) is False
+        assert state.list_drive_escalations() == []
+
+
+class TestInvestigateConvergence:
+    def test_same_row_escalates_once_after_the_convergence_limit(
+        self, monkeypatch
+    ) -> None:
+        # #3769's last acceptance criterion: this is `coord.board_doctor
+        # .sweep`'s existing #3758 convergence contract (untouched by this
+        # issue) exercised against the real `policy_tier_of` /
+        # `AUTO_DISPATCHERS` / `escalation_alert_dispatcher` this module
+        # wires in, not a new mechanism — the same row left alone every
+        # sweep (drive loop still on it, so `_investigate` never alerts on
+        # its own) nonetheless escalates exactly once once the sweep count
+        # reaches CONVERGENCE_LIMIT, and stops being handed to
+        # `_investigate` at all after that.
+        monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
+        monkeypatch.setattr(state, "build_board", lambda: object())
+
+        calls: list[int] = []
+
+        def fake_dispatch(*args, **kwargs):
+            calls.append(1)
+            return {
+                "dispatched": False,
+                "assignment_id": None,
+                "machine": None,
+                "detail": _IN_FLIGHT_DETAIL,
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+
+        key = "acme/widgets#40"
+        cause = queue_diagnose.CAUSE_CI_RED
+        for _ in range(5):
+            sweep(
+                [_row(key, cause)],
+                tier_of=policy_tier_of,
+                auto_dispatchers=AUTO_DISPATCHERS,
+                alert_dispatcher=escalation_alert_dispatcher,
+                convergence_limit=CONVERGENCE_LIMIT,
+            )
+
+        # Sweeps 1-2 dispatch (left alone, no alert); sweep 3 hits the
+        # convergence limit and escalates via the alert tier exactly once,
+        # bypassing `_investigate` entirely; sweeps 4-5 neither re-dispatch
+        # nor re-alert.
+        assert len(calls) == CONVERGENCE_LIMIT - 1
+        row_state = state.board_doctor_row_state("drive-queue", key)
+        assert row_state["escalated"] is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 40)
+        assert escalation is not None
