@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from coord import state
 from coord.board_doctor import (
+    ALERT_SKIPPED,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
@@ -95,6 +96,150 @@ class TestSweepClassifiesAndDispatches:
         assert logged_by_key["repo#1"]["evidence"] == ["cause=no_pr"]
         assert logged_by_key["repo#2"]["cause"] == "merge_conflict"
         assert logged_by_key["repo#2"]["action"] == "alert"
+
+
+class TestAlertDeliveryIsConfirmed:
+    """The failure half of the confirmed-delivery contract.
+
+    `sweep` may only mark a row escalated — which permanently suppresses
+    further alerts for that cause — when the dispatcher CONFIRMS delivery.
+    These drive dispatchers that fail (falsy return), blow up (raise) and
+    deliberately decline (`ALERT_SKIPPED`), and assert the sweep keeps
+    retrying instead of recording a human as notified.
+    """
+
+    def test_falsy_return_reports_alert_failed_and_leaves_the_row_unescalated(
+        self,
+    ) -> None:
+        key = "repo#201"
+
+        report = sweep(
+            [_row(key, "ci_red")],
+            tier_of=_always(TIER_ALERT),
+            alert_dispatcher=lambda row: False,  # noqa: ARG005
+            sweep_id="sweep-failed-1",
+        )
+
+        decision = report.decisions[0]
+        assert decision.action == "alert-failed"
+        assert decision.escalated is False
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is False
+
+        logged = state.board_doctor_decisions()
+        assert [entry["action"] for entry in logged] == ["alert-failed"]
+
+    def test_raising_dispatcher_reports_alert_failed_rather_than_crashing(self) -> None:
+        key = "repo#202"
+
+        def boom(row: StuckRow) -> bool:
+            raise RuntimeError("database is locked")
+
+        report = sweep(
+            [_row(key, "ci_red")],
+            tier_of=_always(TIER_ALERT),
+            alert_dispatcher=boom,
+        )
+
+        decision = report.decisions[0]
+        assert decision.action == "alert-failed"
+        assert decision.escalated is False
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is False
+
+    def test_a_failed_alert_is_re_attempted_by_the_next_sweep(self) -> None:
+        """The whole point of not marking a failed alert escalated."""
+        key = "repo#203"
+        cause = "ci_red"
+        attempts: list[StuckRow] = []
+        delivers = False
+
+        def flaky(row: StuckRow) -> bool:
+            attempts.append(row)
+            return delivers
+
+        first = sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_ALERT),
+            alert_dispatcher=flaky,
+        )
+        assert first.decisions[0].action == "alert-failed"
+        assert len(attempts) == 1
+
+        delivers = True
+        second = sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_ALERT),
+            alert_dispatcher=flaky,
+        )
+        assert len(attempts) == 2  # re-invoked, not suppressed
+        assert second.decisions[0].action == "alert"
+        assert second.decisions[0].escalated is True
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is True
+
+        # Now that delivery IS confirmed, the "escalate exactly once"
+        # contract takes over again.
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_ALERT),
+            alert_dispatcher=flaky,
+        )
+        assert len(attempts) == 2
+
+    def test_a_failed_alert_on_the_convergence_fallback_also_retries(self) -> None:
+        """The auto-tier path at the convergence limit uses the same seam."""
+        key = "repo#204"
+        cause = "ci_red"
+        dispatch = _Recorder()
+        attempts: list[StuckRow] = []
+
+        def failing(row: StuckRow) -> bool:
+            attempts.append(row)
+            return False
+
+        for _ in range(5):
+            sweep(
+                [_row(key, cause)],
+                tier_of=_always(TIER_AUTO),
+                auto_dispatchers={cause: dispatch},
+                alert_dispatcher=failing,
+                convergence_limit=3,
+            )
+
+        # Sweeps 1-2 auto-dispatch; sweeps 3-5 are at/past the limit and
+        # each re-attempt the alert, because none of them was confirmed.
+        assert dispatch.count == 2
+        assert len(attempts) == 3
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is False
+
+    def test_a_skipped_alert_is_labelled_distinctly_and_still_retried(self) -> None:
+        """A dispatcher declining to file is not a delivered alert.
+
+        `coord.board_doctor_policy.escalation_alert_dispatcher` returns
+        this when a more specific escalation already covers the issue —
+        nothing board-doctor filed, so nothing may be suppressed.
+        """
+        key = "repo#205"
+        cause = "ci_red"
+        attempts: list[StuckRow] = []
+
+        def declining(row: StuckRow) -> str:
+            attempts.append(row)
+            return ALERT_SKIPPED
+
+        first = sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_ALERT),
+            alert_dispatcher=declining,
+        )
+        assert first.decisions[0].action == "alert-skipped"
+        assert first.decisions[0].escalated is False
+        assert state.board_doctor_row_state("drive-queue", key)["escalated"] is False
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_ALERT),
+            alert_dispatcher=declining,
+        )
+        assert len(attempts) == 2
 
 
 class TestConvergence:
@@ -261,6 +406,37 @@ class TestConvergence:
             escalation_resolver=lambda queue, k: resolved.append((queue, k)),
         )
         assert resolved == [("drive-queue", key)]
+
+    def test_a_raising_escalation_resolver_does_not_abort_the_clear_walk(self) -> None:
+        """One row's cleanup blowing up must not strand the others."""
+        dispatch = _Recorder()
+        alert = _Recorder()
+        keys = ("repo#15", "repo#16")
+        cause = "ci_red"
+        seen: list[tuple[str, str]] = []
+
+        def exploding(queue: str, key: str) -> None:
+            seen.append((queue, key))
+            raise RuntimeError("escalation store unreachable")
+
+        sweep(
+            [_row(key, cause) for key in keys],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+        )
+
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            escalation_resolver=exploding,
+        )
+
+        assert sorted(seen) == [("drive-queue", k) for k in keys]
+        for key in keys:
+            assert state.board_doctor_row_state("drive-queue", key) == {}
 
     def test_clear_absent_rows_false_leaves_a_partial_walks_counters_alone(
         self,

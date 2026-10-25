@@ -57,6 +57,14 @@ from coord import queue_diagnose
 TIER_AUTO = "auto"
 TIER_ALERT = "alert"
 
+#: Third state an ``alert_dispatcher`` may return, alongside truthy
+#: (delivered) and falsy (not delivered): the dispatcher deliberately
+#: filed nothing for this row — e.g. a more specific alert from another
+#: writer already covers the same issue. :func:`sweep` records it as
+#: ``action="alert-skipped"`` and leaves the row UN-escalated, so once
+#: that cover goes away a later sweep attempts the alert again.
+ALERT_SKIPPED = "skipped"
+
 #: Sweeps a row may stay on the same cause before the harness stops
 #: re-acting on it and escalates once to the alert tier (#3758).
 CONVERGENCE_LIMIT = 3
@@ -107,7 +115,7 @@ class Decision:
     cause: str
     tier: str
     #: "auto-dispatch" | "alert" | "would-alert" | "alert-failed" |
-    #: "no-dispatcher" | "converged-noop"
+    #: "alert-skipped" | "no-dispatcher" | "converged-noop"
     action: str
     count: int
     escalated: bool
@@ -279,7 +287,7 @@ def sweep(
     *,
     tier_of: Callable[[str], str] = default_tier_of,
     auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
-    alert_dispatcher: Callable[[StuckRow], bool] | None = None,
+    alert_dispatcher: Callable[[StuckRow], bool | str] | None = None,
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,
     sweep_id: str | None = None,
@@ -309,7 +317,9 @@ def sweep(
          exactly once per (row, cause), the "escalate exactly once" half
          of #3758. A dispatcher that raises or returns falsy leaves
          ``escalated`` False so the next sweep retries, rather than
-         silently treating an unconfirmed write as done.
+         silently treating an unconfirmed write as done; returning
+         :data:`ALERT_SKIPPED` does the same while saying the dispatcher
+         chose not to file, not that filing failed.
       4. Auto tier: dispatch via ``auto_dispatchers[cause]`` while under
          *convergence_limit*; at/past the limit, fall back to the alert
          path exactly once instead of re-dispatching the same auto action
@@ -355,21 +365,22 @@ def sweep(
         """Attempt the alert path for *row*; returns (escalated, action).
 
         Only a CONFIRMED dispatch (truthy return) marks the row escalated
-        and persists that via `state.mark_board_doctor_escalated` — an
-        exception or falsy return from *alert_dispatcher* must not look
-        like a successful alert, so the next sweep gets another chance to
-        actually deliver it (#2268 review finding: an always-``None``-
-        returning dispatcher used to permanently suppress future alerts).
+        and persists that via `state.mark_board_doctor_escalated`. An
+        exception, a falsy return or :data:`ALERT_SKIPPED` must not look
+        like a successful alert: each leaves the row un-escalated so the
+        next sweep gets another chance to actually deliver it.
         """
         if dry_run:
             return False, "would-alert" if alert_dispatcher is not None else "no-dispatcher"
         if alert_dispatcher is None:
             return False, "no-dispatcher"
         try:
-            delivered = bool(alert_dispatcher(row))
+            outcome = alert_dispatcher(row)
         except Exception:  # noqa: BLE001 — unconfirmed delivery, not a sweep crash
-            delivered = False
-        if not delivered:
+            return False, "alert-failed"
+        if outcome == ALERT_SKIPPED:
+            return False, "alert-skipped"
+        if not outcome:
             return False, "alert-failed"
         state.mark_board_doctor_escalated(row.queue, row.key)
         return True, "alert"
@@ -435,7 +446,12 @@ def sweep(
             if (queue, key) not in touched:
                 state.clear_board_doctor_row(queue, key)
                 if escalation_resolver is not None:
-                    escalation_resolver(queue, key)
+                    try:
+                        escalation_resolver(queue, key)
+                    except Exception:  # noqa: BLE001, S110 — one row's cleanup
+                        # failing must not abort the walk and leave the
+                        # remaining tracked rows' counters uncleared.
+                        pass
 
     return report
 
@@ -445,7 +461,7 @@ def run_sweep(
     config,
     tier_of: Callable[[str], str] = default_tier_of,
     auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
-    alert_dispatcher: Callable[[StuckRow], bool] | None = None,
+    alert_dispatcher: Callable[[StuckRow], bool | str] | None = None,
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,
     escalation_resolver: Callable[[str, str], None] | None = None,

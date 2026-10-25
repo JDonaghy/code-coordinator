@@ -10,7 +10,7 @@ uses for the harness it plugs into.
 from __future__ import annotations
 
 from coord import state
-from coord.board_doctor import TIER_ALERT, TIER_AUTO, StuckRow
+from coord.board_doctor import ALERT_SKIPPED, TIER_ALERT, TIER_AUTO, StuckRow
 from coord.board_doctor_policy import (
     ALLOWLIST,
     AUTO_DISPATCHERS,
@@ -126,12 +126,56 @@ class TestEscalationAlertDispatcher:
         )
         row = _row("acme/widgets#7", "ci_red")
 
-        assert escalation_alert_dispatcher(row) is True
+        # Reported as skipped, NOT delivered: nothing board-doctor filed,
+        # so `sweep` must not mark the row escalated and suppress the
+        # alert forever — the covering escalation can be dismissed by its
+        # own writer at any time.
+        assert escalation_alert_dispatcher(row) == ALERT_SKIPPED
 
         escalation = state.get_drive_escalation("acme/widgets", 7)
         assert escalation is not None
         assert escalation["stage"] == "plan.blocked"
         assert escalation["reason"] == "blocked on a human decision"
+
+    def test_the_alert_is_filed_once_a_covering_escalation_is_dismissed(self) -> None:
+        state.record_drive_escalation(
+            "acme/widgets",
+            11,
+            stage="plan.blocked",
+            reason="blocked on a human decision",
+            gate_readings="",
+            proposed_command="coord approve 11",
+        )
+        row = _row("acme/widgets#11", "ci_red")
+        assert escalation_alert_dispatcher(row) == ALERT_SKIPPED
+
+        state.dismiss_drive_escalation("acme/widgets", 11)
+
+        assert escalation_alert_dispatcher(row) is True
+        escalation = state.get_drive_escalation("acme/widgets", 11)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+
+    def test_a_write_failure_is_reported_as_not_delivered(self, monkeypatch) -> None:
+        # The DB being unavailable must read as a failed alert, not as a
+        # silently-swallowed success — `sweep` keys the "escalate exactly
+        # once" suppression off this return value.
+        def boom(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(state, "record_drive_escalation", boom)
+
+        assert escalation_alert_dispatcher(_row("acme/widgets#12", "ci_red")) is False
+        assert state.list_drive_escalations() == []
+
+    def test_a_write_that_does_not_read_back_is_reported_as_not_delivered(
+        self, monkeypatch
+    ) -> None:
+        # Confirmation is an observation taken AFTER the write: a write
+        # that reports no error but leaves nothing on file is a failure.
+        monkeypatch.setattr(state, "record_drive_escalation", lambda *a, **k: None)
+
+        assert escalation_alert_dispatcher(_row("acme/widgets#13", "ci_red")) is False
 
 
 class TestDismissResolvedEscalation:
