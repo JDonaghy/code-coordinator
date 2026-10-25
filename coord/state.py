@@ -2153,24 +2153,37 @@ def _save_board_doctor_rows_raw(conn, rows: dict[str, dict]) -> None:
     )
 
 
+def next_board_doctor_counter(prior: dict | None, cause: str) -> dict:
+    """Pure transition: prior convergence counter + this sweep's cause -> next counter.
+
+    Same cause as last sweep -> increment ``count`` (the row is STILL
+    stuck on it), carrying forward ``escalated``. A different cause
+    (including a key seen for the first time, i.e. *prior* is ``None``)
+    resets to ``count=1, escalated=False`` — a new cause is a new
+    problem, not a continuation of the old one, so it gets its own chance
+    to auto-act before converging.
+
+    Shared by the real write path (:func:`_record_board_doctor_observation_raw`)
+    and :func:`coord.board_doctor.sweep`'s dry-run read path, so the two
+    can never drift apart on what "same cause" vs "new cause" means
+    (#3758).
+    """
+    if prior is not None and prior.get("cause") == cause:
+        return {
+            "cause": cause,
+            "count": prior.get("count", 0) + 1,
+            "escalated": bool(prior.get("escalated", False)),
+        }
+    return {"cause": cause, "count": 1, "escalated": False}
+
+
 def _record_board_doctor_observation_raw(
     conn, queue: str, key: str, cause: str
 ) -> dict:
-    """Update *queue*/*key*'s convergence counter for *cause* — no commit.
-
-    Same cause as last sweep -> increment `count` (the row is STILL stuck
-    on it). A different cause (including a key seen for the first time)
-    resets to `count=1, escalated=False` — a new cause is a new problem,
-    not a continuation of the old one, so it gets its own chance to
-    auto-act before converging.
-    """
+    """Update *queue*/*key*'s convergence counter for *cause* — no commit."""
     rows = _load_board_doctor_rows_raw(conn)
     row_key = _board_doctor_row_key(queue, key)
-    prior = rows.get(row_key)
-    if prior is not None and prior["cause"] == cause:
-        updated = {"cause": cause, "count": prior["count"] + 1, "escalated": prior["escalated"]}
-    else:
-        updated = {"cause": cause, "count": 1, "escalated": False}
+    updated = next_board_doctor_counter(rows.get(row_key), cause)
     rows[row_key] = updated
     _save_board_doctor_rows_raw(conn, rows)
     return updated
@@ -2225,6 +2238,53 @@ def board_doctor_row_state(queue: str, key: str) -> dict:
     _thin_client_local_board_guard("board_doctor_row_state")
     rows = _load_board_doctor_rows_raw(get_connection())
     return rows.get(_board_doctor_row_key(queue, key), {})
+
+
+def board_doctor_tracked_rows() -> list[tuple[str, str]]:
+    """Every ``(queue, key)`` with a persisted convergence counter (#3758).
+
+    :func:`coord.board_doctor.sweep` reads this against the CURRENT
+    sweep's row set to find rows that dropped out — resolved, or no longer
+    classified as stuck — so it can clear their counters (see
+    :func:`clear_board_doctor_row`). Without this, a row's count/escalated
+    state would persist forever once written, even across a full
+    resolve-then-recur cycle, which is exactly what "consecutive sweeps"
+    promises NOT to do.
+
+    **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
+    """
+    _thin_client_local_board_guard("board_doctor_tracked_rows")
+    rows = _load_board_doctor_rows_raw(get_connection())
+    out: list[tuple[str, str]] = []
+    for row_key in rows:
+        queue, _, key = row_key.partition(":")
+        if key:
+            out.append((queue, key))
+    return out
+
+
+def clear_board_doctor_row(queue: str, key: str) -> None:
+    """Drop *queue*/*key*'s persisted convergence counter entirely (#3758).
+
+    Called for any previously-tracked row absent from the current sweep's
+    row set — the row is no longer stuck (resolved, or no longer matches
+    this doctor's "stuck" criteria), so whatever count/escalation it was
+    accumulating no longer describes reality. The next time this (queue,
+    key) appears, it starts fresh at ``count=1, escalated=False`` exactly
+    like a row seen for the first time — the sibling of
+    :func:`clear_baseline_red_streak` for this counter.
+    """
+    conn = get_connection()
+
+    def _write() -> None:
+        rows = _load_board_doctor_rows_raw(conn)
+        row_key = _board_doctor_row_key(queue, key)
+        if row_key in rows:
+            del rows[row_key]
+            _save_board_doctor_rows_raw(conn, rows)
+        conn.commit()
+
+    retry_on_locked(_write)
 
 
 def record_board_doctor_decision(entry: dict) -> None:
@@ -2283,7 +2343,7 @@ def board_doctor_decisions(limit: int | None = None) -> list[dict]:
         return []
     if not isinstance(log, list):
         return []
-    return log[-limit:] if limit else log
+    return log if limit is None else log[-limit:]
 
 
 def record_uat_verdict(

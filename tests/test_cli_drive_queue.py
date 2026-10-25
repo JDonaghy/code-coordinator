@@ -7944,6 +7944,65 @@ def test_diagnose_does_not_call_a_never_polled_machine_unreachable(
     assert "/health dellserver: not read" in result.output
 
 
+# ── sweep (#3758): the scheduled board-doctor harness, driven end to end ────
+#
+# Same shape as the `diagnose` tests above — real queue, real block log,
+# `gh` stubbed via `gh_world` — but through `coord drive-queue sweep`, which
+# additionally walks the merge queue and persists per-(queue, key)
+# convergence state in `board_meta` (`coord.board_doctor.sweep`).
+
+
+def test_sweep_dry_run_classifies_a_real_stalled_row_and_persists_nothing(
+    cli, seed, block_log, gh_world
+):
+    """The CLI entry point, not `coord.board_doctor.sweep` directly: a real
+    queue row, a real block-log episode, `gh` answering through `gh_world`."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
+    gh_world["mergeable"] = False
+
+    result = cli("sweep", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert f"drive-queue:{REPO}#1762 cause=merge-conflict tier=alert" in result.output
+    assert "action=no-dispatcher count=1" in result.output
+    assert (
+        "--dry-run: nothing was dispatched and no convergence state was persisted"
+        in result.output
+    )
+    # Nothing in `board_meta` moved — a sweep right after this one must see
+    # exactly the same, fresh (count=1) state.
+    assert state.board_doctor_decisions() == []
+    assert state.board_doctor_row_state("drive-queue", f"{REPO}#1762") == {}
+
+
+def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
+    cli, seed, block_log, gh_world
+):
+    """A non-dry-run sweep persists the decision log and the per-row
+    convergence counter — and a second sweep on the SAME unresolved cause
+    advances that counter rather than starting over."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
+    gh_world["mergeable"] = False
+
+    first = cli("sweep")
+    assert first.exit_code == 0, first.output
+    assert "count=1" in first.output
+    assert "row(s) observed and decided" in first.output
+
+    logged = state.board_doctor_decisions()
+    assert len(logged) == 1
+    assert logged[0]["key"] == f"{REPO}#1762"
+    assert logged[0]["cause"] == "merge-conflict"
+
+    second = cli("sweep")
+    assert second.exit_code == 0, second.output
+    assert "count=2" in second.output
+    assert len(state.board_doctor_decisions()) == 2
+
+
 # ── #3395: direction-aware overlap ordering against a QUEUED entry ──────────
 #
 # vimcode#1117 / vimcode#1090: both declared `src/harness.rs` and
