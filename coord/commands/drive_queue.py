@@ -3102,13 +3102,15 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
     This is the scheduled HARNESS #3745's epic asks for, not the per-cause
     actions — it takes no board-mutating action itself. For every stuck
     drive-queue or merge-queue row it classifies cause+tier via #2276 Phase 1
-    (:mod:`coord.queue_diagnose`), hands auto-actionable causes to a C3
-    action dispatcher and alert-only causes to a C4 escalation path (both
-    sibling issues of #3745, not yet built — every cause is conservatively
-    alert-tier today, see `coord.board_doctor.default_tier_of`), and records
-    every decision with provenance in `board_meta`'s board-doctor log
-    (`coord.state.board_doctor_decisions`), in the spirit of #1478's board
-    comments.
+    (:mod:`coord.queue_diagnose`), hands auto-actionable causes to C2's
+    allowlist and alert-only causes to C4's escalation path (both
+    `coord.board_doctor_policy`, #2268). The allowlist ships empty — every
+    cause is conservatively alert-tier until the Phase 0 block log shows one
+    recurring with a known-safe fix — so an alert-tier row is recorded (or
+    renewed) as a `drive_escalations` entry rather than auto-acted on, and
+    every decision is additionally logged with provenance in `board_meta`'s
+    board-doctor log (`coord.state.board_doctor_decisions`), in the spirit
+    of #1478's board comments.
 
     A row stuck on the SAME cause for `coord.board_doctor.CONVERGENCE_LIMIT`
     (default 3) consecutive sweeps stops being re-acted on and escalates to
@@ -3122,7 +3124,7 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
     guard as `drive-queue diagnose`, for the same reason — the queues, the
     block log and `gh` all live on the daemon host.
     """
-    from coord import board_doctor  # noqa: PLC0415
+    from coord import board_doctor, board_doctor_policy  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
     from coord.commands._common import _load_config  # noqa: PLC0415
 
@@ -3134,7 +3136,12 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
         )
 
     config = _load_config(config_path)
-    report = board_doctor.run_sweep(config=config, dry_run=dry_run)
+    report = board_doctor.run_sweep(
+        config=config,
+        tier_of=board_doctor_policy.policy_tier_of,
+        alert_dispatcher=board_doctor_policy.escalation_alert_dispatcher,
+        dry_run=dry_run,
+    )
 
     if output_json:
         click.echo(
