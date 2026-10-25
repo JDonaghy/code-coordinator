@@ -7965,10 +7965,11 @@ def test_sweep_dry_run_classifies_a_real_stalled_row_and_persists_nothing(
     result = cli("sweep", "--dry-run")
     assert result.exit_code == 0, result.output
     assert f"drive-queue:{REPO}#1762 cause=merge-conflict tier=alert" in result.output
-    # The real #2268 policy wires a real alert_dispatcher (it only skips
-    # calling it because of --dry-run), so the action label is "alert",
-    # not "no-dispatcher".
-    assert "action=alert count=1" in result.output
+    # The real policy wires a real alert_dispatcher, so the action label
+    # reflects that a dispatch would happen were this not --dry-run —
+    # "would-alert", not "no-dispatcher" (and never the confirmed-delivery
+    # "alert" label, since nothing was actually dispatched).
+    assert "action=would-alert count=1" in result.output
     assert (
         "--dry-run: nothing was dispatched and no convergence state was persisted"
         in result.output

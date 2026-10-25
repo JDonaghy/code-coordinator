@@ -33,13 +33,19 @@ def _row(key: str, cause: str, queue: str = "drive-queue") -> StuckRow:
 
 
 class _Recorder:
-    """Fake dispatcher that counts calls and records what it saw."""
+    """Fake dispatcher that counts calls and records what it saw.
+
+    Returns ``True`` so it also works as an *alert_dispatcher* under
+    `sweep`'s confirmed-delivery contract — a fake standing in for a real
+    dispatcher must report success the same way a real one would.
+    """
 
     def __init__(self) -> None:
         self.calls: list[StuckRow] = []
 
-    def __call__(self, row: StuckRow) -> None:
+    def __call__(self, row: StuckRow) -> bool:
         self.calls.append(row)
+        return True
 
     @property
     def count(self) -> int:
@@ -221,6 +227,40 @@ class TestConvergence:
         row_state = state.board_doctor_row_state("drive-queue", key)
         assert row_state["count"] == 1
         assert row_state["escalated"] is False
+
+    def test_row_absent_from_a_later_sweep_notifies_the_escalation_resolver(
+        self,
+    ) -> None:
+        """A row dropping out of the walk gets its escalation dismissed.
+
+        Mirrors `test_row_absent_from_a_later_sweep_clears_its_counter` but
+        asserts on the ``escalation_resolver`` callback itself, since that
+        is the hook `coord.board_doctor_policy.dismiss_resolved_escalation`
+        plugs into.
+        """
+        dispatch = _Recorder()
+        alert = _Recorder()
+        resolved: list[tuple[str, str]] = []
+        key = "repo#14"
+        cause = "ci_red"
+
+        sweep(
+            [_row(key, cause)],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            escalation_resolver=lambda queue, k: resolved.append((queue, k)),
+        )
+        assert resolved == []
+
+        sweep(
+            [],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={cause: dispatch},
+            alert_dispatcher=alert,
+            escalation_resolver=lambda queue, k: resolved.append((queue, k)),
+        )
+        assert resolved == [("drive-queue", key)]
 
     def test_clear_absent_rows_false_leaves_a_partial_walks_counters_alone(
         self,
