@@ -9,11 +9,15 @@ uses for the harness it plugs into.
 
 from __future__ import annotations
 
+import pytest
+
 from coord import state
 from coord.board_doctor import ALERT_SKIPPED, TIER_ALERT, TIER_AUTO, StuckRow
+from coord.board_doctor_permissions import SweepPermissionError
 from coord.board_doctor_policy import (
     ALLOWLIST,
     AUTO_DISPATCHERS,
+    _register_auto_action,
     dismiss_resolved_escalation,
     escalation_alert_dispatcher,
     policy_tier_of,
@@ -45,9 +49,9 @@ class TestPolicyTierOf:
 
     def test_a_future_allowlist_entry_would_be_honored(self, monkeypatch) -> None:
         # Pins the seam itself, not a specific entry: if a cause is ever
-        # added to BOTH mappings, policy_tier_of must actually read them
-        # rather than hardcoding "always alert".
-        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "probe-only-action")
+        # registered for a real safe-tier action, policy_tier_of must
+        # actually read the mappings rather than hardcoding "always alert".
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "drive_queue_add")
         monkeypatch.setitem(AUTO_DISPATCHERS, "probe_only_cause", lambda row: True)
         assert policy_tier_of("probe_only_cause") == TIER_AUTO
 
@@ -55,9 +59,44 @@ class TestPolicyTierOf:
         # An allowlist entry with no real dispatcher behind it must never
         # silently promote to auto-tier — that would suppress the alert
         # while doing nothing.
-        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "probe-only-action")
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "drive_queue_add")
         assert "probe_only_cause" not in AUTO_DISPATCHERS
         assert policy_tier_of("probe_only_cause") == TIER_ALERT
+
+    def test_an_allowlist_entry_naming_an_unsafe_action_stays_alert_tier(
+        self, monkeypatch
+    ) -> None:
+        # Guards against a future bug that assigns into ALLOWLIST /
+        # AUTO_DISPATCHERS directly, bypassing _register_auto_action: an
+        # entry naming an action outside SAFE_TIER_ACTIONS must not promote
+        # to auto-tier even though both mappings "agree".
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "force_merge")
+        monkeypatch.setitem(AUTO_DISPATCHERS, "probe_only_cause", lambda row: True)
+        assert policy_tier_of("probe_only_cause") == TIER_ALERT
+
+
+class TestRegisterAutoAction:
+    def test_registers_a_safe_tier_action_in_both_mappings(self) -> None:
+        calls: list[StuckRow] = []
+        try:
+            _register_auto_action("probe_only_cause", "drive_queue_add", calls.append)
+
+            assert ALLOWLIST["probe_only_cause"] == "drive_queue_add"
+            assert policy_tier_of("probe_only_cause") == TIER_AUTO
+
+            row = _row("acme/widgets#1", "probe_only_cause")
+            AUTO_DISPATCHERS["probe_only_cause"](row)
+            assert calls == [row]
+        finally:
+            ALLOWLIST.pop("probe_only_cause", None)
+            AUTO_DISPATCHERS.pop("probe_only_cause", None)
+
+    def test_refuses_to_register_an_action_outside_the_safe_tier(self) -> None:
+        with pytest.raises(SweepPermissionError, match="force_merge"):
+            _register_auto_action("probe_only_cause", "force_merge", lambda row: None)
+
+        assert "probe_only_cause" not in ALLOWLIST
+        assert "probe_only_cause" not in AUTO_DISPATCHERS
 
 
 class TestEscalationAlertDispatcher:
