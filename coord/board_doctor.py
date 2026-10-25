@@ -100,6 +100,16 @@ _LIVE_CLEAR_CAUSES = frozenset({queue_diagnose.CAUSE_NOTHING_BLOCKING})
 #: relabelled, so the broad causes stay alert-eligible for everything else.
 CAUSE_CEILING_BLOCKED_MERGEABLE = "ceiling-blocked-mergeable"
 
+#: A repo whose merge base has hit `coord.state.BASELINE_RED_STREAK_LIMIT`
+#: consecutive confirmed-red classifications (#3386) poisons every row in
+#: both queues for that repo — the rows are not individually stuck, the
+#: base is red. Never registered in `coord.board_doctor_policy.ALLOWLIST`:
+#: there is no safe auto-action for "the base is broken", only a human
+#: decision to go fix it. :func:`baseline_red_rows` collapses every
+#: affected repo to exactly ONE such row rather than one per queue entry,
+#: so a repo with ten blocked PRs produces one alert, not ten.
+CAUSE_BASELINE_RED = "baseline-red"
+
 
 def default_tier_of(cause: str) -> str:
     """Default `tier_of`: delegates to the real C2 policy.
@@ -194,6 +204,40 @@ def merge_queue_rows(entries: Sequence[Any]) -> list[StuckRow]:
             )
         )
     return rows
+
+
+#: Synthetic issue number for the one-row-per-repo :func:`baseline_red_rows`
+#: key — never a real GitHub issue number (those start at 1), so it can
+#: never collide with a genuine per-issue row for the same repo in
+#: `coord.state`'s escalation/convergence tables.
+_BASELINE_RED_ROW_ISSUE = 0
+
+
+def baseline_red_rows(blocked_streaks: Mapping[str, int]) -> list[StuckRow]:
+    """One :class:`StuckRow` per repo whose base is confirmed red (#3386).
+
+    *blocked_streaks* is ``{repo: streak}`` for every repo already past
+    `coord.state.BASELINE_RED_STREAK_LIMIT` consecutive confirmed-red
+    classifications (`coord.state.baseline_red_merge_blocked`) — callers
+    build it by filtering `coord.state.baseline_red_streaks()` through
+    that predicate, never by re-deriving the threshold here (#2096: one
+    question, one answer). Collapses to exactly one row per repo — key
+    ``f"{repo}#{_BASELINE_RED_ROW_ISSUE}"`` — regardless of how many real
+    rows that repo has in either queue, so the escalation ladder files ONE
+    alert for the repo, not one per stuck PR: the rows underneath are not
+    individually wrong, the base is.
+    """
+    return [
+        StuckRow(
+            queue="baseline-red",
+            key=f"{repo_name}#{_BASELINE_RED_ROW_ISSUE}",
+            state="blocked",
+            cause=CAUSE_BASELINE_RED,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(f"baseline_red_streak={streak}",),
+        )
+        for repo_name, streak in blocked_streaks.items()
+    ]
 
 
 def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[StuckRow]:
@@ -320,7 +364,12 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     from coord.drive_queue import entries_from_rows  # noqa: PLC0415
     from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
     from coord.merge_queue import load_queue as load_merge_queue  # noqa: PLC0415
-    from coord.state import build_board, list_drive_queue  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        baseline_red_merge_blocked,
+        baseline_red_streaks,
+        build_board,
+        list_drive_queue,
+    )
 
     episodes = [
         ep for ep in block_log.episodes(block_log.read_events()) if not ep.get("resolved")
@@ -350,6 +399,23 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     rows = _reclassify_ceiling_blocked(rows)
     rows.extend(merge_queue_rows(load_merge_queue()))
+
+    blocked_streaks = {
+        repo_name: streak
+        for repo_name, streak in baseline_red_streaks().items()
+        if baseline_red_merge_blocked(repo_name)
+    }
+    if blocked_streaks:
+        # A red base poisons every row for that repo in both queues — they
+        # are not individually stuck, so collapse them all to the single
+        # synthetic row :func:`baseline_red_rows` builds, rather than
+        # sweeping (and risking a C3 auto-action against) each one.
+        rows = [
+            row
+            for row in rows
+            if row.key.rpartition("#")[0] not in blocked_streaks
+        ]
+        rows.extend(baseline_red_rows(blocked_streaks))
     return rows
 
 
