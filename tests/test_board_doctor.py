@@ -83,13 +83,35 @@ class TestReclassifyCeilingBlocked:
         assert out.evidence[:-1] == row.evidence
         assert "#2972" in out.evidence[-1]
 
-    def test_ci_green_row_is_reclassified(self) -> None:
+    def test_ci_green_row_is_left_alone(self) -> None:
+        # queue_diagnose._rule_ci_green fires on green checks alone and is
+        # the LAST rule in _RULES order — reached precisely when the
+        # stronger _rule_nothing_blocking (gate_ready + all green +
+        # mergeable) did NOT fire. It is not proof the row is actually
+        # clear, so it must not be promoted to auto-tier here.
         _seed_ceiling_blocked_entry("acme/widgets", 102)
         row = _row("acme/widgets#102", queue_diagnose.CAUSE_CI_GREEN)
 
         [out] = _reclassify_ceiling_blocked([row])
 
-        assert out.cause == CAUSE_CEILING_BLOCKED_MERGEABLE
+        assert out == row
+
+    def test_ceiling_blocked_row_with_low_confidence_is_left_alone(self) -> None:
+        # A CONFIDENCE_LOW verdict must never be promoted to auto-tier,
+        # even when the cause itself is in _LIVE_CLEAR_CAUSES.
+        _seed_ceiling_blocked_entry("acme/widgets", 107)
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#107",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_NOTHING_BLOCKING,
+            confidence=queue_diagnose.CONFIDENCE_LOW,
+            evidence=(f"cause={queue_diagnose.CAUSE_NOTHING_BLOCKING}",),
+        )
+
+        [out] = _reclassify_ceiling_blocked([row])
+
+        assert out == row
 
     def test_live_clear_row_that_is_not_ceiling_blocked_is_left_alone(self) -> None:
         # No drive-queue row at all for this issue — "nothing to block on".
@@ -181,6 +203,27 @@ class TestSweepClassifiesAndDispatches:
         assert logged_by_key["repo#1"]["evidence"] == ["cause=no_pr"]
         assert logged_by_key["repo#2"]["cause"] == "merge_conflict"
         assert logged_by_key["repo#2"]["action"] == "alert"
+
+    def test_a_falsy_dispatcher_return_is_logged_as_a_noop_not_a_success(self) -> None:
+        # An auto-dispatcher reporting "nothing to do" (a falsy return, not
+        # an exception) must not be recorded as a confirmed "auto-dispatch"
+        # — that would falsely claim the action actually happened.
+        noop_row = _row("repo#3", "no_pr")
+
+        report = sweep(
+            [noop_row],
+            tier_of=_always(TIER_AUTO),
+            auto_dispatchers={"no_pr": lambda row: False},
+            alert_dispatcher=_Recorder(),
+            sweep_id="sweep-test-noop",
+        )
+
+        [decision] = report.decisions
+        assert decision.action == "auto-dispatch-noop"
+
+        logged = state.board_doctor_decisions()
+        [entry] = [e for e in logged if e["key"] == "repo#3"]
+        assert entry["action"] == "auto-dispatch-noop"
 
 
 class TestAlertDeliveryIsConfirmed:

@@ -3099,18 +3099,20 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
 def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> None:
     """Board-doctor sweep: classify every stuck row, dispatch, record (#3758).
 
-    This is the scheduled HARNESS #3745's epic asks for, not the per-cause
-    actions — it takes no board-mutating action itself. For every stuck
+    This is the scheduled HARNESS #3745's epic asks for; it decides tier and
+    dispatches but does not invent per-cause policy itself. For every stuck
     drive-queue or merge-queue row it classifies cause+tier via #2276 Phase 1
     (:mod:`coord.queue_diagnose`), hands auto-actionable causes to C2's
     allowlist and alert-only causes to C4's escalation path (both
-    `coord.board_doctor_policy`, #2268). The allowlist ships empty — every
-    cause is conservatively alert-tier until the Phase 0 block log shows one
-    recurring with a known-safe fix — so an alert-tier row is recorded (or
-    renewed) as a `drive_escalations` entry rather than auto-acted on, and
-    every decision is additionally logged with provenance in `board_meta`'s
-    board-doctor log (`coord.state.board_doctor_decisions`), in the spirit
-    of #1478's board comments.
+    `coord.board_doctor_policy`, #2268). The allowlist names only the
+    handful of causes with a known-safe, reviewed-in-advance fix — every
+    other cause stays conservatively alert-tier — so an allowlisted cause's
+    row gets its C3 action dispatched (board-mutating, within
+    `SAFE_TIER_ACTIONS`) while everything else is recorded (or renewed) as a
+    `drive_escalations` entry instead, and every decision is additionally
+    logged with provenance in `board_meta`'s board-doctor log
+    (`coord.state.board_doctor_decisions`), in the spirit of #1478's board
+    comments.
 
     A row stuck on the SAME cause for `coord.board_doctor.CONVERGENCE_LIMIT`
     (default 3) consecutive sweeps stops being re-acted on and escalates to

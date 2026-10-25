@@ -88,6 +88,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, TypedDict, cast
 
+from coord.drive_queue import HOLD_RELEASED
+
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.drive_queue import QueueEntry
 
@@ -269,6 +271,36 @@ def _refuse_if_gate_mid_flight(
         "and re-writing the row would re-arm the gate, releasing or "
         "re-imposing a hold a human owns. Leave the row alone until the gate "
         "is resolved (`coord drive-queue resume`)."
+    )
+
+
+def _refuse_if_remove_would_release_gate(
+    repo_name: str, issue_number: int, entry: QueueEntry
+) -> None:
+    """Refuse to remove a row whose #1757 deploy gate is armed or fired but
+    not yet released.
+
+    `coord.drive_queue._after_satisfied` treats a pre-req key ABSENT from
+    the queue entirely as satisfied — so deleting a row with an unresolved
+    ``hold_after`` gate silently releases every ``after=``-dependent row,
+    exactly as if a human had already deployed, regardless of whether
+    `hold_state` is ``""``, ``"armed"`` or ``"fired"``. Only
+    ``hold_state == HOLD_RELEASED`` means a human already resolved the gate
+    by hand (`coord drive-queue resume`), which is the one state removal is
+    safe in. This is a stricter check than :func:`_refuse_if_gate_mid_flight`
+    (which permits re-writing an armed-with-no-probes row because the write
+    reproduces that exact state): a remove makes the row vanish rather than
+    reproduce anything, so there is no "faithful re-write" exception here.
+    """
+    if not entry.hold_after or entry.hold_state == HOLD_RELEASED:
+        return
+    raise SweepPermissionError(
+        f"board-doctor sweep is not permitted to remove {repo_name}#"
+        f"{issue_number} — its #1757 deploy gate is hold_state="
+        f"{entry.hold_state!r}, not yet released, and removing the row "
+        "would silently satisfy every `after=`-dependent row's "
+        "prerequisite as if a human had already deployed. Leave the row "
+        "queued until the gate is resolved (`coord drive-queue resume`)."
     )
 
 
@@ -482,17 +514,19 @@ class DriveQueueRemoval(TypedDict):
     driver_detail: str | None
 
 
-def sweep_drive_queue_remove(repo_name: str, issue_number: int) -> DriveQueueRemoval:
-    """Daemon-internal `drive-queue remove`, authorized for the sweep context.
+def _dequeue_and_log(repo_name: str, issue_number: int) -> DriveQueueRemoval:
+    """The actual removal, shared by :func:`sweep_drive_queue_remove` and
+    :func:`sweep_drive_queue_requeue`'s internal remove-then-re-add.
 
-    Calls `coord.state.dequeue_drive_queue` directly — the same primitive
-    `coord drive-queue remove` calls, including owning the live driver
-    session it orphans (#3282) — never the Click command. A live session
-    that could not be confirmed stopped (`driver_ok=False`) is logged loudly
-    here rather than left for the caller to notice or not: an unattended
-    sweep has nobody else reading its output.
+    Does NOT call :func:`_refuse_if_remove_would_release_gate` — callers
+    decide whether that guard applies. `sweep_drive_queue_requeue` calls
+    this directly rather than through :func:`sweep_drive_queue_remove`
+    because it has already confirmed (via :func:`_refuse_if_gate_mid_flight`)
+    that the row's gate is reproducible and is about to put the exact same
+    declaration straight back — a remove that is immediately followed by a
+    faithful re-add never leaves any ``after=``-dependent row looking at a
+    gate that is actually gone.
     """
-    authorize_sweep_action("drive_queue_remove")
     from coord.state import dequeue_drive_queue  # noqa: PLC0415
 
     result = dequeue_drive_queue(repo_name, issue_number)
@@ -507,6 +541,32 @@ def sweep_drive_queue_remove(repo_name: str, issue_number: int) -> DriveQueueRem
             result.get("driver_detail") or "unknown",
         )
     return cast(DriveQueueRemoval, result)
+
+
+def sweep_drive_queue_remove(repo_name: str, issue_number: int) -> DriveQueueRemoval:
+    """Daemon-internal `drive-queue remove`, authorized for the sweep context.
+
+    Calls `coord.state.dequeue_drive_queue` directly — the same primitive
+    `coord drive-queue remove` calls, including owning the live driver
+    session it orphans (#3282) — never the Click command. A live session
+    that could not be confirmed stopped (`driver_ok=False`) is logged loudly
+    here rather than left for the caller to notice or not: an unattended
+    sweep has nobody else reading its output.
+
+    Refuses outright, via :func:`_refuse_if_remove_would_release_gate`, when
+    the row's #1757 deploy gate is armed or fired but not yet released —
+    deleting such a row would silently satisfy every ``after=``-dependent
+    row's prerequisite, as `coord.drive_queue._after_satisfied` treats an
+    absent pre-req as already met. A row with no `hold_after` gate at all,
+    or one a human already released, removes normally.
+    """
+    authorize_sweep_action("drive_queue_remove")
+
+    entry = _existing_entry(repo_name, issue_number)
+    if entry is not None:
+        _refuse_if_remove_would_release_gate(repo_name, issue_number, entry)
+
+    return _dequeue_and_log(repo_name, issue_number)
 
 
 class DriveQueueRequeue(TypedDict):
@@ -568,7 +628,8 @@ def sweep_drive_queue_requeue(repo_name: str, issue_number: int) -> DriveQueueRe
     # the queue entirely.
     _validate_after(repo_name, issue_number, declaration["after"])
 
-    removal = sweep_drive_queue_remove(repo_name, issue_number)
+    authorize_sweep_action("drive_queue_remove")
+    removal = _dequeue_and_log(repo_name, issue_number)
     if not removal.get("removed"):
         return DriveQueueRequeue(
             requeued=False,
