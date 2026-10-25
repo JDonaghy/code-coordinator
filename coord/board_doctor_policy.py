@@ -13,9 +13,15 @@ A cause belongs on the auto-action allowlist only once the Phase 0 block
 log shows it recurring with a known-safe fix — never as a pre-approved
 guess. That log is not yet mined for a recurring, safe-to-automate cause,
 so :data:`ALLOWLIST` ships empty: every cause is alert-tier today. A later
-change populates it from log evidence without touching this module's shape
-or `sweep`'s control flow. A wrong auto-action default is worse than an
-extra, harmless alert.
+change populates it from log evidence, via :func:`_register_auto_action`,
+without touching this module's shape or `sweep`'s control flow. A wrong
+auto-action default is worse than an extra, harmless alert.
+
+:func:`_register_auto_action` also checks every new entry's action name
+against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` (#3745's C2
+enforcement boundary) before adding it, and :func:`policy_tier_of` checks
+it again at read time — so this allow-list can never promote a cause to
+auto-tier for an action that module's own closed list does not permit.
 
 Why the alert path reuses `drive_escalations`
 ------------------------------------------------
@@ -36,10 +42,15 @@ from __future__ import annotations
 from typing import Callable
 
 from coord.board_doctor import ALERT_SKIPPED, TIER_ALERT, TIER_AUTO, StuckRow
+from coord.board_doctor_permissions import SAFE_TIER_ACTIONS, authorize_sweep_action
 
 #: cause -> auto-action name. Empty by design; see the module docstring.
 #: A future PR populates this from Phase 0 block-log evidence of a
-#: recurring, safe-to-automate cause — never speculatively.
+#: recurring, safe-to-automate cause — never speculatively. Populate it
+#: only via :func:`_register_auto_action`, never by assigning into this
+#: dict directly, so every entry is also checked against
+#: `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` — the one closed
+#: allow-list this module answers to, not a second copy of it.
 ALLOWLIST: dict[str, str] = {}
 
 #: cause -> the C3 callable that actually performs the auto-action named in
@@ -53,18 +64,56 @@ ALLOWLIST: dict[str, str] = {}
 AUTO_DISPATCHERS: dict[str, Callable[[StuckRow], None]] = {}
 
 
+def _register_auto_action(
+    cause: str, action: str, handler: Callable[[StuckRow], None]
+) -> None:
+    """The only way this module may populate :data:`ALLOWLIST` /
+    :data:`AUTO_DISPATCHERS` — a future PR wiring a Phase-0-evidenced cause
+    to a real C3 handler calls this instead of assigning into either dict
+    directly.
+
+    Calls `coord.board_doctor_permissions.authorize_sweep_action` twice
+    over: once here, refusing to register *cause* at all if *action* is not
+    on :data:`coord.board_doctor_permissions.SAFE_TIER_ACTIONS`; and again
+    inside the wrapped dispatcher every time it actually runs, refusing the
+    call even if some future edit mutated :data:`AUTO_DISPATCHERS` directly
+    rather than going through this function. This keeps
+    `SAFE_TIER_ACTIONS` the one allow-list :func:`policy_tier_of` and the
+    sweep's dispatch path both ultimately answer to, rather than a second,
+    independently-maintained judgment living in this module alone.
+    """
+    authorize_sweep_action(action)
+
+    def _gated(row: StuckRow) -> None:
+        authorize_sweep_action(action)
+        handler(row)
+
+    ALLOWLIST[cause] = action
+    AUTO_DISPATCHERS[cause] = _gated
+
+
 def policy_tier_of(cause: str) -> str:
     """#3745's C2: real (if currently conservative) cause -> tier policy.
 
-    Returns :data:`coord.board_doctor.TIER_AUTO` only for a cause present
-    in BOTH :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS` — every other
-    cause, which today is every cause since both mappings are empty, gets
-    :data:`coord.board_doctor.TIER_ALERT`. This is the function `coord
-    drive-queue sweep` wires in as `tier_of`.
+    Returns :data:`coord.board_doctor.TIER_AUTO` only when *cause* is
+    present in BOTH :data:`ALLOWLIST` and :data:`AUTO_DISPATCHERS` AND the
+    action :data:`ALLOWLIST` names for it is on `coord
+    .board_doctor_permissions.SAFE_TIER_ACTIONS` — not merely present in
+    both local mappings. That third check is what makes this module's
+    allow-list answer to the sweep's actual permission boundary instead of
+    being a second, independently-maintained copy of it: an entry naming an
+    action outside the safe tier (which :func:`_register_auto_action` will
+    already have refused to create, but a direct-assignment bug could still
+    produce) gets :data:`coord.board_doctor.TIER_ALERT`, the same as a
+    cause with no entry at all. This is the function `coord drive-queue
+    sweep` wires in as `tier_of`.
     """
-    if cause in ALLOWLIST and cause in AUTO_DISPATCHERS:
-        return TIER_AUTO
-    return TIER_ALERT
+    action = ALLOWLIST.get(cause)
+    if action is None or cause not in AUTO_DISPATCHERS:
+        return TIER_ALERT
+    if action not in SAFE_TIER_ACTIONS:
+        return TIER_ALERT
+    return TIER_AUTO
 
 
 def _board_doctor_stage(queue: str) -> str:
