@@ -2085,6 +2085,207 @@ def baseline_red_merge_blocked(repo_name: str | None) -> bool:
     return baseline_red_streak(repo_name) >= BASELINE_RED_STREAK_LIMIT
 
 
+# ── board-doctor sweep state (#3758) ────────────────────────────────────────
+# Persisted in `board_meta`, the same one-JSON-blob-per-key seam
+# `baseline_red_streaks` above uses — two keys, one for the per-row
+# convergence counters `coord.board_doctor.sweep()` reads before deciding
+# whether to re-act or escalate, one for the append-only decision log
+# (#1478's "every decision recorded, with provenance" in spirit). Neither
+# blob is a merge gate, so these use the same best-effort decode and
+# `retry_on_locked` write discipline, not a stronger guarantee than that.
+
+_BOARD_DOCTOR_ROWS_META_KEY = "board_doctor_rows"
+_BOARD_DOCTOR_LOG_META_KEY = "board_doctor_log"
+
+#: Cap on the decision log's length — a ring buffer, not an audit trail
+#: that grows forever. Same rationale as any other bounded `board_meta`
+#: list: unbounded growth here would make every future read of this key
+#: slower for an operator who only ever wants "what happened recently".
+BOARD_DOCTOR_LOG_LIMIT = 500
+
+
+def _board_doctor_row_key(queue: str, key: str) -> str:
+    """``"drive-queue:repo#123"`` — one string key per (queue, row)."""
+    return f"{queue}:{key}"
+
+
+def _load_board_doctor_rows_raw(conn) -> dict[str, dict]:
+    """Best-effort decode of the persisted ``{row_key: {cause,count,escalated}}`` map.
+
+    A missing row, corrupt JSON, or an unexpected shape all read as "no
+    sweep history yet" — same fail-open convention as
+    :func:`_load_baseline_red_streaks_raw`, for the same reason: a decode
+    failure here must never crash a sweep, only make it start fresh.
+    """
+    row = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key = ?",
+        (_BOARD_DOCTOR_ROWS_META_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for row_key, value in data.items():
+        if (
+            isinstance(row_key, str)
+            and isinstance(value, dict)
+            and isinstance(value.get("cause"), str)
+            and isinstance(value.get("count"), int)
+        ):
+            out[row_key] = {
+                "cause": value["cause"],
+                "count": value["count"],
+                "escalated": bool(value.get("escalated", False)),
+            }
+    return out
+
+
+def _save_board_doctor_rows_raw(conn, rows: dict[str, dict]) -> None:
+    sql.upsert(
+        conn, "board_meta", ["key", "value"],
+        (_BOARD_DOCTOR_ROWS_META_KEY, json.dumps(rows)),
+        conflict_columns=["key"],
+    )
+
+
+def _record_board_doctor_observation_raw(
+    conn, queue: str, key: str, cause: str
+) -> dict:
+    """Update *queue*/*key*'s convergence counter for *cause* — no commit.
+
+    Same cause as last sweep -> increment `count` (the row is STILL stuck
+    on it). A different cause (including a key seen for the first time)
+    resets to `count=1, escalated=False` — a new cause is a new problem,
+    not a continuation of the old one, so it gets its own chance to
+    auto-act before converging.
+    """
+    rows = _load_board_doctor_rows_raw(conn)
+    row_key = _board_doctor_row_key(queue, key)
+    prior = rows.get(row_key)
+    if prior is not None and prior["cause"] == cause:
+        updated = {"cause": cause, "count": prior["count"] + 1, "escalated": prior["escalated"]}
+    else:
+        updated = {"cause": cause, "count": 1, "escalated": False}
+    rows[row_key] = updated
+    _save_board_doctor_rows_raw(conn, rows)
+    return updated
+
+
+def record_board_doctor_observation(queue: str, key: str, cause: str) -> dict:
+    """Record one sweep's observation of *queue*/*key* and return its updated counter.
+
+    Called exactly once per row per sweep, before the sweep decides tier
+    and dispatch — see :func:`coord.board_doctor.sweep`, the only caller.
+    """
+    conn = get_connection()
+    updated: dict = {}
+
+    def _write() -> None:
+        nonlocal updated
+        updated = _record_board_doctor_observation_raw(conn, queue, key, cause)
+        conn.commit()
+
+    retry_on_locked(_write)
+    return updated
+
+
+def mark_board_doctor_escalated(queue: str, key: str) -> None:
+    """Flag *queue*/*key*'s CURRENT counter as escalated — no-op if absent.
+
+    Called once, the sweep a row's `count` first reaches the convergence
+    limit, so the next sweep (and every one after, while the cause stays
+    the same) sees `escalated=True` and stops re-dispatching the alert —
+    the "escalate exactly once" half of #3758's convergence requirement.
+    """
+    conn = get_connection()
+
+    def _write() -> None:
+        rows = _load_board_doctor_rows_raw(conn)
+        row_key = _board_doctor_row_key(queue, key)
+        if row_key in rows:
+            rows[row_key]["escalated"] = True
+            _save_board_doctor_rows_raw(conn, rows)
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
+def board_doctor_row_state(queue: str, key: str) -> dict:
+    """*queue*/*key*'s persisted convergence counter (``{}`` if none yet).
+
+    **Local-DB read only** — ``board_meta`` is canonical on the daemon
+    host, same limitation :func:`baseline_red_streak` documents, for the
+    same reason.
+    """
+    _thin_client_local_board_guard("board_doctor_row_state")
+    rows = _load_board_doctor_rows_raw(get_connection())
+    return rows.get(_board_doctor_row_key(queue, key), {})
+
+
+def record_board_doctor_decision(entry: dict) -> None:
+    """Append one row's sweep outcome to the decision log (#3758, #1478 spirit).
+
+    *entry* is caller-shaped (``coord.board_doctor.sweep`` is the only
+    caller) and stored verbatim as one more JSON object in a ring-buffered
+    list, trimmed to :data:`BOARD_DOCTOR_LOG_LIMIT` entries, oldest first
+    dropped — every decision this harness makes is provenance for an
+    operator asking "why didn't row X get acted on", never silently lost,
+    but also never allowed to grow the `board_meta` row without bound.
+    """
+    conn = get_connection()
+
+    def _write() -> None:
+        row = sql.execute(
+            conn, "SELECT value FROM board_meta WHERE key = ?",
+            (_BOARD_DOCTOR_LOG_META_KEY,),
+        ).fetchone()
+        log: list = []
+        if row is not None and row["value"]:
+            try:
+                decoded = json.loads(row["value"])
+            except ValueError:
+                decoded = []
+            if isinstance(decoded, list):
+                log = decoded
+        log.append(entry)
+        if len(log) > BOARD_DOCTOR_LOG_LIMIT:
+            log = log[-BOARD_DOCTOR_LOG_LIMIT:]
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_BOARD_DOCTOR_LOG_META_KEY, json.dumps(log)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
+def board_doctor_decisions(limit: int | None = None) -> list[dict]:
+    """The persisted decision log, most-recent last (#3758).
+
+    **Local-DB read only** — same limitation as :func:`board_doctor_row_state`.
+    """
+    _thin_client_local_board_guard("board_doctor_decisions")
+    row = sql.execute(
+        get_connection(), "SELECT value FROM board_meta WHERE key = ?",
+        (_BOARD_DOCTOR_LOG_META_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return []
+    try:
+        log = json.loads(row["value"])
+    except ValueError:
+        return []
+    if not isinstance(log, list):
+        return []
+    return log[-limit:] if limit else log
+
+
 def record_uat_verdict(
     *,
     assignment_id: str,

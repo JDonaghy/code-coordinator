@@ -1,0 +1,353 @@
+"""Board-doctor sweep: the scheduled harness, not the per-cause actions (#3758).
+
+#3745's epic asks for a hourly sweep over the drive-queue and merge-queue
+that, for every stuck/blocked/stalled row: (1) classifies its cause+tier via
+the existing #2276 Phase 1 classifier (:mod:`coord.queue_diagnose`), (2)
+hands auto-actionable causes to a C3 action dispatcher and alert-only causes
+to a C4 escalation path, and (3) records every decision with provenance, in
+the spirit of #1478's board comments. This module is the harness that does
+exactly that loop — and *only* that loop. The permission model (#3745's C2:
+which cause gets which tier) and the per-cause action dispatchers (C3) and
+escalation surface (C4) are sibling issues, not yet built; this harness does
+not invent their policy. :func:`default_tier_of` is the conservative
+placeholder — every cause escalates to the alert tier — so the loop is fully
+wired and safe today, with `tier_of`/`auto_dispatchers`/`alert_dispatcher`
+left as the seams C2/C3/C4 populate later without touching :func:`sweep`'s
+control flow.
+
+:func:`sweep` is the pure, fully-testable core: given already-classified
+rows and dispatcher callbacks, it decides tier, tracks convergence, dispatches
+and logs — no board connection, no `gh`, no network. :func:`collect_rows`
+is the impure production walk (drive-queue via
+:func:`coord.queue_diagnose.run_pass`, mirroring
+``coord drive-queue diagnose``'s own wiring exactly rather than a second
+read of the same queue; merge-queue via a local, `gh`-free cause mapping,
+since :mod:`coord.queue_diagnose` only understands drive-queue rows).
+:func:`run_sweep` is the production entry point the CLI calls, composing
+the two.
+
+Convergence (#3758, load-bearing)
+----------------------------------
+A row stuck on the SAME cause across :data:`CONVERGENCE_LIMIT` (default 3)
+consecutive sweeps stops being re-acted on and escalates to the alert tier
+exactly once — never a second alert for the same still-unresolved cause,
+never an auto-dispatch past the limit. Per-(queue, key) sweep counts persist
+in `board_meta` via :mod:`coord.state`'s ``record_board_doctor_observation``
+/ ``mark_board_doctor_escalated`` — the same one-row-of-truth pattern
+``baseline_red_streaks`` uses for its own streak counter (#2096: one
+question, one answer; convergence is decided by reading that ONE counter,
+never re-derived from the decision log).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping, Sequence
+
+from coord import queue_diagnose
+
+TIER_AUTO = "auto"
+TIER_ALERT = "alert"
+
+#: Sweeps a row may stay on the same cause before the harness stops
+#: re-acting on it and escalates once to the alert tier (#3758).
+CONVERGENCE_LIMIT = 3
+
+#: Merge-queue states this sweep treats as "stuck". A row merely waiting
+#: its turn (``pending``/``merging``) or past (``merged``/``skipped``) is
+#: not this doctor's problem — only a row that cannot progress on its own.
+_MERGE_QUEUE_STUCK_CAUSE: dict[str, str] = {
+    "conflict": queue_diagnose.CAUSE_MERGE_CONFLICT,
+    "human_required": queue_diagnose.CAUSE_GATE_BLOCKED,
+}
+
+
+def default_tier_of(cause: str) -> str:  # noqa: ARG001
+    """Conservative placeholder for #3745's C2 permission policy.
+
+    Every cause escalates to the alert tier until a real cause -> tier
+    policy lands in a sibling issue (C2). This harness owns the loop, not
+    the per-cause actions — inventing that policy here would be doing C2's
+    job under cover of #3758, and a wrong auto-action default is worse than
+    an extra, harmless alert.
+    """
+    return TIER_ALERT
+
+
+@dataclass(frozen=True)
+class StuckRow:
+    """One drive-queue or merge-queue row this sweep looked at."""
+
+    queue: str  # "drive-queue" or "merge-queue"
+    key: str
+    state: str
+    cause: str
+    confidence: str
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One row's outcome from a single sweep — the unit both the test
+    suite and the decision log assert on."""
+
+    queue: str
+    key: str
+    cause: str
+    tier: str
+    #: "auto-dispatch" | "alert" | "no-dispatcher" | "converged-noop"
+    action: str
+    count: int
+    escalated: bool
+    dry_run: bool
+
+
+@dataclass
+class SweepReport:
+    """What one call to :func:`sweep` did, for the CLI and for tests."""
+
+    sweep_id: str
+    dry_run: bool = False
+    decisions: list[Decision] = field(default_factory=list)
+
+    def by_action(self, action: str) -> list[Decision]:
+        return [d for d in self.decisions if d.action == action]
+
+
+def merge_queue_rows(entries: Sequence[Any]) -> list[StuckRow]:
+    """Local cause mapping for merge-queue rows (#3758).
+
+    :func:`coord.queue_diagnose.run_pass` only understands drive-queue
+    ``QueueEntry`` rows (#2276 Phase 1); the merge-queue's own state
+    vocabulary is already thin (``pending``/``merging``/``merged``/
+    ``conflict``/``skipped``/``human_required``), so this reuses
+    ``queue_diagnose``'s ``CAUSE_*`` vocabulary rather than inventing a
+    second one, and needs no `gh` call — the already-refreshed
+    ``QueuedMerge.state``/``.error`` is evidence enough for a cause this
+    coarse.
+    """
+    rows: list[StuckRow] = []
+    for entry in entries:
+        cause = _MERGE_QUEUE_STUCK_CAUSE.get(entry.state)
+        if cause is None:
+            continue
+        evidence = (f"merge_queue.state={entry.state}",)
+        if entry.error:
+            evidence += (f"error={entry.error}",)
+        rows.append(
+            StuckRow(
+                queue="merge-queue",
+                key=f"{entry.repo_name}#{entry.issue_number}",
+                state=entry.state,
+                cause=cause,
+                confidence=queue_diagnose.CONFIDENCE_HIGH,
+                evidence=evidence,
+            )
+        )
+    return rows
+
+
+def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[StuckRow]:
+    """Adapt :func:`coord.queue_diagnose.run_pass` output to :class:`StuckRow`."""
+    return [
+        StuckRow(
+            queue="drive-queue",
+            key=d.key,
+            state=d.state,
+            cause=d.cause,
+            confidence=d.confidence,
+            evidence=d.evidence,
+        )
+        for d in diagnoses
+    ]
+
+
+def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRow]:
+    """The impure production walk over both queues (#3758).
+
+    Drive-queue: mirrors ``coord drive-queue diagnose``'s own wiring
+    (:mod:`coord.commands.drive_queue`'s ``drive_queue_diagnose``) exactly —
+    same ``block_log`` open-episode read, same ``GhLiveProbe`` construction
+    — rather than a second, independently-built read of the same queue
+    (#2096). Merge-queue: :func:`merge_queue_rows`, no `gh` needed.
+
+    Deferred imports, same reason ``drive_queue_diagnose`` defers them: this
+    module is imported by the CLI's thin registration layer, and these
+    pull in `gh`-touching modules this harness's own tests must not need.
+    """
+    from coord import block_log  # noqa: PLC0415
+    from coord.commands.drive_queue import _local_host_id  # noqa: PLC0415
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+    from coord.drive_queue import entries_from_rows  # noqa: PLC0415
+    from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
+    from coord.merge_queue import load_queue as load_merge_queue  # noqa: PLC0415
+    from coord.state import build_board, list_drive_queue  # noqa: PLC0415
+
+    episodes = [
+        ep for ep in block_log.episodes(block_log.read_events()) if not ep.get("resolved")
+    ]
+    entries = entries_from_rows(list_drive_queue())
+    fleet_health = local_fleet_health_block([m.name for m in config.machines])
+    live_sessions = frozenset(
+        str(row["session_name"])
+        for row in list_drive_sessions()
+        if row.get("session_name")
+    )
+    probe = queue_diagnose.GhLiveProbe(
+        config=config,
+        board=build_board(),
+        fleet_health=fleet_health,
+        live_sessions=live_sessions,
+        local_host=_local_host_id(),
+    )
+    diagnoses = queue_diagnose.run_pass(
+        entries, episodes, probe=probe, keys=None, triggers=[trigger], limit=None
+    )
+    rows = drive_queue_rows(diagnoses)
+    rows.extend(merge_queue_rows(load_merge_queue()))
+    return rows
+
+
+def sweep(
+    rows: Sequence[StuckRow],
+    *,
+    tier_of: Callable[[str], str] = default_tier_of,
+    auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
+    alert_dispatcher: Callable[[StuckRow], None] | None = None,
+    dry_run: bool = False,
+    convergence_limit: int = CONVERGENCE_LIMIT,
+    sweep_id: str | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> SweepReport:
+    """The pure harness core: classify-already-done rows in, decisions out.
+
+    Takes no board connection and no `gh` handle — only *rows* (already
+    classified by :func:`collect_rows` or hand-built by a test) and
+    dispatcher callbacks. Never mutates the board itself; the only state
+    this function's non-dry-run calls write is the sweep's OWN convergence
+    counters and decision log (:mod:`coord.state`'s
+    ``record_board_doctor_observation`` / ``record_board_doctor_decision``),
+    never a queue row or a GitHub comment — those are C3/C4's job, reached
+    only through *auto_dispatchers*/*alert_dispatcher*.
+
+    For each row:
+      1. Record this sweep's observation of (queue, key, cause) — same
+         cause as last sweep increments the counter; a new/changed cause
+         resets it to 1 and clears any prior escalation.
+      2. ``tier_of(cause)`` decides auto vs. alert.
+      3. Alert tier: dispatch via *alert_dispatcher* iff not already
+         escalated for this cause, then mark escalated — exactly once per
+         (row, cause), the "escalate exactly once" half of #3758.
+      4. Auto tier: dispatch via ``auto_dispatchers[cause]`` while under
+         *convergence_limit*; at/past the limit, fall back to the alert
+         path exactly once instead of re-dispatching the same auto action
+         forever — the "stop being re-acted" half of #3758.
+
+    *dry_run* classifies and logs but dispatches nothing and writes no
+    convergence counter — a second sweep immediately after a dry run sees
+    the SAME state a first sweep would, by construction.
+    """
+    sweep_id = sweep_id or f"sweep-{(now or _utcnow)().strftime('%Y%m%dT%H%M%SZ')}"
+    auto_dispatchers = auto_dispatchers or {}
+    report = SweepReport(sweep_id=sweep_id, dry_run=dry_run)
+
+    from coord import state  # noqa: PLC0415 — deferred so dry-run callers need no DB.
+
+    for row in rows:
+        if dry_run:
+            counter = state.board_doctor_row_state(row.queue, row.key)
+            if counter.get("cause") == row.cause:
+                count = counter.get("count", 0) + 1
+                escalated = bool(counter.get("escalated", False))
+            else:
+                count, escalated = 1, False
+        else:
+            counter = state.record_board_doctor_observation(row.queue, row.key, row.cause)
+            count, escalated = counter["count"], counter["escalated"]
+
+        tier = tier_of(row.cause)
+        action = "converged-noop"
+
+        if tier == TIER_ALERT:
+            if not escalated:
+                if not dry_run and alert_dispatcher is not None:
+                    alert_dispatcher(row)
+                    state.mark_board_doctor_escalated(row.queue, row.key)
+                    escalated = True
+                action = "alert" if alert_dispatcher is not None else "no-dispatcher"
+        elif count < convergence_limit:
+            dispatcher = auto_dispatchers.get(row.cause)
+            if dispatcher is not None:
+                if not dry_run:
+                    dispatcher(row)
+                action = "auto-dispatch"
+            else:
+                action = "no-dispatcher"
+        else:
+            if not escalated:
+                if not dry_run and alert_dispatcher is not None:
+                    alert_dispatcher(row)
+                    state.mark_board_doctor_escalated(row.queue, row.key)
+                    escalated = True
+                action = "alert" if alert_dispatcher is not None else "no-dispatcher"
+
+        decision = Decision(
+            queue=row.queue,
+            key=row.key,
+            cause=row.cause,
+            tier=tier,
+            action=action,
+            count=count,
+            escalated=escalated,
+            dry_run=dry_run,
+        )
+        report.decisions.append(decision)
+        if not dry_run:
+            state.record_board_doctor_decision(
+                {
+                    "sweep_id": sweep_id,
+                    "queue": row.queue,
+                    "key": row.key,
+                    "cause": row.cause,
+                    "tier": tier,
+                    "action": action,
+                    "count": count,
+                    "escalated": escalated,
+                    "confidence": row.confidence,
+                    "evidence": list(row.evidence),
+                    "recorded_at": (now or _utcnow)().isoformat(),
+                }
+            )
+
+    return report
+
+
+def run_sweep(
+    *,
+    config,
+    tier_of: Callable[[str], str] = default_tier_of,
+    auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
+    alert_dispatcher: Callable[[StuckRow], None] | None = None,
+    dry_run: bool = False,
+    convergence_limit: int = CONVERGENCE_LIMIT,
+) -> SweepReport:
+    """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
+
+    The only function the CLI subcommand calls — everything it needs
+    (`gh`, the board, the merge queue) is read here, so :func:`sweep` itself
+    stays importable and runnable with none of that.
+    """
+    rows = collect_rows(config=config)
+    return sweep(
+        rows,
+        tier_of=tier_of,
+        auto_dispatchers=auto_dispatchers,
+        alert_dispatcher=alert_dispatcher,
+        dry_run=dry_run,
+        convergence_limit=convergence_limit,
+    )
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)

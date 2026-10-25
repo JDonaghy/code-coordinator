@@ -3084,6 +3084,99 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
     )
 
 
+# ── sweep (#3758) ────────────────────────────────────────────────────────────
+
+
+@drive_queue_group.command("sweep")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Emit the sweep report as JSON.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Classify and print, but dispatch nothing and persist no convergence state.",
+)
+@_CONFIG_OPTION
+def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> None:
+    """Board-doctor sweep: classify every stuck row, dispatch, record (#3758).
+
+    This is the scheduled HARNESS #3745's epic asks for, not the per-cause
+    actions — it takes no board-mutating action itself. For every stuck
+    drive-queue or merge-queue row it classifies cause+tier via #2276 Phase 1
+    (:mod:`coord.queue_diagnose`), hands auto-actionable causes to a C3
+    action dispatcher and alert-only causes to a C4 escalation path (both
+    sibling issues of #3745, not yet built — every cause is conservatively
+    alert-tier today, see `coord.board_doctor.default_tier_of`), and records
+    every decision with provenance in `board_meta`'s board-doctor log
+    (`coord.state.board_doctor_decisions`), in the spirit of #1478's board
+    comments.
+
+    A row stuck on the SAME cause for `coord.board_doctor.CONVERGENCE_LIMIT`
+    (default 3) consecutive sweeps stops being re-acted on and escalates to
+    the alert tier exactly once — never a repeat alert for an unresolved
+    cause, never an auto-action looping forever. `--dry-run` classifies and
+    prints but mutates no convergence counter and dispatches nothing — a
+    sweep run right after a dry run sees exactly what the dry run saw.
+
+    Meant to run on a schedule (`coord/deploy/coord-board-doctor.timer`,
+    shipped disabled by default) as well as by hand; same `is_remote()`
+    guard as `drive-queue diagnose`, for the same reason — the queues, the
+    block log and `gh` all live on the daemon host.
+    """
+    from coord import board_doctor  # noqa: PLC0415
+    from coord.board_service import is_remote  # noqa: PLC0415
+    from coord.commands._common import _load_config  # noqa: PLC0415
+
+    if is_remote():
+        raise click.ClickException(
+            "drive-queue sweep reads the daemon host's queues, board and "
+            "block log directly — run it there (a board_service-configured "
+            "thin client would sweep an empty queue)."
+        )
+
+    config = _load_config(config_path)
+    report = board_doctor.run_sweep(config=config, dry_run=dry_run)
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "sweep_id": report.sweep_id,
+                    "dry_run": report.dry_run,
+                    "decisions": [
+                        {
+                            "queue": d.queue,
+                            "key": d.key,
+                            "cause": d.cause,
+                            "tier": d.tier,
+                            "action": d.action,
+                            "count": d.count,
+                            "escalated": d.escalated,
+                        }
+                        for d in report.decisions
+                    ],
+                }
+            )
+        )
+        return
+
+    if not report.decisions:
+        click.echo("nothing stuck: no drive-queue or merge-queue row needed a decision")
+        return
+    for d in report.decisions:
+        escalated = " (escalated)" if d.escalated else ""
+        click.echo(
+            f"{d.queue}:{d.key} cause={d.cause} tier={d.tier} "
+            f"action={d.action} count={d.count}{escalated}"
+        )
+    if dry_run:
+        click.echo("--dry-run: nothing was dispatched and no convergence state was persisted")
+    else:
+        click.echo(
+            f"{len(report.decisions)} row(s) decided — read the log later with "
+            "`coord drive-queue sweep --json`"
+        )
+
+
 # ── overlap-report (#2247) ───────────────────────────────────────────────────
 
 

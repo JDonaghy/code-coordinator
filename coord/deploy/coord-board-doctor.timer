@@ -1,0 +1,22 @@
+# coord board-doctor sweep (#3758). Fires coord-board-doctor.service
+# (Type=oneshot) on a cadence. See that unit's header for the full
+# rationale, including the dry-run-by-default requirement.
+#
+# Hourly, matching #3758's own "default hourly" framing — this walks two
+# queues and classifies with `gh`, not a sub-minute signal like
+# coord-notify's pipeline poll, so there is no correctness reason to run
+# it any tighter.
+#
+# Install: see deploy/coord-board-doctor.service's header.
+
+[Unit]
+Description=Run coord board-doctor sweep hourly (#3758)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

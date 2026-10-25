@@ -361,6 +361,8 @@ def test_drive_queue_is_registered_with_every_verb():
         "apply-verdict",
         # #3339: the refused_premise unblock verb.
         "clear-refusal",
+        # #3758: the board-doctor scheduled-sweep harness.
+        "sweep",
     }
 
 
