@@ -7965,7 +7965,10 @@ def test_sweep_dry_run_classifies_a_real_stalled_row_and_persists_nothing(
     result = cli("sweep", "--dry-run")
     assert result.exit_code == 0, result.output
     assert f"drive-queue:{REPO}#1762 cause=merge-conflict tier=alert" in result.output
-    assert "action=no-dispatcher count=1" in result.output
+    # The real #2268 policy wires a real alert_dispatcher (it only skips
+    # calling it because of --dry-run), so the action label is "alert",
+    # not "no-dispatcher".
+    assert "action=alert count=1" in result.output
     assert (
         "--dry-run: nothing was dispatched and no convergence state was persisted"
         in result.output
@@ -7974,6 +7977,8 @@ def test_sweep_dry_run_classifies_a_real_stalled_row_and_persists_nothing(
     # exactly the same, fresh (count=1) state.
     assert state.board_doctor_decisions() == []
     assert state.board_doctor_row_state("drive-queue", f"{REPO}#1762") == {}
+    # --dry-run must not have written a `drive_escalations` row either.
+    assert state.get_drive_escalation(REPO, 1762) is None
 
 
 def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
@@ -7997,10 +8002,21 @@ def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
     assert logged[0]["key"] == f"{REPO}#1762"
     assert logged[0]["cause"] == "merge-conflict"
 
+    # #2268's C4: the first sweep's alert actually filed a `drive_escalations`
+    # row — the real "issue filing" surface, not a literal new GitHub issue.
+    escalation = state.get_drive_escalation(REPO, 1762)
+    assert escalation is not None
+    assert escalation["stage"] == "board-doctor:drive-queue"
+    assert escalation["proposed_command"] == "coord status"
+    assert "merge-conflict" in escalation["reason"]
+
     second = cli("sweep")
     assert second.exit_code == 0, second.output
     assert "count=2" in second.output
     assert len(state.board_doctor_decisions()) == 2
+    # Already escalated for this same, unresolved cause — #3758's
+    # "escalate exactly once" contract — so no second alert overwrites it.
+    assert "action=alert" not in second.output
 
 
 # ── #3395: direction-aware overlap ordering against a QUEUED entry ──────────
