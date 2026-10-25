@@ -8014,10 +8014,81 @@ def test_sweep_records_a_real_decision_and_advances_convergence_on_rerun(
     second = cli("sweep")
     assert second.exit_code == 0, second.output
     assert "count=2" in second.output
-    assert len(state.board_doctor_decisions()) == 2
+    decisions = state.board_doctor_decisions()
+    assert len(decisions) == 2
     # Already escalated for this same, unresolved cause — #3758's
     # "escalate exactly once" contract — so no second alert overwrites it.
-    assert "action=alert" not in second.output
+    assert decisions[-1]["action"] == "converged-noop"
+    assert "action=converged-noop" in second.output
+
+
+def _sweep_json(output: str) -> dict:
+    """The sweep report from `--json` output, ignoring any `warning:` lines.
+
+    A dispatcher that could not deliver echoes its own warning on stderr
+    before the report is printed, and the CliRunner folds stderr in.
+    """
+    return json.loads(output.strip().splitlines()[-1])
+
+
+def test_sweep_reports_alert_failed_when_the_escalation_cannot_be_written(
+    cli, seed, block_log, gh_world, monkeypatch
+):
+    """An alert that could not be delivered must say so, and must not
+    record the row as escalated — otherwise #3758's "escalate exactly
+    once" contract suppresses every future attempt for that cause."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
+    gh_world["mergeable"] = False
+
+    real_record = state.record_drive_escalation
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(state, "record_drive_escalation", unavailable)
+
+    failed = cli("sweep")
+    assert failed.exit_code == 0, failed.output
+    assert "action=alert-failed count=1" in failed.output
+    assert "(escalated)" not in failed.output
+    assert state.get_drive_escalation(REPO, 1762) is None
+    assert state.board_doctor_row_state("drive-queue", f"{REPO}#1762")["escalated"] is False
+    logged = state.board_doctor_decisions()
+    assert logged[-1]["action"] == "alert-failed"
+    assert logged[-1]["escalated"] is False
+
+    # The store comes back: the next sweep re-attempts rather than
+    # treating the lost alert as already delivered.
+    monkeypatch.setattr(state, "record_drive_escalation", real_record)
+    recovered = cli("sweep", "--json")
+    assert recovered.exit_code == 0, recovered.output
+    payload = _sweep_json(recovered.output)
+    assert [d["action"] for d in payload["decisions"]] == ["alert"]
+    assert payload["decisions"][0]["escalated"] is True
+    assert state.get_drive_escalation(REPO, 1762) is not None
+
+
+def test_sweep_json_reports_alert_failed_for_an_undeliverable_alert(
+    cli, seed, block_log, gh_world, monkeypatch
+):
+    """The same verdict is machine-readable, not text-only."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
+    gh_world["mergeable"] = False
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(state, "record_drive_escalation", unavailable)
+
+    result = cli("sweep", "--json")
+    assert result.exit_code == 0, result.output
+    payload = _sweep_json(result.output)
+    assert [d["action"] for d in payload["decisions"]] == ["alert-failed"]
+    assert payload["decisions"][0]["escalated"] is False
 
 
 # ── #3395: direction-aware overlap ordering against a QUEUED entry ──────────

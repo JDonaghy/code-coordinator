@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from coord.board_doctor import StuckRow
+from coord.board_doctor import ALERT_SKIPPED, TIER_ALERT, TIER_AUTO, StuckRow
 
 #: cause -> auto-action name. Empty by design; see the module docstring.
 #: A future PR populates this from Phase 0 block-log evidence of a
@@ -62,8 +62,6 @@ def policy_tier_of(cause: str) -> str:
     :data:`coord.board_doctor.TIER_ALERT`. This is the function `coord
     drive-queue sweep` wires in as `tier_of`.
     """
-    from coord.board_doctor import TIER_ALERT, TIER_AUTO  # noqa: PLC0415
-
     if cause in ALLOWLIST and cause in AUTO_DISPATCHERS:
         return TIER_AUTO
     return TIER_ALERT
@@ -73,7 +71,7 @@ def _board_doctor_stage(queue: str) -> str:
     return f"board-doctor:{queue}"
 
 
-def escalation_alert_dispatcher(row: StuckRow) -> bool:
+def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
     """#3745's C4: surface an alert-tier row via `drive_escalations`.
 
     Parses ``row.key`` (always ``"repo#issue"`` for both drive-queue and
@@ -85,10 +83,16 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool:
     back — `sweep`'s "escalate exactly once" contract depends on this
     return value to decide whether it may mark the row escalated, so a
     silently-swallowed failure here must never look like success. Skips
-    the write (returning ``True``, nothing to do) when a more specific,
-    non-board-doctor escalation already covers this issue, so a generic
-    `coord status` pointer never clobbers it. Never raises: an escalation
-    write failing must not take the sweep down with it, the same contract
+    the write when a more specific, non-board-doctor escalation already
+    covers this issue, so a generic `coord status` pointer never clobbers
+    it; that case returns :data:`coord.board_doctor.ALERT_SKIPPED` rather
+    than ``True``, because no board-doctor alert exists to suppress future
+    ones — `drive_escalations` holds one row per issue, so the covering
+    escalation may be dismissed by its own writer at any time, and the
+    next sweep must then be free to file this row's alert itself.
+
+    Never raises: an escalation write failing must not take the sweep
+    down with it, the same contract
     `coord.commands.drive_queue._escalate_roll_ledger` already relies on —
     a `warning:` line on stderr is the floor.
     """
@@ -122,7 +126,7 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool:
             # A more specific escalation (e.g. plan.blocked) already covers
             # this issue — don't overwrite its reason/created_at with our
             # generic "coord status" pointer.
-            return True
+            return ALERT_SKIPPED
 
         reason = (
             f"board-doctor: {row.queue} row {row.key} stuck on cause="
