@@ -8,12 +8,12 @@ to a C4 escalation path, and (3) records every decision with provenance, in
 the spirit of #1478's board comments. This module is the harness that does
 exactly that loop — and *only* that loop. The permission model (#3745's C2:
 which cause gets which tier) and the per-cause action dispatchers (C3) and
-escalation surface (C4) are sibling issues, not yet built; this harness does
-not invent their policy. :func:`default_tier_of` is the conservative
-placeholder — every cause escalates to the alert tier — so the loop is fully
-wired and safe today, with `tier_of`/`auto_dispatchers`/`alert_dispatcher`
-left as the seams C2/C3/C4 populate later without touching :func:`sweep`'s
-control flow.
+escalation surface (C4) live in :mod:`coord.board_doctor_policy`, a sibling
+module; this harness does not invent their policy. :func:`default_tier_of`
+delegates to that module's :func:`coord.board_doctor_policy.policy_tier_of`
+so the two never drift apart, with `tier_of`/`auto_dispatchers`/
+`alert_dispatcher` left as the seams the CLI wires in without touching
+:func:`sweep`'s control flow.
 
 :func:`sweep` is the pure, fully-testable core: given already-classified
 rows and dispatcher callbacks, it decides tier, tracks convergence, dispatches
@@ -70,16 +70,19 @@ _MERGE_QUEUE_STUCK_CAUSE: dict[str, str] = {
 }
 
 
-def default_tier_of(cause: str) -> str:  # noqa: ARG001
-    """Conservative placeholder for #3745's C2 permission policy.
+def default_tier_of(cause: str) -> str:
+    """Default `tier_of`: delegates to the real C2 policy.
 
-    Every cause escalates to the alert tier until a real cause -> tier
-    policy lands in a sibling issue (C2). This harness owns the loop, not
-    the per-cause actions — inventing that policy here would be doing C2's
-    job under cover of #3758, and a wrong auto-action default is worse than
-    an extra, harmless alert.
+    This harness owns the loop, not the per-cause tier decision — that
+    policy lives in :func:`coord.board_doctor_policy.policy_tier_of`, and
+    this function exists only so `sweep`/`run_sweep` have a safe default
+    that can never silently diverge from it. Deferred import: by the time
+    any caller actually invokes a `tier_of`, this module has finished
+    loading, so there is no import cycle to worry about.
     """
-    return TIER_ALERT
+    from coord.board_doctor_policy import policy_tier_of  # noqa: PLC0415
+
+    return policy_tier_of(cause)
 
 
 @dataclass(frozen=True)
@@ -103,7 +106,8 @@ class Decision:
     key: str
     cause: str
     tier: str
-    #: "auto-dispatch" | "alert" | "no-dispatcher" | "converged-noop"
+    #: "auto-dispatch" | "alert" | "would-alert" | "alert-failed" |
+    #: "no-dispatcher" | "converged-noop"
     action: str
     count: int
     escalated: bool
@@ -275,12 +279,13 @@ def sweep(
     *,
     tier_of: Callable[[str], str] = default_tier_of,
     auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
-    alert_dispatcher: Callable[[StuckRow], None] | None = None,
+    alert_dispatcher: Callable[[StuckRow], bool] | None = None,
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,
     sweep_id: str | None = None,
     now: Callable[[], datetime] | None = None,
     clear_absent_rows: bool = True,
+    escalation_resolver: Callable[[str, str], None] | None = None,
 ) -> SweepReport:
     """The pure harness core: classify-already-done rows in, decisions out.
 
@@ -299,8 +304,12 @@ def sweep(
          resets it to 1 and clears any prior escalation.
       2. ``tier_of(cause)`` decides auto vs. alert.
       3. Alert tier: dispatch via *alert_dispatcher* iff not already
-         escalated for this cause, then mark escalated — exactly once per
-         (row, cause), the "escalate exactly once" half of #3758.
+         escalated for this cause, then mark escalated only once that
+         dispatch is CONFIRMED (``alert_dispatcher`` returns truthy) —
+         exactly once per (row, cause), the "escalate exactly once" half
+         of #3758. A dispatcher that raises or returns falsy leaves
+         ``escalated`` False so the next sweep retries, rather than
+         silently treating an unconfirmed write as done.
       4. Auto tier: dispatch via ``auto_dispatchers[cause]`` while under
          *convergence_limit*; at/past the limit, fall back to the alert
          path exactly once instead of re-dispatching the same auto action
@@ -322,6 +331,16 @@ def sweep(
     ``coord.state.clear_board_doctor_row``, so a later recurrence starts
     fresh at ``count=1, escalated=False`` instead of resuming a stale count
     or staying permanently escalation-blind.
+
+    *escalation_resolver*, if given, is called as ``escalation_resolver
+    (queue, key)`` for every row :func:`clear_absent_rows` drops — the
+    counterpart to the alert path: once a row's cause has resolved (it
+    stopped appearing), whatever alert was filed for it is stale and the
+    resolver is expected to dismiss it. Called only on real (non-dry-run)
+    sweeps, same as the clearing itself; never let a resolver's own
+    failure interrupt the clear loop — that is the resolver's own
+    responsibility to swallow, exactly like *alert_dispatcher* is expected
+    to never raise.
     """
     sweep_id = sweep_id or f"sweep-{(now or _utcnow)().strftime('%Y%m%dT%H%M%SZ')}"
     auto_dispatchers = auto_dispatchers or {}
@@ -331,6 +350,29 @@ def sweep(
     from coord import state  # noqa: PLC0415 — deferred so dry-run callers need no DB.
 
     touched: set[tuple[str, str]] = set()
+
+    def _alert_action(row: StuckRow) -> tuple[bool, str]:
+        """Attempt the alert path for *row*; returns (escalated, action).
+
+        Only a CONFIRMED dispatch (truthy return) marks the row escalated
+        and persists that via `state.mark_board_doctor_escalated` — an
+        exception or falsy return from *alert_dispatcher* must not look
+        like a successful alert, so the next sweep gets another chance to
+        actually deliver it (#2268 review finding: an always-``None``-
+        returning dispatcher used to permanently suppress future alerts).
+        """
+        if dry_run:
+            return False, "would-alert" if alert_dispatcher is not None else "no-dispatcher"
+        if alert_dispatcher is None:
+            return False, "no-dispatcher"
+        try:
+            delivered = bool(alert_dispatcher(row))
+        except Exception:  # noqa: BLE001 — unconfirmed delivery, not a sweep crash
+            delivered = False
+        if not delivered:
+            return False, "alert-failed"
+        state.mark_board_doctor_escalated(row.queue, row.key)
+        return True, "alert"
 
     for row in rows:
         touched.add((row.queue, row.key))
@@ -347,11 +389,7 @@ def sweep(
 
         if tier == TIER_ALERT:
             if not escalated:
-                if not dry_run and alert_dispatcher is not None:
-                    alert_dispatcher(row)
-                    state.mark_board_doctor_escalated(row.queue, row.key)
-                    escalated = True
-                action = "alert" if alert_dispatcher is not None else "no-dispatcher"
+                escalated, action = _alert_action(row)
         elif count < convergence_limit:
             dispatcher = auto_dispatchers.get(row.cause)
             if dispatcher is not None:
@@ -362,11 +400,7 @@ def sweep(
                 action = "no-dispatcher"
         else:
             if not escalated:
-                if not dry_run and alert_dispatcher is not None:
-                    alert_dispatcher(row)
-                    state.mark_board_doctor_escalated(row.queue, row.key)
-                    escalated = True
-                action = "alert" if alert_dispatcher is not None else "no-dispatcher"
+                escalated, action = _alert_action(row)
 
         decision = Decision(
             queue=row.queue,
@@ -400,6 +434,8 @@ def sweep(
         for queue, key in state.board_doctor_tracked_rows():
             if (queue, key) not in touched:
                 state.clear_board_doctor_row(queue, key)
+                if escalation_resolver is not None:
+                    escalation_resolver(queue, key)
 
     return report
 
@@ -409,9 +445,10 @@ def run_sweep(
     config,
     tier_of: Callable[[str], str] = default_tier_of,
     auto_dispatchers: Mapping[str, Callable[[StuckRow], None]] | None = None,
-    alert_dispatcher: Callable[[StuckRow], None] | None = None,
+    alert_dispatcher: Callable[[StuckRow], bool] | None = None,
     dry_run: bool = False,
     convergence_limit: int = CONVERGENCE_LIMIT,
+    escalation_resolver: Callable[[str, str], None] | None = None,
 ) -> SweepReport:
     """Production entry point: :func:`collect_rows` then :func:`sweep` (#3758).
 
@@ -427,6 +464,7 @@ def run_sweep(
         alert_dispatcher=alert_dispatcher,
         dry_run=dry_run,
         convergence_limit=convergence_limit,
+        escalation_resolver=escalation_resolver,
     )
 
 

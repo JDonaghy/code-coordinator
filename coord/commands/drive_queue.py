@@ -3139,8 +3139,10 @@ def drive_queue_sweep(output_json: bool, dry_run: bool, config_path: Path) -> No
     report = board_doctor.run_sweep(
         config=config,
         tier_of=board_doctor_policy.policy_tier_of,
+        auto_dispatchers=board_doctor_policy.AUTO_DISPATCHERS,
         alert_dispatcher=board_doctor_policy.escalation_alert_dispatcher,
         dry_run=dry_run,
+        escalation_resolver=board_doctor_policy.dismiss_resolved_escalation,
     )
 
     if output_json:

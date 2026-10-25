@@ -13,12 +13,16 @@ from coord import state
 from coord.board_doctor import TIER_ALERT, TIER_AUTO, StuckRow
 from coord.board_doctor_policy import (
     ALLOWLIST,
+    AUTO_DISPATCHERS,
+    dismiss_resolved_escalation,
     escalation_alert_dispatcher,
     policy_tier_of,
 )
 
 
-def _row(key: str, cause: str, queue: str = "drive-queue", evidence: tuple = ()) -> StuckRow:
+def _row(
+    key: str, cause: str, queue: str = "drive-queue", evidence: tuple[str, ...] = ()
+) -> StuckRow:
     return StuckRow(
         queue=queue,
         key=key,
@@ -31,7 +35,7 @@ def _row(key: str, cause: str, queue: str = "drive-queue", evidence: tuple = ())
 
 class TestPolicyTierOf:
     def test_allowlist_is_empty_by_design(self) -> None:
-        # #2268: no cause is pre-approved for auto-action without Phase 0
+        # No cause is pre-approved for auto-action without Phase 0
         # block-log evidence of it recurring with a known-safe fix.
         assert ALLOWLIST == {}
 
@@ -39,22 +43,28 @@ class TestPolicyTierOf:
         for cause in ("no_pr", "merge_conflict", "dead_leg", "ci_red", "anything_else"):
             assert policy_tier_of(cause) == TIER_ALERT
 
-    def test_a_future_allowlist_entry_would_be_honored(self) -> None:
+    def test_a_future_allowlist_entry_would_be_honored(self, monkeypatch) -> None:
         # Pins the seam itself, not a specific entry: if a cause is ever
-        # added to ALLOWLIST, policy_tier_of must actually read it rather
-        # than hardcoding "always alert".
-        ALLOWLIST["probe_only_cause"] = "probe-only-action"
-        try:
-            assert policy_tier_of("probe_only_cause") == TIER_AUTO
-        finally:
-            del ALLOWLIST["probe_only_cause"]
+        # added to BOTH mappings, policy_tier_of must actually read them
+        # rather than hardcoding "always alert".
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "probe-only-action")
+        monkeypatch.setitem(AUTO_DISPATCHERS, "probe_only_cause", lambda row: True)
+        assert policy_tier_of("probe_only_cause") == TIER_AUTO
+
+    def test_allowlist_entry_without_a_dispatcher_stays_alert_tier(self, monkeypatch) -> None:
+        # An allowlist entry with no real dispatcher behind it must never
+        # silently promote to auto-tier — that would suppress the alert
+        # while doing nothing.
+        monkeypatch.setitem(ALLOWLIST, "probe_only_cause", "probe-only-action")
+        assert "probe_only_cause" not in AUTO_DISPATCHERS
+        assert policy_tier_of("probe_only_cause") == TIER_ALERT
 
 
 class TestEscalationAlertDispatcher:
     def test_drive_queue_row_files_a_real_escalation(self) -> None:
         row = _row("acme/widgets#1762", "merge_conflict")
 
-        escalation_alert_dispatcher(row)
+        assert escalation_alert_dispatcher(row) is True
 
         escalation = state.get_drive_escalation("acme/widgets", 1762)
         assert escalation is not None
@@ -67,7 +77,7 @@ class TestEscalationAlertDispatcher:
     def test_merge_queue_row_parses_the_same_repo_hash_issue_key(self) -> None:
         row = _row("acme/widgets#99", "gate_blocked", queue="merge-queue")
 
-        escalation_alert_dispatcher(row)
+        assert escalation_alert_dispatcher(row) is True
 
         escalation = state.get_drive_escalation("acme/widgets", 99)
         assert escalation is not None
@@ -80,7 +90,7 @@ class TestEscalationAlertDispatcher:
         first = state.get_drive_escalation("acme/widgets", 5)
         assert first is not None
 
-        escalation_alert_dispatcher(row)
+        assert escalation_alert_dispatcher(row) is True
         second = state.get_drive_escalation("acme/widgets", 5)
         assert second is not None
         assert second["created_at"] == first["created_at"]
@@ -89,6 +99,71 @@ class TestEscalationAlertDispatcher:
         row = _row("no-hash-separator", "ci_red")
 
         # Must not raise — a malformed key is a dropped alert, not a crash.
-        escalation_alert_dispatcher(row)
+        assert escalation_alert_dispatcher(row) is False
 
         assert state.list_drive_escalations() == []
+
+    def test_empty_repo_name_is_rejected_without_writing(self) -> None:
+        # A key like "#12" rpartitions to an empty repo_name — must not
+        # write an escalation keyed on an empty repo.
+        row = _row("#12", "ci_red")
+
+        assert escalation_alert_dispatcher(row) is False
+
+        assert state.list_drive_escalations() == []
+
+    def test_a_more_specific_existing_escalation_is_left_untouched(self) -> None:
+        # A differently-staged escalation (e.g. filed by plan.blocked)
+        # already covers this issue — the generic board-doctor alert must
+        # not clobber its reason with "coord status".
+        state.record_drive_escalation(
+            "acme/widgets",
+            7,
+            stage="plan.blocked",
+            reason="blocked on a human decision",
+            gate_readings="",
+            proposed_command="coord approve 7",
+        )
+        row = _row("acme/widgets#7", "ci_red")
+
+        assert escalation_alert_dispatcher(row) is True
+
+        escalation = state.get_drive_escalation("acme/widgets", 7)
+        assert escalation is not None
+        assert escalation["stage"] == "plan.blocked"
+        assert escalation["reason"] == "blocked on a human decision"
+
+
+class TestDismissResolvedEscalation:
+    def test_dismisses_an_escalation_this_module_filed(self) -> None:
+        row = _row("acme/widgets#8", "ci_red")
+        escalation_alert_dispatcher(row)
+        assert state.get_drive_escalation("acme/widgets", 8) is not None
+
+        dismiss_resolved_escalation("drive-queue", "acme/widgets#8")
+
+        assert state.get_drive_escalation("acme/widgets", 8) is None
+
+    def test_leaves_a_differently_staged_escalation_untouched(self) -> None:
+        state.record_drive_escalation(
+            "acme/widgets",
+            9,
+            stage="plan.blocked",
+            reason="blocked on a human decision",
+            gate_readings="",
+            proposed_command="coord approve 9",
+        )
+
+        dismiss_resolved_escalation("drive-queue", "acme/widgets#9")
+
+        escalation = state.get_drive_escalation("acme/widgets", 9)
+        assert escalation is not None
+        assert escalation["stage"] == "plan.blocked"
+
+    def test_malformed_key_does_not_raise(self) -> None:
+        # Must not raise — a malformed key means nothing to clean up.
+        dismiss_resolved_escalation("drive-queue", "no-hash-separator")
+        dismiss_resolved_escalation("drive-queue", "#12")
+
+    def test_missing_escalation_does_not_raise(self) -> None:
+        dismiss_resolved_escalation("drive-queue", "acme/widgets#404")
