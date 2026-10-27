@@ -122,6 +122,11 @@ class UpstreamGapOutcome:
     number: int | None = None
     url: str | None = None
     queued_after: bool = False
+    # True when THIS call enqueued the upstream issue as a fresh drive-queue
+    # root (so it actually gets worked). False if it was already queued, or
+    # the enqueue failed (see notes). Distinct from ``queued_after``, which is
+    # about holding the DOWNSTREAM row.
+    upstream_queued: bool = False
     detail: str = ""
     notes: list[str] = field(default_factory=list)
 
@@ -338,6 +343,29 @@ def _enqueue_kwargs(entry, after: list[str]) -> dict:
     )
 
 
+def _queue_upstream(upstream_repo: str, number: int) -> tuple[bool, str]:
+    """Enqueue the auto-filed upstream issue as a fresh drive-queue root.
+
+    Without this the upstream issue is filed but never worked, so the
+    downstream row :func:`_block_queue_row` holds ``after=`` it defers forever
+    "waiting on <upstream> (open, not queued)" — the gap #2056/#1771 hit. The
+    upstream is a root: nothing blocks it, so it enqueues with no ``after`` and
+    the tick launches it as soon as its repo has a free slot.
+
+    Idempotent: an issue already in the queue is left EXACTLY as it is — never
+    re-enqueued (which would reset machine/after/holds to defaults) and never
+    pulled out of flight. Returns ``(enqueued_now, note)``.
+    """
+    from coord.drive_queue import QueueEntry  # noqa: PLC0415
+    from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
+
+    entries = [QueueEntry.from_row(r) for r in list_drive_queue()]
+    if any(e.repo == upstream_repo and e.issue == number for e in entries):
+        return False, "upstream already in the drive queue — left as-is"
+    enqueue_drive_queue(upstream_repo, number)
+    return True, "upstream enqueued for drive (fresh root)"
+
+
 def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str) -> tuple[bool, str]:
     """Hold the downstream drive-queue row ``after=upstream_key``.
 
@@ -485,6 +513,13 @@ def _file_one(
                 outcome.notes.append(note)
             except Exception as exc:  # noqa: BLE001
                 outcome.notes.append(f"queue block failed: {exc}")
+            # Heal a first pass that filed but never queued the upstream (the
+            # #1771 case): enqueue it now, idempotently.
+            try:
+                outcome.upstream_queued, qnote = _queue_upstream(upstream.name, number)
+                outcome.notes.append(qnote)
+            except Exception as exc:  # noqa: BLE001
+                outcome.notes.append(f"upstream enqueue failed: {exc}")
         return outcome
 
     created = create_issue(
@@ -530,6 +565,13 @@ def _file_one(
         outcome.notes.append(note)
     except Exception as exc:  # noqa: BLE001
         outcome.notes.append(f"queue block failed: {exc}")
+    # Enqueue the upstream itself so it actually gets worked — otherwise the
+    # downstream row blocked above waits forever on an unqueued issue (#1771).
+    try:
+        outcome.upstream_queued, qnote = _queue_upstream(upstream.name, number)
+        outcome.notes.append(qnote)
+    except Exception as exc:  # noqa: BLE001 — a failed enqueue must not sink the filing
+        outcome.notes.append(f"upstream enqueue failed: {exc}")
     return outcome
 
 

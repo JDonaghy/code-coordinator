@@ -254,7 +254,37 @@ class TestProcessUpstreamGaps:
                                          repo_name="vimcode", issue_number=42)
         assert outcomes[0].status == "filed"
         assert outcomes[0].queued_after is False
+        # The DOWNSTREAM stays unqueued (it never was), but the upstream is
+        # still enqueued as a root so the gap actually gets worked.
         assert state.list_drive_queue("vimcode") == []
+        assert outcomes[0].upstream_queued is True
+        assert _row(501, "quadraui")["issue_number"] == 501
+
+    def test_auto_filed_upstream_is_queued_as_a_root(self, tracker, config) -> None:
+        """The upstream issue is itself enqueued as a fresh drive-queue root
+        (no pre-reqs), so it gets worked and the downstream row it blocks can
+        relaunch — the gap vimcode#2056 hit, where quadraui#1771 was filed and
+        chained but left `open, not queued`."""
+        state.enqueue_drive_queue("vimcode", 42)
+        out = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                    repo_name="vimcode", issue_number=42)[0]
+        assert out.status == "filed" and out.upstream_queued is True
+        assert _after(_row(501, "quadraui")) == []  # a root — nothing blocks it
+
+    def test_upstream_already_queued_is_left_as_is(self, tracker, config) -> None:
+        """Idempotent: an upstream already in the queue is never re-enqueued
+        (which would reset its machine/after) nor pulled out of flight."""
+        state.enqueue_drive_queue("vimcode", 42)
+        first = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                      repo_name="vimcode", issue_number=42)[0]
+        assert first.upstream_queued is True
+        # Operator pins the upstream row to a machine; a replay must not reset it.
+        state.enqueue_drive_queue("quadraui", 501, machine="laptop")
+        second = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                       repo_name="vimcode", issue_number=42)[0]
+        assert second.status == "already-filed" and second.upstream_queued is False
+        rows = [r for r in state.list_drive_queue("quadraui") if r["issue_number"] == 501]
+        assert len(rows) == 1 and rows[0]["machine"] == "laptop"
 
     def test_no_marker_does_nothing(self, tracker, config) -> None:
         assert process_upstream_gaps("all done", config=config,
