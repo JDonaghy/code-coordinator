@@ -330,6 +330,74 @@ def _episode_stuck_row(episode: dict) -> StuckRow | None:
     )
 
 
+def _refresh_ceiling_blocked_settled_rows(
+    settled_episodes: Sequence[dict],
+    *,
+    entries_by_key: Mapping[str, Any],
+    probe: queue_diagnose.LiveProbe,
+    trigger: str,
+) -> tuple[list[StuckRow], list[dict]]:
+    """Give a #2972-ceiling-blocked settled episode one more live look (#3777).
+
+    :func:`_episode_stuck_row` is right that a settled episode's stored
+    cause must stay visible to this sweep — but for the subset of settled
+    episodes whose drive-queue row has already exhausted the fix-round
+    ceiling, that stored cause can also go stale forever: once
+    :func:`coord.queue_diagnose.needs_diagnosis` decides an episode is
+    concluded, nothing ever re-probes it, even after the underlying PR
+    later merges. Widening what :func:`coord.queue_diagnose.run_pass` is
+    handed cannot fix that — it re-applies `needs_diagnosis` internally to
+    every candidate regardless of which list the caller passes, so a
+    settled episode never reaches its probe through that path no matter
+    what. This calls the same two primitives `run_pass` calls internally
+    (`probe.probe` then :func:`coord.queue_diagnose.diagnose`) directly,
+    bypassing `needs_diagnosis` for just this narrow, already-permanently-
+    blocked subset. That bypass is safe: neither `run_pass` nor this
+    module ever writes a diagnosis back to `block_log` (both only read it
+    and build ephemeral rows for this sweep), so it cannot corrupt
+    anything `needs_diagnosis`'s own `gh`-call budget protects.
+
+    Returns the freshly diagnosed rows, plus whichever episodes this left
+    untouched (not ceiling-blocked, unparseable key, or no matching
+    drive-queue entry) for :func:`_episode_stuck_row` to keep handling
+    exactly as before.
+    """
+    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+
+    refreshed: list[StuckRow] = []
+    remaining: list[dict] = []
+    for episode in settled_episodes:
+        key = str(episode.get("key") or "")
+        repo_name, _, issue_text = key.rpartition("#")
+        entry = entries_by_key.get(key)
+        if (
+            not key
+            or entry is None
+            or not repo_name
+            or not issue_text.isdigit()
+            or not fix_round_ceiling_blocked_for_issue(repo_name, int(issue_text))
+        ):
+            remaining.append(episode)
+            continue
+        try:
+            live = probe.probe(entry)
+        except Exception:  # noqa: BLE001 — a refresh must never crash the sweep
+            remaining.append(episode)
+            continue
+        diagnosis = queue_diagnose.diagnose(entry, live, trigger=trigger)
+        refreshed.append(
+            StuckRow(
+                queue="drive-queue",
+                key=diagnosis.key,
+                state=diagnosis.state,
+                cause=diagnosis.cause,
+                confidence=diagnosis.confidence,
+                evidence=diagnosis.evidence,
+            )
+        )
+    return refreshed, remaining
+
+
 def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     """Relabel #2972-ceiling-blocked-but-live-clear rows (#3760 Action 1).
 
@@ -393,7 +461,12 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     directly via :func:`_episode_stuck_row`, so a cause this sweep already
     knows never becomes permanently invisible just because it is settled
     (#3758) — that would invert the point of a sweep that is supposed to
-    ACT on settled causes.
+    ACT on settled causes. Within that settled set, one whose drive-queue
+    row is also blocked on the #2972 fix-round ceiling gets one more live
+    probe via :func:`_refresh_ceiling_blocked_settled_rows` first (#3777)
+    — the one case a stale settled cause (e.g. a merge-conflict diagnosis
+    recorded before the PR actually merged) would otherwise park forever,
+    since nothing else ever re-probes a concluded episode.
 
     Deferred imports, same reason ``drive_queue_diagnose`` defers them: this
     module is imported by the CLI's thin registration layer, and these
@@ -419,6 +492,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     settled_episodes = [ep for ep in episodes if not queue_diagnose.needs_diagnosis(ep)]
 
     entries = entries_from_rows(list_drive_queue())
+    entries_by_key = {e.key: e for e in entries}
     fleet_health = local_fleet_health_block([m.name for m in config.machines])
     live_sessions = frozenset(
         str(row["session_name"])
@@ -436,7 +510,11 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     diagnoses = queue_diagnose.run_pass(
         entries, fresh_episodes, probe=probe, keys=None, triggers=triggers, limit=None
     )
+    refreshed_rows, settled_episodes = _refresh_ceiling_blocked_settled_rows(
+        settled_episodes, entries_by_key=entries_by_key, probe=probe, trigger=trigger
+    )
     rows = drive_queue_rows(diagnoses)
+    rows.extend(refreshed_rows)
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     rows = _reclassify_ceiling_blocked(rows)
     rows.extend(merge_queue_rows(load_merge_queue()))
