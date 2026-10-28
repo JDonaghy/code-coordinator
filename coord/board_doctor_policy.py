@@ -401,6 +401,26 @@ def _alert_fallback(row: StuckRow) -> bool:
     return True
 
 
+#: #3777: the #2972/#3454 ceiling check below exists to stop a BLIND
+#: relaunch loop — dispatching another fix-it leg with no better reason
+#: than "the cause is still alert-eligible" (vimcode#2018's ~14 legs/$31
+#: overnight). A HIGH-confidence diagnosed merge-conflict is not that: the
+#: diagnosis itself is new evidence the ceiling's own ``remaining_fix_rounds``
+#: exhaustion never saw, and the targeted remedy (a conflict-fix rebase) is
+#: a single bounded leg, not an open-ended retry stream. Every other cause,
+#: and every confidence below `CONFIDENCE_HIGH`, stays governed by the
+#: ceiling exactly as before.
+_CEILING_BYPASS_CAUSES = frozenset({queue_diagnose.CAUSE_MERGE_CONFLICT})
+
+
+def _ceiling_bypass_eligible(row: StuckRow) -> bool:
+    """True for a row the #2972 ceiling must not stop `_investigate` dispatching."""
+    return (
+        row.cause in _CEILING_BYPASS_CAUSES
+        and row.confidence == queue_diagnose.CONFIDENCE_HIGH
+    )
+
+
 def _investigate(row: StuckRow) -> bool:
     """#3769's C1 wiring: dispatch a fix-it leg for an alert-eligible
     cause instead of paging a human outright.
@@ -441,7 +461,12 @@ def _investigate(row: StuckRow) -> bool:
     investigate-dispatched legs on top of that (vimcode#2018's ~14 legs/$31
     overnight is exactly the failure mode this guards against). A
     ceiling-blocked row falls straight to :func:`_alert_fallback`, the same
-    as a declined machine pin.
+    as a declined machine pin — UNLESS :func:`_ceiling_bypass_eligible` says
+    otherwise (#3777): a HIGH-confidence diagnosed merge-conflict still gets
+    one targeted fix-it leg even past the ceiling, since that diagnosis is
+    the fleet's strongest signal the row is not actually out of options, and
+    the ceiling's own point is to stop a blind relaunch, not a leg a fresh
+    diagnosis specifically calls for.
 
     Finally, :func:`_investigate_tier_enabled` gates the whole tier on the
     global kill switch (config-level and the ``--no-investigate`` sweep
@@ -471,15 +496,23 @@ def _investigate(row: StuckRow) -> bool:
     from coord.state import build_board  # noqa: PLC0415
 
     if fix_round_ceiling_blocked_for_issue(repo_name, issue_number):
+        if not _ceiling_bypass_eligible(row):
+            click.echo(
+                f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
+                "— its drive-queue row already gave up on the fix-round ceiling "
+                "(#2972/#3454); falling back to the alert tier instead of "
+                "dispatching another fix-it leg (#3756)",
+                err=True,
+            )
+            _alert_fallback(row)
+            return False
         click.echo(
-            f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
-            "— its drive-queue row already gave up on the fix-round ceiling "
-            "(#2972/#3454); falling back to the alert tier instead of "
-            "dispatching another fix-it leg (#3756)",
+            f"warning: board-doctor IS investigating {repo_name}#{issue_number} "
+            "despite the fix-round ceiling — a high-confidence diagnosed "
+            f"{row.cause} is new evidence, not the blind relaunch #3454 "
+            "guards against (#3777)",
             err=True,
         )
-        _alert_fallback(row)
-        return False
 
     try:
         config = resolve_and_load_config(None)

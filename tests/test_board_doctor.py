@@ -23,9 +23,12 @@ from coord.board_doctor import (
     TIER_AUTO,
     StuckRow,
     _reclassify_ceiling_blocked,
+    _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
     sweep,
 )
+from coord.drive_queue import QueueEntry
+from coord.queue_diagnose import LiveState
 
 
 def _row(key: str, cause: str, queue: str = "drive-queue") -> StuckRow:
@@ -72,6 +75,139 @@ def _seed_ceiling_blocked_entry(repo: str, issue: int) -> None:
         state="blocked",
         last_reason="giving up after 2 fix rounds (#2972)",
     )
+
+
+class _FakeProbe:
+    """A :class:`coord.queue_diagnose.LiveProbe` double keyed by ``repo#issue``."""
+
+    def __init__(self, live_by_key: dict[str, LiveState | Exception]) -> None:
+        self._live_by_key = live_by_key
+
+    def probe(self, entry: QueueEntry) -> LiveState:
+        key = f"{entry.repo}#{entry.issue}"
+        result = self._live_by_key.get(key)
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise AssertionError(f"no fake live state configured for {key}")
+        return result
+
+
+class TestRefreshCeilingBlockedSettledRows:
+    """#3777: one more live probe for a settled, ceiling-blocked episode."""
+
+    def test_ceiling_blocked_episode_is_refreshed_to_pr_merged(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 101)
+        entry = QueueEntry(repo="acme/widgets", issue=101)
+        episode = {
+            "key": "acme/widgets#101",
+            "state": "stuck",
+            "diagnosed_cause": queue_diagnose.CAUSE_MERGE_CONFLICT,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+            "diagnosis_evidence": ("pr: mergeable=False",),
+        }
+        probe = _FakeProbe({"acme/widgets#101": LiveState(pr_state="MERGED")})
+
+        refreshed, remaining = _refresh_ceiling_blocked_settled_rows(
+            [episode],
+            entries_by_key={entry.key: entry},
+            probe=probe,
+            trigger="board-doctor-sweep",
+        )
+
+        assert remaining == []
+        [row] = refreshed
+        assert row.key == "acme/widgets#101"
+        assert row.cause == queue_diagnose.CAUSE_PR_MERGED
+        assert row.confidence == queue_diagnose.CONFIDENCE_HIGH
+
+    def test_episode_not_ceiling_blocked_is_left_in_remaining(self) -> None:
+        # No drive-queue row seeded for this issue at all, so the ceiling
+        # predicate reads False — the common case, untouched by this
+        # refresh path.
+        entry = QueueEntry(repo="acme/widgets", issue=102)
+        episode = {
+            "key": "acme/widgets#102",
+            "state": "stuck",
+            "diagnosed_cause": queue_diagnose.CAUSE_MERGE_CONFLICT,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+        }
+        probe = _FakeProbe({})
+
+        refreshed, remaining = _refresh_ceiling_blocked_settled_rows(
+            [episode],
+            entries_by_key={entry.key: entry},
+            probe=probe,
+            trigger="board-doctor-sweep",
+        )
+
+        assert refreshed == []
+        assert remaining == [episode]
+
+    def test_episode_with_no_matching_drive_queue_entry_is_left_in_remaining(self) -> None:
+        episode = {
+            "key": "acme/widgets#103",
+            "state": "stuck",
+            "diagnosed_cause": queue_diagnose.CAUSE_MERGE_CONFLICT,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+        }
+        probe = _FakeProbe({})
+
+        refreshed, remaining = _refresh_ceiling_blocked_settled_rows(
+            [episode],
+            entries_by_key={},
+            probe=probe,
+            trigger="board-doctor-sweep",
+        )
+
+        assert refreshed == []
+        assert remaining == [episode]
+
+    def test_a_probe_failure_falls_back_to_remaining_instead_of_crashing(self) -> None:
+        _seed_ceiling_blocked_entry("acme/widgets", 104)
+        entry = QueueEntry(repo="acme/widgets", issue=104)
+        episode = {
+            "key": "acme/widgets#104",
+            "state": "stuck",
+            "diagnosed_cause": queue_diagnose.CAUSE_MERGE_CONFLICT,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+        }
+        probe = _FakeProbe({"acme/widgets#104": RuntimeError("gh timed out")})
+
+        refreshed, remaining = _refresh_ceiling_blocked_settled_rows(
+            [episode],
+            entries_by_key={entry.key: entry},
+            probe=probe,
+            trigger="board-doctor-sweep",
+        )
+
+        assert refreshed == []
+        assert remaining == [episode]
+
+    def test_ceiling_blocked_episode_still_blocked_keeps_its_cause(self) -> None:
+        # The live probe confirms the row is still mid-conflict — the
+        # refreshed diagnosis just re-derives the same cause from fresh
+        # evidence rather than leaving a stale answer in place.
+        _seed_ceiling_blocked_entry("acme/widgets", 105)
+        entry = QueueEntry(repo="acme/widgets", issue=105)
+        episode = {
+            "key": "acme/widgets#105",
+            "state": "stuck",
+            "diagnosed_cause": queue_diagnose.CAUSE_MERGE_CONFLICT,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+        }
+        probe = _FakeProbe({"acme/widgets#105": LiveState(mergeable=False)})
+
+        refreshed, remaining = _refresh_ceiling_blocked_settled_rows(
+            [episode],
+            entries_by_key={entry.key: entry},
+            probe=probe,
+            trigger="board-doctor-sweep",
+        )
+
+        assert remaining == []
+        [row] = refreshed
+        assert row.cause == queue_diagnose.CAUSE_MERGE_CONFLICT
 
 
 class TestReclassifyCeilingBlocked:
