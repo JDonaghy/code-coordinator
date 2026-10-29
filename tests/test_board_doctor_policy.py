@@ -50,15 +50,21 @@ _UNPINNABLE_DETAIL = (
 
 
 def _row(
-    key: str, cause: str, queue: str = "drive-queue", evidence: tuple[str, ...] = ()
+    key: str,
+    cause: str,
+    queue: str = "drive-queue",
+    evidence: tuple[str, ...] = (),
+    *,
+    fresh: bool = True,
 ) -> StuckRow:
     return StuckRow(
         queue=queue,
         key=key,
         state="stuck",
         cause=cause,
-        confidence="high",
+        confidence=queue_diagnose.CONFIDENCE_HIGH,
         evidence=evidence or (f"cause={cause}",),
+        fresh=fresh,
     )
 
 
@@ -579,6 +585,53 @@ class TestInvestigate:
             cause=queue_diagnose.CAUSE_MERGE_CONFLICT,
             confidence=queue_diagnose.CONFIDENCE_MEDIUM,
             evidence=("cause=merge-conflict",),
+            fresh=True,
+        )
+
+        assert _investigate(row) is False
+        escalation = state.get_drive_escalation("acme/widgets", 40)
+        assert escalation is not None
+        assert escalation["stage"] == "board-doctor:drive-queue"
+
+    def test_ceiling_still_blocks_a_stale_high_confidence_merge_conflict_row(
+        self, monkeypatch
+    ) -> None:
+        # #3777: a HIGH-confidence merge-conflict row is only new evidence
+        # when it is this sweep's own live verdict (`StuckRow.fresh`) — a
+        # row reconstructed from a possibly arbitrarily-old stored
+        # `block_log` diagnosis (`fresh=False`, e.g. via
+        # `coord.board_doctor._episode_stuck_row`) must not bypass the
+        # ceiling just because it happens to carry a stale high-confidence
+        # cause/confidence pair.
+        monkeypatch.setattr(
+            "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+            lambda repo_name, issue_number: True,
+        )
+
+        def boom_if_called(path, **kwargs):
+            raise AssertionError(
+                "config must not be resolved once the ceiling check blocks"
+            )
+
+        monkeypatch.setattr(common, "resolve_and_load_config", boom_if_called)
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "dispatch_sweep_action must not run once the ceiling check blocks"
+            )
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+
+        row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#40",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_MERGE_CONFLICT,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=("cause=merge-conflict",),
+            fresh=False,
         )
 
         assert _investigate(row) is False

@@ -82,9 +82,16 @@ class _FakeProbe:
 
     def __init__(self, live_by_key: dict[str, LiveState | Exception]) -> None:
         self._live_by_key = live_by_key
+        #: every key this probe was actually called with, in order — lets a
+        #: test assert the probe was never reached (``calls == []``) rather
+        #: than relying on an unconfigured key's ``AssertionError`` as a
+        #: proxy, since production's ``except Exception`` would also catch
+        #: that error and mask the short-circuit silently passing.
+        self.calls: list[str] = []
 
     def probe(self, entry: QueueEntry) -> LiveState:
         key = f"{entry.repo}#{entry.issue}"
+        self.calls.append(key)
         result = self._live_by_key.get(key)
         if isinstance(result, Exception):
             raise result
@@ -120,11 +127,15 @@ class TestRefreshCeilingBlockedSettledRows:
         assert row.key == "acme/widgets#101"
         assert row.cause == queue_diagnose.CAUSE_PR_MERGED
         assert row.confidence == queue_diagnose.CONFIDENCE_HIGH
+        assert row.fresh is True
 
     def test_episode_not_ceiling_blocked_is_left_in_remaining(self) -> None:
-        # No drive-queue row seeded for this issue at all, so the ceiling
-        # predicate reads False — the common case, untouched by this
-        # refresh path.
+        # A drive-queue row IS seeded here, but it's still "running" — not
+        # ceiling-blocked — so the ceiling predicate reads False and this
+        # refresh path must never even reach the probe for it. (A prior
+        # version of this test seeded no row at all, which only proved the
+        # "no matching entry" branch, already covered separately below.)
+        state.enqueue_drive_queue("acme/widgets", 102, after=[])
         entry = QueueEntry(repo="acme/widgets", issue=102)
         episode = {
             "key": "acme/widgets#102",
@@ -143,6 +154,7 @@ class TestRefreshCeilingBlockedSettledRows:
 
         assert refreshed == []
         assert remaining == [episode]
+        assert probe.calls == []
 
     def test_episode_with_no_matching_drive_queue_entry_is_left_in_remaining(self) -> None:
         episode = {
@@ -162,6 +174,7 @@ class TestRefreshCeilingBlockedSettledRows:
 
         assert refreshed == []
         assert remaining == [episode]
+        assert probe.calls == []
 
     def test_a_probe_failure_falls_back_to_remaining_instead_of_crashing(self) -> None:
         _seed_ceiling_blocked_entry("acme/widgets", 104)
@@ -208,6 +221,33 @@ class TestRefreshCeilingBlockedSettledRows:
         assert remaining == []
         [row] = refreshed
         assert row.cause == queue_diagnose.CAUSE_MERGE_CONFLICT
+        assert row.fresh is True
+
+    def test_inconclusive_refresh_keeps_the_prior_stored_cause_in_remaining(self) -> None:
+        # A refresh probe that comes back empty must not downgrade a
+        # previously settled, actionable stored cause (CAUSE_PR_MERGED
+        # here) to CAUSE_UNKNOWN — the episode stays in `remaining` so
+        # `_episode_stuck_row` reconstructs it from `block_log` exactly as
+        # it would have without this refresh ever running.
+        _seed_ceiling_blocked_entry("acme/widgets", 106)
+        entry = QueueEntry(repo="acme/widgets", issue=106)
+        episode = {
+            "key": "acme/widgets#106",
+            "state": "stuck",
+            "diagnosed_cause": queue_diagnose.CAUSE_PR_MERGED,
+            "diagnosis_confidence": queue_diagnose.CONFIDENCE_HIGH,
+        }
+        probe = _FakeProbe({"acme/widgets#106": LiveState()})
+
+        refreshed, remaining = _refresh_ceiling_blocked_settled_rows(
+            [episode],
+            entries_by_key={entry.key: entry},
+            probe=probe,
+            trigger="board-doctor-sweep",
+        )
+
+        assert refreshed == []
+        assert remaining == [episode]
 
 
 class TestReclassifyCeilingBlocked:
