@@ -160,6 +160,26 @@ def test_motivating_incident_reconstruction_is_crit_at_default() -> None:
     assert r.severity is Severity.CRIT
 
 
+def test_window_uses_config_default_not_a_hardcoded_value() -> None:
+    # The probe must judge against ``HealthConfig``'s own window default
+    # (5.5h), never a literal baked into the probe. A fully-hot span just
+    # over 5.5h with a stock config is CRIT; a probe that hardcoded the 6.0
+    # representable max would wrongly report "under window" here and never
+    # fire. 1322 samples at 15s cadence spans 1321*15s = ~5.504h > 5.5h.
+    assert HealthConfig().sustained_cpu_window_hours == 5.5
+    count = 1322
+    samples = _series(
+        count=count,
+        cpu_percent=90.0,
+        start=NOW - (count - 1) * CADENCE,
+    )
+    span_hours = (samples[-1]["timestamp"] - samples[0]["timestamp"]) / 3600.0
+    assert 5.5 < span_hours < 6.0
+    ctx = _ctx(daemon_host={"machine_metrics": {"box-a": samples}})
+    r = _result_for(probe_sustained_cpu(ctx), "box-a")
+    assert r.severity is Severity.CRIT
+
+
 def test_multiple_machines_get_independent_results() -> None:
     hot = _series(count=MAX_SAMPLES, cpu_percent=90.0)
     cool = _series(count=MAX_SAMPLES, cpu_percent=5.0)
