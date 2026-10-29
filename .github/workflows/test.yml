@@ -52,7 +52,7 @@ jobs:
       # If a future test needs to be serial-only, give it the same
       # `@pytest.mark.posix_only`-style registered marker and exclude it
       # here AND in `coord-test-runner.sh` together, not just one of them.
-      - run: pytest -n auto --ignore=tests/acceptance
+      - run: pytest -n auto --ignore=tests/acceptance --timeout=120 --timeout-method=thread
       # #2899: the `COORD_TUI_SRC=. python scripts/codegen.py --rust --check`
       # step that used to live here is GONE. It was #2897's explicit stand-in
       # for the byte-comparison, held here only for as long as the crate did
@@ -206,7 +206,7 @@ jobs:
       - run: pip install -e ".[dev]"
       # #2180: same split as the `test` job — the sealed acceptance suite is
       # gated separately through the #2164 CI wrapper.
-      - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q --ignore=tests/acceptance
+      - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q --ignore=tests/acceptance --timeout=120 --timeout-method=thread
 
   # #2135 (child of epic #1902): "every `gh` argv construction lives inside
   # coord/github_ops.py" is the load-bearing assumption under the #1902
@@ -284,7 +284,7 @@ jobs:
       - run: pip install -e ".[dev]"
       # #2180: same split as the `test` job — the sealed acceptance suite is
       # gated separately through the #2164 CI wrapper.
-      - run: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q --ignore=tests/acceptance
+      - run: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q --ignore=tests/acceptance --timeout=120 --timeout-method=thread
       - name: What a red result here means
         if: failure()
         run: |
