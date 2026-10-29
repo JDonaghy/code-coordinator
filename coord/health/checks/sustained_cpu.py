@@ -106,8 +106,14 @@ def probe_sustained_cpu(ctx: HealthContext) -> list[CheckResult]:
             )
         ]
 
-    percent = float(getattr(ctx.thresholds, "sustained_cpu_percent", 50.0))
-    window_hours = float(getattr(ctx.thresholds, "sustained_cpu_window_hours", 6.0))
+    # Read the thresholds straight off the dataclass — they are declared
+    # fields of ``HealthConfig`` with their own defaults (50.0 / 5.5), so a
+    # ``getattr`` fallback here could only ever drift from those real
+    # defaults. A literal ``6.0`` fallback in particular would contradict
+    # this module's own "window must stay below the 6.0 representable max"
+    # invariant (see the module docstring) the moment it were used.
+    percent = float(ctx.thresholds.sustained_cpu_percent)
+    window_hours = float(ctx.thresholds.sustained_cpu_window_hours)
 
     return [
         _judge_machine(name, series, percent=percent, window_hours=window_hours, now=ctx.now)
