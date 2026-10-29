@@ -215,6 +215,12 @@ dev = [
     # identical results (4642 passed) across repeated runs. Not required —
     # tooling that runs the suite should fall back to serial when it is absent.
     "pytest-xdist>=3.5",
+    # #3785: a per-test wall-clock cap so a hung test FAULTS WITH ITS STACK
+    # named in the log, instead of pinning the CI runner to GitHub's 6h
+    # default (claude-coordinator#3777 sat ~16h on one). The job-level
+    # `timeout-minutes` in test.yml is the outer safety net; this names the
+    # culprit. Not required — tooling falls back cleanly when it is absent.
+    "pytest-timeout>=2.3",
     # #1238: the build backend itself, mirrored out of `[build-system].requires`
     # above. Those are installed into an ephemeral, discarded venv by PEP 517
     # build isolation, so a plain `pip install -e ".[dev]"` leaves them
