@@ -2782,10 +2782,15 @@ class HealthConfig:
     # gap this check exists to close. See `coord.health.checks.sustained_cpu`.
     sustained_cpu_percent: float = 50.0
     # Hours of history that must be covered — and found hot — before this
-    # ever reaches CRIT.  Matches `coord.machine_metrics.DEFAULT_MAX_SAMPLES`
-    # at its default 15s cadence (~6h), so a daemon that just started (not
-    # yet enough history) reports OK/UNKNOWN, never a false CRIT.
-    sustained_cpu_window_hours: float = 6.0
+    # ever reaches CRIT.  `coord.machine_metrics.DEFAULT_MAX_SAMPLES` (1440)
+    # holds 1439 *intervals*, so at the default 15s cadence the fullest
+    # possible buffer spans `1439 * 15s` = ~5.996h.  This default sits
+    # strictly below that representable maximum on purpose — at or above
+    # 6.0h the CRIT branch is unreachable except via incidental poll-loop
+    # slop, since the buffer can never actually cover a 6.0h window.  A
+    # daemon that just started (not yet enough history) still reports
+    # OK/UNKNOWN, never a false CRIT.
+    sustained_cpu_window_hours: float = 5.5
 
 
 @dataclass
@@ -5194,8 +5199,13 @@ _HEALTH_FLOAT_FIELDS: dict[str, float] = {
     "webapp_build_heartbeat_crit_minutes": 0.0,
     "pr_churn_window_hours": 0.0,
     "config_drift_crit_hours": 0.0,
-    "sustained_cpu_percent": 0.0,
-    "sustained_cpu_window_hours": 0.0,
+    # Unlike every other entry above, `0` is not "disabled" for these two —
+    # `sustained_cpu_percent: 0` makes every sample "hot" (cpu_percent is
+    # never negative) and `sustained_cpu_window_hours: 0` makes any history
+    # at all "enough span", so either one at 0 is an instant fleet-wide CRIT
+    # rather than a no-op. Floor both above zero instead of at it.
+    "sustained_cpu_percent": 1.0,
+    "sustained_cpu_window_hours": 0.1,
 }
 _HEALTH_INT_FIELDS: tuple[str, ...] = (
     "worktree_warn_count",
