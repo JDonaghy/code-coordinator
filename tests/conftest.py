@@ -39,6 +39,18 @@ _AMBIENT_HOME_AT_COLLECTION = Path(
 ).resolve()
 
 
+# #3789: capture the GENUINE machine_pause._state_path once, at collection,
+# before any test or the autouse `_no_real_pause_store` fixture patches it.
+# The fixture captured it at setup time (`original = machine_pause._state_path`)
+# instead, so once the attribute was already a `_guarded` wrapper, `_guarded`'s
+# $HOME-probe called `_guarded` again and recursed without bound — hanging the
+# whole suite under the populated-home env (coord#3777 / #3785). Anchoring on
+# the real resolver makes that re-entry structurally impossible.
+from coord import machine_pause as _machine_pause_at_collection
+
+_GENUINE_PAUSE_STATE_PATH = _machine_pause_at_collection._state_path
+
+
 def _resolve_posix_bash() -> str:
     """#2727: resolve a real POSIX ``bash`` deliberately rather than trusting
     bare ``"bash"`` + ``PATH`` order.
@@ -866,7 +878,12 @@ def _no_real_pause_store(monkeypatch, tmp_path):
     """
     from coord import machine_pause  # noqa: PLC0415
 
-    original = machine_pause._state_path
+    # #3789: resolve through the GENUINE _state_path captured at collection,
+    # never `machine_pause._state_path` as it stands now — if this fixture's
+    # own wrapper is already installed, re-reading the attribute would make
+    # `_guarded` call `_guarded` and recurse without bound (the populated-home
+    # hang). The genuine resolver cannot route back into the guard.
+    original = _GENUINE_PAUSE_STATE_PATH
     sandbox = tmp_path / "pause-store"
 
     def _sandboxed(name: str) -> Path:
