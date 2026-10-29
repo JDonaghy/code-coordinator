@@ -11287,7 +11287,16 @@ def build_app(
             while True:
                 await asyncio.sleep(health_poll_interval)
                 try:
-                    await run_in_threadpool(_fleet_health_refresher.refresh, config)
+                    # #3779: thread the CPU/mem sampler's history through so
+                    # `sustained_cpu` can see it — same sampler
+                    # `_machine_metrics_loop` below fills, read here rather
+                    # than polled again, since this loop must never make its
+                    # own fan-out HTTP calls (see the module note above).
+                    await run_in_threadpool(
+                        _fleet_health_refresher.refresh,
+                        config,
+                        machine_metrics=_machine_metrics_sampler.all_series(),
+                    )
                 except Exception:  # noqa: BLE001 — keep serving the old snapshot
                     log.warning("fleet-health refresh failed", exc_info=True)
 
