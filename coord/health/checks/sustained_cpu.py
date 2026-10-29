@@ -11,14 +11,17 @@ a normal, bursty load spike.
 This check only *produces* the CRIT verdict — wiring a notifier to page on it
 is a separate issue.
 
-CRIT requires ALL three:
+CRIT requires ALL of:
 
-1. the buffer actually spans ``window_hours`` or more (never judge a daemon
+1. the newest sample is fresh — within :data:`METRICS_STALE_AFTER_SECONDS` of
+   ``ctx.now`` — so a dead sampler loop reads UNKNOWN, never a frozen CRIT or
+   a frozen OK;
+2. the buffer actually spans ``window_hours`` or more (never judge a daemon
    that only just started sampling — that is OK/UNKNOWN, not CRIT);
-2. :data:`MIN_HOT_FRACTION` of the ``status="ok"`` samples in that window are
+3. :data:`MIN_HOT_FRACTION` of the ``status="ok"`` samples in that window are
    at or above ``percent`` ("nearly every", not literally every — one noisy
    sample must never flip the verdict either way);
-3. the window is not dominated by ``status="unknown"`` samples
+4. the window is not dominated by ``status="unknown"`` samples
    (:data:`MAX_UNKNOWN_FRACTION`) — an unreachable agent is the *notifier's*
    separate "can't reach this machine" case, not "pinned".
 
@@ -28,9 +31,19 @@ normalized 0-100 **across all cores**, so N pinned cores out of M reads as
 "high" threshold like 85%.  The discriminator that actually catches that is
 the *sustained* window, not a high percent; see ``HealthConfig`` for the
 same reasoning on the config side.
+
+``window_hours`` defaults below the ring buffer's actual maximum span on
+purpose, not at it: ``DEFAULT_MAX_SAMPLES`` holds up to 1440 samples, which
+is 1439 *intervals*, so at the documented 15s cadence the fullest possible
+buffer spans ``1439 * 15s`` = ~5.996h — strictly less than 6.0h. A
+``window_hours`` at or above that representable maximum makes the CRIT
+branch unreachable except via incidental poll-loop slop; see ``HealthConfig``
+for the margin this leaves.
 """
 
 from __future__ import annotations
+
+import os
 
 from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import check
@@ -47,6 +60,17 @@ MIN_HOT_FRACTION = 0.95
 # verdict is "can't tell", not "pinned" — an unreachable agent is the
 # notifier's own separate failure mode (#3779's own scope note).
 MAX_UNKNOWN_FRACTION = 0.25
+
+# A series whose newest sample is older than this is a frozen buffer, not a
+# live reading — `_machine_metrics_loop` (`coord.serve_app`) is a bare
+# `create_task` loop that is never restarted if it dies, so a dead sampler
+# keeps handing `all_series()` the same pre-death buffer forever. Judging
+# that buffer as current would produce a permanent CRIT for a box that
+# cooled down hours ago, or a permanent OK for one that is now pinned.
+# Same order of magnitude, and the same override knob shape, as
+# `coord.health.fleet_snapshot.STALE_AFTER_SECONDS` (900s default) for the
+# sibling `/health`-poll loop this check's sampler loop mirrors.
+METRICS_STALE_AFTER_SECONDS = float(os.environ.get("COORD_METRICS_STALE_SECS", "900"))
 
 
 @check(
@@ -86,9 +110,19 @@ def probe_sustained_cpu(ctx: HealthContext) -> list[CheckResult]:
     window_hours = float(getattr(ctx.thresholds, "sustained_cpu_window_hours", 6.0))
 
     return [
-        _judge_machine(name, series, percent=percent, window_hours=window_hours)
+        _judge_machine(name, series, percent=percent, window_hours=window_hours, now=ctx.now)
         for name, series in sorted(all_series.items())
     ]
+
+
+def _fmt_pct(value: float) -> str:
+    """Render a configured percent without silently rounding a fractional one.
+
+    `:.0f` would print `sustained_cpu_percent: 52.5` as "53" in every
+    threshold/headroom string — `:g` keeps the fraction when there is one
+    and still prints whole numbers (`50.0` -> "50") the way `:.0f` does.
+    """
+    return f"{value:g}"
 
 
 def _judge_machine(
@@ -97,8 +131,9 @@ def _judge_machine(
     *,
     percent: float,
     window_hours: float,
+    now: float,
 ) -> CheckResult:
-    threshold = f"crit at >={percent:.0f}% for >={window_hours:.1f}h"
+    threshold = f"crit at >={_fmt_pct(percent)}% for >={window_hours:.1f}h"
     n = len(series)
     if n == 0:
         return CheckResult(
@@ -108,6 +143,19 @@ def _judge_machine(
             severity=Severity.OK,
             headroom="no samples yet",
             threshold=threshold,
+        )
+
+    newest_age = now - series[-1]["timestamp"]
+    if newest_age > METRICS_STALE_AFTER_SECONDS:
+        return CheckResult(
+            check_id=CHECK_ID,
+            scope="fleet",
+            subject=machine,
+            severity=Severity.UNKNOWN,
+            headroom=f"newest sample is {newest_age / 60.0:.0f}min old — sampler may be stalled",
+            detail="a frozen buffer must not be judged as a current reading",
+            threshold=threshold,
+            values={"newest_sample_age_seconds": round(newest_age, 1)},
         )
 
     # Samples are oldest-first (MachineMetricsSampler.all_series()).
@@ -164,8 +212,8 @@ def _judge_machine(
             scope="fleet",
             subject=machine,
             severity=Severity.CRIT,
-            headroom=f"cpu ≥{percent:.0f}% for {span_hours:.1f}h "
-            f"({hot_count}/{n} samples)",
+            headroom=f"cpu ≥{_fmt_pct(percent)}% for {span_hours:.1f}h "
+            f"({hot_count}/{len(ok_samples)} samples)",
             detail=f"peak {peak:.0f}%, mean {mean:.0f}% over {len(ok_samples)} ok samples",
             threshold=threshold,
             values=values,
@@ -176,7 +224,7 @@ def _judge_machine(
         scope="fleet",
         subject=machine,
         severity=Severity.OK,
-        headroom=f"cpu not sustained ≥{percent:.0f}% ({hot_fraction * 100:.0f}% of samples hot)",
+        headroom=f"cpu not sustained ≥{_fmt_pct(percent)}% ({hot_fraction * 100:.0f}% of samples hot)",
         threshold=threshold,
         values=values,
     )

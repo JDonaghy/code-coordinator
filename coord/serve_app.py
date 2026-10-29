@@ -11287,15 +11287,22 @@ def build_app(
             while True:
                 await asyncio.sleep(health_poll_interval)
                 try:
-                    # #3779: thread the CPU/mem sampler's history through so
+                    # Thread the CPU/mem sampler's history through so
                     # `sustained_cpu` can see it — same sampler
                     # `_machine_metrics_loop` below fills, read here rather
                     # than polled again, since this loop must never make its
                     # own fan-out HTTP calls (see the module note above).
+                    #
+                    # `.all_series()` copies every buffer (up to machines x
+                    # DEFAULT_MAX_SAMPLES dicts) and must run off the event
+                    # loop too, same as `refresh` itself — call it from
+                    # *inside* the threadpool function, not as an argument
+                    # expression evaluated before `run_in_threadpool` runs.
                     await run_in_threadpool(
-                        _fleet_health_refresher.refresh,
-                        config,
-                        machine_metrics=_machine_metrics_sampler.all_series(),
+                        lambda: _fleet_health_refresher.refresh(
+                            config,
+                            machine_metrics=_machine_metrics_sampler.all_series(),
+                        )
                     )
                 except Exception:  # noqa: BLE001 — keep serving the old snapshot
                     log.warning("fleet-health refresh failed", exc_info=True)
