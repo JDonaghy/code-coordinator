@@ -414,9 +414,21 @@ _CEILING_BYPASS_CAUSES = frozenset({queue_diagnose.CAUSE_MERGE_CONFLICT})
 
 
 def _ceiling_bypass_eligible(row: StuckRow) -> bool:
-    """True for a row the #2972 ceiling must not stop `_investigate` dispatching."""
+    """True for a row the #2972 ceiling must not stop `_investigate` dispatching.
+
+    Requires :attr:`StuckRow.fresh` (#3777): the bypass exists because a
+    high-confidence diagnosed merge-conflict is new evidence the ceiling's
+    blind-relaunch guard was never meant to stop — but `row.cause`/
+    `row.confidence` only carry that meaning when this sweep itself just
+    computed them from a live probe. A row rebuilt by
+    :func:`coord.board_doctor._episode_stuck_row` from `block_log` carries
+    whatever cause/confidence were stored whenever the episode concluded,
+    which can be arbitrarily stale (e.g. the PR has since merged) — that is
+    not new evidence, so it must not bypass anything.
+    """
     return (
-        row.cause in _CEILING_BYPASS_CAUSES
+        row.fresh
+        and row.cause in _CEILING_BYPASS_CAUSES
         and row.confidence == queue_diagnose.CONFIDENCE_HIGH
     )
 
@@ -507,10 +519,10 @@ def _investigate(row: StuckRow) -> bool:
             _alert_fallback(row)
             return False
         click.echo(
-            f"warning: board-doctor IS investigating {repo_name}#{issue_number} "
-            "despite the fix-round ceiling — a high-confidence diagnosed "
+            f"warning: board-doctor bypassing the fix-round ceiling for "
+            f"{repo_name}#{issue_number} — a fresh high-confidence diagnosed "
             f"{row.cause} is new evidence, not the blind relaunch #3454 "
-            "guards against (#3777)",
+            "guards against (#3777); continuing to the investigate tier",
             err=True,
         )
 

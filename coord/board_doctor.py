@@ -48,11 +48,14 @@ escalated once could never be re-alerted after it later resolves and recurs.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from coord import queue_diagnose
+
+_log = logging.getLogger(__name__)
 
 TIER_AUTO = "auto"
 TIER_ALERT = "alert"
@@ -176,6 +179,18 @@ class StuckRow:
     #: skipping its own dispatch/counter update entirely — the collapsed
     #: baseline-red row is what alerts, once per repo, not this one.
     suppressed: bool = False
+    #: #3777: True only for a row whose cause/confidence this SWEEP itself
+    #: just computed from live evidence (:func:`drive_queue_rows`,
+    #: :func:`merge_queue_rows`, :func:`baseline_red_rows`,
+    #: :func:`_refresh_ceiling_blocked_settled_rows`) — never for
+    #: :func:`_episode_stuck_row`'s reconstruction of a *stored* diagnosis,
+    #: which can be arbitrarily old and is never re-confirmed by that path.
+    #: `_ceiling_bypass_eligible` requires this before it will let a
+    #: high-confidence cause skip the #2972 ceiling: bypassing the ceiling
+    #: on a stale stored verdict (e.g. a `merge-conflict`/`high` row whose
+    #: PR has since merged) would spend a fix-it leg against evidence that
+    #: is no longer true, which is exactly what the ceiling exists to stop.
+    fresh: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,6 +257,7 @@ def merge_queue_rows(entries: Sequence[Any]) -> list[StuckRow]:
                 cause=cause,
                 confidence=queue_diagnose.CONFIDENCE_HIGH,
                 evidence=evidence,
+                fresh=True,
             )
         )
     return rows
@@ -276,13 +292,18 @@ def baseline_red_rows(blocked_streaks: Mapping[str, int]) -> list[StuckRow]:
             cause=CAUSE_BASELINE_RED,
             confidence=queue_diagnose.CONFIDENCE_HIGH,
             evidence=(f"baseline_red_streak={streak}",),
+            fresh=True,
         )
         for repo_name, streak in blocked_streaks.items()
     ]
 
 
 def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[StuckRow]:
-    """Adapt :func:`coord.queue_diagnose.run_pass` output to :class:`StuckRow`."""
+    """Adapt :func:`coord.queue_diagnose.run_pass` output to :class:`StuckRow`.
+
+    ``fresh=True``: every *diagnoses* entry came from `run_pass` probing the
+    entry live THIS sweep (#3777) — never a stored verdict from a prior one.
+    """
     return [
         StuckRow(
             queue="drive-queue",
@@ -291,6 +312,7 @@ def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[Stuc
             cause=d.cause,
             confidence=d.confidence,
             evidence=d.evidence,
+            fresh=True,
         )
         for d in diagnoses
     ]
@@ -313,6 +335,12 @@ def _episode_stuck_row(episode: dict) -> StuckRow | None:
     Returns ``None`` for an episode with no concluded, actionable cause
     yet (empty or still :data:`coord.queue_diagnose.CAUSE_UNKNOWN`) — same
     as today's effective behavior for those, just reached without a retry.
+
+    Leaves :attr:`StuckRow.fresh` at its default ``False`` (#3777): the
+    cause/confidence here are whatever `block_log` persisted from the
+    diagnosis event that concluded the episode, which can be arbitrarily
+    old — this never re-confirms them, so nothing downstream may treat
+    this row as this-sweep live evidence.
     """
     cause = episode.get("diagnosed_cause") or ""
     if not cause or cause == queue_diagnose.CAUSE_UNKNOWN:
@@ -352,14 +380,17 @@ def _refresh_ceiling_blocked_settled_rows(
     what. This calls the same two primitives `run_pass` calls internally
     (`probe.probe` then :func:`coord.queue_diagnose.diagnose`) directly,
     bypassing `needs_diagnosis` for just this narrow, already-permanently-
-    blocked subset. That bypass is safe: neither `run_pass` nor this
-    module ever writes a diagnosis back to `block_log` (both only read it
-    and build ephemeral rows for this sweep), so it cannot corrupt
-    anything `needs_diagnosis`'s own `gh`-call budget protects.
+    blocked subset. That bypass does spend one of this sweep's live `gh`
+    probes outside `needs_diagnosis`'s own call-rate budget for this
+    episode — but it cannot corrupt `block_log` itself: neither `run_pass`
+    nor this module ever writes a diagnosis back to it (both only read it
+    and build ephemeral rows for this sweep).
 
-    Returns the freshly diagnosed rows, plus whichever episodes this left
-    untouched (not ceiling-blocked, unparseable key, or no matching
-    drive-queue entry) for :func:`_episode_stuck_row` to keep handling
+    Returns the freshly diagnosed rows (:attr:`StuckRow.fresh` set, since
+    each reflects a probe this sweep just took), plus whichever episodes
+    this left untouched (not ceiling-blocked, unparseable key, no matching
+    drive-queue entry, a failed probe, or a refresh that still can't name
+    an actionable cause) for :func:`_episode_stuck_row` to keep handling
     exactly as before.
     """
     from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
@@ -368,11 +399,13 @@ def _refresh_ceiling_blocked_settled_rows(
     remaining: list[dict] = []
     for episode in settled_episodes:
         key = str(episode.get("key") or "")
+        if not key:
+            remaining.append(episode)
+            continue
         repo_name, _, issue_text = key.rpartition("#")
         entry = entries_by_key.get(key)
         if (
-            not key
-            or entry is None
+            entry is None
             or not repo_name
             or not issue_text.isdigit()
             or not fix_round_ceiling_blocked_for_issue(repo_name, int(issue_text))
@@ -382,9 +415,17 @@ def _refresh_ceiling_blocked_settled_rows(
         try:
             live = probe.probe(entry)
         except Exception:  # noqa: BLE001 — a refresh must never crash the sweep
+            _log.debug("board-doctor: ceiling-refresh probe failed for %s", key, exc_info=True)
             remaining.append(episode)
             continue
         diagnosis = queue_diagnose.diagnose(entry, live, trigger=trigger)
+        if diagnosis.cause == queue_diagnose.CAUSE_UNKNOWN:
+            # A partial/inconclusive probe must not downgrade a previously
+            # settled, actionable stored cause (e.g. CAUSE_PR_MERGED) to
+            # unknown — keep the episode as `_episode_stuck_row` would have
+            # reconstructed it from `block_log`.
+            remaining.append(episode)
+            continue
         refreshed.append(
             StuckRow(
                 queue="drive-queue",
@@ -393,6 +434,7 @@ def _refresh_ceiling_blocked_settled_rows(
                 cause=diagnosis.cause,
                 confidence=diagnosis.confidence,
                 evidence=diagnosis.evidence,
+                fresh=True,
             )
         )
     return refreshed, remaining
