@@ -11,6 +11,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
@@ -159,6 +160,7 @@ jobs:
     # overnight on 2026-08-08.
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -195,6 +197,7 @@ jobs:
   # directory (notably the venv's own bin/) untouched.
   no-gh-on-path:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -231,6 +234,7 @@ jobs:
   # check, not a build step.
   gh-argv-containment:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -271,6 +275,7 @@ jobs:
   # Verified at authoring time: 9590 passed, 13 skipped under these three knobs.
   populated-home:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -296,6 +301,7 @@ jobs:
   # canonical DB but the CLI/notify runs on a laptop without a local copy).
   thin-client-strict:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       COORD_STRICT_LOCAL_BOARD: "1"
       # Simulate a thin-client: point board-service at a non-existent URL so
@@ -414,6 +420,7 @@ jobs:
   # what every other job's `pip install -e ".[dev]"` pulls in.
   postgres:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     # #3392, 2026-09-18: taken out of automatic CI by operator decision -- the
     # Postgres migration is not current work, and until it is this job is pure
     # noise. It gates nothing (`continue-on-error: true` below, and it is not a
