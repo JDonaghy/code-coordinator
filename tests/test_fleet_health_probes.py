@@ -129,6 +129,7 @@ def test_all_fleet_probes_run() -> None:
         "fleet_phantom_running",
         "fleet_toolchain_skew",
         "fleet_unit_drift",
+        "fleet_sustained_cpu",
         "issues_sync_staleness",
     }
 

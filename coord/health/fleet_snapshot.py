@@ -318,7 +318,21 @@ class FleetHealthRefresher:
         self._prune_build_timestamps(now)
         return len(self._board_build_timestamps)
 
-    def refresh(self, config) -> FleetHealthSnapshot:  # noqa: ANN001 — coord.config.Config
+    def refresh(
+        self,
+        config,  # noqa: ANN001 — coord.config.Config
+        *,
+        machine_metrics: dict[str, list[dict]] | None = None,
+    ) -> FleetHealthSnapshot:
+        """Poll every agent, assemble a :class:`FleetSnapshot`, run fleet checks.
+
+        *machine_metrics* is `MachineMetricsSampler.all_series()` (#3020),
+        threaded in by the caller (`coord.serve_app` owns the sampler, this
+        class does not) so `coord.health.checks.sustained_cpu` has the raw
+        CPU-sample history to judge. ``None`` when the caller has no sampler
+        (e.g. a test building a refresher directly) — the probe fails soft to
+        UNKNOWN in that case, same as every other optional daemon-host fact.
+        """
         from coord import network, state  # noqa: PLC0415
         from coord.health.context import build_context  # noqa: PLC0415
         from coord.health.models import FleetSnapshot  # noqa: PLC0415
@@ -422,6 +436,12 @@ class FleetHealthRefresher:
             }
         except Exception:  # noqa: BLE001 — see docstring
             daemon_host["issues_sync_status"] = {}
+        # #3779: raw per-machine CPU/mem sample history (#3020), for
+        # `sustained_cpu` to judge "pinned for the whole ~6h window" from.
+        # Kept out of the persisted/bounded payload entirely — only the
+        # derived CheckResult below rides in `fleet_checks`; this dict itself
+        # is never passed to `bound_health_payload`.
+        daemon_host["machine_metrics"] = machine_metrics or {}
 
         # ── 3. run the fleet-scope registry over the assembled snapshot ────
         by_name = {row["machine"]: {

@@ -2772,6 +2772,21 @@ class HealthConfig:
     # WARN regardless of age. See `coord.health.checks.config_drift`.
     config_drift_crit_hours: float = 24.0
 
+    # ── sustained CPU pin, fleet scope (#3779) ─────────────────────────────
+    # `psutil.cpu_percent` is normalized 0-100 **across all cores**, so 5
+    # pinned cores on a 10-core box reads ~50%, not 100% — the motivating
+    # incident for this check never crossed a "high" threshold like 85%,
+    # it just sat at ~50% for hours. The discriminator that actually catches
+    # it is the SUSTAINED window, not a high percent, so the default here is
+    # moderate on purpose; raising it "to reduce noise" quietly re-opens the
+    # gap this check exists to close. See `coord.health.checks.sustained_cpu`.
+    sustained_cpu_percent: float = 50.0
+    # Hours of history that must be covered — and found hot — before this
+    # ever reaches CRIT.  Matches `coord.machine_metrics.DEFAULT_MAX_SAMPLES`
+    # at its default 15s cadence (~6h), so a daemon that just started (not
+    # yet enough history) reports OK/UNKNOWN, never a false CRIT.
+    sustained_cpu_window_hours: float = 6.0
+
 
 @dataclass
 class NotificationsConfig:
@@ -5179,6 +5194,8 @@ _HEALTH_FLOAT_FIELDS: dict[str, float] = {
     "webapp_build_heartbeat_crit_minutes": 0.0,
     "pr_churn_window_hours": 0.0,
     "config_drift_crit_hours": 0.0,
+    "sustained_cpu_percent": 0.0,
+    "sustained_cpu_window_hours": 0.0,
 }
 _HEALTH_INT_FIELDS: tuple[str, ...] = (
     "worktree_warn_count",
