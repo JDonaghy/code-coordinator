@@ -123,6 +123,7 @@ from coord.board_doctor import (
 )
 from coord.board_doctor_permissions import (
     SAFE_TIER_ACTIONS,
+    SweepPermissionError,
     authorize_sweep_action,
     dispatch_sweep_action,
 )
@@ -308,15 +309,37 @@ def _clear_merged_row(row: StuckRow) -> bool:
     confirmed remove whose driver session could not be stopped
     (``driver_ok=False``) still counts as a successful removal here —
     `sweep_drive_queue_remove` already logged that loudly on its own.
+
+    A row whose #1757 deploy gate is armed or fired but not yet released
+    makes `sweep_drive_queue_remove` raise :class:`SweepPermissionError`
+    (`_refuse_if_remove_would_release_gate`) rather than remove anything.
+    That refusal is caught HERE, not left to propagate: `sweep`'s dispatch
+    call site (`coord.board_doctor.sweep`) has no `try` around it — unlike
+    its own `_alert_action` — so an uncaught exception would abort the
+    entire sweep, leaving every row ordered after this one unclassified and
+    `clear_absent_rows` never run. Swallowing it and returning `False`
+    instead reports `"auto-dispatch-noop"` for this row (recorded as a
+    decision, same as any other no-op) and lets the rest of the sweep
+    proceed; the row's own count keeps climbing toward the convergence
+    limit, where C4 escalates it to a human instead of this action
+    silently starving the sweep on every run until someone notices.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
         return False
     repo_name, issue_number = parsed
-    result = dispatch_sweep_action("drive_queue_remove", repo_name, issue_number)
-    if not result.get("removed"):
-        import click  # noqa: PLC0415
+    import click  # noqa: PLC0415
 
+    try:
+        result = dispatch_sweep_action("drive_queue_remove", repo_name, issue_number)
+    except SweepPermissionError as exc:
+        click.echo(
+            f"warning: board-doctor remove refused for {repo_name}#"
+            f"{issue_number}: {exc}",
+            err=True,
+        )
+        return False
+    if not result.get("removed"):
         click.echo(
             f"warning: board-doctor remove no-op for {repo_name}#"
             f"{issue_number} — row was not found in the drive queue",
