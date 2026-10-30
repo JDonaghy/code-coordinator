@@ -53,11 +53,11 @@ jobs:
       # here AND in `coord-test-runner.sh` together, not just one of them.
       # #3796: `--timeout=120 --timeout-method=signal` bounds every single
       # test's wall time. `signal` (not the default `thread`) is required —
-      # the known hang (test_dry_run_no_network_dispatch, quarantined below)
-      # is CPU-bound in the main thread, and the `thread` method cannot
-      # interrupt that; verified it let a hung test run 80+ minutes. With
-      # `signal`, a hung test fails in <=120s with a traceback naming it
-      # instead of wedging the whole job.
+      # the known hang (test_dry_run_no_network_dispatch, quarantined in
+      # tests/test_cli_assign.py) is CPU-bound in the main thread, and the
+      # `thread` method cannot interrupt that; verified it let a hung test
+      # run 80+ minutes. With `signal`, a hung test fails in <=120s with a
+      # traceback naming it instead of wedging the whole job.
       - run: pytest -n auto --ignore=tests/acceptance --timeout=120 --timeout-method=signal
       # #2899: the `COORD_TUI_SRC=. python scripts/codegen.py --rust --check`
       # step that used to live here is GONE. It was #2897's explicit stand-in
@@ -179,8 +179,15 @@ jobs:
       # #2180: same split as the `test` job above — the sealed acceptance
       # suite is gated separately through the #2164 CI wrapper, not swept
       # into this job's ordinary pytest run.
-      # #3796: same wall-time bound as the `test` job above.
-      - run: pytest --ignore=tests/acceptance --timeout=120 --timeout-method=signal
+      # #3796: same `--timeout=120` bound as the `test` job above, but
+      # without `--timeout-method=signal` — windows-latest has no
+      # `signal.SIGALRM`, and pytest-timeout does not fall back silently:
+      # requesting `signal` where it is unavailable raises an AttributeError
+      # out of every test's setup, which would redden this job for
+      # unrelated reasons the moment it next runs. Leaving `--timeout-method`
+      # unset lets pytest-timeout pick its own per-platform default, which is
+      # `thread` here precisely because `SIGALRM` doesn't exist.
+      - run: pytest --ignore=tests/acceptance --timeout=120
 
   # #1484: run the full suite with `gh` made unresolvable on PATH.
   #

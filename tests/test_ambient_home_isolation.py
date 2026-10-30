@@ -51,6 +51,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: The whole-suite sweep that applies the same three knobs to an arbitrary
@@ -251,9 +253,16 @@ def test_the_populated_home_really_would_make_coord_a_thin_client(
     assert "SERVICE http://127.0.0.1:9" in proc.stdout
 
 
+@pytest.mark.timeout(600)
 def test_ambient_sensitive_targets_pass_in_a_populated_home(tmp_path: Path) -> None:
     """THE regression. All three ambient-sensitive targets, run in the hostile
     environment, must come back green (#2170).
+
+    #3796: the nested ``subprocess.run`` call below carries its own
+    ``timeout=600`` budget, well past the suite-wide ``--timeout=120``
+    CI passes at the outer pytest invocation. Without this marker that
+    outer bound would fail this test as "hung" long before its own,
+    larger budget ever gets a chance to fire.
 
     Before the fix this fails three ways at once, one per knob:
 
@@ -361,12 +370,17 @@ def test_sweep_script_is_executable_and_self_documenting() -> None:
         assert knob in header, knob
 
 
+@pytest.mark.timeout(600)
 def test_sweep_script_applies_all_three_knobs() -> None:
     """Drive the script for real and check each knob landed (#2170).
 
     A sweep that quietly stopped masking would report a green full suite that
     proves nothing -- the identical silent-green failure mode this issue is
     about -- so the script's own guard (`exit 2`) and this test both exist.
+
+    #3796: marked past the outer `--timeout=120` CI passes for the same
+    reason as `test_ambient_sensitive_targets_pass_in_a_populated_home` --
+    `_probe_the_script()`'s own nested `subprocess.run` already budgets 300s.
     """
     env = _probe_the_script()
 
