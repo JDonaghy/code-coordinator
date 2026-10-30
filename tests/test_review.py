@@ -5881,9 +5881,12 @@ def test_maybe_scoped_review_returns_none_without_branch(
 def test_maybe_scoped_review_returns_none_when_no_queue_entry(
     two_machine_config: Config,
 ) -> None:
-    """No matching merge-queue row for this branch — never enqueued (or
-    already cleared) — nothing to scope against; must not attempt any
-    live fetch."""
+    """No matching merge-queue row for this branch (never enqueued, or
+    already cleared) — synthesizes a throwaway in-memory entry instead and
+    DOES refetch the branch's live head SHA/patch-id through it. An empty
+    board has no prior review to scope a delta against, so
+    `find_scoped_review_candidate` declines before any diff is ever
+    fetched, and this still returns None."""
     completed = Assignment(
         machine_name="laptop", repo_name="api", issue_number=1,
         issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
@@ -5891,13 +5894,50 @@ def test_maybe_scoped_review_returns_none_when_no_queue_entry(
     )
 
     def _boom(*a, **k):
-        raise AssertionError("must not fetch live state with no queue entry")
+        raise AssertionError("must not fetch a diff with no prior review to scope against")
 
     result = maybe_scoped_review_for_completed_fix(
         completed, Board(), two_machine_config,
-        branch_sha_fetcher=_boom, branch_patch_id_fetcher=_boom, diff_fetcher=_boom,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+        diff_fetcher=_boom,
     )
     assert result is None
+
+
+def test_maybe_scoped_review_dispatches_via_synthesized_entry(
+    two_machine_config: Config,
+) -> None:
+    """Same bounce chain as `..._dispatches_when_queue_entry_eligible`, but
+    with no real merge-queue row at all — the common request-changes ->
+    fix -> re-review case, since a fix leg's completion races (or simply
+    precedes) the branch ever being enqueued. The in-memory synthesized
+    entry must still carry the scoped review through."""
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review(review_verdict="request-changes")
+    ci_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[ci-fix] t", assignment_id="cifix1", type="work",
+        status="done", branch="issue-1-fix", review_of_assignment_id="w1",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, ci_fix])
+
+    client = _FakeHTTPClient({"id": "scoped-mb"})
+    result = maybe_scoped_review_for_completed_fix(
+        ci_fix, board, two_machine_config,
+        http_client=client,
+        diff_fetcher=_scoped_diff_fetcher,
+        branch_sha_fetcher=lambda repo, branch: "newsha",
+        branch_patch_id_fetcher=lambda repo, target, branch: "patchid-new",
+    )
+
+    assert result is not None
+    assert result.review_scoped is True
+    assert result.review_scope_base_sha == prior.review_head_sha
 
 
 def test_maybe_scoped_review_returns_none_when_head_sha_unresolvable(
