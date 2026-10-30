@@ -4350,7 +4350,12 @@ def dispatch_review(
         # and must never be silently degraded by a cost-driven ladder or a
         # usage-gate reroute, so this is checked ahead of (and instead of)
         # `models.default`, never folded into it.
-        review_model_alias = config.models.model_for_type("review") or config.models.default
+        # #3787: a re-review (`completed.review_iteration > 0` — i.e.
+        # `completed` is itself a bounce-fix worker) pins to the fleet
+        # default `sonnet` instead — see `ModelsConfig.model_for_review`.
+        review_model_alias = config.models.model_for_review(
+            getattr(completed, "review_iteration", 0) or 0
+        )
         review_model_wire = config.models.resolve(review_model_alias)
 
         # #821: capture branch HEAD SHA once; staleness detected post-review.
@@ -5811,10 +5816,13 @@ def dispatch_scoped_review(
     if not candidates:
         return None
 
-    # #1650: see the #911/#1650 comment at the other `review_model_alias`
-    # assignment site (`dispatch_review` above) — `models.pinned["review"]`
-    # wins outright over `models.default` here too.
-    review_model_alias = config.models.model_for_type("review") or config.models.default
+    # #3787: this function only ever runs for a subsequent/re-review — it
+    # exists specifically to scope the diff to what changed since
+    # `prior_review` — so always resolve via the re-review path regardless
+    # of what iteration (if any) ends up stamped on the new review row; see
+    # `ModelsConfig.model_for_review` and the #911/#1650 comment at the
+    # other `review_model_alias` assignment site (`dispatch_review` above).
+    review_model_alias = config.models.model_for_review(1)
     review_model_wire = config.models.resolve(review_model_alias)
 
     _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
