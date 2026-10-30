@@ -210,6 +210,13 @@ def test_plain_runner_smoke_marker_lines_matches_claude_worker_vocabulary() -> N
     baseline_red = PlainRunnerVerdict(passed=False, exit_code=42, log_tail="x", baseline_red=True)
     assert "SMOKE: baseline-red" in plain_runner_smoke_marker_lines(_smoke_spec(), baseline_red)
 
+    harness_crash = PlainRunnerVerdict(
+        passed=False, exit_code=3, log_tail="", harness_crash=True,
+    )
+    crash_text = plain_runner_smoke_marker_lines(_smoke_spec(), harness_crash)
+    assert "SMOKE: harness-crash exit=3" in crash_text
+    assert "SMOKE: fail" not in crash_text
+
 
 # ── End-to-end through the real AgentServer: no claude Popen for a plain
 #    runner leg; the ordinary claude path is untouched when judgement is
@@ -276,9 +283,16 @@ def test_agent_plain_runner_leg_failure_spawns_a_claude_summariser(
     # `coord.brain.call_claude` instead of directly from `coord.agent`.
     monkeypatch.setattr(agent_mod.subprocess, "run", fake_run)
 
+    # Real output on the way out, not a bare `sys.exit(5)` — an exit with no
+    # output at all is a harness-crash verdict (see
+    # `test_agent_plain_runner_smoke_harness_crash_from_empty_output`), which
+    # never spawns the summariser because there is nothing for it to read.
     spec = _spec(
         repo, type="smoke", plain_runner=True,
-        smoke_command=f"{sys.executable} -c \"import sys; sys.exit(5)\"",
+        smoke_command=(
+            f"{sys.executable} -c \"print('AssertionError: expected 1, got 2'); "
+            "import sys; sys.exit(5)\""
+        ),
         smoke_timeout_s=30,
     )
     a = server.assign(spec)
@@ -357,19 +371,15 @@ def test_agent_plain_runner_smoke_exceeding_the_bash_tool_ceiling_still_verdicts
 def test_agent_plain_runner_smoke_crash_still_writes_a_smoke_marker(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """#3736: if :func:`execute_plain_runner_smoke` itself raises (not a
-    smoke-command failure — an infra crash in the executor), the leg must
-    still get a parseable ``SMOKE:`` line in its log, not just a FAILED
-    status with nothing for `coord.progress.parse_smoke_verdict_from_log` to
-    find — the same #2244 no-verdict park this whole fix targets, reachable
-    from a second angle.
-
-    #3784: that marker must be ``harness-crash``, not ``fail`` — the smoke
-    COMMAND never ran here, only the executor around it, so there is no
-    product signal to grade. Recording it as ``fail`` would make
-    `coord.notify._record_smoke_verdict` dispatch a `coord fix` leg off an
-    infra crash and void an existing review approval on the resulting new
-    commits."""
+    """If :func:`execute_plain_runner_smoke` itself raises (not a
+    smoke-command failure — an infra crash in the executor before the
+    command ever ran), the leg must still get a parseable ``SMOKE:`` line in
+    its log, not just a FAILED status with nothing for `coord.progress.
+    parse_smoke_verdict_from_log` to find, and the leg terminates FAILED
+    (not DONE) so it routes through `coord.notify`'s `EVENT_FAILURE` branch
+    to `coord.reconcile.propagate_smoke_terminal_failure` — which already
+    has its own bounded clear-and-retry-then-park handling for an executor
+    crash like this one, keyed off `failure_reason`, not this marker."""
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path, repo_path=repo,
@@ -389,8 +399,79 @@ def test_agent_plain_runner_smoke_crash_still_writes_a_smoke_marker(
 
     assert final.status == FAILED
     log = Path(final.log_path).read_text()
-    assert "SMOKE: harness-crash" in log
-    assert "SMOKE: fail" not in log
+    assert "SMOKE: fail" in log
     assert "boom" in log
     assert "claude-path-ran" not in log
+    server.shutdown()
+
+
+def test_agent_plain_runner_smoke_harness_crash_from_empty_output(
+    tmp_path: Path,
+) -> None:
+    """The smoke COMMAND runs (unlike the executor-crash case above) and
+    exits non-zero, but produces no output at all — there is no assertion
+    signal to grade, so :func:`execute_plain_runner_smoke` classifies this
+    as ``harness_crash=True`` and writes ``SMOKE: harness-crash exit=N``,
+    never ``SMOKE: fail``, and never spawns the failure summariser (there is
+    nothing for it to read). The leg still terminates DONE — a normal
+    verdict, not an infra FAILED — exactly like an ordinary pass/fail."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path, repo_path=repo,
+        argv=[sys.executable, "-c", "raise SystemExit('claude must never run for this leg')"],
+    )
+    spec = _spec(
+        repo, type="smoke", plain_runner=True,
+        smoke_command=f"{sys.executable} -c \"import sys; sys.exit(3)\"",
+        smoke_timeout_s=30,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == DONE
+    assert final.exit_code == 3
+    log = Path(final.log_path).read_text()
+    assert "SMOKE: harness-crash exit=3" in log
+    assert "SMOKE: fail" not in log
+    server.shutdown()
+
+
+def test_agent_plain_runner_smoke_nonzero_exit_with_output_still_fails(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A non-zero exit WITH output is a genuine product failure — it must
+    still classify as ``fail`` (``harness_crash=False``) and still spawn the
+    failure summariser, exactly like
+    `test_agent_plain_runner_leg_failure_spawns_a_claude_summariser` above.
+    This is the permissive direction's counterpart: an empty-output crash
+    clears for retry, but output of any kind means there IS an assertion
+    signal to grade."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == agent_mod.DEFAULT_WORKER_BINARY:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="it failed because of X", stderr="",
+            )
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(agent_mod.subprocess, "run", fake_run)
+
+    spec = _spec(
+        repo, type="smoke", plain_runner=True,
+        smoke_command=(
+            f"{sys.executable} -c \"print('assertion output'); import sys; sys.exit(1)\""
+        ),
+        smoke_timeout_s=30,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == DONE
+    assert final.exit_code == 1
+    log = Path(final.log_path).read_text()
+    assert "SMOKE: fail" in log
+    assert "SMOKE: harness-crash" not in log
     server.shutdown()

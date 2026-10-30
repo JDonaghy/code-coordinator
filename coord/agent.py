@@ -6528,6 +6528,17 @@ class PlainRunnerVerdict:
     #: downstream verdict parsing (`coord.notify._record_smoke_verdict`)
     #: reads the plain-runner's log identically to a worker-printed one.
     baseline_red: bool = False
+    #: True when the exit was non-zero, non-baseline-red, AND the combined
+    #: stdout+stderr was empty (whitespace-only counts as empty). A real
+    #: assertion/test failure reliably prints something; a bare non-zero
+    #: exit with nothing to show is the shape of a harness/infra problem
+    #: (missing PTY/display, wrong invocation, etc.) rather than a graded
+    #: product failure, so it is not an assertion signal at all. Any
+    #: non-zero exit that DOES have output is left as an ordinary failure —
+    #: this only reclassifies the narrow, unambiguous "nothing was printed"
+    #: case, not anything that requires judging whether output "looks like"
+    #: a real failure.
+    harness_crash: bool = False
 
 
 def run_plain_runner_command(
@@ -6553,7 +6564,10 @@ def run_plain_runner_command(
         → ``baseline_red=True``, not a plain failure (the suite already
         re-ran its own failures against the merge-base and found them red
         there too — a statement about the machine/base, not the branch).
-      * any other non-zero exit → failed.
+      * any other non-zero exit, with no combined stdout/stderr at all →
+        ``harness_crash=True`` — there is no assertion signal to grade, so
+        this is not a graded product failure.
+      * any other non-zero exit, with some output → failed.
     A timeout is reported as a failure with exit_code ``-1`` — a smoke
     command that cannot finish within its own configured budget never
     passes by default (fail-closed, matching every other inconclusive case
@@ -6589,8 +6603,10 @@ def run_plain_runner_command(
         result.returncode == RUNNER_BASELINE_RED_EXIT
         and BASELINE_RED_OUTPUT_MARKER in combined
     )
+    harness_crash = not baseline_red and not combined.strip()
     return PlainRunnerVerdict(
-        passed=False, exit_code=result.returncode, log_tail=tail, baseline_red=baseline_red,
+        passed=False, exit_code=result.returncode, log_tail=tail,
+        baseline_red=baseline_red, harness_crash=harness_crash,
     )
 
 
@@ -6606,9 +6622,10 @@ def execute_plain_runner_smoke(
     """The full #3673 plain-runner decision for one smoke leg: run
     ``spec.smoke_command`` directly (:func:`run_plain_runner_command`, no
     LLM involved) and, ONLY when the verdict is a genuine failure (not a
-    pass, and not a `baseline_red` — that is a statement about the machine,
-    not a code defect, so it gets no failure summary either), call
-    *spawn_failure_summary* to produce a human-readable explanation.
+    pass, not a `baseline_red` — that is a statement about the machine, not
+    a code defect — and not a `harness_crash` — there is no output to
+    summarize), call *spawn_failure_summary* to produce a human-readable
+    explanation.
 
     This is the seam the acceptance test drives directly: pass a fake *run*
     that returns a failing/passing `CompletedProcess` and a recording
@@ -6637,7 +6654,12 @@ def execute_plain_runner_smoke(
     else:
         verdict = run_plain_runner_command(spec.smoke_command, cwd, timeout=timeout, env=env, run=run)
 
-    if not verdict.passed and not verdict.baseline_red and spawn_failure_summary is not None:
+    if (
+        not verdict.passed
+        and not verdict.baseline_red
+        and not verdict.harness_crash
+        and spawn_failure_summary is not None
+    ):
         spawn_failure_summary(spec, verdict)
     return verdict
 
@@ -6658,6 +6680,8 @@ def plain_runner_smoke_marker_lines(spec: AssignmentSpec, verdict: PlainRunnerVe
         marker = f"SMOKE: baseline-red exit={verdict.exit_code}"
     elif verdict.passed:
         marker = "SMOKE: pass"
+    elif verdict.harness_crash:
+        marker = f"SMOKE: harness-crash exit={verdict.exit_code}"
     else:
         marker = f"SMOKE: fail exit={verdict.exit_code}"
     return f"{header}{body}\n{marker}\n"
@@ -10452,31 +10476,19 @@ class AgentServer:
             _log.exception(
                 "plain-runner smoke %s: execute_plain_runner_smoke raised", assignment.id,
             )
-            # #3736: write the SAME `SMOKE:` marker vocabulary the normal
-            # path writes, even on this crash branch — `_fail` alone sets
-            # the assignment FAILED but writes nothing to the log, which
-            # left `coord.progress.parse_smoke_verdict_from_log` (read via
-            # `coord.notify._smoke_worker_verdict`) with no marker to find
-            # and the leg parked as a #2244 no-verdict rather than recorded
-            # as a failure a human can act on.
-            #
-            # #3784: that marker must be `harness-crash`, not `fail` — the
-            # smoke COMMAND itself never ran (this except-branch is reached
-            # before `run_plain_runner_command` produces any exit code at
-            # all, e.g. a bad cwd or a missing PTY/display), so there is no
-            # product signal here, only a harness/infra one. Recording it as
-            # `fail` made `coord.notify._record_smoke_verdict` grade this the
-            # same as a real assertion failure: it dispatched a `coord fix`
-            # leg off nothing, and the new commits that leg pushed voided the
-            # existing review approval — one flake, one wasted work+review
-            # cycle. `_SMOKE_VERDICT_RE` is a line-anchored
-            # `^SMOKE:\s*(pass|fail|baseline-red|harness-crash)\b\s*(.*)$`
-            # match, so the free-text reason after `harness-crash` here is
-            # read back as the verdict's `reason` exactly like a `claude -p`
-            # worker's own `SMOKE: fail <reason>` line.
+            # Write the `SMOKE:` marker vocabulary so the log still has a
+            # parseable line for `coord.progress.parse_smoke_verdict_from_log`
+            # to find, even though this leg terminates FAILED rather than
+            # DONE. This terminates via `self._fail()` below, which routes
+            # through `coord.notify`'s `EVENT_FAILURE` branch to
+            # `coord.reconcile.propagate_smoke_terminal_failure` — a path
+            # that classifies on `failure_reason`/`exit_code`, not on this
+            # marker, and already has its own bounded clear-and-retry-then-
+            # park handling for an executor crash like this one. The marker
+            # is for human log-readability only.
             try:
                 with open(assignment.log_path, "a", encoding="utf-8") as fh:
-                    fh.write(f"\nSMOKE: harness-crash plain-runner smoke crashed: {exc}\n")
+                    fh.write(f"\nSMOKE: fail plain-runner smoke crashed: {exc}\n")
             except OSError:
                 _log.exception(
                     "plain-runner smoke %s: failed to write crash marker to log %s",
@@ -10544,16 +10556,29 @@ class AgentServer:
             f"Exit code: {verdict.exit_code}\n\n"
             f"Output:\n{verdict.log_tail}"
         )
-        provider_obj = self._resolve_provider_best_effort(spec)
         try:
+            provider_obj = self._resolve_provider_best_effort(spec)
             from coord.brain import call_claude  # noqa: PLC0415 — avoid a module-load-time cycle
 
             summary = call_claude(
                 system_prompt, prompt, provider=provider_obj, timeout=120,  # type: ignore[arg-type]
             ).strip()
         except Exception:  # noqa: BLE001 — best-effort, must never break the leg
+            # This `except` covers `_resolve_provider_best_effort` too, not
+            # just `call_claude` — `build_provider_from_wire` can raise
+            # something other than the `ValueError` that method already
+            # degrades to `None` on. This function only ever runs AFTER
+            # `execute_plain_runner_smoke` has already computed a genuine
+            # failing `PlainRunnerVerdict` (see its own `if not verdict.passed
+            # and not verdict.baseline_red and not verdict.harness_crash`
+            # guard), so an exception here means
+            # best-effort SUMMARISATION failed, not that the verdict itself is
+            # unknown — it must never propagate out of this method and be
+            # caught by the caller's own crash branch, which would mislabel a
+            # genuine product failure as an executor crash instead of the
+            # `failed` verdict it actually computed.
             _log.exception(
-                "plain-runner smoke %s: failure-summary call_claude call failed",
+                "plain-runner smoke %s: failure-summary call failed",
                 assignment.id,
             )
             return

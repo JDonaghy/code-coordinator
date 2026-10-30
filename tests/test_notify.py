@@ -3374,20 +3374,22 @@ class TestSmokeCompletionBaselineRedVerdict(TestSmokeCompletionVerdict):
         assert row["smoke_test"] == "fail"
 
 
-class TestSmokeCompletionHarnessCrashVerdict3784(TestSmokeCompletionVerdict):
-    """#3784: a smoke RUNNER crash (no PTY/display, a bad cwd, the
-    plain-runner's own harness raising before the smoke command ever ran —
-    `coord.agent.AgentServer._run_plain_runner_smoke_blocking`'s `except
-    Exception` branch) prints `SMOKE: harness-crash <reason>`, which must
-    record test_state='skipped' — never 'failed' — so `coord/drive.py`
-    never dispatches a `coord fix` leg off an infra flake, and no new
-    commits get pushed that would void an existing review approval. A
+class TestSmokeCompletionHarnessCrashVerdict(TestSmokeCompletionVerdict):
+    """A plain-runner smoke command that runs, exits non-zero, and produces
+    no output at all (``coord.agent.run_plain_runner_command``'s
+    ``harness_crash`` classification) prints `SMOKE: harness-crash
+    exit=N`. There is no assertion signal to grade in that shape, so this
+    must never be dispatched as an ordinary product failure: the write is
+    routed through the same infra-outage reclassifier
+    (`coord.state._reclassify_infra_test_failure`) every other
+    environmental Test-stage death already uses, which clears the row for
+    bounded automatic re-dispatch rather than recording a work failure. A
     genuine assertion failure (`SMOKE: fail`) must still land on 'failed'
     and stays reachable from `coord fix`, exactly as
     `test_nonzero_exit_without_baseline_red_line_still_fails` above already
     covers."""
 
-    def test_harness_crash_verdict_sets_parent_test_state_skipped(
+    def test_harness_crash_verdict_clears_for_retry_not_failed(
         self, coord_db, tmp_path
     ) -> None:
         from coord.notify import post_transition  # noqa: PLC0415
@@ -3404,8 +3406,7 @@ class TestSmokeCompletionHarnessCrashVerdict3784(TestSmokeCompletionVerdict):
         log_path = tmp_path / "smoke-6.log"
         log_path.write_text(
             "# agent=laptop repo=api issue=#42 plain-runner (#3673), timeout=600s\n"
-            "SMOKE: harness-crash plain-runner smoke crashed: "
-            "FileNotFoundError: no such cwd\n",
+            "SMOKE: harness-crash exit=1\n",
             encoding="utf-8",
         )
         entry = dict(entry)
@@ -3428,25 +3429,64 @@ class TestSmokeCompletionHarnessCrashVerdict3784(TestSmokeCompletionVerdict):
             ("work-6",),
         ).fetchone()
         assert row is not None, "work assignment must exist in DB"
-        assert row["test_state"] == "skipped", (
-            "a harness-crash smoke exit must record test_state='skipped' "
-            f"(not a branch 'failed'), got {row['test_state']!r} — a wrong "
-            "'failed' here is exactly what dispatches a fix leg off an "
-            "infra flake and voids an existing review approval (#3784)."
+        # Cleared to NULL for automatic bounded re-dispatch — never
+        # recorded 'failed' (that is exactly what dispatches a fix leg off
+        # an infra flake and voids an existing review approval) and never
+        # an unqualified 'skipped' either (that would satisfy the merge
+        # gate's structural-claim bucket with no bound at all).
+        assert row["test_state"] is None, (
+            "a harness-crash smoke exit must clear test_state for bounded "
+            f"automatic re-dispatch, got {row['test_state']!r}"
         )
-        # `skipped` must NOT mirror into the legacy `smoke_test='fail'`
-        # column — that mirror is what `coord fix` gates on.
-        assert row["smoke_test"] != "fail"
-        assert "harness crashed" in (row["test_reason"] or "").lower()
-        assert "FileNotFoundError" in row["test_reason"]
-        # No real confirmation question was asked, so `test_confirmation`
-        # stays unset — `coord/merge_queue.py`'s #1732 "structural claim"
-        # bucket accepts any skip whose confirmation is neither
-        # 'baseline_red' nor 'ci_and_worker' unconditionally, and
-        # `coord.gates.format_gate_report` prints `test_reason` on every row
-        # regardless, so this still surfaces as the operator flag the issue
-        # asks for without a dedicated confirmation value.
-        assert row["test_confirmation"] is None
+        assert row["smoke_test"] is None
+        assert "infra" in (row["test_reason"] or "").lower()
+        assert "reclassified as infrastructure" in (row["test_reason"] or "")
+
+    def test_harness_crash_verdict_parks_once_retry_budget_exhausted(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.smoke import ENVIRONMENTAL_SMOKE_RETRY_BUDGET  # noqa: PLC0415
+        from coord.state import get_connection  # noqa: PLC0415
+
+        self._record_work("work-7")
+        self._record_smoke("smoke-7", parent_id="work-7")
+        transition, record, entry = self._make_transition_and_entry(
+            "smoke-7", exit_code=1
+        )
+        record = dict(record)
+        record["review_of_assignment_id"] = "work-7"
+
+        log_path = tmp_path / "smoke-7.log"
+        log_path.write_text(
+            "# agent=laptop repo=api issue=#42 plain-runner (#3673), timeout=600s\n"
+            "SMOKE: harness-crash exit=1\n",
+            encoding="utf-8",
+        )
+        entry = dict(entry)
+        entry["log_path"] = str(log_path)
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            for _ in range(ENVIRONMENTAL_SMOKE_RETRY_BUDGET):
+                post_transition(transition, record, entry)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?",
+            ("work-7",),
+        ).fetchone()
+        assert row is not None, "work assignment must exist in DB"
+        assert row["test_state"] == "blocked", (
+            "a chronically flaky harness must park, not retry forever, "
+            f"once the shared budget is exhausted — got {row['test_state']!r}"
+        )
 
 
 class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
