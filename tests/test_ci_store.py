@@ -32,6 +32,7 @@ from coord.ci_store import (
     failed_checks,
     in_flight_checks,
     is_verdictless_job,
+    shifted_failed_check_names,
     shrunk_check_names,
     summarize,
 )
@@ -216,6 +217,48 @@ class TestShrunkCheckNames:
         seen = {"a", "b"}
         checks = [_check("c")]
         assert shrunk_check_names(seen, checks) == frozenset({"a", "b"})
+
+
+class TestShiftedFailedCheckNames:
+    """#3809: the caller's #2252 one-rerun budget is already spent and the
+    PR is still red on the next read. The same check failing both times is
+    a genuine regression; a DIFFERENT check failing is an environment-flaky
+    suite, not a code defect — `shifted_failed_check_names` is the pure
+    symmetric-difference comparison that tells the two apart.
+    """
+
+    def test_same_name_failing_both_times_is_not_a_shift(self) -> None:
+        prev = {"build"}
+        checks = [_check("build", conclusion="failure")]
+        assert shifted_failed_check_names(prev, checks) == frozenset()
+
+    def test_different_name_failing_is_a_shift(self) -> None:
+        prev = {"build"}
+        checks = [_check("e2e", conclusion="failure")]
+        assert shifted_failed_check_names(prev, checks) == frozenset({"build", "e2e"})
+
+    def test_passing_checks_do_not_count_as_currently_failing(self) -> None:
+        """Only this read's *failing* names matter — a check that passed
+        this time is neither a repeat nor a shift, it's resolved."""
+        prev = {"build"}
+        checks = [_check("build", conclusion="success")]
+        assert shifted_failed_check_names(prev, checks) == frozenset({"build"})
+
+    def test_empty_previous_names_against_a_failure_is_a_shift(self) -> None:
+        """No prior failing set recorded yet (the caller's first read) —
+        anything failing now differs from "nothing", so this reports it.
+        Callers only consult this once a streak is already established
+        (`ci_flaky_pending` non-empty), so this case is purely defensive."""
+        checks = [_check("build", conclusion="failure")]
+        assert shifted_failed_check_names(set(), checks) == frozenset({"build"})
+
+    def test_identical_multi_check_failure_set_is_not_a_shift(self) -> None:
+        prev = {"build", "lint"}
+        checks = [
+            _check("build", conclusion="failure"),
+            _check("lint", conclusion="failure"),
+        ]
+        assert shifted_failed_check_names(prev, checks) == frozenset()
 
 
 class TestIsUnreadableCheckName:

@@ -508,6 +508,42 @@ def shrunk_check_names(
     return frozenset(name for name in seen_names if name not in current)
 
 
+# ── Shifting-subset flake detection (#3809) ──────────────────────────────────
+#
+# #2252 grants a required-check failure exactly one rerun, then — on the
+# second read — treats "still red" as "confirmed real" unconditionally. That
+# is right for a genuine regression (the same test fails every run) but
+# wrong for an environment-flaky suite whose failing subset *shifts* between
+# runs: nothing in the diff is broken, yet #2252's own fall-through emits
+# ``checks_failed``, which #2510's ci-fix dispatch takes at face value and
+# sends a worker to go "fix" a test that was never actually broken — the
+# refund-loop pathology #3745 and #3760 describe.
+#
+# ``shifted_failed_check_names`` is the pure comparison the caller (#2252's
+# rerun seam in :mod:`coord.merge_queue`) needs to tell the two apart: same
+# failing name(s) on both reads is a regression (empty return, unchanged
+# #2252 behaviour); any name added or dropped between reads is evidence of
+# flakiness, not a code defect (non-empty return). As with ``shrunk_check_
+# names``, persisting the earlier read across calls is the caller's job
+# (``QueuedMerge.ci_flaky_pending``), not this function's.
+def shifted_failed_check_names(
+    prev_failed_names: "Iterable[str]", checks: list[CheckRun]
+) -> frozenset[str]:
+    """Names that differ between *prev_failed_names* and this read's failing
+    checks (#3809).
+
+    Pure symmetric-difference comparison: empty when the exact same check
+    name(s) are failing on both reads (a deterministic, real failure — the
+    caller should treat this the same as before this function existed and
+    fall through to its ``checks_failed`` path). Non-empty when a name was
+    added or dropped between reads (the failing subset shifted — evidence
+    of environment flakiness, not a code defect; the caller should rerun
+    again rather than dispatch a fix).
+    """
+    current = {c.name for c in failed_checks(checks)}
+    return frozenset(current ^ set(prev_failed_names))
+
+
 # ── Post-rerun settle wait (#1925) ──────────────────────────────────────────
 #
 # `coord merge --revalidate`'s CI arm (`_apply_ci_revalidation` in
