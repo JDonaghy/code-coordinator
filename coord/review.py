@@ -5924,6 +5924,80 @@ def dispatch_scoped_review(
     except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
         pass
 
+    # #3787 review round 2 (blocking): this scoped path reaches the same
+    # request-changes -> fix -> re-review bounce chain `dispatch_review`
+    # does, but was skipping BOTH pre-review mechanical gates
+    # (`run_prereview_gate`, `_mechanical_mandatory_verdict`) that
+    # `dispatch_review` always runs — against the full diff — before ever
+    # spending a review leg. Run the same gates here against `new_diff`
+    # (the branch's full current diff; `delta` is a diff-of-diffs neither
+    # check can parse as a real unified diff) and bail out to `None` on a
+    # violation so the caller falls back to the full `dispatch_review`
+    # above, which re-runs these same checks and records the terminal
+    # verdict against the real `completed: Assignment` — `entry` here is a
+    # `QueuedMerge`, which (when synthesized by `maybe_scoped_review_for_
+    # completed_fix`) has no `review_state` a verdict could be written onto.
+    sealed_paths = config.acceptance.sealed_paths(entry.repo_name)
+    sealed_entrypoints = [
+        ep for ep in config.acceptance.entrypoints(entry.repo_name)
+        if ep in sealed_paths
+    ]
+    additive_only_entrypoints = config.acceptance.additive_only_entrypoints(
+        entry.repo_name
+    )
+    coordinator_doc_paths = coordinator_owned_docs(repo)
+
+    _gate_worker_machine = next(
+        (m for m in config.machines if m.name == worker_machine_name), None
+    )
+    _gate_repo_path = (
+        _gate_worker_machine.repo_path(entry.repo_name)
+        if _gate_worker_machine is not None else None
+    )
+    try:
+        _gate_result: GateResult = run_prereview_gate(
+            diff_text=new_diff,
+            repo_config=config.prereview_gate.for_repo(entry.repo_name),
+            repo_path=_gate_repo_path,
+            expected_head_sha=review_head_sha,
+        )
+    except Exception:  # noqa: BLE001 — fail-open: a gate crash must never
+        # block the fallback to a full review, same posture as
+        # `dispatch_review`'s matching call.
+        log.exception(
+            "[review] scoped review for merge entry %s: prereview "
+            "mechanical gate crashed — treating as passed (fail-open)",
+            entry.assignment_id,
+        )
+        _gate_result = GateResult(passed=True)
+    if not _gate_result.passed:
+        log.warning(
+            "[review] scoped review for merge entry %s: prereview "
+            "mechanical gate found %d finding(s) — returning None so the "
+            "caller falls back to a full dispatch_review to record the "
+            "terminal verdict",
+            entry.assignment_id, len(_gate_result.findings),
+        )
+        return None
+
+    _mechanical = _mechanical_mandatory_verdict(
+        assignment_type=entry.assignment_type,
+        diff_text=new_diff,
+        sealed_paths=sealed_paths,
+        sealed_entrypoints=sealed_entrypoints,
+        coordinator_doc_paths=coordinator_doc_paths,
+        additive_only_entrypoints=additive_only_entrypoints,
+    )
+    if _mechanical is not None:
+        log.warning(
+            "[review] scoped review for merge entry %s: mandatory "
+            "mechanical verdict (%s) triggered — returning None so the "
+            "caller falls back to a full dispatch_review to record the "
+            "terminal verdict",
+            entry.assignment_id, _mechanical[0],
+        )
+        return None
+
     _compute_patch_id = patch_id_computer or github_ops.compute_patch_id
     review_patch_id: str | None = None
     try:
