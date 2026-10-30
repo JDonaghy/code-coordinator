@@ -31,6 +31,7 @@ Deliberately out of scope (left to ``coord merge``'s own machinery):
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -39,6 +40,8 @@ import click
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.commands.plan_followup import pr as _pr_legacy
 from coord.config import Config
+
+_log = logging.getLogger(__name__)
 
 
 class _PrGroup(click.Group):
@@ -190,6 +193,12 @@ def _pr_merge_ci_refusal(cfg: Config, repo_slug: str, number: int) -> str | None
     can ever run for it), which is a different fact from "CI never ran on a
     mergeable PR" and needs the opposite response — don't block here, let a
     live merge attempt itself surface the real conflict.
+
+    #3808: a failing check gets the SAME one-shot #2252 flaky re-run
+    ``coord merge``'s board path already has, before refusing — a
+    hand-opened PR has no merge-queue row to carry that budget on, so
+    :func:`_pr_merge_retry_failed_checks_once` persists it keyed on the PR's
+    current head sha instead.
     """
     from coord import github_ops  # noqa: PLC0415
     from coord.ci_store import build_ci_store, failed_checks, in_flight_checks  # noqa: PLC0415
@@ -216,8 +225,21 @@ def _pr_merge_ci_refusal(cfg: Config, repo_slug: str, number: int) -> str | None
 
     failed = failed_checks(checks)
     if failed:
-        names = ", ".join(c.name for c in failed)
-        return f"{repo_slug}#{number} has failing checks: {names}"
+        checks = _pr_merge_retry_failed_checks_once(ci_store, repo_slug, number, checks)
+        if not checks:
+            # #1925 registering gap outlasted the wait budget: the re-run
+            # we just triggered hasn't registered a single check-run on
+            # GitHub yet. Never reads as "all clear" — that would be the
+            # merge-blocking bug #1925 itself fixed for `--revalidate`,
+            # reintroduced here.
+            return (
+                f"{repo_slug}#{number}: CI re-run has not registered yet "
+                "(#1925) — try again shortly"
+            )
+        failed = failed_checks(checks)
+        if failed:
+            names = ", ".join(c.name for c in failed)
+            return f"{repo_slug}#{number} has failing checks: {names}"
 
     pending = in_flight_checks(checks)
     if pending:
@@ -225,6 +247,66 @@ def _pr_merge_ci_refusal(cfg: Config, repo_slug: str, number: int) -> str | None
         return f"{repo_slug}#{number} has checks still running: {names}"
 
     return None
+
+
+def _pr_merge_retry_failed_checks_once(
+    ci_store, repo_slug: str, number: int, checks: list,
+) -> list:
+    """#3808: re-run *repo_slug*#*number*'s currently-failing checks once —
+    mirroring ``coord.merge_queue``'s #2252 flaky-rerun bucket — then wait
+    for a genuinely resolved result before ``_pr_merge_ci_refusal`` re-reads.
+
+    Idempotent per (PR, head sha) via ``coord.state.pr_merge_ci_rerun_
+    already_attempted``/``record_pr_merge_ci_rerun``: a human re-invoking
+    ``coord pr merge`` repeatedly against the SAME still-red commit must not
+    retrigger a fresh rerun cycle every time (a confirmed real failure, not a
+    flake, should just keep refusing). A later push lands a new head sha and
+    so gets a fresh budget. Not ``coord.board_doctor``'s row-counter table —
+    that table's own sweep deletes any row not among ITS tracked rows, which
+    would silently wipe a counter stored there for an unrelated queue.
+
+    *checks* is the caller's already-fetched, currently-failing read; it is
+    returned unchanged whenever the rerun is skipped (sha unresolved, budget
+    already spent, or the backend doesn't support ``rerun_failed_for_pr``) so
+    the caller's existing refusal wording applies exactly as it would
+    without this function. Only re-fetched once an actual rerun is
+    triggered, via :func:`coord.ci_store.wait_for_ci_settle`.
+    """
+    from coord import github_ops, state  # noqa: PLC0415
+    from coord.ci_store import wait_for_ci_settle  # noqa: PLC0415
+
+    # Check backend support FIRST — free, no I/O — before any sha lookup or
+    # state access. A backend/fake without `rerun_failed_for_pr` (including
+    # every pre-#3808 test's `_FakeCiStore`) must take zero new `gh`/state
+    # hits on the ordinary failing-check path.
+    rerun_failed_for_pr = getattr(ci_store, "rerun_failed_for_pr", None)
+    if rerun_failed_for_pr is None:
+        return checks
+
+    sha = github_ops.get_pr_head_sha(repo_slug, number)
+    if not sha:
+        return checks
+    if state.pr_merge_ci_rerun_already_attempted(repo_slug, number, sha):
+        return checks
+
+    # Record the attempt win-or-lose, before the actual call: a crash/
+    # interrupt mid-rerun must not leave the budget un-spent, which would
+    # retry forever on the same commit instead of falling through to a
+    # plain refusal.
+    state.record_pr_merge_ci_rerun(repo_slug, number, sha)
+    if not rerun_failed_for_pr(repo_slug, number):
+        return checks
+
+    _log.info(
+        "#3808 flake re-check for %s#%d: re-running failed checks once "
+        "before refusing `coord pr merge`", repo_slug, number,
+    )
+    click.echo(
+        f"{repo_slug}#{number}: re-running failed checks once before "
+        "refusing (#3808, #2252) — this may take a few minutes"
+    )
+    result = wait_for_ci_settle(ci_store, repo_slug, number, echo=click.echo)
+    return result.checks
 
 
 def _active_merge_queue_entries() -> list[dict]:

@@ -2287,6 +2287,67 @@ def clear_board_doctor_row(queue: str, key: str) -> None:
     retry_on_locked(_write)
 
 
+# ── `coord pr merge` one-shot CI re-run budget (#3808) ──────────────────────
+#
+# A hand-opened PR has no `merge_queue` row, so `coord pr merge` cannot carry
+# a `ci_flaky_reruns` counter the way `coord merge`'s board path does — it
+# needs its OWN persisted "have we already spent this PR's one #2252-style
+# re-run?" marker, scoped per (repo, PR, commit) so a later push gets a
+# fresh budget. This is deliberately a separate `board_meta` row, not a
+# repurposing of `_BOARD_DOCTOR_ROWS_META_KEY`/`record_board_doctor_observation`
+# above: `coord.board_doctor.sweep`'s `clear_absent_rows` pass
+# (`coord/board_doctor.py`) deletes every tracked `(queue, key)` not present
+# in its OWN current sweep's row set, regardless of which `queue` wrote it —
+# a hand-opened PR is never one of board_doctor's rows, so a counter stored
+# there would be wiped by the very next sweep.
+_PR_MERGE_CI_RERUN_META_KEY = "pr_merge_ci_reruns"
+
+
+def _pr_merge_ci_rerun_key(repo_slug: str, number: int, sha: str) -> str:
+    """One budget per (PR, commit) — a later push starts fresh."""
+    return f"{repo_slug}#{number}:{sha}"
+
+
+def _load_pr_merge_ci_reruns_raw(conn) -> dict[str, bool]:
+    row = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key = ?",
+        (_PR_MERGE_CI_RERUN_META_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def pr_merge_ci_rerun_already_attempted(repo_slug: str, number: int, sha: str) -> bool:
+    """True once `coord pr merge` has already spent its one #3808 re-run
+    for *repo_slug*#*number* at *sha* — the idempotency half of #3808's
+    acceptance criteria: a second invocation observing the SAME still-red
+    commit must refuse outright, not trigger another re-run."""
+    key = _pr_merge_ci_rerun_key(repo_slug, number, sha)
+    return bool(_load_pr_merge_ci_reruns_raw(get_connection()).get(key))
+
+
+def record_pr_merge_ci_rerun(repo_slug: str, number: int, sha: str) -> None:
+    """Mark *repo_slug*#*number*@*sha*'s one #3808 re-run as spent."""
+    conn = get_connection()
+
+    def _write() -> None:
+        data = _load_pr_merge_ci_reruns_raw(conn)
+        data[_pr_merge_ci_rerun_key(repo_slug, number, sha)] = True
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_PR_MERGE_CI_RERUN_META_KEY, json.dumps(data)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
 def record_board_doctor_decision(entry: dict) -> None:
     """Append one row's sweep outcome to the decision log (#3758, #1478 spirit).
 

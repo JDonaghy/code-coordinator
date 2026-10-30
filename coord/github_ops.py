@@ -2492,6 +2492,23 @@ def get_pr_head_ref(repo: str, number: int) -> str | None:
     return head_ref or None
 
 
+def get_pr_head_sha(repo: str, number: int) -> str | None:
+    """Return PR *number*'s current head commit sha, or ``None`` on any
+    ``gh`` failure (including "no such PR").
+
+    Used by ``coord pr merge``'s #3808 one-shot CI re-run (``coord/commands/
+    pr.py``) to key its "have we already spent this commit's re-run?"
+    idempotency marker — a new push gets a fresh sha and so a fresh budget.
+    """
+    try:
+        head_sha = _gh(
+            "pr", "view", str(number), "--repo", repo,
+            "--json", "headRefOid", "--jq", ".headRefOid", caller="github_ops.get_pr_head_sha")
+    except RuntimeError:
+        return None
+    return head_sha or None
+
+
 # #3092: the ONE string that ties a provisioned preview lane to the lookup
 # that reads it back. `cloudflare/pages-action` names the GitHub Deployment's
 # environment "<projectName> (Preview)"; `get_pr_deployment_url` below matches

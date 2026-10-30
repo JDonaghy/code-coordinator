@@ -11681,6 +11681,44 @@ class TestProcessCiFlakyAutoRerun:
         assert "ci_flaky_rerun" not in kinds
         assert items[0].error == "checks failed: build (failure)"
 
+    def test_transiently_cancelled_check_is_rerun_then_a_still_pending_sweep_is_a_no_op(
+        self,
+    ) -> None:
+        """#3808's black-box acceptance: a required check cancelled by a
+        GitHub Actions `cancel-in-progress` concurrency group (real job
+        steps ran, so #1892's verdictless classification does not apply)
+        is swept through this same #2252 bucket — one re-run triggered —
+        and a second sweep that observes the re-run still in flight (not
+        yet resolved) must not trigger a second re-run or merge early."""
+        c = _check("cargo-test-gtk", conclusion="cancelled")
+        c.run_id = "999"
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=[c])
+
+        # Sweep 1: transiently-cancelled -> one scoped re-run triggered.
+        events = process(items, gh, ci_store=ci)
+        assert items[0].ci_flaky_reruns == 1
+        assert ci.rerun_failed_calls == [("acme/api", 99)]
+        assert "ci_flaky_rerun" in [e.kind for e in events]
+        assert gh.merge_calls == []
+
+        # Sweep 2: the triggered re-run hasn't resolved yet — still pending,
+        # not yet failed or passed. Must be a no-op: no second re-run call,
+        # no merge, budget untouched.
+        pending = _check("cargo-test-gtk", status="in_progress", conclusion=None)
+        pending.run_id = "999"
+        ci._checks = [pending]
+        events = process(items, gh, ci_store=ci)
+
+        assert ci.rerun_failed_calls == [("acme/api", 99)]  # unchanged
+        assert items[0].ci_flaky_reruns == 1  # unchanged
+        assert gh.merge_calls == []
+        kinds = [e.kind for e in events]
+        assert "ci_flaky_rerun" not in kinds
+        assert "checks_failed" not in kinds
+        assert "checks_pending" in kinds
+
     def test_a_check_that_never_reported_is_untouched_by_this_path(self) -> None:
         """#1904/#2244: zero reported checks is a DIFFERENT condition — a
         re-run of nothing produces nothing but latency, so this path must
