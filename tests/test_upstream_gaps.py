@@ -15,6 +15,7 @@ from coord.models import Machine, Repo
 from coord.upstream_gaps import (
     UPSTREAM_GAP_SOURCE,
     UpstreamGap,
+    _queue_upstream,
     final_message_from_log_text,
     gap_key,
     parse_upstream_markers,
@@ -254,7 +255,37 @@ class TestProcessUpstreamGaps:
                                          repo_name="vimcode", issue_number=42)
         assert outcomes[0].status == "filed"
         assert outcomes[0].queued_after is False
+        # The DOWNSTREAM stays unqueued (it never was), but the upstream is
+        # still enqueued as a root so the gap actually gets worked.
         assert state.list_drive_queue("vimcode") == []
+        assert outcomes[0].upstream_queued is True
+        assert _row(501, "quadraui")["issue_number"] == 501
+
+    def test_auto_filed_upstream_is_queued_as_a_root(self, tracker, config) -> None:
+        """The upstream issue is itself enqueued as a fresh drive-queue root
+        (no pre-reqs), so it gets worked and the downstream row it blocks can
+        relaunch — the gap vimcode#2056 hit, where quadraui#1771 was filed and
+        chained but left `open, not queued`."""
+        state.enqueue_drive_queue("vimcode", 42)
+        out = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                    repo_name="vimcode", issue_number=42)[0]
+        assert out.status == "filed" and out.upstream_queued is True
+        assert _after(_row(501, "quadraui")) == []  # a root — nothing blocks it
+
+    def test_upstream_already_queued_is_left_as_is(self, tracker, config) -> None:
+        """Idempotent: an upstream already in the queue is never re-enqueued
+        (which would reset its machine/after) nor pulled out of flight."""
+        state.enqueue_drive_queue("vimcode", 42)
+        first = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                      repo_name="vimcode", issue_number=42)[0]
+        assert first.upstream_queued is True
+        # Operator pins the upstream row to a machine; a replay must not reset it.
+        state.enqueue_drive_queue("quadraui", 501, machine="laptop")
+        second = process_upstream_gaps(FINAL_MESSAGE, config=config,
+                                       repo_name="vimcode", issue_number=42)[0]
+        assert second.status == "already-filed" and second.upstream_queued is False
+        rows = [r for r in state.list_drive_queue("quadraui") if r["issue_number"] == 501]
+        assert len(rows) == 1 and rows[0]["machine"] == "laptop"
 
     def test_no_marker_does_nothing(self, tracker, config) -> None:
         assert process_upstream_gaps("all done", config=config,
@@ -317,22 +348,27 @@ class TestInFlightRow:
         assert any("returned to waiting" in n for n in outcomes[0].notes)
         # The live driver was stopped through the dequeue seam (#3282) …
         assert stopped == [("vimcode", 42)]
-        # … and the row is back in the walk, at its old slot, carrying the
-        # edge and every operator-declared field, with a fresh run state.
+        # … and the row is back in the walk, carrying the edge and every
+        # operator-declared field, with a fresh run state. Its slot shifted
+        # down by exactly one: the upstream was inserted at the FRONT of the
+        # queue (a blocker is not sunk below the backlog), which renumbers the
+        # global order but preserves the vimcode rows' order among themselves.
         row = _row(42)
         assert row["state"] == STATE_WAITING
         assert _after(row) == ["vimcode#40", "quadraui#501"]
-        assert row["position"] == position_before
+        assert row["position"] == position_before + 1
         assert row["machine"] == "laptop"
         assert row["max_fix_rounds"] == 3
         assert not row["session_name"]
         assert int(row["attempts"] or 0) == 0
         # A `waiting` row is what the tick's walk feeds to `_resolve_prereqs`;
-        # the upstream issue is queued nowhere and open in the cache, so it
-        # defers "waiting on quadraui#501 (open, not queued)".
+        # the upstream is now queued as a root at the front, so the row defers
+        # on an in-flight dep ("waiting on quadraui#501 (queued, …)") rather
+        # than on an unworked "open, not queued" one — the whole point of #3776.
         assert QueueEntry.from_row(row).state == STATE_WAITING
+        assert _row(501, "quadraui")["position"] == 0
         assert state.get_cached_issue_state("quadraui", 501) == "open"
-        # The other queue rows were untouched.
+        # The vimcode rows keep their relative order.
         assert [r["issue_number"] for r in state.list_drive_queue("vimcode")] == [41, 42, 43]
 
     def test_replay_does_not_stop_a_relaunched_drive(
@@ -387,6 +423,73 @@ class TestInFlightRow:
         row = _row(42)
         assert row["state"] == "waiting"
         assert _after(row) == ["quadraui#501", "quadraui#502"]
+
+
+class TestQueueUpstream:
+    """`_queue_upstream` guards (#3776 review): membership alone is not a safe
+    idempotency signal — the row's live STATE and the issue's resolution decide
+    whether to enqueue, leave as-is, or surface — and the enqueue goes to the
+    FRONT, because the upstream is a blocker, not backlog."""
+
+    def test_enqueued_at_the_front_not_the_tail(self, config) -> None:
+        # A blocker must not sink below an existing backlog in its repo.
+        state.enqueue_drive_queue("quadraui", 601)
+        state.enqueue_drive_queue("quadraui", 602)
+        enqueued, note = _queue_upstream("quadraui", 501, assume_open=True)
+        assert enqueued is True and "front" in note
+        assert [r["issue_number"] for r in state.list_drive_queue("quadraui")] == [501, 601, 602]
+        assert _row(501, "quadraui")["position"] == 0
+
+    def test_landed_row_is_not_re_queued(self, config) -> None:
+        # A done/merged row is satisfied — re-driving burns a slot the tick
+        # would only reconcile back to done.
+        state.enqueue_drive_queue("quadraui", 501)
+        state.update_drive_queue_entry("quadraui", 501, state="done")
+        enqueued, note = _queue_upstream("quadraui", 501, assume_open=True)
+        assert enqueued is False and "landed" in note
+        assert _row(501, "quadraui")["state"] == "done"
+
+    @pytest.mark.parametrize("stuck", ["blocked", "failed"])
+    def test_terminally_stuck_row_is_surfaced_not_re_driven(self, config, stuck: str) -> None:
+        # Re-driving a fix-round-ceiling failure on every gap pass would loop;
+        # surface it instead. The row is left exactly as it is.
+        state.enqueue_drive_queue("quadraui", 501, machine="laptop")
+        state.update_drive_queue_entry("quadraui", 501, state=stuck,
+                                       last_reason="fix-round ceiling")
+        enqueued, note = _queue_upstream("quadraui", 501, assume_open=True)
+        assert enqueued is False
+        assert stuck in note and "not auto-re-driven" in note
+        row = _row(501, "quadraui")
+        assert row["state"] == stuck and row["machine"] == "laptop"
+
+    def test_waiting_row_is_left_exactly_as_is(self, config) -> None:
+        state.enqueue_drive_queue("quadraui", 501, machine="laptop")
+        enqueued, note = _queue_upstream("quadraui", 501, assume_open=True)
+        assert enqueued is False and "left as-is" in note
+        assert _row(501, "quadraui")["machine"] == "laptop"
+
+    def test_closed_issue_with_no_row_is_not_re_queued(self, config) -> None:
+        # The #1771-heal replay path: the upstream was resolved out-of-band
+        # (closed, or its done row removed) since the gap was first filed.
+        with patch("coord.github_ops.issue_is_closed", return_value=True) as closed:
+            enqueued, note = _queue_upstream("quadraui", 501, upstream_github="acme/quadraui")
+        assert enqueued is False and "closed" in note
+        assert state.list_drive_queue("quadraui") == []
+        closed.assert_called_once_with("acme/quadraui", 501)
+
+    def test_open_issue_with_no_row_is_enqueued(self, config) -> None:
+        with patch("coord.github_ops.issue_is_closed", return_value=False):
+            enqueued, _ = _queue_upstream("quadraui", 501, upstream_github="acme/quadraui")
+        assert enqueued is True
+        assert _row(501, "quadraui")["issue_number"] == 501
+
+    def test_assume_open_skips_the_closed_check(self, config) -> None:
+        # The just-filed path knows the issue is open (created moments ago) and
+        # must not pay a gh round-trip — nor be fooled by a would-be closed read.
+        with patch("coord.github_ops.issue_is_closed", return_value=True) as closed:
+            enqueued, _ = _queue_upstream("quadraui", 501, assume_open=True)
+        assert enqueued is True
+        closed.assert_not_called()
 
 
 class TestNotifyHook:

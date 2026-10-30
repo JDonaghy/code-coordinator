@@ -122,6 +122,11 @@ class UpstreamGapOutcome:
     number: int | None = None
     url: str | None = None
     queued_after: bool = False
+    # True when THIS call enqueued the upstream issue as a fresh drive-queue
+    # root (so it actually gets worked). False if it was already queued, or
+    # the enqueue failed (see notes). Distinct from ``queued_after``, which is
+    # about holding the DOWNSTREAM row.
+    upstream_queued: bool = False
     detail: str = ""
     notes: list[str] = field(default_factory=list)
 
@@ -338,6 +343,83 @@ def _enqueue_kwargs(entry, after: list[str]) -> dict:
     )
 
 
+def _queue_upstream(
+    upstream_repo: str,
+    number: int,
+    *,
+    upstream_github: str | None = None,
+    assume_open: bool = False,
+) -> tuple[bool, str]:
+    """Enqueue the auto-filed upstream issue as a fresh drive-queue root.
+
+    Without this the upstream issue is filed but never worked, so the
+    downstream row :func:`_block_queue_row` holds ``after=`` it defers forever
+    "waiting on <upstream> (open, not queued)" — the gap #2056/#1771 hit. The
+    upstream is a root: nothing blocks it, so it enqueues with no ``after``.
+
+    It is inserted at ``position=0`` (front of its repo's queue), not the tail:
+    this is a blocker — a downstream row is ``after=`` it and cannot launch
+    until it lands — so sinking it below an existing backlog would de-prioritize
+    the very issue holding the chain up. Returns ``(enqueued_now, note)``.
+
+    Idempotency / guards (membership alone is NOT enough — the row's live state
+    and the issue's resolution matter):
+
+    * Already queued and in flight / waiting (``running``/``waiting``) — left
+      EXACTLY as-is; re-enqueuing would reset machine/after/holds to defaults
+      and pull it out of flight.
+    * Already queued and landed (``done``/``merged-partial``) — left as-is; it
+      is satisfied, re-driving would burn a slot the tick reconciles back.
+    * Already queued but terminally stuck (``blocked``/``failed``) — NOT
+      silently reported as healthy, and deliberately NOT auto-re-driven (that
+      would loop a fix-round-ceiling failure on every gap pass). Surfaced via
+      the note so an operator — or the board-doctor — can intervene; the
+      downstream already reads this dep as "will never satisfy" (not a silent
+      hang).
+    * Not queued at all, but the issue is already closed — NOT enqueued (the
+      ``#1771``-heal replay must not re-drive an upstream resolved out-of-band,
+      e.g. closed by hand or its ``done`` row removed). ``assume_open`` skips
+      this check on the just-filed path, where the issue was created moments
+      ago and the extra ``gh`` round-trip is pure cost.
+    """
+    from coord.drive_queue import (  # noqa: PLC0415
+        STATE_BLOCKED,
+        STATE_DONE_LIKE,
+        STATE_FAILED,
+        QueueEntry,
+    )
+    from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
+
+    existing = next(
+        (
+            e
+            for e in (QueueEntry.from_row(r) for r in list_drive_queue(upstream_repo))
+            if e.issue == number
+        ),
+        None,
+    )
+    if existing is not None:
+        if existing.state in STATE_DONE_LIKE:
+            return False, f"upstream already landed ({existing.state}) — not re-queued"
+        if existing.state in (STATE_BLOCKED, STATE_FAILED):
+            return False, (
+                f"upstream queue row is {existing.state} — needs attention, "
+                "not auto-re-driven (would loop); downstream stays blocked on it"
+            )
+        return False, f"upstream already in the drive queue ({existing.state}) — left as-is"
+
+    if not assume_open:
+        from coord.github_ops import issue_is_closed  # noqa: PLC0415
+
+        # Fail-open: a transient gh error returns False, so we still enqueue
+        # rather than silently drop a legitimate upstream.
+        if issue_is_closed(upstream_github or upstream_repo, number):
+            return False, "upstream already closed — not re-queued"
+
+    enqueue_drive_queue(upstream_repo, number, position=0)
+    return True, "upstream enqueued for drive (fresh root, front of queue)"
+
+
 def _block_queue_row(downstream_repo: str, issue_number: int, upstream_key: str) -> tuple[bool, str]:
     """Hold the downstream drive-queue row ``after=upstream_key``.
 
@@ -485,6 +567,17 @@ def _file_one(
                 outcome.notes.append(note)
             except Exception as exc:  # noqa: BLE001
                 outcome.notes.append(f"queue block failed: {exc}")
+            # Heal a first pass that filed but never queued the upstream (the
+            # #1771 case): enqueue it now, idempotently. This path can replay
+            # long after filing, so it must re-check live state — the issue may
+            # have been resolved out-of-band (closed, row removed) since.
+            try:
+                outcome.upstream_queued, qnote = _queue_upstream(
+                    upstream.name, number, upstream_github=upstream.github or None,
+                )
+                outcome.notes.append(qnote)
+            except Exception as exc:  # noqa: BLE001
+                outcome.notes.append(f"upstream enqueue failed: {exc}")
         return outcome
 
     created = create_issue(
@@ -530,6 +623,17 @@ def _file_one(
         outcome.notes.append(note)
     except Exception as exc:  # noqa: BLE001
         outcome.notes.append(f"queue block failed: {exc}")
+    # Enqueue the upstream itself so it actually gets worked — otherwise the
+    # downstream row blocked above waits forever on an unqueued issue (#1771).
+    # Just created, so skip the is-closed round-trip (assume_open).
+    try:
+        outcome.upstream_queued, qnote = _queue_upstream(
+            upstream.name, number, upstream_github=upstream.github or None,
+            assume_open=True,
+        )
+        outcome.notes.append(qnote)
+    except Exception as exc:  # noqa: BLE001 — a failed enqueue must not sink the filing
+        outcome.notes.append(f"upstream enqueue failed: {exc}")
     return outcome
 
 
