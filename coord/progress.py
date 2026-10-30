@@ -51,27 +51,15 @@ _SMOKE_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
 # print (`coord.smoke.SMOKE_SYSTEM_PROMPT`, `coord.agent.plain_runner_smoke_marker_lines`):
 #
 #   * `SMOKE: pass`
-#   * `SMOKE: fail <reason>`
-#   * `SMOKE: baseline-red <reason>` — #2170: the smoke command's own failures
+#   * `SMOKE: fail <reason>` — the smoke command ran and produced a real,
+#     negative result (a non-zero exit WITH output to show for it).
+#   * `SMOKE: baseline-red <reason>` — the smoke command's own failures
 #     reproduce identically on the merge-base, so this is a statement about
 #     the MACHINE, not the branch.
-#   * `SMOKE: harness-crash <reason>` — #3784: the smoke RUNNER itself died
-#     before the smoke command ever ran (no PTY/display, the plain-runner
-#     process raised before `run_plain_runner_command` could execute), so
-#     there is no product signal at all — never conflate with `fail`, which
-#     means the command ran and produced a real (even if negative) result.
-#
-# #2170 parsed only `baseline-red`; #2244 parses pass/fail/baseline-red.
-# Before that, the pass/fail verdict was taken from the session exit code
-# instead — but a `claude -p` worker CANNOT signal through its exit code (an
-# `exit 1` inside a Bash tool call ends that tool call, not the session,
-# which still ends `end_turn` and exits 0). So a smoke run that found five
-# real failures and printed `SMOKE: fail` was recorded as
-# `test_state=passed`: the whole Test-green/CI-red class (#2091, #2182,
-# #2143, #2230). #3784 parses `harness-crash` too, for the mirror-image
-# defect: a harness/infra crash with no product signal at all was recorded
-# `test_state=failed`, which dispatched a fix leg off nothing and voided an
-# existing review approval.
+#   * `SMOKE: harness-crash <reason>` — the smoke command ran and exited
+#     non-zero, but produced no output at all (empty or whitespace-only
+#     combined stdout/stderr). There is no assertion signal to grade in
+#     that shape, so it is not a graded product failure the way `fail` is.
 #
 # Line-anchored, mirroring `coord.revalidate`'s `is_baseline_red_failure`
 # marker discipline: never a bare substring search, so an assertion message,
@@ -100,7 +88,7 @@ class SmokeVerdict:
     """#2244: a smoke worker's self-reported verdict line.
 
     ``kind`` is normalised to exactly one of ``"pass"``, ``"fail"``,
-    ``"baseline-red"`` or ``"harness-crash"`` (#3784); ``reason`` is the
+    ``"baseline-red"`` or ``"harness-crash"``; ``reason`` is the
     (possibly empty) trailing text on the marker's own line.
 
     ``context`` is a bounded tail (:func:`coord.revalidate._tail`) of

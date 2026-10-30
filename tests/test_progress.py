@@ -647,21 +647,18 @@ class TestSmokeVerdictParser:
         assert v.reason == "all 6 reproduce on main"
 
     def test_parses_harness_crash(self, tmp_path: Path) -> None:
-        """#3784: a harness/infra crash is its own kind, never `fail`'s
-        catch-all — a product failure and a runner that never got to run
-        the smoke command at all must stay distinguishable downstream."""
+        """A smoke command that ran and exited non-zero but produced no
+        output at all (`coord.agent.plain_runner_smoke_marker_lines`'s
+        `harness-crash` marker, e.g. `SMOKE: harness-crash exit=1`) is its
+        own kind, never `fail`'s catch-all — there is no assertion signal to
+        grade in that shape, so it must stay distinguishable downstream from
+        a real product failure."""
         from coord.progress import parse_smoke_verdict_from_log
         v = parse_smoke_verdict_from_log(
-            self._log(
-                tmp_path,
-                "SMOKE: harness-crash plain-runner smoke crashed: "
-                "FileNotFoundError: no such cwd\n",
-            )
+            self._log(tmp_path, "SMOKE: harness-crash exit=1\n")
         )
         assert v is not None and v.kind == "harness-crash"
-        assert v.reason == (
-            "plain-runner smoke crashed: FileNotFoundError: no such cwd"
-        )
+        assert v.reason == "exit=1"
 
     def test_accepts_inflections(self, tmp_path: Path) -> None:
         """The marker is written by a language model; `SMOKE: failed` must
