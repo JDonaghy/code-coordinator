@@ -37,6 +37,7 @@ from coord.board_doctor_policy import (
     policy_tier_of,
 )
 from coord.config import Config
+from coord.drive_queue import parse_key
 from coord.models import Assignment, Board, Repo
 
 _IN_FLIGHT_DETAIL = (
@@ -66,6 +67,13 @@ def _row(
         evidence=evidence or (f"cause={cause}",),
         fresh=fresh,
     )
+
+
+def test_parse_row_key_is_the_one_shared_parser() -> None:
+    # #3807: this module's private row-key splitter must be the same
+    # function as coord.drive_queue.parse_key, not a second
+    # implementation that happens to agree with it today.
+    assert board_doctor_policy._parse_row_key is parse_key
 
 
 class TestPolicyTierOf:
@@ -232,6 +240,18 @@ class TestEscalationAlertDispatcher:
 
         assert state.list_drive_escalations() == []
 
+    def test_negative_issue_number_is_rejected_without_writing(self) -> None:
+        # #3807: a key like "repo#-5" must parse the same way everywhere —
+        # the shared parser (coord.drive_queue.parse_key) requires a bare
+        # digit string after the last "#", so a leading "-" is rejected
+        # here exactly as it is by dismiss_resolved_escalation, instead of
+        # one accepting it via int() and the other rejecting it.
+        row = _row("acme/widgets#-5", "ci_red")
+
+        assert escalation_alert_dispatcher(row) is False
+
+        assert state.list_drive_escalations() == []
+
     def test_a_more_specific_existing_escalation_is_left_untouched(self) -> None:
         # A differently-staged escalation (e.g. filed by plan.blocked)
         # already covers this issue — the generic board-doctor alert must
@@ -387,6 +407,23 @@ class TestDismissResolvedEscalation:
         # Must not raise — a malformed key means nothing to clean up.
         dismiss_resolved_escalation("drive-queue", "no-hash-separator")
         dismiss_resolved_escalation("drive-queue", "#12")
+
+    def test_negative_issue_number_does_not_raise_or_dismiss(self) -> None:
+        # #3807: "repo#-5" must be rejected here exactly as it is by
+        # escalation_alert_dispatcher — both now route through the same
+        # coord.drive_queue.parse_key, which requires a bare digit tail.
+        state.record_drive_escalation(
+            "acme/widgets",
+            5,
+            stage="board-doctor:drive-queue",
+            reason="ci_red",
+            gate_readings="",
+            proposed_command="coord status",
+        )
+
+        dismiss_resolved_escalation("drive-queue", "acme/widgets#-5")
+
+        assert state.get_drive_escalation("acme/widgets", 5) is not None
 
     def test_missing_escalation_does_not_raise(self) -> None:
         dismiss_resolved_escalation("drive-queue", "acme/widgets#404")

@@ -393,7 +393,10 @@ def _refresh_ceiling_blocked_settled_rows(
     an actionable cause) for :func:`_episode_stuck_row` to keep handling
     exactly as before.
     """
-    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+    from coord.drive_queue import (  # noqa: PLC0415
+        fix_round_ceiling_blocked_for_issue,
+        parse_key as _parse_row_key,
+    )
 
     refreshed: list[StuckRow] = []
     remaining: list[dict] = []
@@ -402,13 +405,12 @@ def _refresh_ceiling_blocked_settled_rows(
         if not key:
             remaining.append(episode)
             continue
-        repo_name, _, issue_text = key.rpartition("#")
+        parsed = _parse_row_key(key)
         entry = entries_by_key.get(key)
         if (
             entry is None
-            or not repo_name
-            or not issue_text.isdigit()
-            or not fix_round_ceiling_blocked_for_issue(repo_name, int(issue_text))
+            or parsed is None
+            or not fix_round_ceiling_blocked_for_issue(*parsed)
         ):
             remaining.append(episode)
             continue
@@ -474,7 +476,10 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     (#2096: one question — "is this evidence fresh enough to act on?" — one
     answer, `StuckRow.fresh`).
     """
-    from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+    from coord.drive_queue import (  # noqa: PLC0415
+        fix_round_ceiling_blocked_for_issue,
+        parse_key as _parse_row_key,
+    )
 
     reclassified: list[StuckRow] = []
     for row in rows:
@@ -484,12 +489,8 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
             and row.cause in _LIVE_CLEAR_CAUSES
             and row.confidence != queue_diagnose.CONFIDENCE_LOW
         ):
-            repo_name, _, issue_text = row.key.rpartition("#")
-            if (
-                repo_name
-                and issue_text.isdigit()
-                and fix_round_ceiling_blocked_for_issue(repo_name, int(issue_text))
-            ):
+            parsed = _parse_row_key(row.key)
+            if parsed is not None and fix_round_ceiling_blocked_for_issue(*parsed):
                 row = replace(
                     row,
                     cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
@@ -603,7 +604,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
         # holds — deliberate, since any per-row action here would be
         # against evidence this sweep no longer trusts (the base, not the
         # row, is why the queue diagnosis is unreliable right now).
-        from coord.board_doctor_policy import _parse_row_key  # noqa: PLC0415
+        from coord.drive_queue import parse_key as _parse_row_key  # noqa: PLC0415
 
         def _suppress_if_blocked(row: StuckRow) -> StuckRow:
             parsed = _parse_row_key(row.key)

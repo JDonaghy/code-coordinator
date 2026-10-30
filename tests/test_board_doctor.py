@@ -362,6 +362,18 @@ class TestReclassifyCeilingBlocked:
 
         assert out == row
 
+    def test_negative_issue_number_is_left_alone(self) -> None:
+        # #3807: "repo#-5" must be rejected here exactly as it is by every
+        # other row-key reader in this module and in board_doctor_policy —
+        # all now share coord.drive_queue.parse_key, which requires a bare
+        # digit tail and so never parses a leading "-".
+        _seed_ceiling_blocked_entry("acme/widgets", 5)
+        row = _row("acme/widgets#-5", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
+
+        [out] = _reclassify_ceiling_blocked([row])
+
+        assert out == row
+
 
 class TestSweepClassifiesAndDispatches:
     def test_two_rows_different_causes_each_dispatched_exactly_once(self) -> None:
