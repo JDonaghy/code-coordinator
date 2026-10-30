@@ -84,8 +84,8 @@ class _FakeCiStore:
 
 
 class _FlakyRerunCiStore(_FakeCiStore):
-    """#3808: a `_FakeCiStore` whose ONE `rerun_failed_for_pr()` call flips
-    its currently-failing check to passing — standing in for a transient
+    """A `_FakeCiStore` whose ONE `rerun_failed_for_pr()` call flips its
+    currently-failing check to passing — standing in for a transient
     `cancel-in-progress` that clears on retry.
     """
 
@@ -97,6 +97,38 @@ class _FlakyRerunCiStore(_FakeCiStore):
     def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
         self.rerun_calls.append((repo, number))
         self._checks = [self._passing]
+        return True
+
+
+class _ShrinkingRerunCiStore(_FakeCiStore):
+    """A `_FakeCiStore` whose rerun makes the failing check's record vanish
+    from the next read entirely, leaving only a green sibling — standing in
+    for a partial GitHub re-run that drops a check-run from `list_checks_
+    for_pr` while real work on the sibling finishes (#3263).
+    """
+
+    def __init__(self, failing: CheckRun, sibling: CheckRun, **kwargs: object) -> None:
+        super().__init__([failing, sibling], **kwargs)
+        self._sibling = sibling
+        self.rerun_calls: list[tuple[str, int]] = []
+
+    def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
+        self.rerun_calls.append((repo, number))
+        self._checks = [self._sibling]
+        return True
+
+
+class _StillFailingRerunCiStore(_FakeCiStore):
+    """A `_FakeCiStore` whose rerun is triggered but settles on the SAME
+    failing check — a confirmed real failure, not a flake.
+    """
+
+    def __init__(self, failing: CheckRun, **kwargs: object) -> None:
+        super().__init__([failing], **kwargs)
+        self.rerun_calls: list[tuple[str, int]] = []
+
+    def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
+        self.rerun_calls.append((repo, number))
         return True
 
 
@@ -188,9 +220,9 @@ class TestPrMerge:
     def test_a_transiently_failing_check_is_rerun_once_then_merges(
         self, config_file: Path
     ) -> None:
-        """#3808: the SAME one-shot #2252 flaky re-run `coord merge`'s board
-        path already has, extended to a hand-opened PR's `coord pr merge` —
-        a failing check that clears on retry must not block the merge.
+        """The same one-shot flaky re-run `coord merge`'s board path already
+        has, extended to a hand-opened PR's `coord pr merge` — a failing
+        check that clears on retry must not block the merge.
         """
         fake = _FlakyRerunCiStore(_failing_check("cargo-test"), _passing_check("cargo-test"))
         with (
@@ -212,7 +244,7 @@ class TestPrMerge:
     ) -> None:
         """A second `coord pr merge` invocation against the SAME still-red
         head sha must refuse outright, not spend another rerun — the
-        idempotency half of #3808's acceptance criteria.
+        idempotency half of the flaky-rerun acceptance criteria.
         """
         state_mod.record_pr_merge_ci_rerun("acme/api", 7, "sha1")
         fake = _FlakyRerunCiStore(_failing_check("cargo-test"), _passing_check("cargo-test"))
@@ -227,6 +259,46 @@ class TestPrMerge:
         assert result.exit_code != 0
         assert "cargo-test" in result.output
         assert fake.rerun_calls == []  # budget already spent — never re-triggered
+        merge.assert_not_called()
+
+    def test_a_rerun_that_drops_a_check_from_githubs_report_is_refused(
+        self, config_file: Path
+    ) -> None:
+        """A partial re-run that makes a check-run's record vanish from the
+        next `list_checks_for_pr` read — while a green sibling stays — must
+        refuse rather than merge over a required check never actually
+        re-observed (#3263 check-set shrinkage).
+        """
+        fake = _ShrinkingRerunCiStore(_failing_check("cargo-test"), _passing_check("lint"))
+        with (
+            patch("coord.github_ops.get_pr_head_ref", return_value="throwaway"),
+            patch("coord.github_ops.get_pr_head_sha", return_value="sha-shrink"),
+            patch("coord.ci_store.build_ci_store", return_value=fake),
+            patch("coord.github_ops.merge_pr") as merge,
+        ):
+            result = _invoke("pr", "merge", "api", "7", config_file=config_file)
+
+        assert result.exit_code != 0
+        assert "cargo-test" in result.output
+        assert fake.rerun_calls == [("acme/api", 7)]
+        merge.assert_not_called()
+
+    def test_a_rerun_that_settles_still_red_is_refused(self, config_file: Path) -> None:
+        """A rerun that genuinely happens but the check is still failing once
+        it settles must refuse — a confirmed real failure, not a flake.
+        """
+        fake = _StillFailingRerunCiStore(_failing_check("cargo-test"))
+        with (
+            patch("coord.github_ops.get_pr_head_ref", return_value="throwaway"),
+            patch("coord.github_ops.get_pr_head_sha", return_value="sha-still-red"),
+            patch("coord.ci_store.build_ci_store", return_value=fake),
+            patch("coord.github_ops.merge_pr") as merge,
+        ):
+            result = _invoke("pr", "merge", "api", "7", config_file=config_file)
+
+        assert result.exit_code != 0
+        assert "cargo-test" in result.output
+        assert fake.rerun_calls == [("acme/api", 7)]
         merge.assert_not_called()
 
     def test_refuses_when_a_check_is_pending(self, config_file: Path) -> None:

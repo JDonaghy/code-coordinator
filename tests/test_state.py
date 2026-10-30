@@ -6732,8 +6732,8 @@ class TestUpsertIssueCommentLocal:
 
 
 class TestPrMergeCiRerunBudget:
-    """#3808: `coord pr merge`'s own one-shot CI re-run budget — a hand-opened
-    PR has no `merge_queue` row to carry `ci_flaky_reruns` on, so this is a
+    """`coord pr merge`'s own one-shot CI re-run budget — a hand-opened PR has
+    no `merge_queue` row to carry `ci_flaky_reruns` on, so this is a
     standalone `board_meta` row keyed on (repo, PR, head sha).
 
     `coord_db` (autouse, conftest.py) already gives every test here a
@@ -6777,3 +6777,21 @@ class TestPrMergeCiRerunBudget:
 
         assert not pr_merge_ci_rerun_already_attempted("acme/web", 7, "sha1")
         assert not pr_merge_ci_rerun_already_attempted("acme/api", 8, "sha1")
+
+    def test_map_is_pruned_to_its_size_limit(self, coord_db) -> None:
+        """The oldest-recorded budgets are dropped once the map exceeds
+        `PR_MERGE_CI_RERUN_LIMIT`, mirroring `BOARD_DOCTOR_LOG_LIMIT` — the
+        row must never grow `board_meta` without bound."""
+        from coord.state import (
+            PR_MERGE_CI_RERUN_LIMIT,
+            pr_merge_ci_rerun_already_attempted,
+            record_pr_merge_ci_rerun,
+        )
+
+        for i in range(PR_MERGE_CI_RERUN_LIMIT + 1):
+            record_pr_merge_ci_rerun("acme/api", i, f"sha{i}")
+
+        assert not pr_merge_ci_rerun_already_attempted("acme/api", 0, "sha0")
+        assert pr_merge_ci_rerun_already_attempted(
+            "acme/api", PR_MERGE_CI_RERUN_LIMIT, f"sha{PR_MERGE_CI_RERUN_LIMIT}"
+        )

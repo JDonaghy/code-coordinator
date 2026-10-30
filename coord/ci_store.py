@@ -620,10 +620,16 @@ def wait_for_ci_settle(
     timeout: float = CI_RERUN_MAX_WAIT_SECONDS,
     poll_interval: float = CI_RERUN_POLL_INTERVAL_SECONDS,
     echo=None,
+    echo_label: str = "--revalidate",
     sleep=None,
     clock=None,
 ) -> CiSettleResult:
     """Bounded poll for a just-triggered CI re-run to register and finish.
+
+    *echo_label* names the caller in the progress message (defaults to the
+    original ``coord merge --revalidate`` caller); pass the actual command
+    name for a different caller rather than leaving a mismatched label in
+    its output.
 
     Only ever called right after a successful :meth:`CiStore.rerun_for_pr`
     (#1925) — see this section's header comment for the exact bug this
@@ -675,8 +681,8 @@ def wait_for_ci_settle(
             )
         if not announced:
             echo(
-                f"  --revalidate: waiting for the CI re-run on {repo}#{number} "
-                "to register and settle before evaluating the gate (#1925)..."
+                f"  {echo_label}: waiting for the CI re-run on {repo}#{number} "
+                "to register and settle before evaluating the gate..."
             )
             announced = True
         sleep(poll_interval)

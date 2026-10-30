@@ -2287,11 +2287,11 @@ def clear_board_doctor_row(queue: str, key: str) -> None:
     retry_on_locked(_write)
 
 
-# ── `coord pr merge` one-shot CI re-run budget (#3808) ──────────────────────
+# ── `coord pr merge` one-shot CI re-run budget ──────────────────────────────
 #
 # A hand-opened PR has no `merge_queue` row, so `coord pr merge` cannot carry
 # a `ci_flaky_reruns` counter the way `coord merge`'s board path does — it
-# needs its OWN persisted "have we already spent this PR's one #2252-style
+# needs its OWN persisted "have we already spent this PR's one flaky
 # re-run?" marker, scoped per (repo, PR, commit) so a later push gets a
 # fresh budget. This is deliberately a separate `board_meta` row, not a
 # repurposing of `_BOARD_DOCTOR_ROWS_META_KEY`/`record_board_doctor_observation`
@@ -2300,7 +2300,19 @@ def clear_board_doctor_row(queue: str, key: str) -> None:
 # in its OWN current sweep's row set, regardless of which `queue` wrote it —
 # a hand-opened PR is never one of board_doctor's rows, so a counter stored
 # there would be wiped by the very next sweep.
+#
+# The map is a single JSON `board_meta` row, so it is trimmed the same way
+# `record_board_doctor_decision`'s log is: a bound on the OLDEST-inserted
+# keys, not a true "merged PRs get removed" prune (there is no event that
+# tells this module a PR closed). Insertion order is preserved by Python's
+# dict and by `json.dumps`/`json.loads` round-tripping a dict in order, so
+# dropping from the front keeps the most-recently-recorded commits.
 _PR_MERGE_CI_RERUN_META_KEY = "pr_merge_ci_reruns"
+
+#: Cap on the number of (repo, PR, commit) budgets tracked at once — same
+#: "never allowed to grow the `board_meta` row without bound" rationale as
+#: :data:`BOARD_DOCTOR_LOG_LIMIT`.
+PR_MERGE_CI_RERUN_LIMIT = 1000
 
 
 def _pr_merge_ci_rerun_key(repo_slug: str, number: int, sha: str) -> str:
@@ -2323,21 +2335,32 @@ def _load_pr_merge_ci_reruns_raw(conn) -> dict[str, bool]:
 
 
 def pr_merge_ci_rerun_already_attempted(repo_slug: str, number: int, sha: str) -> bool:
-    """True once `coord pr merge` has already spent its one #3808 re-run
-    for *repo_slug*#*number* at *sha* — the idempotency half of #3808's
-    acceptance criteria: a second invocation observing the SAME still-red
-    commit must refuse outright, not trigger another re-run."""
+    """True once `coord pr merge` has already spent its one re-run for
+    *repo_slug*#*number* at *sha* — the idempotency half: a second
+    invocation observing the SAME still-red commit must refuse outright,
+    not trigger another re-run.
+
+    **Local-DB read only** — same limitation as :func:`board_doctor_row_state`:
+    this budget lives in ``board_meta`` on the canonical board (the daemon
+    host), so a thin-client `coord pr merge` invocation — the documented
+    way to run this command — would otherwise read an empty/stale local
+    copy and treat every PR as having a fresh budget, per-machine rather
+    than fleet-wide.
+    """
+    _thin_client_local_board_guard("pr_merge_ci_rerun_already_attempted")
     key = _pr_merge_ci_rerun_key(repo_slug, number, sha)
     return bool(_load_pr_merge_ci_reruns_raw(get_connection()).get(key))
 
 
 def record_pr_merge_ci_rerun(repo_slug: str, number: int, sha: str) -> None:
-    """Mark *repo_slug*#*number*@*sha*'s one #3808 re-run as spent."""
+    """Mark *repo_slug*#*number*@*sha*'s one `coord pr merge` re-run as spent."""
     conn = get_connection()
 
     def _write() -> None:
         data = _load_pr_merge_ci_reruns_raw(conn)
         data[_pr_merge_ci_rerun_key(repo_slug, number, sha)] = True
+        if len(data) > PR_MERGE_CI_RERUN_LIMIT:
+            data = dict(list(data.items())[-PR_MERGE_CI_RERUN_LIMIT:])
         sql.upsert(
             conn, "board_meta", ["key", "value"],
             (_PR_MERGE_CI_RERUN_META_KEY, json.dumps(data)),

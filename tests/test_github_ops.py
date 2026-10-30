@@ -2745,6 +2745,33 @@ class TestGetPrHeadRef:
             assert github_ops.get_pr_head_ref("acme/api", 42) is None
 
 
+class TestGetPrHeadSha:
+    """Used by `coord pr merge`'s one-shot CI re-run (`coord/commands/pr.py`)
+    to key its per-commit re-run budget — same `_gh`-failure contract as
+    get_pr_head_ref above."""
+
+    def test_returns_head_sha_on_success(self) -> None:
+        with patch("coord.github_ops._gh", return_value="abc123def") as mock_gh:
+            assert github_ops.get_pr_head_sha("acme/api", 42) == "abc123def"
+        args = mock_gh.call_args.args
+        assert args[:2] == ("pr", "view")
+
+    def test_returns_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("no such PR")):
+            assert github_ops.get_pr_head_sha("acme/api", 42) is None
+
+    def test_returns_none_when_gh_is_missing(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            assert github_ops.get_pr_head_sha("acme/api", 42) is None
+
+    def test_returns_none_when_gh_times_out(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
+        ):
+            assert github_ops.get_pr_head_sha("acme/api", 42) is None
+
+
 class TestGetPrDeploymentUrl:
     """#2948: the live GitHub-Deployment lookup that replaced the
     ``{pr_branch_slug}`` Cloudflare-Pages template placeholder — confirmed
