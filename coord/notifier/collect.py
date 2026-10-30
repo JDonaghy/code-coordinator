@@ -35,7 +35,20 @@ log = logging.getLogger(__name__)
 #: recorded under disk pressure is worse than a red one, because a red one
 #: is at least honest.  Deliberately an allowlist — every other check
 #: belongs to `coord health`, not to a phone at 3pm.
+#:
+#: These come from ``machine_health`` rows (scope="machine"/"checkout"
+#: checks, nested per machine).  See ``FLEET_SCOPE_INVALIDATING_CHECK_IDS``
+#: for the sibling list covering scope="fleet" checks, which live in a
+#: separate, flat ``fleet_checks`` list instead.
 INVALIDATING_CHECK_IDS = frozenset({"disk", "cargo_targets"})
+
+#: Scope="fleet" check_ids that degrade in-flight work on a busy machine
+#: (#3780).  A machine whose CPU has stayed pinned for the whole metrics
+#: window is not corrupting what gets recorded the way disk pressure does
+#: — it is just making every leg on that machine slower, which is still
+#: fleet degradation nobody downstream of this collector would otherwise
+#: notice.
+FLEET_SCOPE_INVALIDATING_CHECK_IDS = frozenset({"fleet_sustained_cpu"})
 
 #: Board statuses that mean the leg is in flight right now.
 _ACTIVE_STATUSES = frozenset({"running"})
@@ -399,40 +412,73 @@ def fleet_crits(
 ) -> list[FleetCrit]:
     """CRITs that invalidate in-flight work, on machines that have some.
 
-    Two filters, both deliberate.  ``INVALIDATING_CHECK_IDS`` keeps this
-    from becoming a general health pager — `coord health` is that, and it
-    is a terminal surface by design.  ``busy_machines`` keeps a CRIT on an
-    idle box out of the channel entirely: nothing is in flight, so nothing
-    is being invalidated, so nobody needs to be interrupted.
+    Two filters, both deliberate.  The check-id allowlists keep this from
+    becoming a general health pager — `coord health` is that, and it is a
+    terminal surface by design.  ``busy_machines`` keeps a CRIT on an idle
+    box out of the channel entirely: nothing is in flight, so nothing is
+    being invalidated, so nobody needs to be interrupted.
+
+    Two shapes of CRIT, because fleet-health snapshots carry them in two
+    different places: ``machine_health`` rows nest scope="machine"/
+    "checkout" results under a per-row ``machine`` key, while scope="fleet"
+    results (sustained CPU pinning among them) land flat in ``fleet_checks``
+    with their own ``subject`` field standing in for the machine name.
     """
     if not fleet_health or not busy_machines:
         return []
-    rows = fleet_health.get("machine_health")
-    if not isinstance(rows, list):
-        return []
 
     out: list[FleetCrit] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        machine = str(row.get("machine") or "")
-        if machine not in busy_machines:
-            continue
-        for result in row.get("results") or []:
+
+    rows = fleet_health.get("machine_health")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            machine = str(row.get("machine") or "")
+            if machine not in busy_machines:
+                continue
+            for result in row.get("results") or []:
+                if not isinstance(result, dict):
+                    continue
+                if str(result.get("severity") or "") != "crit":
+                    continue
+                check_id = str(result.get("check_id") or "")
+                if check_id not in INVALIDATING_CHECK_IDS:
+                    continue
+                out.append(
+                    FleetCrit(
+                        machine=machine,
+                        check_id=check_id,
+                        detail=str(result.get("detail") or result.get("title") or check_id),
+                    )
+                )
+
+    fleet_checks = fleet_health.get("fleet_checks")
+    if isinstance(fleet_checks, list):
+        for result in fleet_checks:
             if not isinstance(result, dict):
                 continue
             if str(result.get("severity") or "") != "crit":
                 continue
             check_id = str(result.get("check_id") or "")
-            if check_id not in INVALIDATING_CHECK_IDS:
+            if check_id not in FLEET_SCOPE_INVALIDATING_CHECK_IDS:
+                continue
+            machine = str(result.get("subject") or "")
+            if not machine or machine not in busy_machines:
                 continue
             out.append(
                 FleetCrit(
                     machine=machine,
                     check_id=check_id,
-                    detail=str(result.get("detail") or result.get("title") or check_id),
+                    # `headroom` is the rendered, load-bearing field for a
+                    # fleet check (`coord.health.models.CheckResult`) — it
+                    # already carries the duration/percent the operator
+                    # needs ("cpu >=85% for 6.0h (857/900 samples)"),
+                    # unlike `detail`, which is a secondary elaboration.
+                    detail=str(result.get("headroom") or result.get("detail") or check_id),
                 )
             )
+
     return out
 
 

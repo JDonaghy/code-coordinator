@@ -129,12 +129,17 @@ class HaltedDrive:
 
 @dataclass(frozen=True)
 class FleetCrit:
-    """A fleet CRIT that invalidates in-flight work (#1625).
+    """A fleet CRIT that degrades in-flight work (#1625, #3780).
 
-    Disk mainly: a verdict recorded under disk pressure is worse than a red
-    one.  Only CRITs the collector has classified as *invalidating* reach
-    the predicate — a CRIT on an idle machine with nothing in flight is not
-    a "nobody is coming" event.
+    Two shapes: disk pressure (and a full cargo target dir) can make a
+    *recorded verdict* wrong — a verdict logged while the disk is full is
+    worse than a red one.  Sustained CPU pinning doesn't corrupt anything;
+    it just makes every leg on that machine slower.  Both are "fleet
+    degradation nobody downstream would otherwise notice", which is why
+    they share this type — ``check_id`` is what lets ``_crit_event`` pick
+    the wording that actually fits. Only CRITs the collector has classified
+    as degrading reach the predicate — a CRIT on an idle machine with
+    nothing in flight is not a "nobody is coming" event.
     """
 
     machine: str
@@ -384,16 +389,32 @@ def _halted_event(drive: HaltedDrive, snapshot: PipelineSnapshot) -> NotifyEvent
     )
 
 
+#: check_ids whose CRIT means "this machine is slow", not "a verdict
+#: recorded here may be wrong" (#3780).  Disk pressure and a full cargo
+#: target dir can corrupt what gets recorded; sustained CPU pinning just
+#: taxes every in-flight leg's throughput — a different claim, so it gets
+#: different body wording below.
+_THROUGHPUT_DEGRADED_CHECK_IDS = frozenset({"fleet_sustained_cpu"})
+
+
 def _crit_event(crit: FleetCrit, snapshot: PipelineSnapshot) -> NotifyEvent:
+    detail = crit.detail.strip() or crit.check_id
+    affected_note = f" Affected: {', '.join(crit.affected)}." if crit.affected else ""
+    if crit.check_id in _THROUGHPUT_DEGRADED_CHECK_IDS:
+        body = (
+            f"{crit.machine}: CPU pinned — {detail}. Every in-flight leg on this "
+            "machine is running slower than it should." + affected_note
+        )
+    else:
+        body = (
+            f"{detail} — in-flight work on this machine "
+            "may record verdicts that cannot be trusted." + affected_note
+        )
     return NotifyEvent(
         subject=f"fleet:{crit.machine}:{crit.check_id}",
         condition=CONDITION_FLEET_CRIT,
         title=f"{crit.machine} — {CONDITION_LABELS[CONDITION_FLEET_CRIT]}: {crit.check_id}",
-        body=(
-            f"{crit.detail.strip() or crit.check_id} — in-flight work on this machine "
-            "may record verdicts that cannot be trusted."
-            + (f" Affected: {', '.join(crit.affected)}." if crit.affected else "")
-        ),
+        body=body,
         created_at=snapshot.now,
         repo=None,
         issue=None,

@@ -273,6 +273,64 @@ def test_missing_health_data_is_not_an_event():
                                busy_machines={"dellserver"}) == []
 
 
+# ── sustained-CPU fleet CRIT (#3780) ──────────────────────────────────────
+#
+# `fleet_sustained_cpu` is a scope="fleet" check, so its result lives in
+# the flat `fleet_checks` list, not nested under a `machine_health` row —
+# a different shape from every other test in this section, and the exact
+# gap this check closes.
+
+
+def _fleet_checks(machine="macmini", check_id="fleet_sustained_cpu", severity="crit"):
+    return {
+        "fleet_checks": [
+            {
+                "check_id": check_id,
+                "subject": machine,
+                "severity": severity,
+                "headroom": "cpu ≥85% for 6.0h (857/900 samples)",
+                "detail": "peak 97%, mean 91% over 900 ok samples",
+            }
+        ]
+    }
+
+
+def test_a_sustained_cpu_crit_on_a_busy_machine_fires():
+    crits = collect.fleet_crits(_fleet_checks(), busy_machines={"macmini"})
+    assert [c.check_id for c in crits] == ["fleet_sustained_cpu"]
+    assert crits[0].machine == "macmini"
+    # The headroom string, not detail, is what names the duration.
+    assert "6.0h" in crits[0].detail
+
+
+def test_a_sustained_cpu_crit_on_an_idle_machine_is_not_an_event():
+    assert collect.fleet_crits(_fleet_checks(), busy_machines={"precision"}) == []
+
+
+def test_a_non_invalidating_fleet_scope_crit_is_left_to_coord_health():
+    assert collect.fleet_crits(
+        _fleet_checks(check_id="some_other_fleet_check"), busy_machines={"macmini"}
+    ) == []
+
+
+def test_a_sustained_cpu_warn_is_not_a_crit():
+    assert collect.fleet_crits(
+        _fleet_checks(severity="warn"), busy_machines={"macmini"}
+    ) == []
+
+
+def test_machine_health_and_fleet_checks_crits_combine():
+    """One snapshot can carry both shapes at once — a disk CRIT on one
+    machine and a sustained-CPU CRIT on another must both surface."""
+    health = _health()
+    health.update(_fleet_checks(machine="macmini"))
+    crits = collect.fleet_crits(health, busy_machines={"dellserver", "macmini"})
+    assert sorted((c.machine, c.check_id) for c in crits) == [
+        ("dellserver", "disk"),
+        ("macmini", "fleet_sustained_cpu"),
+    ]
+
+
 # ── every source fails open ──────────────────────────────────────────────
 
 

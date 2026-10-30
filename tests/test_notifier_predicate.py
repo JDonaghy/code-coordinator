@@ -377,6 +377,47 @@ def test_fleet_crit_fires_and_names_the_machine():
     assert "2% free" in events[0].body
 
 
+def test_sustained_cpu_crit_names_the_machine_and_duration():
+    snap = PipelineSnapshot(
+        now=NOW,
+        fleet_crits=[
+            FleetCrit(
+                machine="macmini",
+                check_id="fleet_sustained_cpu",
+                detail="cpu ≥85% for 6.0h (857/900 samples)",
+            )
+        ],
+    )
+    events = evaluate(snap, {})
+    assert [e.condition for e in events] == [CONDITION_FLEET_CRIT]
+    assert "macmini" in events[0].title
+    assert "6.0h" in events[0].body
+    assert "CPU pinned" in events[0].body
+    # Disk/cargo_targets wording claims a recorded verdict can't be trusted —
+    # a sustained-CPU machine still records correctly, it just runs slower.
+    assert "cannot be trusted" not in events[0].body
+
+
+def test_a_pinned_machine_does_not_re_page_on_a_later_tick():
+    snap = PipelineSnapshot(
+        now=NOW,
+        fleet_crits=[
+            FleetCrit(machine="macmini", check_id="fleet_sustained_cpu", detail="cpu ≥85% for 6.0h")
+        ],
+    )
+    events = evaluate(snap, {})
+    ledger: dict = {}
+
+    first = select_deliverable(events, ledger)
+    assert len(first) == 1
+    for event in first:
+        ledger[event.key] = {"subject": event.subject, "condition": event.condition,
+                              "fired_at": NOW}
+
+    # Still pinned on the next tick -> no duplicate push.
+    assert select_deliverable(events, ledger) == []
+
+
 # ── deep links ────────────────────────────────────────────────────────────
 
 

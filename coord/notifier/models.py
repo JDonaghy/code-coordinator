@@ -34,8 +34,9 @@ CONDITION_DRIVE_HALTED = "drive_halted"
 #: A gate parked `HUMAN_REQUIRED` (semantic merge conflict, verify-merge
 #: FOREIGN, retry cap hit...).  Terminal by construction.
 CONDITION_HUMAN_REQUIRED = "human_required"
-#: A fleet CRIT that invalidates in-flight work — disk mainly, since a
-#: verdict recorded under disk pressure is worse than a red one (#1625).
+#: A fleet CRIT that degrades in-flight work — disk pressure corrupting a
+#: recorded verdict (#1625), or a machine's CPU staying sustained-pinned
+#: and taxing every leg running on it (#3780).
 CONDITION_FLEET_CRIT = "fleet_crit"
 #: A stall that survived its nudge.  `drive` nudges a stalled stage and
 #: keeps measuring genuine idle time (#1593); a stall still present after
