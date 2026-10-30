@@ -127,6 +127,7 @@ from coord.board_doctor_permissions import (
     authorize_sweep_action,
     dispatch_sweep_action,
 )
+from coord.drive_queue import parse_key as _parse_row_key
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
@@ -246,19 +247,21 @@ def _board_doctor_stage(queue: str) -> str:
     return f"board-doctor:{queue}"
 
 
-def _parse_row_key(key: str) -> tuple[str, int] | None:
-    """``"repo#issue"`` -> ``(repo, issue)``, or ``None`` if unparseable.
-
-    Same split every C3/C4 reader of ``row.key`` already does
-    (:func:`escalation_alert_dispatcher`, :func:`dismiss_resolved_escalation`)
-    — kept here as one function so a C3 auto-action handler answers the
-    same "what repo/issue is this row" question the same way C4 already
-    does, rather than re-deriving the split a third time.
-    """
-    repo_name, _, issue_text = key.rpartition("#")
-    if not repo_name or not issue_text.isdigit():
-        return None
-    return repo_name, int(issue_text)
+#: ``"repo#issue"`` -> ``(repo, issue)``, or ``None`` if unparseable — this
+#: module's own name for :func:`coord.drive_queue.parse_key`, which already
+#: lives next to :func:`coord.drive_queue.entry_key` (the inverse, building
+#: the same keys). Every C3/C4 reader of a ``row.key``-shaped string in this
+#: module and in `coord.board_doctor` (:func:`escalation_alert_dispatcher`,
+#: :func:`dismiss_resolved_escalation`,
+#: :func:`coord.board_doctor._refresh_ceiling_blocked_settled_rows`,
+#: :func:`coord.board_doctor._reclassify_ceiling_blocked`,
+#: :func:`coord.board_doctor._withdraw_rows_for_blocked_streaks`) calls this
+#: one alias (#3807) rather than re-deriving the split — before #3807 three
+#: of those re-derived it inline with ``int()`` in a ``try``, which (unlike
+#: ``str.isdigit()``) accepts a leading ``-``, so e.g. ``"repo#-5"`` parsed
+#: on some paths and not others. Keeping this as a plain import (not a
+#: wrapper function) means there is exactly one implementation in the
+#: codebase, not two that happen to agree today.
 
 
 def _requeue_ceiling_blocked_mergeable(row: StuckRow) -> bool:
@@ -880,23 +883,15 @@ def escalation_alert_dispatcher(row: StuckRow) -> bool | str:
 
     from coord.state import get_drive_escalation, record_drive_escalation  # noqa: PLC0415
 
-    repo_name, _, issue_text = row.key.rpartition("#")
-    if not repo_name:
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
         click.echo(
             f"warning: board-doctor alert dropped — unparseable row key "
             f"{row.key!r} (expected 'repo#issue')",
             err=True,
         )
         return False
-    try:
-        issue_number = int(issue_text)
-    except ValueError:
-        click.echo(
-            f"warning: board-doctor alert dropped — unparseable row key "
-            f"{row.key!r} (expected 'repo#issue')",
-            err=True,
-        )
-        return False
+    repo_name, issue_number = parsed
 
     stage = _board_doctor_stage(row.queue)
 
@@ -952,13 +947,10 @@ def dismiss_resolved_escalation(queue: str, key: str) -> None:
 
     from coord.state import dismiss_drive_escalation, get_drive_escalation  # noqa: PLC0415
 
-    repo_name, _, issue_text = key.rpartition("#")
-    if not repo_name:
+    parsed = _parse_row_key(key)
+    if parsed is None:
         return
-    try:
-        issue_number = int(issue_text)
-    except ValueError:
-        return
+    repo_name, issue_number = parsed
 
     try:
         existing = get_drive_escalation(repo_name, issue_number)
