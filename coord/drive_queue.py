@@ -5055,6 +5055,23 @@ def _reconcile_running(
     (including the merge-only fast path and auto-dispatched stale-rebase
     conflict-fix) can still act on it.
 
+    #3786 goes one step further for the ONE case #3577 already proved is
+    common: the gate reading above isn't merely "not a permanent block",
+    it's confirmed `PLAN_READY` right now — approved, green, nothing left
+    but the merge itself. Waiting for `attempts` to exhaust and the row to
+    become `blocked` before `_reconcile_blocked`'s merge-only fast path
+    ever gets a look (the ONLY path there before #3786) spends however many
+    ticks that takes sitting in plain `waiting`, competing on equal footing
+    with brand-new Work/fix dispatch in `plan_tick`'s one-launch-per-tick
+    launch walk — exactly the approve-to-merge drift window the issue
+    describes, since `waiting` entries get no `merge_only` check at all.
+    So when `ceiling_exempt_merge_stage_exit` is `True`, this function
+    returns a `merge_only` outcome directly instead of falling through to
+    the `attempts` check below — the SAME outcome shape `_reconcile_blocked`
+    already returns for a cleared gate, attempted THIS tick rather than
+    after however many more relaunch-and-die cycles it would otherwise take
+    to exhaust the budget.
+
     THAT READING COMES FROM TWO SOURCES, not one, checked by
     :func:`_running_merge_gate_reading` in the same order
     :func:`_blocked_gate_reading` already checks them for ``blocked``:
@@ -5794,6 +5811,33 @@ def _reconcile_running(
                 },
             ),
         )
+
+    # #3786: don't just exempt this death from the WORK-budget ceiling above
+    # and fall into the ordinary `attempts`-based retry below — that still
+    # writes `STATE_WAITING`, and a `waiting` entry gets no `merge_only`
+    # check at all (only `parked`/`blocked` do, both frozen in `plan_tick`
+    # BEFORE the launch walk runs). An approved+green entry would then
+    # compete on equal, undifferentiated footing with brand-new Work/fix
+    # dispatch in that walk's one-launch-per-tick sequential elimination —
+    # exactly the approve-to-merge drift window the issue describes, since
+    # nothing there prioritises "already approved+green, only needs a merge
+    # nudge" over a fresh dispatch. `ceiling_exempt_merge_stage_exit` has
+    # already confirmed the gate reads `PLAN_READY` THIS tick (the same
+    # live-preferred reading `_running_merge_gate_reading` used above), so
+    # attempt `coord merge --only` directly, now, mirroring #2350's
+    # blocked/parked fast path instead of relaunching or requeuing behind
+    # anything else. `attempts` stays untouched here too — same posture as
+    # the ceiling-exempt case just above: this isn't a work/fix leg, so it
+    # cannot spend one, and the shell's fallback resets it to 0 anyway on a
+    # race (`_run_merge_only_candidates`).
+    if ceiling_exempt_merge_stage_exit:
+        reason = (
+            f"{own_reason} — merge gate reads clear right now (Test/Review/CI "
+            "already satisfied), so attempting `coord merge --only` directly "
+            "from this tick instead of relaunching or requeuing behind new "
+            f"work (#3786){dispatch_note}"
+        )
+        return Reconcile(entry.key, "merge_only", reason, occupies=False), None
 
     attempts = entry.attempts + 1
     if attempts < effective_max_attempts:
@@ -7364,6 +7408,18 @@ def plan_tick(
             live_running_merge_gate_reason=live_running_merge_gate_reason,
         )
         reconciles.append(reconcile)
+        if reconcile.outcome == "merge_only":
+            # #3786: `_reconcile_running` hands back the exact same
+            # `merge_only` outcome shape `_reconcile_blocked` returns below
+            # for a cleared gate — no state write, so the shell decides the
+            # entry's real next state from the live `coord merge --only`
+            # attempt's outcome (`_run_merge_only_candidates`). Route it the
+            # same way: skip the ordinary occupancy/state/attempts
+            # bookkeeping below entirely and let it ride this tick's
+            # merge-only pass instead of sitting in `waiting` behind
+            # brand-new Work/fix dispatch.
+            merge_only_candidates.append(entry)
+            continue
         if reconcile.occupies:
             occupied += 1
             repo_occupied[entry.repo] = repo_occupied.get(entry.repo, 0) + 1

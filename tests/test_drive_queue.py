@@ -1239,10 +1239,12 @@ def test_a_merge_stage_exit_with_a_clear_gate_is_exempt_from_the_ceiling():
     """Work legs are AT the ceiling, but `own_reason` names a merge-gate
     block and the board's merge-plan reading is already `PLAN_READY`
     (review approved, test passed, nothing left but merge mechanics) — the
-    #2972 ceiling must not fire. The entry falls through to the ordinary
-    attempts-based `retry` instead, with no `(#2972)` marker, so it stays
-    reachable by `_reconcile_blocked`'s gate sweep rather than stranded
-    behind a permanent stop."""
+    #2972 ceiling must not fire. #3786: rather than falling through to the
+    ordinary attempts-based `retry` (which would write `waiting` and sit
+    behind brand-new Work/fix dispatch in the launch walk), the entry gets
+    a direct `merge_only` outcome this same tick — the same fast path
+    `_reconcile_blocked`'s gate sweep already uses for `parked`/`blocked`
+    rows, now reachable straight from `running` without a relaunch."""
     key = entry_key(REPO, 1650)
     own_reason = (
         f"drive exited for {key} (exit_code=1): merge attempted 3 times "
@@ -1264,11 +1266,12 @@ def test_a_merge_stage_exit_with_a_clear_gate_is_exempt_from_the_ceiling():
         exit_reasons={key: own_reason},
     )
     reconcile = plan.reconciles[0]
-    assert reconcile.outcome == "retry"
+    assert reconcile.outcome == "merge_only"
     assert own_reason in reconcile.reason
     assert "fix-round ceiling" not in reconcile.reason
     assert "(#2972)" not in reconcile.reason
     assert len(plan.blocked) == 0
+    assert plan.merge_only == (_dead_running_entry(max_fix_rounds=2, attempts=0),)
 
 
 def test_a_merge_stage_exit_still_blocks_the_ceiling_without_a_clear_gate():
@@ -1351,7 +1354,10 @@ def test_a_live_running_merge_gate_override_exempts_the_ceiling_on_the_daemon_ho
     production — IS enough to exempt the ceiling. This is the evidence the
     exemption is actually reachable on the one host `coord drive-queue
     tick` ever runs on, not just in a test that hands `IssueFacts` a
-    pre-populated `merge_plan` reading no production caller ever builds."""
+    pre-populated `merge_plan` reading no production caller ever builds.
+    #3786: the exemption now also fast-tracks straight to `merge_only`
+    (see test_a_merge_stage_exit_with_a_clear_gate_is_exempt_from_the_
+    ceiling) rather than falling through to `retry`."""
     key = entry_key(REPO, 1650)
     own_reason = (
         f"drive exited for {key} (exit_code=1): merge attempted 3 times "
@@ -1374,11 +1380,12 @@ def test_a_live_running_merge_gate_override_exempts_the_ceiling_on_the_daemon_ho
         live_running_merge_gate={key: False},
     )
     reconcile = plan.reconciles[0]
-    assert reconcile.outcome == "retry"
+    assert reconcile.outcome == "merge_only"
     assert own_reason in reconcile.reason
     assert "fix-round ceiling" not in reconcile.reason
     assert "(#2972)" not in reconcile.reason
     assert len(plan.blocked) == 0
+    assert plan.merge_only == (_dead_running_entry(max_fix_rounds=2, attempts=0),)
 
 
 def test_a_live_running_merge_gate_override_confirming_still_blocked_keeps_the_ceiling():
@@ -1415,6 +1422,47 @@ def test_a_live_running_merge_gate_override_confirming_still_blocked_keeps_the_c
     assert "(#2972)" in reconcile.reason
     assert "review not approved" in reconcile.reason
     assert len(plan.blocked) == 1
+
+
+# ── #3786: fast-track an approved+green merge-stage exit ahead of new work ──
+
+
+def test_a_merge_stage_exit_with_a_clear_gate_is_attempted_the_same_tick_new_work_launches():
+    """The issue's own acceptance criterion: an approved+green PR merges
+    before the queue dispatches unrelated new work that could move its
+    base. A merge-gate-clear `running` exit (position 1650) and a brand
+    new `waiting` entry at a LOWER position (100, so the ordinary
+    one-launch-per-tick walk would pick it first) land in the SAME
+    `plan_tick`. Before #3786 the dead entry fell through to `retry` →
+    `waiting`, re-entering that SAME walk's position-ordered competition
+    for a FUTURE tick's launch slot — however many ticks of new dispatch
+    that takes. Now it never enters the walk at all: it is attempted via
+    `coord merge --only` (`plan.merge_only`) on THIS tick, independent of
+    capacity and the launch walk's own selection of the new entry."""
+    key = entry_key(REPO, 1650)
+    own_reason = (
+        f"drive exited for {key} (exit_code=1): merge attempted 3 times "
+        "without landing."
+    )
+    facts = IssueFacts(
+        known=True,
+        issue_state="open",
+        work_leg_count=4,
+        merge_gate_status="READY",
+    )
+    view = BoardView(issues={key: facts, entry_key(REPO, 100): IssueFacts(known=True)})
+    dead = _dead_running_entry(max_fix_rounds=2, attempts=0)
+    new_work = entry(100, position=100)
+    plan = plan_tick(
+        [dead, new_work],
+        view,
+        capacity=1,
+        now=NOW,
+        fix_round_config_default=None,
+        exit_reasons={key: own_reason},
+    )
+    assert plan.merge_only == (dead,)
+    assert plan.launch is not None and plan.launch.issue == 100
 
 
 def test_the_fix_round_ceiling_reads_pipeline_max_fix_rounds_when_the_entry_has_no_override():
