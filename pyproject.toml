@@ -208,7 +208,13 @@ dev = [
     # default rather than skipping (#3483) — same "read-back through the
     # real library, not just a code-path-didn't-crash check" reasoning.
     "code-coordinator[tui-pty]",
-    "pytest>=8.0",
+    # Cap below 9: pytest 9.2.0's monkeypatch undo deletes PEP 562 lazy module
+    # attributes with delattr, which raises AttributeError on e.g.
+    # `coord.state.COORD_DIR` and aborts teardown — surfacing as suite-wide
+    # ERRORs and, by leaving the pause-store `_state_path` guard un-undone,
+    # wedging the whole suite in a guard-recursion hang. Lift the cap once the
+    # tests are made pytest-9 compatible (migrate lazy-attr setattr to setenv).
+    "pytest>=8.0,<9",
     "pytest-asyncio>=0.23",
     # Parallel test execution. The suite is the dominant cost of the Test gate
     # in an unattended run: 5m49s serial vs 1m36s-2m23s under `-n auto`, with
