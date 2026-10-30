@@ -142,7 +142,10 @@ class SweepWriteNotConfirmedError(RuntimeError):
 #: worker rather than mutating a drive-queue row directly — it is still
 #: safe-tier because the leg it spawns runs at ordinary worker tool-scope
 #: (edit/push/git), never `--dangerously-skip-permissions`, and has no path
-#: to either name in :data:`PERMANENTLY_FORBIDDEN`.
+#: to either name in :data:`PERMANENTLY_FORBIDDEN`. ``"smoke_requeue"``
+#: (#2244) clears a smoke leg's `test_state`/`test_reason` so it re-enters
+#: the ordinary dispatch scan — it never mutates the drive queue or spawns
+#: anything, so it is strictly narrower than any other name on this list.
 SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
     {
         "merge_approved_green",
@@ -151,6 +154,7 @@ SAFE_TIER_ACTIONS: frozenset[str] = frozenset(
         "drive_queue_requeue",
         "ci_rerun",
         "dispatch_fixit_leg",
+        "smoke_requeue",
     }
 )
 
@@ -857,6 +861,73 @@ def sweep_dispatch_fixit_leg(
     )
 
 
+class SmokeRequeue(TypedDict):
+    """:func:`sweep_smoke_requeue`'s return shape.
+
+    ``requeued`` is the one answer to "was the smoke leg actually cleared
+    for re-dispatch" — ``detail`` says why not when it is ``False``, so a
+    no-op reads distinctly from a success to an unattended caller.
+    """
+
+    requeued: bool
+    detail: str
+
+
+def sweep_smoke_requeue(repo_name: str, issue_number: int) -> SmokeRequeue:
+    """Daemon-internal "re-dispatch a no-verdict smoke leg", authorized for
+    the sweep context (#2244).
+
+    A smoke leg that exhausted #2272's mute-leg retry budget without ever
+    producing a parseable verdict (`coord.smoke.NO_SMOKE_VERDICT_MARKER`)
+    parks its row at ``test_state=TEST_STATE_BLOCKED`` exactly like any
+    other Test-gate block — there is nothing to merge, approve or remove,
+    only a stale verdict to clear so the row re-enters the ordinary
+    dispatch scan as if the smoke leg had never run. Calls
+    `coord.state.reset_work_test_state` directly — the same primitive
+    `coord diagnose --stage test --reset` calls — which best-effort
+    releases any outstanding #3182 fan-out smoke claim too.
+
+    Reads `coord.state.test_reset_candidates` FIRST to confirm at least one
+    matching row still carries a `test_state` before writing, so a repeat
+    call against a row this already cleared reports ``requeued=False``
+    rather than a bare pass-through of `reset_work_test_state`'s row-matched
+    count — that count reflects rows the WHERE clause matched, not rows
+    whose value actually changed, so by itself it cannot tell a genuine
+    clear apart from a no-op re-clear of an already-``NULL`` column.
+    """
+    authorize_sweep_action("smoke_requeue")
+
+    from coord.state import reset_work_test_state, test_reset_candidates  # noqa: PLC0415
+
+    before = test_reset_candidates(repo_name, issue_number)
+    if not any(test_state is not None for _aid, _type, test_state in before):
+        return SmokeRequeue(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number} has no assignment row with a "
+                "test_state/test_reason to clear — already re-dispatched or "
+                "moved on"
+            ),
+        )
+
+    cleared = reset_work_test_state(repo_name, issue_number)
+    if cleared <= 0:
+        return SmokeRequeue(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number}: reset matched no assignment "
+                "rows — nothing to clear"
+            ),
+        )
+    return SmokeRequeue(
+        requeued=True,
+        detail=(
+            f"{repo_name}#{issue_number}: cleared test_state/test_reason on "
+            f"{cleared} assignment row(s) so the smoke leg re-dispatches"
+        ),
+    )
+
+
 #: action name -> the daemon-internal handler that actually performs it.
 #: Looked up by :func:`dispatch_sweep_action` only after
 #: :func:`authorize_sweep_action` has already cleared the action — an
@@ -869,6 +940,7 @@ _HANDLERS: dict[str, Callable[..., Any]] = {
     "drive_queue_remove": sweep_drive_queue_remove,
     "drive_queue_requeue": sweep_drive_queue_requeue,
     "dispatch_fixit_leg": sweep_dispatch_fixit_leg,
+    "smoke_requeue": sweep_smoke_requeue,
 }
 
 

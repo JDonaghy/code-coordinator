@@ -12,7 +12,13 @@ import pytest
 
 from coord import queue_diagnose, state
 from coord.audit import query_audit_log
-from coord.board_doctor import CAUSE_CEILING_BLOCKED_MERGEABLE, TIER_AUTO, StuckRow, sweep
+from coord.board_doctor import (
+    CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CAUSE_SMOKE_NO_VERDICT,
+    TIER_AUTO,
+    StuckRow,
+    sweep,
+)
 from coord.board_doctor_permissions import (
     PERMANENTLY_FORBIDDEN,
     SAFE_TIER_ACTIONS,
@@ -35,6 +41,7 @@ from coord.board_doctor_policy import (
 from coord.commands.drive_queue import drive_queue_add, drive_queue_remove
 from coord.config import Config
 from coord.models import Assignment, Board, Machine, Repo
+from coord.smoke import MUTE_SMOKE_LEG_BUDGET, TEST_STATE_BLOCKED, mute_smoke_tally
 
 #: Everything an operator declares on `coord drive-queue add` that
 #: `coord.state.enqueue_drive_queue` replaces on every subsequent call —
@@ -801,6 +808,108 @@ class TestThe3760AutoActionsEndToEnd:
             sweep_id="sweep-3764-merged-second",
         )
         assert state.get_drive_queue_entry("acme/widgets", 3764) is None
+
+
+class TestSmokeNoVerdictRequeue:
+    """#3760 Action 5 / #2244: a smoke leg that produced no parseable verdict
+    parks the row at ``test_state=TEST_STATE_BLOCKED`` with a
+    ``coord.smoke.mute_smoke_tally`` reason once the leg's own retry budget
+    (``MUTE_SMOKE_LEG_BUDGET``) is exhausted. The sweep must re-dispatch it
+    (clear the verdict so the ordinary Test-stage scan picks the row back up)
+    rather than leave it parked or alert a human.
+
+    Same "whole stack as the daemon runs it" pattern as
+    `TestThe3760AutoActionsEndToEnd`, against the real module-level
+    `AUTO_DISPATCHERS` entry `coord.board_doctor_policy` registers for
+    `CAUSE_SMOKE_NO_VERDICT` at import time.
+    """
+
+    @staticmethod
+    def _seed_parked_assignment(
+        coord_db, *, assignment_id: str, repo: str, issue: int
+    ) -> None:
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, branch, type, status) "
+            "VALUES (?, 'm1', ?, ?, 't', ?, 'work', 'done')",
+            (assignment_id, repo, issue, f"issue-{issue}-x"),
+        )
+        coord_db.commit()
+        state.record_test_verdict(
+            assignment_id=assignment_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=mute_smoke_tally(MUTE_SMOKE_LEG_BUDGET),
+        )
+
+    def test_parked_row_is_cleared_and_re_dispatched(self, coord_db) -> None:
+        self._seed_parked_assignment(
+            coord_db, assignment_id="aid-3810-a", repo="acme/widgets", issue=3810
+        )
+        row = StuckRow(
+            queue="smoke-no-verdict",
+            key="acme/widgets#3810",
+            state="blocked",
+            cause=CAUSE_SMOKE_NO_VERDICT,
+            confidence="high",
+            evidence=(f"cause={CAUSE_SMOKE_NO_VERDICT}",),
+        )
+
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3810-smoke-no-verdict",
+        )
+
+        decision = report.decisions[0]
+        assert decision.tier == TIER_AUTO
+        assert decision.action == "auto-dispatch"
+
+        after = state.test_reset_candidates("acme/widgets", 3810)
+        assert after == [("aid-3810-a", "work", None)]
+
+    def test_second_sweep_over_the_now_cleared_row_is_a_noop(self, coord_db) -> None:
+        self._seed_parked_assignment(
+            coord_db, assignment_id="aid-3810-b", repo="acme/widgets", issue=3811
+        )
+        row = StuckRow(
+            queue="smoke-no-verdict",
+            key="acme/widgets#3811",
+            state="blocked",
+            cause=CAUSE_SMOKE_NO_VERDICT,
+            confidence="high",
+            evidence=(f"cause={CAUSE_SMOKE_NO_VERDICT}",),
+        )
+
+        sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3811-smoke-no-verdict-first",
+        )
+        once = state.test_reset_candidates("acme/widgets", 3811)
+        assert once == [("aid-3810-b", "work", None)]
+
+        # A second sweep pass sees the SAME stale StuckRow (`collect_rows`
+        # would have already dropped this cause by now, since the row no
+        # longer reads `test_state=TEST_STATE_BLOCKED`) — the handler itself
+        # must still report an honest no-op rather than a false "cleared it
+        # again".
+        second = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3811-smoke-no-verdict-second",
+        )
+
+        decision = second.decisions[0]
+        assert decision.tier == TIER_AUTO
+        assert decision.action == "auto-dispatch-noop"
+        twice = state.test_reset_candidates("acme/widgets", 3811)
+        assert twice == once
 
 
 # ── #3768: the fix-it leg dispatch primitive + its in-flight lock ──────────
