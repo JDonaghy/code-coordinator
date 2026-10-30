@@ -910,6 +910,10 @@ class ModelsConfig:
     resolve_dispatch_model_alias`, checks ``pinned`` FIRST and returns
     immediately when it matches, so the ladder/labels/usage-gate are never
     even consulted for that dispatch — see :meth:`model_for_type`.
+    ``"review_rereview"`` is a special pinned key consulted only by
+    :meth:`model_for_review` for a re-review (``review_iteration > 0``) —
+    see that method for why its fleet default (``sonnet``) is hardcoded
+    there rather than living in this dataclass's own default factory.
 
     A route is either a bare model alias (resolved against the implicit
     ``claude`` provider's known aliases — ``default``/``escalation``/
@@ -950,6 +954,39 @@ class ModelsConfig:
         if assignment_type is None:
             return None
         return self.pinned.get(assignment_type)
+
+    def model_for_review(self, review_iteration: int) -> str:
+        """Return the model alias to dispatch a review leg on (#3787).
+
+        *review_iteration* is the fix-round counter already carried by the
+        work/fix :class:`~coord.models.Assignment` being reviewed (``0`` for
+        the original work, ``N`` for the Nth bounce-fix round) — the same
+        value every review row inherits via ``getattr(completed,
+        "review_iteration", 0)`` (see :func:`coord.review.dispatch_review`).
+
+        Iteration ``0`` (a first review) keeps today's behaviour: the
+        ``models.pinned["review"]`` route (``opus`` by default) wins outright
+        over ``models.default``, exactly as :meth:`model_for_type` already
+        resolves it.
+
+        Iteration ``> 0`` (a re-review after a fix round) resolves to
+        ``models.pinned["review_rereview"]`` instead, with a **hardcoded**
+        ``"sonnet"`` fallback when that key isn't configured — deliberately
+        not derived from the ``pinned`` dict's own dataclass default, because
+        setting ANY ``models.pinned`` in ``coordinator.yml`` replaces the
+        whole mapping (see ``_parse_models``), which would otherwise silently
+        drop this fleet-wide default for every operator who already pins
+        ``"review"`` to something. A re-review is scoped to the incremental
+        diff since the last fix round (see
+        :func:`coord.merge_queue.find_scoped_review_candidate`), so a lighter
+        model is both cheap and sufficient — operators who need a heavier
+        (or different) re-review model still win outright by setting
+        ``models.pinned["review_rereview"]`` explicitly, same as any other
+        pinned route.
+        """
+        if review_iteration and review_iteration > 0:
+            return self.pinned.get("review_rereview", "sonnet")
+        return self.model_for_type("review") or self.default
 
     def next_model(self, current: str) -> str:
         """Return the next model in the escalation ladder.

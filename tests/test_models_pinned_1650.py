@@ -60,6 +60,37 @@ class TestDefaultPin:
         assert cfg.model_for_type(None) is None
 
 
+class TestModelForReview:
+    """#3787: a re-review (``review_iteration > 0``) resolves to a cheaper
+    fleet-default model (``sonnet``) than a first review's ``review`` pin,
+    independently of whatever an operator has set for ``models.pinned["review"]``."""
+
+    def test_first_review_keeps_the_review_pin(self) -> None:
+        cfg = ModelsConfig()
+        assert cfg.model_for_review(0) == "opus"
+
+    def test_rereview_defaults_to_sonnet(self) -> None:
+        cfg = ModelsConfig()
+        assert cfg.model_for_review(1) == "sonnet"
+        assert cfg.model_for_review(2) == "sonnet"
+
+    def test_rereview_default_holds_even_when_review_pin_is_overridden(self) -> None:
+        # Setting `pinned` at all replaces the whole mapping (no merge), so
+        # this proves the sonnet re-review default is NOT derived from the
+        # dataclass's own `pinned` default — it's hardcoded in the method.
+        cfg = ModelsConfig(pinned={"review": "haiku"})
+        assert cfg.model_for_review(0) == "haiku"
+        assert cfg.model_for_review(1) == "sonnet"
+
+    def test_rereview_pin_override_wins_outright(self) -> None:
+        cfg = ModelsConfig(pinned={"review": "opus", "review_rereview": "opus"})
+        assert cfg.model_for_review(1) == "opus"
+
+    def test_negative_iteration_treated_as_first_review(self) -> None:
+        cfg = ModelsConfig()
+        assert cfg.model_for_review(-1) == "opus"
+
+
 class TestConfigParseValidation:
     """#1650 acceptance: a typo in `models.pinned` fails loudly at config
     load, not silently at dispatch time."""

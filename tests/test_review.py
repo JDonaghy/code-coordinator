@@ -2224,6 +2224,60 @@ def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
     assert "# Project rules" in payload["briefing"]
 
 
+def test_dispatch_review_pins_first_review_to_configured_model(
+    two_machine_config: Config,
+) -> None:
+    """#3787: a first review (``review_iteration=0``, the default) still
+    resolves via the operator's ``models.pinned["review"]`` (opus by
+    default) — only a re-review gets the cheaper sonnet default."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    assert completed.review_iteration == 0
+    client = _FakeHTTPClient({"id": "review-id-first"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42",
+            "existed": True,
+        },
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert result.model == "opus"
+    _, payload = client.calls[0]
+    assert payload["model"] == "opus"
+
+
+def test_dispatch_review_pins_rereview_to_sonnet_regardless_of_review_pin(
+    two_machine_config: Config,
+) -> None:
+    """#3787: once ``completed.review_iteration > 0`` — i.e. ``completed``
+    is itself a bounce-fix worker leg — the re-review dispatches on the
+    cheaper fleet-default ``sonnet``, not the opus ``review`` pin."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    completed.review_iteration = 2
+    client = _FakeHTTPClient({"id": "review-id-rereview"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42",
+            "existed": True,
+        },
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert result.model == "sonnet"
+    _, payload = client.calls[0]
+    assert payload["model"] == "sonnet"
+
+
 def _opencode_repo_config(*, reviews_provider: str | None) -> Config:
     """A repo pinned to `provider: opencode`, with a distinctly-named
     claude-type provider (`review-claude`) also registered, so a test can
@@ -4535,8 +4589,15 @@ def test_dispatch_scoped_review_dispatches_with_delta_in_briefing(
     # auto-loop keys off this exactly like a full review.
     assert result.review_of_assignment_id == "w1"
 
+    # #3787: a scoped review is unconditionally a re-review by construction
+    # (it only exists to scope to what changed since `prior_review`), so it
+    # always pins to the cheaper fleet-default `sonnet` regardless of the
+    # operator's opus `models.pinned["review"]`.
+    assert result.model == "sonnet"
+
     _, payload = client.calls[0]
     assert payload["type"] == "review"
+    assert payload["model"] == "sonnet"
     assert "conflict-fix-resolution" in payload["briefing"]
     assert "kept-from-before" in payload["briefing"]
 
