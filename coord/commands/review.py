@@ -1406,6 +1406,24 @@ def review_reaffirm(
         )
         sys.exit(1)
 
+    # Defense in depth: this call leaves `verdicts` on its default
+    # (`("approve",)`), so `prior_review` should always be an actual
+    # approval — reaffirming a `request-changes` row as covering the
+    # current head would print "unblocked for merge" while the merge gate
+    # (which requires `review_verdict == "approve"`) keeps refusing it.
+    # Refuse outright rather than trust that default silently if it's ever
+    # widened here without updating this check.
+    if getattr(prior_review, "review_verdict", None) != "approve":
+        click.echo(
+            f"error: review {prior_review.assignment_id} is not an approval "
+            f"(verdict={prior_review.review_verdict!r}) — reaffirming it "
+            "would report this branch unblocked while the merge gate still "
+            f"refuses it. A full re-review is required: "
+            f"coord review {work_assignment_id}",
+            err=True,
+        )
+        sys.exit(1)
+
     # #1488 review round 1: `find_scoped_review_candidate` alone does NOT
     # establish that the delta is a mechanical rebase — its "voided ONLY by a
     # content-changing rebase" guarantee comes from the caller pairing it with

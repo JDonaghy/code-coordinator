@@ -900,10 +900,11 @@ def find_scoped_review_candidate(
     ancillary_files: list[str] | None = None,
     ancillary_gh_ops: "GhOps | None" = None,
     config=None,
+    verdicts: tuple[str, ...] = ("approve",),
 ) -> Assignment | None:
     """Return the previous review whose approval was voided ONLY by a
     content-changing rebase (#1476), or whose ``request-changes`` verdict
-    was answered by a bounded fix round (#3787), or ``None``.
+    was answered by a bounded fix round, or ``None``.
 
     *config*, when supplied, resolves *ancillary_files*/*ancillary_gh_ops*
     via :func:`_resolve_ancillary_config` (#3707) — see
@@ -916,13 +917,19 @@ def find_scoped_review_candidate(
     (the base to diff the resolution from) and ``briefing``/findings as
     established context, not just a yes/no.
 
-    Unlike :func:`has_approved_review`, a ``request-changes`` verdict is
-    also an eligible candidate here (#3787): an "approved" review means
-    "nothing to review, the delta is ancillary/cosmetic"; a
-    ``request-changes`` review means "here's a fix round to scope the
-    *next* review around" — scoping the diff is useful in both cases, and
-    it's :func:`only_bounded_fix_since_review` (checked by every caller of
-    this function) that gates whether the delta since a ``request-changes``
+    *verdicts* controls which prior verdicts are eligible candidates. The
+    default, ``("approve",)``, only matches an actual approval — callers
+    that merely *reaffirm* an existing verdict (rather than scoping a fresh
+    re-review around the delta) must stay on this default, since a
+    ``request-changes`` row reaffirmed as covering the current SHA would
+    report the branch unblocked while the merge gate (which still requires
+    ``review_verdict == "approve"``) keeps refusing it. Callers that
+    dispatch a brand-new scoped re-review — where a ``request-changes``
+    verdict legitimately means "here's a fix round to scope the diff
+    around" rather than "this is still approved" — opt in explicitly with
+    ``verdicts=("approve", "request-changes")``; it's
+    :func:`only_bounded_fix_since_review` (checked by every such caller)
+    that then gates whether the delta since that ``request-changes``
     verdict is actually just the bounded fix round it asked for, as opposed
     to unrelated new work.
 
@@ -985,7 +992,7 @@ def find_scoped_review_candidate(
             continue
         if getattr(a, "review_of_assignment_id", None) not in branch_work_ids:
             continue
-        if getattr(a, "review_verdict", None) not in ("approve", "request-changes"):
+        if getattr(a, "review_verdict", None) not in verdicts:
             continue
         review_sha = getattr(a, "review_head_sha", None)
         if review_sha is None or review_sha == current_sha:

@@ -4499,15 +4499,25 @@ class TestScopedReviewCandidate:
         assert mq.find_scoped_review_candidate(entry, board) is None
 
     def test_finds_candidate_when_verdict_was_request_changes(self) -> None:
-        """#3787: a `request-changes` verdict is now also an eligible
-        candidate here — it's the caller (`only_bounded_fix_since_review`)
-        that decides whether the delta since it is actually just the
-        bounded fix round the review asked for."""
+        """A `request-changes` verdict is an eligible candidate when the
+        caller opts into it via `verdicts=` — it's then the caller's own
+        gate (`only_bounded_fix_since_review`) that decides whether the
+        delta since it is actually just the bounded fix round the review
+        asked for. The default stays approve-only (see
+        `test_returns_none_when_verdict_was_neither_approve_nor_request_changes`'s
+        sibling default-arg test) so an unscoped caller like
+        `review_reaffirm` can never match a non-approval by accident."""
         work = self._work("w1")
         review = self._review("w1", verdict="request-changes")
         board = self._board(completed=[work, review])
         entry = self._voided_entry()
-        assert mq.find_scoped_review_candidate(entry, board) is review
+        assert mq.find_scoped_review_candidate(entry, board) is None
+        assert (
+            mq.find_scoped_review_candidate(
+                entry, board, verdicts=("approve", "request-changes"),
+            )
+            is review
+        )
 
     def test_returns_none_when_verdict_was_neither_approve_nor_request_changes(
         self,
@@ -4951,9 +4961,10 @@ class TestScopedReviewCandidate:
     # ── #3787: end-to-end bounce-fix re-review scoping ──────────────────────
 
     def test_request_changes_plus_bounded_fix_round_is_a_scoped_candidate(self) -> None:
-        """#3787: the full chain a fix-round completion walks — a prior
+        """The full chain a fix-round completion walks — a prior
         `request-changes` review followed by a single DONE, chain-linked
-        fix-round leg — is both a scoped-review candidate AND passes the
+        fix-round leg — is both a scoped-review candidate (once the caller
+        opts into `verdicts=("approve", "request-changes")`) AND passes the
         bounded-fix guardrail, so the re-review scopes to the fix delta
         instead of the whole PR."""
         work = self._work("w1")
@@ -4967,7 +4978,9 @@ class TestScopedReviewCandidate:
         board = self._board(completed=[work, review, fix_round])
         entry = self._voided_entry()
 
-        found = mq.find_scoped_review_candidate(entry, board)
+        found = mq.find_scoped_review_candidate(
+            entry, board, verdicts=("approve", "request-changes"),
+        )
         assert found is review
         assert mq.only_bounded_fix_since_review(entry, board, found) is True
 

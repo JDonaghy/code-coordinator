@@ -956,7 +956,7 @@ class ModelsConfig:
         return self.pinned.get(assignment_type)
 
     def model_for_review(self, review_iteration: int) -> str:
-        """Return the model alias to dispatch a review leg on (#3787).
+        """Return the model alias to dispatch a review leg on.
 
         *review_iteration* is the fix-round counter already carried by the
         work/fix :class:`~coord.models.Assignment` being reviewed (``0`` for
@@ -984,7 +984,7 @@ class ModelsConfig:
         ``models.pinned["review_rereview"]`` explicitly, same as any other
         pinned route.
         """
-        if review_iteration and review_iteration > 0:
+        if review_iteration > 0:
             return self.pinned.get("review_rereview", "sonnet")
         return self.model_for_type("review") or self.default
 
