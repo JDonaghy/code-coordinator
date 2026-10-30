@@ -649,7 +649,9 @@ class TestThe3760AutoActionsEndToEnd:
         # #1757: `_after_satisfied` treats an absent row as satisfied, so
         # clearing a merged row whose deploy gate is still armed/fired would
         # silently release every `after=`-dependent row as if a human had
-        # already deployed. The sweep must refuse rather than remove.
+        # already deployed. The sweep must refuse to remove it — and #3805:
+        # that refusal must be absorbed as a no-op for THIS row rather than
+        # propagate out of `sweep()` and abort every row ordered after it.
         monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
         monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
 
@@ -664,18 +666,72 @@ class TestThe3760AutoActionsEndToEnd:
             evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
         )
 
-        with pytest.raises(SweepPermissionError, match="deploy gate"):
-            sweep(
-                [row],
-                tier_of=policy_tier_of,
-                auto_dispatchers=AUTO_DISPATCHERS,
-                alert_dispatcher=_must_not_alert,
-                sweep_id="sweep-3765-merged-gated",
-            )
+        report = sweep(
+            [row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3765-merged-gated",
+        )
+
+        decision = report.decisions[0]
+        assert decision.tier == TIER_AUTO
+        assert decision.action == "auto-dispatch-noop"
 
         after = state.get_drive_queue_entry("acme/widgets", 3765)
         assert after is not None
         assert after == before
+
+    def test_refused_merged_row_does_not_abort_the_rest_of_the_sweep(
+        self, monkeypatch
+    ) -> None:
+        # #3805: a gated row ordered first must not starve every row ordered
+        # after it — the sweep has no `try` around its dispatch call site,
+        # so the refusal has to be caught (and recorded as a decision)
+        # inside the C3 handler itself, not left to propagate.
+        monkeypatch.setattr(drive_queue_add, "callback", _must_not_be_called)
+        monkeypatch.setattr(drive_queue_remove, "callback", _must_not_be_called)
+
+        gated_before = _seed_declared_row("acme/widgets", 3767)
+        assert gated_before["hold_state"] == "armed"
+        state.enqueue_drive_queue("acme/widgets", 3768)
+
+        gated_row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3767",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_PR_MERGED,
+            confidence="high",
+            evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
+        )
+        clean_row = StuckRow(
+            queue="drive-queue",
+            key="acme/widgets#3768",
+            state="stuck",
+            cause=queue_diagnose.CAUSE_PR_MERGED,
+            confidence="high",
+            evidence=(f"cause={queue_diagnose.CAUSE_PR_MERGED}",),
+        )
+
+        report = sweep(
+            [gated_row, clean_row],
+            tier_of=policy_tier_of,
+            auto_dispatchers=AUTO_DISPATCHERS,
+            alert_dispatcher=_must_not_alert,
+            sweep_id="sweep-3805-gated-then-clean",
+        )
+
+        assert len(report.decisions) == 2
+        gated_decision, clean_decision = report.decisions
+        assert gated_decision.key == "acme/widgets#3767"
+        assert gated_decision.action == "auto-dispatch-noop"
+        assert clean_decision.key == "acme/widgets#3768"
+        assert clean_decision.action == "auto-dispatch"
+
+        # The gated row survives untouched; the clean one ordered after it
+        # still got processed and removed.
+        assert state.get_drive_queue_entry("acme/widgets", 3767) is not None
+        assert state.get_drive_queue_entry("acme/widgets", 3768) is None
 
     def test_pr_merged_row_with_a_released_deploy_gate_is_cleared(
         self, monkeypatch
