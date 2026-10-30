@@ -117,6 +117,7 @@ from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CAUSE_SMOKE_NO_VERDICT,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
@@ -352,6 +353,48 @@ def _clear_merged_row(row: StuckRow) -> bool:
     return True
 
 
+def _requeue_smoke_no_verdict(row: StuckRow) -> bool:
+    """#3760 Action 5: re-dispatch a smoke leg that produced no verdict (#2244).
+
+    Mirrors :func:`_clear_merged_row`'s shape rather than
+    :func:`_requeue_ceiling_blocked_mergeable`'s: `sweep_smoke_requeue`
+    (`coord.board_doctor_permissions`) raises no `SweepPermissionError`
+    today, but there is no cost to handling one the same defensive way as
+    every other dispatch call here, in case a future gate wraps it.
+
+    Returns ``True`` only when `sweep_smoke_requeue` confirms
+    ``requeued=True`` — a row whose `test_state`/`test_reason` this already
+    cleared (idempotence: the next sweep no longer selects it at all, since
+    :func:`coord.board_doctor.smoke_no_verdict_rows` re-reads live
+    `test_state`, but a stale decision replay here still reports an honest
+    no-op) or an unparseable key reports `"auto-dispatch-noop"` instead of a
+    false success.
+    """
+    parsed = _parse_row_key(row.key)
+    if parsed is None:
+        return False
+    repo_name, issue_number = parsed
+    import click  # noqa: PLC0415
+
+    try:
+        result = dispatch_sweep_action("smoke_requeue", repo_name, issue_number)
+    except SweepPermissionError as exc:
+        click.echo(
+            f"warning: board-doctor smoke-requeue refused for {repo_name}#"
+            f"{issue_number}: {exc}",
+            err=True,
+        )
+        return False
+    if not result.get("requeued"):
+        click.echo(
+            f"warning: board-doctor smoke-requeue no-op for {repo_name}#"
+            f"{issue_number}: {result.get('detail')}",
+            err=True,
+        )
+        return False
+    return True
+
+
 _register_auto_action(
     CAUSE_CEILING_BLOCKED_MERGEABLE,
     "drive_queue_requeue",
@@ -361,6 +404,11 @@ _register_auto_action(
     queue_diagnose.CAUSE_PR_MERGED,
     "drive_queue_remove",
     _clear_merged_row,
+)
+_register_auto_action(
+    CAUSE_SMOKE_NO_VERDICT,
+    "smoke_requeue",
+    _requeue_smoke_no_verdict,
 )
 
 

@@ -18,6 +18,7 @@ from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CAUSE_SMOKE_NO_VERDICT,
     CONVERGENCE_LIMIT,
     TIER_ALERT,
     TIER_AUTO,
@@ -77,15 +78,18 @@ def test_parse_row_key_is_the_one_shared_parser() -> None:
 
 
 class TestPolicyTierOf:
-    def test_allowlist_holds_exactly_the_two_3760_entries(self) -> None:
+    def test_allowlist_holds_exactly_the_3760_entries(self) -> None:
         # No cause is pre-approved for auto-action without a reviewed,
-        # known-safe fix behind it. #3760 (C3) names exactly two: a
+        # known-safe fix behind it. #3760 names three: a
         # ceiling-blocked-but-mergeable row gets a fresh fix-round budget,
-        # and a row whose PR already merged gets cleared. Every other
-        # cause stays alert-tier.
+        # a row whose PR already merged gets cleared, and a row whose smoke
+        # leg produced no parseable verdict gets its Test verdict cleared so
+        # it re-dispatches (Action 5, #2244). Every other cause stays
+        # alert-tier.
         assert ALLOWLIST == {
             CAUSE_CEILING_BLOCKED_MERGEABLE: "drive_queue_requeue",
             queue_diagnose.CAUSE_PR_MERGED: "drive_queue_remove",
+            CAUSE_SMOKE_NO_VERDICT: "smoke_requeue",
         }
 
     def test_every_other_cause_is_alert_tier_today(self) -> None:

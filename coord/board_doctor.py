@@ -103,6 +103,19 @@ _LIVE_CLEAR_CAUSES = frozenset({queue_diagnose.CAUSE_NOTHING_BLOCKING})
 #: relabelled, so the broad causes stay alert-eligible for everything else.
 CAUSE_CEILING_BLOCKED_MERGEABLE = "ceiling-blocked-mergeable"
 
+#: #3760 Action 5: a Test-stage smoke leg that ended its `claude -p` session
+#: without printing a verdict marker line often enough to exhaust
+#: `coord.smoke.MUTE_SMOKE_LEG_BUDGET` — `coord.notify._record_smoke_verdict`
+#: parks the assignment at `test_state="blocked"` instead of re-dispatching
+#: it forever (#2272), so without this cause the row sits there until a
+#: human notices. Registered in `coord.board_doctor_policy.ALLOWLIST`: the
+#: safe auto-action is simply clearing the parked `test_state`/`test_reason`
+#: (`coord.state.reset_work_test_state`, via the `smoke_requeue` sweep
+#: action) so the assignment re-enters the normal Test-stage dispatch scan
+#: — never a second "no-verdict" tally once that happens, since the row no
+#: longer matches this cause's own detection predicate (#2244).
+CAUSE_SMOKE_NO_VERDICT = "smoke-no-verdict"
+
 #: A repo whose merge base has hit `coord.state.BASELINE_RED_STREAK_LIMIT`
 #: consecutive confirmed-red classifications (#3386) poisons every row in
 #: both queues for that repo — the rows are not individually stuck, the
@@ -164,7 +177,7 @@ _CAPACITY_CHECK_UNSET = _CapacityCheckUnset()
 class StuckRow:
     """One drive-queue or merge-queue row this sweep looked at."""
 
-    queue: str  # "drive-queue", "merge-queue", or "baseline-red"
+    queue: str  # "drive-queue", "merge-queue", "baseline-red", or "smoke-no-verdict"
     key: str
     state: str
     cause: str
@@ -296,6 +309,55 @@ def baseline_red_rows(blocked_streaks: Mapping[str, int]) -> list[StuckRow]:
         )
         for repo_name, streak in blocked_streaks.items()
     ]
+
+
+def smoke_no_verdict_rows(board: Any) -> list[StuckRow]:
+    """One :class:`StuckRow` per assignment parked on a no-verdict smoke leg.
+
+    #3760 Action 5 / #2244: `coord.notify._record_smoke_verdict` parks an
+    assignment at ``test_state=TEST_STATE_BLOCKED`` with a
+    `coord.smoke.mute_smoke_tally`-prefixed `test_reason` once
+    `coord.smoke.mute_smoke_legs` reaches `coord.smoke.MUTE_SMOKE_LEG_BUDGET`
+    consecutive Test-stage legs that ended without printing a verdict marker
+    (not a genuine suite result). That predicate is read directly off the
+    live `test_state`/`test_reason` the board already carries — never
+    re-derived — and is exactly what naturally excludes the two sibling
+    retry-budget parks (#3315's environmental-retry, #3737's
+    abandoned-background): each writes its own distinct tally marker text
+    that `coord.smoke.mute_smoke_legs` does not match, so neither is ever
+    picked up here.
+
+    *board* is a single already-built `coord.models.Board` (callers pass
+    the one `collect_rows` already builds for `queue_diagnose.GhLiveProbe`,
+    rather than this function calling `coord.state.build_board` a second
+    time). Walks ``board.active + board.completed`` since a parked
+    assignment may have already been marked done in some callers' boards.
+    """
+    from coord.smoke import (  # noqa: PLC0415
+        MUTE_SMOKE_LEG_BUDGET,
+        TEST_STATE_BLOCKED,
+        mute_smoke_legs,
+    )
+
+    rows: list[StuckRow] = []
+    for assignment in (*board.active, *board.completed):
+        if assignment.test_state != TEST_STATE_BLOCKED:
+            continue
+        legs = mute_smoke_legs(assignment.test_reason)
+        if legs < MUTE_SMOKE_LEG_BUDGET:
+            continue
+        rows.append(
+            StuckRow(
+                queue="smoke-no-verdict",
+                key=f"{assignment.repo_name}#{assignment.issue_number}",
+                state="blocked",
+                cause=CAUSE_SMOKE_NO_VERDICT,
+                confidence=queue_diagnose.CONFIDENCE_HIGH,
+                evidence=(f"mute_smoke_legs={legs}",),
+                fresh=True,
+            )
+        )
+    return rows
 
 
 def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[StuckRow]:
@@ -558,9 +620,10 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
         for row in list_drive_sessions()
         if row.get("session_name")
     )
+    board = build_board()
     probe = queue_diagnose.GhLiveProbe(
         config=config,
-        board=build_board(),
+        board=board,
         fleet_health=fleet_health,
         live_sessions=live_sessions,
         local_host=_local_host_id(),
@@ -577,6 +640,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     rows = _reclassify_ceiling_blocked(rows)
     rows.extend(merge_queue_rows(load_merge_queue()))
+    rows.extend(smoke_no_verdict_rows(board))
 
     blocked_streaks = {
         repo_name: streak
