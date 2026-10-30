@@ -6729,3 +6729,51 @@ class TestUpsertIssueCommentLocal:
         state._upsert_issue_comment_local("api", 42, body)
 
         assert calls["post"] == ("api", 42, body)
+
+
+class TestPrMergeCiRerunBudget:
+    """#3808: `coord pr merge`'s own one-shot CI re-run budget — a hand-opened
+    PR has no `merge_queue` row to carry `ci_flaky_reruns` on, so this is a
+    standalone `board_meta` row keyed on (repo, PR, head sha).
+
+    `coord_db` (autouse, conftest.py) already gives every test here a
+    private, isolated connection — no extra fixture needed.
+    """
+
+    def test_unattempted_pr_reads_as_not_yet_spent(self, coord_db) -> None:
+        from coord.state import pr_merge_ci_rerun_already_attempted
+
+        assert not pr_merge_ci_rerun_already_attempted("acme/api", 7, "sha1")
+
+    def test_recording_an_attempt_makes_it_read_as_spent(self, coord_db) -> None:
+        from coord.state import (
+            pr_merge_ci_rerun_already_attempted,
+            record_pr_merge_ci_rerun,
+        )
+
+        record_pr_merge_ci_rerun("acme/api", 7, "sha1")
+
+        assert pr_merge_ci_rerun_already_attempted("acme/api", 7, "sha1")
+
+    def test_budget_is_scoped_per_commit_sha(self, coord_db) -> None:
+        """A later push lands a new head sha, so it gets a fresh budget even
+        though the PR number is unchanged."""
+        from coord.state import (
+            pr_merge_ci_rerun_already_attempted,
+            record_pr_merge_ci_rerun,
+        )
+
+        record_pr_merge_ci_rerun("acme/api", 7, "sha1")
+
+        assert not pr_merge_ci_rerun_already_attempted("acme/api", 7, "sha2")
+
+    def test_budget_is_scoped_per_repo_and_pr_number(self, coord_db) -> None:
+        from coord.state import (
+            pr_merge_ci_rerun_already_attempted,
+            record_pr_merge_ci_rerun,
+        )
+
+        record_pr_merge_ci_rerun("acme/api", 7, "sha1")
+
+        assert not pr_merge_ci_rerun_already_attempted("acme/web", 7, "sha1")
+        assert not pr_merge_ci_rerun_already_attempted("acme/api", 8, "sha1")
