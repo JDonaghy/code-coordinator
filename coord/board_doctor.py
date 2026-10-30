@@ -458,6 +458,21 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     reads are clear" has not actually been established for that row; this
     reclassification, and the auto-dispatch it feeds, must not fire on an
     unconfirmed reading.
+
+    Also requires :attr:`StuckRow.fresh` (#3806, follow-up to #3760): a row
+    :func:`_episode_stuck_row` rebuilt from `block_log`'s *stored*
+    ``diagnosed_cause``/``diagnosis_confidence`` can be arbitrarily old —
+    ``queue_diagnose.needs_diagnosis`` never re-probes a settled episode, so
+    a ``nothing-blocking`` verdict earned once would otherwise replay into
+    this reclassifier, and the auto-dispatch it feeds, indefinitely, even
+    after the PR has since gone red or conflicted. Only a row THIS sweep
+    just computed from a live probe (:func:`drive_queue_rows`,
+    :func:`_refresh_ceiling_blocked_settled_rows`) is new-enough evidence to
+    grant a fresh #2972 fix-round budget — the same age bound
+    `_ceiling_bypass_eligible` (`coord/board_doctor_policy.py`) already
+    applies to its own ceiling-bypass decision, so the two stay consistent
+    (#2096: one question — "is this evidence fresh enough to act on?" — one
+    answer, `StuckRow.fresh`).
     """
     from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
 
@@ -465,6 +480,7 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     for row in rows:
         if (
             row.queue == "drive-queue"
+            and row.fresh
             and row.cause in _LIVE_CLEAR_CAUSES
             and row.confidence != queue_diagnose.CONFIDENCE_LOW
         ):
