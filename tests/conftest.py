@@ -752,6 +752,19 @@ def sacrificial_venv_root(monkeypatch, tmp_path):
     return venv_dir
 
 
+def _unwrap_pause_store_guard(fn):
+    """Follow a chain of installed pause-store guards back to the real function.
+
+    Each ``_no_real_pause_store`` guard tags itself and records the callable it
+    wrapped, so capturing ``_state_path`` while a previous test's guard is still
+    live yields the genuine function rather than a guard that would re-enter
+    another guard.
+    """
+    while getattr(fn, "_pause_store_guard", False):
+        fn = fn._unguarded_state_path
+    return fn
+
+
 @pytest.fixture(autouse=True)
 def _no_real_pause_store(monkeypatch, tmp_path):
     """#2101: never let a test write the OPERATOR'S real
@@ -866,7 +879,13 @@ def _no_real_pause_store(monkeypatch, tmp_path):
     """
     from coord import machine_pause  # noqa: PLC0415
 
-    original = machine_pause._state_path
+    # Resolve through to the genuine, unguarded `_state_path`. If a prior test's
+    # guard is still installed on the module (its monkeypatch not yet undone when
+    # this one captures), chaining `original()` calls would recurse guard-into-
+    # guard and, via each layer's `Path.resolve()`, spin until the suite hangs.
+    # Unwrapping here means a guard always calls the real function, never another
+    # guard, however many are stacked.
+    original = _unwrap_pause_store_guard(machine_pause._state_path)
     sandbox = tmp_path / "pause-store"
 
     def _sandboxed(name: str) -> Path:
@@ -922,6 +941,10 @@ def _no_real_pause_store(monkeypatch, tmp_path):
             return _sandboxed(resolved.name)
         return resolved
 
+    # Tag the guard so a later capture (above) can unwrap it to the real
+    # function instead of chaining a second guard on top of it.
+    _guarded._pause_store_guard = True
+    _guarded._unguarded_state_path = original
     monkeypatch.setattr(machine_pause, "_state_path", _guarded)
 
 
