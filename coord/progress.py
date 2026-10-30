@@ -47,22 +47,31 @@ _SMOKE_NONE_RE = re.compile(
 )
 _SMOKE_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
 
-# The three verdict markers the headless Test-stage smoke agent is told to
-# print (`coord.smoke.SMOKE_SYSTEM_PROMPT`):
+# The verdict markers the headless Test-stage smoke agent/runner is told to
+# print (`coord.smoke.SMOKE_SYSTEM_PROMPT`, `coord.agent.plain_runner_smoke_marker_lines`):
 #
 #   * `SMOKE: pass`
 #   * `SMOKE: fail <reason>`
 #   * `SMOKE: baseline-red <reason>` — #2170: the smoke command's own failures
 #     reproduce identically on the merge-base, so this is a statement about
 #     the MACHINE, not the branch.
+#   * `SMOKE: harness-crash <reason>` — #3784: the smoke RUNNER itself died
+#     before the smoke command ever ran (no PTY/display, the plain-runner
+#     process raised before `run_plain_runner_command` could execute), so
+#     there is no product signal at all — never conflate with `fail`, which
+#     means the command ran and produced a real (even if negative) result.
 #
-# #2170 parsed only `baseline-red`; #2244 parses all three. Before that, the
-# pass/fail verdict was taken from the session exit code instead — but a
-# `claude -p` worker CANNOT signal through its exit code (an `exit 1` inside a
-# Bash tool call ends that tool call, not the session, which still ends
-# `end_turn` and exits 0). So a smoke run that found five real failures and
-# printed `SMOKE: fail` was recorded as `test_state=passed`: the whole
-# Test-green/CI-red class (#2091, #2182, #2143, #2230).
+# #2170 parsed only `baseline-red`; #2244 parses pass/fail/baseline-red.
+# Before that, the pass/fail verdict was taken from the session exit code
+# instead — but a `claude -p` worker CANNOT signal through its exit code (an
+# `exit 1` inside a Bash tool call ends that tool call, not the session,
+# which still ends `end_turn` and exits 0). So a smoke run that found five
+# real failures and printed `SMOKE: fail` was recorded as
+# `test_state=passed`: the whole Test-green/CI-red class (#2091, #2182,
+# #2143, #2230). #3784 parses `harness-crash` too, for the mirror-image
+# defect: a harness/infra crash with no product signal at all was recorded
+# `test_state=failed`, which dispatched a fix leg off nothing and voided an
+# existing review approval.
 #
 # Line-anchored, mirroring `coord.revalidate`'s `is_baseline_red_failure`
 # marker discipline: never a bare substring search, so an assertion message,
@@ -71,7 +80,8 @@ _SMOKE_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
 # accepted because the marker is written by a language model, and rejecting
 # `SMOKE: failed` would silently downgrade a real failure to "no verdict".
 _SMOKE_VERDICT_RE = re.compile(
-    r"^SMOKE:[ \t]*(baseline-red|pass(?:ed)?|fail(?:ed|ure|ing)?)\b[ \t]*(.*)$",
+    r"^SMOKE:[ \t]*(baseline-red|harness-crash|pass(?:ed)?|fail(?:ed|ure|ing)?)\b"
+    r"[ \t]*(.*)$",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -89,9 +99,9 @@ _ECHOED_SMOKE_RE = re.compile(
 class SmokeVerdict:
     """#2244: a smoke worker's self-reported verdict line.
 
-    ``kind`` is normalised to exactly one of ``"pass"``, ``"fail"`` or
-    ``"baseline-red"``; ``reason`` is the (possibly empty) trailing text on
-    the marker's own line.
+    ``kind`` is normalised to exactly one of ``"pass"``, ``"fail"``,
+    ``"baseline-red"`` or ``"harness-crash"`` (#3784); ``reason`` is the
+    (possibly empty) trailing text on the marker's own line.
 
     ``context`` is a bounded tail (:func:`coord.revalidate._tail`) of
     whatever text preceded the marker — a plain-runner writes its captured
@@ -483,8 +493,9 @@ def parse_completion_summary_from_agent(
 
 
 def _extract_smoke_verdict_from_text(text: str) -> "SmokeVerdict | None":
-    """#2244: pull the last `SMOKE: pass|fail|baseline-red <reason>` line out
-    of *text*.
+    """#2244: pull the last
+    `SMOKE: pass|fail|baseline-red|harness-crash <reason>` line out of
+    *text*.
 
     Returns ``None`` when the worker printed no verdict line at all — the same
     "None means absent" contract as every other extractor here. Absent is NOT
@@ -504,6 +515,8 @@ def _extract_smoke_verdict_from_text(text: str) -> "SmokeVerdict | None":
     raw_kind = last.group(1).lower()
     if raw_kind.startswith("baseline"):
         kind = "baseline-red"
+    elif raw_kind.startswith("harness"):
+        kind = "harness-crash"
     elif raw_kind.startswith("pass"):
         kind = "pass"
     else:

@@ -3164,7 +3164,10 @@ def _record_smoke_verdict(
        authoritative and this must never clobber it — `dispatch_smoke` stamps
        ``"running"`` at dispatch, so anything terminal here came from the
        worker.
-    2. **The worker's `SMOKE:` marker** — pass / fail / baseline-red (#2170).
+    2. **The worker's `SMOKE:` marker** — pass / fail / baseline-red (#2170) /
+       harness-crash (#3784: the runner itself crashed before the smoke
+       command ran — ``skipped``, never ``failed``, since there is no
+       product signal to grade and a real one still records ``failed``).
     3. **A non-zero session exit with no marker** — still ``failed``. Only
        reachable for a non-`claude -p` smoke lane where the exit code IS the
        signal; it stays fail-closed there.
@@ -3245,6 +3248,44 @@ def _record_smoke_verdict(
 
     verdict = _smoke_worker_verdict(transition, entry)
     exit_code = transition.exit_code or 0
+
+    if verdict is not None and verdict.kind == "harness-crash":
+        # #3784: the smoke RUNNER crashed before the smoke command ever ran
+        # (no PTY/display, a bad cwd, `execute_plain_runner_smoke` raising
+        # out of `_run_plain_runner_smoke_blocking` — see the #3736 comment
+        # there) — there is no product signal to grade, so this must never
+        # become `test_state="failed"`. That misclassification was the whole
+        # defect this fixes: CI's equivalent gallery-capture check passed
+        # green on the same commit while the flaky headless smoke returned a
+        # bare non-deterministic `exit=1`, and recording that as `failed`
+        # dispatched a `coord fix` leg off nothing — which pushed new
+        # commits, changed the patch-id, and voided an existing review
+        # approval. One infra flake, one wasted work+smoke+review cycle
+        # (observed #1788, #1806, #1793).
+        #
+        # Mirrors the `baseline-red` branch immediately below: `skipped`,
+        # not `failed` — `coord/drive.py` treats `skipped` exactly like
+        # `passed` (no `coord fix` dispatch) and `coord/merge_queue.py`'s
+        # #1732 "structural claim" bucket accepts any `skipped` row whose
+        # `test_confirmation` is neither `baseline_red` nor `ci_and_worker`
+        # unconditionally — so leaving `test_confirmation` unset (no
+        # confirmation question was asked; this is a factual statement, not
+        # a judgment call) still satisfies the merge gate. The descriptive
+        # `test_reason` below is the "operator flag" the issue asks for:
+        # `coord.gates.format_gate_report` prints `test_reason` on every row
+        # unconditionally, regardless of `test_confirmation`.
+        record_test_verdict(
+            assignment_id=parent_id,
+            test_state="skipped",
+            test_reason=(
+                f"headless smoke harness crashed (not a product failure, "
+                f"#3784): {verdict.reason}"
+                if verdict.reason
+                else "headless smoke harness crashed before the smoke "
+                "command could run (not a product failure, #3784)"
+            ),
+        )
+        return
 
     if verdict is not None and verdict.kind == "baseline-red":
         # #2170: `skipped`, not `failed` — the merge gate treats a skipped

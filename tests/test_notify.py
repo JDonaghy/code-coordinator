@@ -3374,6 +3374,81 @@ class TestSmokeCompletionBaselineRedVerdict(TestSmokeCompletionVerdict):
         assert row["smoke_test"] == "fail"
 
 
+class TestSmokeCompletionHarnessCrashVerdict3784(TestSmokeCompletionVerdict):
+    """#3784: a smoke RUNNER crash (no PTY/display, a bad cwd, the
+    plain-runner's own harness raising before the smoke command ever ran —
+    `coord.agent.AgentServer._run_plain_runner_smoke_blocking`'s `except
+    Exception` branch) prints `SMOKE: harness-crash <reason>`, which must
+    record test_state='skipped' — never 'failed' — so `coord/drive.py`
+    never dispatches a `coord fix` leg off an infra flake, and no new
+    commits get pushed that would void an existing review approval. A
+    genuine assertion failure (`SMOKE: fail`) must still land on 'failed'
+    and stays reachable from `coord fix`, exactly as
+    `test_nonzero_exit_without_baseline_red_line_still_fails` above already
+    covers."""
+
+    def test_harness_crash_verdict_sets_parent_test_state_skipped(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.state import get_connection  # noqa: PLC0415
+
+        self._record_work("work-6")
+        self._record_smoke("smoke-6", parent_id="work-6")
+        transition, record, entry = self._make_transition_and_entry(
+            "smoke-6", exit_code=1
+        )
+        record = dict(record)
+        record["review_of_assignment_id"] = "work-6"
+
+        log_path = tmp_path / "smoke-6.log"
+        log_path.write_text(
+            "# agent=laptop repo=api issue=#42 plain-runner (#3673), timeout=600s\n"
+            "SMOKE: harness-crash plain-runner smoke crashed: "
+            "FileNotFoundError: no such cwd\n",
+            encoding="utf-8",
+        )
+        entry = dict(entry)
+        entry["log_path"] = str(log_path)
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state, smoke_test, test_reason, test_confirmation "
+            "FROM assignments WHERE assignment_id=?",
+            ("work-6",),
+        ).fetchone()
+        assert row is not None, "work assignment must exist in DB"
+        assert row["test_state"] == "skipped", (
+            "a harness-crash smoke exit must record test_state='skipped' "
+            f"(not a branch 'failed'), got {row['test_state']!r} — a wrong "
+            "'failed' here is exactly what dispatches a fix leg off an "
+            "infra flake and voids an existing review approval (#3784)."
+        )
+        # `skipped` must NOT mirror into the legacy `smoke_test='fail'`
+        # column — that mirror is what `coord fix` gates on.
+        assert row["smoke_test"] != "fail"
+        assert "harness crashed" in (row["test_reason"] or "").lower()
+        assert "FileNotFoundError" in row["test_reason"]
+        # No real confirmation question was asked, so `test_confirmation`
+        # stays unset — `coord/merge_queue.py`'s #1732 "structural claim"
+        # bucket accepts any skip whose confirmation is neither
+        # 'baseline_red' nor 'ci_and_worker' unconditionally, and
+        # `coord.gates.format_gate_report` prints `test_reason` on every row
+        # regardless, so this still surfaces as the operator flag the issue
+        # asks for without a dedicated confirmation value.
+        assert row["test_confirmation"] is None
+
+
 class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
     """#2244: the headless smoke verdict comes from the worker's `SMOKE:`
     marker and FAILS CLOSED — a `claude -p` session exits 0 whatever the

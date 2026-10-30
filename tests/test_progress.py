@@ -646,6 +646,23 @@ class TestSmokeVerdictParser:
         assert v is not None and v.kind == "baseline-red"
         assert v.reason == "all 6 reproduce on main"
 
+    def test_parses_harness_crash(self, tmp_path: Path) -> None:
+        """#3784: a harness/infra crash is its own kind, never `fail`'s
+        catch-all — a product failure and a runner that never got to run
+        the smoke command at all must stay distinguishable downstream."""
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(
+                tmp_path,
+                "SMOKE: harness-crash plain-runner smoke crashed: "
+                "FileNotFoundError: no such cwd\n",
+            )
+        )
+        assert v is not None and v.kind == "harness-crash"
+        assert v.reason == (
+            "plain-runner smoke crashed: FileNotFoundError: no such cwd"
+        )
+
     def test_accepts_inflections(self, tmp_path: Path) -> None:
         """The marker is written by a language model; `SMOKE: failed` must
         not silently degrade a real failure to 'no verdict'."""

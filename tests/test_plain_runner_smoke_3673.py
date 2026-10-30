@@ -359,10 +359,17 @@ def test_agent_plain_runner_smoke_crash_still_writes_a_smoke_marker(
 ) -> None:
     """#3736: if :func:`execute_plain_runner_smoke` itself raises (not a
     smoke-command failure — an infra crash in the executor), the leg must
-    still get a parseable ``SMOKE: fail`` line in its log, not just a FAILED
+    still get a parseable ``SMOKE:`` line in its log, not just a FAILED
     status with nothing for `coord.progress.parse_smoke_verdict_from_log` to
     find — the same #2244 no-verdict park this whole fix targets, reachable
-    from a second angle."""
+    from a second angle.
+
+    #3784: that marker must be ``harness-crash``, not ``fail`` — the smoke
+    COMMAND never ran here, only the executor around it, so there is no
+    product signal to grade. Recording it as ``fail`` would make
+    `coord.notify._record_smoke_verdict` dispatch a `coord fix` leg off an
+    infra crash and void an existing review approval on the resulting new
+    commits."""
     repo = _init_repo(tmp_path / "repo")
     server = _server(
         tmp_path, repo_path=repo,
@@ -382,7 +389,8 @@ def test_agent_plain_runner_smoke_crash_still_writes_a_smoke_marker(
 
     assert final.status == FAILED
     log = Path(final.log_path).read_text()
-    assert "SMOKE: fail" in log
+    assert "SMOKE: harness-crash" in log
+    assert "SMOKE: fail" not in log
     assert "boom" in log
     assert "claude-path-ran" not in log
     server.shutdown()
