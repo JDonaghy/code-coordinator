@@ -4519,6 +4519,54 @@ def test_scoped_briefing_contains_delta_and_established_context_framing() -> Non
     assert "belt and braces" in briefing
 
 
+def test_scoped_briefing_request_changes_states_real_premise_and_embeds_findings() -> None:
+    """#3787 fix round: when the prior verdict was `request-changes`, the
+    briefing must not claim the PR was already approved, and must hand the
+    reviewer the actual prior findings to check the delta against."""
+    briefing = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old resolution\n+new resolution\n",
+        default_branch="main",
+        prior_verdict="request-changes",
+        prior_findings_body=(
+            "## Blocking findings\n- the thing was broken\n"
+            "## Non-blocking concerns\nNone.\n## Nits\nNone.\n"
+        ),
+    )
+    assert "**already approved**" not in briefing
+    assert "do NOT need to re-review the whole PR" in briefing
+    assert "was **not** an approval" in briefing
+    assert "the thing was broken" in briefing
+    assert "-old resolution" in briefing
+    assert "+new resolution" in briefing
+    assert "check EACH blocking finding" in briefing
+    assert "REVIEW_VERDICT: approve" in briefing
+    assert "END_REVIEW" in briefing
+
+
+def test_scoped_briefing_request_changes_without_findings_says_so_plainly() -> None:
+    briefing = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url=None,
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old\n+new\n",
+        default_branch="main",
+        prior_verdict="request-changes",
+        prior_findings_body=None,
+    )
+    assert "(prior findings text unavailable)" in briefing
+
+
 def _scoped_entry(**overrides) -> QueuedMerge:
     defaults = dict(
         assignment_id="w1",
@@ -4600,6 +4648,41 @@ def test_dispatch_scoped_review_dispatches_with_delta_in_briefing(
     assert payload["model"] == "sonnet"
     assert "conflict-fix-resolution" in payload["briefing"]
     assert "kept-from-before" in payload["briefing"]
+
+
+def test_dispatch_scoped_review_request_changes_prior_embeds_findings(
+    two_machine_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3787: when `prior_review.review_verdict == "request-changes"`, the
+    briefing must state that real premise and embed the prior findings —
+    not claim the PR was already approved."""
+    import coord.auto_loop as auto_loop_mod
+
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review(review_verdict="request-changes")
+    client = _FakeHTTPClient({"id": "scoped-2"})
+
+    def _fake_load_findings(review, log_path, machine_host, repo_github=None):
+        return ReviewFindings(
+            verdict="request-changes",
+            body="## Blocking findings\n- fix the off-by-one\n",
+        )
+
+    monkeypatch.setattr(
+        auto_loop_mod, "_load_review_findings", _fake_load_findings,
+    )
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, now=999.0, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is not None
+    _, payload = client.calls[0]
+    assert "was **not** an approval" in payload["briefing"]
+    assert "fix the off-by-one" in payload["briefing"]
+    assert "**already approved**" not in payload["briefing"]
 
 
 def test_dispatch_scoped_review_skips_candidate_with_dead_claude_credential(
