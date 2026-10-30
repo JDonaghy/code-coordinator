@@ -2496,7 +2496,7 @@ def get_pr_head_sha(repo: str, number: int) -> str | None:
     """Return PR *number*'s current head commit sha, or ``None`` on any
     ``gh`` failure (including "no such PR").
 
-    Used by ``coord pr merge``'s #3808 one-shot CI re-run (``coord/commands/
+    Used by ``coord pr merge``'s one-shot CI re-run (``coord/commands/
     pr.py``) to key its "have we already spent this commit's re-run?"
     idempotency marker — a new push gets a fresh sha and so a fresh budget.
     """
