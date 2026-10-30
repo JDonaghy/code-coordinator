@@ -10458,14 +10458,25 @@ class AgentServer:
             # left `coord.progress.parse_smoke_verdict_from_log` (read via
             # `coord.notify._smoke_worker_verdict`) with no marker to find
             # and the leg parked as a #2244 no-verdict rather than recorded
-            # as a failure a human can act on. `_SMOKE_VERDICT_RE` is a
-            # line-anchored `^SMOKE:\s*(pass|fail|baseline-red)\b\s*(.*)$`
-            # match, so the free-text reason after `fail` here is read back
-            # as the verdict's `reason` exactly like a `claude -p` worker's
-            # own `SMOKE: fail <reason>` line.
+            # as a failure a human can act on.
+            #
+            # #3784: that marker must be `harness-crash`, not `fail` — the
+            # smoke COMMAND itself never ran (this except-branch is reached
+            # before `run_plain_runner_command` produces any exit code at
+            # all, e.g. a bad cwd or a missing PTY/display), so there is no
+            # product signal here, only a harness/infra one. Recording it as
+            # `fail` made `coord.notify._record_smoke_verdict` grade this the
+            # same as a real assertion failure: it dispatched a `coord fix`
+            # leg off nothing, and the new commits that leg pushed voided the
+            # existing review approval — one flake, one wasted work+review
+            # cycle. `_SMOKE_VERDICT_RE` is a line-anchored
+            # `^SMOKE:\s*(pass|fail|baseline-red|harness-crash)\b\s*(.*)$`
+            # match, so the free-text reason after `harness-crash` here is
+            # read back as the verdict's `reason` exactly like a `claude -p`
+            # worker's own `SMOKE: fail <reason>` line.
             try:
                 with open(assignment.log_path, "a", encoding="utf-8") as fh:
-                    fh.write(f"\nSMOKE: fail plain-runner smoke crashed: {exc}\n")
+                    fh.write(f"\nSMOKE: harness-crash plain-runner smoke crashed: {exc}\n")
             except OSError:
                 _log.exception(
                     "plain-runner smoke %s: failed to write crash marker to log %s",
