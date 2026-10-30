@@ -31,7 +31,7 @@ from coord.drive_queue import QueueEntry
 from coord.queue_diagnose import LiveState
 
 
-def _row(key: str, cause: str, queue: str = "drive-queue") -> StuckRow:
+def _row(key: str, cause: str, queue: str = "drive-queue", *, fresh: bool = False) -> StuckRow:
     return StuckRow(
         queue=queue,
         key=key,
@@ -39,6 +39,7 @@ def _row(key: str, cause: str, queue: str = "drive-queue") -> StuckRow:
         cause=cause,
         confidence="high",
         evidence=(f"cause={cause}",),
+        fresh=fresh,
     )
 
 
@@ -255,13 +256,27 @@ class TestReclassifyCeilingBlocked:
 
     def test_nothing_blocking_row_is_reclassified(self) -> None:
         _seed_ceiling_blocked_entry("acme/widgets", 101)
-        row = _row("acme/widgets#101", queue_diagnose.CAUSE_NOTHING_BLOCKING)
+        row = _row("acme/widgets#101", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
         [out] = _reclassify_ceiling_blocked([row])
 
         assert out.cause == CAUSE_CEILING_BLOCKED_MERGEABLE
         assert out.evidence[:-1] == row.evidence
         assert "#2972" in out.evidence[-1]
+
+    def test_stale_nothing_blocking_row_is_left_alone(self) -> None:
+        # #3806: a row rebuilt from `block_log`'s *stored* diagnosis
+        # (fresh=False, e.g. `_episode_stuck_row`'s reconstruction of a
+        # settled episode) must never grant a fresh #2972 fix-round budget
+        # — that stored "nothing blocking" verdict can be arbitrarily old,
+        # taken before the PR went red or conflicted, and nothing
+        # re-confirms it just because this sweep is replaying it.
+        _seed_ceiling_blocked_entry("acme/widgets", 108)
+        row = _row("acme/widgets#108", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=False)
+
+        [out] = _reclassify_ceiling_blocked([row])
+
+        assert out == row
 
     def test_ci_green_row_is_left_alone(self) -> None:
         # queue_diagnose._rule_ci_green fires on green checks alone and is
@@ -270,7 +285,7 @@ class TestReclassifyCeilingBlocked:
         # mergeable) did NOT fire. It is not proof the row is actually
         # clear, so it must not be promoted to auto-tier here.
         _seed_ceiling_blocked_entry("acme/widgets", 102)
-        row = _row("acme/widgets#102", queue_diagnose.CAUSE_CI_GREEN)
+        row = _row("acme/widgets#102", queue_diagnose.CAUSE_CI_GREEN, fresh=True)
 
         [out] = _reclassify_ceiling_blocked([row])
 
@@ -287,6 +302,7 @@ class TestReclassifyCeilingBlocked:
             cause=queue_diagnose.CAUSE_NOTHING_BLOCKING,
             confidence=queue_diagnose.CONFIDENCE_LOW,
             evidence=(f"cause={queue_diagnose.CAUSE_NOTHING_BLOCKING}",),
+            fresh=True,
         )
 
         [out] = _reclassify_ceiling_blocked([row])
@@ -295,7 +311,7 @@ class TestReclassifyCeilingBlocked:
 
     def test_live_clear_row_that_is_not_ceiling_blocked_is_left_alone(self) -> None:
         # No drive-queue row at all for this issue — "nothing to block on".
-        row = _row("acme/widgets#103", queue_diagnose.CAUSE_NOTHING_BLOCKING)
+        row = _row("acme/widgets#103", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
         [out] = _reclassify_ceiling_blocked([row])
 
@@ -309,7 +325,7 @@ class TestReclassifyCeilingBlocked:
             state="blocked",
             last_reason="merge conflict, no path forward",
         )
-        row = _row("acme/widgets#104", queue_diagnose.CAUSE_NOTHING_BLOCKING)
+        row = _row("acme/widgets#104", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
         [out] = _reclassify_ceiling_blocked([row])
 
@@ -320,7 +336,7 @@ class TestReclassifyCeilingBlocked:
         # the two "live reads completely clear" causes — must not relabel
         # every cause a ceiling-blocked row happens to carry.
         _seed_ceiling_blocked_entry("acme/widgets", 105)
-        row = _row("acme/widgets#105", "merge_conflict")
+        row = _row("acme/widgets#105", "merge_conflict", fresh=True)
 
         [out] = _reclassify_ceiling_blocked([row])
 
@@ -329,7 +345,10 @@ class TestReclassifyCeilingBlocked:
     def test_merge_queue_rows_are_never_reclassified(self) -> None:
         _seed_ceiling_blocked_entry("acme/widgets", 106)
         row = _row(
-            "acme/widgets#106", queue_diagnose.CAUSE_NOTHING_BLOCKING, queue="merge-queue"
+            "acme/widgets#106",
+            queue_diagnose.CAUSE_NOTHING_BLOCKING,
+            queue="merge-queue",
+            fresh=True,
         )
 
         [out] = _reclassify_ceiling_blocked([row])
@@ -337,7 +356,7 @@ class TestReclassifyCeilingBlocked:
         assert out == row
 
     def test_unparseable_key_is_left_alone(self) -> None:
-        row = _row("no-hash-separator", queue_diagnose.CAUSE_NOTHING_BLOCKING)
+        row = _row("no-hash-separator", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
         [out] = _reclassify_ceiling_blocked([row])
 
