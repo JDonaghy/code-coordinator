@@ -6404,19 +6404,43 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
     attempt — a genuine race, not the common case; or the attempt itself hit
     something a single bounded try cannot resolve): falls back to EXACTLY
     the pre-#2350 ``resumed`` shape — ``STATE_WAITING``, ``attempts`` reset
-    to 0, ``resumes`` bumped for a ``blocked``-origin entry (mirroring
-    ``_reconcile_blocked``'s own formula, so the #2230 oscillation ceiling
-    still sees every chance this entry got, fast-path or not) — never worse
-    than the status quo, and never a `coord drive --tmux` launch attempt
-    spent retrying a race this bounded attempt already ruled out.
+    to 0, ``session_name`` cleared, ``resumes`` bumped for a ``blocked``- or
+    ``running``-origin entry alike (mirroring ``_reconcile_blocked``'s own
+    formula, so the oscillation ceiling — ``_reconcile_blocked``'s own, and
+    `_reconcile_running`'s #3786 fast path reusing the same counter — still
+    sees every chance this entry got, fast-path or not) — never worse than
+    the status quo, and never a `coord drive --tmux` launch attempt spent
+    retrying a race this bounded attempt already ruled out.
     """
     if not plan.merge_only:
         return
 
-    from coord.block_log import merge_only_event, merge_only_fallback_event  # noqa: PLC0415
+    from coord.block_log import (  # noqa: PLC0415
+        enter_event,
+        merge_only_event,
+        merge_only_fallback_event,
+    )
     from coord.state import update_drive_queue_entry  # noqa: PLC0415
 
     for target in plan.merge_only:
+        # #3786: a `running`-origin candidate never went through the
+        # `parked`/`blocked` path that opens #2235's episode on its own (see
+        # `merge_only_event`'s docstring — it assumes that episode is already
+        # open), so its `resolve` below would otherwise be an orphan the
+        # corpus silently drops (`episodes()`'s own documented convention for
+        # a `resolve` with no preceding `enter`). Open one here, synthetic,
+        # the same way the launch-failure branch below already does for its
+        # own invisible-to-`plan_events` transition.
+        running_origin_enter: list[dict[str, Any]] = []
+        if target.state == STATE_RUNNING:
+            running_origin_enter.append(
+                enter_event(
+                    target,
+                    state=STATE_RUNNING,
+                    reason=target.last_reason or "merge gate read clear",
+                    host=_local_host_id(),
+                )
+            )
         argv = _merge_only_argv(target, config_path)
         try:
             result = subprocess.run(  # noqa: S603 — argv built from coord_argv + typed row
@@ -6442,7 +6466,9 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
                 ),
                 session_name=None,
             )
-            _record_block_log([merge_only_event(target, host=_local_host_id())])
+            _record_block_log(
+                [*running_origin_enter, merge_only_event(target, host=_local_host_id())]
+            )
             click.echo(f"merge-only: {target.key} merged directly from the tick")
             continue
 
@@ -6457,8 +6483,14 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
             "state": STATE_WAITING,
             "attempts": 0,
             "last_reason": reason,
+            # Clear unconditionally — a `running`-origin entry still has its
+            # dead session's name on the row at this point, and leaving it
+            # would make `_rule_dead_leg` flag a live `waiting` row as a
+            # "dead leg" for a session that was correctly torn down, not one
+            # still stuck.
+            "session_name": None,
         }
-        if target.state == STATE_BLOCKED:
+        if target.state in (STATE_BLOCKED, STATE_RUNNING):
             updates["resumes"] = target.resumes + 1
         update_drive_queue_entry(target.repo, target.issue, **updates)
         # #2350: this write bypassed `plan.writes()` entirely, so the
@@ -6467,7 +6499,10 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
         # already opened for `target` when it first went `parked`/`blocked`
         # would never see a matching close.
         _record_block_log(
-            [merge_only_fallback_event(target, reason=reason, host=_local_host_id())]
+            [
+                *running_origin_enter,
+                merge_only_fallback_event(target, reason=reason, host=_local_host_id()),
+            ]
         )
         click.echo(f"merge-only: {reason}")
 
@@ -7925,6 +7960,38 @@ def drive_queue_tick(
         # span for no reason connected to the roll.
         if not explicit_reconcile_only:
             _run_merge_only_candidates(plan, config_path)
+        else:
+            # A `parked`/`blocked`-origin candidate's row is already sitting
+            # in that same state from an earlier tick, so skipping the merge
+            # attempt here just leaves it exactly where `--reconcile-only`
+            # promises to leave everything — unchanged. A `running`-origin
+            # candidate (#3786) is different: its `merge_only` Reconcile
+            # deliberately wrote no state (see its docstring), banking on
+            # THIS call to decide the row's real next state live. Skip that
+            # call under `--reconcile-only` and the row is stuck reading
+            # `running` for a session this tick never actually touched —
+            # invisible to `coord drive-queue diagnose`, whose dead-leg rule
+            # only ever looks at `parked`/`blocked` rows. Defer it to
+            # `waiting` instead: a state WRITE, not the external merge
+            # attempt `--reconcile-only` refuses to make, so it still keeps
+            # that mode's own promise.
+            from coord.state import update_drive_queue_entry  # noqa: PLC0415
+
+            for target in plan.merge_only:
+                if target.state != STATE_RUNNING:
+                    continue
+                update_drive_queue_entry(
+                    target.repo,
+                    target.issue,
+                    state=STATE_WAITING,
+                    last_reason=(
+                        f"{target.last_reason} — merge gate read clear, but "
+                        "this tick ran --reconcile-only/--max-parallel 0, so "
+                        "deferring the merge-only attempt rather than taking "
+                        "it; will retry live on an ordinary tick"
+                    ),
+                    session_name=None,
+                )
 
         # #2535: independent of the drive-queue plan above (this scans the
         # MERGE queue directly, not drive-queue rows) — best-effort
