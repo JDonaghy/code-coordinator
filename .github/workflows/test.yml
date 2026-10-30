@@ -51,7 +51,14 @@ jobs:
       # If a future test needs to be serial-only, give it the same
       # `@pytest.mark.posix_only`-style registered marker and exclude it
       # here AND in `coord-test-runner.sh` together, not just one of them.
-      - run: pytest -n auto --ignore=tests/acceptance
+      # #3796: `--timeout=120 --timeout-method=signal` bounds every single
+      # test's wall time. `signal` (not the default `thread`) is required —
+      # the known hang (test_dry_run_no_network_dispatch, quarantined below)
+      # is CPU-bound in the main thread, and the `thread` method cannot
+      # interrupt that; verified it let a hung test run 80+ minutes. With
+      # `signal`, a hung test fails in <=120s with a traceback naming it
+      # instead of wedging the whole job.
+      - run: pytest -n auto --ignore=tests/acceptance --timeout=120 --timeout-method=signal
       # #2899: the `COORD_TUI_SRC=. python scripts/codegen.py --rust --check`
       # step that used to live here is GONE. It was #2897's explicit stand-in
       # for the byte-comparison, held here only for as long as the crate did
@@ -172,7 +179,8 @@ jobs:
       # #2180: same split as the `test` job above — the sealed acceptance
       # suite is gated separately through the #2164 CI wrapper, not swept
       # into this job's ordinary pytest run.
-      - run: pytest --ignore=tests/acceptance
+      # #3796: same wall-time bound as the `test` job above.
+      - run: pytest --ignore=tests/acceptance --timeout=120 --timeout-method=signal
 
   # #1484: run the full suite with `gh` made unresolvable on PATH.
   #
@@ -203,7 +211,8 @@ jobs:
       - run: pip install -e ".[dev]"
       # #2180: same split as the `test` job — the sealed acceptance suite is
       # gated separately through the #2164 CI wrapper.
-      - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q --ignore=tests/acceptance
+      # #3796: same wall-time bound as the `test` job above.
+      - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q --ignore=tests/acceptance --timeout=120 --timeout-method=signal
 
   # #2135 (child of epic #1902): "every `gh` argv construction lives inside
   # coord/github_ops.py" is the load-bearing assumption under the #1902
@@ -279,7 +288,8 @@ jobs:
       - run: pip install -e ".[dev]"
       # #2180: same split as the `test` job — the sealed acceptance suite is
       # gated separately through the #2164 CI wrapper.
-      - run: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q --ignore=tests/acceptance
+      # #3796: same wall-time bound as the `test` job above.
+      - run: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q --ignore=tests/acceptance --timeout=120 --timeout-method=signal
       - name: What a red result here means
         if: failure()
         run: |
@@ -334,6 +344,7 @@ jobs:
                  tests/test_state_review_findings_daemon.py \
                  tests/test_thin_client_daemon_routing_906.py \
                  tests/test_smoke.py \
+                 --timeout=120 --timeout-method=signal \
                  -v
 
 
@@ -456,4 +467,5 @@ jobs:
       # #2180: same split as the `test` job above — the sealed acceptance
       # suite is gated separately through the #2164 CI wrapper, not swept
       # into this job's ordinary pytest run.
-      - run: pytest --ignore=tests/acceptance
+      # #3796: same wall-time bound as the `test` job above.
+      - run: pytest --ignore=tests/acceptance --timeout=120 --timeout-method=signal

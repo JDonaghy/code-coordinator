@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -292,6 +293,14 @@ class TestAssignDryRun:
         assert "#42" in result.output
         assert "Add feature X" in result.output
 
+    @pytest.mark.skipif(
+        not os.environ.get("COORD_RUN_QUARANTINED_TESTS"),
+        reason="#3796: quarantined from the blocking gate — hangs the whole CI job "
+        "(an unbounded walk somewhere under the mocked dry-run path; passes in "
+        "isolation in well under a second, so this is a test-isolation leak from "
+        "an earlier test, not a bug in the test itself). Root cause is tracked in "
+        "a follow-up issue, not fixed here; run with COORD_RUN_QUARANTINED_TESTS=1.",
+    )
     def test_dry_run_no_network_dispatch(self, config_file: Path, coord_dir: Path) -> None:
         """Dry run should not call dispatch or post_briefing."""
         with patch("coord.github_ops.get_issue", return_value={"title": "t"}) as gi, \

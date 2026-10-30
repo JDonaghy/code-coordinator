@@ -210,6 +210,13 @@ dev = [
     "code-coordinator[tui-pty]",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # #3796: bounds every test's wall time (`--timeout=120
+    # --timeout-method=signal`, passed explicitly at each CI invocation
+    # rather than folded into `addopts` here — a local full-suite run
+    # should not get a surprise global cap). Without it, one hung,
+    # order-dependent test eats an entire CI job's timeout instead of
+    # failing in <=120s with a traceback that names it.
+    "pytest-timeout>=2.3",
     # Parallel test execution. The suite is the dominant cost of the Test gate
     # in an unattended run: 5m49s serial vs 1m36s-2m23s under `-n auto`, with
     # identical results (4642 passed) across repeated runs. Not required —
