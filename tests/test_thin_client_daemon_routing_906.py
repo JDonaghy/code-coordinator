@@ -682,6 +682,55 @@ def test_dispatch_followup_in_flight_from_daemon_board(monkeypatch, coord_db) ->
     assert ("shared.py", "server is working there") in captured["do_not_touch"]
 
 
+def test_dispatch_followup_board_wiring_matches_inherit_branch(monkeypatch, coord_db) -> None:
+    """#3817 blocking fix: `_dispatch_followup`'s `board=` kwarg to
+    `dispatch()` (which feeds the preflight-size gate) must only carry the
+    real board for the genuine plan->work hand-off (``inherit_branch=False``)
+    — never for a continuation (``inherit_branch=True``, the default used by
+    `coord pr`/`coord fix`/conflict-fix/smoke fix-ups). Wiring a real board
+    into a continuation would let the gate see an issue that already has a
+    branch/PR and either dispatch an incoherent "split this issue" triage or
+    permanently strand the follow-up via `DispatchRefused` (non-retryable in
+    the drive-queue)."""
+    from coord.commands.plan_followup import _dispatch_followup
+    from coord.models import Assignment
+
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+    )
+    original = Assignment(
+        assignment_id="work-1", machine_name="laptop", repo_name="api",
+        issue_number=10, issue_title="Fix bug", status="done",
+        branch="issue-10-fix",
+    )
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc, "fetch_board_payload", lambda svc, **kw: _daemon_board_with_peer()
+    )
+    monkeypatch.setattr(cc, "post_record", lambda svc, path, payload, **kw: {"ok": True})
+
+    captured: dict = {}
+
+    def _fake_dispatch(proposal, config, **kw):
+        captured["board"] = kw.get("board")
+        return {"id": "assign-2"}
+
+    monkeypatch.setattr("coord.dispatch.dispatch", _fake_dispatch)
+    monkeypatch.setattr("coord.dispatch.post_briefing", lambda *a, **k: None)
+    monkeypatch.setattr("coord.state.record_dispatched", lambda **kw: None)
+
+    # Continuation: board must be None so the preflight gate no-ops.
+    _dispatch_followup(cfg, original, "follow-up briefing", inherit_branch=True)
+    assert captured["board"] is None
+
+    # Genuine plan->work hand-off: the real board must flow through so the
+    # gate can actually act on a flagged issue.
+    _dispatch_followup(cfg, original, "follow-up briefing", inherit_branch=False)
+    assert captured["board"] is not None
+
+
 def test_dispatch_headless_in_flight_from_daemon_board(monkeypatch, coord_db) -> None:
     """#906: `coord assign`'s _dispatch_headless in_flight peer-conflict list
     must come from read_board() (the daemon's board.active on a thin client)."""

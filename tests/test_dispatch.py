@@ -1748,6 +1748,37 @@ class TestPreflightGuard:
         "coord.decomposition_chat.dispatch_size_triage_review",
     )
     @patch("coord.github_ops.get_issue")
+    def test_dedup_is_scoped_to_this_repo(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        """A completed size-triage review for the SAME issue number in a
+        DIFFERENT repo must not dedup against this repo's own issue #99 —
+        issue numbers collide across repos, so the match has to check
+        `repo_name` too, not just `review_target`."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.completed.append(Assignment(
+            machine_name="laptop", repo_name="other-repo", issue_number=99,
+            issue_title="size triage", status="done", type="review",
+            review_target=size_triage_review_target_for(99),
+        ))
+        mock_get_issue.return_value = {
+            "title": "A giant issue", "body": "", "labels": [{"name": "epic"}],
+        }
+
+        with pytest.raises(DispatchRefused, match="flagged by the preflight size"):
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=99,
+                machine=machine, board=board,
+            )
+        mock_dispatch_triage.assert_called_once()
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.github_ops.get_issue")
     def test_terminal_but_unmoved_active_assignment_is_not_in_flight(
         self, mock_get_issue, mock_dispatch_triage,
     ) -> None:
