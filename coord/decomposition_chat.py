@@ -1069,7 +1069,11 @@ def build_size_triage_briefing(
     stays a pure string-assembly function and is trivially unit-testable.
     `size_signals` is `coord/preflight_size.py`'s own reasons for flagging
     the issue, included verbatim so the agent knows *why* it was asked to
-    look.
+    look. Deliberately typed as plain `list[str]` rather than importing
+    `SizeScore`/`SizeSignal` directly: this function only ever renders
+    already-explained reason strings into the briefing, so it stays
+    decoupled from the scorer's internal dataclass shape — the caller is
+    responsible for turning a `SizeScore` into the strings it passes here.
     """
     lines: list[str] = []
     lines.append(f"# Size triage: {repo_github}#{issue_number}")
@@ -1143,6 +1147,14 @@ def build_size_triage_briefing(
     return "\n".join(lines)
 
 
+#  This module's own wire format (`SIZE_TRIAGE_VERDICT:` / `## Child N:` /
+# `## Files` prose, parsed below) is independent of `coord.brain`'s
+# `parse_split_proposals`, which parses a JSON array instead — two separate
+# parsers producing the same `SplitProposal`/`SplitChunk` dataclasses from
+# two different agent-response shapes. That is intentional, not drift: the
+# size-triage agent is a plain-prose `claude -p` session sharing this
+# module's other markdown-section conventions, while `coord.brain`'s
+# planning agent already speaks JSON for its other proposal types.
 _SIZE_TRIAGE_VERDICT_RE = re.compile(
     r"SIZE_TRIAGE_VERDICT:\s*(split|proceed)\b", re.IGNORECASE
 )
@@ -1232,15 +1244,29 @@ def parse_size_triage_response(
 
         files_heading = _SIZE_TRIAGE_FILES_HEADING_RE.search(block)
         scope_text = block[: files_heading.start()] if files_heading else block
+        files_likely = parse_declared_files(block)
+        if not files_likely:
+            raise SizeTriageError(
+                f"SIZE_TRIAGE_VERDICT: split but child {i + 1} ({title!r}) "
+                "declares no files under its '## Files' section — a child "
+                "with no scoped files can't be dispatched as its own "
+                "work item"
+            )
         chunks.append(
             SplitChunk(
                 title=title,
                 scope=scope_text.strip(),
-                files_likely=parse_declared_files(block),
+                files_likely=files_likely,
             )
         )
 
     return SplitProposal(
+        # Placeholder, not a real id — this function only proposes a split,
+        # it never calls `coord.state.save_split_proposals`. Whichever later,
+        # separate step persists this proposal (and makes it selectable via
+        # `coord split <id>`) is responsible for assigning the real id; it
+        # must not persist this `0` unchanged. Same sentinel idiom as the
+        # `Proposal(id=0, ...)` above for a not-yet-queued proposal.
         id=0,
         repo_name=repo_name,
         issue_number=issue_number,
@@ -1315,6 +1341,15 @@ def dispatch_size_triage_review(
         "files_allowed": [],
         "files_forbidden": [],
         "pull_repos": [],
+        # "review" only to reuse coord.agent's CLI-enforced read-only
+        # deny-list for that type (see the module comment above) — it is
+        # not a real code review. coord.notify's completion-comment
+        # formatting for type="review" expects REVIEW_VERDICT/END_REVIEW,
+        # not this module's SIZE_TRIAGE_VERDICT/END_SIZE_TRIAGE, so a
+        # completion comment posted for this assignment type will not
+        # render the triage verdict. Teaching coord.notify a size-triage
+        # format is out of this module's scope; left as a known gap for
+        # whichever later step consumes this assignment's result.
         "type": "review",
         "model": "sonnet",
         "system_prompt": SIZE_TRIAGE_SYSTEM_PROMPT,
