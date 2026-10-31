@@ -1569,14 +1569,18 @@ def test_gate_snapshot_answers_every_required_gh_ops_method() -> None:
     )
     referenced = (direct | guarded) & protocol_methods
 
-    # Mutating operations only ever invoked from the live merge path
-    # (`process()`), which always gets real `github_ops`, never a
-    # `GateSnapshot` — see the module docstring's "the live merge execution
-    # path... keeps its own live CiStore; only the read path serves from
-    # the snapshot."
+    # Operations only ever invoked from the live merge path (`process()`),
+    # which always gets real `github_ops`, never a `GateSnapshot` — see the
+    # module docstring's "the live merge execution path... keeps its own live
+    # CiStore; only the read path serves from the snapshot." Mutations plus
+    # the reads that exist solely to decide/confirm a close:
+    # `get_open_children` (is this issue an epic with open sub-issues?) and
+    # `get_issue_state` (did the close actually take?) are read back only
+    # around `close_issue`, so they never run on the `/board` read path.
     write_only = {
         "create_pr", "merge_pr", "close_issue", "edit_pr_body", "get_pr_body",
-        "has_open_children", "get_compare_files", "get_pr_size",
+        "get_open_children", "get_issue_state",
+        "get_compare_files", "get_pr_size",
     }
     # Deliberately NOT cached by `GateSnapshot` — a live-only mergeability
     # probe whose absence already degrades safely to "inconclusive" by

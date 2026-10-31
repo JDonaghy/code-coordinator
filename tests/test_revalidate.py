@@ -1209,6 +1209,12 @@ def _gh_patches(checkout: Path):
         patch("coord.github_ops.create_pr", side_effect=fake_create_pr),
         patch("coord.github_ops.get_pr_size", return_value=10),
         patch("coord.github_ops.merge_pr", return_value=(True, "ok")),
+        # `close_issue` shells out directly rather than through `_gh`, so
+        # conftest's `_no_live_gh` guard does not intercept it; stub it (and
+        # the post-close state read-back `process()` does right after it)
+        # explicitly so the close path stays offline and deterministic.
+        patch("coord.github_ops.close_issue", return_value=None),
+        patch("coord.github_ops.get_issue_state", return_value="closed"),
         patch("coord.github_ops.get_branch_sha", side_effect=_live_sha(checkout)),
         patch("coord.github_ops.get_branch_patch_id", return_value=None),
         patch("coord.github_ops.get_compare_files", side_effect=_compare_files),

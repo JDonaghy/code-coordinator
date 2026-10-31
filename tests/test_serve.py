@@ -6860,6 +6860,25 @@ def _seed_queued_blocked_entry(
     conn.commit()
 
 
+def _stub_issue_close(monkeypatch) -> None:
+    """Stub the post-merge issue-close seam `process()` drives for a `work`
+    entry with no close block: `close_issue` plus the state read-back that
+    turns a clean return into a confirmed `"merged"` event.
+
+    `github_ops.close_issue` shells out directly rather than through `_gh`,
+    so conftest's `_no_live_gh` guard does not intercept it — without these
+    stubs the close path either raises `FileNotFoundError` or hits the
+    network.
+    """
+    monkeypatch.setattr(
+        "coord.github_ops.close_issue",
+        lambda repo, issue_number, **_kw: None,
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue_state", lambda repo, issue_number: "closed",
+    )
+
+
 def _make_drain_config(tmp_path: "Path", *, auto_drain: bool = True) -> "Path":
     """Write a coordinator.yml with merge.auto_drain set and return its path."""
     content = (
@@ -6912,6 +6931,7 @@ def test_auto_drain_ready_entry_merges(
     )
     monkeypatch.setattr("coord.github_ops.get_pr_size", lambda repo, number: 42)
     monkeypatch.setattr("coord.github_ops.merge_pr", lambda repo, number, method="rebase": (True, "merged"))
+    _stub_issue_close(monkeypatch)
     # NoOpCi so CI gate is always a pass (is_available=False).  Patch at the
     # source module — _auto_drain_tick imports build_ci_store as a local import.
     from coord.ci_store import NoOpCi as _NoOpCi
@@ -6977,6 +6997,7 @@ def test_auto_drain_reconciles_stale_conflict_before_planning(
     monkeypatch.setattr(
         "coord.github_ops.merge_pr", lambda repo, number, method="rebase": (True, "merged"),
     )
+    _stub_issue_close(monkeypatch)
     from coord.ci_store import NoOpCi as _NoOpCi
     monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t, **_kw: _NoOpCi())
 
