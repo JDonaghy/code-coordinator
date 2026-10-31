@@ -60,9 +60,9 @@ from coord.models import (
 )
 from coord.review import (
     ReviewFindings,
+    authoritative_review_counts,
     classify_blocking_evidence,
     dispatch_review,
-    estimate_review_counts,
     maybe_scoped_review_for_completed_fix,
     mechanical_gate_kind,
     needs_redesign_escalation,
@@ -380,7 +380,13 @@ def process_review_completion(
     # parse as 0 (satisfying `parsed_any`) while *blocking* parsed as None.
     # The evidence standard now lives in `classify_blocking_evidence`
     # and is fail-closed: no positive evidence ⇒ the reviewer's verdict stands.
-    blocking, nonblocking, nits = estimate_review_counts(findings.body)
+    # `authoritative_review_counts` is the same marker-first source
+    # `classify_blocking_evidence` reads internally (#3833) — using it here
+    # too keeps these logged/recorded numbers from ever disagreeing with the
+    # gate decision they are explaining.
+    blocking, nonblocking, nits = authoritative_review_counts(
+        findings.body, assignment_id=review.assignment_id,
+    )
     evidence = classify_blocking_evidence(
         findings.body, assignment_id=review.assignment_id,
     )
