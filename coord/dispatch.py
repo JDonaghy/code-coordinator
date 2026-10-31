@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from coord.milestone_dispatch import OracleReadiness
+    from coord.models import Board
 
 from coord import github_ops
 from coord.comments import (
@@ -274,6 +275,108 @@ def enforce_epic_dispatch_guard(
         "`coord assign <machine> <repo> <tracking_issue> --type "
         "epic-decompose` to hand the epic to a worker for in-pickup "
         "decomposition (#3132) — that type never trips this guard."
+    )
+
+
+def enforce_preflight_guard(
+    *,
+    proposal_type: str,
+    repo: Repo | None,
+    config: Config,
+    issue_number: int,
+    machine: Machine | None = None,
+    board: "Board | None" = None,
+) -> None:
+    """#3817: pre-dispatch half of the preflight decomposition guard.
+
+    Scores a `type="work"` issue with the free heuristic scorer
+    (`coord.preflight_size.score_issue_size`, #3815) and, when it comes
+    back `triage_worthy`, defers the original dispatch and hands the issue
+    to the paid size-triage agent (`coord.decomposition_chat.
+    dispatch_size_triage_review`, #3818) instead — the same deterministic-
+    refusal shape as :func:`enforce_oracle_readiness` /
+    :func:`enforce_epic_dispatch_guard`, reusing :class:`DispatchRefused`
+    rather than inventing a second "this refusal doesn't count" concept
+    (#2096).
+
+    Cheap no-op — no network call — unless *proposal_type* is ``"work"``,
+    *repo* is resolved, and ``config.preflight_guard_enabled(repo.name)``
+    is `True` (the fleet kill switch AND the per-repo opt-in, see
+    `Config.preflight_guard_enabled`). Fails OPEN (returns, doesn't gate)
+    if the issue can't be fetched, same posture as the other two gates —
+    a GitHub hiccup must never turn into a fleet-wide dispatch outage.
+
+    *machine*/*board* default `None` because the bare `dispatch()` POST
+    below has neither today — only a caller that resolves both (the
+    drive-queue enqueue loop, once wired) can actually kick off the
+    size-triage dispatch this gate performs when flagged; without them
+    this falls through and the original dispatch proceeds unchanged,
+    identical to the repo not being opted in. Consuming the eventual
+    PROCEED/SPLIT verdict (dispatch the original on PROCEED; on SPLIT,
+    verify via `coord.preflight_size.verify_split_proposal` and file the
+    epic + chained children, superseding the original) is follow-up work
+    — see #3817's own acceptance criteria for why it needs a supersede
+    mechanism and epic-filing plumbing this gate does not touch.
+    """
+    if proposal_type != "work" or repo is None:
+        return
+    if not config.preflight_guard_enabled(repo.name):
+        return
+
+    try:
+        issue_data = github_ops.get_issue(repo.github, issue_number)
+    except RuntimeError:
+        return
+
+    from coord.preflight_size import score_issue_size  # noqa: PLC0415
+
+    thresholds = config.preflight_guard.for_repo(repo.name).resolve_thresholds()
+    score = score_issue_size(
+        body=issue_data.get("body"),
+        labels=issue_data.get("labels") or [],
+        thresholds=thresholds,
+    )
+    if not score.triage_worthy:
+        return
+
+    if machine is None or board is None:
+        # Not wired at this call site yet (#3817 follow-up) — fall through
+        # rather than refusing with no way for the refusal to ever clear.
+        return
+
+    from coord.decomposition_chat import (  # noqa: PLC0415
+        SizeTriageError,
+        dispatch_size_triage_review,
+        size_triage_review_target_for,
+    )
+
+    review_target = size_triage_review_target_for(issue_number)
+    already_in_flight = any(
+        a.review_target == review_target for a in board.active
+    )
+    if not already_in_flight:
+        try:
+            dispatch_size_triage_review(
+                repo_cfg=repo,
+                machine=machine,
+                issue_number=issue_number,
+                issue_title=issue_data.get("title") or f"issue #{issue_number}",
+                issue_body=issue_data.get("body") or "",
+                board=board,
+                size_signals=[signal.detail for signal in score.signals],
+            )
+        except SizeTriageError:
+            # Couldn't even get the triage review out the door — let the
+            # original dispatch proceed rather than refuse with no
+            # follow-up in flight to ever clear the refusal.
+            return
+
+    raise DispatchRefused(
+        f"issue #{issue_number} flagged by the preflight size scorer "
+        f"(score {score.total:g}/{score.threshold:g}): {score.reason}. "
+        f"A size-triage review is {'already ' if already_in_flight else ''}"
+        f"running on {machine.name!r} (review_target={review_target!r}) — "
+        "retry once it posts its verdict."
     )
 
 
@@ -747,11 +850,20 @@ def dispatch(
     status_fetcher=None,
     credential_fetcher=None,
     issue_liveness_fetcher=None,
+    board: "Board | None" = None,
 ) -> dict:
     """POST an assignment to the agent server on the target machine.
 
     Returns the response JSON from the agent server (which includes the
     server-assigned `id`).
+
+    *board* (#3817) opts the `type="work"` STRUCTURAL PREFLIGHT-SIZE GATE
+    below into actually dispatching a size-triage review when the issue
+    scores `triage_worthy` on an opted-in repo — see
+    `enforce_preflight_guard`'s docstring. `None` (the default) makes that
+    gate a pure read-only no-op, same opt-in shape as *status_fetcher* /
+    *credential_fetcher* / *issue_liveness_fetcher*: every caller that
+    predates this parameter is unaffected byte-for-byte.
 
     *status_fetcher* (#3353) opts the `type="work"` liveness-routing gate
     below into a LIVE reachability probe of `proposal.machine_name` before
@@ -914,6 +1026,17 @@ def dispatch(
     enforce_epic_dispatch_guard(
         proposal_type=proposal.type, repo=repo, config=config,
         issue_number=proposal.issue_number,
+    )
+
+    # #3817: STRUCTURAL PREFLIGHT-SIZE GATE — score a `type="work"` issue
+    # on an opted-in repo with the free heuristic scorer and, when flagged,
+    # dispatch a size-triage review in place of the original (see
+    # `enforce_preflight_guard`'s docstring). Placed alongside the two
+    # gates above, before the TOS gate, for the same reason: a refusal
+    # should never depend on provider resolution succeeding first.
+    enforce_preflight_guard(
+        proposal_type=proposal.type, repo=repo, config=config,
+        issue_number=proposal.issue_number, machine=machine, board=board,
     )
 
     # #437: STRUCTURAL TOS-COMPLIANCE GATE — refuse to route an
