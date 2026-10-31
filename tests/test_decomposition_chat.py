@@ -1731,6 +1731,15 @@ _MALFORMED_RESPONSE_NO_VERDICT = """I looked at the issue and think it's fine as
 END_SIZE_TRIAGE
 """
 
+_MARKER_MENTIONED_BEFORE_VERDICT_RESPONSE = """I will end with END_SIZE_TRIAGE when done.
+
+SIZE_TRIAGE_VERDICT: split
+## Child 1: Only child
+Session died here before the terminator.
+## Files
+- a.py
+"""
+
 
 class TestSizeTriageReviewTargetFor:
     def test_non_numeric_sentinel(self):
@@ -1848,6 +1857,42 @@ class TestParseSizeTriageResponse:
                 issue_title="Preflight guard",
             )
 
+    def test_takes_the_last_verdict_not_the_briefing_s_worked_example(self):
+        """`build_size_triage_briefing` embeds a literal worked example
+        containing its own `SIZE_TRIAGE_VERDICT: split` / `## Child 1:` /
+        `## Files` / `END_SIZE_TRIAGE` lines. A real response is dispatched
+        alongside (and may echo) that briefing, so the parser must take the
+        *last* verdict in the text — the agent's actual answer — not the
+        first, which would hit the worked example instead."""
+        briefing = decomposition_chat.build_size_triage_briefing(
+            issue_number=3818,
+            issue_title="Preflight guard",
+            issue_body="Some oversized issue body.",
+            repo_github="acme/code-coordinator",
+        )
+        raw = briefing + "\n\nSIZE_TRIAGE_VERDICT: proceed\nEND_SIZE_TRIAGE\n"
+
+        proposal = decomposition_chat.parse_size_triage_response(
+            raw,
+            repo_name="code-coordinator",
+            issue_number=3818,
+            issue_title="Preflight guard",
+        )
+
+        assert proposal is None
+
+    def test_terminator_mentioned_in_prose_before_verdict_does_not_satisfy_gate(self):
+        """A truncated response that merely *mentions* END_SIZE_TRIAGE in
+        prose before its verdict line must not be accepted as complete —
+        the terminator must appear after the chosen verdict line."""
+        with pytest.raises(decomposition_chat.SizeTriageError):
+            decomposition_chat.parse_size_triage_response(
+                _MARKER_MENTIONED_BEFORE_VERDICT_RESPONSE,
+                repo_name="code-coordinator",
+                issue_number=3818,
+                issue_title="Preflight guard",
+            )
+
 
 class TestDispatchSizeTriageReview:
     def test_happy_path_dispatches_readonly_sonnet_review(self):
@@ -1886,9 +1931,20 @@ class TestDispatchSizeTriageReview:
         assert "Some oversized issue body." in payload["briefing"]
 
     def test_never_files_issues_or_mutates_the_drive_queue(self):
-        """This entry only proposes — filing/queuing a proposal is a separate,
-        later, gated step. Patch the real mutating entry points so a call to
-        either fails the test outright."""
+        """This entry only proposes — filing/queuing a proposal is a
+        separate, later, gated step performed by a different agent.
+
+        Two checks, since patching a seam this function never reaches would
+        make the assertion below pass vacuously: (1) a positive control
+        proves the `coord.github_ops.post_issue_comment` trap actually
+        fires when something calls it, so the negative assertion means
+        something; and (2) a structural check confirms
+        `dispatch_size_triage_review`'s own source never references
+        `coord.github_ops` or `coord.drive_queue` at all, since neither
+        module sits on this function's call path for a mock to intercept.
+        """
+        import inspect
+
         from coord.models import Board
 
         board = Board()
@@ -1909,7 +1965,16 @@ class TestDispatchSizeTriageReview:
                 board=board,
                 http_client=client,
             )
-        mock_comment.assert_not_called()
+            mock_comment.assert_not_called()
+
+            # Positive control: the trap is live, not vacuous — calling the
+            # patched function really does raise.
+            with pytest.raises(AssertionError, match="must not post"):
+                mock_comment("control-call")
+
+        source = inspect.getsource(decomposition_chat.dispatch_size_triage_review)
+        assert "github_ops" not in source
+        assert "drive_queue" not in source
 
     def test_raises_size_triage_error_when_machine_unreachable(self):
         from coord.models import Board
