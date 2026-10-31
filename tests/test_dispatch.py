@@ -13,6 +13,8 @@ from coord.config import (
     AcceptanceDriverConfig,
     Config,
     ModelsConfig,
+    PreflightGuardConfig,
+    PreflightGuardRepoConfig,
     ProviderDef,
     ProvidersConfig,
     ReviewsConfig,
@@ -39,7 +41,6 @@ from coord.dispatch import (
     route_work_by_capability,
     route_work_by_liveness,
 )
-from coord.config import PreflightGuardConfig, PreflightGuardRepoConfig
 from coord.decomposition_chat import SizeTriageError, size_triage_review_target_for
 from coord.models import EPIC_DECOMPOSE_TYPE, Assignment, Board, Machine, Proposal, Repo
 from coord.network import StatusResult
@@ -1711,6 +1712,95 @@ class TestPreflightGuard:
                 machine=machine, board=board,
             )
         mock_dispatch_triage.assert_not_called()
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.github_ops.get_issue")
+    def test_completed_triage_lets_original_proceed_without_redispatch(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        """A triage session that already ran this `review_target` to a
+        terminal status in `board.completed` must not be re-scored into a
+        fresh paid triage dispatch on every subsequent dispatch attempt —
+        the unbounded-cost-loop bug: once the review moves active ->
+        completed, `enforce_preflight_guard` lets the original dispatch
+        proceed (not yet consuming the posted verdict) rather than either
+        refusing forever or firing a brand-new triage session each retry."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.completed.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=99,
+            issue_title="size triage", status="done", type="review",
+            review_target=size_triage_review_target_for(99),
+        ))
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=99,
+            machine=machine, board=board,
+        )  # must not raise — original dispatch proceeds
+        mock_dispatch_triage.assert_not_called()
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.github_ops.get_issue")
+    def test_terminal_but_unmoved_active_assignment_is_not_in_flight(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        """Mirror-image bug: an assignment left in `board.active` (never
+        moved to `completed`) but carrying a terminal status such as
+        `advisory` must not be treated as "still in flight" — that would
+        permanently refuse every future dispatch of this issue since
+        nothing would ever clear it."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=99,
+            issue_title="size triage", status="advisory", type="review",
+            review_target=size_triage_review_target_for(99),
+        ))
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=99,
+            machine=machine, board=board,
+        )  # must not raise — terminal status, not "in flight"
+        mock_dispatch_triage.assert_not_called()
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.github_ops.get_issue")
+    def test_size_signals_filtered_to_positive_points(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        """Only signals that actually moved the score are forwarded to the
+        paid triage agent — a zero-point signal like "1 file declared"
+        would mislead the agent about why the issue was flagged."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "A giant issue",
+            "body": "## Files\n- a.py\n",
+            "labels": [{"name": "epic"}],
+        }
+
+        with pytest.raises(DispatchRefused):
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=99,
+                machine=machine, board=board,
+            )
+        forwarded = mock_dispatch_triage.call_args.kwargs["size_signals"]
+        assert any("epic" in s.lower() for s in forwarded)
+        assert not any("file(s) declared" in s for s in forwarded)
 
     @patch(
         "coord.decomposition_chat.dispatch_size_triage_review",

@@ -892,6 +892,11 @@ def approve(
                 # LIVENESS GATE predicates (issue closed / branch already
                 # merged) — see `github_issue_liveness_fetcher`'s docstring.
                 issue_liveness_fetcher=_issue_liveness_fetcher,
+                # #3817: wire the STRUCTURAL PREFLIGHT-SIZE GATE's
+                # dedup/triage dispatch to a real board — `board` is
+                # already in scope above for `fresh.repo_busy_elsewhere`,
+                # and this is the main `coord approve` dispatch loop.
+                board=board,
             )
         except httpx.HTTPError as e:
             state, reason = classify_error(e)

@@ -306,12 +306,23 @@ def enforce_preflight_guard(
     if the issue can't be fetched, same posture as the other two gates —
     a GitHub hiccup must never turn into a fleet-wide dispatch outage.
 
-    *machine*/*board* default `None` because the bare `dispatch()` POST
-    below has neither today — only a caller that resolves both (the
-    drive-queue enqueue loop, once wired) can actually kick off the
-    size-triage dispatch this gate performs when flagged; without them
-    this falls through and the original dispatch proceeds unchanged,
-    identical to the repo not being opted in. Consuming the eventual
+    *machine*/*board* default `None` for callers that still dispatch
+    without a board in scope (e.g. the chat-continuation path) — for
+    those this falls through and the original dispatch proceeds
+    unchanged, identical to the repo not being opted in, since there
+    would be no board to dedup/record the triage dispatch against.
+    Production chokepoints (`coord assign`/`coord drive`'s WORK stage,
+    the drive-queue auto-drain tick, `coord approve`) all resolve a real
+    board and pass it through.
+
+    The triage dispatch itself only fires once per issue: a matching
+    `review_target` already present in `board.active` *or*
+    `board.completed` (terminal statuses per
+    `coord.drive_state.TERMINAL_STATUSES`, which includes `advisory`/
+    `refused_policy`/`refused_premise` — an assignment can go terminal
+    without ever being moved out of `active`) means a triage session has
+    already run or is running, so this never re-scores and re-dispatches
+    a fresh paid session on every retry. Consuming the eventual
     PROCEED/SPLIT verdict (dispatch the original on PROCEED; on SPLIT,
     verify via `coord.preflight_size.verify_split_proposal` and file the
     epic + chained children, superseding the original) is follow-up work
@@ -340,8 +351,8 @@ def enforce_preflight_guard(
         return
 
     if machine is None or board is None:
-        # Not wired at this call site yet (#3817 follow-up) — fall through
-        # rather than refusing with no way for the refusal to ever clear.
+        # No board in scope at this call site — fall through rather than
+        # refusing with no way for the refusal to ever clear.
         return
 
     from coord.decomposition_chat import (  # noqa: PLC0415
@@ -349,12 +360,27 @@ def enforce_preflight_guard(
         dispatch_size_triage_review,
         size_triage_review_target_for,
     )
+    from coord.drive_state import TERMINAL_STATUSES  # noqa: PLC0415
 
     review_target = size_triage_review_target_for(issue_number)
-    already_in_flight = any(
-        a.review_target == review_target for a in board.active
+    matches = [
+        a
+        for a in (*board.active, *board.completed)
+        if a.review_target == review_target
+    ]
+    in_flight = next(
+        (a for a in matches if a.status not in TERMINAL_STATUSES), None
     )
-    if not already_in_flight:
+    if in_flight is None and matches:
+        # A triage session already ran this issue's review_target to a
+        # terminal status (done/advisory/refused_*/...) — whatever
+        # verdict it posted, re-dispatching another paid triage session
+        # on every retry would be an unbounded cost loop. Let the
+        # original dispatch proceed; verdict consumption is follow-up
+        # work (see docstring).
+        return
+
+    if in_flight is None:
         try:
             dispatch_size_triage_review(
                 repo_cfg=repo,
@@ -363,7 +389,9 @@ def enforce_preflight_guard(
                 issue_title=issue_data.get("title") or f"issue #{issue_number}",
                 issue_body=issue_data.get("body") or "",
                 board=board,
-                size_signals=[signal.detail for signal in score.signals],
+                size_signals=[
+                    signal.detail for signal in score.signals if signal.points > 0
+                ],
             )
         except SizeTriageError:
             # Couldn't even get the triage review out the door — let the
@@ -374,7 +402,7 @@ def enforce_preflight_guard(
     raise DispatchRefused(
         f"issue #{issue_number} flagged by the preflight size scorer "
         f"(score {score.total:g}/{score.threshold:g}): {score.reason}. "
-        f"A size-triage review is {'already ' if already_in_flight else ''}"
+        f"A size-triage review is {'already ' if in_flight is not None else ''}"
         f"running on {machine.name!r} (review_target={review_target!r}) — "
         "retry once it posts its verdict."
     )
@@ -1604,6 +1632,7 @@ def dispatch_with_retry(
     status_fetcher=None,
     credential_fetcher=None,
     issue_liveness_fetcher=None,
+    board: "Board | None" = None,
 ) -> dict:
     """Dispatch with exponential backoff on transient failures.
 
@@ -1617,6 +1646,11 @@ def dispatch_with_retry(
     hits the same `except ValueError: raise` below unchanged) — a closed
     issue, an already-merged branch, or a dead credential is not a
     transient condition backoff can fix.
+
+    *board* (#3817) is forwarded to `dispatch()` untouched — see
+    `enforce_preflight_guard`'s docstring for the STRUCTURAL PREFLIGHT-
+    SIZE GATE it opts into. Defaults to `None` for callers that don't
+    have a board in scope, same fail-open posture as the gate itself.
     """
     from coord.network import classify_error, is_retryable
 
@@ -1629,6 +1663,7 @@ def dispatch_with_retry(
                 status_fetcher=status_fetcher,
                 credential_fetcher=credential_fetcher,
                 issue_liveness_fetcher=issue_liveness_fetcher,
+                board=board,
             )
         except httpx.HTTPError as exc:
             state, reason = classify_error(exc)

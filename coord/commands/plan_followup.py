@@ -179,9 +179,18 @@ def _dispatch_followup(
     # merge of `original`'s own branch/issue between dispatch decision and
     # this call, and re-fixing an already-merged branch is exactly the
     # "cannot matter" case this gate exists for.
+    #
+    # #906: use read_board() to build the peer-conflict in-flight list instead
+    # of load_dispatched() — the latter reads the local DB which is empty on a
+    # thin client.  read_board() routes to the daemon's /board when configured,
+    # so we get the canonical active assignment list for do-not-touch detection.
+    # Read before dispatching so the same board also feeds the #3817
+    # STRUCTURAL PREFLIGHT-SIZE GATE's dedup/triage check below.
+    board = read_board()
     response = dispatch(
         proposal, cfg, credential_fetcher=claude_credential_reachable,
         issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
+        board=board,
     )
     assignment_id = response.get("id", "pending")
     record_dispatched(
@@ -191,12 +200,6 @@ def _dispatch_followup(
         provider_name=response.get("_provider_name"),
     )
 
-    # #906: use read_board() to build the peer-conflict in-flight list instead
-    # of load_dispatched() — the latter reads the local DB which is empty on a
-    # thin client.  read_board() routes to the daemon's /board when configured,
-    # so we get the canonical active assignment list for do-not-touch detection.
-    # This also consolidates the board read we needed anyway for write_board().
-    board = read_board()
     in_flight = [
         {
             "machine_name": a.machine_name,
