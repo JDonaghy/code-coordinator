@@ -5008,6 +5008,18 @@ class GhOps(Protocol):
 
     def close_issue(self, repo: str, issue_number: int) -> None: ...
 
+    def get_issue_state(self, repo: str, issue_number: int) -> str | None:
+        """Return *issue_number*'s current state, ``"open"`` or ``"closed"``.
+
+        ``None`` means the read itself failed (network/auth/parse error) —
+        distinct from either state, never defaulted to "closed" (#3821).
+        Used immediately after :meth:`close_issue` reports success to
+        confirm the issue actually ended up closed, since a clean
+        ``gh issue close`` return is "the request was issued", not proof
+        of the resulting state (#2096).
+        """
+        ...
+
     def get_pr_body(self, repo: str, number: int) -> str:
         """Return PR *number*'s current body text (#1196, PR-body lint)."""
         ...
@@ -7322,7 +7334,7 @@ def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingI
 @dataclass
 class MergeEvent:
     entry: QueuedMerge
-    kind: str  # "opened" | "sized" | "merged" | "merged_partial" | "conflict" | "skipped" | "error" | "reopened"
+    kind: str  # "opened" | "sized" | "merged" | "merged_partial" | "merged_close_unconfirmed" | "conflict" | "skipped" | "error" | "reopened"
     message: str = ""
 
 
@@ -9606,6 +9618,26 @@ def process(
                         _epic_cache[n] = False
                 return _epic_cache[n]
 
+            # #3821: same memoization for `get_open_children` — before this,
+            # the `issue_close_block_reason` computation below and the
+            # PR-body-lint `blocking` set further down each re-derived
+            # "does `n` have open children" independently (the latter via
+            # `has_open_children`, a bare bool wrapper over the exact same
+            # `get_open_children` call), costing a second `gh`/GraphQL round
+            # trip per number and risking the two disagreeing if GitHub's
+            # answer changed between the two calls.
+            _open_children_cache: dict[int, list[dict]] = {}
+
+            def _get_open_children(n: int) -> list[dict]:
+                if n not in _open_children_cache:
+                    try:
+                        _open_children_cache[n] = gh_ops.get_open_children(
+                            entry.repo_github, n
+                        )
+                    except Exception:  # noqa: BLE001 — fail open, never block on this alone
+                        _open_children_cache[n] = []
+                return _open_children_cache[n]
+
             # #3502: resolve the EFFECTIVE worker+reviewer `ISSUE_RESOLUTION:`
             # verdict for this entry ONCE, up front — before the PR-body lint
             # below (which must downgrade an already-existing `Closes #N` to
@@ -9644,15 +9676,17 @@ def process(
             if entry.assignment_type in CLOSES_ISSUE_TYPES:
                 if issue_resolution.value != "resolved":
                     issue_close_block_reason = (
-                        f"marked `ISSUE_RESOLUTION: {issue_resolution.value}`"
+                        f"is marked `ISSUE_RESOLUTION: {issue_resolution.value}`"
                     )
                 else:
                     try:
-                        _open_children = gh_ops.get_open_children(
-                            entry.repo_github, entry.issue_number
+                        _open_children = _get_open_children(entry.issue_number)
+                        _child_refs = ", ".join(
+                            f"#{c.get('number')}" for c in _open_children
                         )
                     except Exception:  # noqa: BLE001 — fail open, never block on this alone
                         _open_children = []
+                        _child_refs = ""
                     if _open_children:
                         # #3821: name the specific open child(ren) — this is
                         # the diagnostic detail that used to come only from
@@ -9660,9 +9694,6 @@ def process(
                         # and being caught; it's preserved here even though
                         # `close_issue()` itself is never attempted on this
                         # blocked path (see the post-merge decision below).
-                        _child_refs = ", ".join(
-                            f"#{c['number']}" for c in _open_children
-                        )
                         issue_close_block_reason = (
                             f"has open sub-issues (#1196): {_child_refs}"
                         )
@@ -9693,11 +9724,13 @@ def process(
                 referenced = find_closing_references(pr_body)
                 blocking: set[int] = set()
                 for n in referenced:
-                    try:
-                        if gh_ops.has_open_children(entry.repo_github, n):
-                            blocking.add(n)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    # #3821: `_get_open_children` (memoized) rather than a
+                    # separate `has_open_children` call — same `gh`/GraphQL
+                    # answer, reused instead of re-fetched, and the single
+                    # source of truth `issue_close_block_reason` above
+                    # already relies on for `entry.issue_number` itself.
+                    if _get_open_children(n):
+                        blocking.add(n)
                     if _is_epic(n):
                         blocking.add(n)
                     # #3821: reuse the single `issue_close_block_reason`
@@ -9978,11 +10011,6 @@ def process(
                 ):
                     try:
                         gh_ops.close_issue(entry.repo_github, entry.issue_number)
-                        events.append(MergeEvent(
-                            entry, "merged",
-                            f"merged PR #{entry.pr_number}; closed issue #{entry.issue_number}"
-                            f"{bypass_note}",
-                        ))
                     except Exception as e:  # noqa: BLE001 — never fail a merge on close
                         # #3821: a close that was expected to succeed (no
                         # known block) but didn't — e.g. a race where a
@@ -10012,6 +10040,82 @@ def process(
                             f"close issue #{entry.issue_number}: {e}){bypass_note}"
                             f"{comment_note}",
                         ))
+                    else:
+                        # #3821/#2096: `close_issue()` returning without
+                        # raising only proves the close REQUEST was issued,
+                        # not that the issue actually ended up closed on
+                        # GitHub — read it back before claiming "merged".
+                        # Deliberately a direct attribute access (not
+                        # `getattr(gh_ops, "get_issue_state", None)` with a
+                        # permissive fallback): a `GhOps` implementation
+                        # that lacks this probe raises `AttributeError`
+                        # here, caught below into the same "unconfirmed"
+                        # bucket as a probe that ran but failed — never
+                        # silently treated as a successful close.
+                        try:
+                            _post_close_state = gh_ops.get_issue_state(
+                                entry.repo_github, entry.issue_number
+                            )
+                        except Exception:  # noqa: BLE001 — see comment above
+                            _post_close_state = None
+                        if _post_close_state == "closed":
+                            events.append(MergeEvent(
+                                entry, "merged",
+                                f"merged PR #{entry.pr_number}; closed issue "
+                                f"#{entry.issue_number}{bypass_note}",
+                            ))
+                        elif _post_close_state == "open":
+                            # #3821: close_issue() did not raise, but the
+                            # issue reads back OPEN — e.g. GitHub's own
+                            # close got reverted by a webhook/automation
+                            # race, or an implementation that no-opped
+                            # instead of raising. Route into the same
+                            # comment + "merged_partial" path as an
+                            # outright close() failure, never claim
+                            # "merged" over a reported outcome that turned
+                            # out not to match reality (#2096).
+                            comment_body = (
+                                f"Merged PR #{entry.pr_number}, and "
+                                f"requested closing issue "
+                                f"#{entry.issue_number}, but it still "
+                                "shows OPEN on GitHub.\n\nThis issue is "
+                                "left OPEN — close it manually once "
+                                "confirmed resolved."
+                            )
+                            try:
+                                comment_on_issue(
+                                    entry.repo_name, entry.issue_number,
+                                    comment_body,
+                                    repo_github=entry.repo_github,
+                                )
+                                comment_note = ""
+                            except Exception as ce:  # noqa: BLE001 — never fail a merge on a comment
+                                comment_note = (
+                                    f" (warning: could not post comment: {ce})"
+                                )
+                            events.append(MergeEvent(
+                                entry, "merged_partial",
+                                f"merged PR #{entry.pr_number} (warning: "
+                                f"requested closing issue "
+                                f"#{entry.issue_number} but it still "
+                                f"reads OPEN){bypass_note}{comment_note}",
+                            ))
+                        else:
+                            # #3821: could not confirm either way — the
+                            # probe itself failed, the response had no
+                            # recognizable state, or this `GhOps` doesn't
+                            # implement it. Its OWN distinguishable event —
+                            # never folded into "merged" (would silently
+                            # assume success) or "merged_partial" (would
+                            # silently assume it stayed open, equally
+                            # unproven).
+                            events.append(MergeEvent(
+                                entry, "merged_close_unconfirmed",
+                                f"merged PR #{entry.pr_number}; requested "
+                                f"closing issue #{entry.issue_number}, but "
+                                "could not confirm it actually closed"
+                                f"{bypass_note}",
+                            ))
                 elif entry.assignment_type in CLOSES_ISSUE_TYPES:
                     # #3821: blocked — never close it, and ALWAYS tell
                     # anyone watching the issue (not just the queue DB)
@@ -10026,7 +10130,7 @@ def process(
                         remainder = f"this issue {issue_close_block_reason}."
                     comment_body = (
                         f"Merged PR #{entry.pr_number}, but issue "
-                        f"#{entry.issue_number} is {issue_close_block_reason} "
+                        f"#{entry.issue_number} {issue_close_block_reason} "
                         "— this issue is intentionally left OPEN.\n\n"
                         f"What remains: {remainder}"
                     )

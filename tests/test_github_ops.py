@@ -49,6 +49,43 @@ class TestIssueIsClosed:
             assert github_ops.issue_is_closed("acme/api", 1) is False
 
 
+class TestGetIssueState:
+    """#3821: `get_issue_state` backs `merge_queue.process`'s post-close
+    confirmation — unlike `issue_is_closed`, it must never fail open to a
+    single permissive value. A failed/ambiguous read is its own `None`,
+    distinct from both real states.
+    """
+
+    def test_closed_when_state_closed(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"number": 1, "state": "CLOSED"}),
+        ):
+            assert github_ops.get_issue_state("acme/api", 1) == "closed"
+
+    def test_open_when_state_open(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"number": 1, "state": "OPEN"}),
+        ):
+            assert github_ops.get_issue_state("acme/api", 1) == "open"
+
+    def test_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_issue_state("acme/api", 1) is None
+
+    def test_none_on_malformed_json(self) -> None:
+        with patch("coord.github_ops._gh", return_value="not json"):
+            assert github_ops.get_issue_state("acme/api", 1) is None
+
+    def test_none_on_missing_or_unrecognized_state(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"number": 1}),
+        ):
+            assert github_ops.get_issue_state("acme/api", 1) is None
+
+
 class TestCheckPrMergeable:
     """#1477: check_pr_mergeable() re-tests GitHub's own mergeability
     computation, used to clear a merge-queue entry's stale CONFLICT verdict.
