@@ -7686,6 +7686,66 @@ class TestBlockingFindingsConfirmedAbsent:
         from coord.review import blocking_findings_confirmed_absent
         assert blocking_findings_confirmed_absent("") is False
 
+    def test_unparseable_prose_with_clean_marker_is_confirmed(self) -> None:
+        """The prose doesn't use the conventional headings at all, but
+        a `coord:review` marker reporting `blocking=0` is positive evidence
+        on its own — trust it rather than forcing a needless fix cycle."""
+        from coord.review import (
+            blocking_findings_confirmed_absent,
+            estimate_review_counts,
+        )
+        body = (
+            "<!-- coord:review verdict=request-changes blocking=0 "
+            "nonblocking=2 nits=1 reviewer=precision -->\n"
+            "\n"
+            "Looks good overall — a couple of minor things worth a look, "
+            "but nothing that blocks merging this.\n"
+        )
+        assert estimate_review_counts(body) == (None, None, None)
+        assert blocking_findings_confirmed_absent(body) is True
+
+    def test_unparseable_prose_with_nonzero_marker_is_not_confirmed(self) -> None:
+        """A marker reporting real blocking findings must not be overridden
+        by the fallback — only `blocking=0` is trusted."""
+        from coord.review import blocking_findings_confirmed_absent
+        body = (
+            "<!-- coord:review verdict=request-changes blocking=2 "
+            "reviewer=precision -->\n"
+            "\n"
+            "This needs work before it can merge.\n"
+        )
+        assert blocking_findings_confirmed_absent(body) is False
+
+    def test_unparseable_prose_without_marker_increments_counter(self) -> None:
+        """The fail-closed path (unparseable prose, no trustworthy marker)
+        must be countable so the residual rate is measurable."""
+        from coord.review import (
+            blocking_findings_confirmed_absent,
+            unparseable_treated_as_blocking_count,
+        )
+        body = "Looks fine to me — approving.\n"
+        before = unparseable_treated_as_blocking_count()
+        assert blocking_findings_confirmed_absent(body) is False
+        assert unparseable_treated_as_blocking_count() == before + 1
+
+    def test_unparseable_prose_with_clean_marker_does_not_increment_counter(
+        self,
+    ) -> None:
+        """The marker-trust path is a confirmed absence, not a fail-closed
+        miss — it must not count toward the unparseable-as-blocking metric."""
+        from coord.review import (
+            blocking_findings_confirmed_absent,
+            unparseable_treated_as_blocking_count,
+        )
+        body = (
+            "<!-- coord:review verdict=approve blocking=0 reviewer=precision -->\n"
+            "\n"
+            "Looks fine overall.\n"
+        )
+        before = unparseable_treated_as_blocking_count()
+        assert blocking_findings_confirmed_absent(body) is True
+        assert unparseable_treated_as_blocking_count() == before
+
 
 class TestExtractBlockingSection:
     """#2466: the #603 per-issue context digest used to carry forward only
