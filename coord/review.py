@@ -788,6 +788,57 @@ class BlockingEvidence:
     fail_closed_unparseable: bool
 
 
+def _authoritative_counts_with_source(
+    body: str, *, assignment_id: str | None = None,
+) -> tuple[int | None, int | None, int | None, str]:
+    """Return (blocking, nonblocking, nits, source) for *body*.
+
+    The trustworthy self-reported ``<!-- coord:review ... -->`` marker
+    (`_parse_trusted_self_reported_marker`) is the AUTHORITATIVE signal
+    whenever it is present and carries a ``blocking=`` token — checked
+    first, on every read, not only as a fallback once prose turns out to
+    be unparseable (#3833). Prose (`estimate_review_counts`) is only a
+    fallback for bodies that never got a trustworthy marker at all.
+
+    ``source`` is ``"marker"`` or ``"prose"`` — callers use it to decide
+    whether the extra "is this blocking section actually empty prose, not
+    just zero-bulleted" sanity check still applies (it only makes sense for
+    prose; a marker's ``blocking=0`` is the reviewer's own attestation,
+    nothing to re-check against the body's prose).
+    """
+    marker = _parse_trusted_self_reported_marker(body, assignment_id)
+    if marker is not None and "blocking" in marker:
+        return (
+            marker.get("blocking"),  # type: ignore[return-value]
+            marker.get("nonblocking"),  # type: ignore[return-value]
+            marker.get("nits"),  # type: ignore[return-value]
+            "marker",
+        )
+    blocking, nonblocking, nits = estimate_review_counts(body)
+    return blocking, nonblocking, nits, "prose"
+
+
+def authoritative_review_counts(
+    body: str, *, assignment_id: str | None = None,
+) -> tuple[int | None, int | None, int | None]:
+    """Return (blocking, nonblocking, nits) for *body*, marker-first.
+
+    This is the one function callers wanting "how many blocking/nonblocking/
+    nit findings does this review report" should call — it is what
+    `classify_blocking_evidence` uses internally, so a caller logging these
+    numbers alongside a `classify_blocking_evidence` decision (e.g.
+    `coord/auto_loop.py`'s #476 override log/reason text) never disagrees
+    with the gate that decision came from (#3833's "one question, one
+    answer"). Prefer this over calling `estimate_review_counts` directly
+    unless you specifically want the prose-only heuristic irrespective of
+    any self-reported marker.
+    """
+    blocking, nonblocking, nits, _source = _authoritative_counts_with_source(
+        body, assignment_id=assignment_id,
+    )
+    return blocking, nonblocking, nits
+
+
 def classify_blocking_evidence(
     body: str, *, assignment_id: str | None = None,
 ) -> BlockingEvidence:
@@ -798,9 +849,22 @@ def classify_blocking_evidence(
     cannot read counts as "not confirmed absent", i.e. "assume the
     reviewer meant what it said".
 
-    `confirmed_absent` is ``True`` when either of these holds:
+    Counts come from `_authoritative_counts_with_source`, which checks the
+    trustworthy self-reported marker FIRST, on every read — not only once
+    prose turns out unparseable. `confirmed_absent` is ``True`` when either
+    of these holds:
 
-    1. Prose evidence: **all** of —
+    1. Marker evidence: the body's very first line is a trustworthy
+       self-reported ``<!-- coord:review ... -->`` marker
+       (`_parse_trusted_self_reported_marker` — position- and
+       assignment-id-anchored, so untrusted prose elsewhere in the body
+       cannot forge it) reporting ``blocking=0``. This is independent
+       evidence from the reviewer itself, not a re-derivation of the same
+       prose heuristic: it is what avoids forcing a needless fix cycle on a
+       review whose *substance* was fine but whose prose heuristic missed.
+
+    2. Prose evidence (only consulted when there is no trustworthy marker):
+       **all** of —
 
        a. A blocking section was actually located (``blocking is not None`` —
           a heading matching `_SECTION_KEYWORDS["blocking"]`).  A body with no
@@ -815,35 +879,25 @@ def classify_blocking_evidence(
           otherwise count as zero and fail open all the same.  Short "None" /
           "N/A" markers are allowed (that's the shape being looked for).
 
-    2. Self-reported marker evidence: the prose is unparseable (``blocking
-       is None``, i.e. no recognisable heading at all) but the body's very
-       first line is a trustworthy self-reported ``<!-- coord:review ... -->``
-       marker (`_parse_trusted_self_reported_marker` — position- and
-       assignment-id-anchored, so untrusted prose elsewhere in the body
-       cannot forge it) reporting ``blocking=0``. This is independent
-       evidence from the reviewer itself, not a re-derivation of the same
-       prose heuristic: it is what avoids forcing a needless fix cycle on a
-       review whose *substance* was fine but whose prose heuristic missed.
-
     `fail_closed_unparseable` is ``True`` exactly when `confirmed_absent` is
-    ``False`` because the prose was unparseable AND no trustworthy marker
-    backed it up — never when the prose parsed to a genuine nonzero
+    ``False`` because there was no trustworthy marker AND the prose was
+    unparseable — never when a marker or prose reported a genuine nonzero
     blocking count, since that is not a parsing failure at all.
     """
-    blocking, _nonblocking, _nits = estimate_review_counts(body)
+    blocking, _nonblocking, _nits, source = _authoritative_counts_with_source(
+        body, assignment_id=assignment_id,
+    )
     if blocking is None:
-        marker = _parse_trusted_self_reported_marker(body, assignment_id)
-        if marker is not None and marker.get("blocking") == 0:
-            log.info(
-                "blocking_findings_confirmed_absent: prose unparseable, "
-                "trusting self-reported coord:review marker (blocking=0, "
-                "assignment=%r)",
-                assignment_id,
-            )
-            return BlockingEvidence(confirmed_absent=True, fail_closed_unparseable=False)
         return BlockingEvidence(confirmed_absent=False, fail_closed_unparseable=True)
     if blocking != 0:
         return BlockingEvidence(confirmed_absent=False, fail_closed_unparseable=False)
+    if source == "marker":
+        log.info(
+            "blocking_findings_confirmed_absent: trusting self-reported "
+            "coord:review marker (blocking=0, assignment=%r)",
+            assignment_id,
+        )
+        return BlockingEvidence(confirmed_absent=True, fail_closed_unparseable=False)
     for bucket, lines in _iter_review_sections(body):
         if bucket != "blocking":
             continue
@@ -899,6 +953,107 @@ def extract_blocking_section(body: str) -> str:
     if all(_is_no_findings_line(line.strip()) for line in joined.splitlines() if line.strip()):
         return ""
     return joined
+
+
+# Default cap on `ProposedFix.diff_text` size for `classify_finding_nit_class`
+# (#3833) — a line count, not a byte count, since diff lines are what a human
+# (or the eventual finisher, #3832 C2) would actually be bounding "small" by.
+# Chosen generously enough to admit a real one- or two-line code change plus
+# its surrounding hunk context, while still excluding anything resembling a
+# rewrite.
+_NIT_CLASS_MAX_CHANGED_LINES = 40
+
+
+@dataclass(frozen=True)
+class ProposedFix:
+    """A single finding's proposed fix — input to `classify_finding_nit_class`.
+
+    Deliberately a thin, caller-supplied description rather than something
+    inferred from `diff_text` alone: whether a change is "behavioral" or
+    "touches a public API" is a judgment call for whoever is proposing the
+    fix (a human reviewer today; the finisher itself, #3832 C2, eventually)
+    to make explicitly. Guessing it from diff text with a regex would be
+    exactly the kind of gate CLAUDE.md warns about — one whose failing
+    branch nobody can actually trust fired for the right reason.
+
+    `diff_text` is still read mechanically, for the two properties that
+    genuinely are mechanical: how big the diff is, and which paths it
+    touches (checked against `sealed_paths`).
+    """
+
+    diff_text: str
+    behavioral: bool
+    touches_public_api: bool
+
+
+def _diff_changed_line_count(diff_text: str) -> int:
+    """Count added+removed content lines in a unified diff.
+
+    Excludes the `+++`/`---` file-header lines (which also start with `+`/
+    `-`) so a diff touching one real line is counted as 1, not 2.
+    """
+    count = 0
+    for line in diff_text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            count += 1
+    return count
+
+
+def classify_finding_nit_class(
+    body: str,
+    *,
+    assignment_id: str | None = None,
+    fix: ProposedFix | None = None,
+    sealed_paths: list[str] | None = None,
+    max_changed_lines: int = _NIT_CLASS_MAX_CHANGED_LINES,
+) -> bool:
+    """Is *body*'s review, plus (optionally) *fix*, "nit-class"?
+
+    This is the gate a future finisher (#3832 C2, and "Trigger A" in C3)
+    needs to decide whether it may autonomously apply a fix, rather than
+    hand the review back for rework. It does NOT replace
+    `classify_blocking_evidence` — it reuses it, so the two can never
+    disagree about whether blocking findings are actually present (#3833's
+    "one question, one answer"):
+
+    - If `classify_blocking_evidence` cannot even confirm the body's
+      evidence (`fail_closed_unparseable`), this is never nit-class —
+      a body too malformed to trust is not a safe autonomous-fix target.
+    - If it confirms zero blocking findings (`confirmed_absent`), this is
+      trivially nit-class: there is nothing to fix, so nothing can be
+      "not a nit".
+    - Otherwise there is at least one blocking finding, and nit-class
+      status depends entirely on the proposed *fix* for it: no `fix` at
+      all is never nit-class (nothing to evaluate), and a `fix` must be
+      ALL of:
+
+      1. Non-behavioral (`not fix.behavioral`) — caller-attested, not
+         inferred (see `ProposedFix`).
+      2. Touches no public-API surface (`not fix.touches_public_api`) —
+         same.
+      3. Touches no sealed path, per `sealed_paths`
+         (`AcceptanceConfig.sealed_paths()` upstream — this function takes
+         the already-resolved list, matching every other sealed-path
+         helper in this module).
+      4. A bounded, nonempty diff: ``0 < changed_lines <= max_changed_lines``.
+         An empty `diff_text` (no actual fix drafted yet) is never
+         nit-class — there is nothing bounded about "no diff".
+    """
+    evidence = classify_blocking_evidence(body, assignment_id=assignment_id)
+    if evidence.fail_closed_unparseable:
+        return False
+    if evidence.confirmed_absent:
+        return True
+    if fix is None:
+        return False
+    if fix.behavioral or fix.touches_public_api:
+        return False
+    if sealed_paths and _diff_touched_sealed_paths(fix.diff_text, sealed_paths):
+        return False
+    changed = _diff_changed_line_count(fix.diff_text)
+    return 0 < changed <= max_changed_lines
 
 
 def _parse_review_text(text: str) -> ReviewFindings | None:
