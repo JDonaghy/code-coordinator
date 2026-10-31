@@ -1893,6 +1893,29 @@ class TestParseSizeTriageResponse:
                 issue_title="Preflight guard",
             )
 
+    def test_child_with_no_declared_files_raises(self):
+        """A `## Child N:` section with a `## Files` heading but no file
+        bullets underneath (or no `## Files` heading at all) can't be
+        dispatched as its own scoped work item, so it must raise rather
+        than silently produce a chunk with an empty `files_likely`."""
+        response = """SIZE_TRIAGE_VERDICT: split
+## Child 1: Scoped child
+Some prose.
+## Files
+- coord/decomposition_chat.py
+
+## Child 2: Unscoped child
+Prose only, no files declared anywhere in this section.
+END_SIZE_TRIAGE
+"""
+        with pytest.raises(decomposition_chat.SizeTriageError, match="child 2"):
+            decomposition_chat.parse_size_triage_response(
+                response,
+                repo_name="code-coordinator",
+                issue_number=3818,
+                issue_title="Preflight guard",
+            )
+
 
 class TestDispatchSizeTriageReview:
     def test_happy_path_dispatches_readonly_sonnet_review(self):
