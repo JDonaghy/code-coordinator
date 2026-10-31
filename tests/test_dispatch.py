@@ -29,6 +29,7 @@ from coord.dispatch import (
     enforce_epic_dispatch_guard,
     enforce_model_provider_compatibility,
     enforce_oracle_readiness,
+    enforce_preflight_guard,
     epic_decompose_briefing,
     post_briefing,
     resolve_dispatch_model,
@@ -38,7 +39,9 @@ from coord.dispatch import (
     route_work_by_capability,
     route_work_by_liveness,
 )
-from coord.models import EPIC_DECOMPOSE_TYPE, Machine, Proposal, Repo
+from coord.config import PreflightGuardConfig, PreflightGuardRepoConfig
+from coord.decomposition_chat import SizeTriageError, size_triage_review_target_for
+from coord.models import EPIC_DECOMPOSE_TYPE, Assignment, Board, Machine, Proposal, Repo
 from coord.network import StatusResult
 from coord.review import repo_focus_lines
 
@@ -1581,6 +1584,207 @@ class TestEpicDispatchGuard:
             enforce_epic_dispatch_guard(
                 proposal_type="work", repo=repo, config=cfg, issue_number=1120,
             )  # must not raise
+
+
+class TestPreflightGuard:
+    """#3817: the pre-dispatch half of the preflight decomposition guard —
+    `enforce_preflight_guard` scores a `type="work"` issue on an opted-in
+    repo and, when flagged, dispatches a size-triage review in place of the
+    original. Mirrors `TestEpicDispatchGuard`'s shape: direct unit tests
+    against the gate function itself, plus a couple of `dispatch()`-level
+    integration tests for gate-sequence placement.
+    """
+
+    def _cfg(self, *, fleet_enabled: bool = True, repo_enabled: bool = True) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            preflight_guard=PreflightGuardConfig(
+                enabled=fleet_enabled,
+                repos={"api": PreflightGuardRepoConfig(enabled=repo_enabled)},
+            ),
+        )
+
+    def test_no_op_for_non_work_type(self) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        # "review" isn't "work" — must short circuit before any GitHub call.
+        enforce_preflight_guard(
+            proposal_type="review", repo=repo, config=cfg, issue_number=1,
+        )
+
+    def test_no_op_when_repo_unresolved(self) -> None:
+        cfg = self._cfg()
+        enforce_preflight_guard(
+            proposal_type="work", repo=None, config=cfg, issue_number=1,
+        )
+
+    @patch("coord.github_ops.get_issue")
+    def test_no_op_when_fleet_kill_switch_disabled(self, mock_get_issue) -> None:
+        cfg = self._cfg(fleet_enabled=False, repo_enabled=True)
+        repo = cfg.repo("api")
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=1,
+        )
+        mock_get_issue.assert_not_called()
+
+    @patch("coord.github_ops.get_issue")
+    def test_no_op_when_repo_not_opted_in(self, mock_get_issue) -> None:
+        cfg = self._cfg(fleet_enabled=True, repo_enabled=False)
+        repo = cfg.repo("api")
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=1,
+        )
+        mock_get_issue.assert_not_called()
+
+    @patch("coord.github_ops.get_issue")
+    def test_no_op_below_threshold(self, mock_get_issue) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        mock_get_issue.return_value = {"body": "a tiny issue", "labels": []}
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=1,
+        )  # must not raise — scorer comes back below threshold
+
+    @patch("coord.github_ops.get_issue")
+    def test_falls_through_without_machine_or_board(self, mock_get_issue) -> None:
+        """A flagged issue with no *machine*/*board* supplied (today's real
+        `dispatch()` call sites) falls through unchanged rather than
+        refusing with no way for the refusal to ever clear."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=1,
+        )  # must not raise
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.github_ops.get_issue")
+    def test_flagged_issue_dispatches_triage_and_refuses(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "A giant issue", "body": "", "labels": [{"name": "epic"}],
+        }
+
+        with pytest.raises(DispatchRefused, match="flagged by the preflight size"):
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=99,
+                machine=machine, board=board,
+            )
+        mock_dispatch_triage.assert_called_once()
+        assert mock_dispatch_triage.call_args.kwargs["issue_number"] == 99
+        assert mock_dispatch_triage.call_args.kwargs["board"] is board
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.github_ops.get_issue")
+    def test_already_in_flight_review_is_not_redispatched(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.active.append(Assignment(
+            machine_name="laptop", repo_name="api", issue_number=99,
+            issue_title="size triage", status="running", type="review",
+            review_target=size_triage_review_target_for(99),
+        ))
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+
+        with pytest.raises(DispatchRefused, match="already running"):
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=99,
+                machine=machine, board=board,
+            )
+        mock_dispatch_triage.assert_not_called()
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+        side_effect=SizeTriageError("machine unreachable"),
+    )
+    @patch("coord.github_ops.get_issue")
+    def test_fails_open_when_triage_dispatch_fails(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=99,
+            machine=machine, board=board,
+        )  # must not raise — can't even get the triage review out the door
+        mock_dispatch_triage.assert_called_once()
+
+    def test_fails_open_when_issue_lookup_fails(self) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        with patch(
+            "coord.github_ops.get_issue", side_effect=RuntimeError("gh failed"),
+        ):
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=1,
+            )  # must not raise
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_issue")
+    def test_dispatch_proceeds_unflagged_issue_opted_in_repo(
+        self, mock_get_issue, mock_post,
+    ) -> None:
+        """Integration: an opted-in repo with a below-threshold issue
+        dispatches the original unchanged — status quo, zero added cost."""
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix a bug", rationale="", type="work",
+        )
+        mock_get_issue.return_value = {"body": "small fix", "labels": []}
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        mock_post.assert_called_once()
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_issue")
+    def test_dispatch_refuses_flagged_issue_when_board_wired(
+        self, mock_get_issue, mock_post, mock_dispatch_triage,
+    ) -> None:
+        """Integration: with a `board` passed through to `dispatch()`, a
+        flagged issue on an opted-in repo gets refused in favour of the
+        size-triage review instead of the original work dispatch."""
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=99,
+            issue_title="A giant issue", rationale="", type="work",
+        )
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+
+        with pytest.raises(DispatchRefused, match="flagged by the preflight size"):
+            dispatch(p, cfg, board=board)
+        mock_post.assert_not_called()
+        mock_dispatch_triage.assert_called_once()
 
 
 class TestEpicDecomposeBriefing:

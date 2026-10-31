@@ -932,8 +932,19 @@ class PreflightGuardRepoConfig:
 
 @dataclass
 class PreflightGuardConfig:
-    """``preflight_guard:`` — repo name -> :class:`PreflightGuardRepoConfig`."""
+    """``preflight_guard:`` — repo name -> :class:`PreflightGuardRepoConfig`,
+    plus a fleet-wide ``enabled`` kill switch (#3817).
 
+    ``enabled`` defaults ``True`` (fleet-wide gate open) so that, exactly
+    like `BoardDoctorConfig.investigate`, the per-repo opt-in below is the
+    only gate that matters until an operator explicitly disarms the whole
+    fleet — flipping this to ``False`` bypasses the guard for every repo
+    regardless of their own ``enabled`` setting, for an incident where the
+    size-triage/verification pipeline itself needs to be taken out of the
+    loop without editing every repo's entry one at a time.
+    """
+
+    enabled: bool = True
     repos: dict[str, PreflightGuardRepoConfig] = field(default_factory=dict)
 
     def for_repo(self, repo_name: str) -> PreflightGuardRepoConfig:
@@ -3176,6 +3187,28 @@ class Config:
     def repo(self, name: str) -> Repo | None:
         return next((r for r in self.repos if r.name == name), None)
 
+    def preflight_guard_enabled(self, repo_name: str) -> bool:
+        """Decide whether the preflight decomposition guard (#3816/#3817)
+        may fire for *repo_name* — the one question/one answer combination
+        of the fleet-wide kill switch and the per-repo opt-in, mirroring
+        :func:`coord.board_doctor_policy._investigate_tier_enabled`'s shape
+        for the same reason: a dispatch-time caller should never have to
+        re-derive this from the two fields itself.
+
+        Two gates, both must pass:
+
+        1. :attr:`preflight_guard.enabled` — the fleet-wide switch
+           (default ``True``, so the per-repo opt-in below is the only
+           gate that matters until an operator explicitly disarms it).
+        2. ``preflight_guard.<repo_name>.enabled`` — the per-repo opt-in
+           (default ``False``): even with the fleet switch on, a repo
+           that has not explicitly opted in dispatches every issue
+           unchanged, today's behaviour before this guard existed.
+        """
+        if not self.preflight_guard.enabled:
+            return False
+        return self.preflight_guard.for_repo(repo_name).enabled
+
 
 def _local_short_hostname() -> str:
     """The OS short hostname (split on '.', lowercased).
@@ -4560,7 +4593,7 @@ def _parse_prereview_gate(raw: Any) -> PrereviewGateConfig:
 
 
 def _parse_preflight_guard(raw: Any) -> PreflightGuardConfig:
-    """Parse the ``preflight_guard:`` block (#3816).
+    """Parse the ``preflight_guard:`` block (#3816, fleet switch #3817).
 
     ``preflight_guard.<repo_name>`` maps a local repo name (as declared
     under ``repos:``) to its :class:`PreflightGuardRepoConfig`. Absent
@@ -4571,14 +4604,26 @@ def _parse_preflight_guard(raw: Any) -> PreflightGuardConfig:
     :data:`coord.preflight_size.DEFAULT_THRESHOLDS` via
     :meth:`PreflightGuardRepoConfig.resolve_thresholds` rather than silently
     becoming ``0``.
+
+    A reserved top-level ``enabled:`` key (a bare boolean, not a mapping)
+    is the fleet-wide kill switch (:attr:`PreflightGuardConfig.enabled`),
+    mirroring ``board_doctor.investigate``'s split between a fleet switch
+    and per-repo opt-in but without a second top-level config key, since
+    every real per-repo entry's value is a mapping and can never collide
+    with this bare-boolean sentinel.
     """
     if raw is None:
         return PreflightGuardConfig()
     if not isinstance(raw, dict):
         raise ConfigError("'preflight_guard' must be a mapping")
 
+    fleet_enabled = True
+    raw_entries = dict(raw)
+    if "enabled" in raw_entries and isinstance(raw_entries["enabled"], bool):
+        fleet_enabled = raw_entries.pop("enabled")
+
     repos: dict[str, PreflightGuardRepoConfig] = {}
-    for repo_name, entry in raw.items():
+    for repo_name, entry in raw_entries.items():
         if not isinstance(entry, dict):
             raise ConfigError(f"preflight_guard[{repo_name!r}] must be a mapping")
 
@@ -4605,7 +4650,7 @@ def _parse_preflight_guard(raw: Any) -> PreflightGuardConfig:
             cfg.triage_threshold = float(value)
         repos[repo_name] = cfg
 
-    return PreflightGuardConfig(repos=repos)
+    return PreflightGuardConfig(enabled=fleet_enabled, repos=repos)
 
 
 def _parse_acceptance(raw: Any) -> AcceptanceConfig:
