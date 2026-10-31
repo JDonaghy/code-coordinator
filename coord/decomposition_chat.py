@@ -1302,12 +1302,18 @@ def file_and_queue_split_proposal(
     real numbers and splice it into the epic body, queue each child
     (confirming every queue write with a readback — an unconfirmed queue
     insert is not a queued child), then close the original issue pointing
-    at the new epic. Returns the new epic's issue number.
+    at the new epic — forcing past the "open children" guard (the
+    original's own body is exactly the shape expected to trip it once it
+    already carries a ``## Sub-issues``/``## Work order`` block, e.g. from
+    a prior triage pass) and confirming the close itself with a readback,
+    since `close_issue()` returning without raising only proves the close
+    *request* was issued, not that GitHub actually ended up with the issue
+    closed (#2096). Returns the new epic's issue number.
 
-    A failure partway through (a `gh` call failing, a queue write that
-    doesn't read back) is allowed to raise — by that point real issues
-    already exist on GitHub, so there is no "abort to dispatching the
-    original" left to fall back to; the caller's own abort-on-rejection
+    A failure partway through (a `gh` call failing, a queue write or close
+    that doesn't read back) is allowed to raise — by that point real
+    issues already exist on GitHub, so there is no "abort to dispatching
+    the original" left to fall back to; the caller's own abort-on-rejection
     path is for *before* this function is ever called, when
     ``verification.ok`` is still ``False``.
     """
@@ -1367,6 +1373,13 @@ def file_and_queue_split_proposal(
                 "did not read back from the drive queue"
             )
 
+    # `force=True`: the original being split is likely to already carry a
+    # `## Sub-issues`/`## Work order` block of its own (e.g. a prior triage
+    # pass), which would otherwise trip `close_issue()`'s open-children
+    # guard (#1196) and leave real epic+children already filed on GitHub
+    # but the original still open and re-dispatchable. Superseding the
+    # original is exactly this function's job, so bypassing that guard
+    # here is deliberate, not a workaround.
     github_ops.close_issue(
         repo.github,
         proposal.issue_number,
@@ -1375,7 +1388,18 @@ def file_and_queue_split_proposal(
             f"{len(proposal.chunks)} child issue(s) per the size-triage "
             "review."
         ),
+        force=True,
     )
+    # `close_issue()` returning without raising only proves the close
+    # REQUEST was issued, not that the issue actually ended up closed on
+    # GitHub — read it back before claiming "superseded" (#2096).
+    post_close_state = github_ops.get_issue_state(repo.github, proposal.issue_number)
+    if post_close_state != "closed":
+        raise RuntimeError(
+            f"filed epic #{epic_number} and queued its children, but "
+            f"closing the superseded original #{proposal.issue_number} "
+            f"did not read back closed (got {post_close_state!r})"
+        )
 
     return epic_number
 

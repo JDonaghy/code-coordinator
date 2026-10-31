@@ -354,6 +354,19 @@ def enforce_preflight_guard(
     except RuntimeError:
         return
 
+    # #3830: a now-closed issue never re-enters the triage/split path. The
+    # common way this fires is the *success* case this gate itself just
+    # produced — `file_and_queue_split_proposal` already superseded
+    # (closed) this exact issue on a previous pass — but it also covers an
+    # issue closed for any other reason. Without this, a retry (`coord
+    # drive-queue remove && add`, a manual `coord assign`, `coord
+    # approve`, ...) re-scores a still-`triage_worthy` body, re-finds the
+    # same terminal triage assignment below, and re-files a second epic +
+    # a duplicate set of children every time. `state` is already on this
+    # same `get_issue` response, so this costs no extra fetch.
+    if str(issue_data.get("state") or "").upper() == "CLOSED":
+        return
+
     from coord.preflight_size import score_issue_size  # noqa: PLC0415
 
     thresholds = config.preflight_guard.for_repo(repo.name).resolve_thresholds()
