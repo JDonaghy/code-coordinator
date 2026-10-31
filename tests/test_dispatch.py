@@ -42,7 +42,18 @@ from coord.dispatch import (
     route_work_by_liveness,
 )
 from coord.decomposition_chat import SizeTriageError, size_triage_review_target_for
-from coord.models import EPIC_DECOMPOSE_TYPE, Assignment, Board, Machine, Proposal, Repo
+from coord.milestone_order import WorkOrder, WorkOrderNode
+from coord.models import (
+    EPIC_DECOMPOSE_TYPE,
+    Assignment,
+    Board,
+    Machine,
+    Proposal,
+    Repo,
+    SplitChunk,
+    SplitProposal,
+)
+from coord.preflight_size import SplitVerification
 from coord.network import StatusResult
 from coord.review import repo_focus_lines
 
@@ -1743,6 +1754,174 @@ class TestPreflightGuard:
             machine=machine, board=board,
         )  # must not raise — original dispatch proceeds
         mock_dispatch_triage.assert_not_called()
+
+    def _completed_triage_assignment(self, **overrides) -> Assignment:
+        fields = dict(
+            machine_name="laptop", repo_name="api", issue_number=99,
+            issue_title="size triage", status="done", type="review",
+            review_target=size_triage_review_target_for(99),
+            assignment_id="asg-1",
+        )
+        fields.update(overrides)
+        return Assignment(**fields)
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.decomposition_chat.parse_size_triage_response")
+    @patch("coord.notify._fetch_raw_log_text_by_id")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_proceed_verdict_lets_original_proceed(
+        self, mock_get_issue, mock_dispatch_triage, mock_fetch_log, mock_parse,
+        mock_file_and_queue,
+    ) -> None:
+        """#3830: a terminal triage assignment whose verdict parses as
+        PROCEED (``parse_size_triage_response`` returns `None`) is consumed
+        — not ignored — but still just lets the original dispatch proceed,
+        same as before verdict consumption existed."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.completed.append(self._completed_triage_assignment())
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+        mock_fetch_log.return_value = "PROCEED — this issue is fine as-is."
+        mock_parse.return_value = None
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=99,
+            machine=machine, board=board,
+        )  # must not raise — PROCEED lets the original dispatch proceed
+        mock_fetch_log.assert_called_once_with("asg-1", None, "laptop.tailnet")
+        mock_parse.assert_called_once()
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch(
+        "coord.decomposition_chat.parse_size_triage_response",
+        side_effect=SizeTriageError("could not parse triage verdict"),
+    )
+    @patch("coord.notify._fetch_raw_log_text_by_id")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_unparseable_verdict_lets_original_proceed(
+        self, mock_get_issue, mock_dispatch_triage, mock_fetch_log, mock_parse,
+        mock_file_and_queue,
+    ) -> None:
+        """An unparseable terminal verdict (`SizeTriageError`) is treated
+        the same as PROCEED — fail open, let the original dispatch
+        proceed, never block on a verdict this gate couldn't understand."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.completed.append(self._completed_triage_assignment())
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+        mock_fetch_log.return_value = "garbage, not a real verdict"
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=99,
+            machine=machine, board=board,
+        )  # must not raise
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.preflight_size.verify_split_proposal")
+    @patch("coord.decomposition_chat.parse_size_triage_response")
+    @patch("coord.notify._fetch_raw_log_text_by_id")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_verified_split_files_queues_and_supersedes_original(
+        self, mock_get_issue, mock_dispatch_triage, mock_fetch_log, mock_parse,
+        mock_verify, mock_file_and_queue,
+    ) -> None:
+        """#3830 acceptance: a SPLIT verdict that passes
+        `verify_split_proposal` is handed to
+        `file_and_queue_split_proposal` — which files the epic + children,
+        queues them, and supersedes the original — and the *original*
+        dispatch is refused in favour of the new epic, not re-dispatched
+        and not handed a second triage session."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.completed.append(self._completed_triage_assignment())
+        mock_get_issue.return_value = {
+            "title": "A giant issue", "labels": [{"name": "epic"}],
+        }
+        mock_fetch_log.return_value = "SPLIT — too big for one worker."
+        proposal = SplitProposal(
+            id=0, repo_name="api", issue_number=99, issue_title="A giant issue",
+            rationale="too big for one worker", chunks=[
+                SplitChunk(title="Part 1", scope="do part 1", files_likely=["a.py"]),
+                SplitChunk(title="Part 2", scope="do part 2", files_likely=["b.py"]),
+            ],
+        )
+        mock_parse.return_value = proposal
+        verification = SplitVerification(
+            ok=True, reason=None, epic_body="epic body",
+            work_order=WorkOrder(nodes=(
+                WorkOrderNode(issue_number=1, after=()),
+                WorkOrderNode(issue_number=2, after=(1,)),
+            )),
+        )
+        mock_verify.return_value = verification
+        mock_file_and_queue.return_value = 555
+
+        with pytest.raises(DispatchRefused, match="split"):
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=99,
+                machine=machine, board=board,
+            )
+        mock_dispatch_triage.assert_not_called()
+        mock_verify.assert_called_once_with(proposal)
+        mock_file_and_queue.assert_called_once()
+        kwargs = mock_file_and_queue.call_args.kwargs
+        assert kwargs["proposal"] is proposal
+        assert kwargs["verification"] is verification
+        assert kwargs["repo"] is repo
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.preflight_size.verify_split_proposal")
+    @patch("coord.decomposition_chat.parse_size_triage_response")
+    @patch("coord.notify._fetch_raw_log_text_by_id")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_gate_rejected_split_lets_original_proceed(
+        self, mock_get_issue, mock_dispatch_triage, mock_fetch_log, mock_parse,
+        mock_verify, mock_file_and_queue,
+    ) -> None:
+        """A SPLIT verdict that `verify_split_proposal` rejects (malformed
+        chunks, a work order that doesn't parse back, ...) must never file
+        a broken epic — it falls through and lets the original dispatch
+        proceed, same as PROCEED."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        board.completed.append(self._completed_triage_assignment())
+        mock_get_issue.return_value = {
+            "title": "A giant issue", "labels": [{"name": "epic"}],
+        }
+        mock_fetch_log.return_value = "SPLIT — too big for one worker."
+        proposal = SplitProposal(
+            id=0, repo_name="api", issue_number=99, issue_title="A giant issue",
+            rationale="too big for one worker", chunks=[
+                SplitChunk(title="Part 1", scope="do part 1", files_likely=[]),
+            ],
+        )
+        mock_parse.return_value = proposal
+        mock_verify.return_value = SplitVerification(
+            ok=False, reason="chunk declares no files",
+        )
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=99,
+            machine=machine, board=board,
+        )  # must not raise — gate-rejected split falls through
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_not_called()
 
     @patch(
         "coord.decomposition_chat.dispatch_size_triage_review",

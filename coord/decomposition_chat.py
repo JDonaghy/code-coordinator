@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from coord.config import Config
     from coord.models import Assignment, Board, Machine, Repo, SplitProposal
+    from coord.preflight_size import SplitVerification
 
 _log = logging.getLogger(__name__)
 
@@ -1277,6 +1278,106 @@ def parse_size_triage_response(
         ),
         chunks=chunks,
     )
+
+
+def file_and_queue_split_proposal(
+    *,
+    proposal: "SplitProposal",
+    verification: "SplitVerification",
+    repo: "Repo",
+) -> int:
+    """File *proposal*'s chunks as a real epic + children and queue them.
+
+    Called only after :func:`coord.preflight_size.verify_split_proposal` has
+    returned ``ok=True`` for *verification* — this function trusts
+    ``verification.work_order`` and ``verification.epic_body`` without
+    re-validating them. ``work_order``'s nodes carry placeholder, 1-based
+    positions (both as ``issue_number`` and inside each node's ``after``
+    tuple) matching ``proposal.chunks``' order, not real GitHub issue
+    numbers — filing each child in order and remapping those positions to
+    the real numbers it gets back is this function's own job.
+
+    Order of operations: file the epic, file each child in
+    ``proposal.chunks`` order, remap the placeholder work order onto the
+    real numbers and splice it into the epic body, queue each child
+    (confirming every queue write with a readback — an unconfirmed queue
+    insert is not a queued child), then close the original issue pointing
+    at the new epic. Returns the new epic's issue number.
+
+    A failure partway through (a `gh` call failing, a queue write that
+    doesn't read back) is allowed to raise — by that point real issues
+    already exist on GitHub, so there is no "abort to dispatching the
+    original" left to fall back to; the caller's own abort-on-rejection
+    path is for *before* this function is ever called, when
+    ``verification.ok`` is still ``False``.
+    """
+    from coord import github_ops
+    from coord.milestone_order import (
+        TRACKING_ISSUE_LABEL,
+        WorkOrder,
+        WorkOrderNode,
+        render_sub_issues,
+        replace_sub_issues_section,
+    )
+    from coord.state import enqueue_drive_queue, get_drive_queue_entry
+
+    assert verification.work_order is not None  # guaranteed by ok=True
+
+    epic_body = (
+        f"{proposal.rationale}\n\n"
+        f"Split from #{proposal.issue_number} by the preflight "
+        "size-triage review. Children are filed below and queued in "
+        "overlap order."
+    )
+    epic = github_ops.create_issue(
+        repo.github,
+        title=f"{proposal.issue_title} (split)",
+        body=epic_body,
+        labels=[TRACKING_ISSUE_LABEL],
+    )
+    epic_number = epic["number"]
+
+    position_to_real: dict[int, int] = {}
+    for position, chunk in enumerate(proposal.chunks, start=1):
+        files_block = "\n".join(f"- {f}" for f in chunk.files_likely)
+        child_body = f"{chunk.scope}\n\n## Files\n{files_block}\n"
+        child = github_ops.create_issue(repo.github, title=chunk.title, body=child_body)
+        position_to_real[position] = child["number"]
+
+    remapped_nodes = tuple(
+        WorkOrderNode(
+            issue_number=position_to_real[node.issue_number],
+            after=tuple(sorted(position_to_real[a] for a in node.after)),
+        )
+        for node in verification.work_order.nodes
+    )
+    new_block = render_sub_issues(WorkOrder(nodes=remapped_nodes))
+    github_ops.update_issue_body(
+        repo.github,
+        epic_number,
+        replace_sub_issues_section(epic_body, new_block),
+    )
+
+    for node in remapped_nodes:
+        after_keys = [f"{repo.name}#{a}" for a in node.after] or None
+        enqueue_drive_queue(repo.name, node.issue_number, after=after_keys)
+        if get_drive_queue_entry(repo.name, node.issue_number) is None:
+            raise RuntimeError(
+                f"queued child #{node.issue_number} in {repo.name!r} but it "
+                "did not read back from the drive queue"
+            )
+
+    github_ops.close_issue(
+        repo.github,
+        proposal.issue_number,
+        comment=(
+            f"Superseded by #{epic_number} — split into "
+            f"{len(proposal.chunks)} child issue(s) per the size-triage "
+            "review."
+        ),
+    )
+
+    return epic_number
 
 
 def dispatch_size_triage_review(
