@@ -7816,6 +7816,29 @@ class TestBlockingFindingsConfirmedAbsent:
         assert evidence.confirmed_absent is True
         assert evidence.fail_closed_unparseable is False
 
+    def test_marker_blocking_zero_does_not_override_contradicting_prose(
+        self,
+    ) -> None:
+        """#3833 (Finding 1): a `blocking=0` marker must not fail-open the
+        #476 override gate when the body's own "## Blocking findings"
+        section contains a genuine, substantive bullet underneath it — the
+        marker is a backstop for bodies with no parseable blocking section
+        at all, not a license to override prose that says otherwise."""
+        from coord.review import (
+            blocking_findings_confirmed_absent,
+            classify_blocking_evidence,
+        )
+        body = (
+            "<!-- coord:review verdict=approve blocking=0 assignment=r1 -->\n"
+            "\n"
+            "## Blocking findings\n"
+            "- The worktree created on the early-exit path is never removed\n"
+        )
+        evidence = classify_blocking_evidence(body, assignment_id="r1")
+        assert evidence.confirmed_absent is False
+        assert evidence.fail_closed_unparseable is False
+        assert blocking_findings_confirmed_absent(body, assignment_id="r1") is False
+
     def test_classify_blocking_evidence_never_touches_the_counter(self) -> None:
         """`classify_blocking_evidence`/`blocking_findings_confirmed_absent`
         are pure — `scripts/audit_review_verdict_overrides.py` replays them
@@ -7999,6 +8022,50 @@ class TestClassifyFindingNitClass:
             "Nothing blocking, a couple of nits worth a look.\n"
         )
         assert classify_finding_nit_class(body, assignment_id="r1") is True
+
+    def test_blocking_zero_body_with_sealed_path_fix_is_not_nit_class(self) -> None:
+        """A clean `blocking=0` report never exempts the *fix itself* from
+        grading — a sealed-path-touching fix is NOT nit-class even when the
+        review body it's attached to reports zero blocking findings."""
+        from coord.review import ProposedFix, classify_finding_nit_class
+        body = (
+            "<!-- coord:review verdict=request-changes blocking=0 "
+            "assignment=r1 -->\n"
+            "\n"
+            "Nothing blocking, a couple of nits worth a look.\n"
+        )
+        fix = ProposedFix(
+            diff_text=(
+                "--- a/tests/acceptance/test_foo.py\n"
+                "+++ b/tests/acceptance/test_foo.py\n"
+                "-x = 1\n"
+                "+x = 2\n"
+            ),
+            behavioral=False,
+            touches_public_api=False,
+        )
+        assert classify_finding_nit_class(
+            body, assignment_id="r1", fix=fix, sealed_paths=["tests/acceptance/"],
+        ) is False
+
+    def test_blocking_zero_body_with_behavioral_fix_is_not_nit_class(self) -> None:
+        """Same as above for a behavioral fix: the fix's own properties are
+        graded regardless of what the review body reported."""
+        from coord.review import ProposedFix, classify_finding_nit_class
+        body = (
+            "<!-- coord:review verdict=request-changes blocking=0 "
+            "assignment=r1 -->\n"
+            "\n"
+            "Nothing blocking, a couple of nits worth a look.\n"
+        )
+        fix = ProposedFix(
+            diff_text="--- a/coord/foo.py\n+++ b/coord/foo.py\n-n = 2\n+n = 3\n",
+            behavioral=True,
+            touches_public_api=False,
+        )
+        assert classify_finding_nit_class(
+            body, assignment_id="r1", fix=fix,
+        ) is False
 
 
 class TestRecordUnparseableTreatedAsBlocking:

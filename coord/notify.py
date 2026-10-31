@@ -4106,14 +4106,21 @@ def _attach_review_header(
 ) -> str:
     """#248: prepend the machine-readable header line to a review *body*.
 
-    Counts are derived heuristically from the body's markdown sections.
-    The header always carries the verdict; counts/identity fields are
-    omitted when unavailable.
+    Counts come from `authoritative_review_counts` — the same
+    marker-first-then-prose read `classify_blocking_evidence` uses
+    internally for the #476 override gate (#3833 "one question, one
+    answer"). Reading counts any other way here would let this header,
+    which the TUI badge and coordinator sessions treat as the audit trail
+    for what the gate decided, disagree with the gate itself. The header
+    always carries the verdict; counts/identity fields are omitted when
+    unavailable.
     """
     from coord.review import (  # noqa: PLC0415 — local import keeps import graph clean
-        estimate_review_counts, format_review_header,
+        authoritative_review_counts, format_review_header,
     )
-    blocking, nonblocking, nits = estimate_review_counts(body)
+    blocking, nonblocking, nits = authoritative_review_counts(
+        body, assignment_id=assignment_id,
+    )
     header = format_review_header(
         verdict=verdict,
         reviewer_machine=reviewer_machine,
