@@ -315,14 +315,21 @@ def enforce_preflight_guard(
     the drive-queue auto-drain tick, `coord approve`) all resolve a real
     board and pass it through.
 
-    The triage dispatch itself only fires once per issue: a matching
-    `review_target` already present in `board.active` *or*
-    `board.completed` (terminal statuses per
-    `coord.drive_state.TERMINAL_STATUSES`, which includes `advisory`/
+    The triage dispatch itself only fires once per issue *within the
+    board's retention window*: a matching `review_target`, scoped to this
+    *repo* (issue numbers collide across repos), already present in
+    `board.active` *or* `board.completed` (terminal statuses per
+    `coord.dao.TERMINAL_STATUSES`, which includes `advisory`/
     `refused_policy`/`refused_premise` — an assignment can go terminal
     without ever being moved out of `active`) means a triage session has
     already run or is running, so this never re-scores and re-dispatches
-    a fresh paid session on every retry. Consuming the eventual
+    a fresh paid session on every retry. A size-triage row can also sit
+    non-terminal (e.g. `finalizing`) for the notify-drain window, during
+    which this gate correctly keeps refusing. A terminal row ages out of
+    the board projection after its retention window (`coord.dao`'s
+    `_DEFAULT_BOARD_RETENTION_DAYS`), so re-dispatching the *same* flagged
+    issue long after that will spawn one more paid triage session — bounded
+    per window, not a one-time guarantee. Consuming the eventual
     PROCEED/SPLIT verdict (dispatch the original on PROCEED; on SPLIT,
     verify via `coord.preflight_size.verify_split_proposal` and file the
     epic + chained children, superseding the original) is follow-up work
@@ -360,13 +367,13 @@ def enforce_preflight_guard(
         dispatch_size_triage_review,
         size_triage_review_target_for,
     )
-    from coord.drive_state import TERMINAL_STATUSES  # noqa: PLC0415
+    from coord.dao import TERMINAL_STATUSES  # noqa: PLC0415
 
     review_target = size_triage_review_target_for(issue_number)
     matches = [
         a
         for a in (*board.active, *board.completed)
-        if a.review_target == review_target
+        if a.review_target == review_target and a.repo_name == repo.name
     ]
     in_flight = next(
         (a for a in matches if a.status not in TERMINAL_STATUSES), None

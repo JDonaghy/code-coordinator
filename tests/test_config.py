@@ -3337,3 +3337,63 @@ def test_tier2_lane_kinds_constant_matches_bugbash_lane_driver_kinds() -> None:
     from coord.bugbash import LANE_DRIVER_KINDS
 
     assert coord_config.TIER2_LANE_KINDS == frozenset(LANE_DRIVER_KINDS)
+
+
+# ── #3817: preflight_guard: fleet-wide kill switch + per-repo opt-in ────────
+
+
+def test_preflight_guard_fleet_kill_switch_parses(tmp_path: Path) -> None:
+    """The reserved top-level `enabled: false` (a bare boolean, not a
+    mapping) is the fleet-wide kill switch — it must parse without being
+    mistaken for a per-repo entry named "enabled", and must fully disable
+    the guard even though `api` itself opted in."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api]\n"
+        "preflight_guard:\n"
+        "  enabled: false\n"
+        "  api:\n"
+        "    enabled: true\n"
+        "    triage_threshold: 5\n"
+    )
+    cfg = load(p)
+    assert cfg.preflight_guard.enabled is False
+    assert cfg.preflight_guard.for_repo("api").enabled is True
+    # The fleet switch wins regardless of the per-repo opt-in.
+    assert cfg.preflight_guard_enabled("api") is False
+
+
+def test_preflight_guard_fleet_kill_switch_defaults_to_enabled(tmp_path: Path) -> None:
+    """Omitting the top-level `enabled:` key defaults the fleet switch to
+    on, so an opted-in repo's threshold fields actually take effect."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api]\n"
+        "preflight_guard:\n"
+        "  api:\n"
+        "    enabled: true\n"
+    )
+    cfg = load(p)
+    assert cfg.preflight_guard.enabled is True
+    assert cfg.preflight_guard_enabled("api") is True
+
+
+def test_preflight_guard_absent_block_disables_every_repo(tmp_path: Path) -> None:
+    """No `preflight_guard:` block at all -> no repo has opted in, matching
+    today's behaviour (the gate never fires) rather than guessing a repo-wide
+    default."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: dell64\n    host: dell64.tail\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.preflight_guard_enabled("api") is False

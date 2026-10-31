@@ -128,6 +128,13 @@ def _dispatch_followup(
     throwaway worktree name (sometimes a stale/wrong capture), and the
     work it spawns must start a FRESH branch derived from the issue.
 
+    ``inherit_branch`` also doubles as the discriminator for the
+    STRUCTURAL PREFLIGHT-SIZE GATE (see below): the gate's ``board`` is
+    only wired in when ``inherit_branch=False``, i.e. only for a genuine
+    plan→work hand-off — never for a continuation of already in-progress
+    work, where it would be incoherent (the issue already has a branch)
+    and could permanently strand the assignment on refusal.
+
     *machine_name* (#3208) overrides which machine the follow-up is
     dispatched to — defaults to ``original.machine_name``, same as before
     this parameter existed. A same-branch fix caller that has already
@@ -184,13 +191,20 @@ def _dispatch_followup(
     # of load_dispatched() — the latter reads the local DB which is empty on a
     # thin client.  read_board() routes to the daemon's /board when configured,
     # so we get the canonical active assignment list for do-not-touch detection.
-    # Read before dispatching so the same board also feeds the #3817
-    # STRUCTURAL PREFLIGHT-SIZE GATE's dedup/triage check below.
     board = read_board()
+    # #3817 STRUCTURAL PREFLIGHT-SIZE GATE: only wire `board` in for the
+    # genuine plan→work hand-off (`inherit_branch=False`). Every other
+    # caller here (`coord fix`, `coord pr`, conflict-fix, smoke fix-ups) is
+    # a *continuation* of work already under way on an existing branch —
+    # the issue already has a branch (and often a PR with green tests), so
+    # "split this issue" is incoherent, and refusing the continuation would
+    # permanently strand the assignment (`DispatchRefused` exits
+    # EXIT_DISPATCH_REFUSED, which the drive-queue treats as non-retryable).
+    # Pass board=None so `dispatch()`'s preflight guard no-ops for those.
     response = dispatch(
         proposal, cfg, credential_fetcher=claude_credential_reachable,
         issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
-        board=board,
+        board=board if not inherit_branch else None,
     )
     assignment_id = response.get("id", "pending")
     record_dispatched(
