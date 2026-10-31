@@ -47,7 +47,15 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-from coord.overlap_predict import parse_declared_files
+from coord.milestone_order import (
+    WorkOrder,
+    WorkOrderError,
+    WorkOrderNode,
+    parse_sub_issues,
+    render_sub_issues,
+)
+from coord.models import SplitProposal
+from coord.overlap_predict import Footprint, parse_declared_files, predict_overlap
 
 __all__ = [
     "SizeThresholds",
@@ -55,6 +63,8 @@ __all__ = [
     "SizeScore",
     "DEFAULT_THRESHOLDS",
     "score_issue_size",
+    "SplitVerification",
+    "verify_split_proposal",
 ]
 
 
@@ -316,3 +326,133 @@ def score_issue_size(
         signals=tuple(signals),
         reason=reason,
     )
+
+
+# ── #3816: mechanical verification gate ─────────────────────────────────────
+#
+# WHAT THIS GUARDS. A size-triage agent (#3818's `parse_size_triage_response`,
+# or the older JSON-shaped `coord.brain.parse_split_proposals`) can propose a
+# `SplitProposal` that LOOKS fine as text but would file a broken epic: a
+# `## Sub-issues` block that doesn't actually parse, a child with no declared
+# `## Files` scope (so later overlap/ordering work has nothing to key off),
+# or an `{after: ...}` edge pointing at a child that was never declared. This
+# module stops there, deterministically and with no `claude`/network/GitHub
+# call of its own — same "pure gate in front of the expensive/irreversible
+# step" shape as :func:`score_issue_size` above, one rung later in the same
+# epic. Wiring a caller's fallback-to-dispatching-the-original-issue behaviour
+# on a rejection is the next rung (child 4) — this module only answers
+# "would this proposal file cleanly", it does not file anything itself.
+#
+# ONE QUESTION, ONE ANSWER. "Does this `## Sub-issues` text parse into a
+# DAG, with no cycle and no edge to an undeclared target" is already fully
+# answered by :func:`coord.milestone_order.parse_sub_issues` (the exact
+# grammar/validation `coord milestone add-child` itself writes against). This
+# gate round-trips through that function rather than re-deriving its own
+# notion of "valid epic body" — a second, hand-rolled grammar check here
+# would disagree with the real one the first time either grows a new shape.
+# Likewise, "which of two chunks' files collide" is already answered by
+# :func:`coord.overlap_predict.predict_overlap` — reused here, not
+# reimplemented, to order children when the caller has no real epic body
+# yet to validate.
+
+
+@dataclass(frozen=True)
+class SplitVerification:
+    """The gate's verdict on one :class:`~coord.models.SplitProposal`.
+
+    ``ok=False`` always carries a non-empty ``reason`` — the caller's
+    contract (#3816) is "reject with a reason, then fall back to dispatching
+    the original issue as-is", so a rejection with nothing to show the
+    operator defeats the point of rejecting at all.
+    """
+
+    ok: bool
+    reason: str | None
+    epic_body: str | None = None
+    work_order: WorkOrder | None = None
+
+
+def verify_split_proposal(
+    proposal: SplitProposal, *, epic_body: str | None = None
+) -> SplitVerification:
+    """Mechanically verify *proposal* is safe to file as a real epic.
+
+    Three checks, each of which rejects on its own (no check is skipped
+    because an earlier one happened to pass — see the module's "a gate must
+    be able to fail" bar):
+
+    1. Every chunk declares a non-empty `## Files` scope
+       (``chunk.files_likely``) — checked directly against the proposal,
+       independently of whichever parser produced it, because one of the
+       two legitimate producers (`coord.brain.parse_split_proposals`,
+       the JSON wire shape) does not enforce this itself.
+    2. *epic_body* — the `## Sub-issues` block that would actually be
+       written to the real epic issue — parses under the create-epic
+       grammar (:func:`coord.milestone_order.parse_sub_issues`) and
+       produces exactly one node per proposed chunk (so every child will
+       actually be visible once filed).
+    3. When the caller has no real epic body yet (the common case: the
+       real issue numbers don't exist until the epic and its children are
+       filed), one is COMPUTED here — sequential placeholder numbers in
+       proposal order, with each child's ``after`` edges derived from
+       :func:`coord.overlap_predict.predict_overlap` against only the
+       chunks strictly before it (a construction that is a DAG by
+       built-in, so it can never itself trip check 2's cycle/undeclared-
+       target failure; those failure modes are reachable through the
+       *epic_body* override instead — see the test suite).
+
+    *epic_body*, when given, is validated AS GIVEN — this lets a caller
+    that already has real issue numbers (or a test asserting a specific
+    failure mode) hand the gate the exact text about to be filed, rather
+    than only ever checking this module's own self-computed convenience
+    default.
+    """
+    if not proposal.chunks:
+        return SplitVerification(
+            ok=False, reason="proposal has no chunks to split into"
+        )
+
+    for i, chunk in enumerate(proposal.chunks, start=1):
+        files = [f for f in (chunk.files_likely or []) if str(f).strip()]
+        if not files:
+            return SplitVerification(
+                ok=False,
+                reason=(
+                    f"child {i} ({chunk.title!r}) declares no '## Files' scope"
+                ),
+            )
+
+    if epic_body is None:
+        nodes: list[WorkOrderNode] = []
+        footprints_so_far: list[Footprint] = []
+        for i, chunk in enumerate(proposal.chunks, start=1):
+            files = tuple(f for f in chunk.files_likely if str(f).strip())
+            prediction = predict_overlap(files, footprints_so_far)
+            after = tuple(
+                sorted({int(k) for k in prediction.after_keys})
+            )
+            nodes.append(WorkOrderNode(issue_number=i, after=after))
+            footprints_so_far.append(
+                Footprint(key=str(i), issue_number=i, files=files)
+            )
+        epic_body = "## Sub-issues\n" + render_sub_issues(WorkOrder(nodes=tuple(nodes)))
+
+    try:
+        parsed = parse_sub_issues(epic_body)
+    except WorkOrderError as exc:
+        return SplitVerification(
+            ok=False,
+            reason=f"proposed epic body failed the create-epic grammar: {exc}",
+        )
+
+    if len(parsed.nodes) != len(proposal.chunks):
+        return SplitVerification(
+            ok=False,
+            reason=(
+                f"proposed epic body declares {len(parsed.nodes)} sub-issue(s), "
+                f"but the proposal has {len(proposal.chunks)} chunk(s) — not "
+                "every child would be visible once filed"
+            ),
+        )
+
+    return SplitVerification(ok=True, reason=None, epic_body=epic_body, work_order=parsed)
