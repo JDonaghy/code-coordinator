@@ -1409,6 +1409,30 @@ def issue_is_closed(repo: str, issue_number: int) -> bool:
         return False
 
 
+def get_issue_state(repo: str, issue_number: int) -> str | None:
+    """Return issue ``issue_number``'s current state, ``"open"`` or ``"closed"``.
+
+    Unlike :func:`issue_is_closed`, this is **not** fail-open to a single
+    permissive boolean: a ``gh`` error, or a response with no recognizable
+    ``state`` field, returns ``None`` — distinct from either real state.
+    ``coord.merge_queue.process`` uses this immediately after
+    :meth:`close_issue` reports success to confirm the issue actually ended
+    up closed, since a clean ``gh issue close`` return only proves the
+    request was issued, not the resulting state (#2096, #3821). Collapsing
+    "couldn't tell" into "closed" there would silently defeat that check.
+    """
+    try:
+        data = get_issue(repo, issue_number)
+    except (RuntimeError, json.JSONDecodeError):
+        return None
+    state = (data.get("state") or "").upper()
+    if state == "CLOSED":
+        return "closed"
+    if state == "OPEN":
+        return "open"
+    return None
+
+
 def pr_is_merged(repo: str, branch: str) -> bool:
     """True when ``branch``'s *current* tip is a commit that actually merged on ``repo``.
 
