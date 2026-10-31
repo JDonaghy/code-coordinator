@@ -159,6 +159,18 @@ _FIXIT_LEG_IN_FLIGHT_MARKER = "already in flight"
 #: `dispatch_sweep_action` call.
 _INVESTIGATE_ACTION = "dispatch_fixit_leg"
 
+#: The `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` action name a
+#: future finisher-tier cause handler dispatches (#3832's C3/C4). Named here,
+#: now, so that handler can reference one constant rather than a repeated
+#: string literal when it lands — but, deliberately, nothing in this module
+#: registers a cause against it yet: no `_register_auto_action` call, no
+#: `ALLOWLIST`/`AUTO_DISPATCHERS`/`INVESTIGATE_CAUSES` entry, no
+#: `policy_tier_of` branch. Wiring an actual cause to
+#: `coord.board_doctor_permissions.sweep_dispatch_finisher_leg` is explicitly
+#: out of scope for #3834, which only builds the permission and the bounded
+#: self-bless logic the handler will call.
+_FINISHER_ACTION = "dispatch_finisher_leg"
+
 #: cause -> auto-action name. Populated only via :func:`_register_auto_action`
 #: — never by assigning into this dict directly, so every entry is also
 #: checked against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` — the
