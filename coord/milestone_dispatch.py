@@ -1531,6 +1531,12 @@ def dispatch_entry(
         response = dispatch(
             proposal, config, status_fetcher=fetch_status,
             issue_liveness_fetcher=issue_liveness_fetcher,
+            # #3817: wire the STRUCTURAL PREFLIGHT-SIZE GATE's dedup/triage
+            # dispatch to a real board — this is the drive-queue auto-drain
+            # tick's own dispatch chokepoint (`coord milestone dispatch`
+            # and the daemon's auto-drain both funnel through here), so
+            # without this the gate could score but never actually act.
+            board=board,
         )
     except (httpx.HTTPError, ValueError) as e:
         return DispatchOutcome(

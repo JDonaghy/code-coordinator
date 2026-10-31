@@ -4029,10 +4029,16 @@ def build_app(
                 # GATE predicates so this route (the same `dispatch()`
                 # chokepoint `coord approve` funnels through) refuses on an
                 # already-closed issue or already-merged branch too.
+                # #3817: wire the STRUCTURAL PREFLIGHT-SIZE GATE's
+                # dedup/triage dispatch to a real board — this is the same
+                # `coord approve` chokepoint the comment above already
+                # names, so without this the gate could score but never
+                # actually act on a flagged verdict.
                 response = dispatch(
                     p, config, status_fetcher=_status_fetcher,
                     credential_fetcher=claude_credential_reachable,
                     issue_liveness_fetcher=github_issue_liveness_fetcher(config),
+                    board=board_for_claim,
                 )
                 assignment_id = response.get("id", "pending")
                 if repo:

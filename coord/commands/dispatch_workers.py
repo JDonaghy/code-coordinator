@@ -5052,6 +5052,13 @@ def _dispatch_headless(
             # DISPATCH-LIVENESS GATE predicates the same way
             # `credential_fetcher` just above already is.
             issue_liveness_fetcher=github_issue_liveness_fetcher(cfg),
+            # #3817: wire the STRUCTURAL PREFLIGHT-SIZE GATE's dedup/triage
+            # dispatch to a real board — `coord assign` (and `coord drive`'s
+            # own WORK stage, which funnels through here too) is a
+            # production dispatch chokepoint, so without this the gate
+            # could score an opted-in repo's issue but never actually act
+            # on a flagged verdict.
+            board=board,
         )
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)
