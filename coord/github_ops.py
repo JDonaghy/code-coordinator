@@ -1402,11 +1402,13 @@ def issue_is_closed(repo: str, issue_number: int) -> bool:
 
     Best-effort and **fail-open**: any ``gh`` error returns ``False`` so a
     transient GitHub/CLI failure never silently blocks a legitimate dispatch.
+    A thin boolean projection of :func:`get_issue_state` rather than a second
+    reader of the same fact, so the two can never disagree about an issue
+    ("couldn't tell" folds into ``False`` here, which *is* this function's
+    fail-open contract; callers that must distinguish it ask
+    :func:`get_issue_state` directly).
     """
-    try:
-        return get_issue(repo, issue_number).get("state", "").upper() == "CLOSED"
-    except (RuntimeError, json.JSONDecodeError):
-        return False
+    return get_issue_state(repo, issue_number) == "closed"
 
 
 def get_issue_state(repo: str, issue_number: int) -> str | None:

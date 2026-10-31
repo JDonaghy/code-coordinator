@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -14910,6 +14912,34 @@ class TestSweepSiblingConflicts:
         assert sibling.state == CONFLICT
         assert "#307" in sibling.error
         assert gh.calls == [("acme/api", 101)]
+
+    def test_merge_landed_kinds_covers_every_merged_event_process_emits(
+        self,
+    ) -> None:
+        """``MERGE_LANDED_KINDS`` sits next to the sweep but is written by
+        hand, while the kinds it has to cover are emitted thousands of lines
+        away in :func:`process`. Derive them straight from ``process()``'s
+        source so adding a fourth ``merged*`` outcome without listing it here
+        fails loudly instead of silently skipping the sibling sweep.
+
+        Read-back of source rather than a parametrised ``process()`` run on
+        purpose: reaching every close-failure arm needs a different gh fake
+        each, and a new arm nobody wrote a case for is exactly the gap this
+        guards.
+        """
+        emitted = set(
+            re.findall(
+                r'MergeEvent\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*,\s*"(merged\w*)"',
+                inspect.getsource(mq.process),
+            )
+        )
+
+        assert emitted, "no merged* MergeEvent found — did process() move?"
+        assert emitted == set(mq.MERGE_LANDED_KINDS), (
+            "process() emits merged* kinds that MERGE_LANDED_KINDS does not "
+            f"list (or vice versa): emitted={sorted(emitted)} "
+            f"listed={sorted(mq.MERGE_LANDED_KINDS)}"
+        )
 
     def test_a_clean_sibling_is_left_alone(self) -> None:
         merged = _sweep_entry("m", pr=100, state=MERGED)
