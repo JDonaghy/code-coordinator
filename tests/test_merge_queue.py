@@ -579,6 +579,12 @@ class FakeGh:
     # `process()`'s lint step is a no-op, matching pre-#1196 behavior.
     pr_bodies: dict[int, str] = field(default_factory=dict)
     open_children: set[int] = field(default_factory=set)
+    # #3821: issue number -> specific open child numbers, for tests that
+    # care about the diagnostic detail in the block-reason/comment text.
+    # Issue numbers present in `open_children` but absent here fall back to
+    # a single placeholder child (`0`) — enough to keep `get_open_children`
+    # non-empty without every pre-#3821 test needing to name a real child.
+    open_children_detail: dict[int, list[int]] = field(default_factory=dict)
     edit_body_calls: list[tuple[str, int, str]] = field(default_factory=list)
     # #1318: PR number -> commit messages on that PR; issue number -> whether
     # it carries the epic/tracking label. Defaults keep every prior test
@@ -679,6 +685,12 @@ class FakeGh:
     def has_open_children(self, repo: str, issue_number: int) -> bool:
         return issue_number in self.open_children
 
+    def get_open_children(self, repo: str, issue_number: int) -> list[dict]:
+        if issue_number not in self.open_children:
+            return []
+        children = self.open_children_detail.get(issue_number, [0])
+        return [{"number": n, "state": "open"} for n in children]
+
     def is_epic_issue(self, repo: str, issue_number: int) -> bool:
         return issue_number in self.epic_issues
 
@@ -773,11 +785,18 @@ class TestProcess:
     def test_close_failure_does_not_revert_merge(self) -> None:
         # #806: closing is best-effort — a `gh issue close` failure must leave
         # the merge standing and surface a warning, never undo MERGED.
+        # #3821: this is now a "merged_partial" event (the issue did NOT end
+        # up closed), and it also posts a human-visible GitHub comment so a
+        # closed-but-not-really issue is never silently stuck.
+        from unittest.mock import patch
+
         items = [_q("a")]
-        events = process(items, FakeGh(close_raises=True))
+        with patch("coord.merge_queue.comment_on_issue") as fake_comment:
+            events = process(items, FakeGh(close_raises=True))
         assert items[0].state == MERGED
-        merged = [e for e in events if e.kind == "merged"]
+        merged = [e for e in events if e.kind == "merged_partial"]
         assert merged and "could not close" in merged[0].message
+        assert fake_comment.call_count == 1
 
     def test_dry_run_does_not_close(self) -> None:
         # #806: dry-run never reaches the real merge path, so no issue is closed.
@@ -1416,6 +1435,81 @@ class TestProcess:
         downgraded = [e for e in events if e.kind == "pr_body_downgraded"]
         assert downgraded and "#1120" in downgraded[0].message
 
+    # ── #3821: the pre-merge body downgrade and the post-merge close/
+    # comment decision must never disagree about `entry.issue_number`
+    # itself (quadraui #1833 stayed open with no explanation; #1313,
+    # which hit none of these block reasons, closed cleanly). ──────────
+
+    def test_entry_issue_number_with_open_children_leaves_issue_open_with_comment(
+        self,
+    ) -> None:
+        # Reproduces #1833: `entry.issue_number` (not some other number
+        # referenced in the body) has open sub-issues. The body's own
+        # "Closes #1" must be downgraded to "Refs #1" AND the post-merge
+        # decision must skip `close_issue` and post an explanatory
+        # comment instead — never silently leave the issue open with
+        # nothing but a buried `MergeEvent`.
+        items = [_q("a")]  # issue_number=1, pr=None -> fallback "Closes #1\n\n..."
+        gh = FakeGh(open_children={1})
+        with patch("coord.merge_queue.comment_on_issue") as fake_comment:
+            events = process(items, gh)
+
+        assert items[0].state == MERGED
+        assert gh.close_calls == []
+        assert gh.pr_bodies[100].startswith("Refs #1")
+        assert "Closes #1" not in gh.pr_bodies[100]
+
+        downgraded = [e for e in events if e.kind == "pr_body_downgraded"]
+        assert downgraded and "#1" in downgraded[0].message
+
+        partial = [e for e in events if e.kind == "merged_partial"]
+        assert partial and "open sub-issues" in partial[0].message
+
+        assert fake_comment.call_count == 1
+        call_args = fake_comment.call_args[0]
+        call_kwargs = fake_comment.call_args[1]
+        assert call_args[0] == "api"
+        assert call_args[1] == 1
+        assert "open sub-issues" in call_args[2]
+        assert "intentionally left OPEN" in call_args[2]
+        assert call_kwargs.get("repo_github") == "acme/api"
+
+    def test_entry_issue_number_with_epic_label_leaves_issue_open_with_comment(
+        self,
+    ) -> None:
+        # Same invariant, but blocked by the epic/tracking label (#1318)
+        # rather than open children (#1196).
+        items = [_q("a")]
+        gh = FakeGh(epic_issues={1})
+        with patch("coord.merge_queue.comment_on_issue") as fake_comment:
+            events = process(items, gh)
+
+        assert items[0].state == MERGED
+        assert gh.close_calls == []
+        assert gh.pr_bodies[100].startswith("Refs #1")
+
+        partial = [e for e in events if e.kind == "merged_partial"]
+        assert partial and "epic/tracking label" in partial[0].message
+        assert fake_comment.call_count == 1
+        assert "epic/tracking label" in fake_comment.call_args[0][2]
+
+    def test_entry_issue_number_with_no_block_reason_closes_and_no_comment(
+        self,
+    ) -> None:
+        # Reproduces #1313: nothing blocks `entry.issue_number` — it
+        # closes cleanly, and (unlike the blocked cases above) no
+        # "left open" comment is ever posted.
+        items = [_q("a")]
+        gh = FakeGh()
+        with patch("coord.merge_queue.comment_on_issue") as fake_comment:
+            events = process(items, gh)
+
+        assert items[0].state == MERGED
+        assert gh.close_calls == [("acme/api", 1)]
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "closed issue #1" in merged[0].message
+        assert fake_comment.call_count == 0
+
 
 class TestProcessLinearityFallback:
     """#1467: `gh pr merge --rebase` refuses any branch containing a merge
@@ -1622,16 +1716,28 @@ class TestProcessRealGithubOpsChokepoint:
         entry = _q("w1", repo="api", repo_github="acme/api", target="main", size=10)
         entry.issue_number = 1041  # #1196 hole 1: the epic itself, type="work"
 
-        events = process([entry], real_gh_ops)
+        from unittest.mock import patch
+
+        with patch("coord.merge_queue.comment_on_issue") as fake_comment:
+            events = process([entry], real_gh_ops)
 
         # Merge succeeded — the PR itself lands.
         assert entry.state == MERGED
-        # But the epic was never closed: the chokepoint's guard refused.
-        merged_events = [e for e in events if e.kind == "merged"]
+        # #3821: the epic was never closed — and, since the unified
+        # `issue_close_block_reason` check already knows #1041 has an open
+        # child BEFORE merge, `close_issue()` is never even attempted (the
+        # `_boom_subprocess` guard above would fail the test if it were).
+        # This is a `"merged_partial"` event, not a bare `"merged"` one —
+        # and the specific open child (#1039) still appears in its message,
+        # read live via `get_open_children` rather than from a caught
+        # `IssueHasOpenChildrenError`.
+        merged_events = [e for e in events if e.kind == "merged_partial"]
         assert merged_events
-        assert "could not close" in merged_events[0].message
-        assert "open children" in merged_events[0].message.lower()
+        assert "open sub-issues" in merged_events[0].message
         assert "#1039" in merged_events[0].message
+        # And a human-visible comment explains why the issue stayed open.
+        assert fake_comment.call_count == 1
+        assert "#1039" in fake_comment.call_args[0][2]
         # Hole 2: the PR body's own `Closes #1041` was downgraded pre-merge.
         downgrade_events = [e for e in events if e.kind == "pr_body_downgraded"]
         assert downgrade_events and "#1041" in downgrade_events[0].message
