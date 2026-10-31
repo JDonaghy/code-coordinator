@@ -5,41 +5,54 @@
 [![Tests](https://github.com/JDonaghy/code-coordinator/actions/workflows/test.yml/badge.svg)](https://github.com/JDonaghy/code-coordinator/actions/workflows/test.yml)
 [![License: FSL-1.1-MIT](https://img.shields.io/badge/license-FSL--1.1--MIT-blue)](LICENSE)
 
-**Run Claude Code as an engineering team, not a chat window.**
+**A harness for running Claude Code on real projects, mostly unattended.**
 
-One Claude Code session is a capable engineer. Ten of them, left alone, are a mess: they
-grade their own work, collide in the same files, forget everything when a session dies,
-quietly widen their scope, and spend money without anyone noticing. code-coordinator is the
-process around the agents. It gives each issue its own isolated worker, sends every change
-through **Work → Test → Review → Merge** gates the worker cannot talk its way past, and keeps
-the human where a human is actually needed: deciding what to build and making the judgment
-calls.
+I built this tool to help me develop [vimcode](https://github.com/JDonaghy/vimcode), and later
+[quadraui](https://github.com/JDonaghy/quadraui), with Claude Code doing most of the work. I was
+delighted by the early results — a basic functioning text editor in a terminal after a day, one
+that was already starting to feel like vi (yes, I remember that incarnation, because I had to use
+it in my first job and disliked it so much).
 
-It drives the `claude` CLI on your existing Max or Pro subscription. There is no API key and no
-Anthropic SDK.
+Yet after a few weeks of progress I realized things weren't going quite as well anymore. I was
+targeting the terminal and GTK on Linux, and I discovered that Claude was reimplementing large
+chunks of logic for both targets. I wanted one codebase for all backends, and I wasn't going to
+get there by assuming Claude would just know what to do — not unless I was extremely explicit
+about what I wanted. Testing wasn't going so well any more either: I would tell Claude what I
+wanted and it would often only deliver after multiple rounds of interactive testing. Too painful
+to be sustainable.
 
-## What it has built
+I realized I needed better tooling if I was ever going to get where I wanted, which was a vim-like
+editor as slick as VS Code, that worked in a terminal and could also run as a native client on all
+major operating systems. And I wanted a framework that could compete with Electron minus the web
+stuff: cross-platform, feels native, highly responsive, and works in a terminal. So
+code-coordinator was born from this desire.
 
-This is not a demo on toy tasks. Since May 2026 code-coordinator has been the way all of the
-following were developed, by agents, with one human acting as tech lead:
+Now I have a board of epics and stories with a 24/7 queue that works through them. Each issue gets
+an isolated worker, every change runs through **Work → Test → Review → Merge** gates, and I get to
+focus on the parts that only I can do: deciding what to build and the judgment calls around that.
 
-| Project | What it is | Commits (co-authored by Claude) |
+I use the `claude` CLI on a Max 20x subscription — no API key, no SDK, though it supports BYOK.
+
+## Where it's gotten me to
+
+The receipts, with Claude Code doing the work and me acting as tech lead:
+
+| Project | | Commits (Claude co-authored) |
 |---|---|---|
-| [vimcode](https://github.com/JDonaghy/vimcode) | A Vim + VS Code hybrid editor in Rust: GTK4, native macOS, native Windows and terminal front ends, LSP, a debugger (DAP), a git panel, Lua extensions. [vimcode.org](https://vimcode.org) | 2,342 (2,056) since Feb 2026; 1,146 of them since code-coordinator took over in May |
-| [quadraui](https://github.com/JDonaghy/quadraui) | The cross-platform UI framework under vimcode: one app codebase rendered to a terminal, GTK4, macOS and Windows. Its [independent audit](https://github.com/JDonaghy/quadraui/blob/develop/quadraui/docs/audits/FRAMEWORK_AUDIT_2026-09-26.md) is published unedited. | 1,314 (1,107) since Apr 2026 |
-| code-coordinator | This repository. It builds itself through its own pipeline. | 2,763 (2,403) since May 2026 |
-| [coord-tui](https://github.com/JDonaghy/coord-tui) | The Rust terminal board for code-coordinator, built on quadraui. | 710 (671) since May 2026 |
+| [vimcode](https://github.com/JDonaghy/vimcode) | The editor it all started with. [vimcode.org](https://vimcode.org) | 2,718 (2,371) since Feb 2026 |
+| [quadraui](https://github.com/JDonaghy/quadraui) | The one-codebase-all-backends UI framework under it. Its [independent audit](https://github.com/JDonaghy/quadraui/blob/develop/quadraui/docs/audits/FRAMEWORK_AUDIT_2026-09-26.md) is published unedited. | 1,810 (1,517) since Apr 2026 |
+| code-coordinator | This repository. It builds itself through its own pipeline. | 2,934 (2,463) since May 2026 |
+| [coord-tui](https://github.com/JDonaghy/coord-tui) | The Rust terminal board for it, built on quadraui. | 712 (622) since May 2026 |
 
-code-coordinator ships to PyPI on most merges to `main`: 512 releases so far, with about 7,500
-Python test functions behind them.
+It ships to PyPI on most merges to `main` — nearly 800 releases so far.
 
-## The traps, and what it does about each
+## The problems, and what it does about each
 
-These are the failure modes that showed up when running many agents for months. Each mechanism
-below exists because the trap actually happened.
+These are the failure modes that showed up running many agents over months. Each mechanism
+below is here because the problem actually bit me.
 
-**1. The agent grades its own homework.** A worker that writes the code and the tests, then
-reports "all tests pass", has told you very little.
+**1. The agent grades its own homework.** A worker that writes both the code and the tests, then
+reports "all tests pass", doesn't tell you much.
 - Review is done by a **separate session with zero shared context**, by default on a different
   machine. It reviews the diff against the repo's own `CLAUDE.md` rules and must return a
   structured verdict.
@@ -51,8 +64,8 @@ reports "all tests pass", has told you very little.
 **2. "Done" is a claim, not a fact.** The Test stage re-runs the suite on hardware that matches
 the change (a GTK box, a Windows box, a browser box) and records a verdict. Review is held until
 Test passes. A verdict also records *how* it was obtained: one the worker recorded itself, or
-one from a machine that only emulates the platform, is labelled as such on the board rather
-than passed off as a clean pass.
+one from a machine that only emulates the platform, is labelled as such on the board rather than
+passed off as a clean pass.
 
 **3. Agents collide.** Every worker runs in its own git worktree. Before an issue is queued, its
 declared files are compared with the **real diffs** of branches already in flight, and the
@@ -92,16 +105,16 @@ the reason attached.
 
 ## What it does not solve
 
-- **You are still the tech lead.** It does not decide what is worth building, and it escalates
+- **You are still the tech lead.** It doesn't decide what's worth building, and it escalates
   rather than guesses when a gate is ambiguous. Expect to spend your time on triage and design,
-  not on watching sessions.
+  not watching sessions.
 - **It still drops things.** Recent examples: an approved PR whose queue row had been removed
-  sat unmerged with nothing alerting on it; and a library fix lands upstream while the issue to
-  adopt it downstream is never filed. Known traps of this kind are written up in
+  sat unmerged with nothing alerting on it; a library fix lands upstream while the issue to
+  adopt it downstream never gets filed. Known traps like these are written up in
   [`docs/OPERATING_GOTCHAS.md`](docs/OPERATING_GOTCHAS.md).
-- **Gates are only as good as the tests behind them.** A suite that cannot see a bug cannot gate
-  it, and a platform with no capable test machine cannot be gated at all.
-- **It is a single-operator tool today.** It runs one person's fleet over Tailscale. There is no
+- **Gates are only as good as the tests behind them.** A suite that can't see a bug can't gate
+  it, and a platform with no capable test machine can't be gated at all.
+- **It's a single-operator tool.** It runs one person's fleet over Tailscale. There's no
   multi-user permission model beyond the tailnet's access controls.
 
 ## How it works
