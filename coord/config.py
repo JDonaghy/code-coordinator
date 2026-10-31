@@ -12,7 +12,7 @@ import sys
 # `from datetime import time` below shadows the stdlib `time` module in this
 # namespace, so the monotonic clock is imported under an explicit alias.
 import time as time_module
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -874,6 +874,73 @@ class PrereviewGateConfig:
         has none configured — mirrors :meth:`AcceptanceConfig.has_driver`'s
         "absent means opted out, never a broken config" posture."""
         return self.repos.get(repo_name, PrereviewGateRepoConfig())
+
+
+@dataclass
+class PreflightGuardRepoConfig:
+    """One entry under ``preflight_guard.<repo_name>`` (#3816) — the
+    opt-in preflight decomposition guard: a size heuristic
+    (:func:`coord.preflight_size.score_issue_size`) that decides whether an
+    issue is worth the (paid) size-triage agent, and a mechanical gate
+    (:func:`coord.preflight_size.verify_split_proposal`) that rejects a
+    triage agent's SPLIT proposal before it is ever filed as a real epic.
+
+    Disabled by default (``enabled=False``): an absent or unconfigured
+    repo takes none of this epic's later rungs, identical to today's
+    behaviour. The threshold fields below are all ``None`` by default —
+    "use :data:`coord.preflight_size.DEFAULT_THRESHOLDS`'s own value" —
+    so setting ``enabled: true`` alone opts a repo into the module's
+    stock heuristic rather than requiring every knob to be re-specified.
+    Wiring this config into an actual dispatch decision is child 4's job;
+    this class only carries the knobs.
+    """
+
+    enabled: bool = False
+    files_some: int | None = None
+    files_many: int | None = None
+    dirs_many: int | None = None
+    criteria_some: int | None = None
+    criteria_many: int | None = None
+    triage_threshold: float | None = None
+
+    def resolve_thresholds(self) -> "SizeThresholds":
+        """This repo's :class:`~coord.preflight_size.SizeThresholds`,
+        overlaying only the fields this entry set onto
+        :data:`~coord.preflight_size.DEFAULT_THRESHOLDS` — an unset
+        (``None``) field keeps the module's own default rather than
+        silently becoming ``0``, same "absent means default, not zero"
+        posture the rest of this config file uses.
+        """
+        from coord.preflight_size import DEFAULT_THRESHOLDS
+
+        overrides = {
+            name: value
+            for name, value in (
+                ("files_some", self.files_some),
+                ("files_many", self.files_many),
+                ("dirs_many", self.dirs_many),
+                ("criteria_some", self.criteria_some),
+                ("criteria_many", self.criteria_many),
+                ("triage_threshold", self.triage_threshold),
+            )
+            if value is not None
+        }
+        if not overrides:
+            return DEFAULT_THRESHOLDS
+        return replace(DEFAULT_THRESHOLDS, **overrides)
+
+
+@dataclass
+class PreflightGuardConfig:
+    """``preflight_guard:`` — repo name -> :class:`PreflightGuardRepoConfig`."""
+
+    repos: dict[str, PreflightGuardRepoConfig] = field(default_factory=dict)
+
+    def for_repo(self, repo_name: str) -> PreflightGuardRepoConfig:
+        """*repo_name*'s guard config, or an all-disabled default when it
+        has none configured — mirrors :meth:`PrereviewGateConfig.for_repo`'s
+        "absent means opted out" posture."""
+        return self.repos.get(repo_name, PreflightGuardRepoConfig())
 
 
 # #1430: plan-worker ESTIMATE -> escalation rung (see ModelsConfig.model_for_estimate).
@@ -3061,6 +3128,9 @@ class Config:
     # dispatch_review call skips straight to the #3180 mechanical check,
     # today's behaviour untouched.
     prereview_gate: PrereviewGateConfig = field(default_factory=PrereviewGateConfig)
+    # #3816 — absent block == no repo has opted in == every repo skips the
+    # preflight decomposition guard entirely, today's behaviour untouched.
+    preflight_guard: PreflightGuardConfig = field(default_factory=PreflightGuardConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -3348,6 +3418,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
     acceptance = _parse_acceptance(raw.get("acceptance"))
     prereview_gate = _parse_prereview_gate(raw.get("prereview_gate"))
+    preflight_guard = _parse_preflight_guard(raw.get("preflight_guard"))
     models = _parse_models(raw.get("models"), set(providers.definitions))
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
@@ -3377,6 +3448,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         smoke_tests=smoke_tests,
         acceptance=acceptance,
         prereview_gate=prereview_gate,
+        preflight_guard=preflight_guard,
         models=models,
         pipeline=pipeline,
         dispatch=dispatch,
@@ -4485,6 +4557,55 @@ def _parse_prereview_gate(raw: Any) -> PrereviewGateConfig:
         repos[repo_name] = cfg
 
     return PrereviewGateConfig(repos=repos)
+
+
+def _parse_preflight_guard(raw: Any) -> PreflightGuardConfig:
+    """Parse the ``preflight_guard:`` block (#3816).
+
+    ``preflight_guard.<repo_name>`` maps a local repo name (as declared
+    under ``repos:``) to its :class:`PreflightGuardRepoConfig`. Absent
+    entirely -> no repo has opted in, matching today's behaviour (no issue
+    takes any rung of this epic's size-triage / mechanical-verification
+    pipeline). The threshold fields are left ``None`` unless explicitly set,
+    so an entry with only ``enabled: true`` inherits
+    :data:`coord.preflight_size.DEFAULT_THRESHOLDS` via
+    :meth:`PreflightGuardRepoConfig.resolve_thresholds` rather than silently
+    becoming ``0``.
+    """
+    if raw is None:
+        return PreflightGuardConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'preflight_guard' must be a mapping")
+
+    repos: dict[str, PreflightGuardRepoConfig] = {}
+    for repo_name, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(f"preflight_guard[{repo_name!r}] must be a mapping")
+
+        cfg = PreflightGuardRepoConfig()
+        if "enabled" in entry:
+            value = entry["enabled"]
+            if not isinstance(value, bool):
+                raise ConfigError(f"preflight_guard[{repo_name!r}].enabled must be a boolean")
+            cfg.enabled = value
+        for int_field in ("files_some", "files_many", "dirs_many", "criteria_some", "criteria_many"):
+            if int_field in entry:
+                value = entry[int_field]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ConfigError(
+                        f"preflight_guard[{repo_name!r}].{int_field} must be an integer"
+                    )
+                setattr(cfg, int_field, value)
+        if "triage_threshold" in entry:
+            value = entry["triage_threshold"]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(
+                    f"preflight_guard[{repo_name!r}].triage_threshold must be a number"
+                )
+            cfg.triage_threshold = float(value)
+        repos[repo_name] = cfg
+
+    return PreflightGuardConfig(repos=repos)
 
 
 def _parse_acceptance(raw: Any) -> AcceptanceConfig:
