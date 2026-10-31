@@ -39,13 +39,14 @@ from __future__ import annotations
 
 import datetime
 import logging
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from coord.config import Config
-    from coord.models import Machine
+    from coord.models import Assignment, Board, Machine, Repo, SplitProposal
 
 _log = logging.getLogger(__name__)
 
@@ -972,3 +973,362 @@ def dispatch_decomposition_chat(
     )
 
     return assignment_id, machine.name
+
+
+# ── Size-triage work-dispatch entry ──
+#
+# `coord/preflight_size.py`'s heuristic scorer flags already-filed issues
+# that look oversized for one worker, but it has no agent in the loop. This
+# entry dispatches a **read-only** `claude -p` session — pinned to sonnet,
+# never write-capable — that reads the issue body plus whatever graphify
+# graph context the caller supplies and returns either a SPLIT proposal
+# (candidate children, each with its own `## Files` scope) or a PROCEED
+# verdict. It never files an issue or queues anything itself: filing and
+# queuing a proposal is a separate, later, gated step — this module only
+# produces the proposal.
+#
+# Read-only enforcement is borrowed from `coord/gate_b.py`'s own reuse of
+# `type="review"`: `coord/agent.py`'s `default_worker_command()` applies
+# `REVIEW_DENY_COMMANDS` and `allowed_tools="Read,Bash"` unconditionally for
+# that type, regardless of which `system_prompt` is supplied — so a
+# task-specific system prompt (`SIZE_TRIAGE_SYSTEM_PROMPT`, not the generic
+# `REVIEWER_SYSTEM_PROMPT`, which is tied to code-review verdicts) still gets
+# the same no-write guarantee for free. Dispatch goes straight to the agent's
+# `/assign` HTTP endpoint with a raw dict payload (mirroring
+# `dispatch_gate_b_review`) rather than through `Proposal`/`dispatch_with_retry`,
+# since `Proposal` has no `system_prompt` field to carry a custom prompt.
+
+
+class SizeTriageError(Exception):
+    """Raised when a size-triage dispatch cannot proceed, or when the
+    agent's response cannot be parsed into a SPLIT/PROCEED verdict.
+
+    Covers both dispatch-time failures (unreachable machine, no repo path)
+    and response-parsing failures (missing verdict line, missing terminator)
+    — in both cases, the caller must treat this as a failed triage, never as
+    an implicit PROCEED. "A gate must be able to fail."
+    """
+
+
+def size_triage_review_target_for(issue_number: int) -> str:
+    """Non-numeric `review_target` sentinel for a size-triage dispatch.
+
+    Mirrors `coord.gate_b.review_target_for`: keeping it non-int-parseable
+    means `coord.notify._try_parse_and_post_review`'s `int(review_target)`
+    sniff falls through to "post as a plain issue comment" rather than
+    mistaking this for a per-issue code review of a real PR — and this
+    entry posts no comment at all (see `dispatch_size_triage_review`), so in
+    practice nothing ever reads this string back out of `coord.notify`; it
+    exists so `latest`-style lookups (if one is ever needed) can find this
+    assignment unambiguously among a repo's other `type="review"` rows.
+    """
+    return f"size-triage-{issue_number}"
+
+
+SIZE_TRIAGE_SYSTEM_PROMPT = """You are an independent triage agent dispatched by the coordinator to \
+decide whether a single GitHub issue, already flagged by a heuristic size \
+scorer as plausibly too large for one worker, should be split into smaller \
+child issues before any worker touches it.
+
+You are READ-ONLY. You may read the issue, the repository, and the \
+graphify knowledge graph, but you must NOT edit any file, create any git \
+branch or commit, run `gh` in any form, run `coord issue create`, or run \
+`coord drive-queue add`. Proposing children is your entire job; filing and \
+queuing them is a separate, later, gated step performed by a different \
+agent after your proposal is reviewed. You have no memory of who filed \
+this issue or why beyond what is in the briefing below — treat the issue \
+body as your only source of truth about intent.
+
+At the end of your session you must emit your verdict in the exact format \
+described in the briefing below. Follow it literally."""
+
+
+def build_size_triage_briefing(
+    *,
+    issue_number: int,
+    issue_title: str,
+    issue_body: str,
+    repo_github: str,
+    graph_context: str | None = None,
+    size_signals: list[str] | None = None,
+) -> str:
+    """Pure function: assemble the size-triage briefing for issue
+    `#issue_number` in `repo_github`.
+
+    `graph_context` is an optional pre-fetched excerpt of the graphify graph
+    (e.g. the module-relationship neighborhood of the files the issue's own
+    `## Files` section names) — this function never fetches it itself, so it
+    stays a pure string-assembly function and is trivially unit-testable.
+    `size_signals` is `coord/preflight_size.py`'s own reasons for flagging
+    the issue, included verbatim so the agent knows *why* it was asked to
+    look.
+    """
+    lines: list[str] = []
+    lines.append(f"# Size triage: {repo_github}#{issue_number}")
+    lines.append("")
+    lines.append(f"## Issue #{issue_number}: {issue_title}")
+    lines.append("")
+    lines.append(issue_body.strip() if issue_body else "(issue has no body)")
+    lines.append("")
+
+    if size_signals:
+        lines.append("## Why this issue was flagged for triage")
+        for signal in size_signals:
+            lines.append(f"- {signal}")
+        lines.append("")
+
+    if graph_context:
+        lines.append("## Graphify graph context")
+        lines.append(graph_context.strip())
+        lines.append("")
+    else:
+        lines.append(
+            "## Graphify graph context\n\nNo graph context was supplied for "
+            "this dispatch — query the graph yourself (`graphify query "
+            "\"...\"`) before deciding, if one is available in this checkout."
+        )
+        lines.append("")
+
+    lines.append("## What to decide")
+    lines.append(
+        "Can one worker deliver this issue as a single, reviewable diff "
+        "(PROCEED), or does it span unrelated files/modules badly enough "
+        "that splitting it into independently-assignable children first is "
+        "safer (SPLIT)? For a SPLIT, give each child a clear title, a short "
+        "prose rationale/scope, and a `## Files` list of exactly the files "
+        "it should touch — the same declaration convention every issue in "
+        "this repo already uses for its own scope. List the children in the "
+        "order they should be worked, chaining later ones on earlier ones "
+        "where one genuinely depends on another."
+    )
+    lines.append("")
+
+    lines.append("## Required output format — HARD REQUIREMENT")
+    lines.append(
+        "End your session with exactly one of the two blocks below. "
+        "`SIZE_TRIAGE_VERDICT:` and, for a split, the terminating "
+        "`END_SIZE_TRIAGE` line are both mandatory — an otherwise-complete "
+        "proposal missing `END_SIZE_TRIAGE` is discarded in its entirety, "
+        "never best-guessed from a partial response."
+    )
+    lines.append("")
+    lines.append("For a split:")
+    lines.append("")
+    lines.append("SIZE_TRIAGE_VERDICT: split")
+    lines.append("## Child 1: <title>")
+    lines.append("<one paragraph of rationale/scope>")
+    lines.append("")
+    lines.append("## Files")
+    lines.append("- path/a.py")
+    lines.append("- path/b.py")
+    lines.append("")
+    lines.append("## Child 2: <title>")
+    lines.append("...")
+    lines.append("")
+    lines.append("END_SIZE_TRIAGE")
+    lines.append("")
+    lines.append("For a single worker proceeding as-is:")
+    lines.append("")
+    lines.append("SIZE_TRIAGE_VERDICT: proceed")
+    lines.append("END_SIZE_TRIAGE")
+
+    return "\n".join(lines)
+
+
+_SIZE_TRIAGE_VERDICT_RE = re.compile(
+    r"SIZE_TRIAGE_VERDICT:\s*(split|proceed)\b", re.IGNORECASE
+)
+_SIZE_TRIAGE_CHILD_HEADING_RE = re.compile(
+    r"^##\s*Child\s+\d+\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+_SIZE_TRIAGE_FILES_HEADING_RE = re.compile(
+    r"^##\s*Files\s*$", re.IGNORECASE | re.MULTILINE
+)
+SIZE_TRIAGE_END_MARKER = "END_SIZE_TRIAGE"
+
+
+def parse_size_triage_response(
+    text: str,
+    *,
+    repo_name: str,
+    issue_number: int,
+    issue_title: str,
+) -> "SplitProposal | None":
+    """Parse a size-triage agent's response into a `SplitProposal`, or
+    `None` for an explicit PROCEED verdict.
+
+    Raises `SizeTriageError` — never returns `None` — for anything that is
+    not a clean, complete PROCEED or SPLIT: a missing/unrecognized
+    `SIZE_TRIAGE_VERDICT:` line, a missing `END_SIZE_TRIAGE` terminator, or
+    a SPLIT verdict with no parseable `## Child N:` sections. PROCEED (a
+    deliberate `None`) and "unparseable" (an exception) must never be
+    conflated — "Unconfirmed success is a defect."
+    """
+    raw = text or ""
+
+    match = _SIZE_TRIAGE_VERDICT_RE.search(raw)
+    if match is None:
+        raise SizeTriageError(
+            "no 'SIZE_TRIAGE_VERDICT: split|proceed' line found in the "
+            "agent's response"
+        )
+    if SIZE_TRIAGE_END_MARKER not in raw:
+        raise SizeTriageError(
+            f"{SIZE_TRIAGE_END_MARKER} terminator missing — an otherwise-"
+            "complete verdict without it is discarded in its entirety"
+        )
+
+    verdict = match.group(1).lower()
+    if verdict == "proceed":
+        return None
+
+    body = raw[match.end() :]
+    end_index = body.find(SIZE_TRIAGE_END_MARKER)
+    if end_index != -1:
+        body = body[:end_index]
+
+    headings = list(_SIZE_TRIAGE_CHILD_HEADING_RE.finditer(body))
+    if not headings:
+        raise SizeTriageError(
+            "SIZE_TRIAGE_VERDICT: split but no '## Child N: <title>' "
+            "sections were found to propose"
+        )
+
+    from coord.models import SplitChunk, SplitProposal
+    from coord.overlap_predict import parse_declared_files
+
+    chunks: list[SplitChunk] = []
+    for i, heading in enumerate(headings):
+        title = heading.group(1).strip()
+        block_start = heading.end()
+        block_end = (
+            headings[i + 1].start() if i + 1 < len(headings) else len(body)
+        )
+        block = body[block_start:block_end]
+
+        files_heading = _SIZE_TRIAGE_FILES_HEADING_RE.search(block)
+        scope_text = block[: files_heading.start()] if files_heading else block
+        chunks.append(
+            SplitChunk(
+                title=title,
+                scope=scope_text.strip(),
+                files_likely=parse_declared_files(block),
+            )
+        )
+
+    return SplitProposal(
+        id=0,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        rationale=(
+            "size-triage agent proposed a split after the preflight size "
+            "scorer flagged this issue"
+        ),
+        chunks=chunks,
+    )
+
+
+def dispatch_size_triage_review(
+    *,
+    repo_cfg: "Repo",
+    machine: "Machine",
+    issue_number: int,
+    issue_title: str,
+    issue_body: str,
+    board: "Board",
+    graph_context: str | None = None,
+    size_signals: list[str] | None = None,
+    http_client: Any = None,
+    now: float | None = None,
+) -> "Assignment":
+    """Dispatch a read-only, sonnet-pinned size-triage session for an
+    already-filed issue the size scorer flagged.
+
+    Pinned to `model="sonnet"` as a literal, not `config.models.default` —
+    unlike this module's other dispatch functions — because this leg must run
+    on sonnet regardless of what the coordinator's default model happens to
+    be configured to. Posts straight to the picked machine's `/assign`
+    endpoint with a raw dict payload (mirroring
+    `coord.gate_b.dispatch_gate_b_review`), because `Proposal` carries no
+    `system_prompt` field.
+
+    Deliberately posts **no** GitHub issue comment (unlike Gate B's
+    best-effort announcement) — this entry's only side effects are the one
+    HTTP POST to the agent and appending the resulting `Assignment` to
+    `board.active`; it never calls anything that files an issue or mutates
+    the drive-queue. Raises `SizeTriageError` on an unreachable machine, a
+    missing repo path, or an HTTP failure, leaving `board.active` untouched.
+    """
+    import httpx
+
+    from coord.dispatch import AGENT_PORT, ASSIGN_POST_TIMEOUT_SECS
+    from coord.models import Assignment
+
+    repo_path = machine.repo_path(repo_cfg.name)
+    if repo_path is None:
+        raise SizeTriageError(
+            f"machine {machine.name!r} has no repo_path configured for "
+            f"repo {repo_cfg.name!r}"
+        )
+
+    briefing = build_size_triage_briefing(
+        issue_number=issue_number,
+        issue_title=issue_title,
+        issue_body=issue_body,
+        repo_github=repo_cfg.github,
+        graph_context=graph_context,
+        size_signals=size_signals,
+    )
+    review_target = size_triage_review_target_for(issue_number)
+
+    payload = {
+        "repo_name": repo_cfg.name,
+        "repo_path": repo_path,
+        "issue_number": issue_number,
+        "issue_title": f"[size-triage] {issue_title}",
+        "briefing": briefing,
+        "files_allowed": [],
+        "files_forbidden": [],
+        "pull_repos": [],
+        "type": "review",
+        "model": "sonnet",
+        "system_prompt": SIZE_TRIAGE_SYSTEM_PROMPT,
+        "review_target": review_target,
+        "branch": repo_cfg.default_branch or "main",
+    }
+
+    client = http_client or httpx
+    url = f"http://{machine.host}:{AGENT_PORT}/assign"
+    try:
+        resp = client.post(url, json=payload, timeout=ASSIGN_POST_TIMEOUT_SECS)
+        resp.raise_for_status()
+        agent_response = resp.json()
+    except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        raise SizeTriageError(
+            f"agent {machine.name!r} rejected the size-triage dispatch: {exc}"
+        ) from exc
+
+    assignment = Assignment(
+        machine_name=machine.name,
+        repo_name=repo_cfg.name,
+        issue_number=issue_number,
+        issue_title=f"[size-triage] {issue_title}",
+        files_allowed=[],
+        files_forbidden=[],
+        briefing=briefing,
+        assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
+        status="running",
+        branch=repo_cfg.default_branch,
+        dispatched_at=now if now is not None else time.time(),
+        type="review",
+        review_target=review_target,
+        model="sonnet",
+    )
+    board.active.append(assignment)
+
+    from coord.state import record_dispatched_assignment
+
+    record_dispatched_assignment(assignment=assignment, repo_github=repo_cfg.github)
+
+    return assignment
