@@ -27,6 +27,8 @@ from coord.board_doctor_permissions import (
     SweepWriteNotConfirmedError,
     authorize_sweep_action,
     dispatch_sweep_action,
+    finisher_self_bless,
+    sweep_dispatch_finisher_leg,
     sweep_dispatch_fixit_leg,
     sweep_drive_queue_add,
     sweep_drive_queue_remove,
@@ -42,6 +44,7 @@ from coord.board_doctor_policy import (
 from coord.commands.drive_queue import drive_queue_add, drive_queue_remove
 from coord.config import Config
 from coord.models import Assignment, Board, Machine, Repo
+from coord.review import ProposedFix, ReviewFindings
 from coord.smoke import (
     BOARD_DOCTOR_REQUEUE_BUDGET,
     MUTE_SMOKE_LEG_BUDGET,
@@ -1199,3 +1202,237 @@ class TestDispatchFixitLeg:
             authorize_sweep_action("force_merge")
         with pytest.raises(SweepPermissionError):
             authorize_sweep_action("override_human_required")
+
+
+class TestDispatchFinisherLeg:
+    """#3834 (#3832's C2): the daemon-internal "dispatch one bounded
+    finisher leg" primitive — mirrors :func:`sweep_dispatch_fixit_leg`'s
+    dispatch half exactly, authorized through the same
+    :func:`authorize_sweep_action` gate under its own
+    ``"dispatch_finisher_leg"`` action name."""
+
+    @pytest.fixture(autouse=True)
+    def _machines_always_reachable(self, monkeypatch: pytest.MonkeyPatch):
+        from coord.network import StatusResult
+
+        monkeypatch.setattr(
+            "coord.network.fetch_status",
+            lambda machine, timeout=3.0: StatusResult(data={}),
+        )
+
+    def test_dispatches_for_a_stuck_row_with_no_live_assignment(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        client = _FakeHTTPClient({"id": "finisher-1"})
+
+        result = sweep_dispatch_finisher_leg(
+            "api", 1, board, config,
+            cause="review_needs_nit_fix",
+            evidence=("2 nits reported",),
+            http_client=client,
+        )
+
+        assert result["dispatched"] is True
+        assert result["assignment_id"] is not None
+        dispatched = board.find_by_id(result["assignment_id"])
+        assert dispatched is not None
+        assert dispatched in board.active
+        assert len(client.calls) == 1
+        _, payload = client.calls[0]
+        assert "review_needs_nit_fix" in payload["briefing"]
+        assert "2 nits reported" in payload["briefing"]
+        # The bounded-authority contract is legible in the briefing itself —
+        # the leg has no merge authority of its own beyond the nit-class
+        # bound.
+        assert "bounded" in payload["briefing"]
+        assert "ordinary worker tool-scope" in payload["briefing"]
+
+        log = query_audit_log(event_type="finisher_leg_dispatched", repo="api", issue=1)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["assignment_id"] == result["assignment_id"]
+
+    def test_noop_when_a_leg_is_already_in_flight(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+        board.active.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="prior-finisher", status="running",
+            type="work", review_of_assignment_id="w1",
+        ))
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+
+        result = sweep_dispatch_finisher_leg(
+            "api", 1, board, config, cause="review_needs_nit_fix", http_client=client,
+        )
+
+        assert result["dispatched"] is False
+        assert result["assignment_id"] is None
+        assert "already" in result["detail"]
+        assert client.calls == []
+
+    def test_noop_when_no_originating_work_assignment_exists(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+
+        result = sweep_dispatch_finisher_leg(
+            "api", 1, board, config, cause="review_needs_nit_fix", http_client=client,
+        )
+
+        assert result["dispatched"] is False
+        assert result["assignment_id"] is None
+        assert client.calls == []
+
+    def test_rejected_when_the_tier_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "coord.board_doctor_permissions.SAFE_TIER_ACTIONS",
+            frozenset(SAFE_TIER_ACTIONS - {"dispatch_finisher_leg"}),
+        )
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        board.completed.append(_fixit_work_assignment())
+
+        with pytest.raises(SweepPermissionError):
+            sweep_dispatch_finisher_leg(
+                "api", 1, board, config, cause="review_needs_nit_fix",
+            )
+
+
+def _finisher_review_assignment(
+    *,
+    aid: str = "r1",
+    review_of: str | None = "w1",
+    review_verdict: str | None = "request-changes",
+) -> Assignment:
+    return Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix the thing",
+        assignment_id=aid,
+        status="done",
+        type="review",
+        review_of_assignment_id=review_of,
+        review_verdict=review_verdict,
+        dispatched_at=10.0,
+    )
+
+
+class TestFinisherSelfBless:
+    """#3834 (#3832's C2): the bounded self-bless core — a finisher leg may
+    record approval + merge *only* when its own diff, graded over the
+    already-reviewed SHA, passes
+    `coord.review.classify_finding_nit_class`. Anything else falls back
+    wholesale to the ordinary full-review fix path
+    (`coord.auto_loop._dispatch_fix_for_review`) and never merges."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_pr_comments(self, monkeypatch: pytest.MonkeyPatch):
+        # Suppress the best-effort audit-trail PR comment's real network
+        # call — recorded separately as a structured audit-log row, which
+        # is what these tests assert on.
+        monkeypatch.setattr("coord.github_ops.post_issue_comment", lambda *a, **k: None)
+
+    def test_nit_class_diff_self_blesses_and_advances_to_merge(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        work.branch = None  # skip merge-queue refresh machinery entirely
+        board.completed.append(work)
+        review = _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        board.completed.append(review)
+        findings = ReviewFindings(
+            verdict="request-changes",
+            body=(
+                "<!-- coord:review verdict=approve blocking=0 assignment=r1 nits=2 -->\n"
+                "## Nits\n- rename var\n"
+            ),
+        )
+        fix = ProposedFix(
+            diff_text=(
+                "--- a/foo.py\n+++ b/foo.py\n@@ -1,1 +1,1 @@\n-foo\n+bar\n"
+            ),
+            behavioral=False,
+            touches_public_api=False,
+        )
+
+        result = finisher_self_bless(
+            review, findings, board, config,
+            fix=fix,
+            applied_nits=("rename var",),
+            waived_nits=(),
+        )
+
+        assert result["blessed"] is True
+        assert result["actions"] == []
+        assert review.review_verdict == "approve"
+        assert review.review_verdict_original == "request-changes"
+        assert review.verdict_source == "overridden"
+        assert review.review_verdict_override_reason
+        assert "nit" in review.review_verdict_override_reason.lower()
+
+        # propagate_review_verdict ran with refresh_merge_queue=True.
+        assert work.review_state == "done"
+        assert work.review_verdict == "approve"
+
+        log = query_audit_log(event_type="finisher_self_bless_approved", repo="api", issue=1)
+        assert len(log["entries"]) == 1
+        details = log["entries"][0]["details"]
+        assert details["applied_nits"] == ["rename var"]
+        assert details["waived_nits"] == []
+        assert details["original_verdict"] == "request-changes"
+
+        # Self-blessing a nit-class diff never widens either
+        # permanently-forbidden lever.
+        assert {"force_merge", "override_human_required"} <= PERMANENTLY_FORBIDDEN
+
+    def test_substantive_diff_falls_back_and_never_merges(self) -> None:
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        # The originating work assignment is deliberately absent from the
+        # board — `_dispatch_fix_for_review` then hits its own
+        # `work is None` early return before it ever touches
+        # `review.review_verdict`, which is exactly the "never self-bless
+        # on a non-nit-class diff" behavior under test, without needing a
+        # full fix-dispatch harness.
+        review = _finisher_review_assignment(review_of="w-missing", review_verdict="request-changes")
+        board.active.append(review)
+        findings = ReviewFindings(verdict="request-changes", body="some behavioral change")
+        fix = ProposedFix(diff_text="--- a/foo.py\n+++ b/foo.py\n", behavioral=True, touches_public_api=False)
+
+        result = finisher_self_bless(review, findings, board, config, fix=fix)
+
+        assert result["blessed"] is False
+        assert len(result["actions"]) == 1
+        assert result["actions"][0].kind == "no_work_found"
+        # The reviewer's original verdict is untouched — no self-bless, no
+        # override fields set.
+        assert review.review_verdict == "request-changes"
+        assert review.review_verdict_original is None
+        assert review.verdict_source is None
+
+        log = query_audit_log(event_type="finisher_self_bless_declined", repo="api", issue=1)
+        assert len(log["entries"]) == 1
+        assert log["entries"][0]["details"]["behavioral"] is True
+
+    def test_rejected_when_the_tier_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "coord.board_doctor_permissions.SAFE_TIER_ACTIONS",
+            frozenset(SAFE_TIER_ACTIONS - {"dispatch_finisher_leg"}),
+        )
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        review = _finisher_review_assignment()
+        fix = ProposedFix(diff_text="x", behavioral=False, touches_public_api=False)
+
+        with pytest.raises(SweepPermissionError):
+            finisher_self_bless(review, ReviewFindings(verdict="approve", body=""), board, config, fix=fix)
