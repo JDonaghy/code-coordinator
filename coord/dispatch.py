@@ -329,12 +329,20 @@ def enforce_preflight_guard(
     the board projection after its retention window (`coord.dao`'s
     `_DEFAULT_BOARD_RETENTION_DAYS`), so re-dispatching the *same* flagged
     issue long after that will spawn one more paid triage session — bounded
-    per window, not a one-time guarantee. Consuming the eventual
-    PROCEED/SPLIT verdict (dispatch the original on PROCEED; on SPLIT,
-    verify via `coord.preflight_size.verify_split_proposal` and file the
-    epic + chained children, superseding the original) is follow-up work
-    — see #3817's own acceptance criteria for why it needs a supersede
-    mechanism and epic-filing plumbing this gate does not touch.
+    per window, not a one-time guarantee.
+
+    Once a matching triage assignment reaches a terminal status, its
+    verdict is consumed rather than ignored: the assignment's raw agent
+    log is fetched and parsed with
+    `coord.decomposition_chat.parse_size_triage_response`. A PROCEED
+    verdict — or anything that fails to fetch or parse — falls through
+    to let the original dispatch proceed unchanged (fail-open, same
+    posture as the rest of this gate). A SPLIT verdict is mechanically
+    re-checked with `coord.preflight_size.verify_split_proposal`; only
+    once that passes is the epic + chained children actually filed and
+    queued (`coord.decomposition_chat.file_and_queue_split_proposal`),
+    superseding the original. A gate-rejected split also falls through
+    to the original dispatch — a broken epic is never filed.
     """
     if proposal_type != "work" or repo is None:
         return
@@ -380,11 +388,58 @@ def enforce_preflight_guard(
     )
     if in_flight is None and matches:
         # A triage session already ran this issue's review_target to a
-        # terminal status (done/advisory/refused_*/...) — whatever
-        # verdict it posted, re-dispatching another paid triage session
-        # on every retry would be an unbounded cost loop. Let the
-        # original dispatch proceed; verdict consumption is follow-up
-        # work (see docstring).
+        # terminal status (done/advisory/refused_*/...). Consume its
+        # verdict: PROCEED (or anything unparseable) falls through to
+        # the original dispatch; a verified SPLIT files the epic +
+        # children, queues them, and supersedes the original instead.
+        terminal = max(matches, key=lambda a: a.dispatched_at or 0.0)
+        triage_machine = next(
+            (m for m in config.machines if m.name == terminal.machine_name), None
+        )
+        if triage_machine is not None and terminal.assignment_id:
+            from coord.notify import _fetch_raw_log_text_by_id  # noqa: PLC0415
+
+            raw_log = _fetch_raw_log_text_by_id(
+                terminal.assignment_id, None, triage_machine.host
+            )
+            if raw_log is not None:
+                from coord.decomposition_chat import (  # noqa: PLC0415
+                    parse_size_triage_response,
+                )
+
+                try:
+                    proposal = parse_size_triage_response(
+                        raw_log,
+                        repo_name=repo.name,
+                        issue_number=issue_number,
+                        issue_title=issue_data.get("title")
+                        or f"issue #{issue_number}",
+                    )
+                except SizeTriageError:
+                    proposal = None
+
+                if proposal is not None:
+                    from coord.preflight_size import (  # noqa: PLC0415
+                        verify_split_proposal,
+                    )
+
+                    verification = verify_split_proposal(proposal)
+                    if verification.ok:
+                        from coord.decomposition_chat import (  # noqa: PLC0415
+                            file_and_queue_split_proposal,
+                        )
+
+                        epic_number = file_and_queue_split_proposal(
+                            proposal=proposal,
+                            verification=verification,
+                            repo=repo,
+                        )
+                        raise DispatchRefused(
+                            f"issue #{issue_number} was split by the preflight "
+                            f"size-triage review into epic #{epic_number} — the "
+                            "original is superseded; work continues on the "
+                            "child issues."
+                        )
         return
 
     if in_flight is None:
