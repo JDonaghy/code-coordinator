@@ -1703,6 +1703,35 @@ class TestPreflightGuard:
         "coord.decomposition_chat.dispatch_size_triage_review",
     )
     @patch("coord.github_ops.get_issue")
+    def test_closed_issue_short_circuits_without_redispatch(
+        self, mock_get_issue, mock_dispatch_triage,
+    ) -> None:
+        """#3830: a closed issue never re-enters the triage/split path —
+        the common trigger is `file_and_queue_split_proposal` itself having
+        superseded (closed) this exact issue on a prior pass, but any other
+        reason the issue is closed must short-circuit identically. Without
+        this, a retry (`coord drive-queue remove && add`, a manual `coord
+        assign`/`coord approve`, ...) would re-score a still-triage-worthy
+        body and re-file a duplicate epic + children every time."""
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "A giant issue", "body": "", "labels": [{"name": "epic"}],
+            "state": "CLOSED",
+        }
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=99,
+            machine=machine, board=board,
+        )  # must not raise — a closed issue is never triaged or split again
+        mock_dispatch_triage.assert_not_called()
+
+    @patch(
+        "coord.decomposition_chat.dispatch_size_triage_review",
+    )
+    @patch("coord.github_ops.get_issue")
     def test_already_in_flight_review_is_not_redispatched(
         self, mock_get_issue, mock_dispatch_triage,
     ) -> None:

@@ -2037,3 +2037,154 @@ class TestDispatchSizeTriageReview:
                 http_client=_FakeHTTPClient({"id": "st-1"}),
             )
         assert board.active == []
+
+
+class TestFileAndQueueSplitProposal:
+    """#3830: `file_and_queue_split_proposal` files a verified
+    `SplitProposal` as a real epic + children, splices the remapped work
+    order into the epic body, chains the children in the drive queue, and
+    supersedes (closes, with a confirmed readback) the original issue."""
+
+    def _proposal(self) -> "decomposition_chat.SplitProposal":
+        from coord.models import SplitChunk, SplitProposal
+
+        return SplitProposal(
+            id=0, repo_name="api", issue_number=99, issue_title="A giant issue",
+            rationale="too big for one worker", chunks=[
+                SplitChunk(title="Part 1", scope="do part 1", files_likely=["a.py"]),
+                SplitChunk(title="Part 2", scope="do part 2", files_likely=["b.py"]),
+            ],
+        )
+
+    def _verification(self) -> "decomposition_chat.SplitVerification":
+        from coord.milestone_order import WorkOrder, WorkOrderNode
+        from coord.preflight_size import SplitVerification
+
+        return SplitVerification(
+            ok=True, reason=None, epic_body="rationale text",
+            work_order=WorkOrder(nodes=(
+                WorkOrderNode(issue_number=1, after=()),
+                WorkOrderNode(issue_number=2, after=(1,)),
+            )),
+        )
+
+    @patch("coord.state.get_drive_queue_entry")
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    def test_files_epic_children_queues_and_supersedes(
+        self, mock_create_issue, mock_update_body, mock_close_issue,
+        mock_get_issue_state, mock_enqueue, mock_get_entry,
+    ) -> None:
+        from coord.models import Repo
+
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},
+            {"number": 501, "url": "https://x/501"},
+            {"number": 502, "url": "https://x/502"},
+        ]
+        mock_get_entry.return_value = {"after_json": []}
+        mock_get_issue_state.return_value = "closed"
+        repo = Repo(name="api", github="acme/api")
+
+        epic_number = decomposition_chat.file_and_queue_split_proposal(
+            proposal=self._proposal(), verification=self._verification(), repo=repo,
+        )
+
+        assert epic_number == 500
+        # Epic filed first, carrying the tracking label.
+        epic_kwargs = mock_create_issue.call_args_list[0].kwargs
+        assert epic_kwargs["labels"] == ["epic"]
+        assert epic_kwargs["title"] == "A giant issue (split)"
+        # Each chunk filed in order as a plain child issue.
+        part1_kwargs = mock_create_issue.call_args_list[1].kwargs
+        assert part1_kwargs["title"] == "Part 1"
+        assert "a.py" in part1_kwargs["body"]
+        part2_kwargs = mock_create_issue.call_args_list[2].kwargs
+        assert part2_kwargs["title"] == "Part 2"
+
+        # The placeholder work order (1, 2) must be remapped onto the real
+        # issue numbers (501, 502) before being spliced into the epic body.
+        update_args = mock_update_body.call_args
+        assert update_args.args[0] == "acme/api"
+        assert update_args.args[1] == 500
+        new_body = update_args.args[2]
+        assert "#501" in new_body
+        assert "#502" in new_body
+
+        # Children queued in `repo#N` `after` form, chained off each other.
+        enqueue_calls = {
+            call.args[:2]: call.kwargs.get("after") for call in mock_enqueue.call_args_list
+        }
+        assert enqueue_calls[("api", 501)] is None
+        assert enqueue_calls[("api", 502)] == ["api#501"]
+
+        # The original is force-closed (its own body may already carry a
+        # `## Sub-issues` block from a prior pass) and the close is
+        # confirmed with a readback before the function returns.
+        close_args, close_kwargs = mock_close_issue.call_args
+        assert close_args == ("acme/api", 99)
+        assert close_kwargs["force"] is True
+        assert "500" in close_kwargs["comment"]
+        mock_get_issue_state.assert_called_once_with("acme/api", 99)
+
+    @patch("coord.state.get_drive_queue_entry")
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.get_issue_state")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    def test_raises_when_close_does_not_read_back_closed(
+        self, mock_create_issue, mock_update_body, mock_close_issue,
+        mock_get_issue_state, mock_enqueue, mock_get_entry,
+    ) -> None:
+        """`close_issue()` returning without raising only proves the close
+        REQUEST was issued — if GitHub still reports the original issue as
+        open (a race, a no-op implementation, ...) this must raise rather
+        than let the caller believe the original was superseded (#2096)."""
+        from coord.models import Repo
+
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},
+            {"number": 501, "url": "https://x/501"},
+            {"number": 502, "url": "https://x/502"},
+        ]
+        mock_get_entry.return_value = {"after_json": []}
+        mock_get_issue_state.return_value = "open"
+        repo = Repo(name="api", github="acme/api")
+
+        with pytest.raises(RuntimeError, match="did not read back closed"):
+            decomposition_chat.file_and_queue_split_proposal(
+                proposal=self._proposal(), verification=self._verification(), repo=repo,
+            )
+        mock_close_issue.assert_called_once()
+
+    @patch("coord.state.get_drive_queue_entry")
+    @patch("coord.state.enqueue_drive_queue")
+    @patch("coord.github_ops.close_issue")
+    @patch("coord.github_ops.update_issue_body")
+    @patch("coord.github_ops.create_issue")
+    def test_raises_when_queued_child_does_not_read_back(
+        self, mock_create_issue, mock_update_body, mock_close_issue,
+        mock_enqueue, mock_get_entry,
+    ) -> None:
+        """An unconfirmed queue insert is not a queued child — the original
+        must not be closed if a child never read back from the drive
+        queue."""
+        from coord.models import Repo
+
+        mock_create_issue.side_effect = [
+            {"number": 500, "url": "https://x/500"},
+            {"number": 501, "url": "https://x/501"},
+            {"number": 502, "url": "https://x/502"},
+        ]
+        mock_get_entry.return_value = None
+        repo = Repo(name="api", github="acme/api")
+
+        with pytest.raises(RuntimeError, match="did not read back"):
+            decomposition_chat.file_and_queue_split_proposal(
+                proposal=self._proposal(), verification=self._verification(), repo=repo,
+            )
+        mock_close_issue.assert_not_called()
