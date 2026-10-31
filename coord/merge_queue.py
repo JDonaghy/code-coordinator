@@ -6030,6 +6030,19 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
 
 # ── Post-merge sibling conflict sweep (#2246) ───────────────────────────────
 
+#: Every ``MergeEvent.kind`` that means "the PR actually merged onto the base
+#: branch". They differ only in the issue-close bookkeeping outcome (#3821):
+#: the issue closed cleanly (``"merged"``), or the merge landed but closing the
+#: issue was vetoed/failed/couldn't be confirmed (``"merged_partial"`` /
+#: ``"merged_close_unconfirmed"``). The base branch moved — and can therefore
+#: invalidate siblings — in every one of these cases, so the sibling-conflict
+#: sweep and its helpers must treat them identically; keying on the bare
+#: ``"merged"`` string alone silently skipped the sweep whenever an otherwise
+#: successful merge couldn't close its issue.
+MERGE_LANDED_KINDS = frozenset(
+    {"merged", "merged_partial", "merged_close_unconfirmed"}
+)
+
 #: How many times the sweep re-asks GitHub for a sibling's mergeability while
 #: it still reads ``UNKNOWN``. GitHub computes ``mergeable`` asynchronously and
 #: a merge that JUST landed is precisely the moment it is least likely to have
@@ -6048,15 +6061,19 @@ SIBLING_SWEEP_INTERVAL = 2.0
 def merged_bases(events: Iterable["MergeEvent"]) -> set[tuple[str, str]]:
     """The ``(repo_github, target_branch)`` pairs a batch of events just moved.
 
-    Scoped deliberately to ``kind == "merged"``: a base branch only invalidates
-    siblings when something actually landed on it. Every other event kind
-    (``opened``, ``sized``, ``conflict``, gate blocks) leaves the base exactly
-    where it was and must not trigger a sweep.
+    Scoped deliberately to :data:`MERGE_LANDED_KINDS`: a base branch only
+    invalidates siblings when something actually landed on it. That includes a
+    merge whose issue-close step was vetoed/failed/unconfirmed
+    (``merged_partial`` / ``merged_close_unconfirmed``, #3821) — the PR still
+    merged. Every other event kind (``opened``, ``sized``, ``conflict``, gate
+    blocks) leaves the base exactly where it was and must not trigger a sweep.
     """
     return {
         (ev.entry.repo_github, ev.entry.target_branch)
         for ev in events
-        if ev.kind == "merged" and ev.entry.repo_github and ev.entry.target_branch
+        if ev.kind in MERGE_LANDED_KINDS
+        and ev.entry.repo_github
+        and ev.entry.target_branch
     }
 
 
@@ -6094,7 +6111,9 @@ def sibling_sweep_candidates(
     if not moved:
         return []
     merged_ids = {
-        ev.entry.assignment_id for ev in events if ev.kind == "merged"
+        ev.entry.assignment_id
+        for ev in events
+        if ev.kind in MERGE_LANDED_KINDS
     }
     out: list[QueuedMerge] = []
     for entry in items:
@@ -6134,7 +6153,7 @@ def sibling_conflict_error(
         f"{ev.entry.repo_name}#{ev.entry.issue_number}"
         + (f" (PR #{ev.entry.pr_number})" if ev.entry.pr_number else "")
         for ev in events
-        if ev.kind == "merged"
+        if ev.kind in MERGE_LANDED_KINDS
         and ev.entry.repo_github == entry.repo_github
         and ev.entry.target_branch == entry.target_branch
     })
@@ -6213,7 +6232,7 @@ def sweep_sibling_conflicts(
     stale by the time we get here and would otherwise clobber any concurrent
     writer's changes to unrelated rows.
     """
-    if not any(ev.kind == "merged" for ev in events):
+    if not any(ev.kind in MERGE_LANDED_KINDS for ev in events):
         return []
     probe = getattr(gh_ops, "check_pr_mergeable", None)
     if probe is None:

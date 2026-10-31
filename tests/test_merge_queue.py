@@ -14883,6 +14883,34 @@ class TestSweepSiblingConflicts:
         assert "#307" in sibling.error
         assert gh.calls == [("acme/api", 101)]
 
+    @pytest.mark.parametrize(
+        "landed_kind", ["merged_partial", "merged_close_unconfirmed"]
+    )
+    def test_sweep_fires_when_merge_landed_but_issue_did_not_close(
+        self, landed_kind: str
+    ) -> None:
+        """#3821: a PR can merge onto the base yet have its issue-close step
+        vetoed/failed/unconfirmed, which ``process()`` reports as
+        ``merged_partial`` / ``merged_close_unconfirmed`` instead of
+        ``merged``. The base branch still moved, so the sibling sweep must
+        fire exactly as it does for a clean ``merged`` — keying on the bare
+        ``"merged"`` string silently skipped it."""
+        merged = _sweep_entry("m", pr=100, state=MERGED, issue=307)
+        sibling = _sweep_entry("s", pr=101, issue=309)
+        gh = _SweepGh({101: [False]})
+
+        out = mq.sweep_sibling_conflicts(
+            [mq.MergeEvent(merged, landed_kind, "landed; issue left open")],
+            [merged, sibling],
+            gh,
+            persist=False,
+        )
+
+        assert [ev.kind for ev in out] == ["conflict"]
+        assert sibling.state == CONFLICT
+        assert "#307" in sibling.error
+        assert gh.calls == [("acme/api", 101)]
+
     def test_a_clean_sibling_is_left_alone(self) -> None:
         merged = _sweep_entry("m", pr=100, state=MERGED)
         sibling = _sweep_entry("s", pr=101, issue=2)
