@@ -51,6 +51,7 @@ def classify_review_row(
     review_verdict: str | None,
     review_findings: str | None,
     review_verdict_original: str | None,
+    assignment_id: str | None = None,
 ) -> Verdict:
     """Classify one assignments row.  Pure — no DB, no I/O.
 
@@ -98,9 +99,14 @@ def classify_review_row(
     # Weaker signal: no verdict in the blob, so lean on the body.  A body whose
     # blocking section is confirmed empty is exactly the shape #476 is allowed
     # to advance, so it is not suspicious even if it uses the word "blocking".
+    #
+    # This calls the PURE predicate, never `record_unparseable_treated_as_blocking`
+    # (#3838) — a historical audit scan replaying this over every `approve`
+    # row must not inflate the fleet's live fail-closed counter; that counter
+    # is incremented only at the real `coord/auto_loop.py` decision site.
     from coord.review import blocking_findings_confirmed_absent  # noqa: PLC0415
 
-    if blocking_findings_confirmed_absent(body):
+    if blocking_findings_confirmed_absent(body, assignment_id=assignment_id):
         return Verdict("clean", "blocking section explicitly empty")
     low = body.lower()
     hits = [m for m in _REJECTION_MARKERS if m in low]
@@ -135,6 +141,7 @@ def scan(db_path: Path) -> list[tuple[sqlite3.Row, Verdict]]:
             review_verdict=row["review_verdict"],
             review_findings=row["review_findings"],
             review_verdict_original=row["review_verdict_original"],
+            assignment_id=row["assignment_id"],
         )
         if verdict.level != "clean":
             out.append((row, verdict))

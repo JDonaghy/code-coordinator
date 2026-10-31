@@ -60,7 +60,7 @@ from coord.models import (
 )
 from coord.review import (
     ReviewFindings,
-    blocking_findings_confirmed_absent,
+    classify_blocking_evidence,
     dispatch_review,
     estimate_review_counts,
     maybe_scoped_review_for_completed_fix,
@@ -68,6 +68,7 @@ from coord.review import (
     needs_redesign_escalation,
     parse_review_from_agent,
     parse_review_from_log,
+    record_unparseable_treated_as_blocking,
 )
 from coord.board_service import read_board, write_board
 from coord.state import record_dispatched_assignment
@@ -377,10 +378,13 @@ def process_review_completion(
     # #1445 a reviewer's well-formed prose `request-changes` was rewritten to
     # `approve` and marked merge-ready because the *nits* bucket happened to
     # parse as 0 (satisfying `parsed_any`) while *blocking* parsed as None.
-    # The evidence standard now lives in `blocking_findings_confirmed_absent`
+    # The evidence standard now lives in `classify_blocking_evidence`
     # and is fail-closed: no positive evidence ⇒ the reviewer's verdict stands.
     blocking, nonblocking, nits = estimate_review_counts(findings.body)
-    if blocking_findings_confirmed_absent(findings.body):
+    evidence = classify_blocking_evidence(
+        findings.body, assignment_id=review.assignment_id,
+    )
+    if evidence.confirmed_absent:
         # log.warning, not info: this is the coordinator overriding a human-
         # readable rejection. It must be conspicuous in the log, and it is
         # additionally recorded on the assignment (below) and posted to GitHub.
@@ -444,6 +448,18 @@ def process_review_completion(
             "reviewer's request-changes verdict (#1456 fail-closed)",
             review.assignment_id, nonblocking, nits,
         )
+        if evidence.fail_closed_unparseable:
+            # One increment == one review that genuinely burned a fix+review
+            # round because neither the prose nor a trustworthy self-reported
+            # marker confirmed the blocking section empty (#3838). Recorded
+            # here, at the decision site, not inside the pure
+            # `classify_blocking_evidence` predicate — an audit script replays
+            # that predicate over historical rows and must not inflate this
+            # count on every scan.
+            record_unparseable_treated_as_blocking(
+                assignment_id=review.assignment_id,
+                excerpt=findings.body[:200],
+            )
 
     # Genuine blocking findings (or counts unparseable) → dispatch a fix worker.
     if not dispatch_fixes:
