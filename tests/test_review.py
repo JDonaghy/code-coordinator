@@ -756,6 +756,36 @@ def test_briefing_requires_the_three_finding_sections() -> None:
     assert "None." in briefing
 
 
+def test_self_reported_marker_rule_present_in_every_reviewer_surface() -> None:
+    """#3838: the marker-trust branch in `classify_blocking_evidence` is only
+    reachable if every surface the reviewer actually reads — the system
+    prompt and both briefings — pins the same emit contract. All three pull
+    the identical `SELF_REPORTED_MARKER_RULE` constant so they can't drift."""
+    from coord.review import REVIEWER_SYSTEM_PROMPT, SELF_REPORTED_MARKER_RULE
+
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="Fix login", issue_body="",
+        branch="issue-7", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+    )
+    scoped_briefing = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old resolution\n+new resolution\n",
+        default_branch="main",
+    )
+    for text in (REVIEWER_SYSTEM_PROMPT, briefing, scoped_briefing):
+        assert SELF_REPORTED_MARKER_RULE in text
+        assert "LITERAL FIRST LINE" in text
+        assert "COORD_ASSIGNMENT_ID" in text
+
+
 def test_briefing_instructs_report_result_before_the_printed_block() -> None:
     """#1457: `build_review_briefing`'s own tail (shared by headless and
     interactive dispatch alike) must also ask for `coord report-result`
@@ -7687,22 +7717,24 @@ class TestBlockingFindingsConfirmedAbsent:
         assert blocking_findings_confirmed_absent("") is False
 
     def test_unparseable_prose_with_clean_marker_is_confirmed(self) -> None:
-        """The prose doesn't use the conventional headings at all, but
-        a `coord:review` marker reporting `blocking=0` is positive evidence
-        on its own — trust it rather than forcing a needless fix cycle."""
+        """The prose doesn't use the conventional headings at all, but a
+        self-reported `coord:review` marker on the literal first line,
+        matching the real assignment id and reporting `blocking=0`, is
+        positive evidence on its own — trust it rather than forcing a
+        needless fix cycle."""
         from coord.review import (
             blocking_findings_confirmed_absent,
             estimate_review_counts,
         )
         body = (
             "<!-- coord:review verdict=request-changes blocking=0 "
-            "nonblocking=2 nits=1 reviewer=precision -->\n"
+            "nonblocking=2 nits=1 assignment=r1 -->\n"
             "\n"
             "Looks good overall — a couple of minor things worth a look, "
             "but nothing that blocks merging this.\n"
         )
         assert estimate_review_counts(body) == (None, None, None)
-        assert blocking_findings_confirmed_absent(body) is True
+        assert blocking_findings_confirmed_absent(body, assignment_id="r1") is True
 
     def test_unparseable_prose_with_nonzero_marker_is_not_confirmed(self) -> None:
         """A marker reporting real blocking findings must not be overridden
@@ -7710,41 +7742,114 @@ class TestBlockingFindingsConfirmedAbsent:
         from coord.review import blocking_findings_confirmed_absent
         body = (
             "<!-- coord:review verdict=request-changes blocking=2 "
-            "reviewer=precision -->\n"
+            "assignment=r1 -->\n"
             "\n"
             "This needs work before it can merge.\n"
         )
-        assert blocking_findings_confirmed_absent(body) is False
+        assert blocking_findings_confirmed_absent(body, assignment_id="r1") is False
 
-    def test_unparseable_prose_without_marker_increments_counter(self) -> None:
-        """The fail-closed path (unparseable prose, no trustworthy marker)
-        must be countable so the residual rate is measurable."""
-        from coord.review import (
-            blocking_findings_confirmed_absent,
-            unparseable_treated_as_blocking_count,
-        )
-        body = "Looks fine to me — approving.\n"
-        before = unparseable_treated_as_blocking_count()
-        assert blocking_findings_confirmed_absent(body) is False
-        assert unparseable_treated_as_blocking_count() == before + 1
-
-    def test_unparseable_prose_with_clean_marker_does_not_increment_counter(
-        self,
-    ) -> None:
-        """The marker-trust path is a confirmed absence, not a fail-closed
-        miss — it must not count toward the unparseable-as-blocking metric."""
-        from coord.review import (
-            blocking_findings_confirmed_absent,
-            unparseable_treated_as_blocking_count,
-        )
+    def test_marker_not_on_first_line_is_not_trusted(self) -> None:
+        """#3838 review (blocking finding): a marker quoted mid-prose — not
+        the literal first line — must NOT be trusted, even with a matching
+        `assignment=` and `blocking=0`. Otherwise a genuinely-blocking review
+        that quotes this exact format while discussing `review.py` could have
+        its own verdict silently downgraded."""
+        from coord.review import blocking_findings_confirmed_absent
         body = (
-            "<!-- coord:review verdict=approve blocking=0 reviewer=precision -->\n"
+            "This needs work before it can merge.\n"
+            "\n"
+            "<!-- coord:review verdict=approve blocking=0 assignment=r1 -->\n"
+        )
+        assert blocking_findings_confirmed_absent(body, assignment_id="r1") is False
+
+    def test_marker_with_mismatched_assignment_is_not_trusted(self) -> None:
+        """A marker on the first line with `blocking=0` but naming a
+        *different* assignment id is not evidence about *this* review —
+        trusting it would let any stale or copy-pasted marker through."""
+        from coord.review import blocking_findings_confirmed_absent
+        body = (
+            "<!-- coord:review verdict=approve blocking=0 assignment=other -->\n"
             "\n"
             "Looks fine overall.\n"
         )
+        assert blocking_findings_confirmed_absent(body, assignment_id="r1") is False
+
+    def test_marker_without_assignment_id_argument_is_not_trusted(self) -> None:
+        """When the caller has no assignment id to check against, the marker
+        path must not be trusted at all — fail closed rather than trust an
+        unverifiable claim."""
+        from coord.review import blocking_findings_confirmed_absent
+        body = "<!-- coord:review verdict=approve blocking=0 assignment=r1 -->\n"
+        assert blocking_findings_confirmed_absent(body) is False
+
+    def test_unparseable_prose_without_marker_is_fail_closed_unparseable(
+        self,
+    ) -> None:
+        """The fail-closed path (unparseable prose, no trustworthy marker)
+        is distinguishable from a genuine nonzero blocking count — that
+        distinction is what `record_unparseable_treated_as_blocking` keys
+        off of at the real call site."""
+        from coord.review import blocking_findings_confirmed_absent, classify_blocking_evidence
+        body = "Looks fine to me — approving.\n"
+        evidence = classify_blocking_evidence(body)
+        assert evidence.confirmed_absent is False
+        assert evidence.fail_closed_unparseable is True
+        assert blocking_findings_confirmed_absent(body) is False
+
+    def test_unparseable_prose_with_clean_marker_is_not_fail_closed(self) -> None:
+        """The marker-trust path is a confirmed absence, not a fail-closed
+        miss."""
+        from coord.review import classify_blocking_evidence
+        body = (
+            "<!-- coord:review verdict=approve blocking=0 assignment=r1 -->\n"
+            "\n"
+            "Looks fine overall.\n"
+        )
+        evidence = classify_blocking_evidence(body, assignment_id="r1")
+        assert evidence.confirmed_absent is True
+        assert evidence.fail_closed_unparseable is False
+
+    def test_classify_blocking_evidence_never_touches_the_counter(self) -> None:
+        """`classify_blocking_evidence`/`blocking_findings_confirmed_absent`
+        are pure — `scripts/audit_review_verdict_overrides.py` replays them
+        over historical DB rows, and a scan must not inflate the fleet's
+        live fail-closed counter. Only `record_unparseable_treated_as_blocking`
+        (called once per real decision in `coord/auto_loop.py`) may do that."""
+        from coord.review import (
+            blocking_findings_confirmed_absent,
+            classify_blocking_evidence,
+            unparseable_treated_as_blocking_count,
+        )
         before = unparseable_treated_as_blocking_count()
-        assert blocking_findings_confirmed_absent(body) is True
+        for _ in range(5):
+            classify_blocking_evidence("Looks fine to me — approving.\n")
+            blocking_findings_confirmed_absent("Looks fine to me — approving.\n")
         assert unparseable_treated_as_blocking_count() == before
+
+
+class TestRecordUnparseableTreatedAsBlocking:
+    """#3838: the real counter-increment + log-line call site, separate from
+    the pure predicate above so an audit script replaying history never
+    inflates it."""
+
+    def test_increments_the_counter(self) -> None:
+        from coord.review import (
+            record_unparseable_treated_as_blocking,
+            unparseable_treated_as_blocking_count,
+        )
+        before = unparseable_treated_as_blocking_count()
+        record_unparseable_treated_as_blocking(assignment_id="r1", excerpt="x")
+        assert unparseable_treated_as_blocking_count() == before + 1
+
+    def test_logs_a_warning_naming_the_assignment(self, caplog) -> None:
+        import logging
+
+        from coord.review import record_unparseable_treated_as_blocking
+
+        with caplog.at_level(logging.WARNING, logger="coord.review"):
+            record_unparseable_treated_as_blocking(assignment_id="r42", excerpt="x")
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("r42" in r.getMessage() for r in warnings)
 
 
 class TestExtractBlockingSection:
