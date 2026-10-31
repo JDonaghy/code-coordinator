@@ -887,26 +887,71 @@ def sweep_smoke_requeue(repo_name: str, issue_number: int) -> SmokeRequeue:
     `coord diagnose --stage test --reset` calls — which best-effort
     releases any outstanding #3182 fan-out smoke claim too.
 
+    #3810: bounded by `coord.smoke.BOARD_DOCTOR_REQUEUE_BUDGET`, separately
+    from the #2272 mute-leg budget it is requeuing past. Clearing
+    `test_state`/`test_reason` to ``NULL`` on every requeue with no bound of
+    its own erased the only tally `coord.smoke.mute_smoke_legs` reads, so a
+    leg that keeps muting after each requeue restarted the #2272 budget from
+    zero and looped forever rather than ever reaching a human. The budget is
+    NOT tracked in `test_reason`: `coord.notify._record_smoke_verdict`
+    overwrites that column wholesale on every subsequent mute leg, so a
+    marker written there would not survive even one more mute/requeue
+    cycle. Instead it reads/increments
+    `coord.state.board_doctor_smoke_requeue_count` /
+    `coord.state.record_board_doctor_smoke_requeue`, a counter kept in its
+    own `board_meta` row keyed by assignment id — untouched by both
+    `_record_smoke_verdict`'s overwrites and `coord.board_doctor.sweep`'s
+    `clear_absent_rows` pass. At or past budget, this refuses WITHOUT
+    touching the row at all, so `test_state` stays set and
+    `coord.board_doctor.smoke_no_verdict_rows` keeps selecting it every
+    subsequent sweep, letting the row's convergence counter climb
+    uninterrupted to the alert tier instead of being wiped by
+    `clear_absent_rows` the moment a reset makes the row stop matching.
+
     Reads `coord.state.test_reset_candidates` FIRST to confirm at least one
     matching row still carries a `test_state` before writing, so a repeat
     call against a row this already cleared reports ``requeued=False``
     rather than a bare pass-through of `reset_work_test_state`'s row-matched
     count — that count reflects rows the WHERE clause matched, not rows
     whose value actually changed, so by itself it cannot tell a genuine
-    clear apart from a no-op re-clear of an already-``NULL`` column.
+    clear apart from a no-op re-clear of an already-``NULL`` column. After
+    writing, re-reads `test_reset_candidates` again and raises
+    :class:`SweepWriteNotConfirmedError` if any matched row still comes
+    back with a `test_state` set — mirroring `coord.diagnose._reset_test_stage`'s
+    before/after confirm pattern, per this module's own documented
+    write-confirmation invariant, rather than trusting the write call's own
+    row-matched count as proof the clear landed.
     """
     authorize_sweep_action("smoke_requeue")
 
-    from coord.state import reset_work_test_state, test_reset_candidates  # noqa: PLC0415
+    from coord.smoke import BOARD_DOCTOR_REQUEUE_BUDGET  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        board_doctor_smoke_requeue_count,
+        record_board_doctor_smoke_requeue,
+        reset_work_test_state,
+        test_reset_candidates,
+    )
 
     before = test_reset_candidates(repo_name, issue_number)
-    if not any(test_state is not None for _aid, _type, test_state in before):
+    live = [(aid, typ) for aid, typ, test_state in before if test_state is not None]
+    if not live:
         return SmokeRequeue(
             requeued=False,
             detail=(
                 f"{repo_name}#{issue_number} has no assignment row with a "
                 "test_state/test_reason to clear — already re-dispatched or "
                 "moved on"
+            ),
+        )
+
+    legs = max(board_doctor_smoke_requeue_count(aid) for aid, _typ in live)
+    if legs >= BOARD_DOCTOR_REQUEUE_BUDGET:
+        return SmokeRequeue(
+            requeued=False,
+            detail=(
+                f"{repo_name}#{issue_number}: already requeued {legs} time(s), "
+                f"at or past BOARD_DOCTOR_REQUEUE_BUDGET={BOARD_DOCTOR_REQUEUE_BUDGET} "
+                "— leaving the row set so it escalates instead of looping"
             ),
         )
 
@@ -919,11 +964,48 @@ def sweep_smoke_requeue(repo_name: str, issue_number: int) -> SmokeRequeue:
                 "rows — nothing to clear"
             ),
         )
+
+    after = test_reset_candidates(repo_name, issue_number)
+    still_set = [(aid, typ) for aid, typ, test_state in after if test_state is not None]
+    if still_set:
+        listed = ", ".join(f"{aid} ({typ})" for aid, typ in still_set)
+        log.error(
+            "board-doctor sweep: smoke-requeue write for %s#%s could not be "
+            "confirmed — test_state is still set on re-read for: %s",
+            repo_name,
+            issue_number,
+            listed,
+        )
+        raise SweepWriteNotConfirmedError(
+            f"sweep cleared {repo_name}#{issue_number}'s smoke verdict but "
+            f"test_state read back still set for: {listed} — the clear did "
+            "not persist"
+        )
+
+    new_count = record_board_doctor_smoke_requeue(live[0][0])
+
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="board_doctor",
+        event_type="smoke_requeued",
+        actor="daemon",
+        summary=(
+            f"board-doctor requeued {repo_name}#{issue_number}'s no-verdict "
+            f"smoke leg ({new_count}/{BOARD_DOCTOR_REQUEUE_BUDGET})"
+        ),
+        repo=repo_name,
+        issue=issue_number,
+        assignment_id=live[0][0],
+        details={"cause": "smoke-no-verdict", "requeue_count": new_count},
+    )
     return SmokeRequeue(
         requeued=True,
         detail=(
-            f"{repo_name}#{issue_number}: cleared test_state/test_reason on "
-            f"{cleared} assignment row(s) so the smoke leg re-dispatches"
+            f"{repo_name}#{issue_number}: cleared test_state on {cleared} "
+            f"assignment row(s) so the smoke leg re-dispatches "
+            f"(requeue {new_count}/{BOARD_DOCTOR_REQUEUE_BUDGET})"
         ),
     )
 

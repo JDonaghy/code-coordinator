@@ -31,6 +31,7 @@ from coord.board_doctor_permissions import (
     sweep_drive_queue_add,
     sweep_drive_queue_remove,
     sweep_drive_queue_requeue,
+    sweep_smoke_requeue,
 )
 from coord.board_doctor_policy import (
     ALLOWLIST,
@@ -41,7 +42,12 @@ from coord.board_doctor_policy import (
 from coord.commands.drive_queue import drive_queue_add, drive_queue_remove
 from coord.config import Config
 from coord.models import Assignment, Board, Machine, Repo
-from coord.smoke import MUTE_SMOKE_LEG_BUDGET, TEST_STATE_BLOCKED, mute_smoke_tally
+from coord.smoke import (
+    BOARD_DOCTOR_REQUEUE_BUDGET,
+    MUTE_SMOKE_LEG_BUDGET,
+    TEST_STATE_BLOCKED,
+    mute_smoke_tally,
+)
 
 #: Everything an operator declares on `coord drive-queue add` that
 #: `coord.state.enqueue_drive_queue` replaces on every subsequent call —
@@ -871,7 +877,7 @@ class TestSmokeNoVerdictRequeue:
 
     def test_second_sweep_over_the_now_cleared_row_is_a_noop(self, coord_db) -> None:
         self._seed_parked_assignment(
-            coord_db, assignment_id="aid-3810-b", repo="acme/widgets", issue=3811
+            coord_db, assignment_id="aid-3811-a", repo="acme/widgets", issue=3811
         )
         row = StuckRow(
             queue="smoke-no-verdict",
@@ -890,7 +896,7 @@ class TestSmokeNoVerdictRequeue:
             sweep_id="sweep-3811-smoke-no-verdict-first",
         )
         once = state.test_reset_candidates("acme/widgets", 3811)
-        assert once == [("aid-3810-b", "work", None)]
+        assert once == [("aid-3811-a", "work", None)]
 
         # A second sweep pass sees the SAME stale StuckRow (`collect_rows`
         # would have already dropped this cause by now, since the row no
@@ -910,6 +916,88 @@ class TestSmokeNoVerdictRequeue:
         assert decision.action == "auto-dispatch-noop"
         twice = state.test_reset_candidates("acme/widgets", 3811)
         assert twice == once
+
+    def test_the_budget_survives_repeated_mute_requeue_cycles_then_refuses(
+        self, coord_db
+    ) -> None:
+        """#3810's actual regression: the requeue budget must be tracked
+        independently of ``test_reason``, because the very next mute leg's
+        `coord.notify._record_smoke_verdict` overwrites that column
+        wholesale. Simulate `BOARD_DOCTOR_REQUEUE_BUDGET` mute -> requeue
+        cycles against the SAME assignment id and confirm each requeue is
+        still allowed and the counter climbs — then confirm one more mute
+        leg past budget is refused WITHOUT touching the row, so it stays
+        selectable for the convergence counter to escalate instead of
+        looping forever.
+        """
+        self._seed_parked_assignment(
+            coord_db, assignment_id="aid-3812-a", repo="acme/widgets", issue=3812
+        )
+
+        assert state.board_doctor_smoke_requeue_count("aid-3812-a") == 0
+
+        for expected_count in range(1, BOARD_DOCTOR_REQUEUE_BUDGET + 1):
+            result = sweep_smoke_requeue("acme/widgets", 3812)
+            assert result["requeued"] is True
+            assert state.board_doctor_smoke_requeue_count("aid-3812-a") == (
+                expected_count
+            )
+            cleared = state.test_reset_candidates("acme/widgets", 3812)
+            assert cleared == [("aid-3812-a", "work", None)]
+
+            # Another mute leg re-parks the row, overwriting test_reason
+            # wholesale exactly like `coord.notify._record_smoke_verdict`
+            # does — this must NOT reset the requeue counter.
+            state.record_test_verdict(
+                assignment_id="aid-3812-a",
+                test_state=TEST_STATE_BLOCKED,
+                test_reason=mute_smoke_tally(MUTE_SMOKE_LEG_BUDGET),
+            )
+
+        # Budget is now exhausted: a further requeue must refuse and leave
+        # the row's test_state set so it keeps being selected.
+        exhausted = sweep_smoke_requeue("acme/widgets", 3812)
+        assert exhausted["requeued"] is False
+        assert str(BOARD_DOCTOR_REQUEUE_BUDGET) in exhausted["detail"]
+        still_parked = state.test_reset_candidates("acme/widgets", 3812)
+        assert still_parked == [("aid-3812-a", "work", TEST_STATE_BLOCKED)]
+        assert state.board_doctor_smoke_requeue_count("aid-3812-a") == (
+            BOARD_DOCTOR_REQUEUE_BUDGET
+        )
+
+    def test_a_requeue_with_no_live_row_is_a_noop(self, coord_db) -> None:
+        result = sweep_smoke_requeue("acme/widgets", 3813)
+        assert result["requeued"] is False
+        assert "no assignment row" in result["detail"]
+
+    def test_an_unconfirmed_write_raises_instead_of_reporting_success(
+        self, coord_db, monkeypatch
+    ) -> None:
+        self._seed_parked_assignment(
+            coord_db, assignment_id="aid-3814-a", repo="acme/widgets", issue=3814
+        )
+        real = state.test_reset_candidates
+        reads: list[int] = []
+
+        def tampering_read(repo_name, issue_number):
+            reads.append(issue_number)
+            rows = real(repo_name, issue_number)
+            if len(reads) > 1:
+                # The write landed for real (confirmed separately by the
+                # other tests above) — inject a stale read on the SECOND
+                # call to prove the confirm step actually inspects it
+                # rather than trusting `reset_work_test_state`'s own
+                # row-matched count.
+                return [(aid, typ, TEST_STATE_BLOCKED) for aid, typ, _ in rows]
+            return rows
+
+        monkeypatch.setattr(state, "test_reset_candidates", tampering_read)
+
+        with pytest.raises(SweepWriteNotConfirmedError, match="still set"):
+            sweep_smoke_requeue("acme/widgets", 3814)
+
+        # An unconfirmed write must not count against the budget.
+        assert state.board_doctor_smoke_requeue_count("aid-3814-a") == 0
 
 
 # ── #3768: the fix-it leg dispatch primitive + its in-flight lock ──────────

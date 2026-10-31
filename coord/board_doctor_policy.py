@@ -11,8 +11,9 @@ Why the allowlist below is NOT empty
 -------------------------------------
 A cause belongs on the auto-action allowlist only once there is a
 known-safe, reviewed-in-advance fix for it — never as a pre-approved
-guess. #3760 (C3) names exactly two such causes, each wired below via
-:func:`_register_auto_action`:
+guess. #3760 (C3) started this allowlist with two such causes; a third
+(``CAUSE_SMOKE_NO_VERDICT``, #3810) has since joined it the same way, each
+wired below via :func:`_register_auto_action`:
 
 * ``CAUSE_CEILING_BLOCKED_MERGEABLE`` (minted by
   `coord.board_doctor._reclassify_ceiling_blocked`, never by
@@ -24,12 +25,18 @@ guess. #3760 (C3) names exactly two such causes, each wired below via
 * ``queue_diagnose.CAUSE_PR_MERGED`` — the row's PR already merged, so
   there is nothing left for the queue to track; ``drive_queue_remove``
   clears it.
+* ``CAUSE_SMOKE_NO_VERDICT`` — a smoke leg that exhausted #2272's
+  mute-leg retry budget without ever producing a parseable verdict.
+  ``sweep_smoke_requeue`` clears it, bounded by its own
+  `coord.smoke.BOARD_DOCTOR_REQUEUE_BUDGET` so a leg that keeps muting
+  after each requeue escalates to a human instead of looping forever.
 
 Every other mechanical cause stays off this allow-list until it has the
 same kind of reviewed, narrowly-scoped evidence behind it — a wrong
 auto-action default is worse than an extra, harmless alert — so
-:data:`ALLOWLIST` growing beyond these two is a deliberate, one-at-a-time
-decision, not a bulk promotion of a whole existing cause bucket.
+:data:`ALLOWLIST` growing beyond these entries is a deliberate,
+one-at-a-time decision, not a bulk promotion of a whole existing cause
+bucket.
 
 :func:`_register_auto_action` also checks every new entry's action name
 against `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` (#3745's C2
@@ -125,6 +132,7 @@ from coord.board_doctor import (
 from coord.board_doctor_permissions import (
     SAFE_TIER_ACTIONS,
     SweepPermissionError,
+    SweepWriteNotConfirmedError,
     authorize_sweep_action,
     dispatch_sweep_action,
 )
@@ -358,17 +366,20 @@ def _requeue_smoke_no_verdict(row: StuckRow) -> bool:
 
     Mirrors :func:`_clear_merged_row`'s shape rather than
     :func:`_requeue_ceiling_blocked_mergeable`'s: `sweep_smoke_requeue`
-    (`coord.board_doctor_permissions`) raises no `SweepPermissionError`
-    today, but there is no cost to handling one the same defensive way as
-    every other dispatch call here, in case a future gate wraps it.
+    (`coord.board_doctor_permissions`) bounds its own retries via
+    `coord.smoke.BOARD_DOCTOR_REQUEUE_BUDGET` and can raise
+    `SweepWriteNotConfirmedError` if a clear it attempted does not read back
+    confirmed — both land here as an honest ``False`` (``"auto-dispatch-noop"``)
+    rather than a crash, same defensive handling as `SweepPermissionError`
+    gets every other dispatch call in this module.
 
     Returns ``True`` only when `sweep_smoke_requeue` confirms
-    ``requeued=True`` — a row whose `test_state`/`test_reason` this already
-    cleared (idempotence: the next sweep no longer selects it at all, since
-    :func:`coord.board_doctor.smoke_no_verdict_rows` re-reads live
-    `test_state`, but a stale decision replay here still reports an honest
-    no-op) or an unparseable key reports `"auto-dispatch-noop"` instead of a
-    false success.
+    ``requeued=True``. A row already at the requeue budget, a row whose
+    `test_state` this already cleared (the next sweep no longer selects it
+    at all, since :func:`coord.board_doctor.smoke_no_verdict_rows` re-reads
+    live `test_state`), an unconfirmed write, or an unparseable key all
+    report `"auto-dispatch-noop"` instead of a false success — the row stays
+    selected so its convergence counter keeps climbing toward escalation.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
@@ -378,7 +389,7 @@ def _requeue_smoke_no_verdict(row: StuckRow) -> bool:
 
     try:
         result = dispatch_sweep_action("smoke_requeue", repo_name, issue_number)
-    except SweepPermissionError as exc:
+    except (SweepPermissionError, SweepWriteNotConfirmedError) as exc:
         click.echo(
             f"warning: board-doctor smoke-requeue refused for {repo_name}#"
             f"{issue_number}: {exc}",
