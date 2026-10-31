@@ -993,10 +993,18 @@ def dispatch_decomposition_chat(
 # that type, regardless of which `system_prompt` is supplied — so a
 # task-specific system prompt (`SIZE_TRIAGE_SYSTEM_PROMPT`, not the generic
 # `REVIEWER_SYSTEM_PROMPT`, which is tied to code-review verdicts) still gets
-# the same no-write guarantee for free. Dispatch goes straight to the agent's
-# `/assign` HTTP endpoint with a raw dict payload (mirroring
-# `dispatch_gate_b_review`) rather than through `Proposal`/`dispatch_with_retry`,
-# since `Proposal` has no `system_prompt` field to carry a custom prompt.
+# the same no-edit/no-git-write guarantee for free. That CLI-enforced deny
+# list does *not* cover `coord issue create` or `coord drive-queue add` —
+# Bash stays allowed, and neither command is in `REVIEW_DENY_COMMANDS` — so
+# "never files or queues" for those two specifically rests on
+# `SIZE_TRIAGE_SYSTEM_PROMPT` telling the agent not to — a prompt-only rule
+# that `coord/agent.py`'s `worker_disallowed_tools` docstring (#3663) notes
+# was proven insufficient on its own elsewhere (a worker ran a forbidden
+# command ~40 times with that exact instruction already in its prompt).
+# Dispatch goes straight to the agent's `/assign` HTTP endpoint with a raw
+# dict payload (mirroring `dispatch_gate_b_review`) rather than through
+# `Proposal`/`dispatch_with_retry`, since `Proposal` has no `system_prompt`
+# field to carry a custom prompt.
 
 
 class SizeTriageError(Exception):
@@ -1159,33 +1167,49 @@ def parse_size_triage_response(
 
     Raises `SizeTriageError` — never returns `None` — for anything that is
     not a clean, complete PROCEED or SPLIT: a missing/unrecognized
-    `SIZE_TRIAGE_VERDICT:` line, a missing `END_SIZE_TRIAGE` terminator, or
-    a SPLIT verdict with no parseable `## Child N:` sections. PROCEED (a
-    deliberate `None`) and "unparseable" (an exception) must never be
-    conflated — "Unconfirmed success is a defect."
+    `SIZE_TRIAGE_VERDICT:` line, a missing `END_SIZE_TRIAGE` terminator
+    *after* that line, or a SPLIT verdict with no parseable `## Child N:`
+    sections. PROCEED (a deliberate `None`) and "unparseable" (an
+    exception) must never be conflated — "Unconfirmed success is a defect."
+
+    Takes the **last** `SIZE_TRIAGE_VERDICT:` match in the text, not the
+    first: `build_size_triage_briefing` embeds a literal worked example
+    containing `SIZE_TRIAGE_VERDICT: split` and `END_SIZE_TRIAGE`, and a
+    real response typically echoes (or is dispatched alongside) that
+    briefing. A first-match `.search()` would hit the worked example
+    instead of the agent's actual answer — the same hazard
+    `coord.review._parse_review_text` guards against with `matches[-1]`
+    for `REVIEW_VERDICT:`.
+
+    The terminator check likewise searches only *after* the chosen verdict
+    line (`raw.find(SIZE_TRIAGE_END_MARKER, match.end())`), not anywhere in
+    the full text — a substring-anywhere test would let a truncated
+    response that merely mentions "...end with END_SIZE_TRIAGE..." in
+    prose *before* its verdict line pass as complete.
     """
     raw = text or ""
 
-    match = _SIZE_TRIAGE_VERDICT_RE.search(raw)
-    if match is None:
+    matches = list(_SIZE_TRIAGE_VERDICT_RE.finditer(raw))
+    if not matches:
         raise SizeTriageError(
             "no 'SIZE_TRIAGE_VERDICT: split|proceed' line found in the "
             "agent's response"
         )
-    if SIZE_TRIAGE_END_MARKER not in raw:
+    match = matches[-1]
+
+    end_index = raw.find(SIZE_TRIAGE_END_MARKER, match.end())
+    if end_index == -1:
         raise SizeTriageError(
-            f"{SIZE_TRIAGE_END_MARKER} terminator missing — an otherwise-"
-            "complete verdict without it is discarded in its entirety"
+            f"{SIZE_TRIAGE_END_MARKER} terminator missing after the verdict "
+            "line — an otherwise-complete proposal without it is discarded "
+            "in its entirety, never best-guessed from a partial response"
         )
 
     verdict = match.group(1).lower()
     if verdict == "proceed":
         return None
 
-    body = raw[match.end() :]
-    end_index = body.find(SIZE_TRIAGE_END_MARKER)
-    if end_index != -1:
-        body = body[:end_index]
+    body = raw[match.end() : end_index]
 
     headings = list(_SIZE_TRIAGE_CHILD_HEADING_RE.finditer(body))
     if not headings:
