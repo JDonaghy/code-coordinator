@@ -849,40 +849,40 @@ def classify_blocking_evidence(
     cannot read counts as "not confirmed absent", i.e. "assume the
     reviewer meant what it said".
 
-    Counts come from `_authoritative_counts_with_source`, which checks the
-    trustworthy self-reported marker FIRST, on every read — not only once
-    prose turns out unparseable. `confirmed_absent` is ``True`` when either
-    of these holds:
+    The reported ``blocking`` count comes from
+    `_authoritative_counts_with_source`, which checks the trustworthy
+    self-reported marker FIRST. But the marker is a backstop, not an
+    override: it can only ever WIDEN confirmation beyond what prose alone
+    would support when the body has no prose to contradict it (no
+    recognisable "## Blocking" heading at all) — it can never overrule
+    prose that is actually there. ``confirmed_absent`` is ``True`` only
+    when the reported count is zero AND the body's own prose, if any
+    blocking section is findable in it, does not disagree. Concretely:
 
-    1. Marker evidence: the body's very first line is a trustworthy
-       self-reported ``<!-- coord:review ... -->`` marker
-       (`_parse_trusted_self_reported_marker` — position- and
-       assignment-id-anchored, so untrusted prose elsewhere in the body
-       cannot forge it) reporting ``blocking=0``. This is independent
-       evidence from the reviewer itself, not a re-derivation of the same
-       prose heuristic: it is what avoids forcing a needless fix cycle on a
-       review whose *substance* was fine but whose prose heuristic missed.
+    1. If ``blocking`` (marker-first) is ``None``, nothing is confirmed —
+       fail-closed unparseable.
+    2. If ``blocking`` is nonzero, nothing is confirmed — there is a
+       reported finding, full stop.
+    3. Otherwise ``blocking == 0``. Walk the body's own markdown sections
+       (`_iter_review_sections`) looking for one that maps to the
+       ``blocking`` bucket:
 
-    2. Prose evidence (only consulted when there is no trustworthy marker):
-       **all** of —
-
-       a. A blocking section was actually located (``blocking is not None`` —
-          a heading matching `_SECTION_KEYWORDS["blocking"]`).  A body with no
-          such heading yields ``None`` = *unknown*, which must never be read
-          as zero: that conflation is the #1456 defect, where a well-formed
-          prose `request-changes` on #1445 was rewritten to `approve` because
-          the *nits* bucket happened to parse as 0 while *blocking* parsed as
-          None.
-       b. That section contains no bullets (an explicit parsed zero).
-       c. That section contains no substantive prose either — a reviewer who
-          writes blocking findings as paragraphs under "## Blocking" would
-          otherwise count as zero and fail open all the same.  Short "None" /
-          "N/A" markers are allowed (that's the shape being looked for).
+       a. No such heading at all: trust the zero count as-is (marker or
+          prose — a marker-only body with no conventional headings is
+          exactly the case the marker exists to cover).
+       b. A heading is found: every line under it must read as an
+          explicit "nothing here" marker (`_is_no_findings_line`) — a real
+          bullet or substantive prose under "## Blocking" means the body
+          disagrees with the reported zero, so `confirmed_absent` is
+          ``False`` regardless of what the marker claimed. This is what
+          keeps a reviewer-emitted `blocking=0` from overriding its own
+          contradicting findings list (the #476 gate must stay fail-closed
+          against disagreement, not just against silence).
 
     `fail_closed_unparseable` is ``True`` exactly when `confirmed_absent` is
-    ``False`` because there was no trustworthy marker AND the prose was
-    unparseable — never when a marker or prose reported a genuine nonzero
-    blocking count, since that is not a parsing failure at all.
+    ``False`` because the reported count could not be determined at all —
+    never when a genuine nonzero count or a prose disagreement is the
+    reason, since neither of those is a parsing failure.
     """
     blocking, _nonblocking, _nits, source = _authoritative_counts_with_source(
         body, assignment_id=assignment_id,
@@ -891,19 +891,18 @@ def classify_blocking_evidence(
         return BlockingEvidence(confirmed_absent=False, fail_closed_unparseable=True)
     if blocking != 0:
         return BlockingEvidence(confirmed_absent=False, fail_closed_unparseable=False)
-    if source == "marker":
-        log.info(
-            "blocking_findings_confirmed_absent: trusting self-reported "
-            "coord:review marker (blocking=0, assignment=%r)",
-            assignment_id,
-        )
-        return BlockingEvidence(confirmed_absent=True, fail_closed_unparseable=False)
     for bucket, lines in _iter_review_sections(body):
         if bucket != "blocking":
             continue
         for line in lines:
             if not _is_no_findings_line(line.strip()):
                 return BlockingEvidence(confirmed_absent=False, fail_closed_unparseable=False)
+    if source == "marker":
+        log.info(
+            "blocking_findings_confirmed_absent: trusting self-reported "
+            "coord:review marker (blocking=0, assignment=%r)",
+            assignment_id,
+        )
     return BlockingEvidence(confirmed_absent=True, fail_closed_unparseable=False)
 
 
@@ -1021,13 +1020,14 @@ def classify_finding_nit_class(
     - If `classify_blocking_evidence` cannot even confirm the body's
       evidence (`fail_closed_unparseable`), this is never nit-class —
       a body too malformed to trust is not a safe autonomous-fix target.
-    - If it confirms zero blocking findings (`confirmed_absent`), this is
-      trivially nit-class: there is nothing to fix, so nothing can be
-      "not a nit".
-    - Otherwise there is at least one blocking finding, and nit-class
-      status depends entirely on the proposed *fix* for it: no `fix` at
-      all is never nit-class (nothing to evaluate), and a `fix` must be
-      ALL of:
+    - If a `fix` is supplied, it is ALWAYS graded on its own four
+      properties below, regardless of what `classify_blocking_evidence`
+      decided — a behavioral / public-API / sealed-path / oversized fix is
+      not nit-class even when the review body itself reports zero blocking
+      findings. A gate deciding whether an autonomous edit may land cannot
+      let the subject of that edit exempt itself just because the *report*
+      was clean; the fix still has to be graded. The four checks, ALL of
+      which must hold:
 
       1. Non-behavioral (`not fix.behavioral`) — caller-attested, not
          inferred (see `ProposedFix`).
@@ -1040,20 +1040,22 @@ def classify_finding_nit_class(
       4. A bounded, nonempty diff: ``0 < changed_lines <= max_changed_lines``.
          An empty `diff_text` (no actual fix drafted yet) is never
          nit-class — there is nothing bounded about "no diff".
+    - If no `fix` is supplied at all, nit-class status falls back to
+      `evidence.confirmed_absent`: zero blocking findings and nothing to
+      fix is trivially nit-class, while a real blocking finding with no
+      proposed fix is never nit-class (nothing to evaluate).
     """
     evidence = classify_blocking_evidence(body, assignment_id=assignment_id)
     if evidence.fail_closed_unparseable:
         return False
-    if evidence.confirmed_absent:
-        return True
-    if fix is None:
-        return False
-    if fix.behavioral or fix.touches_public_api:
-        return False
-    if sealed_paths and _diff_touched_sealed_paths(fix.diff_text, sealed_paths):
-        return False
-    changed = _diff_changed_line_count(fix.diff_text)
-    return 0 < changed <= max_changed_lines
+    if fix is not None:
+        if fix.behavioral or fix.touches_public_api:
+            return False
+        if sealed_paths and _diff_touched_sealed_paths(fix.diff_text, sealed_paths):
+            return False
+        changed = _diff_changed_line_count(fix.diff_text)
+        return 0 < changed <= max_changed_lines
+    return evidence.confirmed_absent
 
 
 def _parse_review_text(text: str) -> ReviewFindings | None:

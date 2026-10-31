@@ -981,6 +981,38 @@ class TestReviewNotify:
         assert body_arg.startswith("<!-- coord:review verdict=request-changes")
         assert "Bug at line 42." in body_arg
 
+    def test_review_header_counts_use_authoritative_marker_not_raw_prose(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """#3833 (Finding 3): the posted header's counts must come from the
+        same authoritative, marker-first read the #476 override gate uses
+        — not a raw re-parse of the prose — so the header never disagrees
+        with the gate's own decision about the same body ("one question,
+        one answer")."""
+        body = (
+            "<!-- coord:review verdict=request-changes blocking=0 "
+            "nonblocking=1 nits=0 assignment=rev4 -->\n"
+            "\n"
+            "## Blocking findings\n"
+            "- This would have parsed as one blocking bullet without the marker\n"
+        )
+        _record_review_assignment("rev4", review_target="88")
+        log_path = _make_log_with_review(tmp_path, "request-changes", body)
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev4", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        mock_review.assert_called_once()
+        _, _, _, body_arg = mock_review.call_args.args
+        assert body_arg.startswith(
+            "<!-- coord:review verdict=request-changes blocking=0",
+        )
+
     def test_review_fallback_when_log_parse_fails(
         self, coord_dir: Path, config: Config, tmp_path: Path
     ) -> None:
