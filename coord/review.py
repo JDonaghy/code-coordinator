@@ -655,6 +655,25 @@ def _is_no_findings_line(text: str) -> bool:
     return any(phrase in low for phrase in _NO_FINDINGS_PHRASES)
 
 
+# Count of bodies that fell through to the fail-closed branch of
+# `blocking_findings_confirmed_absent` — i.e. prose the heuristic could not
+# parse into a blocking count, *and* no trustworthy `coord:review` marker to
+# fall back on.  Each one burns a full extra fix+review round that a
+# well-formed body would have avoided.  Process-global, in-memory only: a
+# measure of residual rate within one run, not a persisted metric.
+_unparseable_treated_as_blocking_count = 0
+
+
+def unparseable_treated_as_blocking_count() -> int:
+    """Return how many bodies this process has fail-closed on.
+
+    Exposed for tests and for operator visibility (``coord doctor`` or an
+    audit script can read it); see the matching ``log.info`` line for the
+    grep-able record of each occurrence.
+    """
+    return _unparseable_treated_as_blocking_count
+
+
 def blocking_findings_confirmed_absent(body: str) -> bool:
     """True only when *body* carries POSITIVE evidence of zero blocking findings.
 
@@ -662,22 +681,54 @@ def blocking_findings_confirmed_absent(body: str) -> bool:
     It is deliberately *fail-closed*: everything the heuristic cannot read
     returns ``False``, i.e. "assume the reviewer meant what it said".
 
-    Returns ``True`` only when **all** of the following hold:
+    Returns ``True`` when either of these holds:
 
-    1. A blocking section was actually located (``blocking is not None`` —
-       a heading matching `_SECTION_KEYWORDS["blocking"]`).  A body with no
-       such heading yields ``None`` = *unknown*, which must never be read as
-       zero: that conflation is the #1456 defect, where a well-formed prose
-       `request-changes` on #1445 was rewritten to `approve` because the
-       *nits* bucket happened to parse as 0 while *blocking* parsed as None.
-    2. That section contains no bullets (an explicit parsed zero).
-    3. That section contains no substantive prose either — a reviewer who
-       writes blocking findings as paragraphs under "## Blocking" would
-       otherwise count as zero and fail open all the same.  Short "None" /
-       "N/A" markers are allowed (that's the shape being looked for).
+    1. Prose evidence: **all** of —
+
+       a. A blocking section was actually located (``blocking is not None`` —
+          a heading matching `_SECTION_KEYWORDS["blocking"]`).  A body with no
+          such heading yields ``None`` = *unknown*, which must never be read
+          as zero: that conflation is the #1456 defect, where a well-formed
+          prose `request-changes` on #1445 was rewritten to `approve` because
+          the *nits* bucket happened to parse as 0 while *blocking* parsed as
+          None.
+       b. That section contains no bullets (an explicit parsed zero).
+       c. That section contains no substantive prose either — a reviewer who
+          writes blocking findings as paragraphs under "## Blocking" would
+          otherwise count as zero and fail open all the same.  Short "None" /
+          "N/A" markers are allowed (that's the shape being looked for).
+
+    2. Marker evidence: the prose is unparseable (``blocking is
+       None``, i.e. no recognisable heading at all) but the body also carries
+       a machine-readable ``<!-- coord:review ... -->`` marker
+       (`parse_review_header`) reporting ``blocking=0``.  A well-behaved
+       reviewer emits that marker independently of whether its prose happens
+       to parse, so a clean marker is positive evidence on its own — trusting
+       it here is what avoids forcing a needless fix cycle on a review whose
+       *substance* was fine but whose prose heuristic missed.
+
+    Every other case — including prose that is unparseable *and* has no
+    trustworthy marker — stays fail-closed, and increments
+    `unparseable_treated_as_blocking_count` so the residual rate is
+    measurable.
     """
     blocking, _nonblocking, _nits = estimate_review_counts(body)
-    if blocking is None or blocking != 0:
+    if blocking is None:
+        header = parse_review_header(body)
+        if header is not None and header.get("blocking") == 0:
+            log.info(
+                "blocking_findings_confirmed_absent: prose unparseable, "
+                "trusting coord:review marker (blocking=0)"
+            )
+            return True
+        global _unparseable_treated_as_blocking_count  # noqa: PLW0603
+        _unparseable_treated_as_blocking_count += 1
+        log.info(
+            "blocking_findings_confirmed_absent: prose unparseable and no "
+            "trustworthy marker, treating as blocking (fail-closed)"
+        )
+        return False
+    if blocking != 0:
         return False
     for bucket, lines in _iter_review_sections(body):
         if bucket != "blocking":
@@ -1230,6 +1281,20 @@ test-naming conventions — are NEVER blocking. Put them under \
 `## Non-blocking concerns` or `## Nits`. Each fix+review round costs real \
 wall-clock time and money; do not burn a round on something that does not \
 change what the code does.
+
+FORMAT CONTRACT — the three marker lines (`REVIEW_VERDICT:`, \
+`REVIEW_BODY:`, `END_REVIEW`) AND the three section headings above are \
+parsed by machine. Each marker line must start at the beginning of its own \
+line as literal plain text, with NO Markdown decoration: no `**bold**`, no \
+backticks, no `#` heading marks, no list bullet. \
+`**REVIEW_VERDICT: request-changes**` is WRONG; `REVIEW_VERDICT: \
+request-changes` is right. The three headings must be written exactly as \
+shown (`## Blocking findings`, `## Non-blocking concerns`, `## Nits`) — not \
+renamed, reordered, merged, or demoted to prose. A `request-changes` whose \
+body the coordinator cannot parse into these sections is treated as fully \
+blocking by default, costing a full extra fix+review round even when you \
+raised nothing blocking — getting the format right the first time is how \
+you avoid that.
 
 `END_REVIEW` is a HARD REQUIREMENT, not a formatting flourish: the coordinator \
 only records a verdict when it sees that exact line, so a review that is \
