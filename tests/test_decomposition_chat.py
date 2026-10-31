@@ -1663,3 +1663,289 @@ def test_cli_interactive_survives_a_house_stack_probe_that_explodes(tmp_path, mo
     briefing_on_disk = brief_path.read_text(encoding="utf-8")
     assert "HOUSE STACK" in briefing_on_disk
     assert "no recognisable stack/deploy signal" in briefing_on_disk
+
+
+# ── Size-triage work-dispatch entry (read-only, sonnet-pinned) ─────────────────
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeHTTPClient:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+        self.calls: list[tuple[str, dict]] = []
+
+    def post(self, url: str, *, json: dict, timeout: float) -> _FakeHTTPResponse:
+        self.calls.append((url, json))
+        return _FakeHTTPResponse(self._payload)
+
+
+class _RejectingHTTPClient:
+    def post(self, url: str, *, json: dict, timeout: float):
+        import httpx
+
+        raise httpx.ConnectError("connection refused")
+
+
+_SPLIT_RESPONSE = """Looking at this issue now.
+
+SIZE_TRIAGE_VERDICT: split
+## Child 1: Add the scorer
+Pure heuristic scoring, no agent involved.
+
+## Files
+- coord/preflight_size.py
+- tests/test_preflight_size.py
+
+## Child 2: Add the triage dispatch entry
+Read-only sonnet-pinned agent that proposes SPLIT/PROCEED.
+
+## Files
+- coord/decomposition_chat.py
+- tests/test_decomposition_chat.py
+
+END_SIZE_TRIAGE
+"""
+
+_PROCEED_RESPONSE = """Reviewed the issue; it is small and self-contained.
+
+SIZE_TRIAGE_VERDICT: proceed
+END_SIZE_TRIAGE
+"""
+
+_MALFORMED_RESPONSE_NO_TERMINATOR = """SIZE_TRIAGE_VERDICT: split
+## Child 1: Oops
+Response got truncated before the terminator.
+"""
+
+_MALFORMED_RESPONSE_NO_VERDICT = """I looked at the issue and think it's fine as-is.
+END_SIZE_TRIAGE
+"""
+
+
+class TestSizeTriageReviewTargetFor:
+    def test_non_numeric_sentinel(self):
+        target = decomposition_chat.size_triage_review_target_for(3818)
+        assert "3818" in target
+        with pytest.raises(ValueError):
+            int(target)
+
+
+class TestBuildSizeTriageBriefing:
+    def test_includes_issue_body_and_contract(self):
+        briefing = decomposition_chat.build_size_triage_briefing(
+            issue_number=3818,
+            issue_title="Preflight guard: work-dispatch entry",
+            issue_body="Add a work-dispatch entry point to decomposition_chat.py.",
+            repo_github="acme/code-coordinator",
+        )
+        assert "#3818" in briefing
+        assert "Add a work-dispatch entry point" in briefing
+        assert "SIZE_TRIAGE_VERDICT: split" in briefing
+        assert "SIZE_TRIAGE_VERDICT: proceed" in briefing
+        assert "END_SIZE_TRIAGE" in briefing
+        assert "HARD REQUIREMENT" in briefing
+
+    def test_includes_size_signals_when_given(self):
+        briefing = decomposition_chat.build_size_triage_briefing(
+            issue_number=3818,
+            issue_title="t",
+            issue_body="b",
+            repo_github="acme/code-coordinator",
+            size_signals=["touches 14 files across 5 directories"],
+        )
+        assert "touches 14 files across 5 directories" in briefing
+
+    def test_includes_graph_context_when_given(self):
+        briefing = decomposition_chat.build_size_triage_briefing(
+            issue_number=3818,
+            issue_title="t",
+            issue_body="b",
+            repo_github="acme/code-coordinator",
+            graph_context="coord/decomposition_chat.py -> coord/gate_b.py (precedent)",
+        )
+        assert "coord/decomposition_chat.py -> coord/gate_b.py" in briefing
+
+    def test_missing_graph_context_still_builds(self):
+        briefing = decomposition_chat.build_size_triage_briefing(
+            issue_number=3818,
+            issue_title="t",
+            issue_body="b",
+            repo_github="acme/code-coordinator",
+        )
+        assert "No graph context was supplied" in briefing
+
+
+class TestParseSizeTriageResponse:
+    def test_parses_split_into_split_proposal_with_ordered_children(self):
+        proposal = decomposition_chat.parse_size_triage_response(
+            _SPLIT_RESPONSE,
+            repo_name="code-coordinator",
+            issue_number=3818,
+            issue_title="Preflight guard",
+        )
+        assert proposal is not None
+        assert proposal.repo_name == "code-coordinator"
+        assert proposal.issue_number == 3818
+        assert [c.title for c in proposal.chunks] == [
+            "Add the scorer",
+            "Add the triage dispatch entry",
+        ]
+        assert proposal.chunks[0].files_likely == [
+            "coord/preflight_size.py",
+            "tests/test_preflight_size.py",
+        ]
+        assert proposal.chunks[1].files_likely == [
+            "coord/decomposition_chat.py",
+            "tests/test_decomposition_chat.py",
+        ]
+        assert "Pure heuristic scoring" in proposal.chunks[0].scope
+        # The files list itself must not leak into the prose scope text.
+        assert "coord/preflight_size.py" not in proposal.chunks[0].scope
+
+    def test_parses_proceed_as_none(self):
+        proposal = decomposition_chat.parse_size_triage_response(
+            _PROCEED_RESPONSE,
+            repo_name="code-coordinator",
+            issue_number=3818,
+            issue_title="Preflight guard",
+        )
+        assert proposal is None
+
+    def test_missing_terminator_raises(self):
+        with pytest.raises(decomposition_chat.SizeTriageError):
+            decomposition_chat.parse_size_triage_response(
+                _MALFORMED_RESPONSE_NO_TERMINATOR,
+                repo_name="code-coordinator",
+                issue_number=3818,
+                issue_title="Preflight guard",
+            )
+
+    def test_missing_verdict_line_raises(self):
+        with pytest.raises(decomposition_chat.SizeTriageError):
+            decomposition_chat.parse_size_triage_response(
+                _MALFORMED_RESPONSE_NO_VERDICT,
+                repo_name="code-coordinator",
+                issue_number=3818,
+                issue_title="Preflight guard",
+            )
+
+    def test_split_with_no_child_headings_raises(self):
+        with pytest.raises(decomposition_chat.SizeTriageError):
+            decomposition_chat.parse_size_triage_response(
+                "SIZE_TRIAGE_VERDICT: split\nEND_SIZE_TRIAGE\n",
+                repo_name="code-coordinator",
+                issue_number=3818,
+                issue_title="Preflight guard",
+            )
+
+
+class TestDispatchSizeTriageReview:
+    def test_happy_path_dispatches_readonly_sonnet_review(self):
+        from coord.models import Board
+
+        board = Board()
+        client = _FakeHTTPClient({"id": "st-1"})
+        machine = _machine("laptop", ["api"])
+        repo = _repo("api")
+
+        with patch("coord.state.record_dispatched_assignment") as mock_record:
+            assignment = decomposition_chat.dispatch_size_triage_review(
+                repo_cfg=repo,
+                machine=machine,
+                issue_number=3818,
+                issue_title="Preflight guard",
+                issue_body="Some oversized issue body.",
+                board=board,
+                http_client=client,
+                now=1000.0,
+            )
+
+        # Pinned to sonnet, read-only via type="review", and found on the board.
+        assert assignment.model == "sonnet"
+        assert assignment.type == "review"
+        assert assignment.review_target == "size-triage-3818"
+        assert assignment in board.active
+        mock_record.assert_called_once()
+
+        assert len(client.calls) == 1
+        _url, payload = client.calls[0]
+        assert payload["type"] == "review"
+        assert payload["model"] == "sonnet"
+        assert payload["system_prompt"] == decomposition_chat.SIZE_TRIAGE_SYSTEM_PROMPT
+        assert payload["issue_number"] == 3818
+        assert "Some oversized issue body." in payload["briefing"]
+
+    def test_never_files_issues_or_mutates_the_drive_queue(self):
+        """This entry only proposes — filing/queuing a proposal is a separate,
+        later, gated step. Patch the real mutating entry points so a call to
+        either fails the test outright."""
+        from coord.models import Board
+
+        board = Board()
+        client = _FakeHTTPClient({"id": "st-1"})
+        machine = _machine("laptop", ["api"])
+        repo = _repo("api")
+
+        with patch("coord.state.record_dispatched_assignment"), patch(
+            "coord.github_ops.post_issue_comment",
+            side_effect=AssertionError("must not post/file anything"),
+        ) as mock_comment:
+            decomposition_chat.dispatch_size_triage_review(
+                repo_cfg=repo,
+                machine=machine,
+                issue_number=3818,
+                issue_title="Preflight guard",
+                issue_body="Some oversized issue body.",
+                board=board,
+                http_client=client,
+            )
+        mock_comment.assert_not_called()
+
+    def test_raises_size_triage_error_when_machine_unreachable(self):
+        from coord.models import Board
+
+        board = Board()
+        machine = _machine("laptop", ["api"])
+        repo = _repo("api")
+
+        with pytest.raises(decomposition_chat.SizeTriageError):
+            decomposition_chat.dispatch_size_triage_review(
+                repo_cfg=repo,
+                machine=machine,
+                issue_number=3818,
+                issue_title="Preflight guard",
+                issue_body="body",
+                board=board,
+                http_client=_RejectingHTTPClient(),
+            )
+        # A failed dispatch must not leave a phantom running assignment.
+        assert board.active == []
+
+    def test_raises_size_triage_error_when_machine_missing_repo_path(self):
+        from coord.models import Board, Machine
+
+        board = Board()
+        bare_machine = Machine(name="bare", host="bare.tail", repos=["api"])
+        repo = _repo("api")
+
+        with pytest.raises(decomposition_chat.SizeTriageError):
+            decomposition_chat.dispatch_size_triage_review(
+                repo_cfg=repo,
+                machine=bare_machine,
+                issue_number=3818,
+                issue_title="Preflight guard",
+                issue_body="body",
+                board=board,
+                http_client=_FakeHTTPClient({"id": "st-1"}),
+            )
+        assert board.active == []
