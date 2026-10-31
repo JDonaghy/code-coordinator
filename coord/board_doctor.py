@@ -54,6 +54,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from coord import queue_diagnose
+from coord.models import Board
 
 _log = logging.getLogger(__name__)
 
@@ -109,11 +110,14 @@ CAUSE_CEILING_BLOCKED_MERGEABLE = "ceiling-blocked-mergeable"
 #: parks the assignment at `test_state="blocked"` instead of re-dispatching
 #: it forever (#2272), so without this cause the row sits there until a
 #: human notices. Registered in `coord.board_doctor_policy.ALLOWLIST`: the
-#: safe auto-action is simply clearing the parked `test_state`/`test_reason`
-#: (`coord.state.reset_work_test_state`, via the `smoke_requeue` sweep
-#: action) so the assignment re-enters the normal Test-stage dispatch scan
-#: — never a second "no-verdict" tally once that happens, since the row no
-#: longer matches this cause's own detection predicate (#2244).
+#: safe auto-action (`coord.board_doctor_permissions.sweep_smoke_requeue`,
+#: via the `smoke_requeue` sweep action) clears the parked `test_state` so
+#: the assignment re-enters the normal Test-stage dispatch scan, bounded by
+#: its own `coord.smoke.BOARD_DOCTOR_REQUEUE_BUDGET` (#3810) — a row that
+#: keeps muting after each requeue is NOT cleared again once that budget is
+#: spent, so it keeps matching this cause's detection predicate every
+#: sweep and its convergence counter escalates to a human instead of the
+#: requeue repeating forever.
 CAUSE_SMOKE_NO_VERDICT = "smoke-no-verdict"
 
 #: A repo whose merge base has hit `coord.state.BASELINE_RED_STREAK_LIMIT`
@@ -311,8 +315,22 @@ def baseline_red_rows(blocked_streaks: Mapping[str, int]) -> list[StuckRow]:
     ]
 
 
-def smoke_no_verdict_rows(board: Any) -> list[StuckRow]:
-    """One :class:`StuckRow` per assignment parked on a no-verdict smoke leg.
+#: Assignment types `coord.state.reset_work_test_state`/`test_reset_candidates`
+#: can clear with no `assignment_id` (`coord.state._test_reset_where`). A
+#: `test-author`/`mock-author` row parked on the same mute-leg tally needs
+#: its own `assignment_id` threaded through to be clearable at all — this
+#: detector has no row to thread (`StuckRow` carries only `queue`/`key`, not
+#: `assignment_id`), so it is restricted to the types the handler can
+#: actually reach rather than minting a `StuckRow` `sweep_smoke_requeue`
+#: would see as "no live row" every sweep forever (`auto-dispatch-noop`
+#: with no path to the alert tier, since the row never stops matching this
+#: detector's predicate to let `clear_absent_rows` give up on it).
+_SMOKE_REQUEUE_REACHABLE_TYPES = frozenset({"work", "plan", "epic-decompose"})
+
+
+def smoke_no_verdict_rows(board: Board) -> list[StuckRow]:
+    """One :class:`StuckRow` per *issue* with an assignment parked on a
+    no-verdict smoke leg.
 
     #3760 Action 5 / #2244: `coord.notify._record_smoke_verdict` parks an
     assignment at ``test_state=TEST_STATE_BLOCKED`` with a
@@ -327,6 +345,19 @@ def smoke_no_verdict_rows(board: Any) -> list[StuckRow]:
     that `coord.smoke.mute_smoke_legs` does not match, so neither is ever
     picked up here.
 
+    Restricted to :data:`_SMOKE_REQUEUE_REACHABLE_TYPES` — a parked
+    ``test-author``/``mock-author`` row is invisible to
+    `coord.state.reset_work_test_state` without its own `assignment_id`,
+    which this detector has no row to carry, so including it here would
+    only mint a `StuckRow` the handler can never actually clear.
+
+    Deduped by issue (``f"{repo_name}#{issue_number}"``): two parked
+    assignments on the same issue produce exactly one row, since
+    `coord.board_doctor_permissions.sweep_smoke_requeue` clears every
+    matching row for the issue in a single call and a second, duplicate
+    `StuckRow` for the same ``(queue, key)`` would only double-count the
+    sweep's own convergence/decision bookkeeping for one real episode.
+
     *board* is a single already-built `coord.models.Board` (callers pass
     the one `collect_rows` already builds for `queue_diagnose.GhLiveProbe`,
     rather than this function calling `coord.state.build_board` a second
@@ -339,25 +370,28 @@ def smoke_no_verdict_rows(board: Any) -> list[StuckRow]:
         mute_smoke_legs,
     )
 
-    rows: list[StuckRow] = []
+    seen: dict[str, StuckRow] = {}
     for assignment in (*board.active, *board.completed):
+        if assignment.type not in _SMOKE_REQUEUE_REACHABLE_TYPES:
+            continue
         if assignment.test_state != TEST_STATE_BLOCKED:
             continue
         legs = mute_smoke_legs(assignment.test_reason)
         if legs < MUTE_SMOKE_LEG_BUDGET:
             continue
-        rows.append(
-            StuckRow(
-                queue="smoke-no-verdict",
-                key=f"{assignment.repo_name}#{assignment.issue_number}",
-                state="blocked",
-                cause=CAUSE_SMOKE_NO_VERDICT,
-                confidence=queue_diagnose.CONFIDENCE_HIGH,
-                evidence=(f"mute_smoke_legs={legs}",),
-                fresh=True,
-            )
+        key = f"{assignment.repo_name}#{assignment.issue_number}"
+        if key in seen:
+            continue
+        seen[key] = StuckRow(
+            queue="smoke-no-verdict",
+            key=key,
+            state="blocked",
+            cause=CAUSE_SMOKE_NO_VERDICT,
+            confidence=queue_diagnose.CONFIDENCE_HIGH,
+            evidence=(f"mute_smoke_legs={legs}",),
+            fresh=True,
         )
-    return rows
+    return list(seen.values())
 
 
 def drive_queue_rows(diagnoses: Sequence[queue_diagnose.Diagnosis]) -> list[StuckRow]:

@@ -19,16 +19,26 @@ from coord.board_doctor import (
     ALERT_SKIPPED,
     CAUSE_BASELINE_RED,
     CAUSE_CEILING_BLOCKED_MERGEABLE,
+    CAUSE_SMOKE_NO_VERDICT,
     TIER_ALERT,
     TIER_AUTO,
     StuckRow,
     _reclassify_ceiling_blocked,
     _refresh_ceiling_blocked_settled_rows,
     baseline_red_rows,
+    smoke_no_verdict_rows,
     sweep,
 )
 from coord.drive_queue import QueueEntry
+from coord.models import Assignment, Board
 from coord.queue_diagnose import LiveState
+from coord.smoke import (
+    ABANDONED_BACKGROUND_SMOKE_MARKER,
+    ENVIRONMENTAL_SMOKE_MARKER,
+    MUTE_SMOKE_LEG_BUDGET,
+    TEST_STATE_BLOCKED,
+    mute_smoke_tally,
+)
 
 
 def _row(key: str, cause: str, queue: str = "drive-queue", *, fresh: bool = False) -> StuckRow:
@@ -1004,3 +1014,160 @@ class TestDryRun:
         after = state.board_doctor_row_state("drive-queue", key)
         assert after == before
         assert dispatch.count == 1  # only the real sweep dispatched
+
+
+def _parked_assignment(
+    *,
+    assignment_id: str,
+    repo: str,
+    issue: int,
+    type: str = "work",  # noqa: A002
+    test_reason: str | None = None,
+) -> Assignment:
+    return Assignment(
+        machine_name="m1",
+        repo_name=repo,
+        issue_number=issue,
+        issue_title=f"issue-{issue}-x",
+        assignment_id=assignment_id,
+        status="done",
+        branch=f"issue-{issue}-x",
+        type=type,
+        test_state=TEST_STATE_BLOCKED,
+        test_reason=test_reason if test_reason is not None else mute_smoke_tally(MUTE_SMOKE_LEG_BUDGET),
+    )
+
+
+class TestSmokeNoVerdictRows:
+    """#3760 Action 5 / #2244: `smoke_no_verdict_rows` is the detector half
+    of `coord.board_doctor_permissions.sweep_smoke_requeue` — it must only
+    surface a row the handler can actually clear.
+    """
+
+    def test_a_row_parked_at_the_mute_budget_is_selected(self) -> None:
+        board = Board(
+            completed=[
+                _parked_assignment(assignment_id="aid-x", repo="acme/widgets", issue=1),
+            ]
+        )
+
+        [row] = smoke_no_verdict_rows(board)
+
+        assert row.queue == "smoke-no-verdict"
+        assert row.key == "acme/widgets#1"
+        assert row.cause == CAUSE_SMOKE_NO_VERDICT
+        assert row.evidence == (f"mute_smoke_legs={MUTE_SMOKE_LEG_BUDGET}",)
+
+    def test_a_row_below_the_mute_budget_is_not_selected(self) -> None:
+        board = Board(
+            completed=[
+                _parked_assignment(
+                    assignment_id="aid-x",
+                    repo="acme/widgets",
+                    issue=2,
+                    test_reason=mute_smoke_tally(MUTE_SMOKE_LEG_BUDGET - 1),
+                ),
+            ]
+        )
+
+        assert smoke_no_verdict_rows(board) == []
+
+    def test_a_row_not_parked_at_all_is_not_selected(self) -> None:
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="m1",
+                    repo_name="acme/widgets",
+                    issue_number=3,
+                    issue_title="issue-3-x",
+                    assignment_id="aid-x",
+                    status="done",
+                    test_state="passed",
+                ),
+            ]
+        )
+
+        assert smoke_no_verdict_rows(board) == []
+
+    def test_a_3315_environmental_retry_park_is_not_picked_up(self) -> None:
+        # Its own tally marker text does not match `mute_smoke_legs`'s
+        # regex, so this cause never fires for it.
+        board = Board(
+            completed=[
+                _parked_assignment(
+                    assignment_id="aid-x",
+                    repo="acme/widgets",
+                    issue=4,
+                    test_reason=ENVIRONMENTAL_SMOKE_MARKER,
+                ),
+            ]
+        )
+
+        assert smoke_no_verdict_rows(board) == []
+
+    def test_a_3737_abandoned_background_park_is_not_picked_up(self) -> None:
+        board = Board(
+            completed=[
+                _parked_assignment(
+                    assignment_id="aid-x",
+                    repo="acme/widgets",
+                    issue=5,
+                    test_reason=ABANDONED_BACKGROUND_SMOKE_MARKER,
+                ),
+            ]
+        )
+
+        assert smoke_no_verdict_rows(board) == []
+
+    def test_a_test_author_row_at_the_mute_budget_is_not_selected(self) -> None:
+        # `coord.state.reset_work_test_state`/`test_reset_candidates` can
+        # only clear this type with an `assignment_id` this detector has no
+        # row to carry (`StuckRow` has no such field) — surfacing it here
+        # would mint a row `sweep_smoke_requeue` could never actually clear.
+        board = Board(
+            completed=[
+                _parked_assignment(
+                    assignment_id="aid-x",
+                    repo="acme/widgets",
+                    issue=6,
+                    type="test-author",
+                ),
+            ]
+        )
+
+        assert smoke_no_verdict_rows(board) == []
+
+    def test_two_parked_rows_on_the_same_issue_collapse_to_one(self) -> None:
+        board = Board(
+            completed=[
+                _parked_assignment(assignment_id="aid-a", repo="acme/widgets", issue=7),
+                _parked_assignment(assignment_id="aid-b", repo="acme/widgets", issue=7),
+            ]
+        )
+
+        rows = smoke_no_verdict_rows(board)
+
+        assert [row.key for row in rows] == ["acme/widgets#7"]
+
+    def test_rows_on_different_issues_both_surface(self) -> None:
+        board = Board(
+            completed=[
+                _parked_assignment(assignment_id="aid-a", repo="acme/widgets", issue=8),
+                _parked_assignment(assignment_id="aid-b", repo="acme/gadgets", issue=9),
+            ]
+        )
+
+        rows = smoke_no_verdict_rows(board)
+
+        assert {row.key for row in rows} == {"acme/widgets#8", "acme/gadgets#9"}
+
+    def test_active_assignments_are_also_scanned(self) -> None:
+        board = Board(
+            active=[
+                _parked_assignment(assignment_id="aid-x", repo="acme/widgets", issue=10),
+            ]
+        )
+
+        [row] = smoke_no_verdict_rows(board)
+
+        assert row.key == "acme/widgets#10"

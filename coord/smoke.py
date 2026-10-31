@@ -2401,6 +2401,27 @@ def abandoned_background_smoke_tally(count: int) -> str:
     return f"{ABANDONED_BACKGROUND_SMOKE_MARKER} x{count}"
 
 
+# ── Board-doctor smoke-requeue retries (#3810) ──────────────────────────────
+#
+# `coord.board_doctor`'s unattended sweep re-dispatches a work row parked at
+# the #2272 mute-leg budget (`MUTE_SMOKE_LEG_BUDGET`) instead of leaving it
+# for a human (`coord.board_doctor_permissions.sweep_smoke_requeue`). A marker
+# embedded in `test_reason` — the shape #3315/#3737 below use — does not
+# survive here: the very next mute leg's `coord.notify._record_smoke_verdict`
+# write OVERWRITES `test_reason` wholesale with nothing but its own
+# `mute_smoke_tally`, discarding anything else that was there. So the
+# requeue budget is tracked in `board_meta` instead
+# (`coord.state.record_board_doctor_smoke_requeue` /
+# `coord.state.board_doctor_smoke_requeue_count`), keyed by assignment id —
+# nothing this module or `coord.notify` writes touches that table.
+#: How many times board-doctor may requeue the SAME assignment off a #2272
+#: mute-leg park before refusing and letting its convergence counter
+#: escalate instead. Separate from `MUTE_SMOKE_LEG_BUDGET` — this bounds
+#: board-doctor's own retry of an already-exhausted budget, not the mute
+#: legs themselves.
+BOARD_DOCTOR_REQUEUE_BUDGET = 2
+
+
 #: Soft (transient) unroutable reports already logged this process, keyed by
 #: ``(assignment_id, message)``. Transient conditions — a machine that is
 #: merely unreachable right now — are left re-dispatchable so the stage
