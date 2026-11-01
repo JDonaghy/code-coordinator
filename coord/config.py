@@ -1544,9 +1544,18 @@ class BoardDoctorConfig:
     `coord.board_doctor_policy._investigate_tier_enabled` is the single
     function that reads both this field and the per-repo opt-in — see its
     docstring for the full decision, so there is exactly one place to look.
+
+    ``finish`` is the fleet-wide switch for Trigger A (#3835), mirroring
+    ``investigate`` exactly: a repo must still opt in via its own
+    ``repos[].board_doctor.finish`` (``BoardDoctorRepoConfig.finish``,
+    default ``False``) for a nit-only `request-changes` to route to a
+    finisher leg instead of the #476 gate's silent approve-with-nits.
+    `coord.board_doctor_policy._finisher_tier_enabled` reads both this
+    field and the per-repo opt-in.
     """
 
     investigate: bool = True
+    finish: bool = True
 
 
 KNOWN_GATE_NAMES = ("test", "review", "uat", "merge")
@@ -3526,6 +3535,11 @@ def _parse_board_doctor(raw: Any) -> BoardDoctorConfig:
         if not isinstance(investigate, bool):
             raise ConfigError("board_doctor.investigate must be a boolean")
         cfg.investigate = investigate
+    if "finish" in raw:
+        finish = raw["finish"]
+        if not isinstance(finish, bool):
+            raise ConfigError("board_doctor.finish must be a boolean")
+        cfg.finish = finish
     return cfg
 
 
@@ -3976,6 +3990,13 @@ def _parse_board_doctor_repo_config(raw: Any, repo_index: int) -> BoardDoctorRep
                 f"repos[{repo_index}].board_doctor.investigate must be a boolean"
             )
         cfg.investigate = investigate
+    if "finish" in raw:
+        finish = raw["finish"]
+        if not isinstance(finish, bool):
+            raise ConfigError(
+                f"repos[{repo_index}].board_doctor.finish must be a boolean"
+            )
+        cfg.finish = finish
     return cfg
 
 

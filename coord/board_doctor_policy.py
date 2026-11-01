@@ -476,6 +476,97 @@ def _investigate_tier_enabled(repo_name: str, config: "Config") -> bool:
     return bool(repo is not None and repo.board_doctor.investigate)
 
 
+NO_FINISHER_ENV_VAR = "COORD_BOARD_DOCTOR_NO_FINISHER"
+"""Process-wide kill switch read by :func:`_finisher_tier_enabled`.
+
+Mirrors :data:`NO_INVESTIGATE_ENV_VAR` for Trigger A (#3835) — set (to any
+truthy string) to disarm nit-only finisher routing fleet-wide without
+touching ``coordinator.yml``.
+"""
+
+#: Trigger A's (#3835) own cause string, passed through to
+#: `coord.board_doctor_permissions.sweep_dispatch_finisher_leg` as
+#: ``cause=``. Not a `coord.board_doctor` `StuckRow.cause` — this fires
+#: synchronously from `coord.auto_loop.process_review_completion` at the
+#: moment a review completes, never from the periodic sweep, so it is never
+#: registered into `ALLOWLIST`/`AUTO_DISPATCHERS`/`INVESTIGATE_CAUSES`.
+CAUSE_NIT_ONLY_REQUEST_CHANGES = "nit_only_request_changes"
+
+
+def _finisher_tier_enabled(repo_name: str, config: "Config") -> bool:
+    """Decide whether Trigger A (#3835) may route a nit-only review here.
+
+    Mirrors :func:`_investigate_tier_enabled`'s three independent gates
+    exactly, reading the ``finish``-named fields instead of
+    ``investigate``:
+
+    1. :data:`NO_FINISHER_ENV_VAR` — a process-wide kill switch.
+    2. ``board_doctor.finish`` — the fleet-wide config switch.
+    3. ``repos[].board_doctor.finish`` — the per-repo opt-in. A repo that
+       has not opted in keeps today's #476 behavior (silent
+       approve-with-nits, nothing applied) regardless of the fleet-wide
+       switch.
+    """
+    if os.environ.get(NO_FINISHER_ENV_VAR):
+        return False
+    if not config.board_doctor.finish:
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.finish)
+
+
+def dispatch_nit_only_finisher(
+    repo_name: str,
+    issue_number: int,
+    board: "Board",
+    config: "Config",
+    *,
+    evidence: tuple[str, ...] = (),
+    http_client: object | None = None,
+) -> bool:
+    """Trigger A (#3835): route a nit-only `request-changes` to a finisher
+    leg instead of #476's silent approve-with-nits.
+
+    Called directly from `coord.auto_loop.process_review_completion` at
+    the moment a review's blocking section is confirmed empty
+    (`coord.review.classify_blocking_evidence().confirmed_absent` — exactly
+    `coord.review.classify_finding_nit_class`'s own fallback answer when no
+    fix has been drafted yet, since no fix exists at review-completion
+    time). This is a plain, synchronously-called function, NOT a
+    `coord.board_doctor.sweep` auto-dispatcher: it is never registered into
+    `ALLOWLIST` / `AUTO_DISPATCHERS` / `INVESTIGATE_CAUSES` /
+    `policy_tier_of`, since that machinery exists for the periodic
+    `StuckRow` sweep, a different call site with different available data.
+
+    Returns ``True`` only when `coord.board_doctor_permissions.
+    sweep_dispatch_finisher_leg` (via :data:`_FINISHER_ACTION`) actually
+    confirms ``dispatched=True`` — mirroring :func:`_investigate`'s
+    confirmed-dispatch discipline (never signalling "handled" off the mere
+    absence of an exception, per #2096). The caller must fall through to
+    its own existing behavior on ``False``, for any reason: the tier is
+    off, the repo hasn't opted in, a fix-it/finisher/drive-session is
+    already in flight for this issue, or `_dispatch_fix` declined (no
+    capable machine, unreachable agent, …). There is no alert-fallback
+    here, unlike :func:`_investigate` — declining just means #476's own
+    behavior already applies, which is itself a safe, legible outcome
+    (approve-with-nits, nothing silently lost), not a stuck row needing a
+    human page.
+    """
+    if not _finisher_tier_enabled(repo_name, config):
+        return False
+    result = dispatch_sweep_action(
+        _FINISHER_ACTION,
+        repo_name,
+        issue_number,
+        board,
+        config,
+        cause=CAUSE_NIT_ONLY_REQUEST_CHANGES,
+        evidence=evidence,
+        http_client=http_client,
+    )
+    return bool(result.get("dispatched"))
+
+
 def _alert_fallback(row: StuckRow) -> bool:
     """Replicate `coord.board_doctor.sweep`'s own private ``_alert_action``
     confirmed-dispatch contract for a row :func:`_investigate` is falling
