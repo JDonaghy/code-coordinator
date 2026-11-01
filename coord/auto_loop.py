@@ -429,6 +429,18 @@ def process_review_completion(
         # here would let a finisher leg re-dispatch onto already-merged
         # work, or blow straight through a drive-queue row that already
         # gave up on the #2972 fix-round ceiling.
+        #
+        # `dispatch_nit_only_finisher` additionally enforces a per-repo
+        # capacity cap (#3837) that `_dispatch_fix_for_review`'s own
+        # ordinary fix dispatch below does not — an opted-in repo already
+        # at capacity falls through to the #476 approve-with-nits gate
+        # instead of a finisher leg, while an ordinary ``request-changes``
+        # with real blocking findings always gets its fix-it leg
+        # regardless of how many other legs the repo already has running.
+        # This asymmetry is intentional, not an oversight: a finisher leg
+        # is optional convenience work the fleet chose to opt into, so it
+        # is the one capped when the repo is busy; a genuine fix for real
+        # blocking findings is not optional in the same way.
         work: Assignment | None = None
         if review.review_of_assignment_id:
             work = board.find_by_id(review.review_of_assignment_id)

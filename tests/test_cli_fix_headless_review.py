@@ -495,6 +495,40 @@ class TestFinisherLegDispatchViaCliDoor:
         assert fixes[0].branch == WORK_BRANCH
         assert fixes[0].review_of_assignment_id == "work-abc"
 
+    def test_no_finish_flag_disarms_the_finisher_for_this_invocation(
+        self, config_file_finisher_enabled: Path, coord_dir: Path
+    ) -> None:
+        """`coord fix --no-finish` (#3837) is the one-shot kill switch for
+        Trigger A — unlike `coord drive-queue sweep --no-finish` (removed:
+        that command never calls `process_review_completion`, so a switch
+        scoped there could never disarm anything), this IS the call site
+        where Trigger A fires, so passing it here must fall back to the
+        #476 approve-with-nits no-op even though the repo and fleet are
+        both opted into `board_doctor.finish`."""
+        _seed(
+            _work(), _review(),
+            body=(
+                "## Blocking\n\nNone — nothing here blocks the merge.\n\n"
+                "## Minor observations (not blocking)\n"
+                "- Rename `tmp` to `scratch` for clarity\n"
+            ),
+        )
+        http = _http_mock(new_id="finisher-new")
+
+        with patch("coord.auto_loop.httpx", http), \
+             patch("coord.auto_loop.record_dispatched_assignment"), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.drive.list_drive_sessions", return_value=[]):
+            result = _run(config_file_finisher_enabled, "review-xyz", "--no-finish")
+
+        assert result.exit_code != 0
+        assert "no blocking findings" in result.output
+        assert "Finisher leg dispatched" not in result.output
+        http.post.assert_not_called()
+
+        board = state_mod.load_board()
+        assert [a for a in board.active if a.assignment_id == "finisher-new"] == []
+
     def test_opted_out_repo_keeps_the_476_fallback(
         self, config_file: Path, coord_dir: Path
     ) -> None:

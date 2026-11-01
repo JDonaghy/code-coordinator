@@ -51,6 +51,15 @@ _UNPINNABLE_DETAIL = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_drive_sessions(monkeypatch) -> None:
+    # `_investigate_in_flight_count` (shared by the finisher tier's own
+    # capacity check via `_at_repo_capacity`, #3837) also checks live
+    # `coord drive` tmux sessions — keep that hermetic across this whole
+    # module rather than in each capacity-check test class individually.
+    monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
+
+
 def _row(
     key: str,
     cause: str,
@@ -704,13 +713,6 @@ class TestInvestigateCapacityCheck:
             machines=[],
         )
 
-    @pytest.fixture(autouse=True)
-    def _no_drive_sessions(self, monkeypatch) -> None:
-        # `_investigate_in_flight_count` now also checks live `coord drive`
-        # tmux sessions — keep that hermetic here, same convention used
-        # across the repo's other drive-queue tests.
-        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
-
     def test_at_the_cap_the_rest_defer_with_no_escalation(self, monkeypatch) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
         monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
@@ -990,6 +992,7 @@ class TestDispatchNitOnlyFinisher:
     directly rather than through `sweep`/`policy_tier_of`.
     """
 
+
     def test_returns_false_without_dispatching_when_tier_disabled(
         self, monkeypatch
     ) -> None:
@@ -1063,3 +1066,131 @@ class TestDispatchNitOnlyFinisher:
         )
 
         assert result is False
+
+
+class TestFinisherCapacityCheck:
+    """#3837: the finisher tier's per-repo cap, resolved via the same
+    shared `_at_repo_capacity` helper the investigate tier's
+    `InvestigateCapacityGate` uses, but called inline on every
+    `dispatch_nit_only_finisher` call rather than via a gate built once per
+    sweep — there is no sweep here, just the one call site.
+    """
+
+    @staticmethod
+    def _config(max_parallel: int) -> Config:
+        from coord.config import BoardDoctorConfig
+        from coord.models import BoardDoctorRepoConfig
+
+        return Config(
+            repos=[
+                Repo(
+                    name="acme/widgets",
+                    github="acme/widgets",
+                    max_parallel=max_parallel,
+                    board_doctor=BoardDoctorRepoConfig(finish=True),
+                )
+            ],
+            machines=[],
+            board_doctor=BoardDoctorConfig(finish=True),
+        )
+
+    def test_at_capacity_does_not_dispatch(self, monkeypatch) -> None:
+        busy_board = Board(
+            active=[
+                Assignment(
+                    machine_name="mac1",
+                    repo_name="acme/widgets",
+                    issue_number=40,
+                    issue_title="t",
+                    status="running",
+                    type="work",
+                )
+            ]
+        )
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError("an at-capacity repo must not dispatch a finisher leg")
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+        config = self._config(max_parallel=1)
+
+        result = board_doctor_policy.dispatch_nit_only_finisher(
+            "acme/widgets", 41, busy_board, config
+        )
+
+        assert result is False
+
+    def test_below_capacity_dispatches(self, monkeypatch) -> None:
+        calls: list[tuple] = []
+
+        def fake_dispatch(action, *args, **kwargs):
+            calls.append((action, args, kwargs))
+            return {
+                "dispatched": True,
+                "assignment_id": "asn-1",
+                "machine": "mac1",
+                "detail": "acme/widgets#41 finisher leg dispatched to mac1",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+        config = self._config(max_parallel=2)
+        board = Board(
+            active=[
+                Assignment(
+                    machine_name="mac1",
+                    repo_name="acme/widgets",
+                    issue_number=40,
+                    issue_title="t",
+                    status="running",
+                    type="work",
+                )
+            ]
+        )
+
+        result = board_doctor_policy.dispatch_nit_only_finisher(
+            "acme/widgets", 41, board, config
+        )
+
+        assert result is True
+        assert len(calls) == 1
+
+    def test_zero_max_parallel_means_unlimited_not_zero_capacity(self, monkeypatch) -> None:
+        # `max_parallel=0` means "no per-repo ceiling at all", mirroring
+        # `coord.drive_queue`'s own resolution semantics — never "never
+        # dispatch" — same contract the investigate tier's capacity check
+        # already guarantees, exercised here against the delegating
+        # finisher-tier wrapper instead.
+        calls: list[tuple] = []
+
+        def fake_dispatch(action, *args, **kwargs):
+            calls.append((action, args, kwargs))
+            return {
+                "dispatched": True,
+                "assignment_id": "asn-1",
+                "machine": "mac1",
+                "detail": "acme/widgets#41 finisher leg dispatched to mac1",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+        config = self._config(max_parallel=0)
+        busy_board = Board(
+            active=[
+                Assignment(
+                    machine_name="mac1",
+                    repo_name="acme/widgets",
+                    issue_number=40,
+                    issue_title="t",
+                    status="running",
+                    type="work",
+                )
+            ]
+        )
+
+        result = board_doctor_policy.dispatch_nit_only_finisher(
+            "acme/widgets", 41, busy_board, config
+        )
+
+        assert result is True
+        assert len(calls) == 1

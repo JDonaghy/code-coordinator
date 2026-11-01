@@ -351,3 +351,11 @@ def test_no_investigate_flag_disarms_the_tier_fleet_wide(
     assert _dispatched_issues() == []
     assert fake_dispatch == []
     assert state.get_drive_escalation(REPO, 401) is not None
+
+
+# `--no-finish` does not exist on this command (#3837 fix round): the
+# finisher tier fires off `coord.auto_loop.process_review_completion` at
+# review-completion time, never from this sweep's own dispatch loop, so a
+# flag scoped to `coord drive-queue sweep` could not disarm it. That kill
+# switch lives on `coord fix <REVIEW_ID> --no-finish` instead — see
+# `tests/test_cli_fix_headless_review.py::TestFinisherLegDispatchViaCliDoor`.
