@@ -202,11 +202,13 @@ class StuckRow:
     #: :func:`_refresh_ceiling_blocked_settled_rows`) — never for
     #: :func:`_episode_stuck_row`'s reconstruction of a *stored* diagnosis,
     #: which can be arbitrarily old and is never re-confirmed by that path.
-    #: `_ceiling_bypass_eligible` requires this before it will let a
-    #: high-confidence cause skip the #2972 ceiling: bypassing the ceiling
-    #: on a stale stored verdict (e.g. a `merge-conflict`/`high` row whose
-    #: PR has since merged) would spend a fix-it leg against evidence that
-    #: is no longer true, which is exactly what the ceiling exists to stop.
+    #: `_fixit_rebudget_environmental` (`coord/board_doctor_policy.py`)
+    #: requires this before it will let a high-confidence cause read as
+    #: environmental and skip the #2972 ceiling: bypassing the ceiling on a
+    #: stale stored verdict (e.g. a `merge-conflict`/`high` row whose PR has
+    #: since merged) would spend this issue's one lifetime fix-it
+    #: auto-rebudget leg (#3847) against evidence that is no longer true,
+    #: which is exactly what the ceiling exists to stop.
     fresh: bool = False
 
 
@@ -567,10 +569,10 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     just computed from a live probe (:func:`drive_queue_rows`,
     :func:`_refresh_ceiling_blocked_settled_rows`) is new-enough evidence to
     grant a fresh #2972 fix-round budget — the same age bound
-    `_ceiling_bypass_eligible` (`coord/board_doctor_policy.py`) already
-    applies to its own ceiling-bypass decision, so the two stay consistent
-    (#2096: one question — "is this evidence fresh enough to act on?" — one
-    answer, `StuckRow.fresh`).
+    `_fixit_rebudget_environmental` (`coord/board_doctor_policy.py`)
+    already applies to its own environmental-vs-flailing decision (#3847),
+    so the two stay consistent (#2096: one question — "is this evidence
+    fresh enough to act on?" — one answer, `StuckRow.fresh`).
     """
     from coord.drive_queue import (  # noqa: PLC0415
         fix_round_ceiling_blocked_for_issue,

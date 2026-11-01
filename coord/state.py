@@ -2456,6 +2456,83 @@ def record_board_doctor_smoke_requeue(assignment_id: str) -> int:
     return result["count"]
 
 
+# #3847: the fix-it tier's one-shot auto-rebudget cap. Unlike the smoke-
+# requeue budget just above — deliberately keyed by assignment id so a
+# fresh dispatch against the same issue gets a fresh budget — this cap must
+# NOT reset on a fresh assignment: #3767's load-bearing safety property is
+# "at most one auto-rebudget per issue, ever", enforced across any number of
+# `remove`+`add` cycles on the live drive-queue row (#3756 only made the
+# *existing* fix-round ceiling consulted fleet-wide for the SAME live row;
+# it does not survive a remove+add, which stamps a brand-new row). Keying
+# this by `f"{repo_name}#{issue_number}"` alone — never by assignment id or
+# row key, both of which change across a remove+add — is what makes it
+# survive that cycle. It is a plain boolean (spent or not), not a counter:
+# there is no "budget" to exhaust past one.
+_BOARD_DOCTOR_FIXIT_REBUDGET_META_KEY = "board_doctor_fixit_rebudgets"
+
+#: Cap on the number of issue-keyed flags tracked at once — same
+#: "never allowed to grow the `board_meta` row without bound" rationale as
+#: :data:`BOARD_DOCTOR_SMOKE_REQUEUE_LIMIT`.
+BOARD_DOCTOR_FIXIT_REBUDGET_LIMIT = 1000
+
+
+def _board_doctor_fixit_rebudget_key(repo_name: str, issue_number: int) -> str:
+    return f"{repo_name}#{issue_number}"
+
+
+def _load_board_doctor_fixit_rebudgets_raw(conn) -> dict[str, bool]:
+    row = sql.execute(
+        conn, "SELECT value FROM board_meta WHERE key = ?",
+        (_BOARD_DOCTOR_FIXIT_REBUDGET_META_KEY,),
+    ).fetchone()
+    if row is None or not row["value"]:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def board_doctor_fixit_rebudget_spent(repo_name: str, issue_number: int) -> bool:
+    """Has board-doctor's fix-it tier already spent its one lifetime
+    auto-rebudget leg on *repo_name*#*issue_number* (#3847)?
+
+    **Local-DB read only** — same limitation as
+    :func:`board_doctor_smoke_requeue_count`: this flag lives in
+    ``board_meta`` on the canonical board (the daemon host), so a
+    thin-client read would otherwise see an empty/stale local copy.
+    """
+    _thin_client_local_board_guard("board_doctor_fixit_rebudget_spent")
+    data = _load_board_doctor_fixit_rebudgets_raw(get_connection())
+    return bool(data.get(_board_doctor_fixit_rebudget_key(repo_name, issue_number), False))
+
+
+def record_board_doctor_fixit_rebudget_spent(repo_name: str, issue_number: int) -> None:
+    """Mark *repo_name*#*issue_number* as having spent its one lifetime
+    board-doctor fix-it auto-rebudget leg (#3847).
+
+    Idempotent — recording an already-spent issue is a no-op write, not an
+    increment, since this is a boolean flag rather than a count.
+    """
+    conn = get_connection()
+
+    def _write() -> None:
+        data = _load_board_doctor_fixit_rebudgets_raw(conn)
+        key = _board_doctor_fixit_rebudget_key(repo_name, issue_number)
+        data[key] = True
+        if len(data) > BOARD_DOCTOR_FIXIT_REBUDGET_LIMIT:
+            data = dict(list(data.items())[-BOARD_DOCTOR_FIXIT_REBUDGET_LIMIT:])
+        sql.upsert(
+            conn, "board_meta", ["key", "value"],
+            (_BOARD_DOCTOR_FIXIT_REBUDGET_META_KEY, json.dumps(data)),
+            conflict_columns=["key"],
+        )
+        conn.commit()
+
+    retry_on_locked(_write)
+
+
 def record_board_doctor_decision(entry: dict) -> None:
     """Append one row's sweep outcome to the decision log (#3758, #1478 spirit).
 

@@ -6068,6 +6068,47 @@ def test_list_marks_an_overrun_row_rather_than_clamping_to_n_over_n(cli, seed):
     assert "fix_rounds=3/3" not in result.output
 
 
+# ── #3847: `list` surfaces the board-doctor fix-it tier's lifetime
+#    one-shot auto-rebudget the same way it already surfaces `resumes=`
+#    and `fix_rounds=` — diagnosable from the queue, not just a sweep's
+#    own journal.
+
+
+def test_list_shows_fixit_rebudget_spent_once_recorded(cli, seed):
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650").exit_code == 0
+    state.record_board_doctor_fixit_rebudget_spent(REPO, 1650)
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "fixit_rebudget=spent" in result.output
+
+
+def test_list_omits_fixit_rebudget_bit_when_never_spent(cli, seed):
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650").exit_code == 0
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "fixit_rebudget=" not in result.output
+
+
+def test_list_fixit_rebudget_read_failure_does_not_break_list(cli, seed, monkeypatch):
+    # Best-effort read: a failure here must never turn a working `list`
+    # into a broken one.
+    seed(issues={1650: "open"})
+    assert cli("add", REPO, "1650").exit_code == 0
+
+    def boom(repo_name, issue_number):
+        raise RuntimeError("state unreachable")
+
+    monkeypatch.setattr(state, "board_doctor_fixit_rebudget_spent", boom)
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "fixit_rebudget=" not in result.output
+
+
 def test_a_failed_launch_is_a_consumed_attempt_not_a_running_entry(
     cli, seed, launches
 ):
