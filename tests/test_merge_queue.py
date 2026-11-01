@@ -28,7 +28,7 @@ from coord.merge_queue import (
     save_queue,
     sequence,
 )
-from coord.models import Assignment
+from coord.models import Assignment, IssueResolution
 from coord.uat_checks import HeaderAssertion, UatCheckConfig, UatCheckResult, UatChecks
 from coord import db as db_mod
 from coord import sql
@@ -15553,33 +15553,54 @@ class TestAttemptDirectMergeForInertBaseMove:
     merge-commit takeover once #3836's predicate has proven the conflict an
     inert skew. Always a plain ``method="merge"`` call, never
     rebase/squash, since only a merge commit leaves *entry*'s own patch-id
-    (and therefore its review approval) untouched."""
+    (and therefore its review approval) untouched.
+
+    *issue_resolution*/*issue_close_block_reason* are the gate chain's
+    already-computed verdict for this entry this tick — a plain "resolved"
+    with no block reason is the common case exercised here; `#3836`'s own
+    post-merge bookkeeping (`_finalize_merged_entry`, close/comment/audit)
+    is exercised separately in `TestFinalizeMergedEntry`-adjacent coverage
+    of `process()` itself, so these tests only assert the takeover's own
+    contract: merge-or-don't, and the resulting event list.
+    """
+
+    _resolved = IssueResolution("resolved", "")
 
     def test_confirmed_success_merges_and_returns_the_event(self) -> None:
         entry = _q("w1", pr=42, state=CONFLICT)
         gh = FakeGh(merge_results={42: (True, "merged via API")})
 
-        ev = mq.attempt_direct_merge_for_inert_base_move(entry, gh)
+        events = mq.attempt_direct_merge_for_inert_base_move(
+            entry, gh, None, None,
+            issue_resolution=self._resolved, issue_close_block_reason=None,
+        )
 
-        assert ev is not None
-        assert ev.kind == "inert_base_move_merged"
-        assert ev.message == "merged via API"
-        assert ev.entry is entry
+        assert events is not None
+        assert events[0].kind == "inert_base_move_merged"
+        assert events[0].message == "merged via API"
+        assert events[0].entry is entry
         assert entry.state == MERGED
         assert entry.error is None
         assert entry.last_attempt is not None
         assert gh.merge_calls == [("acme/api", 42, "merge")]
+        # The shared post-merge helper ran too — the linked issue closed.
+        assert gh.close_calls == [(entry.repo_github, entry.issue_number)]
+        assert any(e.kind == "merged" for e in events)
 
     def test_declined_merge_returns_none_and_leaves_entry_untouched(self) -> None:
         entry = _q("w1", pr=42, state=CONFLICT)
         entry.error = "original conflict error"
         gh = FakeGh(merge_results={42: (False, "still conflicting")})
 
-        ev = mq.attempt_direct_merge_for_inert_base_move(entry, gh)
+        events = mq.attempt_direct_merge_for_inert_base_move(
+            entry, gh, None, None,
+            issue_resolution=self._resolved, issue_close_block_reason=None,
+        )
 
-        assert ev is None
+        assert events is None
         assert entry.state == CONFLICT
         assert entry.error == "original conflict error"
+        assert gh.close_calls == []
 
     def test_raising_merge_call_returns_none_and_leaves_entry_untouched(self) -> None:
         class _Raising(FakeGh):
@@ -15589,9 +15610,12 @@ class TestAttemptDirectMergeForInertBaseMove:
         entry = _q("w1", pr=42, state=CONFLICT)
         entry.error = "original conflict error"
 
-        ev = mq.attempt_direct_merge_for_inert_base_move(entry, _Raising())
+        events = mq.attempt_direct_merge_for_inert_base_move(
+            entry, _Raising(), None, None,
+            issue_resolution=self._resolved, issue_close_block_reason=None,
+        )
 
-        assert ev is None
+        assert events is None
         assert entry.state == CONFLICT
         assert entry.error == "original conflict error"
 
@@ -15599,8 +15623,11 @@ class TestAttemptDirectMergeForInertBaseMove:
         entry = _q("w1", pr=42, state=CONFLICT)
         entry.error = "original conflict error"
 
-        ev = mq.attempt_direct_merge_for_inert_base_move(entry, None)
+        events = mq.attempt_direct_merge_for_inert_base_move(
+            entry, None, None, None,
+            issue_resolution=self._resolved, issue_close_block_reason=None,
+        )
 
-        assert ev is None
+        assert events is None
         assert entry.state == CONFLICT
         assert entry.error == "original conflict error"

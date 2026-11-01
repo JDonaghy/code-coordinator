@@ -2488,8 +2488,14 @@ def conflict_base_move_is_inert(
 
 
 def attempt_direct_merge_for_inert_base_move(
-    entry: QueuedMerge, gh_ops: "GhOps | None"
-) -> "MergeEvent | None":
+    entry: QueuedMerge,
+    gh_ops: "GhOps | None",
+    board,
+    config,
+    *,
+    issue_resolution: IssueResolution,
+    issue_close_block_reason: str | None,
+) -> "list[MergeEvent] | None":
     """Attempt the finisher merge directly for a conflict already proven an
     inert base-move skew (#3836, :func:`conflict_base_move_is_inert`) —
     *entry*'s own content never collided with anything the base moved
@@ -2498,26 +2504,31 @@ def attempt_direct_merge_for_inert_base_move(
     it, which is exactly why a genuine conflict instead goes to
     `dispatch_conflict_fix`).
 
-    Returns an ``"inert_base_move_merged"`` :class:`MergeEvent` on confirmed
-    success — mirroring `process()`'s own success contract: the boolean
-    `merge_pr` returns IS the confirmation, so nothing here assumes success
-    from the mere absence of an exception (epic #2096's "unconfirmed
-    success is a defect"). Returns ``None`` on any failure — the merge call
-    declining or raising — leaving *entry* completely untouched so the
-    caller's existing `dispatch_conflict_fix` fallback runs unchanged, the
-    real, reachable negative branch epic #2096 also requires ("a gate must
-    be able to fail").
+    Returns a list starting with an ``"inert_base_move_merged"``
+    :class:`MergeEvent` on confirmed success — mirroring `process()`'s own
+    success contract: the boolean `merge_pr` returns IS the confirmation, so
+    nothing here assumes success from the mere absence of an exception
+    (epic #2096's "unconfirmed success is a defect"). Returns ``None`` on
+    any failure — the merge call declining or raising — leaving *entry*
+    completely untouched so the caller's existing `dispatch_conflict_fix`
+    fallback runs unchanged, the real, reachable negative branch epic #2096
+    also requires ("a gate must be able to fail").
 
     Always attempts plain ``method="merge"`` (never ``rebase``/``squash``):
     a merge commit is the one method that cannot change *entry*'s own
     patch-id, which is what keeps the existing review approval intact.
-    Deliberately does not replicate `process()`'s own best-effort
-    post-merge enrichment (drive-escalation dismissal, gate-bypass audit,
-    design-round/status pushes, verification note) — each of those is
-    independently fail-safe there and optional, not part of this issue's
-    "merges... with no conflict-fix leg and the approval intact" contract,
-    and the caller's normal `process()` tick will still reach this same
-    entry's issue/PR bookkeeping on its own terms once merged.
+
+    *issue_resolution* / *issue_close_block_reason* must be the SAME verdict
+    the caller's gate chain already computed for this entry THIS tick (the
+    `MergeEvent.issue_resolution` / `.issue_close_block_reason` carried by
+    the in-pass conflict event that triggered this takeover) — never
+    recomputed here. Every post-merge responsibility a landed merge owes —
+    issue close/comment, drive-escalation dismissal, gate-bypass audit, and
+    the design-round/status/verification hooks — runs through the same
+    `_finalize_merged_entry` helper `process()`'s own success path uses, so
+    this takeover leaves the exact same invariant true: issue #N ends up
+    either CLOSED or OPEN with a human-visible comment, never silently
+    stuck.
     """
     if gh_ops is None:
         return None
@@ -2530,7 +2541,13 @@ def attempt_direct_merge_for_inert_base_move(
     entry.state = MERGED
     entry.error = None
     entry.last_attempt = time.time()
-    return MergeEvent(entry, "inert_base_move_merged", msg)
+    events = [MergeEvent(entry, "inert_base_move_merged", msg)]
+    events.extend(_finalize_merged_entry(
+        entry, gh_ops, board, config,
+        issue_resolution=issue_resolution,
+        issue_close_block_reason=issue_close_block_reason,
+    ))
+    return events
 
 
 def _files_are_ancillary(
@@ -7452,9 +7469,22 @@ def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingI
 
 @dataclass
 class MergeEvent:
+    # kind is one of: "opened", "sized", "merged", "merged_partial",
+    # "merged_close_unconfirmed", "conflict", "skipped", "error",
+    # "reopened", "inert_base_move_merged"
     entry: QueuedMerge
-    kind: str  # "opened" | "sized" | "merged" | "merged_partial" | "merged_close_unconfirmed" | "conflict" | "skipped" | "error" | "reopened" | "inert_base_move_merged"
+    kind: str
     message: str = ""
+    # Populated only for a "conflict" event raised by `process()`'s own
+    # merge-attempt failure (never by a dry-run preview or an earlier,
+    # pre-gate conflict check) — the same `issue_resolution` /
+    # `issue_close_block_reason` that entry's gate chain already computed
+    # this tick. #3836's direct-merge takeover for an inert base-move skew
+    # reuses these instead of recomputing them, and treats `None` as "this
+    # conflict's gates were not fully evaluated this tick" — a signal to
+    # fall through to the ordinary conflict-fix dispatch instead.
+    issue_resolution: "IssueResolution | None" = None
+    issue_close_block_reason: str | None = None
 
 
 def _briefing_body(
@@ -8420,6 +8450,204 @@ def _maybe_post_verification(
     return MergeEvent(
         entry, "verification_note_posted", f"posted/updated on issue #{entry.issue_number}",
     )
+
+
+def _finalize_merged_entry(
+    entry: QueuedMerge,
+    gh_ops: "GhOps",
+    board,
+    config,
+    *,
+    issue_resolution: IssueResolution,
+    issue_close_block_reason: str | None,
+) -> list[MergeEvent]:
+    """Run every post-merge bookkeeping step a landed merge owes.
+
+    Shared by `process()`'s own merge-success path and #3836's direct-merge
+    takeover for an inert base-move skew, so both routes leave the same
+    invariant true: issue #N ends up either CLOSED or OPEN with a
+    human-visible comment explaining why — never silently stuck with
+    nothing but a `MergeEvent` buried in the queue DB. Callers must have
+    already set `entry.state = MERGED` / `entry.error = None` and merged
+    the PR; this only handles what comes after.
+
+    *issue_resolution* / *issue_close_block_reason* are the SAME verdict
+    the caller's own gate chain already computed for this entry this tick
+    (`process()`'s per-entry loop, or the conflict event it raised) — never
+    recomputed here, so the close-or-not decision can never disagree with
+    what a PR-body closing-keyword lint already decided elsewhere.
+    """
+    events: list[MergeEvent] = []
+    try:
+        dismiss_drive_escalation(entry.repo_name, entry.issue_number)
+    except Exception:  # noqa: BLE001 — never fail a merge on this
+        pass
+    # #1213: audit any gate bypassed by a per-issue label override BEFORE
+    # announcing the merge, so the "merged" event message already carries
+    # the bypass note — a bypass is never silent.
+    _record_gate_bypass_audit(entry, config)
+    bypass_note = _bypass_note(entry, config)
+    # Deterministically close the linked issue. Even for a CLOSES_ISSUE_TYPES
+    # entry the close can be vetoed (#3502) — by the worker's/reviewer's own
+    # `ISSUE_RESOLUTION:` judgment, by open sub-issues (#1196), or by the
+    # epic/tracking label (#1318).
+    if entry.assignment_type in CLOSES_ISSUE_TYPES and issue_close_block_reason is None:
+        try:
+            gh_ops.close_issue(entry.repo_github, entry.issue_number)
+        except Exception as e:  # noqa: BLE001 — never fail a merge on close
+            comment_body = (
+                f"Merged PR #{entry.pr_number}, but closing issue "
+                f"#{entry.issue_number} failed: {e}\n\nThis issue "
+                "is left OPEN — close it manually once the "
+                "underlying problem is resolved."
+            )
+            try:
+                comment_on_issue(
+                    entry.repo_name, entry.issue_number, comment_body,
+                    repo_github=entry.repo_github,
+                )
+                comment_note = ""
+            except Exception as ce:  # noqa: BLE001 — never fail a merge on a comment
+                comment_note = f" (warning: could not post comment: {ce})"
+            events.append(MergeEvent(
+                entry, "merged_partial",
+                f"merged PR #{entry.pr_number} (warning: could not "
+                f"close issue #{entry.issue_number}: {e}){bypass_note}"
+                f"{comment_note}",
+            ))
+        else:
+            # `close_issue()` returning without raising only proves the
+            # close REQUEST was issued, not that the issue actually ended
+            # up closed on GitHub — read it back before claiming "merged"
+            # (#2096).
+            try:
+                _post_close_state = gh_ops.get_issue_state(
+                    entry.repo_github, entry.issue_number
+                )
+            except Exception:  # noqa: BLE001 — see comment above
+                _post_close_state = None
+            if _post_close_state == "closed":
+                events.append(MergeEvent(
+                    entry, "merged",
+                    f"merged PR #{entry.pr_number}; closed issue "
+                    f"#{entry.issue_number}{bypass_note}",
+                ))
+            elif _post_close_state == "open":
+                comment_body = (
+                    f"Merged PR #{entry.pr_number}, and "
+                    f"requested closing issue "
+                    f"#{entry.issue_number}, but it still "
+                    "shows OPEN on GitHub.\n\nThis issue is "
+                    "left OPEN — close it manually once "
+                    "confirmed resolved."
+                )
+                try:
+                    comment_on_issue(
+                        entry.repo_name, entry.issue_number,
+                        comment_body,
+                        repo_github=entry.repo_github,
+                    )
+                    comment_note = ""
+                except Exception as ce:  # noqa: BLE001 — never fail a merge on a comment
+                    comment_note = (
+                        f" (warning: could not post comment: {ce})"
+                    )
+                events.append(MergeEvent(
+                    entry, "merged_partial",
+                    f"merged PR #{entry.pr_number} (warning: "
+                    f"requested closing issue "
+                    f"#{entry.issue_number} but it still "
+                    f"reads OPEN){bypass_note}{comment_note}",
+                ))
+            else:
+                events.append(MergeEvent(
+                    entry, "merged_close_unconfirmed",
+                    f"merged PR #{entry.pr_number}; requested "
+                    f"closing issue #{entry.issue_number}, but "
+                    "could not confirm it actually closed"
+                    f"{bypass_note}",
+                ))
+    elif entry.assignment_type in CLOSES_ISSUE_TYPES:
+        # Blocked — never close it, and ALWAYS tell anyone watching the
+        # issue (not just the queue DB) why, regardless of which of the
+        # three reasons fired.
+        remainder = (
+            (
+                issue_resolution.reason
+                or "the worker/reviewer marked this PR as not fully "
+                "resolving the issue — see the PR for details."
+            )
+            if issue_resolution.value != "resolved"
+            else ""
+        )
+        comment_body = (
+            f"Merged PR #{entry.pr_number}, but issue "
+            f"#{entry.issue_number} {issue_close_block_reason} "
+            "— this issue is intentionally left OPEN."
+        )
+        if remainder:
+            comment_body += f"\n\nWhat remains: {remainder}"
+        try:
+            comment_on_issue(
+                entry.repo_name, entry.issue_number, comment_body,
+                repo_github=entry.repo_github,
+            )
+            comment_note = ""
+        except Exception as e:  # noqa: BLE001 — never fail a merge on a comment
+            comment_note = f" (warning: could not post remainder comment: {e})"
+        events.append(MergeEvent(
+            entry, "merged_partial",
+            f"merged PR #{entry.pr_number}; issue #{entry.issue_number} "
+            f"left open ({issue_close_block_reason}"
+            f"{f': {remainder}' if remainder else ''})"
+            f"{bypass_note}{comment_note}",
+        ))
+    else:
+        events.append(MergeEvent(
+            entry, "merged",
+            f"merged PR #{entry.pr_number}; issue #{entry.issue_number} "
+            f"left open (assignment type {entry.assignment_type!r} "
+            f"does not close its tracking issue, #1077){bypass_note}",
+        ))
+    # #2164: the fix just landed on the default branch — the ordering event
+    # `expected_red` clearing must wait for. Best effort, never blocks or
+    # fails the merge itself.
+    try:
+        clear_event = _maybe_clear_expected_red(entry, board, gh_ops, config)
+    except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
+        clear_event = MergeEvent(entry, "expected_red_clear_failed", str(e))
+    if clear_event is not None:
+        events.append(clear_event)
+    # PDR-3 (#2508): a merged Gate-A (`type="mock-author"`) branch
+    # auto-pushes a design round to the portal, if (and only if) its
+    # milestone has a portal link on file. Best effort, same as the
+    # expected_red clear above.
+    try:
+        design_round_event = _maybe_push_design_round(entry, config, gh_ops)
+    except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
+        design_round_event = MergeEvent(entry, "design_round_push_failed", str(e))
+    if design_round_event is not None:
+        events.append(design_round_event)
+    # #2588: the same auto-push pattern as the design round just above,
+    # applied to status — a merged `type="work"` PR that closed its issue
+    # may have just finished (or started) its submission; fold every linked
+    # issue and push if changed. Best effort, same posture.
+    try:
+        status_event = _maybe_push_status(entry, config, gh_ops, board)
+    except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
+        status_event = MergeEvent(entry, "status_push_failed", str(e))
+    if status_event is not None:
+        events.append(status_event)
+    # #2109: the verification note — same best-effort posture as every
+    # hook above, posted last so it can read the freshest board/diff state
+    # this merge produced.
+    try:
+        verification_event = _maybe_post_verification(entry, board, gh_ops, config)
+    except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
+        verification_event = MergeEvent(entry, "verification_note_failed", str(e))
+    if verification_event is not None:
+        events.append(verification_event)
+    return events
 
 
 def process(
@@ -10062,261 +10290,30 @@ def process(
             if ok:
                 entry.state = MERGED
                 entry.error = None
-                # #1767: the condition that produced a drive escalation for
-                # this issue (if any) just resolved through the normal
-                # pipeline — clear it so `coord escalate list` doesn't
-                # accumulate phantoms for merged work. Idempotent and a
-                # no-op when there's nothing on file; routes through
-                # `coord.state` so it works (via the daemon) from a thin
-                # client rather than writing the local DB directly.
-                try:
-                    dismiss_drive_escalation(entry.repo_name, entry.issue_number)
-                except Exception:  # noqa: BLE001 — never fail a merge on this
-                    pass
-                # #1213: audit any gate bypassed by a per-issue label override
-                # BEFORE announcing the merge, so the "merged" event message
-                # already carries the bypass note — a bypass is never silent.
-                # Only fires on a real merge (never dry-run, handled above via
-                # the side-effect-free _bypass_note) so previews can't write
-                # phantom audit rows.
-                _record_gate_bypass_audit(entry, config)
-                bypass_note = _bypass_note(entry, config)
-                # Deterministically close the linked issue.  GitHub's `Closes #N`
-                # auto-close only fires when the PR *body* carries the keyword
-                # AND it merges into the default branch; the worker-created-PR
-                # path only asks the LLM for it and `fix(#N):` subjects aren't
-                # closing keywords, so issues got stranded open (#806).
-                # Best-effort — a close failure must not undo a successful merge.
-                # Closing on GitHub keeps the daemon the sole DB writer: the next
-                # reconcile/sync flips the cached row to closed (state.py).
-                #
-                # #1077: only for entries whose issue_number is actually
-                # resolved by this PR (CLOSES_ISSUE_TYPES). A "mock-author"
-                # entry's issue_number is the milestone's tracking issue —
-                # closing it here would be the exact #1077 bug regardless of
-                # what the PR body says.
-                #
-                # Even for a CLOSES_ISSUE_TYPES entry the close can be
-                # vetoed (#3502) — by the worker's/reviewer's own
-                # `ISSUE_RESOLUTION:` judgment, by the issue having open
-                # sub-issues (#1196), or by it carrying the epic/tracking
-                # label (#1318). `issue_close_block_reason`, computed once
-                # near the PR-body lint above, is the SAME verdict that
-                # drove whether `entry.issue_number` got downgraded to
-                # `Refs #N` there — so the close-or-not decision here can
-                # never disagree with what the PR body actually says.
-                #
-                # The invariant these branches enforce: a merge that lands
-                # the work leaves issue #N either CLOSED (this branch)
-                # or OPEN with a human-visible comment explaining why (the
-                # branches below) — never silently stuck with nothing but
-                # a `MergeEvent` buried in the queue DB that nobody
-                # watching the GitHub issue will ever see.
-                if (
-                    entry.assignment_type in CLOSES_ISSUE_TYPES
-                    and issue_close_block_reason is None
-                ):
-                    try:
-                        gh_ops.close_issue(entry.repo_github, entry.issue_number)
-                    except Exception as e:  # noqa: BLE001 — never fail a merge on close
-                        # A close that was expected to succeed (no known
-                        # block) but didn't — e.g. a race where a sub-issue
-                        # opened between the lint check above and this
-                        # call, or a transient `gh` failure. It still gets
-                        # a comment, so a human looking at the issue on
-                        # GitHub has an explanation for why a merged PR
-                        # left it open.
-                        comment_body = (
-                            f"Merged PR #{entry.pr_number}, but closing issue "
-                            f"#{entry.issue_number} failed: {e}\n\nThis issue "
-                            "is left OPEN — close it manually once the "
-                            "underlying problem is resolved."
-                        )
-                        try:
-                            comment_on_issue(
-                                entry.repo_name, entry.issue_number, comment_body,
-                                repo_github=entry.repo_github,
-                            )
-                            comment_note = ""
-                        except Exception as ce:  # noqa: BLE001 — never fail a merge on a comment
-                            comment_note = f" (warning: could not post comment: {ce})"
-                        events.append(MergeEvent(
-                            entry, "merged_partial",
-                            f"merged PR #{entry.pr_number} (warning: could not "
-                            f"close issue #{entry.issue_number}: {e}){bypass_note}"
-                            f"{comment_note}",
-                        ))
-                    else:
-                        # `close_issue()` returning without raising only
-                        # proves the close REQUEST was issued, not that the
-                        # issue actually ended up closed on GitHub — read it
-                        # back before claiming "merged" (#2096).
-                        # Deliberately a direct attribute access (not
-                        # `getattr(gh_ops, "get_issue_state", None)` with a
-                        # permissive fallback): a `GhOps` implementation
-                        # that lacks this probe raises `AttributeError`
-                        # here, caught below into the same "unconfirmed"
-                        # bucket as a probe that ran but failed — never
-                        # silently treated as a successful close.
-                        try:
-                            _post_close_state = gh_ops.get_issue_state(
-                                entry.repo_github, entry.issue_number
-                            )
-                        except Exception:  # noqa: BLE001 — see comment above
-                            _post_close_state = None
-                        if _post_close_state == "closed":
-                            events.append(MergeEvent(
-                                entry, "merged",
-                                f"merged PR #{entry.pr_number}; closed issue "
-                                f"#{entry.issue_number}{bypass_note}",
-                            ))
-                        elif _post_close_state == "open":
-                            # `close_issue()` did not raise, but the
-                            # issue reads back OPEN — e.g. GitHub's own
-                            # close got reverted by a webhook/automation
-                            # race, or an implementation that no-opped
-                            # instead of raising. Route into the same
-                            # comment + "merged_partial" path as an
-                            # outright close() failure, never claim
-                            # "merged" over a reported outcome that turned
-                            # out not to match reality (#2096).
-                            comment_body = (
-                                f"Merged PR #{entry.pr_number}, and "
-                                f"requested closing issue "
-                                f"#{entry.issue_number}, but it still "
-                                "shows OPEN on GitHub.\n\nThis issue is "
-                                "left OPEN — close it manually once "
-                                "confirmed resolved."
-                            )
-                            try:
-                                comment_on_issue(
-                                    entry.repo_name, entry.issue_number,
-                                    comment_body,
-                                    repo_github=entry.repo_github,
-                                )
-                                comment_note = ""
-                            except Exception as ce:  # noqa: BLE001 — never fail a merge on a comment
-                                comment_note = (
-                                    f" (warning: could not post comment: {ce})"
-                                )
-                            events.append(MergeEvent(
-                                entry, "merged_partial",
-                                f"merged PR #{entry.pr_number} (warning: "
-                                f"requested closing issue "
-                                f"#{entry.issue_number} but it still "
-                                f"reads OPEN){bypass_note}{comment_note}",
-                            ))
-                        else:
-                            # Could not confirm either way — the
-                            # probe itself failed, the response had no
-                            # recognizable state, or this `GhOps` doesn't
-                            # implement it. Its OWN distinguishable event —
-                            # never folded into "merged" (would silently
-                            # assume success) or "merged_partial" (would
-                            # silently assume it stayed open, equally
-                            # unproven).
-                            events.append(MergeEvent(
-                                entry, "merged_close_unconfirmed",
-                                f"merged PR #{entry.pr_number}; requested "
-                                f"closing issue #{entry.issue_number}, but "
-                                "could not confirm it actually closed"
-                                f"{bypass_note}",
-                            ))
-                elif entry.assignment_type in CLOSES_ISSUE_TYPES:
-                    # Blocked — never close it, and ALWAYS tell
-                    # anyone watching the issue (not just the queue DB)
-                    # why, regardless of which of the three reasons fired.
-                    remainder = (
-                        (
-                            issue_resolution.reason
-                            or "the worker/reviewer marked this PR as not fully "
-                            "resolving the issue — see the PR for details."
-                        )
-                        if issue_resolution.value != "resolved"
-                        else ""
-                    )
-                    comment_body = (
-                        f"Merged PR #{entry.pr_number}, but issue "
-                        f"#{entry.issue_number} {issue_close_block_reason} "
-                        "— this issue is intentionally left OPEN."
-                    )
-                    # Only append a remainder that says something the
-                    # sentence above doesn't: the `ISSUE_RESOLUTION:` arm
-                    # carries the worker/reviewer's own wording, whereas the
-                    # open-children/epic arms would just restate the reason.
-                    if remainder:
-                        comment_body += f"\n\nWhat remains: {remainder}"
-                    try:
-                        comment_on_issue(
-                            entry.repo_name, entry.issue_number, comment_body,
-                            repo_github=entry.repo_github,
-                        )
-                        comment_note = ""
-                    except Exception as e:  # noqa: BLE001 — never fail a merge on a comment
-                        comment_note = f" (warning: could not post remainder comment: {e})"
-                    events.append(MergeEvent(
-                        entry, "merged_partial",
-                        f"merged PR #{entry.pr_number}; issue #{entry.issue_number} "
-                        f"left open ({issue_close_block_reason}"
-                        f"{f': {remainder}' if remainder else ''})"
-                        f"{bypass_note}{comment_note}",
-                    ))
-                else:
-                    events.append(MergeEvent(
-                        entry, "merged",
-                        f"merged PR #{entry.pr_number}; issue #{entry.issue_number} "
-                        f"left open (assignment type {entry.assignment_type!r} "
-                        f"does not close its tracking issue, #1077){bypass_note}",
-                    ))
-                # #2164: the fix just landed on the default branch — the
-                # ordering event `expected_red` clearing must wait for
-                # (never `coord acceptance record` time, which can run long
-                # before Test/Review/this merge actually happen). Best
-                # effort, never blocks or fails the merge itself.
-                try:
-                    clear_event = _maybe_clear_expected_red(entry, board, gh_ops, config)
-                except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
-                    clear_event = MergeEvent(entry, "expected_red_clear_failed", str(e))
-                if clear_event is not None:
-                    events.append(clear_event)
-                # PDR-3 (#2508): a merged Gate-A (`type="mock-author"`)
-                # branch auto-pushes a design round to the portal, if (and
-                # only if) its milestone has a portal link on file. Best
-                # effort, same as the expected_red clear above — a portal
-                # outage, or simply no `coord portal link` recorded, must
-                # never undo a real merge.
-                try:
-                    design_round_event = _maybe_push_design_round(entry, config, gh_ops)
-                except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
-                    design_round_event = MergeEvent(
-                        entry, "design_round_push_failed", str(e)
-                    )
-                if design_round_event is not None:
-                    events.append(design_round_event)
-                # #2588: the same auto-push pattern as the design round just
-                # above, applied to status — a merged `type="work"` PR that
-                # closed its issue may have just finished (or started) its
-                # submission; fold every linked issue and push if changed.
-                # Best effort, same posture: never undoes a real merge.
-                try:
-                    status_event = _maybe_push_status(entry, config, gh_ops, board)
-                except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
-                    status_event = MergeEvent(entry, "status_push_failed", str(e))
-                if status_event is not None:
-                    events.append(status_event)
-                # #2109: the verification note — same best-effort posture as
-                # every hook above, posted last so it can read the freshest
-                # board/diff state this merge produced.
-                try:
-                    verification_event = _maybe_post_verification(entry, board, gh_ops, config)
-                except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
-                    verification_event = MergeEvent(entry, "verification_note_failed", str(e))
-                if verification_event is not None:
-                    events.append(verification_event)
+                # Everything a landed merge owes — issue close/comment,
+                # drive-escalation dismissal, gate-bypass audit, and the
+                # best-effort portal/status/verification hooks — lives in
+                # `_finalize_merged_entry` so #3836's direct-merge takeover
+                # for an inert base-move skew can share it exactly rather
+                # than reimplement it.
+                events.extend(_finalize_merged_entry(
+                    entry, gh_ops, board, config,
+                    issue_resolution=issue_resolution,
+                    issue_close_block_reason=issue_close_block_reason,
+                ))
                 continue
             entry.state = CONFLICT
             entry.error = msg
-            events.append(MergeEvent(entry, "conflict", msg))
+            # #3836: carry the SAME issue_resolution / issue_close_block_reason
+            # this entry's gate chain just computed this tick, so a direct-merge
+            # takeover for an inert base-move skew (if this conflict qualifies)
+            # can reuse them instead of recomputing — see `MergeEvent`'s
+            # docstring on these two fields.
+            events.append(MergeEvent(
+                entry, "conflict", msg,
+                issue_resolution=issue_resolution,
+                issue_close_block_reason=issue_close_block_reason,
+            ))
             continue  # #735: park this entry; siblings in same group still merge
 
     # #1896 Phase 0: persist merge-gate CI refusal counts by reason — the

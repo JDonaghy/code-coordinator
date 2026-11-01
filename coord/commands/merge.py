@@ -362,7 +362,15 @@ def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) ->
             f"  {e.repo_name} #{e.issue_number} ({e.branch}): {ev.kind} — "
             f"{ev.message}"
         )
-    _dispatch_conflict_fixes(sweep_events, config, dry_run=False, gh_ops=gh_ops)
+    # #3836: `gh_ops` is deliberately omitted (not threaded through) here —
+    # a swept sibling's conflict was discovered on a LATER tick than the
+    # merge that broke it, so this tick's gate chain (CI, approval
+    # staleness, smoke/UAT verdict, group/batch ordering, the #1318/#3502
+    # closing-keyword refusal) never ran against it. The inert-base-move
+    # takeover requires an in-pass conflict event (see
+    # `_dispatch_conflict_fixes`'s docstring); a standing/swept one falls
+    # through to the unchanged conflict-fix dispatch below instead.
+    _dispatch_conflict_fixes(sweep_events, config, dry_run=False)
     # #2246 review: `_dispatch_conflict_fixes` can advance a swept sibling's
     # state a second time in place — e.g. `entry.state = HUMAN_REQUIRED` when
     # `has_prior_conflict_fix` finds this sibling already burned a
@@ -418,6 +426,30 @@ def _dispatch_conflict_fixes(
     conflicts are already verified a stronger way —
     ``_dispatch_revalidation_conflicts``'s real local ``git merge`` attempt
     against the live base — is unaffected.
+
+    The takeover ALSO requires ``ev.issue_resolution is not None`` —
+    populated only on a ``"conflict"`` event `merge_queue.process()` raised
+    from its own merge-attempt failure this same tick, never on a standing
+    ``CONFLICT`` row picked up on a later tick (a sibling-sweep retry, a
+    ``--only``/whole-queue retry of an already-``CONFLICT`` entry). Those
+    later-tick entries never had this tick's gate chain (CI, approval
+    staleness, smoke/UAT verdict, group/batch ordering, the #1318/#3502
+    closing-keyword refusal) run against them, so skipping them here keeps
+    the takeover from ever merging a PR whose gates were not just verified
+    — they fall straight through to the unchanged retry-cap/dispatch logic
+    below instead. Callers that only ever see in-pass events (the ``--only``
+    and whole-queue paths, right after their own ``merge_queue.process()``
+    call this tick) pass ``gh_ops``; callers reading a standing/swept
+    ``CONFLICT`` row (the sibling sweep, a ``--only``/whole-queue retry of
+    an entry already at ``CONFLICT``) must not.
+
+    On a successful takeover, the new merge-success events (an
+    ``"inert_base_move_merged"`` plus whatever `_finalize_merged_entry`
+    produced) are appended onto the SAME *events* list the caller passed
+    in — not just the local ``conflict_events`` filter — so a caller that
+    reads its own ``events`` afterward (the sibling sweep's
+    ``MERGE_LANDED_KINDS`` check, #2246) sees the merge land instead of
+    only ever observing the superseded ``"conflict"`` event.
     """
     conflict_events = [ev for ev in events if ev.kind == "conflict"]
     if not conflict_events or dry_run:
@@ -452,7 +484,7 @@ def _dispatch_conflict_fixes(
             # instead. Any uncertainty (no gh_ops, an unreadable compare, a
             # declined retry) falls straight through to the unchanged
             # retry-cap/dispatch logic below.
-            if gh_ops is not None:
+            if gh_ops is not None and ev.issue_resolution is not None:
                 try:
                     inert_skew = conflict_base_move_is_inert(
                         gh_ops,
@@ -463,10 +495,16 @@ def _dispatch_conflict_fixes(
                 except Exception:  # noqa: BLE001 — fail closed to the dispatch path below
                     inert_skew = False
                 if inert_skew:
-                    direct_ev = attempt_direct_merge_for_inert_base_move(
-                        ev.entry, gh_ops
+                    direct_events = attempt_direct_merge_for_inert_base_move(
+                        ev.entry,
+                        gh_ops,
+                        fix_board,
+                        config,
+                        issue_resolution=ev.issue_resolution,
+                        issue_close_block_reason=ev.issue_close_block_reason,
                     )
-                    if direct_ev is not None:
+                    if direct_events is not None:
+                        events.extend(direct_events)
                         click.echo(
                             f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                             "base-move conflict was an inert skew — merged "
@@ -2323,9 +2361,16 @@ def merge(
                 f"({only_entry.branch}): still CONFLICT — {_verb} #241 "
                 "conflict-fix dispatch instead of refusing outright (#2558)"
             )
+            # #3836: `gh_ops` is deliberately omitted here — this CONFLICT
+            # entry is a STANDING row from an earlier tick (it didn't just
+            # fail `process()` this pass), so this tick's gate chain never
+            # ran against it. The inert-base-move direct-merge takeover
+            # requires an in-pass conflict event (see
+            # `_dispatch_conflict_fixes`'s docstring); a standing entry falls
+            # through to the unchanged conflict-fix dispatch below instead.
             _dispatch_conflict_fixes(
                 [mq.MergeEvent(only_entry, "conflict", only_entry.error)],
-                cfg_only, dry_run=dry_run, gh_ops=gh_ops,
+                cfg_only, dry_run=dry_run,
             )
             if not dry_run:
                 all_items_only = mq.load_queue()
@@ -2334,6 +2379,19 @@ def merge(
                     by_id_only.get(x.assignment_id, x) for x in all_items_only
                 ]
                 mq.save_queue(merged_only)
+        # #2157/#3836: the dispatch above can land `only_entry` on MERGED
+        # (e.g. a future in-pass takeover reachable from this retry), same
+        # as the early MERGED short-circuit above it — re-check here too, so
+        # a successful merge in THIS block isn't caught by the generic
+        # "not PENDING) — cannot merge" refusal below and reported as a
+        # failure (exit 1) when the goal was actually met.
+        if only_entry.state == MERGED:
+            pr = f" (PR #{only_entry.pr_number})" if only_entry.pr_number else ""
+            click.echo(
+                f"merge-queue: entry {only_assignment!r} already merged{pr} "
+                "— nothing to do"
+            )
+            sys.exit(0)
         if only_entry.state != PENDING:
             click.echo(
                 f"merge-queue: entry {only_assignment!r} is in state "
@@ -2811,9 +2869,17 @@ def merge(
                 f"  {x.repo_name} #{x.issue_number} ({x.branch}): still "
                 f"CONFLICT — {_verb} #241 conflict-fix dispatch (#2558)"
             )
+        # #3836: `gh_ops` is deliberately omitted here — every entry in
+        # `standing_conflicts` transitioned to CONFLICT on an EARLIER tick
+        # (that's the whole reason this block exists, per the #2558 comment
+        # above), so this tick's gate chain never ran against any of them.
+        # The inert-base-move direct-merge takeover requires an in-pass
+        # conflict event (see `_dispatch_conflict_fixes`'s docstring); a
+        # standing entry falls through to the unchanged conflict-fix
+        # dispatch below instead.
         _dispatch_conflict_fixes(
             [mq.MergeEvent(x, "conflict", x.error) for x in standing_conflicts],
-            cfg, dry_run=dry_run, gh_ops=gh_ops,
+            cfg, dry_run=dry_run,
         )
 
     if not pending:
