@@ -93,6 +93,7 @@ from coord.drive_queue import HOLD_RELEASED
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from coord.config import Config
     from coord.drive_queue import QueueEntry
+    from coord.merge_queue import QueuedMerge
     from coord.models import Assignment, Board
     from coord.review import ProposedFix, ReviewFindings
 
@@ -1082,15 +1083,26 @@ def sweep_dispatch_finisher_leg(
     )
 
 
+#: The one `coord.auto_loop._dispatch_fix_for_review` action kind that means
+#: a fix round actually went out. Every other kind it can yield
+#: (``no_work_found``, ``terminal_skip``, ``max_iterations``,
+#: ``fix_round_ceiling_blocked``, ``needs_redesign``) is a refusal, so a
+#: decline detail must not call it a fix round.
+_FIX_DISPATCHED_KIND = "fix_dispatched"
+
+
 class FinisherSelfBlessResult(TypedDict):
     """:func:`finisher_self_bless`'s return shape.
 
     ``blessed`` is the one answer to "did this diff re-bless the prior
-    review on its own authority" — ``True`` means *review* was advanced to
-    the merge queue; ``False`` means the normal full-review fix path
-    (:func:`coord.auto_loop._dispatch_fix_for_review`) ran instead and
-    nothing merged. ``actions`` carries that fallback path's own
-    `LoopAction` list when ``blessed`` is ``False``, empty otherwise.
+    review on its own authority" — ``True`` means a PENDING merge-queue
+    entry keyed to the parent work assignment was **read back** afterwards
+    (:func:`_observed_merge_queue_entry`), not merely that nothing raised.
+    ``False`` means either the normal full-review fix path
+    (:func:`coord.auto_loop._dispatch_fix_for_review`) ran instead, or the
+    override was recorded but nothing reached the merge queue. ``actions``
+    carries that fallback path's own `LoopAction` list when the fallback
+    ran, empty otherwise.
     """
 
     blessed: bool
@@ -1142,13 +1154,22 @@ def finisher_self_bless(
     via `coord.state.record_review_reaffirm` (so a merge-queue scan in this
     process or a later one both see the new SHA as approved, not stale),
     then hands off to `coord.auto_loop.propagate_review_verdict` with
-    ``refresh_merge_queue=True`` to advance to the merge queue. ``blessed``
-    reflects what that handoff actually observed happened — not the absence
-    of an exception from it — so a parent work row that can't be found
-    still reports ``blessed=False`` even though the review row was
-    overridden. That handoff is the *only* merge-queue primitive this
-    function ever calls; it has no path to `force_merge` or
-    `override_human_required`, and neither name is ever referenced here.
+    ``refresh_merge_queue=True`` to advance to the merge queue. That handoff
+    is the *only* merge-queue primitive this function ever calls; it has no
+    path to `force_merge` or `override_human_required`, and neither name is
+    ever referenced here.
+
+    ``blessed`` is then decided by **reading the merge queue back**
+    (:func:`_observed_merge_queue_entry`), never by that handoff returning
+    without raising. ``propagate_review_verdict`` returns the parent work
+    row whenever the row is on the board, which says nothing about its
+    merge-queue refresh: the refresh is skipped outright for a row with no
+    branch, and its failures are logged rather than propagated. So a
+    missing parent row, a branchless parent row and a refresh that threw
+    all report ``blessed=False`` with the reason in ``detail`` — the review
+    row's override stands either way, but the claim "advanced it to the
+    merge queue" is only ever made about an entry that was observed to
+    exist.
 
     On a failing fix — either not nit-class, or nit-class but the review
     body still carries a confirmed blocking finding — records why, then
@@ -1216,8 +1237,13 @@ def finisher_self_bless(
         actions = list(_dispatch_fix_for_review(
             review, findings, board, config, http_client=http_client,
         ))
-        if actions:
-            fallback_detail = f"fell back to a full-review fix round ({actions[0].kind})"
+        if actions and actions[0].kind == _FIX_DISPATCHED_KIND:
+            fallback_detail = f"fell back to a full-review fix round ({actions[0].detail})"
+        elif actions:
+            fallback_detail = (
+                "fell back to the full-review path, which dispatched no fix "
+                f"round ({actions[0].kind}: {actions[0].detail})"
+            )
         else:
             fallback_detail = "fell back to the full-review path, but no fix round was dispatched"
         return FinisherSelfBlessResult(
@@ -1291,15 +1317,24 @@ def finisher_self_bless(
 
     work = propagate_review_verdict(review, board, config, refresh_merge_queue=True)
     if work is None:
-        return FinisherSelfBlessResult(
-            blessed=False,
-            actions=[],
-            detail=(
-                f"{review.repo_name}#{review.issue_number}: finisher leg "
-                "recorded the self-bless override, but the parent work "
-                "assignment could not be found on the board — nothing was "
-                "advanced to the merge queue"
+        return _self_bless_not_advanced(
+            review,
+            reason=(
+                "the parent work assignment could not be found on the board"
             ),
+            work_assignment_id=None,
+        )
+
+    entry = _observed_merge_queue_entry(work)
+    if entry is None:
+        return _self_bless_not_advanced(
+            review,
+            reason=(
+                "no pending merge-queue entry is keyed to parent work "
+                f"assignment {work.assignment_id!r} "
+                f"(branch={work.branch!r}) afterwards"
+            ),
+            work_assignment_id=work.assignment_id,
         )
 
     return FinisherSelfBlessResult(
@@ -1308,7 +1343,90 @@ def finisher_self_bless(
         detail=(
             f"{review.repo_name}#{review.issue_number}: finisher leg "
             "self-blessed a nit-class diff and advanced it to the merge "
-            "queue"
+            f"queue (pending entry on {entry.branch!r} keyed to "
+            f"{entry.assignment_id!r})"
+        ),
+    )
+
+
+def _observed_merge_queue_entry(work: "Assignment") -> "QueuedMerge | None":
+    """Read the merge queue back and return the PENDING entry keyed to
+    *work*, or ``None`` when there isn't one.
+
+    This is the observation that decides :func:`finisher_self_bless`'s
+    ``blessed`` (#2096: never derive success from the absence of an
+    exception). :func:`coord.auto_loop.propagate_review_verdict` cannot
+    answer the question itself — it returns the parent work row whenever
+    that row is on the board, while its merge-queue refresh is skipped for
+    a branchless row and swallows its own failures into a log line. Only a
+    read-back distinguishes "an entry the merge gate can pick up now
+    exists" from "the review row was rewritten and nothing else happened".
+
+    A terminal entry (MERGED, CONFLICT, ...) does not count:
+    `coord.merge_queue.refresh_entry_assignment` deliberately leaves those
+    untouched rather than re-keying them, so one is evidence that nothing
+    was advanced, not that something was.
+    """
+    if not work.assignment_id:
+        return None
+    try:
+        from coord.merge_queue import PENDING, load_queue  # noqa: PLC0415
+
+        items = load_queue()
+    except Exception:  # noqa: BLE001 — an unreadable queue is an unobserved advance
+        log.warning(
+            "finisher self-bless: could not read the merge queue back for %s",
+            work.assignment_id, exc_info=True,
+        )
+        return None
+    return next(
+        (
+            x for x in items
+            if x.assignment_id == work.assignment_id and x.state == PENDING
+        ),
+        None,
+    )
+
+
+def _self_bless_not_advanced(
+    review: "Assignment",
+    *,
+    reason: str,
+    work_assignment_id: str | None,
+) -> FinisherSelfBlessResult:
+    """Report a self-bless whose override landed but whose merge-queue
+    advance was not observed, and record it as an audit row.
+
+    The review row keeps its override — it describes the new SHA truthfully
+    — but ``blessed`` is ``False`` and *reason* names what was missing, so
+    the stuck row stays visible to the next board-doctor sweep instead of
+    being reported as a merge that is on its way.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="business",
+        category="review",
+        event_type="finisher_self_bless_advance_unconfirmed",
+        actor="daemon",
+        summary=(
+            f"finisher leg recorded a self-bless override for "
+            f"{review.repo_name}#{review.issue_number} but could not "
+            f"confirm the merge-queue advance — {reason}"
+        ),
+        repo=review.repo_name,
+        issue=review.issue_number,
+        assignment_id=review.assignment_id,
+        machine=review.machine_name,
+        details={"reason": reason, "work_assignment_id": work_assignment_id},
+    )
+    return FinisherSelfBlessResult(
+        blessed=False,
+        actions=[],
+        detail=(
+            f"{review.repo_name}#{review.issue_number}: finisher leg "
+            f"recorded the self-bless override, but {reason} — nothing was "
+            "advanced to the merge queue"
         ),
     )
 

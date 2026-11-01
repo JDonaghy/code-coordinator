@@ -1390,13 +1390,17 @@ class TestFinisherSelfBless:
         # call — recorded separately as a structured audit-log row, which
         # is what these tests assert on.
         monkeypatch.setattr("coord.github_ops.post_issue_comment", lambda *a, **k: None)
+        # The merge-queue entry creation prices the branch diff through `gh`;
+        # the size it records is irrelevant to the self-bless decision.
+        monkeypatch.setattr("coord.github_ops.get_branch_diff_size", lambda *a, **k: 0)
 
     def test_nit_class_diff_self_blesses_and_advances_to_merge(self) -> None:
+        from coord import merge_queue as mq
+
         repo = _fixit_repo()
         config = _fixit_config(repo)
         board = Board()
         work = _fixit_work_assignment()
-        work.branch = None  # skip merge-queue refresh machinery entirely
         board.completed.append(work)
         review = _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
         board.completed.append(review)
@@ -1438,6 +1442,14 @@ class TestFinisherSelfBless:
         # propagate_review_verdict ran with refresh_merge_queue=True.
         assert work.review_state == "done"
         assert work.review_verdict == "approve"
+
+        # `blessed` is only ever True about an entry that is observably in
+        # the queue — read it back the way the merge gate will.
+        queued = [x for x in mq.load_queue() if x.assignment_id == "w1"]
+        assert len(queued) == 1
+        assert queued[0].branch == "issue-1-fix"
+        assert queued[0].state == mq.PENDING
+        assert "issue-1-fix" in result["detail"]
 
         log = query_audit_log(event_type="finisher_self_bless_approved", repo="api", issue=1)
         assert len(log["entries"]) == 1
@@ -1586,3 +1598,161 @@ class TestFinisherSelfBless:
 
         log = query_audit_log(event_type="finisher_self_bless_approved", repo="api", issue=1)
         assert len(log["entries"]) == 1
+        unconfirmed = query_audit_log(
+            event_type="finisher_self_bless_advance_unconfirmed", repo="api", issue=1
+        )
+        assert len(unconfirmed["entries"]) == 1
+
+    def test_blessed_false_when_a_branchless_parent_skips_the_queue_refresh(self) -> None:
+        # `propagate_review_verdict` skips its merge-queue refresh outright
+        # for a parent work row with no branch, yet still returns that row.
+        # "Advanced it to the merge queue" is therefore a claim nothing
+        # supports, so the read-back — not the handoff returning — decides
+        # `blessed` (#2096).
+        from coord import merge_queue as mq
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        work.branch = None
+        board.completed.append(work)
+        review = _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        board.completed.append(review)
+        state.save_board(Board(active=[], completed=[work, review]))
+        findings = ReviewFindings(
+            verdict="request-changes",
+            body=(
+                "<!-- coord:review verdict=approve blocking=0 assignment=r1 nits=1 -->\n"
+                "## Nits\n- rename var\n"
+            ),
+        )
+        fix = ProposedFix(
+            diff_text="--- a/foo.py\n+++ b/foo.py\n@@ -1,1 +1,1 @@\n-foo\n+bar\n",
+            behavioral=False,
+            touches_public_api=False,
+        )
+
+        result = finisher_self_bless(
+            review, findings, board, config, fix=fix, new_head_sha="deadbeef",
+        )
+
+        assert result["blessed"] is False
+        assert result["actions"] == []
+        assert "no pending merge-queue entry" in result["detail"]
+        assert "w1" in result["detail"]
+        # Nothing reached the queue, which is precisely why `blessed` is False.
+        assert mq.load_queue() == []
+        # The override itself still stands — only the advance is unconfirmed.
+        assert review.review_verdict == "approve"
+        assert review.review_head_sha == "deadbeef"
+
+        unconfirmed = query_audit_log(
+            event_type="finisher_self_bless_advance_unconfirmed", repo="api", issue=1
+        )
+        assert len(unconfirmed["entries"]) == 1
+        assert unconfirmed["entries"][0]["details"]["work_assignment_id"] == "w1"
+
+    def test_blessed_false_when_the_queue_refresh_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `coord.auto_loop` swallows a merge-queue refresh failure into a log
+        # line, so the handoff returns the parent row either way. Only the
+        # read-back can notice that nothing was enqueued.
+        from coord import merge_queue as mq
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("queue db is locked")
+
+        monkeypatch.setattr("coord.merge_queue.refresh_entry_assignment", _boom)
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        board.completed.append(work)
+        review = _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        board.completed.append(review)
+        state.save_board(Board(active=[], completed=[work, review]))
+        findings = ReviewFindings(
+            verdict="request-changes",
+            body=(
+                "<!-- coord:review verdict=approve blocking=0 assignment=r1 nits=1 -->\n"
+                "## Nits\n- rename var\n"
+            ),
+        )
+        fix = ProposedFix(
+            diff_text="--- a/foo.py\n+++ b/foo.py\n@@ -1,1 +1,1 @@\n-foo\n+bar\n",
+            behavioral=False,
+            touches_public_api=False,
+        )
+
+        result = finisher_self_bless(
+            review, findings, board, config, fix=fix, new_head_sha="deadbeef",
+        )
+
+        assert result["blessed"] is False
+        assert "no pending merge-queue entry" in result["detail"]
+        assert mq.load_queue() == []
+        assert review.review_verdict == "approve"
+
+        unconfirmed = query_audit_log(
+            event_type="finisher_self_bless_advance_unconfirmed", repo="api", issue=1
+        )
+        assert len(unconfirmed["entries"]) == 1
+
+    def test_a_terminal_entry_on_the_branch_does_not_count_as_advanced(self) -> None:
+        # `refresh_entry_assignment` deliberately leaves a terminal entry
+        # (MERGED/CONFLICT) alone rather than re-keying it, so the branch can
+        # hold a queue row while the parent work assignment has no *pending*
+        # one. That is not an advance.
+        from coord import merge_queue as mq
+
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="w-previous",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-1-fix",
+                target_branch="main",
+                issue_number=1,
+                issue_title="Fix the thing",
+                state=mq.MERGED,
+            )
+        ])
+
+        repo = _fixit_repo()
+        config = _fixit_config(repo)
+        board = Board()
+        work = _fixit_work_assignment()
+        board.completed.append(work)
+        review = _finisher_review_assignment(review_of="w1", review_verdict="request-changes")
+        board.completed.append(review)
+        state.save_board(Board(active=[], completed=[work, review]))
+        findings = ReviewFindings(
+            verdict="request-changes",
+            body=(
+                "<!-- coord:review verdict=approve blocking=0 assignment=r1 nits=1 -->\n"
+                "## Nits\n- rename var\n"
+            ),
+        )
+        fix = ProposedFix(
+            diff_text="--- a/foo.py\n+++ b/foo.py\n@@ -1,1 +1,1 @@\n-foo\n+bar\n",
+            behavioral=False,
+            touches_public_api=False,
+        )
+
+        result = finisher_self_bless(
+            review, findings, board, config, fix=fix, new_head_sha="deadbeef",
+        )
+
+        assert result["blessed"] is False
+        assert "no pending merge-queue entry" in result["detail"]
+        # The terminal entry is untouched — never re-keyed to the new work row.
+        items = mq.load_queue()
+        assert [(x.assignment_id, x.state) for x in items] == [("w-previous", mq.MERGED)]
+
+        unconfirmed = query_audit_log(
+            event_type="finisher_self_bless_advance_unconfirmed", repo="api", issue=1
+        )
+        assert len(unconfirmed["entries"]) == 1
