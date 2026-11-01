@@ -362,7 +362,7 @@ def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) ->
             f"  {e.repo_name} #{e.issue_number} ({e.branch}): {ev.kind} — "
             f"{ev.message}"
         )
-    _dispatch_conflict_fixes(sweep_events, config, dry_run=False)
+    _dispatch_conflict_fixes(sweep_events, config, dry_run=False, gh_ops=gh_ops)
     # #2246 review: `_dispatch_conflict_fixes` can advance a swept sibling's
     # state a second time in place — e.g. `entry.state = HUMAN_REQUIRED` when
     # `has_prior_conflict_fix` finds this sibling already burned a
@@ -390,7 +390,9 @@ def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) ->
     return sweep_events
 
 
-def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
+def _dispatch_conflict_fixes(
+    events, config, *, dry_run: bool, gh_ops: "GhOps | None" = None
+) -> None:
     """#241: classify any conflict events and dispatch a conflict-fix worker
     for the eligible ones.  Mutates each conflict event's ``ev.entry.state``
     in place (to ``HUMAN_REQUIRED`` on a retry-cap hit or a non-rebaseable
@@ -406,6 +408,16 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     watching it, permanently: ``merge_queue.process()`` only ever acts on
     ``PENDING`` entries, so a bare ``CONFLICT`` row is never reprocessed and
     never gets a second chance at this classify-and-dispatch step.
+
+    *gh_ops*, when supplied, gates a ``"rebaseable"`` conflict through
+    #3836's direct-merge takeover first: a base-move skew that is provably
+    inert (``ev.entry`` touches no file the base moved) is merged by this
+    finisher directly, with no conflict-fix leg and no voided review
+    approval — see :func:`coord.merge_queue.conflict_base_move_is_inert`.
+    Defaults to ``None`` (the gate is a no-op) so the one call site whose
+    conflicts are already verified a stronger way —
+    ``_dispatch_revalidation_conflicts``'s real local ``git merge`` attempt
+    against the live base — is unaffected.
     """
     conflict_events = [ev for ev in events if ev.kind == "conflict"]
     if not conflict_events or dry_run:
@@ -419,7 +431,9 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     )
     from coord.merge_queue import (  # noqa: PLC0415
         HUMAN_REQUIRED,
+        attempt_direct_merge_for_inert_base_move,
         classify_conflict,
+        conflict_base_move_is_inert,
         is_rebase_refusal,
     )
     from coord.network import fetch_status  # noqa: PLC0415
@@ -432,6 +446,45 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     for ev in conflict_events:
         kind = classify_conflict(ev.entry.error)
         if kind == "rebaseable":
+            # #3836: an inert base-move skew doesn't need a conflict-fix
+            # worker (and a rebase there would void the review approval,
+            # which is bound to patch-id) — the finisher merges it directly
+            # instead. Any uncertainty (no gh_ops, an unreadable compare, a
+            # declined retry) falls straight through to the unchanged
+            # retry-cap/dispatch logic below.
+            if gh_ops is not None:
+                try:
+                    inert_skew = conflict_base_move_is_inert(
+                        gh_ops,
+                        ev.entry.repo_github,
+                        ev.entry.branch,
+                        ev.entry.target_branch,
+                    )
+                except Exception:  # noqa: BLE001 — fail closed to the dispatch path below
+                    inert_skew = False
+                if inert_skew:
+                    direct_ev = attempt_direct_merge_for_inert_base_move(
+                        ev.entry, gh_ops
+                    )
+                    if direct_ev is not None:
+                        click.echo(
+                            f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                            "base-move conflict was an inert skew — merged "
+                            "directly, no conflict-fix leg"
+                        )
+                        record_audit(
+                            tier="operational",
+                            category="merge",
+                            event_type="conflict_inert_base_move_merged",
+                            actor="daemon",
+                            summary="inert base-move skew merged directly: "
+                            f"{ev.entry.repo_name}#{ev.entry.issue_number}",
+                            repo=ev.entry.repo_name,
+                            issue=ev.entry.issue_number,
+                            assignment_id=ev.entry.assignment_id,
+                            details={"reason": "inert_base_move_skew"},
+                        )
+                        continue
             # Retry cap (#241/#784): if a conflict-fix already ran and
             # failed for this entry in this session, don't loop — mark
             # HUMAN_REQUIRED so the user takes over.  A successful
@@ -2272,7 +2325,7 @@ def merge(
             )
             _dispatch_conflict_fixes(
                 [mq.MergeEvent(only_entry, "conflict", only_entry.error)],
-                cfg_only, dry_run=dry_run,
+                cfg_only, dry_run=dry_run, gh_ops=gh_ops,
             )
             if not dry_run:
                 all_items_only = mq.load_queue()
@@ -2379,7 +2432,7 @@ def merge(
         # a fresh conflict — see _dispatch_conflict_fixes's docstring. Run it
         # before the save below so a retry-cap/non-rebaseable HUMAN_REQUIRED
         # mutation on only_entry.state is persisted, not lost.
-        _dispatch_conflict_fixes(events_only, cfg_only, dry_run=dry_run)
+        _dispatch_conflict_fixes(events_only, cfg_only, dry_run=dry_run, gh_ops=gh_ops)
         # #2510: same reasoning, for a CONFIRMED checks_failed event — dispatch
         # a bounded ci-fix worker or escalate to HUMAN_REQUIRED before the
         # save below, so the mutation on only_entry.state is persisted too.
@@ -2760,7 +2813,7 @@ def merge(
             )
         _dispatch_conflict_fixes(
             [mq.MergeEvent(x, "conflict", x.error) for x in standing_conflicts],
-            cfg, dry_run=dry_run,
+            cfg, dry_run=dry_run, gh_ops=gh_ops,
         )
 
     if not pending:
@@ -2831,7 +2884,7 @@ def merge(
     # #241: classify any conflict events and dispatch a conflict-fix worker
     # for the eligible ones (extracted to _dispatch_conflict_fixes, #1474
     # review, so the --only path below can share it).
-    _dispatch_conflict_fixes(events, cfg, dry_run=dry_run)
+    _dispatch_conflict_fixes(events, cfg, dry_run=dry_run, gh_ops=gh_ops)
 
     # #2510: classify any CONFIRMED checks_failed events and dispatch a
     # bounded ci-fix worker for the eligible ones, escalating to

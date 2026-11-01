@@ -2439,6 +2439,100 @@ def _base_move_spared(
     return False, None
 
 
+def conflict_base_move_is_inert(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    branch: str | None,
+    target_branch: str | None,
+) -> bool:
+    """True when a GitHub-reported merge CONFLICT between *branch* and
+    *target_branch* is provably an inert base-move skew rather than a real
+    content collision (#3836) — i.e. "the branch touches no file the base
+    moved," the acceptance language :func:`_base_move_disjoint_from_branch`
+    already encodes.
+
+    `get_compare_files`'s three-dot ``base...head`` semantics (diff against
+    the computed merge-base, not the two tips directly) make this
+    answerable from the two CURRENT branch names alone, with no recorded
+    SHA snapshot needed: ``target_branch...branch`` is exactly the branch's
+    own diff (merge-base..branch, stable regardless of how far the base has
+    since moved — the same shape #1778's `_branch_is_inert` checks) and
+    ``branch...target_branch`` is exactly what the base has picked up since
+    diverging from the branch (merge-base..target_branch — the live
+    equivalent of #1738's `_base_move_is_inert`'s ``old_sha..new_sha``, with
+    the branch's own merge-base standing in for the recorded
+    ``test_base_sha``).
+
+    Tries the same three #1479/#1847 escape hatches :func:`_base_move_spared`
+    already tries for review/test staleness, just fed these two live
+    compares instead of a recorded-SHA pair: the branch's own diff being
+    inert-only, the base's moved-through diff being inert-only, or the two
+    diffs sharing no file (:func:`_base_move_disjoint_from_branch`). Any one
+    firing means the GitHub-level conflict cannot be a real content
+    collision between this branch and what the base actually moved through
+    — ordered cheapest-first and fetch-sharing exactly like
+    :func:`_base_move_spared`: at most two `get_compare_files` calls.
+
+    Fails closed to ``False`` exactly like the predicates it composes — no
+    *gh_ops*/*repo_github*/branch name, a raising compare, or an unreadable
+    (``None``) result on either side all read as "not proven inert," which
+    leaves the existing conflict-fix dispatch unchanged.
+    """
+    branch_files = _fetch_compare_files(gh_ops, repo_github, target_branch, branch)
+    if _files_are_inert(branch_files):
+        return True
+    base_moved_files = _fetch_compare_files(gh_ops, repo_github, branch, target_branch)
+    if _files_are_inert(base_moved_files):
+        return True
+    return _base_move_disjoint_from_branch(base_moved_files, branch_files)
+
+
+def attempt_direct_merge_for_inert_base_move(
+    entry: QueuedMerge, gh_ops: "GhOps | None"
+) -> "MergeEvent | None":
+    """Attempt the finisher merge directly for a conflict already proven an
+    inert base-move skew (#3836, :func:`conflict_base_move_is_inert`) —
+    *entry*'s own content never collided with anything the base moved
+    through, so the merge-commit this performs needs no rebase and voids no
+    review approval (approval is bound to patch-id; a rebase would change
+    it, which is exactly why a genuine conflict instead goes to
+    `dispatch_conflict_fix`).
+
+    Returns an ``"inert_base_move_merged"`` :class:`MergeEvent` on confirmed
+    success — mirroring `process()`'s own success contract: the boolean
+    `merge_pr` returns IS the confirmation, so nothing here assumes success
+    from the mere absence of an exception (epic #2096's "unconfirmed
+    success is a defect"). Returns ``None`` on any failure — the merge call
+    declining or raising — leaving *entry* completely untouched so the
+    caller's existing `dispatch_conflict_fix` fallback runs unchanged, the
+    real, reachable negative branch epic #2096 also requires ("a gate must
+    be able to fail").
+
+    Always attempts plain ``method="merge"`` (never ``rebase``/``squash``):
+    a merge commit is the one method that cannot change *entry*'s own
+    patch-id, which is what keeps the existing review approval intact.
+    Deliberately does not replicate `process()`'s own best-effort
+    post-merge enrichment (drive-escalation dismissal, gate-bypass audit,
+    design-round/status pushes, verification note) — each of those is
+    independently fail-safe there and optional, not part of this issue's
+    "merges... with no conflict-fix leg and the approval intact" contract,
+    and the caller's normal `process()` tick will still reach this same
+    entry's issue/PR bookkeeping on its own terms once merged.
+    """
+    if gh_ops is None:
+        return None
+    try:
+        ok, msg = gh_ops.merge_pr(entry.repo_github, entry.pr_number, method="merge")
+    except Exception:  # noqa: BLE001 — fail closed: an unconfirmed attempt is not a success
+        return None
+    if not ok:
+        return None
+    entry.state = MERGED
+    entry.error = None
+    entry.last_attempt = time.time()
+    return MergeEvent(entry, "inert_base_move_merged", msg)
+
+
 def _files_are_ancillary(
     files: list[str] | None, ancillary_files: list[str] | None
 ) -> bool:
@@ -7359,7 +7453,7 @@ def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingI
 @dataclass
 class MergeEvent:
     entry: QueuedMerge
-    kind: str  # "opened" | "sized" | "merged" | "merged_partial" | "merged_close_unconfirmed" | "conflict" | "skipped" | "error" | "reopened"
+    kind: str  # "opened" | "sized" | "merged" | "merged_partial" | "merged_close_unconfirmed" | "conflict" | "skipped" | "error" | "reopened" | "inert_base_move_merged"
     message: str = ""
 
 

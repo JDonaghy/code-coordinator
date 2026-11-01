@@ -15454,3 +15454,153 @@ class TestCiPendingPollIntervalS:
     def test_custom_base_and_cap_are_honoured(self) -> None:
         assert mq.ci_pending_poll_interval_s(1, base=10.0, cap=15.0) == 15.0
         assert mq.ci_pending_poll_interval_s(0, base=10.0, cap=15.0) == 10.0
+
+
+# ── #3836: inert base-move skew merges directly, no conflict-fix leg ────────
+
+
+@dataclass
+class _InertSkewGh(FakeGh):
+    """`FakeGh` with `get_compare_files` keyed by the literal (base, head)
+    pair, since `conflict_base_move_is_inert` compares live branch NAMES
+    (``target_branch``/``branch``), not recorded SHAs — unlike the
+    SHA-keyed `_Gh` fixture `TestStaleSmokeVerdictReporting` uses."""
+
+    files_by_pair: dict[tuple[str, str], list[str] | None] = field(
+        default_factory=dict
+    )
+    compare_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+        self.compare_calls.append((base, head))
+        return self.files_by_pair.get((base, head))
+
+
+class TestConflictBaseMoveIsInert:
+    """`conflict_base_move_is_inert` — the #3836 predicate that tells a
+    GitHub-reported ``"rebaseable"`` merge conflict apart from a genuine
+    content collision, by asking the two live branch names (no recorded
+    SHA snapshot needed) the same three #1479/#1847 escape-hatch questions
+    `_base_move_spared` already asks off a recorded SHA pair."""
+
+    def test_true_when_the_branchs_own_diff_is_inert_only(self) -> None:
+        gh = _InertSkewGh(
+            files_by_pair={("main", "worker/w1"): ["docs/README.md"]},
+        )
+        assert mq.conflict_base_move_is_inert(gh, "acme/api", "worker/w1", "main") is True
+
+    def test_true_when_the_base_moved_diff_is_inert_only(self) -> None:
+        gh = _InertSkewGh(
+            files_by_pair={
+                ("main", "worker/w1"): ["coord/merge_queue.py"],
+                ("worker/w1", "main"): ["CONTRIBUTING.md"],
+            },
+        )
+        assert mq.conflict_base_move_is_inert(gh, "acme/api", "worker/w1", "main") is True
+
+    def test_true_when_the_two_diffs_are_disjoint(self) -> None:
+        gh = _InertSkewGh(
+            files_by_pair={
+                ("main", "worker/w1"): ["tui/src/app/render.rs"],
+                ("worker/w1", "main"): ["coord/state.py"],
+            },
+        )
+        assert mq.conflict_base_move_is_inert(gh, "acme/api", "worker/w1", "main") is True
+
+    def test_false_on_a_genuine_overlapping_conflict(self) -> None:
+        gh = _InertSkewGh(
+            files_by_pair={
+                ("main", "worker/w1"): ["coord/state.py", "coord/drive.py"],
+                ("worker/w1", "main"): ["coord/state.py"],
+            },
+        )
+        assert mq.conflict_base_move_is_inert(gh, "acme/api", "worker/w1", "main") is False
+
+    def test_fails_closed_without_gh_ops(self) -> None:
+        assert mq.conflict_base_move_is_inert(None, "acme/api", "worker/w1", "main") is False
+
+    def test_fails_closed_without_repo_github(self) -> None:
+        gh = _InertSkewGh(files_by_pair={("main", "worker/w1"): ["docs/README.md"]})
+        assert mq.conflict_base_move_is_inert(gh, None, "worker/w1", "main") is False
+
+    def test_fails_closed_when_compare_is_unreadable(self) -> None:
+        gh = _InertSkewGh()  # files_by_pair empty -> every compare is None
+        assert mq.conflict_base_move_is_inert(gh, "acme/api", "worker/w1", "main") is False
+
+    def test_fails_closed_when_compare_raises(self) -> None:
+        # `_fetch_compare_files` already catches and swallows this (fails
+        # closed to None) — so the predicate sees an unreadable compare, not
+        # a propagating exception, and reads it the same as "not proven inert".
+        class _Raising(_InertSkewGh):
+            def get_compare_files(self, repo, base, head):
+                raise RuntimeError("gh api boom")
+
+        assert (
+            mq.conflict_base_move_is_inert(_Raising(), "acme/api", "worker/w1", "main")
+            is False
+        )
+
+    def test_calls_get_compare_files_at_most_twice(self) -> None:
+        gh = _InertSkewGh(
+            files_by_pair={("main", "worker/w1"): ["docs/README.md"]},
+        )
+        mq.conflict_base_move_is_inert(gh, "acme/api", "worker/w1", "main")
+        assert len(gh.compare_calls) <= 2
+
+
+class TestAttemptDirectMergeForInertBaseMove:
+    """`attempt_direct_merge_for_inert_base_move` — the finisher's
+    merge-commit takeover once #3836's predicate has proven the conflict an
+    inert skew. Always a plain ``method="merge"`` call, never
+    rebase/squash, since only a merge commit leaves *entry*'s own patch-id
+    (and therefore its review approval) untouched."""
+
+    def test_confirmed_success_merges_and_returns_the_event(self) -> None:
+        entry = _q("w1", pr=42, state=CONFLICT)
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+
+        ev = mq.attempt_direct_merge_for_inert_base_move(entry, gh)
+
+        assert ev is not None
+        assert ev.kind == "inert_base_move_merged"
+        assert ev.message == "merged via API"
+        assert ev.entry is entry
+        assert entry.state == MERGED
+        assert entry.error is None
+        assert entry.last_attempt is not None
+        assert gh.merge_calls == [("acme/api", 42, "merge")]
+
+    def test_declined_merge_returns_none_and_leaves_entry_untouched(self) -> None:
+        entry = _q("w1", pr=42, state=CONFLICT)
+        entry.error = "original conflict error"
+        gh = FakeGh(merge_results={42: (False, "still conflicting")})
+
+        ev = mq.attempt_direct_merge_for_inert_base_move(entry, gh)
+
+        assert ev is None
+        assert entry.state == CONFLICT
+        assert entry.error == "original conflict error"
+
+    def test_raising_merge_call_returns_none_and_leaves_entry_untouched(self) -> None:
+        class _Raising(FakeGh):
+            def merge_pr(self, repo, number, method="rebase"):
+                raise RuntimeError("gh api boom")
+
+        entry = _q("w1", pr=42, state=CONFLICT)
+        entry.error = "original conflict error"
+
+        ev = mq.attempt_direct_merge_for_inert_base_move(entry, _Raising())
+
+        assert ev is None
+        assert entry.state == CONFLICT
+        assert entry.error == "original conflict error"
+
+    def test_fails_closed_without_gh_ops(self) -> None:
+        entry = _q("w1", pr=42, state=CONFLICT)
+        entry.error = "original conflict error"
+
+        ev = mq.attempt_direct_merge_for_inert_base_move(entry, None)
+
+        assert ev is None
+        assert entry.state == CONFLICT
+        assert entry.error == "original conflict error"
