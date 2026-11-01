@@ -917,6 +917,92 @@ class TestMergeOnly:
         assert "pending" in result.stderr.lower()
 
 
+class TestOnlyInertBaseMoveTakeover:
+    """#3836: `coord merge --only <aid>` end-to-end, where the PENDING
+    entry's own `process()` attempt fails with a fresh ("in-pass")
+    rebaseable conflict whose base-move skew `conflict_base_move_is_inert`
+    proves inert. The takeover inside `_dispatch_conflict_fixes` merges it
+    directly within this SAME invocation — the CLI must exit 0 (the #2157
+    postcondition: "aid's branch landed on the target branch"), never the
+    generic "not PENDING" exit 1 a state frozen at CONFLICT would otherwise
+    produce.
+    """
+
+    def test_only_merges_directly_on_an_inert_base_move_conflict(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())
+        _seed_queue([_entry("ibm1")])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 600, "url": "u/600", "existed": False}
+
+        merge_calls: list[tuple] = []
+
+        def fake_merge(repo, number, method="rebase"):
+            merge_calls.append((repo, number, method))
+            if method == "merge":
+                # The takeover's own direct merge — succeeds.
+                return True, "merged via API"
+            # process()'s own first attempt — a rebaseable conflict.
+            return False, "merge conflict: GitHub reports PR as CONFLICTING"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge), \
+             patch("coord.github_ops.close_issue"), \
+             patch.object(mq, "conflict_base_move_is_inert", return_value=True), \
+             patch("coord.conflict_fix.dispatch_conflict_fix") as dcf:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "ibm1"]
+            )
+
+        assert result.exit_code == 0, result.output
+        dcf.assert_not_called()
+        assert ("acme/api", 600, "merge") in merge_calls
+        states = {x.assignment_id: x.state for x in mq.load_queue()}
+        assert states["ibm1"] == mq.MERGED, result.output
+
+    def test_only_still_dispatches_when_base_move_skew_is_not_inert(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Same fresh-conflict setup, but `conflict_base_move_is_inert`
+        declines — the takeover must not fire, and `--only` keeps the
+        pre-existing "not PENDING" exit-1 refusal for a genuine conflict."""
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())
+        _seed_queue([_entry("ibm2")])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 601, "url": "u/601", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            return False, "merge conflict: GitHub reports PR as CONFLICTING"
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge), \
+             patch.object(mq, "conflict_base_move_is_inert", return_value=False), \
+             patch(
+                 "coord.conflict_fix.dispatch_conflict_fix",
+                 return_value=fake_fix,
+             ) as dcf:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "ibm2"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert dcf.called
+        states = {x.assignment_id: x.state for x in mq.load_queue()}
+        assert states["ibm2"] == mq.CONFLICT
+
+
 class TestOnlyAlreadyMerged:
     """#2157: `coord merge --only <aid>` on an entry that has ALREADY merged
     is a SUCCESS, not a failure.
@@ -3763,6 +3849,206 @@ class TestSweepSiblingConflictsWrapper:
 
         assert out == []
         dispatch.assert_not_called()
+
+
+class TestDispatchConflictFixesInertBaseMoveTakeover:
+    """#3836: `_dispatch_conflict_fixes`'s own "rebaseable" + in-pass +
+    inert-skew branch — not just the helpers it calls. A "rebaseable"
+    conflict whose base-move skew `conflict_base_move_is_inert` proves
+    inert is merged directly, with the conflict-fix worker never
+    dispatched; any entry missing the in-pass `issue_resolution` signal
+    (a standing/swept `CONFLICT` row, #3836's own fail-closed gate) falls
+    straight through to the unchanged conflict-fix dispatch regardless of
+    what the inert-skew predicate would have said.
+    """
+
+    def _entry(self, aid: str = "r1", *, pr: int = 42) -> mq.QueuedMerge:
+        return mq.QueuedMerge(
+            assignment_id=aid,
+            repo_name="api",
+            repo_github="acme/api",
+            branch=f"worker/{aid}",
+            target_branch="main",
+            issue_number=309,
+            issue_title="t",
+            state=mq.CONFLICT,
+            pr_number=pr,
+            error="merge conflict: GitHub reports PR as CONFLICTING",
+        )
+
+    def test_in_pass_inert_skew_merges_directly_and_skips_dispatch(
+        self, coord_dir: Path,
+    ) -> None:
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board, IssueResolution
+        from coord.state import save_board
+        from tests.test_merge_queue import FakeGh
+
+        save_board(Board())
+        entry = self._entry()
+        ev = mq.MergeEvent(
+            entry, "conflict", "became CONFLICTING",
+            issue_resolution=IssueResolution("resolved", ""),
+            issue_close_block_reason=None,
+        )
+        events = [ev]
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+
+        with patch.object(
+            mq, "conflict_base_move_is_inert", return_value=True,
+        ), patch(
+            "coord.conflict_fix.dispatch_conflict_fix"
+        ) as dispatch:
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=gh,
+            )
+
+        dispatch.assert_not_called()
+        assert entry.state == mq.MERGED
+        assert gh.merge_calls == [("acme/api", 42, "merge")]
+        kinds = [e.kind for e in events]
+        assert "inert_base_move_merged" in kinds
+        assert "merged" in kinds
+
+    def test_non_in_pass_conflict_falls_through_to_ordinary_dispatch(
+        self, coord_dir: Path,
+    ) -> None:
+        """A standing/swept `CONFLICT` row never had this tick's gate chain
+        run against it (`ev.issue_resolution is None`) — #3836's takeover
+        must not even consult `conflict_base_move_is_inert` for it, let
+        alone merge; it dispatches the conflict-fix worker exactly as
+        before this feature existed."""
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board
+        from coord.state import save_board
+        from tests.test_merge_queue import FakeGh
+
+        save_board(Board())
+        entry = self._entry()
+        ev = mq.MergeEvent(entry, "conflict", "became CONFLICTING")
+        events = [ev]
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch.object(mq, "conflict_base_move_is_inert") as inert_check, \
+             patch(
+                 "coord.conflict_fix.dispatch_conflict_fix",
+                 return_value=fake_fix,
+             ) as dispatch:
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=gh,
+            )
+
+        inert_check.assert_not_called()
+        dispatch.assert_called_once()
+        assert entry.state == mq.CONFLICT
+        assert gh.merge_calls == []
+
+    def test_no_gh_ops_falls_through_to_ordinary_dispatch(
+        self, coord_dir: Path,
+    ) -> None:
+        """Even an in-pass event takes the unchanged dispatch path when the
+        caller passes no `gh_ops` (the one call site whose conflicts are
+        already verified a stronger way — a real local `git merge`)."""
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board, IssueResolution
+        from coord.state import save_board
+
+        save_board(Board())
+        entry = self._entry()
+        ev = mq.MergeEvent(
+            entry, "conflict", "became CONFLICTING",
+            issue_resolution=IssueResolution("resolved", ""),
+            issue_close_block_reason=None,
+        )
+        events = [ev]
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch.object(mq, "conflict_base_move_is_inert") as inert_check, \
+             patch(
+                 "coord.conflict_fix.dispatch_conflict_fix",
+                 return_value=fake_fix,
+             ) as dispatch:
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=None,
+            )
+
+        inert_check.assert_not_called()
+        dispatch.assert_called_once()
+        assert entry.state == mq.CONFLICT
+
+    def test_declined_inert_skew_falls_through_to_ordinary_dispatch(
+        self, coord_dir: Path,
+    ) -> None:
+        """`conflict_base_move_is_inert` says the skew is not provably
+        inert — the takeover must not merge, and the entry still gets the
+        ordinary conflict-fix treatment."""
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board, IssueResolution
+        from coord.state import save_board
+        from tests.test_merge_queue import FakeGh
+
+        save_board(Board())
+        entry = self._entry()
+        ev = mq.MergeEvent(
+            entry, "conflict", "became CONFLICTING",
+            issue_resolution=IssueResolution("resolved", ""),
+            issue_close_block_reason=None,
+        )
+        events = [ev]
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch.object(
+            mq, "conflict_base_move_is_inert", return_value=False,
+        ), patch(
+            "coord.conflict_fix.dispatch_conflict_fix",
+            return_value=fake_fix,
+        ) as dispatch:
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=gh,
+            )
+
+        dispatch.assert_called_once()
+        assert entry.state == mq.CONFLICT
+        assert gh.merge_calls == []
+
+    def test_non_rebaseable_conflict_is_unaffected_by_the_takeover_gate(
+        self, coord_dir: Path,
+    ) -> None:
+        """A genuinely non-rebaseable conflict (permission/protection) is
+        classified "human" long before the takeover's "rebaseable" branch
+        is even reached — #3836 must not change this outcome."""
+        from coord.commands import merge as merge_cmd
+        from coord.models import Board, IssueResolution
+        from coord.state import save_board
+        from tests.test_merge_queue import FakeGh
+
+        save_board(Board())
+        entry = self._entry()
+        entry.error = "required status check is expected"
+        ev = mq.MergeEvent(
+            entry, "conflict", "blocked",
+            issue_resolution=IssueResolution("resolved", ""),
+            issue_close_block_reason=None,
+        )
+        events = [ev]
+        gh = FakeGh(merge_results={42: (True, "merged via API")})
+
+        with patch.object(mq, "conflict_base_move_is_inert") as inert_check:
+            merge_cmd._dispatch_conflict_fixes(
+                events, None, dry_run=False, gh_ops=gh,
+            )
+
+        inert_check.assert_not_called()
+        assert entry.state == mq.HUMAN_REQUIRED
+        assert gh.merge_calls == []
 
 
 class TestMergeSweepsSiblingsEndToEnd:
