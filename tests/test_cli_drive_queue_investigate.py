@@ -351,3 +351,41 @@ def test_no_investigate_flag_disarms_the_tier_fleet_wide(
     assert _dispatched_issues() == []
     assert fake_dispatch == []
     assert state.get_drive_escalation(REPO, 401) is not None
+
+
+def test_no_finish_flag_sets_and_restores_the_kill_switch_env_var(
+    config_path, cli, monkeypatch,
+):
+    """`--no-finish` (#3837) is the one-shot equivalent of `board_doctor
+    .finish: false` for the finisher tier (Trigger A, #3835) — but that tier
+    fires off `coord.auto_loop.process_review_completion` at review-
+    completion time, never from this sweep's own dispatch loop, so there is
+    no stuck row scenario in which `coord drive-queue sweep` itself
+    dispatches or blocks a finisher leg to assert on. What IS genuinely
+    observable from here is the one real effect the flag has: it sets
+    `NO_FINISHER_ENV_VAR` for the duration of this sweep call (so any OTHER
+    code sharing this OS process reads it disarmed) and restores whatever
+    was there before once the call returns."""
+    import os
+
+    from coord import board_doctor, board_doctor_policy
+
+    _write_config(config_path, repo_investigate=False, max_parallel=2)
+
+    seen_during_call: list[str | None] = []
+
+    def fake_run_sweep(*args, **kwargs):
+        seen_during_call.append(os.environ.get(board_doctor_policy.NO_FINISHER_ENV_VAR))
+        return board_doctor.SweepReport(sweep_id="test-sweep", dry_run=False, decisions=[], rows_observed=0)
+
+    monkeypatch.setattr(board_doctor, "run_sweep", fake_run_sweep)
+
+    assert board_doctor_policy.NO_FINISHER_ENV_VAR not in os.environ
+
+    result = cli("sweep", "--no-finish", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert seen_during_call == ["1"]
+    # Restored to "unset" afterwards, not left armed for the next call in
+    # this process.
+    assert board_doctor_policy.NO_FINISHER_ENV_VAR not in os.environ
