@@ -675,6 +675,7 @@ def _fix_from_review(
     guidance: str,
     force: bool,
     machine_override: str | None = None,
+    no_finish: bool = False,
 ) -> None:
     """#1622: dispatch a HEADLESS fix round for a request-changes review.
 
@@ -695,9 +696,20 @@ def _fix_from_review(
     - resolution of the review's log path / machine host, which the transition
       path gets handed by ``coord notify`` and a CLI invocation does not.
 
+    *no_finish* (#3837's `coord fix --no-finish`) disarms the finisher tier
+    (Trigger A, #3835) for just the :func:`coord.auto_loop.
+    process_review_completion` call below — this IS the call site where
+    Trigger A fires, unlike `coord drive-queue sweep`, so setting
+    `board_doctor_policy.NO_FINISHER_ENV_VAR` here genuinely changes this
+    invocation's own outcome, and the ``finally`` restores it immediately
+    after so a caller sharing this OS process with other board-doctor
+    callers never observes it armed past this one call.
+
     Never returns — always exits via :func:`sys.exit`.
     """
-    from coord import auto_loop
+    import os  # noqa: PLC0415
+
+    from coord import auto_loop, board_doctor_policy  # noqa: PLC0415
     from coord.board_service import write_board
     from coord.state import COORD_DIR, add_issue_context_entry
 
@@ -767,10 +779,21 @@ def _fix_from_review(
         machine_host = _machine.host
 
     before = {a.assignment_id for a in board.active}
-    actions = auto_loop.process_review_completion(
-        review, board, cfg, log_path=log_path, machine_host=machine_host,
-        override_machine=machine_override,
-    )
+    _env_var = board_doctor_policy.NO_FINISHER_ENV_VAR
+    _previous = os.environ.get(_env_var)
+    if no_finish:
+        os.environ[_env_var] = "1"
+    try:
+        actions = auto_loop.process_review_completion(
+            review, board, cfg, log_path=log_path, machine_host=machine_host,
+            override_machine=machine_override,
+        )
+    finally:
+        if no_finish:
+            if _previous is None:
+                os.environ.pop(_env_var, None)
+            else:
+                os.environ[_env_var] = _previous
 
     # `process_review_completion` mutates the board and leaves persistence to
     # its caller — same contract, same kind list, as the transition path.
@@ -875,9 +898,24 @@ def _fix_from_review(
         "SPECIFIC one, or every automatic fallback was also unreachable."
     ),
 )
+@click.option(
+    "--no-finish",
+    is_flag=True,
+    default=False,
+    help=(
+        "One-shot equivalent of `board_doctor.finish: false` (#3837): disarm "
+        "the finisher tier (Trigger A, #3835) for THIS invocation only, so a "
+        "nit-only request-changes verdict falls back to the #476 "
+        "approve-with-nits no-op even when the repo and fleet are both "
+        "opted in. Only matters for a REVIEW-id ASSIGNMENT_ID — this is the "
+        "command that actually calls `process_review_completion`, the one "
+        "and only place Trigger A fires; it is a no-op for a WORK-id "
+        "ASSIGNMENT_ID."
+    ),
+)
 def fix(
     assignment_id: str, config_path: Path, guidance: str, force: bool,
-    machine_override: str | None,
+    machine_override: str | None, no_finish: bool,
 ) -> None:
     from coord.board_service import read_board
     from coord.state import COORD_DIR
@@ -896,7 +934,7 @@ def fix(
     if assignment.type == "review":
         _fix_from_review(
             cfg, board, assignment, guidance=guidance, force=force,
-            machine_override=machine_override,
+            machine_override=machine_override, no_finish=no_finish,
         )
         return
 

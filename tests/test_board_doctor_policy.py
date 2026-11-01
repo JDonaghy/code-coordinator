@@ -51,6 +51,15 @@ _UNPINNABLE_DETAIL = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_drive_sessions(monkeypatch) -> None:
+    # `_investigate_in_flight_count` (shared by the finisher tier's own
+    # capacity check via `_at_repo_capacity`, #3837) also checks live
+    # `coord drive` tmux sessions — keep that hermetic across this whole
+    # module rather than in each capacity-check test class individually.
+    monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
+
+
 def _row(
     key: str,
     cause: str,
@@ -704,13 +713,6 @@ class TestInvestigateCapacityCheck:
             machines=[],
         )
 
-    @pytest.fixture(autouse=True)
-    def _no_drive_sessions(self, monkeypatch) -> None:
-        # `_investigate_in_flight_count` now also checks live `coord drive`
-        # tmux sessions — keep that hermetic here, same convention used
-        # across the repo's other drive-queue tests.
-        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
-
     def test_at_the_cap_the_rest_defer_with_no_escalation(self, monkeypatch) -> None:
         monkeypatch.setattr(common, "resolve_and_load_config", lambda path, **k: object())
         monkeypatch.setattr(board_doctor_policy, "_investigate_tier_enabled", lambda *a, **k: True)
@@ -990,13 +992,6 @@ class TestDispatchNitOnlyFinisher:
     directly rather than through `sweep`/`policy_tier_of`.
     """
 
-    @pytest.fixture(autouse=True)
-    def _no_drive_sessions(self, monkeypatch) -> None:
-        # #3837's capacity check (`_finisher_in_flight_count`) reuses
-        # `_investigate_in_flight_count`, which also checks live `coord
-        # drive` tmux sessions — keep that hermetic here, same convention
-        # as `TestInvestigateCapacityCheck`.
-        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
 
     def test_returns_false_without_dispatching_when_tier_disabled(
         self, monkeypatch
@@ -1074,10 +1069,9 @@ class TestDispatchNitOnlyFinisher:
 
 
 class TestFinisherCapacityCheck:
-    """#3837: the finisher tier's per-repo cap, resolved the same way as
-    the investigate tier's (`_finisher_repo_capacity` /
-    `_finisher_in_flight_count` delegate to `_investigate_repo_capacity` /
-    `_investigate_in_flight_count` verbatim) but checked inline on every
+    """#3837: the finisher tier's per-repo cap, resolved via the same
+    shared `_at_repo_capacity` helper the investigate tier's
+    `InvestigateCapacityGate` uses, but called inline on every
     `dispatch_nit_only_finisher` call rather than via a gate built once per
     sweep — there is no sweep here, just the one call site.
     """
@@ -1099,10 +1093,6 @@ class TestFinisherCapacityCheck:
             machines=[],
             board_doctor=BoardDoctorConfig(finish=True),
         )
-
-    @pytest.fixture(autouse=True)
-    def _no_drive_sessions(self, monkeypatch) -> None:
-        monkeypatch.setattr("coord.drive.list_drive_sessions", lambda *a, **k: [])
 
     def test_at_capacity_does_not_dispatch(self, monkeypatch) -> None:
         busy_board = Board(

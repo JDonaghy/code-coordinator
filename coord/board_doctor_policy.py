@@ -113,25 +113,12 @@ same question twice). :func:`escalation_alert_dispatcher` writes to
 exactly that surface, with `proposed_command="coord status"`, so an
 operator landing on the alert has the next action right there.
 
-Why the finisher tier (Trigger A, #3835) ships gated the same way (#3837)
----------------------------------------------------------------------------
-Trigger A fires synchronously off `coord.auto_loop.process_review_completion`
-rather than the periodic sweep, but it is just as capable of silently
-changing fleet behavior as the investigate tier, so it ships OFF with the
-same two-switch shape: :func:`_finisher_tier_enabled`'s three gates
-(:data:`NO_FINISHER_ENV_VAR`, the fleet-wide `board_doctor.finish`, the
-per-repo `repos[].board_doctor.finish` opt-in) mirror
-:func:`_investigate_tier_enabled` field-for-field, and
-:func:`_finisher_repo_capacity` / :func:`_finisher_in_flight_count` reuse
-:func:`_investigate_repo_capacity` / :func:`_investigate_in_flight_count`
-verbatim rather than re-deriving a second per-repo ceiling. There is no
-`InvestigateCapacityGate`-shaped class here because there is no sweep to
-build one once per pass — :func:`dispatch_nit_only_finisher` is the one
-and only call site, so it resolves the cap and the in-flight count
-directly, inline, every time it runs; `coord.auto_loop.process_review_completion`
-always calls it with its own just-loaded `config`/`board`, so both gates
-are read fresh at the moment a review completes, with nothing to go stale
-between calls.
+The finisher tier (Trigger A) ships gated the same two-switch shape as the
+investigate tier above, via :func:`_finisher_tier_enabled` and
+:func:`_at_repo_capacity` — see their own docstrings, and
+:func:`dispatch_nit_only_finisher`'s, for the details and for how its
+single-call-site shape differs from :class:`InvestigateCapacityGate`'s
+per-sweep one.
 """
 
 from __future__ import annotations
@@ -536,34 +523,41 @@ def _finisher_tier_enabled(repo_name: str, config: "Config") -> bool:
     return bool(repo is not None and repo.board_doctor.finish)
 
 
-def _finisher_repo_capacity(repo_name: str, config: "Config") -> int:
-    """The finisher tier's per-repo dispatch cap for *repo_name* (#3837).
+def _at_repo_capacity(
+    repo_name: str,
+    config: "Config",
+    board: "Board",
+    *,
+    claimed: int = 0,
+) -> bool:
+    """Shared "is *repo_name* at or over its per-repo dispatch cap" predicate
+    (#3837), used by both the investigate tier's per-sweep
+    :class:`InvestigateCapacityGate` and the finisher tier's single-call
+    :func:`dispatch_nit_only_finisher`. Both tiers share one capacity knob —
+    :func:`_investigate_repo_capacity` / :func:`_investigate_in_flight_count`,
+    neither of which has an investigate-specific meaning despite the name
+    (see their own docstrings) — so this is the one place that resolves it
+    and compares against in-flight occupancy.
 
-    Delegates to :func:`_investigate_repo_capacity` verbatim: Trigger A
-    (#3835) has no dedicated capacity knob of its own either, so it is
-    bound by the exact same `repos[].max_parallel` /
-    `pipeline.max_parallel_per_repo` resolution the investigate tier uses
-    — never a second knob. A named wrapper exists (rather than calling
-    `_investigate_repo_capacity` directly from
-    :func:`dispatch_nit_only_finisher`) so the cap the finisher tier is
-    bound by has its own name to repoint first, if it ever needs its own
-    knob.
+    *claimed* is the caller's own additional in-flight count not yet
+    reflected in *board* — :class:`InvestigateCapacityGate` passes its own
+    per-sweep ``self._claimed.get(repo_name, 0)`` so a row CONFIRMED
+    dispatched earlier in the same sweep still counts even though *board*
+    was built once at sweep start and is never refreshed mid-sweep.
+    :func:`dispatch_nit_only_finisher` has no such per-sweep state — it is
+    the one and only call site for a review completing — and omits it,
+    defaulting to ``0``.
+
+    Returns ``False`` (never at capacity) if the resolved cap is
+    non-positive — ``0`` means "no ceiling" per
+    :func:`_investigate_repo_capacity`'s own documented semantics, not
+    "zero capacity".
     """
-    return _investigate_repo_capacity(repo_name, config)
-
-
-def _finisher_in_flight_count(repo_name: str, board: "Board") -> int:
-    """How many issues in *repo_name* are already occupied by in-flight
-    work, for the finisher tier's own per-repo cap (#3837).
-
-    Delegates to :func:`_investigate_in_flight_count` verbatim — that
-    function's own docstring already describes itself as a repo-wide
-    signal shared with "ordinary drive-queue work... fix-it leg or not",
-    not an investigate-specific one, so a finisher leg already dispatched
-    for another issue in the same repo eats into this cap exactly the
-    same way a fix-it leg or a plain drive session does.
-    """
-    return _investigate_in_flight_count(repo_name, board)
+    cap = _investigate_repo_capacity(repo_name, config)
+    if cap <= 0:
+        return False
+    in_flight = _investigate_in_flight_count(repo_name, board) + claimed
+    return in_flight >= cap
 
 
 def dispatch_nit_only_finisher(
@@ -597,7 +591,7 @@ def dispatch_nit_only_finisher(
     absence of an exception, per #2096). The caller must fall through to
     its own existing behavior on ``False``, for any reason: the tier is
     off, the repo hasn't opted in, the repo is already at its per-repo
-    capacity cap (:func:`_finisher_repo_capacity`, #3837), a
+    capacity cap (:func:`_at_repo_capacity`, #3837), a
     fix-it/finisher/drive-session is already in flight for this issue, or
     `_dispatch_fix` declined (no capable machine, unreachable agent, …).
     There is no alert-fallback here, unlike :func:`_investigate` —
@@ -605,14 +599,30 @@ def dispatch_nit_only_finisher(
     itself a safe, legible outcome (approve-with-nits, nothing silently
     lost), not a stuck row needing a human page.
 
+    The capacity decline is terminal for this review, unlike the
+    investigate tier's per-sweep deferral (:class:`InvestigateCapacityGate`
+    re-peeks a deferred row on every later sweep pass, so it eventually
+    gets through once something else frees a slot): this function has no
+    sweep loop retrying it, so "at capacity" here just means #476's
+    approve-with-nits applies for THIS review, permanently — a later
+    review for the same issue gets its own fresh capacity check.
+
     *nits* carries the reviewer's actual nit/non-blocking findings text
     (see `coord.review.extract_nits_section`) so the finisher leg's
     briefing can tell the worker what to apply, rather than just a count.
     """
     if not _finisher_tier_enabled(repo_name, config):
         return False
-    cap = _finisher_repo_capacity(repo_name, config)
-    if cap > 0 and _finisher_in_flight_count(repo_name, board) >= cap:
+    if _at_repo_capacity(repo_name, config, board):
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"warning: board-doctor NOT dispatching a finisher leg for "
+            f"{repo_name}#{issue_number} — the repo is already at its "
+            "per-repo capacity cap (_at_repo_capacity, #3837); falling back "
+            "to #476's approve-with-nits for this review instead",
+            err=True,
+        )
         return False
     result = dispatch_sweep_action(
         _FINISHER_ACTION,
@@ -973,7 +983,9 @@ class InvestigateCapacityGate:
           stuck.
         * Returns ``False`` (unlimited) if the repo's resolved cap
           (:func:`_investigate_repo_capacity`) is non-positive.
-        * Otherwise compares ``in_flight + claimed`` against the cap.
+        * Otherwise defers to :func:`_at_repo_capacity` (shared with the
+          finisher tier's :func:`dispatch_nit_only_finisher`, #3837) for
+          the actual ``in_flight + claimed`` vs. cap comparison.
         """
         if row.cause not in INVESTIGATE_CAUSES:
             return False
@@ -981,13 +993,12 @@ class InvestigateCapacityGate:
         if parsed is None:
             return False
         repo_name, _issue_number = parsed
-        cap = _investigate_repo_capacity(repo_name, self._config)
-        if cap <= 0:
-            return False
-        in_flight = _investigate_in_flight_count(
-            repo_name, self._board
-        ) + self._claimed.get(repo_name, 0)
-        return in_flight >= cap
+        return _at_repo_capacity(
+            repo_name,
+            self._config,
+            self._board,
+            claimed=self._claimed.get(repo_name, 0),
+        )
 
     def confirm_dispatch(self, row: StuckRow) -> None:
         """Claim one slot for *row*'s repo after a CONFIRMED dispatch.
