@@ -5618,17 +5618,23 @@ def test_a_never_dispatched_after_blocked_entry_still_resumes_once_its_prereq_la
 # remote branch — nothing a merge gate could ever read. #2230's sweep kept
 # re-stamping the same "could not be read" sentence every tick forever, and
 # only an operator `coord drive-queue remove` + `add` ever cleared the row.
-# `_reconcile_blocked_unreachable` performs that same remove+add automatically
-# for the one shape that is safe to ground purely on the queue's own ledger:
-# `attempts == 0` (never dispatched at all).
+# `_reconcile_blocked_unreachable` performs that same remove+add
+# automatically, on the first tick that sees the row, for the one shape it can
+# prove is safe: `attempts == 0` on the ledger (never dispatched), this tick's
+# own gate probe coming back with nothing to read, no live gate verdict either
+# way, and a board observation that no work-like assignment exists for the
+# issue at all.
 
-_UNREADABLE_REASON = (
-    "claude-coordinator#1945s merge gate could not be read this tick (no "
-    "merge-queue row for this entry, even after the self-heal enqueue "
-    "attempt) — this is NOT a confirmed-still-shut gate, only a failed "
-    "probe; the #2230 sweep will try again next tick rather than guessing "
-    "(#2806)"
-)
+
+def _unreadable_reason(number: int) -> str:
+    """The #2806 failed-probe sentence `_reconcile_blocked_unreadable` stamps."""
+    return (
+        f"{REPO}#{number}s merge gate could not be read this tick (no "
+        "merge-queue row for this entry, even after the self-heal enqueue "
+        "attempt) — this is NOT a confirmed-still-shut gate, only a failed "
+        "probe; the #2230 sweep will try again next tick rather than guessing "
+        "(#2806)"
+    )
 
 
 def test_a_never_dispatched_blocked_entry_auto_resets_to_waiting():
@@ -5639,7 +5645,7 @@ def test_a_never_dispatched_blocked_entry_auto_resets_to_waiting():
             attempts=0,
             deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
             resumes=0,
-            last_reason=_UNREADABLE_REASON,
+            last_reason=_unreadable_reason(1945),
         )
     ]
     plan = plan_tick(
@@ -5665,7 +5671,7 @@ def test_a_blocked_entry_that_was_actually_dispatched_does_not_auto_reset():
             attempts=DEFAULT_MAX_ATTEMPTS,
             deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
             resumes=0,
-            last_reason=_UNREADABLE_REASON,
+            last_reason=_unreadable_reason(1946),
         )
     ]
     plan = plan_tick(
@@ -5682,15 +5688,21 @@ def test_a_blocked_entry_that_was_actually_dispatched_does_not_auto_reset():
     assert plan.launch is None
 
 
-def test_a_never_dispatched_blocked_entry_within_the_grace_window_does_not_auto_reset():
+def test_a_never_deferred_blocked_entry_auto_resets_within_one_tick():
+    # The recovery bound has to hold for a row that raced straight from
+    # `waiting` to `blocked` on its first tick: `deferrals` is frozen once a
+    # row leaves `waiting`, so that row reads `deferrals=0` for as long as it
+    # stays wedged and a deferral-counting grace window would never mature
+    # for it. The heal is grounded on the live board observation instead, so
+    # one tick is the whole bound.
     entries = [
         _blocked_entry(
             1947,
             position=1,
             attempts=0,
-            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS,
+            deferrals=0,
             resumes=0,
-            last_reason=_UNREADABLE_REASON,
+            last_reason=_unreadable_reason(1947),
         )
     ]
     plan = plan_tick(
@@ -5701,8 +5713,54 @@ def test_a_never_dispatched_blocked_entry_within_the_grace_window_does_not_auto_
         live_blocked_unreadable={entry_key(REPO, 1947): "no merge-queue row"},
     )
     reconcile = plan.reconciles[0]
-    assert reconcile.outcome != "unreachable_reset"
-    assert reconcile.outcome == "gate_unreadable"
+    assert reconcile.outcome == "unreachable_reset"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert plan.launch is not None and plan.launch.issue == 1947
+
+
+def test_a_blocked_entry_whose_gate_still_reads_shut_does_not_auto_reset():
+    # A live gate verdict of ANY kind means the merge queue holds a real row
+    # for this entry, so the block is a genuine wait rather than the wedge:
+    # `_reconcile_blocked` owns it, and a reset here would preempt its own
+    # resume path with a bare `waiting` that relaunches nothing.
+    entries = [
+        _blocked_entry(
+            1949,
+            position=1,
+            attempts=0,
+            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
+            resumes=0,
+            last_reason=_unreadable_reason(1949),
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={entry_key(REPO, 1949): True},
+        live_blocked_unreadable={entry_key(REPO, 1949): "no merge-queue row"},
+    )
+    assert all(r.outcome != "unreachable_reset" for r in plan.reconciles)
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_with_no_gate_probe_this_tick_does_not_auto_reset():
+    # The heal fires on a probe that was attempted and came back with nothing
+    # to read — not on a tick that never probed this entry at all. Without a
+    # probe observation there is no evidence the row is wedged rather than
+    # simply held by one of the other `blocked` reconcilers.
+    entries = [
+        _blocked_entry(
+            1950,
+            position=1,
+            attempts=0,
+            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
+            resumes=0,
+            last_reason=_unreadable_reason(1950),
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, live_blocked_gate={})
+    assert all(r.outcome != "unreachable_reset" for r in plan.reconciles)
     assert plan.launch is None
 
 
@@ -5723,7 +5781,7 @@ def test_a_never_dispatched_looking_entry_with_a_real_board_assignment_does_not_
             attempts=0,
             deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
             resumes=0,
-            last_reason=_UNREADABLE_REASON,
+            last_reason=_unreadable_reason(1948),
         )
     ]
     plan = plan_tick(
