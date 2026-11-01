@@ -274,6 +274,16 @@ _OPERATOR_CAUSE = (
     "hand, and what they actually fixed is NOT recorded here"
 )
 _UNKNOWN_CAUSE = "unclassified — left {state} by a transition this log does not recognise"
+#: `_reconcile_blocked_unreachable`'s own outcome string, not a `last_reason`
+#: marker — unlike `_RESUME_CAUSES`, this is matched on `outcome` directly in
+#: `_resolve_record` because the function has exactly one reset shape (no
+#: marker family to disambiguate), so giving it a `_resume_cause` entry would
+#: add indirection a single constant does not need.
+_UNREACHABLE_RESET_CAUSE = (
+    "unreachable-reset — the entry was wedged on a merge-gate probe with "
+    "nothing dispatched or landed for it to ever read, so the queue reset "
+    "it to `waiting` instead of waiting out a gate that could never clear"
+)
 
 
 def _resume_cause(reason: str) -> tuple[str, bool]:
@@ -468,6 +478,9 @@ def _resolve_record(
         resolution = "landed"
     elif outcome == "resumed":
         true_cause, human = _resume_cause(reason)
+        resolution = "auto_resumed"
+    elif outcome == "unreachable_reset":
+        true_cause, human = _UNREACHABLE_RESET_CAUSE, False
         resolution = "auto_resumed"
     else:
         true_cause, human = _UNKNOWN_CAUSE.format(state=old_state), False
