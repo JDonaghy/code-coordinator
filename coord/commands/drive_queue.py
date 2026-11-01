@@ -1936,6 +1936,28 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             # THIS row from `blocked` — the churn signal the issue asks to be
             # visible, not just logged in a tick's journal.
             bits.append(f"resumes={entry.resumes}/{MAX_BLOCKED_RESUMES}")
+        # #3847: this issue's lifetime fix-it auto-rebudget leg — same
+        # "diagnosable from the queue, not just a tick's journal" bar as
+        # `fix_rounds=`/`resumes=` above, and the same remove+add-resistant
+        # cap `_fixit_rebudget_eligible` (`coord/board_doctor_policy.py`)
+        # itself gates on, so a row that looks fresh again after a
+        # `drive-queue remove`+`add` still visibly shows it already spent
+        # its one shot rather than looking like a brand-new row. Shown only
+        # once the leg has actually been spent — same "suppress at 0"
+        # posture as every other bit above. Best-effort: a read failure here
+        # must never turn a working `list` into a broken one.
+        try:
+            parsed_key = parse_key(entry.key)
+            if parsed_key is not None:
+                from coord.state import (  # noqa: PLC0415
+                    board_doctor_fixit_rebudget_spent,
+                )
+
+                repo_name, issue_number = parsed_key
+                if board_doctor_fixit_rebudget_spent(repo_name, issue_number):
+                    bits.append("fixit_rebudget=spent")
+        except Exception:  # noqa: BLE001 — advisory read, see comment above
+            pass
         if entry.hold_after:
             bits.append(f"hold={entry.hold_state or 'armed'}")
             if entry.hold_scope == HOLD_SCOPE_FLEET:

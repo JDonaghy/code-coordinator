@@ -303,26 +303,53 @@ def _requeue_ceiling_blocked_mergeable(row: StuckRow) -> bool:
     touches the PR itself (no merge, no force-merge: that stays outside
     `SAFE_TIER_ACTIONS` entirely).
 
+    This action IS the fix-it tier's lifetime one-shot auto-rebudget
+    (#3847) for this cause — ``CAUSE_CEILING_BLOCKED_MERGEABLE`` only
+    exists because the row already gave up on the #2972/#3454 fix-round
+    ceiling, so every call here is already a rebudget attempt, gated by
+    :func:`_fixit_rebudget_eligible` the same as :func:`_investigate`'s
+    ceiling-bypass branch (#2096: one question, one answer — neither call
+    site keeps its own judgment). A row already spent, or that no longer
+    reads environmental, is left untouched here so it falls through to
+    :func:`coord.board_doctor.sweep`'s own alert tier instead of looping.
+
     Returns ``True`` only when `sweep_drive_queue_requeue` confirms
-    ``requeued=True`` — an unparseable row key or a reported no-op (row no
-    longer queued, gate mid-flight refusal aside, since that raises instead)
-    both return ``False`` so :func:`coord.board_doctor.sweep` records
-    ``"auto-dispatch-noop"`` rather than falsely claiming the action fired.
+    ``requeued=True`` — an unparseable row key, a not-yet-eligible row, or
+    a reported no-op (row no longer queued, gate mid-flight refusal aside,
+    since that raises instead) all return ``False`` so
+    :func:`coord.board_doctor.sweep` records ``"auto-dispatch-noop"``
+    rather than falsely claiming the action fired.
     """
     parsed = _parse_row_key(row.key)
     if parsed is None:
         return False
     repo_name, issue_number = parsed
+
+    import click  # noqa: PLC0415
+
+    if not _fixit_rebudget_eligible(row, repo_name, issue_number):
+        click.echo(
+            f"warning: board-doctor NOT rebudgeting {repo_name}#{issue_number} "
+            "— it already spent its one lifetime fix-it auto-rebudget leg, "
+            "or no longer reads as environmental rather than flailing "
+            "(#3847); leaving the row for the alert tier instead of "
+            "requeuing it again",
+            err=True,
+        )
+        return False
+
     result = dispatch_sweep_action("drive_queue_requeue", repo_name, issue_number)
     if not result.get("requeued"):
-        import click  # noqa: PLC0415
-
         click.echo(
             f"warning: board-doctor requeue no-op for {repo_name}#"
             f"{issue_number}: {result.get('detail')}",
             err=True,
         )
         return False
+
+    from coord.state import record_board_doctor_fixit_rebudget_spent  # noqa: PLC0415
+
+    record_board_doctor_fixit_rebudget_spent(repo_name, issue_number)
     return True
 
 
@@ -660,36 +687,99 @@ def _alert_fallback(row: StuckRow) -> bool:
     return True
 
 
-#: #3777: the #2972/#3454 ceiling check below exists to stop a BLIND
-#: relaunch loop — dispatching another fix-it leg with no better reason
-#: than "the cause is still alert-eligible" (vimcode#2018's ~14 legs/$31
-#: overnight). A HIGH-confidence diagnosed merge-conflict is not that: the
-#: diagnosis itself is new evidence the ceiling's own ``remaining_fix_rounds``
-#: exhaustion never saw, and the targeted remedy (a conflict-fix rebase) is
-#: a single bounded leg, not an open-ended retry stream. Every other cause,
-#: and every confidence below `CONFIDENCE_HIGH`, stays governed by the
-#: ceiling exactly as before.
-_CEILING_BYPASS_CAUSES = frozenset({queue_diagnose.CAUSE_MERGE_CONFLICT})
+#: #3847: causes admitted as "environmental" evidence for the fix-it
+#: tier's lifetime one-shot auto-rebudget (:func:`_fixit_rebudget_eligible`)
+#: — evidence the #2972/#3454 blind-relaunch ceiling was never meant to
+#: stop, as opposed to a row flailing on the same unresolved problem every
+#: round (vimcode#2018's ~14 legs/$31 overnight is exactly the blind
+#: relaunch the ceiling itself guards against; this set is strictly
+#: narrower than "the cause is still alert-eligible"). Extends #3777's
+#: original single-cause set (a HIGH-confidence diagnosed merge-conflict —
+#: the diagnosis itself is new evidence the ceiling's own
+#: ``remaining_fix_rounds`` exhaustion never saw, and the targeted remedy
+#: is a single bounded leg, not an open-ended retry stream) with the two
+#: causes that mean "this row's own history changed for reasons outside
+#: the fix itself": ``CAUSE_CEILING_BLOCKED_MERGEABLE`` (the row already
+#: gave up on the ceiling but now reads completely clear live —
+#: review-approved, every check green, PR mergeable) and
+#: `queue_diagnose.CAUSE_CI_GREEN` (checks are green now, whatever broke
+#: them before has cleared). Every other cause, and every confidence
+#: `_fixit_rebudget_environmental` does not explicitly admit, stays
+#: governed by the ceiling exactly as before (#3767: uncertain defaults to
+#: NO, the conservative existing behavior).
+_FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES = frozenset(
+    {
+        queue_diagnose.CAUSE_MERGE_CONFLICT,
+        CAUSE_CEILING_BLOCKED_MERGEABLE,
+        queue_diagnose.CAUSE_CI_GREEN,
+    }
+)
 
 
-def _ceiling_bypass_eligible(row: StuckRow) -> bool:
-    """True for a row the #2972 ceiling must not stop `_investigate` dispatching.
+def _fixit_rebudget_environmental(row: StuckRow) -> bool:
+    """True when *row*'s own cause/confidence read as environmental rather
+    than flailing (#3847).
 
-    Requires :attr:`StuckRow.fresh` (#3777): the bypass exists because a
-    high-confidence diagnosed merge-conflict is new evidence the ceiling's
-    blind-relaunch guard was never meant to stop — but `row.cause`/
-    `row.confidence` only carry that meaning when this sweep itself just
-    computed them from a live probe. A row rebuilt by
+    This is the classifier half of :func:`_fixit_rebudget_eligible` — a
+    pure, zero-cost function over fields :func:`coord.board_doctor.sweep`
+    already computed this sweep; the other half is the global
+    already-spent cap, checked separately in
+    :func:`_fixit_rebudget_eligible` so this function never reads state.
+
+    Requires :attr:`StuckRow.fresh` (#3777): `row.cause`/`row.confidence`
+    only carry "new evidence" meaning when THIS sweep just computed them
+    from a live probe. A row rebuilt by
     :func:`coord.board_doctor._episode_stuck_row` from `block_log` carries
     whatever cause/confidence were stored whenever the episode concluded,
-    which can be arbitrarily stale (e.g. the PR has since merged) — that is
-    not new evidence, so it must not bypass anything.
+    which can be arbitrarily stale (e.g. the PR has since merged) — that
+    is not new evidence, so it must not count as environmental.
+
+    A diagnosed merge-conflict requires exactly `CONFIDENCE_HIGH` (#3777,
+    unchanged — the strongest signal `queue_diagnose` assigns).
+    ``CAUSE_CEILING_BLOCKED_MERGEABLE`` and `queue_diagnose.CAUSE_CI_GREEN`
+    instead require only ``confidence != CONFIDENCE_LOW``, because
+    `queue_diagnose` never assigns either of them `CONFIDENCE_HIGH` in the
+    first place — both always resolve to `CONFIDENCE_MEDIUM` — so a
+    ``== CONFIDENCE_HIGH`` bar would silently admit neither cause ever.
     """
-    return (
-        row.fresh
-        and row.cause in _CEILING_BYPASS_CAUSES
-        and row.confidence == queue_diagnose.CONFIDENCE_HIGH
-    )
+    if not row.fresh or row.cause not in _FIXIT_REBUDGET_ENVIRONMENTAL_CAUSES:
+        return False
+    if row.cause == queue_diagnose.CAUSE_MERGE_CONFLICT:
+        return row.confidence == queue_diagnose.CONFIDENCE_HIGH
+    return row.confidence != queue_diagnose.CONFIDENCE_LOW
+
+
+def _fixit_rebudget_eligible(row: StuckRow, repo_name: str, issue_number: int) -> bool:
+    """#3847: may the fix-it tier spend its *one lifetime* auto-rebudget leg
+    on *repo_name*#*issue_number* right now?
+
+    Two independent gates, both required, checked cheapest-first:
+
+    1. The global, remove+add-resistant cap
+       (`coord.state.board_doctor_fixit_rebudget_spent`) — keyed by
+       ``(repo_name, issue_number)`` alone, never by assignment id or row
+       key, so it survives a `drive_queue_remove`+`drive_queue_requeue`
+       cycle on the live row the way the #2972/#3454 ceiling check itself
+       does not (#3756 only made that ceiling check CONSULTED fleet-wide
+       for the SAME live row — it does not survive a fresh row).
+    2. :func:`_fixit_rebudget_environmental` — the row's own cause/
+       confidence must read as environmental, not flailing.
+
+    Both of the fix-it tier's rebudget call sites
+    (:func:`_requeue_ceiling_blocked_mergeable`'s mechanical ``remove``+
+    ``add``, and :func:`_investigate`'s ceiling-bypass branch) call this
+    one function rather than each keeping its own judgment (#2096: one
+    question, one answer) — and each calls
+    `coord.state.record_board_doctor_fixit_rebudget_spent` itself, only
+    once its own dispatch is CONFIRMED to have actually fired, so a row
+    that turns out to be an unparseable key or a reported no-op never
+    burns the lifetime leg it never used.
+    """
+    from coord.state import board_doctor_fixit_rebudget_spent  # noqa: PLC0415
+
+    if board_doctor_fixit_rebudget_spent(repo_name, issue_number):
+        return False
+    return _fixit_rebudget_environmental(row)
 
 
 def _investigate(row: StuckRow) -> bool:
@@ -732,12 +822,14 @@ def _investigate(row: StuckRow) -> bool:
     investigate-dispatched legs on top of that (vimcode#2018's ~14 legs/$31
     overnight is exactly the failure mode this guards against). A
     ceiling-blocked row falls straight to :func:`_alert_fallback`, the same
-    as a declined machine pin — UNLESS :func:`_ceiling_bypass_eligible` says
-    otherwise (#3777): a HIGH-confidence diagnosed merge-conflict still gets
-    one targeted fix-it leg even past the ceiling, since that diagnosis is
-    the fleet's strongest signal the row is not actually out of options, and
-    the ceiling's own point is to stop a blind relaunch, not a leg a fresh
-    diagnosis specifically calls for.
+    as a declined machine pin — UNLESS :func:`_fixit_rebudget_eligible`
+    says otherwise (#3777, generalized by #3847): a row reading as
+    environmental rather than flailing, that has not already spent its one
+    lifetime fix-it auto-rebudget leg on this issue, still gets one
+    targeted fix-it leg even past the ceiling — the ceiling's own point is
+    to stop a blind relaunch, not a leg fresh evidence specifically calls
+    for, and the global cap is what keeps that exception a one-time leg
+    rather than a second unbounded retry stream.
 
     Finally, :func:`_investigate_tier_enabled` gates the whole tier on the
     global kill switch (config-level and the ``--no-investigate`` sweep
@@ -766,22 +858,27 @@ def _investigate(row: StuckRow) -> bool:
     from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
     from coord.state import build_board  # noqa: PLC0415
 
+    ceiling_bypassed = False
     if fix_round_ceiling_blocked_for_issue(repo_name, issue_number):
-        if not _ceiling_bypass_eligible(row):
+        if not _fixit_rebudget_eligible(row, repo_name, issue_number):
             click.echo(
                 f"warning: board-doctor NOT investigating {repo_name}#{issue_number} "
                 "— its drive-queue row already gave up on the fix-round ceiling "
-                "(#2972/#3454); falling back to the alert tier instead of "
-                "dispatching another fix-it leg (#3756)",
+                "(#2972/#3454), and it either already spent its one lifetime "
+                "fix-it auto-rebudget leg or no longer reads as environmental "
+                "rather than flailing (#3847); falling back to the alert tier "
+                "instead of dispatching another fix-it leg (#3756)",
                 err=True,
             )
             _alert_fallback(row)
             return False
+        ceiling_bypassed = True
         click.echo(
             f"warning: board-doctor bypassing the fix-round ceiling for "
-            f"{repo_name}#{issue_number} — a fresh high-confidence diagnosed "
-            f"{row.cause} is new evidence, not the blind relaunch #3454 "
-            "guards against (#3777); continuing to the investigate tier",
+            f"{repo_name}#{issue_number} — a fresh {row.cause} diagnosis is "
+            "environmental, not the blind relaunch #3454 guards against "
+            "(#3777/#3847); spending this issue's one lifetime fix-it "
+            "auto-rebudget leg to continue to the investigate tier",
             err=True,
         )
 
@@ -820,6 +917,10 @@ def _investigate(row: StuckRow) -> bool:
         evidence=row.evidence,
     )
     if result.get("dispatched"):
+        if ceiling_bypassed:
+            from coord.state import record_board_doctor_fixit_rebudget_spent  # noqa: PLC0415
+
+            record_board_doctor_fixit_rebudget_spent(repo_name, issue_number)
         return True
     detail = result.get("detail", "")
     if _FIXIT_LEG_IN_FLIGHT_MARKER in detail:
