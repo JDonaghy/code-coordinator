@@ -14918,9 +14918,16 @@ class TestSweepSiblingConflicts:
     ) -> None:
         """``MERGE_LANDED_KINDS`` sits next to the sweep but is written by
         hand, while the kinds it has to cover are emitted thousands of lines
-        away in :func:`process`. Derive them straight from ``process()``'s
-        source so adding a fourth ``merged*`` outcome without listing it here
-        fails loudly instead of silently skipping the sibling sweep.
+        away in the merge-finalization path. Derive them straight from that
+        path's source so adding a fourth ``merged*`` outcome without listing
+        it here fails loudly instead of silently skipping the sibling sweep.
+
+        The path spans two functions: ``process()`` and the shared
+        ``_finalize_merged_entry()`` helper it (and the inert base-move
+        takeover) delegate post-merge bookkeeping to — the ``merged_partial``
+        / ``merged_close_unconfirmed`` emissions live in the helper. Both are
+        scraped, so a ``merged*`` emission later extracted into a further
+        helper must be added to this tuple too.
 
         Read-back of source rather than a parametrised ``process()`` run on
         purpose: reaching every close-failure arm needs a different gh fake
@@ -14930,7 +14937,10 @@ class TestSweepSiblingConflicts:
         emitted = set(
             re.findall(
                 r'MergeEvent\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*,\s*"(merged\w*)"',
-                inspect.getsource(mq.process),
+                "".join(
+                    inspect.getsource(fn)
+                    for fn in (mq.process, mq._finalize_merged_entry)
+                ),
             )
         )
 
