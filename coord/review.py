@@ -954,6 +954,38 @@ def extract_blocking_section(body: str) -> str:
     return joined
 
 
+def extract_nits_section(body: str) -> str:
+    """Return the verbatim text of *body*'s advisory section(s) — anything
+    that maps to the ``nits`` or ``nonblocking`` bucket of
+    :func:`_iter_review_sections`.
+
+    Both buckets are combined because this is what `process_review_
+    completion`'s #476/#1456 gate treats as a single discardable unit
+    (``nonblocking=X nits=Y`` together) once the blocking section is
+    confirmed empty — #3835's Trigger A hands this text to a finisher leg
+    as the actual work to apply, instead of just a count summary. Mirrors
+    `extract_blocking_section`'s structure exactly; see that docstring for
+    why both reuse `_iter_review_sections` rather than re-deriving section
+    boundaries.
+
+    Returns "" when neither heading is found, or when every matched line
+    reads as an explicit "none" marker.
+    """
+    chunks: list[str] = []
+    for bucket, lines in _iter_review_sections(body):
+        if bucket not in ("nits", "nonblocking"):
+            continue
+        text = "\n".join(lines).strip("\n")
+        if text.strip():
+            chunks.append(text)
+    joined = "\n\n".join(chunks).strip()
+    if not joined:
+        return ""
+    if all(_is_no_findings_line(line.strip()) for line in joined.splitlines() if line.strip()):
+        return ""
+    return joined
+
+
 # Default cap on `ProposedFix.diff_text` size for `classify_finding_nit_class`
 # (#3833) — a line count, not a byte count, since diff lines are what a human
 # (or the eventual finisher, #3832 C2) would actually be bounding "small" by.

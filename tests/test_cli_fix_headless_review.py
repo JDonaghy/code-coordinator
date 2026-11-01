@@ -56,6 +56,18 @@ CONFIG_YAML_TWO_MACHINES = CONFIG_YAML.replace(
     "pipeline:",
 )
 
+# #3835 Trigger A: opts *api* into the nit-only finisher tier — both the
+# fleet-wide and the per-repo ``board_doctor.finish`` switches have to be on
+# (`_finisher_tier_enabled`), unlike every other config in this module which
+# leaves the tier off and so always falls through to the #476 behavior.
+CONFIG_YAML_FINISHER_ENABLED = CONFIG_YAML.replace(
+    "    default_branch: main\n",
+    "    default_branch: main\n    board_doctor:\n      finish: true\n",
+).replace(
+    "ci_store:",
+    "board_doctor:\n  finish: true\nci_store:",
+)
+
 WORK_BRANCH = "issue-42-feature-x"
 
 
@@ -70,6 +82,13 @@ def config_file(tmp_path: Path) -> Path:
 def config_file_two_machines(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"
     p.write_text(CONFIG_YAML_TWO_MACHINES)
+    return p
+
+
+@pytest.fixture
+def config_file_finisher_enabled(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML_FINISHER_ENABLED)
     return p
 
 
@@ -433,6 +452,73 @@ class TestGuardsSurviveTheCliDoor:
         from coord.state import issue_context_block
 
         assert "MAINTAINER DECISION: keep GET /outbox." in issue_context_block("api", 42)
+
+
+# ── #3835 Trigger A: nit-only request-changes through the CLI door ──────────
+
+
+class TestFinisherLegDispatchViaCliDoor:
+    def test_nit_only_review_dispatches_a_finisher_leg_when_opted_in(
+        self, config_file_finisher_enabled: Path, coord_dir: Path
+    ) -> None:
+        """A repo that has opted into ``board_doctor.finish`` routes a
+        nit-only request-changes verdict to a finisher leg instead of the
+        bare #476 approve-with-nits no-op — through the real
+        `sweep_dispatch_finisher_leg` chain, not a mock."""
+        _seed(
+            _work(), _review(),
+            body=(
+                "## Blocking\n\nNone — nothing here blocks the merge.\n\n"
+                "## Minor observations (not blocking)\n"
+                "- Rename `tmp` to `scratch` for clarity\n"
+            ),
+        )
+        http = _http_mock(new_id="finisher-new")
+
+        with patch("coord.auto_loop.httpx", http), \
+             patch("coord.auto_loop.record_dispatched_assignment"), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.drive.list_drive_sessions", return_value=[]):
+            result = _run(config_file_finisher_enabled, "review-xyz")
+
+        assert result.exit_code == 0, result.output
+        assert "Finisher leg dispatched (#3835 Trigger A)" in result.output
+        assert "finisher-new" in result.output
+
+        # The briefing carries the reviewer's actual nit text, not a count.
+        briefing = http.post.call_args.kwargs["json"]["briefing"]
+        assert "Rename `tmp` to `scratch`" in briefing
+
+        board = state_mod.load_board()
+        fixes = [a for a in board.active if a.assignment_id == "finisher-new"]
+        assert len(fixes) == 1, board.active
+        assert fixes[0].branch == WORK_BRANCH
+        assert fixes[0].review_of_assignment_id == "work-abc"
+
+    def test_opted_out_repo_keeps_the_476_fallback(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Same nit-only body, but `config_file`'s repo never opted into
+        ``board_doctor.finish`` — confirms the CLI door's default behavior
+        is unchanged by Trigger A's existence."""
+        _seed(
+            _work(), _review(),
+            body=(
+                "## Blocking\n\nNone — nothing here blocks the merge.\n\n"
+                "## Minor observations (not blocking)\n"
+                "- Rename `tmp` to `scratch` for clarity\n"
+            ),
+        )
+        http = _http_mock()
+
+        with patch("coord.auto_loop.httpx", http), \
+             patch("coord.auto_loop.record_dispatched_assignment"), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = _run(config_file, "review-xyz")
+
+        assert result.exit_code != 0
+        assert "no blocking findings" in result.output
+        http.post.assert_not_called()
 
 
 # ── Part 3: red CI as the third trigger ──────────────────────────────────────

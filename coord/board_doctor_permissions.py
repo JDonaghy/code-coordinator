@@ -884,9 +884,10 @@ def _finisher_leg_briefing(
     *evidence* shape :func:`_fixit_leg_briefing` hands a fix-it leg, plus the
     bounded self-bless contract spelled out explicitly so the leg itself
     knows the limits of its own authority before it starts. *nits*, when the
-    caller has the reviewer's actual nit findings on hand, is listed
-    explicitly; the sweep's own dispatch call site does not have that data
-    today and leaves it empty.
+    caller has the reviewer's actual nit findings on hand (as Trigger A's
+    `coord.auto_loop.process_review_completion` call site does, via
+    `coord.review.extract_nits_section`), is listed explicitly; any other
+    caller that does not have that text on hand leaves it empty.
 
     A finisher leg runs like any other fix round right up until it pushes —
     same worker tool-scope, same `git`/edit/push primitives, no
@@ -956,6 +957,7 @@ def sweep_dispatch_finisher_leg(
     *,
     cause: str,
     evidence: tuple[str, ...] = (),
+    nits: tuple[str, ...] = (),
     http_client: Any | None = None,
 ) -> FinisherLegDispatch:
     """Daemon-internal "dispatch one autonomous finisher leg", authorized for
@@ -977,6 +979,10 @@ def sweep_dispatch_finisher_leg(
     a leg already in flight, or an underlying `_dispatch_fix` call that
     declined. Only an observed, confirmed `Assignment` back from
     `_dispatch_fix` is reported as ``dispatched=True``.
+
+    *nits* is forwarded straight to :func:`_finisher_leg_briefing` — the
+    reviewer's actual nit/non-blocking findings text, when the caller has
+    it, so the leg's briefing names what to apply instead of just a count.
     """
     authorize_sweep_action("dispatch_finisher_leg")
 
@@ -1037,7 +1043,7 @@ def sweep_dispatch_finisher_leg(
     from coord.auto_loop import _dispatch_fix, next_fix_iteration  # noqa: PLC0415
 
     iteration = next_fix_iteration(board, work)
-    briefing = _finisher_leg_briefing(cause=cause, evidence=evidence)
+    briefing = _finisher_leg_briefing(cause=cause, evidence=evidence, nits=nits)
 
     fix = _dispatch_fix(
         work, briefing, board, config, iteration, http_client=http_client,

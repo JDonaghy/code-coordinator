@@ -1135,9 +1135,14 @@ _STALLED_DISPATCH_KINDS = frozenset({
 # kinds that mutate `board` in place per its own documented contract, even
 # when they don't dispatch a fix worker. `disabled`/`no_findings` return
 # before any mutation; `no_work_found`/`max_iterations` return without
-# touching `board` (only a GitHub notice for the latter).
+# touching `board` (only a GitHub notice for the latter). `finisher_dispatched`
+# (#3835 Trigger A) propagates the review verdict and starts a new assignment
+# exactly like `fix_dispatched` does — must stay in sync with
+# `coord.auto_loop.PERSIST_ACTION_KINDS`, which is the analogous registry for
+# `coord fix`'s own `write_board` decision.
 _MUTATING_REVIEW_COMPLETION_KINDS = frozenset({
     "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
+    "finisher_dispatched",
 })
 
 

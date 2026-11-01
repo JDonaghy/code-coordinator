@@ -160,15 +160,16 @@ _FIXIT_LEG_IN_FLIGHT_MARKER = "already in flight"
 _INVESTIGATE_ACTION = "dispatch_fixit_leg"
 
 #: The `coord.board_doctor_permissions.SAFE_TIER_ACTIONS` action name a
-#: future finisher-tier cause handler dispatches (#3832's C3/C4). Named here,
-#: now, so that handler can reference one constant rather than a repeated
-#: string literal when it lands — but, deliberately, nothing in this module
-#: registers a cause against it yet: no `_register_auto_action` call, no
-#: `ALLOWLIST`/`AUTO_DISPATCHERS`/`INVESTIGATE_CAUSES` entry, no
-#: `policy_tier_of` branch. Wiring an actual cause to
-#: `coord.board_doctor_permissions.sweep_dispatch_finisher_leg` is explicitly
-#: out of scope for #3834, which only builds the permission and the bounded
-#: self-bless logic the handler will call.
+#: future finisher-tier cause handler dispatches (#3832's C3/C4), and the one
+#: :func:`dispatch_nit_only_finisher` already dispatches today (#3835,
+#: `CAUSE_NIT_ONLY_REQUEST_CHANGES`) — named here once so both reference one
+#: constant rather than a repeated string literal. #3835's call is
+#: synchronous, firing straight from `coord.auto_loop.process_review_
+#: completion` at the moment a review completes, so it still registers
+#: nothing into `ALLOWLIST`/`AUTO_DISPATCHERS`/`INVESTIGATE_CAUSES` or
+#: `policy_tier_of` — those three are exclusively for causes the *periodic*
+#: sweep discovers and auto-dispatches on its own, which a future C3/C4
+#: handler would still need to wire up.
 _FINISHER_ACTION = "dispatch_finisher_leg"
 
 #: cause -> auto-action name. Populated only via :func:`_register_auto_action`
@@ -522,6 +523,7 @@ def dispatch_nit_only_finisher(
     config: "Config",
     *,
     evidence: tuple[str, ...] = (),
+    nits: tuple[str, ...] = (),
     http_client: object | None = None,
 ) -> bool:
     """Trigger A (#3835): route a nit-only `request-changes` to a finisher
@@ -551,6 +553,10 @@ def dispatch_nit_only_finisher(
     behavior already applies, which is itself a safe, legible outcome
     (approve-with-nits, nothing silently lost), not a stuck row needing a
     human page.
+
+    *nits* carries the reviewer's actual nit/non-blocking findings text
+    (see `coord.review.extract_nits_section`) so the finisher leg's
+    briefing can tell the worker what to apply, rather than just a count.
     """
     if not _finisher_tier_enabled(repo_name, config):
         return False
@@ -562,6 +568,7 @@ def dispatch_nit_only_finisher(
         config,
         cause=CAUSE_NIT_ONLY_REQUEST_CHANGES,
         evidence=evidence,
+        nits=nits,
         http_client=http_client,
     )
     return bool(result.get("dispatched"))
