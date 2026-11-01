@@ -4155,7 +4155,25 @@ WORK_TURN_CEILING = 150
 # branch) since those are the only legs the cost analysis found running
 # long enough for this to matter; chat/review/smoke legs are short-lived
 # and unaffected either way.
-WORK_AUTOCOMPACT_TOKENS = "100000"
+#
+# History / why 400k now (operator audit, 2026-11-01). The original 100k
+# (merged 2026-10-09) over-corrected. The flag value is a *budget*; the CLI
+# reserves headroom and auto-compacts at ~67k of actual context. Across a
+# 30-day sample (macmini + dell64, 220 work legs) that fired on ~80% of
+# work legs, a median of 3-4x per leg (max 171), each compaction taking
+# ~160s and discarding ~57k tokens — ~36h of pure compaction wall-clock
+# across 183 legs. Because each compaction wipes context down to ~10k, the
+# worker loses its thread, ships a weaker diff and needs another review
+# round: rework share of work legs rose 37%->49%, legs per merged issue
+# 5.7->7.9, cost per issue $9.69->$12.43. So 100k cut per-LEG cache-read
+# cost but raised per-ISSUE cost and latency (the "slower + costlier" the
+# operator was chasing). 400k keeps a backstop against the runaway 200-450
+# turn / 425k-token legs the original analysis targeted, while letting a
+# normal long leg finish in one context (pre-100k, legs ran to 150k-369k
+# with zero compactions). Prefer tuning `WORK_TURN_CEILING` (keep legs
+# short) over lowering this again. Full writeup: 2026-11-01 fleet-slowdown
+# audit.
+WORK_AUTOCOMPACT_TOKENS = "400000"
 
 # #3697: fix/conflict-fix legs carry the review findings as their first
 # user message (not the system prompt), so auto-compaction summarizes away
