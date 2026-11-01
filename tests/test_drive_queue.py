@@ -5610,6 +5610,128 @@ def test_a_never_dispatched_after_blocked_entry_still_resumes_once_its_prereq_la
     assert tick2.launch is not None and tick2.launch.issue == 2899
 
 
+# ── #2920: a never-dispatched entry auto-heals off a merge gate it can ─────
+# ── never satisfy, instead of being re-probed forever ──────────────────────
+#
+# claude-coordinator#1945/#1946/#2867 and quadraui#1846/#1847 all reached
+# `blocked` on a merge-gate probe despite having no board assignment and no
+# remote branch — nothing a merge gate could ever read. #2230's sweep kept
+# re-stamping the same "could not be read" sentence every tick forever, and
+# only an operator `coord drive-queue remove` + `add` ever cleared the row.
+# `_reconcile_blocked_unreachable` performs that same remove+add automatically
+# for the one shape that is safe to ground purely on the queue's own ledger:
+# `attempts == 0` (never dispatched at all).
+
+_UNREADABLE_REASON = (
+    "claude-coordinator#1945s merge gate could not be read this tick (no "
+    "merge-queue row for this entry, even after the self-heal enqueue "
+    "attempt) — this is NOT a confirmed-still-shut gate, only a failed "
+    "probe; the #2230 sweep will try again next tick rather than guessing "
+    "(#2806)"
+)
+
+
+def test_a_never_dispatched_blocked_entry_auto_resets_to_waiting():
+    entries = [
+        _blocked_entry(
+            1945,
+            position=1,
+            attempts=0,
+            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
+            resumes=0,
+            last_reason=_UNREADABLE_REASON,
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={entry_key(REPO, 1945): "no merge-queue row"},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "unreachable_reset"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert reconcile.updates["resumes"] == 1
+    assert plan.launch is not None and plan.launch.issue == 1945
+
+
+def test_a_blocked_entry_that_was_actually_dispatched_does_not_auto_reset():
+    entries = [
+        _blocked_entry(
+            1946,
+            position=1,
+            attempts=DEFAULT_MAX_ATTEMPTS,
+            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
+            resumes=0,
+            last_reason=_UNREADABLE_REASON,
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={entry_key(REPO, 1946): "no merge-queue row"},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome != "unreachable_reset"
+    assert reconcile.outcome == "gate_unreadable"
+    assert "state" not in reconcile.updates
+    assert plan.launch is None
+
+
+def test_a_never_dispatched_blocked_entry_within_the_grace_window_does_not_auto_reset():
+    entries = [
+        _blocked_entry(
+            1947,
+            position=1,
+            attempts=0,
+            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS,
+            resumes=0,
+            last_reason=_UNREADABLE_REASON,
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={entry_key(REPO, 1947): "no merge-queue row"},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome != "unreachable_reset"
+    assert reconcile.outcome == "gate_unreadable"
+    assert plan.launch is None
+
+
+def test_a_never_dispatched_blocked_entry_with_an_unsatisfiable_after_is_left_to_that_guard():
+    dep_key = entry_key(REPO, 2897)
+    entries = [
+        entry(2897, position=0, state=STATE_BLOCKED),
+        _blocked_entry(
+            2899,
+            position=1,
+            attempts=0,
+            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
+            after=(dep_key,),
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={entry_key(REPO, 2899): "no merge-queue row"},
+    )
+    # The #2935 unsatisfiable-`after=` guard owns this entry's fate, not the
+    # #2920 auto-heal — neither reconciler should touch it this tick.
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
 # ── #2362: a blocked entry resumes once its unsatisfiable after= lands ─────
 #
 # `_resolve_prereqs` blocks a `waiting` entry the instant one of its named

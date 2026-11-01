@@ -6288,6 +6288,86 @@ def _reconcile_blocked_test_routing(
     )
 
 
+def _reconcile_blocked_unreachable(entry: QueueEntry) -> Reconcile | None:
+    """Auto-heal a `blocked` entry that was never dispatched at all (#2920).
+
+    #2935 stopped `_reconcile_blocked` from overwriting a never-dispatched
+    entry's unsatisfiable-`after=` marker with a merge-gate "could not be
+    read" sentence, so the entry's fate stayed `_reconcile_blocked_after`'s
+    to decide from the `after=` graph — correct, but only for entries whose
+    `last_reason` STILL carries that marker. The claude-coordinator#2920 and
+    quadraui#1846/#1847 incidents show rows that reached `blocked` on a
+    merge-gate probe BEFORE #2935 existed (or via some other path that never
+    produced an assignment or a branch), whose `last_reason` already reads
+    as the probe's own "no merge-queue row for this entry... #2806" sentence
+    — not the `after=` marker `_reconcile_blocked_after`/`_reconcile_blocked`
+    key off of. Nothing re-probes that shape: `_reconcile_blocked`'s merge
+    gate has no branch to ever read, so #2230's sweep just re-stamps the same
+    unreadable verdict every tick, forever. The only thing that ever cleared
+    these rows was an operator's `coord drive-queue remove` + `add` — this
+    function is that same remove+add, firing automatically instead.
+
+    Scoped to the one shape #2944's `detect_unreachable_waits` already
+    trusts as safe to flag without live evidence: ``attempts == 0`` — this
+    entry has never been dispatched, so by construction there is no
+    assignment on the board and no branch on the remote, and therefore no
+    merge-queue row any gate probe could ever have found. `deferrals >
+    UNREACHABLE_WAIT_MIN_DEFERRALS` is the same grace window #2944 uses
+    before calling a wait "guaranteed false" rather than merely slow.
+    `detect_unreachable_waits`'s second shape (`attempts > 0`, exhausted
+    dispatch retries) is deliberately NOT handled here: that entry WAS
+    dispatched at least once, so declaring it safe to reset needs live
+    branch evidence this function does not have, not just the ledger.
+
+    Returns ``None`` for every entry except that one shape — in particular,
+    for `is_permanent_block_reason`/`_is_unsatisfiable_prereq_reason`
+    matches, which stay exactly where #1844/#2019/#2935 already put them:
+    the permanent-block guard refusal, and the `after=` graph, respectively.
+
+    Called BEFORE `_reconcile_blocked` in `plan_tick`'s `STATE_BLOCKED`
+    chain, same reasoning as `_reconcile_blocked_after`/`_reconcile_blocked_
+    test_routing`: `_reconcile_blocked` would otherwise re-stamp this row's
+    `last_reason` with its own "could not be read" sentence before this
+    function ever gets a turn, or (once the row IS reset to `waiting`) have
+    nothing further to say about it at all.
+
+    Deliberately NOT folded into the #3536 per-tick-per-repo resume stagger:
+    that stagger throttles resumes that immediately drive a live `gh`
+    re-check (branch head, CI status) on the very next poll — the
+    synchronized-poll pattern #3536 exists to avoid. A reset performed here
+    produces no branch and triggers no such re-check; the entry only becomes
+    eligible for a fresh Work dispatch, which the ordinary per-tick capacity
+    limit already throttles.
+    """
+    if entry.attempts != 0:
+        return None
+    if entry.deferrals <= UNREACHABLE_WAIT_MIN_DEFERRALS:
+        return None
+    if is_permanent_block_reason(entry.last_reason):
+        return None
+    if _is_unsatisfiable_prereq_reason(entry.last_reason):
+        return None
+    reason = (
+        f"{entry.key} was blocked on a merge-gate probe but has never been "
+        "dispatched — no assignment was ever created and no branch can "
+        "exist for it, so the gate can never be satisfied (#2920); "
+        "resetting to `waiting` for a fresh Work dispatch instead of "
+        "re-probing a gate with nothing to read"
+    )
+    return Reconcile(
+        entry.key,
+        "unreachable_reset",
+        reason,
+        occupies=False,
+        updates={
+            "state": STATE_WAITING,
+            "attempts": 0,
+            "resumes": entry.resumes + 1,
+            "last_reason": reason,
+        },
+    )
+
+
 def _reconcile_blocked(
     entry: QueueEntry,
     facts: IssueFacts,
@@ -7630,6 +7710,15 @@ def plan_tick(
                     live_test_routing_clear,
                     live_test_routing_reason,
                 )
+            if blocked_reconcile is None:
+                # #2920: auto-heal a `blocked` entry that was never
+                # dispatched at all (no assignment, no branch — nothing a
+                # merge-gate probe could ever read) BEFORE `_reconcile_
+                # blocked` below gets a turn and re-stamps its "could not be
+                # read" sentence yet again. See
+                # :func:`_reconcile_blocked_unreachable` for the full
+                # decision.
+                blocked_reconcile = _reconcile_blocked_unreachable(entry)
             if blocked_reconcile is None:
                 # #2230: re-examine a `blocked` entry against the CURRENT gate
                 # reading before falling through to the `parked`-only
