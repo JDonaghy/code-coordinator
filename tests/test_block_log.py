@@ -215,6 +215,39 @@ def test_a_2230_auto_resume_is_recorded_as_a_stale_stated_reason_and_no_human():
     assert event["stated_reason"] == "checks_failed"
 
 
+def test_an_unreachable_reset_is_recorded_as_an_auto_mechanism_not_unclassified():
+    """#2920's `unreachable_reset` outcome needs its own classification.
+
+    It isn't a `resumed` outcome — the entry goes back to `waiting`, not
+    straight to a relaunch — so `_resume_cause`'s marker-family match never
+    sees it and would otherwise fall through to `_UNKNOWN_CAUSE`.
+    """
+    reason = (
+        f"{REPO}#1948 is blocked on a merge-gate probe, has never been "
+        "dispatched or deferred past the wedge grace window, and the board "
+        "shows no active work, completed work, or merge for it — resetting "
+        "to `waiting` for a fresh Work dispatch instead of re-probing a "
+        "gate with nothing to read"
+    )
+    plan = TickPlan(
+        reconciles=(
+            Reconcile(f"{REPO}#1948", "unreachable_reset", reason,
+                      updates={"state": STATE_WAITING, "attempts": 0,
+                               "resumes": 1, "last_reason": reason}),
+        ),
+    )
+    (event,) = plan_events(
+        [entry(1948, state=STATE_BLOCKED, last_reason="merge gate probe pending")],
+        plan,
+        now=NOW,
+    )
+    assert event["event"] == EVENT_RESOLVE
+    assert event["resolution"] == "auto_resumed"
+    assert event["human_acted"] is False
+    assert event["true_cause"].startswith("unreachable-reset")
+    assert event["stated_reason"] == "merge gate probe pending"
+
+
 def test_a_gate_a_release_is_the_one_auto_resume_that_counts_as_human_action():
     """#2063 polls for a HUMAN's signature; the tick just notices it arrived.
 

@@ -5706,6 +5706,40 @@ def test_a_never_dispatched_blocked_entry_within_the_grace_window_does_not_auto_
     assert plan.launch is None
 
 
+def test_a_never_dispatched_looking_entry_with_a_real_board_assignment_does_not_auto_reset():
+    # #2920 review, finding 1: a successful launch never increments
+    # `attempts` (only a death/failed-launch path does) — so an entry can
+    # read `attempts == 0` on the ledger while a real work assignment, with
+    # a real branch and PR, already exists on the board and is wedged on
+    # the #3254 `checks_absent` merge-gate block (which itself never
+    # touches `attempts` either). Auto-resetting that row to `waiting`
+    # would orphan the real PR and fire a duplicate Work dispatch — the
+    # `active=` board fact must block the reset even though the ledger
+    # shape alone looks identical to the genuinely-never-dispatched case.
+    entries = [
+        _blocked_entry(
+            1948,
+            position=1,
+            attempts=0,
+            deferrals=UNREACHABLE_WAIT_MIN_DEFERRALS + 1,
+            resumes=0,
+            last_reason=_UNREADABLE_REASON,
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(active=(1948,)),
+        capacity=1,
+        live_blocked_gate={},
+        live_blocked_unreadable={entry_key(REPO, 1948): "no merge-queue row"},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome != "unreachable_reset"
+    assert reconcile.outcome == "gate_unreadable"
+    assert "state" not in reconcile.updates
+    assert plan.launch is None
+
+
 def test_a_never_dispatched_blocked_entry_with_an_unsatisfiable_after_is_left_to_that_guard():
     dep_key = entry_key(REPO, 2897)
     entries = [

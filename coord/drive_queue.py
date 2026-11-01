@@ -2654,7 +2654,7 @@ class Reconcile:
     """
 
     key: str
-    outcome: str  # alive | starting | held | unknown | done | refused | dead_end | parked | ci_absent | reparked | retry | exhausted | merge_only | resumed | oscillating | gate_unreadable
+    outcome: str  # alive | starting | held | unknown | done | refused | dead_end | parked | ci_absent | reparked | retry | exhausted | merge_only | resumed | oscillating | gate_unreadable | unreachable_reset
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
@@ -3748,12 +3748,22 @@ class UnreachableWait:
     dependents: int = 0
 
 
-def detect_unreachable_waits(
-    entries: Iterable[QueueEntry],
+def is_unreachable_wait_shape(
+    entry: QueueEntry,
     *,
     min_deferrals: int = UNREACHABLE_WAIT_MIN_DEFERRALS,
-) -> list[UnreachableWait]:
-    """Entries sitting in the #2944 guaranteed-false wait.
+) -> bool:
+    """Does *entry* sit in the #2944 guaranteed-false-wait LEDGER shape?
+
+    The ONE predicate behind "this is wedged in a way no sweep's re-probe
+    can ever resolve" — :func:`detect_unreachable_waits` (the `coord
+    drive-queue status` `alert:` line and `coord doctor` WARN) and #2920's
+    :func:`_reconcile_blocked_unreachable` both call this, rather than each
+    keeping their own copy that can silently drift apart (#2920 review: the
+    first `_reconcile_blocked_unreachable` draft re-implemented this inline,
+    dropped `STATE_PARKED`, and added an `is_permanent_block_reason`
+    exclusion the original lacked — two definitions of "wedged" disagreeing
+    on the same row).
 
     Two independent shapes, either of which qualifies a `blocked`/`parked`
     entry — both provably have no branch/PR/merge-queue row for any sweep to
@@ -3783,6 +3793,36 @@ def detect_unreachable_waits(
     never satisfy") out of the result entirely, leaving only the root that
     actually needs a human.
 
+    A `(#1844)`/`(#2019)`/`(#2972)`/`(#3522)` permanent block
+    (:func:`is_permanent_block_reason`) is excluded too — that shape's
+    remedy is fixing whatever the guard refused or the dead end named, never
+    `remove`+`add` (or #2920's equivalent auto-reset): re-queuing it would
+    only run straight back into the same refusal.
+
+    Pure and cheap (a predicate over one already-loaded row, no clock, no
+    I/O) so callers in both tick-time reconcile and read-only status/doctor
+    paths can share it without either paying for or needing live evidence.
+    """
+    if entry.state not in (STATE_BLOCKED, STATE_PARKED):
+        return False
+    if _is_unsatisfiable_prereq_reason(entry.last_reason):
+        return False
+    if is_permanent_block_reason(entry.last_reason):
+        return False
+    if entry.attempts == 0:
+        return entry.deferrals > min_deferrals
+    return entry.state == STATE_BLOCKED and _is_dispatch_failure_reason(entry.last_reason)
+
+
+def detect_unreachable_waits(
+    entries: Iterable[QueueEntry],
+    *,
+    min_deferrals: int = UNREACHABLE_WAIT_MIN_DEFERRALS,
+) -> list[UnreachableWait]:
+    """Entries sitting in the #2944 guaranteed-false wait.
+
+    See :func:`is_unreachable_wait_shape` for the predicate.
+
     Pure and cheap (a predicate over already-loaded rows, no clock, no I/O),
     so the same function backs both `coord drive-queue status`'s `alert:`
     line (`coord.commands.drive_queue._queue_alert`) and the `coord doctor`
@@ -3797,14 +3837,7 @@ def detect_unreachable_waits(
 
     waits: list[UnreachableWait] = []
     for e in entries:
-        if e.state not in (STATE_BLOCKED, STATE_PARKED):
-            continue
-        if _is_unsatisfiable_prereq_reason(e.last_reason):
-            continue
-        if e.attempts == 0:
-            if e.deferrals <= min_deferrals:
-                continue
-        elif not (e.state == STATE_BLOCKED and _is_dispatch_failure_reason(e.last_reason)):
+        if not is_unreachable_wait_shape(e, min_deferrals=min_deferrals):
             continue
         waits.append(
             UnreachableWait(
@@ -6288,41 +6321,59 @@ def _reconcile_blocked_test_routing(
     )
 
 
-def _reconcile_blocked_unreachable(entry: QueueEntry) -> Reconcile | None:
-    """Auto-heal a `blocked` entry that was never dispatched at all (#2920).
+def _reconcile_blocked_unreachable(entry: QueueEntry, facts: IssueFacts) -> Reconcile | None:
+    """Auto-heal a `blocked` entry wedged in the #2944 guaranteed-false wait.
 
     #2935 stopped `_reconcile_blocked` from overwriting a never-dispatched
     entry's unsatisfiable-`after=` marker with a merge-gate "could not be
     read" sentence, so the entry's fate stayed `_reconcile_blocked_after`'s
     to decide from the `after=` graph — correct, but only for entries whose
-    `last_reason` STILL carries that marker. The claude-coordinator#2920 and
-    quadraui#1846/#1847 incidents show rows that reached `blocked` on a
-    merge-gate probe BEFORE #2935 existed (or via some other path that never
-    produced an assignment or a branch), whose `last_reason` already reads
-    as the probe's own "no merge-queue row for this entry... #2806" sentence
-    — not the `after=` marker `_reconcile_blocked_after`/`_reconcile_blocked`
-    key off of. Nothing re-probes that shape: `_reconcile_blocked`'s merge
-    gate has no branch to ever read, so #2230's sweep just re-stamps the same
-    unreadable verdict every tick, forever. The only thing that ever cleared
-    these rows was an operator's `coord drive-queue remove` + `add` — this
-    function is that same remove+add, firing automatically instead.
+    `last_reason` STILL carries that marker. Some rows instead reach
+    `blocked` on a merge-gate probe via a path that leaves no `after=`
+    marker behind, whose `last_reason` already reads as the probe's own "no
+    merge-queue row for this entry... #2806" sentence. Nothing re-probes
+    that shape when it is genuinely ledger-wedged: `_reconcile_blocked`'s
+    merge gate has no branch to ever read, so #2230's sweep just re-stamps
+    the same unreadable verdict every tick, forever. The only thing that
+    ever cleared these rows was an operator's `coord drive-queue remove` +
+    `add` — this function is that same remove+add, firing automatically,
+    but ONLY once the board itself (not just the attempts ledger) confirms
+    there is nothing for a reset to clobber.
 
-    Scoped to the one shape #2944's `detect_unreachable_waits` already
-    trusts as safe to flag without live evidence: ``attempts == 0`` — this
-    entry has never been dispatched, so by construction there is no
-    assignment on the board and no branch on the remote, and therefore no
-    merge-queue row any gate probe could ever have found. `deferrals >
-    UNREACHABLE_WAIT_MIN_DEFERRALS` is the same grace window #2944 uses
-    before calling a wait "guaranteed false" rather than merely slow.
-    `detect_unreachable_waits`'s second shape (`attempts > 0`, exhausted
-    dispatch retries) is deliberately NOT handled here: that entry WAS
-    dispatched at least once, so declaring it safe to reset needs live
-    branch evidence this function does not have, not just the ledger.
+    Gated on :func:`is_unreachable_wait_shape` — the same ledger-shape
+    predicate `detect_unreachable_waits` uses for its `alert:`/WARN line, so
+    this function and that one agree on what "wedged" means instead of each
+    keeping a copy that can drift. That predicate covers two distinct
+    shapes, though, and this function only ever acts on one of them: it
+    additionally requires ``entry.attempts == 0`` — the never-dispatched
+    shape — and leaves the `attempts > 0` dispatch-failure shape alone
+    entirely, because `_reconcile_blocked` below already owns that one (its
+    `_blocked_gate_reading` resume re-launches the entry the moment the
+    gate reads clear, and its `_reconcile_blocked_unreadable` call reports a
+    failed probe distinctly); a reset here would preempt both with a bare
+    `waiting` that triggers no immediate relaunch, which is strictly worse
+    for a row that NO LONGER needs remove+add — it already has a working
+    resume path.
 
-    Returns ``None`` for every entry except that one shape — in particular,
+    Even restricted to `attempts == 0`, the ledger shape alone is NOT
+    sufficient to reset: a successful launch never increments `attempts` —
+    only a death/failed-launch path does — so an `attempts == 0` entry can
+    still have a real, in-flight PR on the board if it landed on a
+    merge-gate block that itself never touches `attempts` either. Resetting
+    that row to `waiting` would silently orphan a real PR and fire a
+    duplicate Work dispatch. So this function additionally requires
+    ``facts`` — the board-derived observation threaded through `plan_tick`,
+    never the `attempts` counter — to show no work-like row of any kind for
+    this issue (`active_work`, `work_done`, `merged` all false) before it
+    will touch the entry.
+
+    Returns ``None`` for every entry that fails any gate — in particular,
     for `is_permanent_block_reason`/`_is_unsatisfiable_prereq_reason`
-    matches, which stay exactly where #1844/#2019/#2935 already put them:
-    the permanent-block guard refusal, and the `after=` graph, respectively.
+    matches (excluded inside `is_unreachable_wait_shape`), which stay
+    exactly where #1844/#2019/#2935 already put them: the permanent-block
+    guard refusal, and the `after=` graph, respectively. Also bounded by
+    :data:`MAX_BLOCKED_RESUMES`, the same oscillation ceiling every other
+    auto-resume path in this chain respects.
 
     Called BEFORE `_reconcile_blocked` in `plan_tick`'s `STATE_BLOCKED`
     chain, same reasoning as `_reconcile_blocked_after`/`_reconcile_blocked_
@@ -6339,20 +6390,20 @@ def _reconcile_blocked_unreachable(entry: QueueEntry) -> Reconcile | None:
     eligible for a fresh Work dispatch, which the ordinary per-tick capacity
     limit already throttles.
     """
+    if not is_unreachable_wait_shape(entry):
+        return None
     if entry.attempts != 0:
         return None
-    if entry.deferrals <= UNREACHABLE_WAIT_MIN_DEFERRALS:
+    if facts.active_work or facts.work_done or facts.merged:
         return None
-    if is_permanent_block_reason(entry.last_reason):
-        return None
-    if _is_unsatisfiable_prereq_reason(entry.last_reason):
+    if entry.resumes >= MAX_BLOCKED_RESUMES:
         return None
     reason = (
-        f"{entry.key} was blocked on a merge-gate probe but has never been "
-        "dispatched — no assignment was ever created and no branch can "
-        "exist for it, so the gate can never be satisfied (#2920); "
-        "resetting to `waiting` for a fresh Work dispatch instead of "
-        "re-probing a gate with nothing to read"
+        f"{entry.key} is blocked on a merge-gate probe, has never been "
+        "dispatched or deferred past the wedge grace window, and the board "
+        "shows no active work, completed work, or merge for it — resetting "
+        "to `waiting` for a fresh Work dispatch instead of re-probing a "
+        "gate with nothing to read"
     )
     return Reconcile(
         entry.key,
@@ -7711,14 +7762,12 @@ def plan_tick(
                     live_test_routing_reason,
                 )
             if blocked_reconcile is None:
-                # #2920: auto-heal a `blocked` entry that was never
-                # dispatched at all (no assignment, no branch — nothing a
-                # merge-gate probe could ever read) BEFORE `_reconcile_
-                # blocked` below gets a turn and re-stamps its "could not be
-                # read" sentence yet again. See
-                # :func:`_reconcile_blocked_unreachable` for the full
-                # decision.
-                blocked_reconcile = _reconcile_blocked_unreachable(entry)
+                # Auto-heal a `blocked` entry wedged in the #2944
+                # guaranteed-false wait, BEFORE `_reconcile_blocked` below
+                # gets a turn and re-stamps its "could not be read" sentence
+                # yet again. See :func:`_reconcile_blocked_unreachable` for
+                # the full decision, including the `facts` board check.
+                blocked_reconcile = _reconcile_blocked_unreachable(entry, facts)
             if blocked_reconcile is None:
                 # #2230: re-examine a `blocked` entry against the CURRENT gate
                 # reading before falling through to the `parked`-only
