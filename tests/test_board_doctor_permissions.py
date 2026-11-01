@@ -553,6 +553,12 @@ class TestThe3760AutoActionsEndToEnd:
             cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
             confidence="high",
             evidence=(f"cause={CAUSE_CEILING_BLOCKED_MERGEABLE}",),
+            # Production only ever stamps this cause onto a row THIS sweep
+            # just reprobed (`_reclassify_ceiling_blocked` requires it), and
+            # the fix-it rebudget gate (#3847) treats a non-fresh row as not
+            # environmental, so the fixture must carry it to reach the
+            # auto-dispatch path under test.
+            fresh=True,
         )
 
         report = sweep(
@@ -602,6 +608,10 @@ class TestThe3760AutoActionsEndToEnd:
             cause=CAUSE_CEILING_BLOCKED_MERGEABLE,
             confidence="high",
             evidence=(f"cause={CAUSE_CEILING_BLOCKED_MERGEABLE}",),
+            # Fresh for the same reason as the row above: this cause only
+            # exists on a just-reprobed row, which is what makes the fix-it
+            # rebudget gate (#3847) read it as environmental.
+            fresh=True,
         )
 
         sweep(
