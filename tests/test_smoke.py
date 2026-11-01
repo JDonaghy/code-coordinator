@@ -4890,6 +4890,52 @@ def test_infra_reclassified_row_is_actually_picked_up_by_the_dispatcher(
     assert result == [sentinel]
 
 
+def test_dispatch_pending_smoke_isolates_a_row_whose_dispatch_raises(
+    gtk_and_server_config: Config, monkeypatch, caplog,
+) -> None:
+    """#3657: one row's dispatch raising (a `gh` lookup that keeps failing,
+    a transport error) must not abort the whole bulk Test-stage pass — every
+    OTHER eligible row on the board, before and after the poisoned one, still
+    gets dispatched, and the failure is retried on the next pass rather than
+    silently starving the rest of the backlog forever (the #3668 shape,
+    applied here to `dispatch_pending_smoke`)."""
+    import logging
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    good_a = replace(_completed(), assignment_id="w1", issue_number=1)
+    poison = replace(_completed(), assignment_id="poison7", issue_number=7)
+    good_b = replace(_completed(), assignment_id="w2", issue_number=2)
+    board = Board(completed=[good_a, poison, good_b])
+
+    def _dispatch_smoke_legs(completed, board, config, **kw):
+        if completed.assignment_id == "poison7":
+            raise RuntimeError("gh pr list: HTTP 502")
+        return [completed.assignment_id]
+
+    monkeypatch.setattr("coord.smoke._dispatch_smoke_legs", _dispatch_smoke_legs)
+
+    with caplog.at_level(logging.ERROR, logger="coord.smoke"):
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert sorted(result) == ["w1", "w2"]
+    assert poison.test_state is None
+    assert any(
+        "poison7" in rec.getMessage() and "#3657" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+    # Next pass: the poisoned row is attempted again rather than dropped —
+    # it still raises, and is still isolated, instead of ever propagating.
+    with caplog.at_level(logging.ERROR, logger="coord.smoke"):
+        dispatch_pending_smoke(board, gtk_and_server_config)
+    assert poison.test_state is None
+    assert sum(
+        "poison7" in rec.getMessage() and "#3657" in rec.getMessage()
+        for rec in caplog.records
+    ) == 2
+
+
 # ── #3309: dispatch_pending_smoke skips on verdict PRESENCE, the merge gate
 # blocks on FRESHNESS — a rebase (moved base) makes a recorded `passed`
 # verdict #1479-stale, and without a re-dispatch here nothing ever produces a

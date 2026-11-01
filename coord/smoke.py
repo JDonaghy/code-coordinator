@@ -4306,243 +4306,264 @@ def dispatch_pending_smoke(
         if completed.status != "done":
             continue
 
-        # #3343: refresh `test_state` from the authoritative single-row store
-        # right before evaluating it below. `completed` is `board`'s
-        # in-memory copy — a snapshot taken once, at the start of whatever
-        # tick called this function — and this loop can run for a while (the
-        # `_test_verdict_is_stale` check a few lines down does live `gh`
-        # round trips per row, and dispatching a leg for an EARLIER row in
-        # this same loop can itself take seconds). A verdict recorded on
-        # THIS row by a smoke leg that finishes while this scan is still
-        # running is invisible to the stale snapshot, so the checks below
-        # would read "no verdict yet" and dispatch a redundant leg — the
-        # #3343 incident: 3 wasted smoke legs on one issue, the last
-        # dispatched 4s after the branch had already merged on the strength
-        # of an earlier leg's verdict. `None` (row unknown, or a remote read
-        # failed) is left as-is — never worse than what this loop already
-        # tolerated before #3343, and `_dispatch_smoke_single_leg`'s own
-        # pre-write re-check is the belt-and-braces backstop if a race still
-        # slips past this one.
-        if completed.assignment_id is not None:
-            fresh_test_state = load_assignment_test_state(completed.assignment_id)
-            if fresh_test_state is not None:
-                completed.test_state = fresh_test_state
-
-        if completed.test_state in (TEST_STATE_BLOCKED, "running"):
-            # "running" — someone (an interactive --smoke-of session, or a
-            # smoke assignment already in flight) is genuinely handling this
-            # row right now; skip unconditionally, no re-probing needed.
-            #
-            # #1672: "blocked" is also what makes the unroutable report fire
-            # ONCE. `dispatch_smoke` records `test_state="blocked"` when no
-            # capability-matched machine can take the stage, so the next tick
-            # lands here and skips instead of re-probing a fleet that is
-            # still broken and re-logging the identical refusal every 30 s
-            # (#1678). Clearing it (`coord diagnose <repo> <issue> --stage
-            # test --reset`) puts the row back in this scan.
-            continue
-        if completed.test_state is not None:
-            # A terminal verdict exists ("passed"/"failed"/"skipped"). Before
-            # #3309 presence alone was enough to skip forever — but a
-            # "passed" verdict can go #1479-stale the moment the merge base
-            # moves (a #241 conflict-fix rebase), and once the drive that
-            # recorded it has exited nothing else ever asks for a fresh one:
-            # the merge gate then reports `smoke_required` against a row this
-            # producer, its only automatic source, believes is already
-            # handled — and it deadlocks silently forever. Re-dispatch only
-            # when the SAME staleness predicate the merge gate applies
-            # (`_test_verdict_is_stale`, #1479) confirms the recorded verdict
-            # is genuinely stale — never merely because it's missing or
-            # unconfirmable (see that function's docstring).
-            if not _test_verdict_is_stale(completed, board, config, gh_ops):
-                continue
-            logger.info(
-                "dispatch_pending_smoke: %s#%s row %s carries a %r Test "
-                "verdict recorded against a base/branch that has since "
-                "moved (#1479) — re-dispatching instead of deadlocking "
-                "against the merge gate's `smoke_required` (#3309).",
-                completed.repo_name, completed.issue_number,
-                completed.assignment_id, completed.test_state,
-            )
-            # Clear the stale verdict BEFORE dispatching the re-run — both
-            # the persisted row (`record_test_verdict(test_state=None)`, the
-            # same "make this row eligible for re-dispatch" step every other
-            # clearer in this codebase already takes: `coord/reconcile.py`'s
-            # environmental-death clear, `coord/notify.py`'s mute-leg-budget
-            # clear) and the in-memory `completed.test_state` this loop
-            # itself is about to hand to `_dispatch_smoke_legs`.
-            #
-            # Skipping this step left the stale "passed" sitting on the row
-            # for the ENTIRE duration of the new run: `_dispatch_smoke_single_
-            # leg`'s own #1819 guard (never stamp "running" over a terminal
-            # verdict) would refuse to record the new leg as in-flight, so
-            # every subsequent tick still saw "passed" and kept re-dispatching
-            # (re-triggering the live #1479 SHA lookup on every one), AND —
-            # far worse — when the new leg completed,
-            # `coord.notify._record_smoke_verdict` would read the still-
-            # "passed" `current_state`, wrongly conclude the worker
-            # self-recorded it via `coord test` (#2217/#2464's branch), and
-            # never inspect the new worker's actual `SMOKE:` verdict at all —
-            # silently laundering a stale pass into a fresh-anchored one with
-            # no real observation behind it (worse than the deadlock #3309
-            # set out to fix). Clearing it here makes the row read "running"
-            # (or unset) until the new leg's own verdict lands, exactly like
-            # every other re-dispatch path.
+        # #3657: isolate this row's processing. Any one row's dispatch-
+        # time work below does live `gh` round trips (`_test_verdict_is_
+        # stale`, the `#3375` liveness fetcher) and can raise — review
+        # dispatch already isolates each row this way for the identical
+        # reason (#3668, `dispatch_pending_reviews`): without it, one
+        # poisoned row's exception propagates out of this `for` loop and
+        # aborts dispatch for every OTHER eligible row behind it on this
+        # pass — and since `board.completed` is scanned in the same order
+        # every ~60s tick, the same row re-aborts the identical call
+        # indefinitely, starving the whole Test-stage backlog with no
+        # smoke, no review, and no CI-fix round ever dispatched (#3657).
+        try:
+            # #3343: refresh `test_state` from the authoritative single-row store
+            # right before evaluating it below. `completed` is `board`'s
+            # in-memory copy — a snapshot taken once, at the start of whatever
+            # tick called this function — and this loop can run for a while (the
+            # `_test_verdict_is_stale` check a few lines down does live `gh`
+            # round trips per row, and dispatching a leg for an EARLIER row in
+            # this same loop can itself take seconds). A verdict recorded on
+            # THIS row by a smoke leg that finishes while this scan is still
+            # running is invisible to the stale snapshot, so the checks below
+            # would read "no verdict yet" and dispatch a redundant leg — the
+            # #3343 incident: 3 wasted smoke legs on one issue, the last
+            # dispatched 4s after the branch had already merged on the strength
+            # of an earlier leg's verdict. `None` (row unknown, or a remote read
+            # failed) is left as-is — never worse than what this loop already
+            # tolerated before #3343, and `_dispatch_smoke_single_leg`'s own
+            # pre-write re-check is the belt-and-braces backstop if a race still
+            # slips past this one.
             if completed.assignment_id is not None:
-                from coord.state import record_test_verdict  # noqa: PLC0415
+                fresh_test_state = load_assignment_test_state(completed.assignment_id)
+                if fresh_test_state is not None:
+                    completed.test_state = fresh_test_state
 
-                record_test_verdict(
-                    assignment_id=completed.assignment_id,
-                    test_state=None,
-                    test_reason=(
-                        f"Cleared a #1479-stale {completed.test_state!r} Test "
-                        "verdict for re-dispatch — the recorded verdict was "
-                        "against a base/branch that has since moved (#3309)."
-                    ),
-                )
-            completed.test_state = None
-
-        # #685: per-issue test-mode policy gates auto-smoke dispatch.
-        #   test-mode:auto  → headless smoke (auto-dispatch here).
-        #   test-mode:smoke → skip; the TUI offers the interactive smoke agent.
-        #   no label        → no policy set → respect auto_queue (back-compat).
-        test_mode = get_issue_test_mode(completed.repo_name, completed.issue_number)
-        if test_mode == "smoke":
-            # #2024: say so. This skip is CORRECT (the policy asked for a
-            # human-attended Test stage) but it was completely silent, and
-            # silence here is what dead-ends an unattended `--fix-of` round:
-            # review dispatch is held until this row carries a passed/skipped
-            # verdict (`pipeline.test_precedes_review`), and under this policy
-            # no automatic component will ever produce one. Round 0 gets
-            # attended because a human is watching; rounds 1..N complete at 3am
-            # and sit there (vimcode#635: 25 min, then 160 min). The DRIVER now
-            # recognises the shape from the same label and escalates instead of
-            # counting (`coord.dead_end` shape 3) — this line is the daemon-side
-            # half of the same statement, for whoever reads the log first.
-            #
-            # Deliberately NOT widened to "dispatch anyway for fix rounds":
-            # that would silently override an explicit per-issue policy. The
-            # answer to "nobody will produce a verdict" is to SAY so, not to
-            # take the decision away from the operator who set the label.
-            #
-            # ONCE per row per process, not once per tick — #1678 is the
-            # standing lesson that a refusal re-logged every 30 s against a
-            # state that cannot change is its own kind of noise (this row can
-            # sit here for hours by design). The daemon is long-lived, so the
-            # set is the right lifetime; a restart re-states it, which is
-            # exactly when an operator wants to hear it again.
-            if completed.assignment_id in _TEST_MODE_SKIP_LOGGED:
+            if completed.test_state in (TEST_STATE_BLOCKED, "running"):
+                # "running" — someone (an interactive --smoke-of session, or a
+                # smoke assignment already in flight) is genuinely handling this
+                # row right now; skip unconditionally, no re-probing needed.
+                #
+                # #1672: "blocked" is also what makes the unroutable report fire
+                # ONCE. `dispatch_smoke` records `test_state="blocked"` when no
+                # capability-matched machine can take the stage, so the next tick
+                # lands here and skips instead of re-probing a fleet that is
+                # still broken and re-logging the identical refusal every 30 s
+                # (#1678). Clearing it (`coord diagnose <repo> <issue> --stage
+                # test --reset`) puts the row back in this scan.
                 continue
-            if completed.assignment_id:
-                _TEST_MODE_SKIP_LOGGED.add(completed.assignment_id)
-            logger.info(
-                "dispatch_pending_smoke: skipping %s#%s row %s — issue is "
-                "labelled `test-mode:smoke`, so the headless Test stage is off "
-                "for it by policy (#685) and NOTHING automatic will record a "
-                "verdict. Review dispatch stays held until one exists: `coord "
-                "test %s --passed|--skipped`, or run the attended stage with "
-                "`coord assign <machine> %s %s --smoke-of %s --interactive` "
-                "(#2024).",
-                completed.repo_name, completed.issue_number,
-                completed.assignment_id, completed.assignment_id,
-                completed.repo_name, completed.issue_number,
-                completed.assignment_id,
-            )
-            continue
-
-        # #3375: refuse to dispatch a Test stage for a row whose issue has
-        # already closed or whose branch has already merged — the liveness
-        # precondition #3376 built for `coord.dispatch.dispatch()` but never
-        # reached this stage, because smoke dispatch never calls it (see the
-        # docstring above). Checked here, right before candidate walking,
-        # because it needs no machine selection to answer. A hit records a
-        # `skipped` verdict (there is nothing left for a Test verdict to
-        # gate) instead of `None`/leaving it unset — leaving it unset would
-        # re-enter this exact row on the very next tick and re-probe GitHub
-        # forever for an answer that cannot change back.
-        #
-        # #3416: that `skipped` write is only correct when the row has NO
-        # verdict yet. A liveness refusal fires on "issue closed OR branch
-        # already merged" — a row can reach here carrying a real, terminal
-        # verdict (`passed`/`failed`/`blocked`) recorded moments earlier by
-        # `coord test`, and stamping `skipped` over it would destroy the
-        # only evidence a suite was ever run (#3357 exists precisely so
-        # `passed` reads differently from "nobody checked"), and — worse —
-        # would silently turn a gate-BLOCKING `failed` into a gate-
-        # SATISFYING `skipped`. Re-read the authoritative persisted state
-        # right here rather than trusting `completed.test_state` (a
-        # snapshot taken at the top of this loop, refreshed once at #3343
-        # but not since): fill `skipped` only when that read comes back
-        # empty; a terminal verdict is left exactly as it is, and the
-        # refusal is still recorded via `record_dispatch_refusal` below so
-        # it stays visible in the audit trail even when it changes nothing
-        # on the row.
-        if issue_liveness_fetcher is not None:
-            from coord.dispatch_liveness import (  # noqa: PLC0415
-                check_dispatch_liveness,
-                record_dispatch_refusal,
-            )
-
-            issue_closed, branch_merged = issue_liveness_fetcher(
-                completed.repo_name, completed.issue_number, completed.branch
-            )
-            refusal = check_dispatch_liveness(
-                repo_name=completed.repo_name,
-                issue_number=completed.issue_number,
-                machine_name="(smoke: no machine selected yet)",
-                issue_closed=issue_closed,
-                branch_merged=branch_merged,
-            )
-            if refusal is not None:
+            if completed.test_state is not None:
+                # A terminal verdict exists ("passed"/"failed"/"skipped"). Before
+                # #3309 presence alone was enough to skip forever — but a
+                # "passed" verdict can go #1479-stale the moment the merge base
+                # moves (a #241 conflict-fix rebase), and once the drive that
+                # recorded it has exited nothing else ever asks for a fresh one:
+                # the merge gate then reports `smoke_required` against a row this
+                # producer, its only automatic source, believes is already
+                # handled — and it deadlocks silently forever. Re-dispatch only
+                # when the SAME staleness predicate the merge gate applies
+                # (`_test_verdict_is_stale`, #1479) confirms the recorded verdict
+                # is genuinely stale — never merely because it's missing or
+                # unconfirmable (see that function's docstring).
+                if not _test_verdict_is_stale(completed, board, config, gh_ops):
+                    continue
+                logger.info(
+                    "dispatch_pending_smoke: %s#%s row %s carries a %r Test "
+                    "verdict recorded against a base/branch that has since "
+                    "moved (#1479) — re-dispatching instead of deadlocking "
+                    "against the merge gate's `smoke_required` (#3309).",
+                    completed.repo_name, completed.issue_number,
+                    completed.assignment_id, completed.test_state,
+                )
+                # Clear the stale verdict BEFORE dispatching the re-run — both
+                # the persisted row (`record_test_verdict(test_state=None)`, the
+                # same "make this row eligible for re-dispatch" step every other
+                # clearer in this codebase already takes: `coord/reconcile.py`'s
+                # environmental-death clear, `coord/notify.py`'s mute-leg-budget
+                # clear) and the in-memory `completed.test_state` this loop
+                # itself is about to hand to `_dispatch_smoke_legs`.
+                #
+                # Skipping this step left the stale "passed" sitting on the row
+                # for the ENTIRE duration of the new run: `_dispatch_smoke_single_
+                # leg`'s own #1819 guard (never stamp "running" over a terminal
+                # verdict) would refuse to record the new leg as in-flight, so
+                # every subsequent tick still saw "passed" and kept re-dispatching
+                # (re-triggering the live #1479 SHA lookup on every one), AND —
+                # far worse — when the new leg completed,
+                # `coord.notify._record_smoke_verdict` would read the still-
+                # "passed" `current_state`, wrongly conclude the worker
+                # self-recorded it via `coord test` (#2217/#2464's branch), and
+                # never inspect the new worker's actual `SMOKE:` verdict at all —
+                # silently laundering a stale pass into a fresh-anchored one with
+                # no real observation behind it (worse than the deadlock #3309
+                # set out to fix). Clearing it here makes the row read "running"
+                # (or unset) until the new leg's own verdict lands, exactly like
+                # every other re-dispatch path.
                 if completed.assignment_id is not None:
                     from coord.state import record_test_verdict  # noqa: PLC0415
 
-                    current_state = load_assignment_test_state(
-                        completed.assignment_id
+                    record_test_verdict(
+                        assignment_id=completed.assignment_id,
+                        test_state=None,
+                        test_reason=(
+                            f"Cleared a #1479-stale {completed.test_state!r} Test "
+                            "verdict for re-dispatch — the recorded verdict was "
+                            "against a base/branch that has since moved (#3309)."
+                        ),
                     )
-                    if current_state is None:
-                        record_test_verdict(
-                            assignment_id=completed.assignment_id,
-                            test_state="skipped",
-                            test_reason=(
-                                f"Test stage skipped — {refusal.reason} "
-                                "(#3375)"
-                            ),
-                        )
-                        completed.test_state = "skipped"
-                    else:
-                        logger.info(
-                            "dispatch_pending_smoke: %s#%s row %s already "
-                            "carries a terminal test_state=%r — the #3375 "
-                            "liveness refusal is logged/audited only and "
-                            "leaves it untouched (#3416).",
-                            completed.repo_name, completed.issue_number,
-                            completed.assignment_id, current_state,
-                        )
-                record_dispatch_refusal(
-                    refusal,
-                    repo_name=completed.repo_name,
-                    issue_number=completed.issue_number,
-                    machine_name="(smoke: no machine selected yet)",
-                    assignment_type="smoke",
-                )
+                completed.test_state = None
+
+            # #685: per-issue test-mode policy gates auto-smoke dispatch.
+            #   test-mode:auto  → headless smoke (auto-dispatch here).
+            #   test-mode:smoke → skip; the TUI offers the interactive smoke agent.
+            #   no label        → no policy set → respect auto_queue (back-compat).
+            test_mode = get_issue_test_mode(completed.repo_name, completed.issue_number)
+            if test_mode == "smoke":
+                # #2024: say so. This skip is CORRECT (the policy asked for a
+                # human-attended Test stage) but it was completely silent, and
+                # silence here is what dead-ends an unattended `--fix-of` round:
+                # review dispatch is held until this row carries a passed/skipped
+                # verdict (`pipeline.test_precedes_review`), and under this policy
+                # no automatic component will ever produce one. Round 0 gets
+                # attended because a human is watching; rounds 1..N complete at 3am
+                # and sit there (vimcode#635: 25 min, then 160 min). The DRIVER now
+                # recognises the shape from the same label and escalates instead of
+                # counting (`coord.dead_end` shape 3) — this line is the daemon-side
+                # half of the same statement, for whoever reads the log first.
+                #
+                # Deliberately NOT widened to "dispatch anyway for fix rounds":
+                # that would silently override an explicit per-issue policy. The
+                # answer to "nobody will produce a verdict" is to SAY so, not to
+                # take the decision away from the operator who set the label.
+                #
+                # ONCE per row per process, not once per tick — #1678 is the
+                # standing lesson that a refusal re-logged every 30 s against a
+                # state that cannot change is its own kind of noise (this row can
+                # sit here for hours by design). The daemon is long-lived, so the
+                # set is the right lifetime; a restart re-states it, which is
+                # exactly when an operator wants to hear it again.
+                if completed.assignment_id in _TEST_MODE_SKIP_LOGGED:
+                    continue
+                if completed.assignment_id:
+                    _TEST_MODE_SKIP_LOGGED.add(completed.assignment_id)
                 logger.info(
-                    "dispatch_pending_smoke: refused to dispatch for %s#%s "
-                    "row %s — %s",
+                    "dispatch_pending_smoke: skipping %s#%s row %s — issue is "
+                    "labelled `test-mode:smoke`, so the headless Test stage is off "
+                    "for it by policy (#685) and NOTHING automatic will record a "
+                    "verdict. Review dispatch stays held until one exists: `coord "
+                    "test %s --passed|--skipped`, or run the attended stage with "
+                    "`coord assign <machine> %s %s --smoke-of %s --interactive` "
+                    "(#2024).",
                     completed.repo_name, completed.issue_number,
-                    completed.assignment_id, refusal.reason,
+                    completed.assignment_id, completed.assignment_id,
+                    completed.repo_name, completed.issue_number,
+                    completed.assignment_id,
                 )
                 continue
 
-        # #3182: the full-list implementation — a capability fan-out
-        # dispatches more than one leg per completion, so this loop cannot
-        # go through the compat-wrapping `dispatch_smoke` (which only ever
-        # returns the FIRST leg, for callers still expecting the pre-#3182
-        # `Assignment | None` shape) without silently under-reporting the
-        # rest in this function's own returned list. `board.active` (every
-        # leg is appended there regardless of which entry point dispatched
-        # it) is unaffected either way.
-        dispatched.extend(_dispatch_smoke_legs(completed, board, config, now=now))
+            # #3375: refuse to dispatch a Test stage for a row whose issue has
+            # already closed or whose branch has already merged — the liveness
+            # precondition #3376 built for `coord.dispatch.dispatch()` but never
+            # reached this stage, because smoke dispatch never calls it (see the
+            # docstring above). Checked here, right before candidate walking,
+            # because it needs no machine selection to answer. A hit records a
+            # `skipped` verdict (there is nothing left for a Test verdict to
+            # gate) instead of `None`/leaving it unset — leaving it unset would
+            # re-enter this exact row on the very next tick and re-probe GitHub
+            # forever for an answer that cannot change back.
+            #
+            # #3416: that `skipped` write is only correct when the row has NO
+            # verdict yet. A liveness refusal fires on "issue closed OR branch
+            # already merged" — a row can reach here carrying a real, terminal
+            # verdict (`passed`/`failed`/`blocked`) recorded moments earlier by
+            # `coord test`, and stamping `skipped` over it would destroy the
+            # only evidence a suite was ever run (#3357 exists precisely so
+            # `passed` reads differently from "nobody checked"), and — worse —
+            # would silently turn a gate-BLOCKING `failed` into a gate-
+            # SATISFYING `skipped`. Re-read the authoritative persisted state
+            # right here rather than trusting `completed.test_state` (a
+            # snapshot taken at the top of this loop, refreshed once at #3343
+            # but not since): fill `skipped` only when that read comes back
+            # empty; a terminal verdict is left exactly as it is, and the
+            # refusal is still recorded via `record_dispatch_refusal` below so
+            # it stays visible in the audit trail even when it changes nothing
+            # on the row.
+            if issue_liveness_fetcher is not None:
+                from coord.dispatch_liveness import (  # noqa: PLC0415
+                    check_dispatch_liveness,
+                    record_dispatch_refusal,
+                )
+
+                issue_closed, branch_merged = issue_liveness_fetcher(
+                    completed.repo_name, completed.issue_number, completed.branch
+                )
+                refusal = check_dispatch_liveness(
+                    repo_name=completed.repo_name,
+                    issue_number=completed.issue_number,
+                    machine_name="(smoke: no machine selected yet)",
+                    issue_closed=issue_closed,
+                    branch_merged=branch_merged,
+                )
+                if refusal is not None:
+                    if completed.assignment_id is not None:
+                        from coord.state import record_test_verdict  # noqa: PLC0415
+
+                        current_state = load_assignment_test_state(
+                            completed.assignment_id
+                        )
+                        if current_state is None:
+                            record_test_verdict(
+                                assignment_id=completed.assignment_id,
+                                test_state="skipped",
+                                test_reason=(
+                                    f"Test stage skipped — {refusal.reason} "
+                                    "(#3375)"
+                                ),
+                            )
+                            completed.test_state = "skipped"
+                        else:
+                            logger.info(
+                                "dispatch_pending_smoke: %s#%s row %s already "
+                                "carries a terminal test_state=%r — the #3375 "
+                                "liveness refusal is logged/audited only and "
+                                "leaves it untouched (#3416).",
+                                completed.repo_name, completed.issue_number,
+                                completed.assignment_id, current_state,
+                            )
+                    record_dispatch_refusal(
+                        refusal,
+                        repo_name=completed.repo_name,
+                        issue_number=completed.issue_number,
+                        machine_name="(smoke: no machine selected yet)",
+                        assignment_type="smoke",
+                    )
+                    logger.info(
+                        "dispatch_pending_smoke: refused to dispatch for %s#%s "
+                        "row %s — %s",
+                        completed.repo_name, completed.issue_number,
+                        completed.assignment_id, refusal.reason,
+                    )
+                    continue
+
+            # #3182: the full-list implementation — a capability fan-out
+            # dispatches more than one leg per completion, so this loop cannot
+            # go through the compat-wrapping `dispatch_smoke` (which only ever
+            # returns the FIRST leg, for callers still expecting the pre-#3182
+            # `Assignment | None` shape) without silently under-reporting the
+            # rest in this function's own returned list. `board.active` (every
+            # leg is appended there regardless of which entry point dispatched
+            # it) is unaffected either way.
+            dispatched.extend(_dispatch_smoke_legs(completed, board, config, now=now))
+        except Exception:  # noqa: BLE001 — isolate; see #3657 comment above
+            logger.exception(
+                "dispatch_pending_smoke (#3657): dispatching Test for %s "
+                "(%s #%s) raised — leaving it for the next pass and "
+                "continuing with the remaining eligible rows",
+                completed.assignment_id, completed.repo_name,
+                completed.issue_number,
+            )
+            continue
 
     return dispatched
 
