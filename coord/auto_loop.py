@@ -163,6 +163,14 @@ class LoopAction:
                                  though ``max_review_iterations`` had budget
                                  left, because that counter is a SEPARATE
                                  budget from the drive-queue's
+    - ``"finisher_dispatched"`` — #3835 Trigger A: request-changes with an
+                                 explicitly empty blocking section (the same
+                                 condition `"approved_with_nits"` handles)
+                                 was routed to a bounded finisher leg instead,
+                                 because this repo opted in; the nits get
+                                 applied directly rather than discarded as an
+                                 advisory comment, with no extra work leg or
+                                 fresh review round
     """
     assignment_id: str | None
     detail: str = ""
@@ -391,6 +399,56 @@ def process_review_completion(
         findings.body, assignment_id=review.assignment_id,
     )
     if evidence.confirmed_absent:
+        # Trigger A (#3835): before falling through to the #476 override
+        # below (which silently discards the nits as an advisory comment,
+        # applying nothing), give an opted-in repo a chance to actually
+        # apply them via a bounded, self-blessing finisher leg instead.
+        # `dispatch_nit_only_finisher` is a plain, synchronously-called
+        # function — not the `StuckRow` sweep's `ALLOWLIST`/
+        # `AUTO_DISPATCHERS` machinery, which fires on a different
+        # schedule off different data. It returns `False` with zero side
+        # effects for every reason the tier may not apply here (off
+        # fleet-wide, not opted in for this repo, a finisher/fix-it/drive
+        # session already in flight, no capable machine) — on `False` this
+        # falls through to the existing override logic completely
+        # unchanged, so tier-off behavior stays byte-for-byte identical to
+        # before #3835. Gated on `dispatch_fixes` for the same reason
+        # `_dispatch_fix_for_review` below is: the daemon drain (#1663) is
+        # not allowed to spawn any worker, finisher legs included.
+        from coord.board_doctor_policy import dispatch_nit_only_finisher  # noqa: PLC0415
+
+        if dispatch_fixes and dispatch_nit_only_finisher(
+            review.repo_name, review.issue_number, board, config,
+            evidence=(
+                f"request-changes with blocking=0 nonblocking={nonblocking} "
+                f"nits={nits}",
+            ),
+            http_client=http_client,
+        ):
+            log.info(
+                "auto_loop: Trigger A (#3835) routed review %s to a "
+                "finisher leg instead of the #476 approve-with-nits gate "
+                "— blocking=%r nonblocking=%r nits=%r",
+                review.assignment_id, blocking, nonblocking, nits,
+            )
+            # Mirrors `_dispatch_fix_for_review`'s own bookkeeping: the
+            # parent work row must read `request-changes`, not the #476
+            # override's `approve` — a finisher leg is still an active fix
+            # round, not a merge-ready approval. No merge-queue refresh:
+            # request-changes can never satisfy `has_approved_review`.
+            propagate_review_verdict(review, board, config, refresh_merge_queue=False)
+            return [LoopAction(
+                kind="finisher_dispatched",
+                assignment_id=review.assignment_id,
+                detail=(
+                    "Review requested changes but its blocking section was "
+                    f"explicitly empty (nonblocking={nonblocking}, "
+                    f"nits={nits}) — routed to a finisher leg (#3835 "
+                    "Trigger A) to apply the nits directly instead of "
+                    "discarding them via the #476 approve-with-nits gate"
+                ),
+            )]
+
         # log.warning, not info: this is the coordinator overriding a human-
         # readable rejection. It must be conspicuous in the log, and it is
         # additionally recorded on the assignment (below) and posted to GitHub.

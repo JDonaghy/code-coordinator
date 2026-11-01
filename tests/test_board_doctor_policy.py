@@ -936,3 +936,130 @@ class TestInvestigateConvergence:
 
         escalation = state.get_drive_escalation("acme/widgets", 40)
         assert escalation is not None
+
+
+class TestFinisherTierEnabled:
+    """#3835 Trigger A: `_finisher_tier_enabled` mirrors
+    `_investigate_tier_enabled`'s three independent gates, but reads the
+    `finish`-named fields.
+    """
+
+    @staticmethod
+    def _config(*, fleet_finish: bool, repo_finish: bool) -> Config:
+        from coord.config import BoardDoctorConfig
+        from coord.models import BoardDoctorRepoConfig
+
+        return Config(
+            repos=[
+                Repo(
+                    name="acme/widgets",
+                    github="acme/widgets",
+                    board_doctor=BoardDoctorRepoConfig(finish=repo_finish),
+                )
+            ],
+            machines=[],
+            board_doctor=BoardDoctorConfig(finish=fleet_finish),
+        )
+
+    def test_disabled_when_repo_has_not_opted_in(self) -> None:
+        config = self._config(fleet_finish=True, repo_finish=False)
+        assert board_doctor_policy._finisher_tier_enabled("acme/widgets", config) is False
+
+    def test_disabled_when_fleet_switch_is_off(self) -> None:
+        config = self._config(fleet_finish=False, repo_finish=True)
+        assert board_doctor_policy._finisher_tier_enabled("acme/widgets", config) is False
+
+    def test_enabled_when_both_gates_are_on(self) -> None:
+        config = self._config(fleet_finish=True, repo_finish=True)
+        assert board_doctor_policy._finisher_tier_enabled("acme/widgets", config) is True
+
+    def test_env_var_kill_switch_overrides_everything(self, monkeypatch) -> None:
+        monkeypatch.setenv(board_doctor_policy.NO_FINISHER_ENV_VAR, "1")
+        config = self._config(fleet_finish=True, repo_finish=True)
+        assert board_doctor_policy._finisher_tier_enabled("acme/widgets", config) is False
+
+    def test_unknown_repo_is_disabled(self) -> None:
+        config = self._config(fleet_finish=True, repo_finish=True)
+        assert board_doctor_policy._finisher_tier_enabled("no-such-repo", config) is False
+
+
+class TestDispatchNitOnlyFinisher:
+    """#3835 Trigger A: `dispatch_nit_only_finisher` is a plain, directly
+    called function — not part of the `StuckRow` sweep's
+    `ALLOWLIST`/`AUTO_DISPATCHERS` machinery — so it is exercised here
+    directly rather than through `sweep`/`policy_tier_of`.
+    """
+
+    def test_returns_false_without_dispatching_when_tier_disabled(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            board_doctor_policy, "_finisher_tier_enabled", lambda *a, **k: False
+        )
+
+        def dispatch_must_not_be_called(*args, **kwargs):
+            raise AssertionError("tier-off must never reach dispatch_sweep_action")
+
+        monkeypatch.setattr(
+            board_doctor_policy, "dispatch_sweep_action", dispatch_must_not_be_called
+        )
+        config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+
+        result = board_doctor_policy.dispatch_nit_only_finisher(
+            "acme/widgets", 40, Board(), config
+        )
+
+        assert result is False
+
+    def test_returns_true_when_the_sweep_action_dispatches(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            board_doctor_policy, "_finisher_tier_enabled", lambda *a, **k: True
+        )
+        calls: list[tuple] = []
+
+        def fake_dispatch(action, *args, **kwargs):
+            calls.append((action, args, kwargs))
+            return {
+                "dispatched": True,
+                "assignment_id": "asn-1",
+                "machine": "mac1",
+                "detail": "acme/widgets#40 finisher leg dispatched to mac1",
+            }
+
+        monkeypatch.setattr(board_doctor_policy, "dispatch_sweep_action", fake_dispatch)
+        config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+        board = Board()
+
+        result = board_doctor_policy.dispatch_nit_only_finisher(
+            "acme/widgets", 40, board, config, evidence=("blocking=0",)
+        )
+
+        assert result is True
+        assert len(calls) == 1
+        action, args, kwargs = calls[0]
+        assert action == board_doctor_policy._FINISHER_ACTION
+        assert args == ("acme/widgets", 40, board, config)
+        assert kwargs["cause"] == board_doctor_policy.CAUSE_NIT_ONLY_REQUEST_CHANGES
+        assert kwargs["evidence"] == ("blocking=0",)
+
+    def test_returns_false_when_the_sweep_action_declines(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            board_doctor_policy, "_finisher_tier_enabled", lambda *a, **k: True
+        )
+        monkeypatch.setattr(
+            board_doctor_policy,
+            "dispatch_sweep_action",
+            lambda *a, **k: {
+                "dispatched": False,
+                "assignment_id": None,
+                "machine": None,
+                "detail": _IN_FLIGHT_DETAIL,
+            },
+        )
+        config = Config(repos=[Repo(name="acme/widgets", github="acme/widgets")], machines=[])
+
+        result = board_doctor_policy.dispatch_nit_only_finisher(
+            "acme/widgets", 40, Board(), config
+        )
+
+        assert result is False

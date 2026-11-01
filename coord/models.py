@@ -65,9 +65,24 @@ class BoardDoctorRepoConfig:
     (`Config.board_doctor.investigate`) and the `--no-investigate` CLI
     override, so there is exactly one place to look to answer "will this
     repo's stuck row get investigated".
+
+    ``finish`` is this repo's opt-in to Trigger A (#3835): when a review
+    completes `request-changes` with its blocking section confirmed empty
+    (`coord.review.classify_blocking_evidence`'s ``confirmed_absent``, which
+    is exactly `coord.review.classify_finding_nit_class`'s fallback answer
+    with no fix drafted yet), route to a finisher leg
+    (`coord.board_doctor_permissions.sweep_dispatch_finisher_leg`) instead
+    of the #476 gate's silent approve-with-nits. `False` (the default)
+    leaves #476's own behavior — advance as approved, post the nits as an
+    advisory comment, apply nothing — completely unchanged.
+    `coord.board_doctor_policy._finisher_tier_enabled` is the single
+    function that reads this alongside the fleet-wide kill switch
+    (`Config.board_doctor.finish`) and its `COORD_BOARD_DOCTOR_NO_FINISHER`
+    env-var override.
     """
 
     investigate: bool = False
+    finish: bool = False
 
 
 @dataclass
