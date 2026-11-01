@@ -3107,25 +3107,9 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
         "(C2/C3 allowlist) and alert (C4) tiers are unaffected."
     ),
 )
-@click.option(
-    "--no-finish",
-    is_flag=True,
-    default=False,
-    help=(
-        "One-shot equivalent of `board_doctor.finish: false` (#3837): set "
-        "the finisher (Trigger A, #3835) kill switch for the duration of "
-        "this process. `coord sweep` never dispatches a finisher leg "
-        "itself — Trigger A only fires synchronously from "
-        "`coord.auto_loop.process_review_completion`, not the periodic "
-        "sweep — so this has no effect on THIS command's own output; it "
-        "exists for a caller that runs `coord sweep` and `process_review_"
-        "completion` in the same long-lived process and wants both read "
-        "the same disarmed switch without touching `coordinator.yml`."
-    ),
-)
 @_CONFIG_OPTION
 def drive_queue_sweep(
-    output_json: bool, dry_run: bool, no_investigate: bool, no_finish: bool, config_path: Path,
+    output_json: bool, dry_run: bool, no_investigate: bool, config_path: Path,
 ) -> None:
     """Board-doctor sweep: classify every stuck row, dispatch, record (#3758).
 
@@ -3166,13 +3150,12 @@ def drive_queue_sweep(
     `coordinator.yml` would for every future sweep — the mechanical and
     alert tiers keep running either way.
 
-    `--no-finish` is the same one-shot kill switch for the finisher tier
-    (Trigger A, #3835/#3837) — but that tier fires off
-    `coord.auto_loop.process_review_completion` at review-completion time,
-    never from this sweep's own dispatch loop, so setting it here changes
-    nothing THIS command prints or dispatches; it only matters to a caller
-    that shares this OS process with whatever calls
-    `process_review_completion`.
+    There is no `--no-finish` here: the finisher tier (Trigger A,
+    #3835/#3837) fires off `coord.auto_loop.process_review_completion` at
+    review-completion time, never from this sweep's own dispatch loop, so a
+    kill switch scoped to this command would disarm nothing it does. Use
+    `coord fix <REVIEW_ID> --no-finish` instead — that IS the call site
+    where Trigger A fires.
     """
     from coord import board_doctor, board_doctor_policy  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
@@ -3189,7 +3172,6 @@ def drive_queue_sweep(
 
     env_overrides = {
         board_doctor_policy.NO_INVESTIGATE_ENV_VAR: no_investigate,
-        board_doctor_policy.NO_FINISHER_ENV_VAR: no_finish,
     }
     previous_values = {name: os.environ.get(name) for name in env_overrides}
     for name, set_it in env_overrides.items():
@@ -3208,8 +3190,7 @@ def drive_queue_sweep(
         # Restore rather than blindly delete: a caller already running with
         # a kill switch set via the environment (e.g. a wrapper script)
         # must not have it cleared out from under it by an unrelated
-        # `--no-investigate`/`--no-finish` sweep invocation in the same
-        # process.
+        # `--no-investigate` sweep invocation in the same process.
         for name, set_it in env_overrides.items():
             if not set_it:
                 continue
