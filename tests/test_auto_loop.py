@@ -774,7 +774,7 @@ class TestProcessReviewCompletion:
 
     # ── #3835 Trigger A: nit-only request-changes → finisher leg ───────────
 
-    def test_confirmed_absent_routes_to_finisher_when_opted_in(
+    def test_confirmed_absent_routes_to_finisher_when_dispatch_confirmed(
         self, config: Config, tmp_path
     ) -> None:
         """When `dispatch_nit_only_finisher` reports a successful dispatch
@@ -905,6 +905,124 @@ class TestProcessReviewCompletion:
 
         mock_finisher.assert_not_called()
         assert actions[0].kind == "approved_with_nits"
+
+    def test_confirmed_absent_terminal_work_never_calls_finisher(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#522: a finisher leg is still a fix round against the reviewed
+        work row, so merged/closed work must not be re-dispatched onto by
+        Trigger A either — same guard `_dispatch_fix_for_review` applies."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "None — nothing here blocks the merge.\n"
+            "## Minor observations (not blocking)\n"
+            "- Low-value test could exercise the real handler\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=2)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        with (
+            patch("coord.github_ops.work_is_terminal", return_value=True),
+            patch(
+                "coord.board_doctor_policy.dispatch_nit_only_finisher",
+            ) as mock_finisher,
+            patch("coord.auto_loop._post_advisory_nits_notice") as mock_notice,
+        ):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        mock_finisher.assert_not_called()
+        assert actions[0].kind == "approved_with_nits"
+        mock_notice.assert_called_once()
+
+    def test_confirmed_absent_ceiling_blocked_never_calls_finisher(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#3756: a drive-queue row that already gave up on the fix-round
+        ceiling for this (repo, issue) must stop Trigger A too, not just
+        `_dispatch_fix_for_review` — falls through to the #476 override
+        instead of dead-ending the review."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "None — nothing here blocks the merge.\n"
+            "## Minor observations (not blocking)\n"
+            "- Low-value test could exercise the real handler\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=2)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        with (
+            patch(
+                "coord.drive_queue.fix_round_ceiling_blocked_for_issue",
+                return_value=True,
+            ) as mock_blocked,
+            patch(
+                "coord.board_doctor_policy.dispatch_nit_only_finisher",
+            ) as mock_finisher,
+            patch("coord.auto_loop._post_advisory_nits_notice") as mock_notice,
+        ):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        mock_blocked.assert_called_once_with("api", 1)
+        mock_finisher.assert_not_called()
+        assert actions[0].kind == "approved_with_nits"
+        mock_notice.assert_called_once()
+
+    def test_confirmed_absent_passes_reviewer_nits_text_to_finisher(
+        self, config: Config, tmp_path
+    ) -> None:
+        """The finisher leg must receive the reviewer's actual nit text
+        (#3835 finding f), not just a bare count — `dispatch_nit_only_finisher`
+        gets called with ``nits=`` containing the "Minor observations"
+        section body."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "None — nothing here blocks the merge.\n"
+            "## Minor observations (not blocking)\n"
+            "- Rename `tmp` to `scratch` for clarity\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=2)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        with patch(
+            "coord.board_doctor_policy.dispatch_nit_only_finisher",
+            return_value=True,
+        ) as mock_finisher:
+            process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        mock_finisher.assert_called_once()
+        nits_kwarg = mock_finisher.call_args.kwargs["nits"]
+        assert len(nits_kwarg) == 1
+        assert "Rename `tmp` to `scratch`" in nits_kwarg[0]
 
     def test_real_blocking_finding_never_calls_finisher(
         self, config: Config, tmp_path

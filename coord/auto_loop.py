@@ -63,6 +63,7 @@ from coord.review import (
     authoritative_review_counts,
     classify_blocking_evidence,
     dispatch_review,
+    extract_nits_section,
     maybe_scoped_review_for_completed_fix,
     mechanical_gate_kind,
     needs_redesign_escalation,
@@ -110,7 +111,7 @@ FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work"}) | SEALED_PATH_AUTHOR_TY
 # copies of this tuple is exactly the drift shape #1601/#1624 keep hitting.
 PERSIST_ACTION_KINDS: tuple[str, ...] = (
     "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
-    "verdict_propagated",
+    "verdict_propagated", "finisher_dispatched",
 )
 
 
@@ -169,8 +170,14 @@ class LoopAction:
                                  was routed to a bounded finisher leg instead,
                                  because this repo opted in; the nits get
                                  applied directly rather than discarded as an
-                                 advisory comment, with no extra work leg or
-                                 fresh review round
+                                 advisory comment. This is still an ordinary
+                                 fix round (same `_work_is_terminal`/fix-round-
+                                 ceiling guards as any other fix dispatch) —
+                                 it completes into the normal re-review cycle
+                                 like any other fix leg, since
+                                 `coord.board_doctor_permissions.
+                                 finisher_self_bless` has no caller yet
+                                 (#3834)
     """
     assignment_id: str | None
     detail: str = ""
@@ -415,39 +422,73 @@ def process_review_completion(
         # before #3835. Gated on `dispatch_fixes` for the same reason
         # `_dispatch_fix_for_review` below is: the daemon drain (#1663) is
         # not allowed to spawn any worker, finisher legs included.
-        from coord.board_doctor_policy import dispatch_nit_only_finisher  # noqa: PLC0415
+        #
+        # A finisher leg is still an ordinary fix round against the
+        # reviewed work row, so it owes that row the exact same #522/#3756
+        # guards `_dispatch_fix_for_review` applies below — skipping them
+        # here would let a finisher leg re-dispatch onto already-merged
+        # work, or blow straight through a drive-queue row that already
+        # gave up on the #2972 fix-round ceiling.
+        work: Assignment | None = None
+        if review.review_of_assignment_id:
+            work = board.find_by_id(review.review_of_assignment_id)
 
-        if dispatch_fixes and dispatch_nit_only_finisher(
-            review.repo_name, review.issue_number, board, config,
-            evidence=(
-                f"request-changes with blocking=0 nonblocking={nonblocking} "
-                f"nits={nits}",
-            ),
-            http_client=http_client,
+        if work is not None and dispatch_fixes and not _work_is_terminal(
+            work, config, cache=terminal_cache,
         ):
-            log.info(
-                "auto_loop: Trigger A (#3835) routed review %s to a "
-                "finisher leg instead of the #476 approve-with-nits gate "
-                "— blocking=%r nonblocking=%r nits=%r",
-                review.assignment_id, blocking, nonblocking, nits,
+            from coord.board_doctor_policy import dispatch_nit_only_finisher  # noqa: PLC0415
+            from coord.drive_queue import fix_round_ceiling_blocked_for_issue  # noqa: PLC0415
+
+            ceiling_blocked = fix_round_ceiling_blocked_for_issue(
+                work.repo_name, work.issue_number,
             )
-            # Mirrors `_dispatch_fix_for_review`'s own bookkeeping: the
-            # parent work row must read `request-changes`, not the #476
-            # override's `approve` — a finisher leg is still an active fix
-            # round, not a merge-ready approval. No merge-queue refresh:
-            # request-changes can never satisfy `has_approved_review`.
-            propagate_review_verdict(review, board, config, refresh_merge_queue=False)
-            return [LoopAction(
-                kind="finisher_dispatched",
-                assignment_id=review.assignment_id,
-                detail=(
-                    "Review requested changes but its blocking section was "
-                    f"explicitly empty (nonblocking={nonblocking}, "
-                    f"nits={nits}) — routed to a finisher leg (#3835 "
-                    "Trigger A) to apply the nits directly instead of "
-                    "discarding them via the #476 approve-with-nits gate"
-                ),
-            )]
+            if ceiling_blocked:
+                log.warning(
+                    "auto_loop: Trigger A (#3835) skipped for review %s — "
+                    "%s#%s's drive-queue row already gave up on the #2972 "
+                    "fix-round ceiling; falling through to the #476 "
+                    "approve-with-nits gate instead of dispatching a "
+                    "finisher leg",
+                    review.assignment_id, work.repo_name, work.issue_number,
+                )
+            else:
+                nit_text = extract_nits_section(findings.body)
+                if dispatch_nit_only_finisher(
+                    review.repo_name, review.issue_number, board, config,
+                    evidence=(
+                        f"request-changes with blocking={blocking} "
+                        f"nonblocking={nonblocking} nits={nits}",
+                    ),
+                    nits=(nit_text,) if nit_text else (),
+                    http_client=http_client,
+                ):
+                    log.info(
+                        "auto_loop: Trigger A (#3835) routed review %s to a "
+                        "finisher leg instead of the #476 approve-with-nits "
+                        "gate — blocking=%r nonblocking=%r nits=%r",
+                        review.assignment_id, blocking, nonblocking, nits,
+                    )
+                    # Mirrors `_dispatch_fix_for_review`'s own bookkeeping:
+                    # the parent work row must read `request-changes`, not
+                    # the #476 override's `approve` — a finisher leg is
+                    # still an active fix round, not a merge-ready approval.
+                    # No merge-queue refresh: request-changes can never
+                    # satisfy `has_approved_review`.
+                    propagate_review_verdict(
+                        review, board, config, refresh_merge_queue=False,
+                    )
+                    return [LoopAction(
+                        kind="finisher_dispatched",
+                        assignment_id=review.assignment_id,
+                        detail=(
+                            "Review requested changes but its blocking "
+                            f"section was explicitly empty (nonblocking="
+                            f"{nonblocking}, nits={nits}) — routed to a "
+                            "finisher leg (#3835 Trigger A) to apply the "
+                            "nits directly instead of discarding them via "
+                            "the #476 approve-with-nits gate"
+                        ),
+                    )]
 
         # log.warning, not info: this is the coordinator overriding a human-
         # readable rejection. It must be conspicuous in the log, and it is

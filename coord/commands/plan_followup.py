@@ -780,9 +780,14 @@ def _fix_from_review(
     kinds = {a.kind for a in actions}
     detail = "; ".join(a.detail for a in actions if a.detail)
 
-    if "fix_dispatched" in kinds:
+    if "fix_dispatched" in kinds or "finisher_dispatched" in kinds:
         max_iter = cfg.pipeline.max_review_iterations
-        click.echo(f"Fix worker dispatched ({detail})")
+        label = (
+            "Finisher leg dispatched (#3835 Trigger A)"
+            if "finisher_dispatched" in kinds
+            else "Fix worker dispatched"
+        )
+        click.echo(f"{label} ({detail})")
         for row in board.active:
             if row.assignment_id in before:
                 continue
