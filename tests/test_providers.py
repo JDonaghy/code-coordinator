@@ -2664,7 +2664,41 @@ def _run_real_opencode_work(
             f"NDJSON — likely no usable credentials on this machine. "
             f"stderr={result.stderr[:500]!r}"
         )
+    # An expired/revoked opencode account credential is "no usable credentials
+    # on this machine" just as much as the empty-output case above — it is an
+    # environmental auth problem upstream, not a permission-enforcement result.
+    # The only difference is that opencode reports it as a parseable `error`
+    # NDJSON event (HTTP 401/403 from the inference endpoint) instead of
+    # printing nothing, so it slips past the `not events` guard and would
+    # otherwise fail the positive-path assertions. Per this helper's contract
+    # ("Skips (never fails) ... missing credentials"), skip here too.
+    auth_error = _opencode_auth_error(events)
+    if auth_error is not None:
+        pytest.skip(
+            "opencode account credentials are unusable on this machine "
+            f"(auth error from the inference endpoint): {auth_error}"
+        )
     return events
+
+
+def _opencode_auth_error(events: list[dict]) -> str | None:
+    """Return a short description of the first credential/auth failure among
+    *events*, or ``None`` when there is none.
+
+    opencode surfaces an unusable account credential (expired, revoked, or
+    otherwise rejected key) as a top-level ``error`` event whose
+    ``error.data.statusCode`` is an HTTP 401/403 from the inference endpoint —
+    e.g. ``api_key_expired`` / ``authentication_error``. That is environmental,
+    not a coord-side enforcement outcome, so callers treat it as skip (not
+    fail) territory."""
+    for event in events:
+        if event.get("type") != "error":
+            continue
+        data = event.get("error", {}).get("data", {})
+        if data.get("statusCode") in (401, 403):
+            message = data.get("message") or data.get("responseBody") or ""
+            return f"HTTP {data.get('statusCode')}: {str(message)[:200]}"
+    return None
 
 
 def _bash_tool_calls(events: list[dict]) -> list[dict]:
@@ -2712,6 +2746,49 @@ def _require_attempt(events: list[dict], calls: list[dict], expectation: str) ->
         f"the system-prompt advisory preempted it, so permission enforcement "
         f"was not exercised this run; model said: {texts[:300]!r}"
     )
+
+
+def test_opencode_auth_error_detects_expired_key_event() -> None:
+    """An expired opencode account key surfaces as a parseable 401 `error`
+    NDJSON event, which must be classified as a credential problem so
+    `_run_real_opencode_work` skips (per its contract) rather than letting
+    the positive-path assertions fail on an environmental auth failure."""
+    expired = {
+        "type": "error",
+        "error": {
+            "name": "APIError",
+            "data": {
+                "message": "This API key has expired.",
+                "statusCode": 401,
+                "responseBody": '{"error":{"code":"api_key_expired"}}',
+            },
+        },
+    }
+    detail = _opencode_auth_error([expired])
+    assert detail is not None
+    assert "401" in detail
+    assert "expired" in detail.lower()
+
+
+def test_opencode_auth_error_ignores_non_auth_events() -> None:
+    """A normal run (assistant text, tool calls) and a non-auth error (e.g.
+    a 500) are not credential problems, so the helper returns ``None`` and the
+    real run proceeds to its enforcement assertions."""
+    assert _opencode_auth_error([]) is None
+    assert (
+        _opencode_auth_error(
+            [
+                {"type": "text", "part": {"text": "hello"}},
+                {"type": "tool_use", "part": {"tool": "bash"}},
+            ]
+        )
+        is None
+    )
+    server_error = {
+        "type": "error",
+        "error": {"name": "APIError", "data": {"statusCode": 500}},
+    }
+    assert _opencode_auth_error([server_error]) is None
 
 
 @_requires_real_opencode
