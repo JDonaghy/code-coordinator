@@ -20,6 +20,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 from coord.platform_paths import default_coord_dir, venv_bin, venv_exe, venv_pip, venv_python
 
 
@@ -307,3 +309,42 @@ def test_coord_dir_stays_lazy_after_a_prior_tests_monkeypatch_setattr(
     monkeypatch.setenv("COORD_DIR", str(override))
 
     assert db_mod.COORD_DIR == override
+
+
+def test_no_frozen_coord_dir_constants_leaves_attribute_for_monkeypatch_to_remove() -> None:
+    """``pytest>=9.2``'s ``monkeypatch.setattr``/``delattr`` probe the "original"
+    value with a lookup that, unlike plain ``getattr``, does not trigger a
+    module's PEP 562 ``__getattr__`` -- so for a name like ``COORD_DIR`` that
+    only exists via that fallback, they record the "didn't exist" sentinel and
+    undo by calling ``delattr`` instead of ``setattr``. ``tests/conftest.py``'s
+    ``_no_frozen_coord_dir_constants`` fixture runs its own teardown *before*
+    monkeypatch's finalizer (see that fixture's docstring for why); if it also
+    popped the name at that point, monkeypatch's later ``delattr`` would land
+    on an already-missing attribute and raise. Driving the fixture's generator
+    directly, independent of which pytest version is actually installed,
+    proves its teardown half no longer pops the name -- only its *setup* half
+    (exercised again by the next test) does.
+    """
+    import coord.state as state_mod
+    from tests.conftest import _no_frozen_coord_dir_constants
+
+    # The fixture decorator wraps the generator function in a
+    # ``FixtureFunctionDefinition``, which pytest refuses to call directly
+    # (it must be requested as a test parameter) -- unwrap to the plain
+    # generator function to drive its setup/teardown halves by hand.
+    raw_fixture = _no_frozen_coord_dir_constants.__wrapped__
+    gen = raw_fixture()
+    next(gen)  # setup half: scrubs COORD_DIR out of state_mod.__dict__
+
+    # Simulate a test body's `monkeypatch.setattr(state_mod, "COORD_DIR", ...)`
+    # without pulling in the real `monkeypatch` fixture, so this reproduces
+    # deterministically regardless of installed pytest version.
+    sentinel = Path("/sentinel/for/teardown-isolation")
+    state_mod.__dict__["COORD_DIR"] = sentinel
+    try:
+        with pytest.raises(StopIteration):
+            next(gen)  # teardown half
+
+        assert state_mod.__dict__.get("COORD_DIR") == sentinel
+    finally:
+        state_mod.__dict__.pop("COORD_DIR", None)
