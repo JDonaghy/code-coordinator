@@ -58,6 +58,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -714,6 +715,45 @@ class FlickeringPtyChild(FakePtyChild):
         return self._data
 
 
+class _LogicalClock:
+    """A stand-in for ``time.monotonic`` that advances by a fixed quantum
+    per *call*, rather than by elapsed wall time (#3854).
+
+    ``SmokeRunner._do_wait_idle`` grades "idle" as `time.monotonic() -
+    last_byte_time`, where both sides come from real OS wall-clock reads
+    taken on two different threads (the background reader thread and the
+    step-runner thread). Under `pytest -n auto` on a loaded machine, the
+    whole worker *process* — every thread in it — can be starved of CPU
+    for a stretch; when it resumes, whichever thread happens to run first
+    reads a `last_byte_time` that is stale **by the full stall duration**,
+    even though nothing was actually idle — the process simply wasn't
+    scheduled. That manufactures a false idle window the busy-loop
+    :class:`FlickeringPtyChild` can't defeat by construction alone, because
+    the false reading comes from the *consumer* (this process) being
+    paused, not from the producer going quiet.
+
+    Patched over the global ``time.monotonic`` for the duration of one
+    test, this clock only advances through actual Python calls: a
+    process-wide stall makes zero calls on every thread, so it contributes
+    zero elapsed time instead of the full stall. The dominant caller here
+    is the reader thread's own tight loop, which — whenever it *is*
+    scheduled at all — refreshes ``last_byte_time`` far more often than the
+    step-runner thread can advance its own idle/deadline math, so the
+    "since last byte" gap measured in quanta stays small deterministically,
+    independent of how long any real-world scheduling gap actually was.
+    """
+
+    def __init__(self, quantum_s: float = 0.001) -> None:
+        self._quantum = quantum_s
+        self._ticks = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            self._ticks += 1
+            return self._ticks * self._quantum
+
+
 def _spec(steps: list[SmokeStep], cols: int = 80, rows: int = 24) -> SmokeSpec:
     return SmokeSpec(name="test", cols=cols, rows=rows, steps=tuple(steps))
 
@@ -909,7 +949,7 @@ class TestSmokeRunnerWaitIdle:
         ]))
         assert results[1] == {"id": "001 wait_idle", "status": "pass", "message": ""}
 
-    def test_a_gate_that_never_goes_idle_can_fail(self) -> None:
+    def test_a_gate_that_never_goes_idle_can_fail(self, monkeypatch) -> None:
         # A stream that is never silent — never a clean 60ms idle window —
         # must time out, not hang or pass. This is the "a gate must be able
         # to fail" check for wait_idle.
@@ -922,6 +962,14 @@ class TestSmokeRunnerWaitIdle:
         # the script simply be lengthened — `time.sleep()` overshoots to
         # ~0.13s under load here, so any sleep between scripted bytes
         # exceeds this gate's own 60ms idle threshold.
+        #
+        # `wait_idle`'s own idle/deadline math is real wall-clock
+        # (`time.monotonic()` reads on two different threads) — see
+        # :class:`_LogicalClock` for why that is unsafe to grade under
+        # `pytest -n auto`'s CPU contention, and why patching it out removes
+        # the wall-clock dependence without changing any product behavior
+        # (the code path is identical; only its clock source is fake).
+        monkeypatch.setattr(time, "monotonic", _LogicalClock())
         child = FlickeringPtyChild(data=b"x")
         runner = SmokeRunner(lambda cols, rows: child)
         results = runner.run(_spec([
