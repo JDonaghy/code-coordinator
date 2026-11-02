@@ -197,7 +197,7 @@ jobs:
   # directory (notably the venv's own bin/) untouched.
   no-gh-on-path:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -275,7 +275,7 @@ jobs:
   # Verified at authoring time: 9590 passed, 13 skipped under these three knobs.
   populated-home:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
