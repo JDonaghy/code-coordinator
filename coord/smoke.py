@@ -2982,18 +2982,10 @@ def _walk_candidates_and_dispatch(
             # #255: smoke checks out the worker's PR branch but the agent still
             # consults `branch` as the integration base.
             "branch": repo.default_branch or "main",
-            # #3857: tell `AgentServer._setup_worktree` explicitly which
-            # branch to check out — the same `target_branch` mechanism the
-            # auto-loop's fix dispatch already uses. Without this, the
-            # worktree's branch name is derived from THIS smoke leg's own
-            # `issue_title` (`"[smoke] " + completed.issue_title`, set two
-            # lines above the call into `_walk_candidates_and_dispatch`),
-            # which never matches the real PR branch's slug — so
-            # `origin_has_branch` always misses and every leg (plain-runner
-            # AND claude-driven) silently fell back to a fresh branch off
-            # `origin/<default>`. `completed.branch` is the actual pushed
-            # branch under test; setting this makes `_setup_worktree` branch
-            # straight off `origin/<completed.branch>`, same as a retry.
+            # Tells `AgentServer._setup_worktree` exactly which branch to
+            # check out — the same `target_branch` mechanism the auto-loop's
+            # fix dispatch uses — rather than letting it derive a (possibly
+            # non-matching) branch name from this leg's own `issue_title`.
             "target_branch": completed.branch,
             "model": smoke_model_wire,
             # #3673: plain-runner wiring — see this function's own docstring.

@@ -9869,6 +9869,27 @@ class AgentServer:
             except _GitError:
                 pass
 
+        # `target_branch` means the caller wants THIS branch checked out,
+        # not a fresh one derived from the issue title — so when it's set
+        # and this repo has a remote, a missing `origin/<branch_name>` is a
+        # hard error, never a reason to fall back to branching fresh off
+        # `origin/<default>`. That fallback would silently run the worker
+        # against the wrong code (e.g. a smoke leg grading the base branch
+        # instead of the PR under test) with no record that it happened.
+        if (
+            assignment.spec.target_branch
+            and has_origin
+            and not assignment.spec.fresh_branch
+            and not origin_has_branch
+        ):
+            raise _GitError(
+                f"_setup_worktree: target_branch {branch_name!r} was "
+                f"requested but origin/{branch_name} could not be resolved "
+                f"in {repo_path} (the fetch above may have failed, or the "
+                f"branch does not exist on origin). Refusing to fall back "
+                f"to a fresh branch off origin/{default_branch}."
+            )
+
         # #460 (Part 1): proactively evict any other worktree that has
         # branch_name checked out before the add.  This handles serial
         # fix/retry/PR-worker dispatches on the same branch where the prior
@@ -10464,6 +10485,49 @@ class AgentServer:
             self._threads[assignment.id] = thread
         thread.start()
 
+    def _check_plain_runner_target_branch(
+        self, assignment: AgentAssignment, worktree_path: Path,
+    ) -> str | None:
+        """Confirm *worktree_path*'s ``HEAD`` matches
+        ``origin/<assignment.spec.target_branch>`` and log both SHAs
+        (#3857). Returns an error string — never raises — on any mismatch
+        or unresolvable ref; returns ``None`` (and has logged the match)
+        when they agree. A repo with no ``origin`` remote (test fixtures,
+        local-only repos) has nothing to cross-check and always returns
+        ``None``, matching :meth:`_setup_worktree`'s own ``has_origin`` gate.
+        """
+        branch = assignment.spec.target_branch
+        try:
+            _git(worktree_path, "remote", "get-url", "origin")
+        except _GitError:
+            return None
+        try:
+            head_sha = _git(worktree_path, "rev-parse", "HEAD").strip()
+        except _GitError as exc:
+            return f"plain-runner smoke: could not resolve HEAD in {worktree_path}: {exc}"
+        try:
+            origin_sha = _git(worktree_path, "rev-parse", f"origin/{branch}").strip()
+        except _GitError as exc:
+            return (
+                f"plain-runner smoke: could not resolve origin/{branch} in "
+                f"{worktree_path} — refusing to grade an unverified branch: {exc}"
+            )
+        try:
+            with open(assignment.log_path, "a", encoding="utf-8") as fh:
+                fh.write(
+                    f"# branch check (#3857): HEAD={head_sha} "
+                    f"origin/{branch}={origin_sha}\n"
+                )
+        except OSError:
+            pass
+        if head_sha != origin_sha:
+            return (
+                f"plain-runner smoke: worktree HEAD {head_sha[:12]} does not "
+                f"match origin/{branch} {origin_sha[:12]} — refusing to run "
+                f"smoke_command against the wrong code"
+            )
+        return None
+
     def _run_plain_runner_smoke_blocking(
         self, assignment: AgentAssignment, repo_path: Path,
     ) -> None:
@@ -10477,6 +10541,28 @@ class AgentServer:
         downstream verdict-parsing change needed for this path to exist.
         """
         spec = assignment.spec
+
+        # #3857: a plain-runner verdict must be an observation taken after
+        # checkout, not an assumption that `_setup_worktree` resolved the
+        # right branch. When this leg carries an explicit `target_branch`,
+        # confirm (and log) that the worktree's HEAD actually matches
+        # `origin/<target_branch>` before running `smoke_command` at all;
+        # refuse to run — fail the leg, don't grade — on any mismatch or
+        # unresolvable ref.
+        if spec.target_branch:
+            branch_error = self._check_plain_runner_target_branch(assignment, repo_path)
+            if branch_error is not None:
+                try:
+                    with open(assignment.log_path, "a", encoding="utf-8") as fh:
+                        fh.write(f"\nSMOKE: fail {branch_error}\n")
+                except OSError:
+                    _log.exception(
+                        "plain-runner smoke %s: failed to write branch-check "
+                        "failure to log %s", assignment.id, assignment.log_path,
+                    )
+                self._fail(assignment, branch_error)
+                return
+
         timeout = (
             spec.smoke_timeout_s
             if spec.smoke_timeout_s and spec.smoke_timeout_s > 0

@@ -2428,10 +2428,6 @@ def test_dispatch_smoke_sends_to_capable_different_machine(
     assert payload["type"] == "smoke"
     assert payload["system_prompt"] == SMOKE_SYSTEM_PROMPT
     assert payload["review_target"] == "issue-1-fix"
-    # #3857: the agent's `_setup_worktree` must branch off the PR's own
-    # branch, not whatever it derives from this leg's own (`"[smoke] "`-
-    # prefixed) `issue_title` — `target_branch` is the field that tells it
-    # so, verbatim (same mechanism the auto-loop's fix dispatch already uses).
     assert payload["target_branch"] == "issue-1-fix"
     assert payload["repo_path"] == "/d/api"
     # Briefing should mention the test_command fallback (make test).
