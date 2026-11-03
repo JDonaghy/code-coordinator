@@ -530,6 +530,12 @@ def test_agent_puts_the_base_back_when_a_worker_parked_it(
     exercises the restore for real.
     """
     base = repo_with_remote
+    # #3857: a `target_branch` assignment now requires that branch to exist on
+    # origin — `_setup_worktree` refuses (rather than silently grading the base
+    # branch) when it doesn't. Push it so this test still exercises the real
+    # parked-base restore instead of tripping the new guard before the worker
+    # ever runs (which left `a.exit_code is None`).
+    _run(base, "push", "origin", "main:issue-1694-escape-1")
     server = AgentServer(
         machine_name="t", repos=["api"],
         repo_paths={"api": str(base)},
