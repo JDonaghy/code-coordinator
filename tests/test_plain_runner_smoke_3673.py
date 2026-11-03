@@ -32,7 +32,7 @@ from coord.agent import (
     run_plain_runner_command,
 )
 
-from tests.test_agent import _init_repo, _server, _spec
+from tests.test_agent import _init_repo, _init_repo_with_remote, _server, _spec
 
 
 # ── run_plain_runner_command: exit-code-only verdicts, no LLM ──────────────
@@ -474,4 +474,113 @@ def test_agent_plain_runner_smoke_nonzero_exit_with_output_still_fails(
     log = Path(final.log_path).read_text()
     assert "SMOKE: fail" in log
     assert "SMOKE: harness-crash" not in log
+    server.shutdown()
+
+
+# ── #3857: the leg must grade the PR branch, not whatever origin/<default>
+#    happens to be — and must say so when it can't verify that. ────────────
+
+
+def test_agent_plain_runner_smoke_target_branch_checks_out_and_logs_the_match(
+    tmp_path: Path,
+) -> None:
+    """A `target_branch` leg checks out the real PR branch (via
+    `_setup_worktree`'s `target_branch` handling) and, before running
+    `smoke_command`, logs the HEAD/`origin/<branch>` SHAs it verified —
+    composing the #3857 dispatch fix (`target_branch` on the wire) with the
+    agent-side checkout for one `type="smoke"` + `plain_runner=True` leg
+    end to end."""
+    repo = _init_repo_with_remote(tmp_path / "repo")
+    subprocess.run(["git", "checkout", "-b", "issue-7-pr"], cwd=str(repo), check=True, capture_output=True)
+    (repo / "pr.txt").write_text("pr content\n")
+    subprocess.run(["git", "add", "pr.txt"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "pr work"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "push", "-u", "origin", "issue-7-pr"], cwd=str(repo), check=True, capture_output=True,
+    )
+    subprocess.run(["git", "checkout", "main"], cwd=str(repo), check=True, capture_output=True)
+
+    server = _server(
+        tmp_path, repo_path=repo,
+        argv=[sys.executable, "-c", "raise SystemExit('claude must never run for this leg')"],
+    )
+    spec = _spec(
+        repo, type="smoke", plain_runner=True, target_branch="issue-7-pr",
+        smoke_command=(
+            f"{sys.executable} -c \"import pathlib; "
+            "assert pathlib.Path('pr.txt').exists(); print('saw-pr-content')\""
+        ),
+        smoke_timeout_s=30,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == DONE
+    assert final.exit_code == 0
+    log = Path(final.log_path).read_text()
+    assert "saw-pr-content" in log
+    assert "SMOKE: pass" in log
+    assert "# branch check (#3857): HEAD=" in log
+    head_line = next(line for line in log.splitlines() if line.startswith("# branch check"))
+    head_sha = head_line.split("HEAD=")[1].split()[0]
+    origin_sha = head_line.split("origin/issue-7-pr=")[1].strip()
+    assert head_sha == origin_sha
+    server.shutdown()
+
+
+def test_agent_plain_runner_smoke_unresolvable_target_branch_fails_not_passes(
+    tmp_path: Path,
+) -> None:
+    """When `target_branch` names a branch that is on neither `origin` nor
+    locally, `_setup_worktree` must refuse to fall back to a fresh branch
+    off `origin/<default>` — the leg fails worktree setup instead of
+    silently grading the base branch as a pass (#3857)."""
+    repo = _init_repo_with_remote(tmp_path / "repo")
+    server = _server(
+        tmp_path, repo_path=repo,
+        argv=[sys.executable, "-c", "raise SystemExit('claude must never run for this leg')"],
+    )
+    spec = _spec(
+        repo, type="smoke", plain_runner=True, target_branch="issue-404-never-pushed",
+        smoke_command=f"{sys.executable} -c \"import sys; sys.exit(0)\"",
+        smoke_timeout_s=30,
+    )
+    a = server.assign(spec)
+
+    assert a.status == FAILED
+    assert "issue-404-never-pushed" in a.error
+    assert "SMOKE: pass" not in (a.error or "")
+    server.shutdown()
+
+
+def test_check_plain_runner_target_branch_detects_head_mismatch(tmp_path: Path) -> None:
+    """Direct unit coverage of `_check_plain_runner_target_branch`: when the
+    worktree's HEAD and `origin/<target_branch>` disagree, it reports the
+    mismatch (and never claims a match) instead of letting the caller run
+    `smoke_command` against unverified code."""
+    repo = _init_repo_with_remote(tmp_path / "repo")
+    subprocess.run(["git", "checkout", "-b", "feat"], cwd=str(repo), check=True, capture_output=True)
+    (repo / "feat.txt").write_text("feature work\n")
+    subprocess.run(["git", "add", "feat.txt"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "feature work"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "push", "-u", "origin", "feat"], cwd=str(repo), check=True, capture_output=True,
+    )
+    # Leave the worktree checked out at `main`, deliberately NOT on `feat` —
+    # the scenario `_setup_worktree`'s own target_branch handling prevents,
+    # exercised here directly against the checker.
+    subprocess.run(["git", "checkout", "main"], cwd=str(repo), check=True, capture_output=True)
+
+    server = _server(tmp_path, repo_path=repo)
+    from coord.agent import AgentAssignment
+
+    log_path = tmp_path / "leg.log"
+    log_path.write_text("")
+    spec = _spec(repo, target_branch="feat")
+    assignment = AgentAssignment(id="a1", spec=spec, log_path=str(log_path))
+
+    error = server._check_plain_runner_target_branch(assignment, repo)
+
+    assert error is not None
+    assert "does not match" in error
     server.shutdown()

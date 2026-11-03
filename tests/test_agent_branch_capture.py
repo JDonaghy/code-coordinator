@@ -391,3 +391,29 @@ def test_no_target_branch_uses_slugified_title(
     assert final.status == ADVISORY
     assert final.branch == "issue-99-my-cool-change"
     server.shutdown()
+
+
+def test_target_branch_unresolvable_on_origin_fails_setup(
+    tmp_path: Path, repo_with_origin: tuple[Path, Path]
+) -> None:
+    """When `target_branch` names a branch that exists on neither `origin`
+    nor locally, `_setup_worktree` must refuse to fall back to a fresh
+    branch off `origin/<default>` — a caller that asked for a specific
+    branch and can't get it needs a FAILED assignment, not a worker
+    quietly running against the wrong code (#3857)."""
+    clone, _origin = repo_with_origin
+    server = AgentServer(
+        machine_name="t", repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: NOOP_WORKER_ARGV,
+    )
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(clone),
+        issue_number=7, issue_title="fix thing", briefing="b",
+        target_branch="issue-7-never-pushed",
+    )
+    a = server.assign(spec)
+    assert a.status == FAILED
+    assert "issue-7-never-pushed" in a.error
+    server.shutdown()
