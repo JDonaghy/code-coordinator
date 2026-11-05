@@ -1739,6 +1739,94 @@ class TestHasPriorConflictFix:
         assert has_prior_conflict_fix(board, "abc123") is False
 
 
+class TestHasPriorConflictFixBaseShaAware:
+    """#3859: `current_base_sha` lets a stale-rebase attempt's own failure
+    be recognized as stale evidence once the base has moved again, instead
+    of consuming the retry cap forever (quadraui#1961)."""
+
+    def _failed_stale_rebase(self, *, dispatched_base_sha: str, status: str = "failed"):
+        return Assignment(
+            machine_name="m", repo_name="api", issue_number=1,
+            issue_title=f"{STALE_REBASE_FIX_TITLE_PREFIX} x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status=status,
+            briefing=(
+                "# Stale-CI rebase\nReason: CI stale\n"
+                f"Target base SHA: {dispatched_base_sha}\n"
+            ),
+        )
+
+    def test_failed_attempt_against_a_now_stale_base_does_not_block(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(self._failed_stale_rebase(dispatched_base_sha="old-sha"))
+        assert has_prior_conflict_fix(
+            board, "abc123", current_base_sha="new-sha",
+        ) is False
+
+    def test_failed_attempt_against_the_still_current_base_blocks(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(self._failed_stale_rebase(dispatched_base_sha="same-sha"))
+        assert has_prior_conflict_fix(
+            board, "abc123", current_base_sha="same-sha",
+        ) is True
+
+    def test_omitting_current_base_sha_keeps_the_pre_3859_behaviour(self) -> None:
+        """A caller that doesn't pass `current_base_sha` is byte-for-byte
+        unaffected — the failure still blocks forever, exactly as before."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(self._failed_stale_rebase(dispatched_base_sha="old-sha"))
+        assert has_prior_conflict_fix(board, "abc123") is True
+
+    def test_a_row_with_no_recoverable_base_sha_falls_back_unchanged(self) -> None:
+        """A stale-rebase row dispatched before #3859 (no "Target base
+        SHA:" line) has nothing for `current_base_sha` to compare against —
+        it falls through to the base-SHA-blind rule, still blocking."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1,
+            issue_title=f"{STALE_REBASE_FIX_TITLE_PREFIX} x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="failed", briefing="# Stale-CI rebase\nReason: CI stale\n",
+        ))
+        assert has_prior_conflict_fix(
+            board, "abc123", current_base_sha="new-sha",
+        ) is True
+
+    def test_ordinary_conflict_fix_is_unaffected_by_current_base_sha(self) -> None:
+        """The base-SHA gate is scoped to stale-rebase-titled rows only — an
+        ordinary conflict-fix (a real content conflict) still blocks
+        regardless of base movement."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1,
+            issue_title="[conflict-fix] x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="failed",
+            briefing="# Conflict fix\nReason: Merge conflict in foo.py\n",
+        ))
+        assert has_prior_conflict_fix(
+            board, "abc123", current_base_sha="new-sha",
+        ) is True
+
+    def test_active_in_flight_still_blocks_regardless_of_base_sha(self) -> None:
+        """A running/pending attempt always blocks duplicate dispatch — the
+        base-SHA gate only ever applies to a CONCLUDED attempt's
+        failed/advisory/done status."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.active.append(self._failed_stale_rebase(
+            dispatched_base_sha="old-sha", status="running",
+        ))
+        assert has_prior_conflict_fix(
+            board, "abc123", current_base_sha="new-sha",
+        ) is True
+
+
 # ── Reconcile hook ──────────────────────────────────────────────────────────
 
 

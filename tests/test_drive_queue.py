@@ -6641,6 +6641,63 @@ def test_fix_round_ceiling_blocked_for_issue_reads_live_row_through_the_predicat
         assert fix_round_ceiling_blocked_for_issue(REPO, 3756) is False
 
 
+def test_is_checks_stale_race_giveup_reason_requires_both_markers():
+    """#3859: the quadraui#1961 shape — a drive that burned its whole
+    merge-attempt budget, whose LAST diagnostic named CI staleness — is
+    distinct from any other exhausted-attempts give-up."""
+    from coord.drive_queue import is_checks_stale_race_giveup_reason
+
+    assert is_checks_stale_race_giveup_reason(
+        "merge attempted 3 times without landing.\n"
+        "   Last board state: status='CONFLICT' reason='none'\n"
+        "   Last `coord merge --only` diagnostic:\n"
+        "     CI stale: checks predate the current base — rebase onto main"
+    )
+    # Exhausted attempts, but the last diagnostic names a real conflict,
+    # not staleness.
+    assert not is_checks_stale_race_giveup_reason(
+        "merge attempted 3 times without landing.\n"
+        "   Last board state: status='CONFLICT' reason='none'\n"
+        "   Last `coord merge --only` diagnostic:\n"
+        "     merge conflict in foo.py"
+    )
+    # CI-stale text with no "merge attempted" give-up wording at all.
+    assert not is_checks_stale_race_giveup_reason(
+        "CI stale: checks predate the current base — rebase onto main"
+    )
+    assert not is_checks_stale_race_giveup_reason("")
+    assert not is_checks_stale_race_giveup_reason(None)
+
+
+def test_checks_stale_race_giveup_for_issue_reads_live_row_through_the_predicate():
+    """Mirrors `test_fix_round_ceiling_blocked_for_issue_reads_live_row_
+    through_the_predicate` exactly — the live `blocked` state is required,
+    not just a reason string that happens to mention both markers."""
+    from unittest.mock import patch
+
+    from coord.drive_queue import (
+        STATE_BLOCKED,
+        STATE_WAITING,
+        checks_stale_race_giveup_for_issue,
+    )
+
+    stale_race_reason = (
+        "merge attempted 3 times without landing.\n"
+        "   Last `coord merge --only` diagnostic:\n"
+        "     CI stale: checks predate the current base — rebase onto main"
+    )
+    blocked_row = {
+        "repo_name": REPO, "issue_number": 1961,
+        "state": STATE_BLOCKED, "last_reason": stale_race_reason,
+    }
+    with patch("coord.state.get_drive_queue_entry", return_value=blocked_row):
+        assert checks_stale_race_giveup_for_issue(REPO, 1961) is True
+
+    waiting_row = dict(blocked_row, state=STATE_WAITING)
+    with patch("coord.state.get_drive_queue_entry", return_value=waiting_row):
+        assert checks_stale_race_giveup_for_issue(REPO, 1961) is False
+
+
 def test_a_genuinely_dead_drive_without_ci_pending_still_retries_normally():
     """No regression: without `merge_ci_pending`, a dead drive takes the
     EXACT pre-#1891 path — this is byte-for-byte

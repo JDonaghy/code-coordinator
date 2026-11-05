@@ -631,6 +631,7 @@ def build_stale_rebase_briefing(
         "solely because its CI checks predate the current base — no content "
         "conflict is known.",
         f"Reason: {entry.error or 'CI stale'}",
+        f"Target base SHA: {entry.target_branch_head_sha or 'unknown'}",
         "",
         f"Issue: #{entry.issue_number} — {entry.issue_title}",
         "",
@@ -1314,12 +1315,37 @@ def _dispatched_error(assignment: Assignment) -> str | None:
     return None
 
 
+def _dispatched_base_sha(assignment: Assignment) -> str | None:
+    """The target-branch SHA a stale-rebase conflict-fix's briefing was
+    dispatched against (#3859).
+
+    :func:`build_stale_rebase_briefing` embeds the entry's live
+    ``target_branch_head_sha`` verbatim as a ``"Target base SHA: …"`` line —
+    the only durable record of which base THAT attempt actually targeted,
+    since the merge queue never persists ``target_branch_head_sha`` itself
+    (it is recomputed from GitHub on every ``process()`` tick). Returns
+    ``None`` when the briefing carries no such line (an ordinary
+    conflict-fix, a hand-built test ``Assignment``, or the literal
+    ``"unknown"`` placeholder written when the base SHA could not be read at
+    dispatch time) — callers must then fall back to the pre-#3859,
+    base-SHA-blind behaviour rather than treat an absent anchor as a match
+    or a mismatch.
+    """
+    briefing = assignment.briefing or ""
+    for line in briefing.splitlines():
+        if line.startswith("Target base SHA: "):
+            value = line[len("Target base SHA: "):].strip()
+            return value if value and value != "unknown" else None
+    return None
+
+
 def has_prior_conflict_fix(
     board: Board,
     merge_entry_id: str | None,
     *,
     current_error: str | None = None,
     ignore_stale_rebase_attempts: bool = False,
+    current_base_sha: str | None = None,
 ) -> bool:
     """True when a second conflict-fix dispatch for *merge_entry_id* is blocked.
 
@@ -1359,6 +1385,28 @@ def has_prior_conflict_fix(
     (:func:`coord.reconcile._try_ordinary_escalation_after_stale_mismatch`)
     to skip every stale-rebase-titled row entirely — active or not — so
     ONLY prior *ordinary* conflict-fix attempts count against the cap.
+
+    *current_base_sha* (#3859): without it, a stale-rebase attempt's
+    ``failed``/``advisory`` status consumes the cap FOREVER, regardless of
+    whether the target branch has since moved again — treating "the base
+    moved a second time" as indistinguishable from "the fix genuinely
+    failed against the base that is still current". quadraui#1961 lived
+    this: a stale-rebase attempt failed (or an ordinary conflict-fix did)
+    against one base, a sibling PR merged and moved the base again, and the
+    NEXT rebase attempt — against the new base — would have succeeded, but
+    never got the chance because this function kept reporting the cap as
+    spent. When *current_base_sha* is given, a stale-rebase row's own
+    dispatched base (:func:`_dispatched_base_sha`) is compared against it:
+    a MISMATCH means the base has moved since that attempt ran, so it is
+    stale evidence about a block that no longer exists — it is skipped
+    entirely (continues to the next assignment) rather than consuming the
+    cap, for both the ``failed``/``advisory`` branch and the ``done`` +
+    identical-error branch. A row with no recoverable base SHA
+    (:func:`_dispatched_base_sha` returns ``None`` — predates #3859, or the
+    base genuinely couldn't be read at dispatch time) is treated exactly as
+    before: *current_base_sha* has nothing to compare against for it, so it
+    falls through to the base-SHA-blind rules unchanged. Callers that don't
+    pass *current_base_sha* get the pre-#3859 behaviour byte-for-byte.
     """
     if merge_entry_id is None:
         return False
@@ -1367,10 +1415,22 @@ def has_prior_conflict_fix(
             continue
         if a.review_of_assignment_id != merge_entry_id:
             continue
-        if ignore_stale_rebase_attempts and (a.issue_title or "").startswith(
+        is_stale_rebase_row = (a.issue_title or "").startswith(
             STALE_REBASE_FIX_TITLE_PREFIX,
-        ):
+        )
+        if ignore_stale_rebase_attempts and is_stale_rebase_row:
             continue
+        if (
+            current_base_sha is not None
+            and is_stale_rebase_row
+            and a.status in ("failed", "advisory", "done", "cancelled")
+        ):
+            dispatched_base = _dispatched_base_sha(a)
+            if dispatched_base is not None and dispatched_base != current_base_sha:
+                # The base moved again since this attempt ran — new
+                # evidence, not the same block recurring. Does not consume
+                # the cap, same as an unrelated "done".
+                continue
         # Active attempt in flight — prevent duplicate dispatch.
         if a.status in ("running", "pending"):
             return True

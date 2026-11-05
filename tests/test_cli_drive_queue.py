@@ -4641,6 +4641,183 @@ def test_auto_revalidate_dismisses_a_stale_escalation_once_the_block_clears(
     assert state._get_drive_escalation_local(REPO, 9999) is None
 
 
+# ── #3859: checks_stale sibling-merge race — reservation instead of
+# escalating straight to `merge_checks_stale_human_required` ───────────────
+#
+# quadraui#1961's timeline: a `[stale-rebase-fix]` conflict-fix FAILED once
+# against a base that has since moved again (a sibling PR merged). Before
+# #3859, `has_prior_conflict_fix` read that failure as "the retry cap is
+# spent" forever, regardless of whether the base had moved since — so this
+# tick escalated to a human even though a fresh rebase against the NEW base
+# would have succeeded (and, in the real incident, later did — just too
+# late, after the drive itself had already burned its own attempt budget).
+
+_STALE_RACE_CONFIG_YAML = f"""\
+repos:
+  - name: {REPO}
+    github: john/claude-coordinator
+    default_branch: main
+    board_doctor:
+      stale_race: true
+  - name: {OTHER_REPO}
+    github: john/quadraui
+    default_branch: main
+machines:
+  - name: dellserver
+    host: dellserver
+    repos: [{REPO}, {OTHER_REPO}]
+reviews:
+  enabled: false
+pipeline:
+  default_gates: []
+board_doctor:
+  stale_race: true
+"""
+
+
+@pytest.fixture
+def cli_stale_race(tmp_path: Path):
+    """Same shape as `cli_no_gates`, with #3859's checks-stale-race
+    disposition opted into fleet-wide AND for `REPO`."""
+    path = tmp_path / "coordinator-stale-race.yml"
+    path.write_text(_STALE_RACE_CONFIG_YAML)
+
+    def run(*args: str):
+        return CliRunner().invoke(main, ["drive-queue", *args, "--config", str(path)])
+
+    return run
+
+
+def _seed_failed_stale_rebase_attempt(
+    coord_db, issue: int, *, dispatched_base_sha: str, dispatched_at: float = 200.0,
+) -> None:
+    """A FAILED `[stale-rebase-fix]` conflict-fix for *issue*'s merge-queue
+    row, with its own dispatch-time target base stamped into its briefing —
+    the one durable record `_dispatched_base_sha` (`coord/conflict_fix.py`)
+    reads to tell "the base is still the one this attempt targeted" apart
+    from "a sibling merge has since moved it again"."""
+    coord_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, machine_name, "
+        " type, status, review_of_assignment_id, dispatched_at, briefing) "
+        "VALUES (?, ?, ?, ?, 'dellserver', 'conflict-fix', 'failed', ?, ?, ?)",
+        (
+            f"cf-{issue}", REPO, issue, f"[stale-rebase-fix] issue {issue}",
+            f"w{issue}", dispatched_at,
+            f"# Stale-CI rebase\nReason: CI stale\n"
+            f"Target base SHA: {dispatched_base_sha}\n",
+        ),
+    )
+    coord_db.commit()
+
+
+def test_stale_race_dispatches_a_fresh_rebase_instead_of_escalating_when_base_moved(
+    cli_stale_race, coord_db, stale_ci_backend, monkeypatch,
+):
+    """#3859 acceptance: an approved/Test-passed row whose prior
+    `[stale-rebase-fix]` attempt failed against an OLD base, with the base
+    having moved again since (a sibling merge landed) must reserve the
+    repo's merge gate and dispatch a FRESH stale-rebase — never
+    `merge_checks_stale_human_required` — because the failure is stale
+    evidence about a block that no longer exists."""
+    import coord.github_ops as github_ops
+
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    _seed_failed_stale_rebase_attempt(coord_db, 2534, dispatched_base_sha="old-sha-1")
+    set_board_meta(coord_db, "board_initialized", "1")
+    # The base has moved AGAIN since the failed attempt (a sibling merge) —
+    # the live read now returns a DIFFERENT SHA than the failed attempt's.
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch, **_kw: "new-sha-2")
+
+    fix_assignment = Assignment(
+        machine_name="dellserver", repo_name=REPO, issue_number=2534,
+        issue_title="[stale-rebase-fix] issue 2534", assignment_id="cf-fresh",
+        status="pending", type="conflict-fix",
+    )
+    stub = MagicMock(return_value=fix_assignment)
+    monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+    result = cli_stale_race("tick")
+    assert result.exit_code == 0, result.output
+    assert "dispatched a stale-rebase conflict-fix" in result.output
+    assert "needs a human" not in result.output
+
+    from coord.audit import query_audit_log
+
+    assert query_audit_log(event_type="merge_checks_stale_human_required")["entries"] == []
+    assert state._get_drive_escalation_local(REPO, 2534) is None
+
+    reservation = state.get_merge_reservation(REPO)
+    assert reservation is not None
+    assert reservation["holder"] == f"{REPO}#2534"
+
+
+def test_stale_race_still_escalates_when_the_base_has_not_moved(
+    cli_stale_race, coord_db, stale_ci_backend, monkeypatch,
+):
+    """The human_required escalation still fires for a GENUINE block — the
+    base is the SAME one the failed attempt already targeted, so a fresh
+    rebase cannot do anything a CI re-run couldn't. The text must not claim
+    "(same base)" it cannot independently confirm true or false beyond this
+    check — #3859 just drops that clause instead of asserting it."""
+    import coord.github_ops as github_ops
+
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    _seed_failed_stale_rebase_attempt(coord_db, 2534, dispatched_base_sha="same-sha")
+    set_board_meta(coord_db, "board_initialized", "1")
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch, **_kw: "same-sha")
+
+    result = cli_stale_race("tick")
+    assert result.exit_code == 0, result.output
+    assert "needs a human" in result.output
+    assert "same base" not in result.output
+
+    from coord.audit import query_audit_log
+
+    entries = query_audit_log(event_type="merge_checks_stale_human_required")["entries"]
+    assert len(entries) == 1
+    assert entries[0]["issue"] == 2534
+    assert state.get_merge_reservation(REPO) is None
+
+
+def test_stale_race_second_sibling_row_defers_to_the_reservation(
+    cli_stale_race, coord_db, stale_ci_backend, monkeypatch,
+):
+    """#3859 acceptance: with a reservation held, a second row in the SAME
+    repo that is also `checks_stale`-eligible is held at the merge gate —
+    deferred, not dispatched and not escalated — with a reason naming the
+    reserving row, instead of racing it for a sibling-merge-invalidated
+    CI re-run."""
+    import coord.github_ops as github_ops
+
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    _seed_pending_merge_row(coord_db, 2535, pr_number=43)
+    set_board_meta(coord_db, "board_initialized", "1")
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch, **_kw: "sha-x")
+
+    fix_assignment = Assignment(
+        machine_name="dellserver", repo_name=REPO, issue_number=2534,
+        issue_title="[stale-rebase-fix] issue 2534", assignment_id="cf-first",
+        status="pending", type="conflict-fix",
+    )
+    stub = MagicMock(return_value=fix_assignment)
+    monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+    result = cli_stale_race("tick")
+    assert result.exit_code == 0, result.output
+    assert "dispatched a stale-rebase conflict-fix" in result.output
+    assert f"deferring to {REPO}'s merge-gate reservation held by {REPO}#2534" in result.output
+
+    # Only ONE dispatch happened this tick — the second row waited instead
+    # of also racing a stale-rebase worker.
+    stub.assert_called_once()
+
+    reservation = state.get_merge_reservation(REPO)
+    assert reservation is not None
+    assert reservation["holder"] == f"{REPO}#2534"
+    assert state._get_drive_escalation_local(REPO, 2535) is None
+
+
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     cli, seed, launches, coord_db
 ):

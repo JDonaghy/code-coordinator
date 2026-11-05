@@ -1315,6 +1315,51 @@ class TestFinisherTierEnabled:
         assert board_doctor_policy._finisher_tier_enabled("no-such-repo", config) is False
 
 
+class TestStaleRaceTierEnabled:
+    """#3859: `_stale_race_tier_enabled` mirrors `_investigate_tier_enabled`/
+    `_finisher_tier_enabled`'s three independent gates, reading the
+    `stale_race`-named fields.
+    """
+
+    @staticmethod
+    def _config(*, fleet_stale_race: bool, repo_stale_race: bool) -> Config:
+        from coord.config import BoardDoctorConfig
+        from coord.models import BoardDoctorRepoConfig
+
+        return Config(
+            repos=[
+                Repo(
+                    name="acme/widgets",
+                    github="acme/widgets",
+                    board_doctor=BoardDoctorRepoConfig(stale_race=repo_stale_race),
+                )
+            ],
+            machines=[],
+            board_doctor=BoardDoctorConfig(stale_race=fleet_stale_race),
+        )
+
+    def test_disabled_when_repo_has_not_opted_in(self) -> None:
+        config = self._config(fleet_stale_race=True, repo_stale_race=False)
+        assert board_doctor_policy._stale_race_tier_enabled("acme/widgets", config) is False
+
+    def test_disabled_when_fleet_switch_is_off(self) -> None:
+        config = self._config(fleet_stale_race=False, repo_stale_race=True)
+        assert board_doctor_policy._stale_race_tier_enabled("acme/widgets", config) is False
+
+    def test_enabled_when_both_gates_are_on(self) -> None:
+        config = self._config(fleet_stale_race=True, repo_stale_race=True)
+        assert board_doctor_policy._stale_race_tier_enabled("acme/widgets", config) is True
+
+    def test_env_var_kill_switch_overrides_everything(self, monkeypatch) -> None:
+        monkeypatch.setenv(board_doctor_policy.NO_STALE_RACE_ENV_VAR, "1")
+        config = self._config(fleet_stale_race=True, repo_stale_race=True)
+        assert board_doctor_policy._stale_race_tier_enabled("acme/widgets", config) is False
+
+    def test_unknown_repo_is_disabled(self) -> None:
+        config = self._config(fleet_stale_race=True, repo_stale_race=True)
+        assert board_doctor_policy._stale_race_tier_enabled("no-such-repo", config) is False
+
+
 class TestDispatchNitOnlyFinisher:
     """#3835 Trigger A: `dispatch_nit_only_finisher` is a plain, directly
     called function — not part of the `StuckRow` sweep's

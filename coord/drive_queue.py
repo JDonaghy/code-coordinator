@@ -439,6 +439,51 @@ def fix_round_ceiling_blocked_for_issue(repo_name: str, issue_number: int) -> bo
     return is_fix_round_ceiling_blocked(entry.state, entry.last_reason)
 
 
+def is_checks_stale_race_giveup_reason(reason: str | None) -> bool:
+    """#3859: does *reason* name a drive-session give-up whose LAST diagnostic
+    was CI staleness — the exhausted-merge-attempts shape (:data:`_die`'s
+    ``"merge attempted N times without landing"`` wording, embedded verbatim
+    in this module's own ``is_fix_round_ceiling_reason``/#2972 sibling), but
+    with the quoted diagnostic itself naming
+    :data:`coord.merge_queue.CI_STALE_PREFIX` rather than a real conflict or
+    a red check.
+
+    This is the quadraui#1961 shape: the drive burned its entire
+    ``max_merge_attempts`` budget losing a race against sibling merges
+    landing on the SAME repo faster than this PR's re-run CI could finish —
+    never a problem WITH the branch. Marker-based, same convention as
+    :func:`is_fix_round_ceiling_reason`: both substrings are stamped
+    verbatim by the code paths that produce them (``_die`` and
+    :func:`coord.merge_queue.ci_stale_reason` respectively), so a substring
+    check is exact, not a heuristic guess.
+    """
+    if not reason:
+        return False
+    from coord.merge_queue import CI_STALE_PREFIX  # noqa: PLC0415
+
+    return "merge attempted" in reason and CI_STALE_PREFIX in reason
+
+
+def checks_stale_race_giveup_for_issue(repo_name: str, issue_number: int) -> bool:
+    """#3859: has THIS ``(repo, issue)``'s drive-queue row already given up
+    with the quadraui#1961 checks-stale-race shape (:func:`
+    is_checks_stale_race_giveup_reason`)?
+
+    Mirrors :func:`fix_round_ceiling_blocked_for_issue` exactly — same
+    live-state read, same "no row at all reads as nothing to act on" rule —
+    so a caller asking this question never re-derives the row lookup.
+    """
+    from coord.state import get_drive_queue_entry  # noqa: PLC0415
+
+    row = get_drive_queue_entry(repo_name, issue_number)
+    if row is None:
+        return False
+    entry = QueueEntry.from_row(row)
+    return entry.state == STATE_BLOCKED and is_checks_stale_race_giveup_reason(
+        entry.last_reason
+    )
+
+
 def is_permanent_block_reason(text: str | None) -> bool:
     """Whether *text* names a cause of `blocked` that #2230's sweep must
     never re-check — **relaunching the drive session cannot change the

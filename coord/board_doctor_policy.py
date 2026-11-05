@@ -550,6 +550,54 @@ def _finisher_tier_enabled(repo_name: str, config: "Config") -> bool:
     return bool(repo is not None and repo.board_doctor.finish)
 
 
+NO_STALE_RACE_ENV_VAR = "COORD_BOARD_DOCTOR_NO_STALE_RACE"
+"""Process-wide kill switch read by :func:`_stale_race_tier_enabled`.
+
+Mirrors :data:`NO_INVESTIGATE_ENV_VAR`/:data:`NO_FINISHER_ENV_VAR` for #3859
+— set (to any truthy string) to disarm the checks-stale-race disposition
+fleet-wide without touching ``coordinator.yml``.
+"""
+
+#: #3859: roughly 2x quadraui's own measured PR CI wall-clock (~25-40
+#: minutes, per the issue) — the bound on how long a merge-gate reservation
+#: may hold a repo's siblings before releasing on its own. A single
+#: fleet-wide constant rather than a new per-repo config knob: there is no
+#: per-repo CI-wall-clock measurement anywhere in this fleet yet to size a
+#: knob against, and a reservation that outlives its holder's actual CI run
+#: costs the rest of the repo's rows at most one extra wait, never a stuck
+#: row (:func:`coord.state.get_merge_reservation` auto-expires it).
+STALE_RACE_RESERVATION_TTL_SECONDS = 2 * 60 * 60
+
+
+def _stale_race_tier_enabled(repo_name: str, config: "Config") -> bool:
+    """Decide whether #3859's checks-stale-race disposition may act for
+    *repo_name* — reserve the merge gate and dispatch a stale-rebase,
+    instead of today's straight-to-``merge_checks_stale_human_required``
+    escalation.
+
+    Mirrors :func:`_investigate_tier_enabled`/:func:`_finisher_tier_enabled`'s
+    three independent gates exactly, reading the ``stale_race``-named fields:
+
+    1. :data:`NO_STALE_RACE_ENV_VAR` — a process-wide kill switch.
+    2. ``board_doctor.stale_race`` — the fleet-wide config switch.
+    3. ``repos[].board_doctor.stale_race`` — the per-repo opt-in. A repo
+       that has not opted in keeps today's behavior unchanged regardless of
+       the fleet-wide switch.
+
+    Called directly by `coord.commands.drive_queue._run_auto_revalidate_
+    checks_stale` (not only from the periodic board-doctor sweep) — the
+    checks-stale-race shape this disposition targets is produced by that
+    same tick's own escalation path, so the ordering/reservation logic lives
+    there rather than behind a second, independently-derived gate check.
+    """
+    if os.environ.get(NO_STALE_RACE_ENV_VAR):
+        return False
+    if not config.board_doctor.stale_race:
+        return False
+    repo = config.repo(repo_name)
+    return bool(repo is not None and repo.board_doctor.stale_race)
+
+
 def _at_repo_capacity(
     repo_name: str,
     config: "Config",
