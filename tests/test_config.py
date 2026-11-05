@@ -16,6 +16,8 @@ from coord.config import (
     ProviderDef,
     ProvidersConfig,
     StoreConfig,
+    _parse_board_doctor,
+    _parse_board_doctor_repo_config,
     _parse_concurrency,
     _parse_merge,
     _parse_store,
@@ -3397,3 +3399,39 @@ def test_preflight_guard_absent_block_disables_every_repo(tmp_path: Path) -> Non
     )
     cfg = load(p)
     assert cfg.preflight_guard_enabled("api") is False
+
+
+# ── #3859: board_doctor.stale_race / repos[].board_doctor.stale_race ───────
+
+def test_board_doctor_stale_race_defaults_to_true() -> None:
+    """Absent `board_doctor:` -> the fleet-wide switch stays at its default
+    (`True`); each repo's own opt-in is still the gate that actually
+    matters (see `_stale_race_tier_enabled`)."""
+    cfg = _parse_board_doctor(None)
+    assert cfg.stale_race is True
+
+
+def test_board_doctor_stale_race_parses_bool() -> None:
+    assert _parse_board_doctor({"stale_race": True}).stale_race is True
+    assert _parse_board_doctor({"stale_race": False}).stale_race is False
+
+
+def test_board_doctor_stale_race_rejects_non_bool() -> None:
+    with pytest.raises(ConfigError, match="board_doctor.stale_race must be a boolean"):
+        _parse_board_doctor({"stale_race": "true"})
+
+
+def test_repo_board_doctor_stale_race_defaults_to_false() -> None:
+    cfg = _parse_board_doctor_repo_config(None, 0)
+    assert cfg.stale_race is False
+
+
+def test_repo_board_doctor_stale_race_parses_bool() -> None:
+    assert _parse_board_doctor_repo_config({"stale_race": True}, 0).stale_race is True
+
+
+def test_repo_board_doctor_stale_race_rejects_non_bool() -> None:
+    with pytest.raises(
+        ConfigError, match=r"repos\[0\].board_doctor.stale_race must be a boolean"
+    ):
+        _parse_board_doctor_repo_config({"stale_race": "true"}, 0)

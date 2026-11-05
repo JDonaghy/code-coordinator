@@ -6897,3 +6897,37 @@ class TestMergeReservation:
         live = list_merge_reservations()
         assert "acme/api" not in live
         assert live["acme/web"]["holder"] == "acme/web#1"
+
+    def test_the_map_is_pruned_by_oldest_expiry_not_insertion_order(
+        self, coord_db, monkeypatch,
+    ) -> None:
+        """#3859 review: a renewed reservation (re-assigning an existing
+        key) must not be evicted ahead of entries that were never touched
+        again, even though plain dict insertion order would put it first."""
+        import coord.state as state_mod
+        from coord.state import (
+            MERGE_RESERVATION_LIMIT,
+            get_merge_reservation,
+            reserve_merge_slot,
+        )
+
+        now = [3_000_000.0]
+        monkeypatch.setattr(state_mod.time, "time", lambda: now[0])
+
+        # Fill to the limit, "acme/repo-0" first.
+        for i in range(MERGE_RESERVATION_LIMIT):
+            reserve_merge_slot(f"acme/repo-{i}", f"acme/repo-{i}#1", ttl_seconds=60)
+
+        # Renew the FIRST entry — insertion-order eviction would now treat
+        # every other entry as "more recent" than it, even though it is the
+        # most-recently-written one and should be the LAST evicted.
+        reserve_merge_slot("acme/repo-0", "acme/repo-0#1", ttl_seconds=600)
+
+        # One brand-new repo pushes the map over the limit.
+        reserve_merge_slot("acme/repo-new", "acme/repo-new#1", ttl_seconds=60)
+
+        # The renewed entry survives (far-future expiry); the never-renewed
+        # oldest-by-expiry entry is the one evicted instead.
+        assert get_merge_reservation("acme/repo-0") is not None
+        assert get_merge_reservation("acme/repo-1") is None
+        assert get_merge_reservation("acme/repo-new") is not None

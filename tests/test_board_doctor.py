@@ -31,8 +31,9 @@ from coord.board_doctor import (
     smoke_no_verdict_rows,
     sweep,
 )
+from coord.config import BoardDoctorConfig, Config
 from coord.drive_queue import QueueEntry
-from coord.models import Assignment, Board
+from coord.models import Assignment, Board, BoardDoctorRepoConfig, Repo
 from coord.queue_diagnose import LiveState
 from coord.smoke import (
     ABANDONED_BACKGROUND_SMOKE_MARKER,
@@ -405,6 +406,21 @@ def _seed_stale_race_blocked_entry(repo: str, issue: int) -> None:
     )
 
 
+def _stale_race_config(repo: str, *, opted_in: bool = True) -> Config:
+    """A `Config` whose fleet + per-repo `stale_race` opt-in are both set to
+    *opted_in* — the same two-gate shape `_stale_race_tier_enabled` reads."""
+    return Config(
+        repos=[
+            Repo(
+                name=repo, github=repo,
+                board_doctor=BoardDoctorRepoConfig(stale_race=opted_in),
+            )
+        ],
+        machines=[],
+        board_doctor=BoardDoctorConfig(stale_race=opted_in),
+    )
+
+
 class TestReclassifyChecksStaleRace:
     """#3859: relabel a checks-stale-race-but-live-clear row."""
 
@@ -412,17 +428,34 @@ class TestReclassifyChecksStaleRace:
         _seed_stale_race_blocked_entry("acme/widgets", 201)
         row = _row("acme/widgets#201", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
-        [out] = _reclassify_checks_stale_race([row])
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets")
+        )
 
         assert out.cause == CAUSE_CHECKS_STALE_RACE
         assert out.evidence[:-1] == row.evidence
         assert "#3859" in out.evidence[-1]
 
+    def test_repo_that_has_not_opted_in_is_left_alone(self) -> None:
+        # Gating (#3859 review): the classification half of this feature
+        # must not be live for a repo that never opted into the
+        # `stale_race` tier, even though the row would otherwise qualify.
+        _seed_stale_race_blocked_entry("acme/widgets", 299)
+        row = _row("acme/widgets#299", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
+
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets", opted_in=False)
+        )
+
+        assert out == row
+
     def test_stale_row_is_left_alone(self) -> None:
         _seed_stale_race_blocked_entry("acme/widgets", 202)
         row = _row("acme/widgets#202", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=False)
 
-        [out] = _reclassify_checks_stale_race([row])
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets")
+        )
 
         assert out == row
 
@@ -436,7 +469,9 @@ class TestReclassifyChecksStaleRace:
             fresh=True,
         )
 
-        [out] = _reclassify_checks_stale_race([row])
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets")
+        )
 
         assert out == row
 
@@ -454,7 +489,9 @@ class TestReclassifyChecksStaleRace:
         )
         row = _row("acme/widgets#204", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
-        [out] = _reclassify_checks_stale_race([row])
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets")
+        )
 
         assert out == row
 
@@ -465,7 +502,9 @@ class TestReclassifyChecksStaleRace:
         _seed_ceiling_blocked_entry("acme/widgets", 205)
         row = _row("acme/widgets#205", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
-        [out] = _reclassify_checks_stale_race([row])
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets")
+        )
 
         assert out == row
 
@@ -476,14 +515,18 @@ class TestReclassifyChecksStaleRace:
             queue="merge-queue", fresh=True,
         )
 
-        [out] = _reclassify_checks_stale_race([row])
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets")
+        )
 
         assert out == row
 
     def test_unparseable_key_is_left_alone(self) -> None:
         row = _row("no-hash-separator", queue_diagnose.CAUSE_NOTHING_BLOCKING, fresh=True)
 
-        [out] = _reclassify_checks_stale_race([row])
+        [out] = _reclassify_checks_stale_race(
+            [row], config=_stale_race_config("acme/widgets")
+        )
 
         assert out == row
 

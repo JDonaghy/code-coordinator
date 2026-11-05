@@ -2622,7 +2622,11 @@ def reserve_merge_slot(repo_name: str, holder_key: str, ttl_seconds: float) -> b
     conflict with itself). Returns ``False`` without writing anything when a
     DIFFERENT holder's reservation is still live — the caller must defer,
     never overwrite another row's claim.
+
+    **Local-DB write only** — same limitation as :func:`get_merge_
+    reservation`'s read; see that docstring.
     """
+    _thin_client_local_board_guard("reserve_merge_slot")
     conn = get_connection()
     result = {"ok": False}
 
@@ -2642,7 +2646,18 @@ def reserve_merge_slot(repo_name: str, holder_key: str, ttl_seconds: float) -> b
             "expires_at": time.time() + ttl_seconds,
         }
         if len(data) > MERGE_RESERVATION_LIMIT:
-            data = dict(list(data.items())[-MERGE_RESERVATION_LIMIT:])
+            # #3859 review: evict by oldest `expires_at`, not by insertion
+            # order — a `dict`'s insertion order is NOT re-set when an
+            # existing key is reassigned (e.g. a renewed reservation), so
+            # the previous `list(data.items())[-LIMIT:]` could in principle
+            # evict the entry this very write just made current. Unreachable
+            # at today's ~500-repo fleet size, but evicting by actual
+            # recency is the obviously-correct rule to keep regardless.
+            data = dict(
+                sorted(
+                    data.items(), key=lambda kv: kv[1].get("expires_at", 0),
+                )[-MERGE_RESERVATION_LIMIT:]
+            )
         sql.upsert(
             conn, "board_meta", ["key", "value"],
             (_MERGE_RESERVATION_META_KEY, json.dumps(data)),
@@ -2665,7 +2680,11 @@ def release_merge_reservation(repo_name: str, holder_key: str | None = None) -> 
     Returns ``True`` only when a reservation was actually removed; ``False``
     means "nothing to release" — already absent/expired, or held by someone
     else.
+
+    **Local-DB write only** — same limitation as :func:`get_merge_
+    reservation`'s read; see that docstring.
     """
+    _thin_client_local_board_guard("release_merge_reservation")
     conn = get_connection()
     result = {"ok": False}
 

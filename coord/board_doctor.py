@@ -614,7 +614,7 @@ def _reclassify_ceiling_blocked(rows: list[StuckRow]) -> list[StuckRow]:
     return reclassified
 
 
-def _reclassify_checks_stale_race(rows: list[StuckRow]) -> list[StuckRow]:
+def _reclassify_checks_stale_race(rows: list[StuckRow], *, config) -> list[StuckRow]:
     """Relabel checks-stale-race-but-live-clear rows (#3859).
 
     Runs strictly AFTER :func:`queue_diagnose.diagnose` has already picked a
@@ -623,11 +623,11 @@ def _reclassify_checks_stale_race(rows: list[StuckRow]) -> list[StuckRow]:
     classifier (#2235's invariant); it only reads the drive-queue row's
     OWN stored state/reason afterward, through
     :func:`coord.drive_queue.checks_stale_race_giveup_for_issue`, to ask
-    whether a row this sweep would otherwise leave at the alert tier (via
-    `CAUSE_GATE_BLOCKED`/`CAUSE_CI_PENDING`, whichever `queue_diagnose`
-    assigned to a row whose live checks are still catching up) actually
-    lost its last life to the quadraui#1961 sibling-merge race rather than
-    a real problem.
+    whether a row this sweep would otherwise leave classified
+    `CAUSE_NOTHING_BLOCKING` (:data:`_LIVE_CLEAR_CAUSES` — the same set
+    :func:`_reclassify_ceiling_blocked` reads, a row whose live gate reads
+    clear) actually lost its last life to the quadraui#1961 sibling-merge
+    race rather than a real problem.
 
     Same freshness/confidence bar as :func:`_reclassify_ceiling_blocked`
     (:attr:`StuckRow.fresh`, confidence above
@@ -637,7 +637,18 @@ def _reclassify_checks_stale_race(rows: list[StuckRow]) -> list[StuckRow]:
     evidence to reclassify — the review-approved/Test-passed/mergeable
     reading this reclassifier promotes on must be confirmed THIS sweep, not
     inherited from whenever the episode last concluded.
+
+    Gated per-repo by :func:`coord.board_doctor_policy._stale_race_tier_
+    enabled` — the same fleet + per-repo opt-in
+    `coord.commands.drive_queue._run_auto_revalidate_checks_stale` checks
+    before reserving a merge-gate slot. A repo that has not opted in keeps
+    its pre-#3859 label (whatever `queue_diagnose` assigned) unchanged; this
+    label is purely informational today (`policy_tier_of` has no entry for
+    `CAUSE_CHECKS_STALE_RACE`, so it resolves to the same alert tier either
+    way), but it must not claim a race-driven disposition is in play on a
+    repo where that disposition cannot actually fire.
     """
+    from coord.board_doctor_policy import _stale_race_tier_enabled  # noqa: PLC0415
     from coord.drive_queue import (  # noqa: PLC0415
         checks_stale_race_giveup_for_issue,
         parse_key as _parse_row_key,
@@ -652,7 +663,11 @@ def _reclassify_checks_stale_race(rows: list[StuckRow]) -> list[StuckRow]:
             and row.confidence != queue_diagnose.CONFIDENCE_LOW
         ):
             parsed = _parse_row_key(row.key)
-            if parsed is not None and checks_stale_race_giveup_for_issue(*parsed):
+            if (
+                parsed is not None
+                and _stale_race_tier_enabled(parsed[0], config)
+                and checks_stale_race_giveup_for_issue(*parsed)
+            ):
                 row = replace(
                     row,
                     cause=CAUSE_CHECKS_STALE_RACE,
@@ -740,7 +755,7 @@ def collect_rows(*, config, trigger: str = "board-doctor-sweep") -> list[StuckRo
     rows.extend(refreshed_rows)
     rows.extend(row for ep in settled_episodes if (row := _episode_stuck_row(ep)) is not None)
     rows = _reclassify_ceiling_blocked(rows)
-    rows = _reclassify_checks_stale_race(rows)
+    rows = _reclassify_checks_stale_race(rows, config=config)
     rows.extend(merge_queue_rows(load_merge_queue()))
     rows.extend(smoke_no_verdict_rows(board))
 
