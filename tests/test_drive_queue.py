@@ -270,7 +270,10 @@ def test_merge_landed_state_is_state_merged_partial_for_a_partial_marker():
 
 
 def test_confirmed_merged_reads_partial_even_though_facts_merged_is_still_stale():
-    """The race: a caller (the `own_reason`/`live_prereq_terminal` branches)
+    """The race: a caller (the `own_reason` branch, the one call site whose
+    live evidence actually IS a merge confirmation — see `_merge_landed_
+    state`'s own docstring and the `live_prereq_terminal` branch's #3863
+    review comment for why that OTHER caller does not use this override)
     already has LIVE evidence this landed, but the cached board's
     `facts.merged` has not caught up yet (`coord.reconcile.py`'s own,
     separate, later flip of `assignments.status` from `done` to `merged`)
@@ -535,6 +538,70 @@ def test_build_board_view_done_row_with_no_summary_leaves_resolution_at_default(
     )
     facts = view.facts(entry_key(REPO, 1650))
     assert facts.merge_resolution == "resolved"
+
+
+def test_build_board_view_merged_row_wins_over_a_later_done_row_in_the_payload():
+    # #3863 (review): `/board`'s `assignments` list has no `ORDER BY` and a
+    # landed issue can carry MANY work-like rows for the same key — the one
+    # `merged` row plus every other leg, which stays `status='done'` forever
+    # (`coord.state.mark_assignment_merged` flips only the merged row). If
+    # this `done` row for a SUPERSEDED/abandoned leg happens to be visited
+    # AFTER the authoritative `merged` row, it must not overwrite that
+    # row's real `partial` reading with its own default `resolved`.
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 1960, "type": "work",
+                    "status": "merged",
+                    "completion_summary": (
+                        "Fixed the symptom.\n\nISSUE_RESOLUTION: partial — "
+                        "root cause elsewhere."
+                    ),
+                },
+                {
+                    "repo_name": REPO, "issue_number": 1960, "type": "work",
+                    "status": "done",
+                    "completion_summary": "All good.\n\nISSUE_RESOLUTION: resolved",
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 1960))
+    assert facts.merged
+    assert facts.merge_resolution == "partial"
+    assert facts.merged_partial
+
+
+def test_build_board_view_merged_row_wins_over_an_earlier_done_row_in_the_payload():
+    # Mirror of the above: a stale `done` leg carrying a non-default marker
+    # (from an earlier, abandoned/superseded attempt) visited BEFORE the
+    # real merged row must not survive that row's own `resolved` reading.
+    view = build_board_view(
+        {
+            "assignments": [
+                {
+                    "repo_name": REPO, "issue_number": 1960, "type": "work",
+                    "status": "done",
+                    "completion_summary": (
+                        "Abandoned attempt.\n\nISSUE_RESOLUTION: partial — "
+                        "superseded."
+                    ),
+                },
+                {
+                    "repo_name": REPO, "issue_number": 1960, "type": "work",
+                    "status": "merged",
+                    "completion_summary": "All good.\n\nISSUE_RESOLUTION: resolved",
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 1960))
+    assert facts.merged
+    assert facts.merge_resolution == "resolved"
+    assert not facts.merged_partial
 
 
 def test_build_board_view_reads_merge_ci_pending_from_the_live_plan_reason():
@@ -2412,7 +2479,14 @@ def test_a_done_row_with_an_open_partial_marked_issue_corrects_to_merged_partial
     )
     reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1960))
     assert reconcile.updates["state"] == STATE_MERGED_PARTIAL
-    assert "merged-partial" in reconcile.reason or "merged-partial" in reconcile.updates["last_reason"]
+    # #3863 (review): the reason now uses the SAME `done ({witness})` shape
+    # the live #1891/#2850 paths already write (routed through the one
+    # `_merge_landed_state` implementation, not a re-derived string), with
+    # only a trailing clause marking it a retroactive correction.
+    for text in (reconcile.reason, reconcile.updates["last_reason"]):
+        assert text.startswith("done (")
+        assert "intentionally left open" in text
+        assert "corrected" in text
 
 
 def test_a_done_row_for_a_cleanly_resolved_issue_is_left_untouched():
@@ -4765,11 +4839,18 @@ def test_an_own_reason_confirming_a_partial_merge_reconciles_to_merged_partial()
     assert plan.blocked == ()
 
 
-def test_a_live_recheck_confirming_a_partial_merge_reconciles_to_merged_partial():
-    """#3863's twin for the OTHER #2850 "already landed" signal — the
-    `live_prereq_terminal` live re-check, not `own_reason` text. Same
-    stale-cache race: `facts.merged` has not caught up, but
-    `facts.merge_resolution` already carries `partial`."""
+def test_a_live_recheck_confirming_closed_reconciles_to_done_not_merged_partial():
+    """#3863 (review): `_fetch_live_prereq_terminal`'s one live call,
+    `work_is_terminal(repo_github, issue_number, "")`, always passes
+    `branch=""` (its own #2639 audit comment explains why), so
+    `work_is_terminal`'s `elif branch and pr_is_merged(...)` can never
+    fire there — a `True` reading in `live_prereq_terminal` is PROVABLY a
+    closed-issue confirmation, never a merged-PR one. A stale
+    `merge_resolution: partial` left over from an earlier, unrelated merge
+    record must NOT turn this into `merged-partial`: a close is `landed`'s
+    own "closed wins outright" case — plain `done`, regardless of what an
+    earlier merge's resolution said (`IssueFacts.merged_partial`'s own
+    docstring excludes the closed case for exactly this reason)."""
     entries = [
         entry(
             1650,
@@ -4787,7 +4868,7 @@ def test_a_live_recheck_confirming_a_partial_merge_reconciles_to_merged_partial(
     )
     reconcile = plan.reconciles[0]
     assert reconcile.outcome == "done"
-    assert reconcile.updates["state"] == STATE_MERGED_PARTIAL
+    assert reconcile.updates["state"] == STATE_DONE
     assert plan.blocked == ()
 
 
