@@ -902,6 +902,17 @@ class PreflightGuardRepoConfig:
     criteria_some: int | None = None
     criteria_many: int | None = None
     triage_threshold: float | None = None
+    # #3866: this repo's one-backend-per-issue backend names, e.g.
+    # `["gtk", "cocoa", "windows", "tui"]` for a quadraui-style repo. Empty
+    # (the default) means the repo has NOT declared a one-backend-per-issue
+    # rule at all — the cross-backend decomposition check in
+    # `coord.preflight_size.detect_cross_backend_scope` is completely inert
+    # for it, same "absent means opted out" posture as `enabled` above. This
+    # is a repo-topology fact the coordinator is told directly, not inferred
+    # from parsing the target repo's own CLAUDE.md — see the explanatory
+    # comment above `detect_cross_backend_scope` in
+    # `coord/preflight_size.py` for why that distinction matters.
+    backends: tuple[str, ...] = ()
 
     def resolve_thresholds(self) -> "SizeThresholds":
         """This repo's :class:`~coord.preflight_size.SizeThresholds`,
@@ -4646,6 +4657,11 @@ def _parse_preflight_guard(raw: Any) -> PreflightGuardConfig:
     :meth:`PreflightGuardRepoConfig.resolve_thresholds` rather than silently
     becoming ``0``.
 
+    ``backends:`` (#3866) is a flat list of backend names declaring this
+    repo's one-backend-per-issue rule — absent or empty means the repo has
+    no such rule and the cross-backend decomposition check never fires for
+    it, same "absent means opted out" posture as every other knob here.
+
     A reserved top-level ``enabled:`` key (a bare boolean, not a mapping)
     is the fleet-wide kill switch (:attr:`PreflightGuardConfig.enabled`),
     mirroring ``board_doctor.investigate``'s split between a fleet switch
@@ -4689,6 +4705,16 @@ def _parse_preflight_guard(raw: Any) -> PreflightGuardConfig:
                     f"preflight_guard[{repo_name!r}].triage_threshold must be a number"
                 )
             cfg.triage_threshold = float(value)
+        if "backends" in entry:
+            value = entry["backends"]
+            if not isinstance(value, list) or not all(
+                isinstance(b, str) and b.strip() for b in value
+            ):
+                raise ConfigError(
+                    f"preflight_guard[{repo_name!r}].backends must be a list "
+                    "of non-empty strings"
+                )
+            cfg.backends = tuple(value)
         repos[repo_name] = cfg
 
     return PreflightGuardConfig(enabled=fleet_enabled, repos=repos)

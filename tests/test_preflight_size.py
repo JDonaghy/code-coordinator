@@ -15,6 +15,8 @@ from coord.models import SplitChunk, SplitProposal
 from coord.preflight_size import (
     DEFAULT_THRESHOLDS,
     SizeThresholds,
+    build_cross_backend_split_proposal,
+    detect_cross_backend_scope,
     score_issue_size,
     verify_split_proposal,
 )
@@ -499,3 +501,211 @@ preflight_guard:
         )
         with pytest.raises(ConfigError):
             load(p)
+
+    def test_backends_list_round_trips(self, tmp_path: Path) -> None:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            _CONFIG_BASE
+            + """\
+preflight_guard:
+  quadraui:
+    enabled: true
+    backends: [gtk, cocoa, windows, tui]
+"""
+        )
+        cfg = load(p)
+        assert cfg.preflight_guard.for_repo("quadraui").backends == (
+            "gtk",
+            "cocoa",
+            "windows",
+            "tui",
+        )
+
+    def test_backends_absent_defaults_to_empty(self, tmp_path: Path) -> None:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            _CONFIG_BASE
+            + """\
+preflight_guard:
+  quadraui:
+    enabled: true
+"""
+        )
+        cfg = load(p)
+        assert cfg.preflight_guard.for_repo("quadraui").backends == ()
+
+    def test_bad_backends_type_raises(self, tmp_path: Path) -> None:
+        from coord.config import ConfigError
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            _CONFIG_BASE
+            + """\
+preflight_guard:
+  quadraui:
+    backends: "gtk"
+"""
+        )
+        with pytest.raises(ConfigError):
+            load(p)
+
+
+_QUADRAUI_MULTI_BACKEND_BODY = """\
+This touches every backend's render path.
+
+## Files
+
+- src/gtk/render.rs
+- src/cocoa/render.m
+- src/windows/render.cpp
+- src/shared/render_contract.rs
+
+## Acceptance
+
+- [ ] renders correctly on gtk, cocoa, and windows
+"""
+
+
+class TestDetectCrossBackendScope:
+    """#3866 acceptance: the decomposition-rule check that feeds the
+    preflight guard's cross-backend split, independent of the paid
+    size-triage agent entirely.
+    """
+
+    def test_multi_backend_body_is_flagged(self) -> None:
+        named = detect_cross_backend_scope(
+            title="Fix render path",
+            body=_QUADRAUI_MULTI_BACKEND_BODY,
+            backends=["gtk", "cocoa", "windows"],
+        )
+        assert set(named) == {"gtk", "cocoa", "windows"}
+
+    def test_every_backend_phrase_names_the_full_configured_list(self) -> None:
+        named = detect_cross_backend_scope(
+            title="Fix render path in every backend",
+            body="no file list here, just prose",
+            backends=["gtk", "cocoa", "windows"],
+        )
+        assert named == ("gtk", "cocoa", "windows")
+
+    def test_single_backend_issue_passes_untouched(self) -> None:
+        named = detect_cross_backend_scope(
+            title="Fix gtk render glitch",
+            body="## Files\n- src/gtk/render.rs\n",
+            backends=["gtk", "cocoa", "windows"],
+        )
+        assert named == ()
+
+    def test_explicit_seam_issue_passes_untouched_even_with_many_backends_named(
+        self,
+    ) -> None:
+        """An issue that already scopes itself to "the seam" is treated as
+        single-scoped, the same as naming only one backend — even when its
+        prose happens to also mention several backend names in passing
+        (e.g. explaining what the shared contract is used BY)."""
+        named = detect_cross_backend_scope(
+            title="Define the shared seam contract",
+            body=(
+                "This defines the seam contract gtk, cocoa, and windows "
+                "will all eventually consume.\n\n## Files\n"
+                "- src/shared/render_contract.rs\n"
+            ),
+            backends=["gtk", "cocoa", "windows"],
+        )
+        assert named == ()
+
+    def test_repo_with_fewer_than_two_backends_never_fires(self) -> None:
+        named = detect_cross_backend_scope(
+            title="touches gtk and cocoa",
+            body="## Files\n- a.py\n- b.py\n",
+            backends=["gtk"],
+        )
+        assert named == ()
+        named = detect_cross_backend_scope(
+            title="touches gtk and cocoa", body="whatever", backends=[]
+        )
+        assert named == ()
+
+
+class TestBuildCrossBackendSplitProposal:
+    """#3866 acceptance: a flagged multi-backend issue builds a well-formed
+    seam + per-backend `SplitProposal`, each child pinned to exactly one
+    backend's own declared files.
+    """
+
+    def test_builds_seam_plus_one_child_per_backend_with_correct_pins(
+        self,
+    ) -> None:
+        proposal = build_cross_backend_split_proposal(
+            repo_name="acme/quadraui",
+            issue_number=321,
+            issue_title="Fix render path",
+            issue_body=_QUADRAUI_MULTI_BACKEND_BODY,
+            named_backends=("gtk", "cocoa", "windows"),
+        )
+        assert proposal is not None
+        assert len(proposal.chunks) == 4  # seam + 3 backends
+        by_title = {c.title: c for c in proposal.chunks}
+        assert by_title["Fix render path (seam)"].files_likely == [
+            "src/shared/render_contract.rs"
+        ]
+        assert by_title["Fix render path (gtk)"].files_likely == ["src/gtk/render.rs"]
+        assert by_title["Fix render path (cocoa)"].files_likely == [
+            "src/cocoa/render.m"
+        ]
+        assert by_title["Fix render path (windows)"].files_likely == [
+            "src/windows/render.cpp"
+        ]
+        # No cross-contamination: a backend-pinned child never carries
+        # another backend's file.
+        assert "src/cocoa/render.m" not in by_title["Fix render path (gtk)"].files_likely
+
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
+
+    def test_no_declared_files_builds_nothing(self) -> None:
+        proposal = build_cross_backend_split_proposal(
+            repo_name="acme/quadraui",
+            issue_number=321,
+            issue_title="Fix render path everywhere",
+            issue_body="just prose, no ## Files section at all",
+            named_backends=("gtk", "cocoa", "windows"),
+        )
+        assert proposal is None
+
+    def test_a_backend_with_no_pinned_files_builds_nothing(self) -> None:
+        """Named by text/phrase but with zero declared files actually
+        falling under its own directory — no real evidence to pin a
+        partition on, so this bails rather than fabricating a scope."""
+        proposal = build_cross_backend_split_proposal(
+            repo_name="acme/quadraui",
+            issue_number=321,
+            issue_title="Fix render path",
+            issue_body="## Files\n- src/gtk/render.rs\n- src/cocoa/render.m\n",
+            named_backends=("gtk", "cocoa", "windows"),
+        )
+        assert proposal is None
+
+    def test_no_seam_files_falls_back_to_the_full_declared_scope(self) -> None:
+        """When every declared file lives under some backend's own
+        directory (no backend-neutral file at all), the seam chunk still
+        gets a real, non-empty `## Files` list rather than being dropped."""
+        proposal = build_cross_backend_split_proposal(
+            repo_name="acme/quadraui",
+            issue_number=321,
+            issue_title="Fix render path",
+            issue_body=(
+                "## Files\n- src/gtk/render.rs\n- src/cocoa/render.m\n"
+                "- src/windows/render.cpp\n"
+            ),
+            named_backends=("gtk", "cocoa", "windows"),
+        )
+        assert proposal is not None
+        seam = next(c for c in proposal.chunks if c.title.endswith("(seam)"))
+        assert set(seam.files_likely) == {
+            "src/gtk/render.rs",
+            "src/cocoa/render.m",
+            "src/windows/render.cpp",
+        }
+        verification = verify_split_proposal(proposal)
+        assert verification.ok is True
