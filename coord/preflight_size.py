@@ -54,7 +54,7 @@ from coord.milestone_order import (
     parse_sub_issues,
     render_sub_issues,
 )
-from coord.models import SplitProposal
+from coord.models import SplitChunk, SplitProposal
 from coord.overlap_predict import Footprint, parse_declared_files, predict_overlap
 
 __all__ = [
@@ -65,6 +65,8 @@ __all__ = [
     "score_issue_size",
     "SplitVerification",
     "verify_split_proposal",
+    "detect_cross_backend_scope",
+    "build_cross_backend_split_proposal",
 ]
 
 
@@ -456,3 +458,181 @@ def verify_split_proposal(
         )
 
     return SplitVerification(ok=True, reason=None, epic_body=epic_body, work_order=parsed)
+
+
+# ── #3866: cross-backend decomposition-rule check ───────────────────────────
+#
+# WHAT THIS GUARDS. Most partial merges in the 2026-11-03/04 quadraui batch
+# were predictable at filing time: the issue's own scope named every
+# backend, and quadraui's CLAUDE.md tells a worker "if your issue spans
+# several backends, do the one it names (or the seam) and list the rest" —
+# the worker complies and the merge is partial by construction. This check
+# catches that shape BEFORE Work, deterministically, with no `claude`/
+# network call of its own (same "pure gate in front of the expensive step"
+# posture as the rest of this module): given the repo's own declared
+# backend names (a `coordinator.yml` fact, `PreflightGuardRepoConfig.
+# backends` — never parsed out of the target repo's CLAUDE.md, which this
+# module has no access to and no business reading), decide whether an
+# issue's scope names more than one of them, and if so build the same
+# `SplitProposal` shape the paid size-triage agent produces — a seam chunk
+# plus one chunk per named backend — so the caller can reuse the existing
+# `verify_split_proposal` / `file_and_queue_split_proposal` split/supersede
+# path unchanged (#2096: one path files a split, whether the proposal came
+# from a paid agent or this free mechanical check).
+#
+# ONE QUESTION, ONE ANSWER. "Which files did this issue declare?" is, again,
+# answered by :func:`coord.overlap_predict.parse_declared_files` — this
+# check partitions that same list by backend rather than re-deriving its
+# own notion of "declared files".
+
+_ALL_BACKENDS_RE = re.compile(r"\b(?:every|all)\s+backends?\b", re.IGNORECASE)
+_SEAM_RE = re.compile(r"\bseam\b", re.IGNORECASE)
+
+
+def _backend_word_re(name: str) -> re.Pattern[str]:
+    return re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+
+
+def detect_cross_backend_scope(
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    backends: Sequence[str],
+) -> tuple[str, ...]:
+    """Which of *backends* this issue's title/body names, or ``()`` when
+    there is nothing to split.
+
+    ``()`` — "pass untouched" — covers three cases, each deliberately
+    checked before the others so none can be masked by a false positive
+    elsewhere in the text:
+
+    1. *backends* has fewer than two entries — a repo with at most one
+       declared backend has no "one-backend-per-issue" rule to enforce in
+       the first place.
+    2. The text contains the standalone word "seam" — the issue has
+       already explicitly scoped itself to the cross-backend seam (the
+       same single-scope choice quadraui's own CLAUDE.md offers alongside
+       each individual backend), so it is single-scoped exactly like an
+       issue naming one backend. This check wins even over an "every
+       backend" phrase appearing elsewhere in the same body — an issue
+       that says both is explicitly claiming the seam, not asking to be
+       split.
+    3. At most one backend name appears as a whole word (case-insensitive)
+       anywhere in the title+body — a single-backend issue, same as #1.
+
+    Otherwise, returns the backends actually named — every configured
+    backend, in *backends*' own order, for an explicit "every backend" /
+    "all backends" phrase; just the ones matched by name otherwise.
+    """
+    if len(backends) < 2:
+        return ()
+    text = f"{title or ''}\n{body or ''}"
+    if _SEAM_RE.search(text):
+        return ()
+    if _ALL_BACKENDS_RE.search(text):
+        return tuple(backends)
+    named = tuple(b for b in backends if _backend_word_re(b).search(text))
+    return named if len(named) >= 2 else ()
+
+
+def build_cross_backend_split_proposal(
+    *,
+    repo_name: str,
+    issue_number: int,
+    issue_title: str,
+    issue_body: str | None,
+    named_backends: Sequence[str],
+) -> SplitProposal | None:
+    """Build the seam-plus-per-backend :class:`SplitProposal` for an issue
+    :func:`detect_cross_backend_scope` flagged, or ``None`` when there is
+    not enough real file-scope evidence to pin a clean partition.
+
+    Reuses the issue's OWN `## Files` declaration (via
+    :func:`coord.overlap_predict.parse_declared_files`) rather than
+    inventing file paths: a declared file is pinned to backend *b* when
+    one of its path segments case-insensitively equals *b* (quadraui's own
+    `src/<backend>/...` layout); everything else is "seam" scope — the
+    backend-neutral slice every backend shares. Each per-backend child's
+    `files_likely` is pinned to ONLY that backend's own files, the
+    mechanical enforcement of "one backend per issue" this whole check
+    exists for.
+
+    Returns ``None`` — "nothing to pin, don't fabricate a scope" — when:
+
+    * the issue declared no `## Files` at all (nothing to partition), or
+    * any named backend has zero files pinned to it (the text named it,
+      but no declared file actually falls under its directory, so this
+      check has no real evidence for how to split that backend out).
+
+    A caller seeing ``None`` falls through to whatever triage path would
+    otherwise have run (the free heuristic scorer, or nothing) — this
+    check is a prevention net for the common, file-evidenced case, not a
+    guarantee it catches every cross-backend issue shape.
+    """
+    files = parse_declared_files(issue_body)
+    if not files:
+        return None
+
+    by_backend: dict[str, list[str]] = {b: [] for b in named_backends}
+    seam_files: list[str] = []
+    backend_segments = {b.lower(): b for b in named_backends}
+    for f in files:
+        segments = {seg.lower() for seg in f.split("/")}
+        matched = [backend_segments[s] for s in segments if s in backend_segments]
+        if matched:
+            for b in matched:
+                by_backend[b].append(f)
+        else:
+            seam_files.append(f)
+
+    if any(not pinned for pinned in by_backend.values()):
+        return None
+
+    if not seam_files:
+        # No backend-neutral file in the declaration to anchor the seam
+        # chunk on — fall back to the full originally-declared scope so the
+        # seam issue still carries a real, non-empty `## Files` list (the
+        # coordination/shared-contract work the seam represents is real
+        # even when every declared file also happens to live under some
+        # backend's own directory).
+        seam_files = list(files)
+
+    chunks = [
+        SplitChunk(
+            title=f"{issue_title} (seam)",
+            scope=(
+                f"Backend-neutral seam slice of #{issue_number}'s scope — "
+                "the shared contract every backend below depends on. Land "
+                "this first, independent of any single backend."
+            ),
+            files_likely=seam_files,
+        )
+    ]
+    for b in named_backends:
+        chunks.append(
+            SplitChunk(
+                title=f"{issue_title} ({b})",
+                scope=(
+                    f"{b}-only slice of #{issue_number}'s scope, split out "
+                    "because the parent named more than one backend in a "
+                    f"repo with a one-backend-per-issue rule — pinned to "
+                    f"{b} alone; every other backend is out of scope here."
+                ),
+                files_likely=by_backend[b],
+            )
+        )
+
+    return SplitProposal(
+        id=0,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        rationale=(
+            f"preflight decomposition-rule check: #{issue_number} named "
+            f"{len(named_backends)} backends ({', '.join(named_backends)}) "
+            "in a repo with a one-backend-per-issue rule — split into a "
+            "seam issue plus one child per backend, each pinned to its own "
+            "backend's files."
+        ),
+        chunks=chunks,
+    )

@@ -289,15 +289,27 @@ def enforce_preflight_guard(
 ) -> None:
     """#3817: pre-dispatch half of the preflight decomposition guard.
 
-    Scores a `type="work"` issue with the free heuristic scorer
-    (`coord.preflight_size.score_issue_size`, #3815) and, when it comes
-    back `triage_worthy`, defers the original dispatch and hands the issue
-    to the paid size-triage agent (`coord.decomposition_chat.
-    dispatch_size_triage_review`, #3818) instead — the same deterministic-
-    refusal shape as :func:`enforce_oracle_readiness` /
-    :func:`enforce_epic_dispatch_guard`, reusing :class:`DispatchRefused`
-    rather than inventing a second "this refusal doesn't count" concept
-    (#2096).
+    Two checks run in order, both short-circuiting straight to a split
+    when they fire:
+
+    1. #3866: a fully mechanical decomposition-rule check — when the repo
+       has declared a one-backend-per-issue rule
+       (`PreflightGuardRepoConfig.backends`) and the issue's own scope
+       names more than one of those backends
+       (`coord.preflight_size.detect_cross_backend_scope`), it is split
+       immediately into a seam issue plus one child per backend with no
+       paid agent involved at all.
+    2. Falling through #1, scores the issue with the free heuristic
+       scorer (`coord.preflight_size.score_issue_size`, #3815) and, when
+       it comes back `triage_worthy`, defers the original dispatch and
+       hands the issue to the paid size-triage agent
+       (`coord.decomposition_chat.dispatch_size_triage_review`, #3818)
+       instead.
+
+    Both paths reuse the same deterministic-refusal shape as
+    :func:`enforce_oracle_readiness` / :func:`enforce_epic_dispatch_guard`,
+    reusing :class:`DispatchRefused` rather than inventing a second "this
+    refusal doesn't count" concept (#2096).
 
     Cheap no-op — no network call — unless *proposal_type* is ``"work"``,
     *repo* is resolved, and ``config.preflight_guard_enabled(repo.name)``
@@ -366,6 +378,59 @@ def enforce_preflight_guard(
     # same `get_issue` response, so this costs no extra fetch.
     if str(issue_data.get("state") or "").upper() == "CLOSED":
         return
+
+    # #3866: the decomposition-rule check — fully mechanical, no paid agent
+    # involved — runs before the heuristic scorer below. A repo that has
+    # declared a one-backend-per-issue rule (`PreflightGuardRepoConfig.
+    # backends`, non-empty) and an issue whose scope names more than one of
+    # those backends is split immediately into a seam issue plus one child
+    # per backend, reusing the same `verify_split_proposal` /
+    # `file_and_queue_split_proposal` path a paid SPLIT verdict uses below
+    # — no need to spend a triage session deciding something this
+    # deterministic. A repo with no declared backends (the common case,
+    # today, for every repo) sees `detect_cross_backend_scope` short-circuit
+    # on `len(backends) < 2` and this falls through unchanged.
+    backend_names = config.preflight_guard.for_repo(repo.name).backends
+    if backend_names:
+        from coord.preflight_size import (  # noqa: PLC0415
+            build_cross_backend_split_proposal,
+            detect_cross_backend_scope,
+            verify_split_proposal,
+        )
+
+        named = detect_cross_backend_scope(
+            title=issue_data.get("title"),
+            body=issue_data.get("body"),
+            backends=backend_names,
+        )
+        if named:
+            cross_backend_proposal = build_cross_backend_split_proposal(
+                repo_name=repo.name,
+                issue_number=issue_number,
+                issue_title=issue_data.get("title") or f"issue #{issue_number}",
+                issue_body=issue_data.get("body"),
+                named_backends=named,
+            )
+            if cross_backend_proposal is not None:
+                cross_backend_verification = verify_split_proposal(cross_backend_proposal)
+                if cross_backend_verification.ok:
+                    from coord.decomposition_chat import (  # noqa: PLC0415
+                        file_and_queue_split_proposal,
+                    )
+
+                    epic_number = file_and_queue_split_proposal(
+                        proposal=cross_backend_proposal,
+                        verification=cross_backend_verification,
+                        repo=repo,
+                    )
+                    raise DispatchRefused(
+                        f"issue #{issue_number} named {len(named)} backends "
+                        f"({', '.join(named)}) in a repo with a "
+                        "one-backend-per-issue rule — split by the preflight "
+                        f"decomposition-rule check into epic #{epic_number}; "
+                        "the original is superseded, work continues on the "
+                        "seam and per-backend children."
+                    )
 
     from coord.preflight_size import score_issue_size  # noqa: PLC0415
 

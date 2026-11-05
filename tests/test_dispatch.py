@@ -2116,6 +2116,164 @@ class TestPreflightGuard:
         mock_dispatch_triage.assert_called_once()
 
 
+class TestPreflightGuardCrossBackendSplit:
+    """#3866: the decomposition-rule check — a repo with a declared
+    one-backend-per-issue rule (`PreflightGuardRepoConfig.backends`)
+    splits a multi-backend issue immediately, with no paid triage agent
+    involved, before the heuristic scorer ever runs.
+    """
+
+    def _cfg(self, backends: list[str] | None = None) -> Config:
+        return Config(
+            repos=[Repo(name="quadraui", github="acme/quadraui", default_branch="main")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["quadraui"],
+                repo_paths={"quadraui": "/home/user/src/quadraui"},
+            )],
+            preflight_guard=PreflightGuardConfig(
+                repos={"quadraui": PreflightGuardRepoConfig(
+                    enabled=True, backends=tuple(backends or ()),
+                )},
+            ),
+        )
+
+    _MULTI_BACKEND_BODY = (
+        "## Files\n"
+        "- src/gtk/render.rs\n"
+        "- src/cocoa/render.m\n"
+        "- src/windows/render.cpp\n"
+        "- src/shared/render_contract.rs\n"
+    )
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_multi_backend_issue_is_split_without_a_triage_dispatch(
+        self, mock_get_issue, mock_dispatch_triage, mock_file_and_queue,
+    ) -> None:
+        cfg = self._cfg(["gtk", "cocoa", "windows"])
+        repo = cfg.repo("quadraui")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "Fix render path", "body": self._MULTI_BACKEND_BODY,
+            "labels": [],
+        }
+        mock_file_and_queue.return_value = 777
+
+        with pytest.raises(DispatchRefused, match="named 3 backends"):
+            enforce_preflight_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=321,
+                machine=machine, board=board,
+            )
+
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_called_once()
+        proposal = mock_file_and_queue.call_args.kwargs["proposal"]
+        assert len(proposal.chunks) == 4  # seam + 3 backends
+        assert mock_file_and_queue.call_args.kwargs["repo"] is repo
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_single_backend_issue_passes_untouched(
+        self, mock_get_issue, mock_dispatch_triage, mock_file_and_queue,
+    ) -> None:
+        cfg = self._cfg(["gtk", "cocoa", "windows"])
+        repo = cfg.repo("quadraui")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "Fix gtk render glitch",
+            "body": "## Files\n- src/gtk/render.rs\n",
+            "labels": [],
+        }
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=321,
+            machine=machine, board=board,
+        )  # must not raise — single-backend issue, nothing to split
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_explicit_seam_issue_passes_untouched(
+        self, mock_get_issue, mock_dispatch_triage, mock_file_and_queue,
+    ) -> None:
+        cfg = self._cfg(["gtk", "cocoa", "windows"])
+        repo = cfg.repo("quadraui")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "Define the shared seam contract",
+            "body": "## Files\n- src/shared/render_contract.rs\n",
+            "labels": [],
+        }
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=321,
+            machine=machine, board=board,
+        )  # must not raise — already scoped to the seam
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_no_backends_declared_falls_through_to_heuristic_scorer(
+        self, mock_get_issue, mock_dispatch_triage, mock_file_and_queue,
+    ) -> None:
+        """A repo with no `backends:` declared at all never takes this
+        rung — status quo, falls straight through to the existing
+        heuristic-scorer path below it."""
+        cfg = self._cfg(backends=None)
+        repo = cfg.repo("quadraui")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "Fix render path in every backend",
+            "body": self._MULTI_BACKEND_BODY,
+            "labels": [],
+        }
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=321,
+            machine=machine, board=board,
+        )  # must not raise — no backends declared, heuristic scorer below
+        # threshold for this small body, so nothing fires at all
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_not_called()
+
+    @patch("coord.decomposition_chat.file_and_queue_split_proposal")
+    @patch("coord.decomposition_chat.dispatch_size_triage_review")
+    @patch("coord.github_ops.get_issue")
+    def test_flagged_but_no_file_evidence_falls_through_to_heuristic_scorer(
+        self, mock_get_issue, mock_dispatch_triage, mock_file_and_queue,
+    ) -> None:
+        """Named by prose but with no `## Files` declaration at all — the
+        mechanical check can't build a well-formed split, so it falls
+        through to the heuristic scorer rather than refusing with nothing
+        to act on."""
+        cfg = self._cfg(["gtk", "cocoa", "windows"])
+        repo = cfg.repo("quadraui")
+        machine = cfg.machines[0]
+        board = Board(repos=cfg.repos, machines=cfg.machines)
+        mock_get_issue.return_value = {
+            "title": "Fix render path in every backend",
+            "body": "just prose, no files section",
+            "labels": [],
+        }
+
+        enforce_preflight_guard(
+            proposal_type="work", repo=repo, config=cfg, issue_number=321,
+            machine=machine, board=board,
+        )  # must not raise — below the heuristic threshold too
+        mock_dispatch_triage.assert_not_called()
+        mock_file_and_queue.assert_not_called()
+
+
 class TestEpicDecomposeBriefing:
     """#3132 acceptance: dispatching `type="epic-decompose"` against a
     fixture epic renders a briefing carrying the decompose contract — file
