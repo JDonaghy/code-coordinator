@@ -4688,21 +4688,45 @@ def cli_stale_race(tmp_path: Path):
     return run
 
 
+_STALE_RACE_OPTED_OUT_CONFIG_YAML = _STALE_RACE_CONFIG_YAML.replace(
+    "    board_doctor:\n      stale_race: true\n", ""
+)
+
+
+@pytest.fixture
+def cli_stale_race_opted_out(tmp_path: Path):
+    """Same fleet-wide switch as `cli_stale_race`, but `REPO` itself has
+    NOT opted in — today's pre-#3859 behaviour for the reservation half of
+    this feature (the base-SHA-aware retry cap and the absolute cap both
+    still apply regardless of this opt-in; only the merge-gate reservation
+    does not)."""
+    path = tmp_path / "coordinator-stale-race-opted-out.yml"
+    path.write_text(_STALE_RACE_OPTED_OUT_CONFIG_YAML)
+
+    def run(*args: str):
+        return CliRunner().invoke(main, ["drive-queue", *args, "--config", str(path)])
+
+    return run
+
+
 def _seed_failed_stale_rebase_attempt(
     coord_db, issue: int, *, dispatched_base_sha: str, dispatched_at: float = 200.0,
+    attempt: int = 0,
 ) -> None:
     """A FAILED `[stale-rebase-fix]` conflict-fix for *issue*'s merge-queue
     row, with its own dispatch-time target base stamped into its briefing —
     the one durable record `_dispatched_base_sha` (`coord/conflict_fix.py`)
     reads to tell "the base is still the one this attempt targeted" apart
-    from "a sibling merge has since moved it again"."""
+    from "a sibling merge has since moved it again". *attempt* lets a test
+    seed more than one prior attempt for the same issue with distinct
+    ``assignment_id``s."""
     coord_db.execute(
         "INSERT INTO assignments "
         "(assignment_id, repo_name, issue_number, issue_title, machine_name, "
         " type, status, review_of_assignment_id, dispatched_at, briefing) "
         "VALUES (?, ?, ?, ?, 'dellserver', 'conflict-fix', 'failed', ?, ?, ?)",
         (
-            f"cf-{issue}", REPO, issue, f"[stale-rebase-fix] issue {issue}",
+            f"cf-{issue}-{attempt}", REPO, issue, f"[stale-rebase-fix] issue {issue}",
             f"w{issue}", dispatched_at,
             f"# Stale-CI rebase\nReason: CI stale\n"
             f"Target base SHA: {dispatched_base_sha}\n",
@@ -4780,14 +4804,158 @@ def test_stale_race_still_escalates_when_the_base_has_not_moved(
     assert state.get_merge_reservation(REPO) is None
 
 
-def test_stale_race_second_sibling_row_defers_to_the_reservation(
+def test_stale_race_hits_the_absolute_retry_cap_and_escalates(
     cli_stale_race, coord_db, stale_ci_backend, monkeypatch,
 ):
-    """#3859 acceptance: with a reservation held, a second row in the SAME
-    repo that is also `checks_stale`-eligible is held at the merge gate —
-    deferred, not dispatched and not escalated — with a reason naming the
-    reserving row, instead of racing it for a sibling-merge-invalidated
-    CI re-run."""
+    """#3859 review (blocking #1): the base-move skip has no ceiling of its
+    own — each of these MAX_STALE_REBASE_RACE_ATTEMPTS prior attempts was
+    dispatched against a base that has since moved AGAIN (so, on its own,
+    `has_prior_conflict_fix` would wave every one of them through as stale
+    evidence rather than a genuine block). Once the row has accumulated
+    that many stale-rebase rows it must escalate with a "lost N races"
+    reason instead of dispatching a 6th paid leg, and must release any
+    merge-gate reservation it held — a human is now responsible for it, not
+    a sibling waiting out the TTL behind it."""
+    from coord.conflict_fix import MAX_STALE_REBASE_RACE_ATTEMPTS
+
+    import coord.github_ops as github_ops
+
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    for i in range(MAX_STALE_REBASE_RACE_ATTEMPTS):
+        _seed_failed_stale_rebase_attempt(
+            coord_db, 2534, dispatched_base_sha=f"old-sha-{i}", attempt=i,
+        )
+    set_board_meta(coord_db, "board_initialized", "1")
+    # The live base differs from every prior attempt's own dispatched base —
+    # each one, in isolation, reads as stale evidence (base moved again),
+    # not a genuine block.
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch, **_kw: "newest-sha")
+    state.reserve_merge_slot(REPO, f"{REPO}#2534", ttl_seconds=3600)
+
+    result = cli_stale_race("tick")
+    assert result.exit_code == 0, result.output
+    assert "lost" in result.output
+    assert f"{MAX_STALE_REBASE_RACE_ATTEMPTS} stale-rebase races" in result.output
+    assert "needs a human" in result.output
+
+    from coord.audit import query_audit_log
+
+    entries = query_audit_log(event_type="merge_checks_stale_human_required")["entries"]
+    assert len(entries) == 1
+    assert entries[0]["issue"] == 2534
+    assert entries[0]["details"]["stale_rebase_attempts"] == MAX_STALE_REBASE_RACE_ATTEMPTS
+    # The reservation this row held is released, not left dangling for a
+    # sibling to wait out the full TTL behind a row that just paged a human.
+    assert state.get_merge_reservation(REPO) is None
+
+
+def test_stale_race_releases_its_reservation_on_a_dispatch_decline(
+    cli_stale_race, coord_db, stale_ci_backend, monkeypatch,
+):
+    """#3859 review (blocking #2): the decline path leaks a reservation
+    exactly like the escalation path did before this fix — assert it is
+    released here too."""
+    import coord.github_ops as github_ops
+
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    set_board_meta(coord_db, "board_initialized", "1")
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch, **_kw: "sha-x")
+    monkeypatch.setattr(
+        "coord.conflict_fix.dispatch_conflict_fix", MagicMock(return_value=None)
+    )
+    state.reserve_merge_slot(REPO, f"{REPO}#2534", ttl_seconds=3600)
+
+    result = cli_stale_race("tick")
+    assert result.exit_code == 0, result.output
+    assert "dispatch declined" in result.output
+
+    assert state.get_merge_reservation(REPO) is None
+
+
+def test_stale_race_defers_when_reserve_merge_slot_loses_the_claim_race(
+    cli_stale_race, coord_db, stale_ci_backend, monkeypatch,
+):
+    """#3859 review (blocking #3): `reserve_merge_slot` returning `False` —
+    a concurrent tick/sweep claimed the slot between this tick's read and
+    its own write — must be honored, not treated as success just because
+    no exception was raised (epic #2096: derive "proceeding is safe" from
+    the observed result of the claim)."""
+    import coord.github_ops as github_ops
+    import coord.state as state_mod
+
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    set_board_meta(coord_db, "board_initialized", "1")
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch, **_kw: "sha-x")
+    monkeypatch.setattr(state_mod, "reserve_merge_slot", lambda *a, **kw: False)
+    stub = MagicMock(return_value=None)
+    monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+    result = cli_stale_race("tick")
+    assert result.exit_code == 0, result.output
+    assert "lost the race to claim" in result.output
+    stub.assert_not_called()
+
+
+def test_stale_race_reservation_cleanup_releases_when_holder_is_no_longer_live(
+    cli_stale_race, coord_db, stale_ci_backend,
+):
+    """Mirrors `test_auto_revalidate_dismisses_a_stale_escalation_once_the_
+    block_clears` for the reservation (#3859 review's test-gap note): a
+    reservation whose holder stopped being a `checks_stale` candidate
+    (merged, or the base stopped moving) must be released even though this
+    tick finds zero live candidates — not left dangling for the full TTL."""
+    set_board_meta(coord_db, "board_initialized", "1")
+    state.reserve_merge_slot(REPO, f"{REPO}#2534", ttl_seconds=3600)
+    assert state.get_merge_reservation(REPO) is not None
+
+    result = cli_stale_race("tick")
+    assert result.exit_code == 0, result.output
+
+    assert state.get_merge_reservation(REPO) is None
+
+
+def test_stale_race_opted_out_repo_still_dispatches_but_never_reserves(
+    cli_stale_race_opted_out, coord_db, stale_ci_backend, monkeypatch,
+):
+    """The reservation is opt-in per repo; the base-SHA-aware retry cap is
+    not. A repo that has not opted into `board_doctor.stale_race` still
+    gets the #3859 base-move-aware dispatch (today's behaviour, unchanged)
+    but never acquires a merge-gate reservation for it."""
+    import coord.github_ops as github_ops
+
+    _seed_pending_merge_row(coord_db, 2534, pr_number=42)
+    _seed_failed_stale_rebase_attempt(coord_db, 2534, dispatched_base_sha="old-sha-1")
+    set_board_meta(coord_db, "board_initialized", "1")
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch, **_kw: "new-sha-2")
+
+    fix_assignment = Assignment(
+        machine_name="dellserver", repo_name=REPO, issue_number=2534,
+        issue_title="[stale-rebase-fix] issue 2534", assignment_id="cf-fresh",
+        status="pending", type="conflict-fix",
+    )
+    stub = MagicMock(return_value=fix_assignment)
+    monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+
+    result = cli_stale_race_opted_out("tick")
+    assert result.exit_code == 0, result.output
+    assert "dispatched a stale-rebase conflict-fix" in result.output
+
+    assert state.get_merge_reservation(REPO) is None
+
+
+def test_stale_race_second_sibling_row_defers_its_stale_rebase_dispatch(
+    cli_stale_race, coord_db, stale_ci_backend, monkeypatch,
+):
+    """With a reservation held, a second `checks_stale` row in the SAME
+    repo is held out of THIS tick's stale-rebase dispatcher — deferred, not
+    dispatched and not escalated, with a reason naming the reserving row —
+    instead of racing it for a sibling-merge-invalidated CI re-run.
+
+    This is NOT the merge gate itself: neither row here is merge-ready (both
+    are still `checks_stale`), and nothing in `coord.merge_queue.process()`
+    consults this reservation — see that module for the actual merge gate.
+    What this covers is narrower: the ordering between two rebase dispatches
+    in one tick."""
     import coord.github_ops as github_ops
 
     _seed_pending_merge_row(coord_db, 2534, pr_number=42)

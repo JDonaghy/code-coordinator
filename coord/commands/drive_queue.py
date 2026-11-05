@@ -6743,7 +6743,12 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     (:func:`coord.board_doctor_policy._stale_race_tier_enabled`,
     `coord.state.reserve_merge_slot`) so a later sibling becoming
     merge-ready waits its turn instead of leapfrogging a row that is
-    already mid-rebase.
+    already mid-rebase. That reservation orders dispatches; it does not cap
+    them, and is opt-in — so unconditionally (every repo, opted in or not),
+    :func:`coord.conflict_fix.count_stale_rebase_attempts` bounds how many
+    stale-rebase rows one merge entry may accumulate before this tick
+    escalates with an accurate "lost N races" reason instead of retrying
+    forever.
     """
     from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
 
@@ -6757,15 +6762,21 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
         from coord.ci_store import build_ci_store  # noqa: PLC0415
         from coord.commands._common import _load_config  # noqa: PLC0415
         from coord.conflict_fix import (  # noqa: PLC0415
+            BLOCK_REASON_BASE_UNKNOWN,
+            BLOCK_REASON_ORDINARY_FAILURE,
+            BLOCK_REASON_SAME_BASE,
+            MAX_STALE_REBASE_RACE_ATTEMPTS,
+            _classify_prior_conflict_fix,
             _has_active_conflict_fix,
+            count_stale_rebase_attempts,
             describe_conflict_fix_decline,
             dispatch_conflict_fix,
-            has_prior_conflict_fix,
         )
         from coord.board_doctor_policy import (  # noqa: PLC0415
             STALE_RACE_RESERVATION_TTL_SECONDS,
             _stale_race_tier_enabled,
         )
+        from coord.github_ops import GhTransientError  # noqa: PLC0415
         from coord.network import fetch_status  # noqa: PLC0415
         from coord.state import (  # noqa: PLC0415
             dismiss_drive_escalation,
@@ -6870,14 +6881,15 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
     try:
         for repo_name, reservation in list_merge_reservations().items():
             holder = reservation.get("holder") or ""
-            parts = holder.split("#", 1)
-            if len(parts) != 2:
-                continue
-            try:
-                holder_key = (parts[0], int(parts[1]))
-            except ValueError:
-                continue
-            if holder_key not in live_keys:
+            # #3859 review: parse through the one shared `"repo#N"` codec
+            # (`coord.drive_queue.parse_key`) rather than a hand-rolled
+            # `split("#", 1)` + `int()` — the latter diverges from
+            # `parse_key`'s `rpartition` + `str.isdigit()` on a repo name
+            # that itself contains a `#`, or a malformed trailing value
+            # `int()` accepts (e.g. a leading `-`) that `isdigit()` would
+            # reject (#3807).
+            holder_key = parse_key(holder)
+            if holder_key is not None and holder_key not in live_keys:
                 release_merge_reservation(repo_name, holder)
     except Exception:  # noqa: BLE001 — best-effort, see docstring
         pass
@@ -6887,21 +6899,39 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
 
     for entry in candidates:
         label = f"{entry.repo_name} #{entry.issue_number} ({entry.branch})"
-        row_key = f"{entry.repo_name}#{entry.issue_number}"
+        # #3859 review: go through the one shared `"repo#N"` codec rather
+        # than a hand-rolled f-string — see the release pass above for why
+        # that divergence (#3807) matters.
+        row_key = entry_key(entry.repo_name, entry.issue_number)
 
         # #3859: `ci_revalidation_candidates` never populates
         # `target_branch_head_sha` (only `process()`'s own live merge
         # attempt does — see that field's docstring in `coord/merge_queue.py`),
         # so this tick fetches it itself, the same primitive `process()`
-        # uses. A fetch failure (rate limit, transient network) leaves it
-        # `None` — the pre-#3859 base-SHA-blind behaviour, not a crash.
-        # Mutating `entry` directly (rather than threading a separate
+        # uses. Mutating `entry` directly (rather than threading a separate
         # variable through) means `build_stale_rebase_briefing` below picks
         # the SAME value up automatically when it stamps "Target base SHA:".
+        #
+        # #3859 review: `raise_on_transient=True` so a rate-limited/
+        # unauthenticated read (`GhTransientError`) is distinguishable from
+        # a confirmed-absent branch — without it, both looked like a bare
+        # `None` and this tick would dispatch anyway with "Target base SHA:
+        # unknown" stamped PERMANENTLY into that attempt's briefing,
+        # blinding its own future `_dispatched_base_sha` comparison even
+        # after the transient probe failure clears. On a confirmed transient
+        # failure this candidate is skipped for the round entirely (deferred
+        # to the next tick) rather than dispatched base-SHA-blind.
         try:
             entry.target_branch_head_sha = _gh_ops.get_branch_sha(
-                entry.repo_github, entry.target_branch
+                entry.repo_github, entry.target_branch, raise_on_transient=True,
             )
+        except GhTransientError as exc:
+            click.echo(
+                f"auto-revalidate: {label} is checks_stale — base-SHA probe "
+                f"failed transiently ({exc}); deferring to the next tick "
+                "rather than dispatching with an unknown base"
+            )
+            continue
         except Exception:  # noqa: BLE001 — best-effort, see docstring
             entry.target_branch_head_sha = None
 
@@ -6913,10 +6943,11 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
         # failed/advisory attempt consumed the retry cap forever, even once
         # the base had moved again and a fresh rebase would have succeeded
         # (quadraui#1961).
-        if has_prior_conflict_fix(
+        block_reason = _classify_prior_conflict_fix(
             board, entry.assignment_id, current_error=entry.error,
             current_base_sha=entry.target_branch_head_sha,
-        ):
+        )
+        if block_reason is not None:
             if _has_active_conflict_fix(board, entry.assignment_id):
                 # A stale-rebase attempt is already running/pending for this
                 # entry (dispatched by this same tick earlier, a live drive,
@@ -6933,15 +6964,37 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
             # target base could not be recovered) — the retry cap is spent,
             # and re-diagnosing it every tick forever is exactly the #3396
             # bug. Escalate once into the durable table instead of only
-            # echoing. #3859: this text no longer claims "(same base)" —
-            # reaching this branch at all now means `has_prior_conflict_fix`
-            # already confirmed the base is unchanged (or unknowable), so
-            # the claim stays true instead of asserting it unconditionally.
-            reason = (
-                f"{label} is checks_stale and a prior conflict-fix attempt "
-                "already failed and a fresh rebase cannot clear it — the "
-                "automatic rebase already gave up; needs a human"
-            )
+            # echoing.
+            #
+            # #3859 review: the wording now branches on *block_reason* —
+            # only `BLOCK_REASON_SAME_BASE` confirms the base comparison
+            # actually ran and found it unchanged; `BLOCK_REASON_BASE_
+            # UNKNOWN` means the base could not be confirmed either way
+            # (not "same", not "moved"), and `BLOCK_REASON_ORDINARY_FAILURE`
+            # means a mechanical conflict-fix failed before any rebase was
+            # even attempted against this specific base. Asserting "same
+            # base" for all three was the exact unverified-claim defect
+            # #3859 itself was filed to fix, just in different wording.
+            if block_reason == BLOCK_REASON_SAME_BASE:
+                reason = (
+                    f"{label} is checks_stale and a prior stale-rebase "
+                    "attempt already failed against the base that is still "
+                    "current — a fresh rebase cannot clear it; needs a human"
+                )
+            elif block_reason == BLOCK_REASON_BASE_UNKNOWN:
+                reason = (
+                    f"{label} is checks_stale and a prior stale-rebase "
+                    "attempt already failed, but the target base could not "
+                    "be confirmed unchanged or moved — a fresh rebase is "
+                    "not known to clear it; needs a human"
+                )
+            else:
+                assert block_reason == BLOCK_REASON_ORDINARY_FAILURE
+                reason = (
+                    f"{label} is checks_stale and a prior mechanical "
+                    "conflict-fix already failed — the automatic rebase "
+                    "already gave up; needs a human"
+                )
             click.echo(f"auto-revalidate: {reason}")
             record_audit(
                 tier="operational", category="merge",
@@ -6953,6 +7006,44 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
                 details={"pr_number": entry.pr_number, "error": entry.error},
             )
             _record_checks_stale_escalation(entry, reason=reason)
+            # #3859 review: a reservation this row held (if any) is now a
+            # human's problem — release it so no sibling in the repo waits
+            # out the full TTL behind a row that just paged an operator.
+            release_merge_reservation(entry.repo_name, row_key)
+            continue
+
+        # #3859 review: the base-move skip above has no ceiling of its own —
+        # bound the total number of stale-rebase rows this entry may
+        # accumulate regardless of why each prior one didn't block (a
+        # genuine failure, a base-move skip, or a clean success immediately
+        # invalidated by the next sibling merge all look the same from
+        # here: this PR keeps losing races against its own repo's merge
+        # cadence). Applies unconditionally — not only on repos that opted
+        # into the `stale_race` reservation tier below — since the
+        # reservation orders dispatches, it does not cap them.
+        race_attempts = count_stale_rebase_attempts(board, entry.assignment_id)
+        if race_attempts >= MAX_STALE_REBASE_RACE_ATTEMPTS:
+            reason = (
+                f"{label} is checks_stale and has lost {race_attempts} "
+                "stale-rebase races against sibling merges in this repo in "
+                "a row — a fresh rebase keeps being invalidated before it "
+                "can land; needs a human to break the cycle"
+            )
+            click.echo(f"auto-revalidate: {reason}")
+            record_audit(
+                tier="operational", category="merge",
+                event_type="merge_checks_stale_human_required",
+                actor="drive-queue-tick",
+                summary=reason,
+                repo=entry.repo_name, issue=entry.issue_number,
+                assignment_id=entry.assignment_id,
+                details={
+                    "pr_number": entry.pr_number,
+                    "stale_rebase_attempts": race_attempts,
+                },
+            )
+            _record_checks_stale_escalation(entry, reason=reason)
+            release_merge_reservation(entry.repo_name, row_key)
             continue
 
         # #3859: ships off by default (`_stale_race_tier_enabled`'s own
@@ -6971,9 +7062,26 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
                     "it releases or times out"
                 )
                 continue
-            reserve_merge_slot(
+            # #3859 review: `reserve_merge_slot`'s return value is the one
+            # confirmation that THIS tick actually holds the gate — the
+            # `get_merge_reservation` read above and this write are not
+            # atomic with each other (`coord notify`'s sweep, or a second
+            # concurrent tick, can claim the slot in between; see this
+            # function's own docstring), so a caller that assumes success
+            # from the absence of an exception can leapfrog a reservation
+            # exactly like the race this mechanism exists to prevent (epic
+            # #2096: derive "proceeding is safe" from the observed result
+            # of the claim, never from an inability to look). A declined
+            # claim defers exactly like losing the read-side check above.
+            if not reserve_merge_slot(
                 entry.repo_name, row_key, STALE_RACE_RESERVATION_TTL_SECONDS
-            )
+            ):
+                click.echo(
+                    f"auto-revalidate: {label} is checks_stale — lost the "
+                    f"race to claim {entry.repo_name}'s merge-gate "
+                    "reservation to a concurrent tick; will retry next round"
+                )
+                continue
 
         pick_out: list = []
         fix = dispatch_conflict_fix(
@@ -7041,6 +7149,11 @@ def _run_auto_revalidate_checks_stale(config_path: Path | None) -> None:
             details={"pr_number": entry.pr_number, "decline_reason": decline_reason},
         )
         _record_checks_stale_escalation(entry, reason=reason)
+        # #3859 review: a decline parks this row exactly like the
+        # genuine-failure escalation above — release any reservation it
+        # held so a sibling in the repo is not blocked behind a row nobody
+        # is dispatching against.
+        release_merge_reservation(entry.repo_name, row_key)
 
 
 def _run_resume_probe(entry: QueueEntry) -> ProbeResult:
